@@ -1,7 +1,8 @@
 use recipe_core::{DType, ScalarLiteral, ScalarOpcode};
 use recipe_language::{
-	AtomicOperation, AtomicOrdering, AxisSet, Elementwise, Gather, Histogram, IndexBounds, PrimitiveKind, Reduce,
-	ReduceOperator, ReduceResult, Scan, ScanMode, Scatter, ScatterConflict, Shape, Sort, SortDirection,
+	AtomicOperation, AtomicOrdering, AxisSet, Contraction, Elementwise, Gather, Histogram, IndexBounds,
+	PrimitiveKind, Reduce, ReduceOperator, ReduceResult, Scan, ScanMode, Scatter, ScatterConflict, Shape, Sort,
+	SortDirection,
 };
 use recipe_math::MathFunction;
 
@@ -28,6 +29,7 @@ const OPERATIONS: &[(&str, &str)] = &[
 	("gpu_gaussian_logprob", "gpu-core/src/rl.rs:156"),
 	("gpu_gcn_norm", "gpu-core/src/graph.rs:180"),
 	("gpu_neighbor_aggregate", "gpu-core/src/graph.rs:111"),
+	("gpu_pairwise_l2", "gpu-core/src/kernels.rs:5239"),
 	("gpu_td_targets", "gpu-core/src/rl.rs:105"),
 	("gpu_union_find_cc", "gpu-core/src/cluster.rs:251"),
 ];
@@ -54,6 +56,7 @@ pub(super) fn dispatch(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 				"gpu_gaussian_logprob" => emit_gaussian_log_probability(request, emitter),
 				"gpu_gcn_norm" => emit_gcn_normalization(request, emitter),
 				"gpu_neighbor_aggregate" => emit_neighbor_aggregate(request, emitter),
+				"gpu_pairwise_l2" => emit_pairwise_l2(request, emitter),
 				"gpu_td_targets" => emit_temporal_difference_targets(request, emitter),
 				"gpu_union_find_cc" => emit_union_find_two_nodes(request, emitter),
 				symbol => Err(operation_error(
@@ -1046,6 +1049,91 @@ fn emit_core_distance(request: &MaterializationRequest<'_>, emitter: &mut Emitte
 	)
 }
 
+fn emit_pairwise_l2(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
+	require_exact_abi(
+		request,
+		&["query", "training"],
+		&["distances"],
+		&["queries", "training_rows", "dimensions", "tree_lanes"],
+	)?;
+	let query = input(request, "query")?;
+	let training = input(request, "training")?;
+	let distances = output(request, "distances")?;
+	let queries = prepared_dimension(request, "queries")?;
+	let training_rows = prepared_dimension(request, "training_rows")?;
+	let dimensions = prepared_dimension(request, "dimensions")?;
+	let tree_lanes = prepared_tree_lanes(request)?;
+	require_dtype(request, query, DType::F32, "query")?;
+	require_dtype(request, training, DType::F32, "training")?;
+	require_dtype(request, distances, DType::F32, "distances")?;
+	require_shape(request, query, &[queries, dimensions], "query")?;
+	require_shape(request, training, &[training_rows, dimensions], "training")?;
+	require_shape(request, distances, &[queries, training_rows], "distances")?;
+
+	let query_squared = emitter.intermediate(DType::F32, query.shape.clone())?;
+	let training_squared = emitter.intermediate(DType::F32, training.shape.clone())?;
+	emitter.emit_stage([
+		KernelEmission {
+			inputs: vec![query.id],
+			outputs: vec![query_squared],
+			kind: PrimitiveKind::Elementwise(Elementwise {
+				program: square_program(request.descriptor.id)?,
+			}),
+		},
+		KernelEmission {
+			inputs: vec![training.id],
+			outputs: vec![training_squared],
+			kind: PrimitiveKind::Elementwise(Elementwise {
+				program: square_program(request.descriptor.id)?,
+			}),
+		},
+	])?;
+	let query_norms = emitter.intermediate(DType::F32, shape(request, &[queries, 1])?)?;
+	let training_norms = emitter.intermediate(DType::F32, shape(request, &[training_rows])?)?;
+	emitter.emit_stage([
+		KernelEmission {
+			inputs: vec![query_squared],
+			outputs: vec![query_norms],
+			kind: reduction(
+				request.descriptor.id,
+				ReduceOperator::Sum,
+				&[1],
+				true,
+				ReduceResult::Value,
+				tree_lanes,
+			)?,
+		},
+		KernelEmission {
+			inputs: vec![training_squared],
+			outputs: vec![training_norms],
+			kind: reduction(
+				request.descriptor.id,
+				ReduceOperator::Sum,
+				&[1],
+				false,
+				ReduceResult::Value,
+				tree_lanes,
+			)?,
+		},
+	])?;
+	let products = emitter.intermediate(DType::F32, distances.shape.clone())?;
+	emitter.emit(
+		vec![query.id, training.id],
+		vec![products],
+		PrimitiveKind::Contraction(Contraction {
+			batch_axes: Vec::new(),
+			contract_axes: vec![(1, 1)],
+		}),
+	)?;
+	emitter.emit(
+		vec![query_norms, training_norms, products],
+		vec![distances.id],
+		PrimitiveKind::Elementwise(Elementwise {
+			program: pairwise_l2_result_program(request.descriptor.id)?,
+		}),
+	)
+}
+
 fn emit_fixed_radius_singleton(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
 	require_exact_abi(
 		request,
@@ -1899,6 +1987,19 @@ fn squared_difference_program(operation: OperationId) -> OperationResult<recipe_
 	scalar_finish(operation, builder, &[squared])
 }
 
+fn square_program(operation: OperationId) -> OperationResult<recipe_core::ScalarProgram> {
+	let mut builder = scalar_builder(operation)?;
+	let value = scalar_input(operation, &mut builder, DType::F32)?;
+	let squared = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::Multiply,
+		value,
+		value,
+	)?;
+	scalar_finish(operation, builder, &[squared])
+}
+
 fn nonnegative_square_root_program(operation: OperationId) -> OperationResult<recipe_core::ScalarProgram> {
 	let mut builder = scalar_builder(operation)?;
 	let value = scalar_input(operation, &mut builder, DType::F32)?;
@@ -1913,6 +2014,50 @@ fn nonnegative_square_root_program(operation: OperationId) -> OperationResult<re
 	scalar_unary(operation, &mut builder, ScalarOpcode::Require, valid)?;
 	let root = scalar_unary(operation, &mut builder, ScalarOpcode::SquareRoot, value)?;
 	scalar_finish(operation, builder, &[root])
+}
+
+fn pairwise_l2_result_program(operation: OperationId) -> OperationResult<recipe_core::ScalarProgram> {
+	let mut builder = scalar_builder(operation)?;
+	let query_norm = scalar_input(operation, &mut builder, DType::F32)?;
+	let training_norm = scalar_input(operation, &mut builder, DType::F32)?;
+	let product = scalar_input(operation, &mut builder, DType::F32)?;
+	let two = scalar_f32(operation, &mut builder, 2.0)?;
+	let twice_product = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::Multiply,
+		product,
+		two,
+	)?;
+	let norm_sum = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::Add,
+		query_norm,
+		training_norm,
+	)?;
+	let squared_distance = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::Subtract,
+		norm_sum,
+		twice_product,
+	)?;
+	let zero = scalar_f32(operation, &mut builder, 0.0)?;
+	let nonnegative = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::Maximum,
+		squared_distance,
+		zero,
+	)?;
+	let distance = scalar_unary(
+		operation,
+		&mut builder,
+		ScalarOpcode::SquareRoot,
+		nonnegative,
+	)?;
+	scalar_finish(operation, builder, &[distance])
 }
 
 fn minimum_representative_hook_program(operation: OperationId) -> OperationResult<recipe_core::ScalarProgram> {

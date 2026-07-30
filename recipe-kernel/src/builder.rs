@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
 	AmdTarget, ArtifactDigest, InspectedCubin, InspectedHsaco, KernelTarget, LoweredKernel, LoweringError,
-	LoweringErrorKind, NvidiaTarget, inspect_cubin, inspect_hsaco,
+	LoweringErrorKind, NvidiaTarget, inspect_cubin, inspect_hsaco, inspect_hsaco_bundle,
 };
 
 static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -306,17 +306,12 @@ impl ArtifactBuilder {
 		linker_arguments.extend([OsString::from("-o"), output.as_os_str().to_owned()]);
 		invoke(linker, linker_arguments, &workspace.path, &mut invocations)?;
 		let bytes = read_regular(&output)?;
-		let inspections = lowered
-			.iter()
-			.map(|kernel| {
-				inspect_hsaco(
-					&bytes,
-					&target.target_id,
-					target.code_object_version,
-					&kernel.abi,
-				)
-			})
-			.collect::<Result<Vec<_>, _>>()?;
+		let inspections = inspect_hsaco_bundle(
+			&bytes,
+			&target.target_id,
+			target.code_object_version,
+			lowered.iter().map(|kernel| &kernel.abi),
+		)?;
 		let provenance = HsacoBundleProvenance {
 			phase,
 			llvm_ir: lowered

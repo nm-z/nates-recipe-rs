@@ -52,7 +52,7 @@ pub mod operations {
 	pub use recipe_core::ScalarProgram;
 	pub use recipe_ops::{
 		CompositionPayload, CompositionRecipe, CompositionStep, IdentityNamespace, IterationBound, LoweredProgram,
-		LoweringAvailability, MaterializationRequest, MaterializedComposition, MissingConcreteComponent,
+		LoweringAvailability, LoweringHardware, MaterializationRequest, MaterializedComposition, MissingConcreteComponent,
 		NamedTensor, NonCalculationRecipe, OperationDescriptor, OperationError, OperationErrorKind,
 		OperationRegistry, OperationResult, PreparedParameter, PreparedParameters, PrimitiveRequest,
 		RemainingComposition, ResolvedBound, ResolvedComposition, ResolvedIteration, ResolvedStep, StageEmission,
@@ -89,8 +89,9 @@ pub mod operations {
 	pub fn lower_primitive(
 		descriptor: OperationDescriptor,
 		request: PrimitiveRequest<'_>,
+		hardware: LoweringHardware,
 	) -> OperationResult<LoweredProgram> {
-		recipe_ops::lower_primitive(descriptor, request)
+		recipe_ops::lower_primitive(descriptor, request, hardware)
 	}
 
 	/// Validate that a structured operation is a finite composition of owned

@@ -235,6 +235,7 @@ const RANDOM: CompositionStep = CompositionStep::primitive(
 const MAP_ONLY: &[CompositionStep] = &[MAP];
 const MAP_REDUCE: &[CompositionStep] = &[MAP, REDUCE];
 const MAP_REDUCE_MAP: &[CompositionStep] = &[MAP, REDUCE, MAP];
+const PAIRWISE_L2_STEPS: &[CompositionStep] = &[MAP, REDUCE, CONTRACT, MAP];
 const MAP_SCAN: &[CompositionStep] = &[MAP, SCAN];
 const MAP_SORT: &[CompositionStep] = &[MAP, SORT];
 const MAP_SORT_GATHER: &[CompositionStep] = &[MAP, SORT, GATHER];
@@ -1932,7 +1933,7 @@ fn composition_for_entry(symbol: &str, source: &str) -> Option<CompositionRecipe
 		"gpu_pairwise_l2" => recipe(
 			"pairwise_l2_distance",
 			"square pairwise differences, sum features with fixed trees, and apply the owned square root",
-			MAP_REDUCE,
+			PAIRWISE_L2_STEPS,
 			CompositionPayload::F32,
 			OperationFamily::Distance,
 		),

@@ -5,7 +5,7 @@ use recipe_language::{
 	AtomicOperation, AtomicOrdering, IndexBounds, PrimitiveKernel, PrimitiveKind, ReduceOperator, ReduceResult,
 	ScanMode, ScatterConflict, SortDirection, Tensor,
 };
-use recipe_primitives::LoweredProgram;
+use recipe_primitives::{LoweredProgram, LoweringHardware};
 
 use crate::{
 	CanonicalDTypeContract, LoweringAvailability, OperationDescriptor, OperationError, OperationErrorKind,
@@ -371,6 +371,7 @@ impl PrimitiveRecipe {
 pub fn lower_primitive(
 	descriptor: OperationDescriptor,
 	request: PrimitiveRequest<'_>,
+	hardware: LoweringHardware,
 ) -> OperationResult<LoweredProgram> {
 	let recipe = match descriptor.lowering {
 		LoweringAvailability::Primitive(recipe) => recipe,
@@ -392,7 +393,7 @@ pub fn lower_primitive(
 			.for_operation(descriptor.id));
 		}
 	};
-	lower_recipe(recipe, request).map_err(|error| error.for_operation(descriptor.id))
+	lower_recipe(recipe, request, hardware).map_err(|error| error.for_operation(descriptor.id))
 }
 
 /// Lower Recipe's iteration-aware affine int32 source without inventing a
@@ -402,13 +403,17 @@ pub fn lower_primitive(
 /// aliases. Its output shape fixes the number of generated indexes; `start`,
 /// `element_step`, `iteration_step`, and the optional positive modulus remain
 /// explicit in the immutable lowered program.
-pub fn lower_index_map(request: PrimitiveRequest<'_>) -> OperationResult<LoweredProgram> {
-	lower_recipe(PrimitiveRecipe::IndexMap, request)
+pub fn lower_index_map(request: PrimitiveRequest<'_>, hardware: LoweringHardware) -> OperationResult<LoweredProgram> {
+	lower_recipe(PrimitiveRecipe::IndexMap, request, hardware)
 }
 
-fn lower_recipe(recipe: PrimitiveRecipe, request: PrimitiveRequest<'_>) -> OperationResult<LoweredProgram> {
+fn lower_recipe(
+	recipe: PrimitiveRecipe,
+	request: PrimitiveRequest<'_>,
+	hardware: LoweringHardware,
+) -> OperationResult<LoweredProgram> {
 	match recipe.matches(request.kernel, request.tensors) {
-		true => recipe_primitives::lower(request.kernel, request.tensors).map_err(|error| {
+		true => recipe_primitives::lower(request.kernel, request.tensors, hardware).map_err(|error| {
 			OperationError::new(
 				OperationErrorKind::PrimitiveLoweringFailed,
 				error.to_string(),

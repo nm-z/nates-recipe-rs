@@ -38,7 +38,7 @@ pub struct InitAdmissionWork<'a> {
 pub struct CalculationWork<'a> {
 	pub task: TaskId,
 	pub run: RunId,
-	/// Zero-based finalized loop iteration for batch and schedule addressing.
+	/// Zero-based finalized loop iteration for recurrent-state and schedule addressing.
 	pub iteration: LoopIteration,
 	pub device: DeviceId,
 	pub kernel_template: KernelTemplateId,

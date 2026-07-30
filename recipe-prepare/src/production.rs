@@ -20,12 +20,14 @@ use recipe_core::{
 	TargetIdentity, ToolchainIdentity, Topology,
 };
 use recipe_cuda::{ComputeCapability, DriverSymbol, DriverVersion, ToolchainIdentity as CudaToolchainIdentity};
-use recipe_kernel::{ArtifactBuilder, ArtifactDigest, BuildPhase, KernelTarget, LoweringError, LoweringOptions};
+use recipe_kernel::{
+	ArtifactBuilder, BuildPhase, KernelTarget, LoweringError, LoweringOptions, inspect_cubin, inspect_hsaco_bundle,
+};
 use recipe_language::CalculationGraph;
 use recipe_native_executor::{
 	CandidateArtifact as ExecutorCandidateArtifact, CandidateFailure as ExecutorCandidateFailure,
 	CandidateRealizationRequest as ExecutorCandidateRequest, CandidateSessionFactory, RuntimeArtifact,
-	RuntimeArtifactKind, ValidatedCandidateFactory, ValidatedCandidateSession,
+	RuntimeArtifactKind, RuntimeImage, ValidatedCandidateFactory, ValidatedCandidateSession,
 };
 use recipe_planner::PlannedCandidate;
 use recipe_probe::{MeasuredProfile, validate_profile};
@@ -263,6 +265,7 @@ impl TargetBuildSpec {
 #[derive(Clone, Debug)]
 pub struct DeferredArtifactCompiler {
 	targets: Vec<TargetBuildSpec>,
+	prebuilt_bundles: BTreeMap<TargetIdentity, Arc<[u8]>>,
 }
 
 impl DeferredArtifactCompiler {
@@ -279,7 +282,39 @@ impl DeferredArtifactCompiler {
 				)),
 			)?;
 		}
-		Ok(Self { targets })
+		Ok(Self {
+			targets,
+			prebuilt_bundles: BTreeMap::new(),
+		})
+	}
+
+	/// Supply one exact native bundle for a measured target. Realization still
+	/// lowers every current stage to recover its ABI and validates every entry
+	/// in the supplied image, but it does not invoke the native compiler.
+	pub fn with_prebuilt_bundle(
+		mut self,
+		target: TargetIdentity,
+		bytes: Arc<[u8]>,
+	) -> Result<Self, NativePrepareError<Infallible>> {
+		require(
+			!bytes.is_empty(),
+			NativePrepareError::InvalidArtifact("prebuilt native bundle is empty".to_owned()),
+		)?;
+		require(
+			self.targets
+				.iter()
+				.any(|spec| spec.target_identity == target),
+			NativePrepareError::MissingBuildTarget(target.clone()),
+		)?;
+		require(
+			self.prebuilt_bundles
+				.insert(target.clone(), bytes)
+				.is_none(),
+			NativePrepareError::InvalidConfiguration(format!(
+				"target {target:?} has more than one prebuilt native bundle"
+			)),
+		)?;
+		Ok(self)
 	}
 
 	fn materialize(
@@ -385,6 +420,25 @@ impl DeferredArtifactCompiler {
 			.iter()
 			.map(|build| lower_deferred_stage(candidate, spec, build))
 			.collect::<Result<Vec<_>, _>>()?;
+		if let Some(bytes) = self.prebuilt_bundles.get(&spec.target_identity) {
+			let expected_sm = target
+				.sm_major
+				.checked_mul(10)
+				.and_then(|major| major.checked_add(target.sm_minor))
+				.ok_or_else(|| {
+					NativePrepareError::InvalidConfiguration("NVIDIA SM identity overflowed u8".to_owned())
+				})?;
+			for kernel in &lowered {
+				inspect_cubin(bytes, expected_sm, &kernel.abi.entry_symbol)
+					.map_err(NativePrepareError::Lowering)?;
+			}
+			let image = RuntimeImage::new(Arc::clone(bytes));
+			return builds
+				.iter()
+				.zip(lowered)
+				.map(|(build, kernel)| native_artifact_from_image(spec, build, kernel, image.clone()))
+				.collect();
+		}
 		let built = spec
 			.builder
 			.build_cubin_bundle(BuildPhase::Realize, &lowered, *target, &spec.scratch_parent)
@@ -408,10 +462,10 @@ impl DeferredArtifactCompiler {
 				)),
 			)?;
 		}
-		let bytes: Arc<[u8]> = built.bytes.into();
+		let image = RuntimeImage::new(built.bytes.into());
 		builds.iter()
 			.zip(lowered)
-			.map(|(build, kernel)| native_artifact_from_image(spec, build, kernel, Arc::clone(&bytes)))
+			.map(|(build, kernel)| native_artifact_from_image(spec, build, kernel, image.clone()))
 			.collect()
 	}
 
@@ -430,6 +484,21 @@ impl DeferredArtifactCompiler {
 			.iter()
 			.map(|build| lower_deferred_stage(candidate, spec, build))
 			.collect::<Result<Vec<_>, _>>()?;
+		if let Some(bytes) = self.prebuilt_bundles.get(&spec.target_identity) {
+			inspect_hsaco_bundle(
+				bytes,
+				&target.target_id,
+				target.code_object_version,
+				lowered.iter().map(|kernel| &kernel.abi),
+			)
+			.map_err(NativePrepareError::Lowering)?;
+			let image = RuntimeImage::new(Arc::clone(bytes));
+			return builds
+				.iter()
+				.zip(lowered)
+				.map(|(build, kernel)| native_artifact_from_image(spec, build, kernel, image.clone()))
+				.collect();
+		}
 		let built = spec
 			.builder
 			.build_hsaco_bundle(BuildPhase::Realize, &lowered, target, &spec.scratch_parent)
@@ -453,10 +522,10 @@ impl DeferredArtifactCompiler {
 				)),
 			)?;
 		}
-		let bytes: Arc<[u8]> = built.bytes.into();
+		let image = RuntimeImage::new(built.bytes.into());
 		builds.iter()
 			.zip(lowered)
-			.map(|(build, kernel)| native_artifact_from_image(spec, build, kernel, Arc::clone(&bytes)))
+			.map(|(build, kernel)| native_artifact_from_image(spec, build, kernel, image.clone()))
 			.collect()
 	}
 }
@@ -496,9 +565,9 @@ fn native_artifact_from_image(
 	spec: &TargetBuildSpec,
 	build: &ArtifactBuildRecipe,
 	lowered: recipe_kernel::LoweredKernel,
-	bytes: Arc<[u8]>,
+	image: RuntimeImage,
 ) -> Result<NativeArtifact, NativePrepareError<Infallible>> {
-	let digest = ArtifactDigest::of(&bytes).bytes();
+	let digest = image.digest().bytes();
 	let identity = ArtifactIdentity {
 		id: build.artifact,
 		digest: Digest::new(digest),
@@ -516,7 +585,7 @@ fn native_artifact_from_image(
 		build: Some(build.provenance),
 	};
 	let runtime_kind = runtime_kind(spec, digest)?;
-	let runtime = RuntimeArtifact::new(build.artifact, bytes, lowered.abi, runtime_kind);
+	let runtime = RuntimeArtifact::from_image(build.artifact, image, lowered.abi, runtime_kind);
 	NativeArtifact::new(identity, runtime).map_err(erase_never)
 }
 
@@ -601,7 +670,7 @@ fn validate_native_artifact(
 			identity.id
 		)),
 	)?;
-	let digest = ArtifactDigest::of(runtime.bytes()).bytes();
+	let digest = runtime.digest().bytes();
 	require(
 		digest == identity.digest.bytes(),
 		NativePrepareError::InvalidArtifact(format!(
@@ -1424,7 +1493,7 @@ mod tests {
 
 	fn native_artifact() -> NativeArtifact {
 		let bytes: Arc<[u8]> = Arc::from(&b"recipe-cubin"[..]);
-		let digest = ArtifactDigest::of(&bytes).bytes();
+		let digest = recipe_kernel::ArtifactDigest::of(&bytes).bytes();
 		let target = TargetIdentity {
 			backend: label(CUDA_BACKEND),
 			architecture: label("sm_52"),
@@ -1538,6 +1607,7 @@ mod tests {
 			discovery,
 			compiler: DeferredArtifactCompiler {
 				targets: Vec::new(),
+				prebuilt_bundles: BTreeMap::new(),
 			},
 			driver: TestDriver::default(),
 		};

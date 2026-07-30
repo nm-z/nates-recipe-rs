@@ -1,5 +1,6 @@
 use core::fmt;
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -527,7 +528,10 @@ pub enum Activation {
 	Linear,
 	Cosine,
 	Exponential,
+	/// Signed logarithm `sign(x) * ln(abs(x))` on nonzero inputs.
 	Logarithm,
+	/// Natural logarithm `ln(x)` on strictly positive inputs.
+	NaturalLogarithm,
 	Huber,
 	Tangent,
 	Relu,
@@ -754,11 +758,7 @@ pub enum LayerSpec {
 		clusters: usize,
 		group_to_neuron: Option<GroupToNeuronConnection>,
 	},
-	KnnPrediction {
-		neighbors: usize,
-	},
-	KnnReduction {
-		outputs: usize,
+	Knn {
 		neighbors: usize,
 		operations: Vec<LayerOperation>,
 	},
@@ -802,10 +802,7 @@ impl LayerSpec {
 					&& group_to_neuron
 						.is_none_or(|connection| connection.valid_for(GroupCount::Exact(*clusters)))
 			}
-			Self::KnnPrediction { neighbors } => *neighbors != 0,
-			Self::KnnReduction {
-				outputs, neighbors, ..
-			} => *outputs != 0 && *neighbors != 0,
+			Self::Knn { neighbors, .. } => *neighbors != 0,
 			Self::Residual {
 				branch,
 				output_width,
@@ -845,27 +842,6 @@ impl IntoLayer for usize {
 impl IntoLayer for LayerSpec {
 	fn into_layer(self) -> LayerSpec {
 		self
-	}
-}
-
-trait IntoKnnSpec {
-	fn into_knn_spec(self) -> LayerSpec;
-}
-
-impl IntoKnnSpec for usize {
-	fn into_knn_spec(self) -> LayerSpec {
-		LayerSpec::KnnPrediction { neighbors: self }
-	}
-}
-
-impl IntoKnnSpec for [usize; 2] {
-	fn into_knn_spec(self) -> LayerSpec {
-		let [outputs, neighbors] = self;
-		LayerSpec::KnnReduction {
-			outputs,
-			neighbors,
-			operations: Vec::new(),
-		}
 	}
 }
 
@@ -910,6 +886,8 @@ pub const bce: Loss = Loss::BinaryCrossEntropy;
 /// the categorical target contract.
 pub const ce: Loss = Loss::CrossEntropy;
 #[allow(non_upper_case_globals)]
+/// Binary focal loss evaluated from logits with Recipe's fixed historical
+/// `alpha = 0.25` and `gamma = 2.0`. Targets must be exact zero or one.
 pub const focal: Loss = Loss::Focal;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1226,6 +1204,11 @@ impl Model {
 	/// declaration, while a parent may feed any number of children. Parent nodes
 	/// may be declared later or remain implicit roots. The resulting network
 	/// must be acyclic.
+	///
+	/// The current executable repeated-call instrument binds every child to the
+	/// corresponding declared data target and requires every parent to remain an
+	/// observed categorical inference feature. It does not reinterpret a target
+	/// child as sampled or marginalized evidence for another conditional.
 	pub fn bayes(mut self, child: &str, parents: impl IntoTargets) -> Self {
 		let dependency = BayesDependency {
 			child: child.to_owned(),
@@ -1311,9 +1294,11 @@ impl Model {
 		self
 	}
 
-	#[allow(private_bounds)]
-	pub fn knn(mut self, spec: impl IntoKnnSpec) -> Self {
-		let spec = spec.into_knn_spec();
+	pub fn knn(mut self, neighbors: usize) -> Self {
+		let spec = LayerSpec::Knn {
+			neighbors,
+			operations: Vec::new(),
+		};
 		if let Err(error) = spec.validate() {
 			self.defer(error.kind, error.detail);
 		} else {
@@ -1375,6 +1360,9 @@ impl Model {
 		self.with_last_activation(Activation::Elu)
 	}
 
+	/// Appends a parametric ReLU with one independently learned scalar slope.
+	/// Every ordered occurrence starts at `0.25` and owns distinct optimizer and
+	/// checkpoint state.
 	pub fn prelu(self) -> Self {
 		self.with_last_activation(Activation::PRelu)
 	}
@@ -1387,10 +1375,18 @@ impl Model {
 		self.with_last_activation(Activation::Exponential)
 	}
 
-	/// Applies the signed logarithmic activation
-	/// `sign(x) * ln(1 + abs(x))`.
+	/// Applies `sign(x) * ln(abs(x))` to each finite, nonzero value.
+	/// Positive and negative zero are rejected through Recipe's device fault
+	/// boundary.
 	pub fn log(self) -> Self {
 		self.with_last_activation(Activation::Logarithm)
+	}
+
+	/// Applies the ordinary natural logarithm to each finite, strictly positive
+	/// value. Zero and negative values are rejected through Recipe's device fault
+	/// boundary.
+	pub fn ln(self) -> Self {
+		self.with_last_activation(Activation::NaturalLogarithm)
 	}
 
 	pub fn huber(self) -> Self {
@@ -1435,11 +1431,14 @@ impl Model {
 				| LayerSpec::Rnn { operations, .. }
 				| LayerSpec::Gru { operations, .. }
 				| LayerSpec::Lstm { operations, .. }
-				| LayerSpec::KnnReduction { operations, .. }
 				| LayerSpec::Residual { operations, .. },
 			) => {
 				operations.push(LayerOperation::Normalization(normalization));
 			}
+			Some(LayerSpec::Knn { .. }) => self.defer(
+				DeclarationErrorKind::InvalidLayer,
+				"normalization cannot follow terminal all-output KNN reduction",
+			),
 			Some(
 				LayerSpec::Convolution { .. }
 				| LayerSpec::Pool { .. }
@@ -1448,13 +1447,12 @@ impl Model {
 				| LayerSpec::Xgbst { .. }
 				| LayerSpec::Forest { .. }
 				| LayerSpec::KMeans { .. }
-				| LayerSpec::KnnPrediction { .. }
 				| LayerSpec::Embedding { .. }
 				| LayerSpec::Attention { .. },
 			)
 			| None => self.defer(
 				DeclarationErrorKind::InvalidLayer,
-				"layer normalization requires a preceding dense, perceptron, recurrent, KNN reduction, or residual block",
+				"layer normalization requires a preceding dense, perceptron, recurrent, or residual block",
 			),
 		}
 		crate::remember_recipe_model(self.clone());
@@ -1476,6 +1474,25 @@ impl Model {
 				DeclarationErrorKind::InvalidLayer,
 				"a model requires at least one layer, Bayesian dependency, or declared weight source",
 			));
+		}
+		if let Some((index, LayerSpec::Knn { operations, .. })) = self
+			.layers
+			.iter()
+			.enumerate()
+			.find(|(_, layer)| matches!(layer, LayerSpec::Knn { .. }))
+		{
+			if self.layers.len() != 1 || index != 0 {
+				return Err(DeclarationError::new(
+					DeclarationErrorKind::InvalidLayer,
+					"`.knn(neighbors)` is one standalone terminal all-output model and cannot compose with other blocks",
+				));
+			}
+			if !operations.is_empty() {
+				return Err(DeclarationError::new(
+					DeclarationErrorKind::InvalidLayer,
+					"terminal all-output KNN reduction cannot contain activation or normalization operations",
+				));
+			}
 		}
 		for (index, layer) in self.layers.iter().enumerate() {
 			layer.validate()?;
@@ -1572,11 +1589,14 @@ impl Model {
 				| LayerSpec::Rnn { operations, .. }
 				| LayerSpec::Gru { operations, .. }
 				| LayerSpec::Lstm { operations, .. }
-				| LayerSpec::KnnReduction { operations, .. }
 				| LayerSpec::Residual { operations, .. },
 			) => {
 				operations.push(LayerOperation::Activation(activation));
 			}
+			Some(LayerSpec::Knn { .. }) => self.defer(
+				DeclarationErrorKind::InvalidActivation,
+				"activation cannot follow terminal all-output KNN reduction",
+			),
 			Some(LayerSpec::Convolution {
 				activation: current,
 				..
@@ -1588,14 +1608,13 @@ impl Model {
 				| LayerSpec::Xgbst { .. }
 				| LayerSpec::Forest { .. }
 				| LayerSpec::KMeans { .. }
-				| LayerSpec::KnnPrediction { .. }
 				| LayerSpec::Embedding { .. }
 				| LayerSpec::Attention { .. },
 			)
 			| None => self.defer(
 				DeclarationErrorKind::InvalidActivation,
 				concat!(
-					"activation methods require a preceding dense, perceptron, recurrent, convolution, KNN reduction,",
+					"activation methods require a preceding dense, perceptron, recurrent, convolution,",
 					" or residual block",
 				),
 			),
@@ -1692,7 +1711,9 @@ impl Metric {
 			| Self::AuPrc
 			| Self::Brier
 			| Self::CalibrationError => Some("target-free inference has no target values for this metric"),
-			Self::Epoch | Self::LearningRate => Some("inference has no training epoch or optimizer state for this metric"),
+			Self::Epoch | Self::LearningRate => {
+				Some("inference has no training epoch or optimizer state for this metric")
+			}
 		}
 	}
 }
@@ -1809,61 +1830,34 @@ pub enum LearningRateSchedule {
 	ExponentialDecay,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EarlyStopping {
-	metric: LogItem,
-	patience: usize,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LogDeclaration {
+	items: Vec<LogItem>,
+	every: NonZeroUsize,
 }
 
-impl EarlyStopping {
-	#[must_use]
-	pub const fn metric(self) -> LogItem {
-		self.metric
-	}
-
-	#[must_use]
-	pub const fn patience(self) -> usize {
-		self.patience
-	}
-}
-
-pub trait SavePath {
-	fn or_default(self) -> String;
-}
-
-impl SavePath for () {
-	fn or_default(self) -> String {
-		"model.ogdl".to_owned()
-	}
-}
-
-impl SavePath for &str {
-	fn or_default(self) -> String {
-		self.to_owned()
-	}
-}
-
-impl SavePath for String {
-	fn or_default(self) -> String {
-		self
-	}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TrainingArtifactDeclaration {
+	model: Option<String>,
+	kernel: Option<String>,
 }
 
 /// Static training policy. Calling builder methods does not probe hardware,
 /// parse data, prepare a bundle, or start a run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Train {
-	batch_fraction_bits: Option<u32>,
 	epochs: Option<usize>,
 	learning_rate_bits: Option<u32>,
 	warmup_epochs: Option<usize>,
 	learning_rate_schedule: Option<LearningRateSchedule>,
 	optimizer: Option<Optimizer>,
-	early_stopping: Option<EarlyStopping>,
-	log_every: Option<usize>,
 	log: Vec<LogItem>,
+	log_declarations: Vec<LogDeclaration>,
 	plot: Vec<LogItem>,
-	resume: Option<String>,
+	resume: TrainingArtifactDeclaration,
+	resume_declared: bool,
+	save: TrainingArtifactDeclaration,
+	save_declared: bool,
 	deferred: Option<DeclarationError>,
 }
 
@@ -1871,32 +1865,26 @@ impl Train {
 	#[must_use]
 	pub(crate) const fn new() -> Self {
 		Self {
-			batch_fraction_bits: None,
 			epochs: None,
 			learning_rate_bits: None,
 			warmup_epochs: None,
 			learning_rate_schedule: None,
 			optimizer: None,
-			early_stopping: None,
-			log_every: None,
 			log: Vec::new(),
+			log_declarations: Vec::new(),
 			plot: Vec::new(),
-			resume: None,
+			resume: TrainingArtifactDeclaration {
+				model: None,
+				kernel: None,
+			},
+			resume_declared: false,
+			save: TrainingArtifactDeclaration {
+				model: None,
+				kernel: None,
+			},
+			save_declared: false,
 			deferred: None,
 		}
-	}
-
-	#[must_use]
-	pub fn batch(mut self, fraction: f64) -> Self {
-		let narrowed = fraction as f32;
-		if !fraction.is_finite() || fraction <= 0.0 || fraction >= 1.0 || narrowed <= 0.0 || narrowed >= 1.0 {
-			self.defer(format!(
-				"training batch fraction must be finite and in (0, 1), got {fraction}"
-			));
-		} else {
-			self.batch_fraction_bits = Some(narrowed.to_bits());
-		}
-		self
 	}
 
 	#[must_use]
@@ -1955,35 +1943,35 @@ impl Train {
 	}
 
 	#[must_use]
-	pub fn early_stop(mut self, metric: LogItem, patience: usize) -> Self {
-		if let Err(error) = metric.validate() {
-			self.defer_kind(error.kind, error.detail);
-		} else if patience == 0 {
-			self.defer("early-stopping patience must be nonzero");
-		} else {
-			self.early_stopping = Some(EarlyStopping { metric, patience });
-		}
-		self
-	}
-
-	#[must_use]
-	pub fn log_every(mut self, interval: usize) -> Self {
-		if interval == 0 {
+	pub fn every(mut self, interval: usize) -> Self {
+		let Some(every) = NonZeroUsize::new(interval) else {
 			self.defer("training log interval must be nonzero");
-		} else {
-			self.log_every = Some(interval);
-		}
+			return self;
+		};
+		let Some(last) = self.log_declarations.last_mut() else {
+			self.defer("training log interval must follow a .log call");
+			return self;
+		};
+		last.every = every;
 		self
 	}
 
 	#[must_use]
 	pub fn log(mut self, items: impl IntoLogItems) -> Self {
+		let mut declared = Vec::new();
 		for item in items.into_log_items() {
 			if let Err(error) = item.validate() {
 				self.defer_kind(error.kind, error.detail);
 			} else {
 				self.log.push(item);
+				declared.push(item);
 			}
+		}
+		if !declared.is_empty() {
+			self.log_declarations.push(LogDeclaration {
+				every: NonZeroUsize::new(1).expect("default training log interval is one"),
+				items: declared,
+			});
 		}
 		self
 	}
@@ -2001,12 +1989,91 @@ impl Train {
 	}
 
 	#[must_use]
-	pub fn resume(mut self, path: impl SavePath) -> Self {
-		let path = path.or_default();
+	pub fn resume(mut self, path: impl Into<String>) -> Self {
+		let path = path.into();
+		if self.resume_declared {
+			self.defer(
+				"training accepts one resume declaration; use the literal two-path form for model plus kernel",
+			);
+			return self;
+		}
+		self.resume_declared = true;
 		if path.is_empty() {
 			self.defer("training resume path is empty");
+		} else if artifact_path_extension(&path) != Some("ogdl") {
+			self.defer("training resume requires a semantic .ogdl model as its first argument");
 		} else {
-			self.resume = Some(path);
+			self.resume.model = Some(path);
+		}
+		self
+	}
+
+	/// Source-frontend lowering target for the literal
+	/// `.resume("model.ogdl", "kernel.cubin")` form.
+	#[doc(hidden)]
+	#[must_use]
+	pub fn __recipe_resume_pair(mut self, model: impl Into<String>, kernel: impl Into<String>) -> Self {
+		let model = model.into();
+		let kernel = kernel.into();
+		if self.resume_declared {
+			self.defer("training accepts one resume declaration");
+			return self;
+		}
+		self.resume_declared = true;
+		if model.is_empty() || artifact_path_extension(&model) != Some("ogdl") {
+			self.defer("the first training resume path must be a semantic .ogdl model");
+		} else if kernel.is_empty() || !is_native_kernel_extension(artifact_path_extension(&kernel)) {
+			self.defer("the second training resume path must be a .cubin or .hsaco native kernel");
+		} else {
+			self.resume.model = Some(model);
+			self.resume.kernel = Some(kernel);
+		}
+		self
+	}
+
+	/// Declare one artifact path before execution. The extension selects the
+	/// semantic model or native-kernel artifact.
+	#[must_use]
+	pub fn save(mut self, path: impl Into<String>) -> Self {
+		let path = path.into();
+		if self.save_declared {
+			self.defer(
+				"training accepts one save declaration; use the literal two-path form to save both artifacts",
+			);
+			return self;
+		}
+		self.save_declared = true;
+		if path.is_empty() {
+			self.defer("training save path is empty");
+		} else {
+			match artifact_path_extension(&path) {
+				Some("ogdl") => self.save.model = Some(path),
+				Some("cubin" | "hsaco") => self.save.kernel = Some(path),
+				_ => self.defer("training save path must end in .ogdl, .cubin, or .hsaco"),
+			}
+		}
+		self
+	}
+
+	/// Source-frontend lowering target for the literal
+	/// `.save("model.ogdl", "kernel.cubin")` form.
+	#[doc(hidden)]
+	#[must_use]
+	pub fn __recipe_save_pair(mut self, model: impl Into<String>, kernel: impl Into<String>) -> Self {
+		let model = model.into();
+		let kernel = kernel.into();
+		if self.save_declared {
+			self.defer("training accepts one save declaration");
+			return self;
+		}
+		self.save_declared = true;
+		if model.is_empty() || artifact_path_extension(&model) != Some("ogdl") {
+			self.defer("the first training save path must be a semantic .ogdl model");
+		} else if kernel.is_empty() || !is_native_kernel_extension(artifact_path_extension(&kernel)) {
+			self.defer("the second training save path must be a .cubin or .hsaco native kernel");
+		} else {
+			self.save.model = Some(model);
+			self.save.kernel = Some(kernel);
 		}
 		self
 	}
@@ -2024,15 +2091,7 @@ impl Train {
 		for item in self.log.iter().chain(&self.plot) {
 			item.validate()?;
 		}
-		if let Some(early_stopping) = self.early_stopping {
-			early_stopping.metric.validate()?;
-		}
 		Ok(())
-	}
-
-	#[must_use]
-	pub fn batch_fraction(&self) -> Option<f32> {
-		self.batch_fraction_bits.map(f32::from_bits)
 	}
 
 	#[must_use]
@@ -2041,8 +2100,14 @@ impl Train {
 	}
 
 	#[must_use]
-	pub const fn log_interval(&self) -> Option<usize> {
-		self.log_every
+	pub(crate) fn metric_log_interval(&self, metric: Metric) -> Option<std::num::NonZeroU64> {
+		self.log_declarations.iter().rev().find_map(|declaration| {
+			if declaration.items.iter().any(|item| item.metric() == metric) {
+				Some(std::num::NonZeroU64::new(declaration.every.get() as u64).expect("every is nonzero"))
+			} else {
+				None
+			}
+		})
 	}
 
 	#[must_use]
@@ -2066,11 +2131,6 @@ impl Train {
 	}
 
 	#[must_use]
-	pub const fn early_stopping(&self) -> Option<EarlyStopping> {
-		self.early_stopping
-	}
-
-	#[must_use]
 	pub fn log_items(&self) -> &[LogItem] {
 		&self.log
 	}
@@ -2082,7 +2142,19 @@ impl Train {
 
 	#[must_use]
 	pub fn resume_source(&self) -> Option<&str> {
-		self.resume.as_deref()
+		self.resume.model.as_deref()
+	}
+
+	pub(crate) fn resume_kernel_source(&self) -> Option<&str> {
+		self.resume.kernel.as_deref()
+	}
+
+	pub(crate) fn save_model_destination(&self) -> Option<&str> {
+		self.save.model.as_deref()
+	}
+
+	pub(crate) fn save_kernel_destination(&self) -> Option<&str> {
+		self.save.kernel.as_deref()
 	}
 
 	fn defer(&mut self, detail: impl Into<String>) {
@@ -2094,6 +2166,16 @@ impl Train {
 			self.deferred = Some(DeclarationError::new(kind, detail));
 		}
 	}
+}
+
+fn artifact_path_extension(path: &str) -> Option<&str> {
+	std::path::Path::new(path)
+		.extension()
+		.and_then(|extension| extension.to_str())
+}
+
+fn is_native_kernel_extension(extension: Option<&str>) -> bool {
+	matches!(extension, Some("cubin" | "hsaco"))
 }
 
 /// Static inference policy and logging declaration.
@@ -2134,9 +2216,7 @@ impl Infer {
 		self
 	}
 
-	/// Resolve this policy against the immediately preceding `recipe.data(...)`
-	/// and `recipe.model()` declarations.
-	pub fn evaluate(&self) -> DeclarationResult<InferenceDeclaration> {
+	pub(crate) fn resolve_declaration(&self) -> DeclarationResult<InferenceDeclaration> {
 		let sequence = crate::take_recipe_inference_sequence();
 		self.validate()?;
 		let (data, model) = sequence.map_err(|detail| {
@@ -2149,6 +2229,14 @@ impl Infer {
 			data: Some(data),
 			policy: self.clone(),
 		})
+	}
+
+	/// Compile and execute target-free inference against the immediately
+	/// preceding data and checkpoint-model declarations, then print the exact
+	/// prediction rows after native teardown.
+	pub fn evaluate(&self) -> crate::inference::InferenceResult<crate::inference::InferenceReport> {
+		let declaration = self.resolve_declaration()?;
+		crate::inference::evaluate_inference_declaration(&declaration)
 	}
 
 	pub(crate) fn validate(&self) -> DeclarationResult<()> {

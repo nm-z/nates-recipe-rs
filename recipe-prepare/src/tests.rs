@@ -84,6 +84,9 @@ fn fixture() -> (
 					rate: measured(FlopsPerSecond::new(1_000_000_000).unwrap()),
 					asynchronous_submission: true,
 					maximum_concurrent_tasks: 2,
+					subgroup_lanes: 32,
+					maximum_workgroup_lanes: 256,
+					maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
 				}),
 			})
 			.collect(),

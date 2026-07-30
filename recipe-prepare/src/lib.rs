@@ -850,7 +850,7 @@ fn hash_bundle_with_loop_domains(
 	loop_iterations: LoopIterations,
 	loop_domains: &[LoopTaskDomain],
 ) -> BundleIdentity {
-	let mut hash = CanonicalHash::new("recipe-finalized-bundle-v4");
+	let mut hash = CanonicalHash::new("recipe-finalized-bundle-v5");
 	hash.digest(topology.identity.digest());
 	hash.digest(discovery.identity.digest());
 	hash.digest(draft.identity.digest());
@@ -860,12 +860,14 @@ fn hash_bundle_with_loop_domains(
 	hash.artifact_builds(&draft.artifact_builds);
 	hash.value_aliases(&draft.value_aliases);
 	hash.tasks(&draft.tasks);
-	hash.u64(loop_iterations.get());
+	hash.u64(u64::from(loop_iterations.is_unbounded()));
+	hash.u64(loop_iterations.finite().map_or(0, |finite| finite.get()));
 	hash.u64(loop_domains.len() as u64);
 	for assignment in loop_domains {
 		hash.u64(assignment.task.get());
 		hash.u64(assignment.domain.first_iteration());
-		hash.u64(assignment.domain.end_exclusive());
+		hash.u64(u64::from(assignment.domain.is_unbounded()));
+		hash.u64(assignment.domain.end_exclusive().unwrap_or(0));
 		hash.u64(assignment.domain.stride().get());
 	}
 	hash.resources(&realization.resources);

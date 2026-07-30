@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::{self, Write};
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use recipe_core::{
@@ -16,7 +17,7 @@ use crate::backend::{
 use crate::error::{BackendMessage, BackendOperation, ExecutorError, JournalStream, Result};
 use crate::metrics::{MetricMailbox, MetricSample};
 
-const RUN_LIFECYCLE_LOGICAL_EVENTS: usize = 5;
+const RUN_LIFECYCLE_LOGICAL_EVENTS: usize = 6;
 const BLOCKING_POLL_INITIAL_DELAY: Duration = Duration::from_micros(50);
 const BLOCKING_POLL_MAXIMUM_DELAY: Duration = Duration::from_millis(2);
 
@@ -70,6 +71,23 @@ mod blocking_poll_backoff_tests {
 		backoff.reset();
 		assert_eq!(backoff.next_delay, BLOCKING_POLL_INITIAL_DELAY);
 	}
+
+	#[test]
+	fn watchdog_poll_budget_scales_with_expected_duration() {
+		let multiplier = NonZeroU32::new(4).expect("nonzero multiplier");
+		let immediate = Watchdog::for_expected_duration(Duration::ZERO, multiplier);
+		let measured = Watchdog::for_expected_duration(Duration::from_millis(10), multiplier);
+		assert!(immediate.max_nonprogress_polls() > 1);
+		assert!(measured.max_nonprogress_polls() > immediate.max_nonprogress_polls());
+
+		let mut elapsed = Duration::ZERO;
+		let mut backoff = BlockingPollBackoff::new();
+		for _ in 1..measured.max_nonprogress_polls() {
+			elapsed = elapsed.saturating_add(backoff.next_delay);
+			backoff.advance();
+		}
+		assert!(elapsed >= Duration::from_millis(42));
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,12 +111,35 @@ impl Watchdog {
 	pub const fn max_nonprogress_polls(self) -> u32 {
 		self.max_nonprogress_polls
 	}
-}
 
-impl Default for Watchdog {
-	fn default() -> Self {
+	/// Convert a measured upper-bound operation duration into the number of
+	/// nonprogress polls admitted by the executor's blocking backoff.
+	///
+	/// The extra maximum-delay interval prevents a zero- or sub-poll estimate
+	/// from expiring on the first asynchronous observation. Saturation retains
+	/// a finite watchdog even when the duration exceeds the `u32` poll domain.
+	#[must_use]
+	pub fn for_expected_duration(expected: Duration, safety_multiplier: NonZeroU32) -> Self {
+		let target = expected
+			.as_nanos()
+			.saturating_mul(u128::from(safety_multiplier.get()))
+			.saturating_add(BLOCKING_POLL_MAXIMUM_DELAY.as_nanos());
+		let mut elapsed = 0_u128;
+		let mut delay = BLOCKING_POLL_INITIAL_DELAY;
+		let mut sleeps = 0_u128;
+		while elapsed < target && delay < BLOCKING_POLL_MAXIMUM_DELAY {
+			elapsed = elapsed.saturating_add(delay.as_nanos());
+			delay = delay.saturating_mul(2).min(BLOCKING_POLL_MAXIMUM_DELAY);
+			sleeps += 1;
+		}
+		if elapsed < target {
+			let remaining = target - elapsed;
+			let maximum_delay = BLOCKING_POLL_MAXIMUM_DELAY.as_nanos();
+			sleeps = sleeps.saturating_add(remaining.saturating_add(maximum_delay - 1) / maximum_delay);
+		}
+		let polls = sleeps.saturating_add(1).min(u128::from(u32::MAX)) as u32;
 		Self {
-			max_nonprogress_polls: 1_024,
+			max_nonprogress_polls: polls.max(1),
 		}
 	}
 }
@@ -198,6 +239,10 @@ pub enum LogicalEvent {
 		run: RunId,
 		iteration: LoopIteration,
 	},
+	LoopStopAccepted {
+		run: RunId,
+		after_iteration: LoopIteration,
+	},
 	LoopCompleted {
 		run: RunId,
 	},
@@ -237,13 +282,27 @@ impl JournalCapacity {
 	/// exact counter per finalized task, so this bound is independent of the
 	/// watchdog stretch.
 	pub fn for_bundle<B: Backend>(bundle: &FinalizedBundle) -> Result<Self> {
+		#[cfg(test)]
+		let retained_loop_iterations = bundle
+			.loop_iterations()
+			.finite()
+			.map_or(1, |finite| finite.get());
+		#[cfg(not(test))]
+		let retained_loop_iterations = 1_u64;
+		Self::for_bundle_retaining::<B>(bundle, retained_loop_iterations)
+	}
+
+	pub(crate) fn for_bundle_retaining<B: Backend>(
+		bundle: &FinalizedBundle,
+		retained_loop_iterations: u64,
+	) -> Result<Self> {
 		if B::MAX_NON_POLL_PHYSICAL_CALLS == 0 || B::MAX_NON_POLL_PHYSICAL_CALLS > MAX_PHYSICAL_CALLS_PER_OPERATION
 		{
 			return Err(ExecutorError::PreparationCapacityOverflow);
 		}
 		let task_count = bundle.tasks().len();
-		let loop_iterations = usize::try_from(bundle.loop_iterations().get())
-			.map_err(|_| ExecutorError::PreparationCapacityOverflow)?;
+		let retained_loop_iteration_count =
+			usize::try_from(retained_loop_iterations).map_err(|_| ExecutorError::PreparationCapacityOverflow)?;
 		let loop_task_count = bundle
 			.tasks()
 			.iter()
@@ -252,7 +311,7 @@ impl JournalCapacity {
 		let non_loop_task_count = task_count
 			.checked_sub(loop_task_count)
 			.ok_or(ExecutorError::PreparationCapacityOverflow)?;
-		let loop_task_completions = checked_capacity_mul(loop_task_count, loop_iterations)?;
+		let loop_task_completions = checked_capacity_mul(loop_task_count, retained_loop_iteration_count)?;
 		let active_loop_tasks = bundle
 			.tasks()
 			.iter()
@@ -261,8 +320,11 @@ impl JournalCapacity {
 				let domain = bundle
 					.iteration_domain(task.id)
 					.ok_or(ExecutorError::PreparationCapacityOverflow)?;
-				total.checked_add(iteration_domain_activations(domain)?)
-					.ok_or(ExecutorError::PreparationCapacityOverflow)
+				total.checked_add(iteration_domain_activations_before(
+					domain,
+					retained_loop_iterations,
+				)?)
+				.ok_or(ExecutorError::PreparationCapacityOverflow)
 			})?;
 		let task_executions = checked_capacity_sum(&[non_loop_task_count, active_loop_tasks])?;
 		let arena_count = bundle.arena_layouts().len();
@@ -274,8 +336,11 @@ impl JournalCapacity {
 				let domain = bundle
 					.iteration_domain(task.id)
 					.ok_or(ExecutorError::PreparationCapacityOverflow)?;
-				total.checked_add(iteration_domain_activations(domain)?)
-					.ok_or(ExecutorError::PreparationCapacityOverflow)
+				total.checked_add(iteration_domain_activations_before(
+					domain,
+					retained_loop_iterations,
+				)?)
+				.ok_or(ExecutorError::PreparationCapacityOverflow)
 			})?;
 		let exit_image_count = bundle
 			.tasks()
@@ -293,14 +358,15 @@ impl JournalCapacity {
 			.count();
 
 		let logical_events = checked_capacity_sum(&[
-			// Prepared, Initialized, LoopStarted, LoopCompleted, Exited.
+			// Prepared, Initialized, LoopStarted, optional LoopStopAccepted,
+			// LoopCompleted, and Exited.
 			RUN_LIFECYCLE_LOGICAL_EVENTS,
 			checked_capacity_mul(arena_count, 2)?,
 			checked_capacity_mul(non_loop_task_count, 2)?,
 			loop_task_completions,
 			active_loop_tasks,
 			metric_emissions,
-			checked_capacity_mul(loop_iterations, 2)?,
+			checked_capacity_mul(retained_loop_iteration_count, 2)?,
 		])?;
 
 		// Every non-poll operation may report a full inline batch. A completed
@@ -326,16 +392,41 @@ pub struct PendingPollCount {
 	pub count: u128,
 }
 
+/// Bounded production-journal accounting across the complete run.
+///
+/// Production retains ordered detail for the first loop iteration plus every
+/// non-repeating lifecycle event. These counters preserve how much activity was
+/// observed and compacted without allocating in proportion to the loop bound.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JournalSummary {
+	pub logical_events_observed: u128,
+	pub logical_events_compacted: u128,
+	pub physical_calls_observed: u128,
+	pub physical_calls_compacted: u128,
+}
+
 #[derive(Clone, Debug)]
 pub struct RunJournal {
 	logical_events: Vec<LogicalEvent>,
 	physical_calls: Vec<PhysicalCall>,
 	pending_polls: Vec<PendingPollCount>,
+	loop_tasks: Vec<TaskId>,
+	current_loop_iteration: Option<LoopIteration>,
+	retain_all_loop_iterations: bool,
+	summary: JournalSummary,
 	declared: JournalCapacity,
 }
 
 impl RunJournal {
 	pub(crate) fn with_capacity(declared: JournalCapacity, tasks: &[Task]) -> Self {
+		Self::with_loop_detail(declared, tasks, cfg!(test))
+	}
+
+	pub(crate) fn with_loop_detail(
+		declared: JournalCapacity,
+		tasks: &[Task],
+		retain_all_loop_iterations: bool,
+	) -> Self {
 		let mut pending_polls = tasks
 			.iter()
 			.map(|task| PendingPollCount {
@@ -344,15 +435,32 @@ impl RunJournal {
 			})
 			.collect::<Vec<_>>();
 		pending_polls.sort_unstable_by_key(|entry| entry.task);
+		let mut loop_tasks = tasks
+			.iter()
+			.filter_map(|task| (task.phase == RunPhase::Loop).then_some(task.id))
+			.collect::<Vec<_>>();
+		loop_tasks.sort_unstable();
 		Self {
 			logical_events: Vec::with_capacity(declared.logical_events),
 			physical_calls: Vec::with_capacity(declared.physical_calls),
 			pending_polls,
+			loop_tasks,
+			current_loop_iteration: None,
+			retain_all_loop_iterations,
+			summary: JournalSummary::default(),
 			declared,
 		}
 	}
 
 	pub(crate) fn record_logical(&mut self, event: LogicalEvent) -> Result<()> {
+		self.summary.logical_events_observed = self.summary.logical_events_observed.saturating_add(1);
+		if let LogicalEvent::LoopIterationStarted { iteration, .. } = &event {
+			self.current_loop_iteration = Some(*iteration);
+		}
+		if !self.retains_repeated_loop_detail() && repeated_loop_event(&event) {
+			self.summary.logical_events_compacted = self.summary.logical_events_compacted.saturating_add(1);
+			return Ok(());
+		}
 		match self.logical_events.len() < self.declared.logical_events {
 			true => {
 				self.logical_events.push(event);
@@ -365,46 +473,83 @@ impl RunJournal {
 		}
 	}
 
+	fn retains_repeated_loop_detail(&self) -> bool {
+		self.retain_all_loop_iterations
+			|| self
+				.current_loop_iteration
+				.is_none_or(|iteration| iteration.index() == 0)
+	}
+
+	fn is_loop_task(&self, task: TaskId) -> bool {
+		self.loop_tasks.binary_search(&task).is_ok()
+	}
+
+	fn retains_physical_call(&self, call: PhysicalCall) -> bool {
+		self.retains_repeated_loop_detail() || !self.is_repeated_loop_physical(call)
+	}
+
+	fn is_repeated_loop_physical(&self, call: PhysicalCall) -> bool {
+		let task = match call {
+			PhysicalCall::SubmitCalculation { task }
+			| PhysicalCall::SubmitInternalTransfer { task }
+			| PhysicalCall::SubmitMetric { task, .. }
+			| PhysicalCall::SubmitExternalIngress { task, .. }
+			| PhysicalCall::SubmitExternalEgress { task, .. }
+			| PhysicalCall::AcknowledgeExternalEgress { task }
+			| PhysicalCall::Poll { task, .. } => Some(task),
+			PhysicalCall::BindResources
+			| PhysicalCall::PreparePending { .. }
+			| PhysicalCall::PrepareExternal { .. }
+			| PhysicalCall::AllocateArena { .. }
+			| PhysicalCall::AdmissionChunk { .. }
+			| PhysicalCall::SubmitExitTransfer { .. }
+			| PhysicalCall::QuiesceWorker
+			| PhysicalCall::CollectExit { .. }
+			| PhysicalCall::ReleaseArena { .. }
+			| PhysicalCall::DestroyResources => None,
+		};
+		task.is_some_and(|task| self.is_loop_task(task))
+	}
+
 	pub(crate) fn record_physical(&mut self, calls: PhysicalCallBatch) -> Result<()> {
 		let mut pending_batch = [None::<(TaskId, u8)>; MAX_PHYSICAL_CALLS_PER_OPERATION];
 		let mut pending_batch_len = 0_usize;
-		let mut retained = 0_usize;
+		let mut retained_calls = [None::<PhysicalCall>; MAX_PHYSICAL_CALLS_PER_OPERATION];
+		let mut retained_len = 0_usize;
 		for call in calls.iter() {
-			let PhysicalCall::Poll {
+			let mut retain = self.retains_physical_call(call);
+			if let PhysicalCall::Poll {
 				task,
 				status: crate::backend::PhysicalPollStatus::Pending,
 			} = call
-			else {
-				retained = retained
-					.checked_add(1)
-					.ok_or(ExecutorError::PreparationCapacityOverflow)?;
-				continue;
-			};
-			let index = self
-				.pending_polls
-				.binary_search_by_key(&task, |entry| entry.task)
-				.map_err(|_| ExecutorError::BackendProtocol {
-					task,
-					detail: "pending poll names a task absent from the finalized bundle",
-				})?;
-			let existing = pending_batch[..pending_batch_len]
-				.iter_mut()
-				.find_map(|entry| entry.as_mut().filter(|(candidate, _)| *candidate == task));
-			match existing {
-				Some((_, count)) => {
-					*count = count
-						.checked_add(1)
-						.ok_or(ExecutorError::PendingPollCountOverflow { task })?;
-				}
-				None => {
-					pending_batch[pending_batch_len] = Some((task, 1));
-					pending_batch_len += 1;
-					if self.pending_polls[index].count == 0 {
-						retained = retained
+			{
+				let index = self
+					.pending_polls
+					.binary_search_by_key(&task, |entry| entry.task)
+					.map_err(|_| ExecutorError::BackendProtocol {
+						task,
+						detail: "pending poll names a task absent from the finalized bundle",
+					})?;
+				let existing = pending_batch[..pending_batch_len]
+					.iter_mut()
+					.find_map(|entry| entry.as_mut().filter(|(candidate, _)| *candidate == task));
+				match existing {
+					Some((_, count)) => {
+						*count = count
 							.checked_add(1)
-							.ok_or(ExecutorError::PreparationCapacityOverflow)?;
+							.ok_or(ExecutorError::PendingPollCountOverflow { task })?;
+						retain = false;
+					}
+					None => {
+						pending_batch[pending_batch_len] = Some((task, 1));
+						pending_batch_len += 1;
+						retain &= self.pending_polls[index].count == 0;
 					}
 				}
+			}
+			if retain {
+				retained_calls[retained_len] = Some(call);
+				retained_len += 1;
 			}
 		}
 		for (task, increment) in pending_batch[..pending_batch_len].iter().flatten() {
@@ -423,41 +568,38 @@ impl RunJournal {
 		let required = self
 			.physical_calls
 			.len()
-			.checked_add(retained)
+			.checked_add(retained_len)
 			.ok_or(ExecutorError::PreparationCapacityOverflow)?;
-		match required <= self.declared.physical_calls {
-			true => {
-				for call in calls.iter() {
-					match call {
-						PhysicalCall::Poll {
-							task,
-							status: crate::backend::PhysicalPollStatus::Pending,
-						} => {
-							let index = self
-								.pending_polls
-								.binary_search_by_key(&task, |entry| entry.task)
-								.map_err(|_| ExecutorError::BackendProtocol {
-									task,
-									detail: "pending poll names a task absent from the finalized bundle",
-								})?;
-							if self.pending_polls[index].count == 0 {
-								self.physical_calls.push(call);
-							}
-							self.pending_polls[index].count = self.pending_polls[index]
-								.count
-								.checked_add(1)
-								.ok_or(ExecutorError::PendingPollCountOverflow { task })?;
-						}
-						_ => self.physical_calls.push(call),
-					}
-				}
-				Ok(())
-			}
-			false => Err(ExecutorError::JournalCapacityExceeded {
+		if required > self.declared.physical_calls {
+			return Err(ExecutorError::JournalCapacityExceeded {
 				stream: JournalStream::Physical,
 				capacity: self.declared.physical_calls,
-			}),
+			});
 		}
+		for (task, increment) in pending_batch[..pending_batch_len].iter().flatten() {
+			let index = self
+				.pending_polls
+				.binary_search_by_key(task, |entry| entry.task)
+				.map_err(|_| ExecutorError::BackendProtocol {
+					task: *task,
+					detail: "pending poll names a task absent from the finalized bundle",
+				})?;
+			self.pending_polls[index].count = self.pending_polls[index]
+				.count
+				.checked_add(u128::from(*increment))
+				.ok_or(ExecutorError::PendingPollCountOverflow { task: *task })?;
+		}
+		self.physical_calls
+			.extend(retained_calls[..retained_len].iter().flatten().copied());
+		self.summary.physical_calls_observed = self
+			.summary
+			.physical_calls_observed
+			.saturating_add(calls.len() as u128);
+		self.summary.physical_calls_compacted = self
+			.summary
+			.physical_calls_compacted
+			.saturating_add(calls.len().saturating_sub(retained_len) as u128);
+		Ok(())
 	}
 
 	#[must_use]
@@ -488,6 +630,11 @@ impl RunJournal {
 			.binary_search_by_key(&task, |entry| entry.task)
 			.ok()
 			.map(|index| self.pending_polls[index].count)
+	}
+
+	#[must_use]
+	pub const fn summary(&self) -> JournalSummary {
+		self.summary
 	}
 
 	#[must_use]
@@ -716,7 +863,13 @@ impl<B: Backend> PreparedRun<B> {
 		journal_capacity: JournalCapacity,
 	) -> std::result::Result<Self, RunFailure<B>> {
 		let bundle_identity = bundle.identity();
-		if bundle.loop_iterations().get() > 1 && !backend.supports_loop_repetition() {
+		if (bundle.loop_iterations().is_unbounded()
+			|| bundle
+				.loop_iterations()
+				.finite()
+				.is_some_and(|iterations| iterations.get() > 1))
+			&& !backend.supports_loop_repetition()
+		{
 			return Err(unstarted_failure(
 				run_id,
 				bundle_identity,
@@ -726,7 +879,11 @@ impl<B: Backend> PreparedRun<B> {
 				},
 			));
 		}
-		let mut journal = RunJournal::with_capacity(journal_capacity, bundle.tasks());
+		let mut journal = RunJournal::with_loop_detail(
+			journal_capacity,
+			bundle.tasks(),
+			cfg!(test) && !bundle.loop_iterations().is_unbounded(),
+		);
 		let prepared = match PreparedPhases::new(&bundle) {
 			Ok(prepared) => prepared,
 			Err(error) => {
@@ -1045,6 +1202,19 @@ impl<B: Backend> RunningRun<B> {
 	/// Performs one bounded, nonblocking scheduler/poll pass and reports
 	/// whether that pass submitted or completed any work.
 	pub fn poll_with_progress(&mut self) -> Result<(LoopStatus, bool)> {
+		self.poll_with_progress_or_stop(|| false)
+	}
+
+	/// Performs one bounded scheduler/poll pass and accepts a graceful stop
+	/// only after the active loop iteration reaches terminal completion.
+	///
+	/// `stop_requested` is evaluated at that safe boundary, immediately before
+	/// another iteration could begin. An accepted stop preserves the completed
+	/// iteration's state and makes [`Self::into_exited_loop`] legal.
+	pub fn poll_with_progress_or_stop(
+		&mut self,
+		stop_requested: impl FnOnce() -> bool,
+	) -> Result<(LoopStatus, bool)> {
 		let failure_check = self.failure.map(Err::<(), ExecutorError>).transpose()?;
 		debug_assert!(failure_check.is_none());
 		match poll_phase_once(&mut self.core, &mut self.phase, None) {
@@ -1067,13 +1237,19 @@ impl<B: Backend> RunningRun<B> {
 						run: self.core.run_id,
 						iteration,
 					})?;
-				let next_index = iteration
-					.index()
-					.checked_add(1)
-					.ok_or(ExecutorError::LifecycleInvariant {
-						detail: "loop iteration index overflowed before its declared bound",
-					})?;
-				if let Some(next) = iteration.total().iteration(next_index) {
+				let stop_requested = stop_requested();
+				let next =
+					if stop_requested {
+						None
+					} else {
+						let next_index = iteration.index().checked_add(1).ok_or(
+							ExecutorError::LifecycleInvariant {
+								detail: "loop iteration index exhausted the u64 coordinate space",
+							},
+						)?;
+						iteration.total().iteration(next_index)
+					};
+				if let Some(next) = next {
 					self.core.completed.reset_phase(RunPhase::Loop);
 					self.phase.begin_loop_iteration(next);
 					self.core
@@ -1083,6 +1259,14 @@ impl<B: Backend> RunningRun<B> {
 							iteration: next,
 						})?;
 					return Ok((LoopStatus::Pending, true));
+				}
+				if stop_requested {
+					self.core
+						.journal
+						.record_logical(LogicalEvent::LoopStopAccepted {
+							run: self.core.run_id,
+							after_iteration: iteration,
+						})?;
 				}
 				self.core
 					.journal
@@ -2596,9 +2780,14 @@ fn checked_capacity_sum(values: &[usize]) -> Result<usize> {
 	})
 }
 
-fn iteration_domain_activations(domain: IterationDomain) -> Result<usize> {
-	let span = domain
+fn iteration_domain_activations_before(domain: IterationDomain, retained_end: u64) -> Result<usize> {
+	let end_exclusive = domain
 		.end_exclusive()
+		.map_or(retained_end, |end| end.min(retained_end));
+	if end_exclusive <= domain.first_iteration() {
+		return Ok(0);
+	}
+	let span = end_exclusive
 		.checked_sub(domain.first_iteration())
 		.ok_or(ExecutorError::PreparationCapacityOverflow)?;
 	let stride = domain.stride().get();
@@ -2607,6 +2796,22 @@ fn iteration_domain_activations(domain: IterationDomain) -> Result<usize> {
 		.and_then(|value| value.checked_div(stride))
 		.ok_or(ExecutorError::PreparationCapacityOverflow)?;
 	usize::try_from(activations).map_err(|_| ExecutorError::PreparationCapacityOverflow)
+}
+
+fn repeated_loop_event(event: &LogicalEvent) -> bool {
+	matches!(
+		event,
+		LogicalEvent::TaskSubmitted {
+			phase: RunPhase::Loop,
+			..
+		} | LogicalEvent::TaskCompleted {
+			phase: RunPhase::Loop,
+			..
+		} | LogicalEvent::LoopIterationStarted { .. }
+			| LogicalEvent::MetricPublished { .. }
+			| LogicalEvent::FaultChecked { .. }
+			| LogicalEvent::LoopIterationCompleted { .. }
+	)
 }
 
 fn checked_capacity_mul(left: usize, right: usize) -> Result<usize> {

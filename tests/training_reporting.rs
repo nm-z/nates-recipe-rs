@@ -85,11 +85,9 @@ fn public_compile_and_report_boundaries_preserve_typed_validation_status() {
 	let train = recipe::recipe
 		.train()
 		.optimizer(recipe::adamw)
-		.batch(0.5)
 		.epochs(1)
 		.lr(0.001)
 		.cos()
-		.early_stop(recipe::AuPrc, 1)
 		.log([recipe::AuPrc, recipe::CalibrationError]);
 
 	let compiled = recipe::compile_training(&train, &data, &model).expect("compile zero-known validation training");

@@ -39,7 +39,7 @@ pub use local::{
 	LocalPending, LocalPreparedSession, LocalResources, PreparedBridge, PreparedBridgeError, RejectCrossBackend,
 	UnavailableLocalStabilizer,
 };
-pub use plan::{RuntimeArtifact, RuntimeArtifactKind};
+pub use plan::{RuntimeArtifact, RuntimeArtifactKind, RuntimeImage};
 
 pub(crate) use plan::{ExecutionPlan, PlannedSubmission};
 

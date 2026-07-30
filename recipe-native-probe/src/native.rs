@@ -380,6 +380,9 @@ mod tests {
 			asynchronous_submission: true,
 			maximum_submission_queues: 1,
 			maximum_concurrent_tasks: 1,
+			subgroup_lanes: 32,
+			maximum_workgroup_lanes: 256,
+			maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
 			transfer_overlaps_calculation: true,
 		}
 	}

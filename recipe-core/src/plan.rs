@@ -890,6 +890,23 @@ fn validate_tasks(
 
 fn validate_fault_readbacks(validator: &mut Validator, draft: &DraftPlan, tasks: &BTreeMap<TaskId, &Task>) {
 	let mut checked_by_flag = BTreeMap::<ValueId, Vec<(&Task, &Task)>>::new();
+	let mut readbacks_by_calculation = BTreeMap::<TaskId, Vec<&Task>>::new();
+	let mut metric_slot_uses = BTreeMap::new();
+	let mut direct_dependents = BTreeMap::<TaskId, Vec<&Task>>::new();
+	for task in &draft.tasks {
+		for dependency in &task.dependencies {
+			direct_dependents.entry(*dependency).or_default().push(task);
+		}
+		if let TaskKind::Metric(metric) = &task.kind {
+			*metric_slot_uses.entry(metric.slot).or_insert(0usize) += 1;
+			if let MetricPurpose::FaultReadback { calculation } = metric.purpose {
+				readbacks_by_calculation
+					.entry(calculation)
+					.or_default()
+					.push(task);
+			}
+		}
+	}
 	for (calculation_index, calculation_task) in draft.tasks.iter().enumerate() {
 		let TaskKind::Calculation(calculation) = &calculation_task.kind else {
 			continue;
@@ -897,31 +914,21 @@ fn validate_fault_readbacks(validator: &mut Validator, draft: &DraftPlan, tasks:
 		let Some(fault_flag) = calculation.fault_flag else {
 			continue;
 		};
-		let readbacks = draft
-			.tasks
-			.iter()
-			.filter(|candidate| {
-				matches!(
-					&candidate.kind,
-					TaskKind::Metric(metric)
-						if metric.purpose
-							== MetricPurpose::FaultReadback {
-								calculation: calculation_task.id,
-							}
-				)
-			})
-			.collect::<Vec<_>>();
+		let readbacks = readbacks_by_calculation.get(&calculation_task.id);
+		let readback_count = readbacks.map_or(0, Vec::len);
 		validator.require(
-			readbacks.len() == 1,
+			readback_count == 1,
 			ValidationCode::InvalidFaultReadback,
 			format!("tasks[{calculation_index}].fault_flag"),
 			format!(
 				"checked calculation {} requires exactly one fault readback, found {}",
-				calculation_task.id,
-				readbacks.len()
+				calculation_task.id, readback_count
 			),
 		);
-		let [readback] = readbacks.as_slice() else {
+		let Some(readback) = readbacks
+			.and_then(|readbacks| readbacks.first().copied())
+			.filter(|_| readback_count == 1)
+		else {
 			continue;
 		};
 		let TaskKind::Metric(metric) = &readback.kind else {
@@ -936,13 +943,7 @@ fn validate_fault_readbacks(validator: &mut Validator, draft: &DraftPlan, tasks:
 				calculation_task.id, metric.value
 			),
 		);
-		let slot_uses = draft
-			.tasks
-			.iter()
-			.filter(
-				|candidate| matches!(&candidate.kind, TaskKind::Metric(candidate) if candidate.slot == metric.slot),
-			)
-			.count();
+		let slot_uses = metric_slot_uses.get(&metric.slot).copied().unwrap_or(0);
 		validator.require(
 			slot_uses == 1,
 			ValidationCode::InvalidFaultReadback,
@@ -953,18 +954,25 @@ fn validate_fault_readbacks(validator: &mut Validator, draft: &DraftPlan, tasks:
 			),
 		);
 
-		for dependent in draft.tasks.iter().filter(|candidate| {
-			candidate.id != readback.id && task_depends_on(tasks, candidate.id, calculation_task.id)
-		}) {
-			validator.require(
-				task_depends_on(tasks, dependent.id, readback.id),
-				ValidationCode::InvalidFaultReadback,
-				format!("tasks[{}].dependencies", dependent.id),
-				format!(
-					"task {} can pass checked calculation {} without waiting for fault readback {}",
-					dependent.id, calculation_task.id, readback.id
-				),
-			);
+		if let Some(dependents) = direct_dependents.get(&calculation_task.id) {
+			// Gating the direct successor frontier is equivalent to checking every
+			// transitive descendant: every path out of the calculation crosses one
+			// of these tasks, and all later descendants inherit that dependency.
+			for dependent in dependents
+				.iter()
+				.copied()
+				.filter(|dependent| dependent.id != readback.id)
+			{
+				validator.require(
+					task_depends_on(tasks, dependent.id, readback.id),
+					ValidationCode::InvalidFaultReadback,
+					format!("tasks[{}].dependencies", dependent.id),
+					format!(
+						"task {} can pass checked calculation {} without waiting for fault readback {}",
+						dependent.id, calculation_task.id, readback.id
+					),
+				);
+			}
 		}
 		checked_by_flag
 			.entry(fault_flag)
@@ -2301,11 +2309,16 @@ fn validate_loop_domains(
 			ValidationCode::InvalidIterationDomain,
 			format!("{path}.domain"),
 			format!(
-				"iteration domain [{}, {}) stride {} exceeds bounded loop [0, {})",
+				"iteration domain [{}, {}) stride {} exceeds loop [0, {})",
 				assignment.domain.first_iteration(),
-				assignment.domain.end_exclusive(),
+				assignment
+					.domain
+					.end_exclusive()
+					.map_or_else(|| "unbounded".to_owned(), |end| end.to_string()),
 				assignment.domain.stride(),
-				loop_iterations.get()
+				loop_iterations
+					.finite()
+					.map_or_else(|| "unbounded".to_owned(), |end| end.get().to_string())
 			),
 		);
 	}
@@ -3041,6 +3054,9 @@ mod tests {
 						rate: property(FlopsPerSecond::new(380_000_000_000).unwrap()),
 						asynchronous_submission: true,
 						maximum_concurrent_tasks: 2,
+						subgroup_lanes: 32,
+						maximum_workgroup_lanes: 256,
+						maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
 					}),
 				},
 				DiscoveredDevice {
@@ -3584,6 +3600,27 @@ mod tests {
 		});
 		let errors = draft.validate(&topology, &discovery).unwrap_err();
 		assert!(errors.contains(ValidationCode::InvalidFaultReadback));
+	}
+
+	#[test]
+	fn fault_readback_frontier_gates_transitive_descendants_without_rescanning_them() {
+		let (_, _, mut draft, _, _) = fixture();
+		let readback = add_fault_contract(&mut draft);
+		let mut gated_successor = draft.tasks[1].clone();
+		gated_successor.id = TaskId::new(5);
+		gated_successor.dependencies = vec![TaskId::new(3), readback];
+		let mut transitive_descendant = draft.tasks[1].clone();
+		transitive_descendant.id = TaskId::new(6);
+		transitive_descendant.dependencies = vec![gated_successor.id];
+		draft.tasks.extend([gated_successor, transitive_descendant]);
+		let tasks = draft
+			.tasks
+			.iter()
+			.map(|task| (task.id, task))
+			.collect::<BTreeMap<_, _>>();
+		let mut validator = Validator::default();
+		validate_fault_readbacks(&mut validator, &draft, &tasks);
+		validator.finish().unwrap();
 	}
 
 	#[test]

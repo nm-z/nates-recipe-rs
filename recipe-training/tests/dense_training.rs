@@ -1,8 +1,8 @@
-use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use core::num::{NonZeroU32, NonZeroU64};
 use std::collections::BTreeSet;
 use std::error::Error;
 
-use recipe_core::{AliasPermission, DType, MetricId, ScalarOpcode, ValueId};
+use recipe_core::{AliasPermission, DType, MetricId, ScalarLiteral, ScalarOpcode, ValueId};
 use recipe_ingest::{
 	CategoricalEncodingModel, Delimiter, HeaderMode, IngestLimits, PreparationRequest, PreparedDataset, SemanticType,
 	TableRequest, TrainFraction, VectorEncoding, VectorMetadata, VectorRole, parse_table, prepare_table,
@@ -14,14 +14,15 @@ use recipe_language::{
 use recipe_program::{IterationDomain, StaticCalculationProgram};
 use recipe_training::{
 	AdamWConfig, BinaryValidationConfig, CheckpointManifest, CompiledTraining, DecodedMulticlassClass,
-	DenseActivation, DenseBlock, DenseBlockState, DenseDataNormalization, DenseFeatureLowering, DenseLayer,
-	DenseLayerState, DenseLoss, DenseNormalization, DenseOperation, DensePool, DensePoolGroupOrder,
-	DensePoolWinnerContract, DenseResidual, DenseResidualOperation, DenseTask, DenseTrainingConfig,
-	ExternalInputRole, LearningRateDecay, MulticlassValidationConfig, TemperatureScalingConfig,
-	TrainingCompileErrorKind, TrainingMetricKind, ValidationMetricFamily, ValidationMetricStatus,
+	DenseActivation, DenseAttention, DenseBlock, DenseBlockState, DenseConvolution, DenseDataNormalization,
+	DenseEmbedding, DenseFeatureLowering, DenseGru, DenseLayer, DenseLayerState, DenseLoss, DenseLstm,
+	DenseNormalization, DenseOperation, DensePool, DensePoolGroupOrder, DensePoolWinnerContract, DenseResidual,
+	DenseResidualOperation, DenseRnn, DenseTask, DenseTrainingConfig, DenseTree, DenseTreeFamily, ExternalInputRole,
+	LearningRateDecay, MulticlassValidationConfig, RegressionValidationConfig, TemperatureScalingConfig,
+	TrainingCompileErrorKind, TrainingHorizon, TrainingMetricKind, ValidationMetricFamily, ValidationMetricStatus,
 	ValidationUnavailableReason, compile_dense_training, compile_dense_training_with_binary_validation,
 	compile_dense_training_with_blocks, compile_dense_training_with_blocks_and_binary_validation,
-	compile_dense_training_with_multiclass_validation,
+	compile_dense_training_with_multiclass_validation, compile_dense_training_with_regression_validation,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -41,6 +42,58 @@ fn prepare_csv(source: &[u8]) -> TestResult<PreparedDataset> {
 		&PreparationRequest::new(["target"], fraction),
 		&CategoricalEncodingModel,
 	)?)
+}
+
+fn prepare_csv_targets<const N: usize>(source: &[u8], targets: [&str; N]) -> TestResult<PreparedDataset> {
+	let table = parse_table(
+		source,
+		TableRequest::new(
+			Delimiter::Comma,
+			HeaderMode::Present,
+			IngestLimits::new(1_048_576, 64, 8, 1_024)?,
+		),
+	)?;
+	let fraction = TrainFraction::new(5, 7)?;
+	Ok(prepare_table(
+		&table,
+		&PreparationRequest::new(targets, fraction),
+		&CategoricalEncodingModel,
+	)?)
+}
+
+fn multi_target_dataset() -> TestResult<PreparedDataset> {
+	prepare_csv_targets(
+		b"feature,winner_model_a,winner_model_b,winner_tie\n\
+		1,1,0,0\n\
+		2,0,1,0\n\
+		3,0,0,1\n\
+		4,1,0,0\n\
+		5,0,1,0\n\
+		6,0,0,1\n\
+		7,1,0,0\n",
+		["winner_model_b", "winner_model_a", "winner_tie"],
+	)
+}
+
+fn multi_target_validation_dataset() -> TestResult<PreparedDataset> {
+	prepare_csv_targets(
+		b"feature,winner_model_a,winner_model_b,winner_tie\n\
+		1,1,0,0\n\
+		2,0,1,0\n\
+		3,0,0,1\n\
+		4,1,0,0\n\
+		5,0,1,0\n\
+		6,0,0,1\n\
+		7,1,0,0\n\
+		8,0,1,0\n\
+		9,0,0,1\n\
+		10,1,0,0\n\
+		11,1,0,0\n\
+		12,0,1,0\n\
+		13,0,0,1\n\
+		14,1,0,0\n",
+		["winner_model_b", "winner_model_a", "winner_tie"],
+	)
 }
 
 fn prepared_dataset(targets: &[i32]) -> TestResult<PreparedDataset> {
@@ -226,16 +279,607 @@ fn config() -> DenseTrainingConfig {
 		],
 		loss: DenseLoss::BinaryCrossEntropy,
 		data_normalization: DenseDataNormalization::ZScore,
-		batch_size: NonZeroUsize::new(3).unwrap(),
-		epochs: NonZeroU64::new(2).unwrap(),
+		epochs: TrainingHorizon::Finite(NonZeroU64::new(2).unwrap()),
 		warmup_epochs: 1,
 		learning_rate_decay: LearningRateDecay::Cosine,
-		gradient_clip_norm: 1.0,
+		gradient_clip_norm: Some(1.0),
 		normalization_epsilon: 1.0e-6,
 		reduction_tree_lanes: 32,
 		random_seed: 17,
 		adamw: AdamWConfig::default(),
 	}
+}
+
+fn token_sequence_dataset() -> TestResult<PreparedDataset> {
+	prepare_csv(
+		b"token_zero,token_one,token_two,target\n\
+		0,1,2,0\n\
+		1,2,3,1\n\
+		2,3,4,0\n\
+		3,4,5,1\n\
+		4,5,6,0\n\
+		5,6,7,1\n\
+		6,7,0,0\n",
+	)
+}
+
+fn multi_target_config(loss: DenseLoss) -> DenseTrainingConfig {
+	let mut config = config();
+	config.layers[1] = DenseLayer::new(NonZeroU64::new(3).unwrap(), DenseActivation::Linear);
+	config.loss = loss;
+	config
+}
+
+#[test]
+fn fixed_i32_token_rows_train_one_learned_embedding_table() -> TestResult {
+	let mut training = config();
+	training.layers.clear();
+	training.loss = DenseLoss::MeanSquaredError;
+	training.data_normalization = DenseDataNormalization::Identity;
+	let embedding = DenseEmbedding::new(NonZeroU64::new(4).unwrap(), NonZeroU64::new(8).unwrap());
+	let blocks = [
+		DenseBlock::Embedding(embedding),
+		DenseBlock::Layer(DenseLayer::new(NonZeroU64::MIN, DenseActivation::Linear)),
+	];
+	let compiled = compile_dense_training_with_blocks(&token_sequence_dataset()?, &training, &blocks)?;
+	let [DenseBlockState::Embedding(state), DenseBlockState::Layer(_)] = compiled.outputs().blocks.as_slice() else {
+		panic!("embedding compilation did not retain one table followed by one dense layer");
+	};
+	assert_eq!(state.sequence_length.get(), 3);
+	assert_eq!(state.dimensions.get(), 4);
+	assert_eq!(state.vocabulary.get(), 8);
+	let table = compiled
+		.graph()
+		.tensors
+		.iter()
+		.find(|tensor| tensor.id == state.table.initial_parameter)
+		.expect("embedding table tensor exists");
+	assert_eq!(table.dtype, DType::F32);
+	assert_eq!(table.shape.extents(), [8, 4]);
+	let train_features = compiled
+		.external_inputs()
+		.iter()
+		.find(|input| input.role() == ExternalInputRole::TrainFeatures)
+		.expect("token matrix is an external input");
+	assert_eq!(train_features.dtype(), DType::I32);
+	assert_eq!(train_features.shape().extents(), [5, 3]);
+	assert!(compiled.graph().nodes.iter().any(|node| {
+		matches!(node.kernel.kind, PrimitiveKind::Gather(_))
+			&& node.kernel.inputs.first() == Some(&state.table.initial_parameter)
+	}));
+	assert!(compiled.graph().nodes.iter().any(|node| {
+		matches!(
+			node.kernel.kind,
+			PrimitiveKind::Scatter(recipe_language::Scatter {
+				conflict: ScatterConflict::Atomic { .. },
+				..
+			})
+		)
+	}));
+	let manifest = CheckpointManifest::from_compiled(&compiled)?;
+	assert_eq!(manifest.format_version(), 13);
+	Ok(())
+}
+
+#[test]
+fn fixed_token_sequences_train_causal_multi_head_attention() -> TestResult {
+	let mut training = config();
+	training.layers.clear();
+	training.loss = DenseLoss::MeanSquaredError;
+	training.data_normalization = DenseDataNormalization::Identity;
+	let blocks = [
+		DenseBlock::Embedding(DenseEmbedding::new(
+			NonZeroU64::new(4).unwrap(),
+			NonZeroU64::new(8).unwrap(),
+		)),
+		DenseBlock::Attention(DenseAttention::new(NonZeroU64::new(2).unwrap())),
+		DenseBlock::Layer(DenseLayer::new(NonZeroU64::MIN, DenseActivation::Linear)),
+	];
+	let compiled = compile_dense_training_with_blocks(&token_sequence_dataset()?, &training, &blocks)?;
+	let [
+		DenseBlockState::Embedding(_),
+		DenseBlockState::Attention(state),
+		DenseBlockState::Layer(_),
+	] = compiled.outputs().blocks.as_slice()
+	else {
+		panic!("attention compilation did not retain embedding, attention, and output-layer state");
+	};
+	assert_eq!(state.sequence_length.get(), 3);
+	assert_eq!(state.dimensions.get(), 4);
+	assert_eq!(state.heads.get(), 2);
+	assert_eq!(state.head_dimension.get(), 2);
+	for parameter in [state.query, state.key, state.value, state.output] {
+		let tensor = compiled
+			.graph()
+			.tensors
+			.iter()
+			.find(|tensor| tensor.id == parameter.updated_parameter)
+			.expect("updated attention matrix exists");
+		assert_eq!(tensor.dtype, DType::F32);
+		assert_eq!(tensor.shape.extents(), [4, 4]);
+	}
+	assert!(compiled.graph().nodes.iter().any(|node| {
+		matches!(
+			&node.kernel.kind,
+			PrimitiveKind::Contraction(contraction)
+				if contraction.batch_axes == [(0, 0), (2, 2)]
+					&& contraction.contract_axes == [(3, 3)]
+		)
+	}));
+	let reductions = compiled
+		.graph()
+		.nodes
+		.iter()
+		.filter_map(|node| match &node.kernel.kind {
+			PrimitiveKind::Reduce(reduce) => Some(reduce.operator),
+			_ => None,
+		})
+		.collect::<Vec<_>>();
+	assert!(reductions.contains(&ReduceOperator::Maximum));
+	assert!(reductions.contains(&ReduceOperator::Sum));
+	assert!(compiled.graph().nodes.iter().any(|node| {
+		matches!(&node.kernel.kind, PrimitiveKind::Elementwise(elementwise) if elementwise
+			.program
+			.instructions
+			.iter()
+			.any(|instruction| instruction.opcode == ScalarOpcode::LessThanOrEqual))
+	}));
+	let manifest = CheckpointManifest::from_compiled(&compiled)?;
+	assert_eq!(manifest.format_version(), 13);
+	Ok(())
+}
+
+#[test]
+fn numeric_feature_columns_train_one_zero_initialized_final_state_rnn() -> TestResult {
+	let mut training = config();
+	training.layers.clear();
+	training.loss = DenseLoss::MeanSquaredError;
+	let blocks = [
+		DenseBlock::Rnn(DenseRnn::new(NonZeroU64::new(4).unwrap())),
+		DenseBlock::Layer(DenseLayer::new(NonZeroU64::MIN, DenseActivation::Linear)),
+	];
+	let compiled = compile_dense_training_with_blocks(&token_sequence_dataset()?, &training, &blocks)?;
+	let [DenseBlockState::Rnn(state), DenseBlockState::Layer(_)] = compiled.outputs().blocks.as_slice() else {
+		panic!("RNN compilation did not retain recurrent and output-layer state");
+	};
+	assert_eq!(state.sequence_length.get(), 3);
+	assert_eq!(state.width.get(), 4);
+	for (parameter, expected_shape) in [
+		(state.input_weight, &[1, 4][..]),
+		(state.recurrent_weight, &[4, 4][..]),
+		(state.bias, &[4][..]),
+	] {
+		let tensor = compiled
+			.graph()
+			.tensors
+			.iter()
+			.find(|tensor| tensor.id == parameter.updated_parameter)
+			.expect("updated RNN parameter exists");
+		assert_eq!(tensor.dtype, DType::F32);
+		assert_eq!(tensor.shape.extents(), expected_shape);
+	}
+	assert!(
+		compiled
+			.graph()
+			.nodes
+			.iter()
+			.filter(|node| {
+				matches!(node.kernel.kind, PrimitiveKind::Contraction(_))
+					&& node.kernel.inputs.get(1) == Some(&state.recurrent_weight.initial_parameter)
+			})
+			.count() >= 3
+	);
+	let manifest = CheckpointManifest::from_compiled(&compiled)?;
+	assert_eq!(manifest.format_version(), 14);
+	Ok(())
+}
+
+#[test]
+fn numeric_feature_columns_train_one_reset_before_final_state_gru() -> TestResult {
+	let mut training = config();
+	training.layers.clear();
+	training.loss = DenseLoss::MeanSquaredError;
+	let blocks = [
+		DenseBlock::Gru(DenseGru::new(NonZeroU64::new(4).unwrap())),
+		DenseBlock::Layer(DenseLayer::new(NonZeroU64::MIN, DenseActivation::Linear)),
+	];
+	let compiled = compile_dense_training_with_blocks(&token_sequence_dataset()?, &training, &blocks)?;
+	let [DenseBlockState::Gru(state), DenseBlockState::Layer(_)] = compiled.outputs().blocks.as_slice() else {
+		panic!("GRU compilation did not retain gated recurrent and output-layer state");
+	};
+	assert_eq!(state.sequence_length.get(), 3);
+	assert_eq!(state.width.get(), 4);
+	for (parameter, expected_shape) in [
+		(state.reset_input_weight, &[1, 4][..]),
+		(state.reset_recurrent_weight, &[4, 4][..]),
+		(state.reset_bias, &[4][..]),
+		(state.update_input_weight, &[1, 4][..]),
+		(state.update_recurrent_weight, &[4, 4][..]),
+		(state.update_bias, &[4][..]),
+		(state.candidate_input_weight, &[1, 4][..]),
+		(state.candidate_recurrent_weight, &[4, 4][..]),
+		(state.candidate_bias, &[4][..]),
+	] {
+		let tensor = compiled
+			.graph()
+			.tensors
+			.iter()
+			.find(|tensor| tensor.id == parameter.updated_parameter)
+			.expect("updated GRU parameter exists");
+		assert_eq!(tensor.dtype, DType::F32);
+		assert_eq!(tensor.shape.extents(), expected_shape);
+	}
+	for recurrent_parameter in [
+		state.reset_recurrent_weight.initial_parameter,
+		state.update_recurrent_weight.initial_parameter,
+		state.candidate_recurrent_weight.initial_parameter,
+	] {
+		assert!(
+			compiled
+				.graph()
+				.nodes
+				.iter()
+				.filter(|node| {
+					matches!(node.kernel.kind, PrimitiveKind::Contraction(_))
+						&& node.kernel.inputs.get(1) == Some(&recurrent_parameter)
+				})
+				.count() >= 3
+		);
+	}
+	let manifest = CheckpointManifest::from_compiled(&compiled)?;
+	assert_eq!(manifest.format_version(), 15);
+	Ok(())
+}
+
+#[test]
+fn numeric_feature_columns_train_one_zero_cell_final_hidden_lstm() -> TestResult {
+	let mut training = config();
+	training.layers.clear();
+	training.loss = DenseLoss::MeanSquaredError;
+	let blocks = [
+		DenseBlock::Lstm(DenseLstm::new(NonZeroU64::new(4).unwrap())),
+		DenseBlock::Layer(DenseLayer::new(NonZeroU64::MIN, DenseActivation::Linear)),
+	];
+	let compiled = compile_dense_training_with_blocks(&token_sequence_dataset()?, &training, &blocks)?;
+	let [DenseBlockState::Lstm(state), DenseBlockState::Layer(_)] = compiled.outputs().blocks.as_slice() else {
+		panic!("LSTM compilation did not retain cell-gated recurrent and output-layer state");
+	};
+	assert_eq!(state.sequence_length.get(), 3);
+	assert_eq!(state.width.get(), 4);
+	for (parameter, expected_shape) in [
+		(state.input_gate_input_weight, &[1, 4][..]),
+		(state.input_gate_recurrent_weight, &[4, 4][..]),
+		(state.input_gate_bias, &[4][..]),
+		(state.forget_gate_input_weight, &[1, 4][..]),
+		(state.forget_gate_recurrent_weight, &[4, 4][..]),
+		(state.forget_gate_bias, &[4][..]),
+		(state.output_gate_input_weight, &[1, 4][..]),
+		(state.output_gate_recurrent_weight, &[4, 4][..]),
+		(state.output_gate_bias, &[4][..]),
+		(state.candidate_input_weight, &[1, 4][..]),
+		(state.candidate_recurrent_weight, &[4, 4][..]),
+		(state.candidate_bias, &[4][..]),
+	] {
+		let tensor = compiled
+			.graph()
+			.tensors
+			.iter()
+			.find(|tensor| tensor.id == parameter.updated_parameter)
+			.expect("updated LSTM parameter exists");
+		assert_eq!(tensor.dtype, DType::F32);
+		assert_eq!(tensor.shape.extents(), expected_shape);
+	}
+	for recurrent_parameter in [
+		state.input_gate_recurrent_weight.initial_parameter,
+		state.forget_gate_recurrent_weight.initial_parameter,
+		state.output_gate_recurrent_weight.initial_parameter,
+		state.candidate_recurrent_weight.initial_parameter,
+	] {
+		assert!(
+			compiled
+				.graph()
+				.nodes
+				.iter()
+				.filter(|node| {
+					matches!(node.kernel.kind, PrimitiveKind::Contraction(_))
+						&& node.kernel.inputs.get(1) == Some(&recurrent_parameter)
+				})
+				.count() >= 3
+		);
+	}
+	let manifest = CheckpointManifest::from_compiled(&compiled)?;
+	assert_eq!(manifest.format_version(), 16);
+	Ok(())
+}
+
+#[test]
+fn terminal_tree_block_materializes_checked_traversal_and_persistable_leaf_state() -> TestResult {
+	let dataset = binary_dataset()?;
+	let tree = DenseTree::new(
+		DenseTreeFamily::XGBoost,
+		NonZeroU64::new(2).unwrap(),
+		NonZeroU32::new(2).unwrap(),
+	);
+	let compiled = compile_dense_training_with_blocks(&dataset, &config(), &[DenseBlock::Tree(tree)])?;
+	assert_eq!(compiled.blocks(), [DenseBlock::Tree(tree)]);
+	let [DenseBlockState::Tree(state)] = compiled.outputs().blocks.as_slice() else {
+		panic!("tree compilation did not retain tree state")
+	};
+	assert_eq!(state.declaration, tree);
+	assert_eq!(state.internal_nodes_per_tree.get(), 3);
+	assert_eq!(state.leaves_per_tree.get(), 4);
+	assert_eq!(state.output_width.get(), 1);
+	assert!(
+		compiled
+			.graph()
+			.nodes
+			.iter()
+			.any(|node| matches!(node.kernel.kind, PrimitiveKind::Sort(_)))
+	);
+	assert!(
+		compiled
+			.graph()
+			.nodes
+			.iter()
+			.any(|node| matches!(node.kernel.kind, PrimitiveKind::Scan(_)))
+	);
+	assert!(compiled.graph().nodes.iter().all(|node| {
+		!matches!(
+			node.kernel.kind,
+			PrimitiveKind::Scatter(recipe_language::Scatter {
+				conflict: ScatterConflict::Atomic { .. },
+				..
+			})
+		)
+	}));
+	let bootstrap_streams = compiled
+		.graph()
+		.nodes
+		.iter()
+		.filter_map(|node| match &node.kernel.kind {
+			PrimitiveKind::Random(recipe_language::RandomMap {
+				distribution: RandomDistribution::UniformI32 { low: 0, .. },
+				key,
+				philox_rounds: 10,
+			}) => Some(key.stream),
+			_ => None,
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(bootstrap_streams, [1, 2]);
+	compiled.graph().validate()?;
+	compiled.program().validate()?;
+	Ok(())
+}
+
+#[test]
+fn catboost_selects_one_oblivious_split_per_depth_while_xgboost_selects_per_node() -> TestResult {
+	let dataset = binary_dataset()?;
+	let depth = NonZeroU32::new(3).unwrap();
+	let catboost = compile_dense_training_with_blocks(
+		&dataset,
+		&config(),
+		&[DenseBlock::Tree(DenseTree::new(
+			DenseTreeFamily::CatBoost,
+			NonZeroU64::MIN,
+			depth,
+		))],
+	)?;
+	let xgboost = compile_dense_training_with_blocks(
+		&dataset,
+		&config(),
+		&[DenseBlock::Tree(DenseTree::new(
+			DenseTreeFamily::XGBoost,
+			NonZeroU64::MIN,
+			depth,
+		))],
+	)?;
+	let maximum_axes = |compiled: &CompiledTraining| {
+		compiled
+			.graph()
+			.nodes
+			.iter()
+			.filter_map(|node| match &node.kernel.kind {
+				PrimitiveKind::Reduce(reduction)
+					if reduction.operator == ReduceOperator::Maximum
+						&& reduction.result == ReduceResult::ValueAndIndex =>
+				{
+					Some(reduction.axes.as_slice().to_vec())
+				}
+				_ => None,
+			})
+			.collect::<Vec<_>>()
+	};
+	assert_eq!(maximum_axes(&catboost), vec![vec![0]; 3]);
+	assert_eq!(maximum_axes(&xgboost), vec![vec![1]; 3]);
+	Ok(())
+}
+
+#[test]
+fn lightgbm_grows_one_globally_best_leaf_per_possible_nonempty_split() -> TestResult {
+	let dataset = binary_dataset()?;
+	let compiled = compile_dense_training_with_blocks(
+		&dataset,
+		&config(),
+		&[DenseBlock::Tree(DenseTree::new(
+			DenseTreeFamily::LightGbm,
+			NonZeroU64::MIN,
+			NonZeroU32::new(3).unwrap(),
+		))],
+	)?;
+	let maximum_axes = compiled
+		.graph()
+		.nodes
+		.iter()
+		.filter_map(|node| match &node.kernel.kind {
+			PrimitiveKind::Reduce(reduction)
+				if reduction.operator == ReduceOperator::Maximum
+					&& reduction.result == ReduceResult::ValueAndIndex =>
+			{
+				Some(reduction.axes.as_slice().to_vec())
+			}
+			_ => None,
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(maximum_axes, vec![vec![0]; 4]);
+	assert!(compiled.graph().nodes.iter().all(|node| {
+		!matches!(
+			node.kernel.kind,
+			PrimitiveKind::Scatter(recipe_language::Scatter {
+				conflict: ScatterConflict::Atomic { .. },
+				..
+			})
+		)
+	}));
+	compiled.graph().validate()?;
+	compiled.program().validate()?;
+	Ok(())
+}
+
+#[test]
+fn multiple_declared_targets_form_one_ordered_matrix_for_every_dense_objective_family() -> TestResult {
+	let dataset = multi_target_dataset()?;
+	assert_eq!(dataset.target_source_indices(), [2, 1, 3]);
+	for (loss, expected_task) in [
+		(
+			DenseLoss::BinaryCrossEntropy,
+			DenseTask::MultiTargetBinaryClassification {
+				first_target_vector: 2,
+				target_count: 3,
+			},
+		),
+		(
+			DenseLoss::Focal,
+			DenseTask::MultiTargetBinaryClassification {
+				first_target_vector: 2,
+				target_count: 3,
+			},
+		),
+		(
+			DenseLoss::CrossEntropy,
+			DenseTask::JointMulticlassClassification {
+				first_target_vector: 2,
+				target_count: 3,
+			},
+		),
+		(
+			DenseLoss::MeanSquaredError,
+			DenseTask::MultiTargetRegression {
+				first_target_vector: 2,
+				target_count: 3,
+			},
+		),
+		(
+			DenseLoss::MeanAbsoluteError,
+			DenseTask::MultiTargetRegression {
+				first_target_vector: 2,
+				target_count: 3,
+			},
+		),
+		(
+			DenseLoss::Huber,
+			DenseTask::MultiTargetRegression {
+				first_target_vector: 2,
+				target_count: 3,
+			},
+		),
+	] {
+		let compiled = compile_dense_training(&dataset, &multi_target_config(loss))?;
+		assert_eq!(compiled.dataset_schema().targets(), [2, 1, 3]);
+		assert_eq!(compiled.dataset_schema().target_dtypes(), [DType::I32; 3]);
+		assert_eq!(compiled.dataset_schema().task(), expected_task);
+		assert_eq!(compiled.dataset_schema().output_width(), 3);
+		let targets = compiled
+			.external_inputs()
+			.iter()
+			.find(|input| input.role() == ExternalInputRole::TrainTargets)
+			.expect("ordered multi-target input exists");
+		assert_eq!(targets.dtype(), DType::F32);
+		assert_eq!(targets.shape().extents(), [5, 3]);
+		compiled.graph().validate()?;
+		compiled.program().validate()?;
+		let manifest = CheckpointManifest::from_compiled(&compiled)?;
+		assert_eq!(manifest.target_source_indices(), [2, 1, 3]);
+		assert_eq!(manifest.task(), expected_task);
+	}
+	Ok(())
+}
+
+#[test]
+fn multiple_declared_targets_preserve_matrix_semantics_in_every_validation_family() -> TestResult {
+	let dataset = multi_target_validation_dataset()?;
+	let binary = compile_dense_training_with_binary_validation(
+		&dataset,
+		&multi_target_config(DenseLoss::BinaryCrossEntropy),
+		&BinaryValidationConfig::new(NonZeroU32::new(4).unwrap(), [0.5]),
+	)?;
+	binary.graph().validate()?;
+	binary.program().validate()?;
+	let binary_outputs = binary
+		.outputs()
+		.validation
+		.as_ref()
+		.expect("multi-target binary validation outputs exist");
+	assert!(binary_outputs.temperature_scaling.is_none());
+	assert_eq!(binary.dataset_schema().targets(), [2, 1, 3]);
+
+	let joint = compile_dense_training_with_multiclass_validation(
+		&dataset,
+		&multi_target_config(DenseLoss::CrossEntropy),
+		&MulticlassValidationConfig,
+	)?;
+	joint.graph().validate()?;
+	joint.program().validate()?;
+	assert!(joint.outputs().multiclass_validation.is_some());
+	assert_eq!(joint.dataset_schema().targets(), [2, 1, 3]);
+
+	let regression = compile_dense_training_with_regression_validation(
+		&dataset,
+		&multi_target_config(DenseLoss::MeanSquaredError),
+		&RegressionValidationConfig,
+	)?;
+	regression.graph().validate()?;
+	regression.program().validate()?;
+	assert!(regression.outputs().regression_validation.is_some());
+	assert_eq!(regression.dataset_schema().targets(), [2, 1, 3]);
+
+	for compiled in [&binary, &joint, &regression] {
+		let targets = compiled
+			.external_inputs()
+			.iter()
+			.find(|input| input.role() == ExternalInputRole::ValidationTargets)
+			.expect("ordered multi-target validation input exists");
+		assert_eq!(targets.dtype(), DType::F32);
+		assert_eq!(targets.shape().extents(), [4, 3]);
+	}
+	Ok(())
+}
+
+#[test]
+fn multi_target_binary_metrics_require_both_classes_in_every_target_column() -> TestResult {
+	let compiled = compile_dense_training_with_binary_validation(
+		&multi_target_dataset()?,
+		&multi_target_config(DenseLoss::BinaryCrossEntropy),
+		&BinaryValidationConfig::new(NonZeroU32::new(4).unwrap(), [0.5]),
+	)?;
+	assert_eq!(
+		compiled.outputs().validation_status,
+		ValidationMetricStatus::Unavailable {
+			family: ValidationMetricFamily::Binary,
+			reason: ValidationUnavailableReason::SingleKnownClass {
+				known_rows: NonZeroU64::new(2).unwrap(),
+			},
+			split_rows: 2,
+		}
+	);
+	assert!(compiled.outputs().validation.is_none());
+	Ok(())
+}
+
+fn finite_iterations(iterations: recipe_core::LoopIterations) -> u64 {
+	iterations
+		.finite()
+		.expect("test expects a finite loop")
+		.get()
 }
 
 fn training_schedule_program(compiled: &CompiledTraining) -> &recipe_core::ScalarProgram {
@@ -263,6 +907,40 @@ fn training_schedule_program(compiled: &CompiledTraining) -> &recipe_core::Scala
 			_ => None,
 		})
 		.expect("training schedule program exists")
+}
+
+fn contains_global_clip_scale(compiled: &CompiledTraining) -> bool {
+	let expected = [
+		ScalarOpcode::SquareRoot,
+		ScalarOpcode::Maximum,
+		ScalarOpcode::Divide,
+		ScalarOpcode::Minimum,
+	];
+	compiled.graph().nodes.iter().any(|node| {
+		let PrimitiveKind::Elementwise(elementwise) = &node.kernel.kind else {
+			return false;
+		};
+		elementwise
+			.program
+			.instructions
+			.iter()
+			.map(|instruction| instruction.opcode)
+			.eq(expected)
+	})
+}
+
+#[test]
+fn absent_gradient_declaration_omits_the_global_clipping_graph() -> TestResult {
+	let dataset = categorical_feature_dataset()?;
+	let clipped = compile_dense_training(&dataset, &config())?;
+	let mut unclipped_config = config();
+	unclipped_config.gradient_clip_norm = None;
+	let unclipped = compile_dense_training(&dataset, &unclipped_config)?;
+
+	assert!(contains_global_clip_scale(&clipped));
+	assert!(!contains_global_clip_scale(&unclipped));
+	assert!(unclipped.graph().nodes.len() < clipped.graph().nodes.len());
+	Ok(())
 }
 
 #[test]
@@ -293,9 +971,16 @@ fn compiles_every_data_normalizer_and_both_layer_operation_orders() -> TestResul
 		] {
 			let mut config = config();
 			config.data_normalization = data_normalization;
-			config.layers[0] = DenseLayer::with_operations(NonZeroU64::new(4).unwrap(), operations);
+			config.layers[0] = DenseLayer::with_operations(NonZeroU64::new(4).unwrap(), operations.clone());
 			let compiled =
 				compile_dense_training_with_binary_validation(&binary_dataset()?, &config, &validation)?;
+			assert_eq!(compiled.config().data_normalization, data_normalization);
+			let DenseBlock::Layer(first) = &compiled.blocks()[0] else {
+				panic!("first declared layer changed block kind");
+			};
+			assert_eq!(first.operations(), operations);
+			let manifest = CheckpointManifest::from_compiled(&compiled)?;
+			assert_eq!(manifest.task(), compiled.dataset_schema().task());
 			compiled.graph().validate()?;
 			compiled.program().validate()?;
 		}
@@ -304,9 +989,10 @@ fn compiles_every_data_normalizer_and_both_layer_operation_orders() -> TestResul
 }
 
 #[test]
-fn compiles_every_pointwise_loss_and_its_backward_seed() -> TestResult {
+fn compiles_every_declared_loss_and_its_backward_seed() -> TestResult {
 	for loss in [
 		DenseLoss::BinaryCrossEntropy,
+		DenseLoss::Focal,
 		DenseLoss::MeanSquaredError,
 		DenseLoss::MeanAbsoluteError,
 		DenseLoss::Huber,
@@ -314,7 +1000,7 @@ fn compiles_every_pointwise_loss_and_its_backward_seed() -> TestResult {
 		let mut config = config();
 		config.loss = loss;
 		let dataset = match loss {
-			DenseLoss::BinaryCrossEntropy => binary_dataset()?,
+			DenseLoss::BinaryCrossEntropy | DenseLoss::Focal => binary_dataset()?,
 			DenseLoss::MeanSquaredError | DenseLoss::MeanAbsoluteError | DenseLoss::Huber => {
 				regression_dataset()?
 			}
@@ -326,7 +1012,7 @@ fn compiles_every_pointwise_loss_and_its_backward_seed() -> TestResult {
 		assert_eq!(
 			compiled.dataset_schema().task(),
 			match loss {
-				DenseLoss::BinaryCrossEntropy => DenseTask::BinaryClassification {
+				DenseLoss::BinaryCrossEntropy | DenseLoss::Focal => DenseTask::BinaryClassification {
 					target_vector: 2,
 					positive_code: 1,
 				},
@@ -338,6 +1024,21 @@ fn compiles_every_pointwise_loss_and_its_backward_seed() -> TestResult {
 }
 
 #[test]
+fn focal_training_retains_binary_validation_and_checkpoint_boundaries() -> TestResult {
+	let mut training = config();
+	training.loss = DenseLoss::Focal;
+	let validation = BinaryValidationConfig::new(NonZeroU32::new(8).unwrap(), [0.25, 0.75]);
+	let compiled = compile_dense_training_with_binary_validation(&binary_dataset()?, &training, &validation)?;
+
+	assert_eq!(compiled.config().loss, DenseLoss::Focal);
+	assert!(compiled.outputs().validation.is_some());
+	compiled.graph().validate()?;
+	compiled.program().validate()?;
+	let _manifest = CheckpointManifest::from_compiled(&compiled)?;
+	Ok(())
+}
+
+#[test]
 fn compiled_schema_retains_numeric_regression_semantics_and_spans() -> TestResult {
 	let mut config = config();
 	config.loss = DenseLoss::MeanSquaredError;
@@ -345,6 +1046,7 @@ fn compiled_schema_retains_numeric_regression_semantics_and_spans() -> TestResul
 	let schema = compiled.dataset_schema();
 	assert_eq!(schema.input_width(), 2);
 	assert_eq!(schema.target(), 2);
+	assert_eq!(schema.target_dtype(), DType::I32);
 	assert_eq!(
 		schema.task(),
 		DenseTask::ScalarRegression { target_vector: 2 }
@@ -362,7 +1064,14 @@ fn compiled_schema_retains_numeric_regression_semantics_and_spans() -> TestResul
 	assert_eq!(target.semantic_type(), SemanticType::Numeric);
 	assert_eq!(target.encoding(), VectorEncoding::I32);
 	assert_eq!(target.metadata(), &VectorMetadata::None);
+	let train_targets = compiled
+		.external_inputs()
+		.iter()
+		.find(|input| input.role() == ExternalInputRole::TrainTargets)
+		.expect("compiled target input exists");
+	assert_eq!(train_targets.dtype(), schema.target_dtype());
 	let checkpoint = CheckpointManifest::from_compiled(&compiled)?;
+	assert_eq!(checkpoint.target_dtype(), Some(DType::I32));
 	assert_eq!(checkpoint.feature_width(), schema.input_width());
 	assert_eq!(checkpoint.vectors().len(), schema.vectors().len());
 	assert_eq!(
@@ -370,6 +1079,36 @@ fn compiled_schema_retains_numeric_regression_semantics_and_spans() -> TestResul
 		SemanticType::Numeric
 	);
 	assert_eq!(checkpoint.vectors()[2].encoding(), VectorEncoding::I32);
+	Ok(())
+}
+
+#[test]
+fn distilled_f32_target_dtype_survives_training_metrics_and_semantic_model_boundaries() -> TestResult {
+	let mut config = config();
+	config.loss = DenseLoss::Huber;
+	let compiled = compile_dense_training_with_regression_validation(
+		&missing_f32_regression_dataset()?,
+		&config,
+		&RegressionValidationConfig,
+	)?;
+	assert_eq!(compiled.dataset_schema().target_dtype(), DType::F32);
+	for role in [
+		ExternalInputRole::TrainTargets,
+		ExternalInputRole::ValidationTargets,
+	] {
+		let targets = compiled
+			.external_inputs()
+			.iter()
+			.find(|input| input.role() == role)
+			.expect("typed target partition exists");
+		assert_eq!(targets.dtype(), DType::F32);
+	}
+	for binding in &compiled.outputs().metric_bindings {
+		let tensor = graph_tensor(&compiled, binding.value);
+		assert_eq!(tensor.dtype, DType::F32);
+	}
+	let checkpoint = CheckpointManifest::from_compiled(&compiled)?;
+	assert_eq!(checkpoint.target_dtype(), Some(DType::F32));
 	Ok(())
 }
 
@@ -510,6 +1249,62 @@ fn categorical_feature_lowering_routes_missing_values_and_rejects_unsupported_se
 }
 
 #[test]
+fn all_missing_fit_categorical_feature_uses_only_the_reserved_one_hot_route() -> TestResult {
+	let prepared = prepare_csv(
+		b"amount,member,target\n\
+		10,,0\n\
+		20,,1\n\
+		30,,0\n\
+		40,,1\n\
+		50,,1\n\
+		60,archive-member,0\n\
+		70,,1\n",
+	)?;
+	let compiled = compile_dense_training(&prepared, &config())?;
+	let schema = compiled.dataset_schema();
+	assert_eq!(schema.input_width(), 2);
+	assert_eq!(schema.features().len(), 2);
+	assert_eq!(schema.features()[1].start(), 1);
+	assert_eq!(schema.features()[1].width(), 1);
+	assert_eq!(
+		schema.features()[1].lowering(),
+		DenseFeatureLowering::CategoricalOneHot {
+			dictionary_width: 0,
+			reserved_index: 0,
+		}
+	);
+	let member = schema
+		.vectors()
+		.iter()
+		.find(|vector| vector.name() == b"member")
+		.expect("member schema exists");
+	assert_eq!(
+		member.metadata(),
+		&VectorMetadata::Categorical {
+			dictionary: Vec::new(),
+		}
+	);
+	for role in [
+		ExternalInputRole::TrainFeatures,
+		ExternalInputRole::ValidationFeatures,
+	] {
+		let features = compiled
+			.external_inputs()
+			.iter()
+			.find(|input| input.role() == role)
+			.expect("lowered feature partition exists");
+		let values = features
+			.bytes()
+			.chunks_exact(4)
+			.map(|bytes| f32::from_le_bytes(bytes.try_into().expect("one f32")))
+			.collect::<Vec<_>>();
+		assert!(values.chunks_exact(2).all(|row| row[1] == 1.0));
+	}
+	CheckpointManifest::from_compiled(&compiled)?;
+	Ok(())
+}
+
+#[test]
 fn bce_accepts_two_label_categorical_targets_and_records_the_dictionary() -> TestResult {
 	let compiled = compile_dense_training(&categorical_dataset()?, &config())?;
 	assert_eq!(
@@ -537,11 +1332,11 @@ fn bce_accepts_two_label_categorical_targets_and_records_the_dictionary() -> Tes
 }
 
 #[test]
-fn multiclass_cross_entropy_uses_training_dictionary_reserved_route_and_output_adapter() -> TestResult {
+fn multiclass_cross_entropy_uses_training_dictionary_reserved_route_and_declared_output() -> TestResult {
 	let dataset = multiclass_dataset_with_validation_only_label()?;
 	let mut config = config();
 	config.loss = DenseLoss::CrossEntropy;
-	config.layers[1] = DenseLayer::new(NonZeroU64::new(2).unwrap(), DenseActivation::Silu);
+	config.layers[1] = DenseLayer::new(NonZeroU64::new(4).unwrap(), DenseActivation::Linear);
 	let compiled = compile_dense_training(&dataset, &config)?;
 	compiled.graph().validate()?;
 	compiled.program().validate()?;
@@ -575,29 +1370,8 @@ fn multiclass_cross_entropy_uses_training_dictionary_reserved_route_and_output_a
 			dictionary: vec![b"blue".to_vec(), b"green".to_vec(), b"red".to_vec()],
 		}
 	);
-	let adapter = compiled
-		.output_adapter()
-		.expect("mismatched nonlinear output is adapted");
-	assert_eq!(adapter.source_width().get(), 2);
-	assert_eq!(adapter.target_width().get(), 4);
-	assert_eq!(compiled.layers().len(), config.layers.len() + 1);
-	assert_eq!(
-		compiled
-			.layers()
-			.last()
-			.expect("adapter layer")
-			.width()
-			.get(),
-		4
-	);
-	assert!(
-		compiled
-			.layers()
-			.last()
-			.expect("adapter layer")
-			.operations()
-			.is_empty()
-	);
+	assert_eq!(compiled.output_adapter(), None);
+	assert_eq!(compiled.layers(), config.layers);
 
 	let train_targets = compiled
 		.external_inputs()
@@ -648,12 +1422,12 @@ fn multiclass_cross_entropy_uses_training_dictionary_reserved_route_and_output_a
 			.find(|tensor| tensor.id == *output)
 			.expect("cross-entropy output tensor exists");
 		assert_eq!(tensor.dtype, DType::F32);
-		assert_eq!(tensor.shape.extents(), [3, 4]);
+		assert_eq!(tensor.shape.extents(), [5, 4]);
 	}
 
 	let manifest = CheckpointManifest::from_compiled(&compiled)?;
 	assert_eq!(manifest.task(), compiled.dataset_schema().task());
-	assert_eq!(manifest.output_adapter(), Some(adapter));
+	assert_eq!(manifest.output_adapter(), None);
 	assert_eq!(manifest.vectors()[2].metadata(), target.metadata());
 	Ok(())
 }
@@ -678,9 +1452,9 @@ fn multiclass_validation_materializes_device_cross_entropy_and_top_one_accuracy(
 	assert_eq!(
 		validation.metric_domain,
 		IterationDomain::new(
-			compiled.bounds().batches_per_epoch - 1,
-			compiled.bounds().training_iterations.get(),
-			compiled.bounds().batches_per_epoch,
+			0,
+			finite_iterations(compiled.bounds().training_iterations),
+			1
 		)
 		.expect("epoch-bound validation domain")
 	);
@@ -692,7 +1466,8 @@ fn multiclass_validation_materializes_device_cross_entropy_and_top_one_accuracy(
 			.map(|binding| binding.kind)
 			.collect::<Vec<_>>(),
 		[
-			TrainingMetricKind::BatchLoss,
+			TrainingMetricKind::TrainingLoss,
+			TrainingMetricKind::LearningRate,
 			TrainingMetricKind::ValidationMeanCrossEntropy,
 			TrainingMetricKind::Accuracy,
 		]
@@ -721,9 +1496,72 @@ fn multiclass_validation_materializes_device_cross_entropy_and_top_one_accuracy(
 }
 
 #[test]
-fn defined_output_projection_adapts_unusual_widths_instead_of_rejecting_training() -> TestResult {
+fn regression_validation_materializes_full_partition_r2() -> TestResult {
+	let mut config = config();
+	config.loss = DenseLoss::MeanSquaredError;
+	let compiled = compile_dense_training_with_regression_validation(
+		&regression_dataset()?,
+		&config,
+		&RegressionValidationConfig,
+	)?;
+	compiled.graph().validate()?;
+	compiled.program().validate()?;
+	assert_eq!(
+		compiled.outputs().validation_status,
+		ValidationMetricStatus::Available {
+			family: ValidationMetricFamily::Regression,
+			known_rows: NonZeroU64::new(2).unwrap(),
+		}
+	);
+	let validation = compiled
+		.outputs()
+		.regression_validation
+		.expect("regression validation outputs exist");
+	assert_eq!(
+		validation.metric_domain,
+		IterationDomain::new(
+			0,
+			finite_iterations(compiled.bounds().training_iterations),
+			1
+		)
+		.expect("epoch-bound R2 domain")
+	);
+	assert_eq!(
+		compiled
+			.outputs()
+			.metric_bindings
+			.iter()
+			.map(|binding| binding.kind)
+			.collect::<Vec<_>>(),
+		[
+			TrainingMetricKind::TrainingLoss,
+			TrainingMetricKind::LearningRate,
+			TrainingMetricKind::R2,
+		]
+	);
+	let r2 = compiled
+		.outputs()
+		.metric_bindings
+		.iter()
+		.find(|binding| binding.kind == TrainingMetricKind::R2)
+		.expect("R2 metric binding exists");
+	assert_eq!(r2.value, validation.metrics.r2);
+	assert_eq!(r2.domain, validation.metric_domain);
+	let targets = compiled
+		.external_inputs()
+		.iter()
+		.find(|input| input.role() == ExternalInputRole::ValidationTargets)
+		.expect("full regression validation targets exist");
+	assert_eq!(targets.dtype(), DType::I32);
+	assert_eq!(targets.shape().extents(), [2, 1]);
+	Ok(())
+}
+
+#[test]
+fn output_shape_is_exactly_the_declared_final_block_without_hidden_projection() -> TestResult {
 	for (loss, dataset) in [
 		(DenseLoss::BinaryCrossEntropy, binary_dataset()?),
+		(DenseLoss::Focal, binary_dataset()?),
 		(DenseLoss::MeanSquaredError, regression_dataset()?),
 		(
 			DenseLoss::CrossEntropy,
@@ -733,19 +1571,21 @@ fn defined_output_projection_adapts_unusual_widths_instead_of_rejecting_training
 		let mut config = config();
 		config.loss = loss;
 		config.layers[1] = DenseLayer::new(NonZeroU64::new(5).unwrap(), DenseActivation::Silu);
-		let compiled = compile_dense_training(&dataset, &config)?;
-		let adapter = compiled
-			.output_adapter()
-			.expect("unusual width has a defined projection");
-		assert_eq!(adapter.source_width().get(), 5);
-		assert_eq!(
-			adapter.target_width().get(),
-			compiled.dataset_schema().output_width() as u64
+		let error = compile_dense_training(&dataset, &config)
+			.expect_err("mismatched final width must not create a hidden projection");
+		assert_eq!(error.kind, TrainingCompileErrorKind::InvalidNetwork);
+		assert!(
+			error.detail
+				.contains("declare that output layer explicitly")
 		);
-		assert_eq!(compiled.layers().len(), config.layers.len() + 1);
-		compiled.graph().validate()?;
-		compiled.program().validate()?;
 	}
+
+	let mut nonlinear_binary = config();
+	nonlinear_binary.layers[1] = DenseLayer::new(NonZeroU64::new(1).unwrap(), DenseActivation::Silu);
+	let error = compile_dense_training(&binary_dataset()?, &nonlinear_binary)
+		.expect_err("classification output activation must not be hidden behind a projection");
+	assert_eq!(error.kind, TrainingCompileErrorKind::InvalidNetwork);
+	assert!(error.detail.contains("emit raw logits"));
 
 	let mut matched = config();
 	matched.loss = DenseLoss::CrossEntropy;
@@ -816,7 +1656,6 @@ fn loss_contract_rejects_semantically_incompatible_targets() -> TestResult {
 #[test]
 fn missing_targets_use_safe_placeholders_and_gate_the_entire_optimizer_transition() -> TestResult {
 	let mut training = config();
-	training.batch_size = NonZeroUsize::new(2).unwrap();
 	training.layers[0] = DenseLayer::with_operations(
 		NonZeroU64::new(4).unwrap(),
 		[DenseOperation::Normalization(DenseNormalization::Batch)],
@@ -853,9 +1692,9 @@ fn missing_targets_use_safe_placeholders_and_gate_the_entire_optimizer_transitio
 		.outputs()
 		.optimizer_progress
 		.expect("masked targets declare accepted-update progress");
-	assert_eq!(progress.accepted_updates_per_epoch, 2);
-	assert_eq!(progress.maximum_accepted_updates, 4);
-	assert_eq!(progress.warmup_accepted_updates, 2);
+	assert_eq!(progress.accepted_updates_per_epoch, 1);
+	assert_eq!(progress.maximum_accepted_updates, Some(2));
+	assert_eq!(progress.warmup_accepted_updates, 1);
 	let accepted = compiled
 		.graph()
 		.nodes
@@ -935,7 +1774,7 @@ fn missing_targets_use_safe_placeholders_and_gate_the_entire_optimizer_transitio
 					.kernel
 					.outputs
 					.iter()
-					.any(|output| graph_tensor(&compiled, *output).shape.extents() == [2, 4])
+					.any(|output| graph_tensor(&compiled, *output).shape.extents() == [5, 4])
 		})
 		.collect::<Vec<_>>();
 	assert!(
@@ -958,6 +1797,48 @@ fn missing_targets_use_safe_placeholders_and_gate_the_entire_optimizer_transitio
 				.all(|instruction| instruction.opcode != ScalarOpcode::Multiply)
 	}));
 	let _manifest = CheckpointManifest::from_compiled(&compiled)?;
+	Ok(())
+}
+
+#[test]
+fn unbounded_training_has_symbolic_domains_and_a_saturating_warmup_clock() -> TestResult {
+	let mut training = config();
+	training.epochs = TrainingHorizon::Unbounded;
+	training.warmup_epochs = 2;
+	training.learning_rate_decay = LearningRateDecay::Constant;
+	let compiled = compile_dense_training(&partially_missing_binary_dataset()?, &training)?;
+	compiled.graph().validate()?;
+	compiled.program().validate()?;
+
+	assert_eq!(compiled.bounds().epochs, TrainingHorizon::Unbounded);
+	assert_eq!(
+		compiled.bounds().training_iterations,
+		recipe_core::LoopIterations::UNBOUNDED
+	);
+	assert_eq!(
+		compiled.bounds().iterations,
+		recipe_core::LoopIterations::UNBOUNDED
+	);
+	assert_eq!(compiled.bounds().calibration_iterations, 0);
+	assert!(
+		compiled
+			.program()
+			.domains()
+			.iter()
+			.any(|assignment| assignment.domain.is_unbounded())
+	);
+	assert!(
+		compiled.program().domains().iter().all(|assignment| {
+			assignment.domain.is_unbounded() || assignment.domain == IterationDomain::first()
+		})
+	);
+	let progress = compiled
+		.outputs()
+		.optimizer_progress
+		.expect("masked unbounded training retains a bounded warmup clock");
+	assert_eq!(progress.maximum_accepted_updates, None);
+	assert_eq!(progress.warmup_accepted_updates, 2);
+	assert_eq!(progress.accepted_update_counter_limit, 2);
 	Ok(())
 }
 
@@ -1002,7 +1883,6 @@ fn every_numeric_and_categorical_loss_accepts_unsupervised_target_rows() -> Test
 	] {
 		let mut training = config();
 		training.loss = loss;
-		training.batch_size = NonZeroUsize::new(2).unwrap();
 		let compiled = compile_dense_training(&missing_f32_regression_dataset()?, &training)?;
 		compiled.graph().validate()?;
 		assert!(compiled.outputs().optimizer_progress.is_some());
@@ -1010,7 +1890,6 @@ fn every_numeric_and_categorical_loss_accepts_unsupervised_target_rows() -> Test
 
 	let mut training = config();
 	training.loss = DenseLoss::CrossEntropy;
-	training.batch_size = NonZeroUsize::new(2).unwrap();
 	training.layers[1] = DenseLayer::new(NonZeroU64::new(4).unwrap(), DenseActivation::Linear);
 	let compiled = compile_dense_training_with_multiclass_validation(
 		&missing_multiclass_target_dataset()?,
@@ -1051,14 +1930,14 @@ fn every_loss_sanitizes_ignored_logits_and_targets_before_checked_math() -> Test
 	let mut cases = Vec::new();
 	for loss in [
 		DenseLoss::BinaryCrossEntropy,
+		DenseLoss::Focal,
 		DenseLoss::MeanSquaredError,
 		DenseLoss::MeanAbsoluteError,
 		DenseLoss::Huber,
 	] {
 		let mut training = config();
 		training.loss = loss;
-		training.batch_size = NonZeroUsize::new(2).unwrap();
-		let dataset = if loss == DenseLoss::BinaryCrossEntropy {
+		let dataset = if matches!(loss, DenseLoss::BinaryCrossEntropy | DenseLoss::Focal) {
 			partially_missing_binary_dataset()?
 		} else {
 			missing_f32_regression_dataset()?
@@ -1067,7 +1946,6 @@ fn every_loss_sanitizes_ignored_logits_and_targets_before_checked_math() -> Test
 	}
 	let mut cross_entropy = config();
 	cross_entropy.loss = DenseLoss::CrossEntropy;
-	cross_entropy.batch_size = NonZeroUsize::new(2).unwrap();
 	cross_entropy.layers[1] = DenseLayer::new(NonZeroU64::new(4).unwrap(), DenseActivation::Linear);
 	cases.push(compile_dense_training(
 		&missing_multiclass_target_dataset()?,
@@ -1092,7 +1970,7 @@ fn every_loss_sanitizes_ignored_logits_and_targets_before_checked_math() -> Test
 					};
 					node.kernel.outputs.len() == 2
 						&& node.kernel.outputs.iter().all(|output| {
-							graph_tensor(compiled, *output).shape.extents().first() == Some(&2)
+							graph_tensor(compiled, *output).shape.extents().first() == Some(&5)
 						}) && elementwise
 						.program
 						.instructions
@@ -1119,7 +1997,7 @@ fn every_loss_sanitizes_ignored_logits_and_targets_before_checked_math() -> Test
 							PrimitiveKind::Reduce(reduce)
 								if reduce.operator == recipe_language::ReduceOperator::Maximum
 						) && node.kernel.inputs.iter().any(|input| {
-							graph_tensor(compiled, *input).shape.extents().first() == Some(&2)
+							graph_tensor(compiled, *input).shape.extents().first() == Some(&5)
 						})
 					})
 					.expect("cross-entropy row maximum exists");
@@ -1135,8 +2013,7 @@ fn every_loss_sanitizes_ignored_logits_and_targets_before_checked_math() -> Test
 
 #[test]
 fn entirely_unsupervised_training_is_a_finite_planned_no_op() -> TestResult {
-	let mut training = config();
-	training.batch_size = NonZeroUsize::new(2).unwrap();
+	let training = config();
 	let compiled = compile_dense_training(&entirely_unsupervised_training_dataset()?, &training)?;
 	compiled.graph().validate()?;
 	compiled.program().validate()?;
@@ -1145,7 +2022,7 @@ fn entirely_unsupervised_training_is_a_finite_planned_no_op() -> TestResult {
 		.optimizer_progress
 		.expect("all-unsupervised training retains explicit optimizer progress");
 	assert_eq!(progress.accepted_updates_per_epoch, 0);
-	assert_eq!(progress.maximum_accepted_updates, 0);
+	assert_eq!(progress.maximum_accepted_updates, Some(0));
 	assert_eq!(progress.warmup_accepted_updates, 0);
 	let supervision = compiled
 		.external_inputs()
@@ -1163,10 +2040,13 @@ fn entirely_unsupervised_training_is_a_finite_planned_no_op() -> TestResult {
 
 #[test]
 fn zero_and_one_known_categorical_dictionaries_form_bounded_bce_and_ce_tasks() -> TestResult {
-	for loss in [DenseLoss::BinaryCrossEntropy, DenseLoss::CrossEntropy] {
+	for loss in [
+		DenseLoss::BinaryCrossEntropy,
+		DenseLoss::Focal,
+		DenseLoss::CrossEntropy,
+	] {
 		let mut training = config();
 		training.loss = loss;
-		training.batch_size = NonZeroUsize::new(2).unwrap();
 
 		let zero_known = compile_dense_training(
 			&entirely_unsupervised_categorical_training_dataset()?,
@@ -1179,10 +2059,10 @@ fn zero_and_one_known_categorical_dictionaries_form_bounded_bce_and_ce_tasks() -
 			.optimizer_progress
 			.expect("zero-known categorical task retains the optimizer gate");
 		assert_eq!(zero_progress.accepted_updates_per_epoch, 0);
-		assert_eq!(zero_progress.maximum_accepted_updates, 0);
+		assert_eq!(zero_progress.maximum_accepted_updates, Some(0));
 		assert_eq!(zero_known.dataset_schema().output_width(), 1);
 		match loss {
-			DenseLoss::BinaryCrossEntropy => assert_eq!(
+			DenseLoss::BinaryCrossEntropy | DenseLoss::Focal => assert_eq!(
 				zero_known.dataset_schema().task(),
 				DenseTask::BinaryClassification {
 					target_vector: 2,
@@ -1239,6 +2119,9 @@ fn zero_and_one_known_categorical_dictionaries_form_bounded_bce_and_ce_tasks() -
 		);
 		let _zero_manifest = CheckpointManifest::from_compiled(&zero_known)?;
 
+		if loss == DenseLoss::CrossEntropy {
+			training.layers[1] = DenseLayer::new(NonZeroU64::new(2).unwrap(), DenseActivation::Linear);
+		}
 		let one_known = compile_dense_training(&one_known_categorical_training_dataset()?, &training)?;
 		one_known.graph().validate()?;
 		one_known.program().validate()?;
@@ -1247,7 +2130,7 @@ fn zero_and_one_known_categorical_dictionaries_form_bounded_bce_and_ce_tasks() -
 			.optimizer_progress
 			.expect("one-known categorical task retains the optimizer gate");
 		assert_eq!(one_progress.accepted_updates_per_epoch, 1);
-		assert_eq!(one_progress.maximum_accepted_updates, 2);
+		assert_eq!(one_progress.maximum_accepted_updates, Some(2));
 		assert_eq!(
 			one_known.dataset_schema().output_width(),
 			if loss == DenseLoss::CrossEntropy {
@@ -1266,7 +2149,7 @@ fn zero_and_one_known_categorical_dictionaries_form_bounded_bce_and_ce_tasks() -
 			.map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
 			.collect::<Vec<_>>();
 		assert_eq!(one_supervision, [1.0, 0.0, 0.0, 0.0, 0.0]);
-		if loss == DenseLoss::BinaryCrossEntropy {
+		if matches!(loss, DenseLoss::BinaryCrossEntropy | DenseLoss::Focal) {
 			assert_eq!(
 				one_known.dataset_schema().task(),
 				DenseTask::BinaryClassification {
@@ -1323,6 +2206,7 @@ fn binary_validation_requires_both_known_classes_without_rejecting_training() ->
 
 	let mut cross_entropy = config();
 	cross_entropy.loss = DenseLoss::CrossEntropy;
+	cross_entropy.layers[1] = DenseLayer::new(NonZeroU64::new(2).unwrap(), DenseActivation::Linear);
 	let compiled = compile_dense_training_with_multiclass_validation(
 		&one_known_categorical_training_dataset()?,
 		&cross_entropy,
@@ -1341,7 +2225,6 @@ fn binary_validation_requires_both_known_classes_without_rejecting_training() ->
 #[test]
 fn ignored_activation_lanes_are_selected_before_and_after_checked_nonlinearity() -> TestResult {
 	let mut training = config();
-	training.batch_size = NonZeroUsize::new(2).unwrap();
 	training.layers[0] = DenseLayer::new(NonZeroU64::new(4).unwrap(), DenseActivation::Exponential);
 	let compiled = compile_dense_training(
 		&entirely_unsupervised_categorical_training_dataset()?,
@@ -1365,7 +2248,7 @@ fn ignored_activation_lanes_are_selected_before_and_after_checked_nonlinearity()
 				&& node.kernel.outputs.len() == 1
 				&& graph_tensor(&compiled, node.kernel.outputs[0])
 					.shape
-					.extents() == [2, 4]
+					.extents() == [5, 4]
 				&& elementwise
 					.program
 					.instructions
@@ -1388,12 +2271,12 @@ fn ignored_activation_lanes_are_selected_before_and_after_checked_nonlinearity()
 
 #[test]
 fn zero_known_validation_targets_are_explicitly_unavailable() -> TestResult {
-	let validation = BinaryValidationConfig::new(NonZeroU32::new(4).unwrap(), [])
-		.with_auprc_early_stopping(NonZeroU64::new(2).unwrap())
-		.with_temperature_scaling(TemperatureScalingConfig {
+	let validation = BinaryValidationConfig::new(NonZeroU32::new(4).unwrap(), []).with_temperature_scaling(
+		TemperatureScalingConfig {
 			iterations: NonZeroU64::new(3).unwrap(),
 			..TemperatureScalingConfig::default()
-		});
+		},
+	);
 	let compiled = compile_dense_training_with_binary_validation(
 		&unknown_validation_target_dataset()?,
 		&config(),
@@ -1416,7 +2299,7 @@ fn zero_known_validation_targets_are_explicitly_unavailable() -> TestResult {
 		compiled.bounds().iterations,
 		compiled.bounds().training_iterations
 	);
-	assert_eq!(compiled.outputs().metric_bindings.len(), 1);
+	assert_eq!(compiled.outputs().metric_bindings.len(), 2);
 	assert!(compiled.external_inputs().iter().all(|input| {
 		!matches!(
 			input.role(),
@@ -1453,11 +2336,19 @@ fn compiles_contextual_activations_and_learning_rate_decays() -> TestResult {
 		DenseActivation::Cosine,
 		DenseActivation::Exponential,
 		DenseActivation::Logarithm,
+		DenseActivation::NaturalLogarithm,
+		DenseActivation::LegacySignedLogOnePlus,
 		DenseActivation::Huber,
 		DenseActivation::Tangent,
 		DenseActivation::Relu,
+		DenseActivation::LeakyRelu,
+		DenseActivation::Sigmoid,
+		DenseActivation::Tanh,
+		DenseActivation::Selu,
 		DenseActivation::Gelu,
 		DenseActivation::Silu,
+		DenseActivation::Elu,
+		DenseActivation::PRelu,
 	] {
 		for decay in [
 			LearningRateDecay::Linear,
@@ -1476,6 +2367,149 @@ fn compiles_contextual_activations_and_learning_rate_decays() -> TestResult {
 }
 
 #[test]
+fn logarithm_forward_lowering_uses_distinct_signed_natural_and_legacy_programs() -> TestResult {
+	let mut config = config();
+	config.loss = DenseLoss::MeanSquaredError;
+	config.layers[0] = DenseLayer::with_operations(
+		NonZeroU64::new(4).unwrap(),
+		[
+			DenseOperation::Activation(DenseActivation::Logarithm),
+			DenseOperation::Activation(DenseActivation::NaturalLogarithm),
+			DenseOperation::Activation(DenseActivation::LegacySignedLogOnePlus),
+		],
+	);
+	let compiled = compile_dense_training(&regression_dataset()?, &config)?;
+	let signed_and_natural = recipe_core::ScalarProgram::try_from(recipe_math::MathFunction::Log)?;
+	let legacy = recipe_core::ScalarProgram::try_from(recipe_math::MathFunction::LogOnePlus)?;
+
+	let signed_and_natural_count = compiled
+		.graph()
+		.nodes
+		.iter()
+		.filter(|node| {
+			matches!(
+				&node.kernel.kind,
+				PrimitiveKind::Elementwise(elementwise) if elementwise.program == signed_and_natural
+			)
+		})
+		.count();
+	let legacy_count = compiled
+		.graph()
+		.nodes
+		.iter()
+		.filter(|node| {
+			matches!(
+				&node.kernel.kind,
+				PrimitiveKind::Elementwise(elementwise) if elementwise.program == legacy
+			)
+		})
+		.count();
+
+	assert_eq!(signed_and_natural_count, 2);
+	assert_eq!(legacy_count, 1);
+	Ok(())
+}
+
+#[test]
+fn repeated_prelu_activations_own_independent_scalar_adamw_state() -> TestResult {
+	let mut config = config();
+	config.layers[0] = DenseLayer::with_operations(
+		NonZeroU64::new(4).unwrap(),
+		[
+			DenseOperation::Activation(DenseActivation::PRelu),
+			DenseOperation::Activation(DenseActivation::Relu),
+			DenseOperation::Activation(DenseActivation::PRelu),
+		],
+	);
+	let compiled = compile_dense_training(&binary_dataset()?, &config)?;
+	compiled.graph().validate()?;
+	compiled.program().validate()?;
+
+	let slopes = &compiled.outputs().layers[0].prelu;
+	assert_eq!(slopes.len(), 2);
+	let state_values = slopes
+		.iter()
+		.flat_map(|state| {
+			[
+				state.initial_parameter,
+				state.updated_parameter,
+				state.initial_first_moment,
+				state.updated_first_moment,
+				state.initial_second_moment,
+				state.updated_second_moment,
+			]
+		})
+		.collect::<BTreeSet<_>>();
+	assert_eq!(
+		state_values.len(),
+		12,
+		"PReLU occurrences must not alias state"
+	);
+	assert_ne!(slopes[0].update_kernel, slopes[1].update_kernel);
+
+	for slope in slopes {
+		for value in [
+			slope.initial_parameter,
+			slope.updated_parameter,
+			slope.initial_first_moment,
+			slope.updated_first_moment,
+			slope.initial_second_moment,
+			slope.updated_second_moment,
+		] {
+			assert_eq!(graph_tensor(&compiled, value).shape.extents(), [1]);
+		}
+
+		let resume_select = producer(&compiled, slope.initial_parameter);
+		assert_eq!(resume_select.kernel.inputs.len(), 3);
+		let initializer = producer(&compiled, resume_select.kernel.inputs[0]);
+		let PrimitiveKind::Elementwise(elementwise) = &initializer.kernel.kind else {
+			panic!("fresh PReLU scalar is produced by a Recipe scalar program");
+		};
+		let initial_output = elementwise.program.outputs[0];
+		let initial_constant = elementwise
+			.program
+			.constants
+			.iter()
+			.find(|constant| constant.id == initial_output)
+			.expect("PReLU initializer emits a literal scalar");
+		assert_eq!(
+			initial_constant.value,
+			ScalarLiteral::F32Bits(0.25f32.to_bits())
+		);
+
+		let update = compiled
+			.graph()
+			.nodes
+			.iter()
+			.find(|node| node.kernel.id == slope.update_kernel)
+			.expect("PReLU AdamW update exists");
+		assert_eq!(update.kernel.inputs[1], slope.initial_parameter);
+		assert_eq!(update.kernel.inputs[2], slope.initial_first_moment);
+		assert_eq!(update.kernel.inputs[3], slope.initial_second_moment);
+		assert_eq!(
+			update.kernel.outputs,
+			[
+				slope.updated_first_moment,
+				slope.updated_second_moment,
+				slope.updated_parameter,
+			]
+		);
+	}
+
+	let resume_parameter_ordinals = compiled
+		.external_inputs()
+		.iter()
+		.filter_map(|input| match input.role() {
+			ExternalInputRole::ResumeParameter { ordinal } => Some(ordinal),
+			_ => None,
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(resume_parameter_ordinals, [0, 1, 2, 3, 4, 5]);
+	let _manifest = CheckpointManifest::from_compiled(&compiled)?;
+	Ok(())
+}
+
+#[test]
 fn temperature_calibration_does_not_change_the_training_schedule() -> TestResult {
 	let validation = BinaryValidationConfig::new(NonZeroU32::new(4).unwrap(), []);
 	let calibrated_validation = BinaryValidationConfig::new(NonZeroU32::new(4).unwrap(), [])
@@ -1487,10 +2521,19 @@ fn temperature_calibration_does_not_change_the_training_schedule() -> TestResult
 	let without_calibration = compile_dense_training_with_binary_validation(&dataset, &config(), &validation)?;
 	let with_calibration =
 		compile_dense_training_with_binary_validation(&dataset, &config(), &calibrated_validation)?;
-	assert_eq!(without_calibration.bounds().training_iterations.get(), 4);
-	assert_eq!(with_calibration.bounds().training_iterations.get(), 4);
-	assert_eq!(without_calibration.bounds().iterations.get(), 4);
-	assert_eq!(with_calibration.bounds().iterations.get(), 7);
+	assert_eq!(
+		finite_iterations(without_calibration.bounds().training_iterations),
+		2
+	);
+	assert_eq!(
+		finite_iterations(with_calibration.bounds().training_iterations),
+		2
+	);
+	assert_eq!(
+		finite_iterations(without_calibration.bounds().iterations),
+		2
+	);
+	assert_eq!(finite_iterations(with_calibration.bounds().iterations), 5);
 	assert_eq!(
 		training_schedule_program(&without_calibration),
 		training_schedule_program(&with_calibration),
@@ -1526,7 +2569,7 @@ fn zero_adam_betas_compile_as_one_shared_recurrent_state() -> TestResult {
 		.expect("shared beta-power recurrence exists");
 	assert_eq!(
 		compiled.program().domain(recurrence.kernel.id),
-		Some(IterationDomain::new(0, 4, 1).unwrap()),
+		Some(IterationDomain::new(0, 2, 1).unwrap()),
 	);
 	assert_eq!(
 		recurrence
@@ -1565,36 +2608,65 @@ fn zero_adam_betas_compile_as_one_shared_recurrent_state() -> TestResult {
 }
 
 #[test]
-fn compiles_exact_partial_batches_and_owned_external_bytes() -> TestResult {
+fn compiles_one_full_partition_update_per_epoch_and_owned_external_bytes() -> TestResult {
 	let compiled = compile_dense_training(&binary_dataset()?, &config())?;
 	compiled.graph().validate()?;
 	compiled.program().validate()?;
 	assert_eq!(compiled.bounds().train_rows, 5);
-	assert_eq!(compiled.bounds().batch_size, 3);
-	assert_eq!(compiled.bounds().batches_per_epoch, 2);
-	assert_eq!(compiled.bounds().padded_rows_per_epoch, 6);
-	assert_eq!(compiled.bounds().iterations.get(), 4);
-	assert_eq!(compiled.bounds().warmup_iterations, 2);
-	assert_eq!(compiled.outputs().metric_bindings.len(), 1);
-	let batch_metric = compiled.outputs().metric_bindings[0];
-	assert_eq!(batch_metric.kind, TrainingMetricKind::BatchLoss);
-	assert_eq!(batch_metric.metric, MetricId::new(1));
-	assert_eq!(batch_metric.value, compiled.outputs().batch_loss);
-	assert_eq!(batch_metric.domain, compiled.outputs().batch_loss_domain);
 	assert_eq!(
-		compiled.program().metric(batch_metric.metric),
+		compiled.bounds().training_iterations,
+		compiled.bounds().epochs.loop_iterations()
+	);
+	assert_eq!(finite_iterations(compiled.bounds().iterations), 2);
+	assert_eq!(compiled.bounds().warmup_iterations, 1);
+	assert!(compiled.graph().nodes.iter().all(|node| {
+		!matches!(
+			node.kernel.kind,
+			PrimitiveKind::Gather(recipe_language::Gather {
+				bounds: recipe_language::IndexBounds::Clamp,
+				..
+			})
+		)
+	}));
+	assert_eq!(compiled.outputs().metric_bindings.len(), 2);
+	let training_metric = compiled.outputs().metric_bindings[0];
+	assert_eq!(training_metric.kind, TrainingMetricKind::TrainingLoss);
+	assert_eq!(training_metric.metric, MetricId::new(1));
+	assert_eq!(training_metric.value, compiled.outputs().training_loss);
+	assert_eq!(
+		training_metric.domain,
+		compiled.outputs().training_loss_domain
+	);
+	assert_eq!(
+		compiled.program().metric(training_metric.metric),
 		Some(recipe_program::MetricEmission {
-			metric: batch_metric.metric,
-			value: batch_metric.value,
-			domain: batch_metric.domain,
+			metric: training_metric.metric,
+			value: training_metric.value,
+			domain: training_metric.domain,
 		})
+	);
+	let learning_rate = compiled.outputs().metric_bindings[1];
+	assert_eq!(learning_rate.kind, TrainingMetricKind::LearningRate);
+	assert_eq!(learning_rate.metric, MetricId::new(2));
+	assert_eq!(
+		learning_rate.domain,
+		compiled.outputs().training_loss_domain
 	);
 
 	let manifest = compiled.external_inputs();
-	assert_eq!(manifest.len(), 4);
+	assert_eq!(manifest.len(), 17);
 	assert_eq!(
 		manifest
 			.iter()
+			.filter(|input| {
+				matches!(
+					input.role(),
+					ExternalInputRole::TrainFeatures
+						| ExternalInputRole::TrainTargets
+						| ExternalInputRole::ValidationFeatures
+						| ExternalInputRole::ValidationTargets
+				)
+			})
 			.map(|input| input.role())
 			.collect::<Vec<_>>(),
 		[
@@ -1604,8 +2676,30 @@ fn compiles_exact_partial_batches_and_owned_external_bytes() -> TestResult {
 			ExternalInputRole::ValidationTargets,
 		]
 	);
+	let resume_enabled = manifest
+		.iter()
+		.filter(|input| input.role() == ExternalInputRole::ResumeEnabled)
+		.collect::<Vec<_>>();
+	assert_eq!(resume_enabled.len(), 1);
+	assert_eq!(resume_enabled[0].dtype(), DType::I32);
+	assert_eq!(resume_enabled[0].shape().extents(), [1]);
+	assert_eq!(resume_enabled[0].bytes(), 0i32.to_le_bytes());
+	for ordinal in 0..4 {
+		for role in [
+			ExternalInputRole::ResumeParameter { ordinal },
+			ExternalInputRole::ResumeFirstMoment { ordinal },
+			ExternalInputRole::ResumeSecondMoment { ordinal },
+		] {
+			let inputs = manifest
+				.iter()
+				.filter(|input| input.role() == role)
+				.collect::<Vec<_>>();
+			assert_eq!(inputs.len(), 1, "resume role {role:?}");
+			assert_eq!(inputs[0].dtype(), DType::F32);
+			assert!(inputs[0].bytes().iter().all(|byte| *byte == 0));
+		}
+	}
 	for input in manifest {
-		assert_eq!(input.dtype(), DType::I32);
 		assert_eq!(
 			u64::try_from(input.bytes().len())?,
 			input.shape().bytes(input.dtype())?.get()
@@ -1622,9 +2716,9 @@ fn compiles_exact_partial_batches_and_owned_external_bytes() -> TestResult {
 }
 
 #[test]
-fn emits_gpu_iteration_batching_initialization_and_recurrent_adamw() -> TestResult {
+fn emits_full_partition_initialization_and_recurrent_adamw() -> TestResult {
 	let compiled = compile_dense_training(&binary_dataset()?, &config())?;
-	let mut batch_map = false;
+	let mut full_partition_map = false;
 	let mut step_map = false;
 	let mut normal_initializers = 0;
 	for node in &compiled.graph().nodes {
@@ -1632,9 +2726,18 @@ fn emits_gpu_iteration_batching_initialization_and_recurrent_adamw() -> TestResu
 			PrimitiveKind::IndexMap(IndexMap {
 				start: 0,
 				element_step: 1,
-				iteration_step: 3,
-				modulus: Some(6),
-			}) => batch_map = true,
+				iteration_step: 0,
+				modulus: None,
+			}) if node.kernel.outputs.iter().any(|output| {
+				compiled
+					.graph()
+					.tensors
+					.iter()
+					.any(|tensor| tensor.id == *output && tensor.shape.extents() == [5, 1])
+			}) =>
+			{
+				full_partition_map = true
+			}
 			PrimitiveKind::IndexMap(IndexMap {
 				start: 1,
 				element_step: 0,
@@ -1651,7 +2754,7 @@ fn emits_gpu_iteration_batching_initialization_and_recurrent_adamw() -> TestResu
 			_ => {}
 		}
 	}
-	assert!(batch_map);
+	assert!(full_partition_map);
 	assert!(step_map);
 	assert_eq!(normal_initializers, 2);
 
@@ -1701,9 +2804,8 @@ fn graph_and_program_ogdl_round_trip_deterministically() -> TestResult {
 }
 
 #[test]
-fn validation_metrics_early_stop_and_temperature_have_exact_domains() -> TestResult {
+fn validation_metrics_and_temperature_have_exact_domains() -> TestResult {
 	let validation = BinaryValidationConfig::new(NonZeroU32::new(4).unwrap(), [0.1, 0.2, 0.3])
-		.with_auprc_early_stopping(NonZeroU64::new(2).unwrap())
 		.with_temperature_scaling(TemperatureScalingConfig {
 			iterations: NonZeroU64::new(3).unwrap(),
 			..TemperatureScalingConfig::default()
@@ -1711,17 +2813,17 @@ fn validation_metrics_early_stop_and_temperature_have_exact_domains() -> TestRes
 	let compiled = compile_dense_training_with_binary_validation(&binary_dataset()?, &config(), &validation)?;
 	compiled.graph().validate()?;
 	compiled.program().validate()?;
-	assert_eq!(compiled.bounds().training_iterations.get(), 4);
+	assert_eq!(finite_iterations(compiled.bounds().training_iterations), 2);
 	assert_eq!(compiled.bounds().calibration_iterations, 3);
-	assert_eq!(compiled.bounds().iterations.get(), 7);
+	assert_eq!(finite_iterations(compiled.bounds().iterations), 5);
 	let metric_bindings = &compiled.outputs().metric_bindings;
-	assert_eq!(metric_bindings.len(), 9);
+	assert_eq!(metric_bindings.len(), 11);
 	assert_eq!(
 		metric_bindings
 			.iter()
 			.map(|binding| binding.metric.get())
 			.collect::<Vec<_>>(),
-		(1_u64..=9).collect::<Vec<_>>()
+		(1_u64..=11).collect::<Vec<_>>()
 	);
 	assert_eq!(
 		metric_bindings
@@ -1729,8 +2831,10 @@ fn validation_metrics_early_stop_and_temperature_have_exact_domains() -> TestRes
 			.map(|binding| binding.kind)
 			.collect::<Vec<_>>(),
 		[
-			TrainingMetricKind::BatchLoss,
+			TrainingMetricKind::TrainingLoss,
+			TrainingMetricKind::LearningRate,
 			TrainingMetricKind::ValidationMeanBce,
+			TrainingMetricKind::Accuracy,
 			TrainingMetricKind::AuRoc,
 			TrainingMetricKind::AuPrc,
 			TrainingMetricKind::BrierScore,
@@ -1771,9 +2875,10 @@ fn validation_metrics_early_stop_and_temperature_have_exact_domains() -> TestRes
 			.collect::<Vec<_>>(),
 		[0.1, 0.2, 0.3]
 	);
-	let validation_domain = IterationDomain::new(1, 4, 2).unwrap();
+	let validation_domain = IterationDomain::new(0, 2, 1).unwrap();
 	for metric in [
 		outputs.metrics.mean_bce,
+		outputs.metrics.accuracy,
 		outputs.metrics.auroc,
 		outputs.metrics.auprc,
 		outputs.metrics.brier_score,
@@ -1800,65 +2905,19 @@ fn validation_metrics_early_stop_and_temperature_have_exact_domains() -> TestRes
 		);
 	}
 
-	let early = outputs.early_stopping.expect("early stopping state exists");
-	assert_eq!(
-		compiled.program().domain(early.update_kernel),
-		Some(validation_domain)
-	);
-	let early_kernel = compiled
-		.graph()
-		.nodes
-		.iter()
-		.find(|node| node.kernel.id == early.update_kernel)
-		.expect("early-stop update exists");
-	assert_eq!(
-		early_kernel
-			.kernel
-			.alias_rules
-			.iter()
-			.filter(|rule| rule.permission == AliasPermission::MustAliasExact)
-			.map(|rule| (rule.input, rule.output))
-			.collect::<BTreeSet<_>>(),
-		BTreeSet::from([(1, 0), (2, 1), (3, 2)])
-	);
 	let first_adam = compiled.outputs().layers[0].weight.update_kernel;
 	assert_eq!(
 		compiled.program().domain(first_adam),
-		Some(IterationDomain::new(0, 4, 1).unwrap())
+		Some(IterationDomain::new(0, 2, 1).unwrap())
 	);
-	let learning_rate = compiled
-		.graph()
-		.nodes
-		.iter()
-		.find(|node| node.kernel.id == first_adam)
-		.expect("AdamW update exists")
-		.kernel
-		.inputs[4];
-	let learning_rate_kernel = compiled
-		.graph()
-		.nodes
-		.iter()
-		.find(|node| node.kernel.outputs.contains(&learning_rate))
-		.expect("learning-rate producer exists");
-	let progress = compiled
-		.outputs()
-		.optimizer_progress
-		.expect("early stopping gates complete optimizer progress");
-	assert!(
-		learning_rate_kernel
-			.kernel
-			.inputs
-			.contains(&progress.apply_update)
-	);
-	let update_gate = producer(&compiled, progress.apply_update);
-	assert!(update_gate.kernel.inputs.contains(&early.initial_stopped));
+	assert_eq!(compiled.outputs().optimizer_progress, None);
 
 	let temperature = outputs
 		.temperature_scaling
 		.expect("temperature-scaling state exists");
 	assert_eq!(
 		compiled.program().domain(temperature.update_kernel),
-		Some(IterationDomain::new(4, 7, 1).unwrap())
+		Some(IterationDomain::new(2, 5, 1).unwrap())
 	);
 	let temperature_kernel = compiled
 		.graph()
@@ -2015,9 +3074,121 @@ fn exact_add<'a>(compiled: &'a CompiledTraining, left: ValueId, right: ValueId) 
 fn regression_config() -> DenseTrainingConfig {
 	let mut config = config();
 	config.loss = DenseLoss::MeanSquaredError;
-	config.epochs = NonZeroU64::new(1).unwrap();
+	config.epochs = TrainingHorizon::Finite(NonZeroU64::new(1).unwrap());
 	config.warmup_epochs = 0;
 	config
+}
+
+#[test]
+fn channelwise_convolution_trains_repeated_channels_and_replays_validation_shape() -> TestResult {
+	let blocks = vec![
+		DenseBlock::Convolution(DenseConvolution::new(
+			NonZeroU64::new(2).unwrap(),
+			NonZeroU64::new(2).unwrap(),
+			DenseActivation::Relu,
+		)),
+		DenseBlock::Convolution(DenseConvolution::new(
+			NonZeroU64::new(3).unwrap(),
+			NonZeroU64::new(2).unwrap(),
+			DenseActivation::PRelu,
+		)),
+		DenseBlock::Pool(DensePool::new(NonZeroU64::new(2).unwrap(), None)),
+		DenseBlock::Layer(DenseLayer::new(
+			NonZeroU64::new(1).unwrap(),
+			DenseActivation::Linear,
+		)),
+	];
+	let validation = BinaryValidationConfig::new(NonZeroU32::new(4).unwrap(), []);
+	let compiled = compile_dense_training_with_blocks_and_binary_validation(
+		&four_feature_binary_dataset()?,
+		&config(),
+		&blocks,
+		&validation,
+	)?;
+	compiled.graph().validate()?;
+	compiled.program().validate()?;
+	assert_eq!(
+		CheckpointManifest::from_compiled(&compiled)?.format_version(),
+		9
+	);
+	let [
+		DenseBlockState::Convolution(first),
+		DenseBlockState::Convolution(second),
+		DenseBlockState::Pool(pool),
+		DenseBlockState::Layer(_),
+	] = compiled.outputs().blocks.as_slice()
+	else {
+		panic!("expected convolution, convolution, pool, output-layer state topology");
+	};
+	assert_eq!(first.geometry.input_length().get(), 4);
+	assert_eq!(first.geometry.input_channels().get(), 1);
+	assert_eq!(first.geometry.output_length().get(), 3);
+	assert_eq!(first.geometry.filters().get(), 2);
+	assert_eq!(
+		graph_tensor(&compiled, first.weight.initial_parameter)
+			.shape
+			.extents(),
+		[2, 1, 2]
+	);
+	assert_eq!(second.geometry.input_length().get(), 3);
+	assert_eq!(second.geometry.input_channels().get(), 2);
+	assert_eq!(second.geometry.output_length().get(), 2);
+	assert_eq!(second.geometry.filters().get(), 3);
+	assert_eq!(
+		graph_tensor(&compiled, second.weight.initial_parameter)
+			.shape
+			.extents(),
+		[2, 2, 3]
+	);
+	assert_eq!(second.prelu.len(), 1);
+	assert_eq!(pool.input_length().get(), 2);
+	assert_eq!(pool.channels().get(), 3);
+	assert_eq!(pool.output_length().get(), 1);
+	for role in [
+		ExternalInputRole::TrainingConvolutionWindowIndices { block: 0 },
+		ExternalInputRole::TrainingConvolutionWindowIndices { block: 1 },
+		ExternalInputRole::TrainingConvolutionInputGradientIndices { block: 1 },
+		ExternalInputRole::TrainingConvolutionInputGradientValidity { block: 1 },
+		ExternalInputRole::ValidationConvolutionWindowIndices { block: 0 },
+		ExternalInputRole::ValidationConvolutionWindowIndices { block: 1 },
+	] {
+		assert!(
+			compiled
+				.external_inputs()
+				.iter()
+				.any(|input| input.role() == role),
+			"missing prepared convolution input {role:?}"
+		);
+	}
+	assert!(
+		!compiled.external_inputs().iter().any(|input| {
+			input.role() == ExternalInputRole::TrainingConvolutionInputGradientIndices { block: 0 }
+		})
+	);
+	Ok(())
+}
+
+#[test]
+fn channelwise_convolution_rejects_a_kernel_wider_than_the_current_logical_length() -> TestResult {
+	let blocks = [
+		DenseBlock::Convolution(DenseConvolution::new(
+			NonZeroU64::new(2).unwrap(),
+			NonZeroU64::new(5).unwrap(),
+			DenseActivation::Relu,
+		)),
+		DenseBlock::Layer(DenseLayer::new(
+			NonZeroU64::new(1).unwrap(),
+			DenseActivation::Linear,
+		)),
+	];
+	let error = compile_dense_training_with_blocks(&four_feature_binary_dataset()?, &config(), &blocks)
+		.expect_err("a convolution kernel wider than its logical input was accepted");
+	assert_eq!(error.kind, TrainingCompileErrorKind::InvalidNetwork);
+	assert!(
+		error.detail
+			.contains("convolution kernel 5 exceeds logical input length 4")
+	);
+	Ok(())
 }
 
 #[test]
@@ -2047,7 +3218,7 @@ fn channelwise_pool_retains_shape_winners_backward_and_validation_topology() -> 
 	compiled.program().validate()?;
 	assert_eq!(
 		CheckpointManifest::from_compiled(&compiled)?.format_version(),
-		7
+		9
 	);
 	let [
 		DenseBlockState::Pool(pool),
@@ -2110,7 +3281,7 @@ fn channelwise_pool_retains_shape_winners_backward_and_validation_topology() -> 
 			})
 		) && node.kernel.inputs.iter().any(|input| {
 			graph_tensor(&compiled, *input).dtype == DType::I32
-				&& graph_tensor(&compiled, *input).shape.extents() == [3, 2, 1]
+				&& graph_tensor(&compiled, *input).shape.extents() == [5, 2, 1]
 		})
 	}));
 	for role in [
@@ -2165,7 +3336,7 @@ fn repeated_pool_blocks_preserve_logical_length_until_the_dense_boundary() -> Te
 	);
 	assert_eq!(
 		CheckpointManifest::from_compiled(&compiled)?.format_version(),
-		7
+		9
 	);
 	assert_eq!(
 		compiled
@@ -2239,7 +3410,7 @@ fn equal_width_residual_forms_an_exact_identity_diamond() -> TestResult {
 	];
 	let compiled = compile_dense_training_with_blocks(&regression_dataset()?, &regression_config(), &blocks)?;
 	let checkpoint = CheckpointManifest::from_compiled(&compiled)?;
-	assert_eq!(checkpoint.format_version(), 6);
+	assert_eq!(checkpoint.format_version(), 9);
 	let [
 		DenseBlockState::Layer(first),
 		DenseBlockState::Residual(residual),
@@ -2257,7 +3428,7 @@ fn equal_width_residual_forms_an_exact_identity_diamond() -> TestResult {
 	let merge = exact_add(&compiled, branch, input);
 	let merged = merge.kernel.outputs[0];
 	for value in [branch, input, merged] {
-		assert_eq!(graph_tensor(&compiled, value).shape.extents(), [3, 2]);
+		assert_eq!(graph_tensor(&compiled, value).shape.extents(), [5, 2]);
 	}
 	assert!(
 		merge.kernel
@@ -2299,7 +3470,7 @@ fn projected_residual_is_weight_only_and_backpropagates_both_paths() -> TestResu
 	];
 	let compiled = compile_dense_training_with_blocks(&regression_dataset()?, &regression_config(), &blocks)?;
 	let checkpoint = CheckpointManifest::from_compiled(&compiled)?;
-	assert_eq!(checkpoint.format_version(), 6);
+	assert_eq!(checkpoint.format_version(), 9);
 	let [
 		DenseBlockState::Layer(first),
 		DenseBlockState::Residual(residual),
@@ -2332,7 +3503,7 @@ fn projected_residual_is_weight_only_and_backpropagates_both_paths() -> TestResu
 			.extents(),
 		[3, 5]
 	);
-	assert_eq!(graph_tensor(&compiled, projected).shape.extents(), [3, 5]);
+	assert_eq!(graph_tensor(&compiled, projected).shape.extents(), [5, 5]);
 	let merge = exact_add(&compiled, branch, projected);
 	let merge_gradient = forward_contraction(&compiled, last)
 		.kernel
@@ -2406,7 +3577,7 @@ fn projected_residual_is_weight_only_and_backpropagates_both_paths() -> TestResu
 		graph_tensor(&compiled, backward_merge.kernel.outputs[0])
 			.shape
 			.extents(),
-		[3, 3]
+		[5, 3]
 	);
 	for value in [
 		projection.initial_parameter,
@@ -2553,7 +3724,9 @@ fn residual_keeps_unique_streams_and_exact_pre_and_post_operation_order() -> Tes
 	let streams = weights
 		.iter()
 		.map(|parameter| {
-			let scaled = producer(&compiled, parameter.initial_parameter);
+			let selected = producer(&compiled, parameter.initial_parameter);
+			assert_eq!(selected.kernel.inputs.len(), 3);
+			let scaled = producer(&compiled, selected.kernel.inputs[0]);
 			let random = producer(&compiled, scaled.kernel.inputs[0]);
 			match &random.kernel.kind {
 				PrimitiveKind::Random(random) => {

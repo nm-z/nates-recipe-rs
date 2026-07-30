@@ -66,3 +66,61 @@ and the model. Do not add user-facing configuration APIs for any of the followin
 
 Do not add any parameter the system can derive from hardware
 or model metadata.
+
+Deriving an execution parameter does not mean subdividing work merely because
+the backend has a subdivision mechanism. Recipe must first determine whether
+the complete operation fits on the measured hardware. Batching and tiling are
+fallbacks for operations that do not fit, not defaults applied to operations
+that already fit. When subdivision is necessary, Recipe derives it; the user
+does not configure it.
+
+### Batching
+
+Do not divide a dataset into smaller launches when the complete training set
+fits. A failure that established this rule used:
+
+```text
+1168 rows x 80 columns x 4 bytes = about 370 KB
+```
+
+That dataset fit in VRAM roughly 32,000 times over. The system nevertheless
+selected one row per launch, planned 1,168 launches instead of one for every
+epoch, and expanded 100,000 epochs into 116,800,000 training iterations. The
+production `RunJournal` then attempted to reserve 26,513,600,107 logical-event
+slots, requiring 1.272 TB for a debug trace, and killed the program before
+training began.
+
+The user-facing `.batch()` API is banned independently of that failure. Asking
+the user how many rows belong in a launch asks them to predict available VRAM
+and the backend's realized memory requirements. Recipe measures and knows those
+values; the user does not need to supply them.
+
+### Tiling
+
+Tiling is batching along another axis. Do not subdivide a matrix that fits in
+the relevant measured LDS capacity. If the complete operation does not fit,
+Recipe derives the necessary tiling from the realized shape and hardware
+profile. The user never supplies tile, block, grid, or chunk sizes.
+
+## Intermediate Checkpointing Is Banned
+
+Do not save periodic intermediate copies of a model that is already live in
+memory and still training. This does not prohibit the user from deliberately
+saving the resulting model; it prohibits an automatic intermediate-checkpoint
+mechanism and its configuration surface.
+
+## Automatic Stopping Is Banned
+
+Do not implement early stopping. Early stopping guesses that training should
+end because a selected metric plateaued; the user can observe the training run
+and stop it with Ctrl+C.
+
+An explicit `.epochs(n)` declaration is valid and exact: training stops after
+exactly `n` complete passes over the training set. It is optional. When
+`.epochs(...)` is absent, Recipe trains indefinitely while reporting the live
+loss, until the user stops the run with Ctrl+C. Recipe must not invent an
+implicit epoch bound.
+
+These rules have one shared philosophy: do not subdivide something that fits,
+ask the user for something the system knows, save something that does not need
+saving, or automatically stop something the user can stop themselves.

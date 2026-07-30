@@ -12,7 +12,7 @@ categories = ["science::ml"]
 
 [lib]
 name = "recipe"
-test = false
+test = true
 doctest = false
 
 [[bin]]
@@ -31,6 +31,10 @@ path = "tests/public_api_compile.rs"
 [[test]]
 name = "training-reporting"
 path = "tests/training_reporting.rs"
+
+[[test]]
+name = "source-runner"
+path = "tests/source_runner.rs"
 
 [workspace]
 resolver = "3"
@@ -64,6 +68,7 @@ members = [
 ]
 
 [dependencies]
+libc = "0.2"
 proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 recipe-cluster = { path = "recipe-cluster" }
 recipe-core = { path = "recipe-core" }

@@ -7,7 +7,7 @@ const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const DEFAULT_ALIGNMENT: u32 = 32;
 const METADATA_KEY_BYTES_MAX: u64 = 65_535;
 const TENSOR_NAME_BYTES_MAX: u64 = 64;
-const ARRAY_DEPTH_HARD_MAX: u32 = 64;
+const CURRENT_TENSOR_RANK_MAX: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GgufEndian {
@@ -23,7 +23,7 @@ pub struct GgufLimits {
 	rank: NonZeroU32,
 	string_bytes: NonZeroU64,
 	array_elements: NonZeroU64,
-	array_depth: NonZeroU32,
+	array_depth: NonZeroU64,
 }
 
 impl GgufLimits {
@@ -31,8 +31,7 @@ impl GgufLimits {
 	///
 	/// # Errors
 	///
-	/// Returns [`GgufErrorKind::InvalidLimit`] for zero limits or an array
-	/// depth above the fixed recursion ceiling.
+	/// Returns [`GgufErrorKind::InvalidLimit`] for zero limits.
 	pub fn new(
 		file_bytes: u64,
 		metadata_pairs: u64,
@@ -40,24 +39,17 @@ impl GgufLimits {
 		rank: u32,
 		string_bytes: u64,
 		array_elements: u64,
-		array_depth: u32,
+		array_depth: u64,
 	) -> GgufResult<Self> {
-		let depth = nonzero_u32("array depth", array_depth)?;
-		match depth.get() <= ARRAY_DEPTH_HARD_MAX {
-			true => Ok(Self {
-				file_bytes: nonzero_u64("file byte", file_bytes)?,
-				metadata_pairs: nonzero_u64("metadata pair", metadata_pairs)?,
-				tensors: nonzero_u64("tensor", tensors)?,
-				rank: nonzero_u32("rank", rank)?,
-				string_bytes: nonzero_u64("aggregate string byte", string_bytes)?,
-				array_elements: nonzero_u64("aggregate array element", array_elements)?,
-				array_depth: depth,
-			}),
-			false => Err(GgufError::new(
-				GgufErrorKind::InvalidLimit,
-				format!("array depth limit exceeds hard ceiling {ARRAY_DEPTH_HARD_MAX}"),
-			)),
-		}
+		Ok(Self {
+			file_bytes: nonzero_u64("file byte", file_bytes)?,
+			metadata_pairs: nonzero_u64("metadata pair", metadata_pairs)?,
+			tensors: nonzero_u64("tensor", tensors)?,
+			rank: nonzero_u32("rank", rank)?,
+			string_bytes: nonzero_u64("aggregate string byte", string_bytes)?,
+			array_elements: nonzero_u64("aggregate array element", array_elements)?,
+			array_depth: nonzero_u64("array depth", array_depth)?,
+		})
 	}
 
 	#[must_use]
@@ -91,7 +83,7 @@ impl GgufLimits {
 	}
 
 	#[must_use]
-	pub const fn array_depth(self) -> NonZeroU32 {
+	pub const fn array_depth(self) -> NonZeroU64 {
 		self.array_depth
 	}
 }
@@ -114,7 +106,7 @@ pub enum GgufMetadataType {
 }
 
 impl GgufMetadataType {
-	fn parse(code: u32) -> GgufResult<Self> {
+	pub(crate) fn parse(code: u32) -> GgufResult<Self> {
 		match code {
 			0 => Ok(Self::U8),
 			1 => Ok(Self::I8),
@@ -160,6 +152,17 @@ impl GgufMetadataType {
 pub struct GgufMetadataArray<'a> {
 	element_type: GgufMetadataType,
 	values: Vec<GgufMetadataValue<'a>>,
+}
+
+impl Drop for GgufMetadataArray<'_> {
+	fn drop(&mut self) {
+		let mut pending = core::mem::take(&mut self.values);
+		while let Some(mut value) = pending.pop() {
+			if let GgufMetadataValue::Array(array) = &mut value {
+				pending.extend(core::mem::take(&mut array.values));
+			}
+		}
+	}
 }
 
 impl<'a> GgufMetadataArray<'a> {
@@ -265,10 +268,13 @@ pub enum GgufTensorType {
 	Tq1_0,
 	Tq2_0,
 	Mxfp4,
+	Nvfp4,
+	Q1_0,
+	Q2_0,
 }
 
 impl GgufTensorType {
-	fn parse(code: u32) -> GgufResult<Self> {
+	pub(crate) fn parse(code: u32) -> GgufResult<Self> {
 		match code {
 			0 => Ok(Self::F32),
 			1 => Ok(Self::F16),
@@ -302,6 +308,9 @@ impl GgufTensorType {
 			34 => Ok(Self::Tq1_0),
 			35 => Ok(Self::Tq2_0),
 			39 => Ok(Self::Mxfp4),
+			40 => Ok(Self::Nvfp4),
+			41 => Ok(Self::Q1_0),
+			42 => Ok(Self::Q2_0),
 			other => Err(GgufError::new(
 				GgufErrorKind::UnsupportedTensorType,
 				format!("GGML tensor type code {other} is unsupported or removed"),
@@ -344,6 +353,9 @@ impl GgufTensorType {
 			Self::Tq1_0 => 34,
 			Self::Tq2_0 => 35,
 			Self::Mxfp4 => 39,
+			Self::Nvfp4 => 40,
+			Self::Q1_0 => 41,
+			Self::Q2_0 => 42,
 		}
 	}
 
@@ -359,6 +371,8 @@ impl GgufTensorType {
 			| Self::Q8_1
 			| Self::Iq4Nl
 			| Self::Mxfp4 => 32,
+			Self::Nvfp4 | Self::Q2_0 => 64,
+			Self::Q1_0 => 128,
 			Self::Q2K
 			| Self::Q3K
 			| Self::Q4K
@@ -406,6 +420,9 @@ impl GgufTensorType {
 			Self::Iq1M => 56,
 			Self::Tq1_0 => 54,
 			Self::Mxfp4 => 17,
+			Self::Nvfp4 => 36,
+			Self::Q1_0 => 18,
+			Self::Q2_0 => 18,
 		}
 	}
 }
@@ -611,7 +628,7 @@ struct Reader<'a> {
 	position: usize,
 	string_bytes_remaining: u64,
 	array_elements_remaining: u64,
-	array_depth_limit: u32,
+	array_depth_limit: u64,
 }
 
 impl<'a> Reader<'a> {
@@ -745,7 +762,101 @@ impl<'a> Reader<'a> {
 		Ok(value)
 	}
 
-	fn read_metadata_value(&mut self, value_type: GgufMetadataType, depth: u32) -> GgufResult<GgufMetadataValue<'a>> {
+	fn read_metadata_value(&mut self, value_type: GgufMetadataType) -> GgufResult<GgufMetadataValue<'a>> {
+		#[derive(Debug)]
+		struct ArrayFrame<'a> {
+			element_type: GgufMetadataType,
+			remaining: u64,
+			values: Vec<GgufMetadataValue<'a>>,
+		}
+
+		let mut frames = Vec::<ArrayFrame<'a>>::new();
+		let mut next_type = value_type;
+		loop {
+			let mut completed = if next_type == GgufMetadataType::Array {
+				let nested_depth = u64::try_from(frames.len())
+					.map_err(|error| {
+						GgufError::new(
+							GgufErrorKind::ArithmeticOverflow,
+							format!("metadata array depth cannot be represented by u64: {error}"),
+						)
+					})?
+					.checked_add(1)
+					.ok_or_else(|| {
+						GgufError::new(
+							GgufErrorKind::ArithmeticOverflow,
+							"GGUF metadata array depth overflowed u64",
+						)
+					})?;
+				if nested_depth > self.array_depth_limit {
+					return Err(GgufError::new(
+						GgufErrorKind::ArrayDepthExceeded,
+						format!(
+							"metadata array depth {nested_depth} exceeds limit {}",
+							self.array_depth_limit
+						),
+					));
+				}
+				let element_type = GgufMetadataType::parse(self.read_u32("metadata array element type")?)?;
+				let length = self.read_u64("metadata array length")?;
+				if length > self.array_elements_remaining {
+					return Err(GgufError::new(
+						GgufErrorKind::ArrayLimitExceeded,
+						format!(
+							"metadata array has {length} elements, aggregate remaining budget is {}",
+							self.array_elements_remaining
+						),
+					));
+				}
+				self.array_elements_remaining -= length;
+				let minimum_bytes = minimum_metadata_value_bytes(element_type)
+					.checked_mul(length)
+					.ok_or_else(|| {
+						GgufError::new(
+							GgufErrorKind::ArithmeticOverflow,
+							"minimum metadata array byte count overflowed u64",
+						)
+					})?;
+				require_available_bytes(minimum_bytes, self.remaining(), "metadata array values")?;
+				let values = Vec::with_capacity(bounded_usize(length, "metadata array length")?);
+				if length == 0 {
+					GgufMetadataValue::Array(GgufMetadataArray {
+						element_type,
+						values,
+					})
+				} else {
+					frames.push(ArrayFrame {
+						element_type,
+						remaining: length,
+						values,
+					});
+					next_type = element_type;
+					continue;
+				}
+			} else {
+				self.read_metadata_scalar(next_type)?
+			};
+
+			loop {
+				let Some(frame) = frames.last_mut() else {
+					return Ok(completed);
+				};
+				frame.values.push(completed);
+				frame.remaining -= 1;
+				if frame.remaining > 0 {
+					next_type = frame.element_type;
+					break;
+				}
+				let frame = frames.pop().expect("completed metadata array frame exists");
+				completed = GgufMetadataValue::Array(GgufMetadataArray {
+					element_type: frame.element_type,
+					values: frame.values,
+				});
+			}
+		}
+	}
+
+	fn read_metadata_scalar(&mut self, value_type: GgufMetadataType) -> GgufResult<GgufMetadataValue<'a>> {
 		match value_type {
 			GgufMetadataType::U8 => Ok(GgufMetadataValue::U8(self.read_u8("uint8 metadata value")?)),
 			GgufMetadataType::I8 => Ok(GgufMetadataValue::I8(self.read_i8("int8 metadata value")?)),
@@ -775,7 +886,6 @@ impl<'a> Reader<'a> {
 			GgufMetadataType::String => Ok(GgufMetadataValue::String(
 				self.read_string("metadata string", u64::MAX)?,
 			)),
-			GgufMetadataType::Array => self.read_metadata_array(depth),
 			GgufMetadataType::U64 => Ok(GgufMetadataValue::U64(
 				self.read_u64("uint64 metadata value")?,
 			)),
@@ -785,63 +895,11 @@ impl<'a> Reader<'a> {
 			GgufMetadataType::F64 => Ok(GgufMetadataValue::F64Bits(
 				self.read_u64("float64 metadata bits")?,
 			)),
+			GgufMetadataType::Array => Err(GgufError::new(
+				GgufErrorKind::UnsupportedMetadataType,
+				"array metadata reached the scalar decoder",
+			)),
 		}
-	}
-
-	fn read_metadata_array(&mut self, depth: u32) -> GgufResult<GgufMetadataValue<'a>> {
-		let nested_depth = depth.checked_add(1).ok_or_else(|| {
-			GgufError::new(
-				GgufErrorKind::ArithmeticOverflow,
-				"GGUF metadata array depth overflowed u32",
-			)
-		})?;
-		match nested_depth <= self.array_depth_limit {
-			true => Ok(()),
-			false => {
-				return Err(GgufError::new(
-					GgufErrorKind::ArrayDepthExceeded,
-					format!(
-						"metadata array depth {nested_depth} exceeds limit {}",
-						self.array_depth_limit
-					),
-				));
-			}
-		}?;
-		let element_type = GgufMetadataType::parse(self.read_u32("metadata array element type")?)?;
-		let length = self.read_u64("metadata array length")?;
-		match length <= self.array_elements_remaining {
-			true => Ok(()),
-			false => {
-				return Err(GgufError::new(
-					GgufErrorKind::ArrayLimitExceeded,
-					format!(
-						"metadata array has {length} elements, aggregate remaining budget is {}",
-						self.array_elements_remaining
-					),
-				));
-			}
-		}?;
-		self.array_elements_remaining -= length;
-		let minimum_bytes = minimum_metadata_value_bytes(element_type)
-			.checked_mul(length)
-			.ok_or_else(|| {
-				GgufError::new(
-					GgufErrorKind::ArithmeticOverflow,
-					"minimum metadata array byte count overflowed u64",
-				)
-			})?;
-		require_available_bytes(minimum_bytes, self.remaining(), "metadata array values")?;
-		let capacity = bounded_usize(length, "metadata array length")?;
-		let mut values = Vec::with_capacity(capacity);
-		for element_index in 0..length {
-			let value = self.read_metadata_value(element_type, nested_depth)?;
-			debug_assert!(element_index < length);
-			values.push(value);
-		}
-		Ok(GgufMetadataValue::Array(GgufMetadataArray {
-			element_type,
-			values,
-		}))
 	}
 }
 
@@ -954,7 +1012,7 @@ pub fn parse_gguf(bytes: &[u8], limits: GgufLimits) -> GgufResult<GgufArchive<'_
 			}
 		}?;
 		let value_type = GgufMetadataType::parse(reader.read_u32("metadata value type")?)?;
-		let value = reader.read_metadata_value(value_type, 0)?;
+		let value = reader.read_metadata_value(value_type)?;
 		debug_assert!(pair_index < metadata_count);
 		metadata.push(GgufMetadataEntry { key, value });
 	}
@@ -977,12 +1035,14 @@ pub fn parse_gguf(bytes: &[u8], limits: GgufLimits) -> GgufResult<GgufArchive<'_
 			}
 		}?;
 		let rank = reader.read_u32("tensor rank")?;
-		match (rank > 0, rank <= limits.rank.get()) {
+		match (rank <= CURRENT_TENSOR_RANK_MAX, rank <= limits.rank.get()) {
 			(true, true) => Ok(()),
-			(false, true) | (false, false) => {
+			(false, _) => {
 				return Err(GgufError::new(
 					GgufErrorKind::InvalidDimension,
-					format!("tensor {name:?} has zero rank"),
+					format!(
+						"tensor {name:?} rank {rank} exceeds current GGUF v3 maximum {CURRENT_TENSOR_RANK_MAX}"
+					),
 				));
 			}
 			(true, false) => {
@@ -998,17 +1058,8 @@ pub fn parse_gguf(bytes: &[u8], limits: GgufLimits) -> GgufResult<GgufArchive<'_
 				format!("tensor rank cannot address host memory: {error}"),
 			)
 		})?);
-		for axis in 0..rank {
-			let dimension = reader.read_u64("tensor dimension")?;
-			match dimension > 0 {
-				true => dimensions.push(dimension),
-				false => {
-					return Err(GgufError::new(
-						GgufErrorKind::InvalidDimension,
-						format!("tensor {name:?} axis {axis} has zero extent"),
-					));
-				}
-			}
+		for _axis in 0..rank {
+			dimensions.push(reader.read_u64("tensor dimension")?);
 		}
 		let tensor_type = GgufTensorType::parse(reader.read_u32("tensor type")?)?;
 		let data_offset = reader.read_u64("tensor data offset")?;
@@ -1038,9 +1089,24 @@ pub fn parse_gguf(bytes: &[u8], limits: GgufLimits) -> GgufResult<GgufArchive<'_
 			format!("GGUF header position cannot be represented by u64: {error}"),
 		)
 	})?;
-	let data_start = match tensor_count {
-		0 => header_end,
-		_ => align_up(header_end, alignment_u64)?,
+	let aligned_header_end = align_up(header_end, alignment_u64)?;
+	let file_bytes = u64::try_from(bytes.len()).map_err(|error| {
+		GgufError::new(
+			GgufErrorKind::ArithmeticOverflow,
+			format!("GGUF image length cannot be represented by u64: {error}"),
+		)
+	})?;
+	let data_start = match (tensor_count, file_bytes) {
+		(0, length) if length == header_end || length == aligned_header_end => length,
+		(0, length) => {
+			return Err(GgufError::new(
+				GgufErrorKind::TrailingData,
+				format!(
+					"tensor-free GGUF ends at {length}; expected unpadded header end {header_end} or padded end {aligned_header_end}"
+				),
+			));
+		}
+		(_, _) => aligned_header_end,
 	};
 	let data_start_host = bounded_usize(data_start, "tensor data start")?;
 	let header_padding = bytes
@@ -1128,7 +1194,7 @@ fn materialize_tensors<'a>(
 
 fn tensor_encoded_bytes(name: &str, dimensions: &[u64], tensor_type: GgufTensorType) -> GgufResult<u64> {
 	let block_elements = tensor_type.block_elements();
-	let first_dimension = dimensions[0];
+	let first_dimension = dimensions.first().copied().unwrap_or(1);
 	match first_dimension % block_elements {
 		0 => Ok(()),
 		remainder => {
@@ -1141,14 +1207,18 @@ fn tensor_encoded_bytes(name: &str, dimensions: &[u64], tensor_type: GgufTensorT
 			));
 		}
 	}?;
-	let elements = dimensions.iter().try_fold(1_u64, |product, dimension| {
-		product.checked_mul(*dimension).ok_or_else(|| {
-			GgufError::new(
-				GgufErrorKind::ArithmeticOverflow,
-				format!("tensor {name:?} dimension product overflowed u64"),
-			)
-		})
-	})?;
+	let elements = if dimensions.contains(&0) {
+		0
+	} else {
+		dimensions.iter().try_fold(1_u64, |product, dimension| {
+			product.checked_mul(*dimension).ok_or_else(|| {
+				GgufError::new(
+					GgufErrorKind::ArithmeticOverflow,
+					format!("tensor {name:?} dimension product overflowed u64"),
+				)
+			})
+		})?
+	};
 	let blocks = elements / block_elements;
 	blocks.checked_mul(tensor_type.block_bytes())
 		.ok_or_else(|| {
@@ -1208,16 +1278,27 @@ fn validate_tensor_spans(tensors: &[GgufTensor<'_>], data: &[u8], alignment: u64
 			format!("tensor data length cannot be represented by u64: {error}"),
 		)
 	})?;
-	match cursor == data_bytes {
-		true => Ok(()),
-		false => Err(GgufError::new(
+	let padded_end = align_up(cursor, alignment)?;
+	if data_bytes != cursor && data_bytes != padded_end {
+		return Err(GgufError::new(
 			GgufErrorKind::TrailingData,
-			format!("validated tensors end at {cursor}, tensor data has {data_bytes} bytes"),
-		)),
+			format!(
+				"validated tensors end at {cursor}; tensor data has {data_bytes} bytes, expected the exact end or aligned end {padded_end}"
+			),
+		));
 	}
+	let padding_start = bounded_usize(cursor, "terminal tensor padding start")?;
+	let padding_end = bounded_usize(data_bytes, "terminal tensor padding end")?;
+	let padding = data.get(padding_start..padding_end).ok_or_else(|| {
+		GgufError::new(
+			GgufErrorKind::InvalidOffset,
+			"terminal tensor padding lies outside tensor data",
+		)
+	})?;
+	require_zero_padding(padding, "terminal tensor padding")
 }
 
-fn metadata_alignment(metadata: &[GgufMetadataEntry<'_>], limits: GgufLimits) -> GgufResult<u32> {
+fn metadata_alignment(metadata: &[GgufMetadataEntry<'_>], _limits: GgufLimits) -> GgufResult<u32> {
 	let entry = metadata
 		.iter()
 		.find(|entry| entry.key == "general.alignment");
@@ -1236,28 +1317,15 @@ fn metadata_alignment(metadata: &[GgufMetadataEntry<'_>], limits: GgufLimits) ->
 			}
 		},
 	};
-	match (
-		alignment > 0,
-		alignment % 8 == 0,
-		u64::from(alignment) <= limits.file_bytes.get(),
-	) {
-		(true, true, true) => Ok(alignment),
-		(false, true, true) | (false, false, true) | (false, true, false) | (false, false, false) => {
-			Err(GgufError::new(
-				GgufErrorKind::InvalidAlignment,
-				"general.alignment must be nonzero",
-			))
-		}
-		(true, false, true) | (true, false, false) => Err(GgufError::new(
+	match (alignment > 0, alignment % 8 == 0) {
+		(true, true) => Ok(alignment),
+		(false, _) => Err(GgufError::new(
+			GgufErrorKind::InvalidAlignment,
+			"general.alignment must be nonzero",
+		)),
+		(true, false) => Err(GgufError::new(
 			GgufErrorKind::InvalidAlignment,
 			format!("general.alignment {alignment} is not a multiple of eight"),
-		)),
-		(true, true, false) => Err(GgufError::new(
-			GgufErrorKind::InvalidAlignment,
-			format!(
-				"general.alignment {alignment} exceeds file byte limit {}",
-				limits.file_bytes
-			),
 		)),
 	}
 }
@@ -1277,42 +1345,16 @@ fn validate_metadata_key(key: &str) -> GgufResult<()> {
 				)),
 			}
 		}
-	}?;
-	for segment in key.split('.') {
-		match segment.len() {
-			0 => Err(GgufError::new(
-				GgufErrorKind::InvalidMetadataKey,
-				format!("metadata key {key:?} contains an empty hierarchy segment"),
-			)),
-			1.. => Ok(()),
-		}?;
-		for byte in segment.bytes() {
-			let valid = byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_';
-			match valid {
-				true => Ok(()),
-				false => Err(GgufError::new(
-					GgufErrorKind::InvalidMetadataKey,
-					format!("metadata key {key:?} is not hierarchical lower snake case"),
-				)),
-			}?;
-		}
 	}
-	Ok(())
 }
 
 fn validate_tensor_name(name: &str) -> GgufResult<()> {
-	match name.len() {
-		0 => Err(GgufError::new(
+	match name.len() <= bounded_usize(TENSOR_NAME_BYTES_MAX, "tensor name maximum")? {
+		true => Ok(()),
+		false => Err(GgufError::new(
 			GgufErrorKind::InvalidTensorName,
-			"GGUF tensor name is empty",
+			format!("tensor name {name:?} exceeds the 64-byte format maximum"),
 		)),
-		positive_length => match positive_length <= bounded_usize(TENSOR_NAME_BYTES_MAX, "tensor name maximum")? {
-			true => Ok(()),
-			false => Err(GgufError::new(
-				GgufErrorKind::InvalidTensorName,
-				format!("tensor name {name:?} exceeds the 64-byte format maximum"),
-			)),
-		},
 	}
 }
 
@@ -1610,6 +1652,24 @@ mod tests {
 		}
 	}
 
+	fn deeply_nested_array_fixture(depth: u64) -> Vec<u8> {
+		assert!(depth > 0);
+		let mut encoder = Encoder::begin(3, GgufEndian::Little, 0, 1);
+		encoder.string("test.deep");
+		encoder.u32(GgufMetadataType::Array.code());
+		for level in 0..depth {
+			encoder.u32(if level + 1 == depth {
+				GgufMetadataType::U8
+			} else {
+				GgufMetadataType::Array
+			}
+			.code());
+			encoder.u64(1);
+		}
+		encoder.u8(0xa5);
+		encoder.bytes
+	}
+
 	fn generous_limits(bytes: usize) -> GgufLimits {
 		limits(host_u64(bytes), 64, 64, 8, 16_384, 16_384, 8)
 	}
@@ -1621,7 +1681,7 @@ mod tests {
 		rank: u32,
 		string_bytes: u64,
 		array_elements: u64,
-		array_depth: u32,
+		array_depth: u64,
 	) -> GgufLimits {
 		match GgufLimits::new(
 			file_bytes,
@@ -1716,6 +1776,33 @@ mod tests {
 		encoder.bytes
 	}
 
+	fn rank_zero_scalar_fixture(name: &str) -> Vec<u8> {
+		let mut encoder = Encoder::begin(3, GgufEndian::Little, 1, 0);
+		encoder.string(name);
+		encoder.u32(0);
+		encoder.u32(GgufTensorType::I8.code());
+		encoder.u64(0);
+		encoder.align_zero(u64::from(DEFAULT_ALIGNMENT));
+		encoder.u8(0x5a);
+		encoder.bytes
+	}
+
+	fn zero_extent_tensor_fixture() -> Vec<u8> {
+		let mut encoder = Encoder::begin(3, GgufEndian::Little, 1, 0);
+		encoder.string("empty");
+		encoder.u32(3);
+		encoder.u64(u64::MAX);
+		encoder.u64(u64::MAX);
+		encoder.u64(0);
+		encoder.u32(GgufTensorType::F32.code());
+		encoder.u64(u64::from(DEFAULT_ALIGNMENT));
+		encoder.align_zero(u64::from(DEFAULT_ALIGNMENT));
+		encoder
+			.bytes
+			.resize(encoder.bytes.len() + DEFAULT_ALIGNMENT as usize, 0);
+		encoder.bytes
+	}
+
 	fn duplicate_metadata_fixture() -> Vec<u8> {
 		let mut encoder = Encoder::begin(3, GgufEndian::Little, 0, 2);
 		encoder.metadata_u8("dup.key", 1);
@@ -1752,6 +1839,22 @@ mod tests {
 		encoder.u32(GgufTensorType::I8.code());
 		encoder.u64(0);
 		encoder.u8(0);
+		encoder.bytes
+	}
+
+	fn rank_five_fixture() -> Vec<u8> {
+		let mut encoder = Encoder::begin(3, GgufEndian::Little, 1, 0);
+		encoder.string("rank_five");
+		encoder.u32(5);
+		for _ in 0..5 {
+			encoder.u64(1);
+		}
+		encoder.u32(GgufTensorType::I8.code());
+		encoder.u64(0);
+		let alignment = usize::try_from(DEFAULT_ALIGNMENT).unwrap();
+		let aligned = (encoder.bytes.len() + alignment - 1) & !(alignment - 1);
+		encoder.bytes.resize(aligned, 0);
+		encoder.u8(1);
 		encoder.bytes
 	}
 
@@ -1837,6 +1940,59 @@ mod tests {
 	}
 
 	#[test]
+	fn current_ggml_tensor_type_table_is_exhaustive_and_exact() {
+		let active = [
+			(0, GgufTensorType::F32, 1, 4),
+			(1, GgufTensorType::F16, 1, 2),
+			(2, GgufTensorType::Q4_0, 32, 18),
+			(3, GgufTensorType::Q4_1, 32, 20),
+			(6, GgufTensorType::Q5_0, 32, 22),
+			(7, GgufTensorType::Q5_1, 32, 24),
+			(8, GgufTensorType::Q8_0, 32, 34),
+			(9, GgufTensorType::Q8_1, 32, 36),
+			(10, GgufTensorType::Q2K, 256, 84),
+			(11, GgufTensorType::Q3K, 256, 110),
+			(12, GgufTensorType::Q4K, 256, 144),
+			(13, GgufTensorType::Q5K, 256, 176),
+			(14, GgufTensorType::Q6K, 256, 210),
+			(15, GgufTensorType::Q8K, 256, 292),
+			(16, GgufTensorType::Iq2Xxs, 256, 66),
+			(17, GgufTensorType::Iq2Xs, 256, 74),
+			(18, GgufTensorType::Iq3Xxs, 256, 98),
+			(19, GgufTensorType::Iq1S, 256, 50),
+			(20, GgufTensorType::Iq4Nl, 32, 18),
+			(21, GgufTensorType::Iq3S, 256, 110),
+			(22, GgufTensorType::Iq2S, 256, 82),
+			(23, GgufTensorType::Iq4Xs, 256, 136),
+			(24, GgufTensorType::I8, 1, 1),
+			(25, GgufTensorType::I16, 1, 2),
+			(26, GgufTensorType::I32, 1, 4),
+			(27, GgufTensorType::I64, 1, 8),
+			(28, GgufTensorType::F64, 1, 8),
+			(29, GgufTensorType::Iq1M, 256, 56),
+			(30, GgufTensorType::Bf16, 1, 2),
+			(34, GgufTensorType::Tq1_0, 256, 54),
+			(35, GgufTensorType::Tq2_0, 256, 66),
+			(39, GgufTensorType::Mxfp4, 32, 17),
+			(40, GgufTensorType::Nvfp4, 64, 36),
+			(41, GgufTensorType::Q1_0, 128, 18),
+			(42, GgufTensorType::Q2_0, 64, 18),
+		];
+		for (code, tensor_type, block_elements, block_bytes) in active {
+			assert_eq!(GgufTensorType::parse(code), Ok(tensor_type));
+			assert_eq!(tensor_type.code(), code);
+			assert_eq!(tensor_type.block_elements(), block_elements);
+			assert_eq!(tensor_type.block_bytes(), block_bytes);
+		}
+		for removed in [4, 5, 31, 32, 33, 36, 37, 38] {
+			assert_eq!(
+				GgufTensorType::parse(removed).map_err(|error| error.kind()),
+				Err(GgufErrorKind::UnsupportedTensorType)
+			);
+		}
+	}
+
+	#[test]
 	fn rejects_version_endian_and_scalar_encoding_errors() {
 		let big_v2 = fixture(2, GgufEndian::Big);
 		assert_eq!(
@@ -1894,6 +2050,69 @@ mod tests {
 				generous_limits(removed_tensor_type.len())
 			),
 			GgufErrorKind::UnsupportedTensorType
+		);
+	}
+
+	#[test]
+	fn rejects_rank_above_the_current_v3_format_maximum_even_with_a_larger_caller_limit() {
+		let bytes = rank_five_fixture();
+		assert_eq!(
+			error_kind(&bytes, limits(host_u64(bytes.len()), 4, 4, 16, 256, 16, 4)),
+			GgufErrorKind::InvalidDimension
+		);
+	}
+
+	#[test]
+	fn permits_zero_rank_scalar_tensors_and_empty_tensor_names() {
+		let bytes = rank_zero_scalar_fixture("");
+		let archive = parse_valid(&bytes, generous_limits(bytes.len()));
+		let [tensor] = archive.tensors() else {
+			panic!("rank-zero fixture did not contain exactly one tensor");
+		};
+		assert_eq!(tensor.name(), "");
+		assert!(tensor.dimensions().is_empty());
+		assert_eq!(tensor.tensor_type(), GgufTensorType::I8);
+		assert_eq!(tensor.encoded_bytes(), 1);
+		assert_eq!(archive.raw_tensor(""), Some(&[0x5a][..]));
+	}
+
+	#[test]
+	fn permits_zero_extent_tensors_without_intermediate_product_overflow() {
+		let bytes = zero_extent_tensor_fixture();
+		let archive = parse_valid(&bytes, generous_limits(bytes.len()));
+		let [tensor] = archive.tensors() else {
+			panic!("zero-extent fixture did not contain exactly one tensor");
+		};
+		assert_eq!(tensor.name(), "empty");
+		assert_eq!(tensor.dimensions(), &[u64::MAX, u64::MAX, 0]);
+		assert_eq!(tensor.encoded_bytes(), 0);
+		assert_eq!(archive.raw_tensor("empty"), Some(&[][..]));
+	}
+
+	#[test]
+	fn nested_metadata_depth_is_bounded_only_by_the_caller_not_an_invented_format_ceiling() {
+		const DEPTH: u64 = 1_024;
+		let bytes = deeply_nested_array_fixture(DEPTH);
+		let archive = parse_valid(
+			&bytes,
+			limits(host_u64(bytes.len()), 1, 1, 4, 128, DEPTH, DEPTH),
+		);
+		let mut value = archive.metadata()[0].value();
+		for _ in 0..DEPTH {
+			let GgufMetadataValue::Array(array) = value else {
+				panic!("deep metadata array terminated before its declared depth");
+			};
+			assert_eq!(array.values().len(), 1);
+			value = &array.values()[0];
+		}
+		assert_eq!(value, &GgufMetadataValue::U8(0xa5));
+
+		assert_eq!(
+			error_kind(
+				&bytes,
+				limits(host_u64(bytes.len()), 1, 1, 4, 128, DEPTH, DEPTH - 1,)
+			),
+			GgufErrorKind::ArrayDepthExceeded
 		);
 	}
 
@@ -1980,15 +2199,17 @@ mod tests {
 		assert_eq!(zero_error.kind(), GgufErrorKind::InvalidLimit);
 		assert!(zero_error.detail().contains("nonzero"));
 
-		let excessive_depth = GgufLimits::new(1, 1, 1, 1, 1, 1, ARRAY_DEPTH_HARD_MAX + 1);
-		let Err(depth_error) = excessive_depth else {
-			panic!("excessive recursion limit was accepted");
-		};
-		assert_eq!(depth_error.kind(), GgufErrorKind::InvalidLimit);
+		assert_eq!(
+			GgufLimits::new(1, 1, 1, 1, 1, 1, u64::MAX)
+				.expect("array depth is a caller bound, not a format ceiling")
+				.array_depth()
+				.get(),
+			u64::MAX
+		);
 	}
 
 	#[test]
-	fn rejects_duplicate_and_invalid_names() {
+	fn rejects_duplicate_and_length_invalid_names_but_accepts_current_upstream_key_names() {
 		let duplicate_metadata = duplicate_metadata_fixture();
 		assert_eq!(
 			error_kind(
@@ -2004,13 +2225,22 @@ mod tests {
 			GgufErrorKind::DuplicateTensor
 		);
 
-		for key in ["General.name", "bad..key", "bad-key"] {
-			let invalid = invalid_key_fixture(key);
-			assert_eq!(
-				error_kind(&invalid, generous_limits(invalid.len())),
-				GgufErrorKind::InvalidMetadataKey
-			);
+		for key in [
+			"General.name",
+			"bad..key",
+			"command-r.context_length",
+			"unicode.λ",
+		] {
+			let bytes = invalid_key_fixture(key);
+			let archive = parse_valid(&bytes, generous_limits(bytes.len()));
+			assert_eq!(archive.metadata()[0].key(), key);
 		}
+
+		let empty_key = invalid_key_fixture("");
+		assert_eq!(
+			error_kind(&empty_key, generous_limits(empty_key.len())),
+			GgufErrorKind::InvalidMetadataKey
+		);
 
 		let long_name = "n".repeat(65);
 		let invalid_name = invalid_tensor_name_fixture(&long_name);
@@ -2023,18 +2253,6 @@ mod tests {
 	#[test]
 	fn rejects_invalid_dimensions_offsets_and_spans() {
 		let sample = fixture(3, GgufEndian::Little);
-
-		let mut zero_dimension = sample.bytes.clone();
-		patch_u64(
-			&mut zero_dimension,
-			GgufEndian::Little,
-			sample.first_dimension,
-			0,
-		);
-		assert_eq!(
-			error_kind(&zero_dimension, generous_limits(zero_dimension.len())),
-			GgufErrorKind::InvalidDimension
-		);
 
 		let mut block_mismatch = sample.bytes.clone();
 		patch_u64(
@@ -2091,7 +2309,7 @@ mod tests {
 	}
 
 	#[test]
-	fn rejects_padding_trailing_bytes_and_every_truncated_prefix() {
+	fn admits_canonical_terminal_padding_and_rejects_other_trailing_bytes_and_every_truncated_prefix() {
 		let sample = fixture(3, GgufEndian::Little);
 		assert!(sample.header_end < sample.data_start);
 
@@ -2114,6 +2332,30 @@ mod tests {
 		assert_eq!(
 			error_kind(&trailing, generous_limits(trailing.len())),
 			GgufErrorKind::TrailingData
+		);
+
+		let padded_length = host_usize(parsed_align_up(
+			host_u64(sample.bytes.len()),
+			u64::from(DEFAULT_ALIGNMENT),
+		));
+		assert!(padded_length > sample.bytes.len());
+		let mut terminal_padding = sample.bytes.clone();
+		terminal_padding.resize(padded_length, 0);
+		let archive = parse_valid(&terminal_padding, generous_limits(terminal_padding.len()));
+		assert_eq!(
+			archive.data().len(),
+			terminal_padding.len() - sample.data_start
+		);
+		drop(archive);
+
+		let mut nonzero_terminal_padding = terminal_padding;
+		*nonzero_terminal_padding.last_mut().unwrap() = 1;
+		assert_eq!(
+			error_kind(
+				&nonzero_terminal_padding,
+				generous_limits(nonzero_terminal_padding.len())
+			),
+			GgufErrorKind::NonZeroPadding
 		);
 
 		for prefix_length in 0..sample.bytes.len() {

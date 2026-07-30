@@ -1,6 +1,8 @@
 use core::fmt;
 use std::collections::BTreeSet;
 
+use recipe_core::DType;
+
 use crate::image_header::has_recognized_image_signature;
 use crate::{RawTable, parse_contract_f32, parse_contract_i32};
 
@@ -28,6 +30,21 @@ pub enum VectorEncoding {
 	OrdinalI32,
 	Utf8,
 	Bytes,
+}
+
+impl VectorEncoding {
+	/// Calculation-facing storage type selected by semantic distillation.
+	///
+	/// Variable-width text and binary vectors have no scalar calculation dtype
+	/// until a declared operation supplies a typed lowering.
+	#[must_use]
+	pub const fn dtype(self) -> Option<DType> {
+		match self {
+			Self::F32 => Some(DType::F32),
+			Self::I32 | Self::RelativeSecondsI32 | Self::DictionaryI32 | Self::OrdinalI32 => Some(DType::I32),
+			Self::Utf8 | Self::Bytes => None,
+		}
+	}
 }
 
 /// Evidence presented to an ambiguous-vector classifier.
@@ -703,6 +720,21 @@ mod tests {
 		let floats = table(b"x\n1.23456\n-0.125\n");
 		let inferred = infer_table_vectors(&floats, &CategoricalEncodingModel).unwrap();
 		assert_eq!(inferred.vectors()[0].encoding(), VectorEncoding::F32);
+	}
+
+	#[test]
+	fn every_distilled_fixed_width_encoding_has_one_authoritative_dtype() {
+		for encoding in [
+			VectorEncoding::I32,
+			VectorEncoding::RelativeSecondsI32,
+			VectorEncoding::DictionaryI32,
+			VectorEncoding::OrdinalI32,
+		] {
+			assert_eq!(encoding.dtype(), Some(DType::I32));
+		}
+		assert_eq!(VectorEncoding::F32.dtype(), Some(DType::F32));
+		assert_eq!(VectorEncoding::Utf8.dtype(), None);
+		assert_eq!(VectorEncoding::Bytes.dtype(), None);
 	}
 
 	#[test]

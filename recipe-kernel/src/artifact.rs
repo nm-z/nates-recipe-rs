@@ -309,6 +309,27 @@ pub fn inspect_hsaco(
 	expected_code_object_version: u8,
 	expected_abi: &KernelAbi,
 ) -> Result<InspectedHsaco, LoweringError> {
+	let mut inspections = inspect_hsaco_bundle(
+		bytes,
+		expected_target_id,
+		expected_code_object_version,
+		std::iter::once(expected_abi),
+	)?;
+	Ok(inspections
+		.pop()
+		.expect("one requested HSACO ABI produces one inspection"))
+}
+
+/// Structurally inspect one multi-entry HSACO and match every requested ABI.
+///
+/// The ELF symbol table and AMDGPU MessagePack metadata are decoded once. The
+/// returned inspections preserve the requested ABI order.
+pub fn inspect_hsaco_bundle<'a>(
+	bytes: &[u8],
+	expected_target_id: &str,
+	expected_code_object_version: u8,
+	expected_abis: impl IntoIterator<Item = &'a KernelAbi>,
+) -> Result<Vec<InspectedHsaco>, LoweringError> {
 	let elf = ElfFile::parse(bytes)?;
 	if elf.os_abi != ELF_OSABI_AMDGPU_HSA || elf.machine != ELF_MACHINE_AMDGPU {
 		return Err(artifact_mismatch(format!(
@@ -327,12 +348,14 @@ pub fn inspect_hsaco(
 	}
 	let symbols = elf.symbols()?;
 	audit_symbols(&symbols)?;
-	require_symbol(&symbols, &expected_abi.entry_symbol, SYMBOL_TYPE_FUNCTION)?;
-	require_symbol(
-		&symbols,
-		&format!("{}.kd", expected_abi.entry_symbol),
-		SYMBOL_TYPE_OBJECT,
-	)?;
+	let defined_symbols = symbols
+		.iter()
+		.filter(|symbol| {
+			symbol.section != ELF_UNDEFINED_SECTION
+				&& matches!(symbol.binding, SYMBOL_BIND_GLOBAL | SYMBOL_BIND_WEAK)
+		})
+		.map(|symbol| (symbol.name.as_str(), symbol.kind))
+		.collect::<BTreeSet<_>>();
 	let metadata = hsa_metadata(&elf)?;
 	let target_id = metadata
 		.string("amdhsa.target")
@@ -348,26 +371,61 @@ pub fn inspect_hsaco(
 		.array("amdhsa.kernels")
 		.or_else(|| metadata.array(".amdhsa.kernels"))
 		.ok_or_else(|| artifact_format("AMDGPU metadata omits its kernel list"))?;
-	let kernel = kernels
-		.iter()
-		.filter_map(MsgValue::as_map)
-		.find(|kernel| kernel.string(".name") == Some(expected_abi.entry_symbol.as_str()))
-		.ok_or_else(|| {
-			artifact_mismatch(format!(
-				"HSACO metadata has no kernel named `{}`",
-				expected_abi.entry_symbol
-			))
-		})?;
-	let kernel = parse_hsa_kernel(kernel)?;
-	validate_hsa_abi(&kernel, expected_abi)?;
-	Ok(InspectedHsaco {
-		digest: digest(bytes),
-		elf_abi_version: elf.abi_version,
-		code_object_version,
-		elf_flags: elf.flags,
-		target_id,
-		kernel,
-	})
+	let mut kernels_by_name = BTreeMap::new();
+	for value in kernels {
+		let kernel = value
+			.as_map()
+			.ok_or_else(|| artifact_format("AMDGPU kernel metadata entry is not a map"))?;
+		let name = kernel
+			.string(".name")
+			.ok_or_else(|| artifact_format("AMDGPU kernel metadata omits `.name`"))?;
+		if kernels_by_name.insert(name, kernel).is_some() {
+			return Err(artifact_format(format!(
+				"AMDGPU metadata repeats kernel `{name}`"
+			)));
+		}
+	}
+	let artifact_digest = digest(bytes);
+	expected_abis
+		.into_iter()
+		.map(|expected_abi| {
+			require_indexed_symbol(
+				&defined_symbols,
+				&expected_abi.entry_symbol,
+				SYMBOL_TYPE_FUNCTION,
+			)?;
+			let descriptor = format!("{}.kd", expected_abi.entry_symbol);
+			require_indexed_symbol(&defined_symbols, &descriptor, SYMBOL_TYPE_OBJECT)?;
+			let kernel = kernels_by_name
+				.get(expected_abi.entry_symbol.as_str())
+				.ok_or_else(|| {
+					artifact_mismatch(format!(
+						"HSACO metadata has no kernel named `{}`",
+						expected_abi.entry_symbol
+					))
+				})?;
+			let kernel = parse_hsa_kernel(kernel)?;
+			validate_hsa_abi(&kernel, expected_abi)?;
+			Ok(InspectedHsaco {
+				digest: artifact_digest,
+				elf_abi_version: elf.abi_version,
+				code_object_version,
+				elf_flags: elf.flags,
+				target_id: target_id.clone(),
+				kernel,
+			})
+		})
+		.collect()
+}
+
+fn require_indexed_symbol(symbols: &BTreeSet<(&str, u8)>, name: &str, kind: u8) -> Result<(), LoweringError> {
+	if symbols.contains(&(name, kind)) {
+		Ok(())
+	} else {
+		Err(artifact_mismatch(format!(
+			"artifact has no defined global symbol `{name}` of kind {kind}"
+		)))
+	}
 }
 
 fn target_ids_match(actual: &str, expected: &str) -> bool {

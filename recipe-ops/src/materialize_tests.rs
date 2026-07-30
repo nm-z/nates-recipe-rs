@@ -507,8 +507,8 @@ fn workspace_and_missing_semantics_fail_closed_with_an_exact_manifest() -> TestR
 		.count();
 	let concrete = total_compositions - manifest.len();
 	assert_eq!(total_compositions, 266);
-	assert_eq!(concrete, 134);
-	assert_eq!(manifest.len(), 132);
+	assert_eq!(concrete, 136);
+	assert_eq!(manifest.len(), 130);
 	assert_eq!(manifest.len(), total_compositions - concrete);
 	assert!(
 		manifest

@@ -17,6 +17,9 @@ pub(crate) type CuEvent = *mut c_void;
 pub(crate) const CUDA_SUCCESS: CuResult = 0;
 pub(crate) const CUDA_ERROR_NOT_READY: CuResult = 600;
 pub(crate) const CUDA_ERROR_NOT_SUPPORTED: CuResult = 801;
+pub(crate) const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 1;
+pub(crate) const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: c_int = 8;
+pub(crate) const CU_DEVICE_ATTRIBUTE_WARP_SIZE: c_int = 10;
 pub(crate) const CU_DEVICE_ATTRIBUTE_CLOCK_RATE: c_int = 13;
 pub(crate) const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
 pub(crate) const CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS: c_int = 31;
@@ -710,6 +713,10 @@ pub(crate) mod test_support {
 
 	unsafe extern "C" fn fake_device_get_attribute(out: *mut c_int, attribute: c_int, device: CuDevice) -> CuResult {
 		let value = match (attribute, device) {
+			(CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, _) => 1024,
+			(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, 0) => 49_152,
+			(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, _) => 65_536,
+			(CU_DEVICE_ATTRIBUTE_WARP_SIZE, _) => 32,
 			(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, 0) => 3,
 			(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, 0) => 7,
 			(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, _) => 5,

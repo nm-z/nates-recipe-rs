@@ -17,7 +17,7 @@ mod target;
 
 pub use artifact::{
 	ArtifactDigest, HsaKernelArgument, HsaKernelMetadata, InspectedCubin, InspectedHsaco, inspect_cubin,
-	inspect_hsaco,
+	inspect_hsaco, inspect_hsaco_bundle,
 };
 pub use audit::{AuditFinding, AuditKind, audit_llvm_ir};
 pub use builder::{

@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 #![deny(missing_debug_implementations)]
 
-//! Bounded lifecycle envelope for Recipe calculation graphs.
+//! Static lifecycle envelope for Recipe calculation graphs.
 //!
 //! [`CalculationGraph`](recipe_language::CalculationGraph) remains an acyclic
 //! description of calculation dependencies. This crate assigns those kernels
-//! to explicit subsets of a bounded loop without unrolling the graph or its
+//! to explicit subsets of a finite or gracefully stopped unbounded loop without unrolling the graph or its
 //! artifacts. Init admission and exit remain separate runtime phases.
 
 use core::fmt;
@@ -28,7 +28,7 @@ pub struct KernelIterationDomain {
 }
 
 /// One user-facing scalar emitted through a preallocated, nonblocking metric
-/// slot on an explicit subset of the bounded loop.
+/// slot on an explicit subset of the finite or unbounded loop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetricEmission {
 	pub metric: MetricId,
@@ -130,10 +130,10 @@ impl StaticCalculationProgram {
 				return Err(ProgramError::new(
 					ProgramErrorKind::InvalidIterationDomain,
 					format!(
-						"iteration domain [{}, {}) exceeds bounded loop [0, {})",
+						"iteration domain [{}, {}) exceeds loop [0, {})",
 						assignment.domain.first_iteration(),
-						assignment.domain.end_exclusive(),
-						self.iterations.get()
+						domain_end_text(assignment.domain),
+						loop_end_text(self.iterations),
 					),
 				));
 			}
@@ -237,12 +237,12 @@ impl StaticCalculationProgram {
 				return Err(ProgramError::new(
 					ProgramErrorKind::InvalidIterationDomain,
 					format!(
-						"metric {} domain [{}, {}) stride {} exceeds bounded loop [0, {})",
+						"metric {} domain [{}, {}) stride {} exceeds loop [0, {})",
 						emission.metric,
 						emission.domain.first_iteration(),
-						emission.domain.end_exclusive(),
+						domain_end_text(emission.domain),
 						emission.domain.stride(),
-						self.iterations.get()
+						loop_end_text(self.iterations),
 					),
 				));
 			}
@@ -263,10 +263,10 @@ impl StaticCalculationProgram {
 						"metric {} domain [{}, {}) stride {} is not covered by producer {producer} domain [{}, {}) stride {}",
 						emission.metric,
 						emission.domain.first_iteration(),
-						emission.domain.end_exclusive(),
+						domain_end_text(emission.domain),
 						emission.domain.stride(),
 						producer_domain.first_iteration(),
-						producer_domain.end_exclusive(),
+						domain_end_text(producer_domain),
 						producer_domain.stride()
 					),
 				));
@@ -327,7 +327,7 @@ impl StaticCalculationProgram {
 			&mut output,
 			program,
 			"iterations",
-			self.iterations.get().to_string(),
+			loop_end_text(self.iterations),
 		)?;
 		let domains = output.append_child(program, "domains")?;
 		for assignment in &self.domains {
@@ -348,7 +348,7 @@ impl StaticCalculationProgram {
 				&mut output,
 				domain,
 				"end_exclusive",
-				assignment.domain.end_exclusive().to_string(),
+				domain_end_text(assignment.domain),
 			)?;
 			append_field(
 				&mut output,
@@ -377,7 +377,7 @@ impl StaticCalculationProgram {
 				&mut output,
 				metric,
 				"end_exclusive",
-				emission.domain.end_exclusive().to_string(),
+				domain_end_text(emission.domain),
 			)?;
 			append_field(
 				&mut output,
@@ -444,16 +444,11 @@ impl StaticCalculationProgram {
 			PROGRAM_SCHEMA,
 			"RecipeProgram.schema",
 		)?;
-		let iterations = LoopIterations::new(parse_u64(
-			leaf_value(source, fields["iterations"], "RecipeProgram.iterations")?,
+		let iterations = parse_loop_iterations(leaf_value(
+			source,
+			fields["iterations"],
 			"RecipeProgram.iterations",
-		)?)
-		.ok_or_else(|| {
-			ProgramError::new(
-				ProgramErrorKind::InvalidNumber,
-				"RecipeProgram.iterations must be nonzero",
-			)
-		})?;
+		)?)?;
 		let domains_node = fields["domains"];
 		let domain_children = node(source, domains_node, "RecipeProgram.domains")?.children();
 		let mut domains = Vec::with_capacity(domain_children.len());
@@ -474,12 +469,9 @@ impl StaticCalculationProgram {
 				leaf_value(source, fields["first"], &format!("{path}.first"))?,
 				&format!("{path}.first"),
 			)?;
-			let end_exclusive = parse_u64(
-				leaf_value(
-					source,
-					fields["end_exclusive"],
-					&format!("{path}.end_exclusive"),
-				)?,
+			let end_exclusive = leaf_value(
+				source,
+				fields["end_exclusive"],
 				&format!("{path}.end_exclusive"),
 			)?;
 			let stride = parse_u64(
@@ -488,12 +480,7 @@ impl StaticCalculationProgram {
 			)?;
 			domains.push(KernelIterationDomain {
 				kernel,
-				domain: IterationDomain::new(first, end_exclusive, stride).ok_or_else(|| {
-					ProgramError::new(
-						ProgramErrorKind::InvalidIterationDomain,
-						format!("{path} has an empty, reversed, or zero-stride iteration domain"),
-					)
-				})?,
+				domain: parse_iteration_domain(first, end_exclusive, stride, &path)?,
 			});
 		}
 		let mut metrics = Vec::new();
@@ -521,12 +508,9 @@ impl StaticCalculationProgram {
 					leaf_value(source, fields["first"], &format!("{path}.first"))?,
 					&format!("{path}.first"),
 				)?;
-				let end_exclusive = parse_u64(
-					leaf_value(
-						source,
-						fields["end_exclusive"],
-						&format!("{path}.end_exclusive"),
-					)?,
+				let end_exclusive = leaf_value(
+					source,
+					fields["end_exclusive"],
 					&format!("{path}.end_exclusive"),
 				)?;
 				let stride = parse_u64(
@@ -536,12 +520,7 @@ impl StaticCalculationProgram {
 				metrics.push(MetricEmission {
 					metric,
 					value,
-					domain: IterationDomain::new(first, end_exclusive, stride).ok_or_else(|| {
-						ProgramError::new(
-							ProgramErrorKind::InvalidIterationDomain,
-							format!("{path} has an empty, reversed, or zero-stride iteration domain"),
-						)
-					})?,
+					domain: parse_iteration_domain(first, end_exclusive, stride, &path)?,
 				});
 			}
 		}
@@ -747,19 +726,64 @@ fn domain_covers(producer: IterationDomain, emission: IterationDomain) -> bool {
 	if emission.first_iteration() < producer.first_iteration() {
 		return false;
 	}
-	let emission_span = emission.end_exclusive() - 1 - emission.first_iteration();
-	let emission_last =
-		emission.first_iteration() + emission_span / emission.stride().get() * emission.stride().get();
-	if emission_last >= producer.end_exclusive()
-		|| !(emission.first_iteration() - producer.first_iteration()).is_multiple_of(producer.stride().get())
-	{
+	if !(emission.first_iteration() - producer.first_iteration()).is_multiple_of(producer.stride().get()) {
 		return false;
 	}
-	emission_last == emission.first_iteration()
+	let emission_last = emission.end_exclusive().map(|end| {
+		let span = end - 1 - emission.first_iteration();
+		emission.first_iteration() + span / emission.stride().get() * emission.stride().get()
+	});
+	match (producer.end_exclusive(), emission_last) {
+		(Some(producer_end), Some(last)) if last >= producer_end => return false,
+		(Some(_), None) => return false,
+		(Some(_), Some(_)) | (None, Some(_)) | (None, None) => {}
+	}
+	emission_last == Some(emission.first_iteration())
 		|| emission
 			.stride()
 			.get()
 			.is_multiple_of(producer.stride().get())
+}
+
+fn loop_end_text(iterations: LoopIterations) -> String {
+	iterations
+		.finite()
+		.map_or_else(|| "unbounded".to_owned(), |value| value.get().to_string())
+}
+
+fn domain_end_text(domain: IterationDomain) -> String {
+	domain.end_exclusive()
+		.map_or_else(|| "unbounded".to_owned(), |value| value.to_string())
+}
+
+fn parse_loop_iterations(value: &str) -> ProgramResult<LoopIterations> {
+	if value == "unbounded" {
+		return Ok(LoopIterations::UNBOUNDED);
+	}
+	LoopIterations::new(parse_u64(value, "RecipeProgram.iterations")?).ok_or_else(|| {
+		ProgramError::new(
+			ProgramErrorKind::InvalidNumber,
+			"RecipeProgram.iterations must be nonzero or `unbounded`",
+		)
+	})
+}
+
+fn parse_iteration_domain(first: u64, end_exclusive: &str, stride: u64, path: &str) -> ProgramResult<IterationDomain> {
+	let domain = if end_exclusive == "unbounded" {
+		IterationDomain::unbounded(first, stride)
+	} else {
+		IterationDomain::new(
+			first,
+			parse_u64(end_exclusive, &format!("{path}.end_exclusive"))?,
+			stride,
+		)
+	};
+	domain.ok_or_else(|| {
+		ProgramError::new(
+			ProgramErrorKind::InvalidIterationDomain,
+			format!("{path} has an empty, reversed, or zero-stride iteration domain"),
+		)
+	})
 }
 
 fn leaf_value<'a>(graph: &'a Graph, field: NodeId, path: &str) -> ProgramResult<&'a str> {
@@ -897,6 +921,25 @@ mod tests {
 		assert!(text.starts_with("RecipeProgram\tschema\tStaticCalculationProgram"));
 		assert!(text.contains("\nRecipeIR\tschema\tCalculationGraph"));
 		assert!(!text.contains('"'));
+		assert_eq!(StaticCalculationProgram::from_ogdl(&text).unwrap(), program);
+	}
+
+	#[test]
+	fn unbounded_program_roundtrips_without_a_synthetic_terminal_iteration() {
+		let iterations = LoopIterations::UNBOUNDED;
+		let program = StaticCalculationProgram::new(
+			graph(),
+			iterations,
+			vec![KernelIterationDomain {
+				kernel: KernelTemplateId::new(7),
+				domain: IterationDomain::unbounded(0, 1).unwrap(),
+			}],
+		)
+		.unwrap();
+		let text = program.to_ogdl().unwrap();
+		assert!(text.contains("iterations\tunbounded"));
+		assert!(text.contains("end_exclusive\tunbounded"));
+		assert!(!text.contains(&u64::MAX.to_string()));
 		assert_eq!(StaticCalculationProgram::from_ogdl(&text).unwrap(), program);
 	}
 

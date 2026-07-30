@@ -11,8 +11,8 @@ use recipe_core::{
 
 use crate::error::ProbeResult;
 
-pub const PROFILE_SCHEMA: u32 = 6;
-pub const PROFILE_CODEC_SCHEMA: u32 = 6;
+pub const PROFILE_SCHEMA: u32 = 7;
+pub const PROFILE_CODEC_SCHEMA: u32 = 7;
 pub const PEER_BENCHMARK_PROTOCOL_SCHEMA: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +100,9 @@ pub struct GpuDescriptor {
 	pub asynchronous_submission: bool,
 	pub maximum_submission_queues: u32,
 	pub maximum_concurrent_tasks: u32,
+	pub subgroup_lanes: u32,
+	pub maximum_workgroup_lanes: u32,
+	pub maximum_shared_memory_per_workgroup: ByteCount,
 	pub transfer_overlaps_calculation: bool,
 }
 

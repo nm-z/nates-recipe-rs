@@ -1798,7 +1798,7 @@ fn realize_device<'context>(
 				detail: "inspected cubin entry differs from immutable ABI".to_owned(),
 			},
 		)?;
-		let digest = ArtifactDigest::of(&runtime.bytes);
+		let digest = runtime.digest();
 		if let Some((_, first)) = bundles.get(&digest).and_then(|entries| entries.first()) {
 			ensure(
 				first.bytes.as_ref() == runtime.bytes.as_ref(),

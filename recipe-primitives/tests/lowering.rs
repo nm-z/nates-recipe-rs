@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt;
 
 use recipe_core::{
-	AliasPermission, DType, KernelTemplateId, ScalarInput, ScalarInstruction, ScalarLiteral, ScalarOpcode,
+	AliasPermission, ByteCount, DType, KernelTemplateId, ScalarInput, ScalarInstruction, ScalarLiteral, ScalarOpcode,
 	ScalarProgram, ScalarValueId, ValueId,
 };
 use recipe_language::{
@@ -12,8 +12,8 @@ use recipe_language::{
 	ReduceOperator, ReduceResult, Scan, ScanMode, Scatter, ScatterConflict, Shape, Sort, SortDirection, Tensor,
 };
 use recipe_primitives::{
-	BufferLifetime, FaultReason, HistogramBinMapping, OwnedAtomicOperation, ProgramDigest, ScratchPurpose, StageKind,
-	lower,
+	BufferLifetime, ContractionStrategy, FaultReason, HistogramBinMapping, LoweredProgram, LoweringHardware,
+	LoweringResult, OwnedAtomicOperation, ProgramDigest, ScratchPurpose, StageKind,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -41,6 +41,26 @@ fn tensor(id: u64, dtype: DType, shape: &[u64]) -> Result<Tensor, recipe_languag
 
 fn index(tensors: &[Tensor]) -> BTreeMap<ValueId, &Tensor> {
 	tensors.iter().map(|tensor| (tensor.id, tensor)).collect()
+}
+
+fn lower(kernel: &PrimitiveKernel, tensors: &BTreeMap<ValueId, &Tensor>) -> LoweringResult<LoweredProgram> {
+	lower_with_hardware(
+		kernel,
+		tensors,
+		LoweringHardware {
+			subgroup_lanes: 32,
+			maximum_workgroup_lanes: 256,
+			maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
+		},
+	)
+}
+
+fn lower_with_hardware(
+	kernel: &PrimitiveKernel,
+	tensors: &BTreeMap<ValueId, &Tensor>,
+	hardware: LoweringHardware,
+) -> LoweringResult<LoweredProgram> {
+	recipe_primitives::lower(kernel, tensors, hardware)
 }
 
 fn aliases(inputs: usize, outputs: usize) -> Vec<PrimitiveAliasRule> {
@@ -128,6 +148,95 @@ fn elementwise_retains_the_validated_kernel_template_and_broadcast_access() -> T
 	assert_eq!(template.inputs[0].access.strides, [1, 0]);
 	assert_eq!(template.inputs[1].access.strides, [0, 1]);
 	assert_eq!(program.resources.total_flops.get(), 6);
+	Ok(())
+}
+
+#[test]
+fn physical_geometry_and_contraction_strategy_follow_measured_limits() -> TestResult {
+	let map_tensors = [
+		tensor(1, DType::F32, &[4_096])?,
+		tensor(2, DType::F32, &[4_096])?,
+		tensor(3, DType::F32, &[4_096])?,
+	];
+	let map = kernel(
+		2,
+		&[1, 2],
+		&[3],
+		PrimitiveKind::Elementwise(Elementwise {
+			program: add_program(),
+		}),
+	);
+	let narrow = lower_with_hardware(
+		&map,
+		&index(&map_tensors),
+		LoweringHardware {
+			subgroup_lanes: 32,
+			maximum_workgroup_lanes: 64,
+			maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
+		},
+	)?;
+	let wide = lower_with_hardware(
+		&map,
+		&index(&map_tensors),
+		LoweringHardware {
+			subgroup_lanes: 32,
+			maximum_workgroup_lanes: 512,
+			maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
+		},
+	)?;
+	assert_eq!(narrow.stages[0].geometry.workgroup_lanes, 64);
+	assert_eq!(wide.stages[0].geometry.workgroup_lanes, 512);
+	assert_ne!(narrow.digest, wide.digest);
+
+	let contraction_tensors = [
+		tensor(11, DType::F32, &[8, 64])?,
+		tensor(12, DType::F32, &[64, 8])?,
+		tensor(13, DType::F32, &[8, 8])?,
+	];
+	let contraction = kernel(
+		3,
+		&[11, 12],
+		&[13],
+		PrimitiveKind::Contraction(Contraction {
+			batch_axes: Vec::new(),
+			contract_axes: vec![(1, 0)],
+		}),
+	);
+	let direct = lower_with_hardware(
+		&contraction,
+		&index(&contraction_tensors),
+		LoweringHardware {
+			subgroup_lanes: 32,
+			maximum_workgroup_lanes: 64,
+			maximum_shared_memory_per_workgroup: ByteCount::new(64),
+		},
+	)?;
+	let staged = lower_with_hardware(
+		&contraction,
+		&index(&contraction_tensors),
+		LoweringHardware {
+			subgroup_lanes: 32,
+			maximum_workgroup_lanes: 64,
+			maximum_shared_memory_per_workgroup: ByteCount::new(256),
+		},
+	)?;
+	let StageKind::TiledContraction(direct_stage) = &direct.stages[0].kind else {
+		panic!("expected direct contraction stage");
+	};
+	let StageKind::TiledContraction(staged_stage) = &staged.stages[0].kind else {
+		panic!("expected staged contraction stage");
+	};
+	assert_eq!(direct_stage.strategy, ContractionStrategy::Direct);
+	assert_eq!(
+		direct.stages[0].resources.shared_bytes_per_workgroup,
+		ByteCount::ZERO
+	);
+	assert_eq!(staged_stage.strategy, ContractionStrategy::Staged);
+	assert_eq!(
+		staged.stages[0].resources.shared_bytes_per_workgroup,
+		ByteCount::new(256)
+	);
+	assert_ne!(direct.digest, staged.digest);
 	Ok(())
 }
 

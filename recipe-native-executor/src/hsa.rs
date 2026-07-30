@@ -19,7 +19,7 @@ use recipe_hsa::{
 	Allocation, DeviceType, DiscoveredAgent, DispatchGeometry, Executable, Kernel, MemoryPoolFlags, MemorySegment,
 	PollStatus, PreparedPending, Queue, QueueConfig, QueueKind, QueueProgress, Session,
 };
-use recipe_kernel::{ArtifactDigest, KernelArgument, inspect_hsaco};
+use recipe_kernel::{ArtifactDigest, KernelArgument, inspect_hsaco_bundle};
 
 use crate::error::ensure_submission_queue_capacity;
 use crate::plan::InitImageContract;
@@ -1905,14 +1905,7 @@ fn realize_device<'scope>(
 			TaskKind::Transfer(_) | TaskKind::Metric(_) => None,
 		})
 		.collect::<BTreeSet<_>>();
-	let mut bundles = BTreeMap::<
-		ArtifactDigest,
-		Vec<(
-			ArtifactId,
-			&crate::RuntimeArtifact,
-			recipe_kernel::InspectedHsaco,
-		)>,
-	>::new();
+	let mut bundles = BTreeMap::<ArtifactDigest, Vec<(ArtifactId, &crate::RuntimeArtifact)>>::new();
 	for artifact_id in artifact_ids {
 		let runtime = runtime_artifacts
 			.get(&artifact_id)
@@ -1936,21 +1929,8 @@ fn realize_device<'scope>(
 				detail: "HSACO target or code-object version differs from the HSA binding".to_owned(),
 			},
 		)?;
-		let inspection = inspect_hsaco(
-			&runtime.bytes,
-			target_id,
-			*code_object_version,
-			&runtime.abi,
-		)?;
-		ensure(
-			inspection.kernel.name == runtime.abi.entry_symbol,
-			Error::ArtifactMismatch {
-				artifact: artifact_id,
-				detail: "inspected HSACO entry differs from immutable ABI".to_owned(),
-			},
-		)?;
-		let digest = ArtifactDigest::of(&runtime.bytes);
-		if let Some((_, first, _)) = bundles.get(&digest).and_then(|entries| entries.first()) {
+		let digest = runtime.digest();
+		if let Some((_, first)) = bundles.get(&digest).and_then(|entries| entries.first()) {
 			ensure(
 				first.bytes.as_ref() == runtime.bytes.as_ref(),
 				Error::ArtifactMismatch {
@@ -1962,7 +1942,7 @@ fn realize_device<'scope>(
 		bundles
 			.entry(digest)
 			.or_default()
-			.push((artifact_id, runtime, inspection));
+			.push((artifact_id, runtime));
 	}
 
 	// A runtime artifact identifies one logical entry point, while its byte
@@ -1973,11 +1953,24 @@ fn realize_device<'scope>(
 	let mut executables = BTreeMap::new();
 	let mut artifacts = BTreeMap::new();
 	for (digest, entries) in bundles {
-		let (_, first_runtime, _) = entries
+		let (_, first_runtime) = entries
 			.first()
 			.expect("an HSACO bundle group is created only for an artifact");
+		let inspections = inspect_hsaco_bundle(
+			&first_runtime.bytes,
+			&binding.target_id,
+			binding.code_object_version,
+			entries.iter().map(|(_, runtime)| &runtime.abi),
+		)?;
 		let executable = binding.session.load_hsaco(&first_runtime.bytes)?;
-		for (artifact_id, runtime, inspection) in entries {
+		for ((artifact_id, runtime), inspection) in entries.into_iter().zip(inspections) {
+			ensure(
+				inspection.kernel.name == runtime.abi.entry_symbol,
+				Error::ArtifactMismatch {
+					artifact: artifact_id,
+					detail: "inspected HSACO entry differs from immutable ABI".to_owned(),
+				},
+			)?;
 			let runtime_symbol = inspection.kernel.symbol;
 			let kernel = executable
 				.kernel(&runtime_symbol)

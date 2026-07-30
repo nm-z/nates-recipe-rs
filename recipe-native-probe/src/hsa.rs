@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -26,7 +27,6 @@ use crate::identity::{
 use crate::native::Backend;
 
 const HSA_KERNEL_ENTRY: &str = "recipe_probe_fma_f32";
-const PREFERRED_WORKGROUP_LANES: u32 = 256;
 const COMPLETION_POLL_INITIAL_DELAY: Duration = Duration::from_micros(50);
 const COMPLETION_POLL_MAXIMUM_DELAY: Duration = Duration::from_millis(2);
 const TIMED_OUT_CLEANUP_INITIAL_DELAY: Duration = Duration::from_millis(10);
@@ -209,6 +209,33 @@ impl HsaBackend {
 		} else {
 			gpu.product_name.clone()
 		};
+		let subgroup_lanes = description.first_isa_wavefront_size.ok_or_else(|| {
+			ProbeError::Discovery(format!(
+				"HSA GPU {} omitted its native wavefront width",
+				description.identity.uuid
+			))
+		})?;
+		let maximum_workgroup_lanes = description
+			.isas
+			.iter()
+			.map(|isa| {
+				isa.maximum_workgroup_size
+					.min(u32::from(isa.maximum_workgroup_dimensions[0]))
+			})
+			.min()
+			.ok_or_else(|| {
+				ProbeError::Discovery(format!(
+					"HSA GPU {} omitted ISA workgroup limits",
+					description.identity.uuid
+				))
+			})?;
+		let maximum_shared_memory_per_workgroup =
+			kfd_lds_capacity(description.identity.driver_node_id.ok_or_else(|| {
+				ProbeError::Discovery(format!(
+					"HSA GPU {} omitted its KFD node",
+					description.identity.uuid
+				))
+			})?)?;
 		Ok(Some(GpuDescriptor {
 			key: label(
 				format!("hsa:{}@{pci}", description.identity.uuid),
@@ -260,6 +287,9 @@ impl HsaBackend {
 			asynchronous_submission: true,
 			maximum_submission_queues: queue.maximum_queues,
 			maximum_concurrent_tasks: 1,
+			subgroup_lanes,
+			maximum_workgroup_lanes,
+			maximum_shared_memory_per_workgroup,
 			transfer_overlaps_calculation: gpu.sdma_engine_count != 0,
 		}))
 	}
@@ -543,6 +573,43 @@ impl HsaBackend {
 	}
 }
 
+fn kfd_lds_capacity(node: u32) -> ProbeResult<recipe_core::ByteCount> {
+	let path = PathBuf::from("/sys/class/kfd/kfd/topology/nodes")
+		.join(node.to_string())
+		.join("properties");
+	let properties =
+		fs::read_to_string(&path).map_err(|error| ProbeError::io("read KFD GPU properties", &path, error))?;
+	let kilobytes = properties.lines().find_map(|line| {
+		let mut fields = line.split_whitespace();
+		match (fields.next(), fields.next(), fields.next()) {
+			(Some("lds_size_in_kb"), Some(value), None) => Some(value),
+			_ => None,
+		}
+	});
+	let kilobytes = kilobytes.ok_or_else(|| {
+		ProbeError::Discovery(format!(
+			"KFD properties at {} omit lds_size_in_kb",
+			path.display()
+		))
+	})?;
+	let kilobytes = kilobytes.parse::<u64>().map_err(|error| {
+		ProbeError::Discovery(format!(
+			"KFD lds_size_in_kb at {} is not an integer: {error}",
+			path.display()
+		))
+	})?;
+	let bytes = kilobytes
+		.checked_mul(1024)
+		.filter(|bytes| *bytes != 0)
+		.ok_or_else(|| {
+			ProbeError::Discovery(format!(
+				"KFD LDS capacity at {} is zero or overflowed",
+				path.display()
+			))
+		})?;
+	Ok(recipe_core::ByteCount::new(bytes))
+}
+
 impl Backend for HsaBackend {
 	fn discover(&self) -> ProbeResult<Vec<GpuDescriptor>> {
 		Ok(self
@@ -713,7 +780,6 @@ fn hsa_workgroup_lanes(description: &AgentDescription, elements: u32) -> ProbeRe
 		})
 		.min()
 		.ok_or_else(|| ProbeError::Benchmark("HSA GPU has no ISA limits".to_owned()))?
-		.min(PREFERRED_WORKGROUP_LANES)
 		.min(elements);
 	if maximum == 0 {
 		return Err(ProbeError::Benchmark(
@@ -823,6 +889,17 @@ mod tests {
 		assert_eq!(
 			hsa_workgroup_lanes(&description, 100).expect("workgroup lanes"),
 			64
+		);
+	}
+
+	#[test]
+	fn workgroup_selection_has_no_architecture_independent_cap() {
+		let mut description = fixture_description();
+		description.isas[0].maximum_workgroup_size = 1_024;
+		description.isas[0].maximum_workgroup_dimensions[0] = 1_024;
+		assert_eq!(
+			hsa_workgroup_lanes(&description, 900).expect("workgroup lanes"),
+			512
 		);
 	}
 

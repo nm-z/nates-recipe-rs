@@ -1185,6 +1185,9 @@ fn encode_discovery(encoder: &mut Encoder, discovery: &DiscoveryProfile) -> Prob
 			encoder.property_flops(calculation.rate);
 			encoder.bool(calculation.asynchronous_submission);
 			encoder.u32(calculation.maximum_concurrent_tasks);
+			encoder.u32(calculation.subgroup_lanes);
+			encoder.u32(calculation.maximum_workgroup_lanes);
+			encoder.u64(calculation.maximum_shared_memory_per_workgroup.get());
 		}
 	}
 	encoder.length(discovery.links.len(), "discovery.links")?;
@@ -1234,6 +1237,15 @@ fn decode_discovery(decoder: &mut Decoder<'_>) -> ProbeResult<DiscoveryProfile> 
 				maximum_concurrent_tasks: decoder.u32(&format!(
 					"discovery.devices[{index}].calculation.maximum_concurrent"
 				))?,
+				subgroup_lanes: decoder.u32(&format!(
+					"discovery.devices[{index}].calculation.subgroup_lanes"
+				))?,
+				maximum_workgroup_lanes: decoder.u32(&format!(
+					"discovery.devices[{index}].calculation.maximum_workgroup_lanes"
+				))?,
+				maximum_shared_memory_per_workgroup: ByteCount::new(decoder.u64(&format!(
+					"discovery.devices[{index}].calculation.maximum_shared_memory_per_workgroup"
+				))?),
 			})
 		} else {
 			None

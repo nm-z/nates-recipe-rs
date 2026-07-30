@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use recipe_core::{AliasPermission, DType, KernelTemplateId, ScalarLiteral, ValueId};
+use recipe_core::{AliasPermission, ByteCount, DType, KernelTemplateId, ScalarLiteral, ValueId};
 use recipe_language::{
 	AtomicOperation, AtomicOrdering, AxisSet, Contraction, Gather, IndexBounds, IndexMap, PrimitiveAliasRule,
 	PrimitiveKernel, PrimitiveKind, RandomDistribution, RandomKey, RandomMap, Reduce, Scan, ScanMode, Scatter,
@@ -9,6 +9,14 @@ use recipe_language::{
 use recipe_primitives::{INDEX_MAP_INTEGER_OPERATIONS_PER_LANE, StageKind};
 
 use super::*;
+
+fn lowering_hardware() -> LoweringHardware {
+	LoweringHardware {
+		subgroup_lanes: 32,
+		maximum_workgroup_lanes: 256,
+		maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
+	}
+}
 
 #[test]
 fn inventory_matches_every_normative_line_in_order() {
@@ -316,9 +324,9 @@ fn every_primitive_recipe_performs_real_deterministic_lowering() {
 			kernel: &case.kernel,
 			tensors: &tensors,
 		};
-		let first = lower_primitive(descriptor, request)
+		let first = lower_primitive(descriptor, request, lowering_hardware())
 			.unwrap_or_else(|error| panic!("{} failed primitive lowering: {error}", descriptor.symbol));
-		let second = lower_primitive(descriptor, request).unwrap();
+		let second = lower_primitive(descriptor, request, lowering_hardware()).unwrap();
 		assert_eq!(first, second, "{} was nondeterministic", descriptor.symbol);
 		first.validate().unwrap();
 	}
@@ -348,8 +356,8 @@ fn index_map_lowers_zero_inputs_into_the_exact_int32_output_shape_and_contract()
 			outputs: &[DType::I32],
 		}
 	);
-	let first = lower_index_map(request).unwrap();
-	let second = lower_index_map(request).unwrap();
+	let first = lower_index_map(request, lowering_hardware()).unwrap();
+	let second = lower_index_map(request, lowering_hardware()).unwrap();
 	assert_eq!(first, second);
 	first.validate().unwrap();
 	assert_eq!(first.source_input_count, 0);
@@ -486,7 +494,9 @@ fn wrong_and_unsupported_lowering_requests_fail_closed() {
 	for descriptor in operation_registry().iter() {
 		match descriptor.lowering {
 			LoweringAvailability::Scalar(_) => assert_eq!(
-				lower_primitive(descriptor, request).unwrap_err().kind,
+				lower_primitive(descriptor, request, lowering_hardware())
+					.unwrap_err()
+					.kind,
 				OperationErrorKind::WrongLoweringKind,
 				"{} accepted primitive lowering",
 				descriptor.symbol
@@ -505,7 +515,9 @@ fn wrong_and_unsupported_lowering_requests_fail_closed() {
 					OperationErrorKind::WrongLoweringKind
 				);
 				assert_eq!(
-					lower_primitive(descriptor, request).unwrap_err().kind,
+					lower_primitive(descriptor, request, lowering_hardware())
+						.unwrap_err()
+						.kind,
 					OperationErrorKind::WrongLoweringKind
 				);
 			}
@@ -517,7 +529,9 @@ fn wrong_and_unsupported_lowering_requests_fail_closed() {
 					descriptor.symbol
 				);
 				assert_eq!(
-					lower_primitive(descriptor, request).unwrap_err().kind,
+					lower_primitive(descriptor, request, lowering_hardware())
+						.unwrap_err()
+						.kind,
 					OperationErrorKind::UnsupportedLowering,
 					"{} did not fail closed in primitive lowering",
 					descriptor.symbol
@@ -526,7 +540,9 @@ fn wrong_and_unsupported_lowering_requests_fail_closed() {
 		}
 	}
 	assert_eq!(
-		lower_primitive(primitive, request).unwrap_err().kind,
+		lower_primitive(primitive, request, lowering_hardware())
+			.unwrap_err()
+			.kind,
 		OperationErrorKind::PrimitiveRecipeMismatch
 	);
 }
@@ -851,6 +867,7 @@ fn assert_primitive_mismatch(symbol: &str, case: &PrimitiveCase) {
 		lower_primitive(
 			operation_registry().resolve_unique(symbol).unwrap(),
 			request,
+			lowering_hardware(),
 		)
 		.unwrap_err()
 		.kind,
@@ -868,10 +885,13 @@ fn tensor_index(case: &PrimitiveCase) -> BTreeMap<ValueId, &Tensor> {
 
 fn lower_index_map_case(case: &PrimitiveCase) -> OperationResult<LoweredProgram> {
 	let tensors = tensor_index(case);
-	lower_index_map(PrimitiveRequest {
-		kernel: &case.kernel,
-		tensors: &tensors,
-	})
+	lower_index_map(
+		PrimitiveRequest {
+			kernel: &case.kernel,
+			tensors: &tensors,
+		},
+		lowering_hardware(),
+	)
 }
 
 #[derive(Debug)]

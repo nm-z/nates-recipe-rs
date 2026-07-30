@@ -485,6 +485,16 @@ fn validate_kind(stage: &ProgramStage, path: &str, errors: &mut Vec<ProgramValid
 				"contraction tile dimensions must be nonzero",
 				errors,
 			);
+			require(
+				contraction
+					.tile
+					.output_x
+					.checked_mul(contraction.tile.output_y)
+					== Some(stage.geometry.workgroup_lanes),
+				format!("{path}.kind.tile"),
+				"contraction output tile must equal the realized workgroup width",
+				errors,
+			);
 		}
 		StageKind::Gather { bounds, .. } | StageKind::Scatter { bounds, .. } => {
 			require(
@@ -698,10 +708,13 @@ fn validate_stage_resources(stage: &ProgramStage, path: &str, errors: &mut Vec<P
 		StageKind::FixedTreeReduce(reduction) => Some(tree_sync(&reduction.tree)),
 		StageKind::FixedTreeScanLocal(scan) => Some(tree_sync(&scan.tree)),
 		StageKind::TiledContraction(contraction) => {
-			let count = contraction
-				.contracted_elements
-				.div_ceil(u64::from(contraction.tile.reduction))
-				.saturating_mul(2);
+			let count = match contraction.strategy {
+				ContractionStrategy::Direct => 0,
+				ContractionStrategy::Staged => contraction
+					.contracted_elements
+					.div_ceil(u64::from(contraction.tile.reduction))
+					.saturating_mul(2),
+			};
 			match usize::try_from(count) {
 				Ok(count) => Some(count),
 				Err(error) => {
@@ -808,12 +821,12 @@ fn expected_stage_resources(stage: &ProgramStage) -> Option<StageResourceBounds>
 		}
 		StageKind::ScanUniformCombine(_) => (logical, logical, 0, 0, 12),
 		StageKind::TiledContraction(contraction) => {
-			let tile_words = u64::from(contraction.tile.output_x)
-				.checked_mul(u64::from(contraction.tile.reduction))?
-				.checked_add(
-					u64::from(contraction.tile.output_y)
-						.checked_mul(u64::from(contraction.tile.reduction))?,
-				)?;
+			let shared = match contraction.strategy {
+				ContractionStrategy::Direct => 0,
+				ContractionStrategy::Staged => {
+					u64::from(lanes).checked_mul(u64::from(contraction.dtype.byte_width()))?
+				}
+			};
 			(
 				contraction
 					.output_elements
@@ -821,7 +834,7 @@ fn expected_stage_resources(stage: &ProgramStage) -> Option<StageResourceBounds>
 					.checked_mul(2)?,
 				logical,
 				0,
-				tile_words.checked_mul(u64::from(contraction.dtype.byte_width()))?,
+				shared,
 				24,
 			)
 		}

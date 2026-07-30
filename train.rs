@@ -1,67 +1,24 @@
 #!/usr/bin/env -S recipe run
+// Generated token by token from API.ogdl.
+// Reproduce with: cargo run --bin generate-train -- --seed 42
+
 use recipe::*;
 
-fn main() {
-	const HP: &str = "examples/datasets/house-prices/train.csv";
+fn main() -> TrainingResult<()> {
+	recipe.data("examples/datasets/uci-abalone/abalone.data")
+		.target("col9")
+		.norm(min_max)
+		.split(0.85);
 
-	recipe.data(HP)
-		.exclude("Id")
-		.target("SalePrice")
-		.norm(z_score)
-		.split(0.8);
-	recipe.model().branch;
-		Branch {
-			layer: 64,
-			atvn: relu,
-		}.layer(1).loss(mse);
+	recipe.model().layer(16).log().layer(1).loss(mae);
+
 	recipe.train()
 		.optimizer(adamw)
-		.batch(0.1)
-		.epochs(20)
-		.lr(0.05)
+		.epochs(8)
+		.lr(0.0002)
 		.cos()
-		.log([Loss, R2])
-		.run();
+		.warmup(1)
+		.log([Device, Epoch, Loss])
+		.run()?;
+	Ok(())
 }
-
-recipe.model().branch();
-	Branch {
-		layer: 64,
-		atvn: relu,
-	}
-	Branch {
-		layer: 1,
-		loss: mse,
-	}
-
-
-
-
-// 6. wrap-macro: the one place you get ANY grammar you want
-branch! {
-    data  csv "d4.csv"
-    knn   5
-    pool  8
-}
-
-
-
-recipe.model()
-	.residual(
-		layer(64),
-		relu(),
-	).layer(1).loss(mse);
-
-
-
-
-
-
-
-
-
-
-
-
-
-.

@@ -1,5 +1,8 @@
 use recipe_core::{DType, ScalarOpcode};
-use recipe_language::{Elementwise, Gather, IndexBounds, PrimitiveKind, Scatter, ScatterConflict, Sort, SortDirection};
+use recipe_language::{
+	AxisSet, Elementwise, Gather, IndexBounds, IndexMap, PrimitiveKind, Reduce, ReduceOperator, ReduceResult, Scan,
+	ScanMode, Scatter, ScatterConflict, Shape, Sort, SortDirection,
+};
 
 use crate::{OperationDescriptor, OperationErrorKind, OperationResult};
 
@@ -20,6 +23,7 @@ const OPERATIONS: &[(&str, &str)] = &[
 	("gpu_one_hot", "gpu-core/src/encoding.rs:169"),
 	("gpu_pack_upper_tri", "gpu-core/src/kernels.rs:5563"),
 	("gpu_partial_argsort", "gpu-core/src/kernels.rs:5267"),
+	("gpu_segment_sum", "gpu-core/src/reductions.rs:627"),
 	("gpu_slice_cols", "gpu-core/src/kernels.rs:6550"),
 	("gpu_slice_lead_into", "gpu-core/src/kernels.rs:5390"),
 	("gpu_slice_rows", "gpu-core/src/kernels.rs:5619"),
@@ -46,6 +50,7 @@ pub(super) fn dispatch(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 			"gpu_one_hot" => emit_one_hot(request, emitter),
 			"gpu_pack_upper_tri" => emit_dense_upper_triangle(request, emitter),
 			"gpu_partial_argsort" => emit_partial_argsort(request, emitter),
+			"gpu_segment_sum" => emit_segment_sum(request, emitter),
 			"gpu_slice_cols" => emit_column_slice(request, emitter),
 			"gpu_slice_lead_into" => emit_leading_slice(request, emitter),
 			"gpu_slice_rows" => emit_row_slice(request, emitter),
@@ -254,6 +259,188 @@ fn emit_partial_argsort(request: &MaterializationRequest<'_>, emitter: &mut Emit
 	}
 }
 
+fn emit_segment_sum(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
+	require_exact_abi(
+		request,
+		&["values", "segment_ids"],
+		&["sums"],
+		&[
+			"elements",
+			"segments",
+			"maximum_segment_length",
+			"tree_lanes",
+		],
+	)?;
+	let values = input(request, "values")?;
+	let segment_ids = input(request, "segment_ids")?;
+	let sums = output(request, "sums")?;
+	let elements = positive_parameter(request, "elements")?;
+	let segments = positive_parameter(request, "segments")?;
+	let maximum_segment_length = positive_parameter(request, "maximum_segment_length")?;
+	if maximum_segment_length > elements {
+		return Err(request_error(
+			request,
+			"maximum_segment_length exceeds the input element count",
+		));
+	}
+	let grouped_elements = checked_product(
+		request,
+		segments,
+		maximum_segment_length,
+		"segmented reduction workspace element count",
+	)?;
+	require_i32_indexable(request, elements, "segmented reduction input element count")?;
+	require_i32_indexable(request, segments, "segmented reduction segment count")?;
+	require_i32_indexable(
+		request,
+		grouped_elements,
+		"segmented reduction packed workspace element count",
+	)?;
+	let tree_lanes = super::prepared_tree_lanes(request)?;
+	require_dtype(request, values, DType::F32, "values")?;
+	require_dtype(request, segment_ids, DType::I32, "segment_ids")?;
+	require_dtype(request, sums, DType::F32, "sums")?;
+	require_shape(request, values, &[elements], "values")?;
+	require_shape(request, segment_ids, &[elements], "segment_ids")?;
+	require_shape(request, sums, &[segments], "sums")?;
+
+	let sorted_ids = emitter.intermediate(DType::I32, segment_ids.shape.clone())?;
+	let sorted_original_indices = emitter.intermediate(DType::I32, segment_ids.shape.clone())?;
+	emitter.emit(
+		vec![segment_ids.id],
+		vec![sorted_ids, sorted_original_indices],
+		ascending_stable_sort(0),
+	)?;
+
+	let positions = emitter.intermediate(DType::I32, segment_ids.shape.clone())?;
+	let previous_positions = emitter.intermediate(DType::I32, segment_ids.shape.clone())?;
+	let previous_ids = emitter.intermediate(DType::I32, segment_ids.shape.clone())?;
+	let boundary_positions = emitter.intermediate(DType::I32, segment_ids.shape.clone())?;
+	let segment_starts = emitter.intermediate(DType::I32, segment_ids.shape.clone())?;
+	emitter.emit_stage([
+		KernelEmission {
+			inputs: Vec::new(),
+			outputs: vec![positions],
+			kind: PrimitiveKind::IndexMap(IndexMap {
+				start: 0,
+				element_step: 1,
+				iteration_step: 0,
+				modulus: None,
+			}),
+		},
+		KernelEmission {
+			inputs: Vec::new(),
+			outputs: vec![previous_positions],
+			kind: PrimitiveKind::IndexMap(IndexMap {
+				start: -1,
+				element_step: 1,
+				iteration_step: 0,
+				modulus: None,
+			}),
+		},
+		KernelEmission {
+			inputs: vec![sorted_ids, previous_positions],
+			outputs: vec![previous_ids],
+			kind: PrimitiveKind::Gather(Gather {
+				axis: 0,
+				bounds: IndexBounds::Clamp,
+			}),
+		},
+		KernelEmission {
+			inputs: vec![sorted_ids, previous_ids, positions],
+			outputs: vec![boundary_positions],
+			kind: PrimitiveKind::Elementwise(Elementwise {
+				program: segment_boundary_program(request)?,
+			}),
+		},
+		KernelEmission {
+			inputs: vec![boundary_positions],
+			outputs: vec![segment_starts],
+			kind: PrimitiveKind::Scan(Scan {
+				operator: ReduceOperator::Maximum,
+				axis: 0,
+				mode: ScanMode::Inclusive,
+				reverse: false,
+				tree_lanes,
+			}),
+		},
+	])?;
+
+	let sorted_values = emitter.intermediate(DType::F32, values.shape.clone())?;
+	let destinations = emitter.intermediate(DType::I32, segment_ids.shape.clone())?;
+	let packed_positions_shape = materialized_shape(request, &[grouped_elements])?;
+	let packed_positions = emitter.intermediate(DType::I32, packed_positions_shape.clone())?;
+	let zero_base = emitter.intermediate(DType::F32, packed_positions_shape.clone())?;
+	let packed = emitter.intermediate(DType::F32, packed_positions_shape)?;
+	let matrix_shape = materialized_shape(request, &[segments, maximum_segment_length])?;
+	let matrix_positions = emitter.intermediate(DType::I32, matrix_shape.clone())?;
+	let grouped = emitter.intermediate(DType::F32, matrix_shape)?;
+	let reduction_axes =
+		AxisSet::new(vec![1]).map_err(|error| language_error(request.descriptor.id, error.to_string()))?;
+	emitter.emit_stage([
+		KernelEmission {
+			inputs: vec![values.id, sorted_original_indices],
+			outputs: vec![sorted_values],
+			kind: checked_gather(0),
+		},
+		KernelEmission {
+			inputs: vec![sorted_ids, positions, segment_starts],
+			outputs: vec![destinations],
+			kind: PrimitiveKind::Elementwise(Elementwise {
+				program: segment_destination_program(request, segments, maximum_segment_length)?,
+			}),
+		},
+		KernelEmission {
+			inputs: Vec::new(),
+			outputs: vec![packed_positions],
+			kind: PrimitiveKind::IndexMap(IndexMap {
+				start: 0,
+				element_step: 1,
+				iteration_step: 0,
+				modulus: None,
+			}),
+		},
+		KernelEmission {
+			inputs: vec![packed_positions],
+			outputs: vec![zero_base],
+			kind: PrimitiveKind::Elementwise(Elementwise {
+				program: zero_from_i32_program(request)?,
+			}),
+		},
+		KernelEmission {
+			inputs: vec![zero_base, destinations, sorted_values],
+			outputs: vec![packed],
+			kind: checked_unique_scatter(0),
+		},
+		KernelEmission {
+			inputs: Vec::new(),
+			outputs: vec![matrix_positions],
+			kind: PrimitiveKind::IndexMap(IndexMap {
+				start: 0,
+				element_step: 1,
+				iteration_step: 0,
+				modulus: None,
+			}),
+		},
+		KernelEmission {
+			inputs: vec![packed, matrix_positions],
+			outputs: vec![grouped],
+			kind: checked_gather(0),
+		},
+		KernelEmission {
+			inputs: vec![grouped],
+			outputs: vec![sums.id],
+			kind: PrimitiveKind::Reduce(Reduce {
+				operator: ReduceOperator::Sum,
+				axes: reduction_axes,
+				keep_dimensions: false,
+				result: ReduceResult::Value,
+				tree_lanes,
+			}),
+		},
+	])
+}
+
 fn emit_topk_per_row(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
 	require_exact_abi(
 		request,
@@ -267,15 +454,9 @@ fn emit_topk_per_row(request: &MaterializationRequest<'_>, emitter: &mut Emitter
 	let rows = positive_parameter(request, "rows")?;
 	let columns = positive_parameter(request, "columns")?;
 	let k = positive_parameter(request, "k")?;
-	match (k <= columns, k <= 64) {
-		(true, true) => Ok(()),
-		(false, true) | (false, false) => Err(request_error(request, "k must not exceed columns")),
-		(true, false) => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::UnsupportedConcreteShape,
-			"legacy gpu_topk_per_row has a fixed 64-entry local ordering buffer",
-		)),
-	}?;
+	if k > columns {
+		return Err(request_error(request, "k must not exceed columns"));
+	}
 	require_i32_indexable(request, columns, "column count")?;
 	require_true(request, "prefix_indices_verified")?;
 	require_dtype(request, values, DType::F32, "values")?;
@@ -879,6 +1060,154 @@ fn checked_product(request: &MaterializationRequest<'_>, left: u64, right: u64, 
 			format!("{label} overflowed u64"),
 		)
 	})
+}
+
+fn materialized_shape(request: &MaterializationRequest<'_>, extents: &[u64]) -> OperationResult<Shape> {
+	Shape::new(extents.to_vec()).map_err(|error| language_error(request.descriptor.id, error.to_string()))
+}
+
+fn segment_boundary_program(request: &MaterializationRequest<'_>) -> OperationResult<recipe_core::ScalarProgram> {
+	let operation = request.descriptor.id;
+	let mut builder = scalar_builder(operation)?;
+	let current = scalar_input(operation, &mut builder, DType::I32)?;
+	let previous = scalar_input(operation, &mut builder, DType::I32)?;
+	let position = scalar_input(operation, &mut builder, DType::I32)?;
+	let zero = builder
+		.i32(0)
+		.map_err(|error| language_error(operation, error.to_string()))?;
+	let first = scalar_binary(operation, &mut builder, ScalarOpcode::Equal, position, zero)?;
+	let changed = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::NotEqual,
+		current,
+		previous,
+	)?;
+	let boundary = scalar_binary(operation, &mut builder, ScalarOpcode::BitOr, first, changed)?;
+	let start = scalar_ternary(
+		operation,
+		&mut builder,
+		ScalarOpcode::Select,
+		boundary,
+		position,
+		zero,
+	)?;
+	scalar_finish(operation, builder, &[start])
+}
+
+fn segment_destination_program(
+	request: &MaterializationRequest<'_>,
+	segments: u64,
+	maximum_segment_length: u64,
+) -> OperationResult<recipe_core::ScalarProgram> {
+	let operation = request.descriptor.id;
+	let segments = i32::try_from(segments).map_err(|error| request_error(request, error.to_string()))?;
+	let maximum_segment_length =
+		i32::try_from(maximum_segment_length).map_err(|error| request_error(request, error.to_string()))?;
+	let mut builder = scalar_builder(operation)?;
+	let segment = scalar_input(operation, &mut builder, DType::I32)?;
+	let position = scalar_input(operation, &mut builder, DType::I32)?;
+	let start = scalar_input(operation, &mut builder, DType::I32)?;
+	let zero = builder
+		.i32(0)
+		.map_err(|error| language_error(operation, error.to_string()))?;
+	let segment_limit = builder
+		.i32(segments)
+		.map_err(|error| language_error(operation, error.to_string()))?;
+	let length_limit = builder
+		.i32(maximum_segment_length)
+		.map_err(|error| language_error(operation, error.to_string()))?;
+	let local = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::Subtract,
+		position,
+		start,
+	)?;
+	let segment_nonnegative = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::GreaterThanOrEqual,
+		segment,
+		zero,
+	)?;
+	let segment_bounded = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::LessThan,
+		segment,
+		segment_limit,
+	)?;
+	let local_nonnegative = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::GreaterThanOrEqual,
+		local,
+		zero,
+	)?;
+	let local_bounded = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::LessThan,
+		local,
+		length_limit,
+	)?;
+	let valid_segment = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::BitAnd,
+		segment_nonnegative,
+		segment_bounded,
+	)?;
+	let valid_local = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::BitAnd,
+		local_nonnegative,
+		local_bounded,
+	)?;
+	let valid = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::BitAnd,
+		valid_segment,
+		valid_local,
+	)?;
+	scalar_unary(operation, &mut builder, ScalarOpcode::Require, valid)?;
+	let base = scalar_binary(
+		operation,
+		&mut builder,
+		ScalarOpcode::Multiply,
+		segment,
+		length_limit,
+	)?;
+	let destination = scalar_binary(operation, &mut builder, ScalarOpcode::Add, base, local)?;
+	scalar_finish(operation, builder, &[destination])
+}
+
+fn zero_from_i32_program(request: &MaterializationRequest<'_>) -> OperationResult<recipe_core::ScalarProgram> {
+	let operation = request.descriptor.id;
+	let mut builder = scalar_builder(operation)?;
+	let position = scalar_input(operation, &mut builder, DType::I32)?;
+	let consumed = scalar_unary(
+		operation,
+		&mut builder,
+		ScalarOpcode::ConvertI32ToF32,
+		position,
+	)?;
+	let zero = scalar_f32(operation, &mut builder, 0.0)?;
+	let always = builder
+		.i32(1)
+		.map_err(|error| language_error(operation, error.to_string()))?;
+	let cleared = scalar_ternary(
+		operation,
+		&mut builder,
+		ScalarOpcode::Select,
+		always,
+		zero,
+		consumed,
+	)?;
+	scalar_finish(operation, builder, &[cleared])
 }
 
 fn require_i32_indexable(request: &MaterializationRequest<'_>, extent: u64, label: &str) -> OperationResult<()> {

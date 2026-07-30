@@ -6,7 +6,7 @@ use recipe_language::{
 
 use crate::model::*;
 
-const HASH_DOMAIN: &[u8] = b"recipe-lowered-primitive-program-v1\0";
+const HASH_DOMAIN: &[u8] = b"recipe-lowered-primitive-program-v2\0";
 
 pub(crate) fn program_digest(program: &LoweredProgram) -> ProgramDigest {
 	let mut writer = CanonicalWriter::default();
@@ -426,6 +426,10 @@ impl CanonicalWriter {
 		self.dtype(value.dtype);
 		self.u64(value.output_elements);
 		self.u64(value.contracted_elements);
+		self.tag(match value.strategy {
+			ContractionStrategy::Direct => 0,
+			ContractionStrategy::Staged => 1,
+		});
 		self.u32(value.tile.output_x);
 		self.u32(value.tile.output_y);
 		self.u32(value.tile.reduction);

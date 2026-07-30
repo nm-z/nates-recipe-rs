@@ -795,6 +795,7 @@ dependencies = [
 name = "recipe"
 version = "0.1.1"
 dependencies = [
+ "libc",
  "proc-macro2",
  "recipe-cluster",
  "recipe-core",
@@ -887,6 +888,7 @@ dependencies = [
  "csv",
  "quick-xml",
  "recipe-core",
+ "recipe-ogdl",
  "serde",
  "serde_json",
  "sha2",
@@ -1056,6 +1058,7 @@ dependencies = [
  "recipe-probe",
  "recipe-program",
  "rustix",
+ "sha2",
 ]
 
 [[package]]

@@ -3,7 +3,7 @@ use std::error::Error;
 
 use recipe_core::{ByteCount, DType, KernelTemplateId, ScalarLiteral, ScalarOpcode, ValueId};
 use recipe_language::{AtomicOperation, PrimitiveKind, ReduceOperator, ReduceResult, ScatterConflict, Shape, Tensor};
-use recipe_primitives::{ReductionTieBreak, StageKind};
+use recipe_primitives::{LoweringHardware, ReductionTieBreak, StageKind};
 
 use crate::{
 	IdentityNamespace, MaterializationRequest, NamedTensor, OperationErrorKind, PreparedParameter,
@@ -650,7 +650,15 @@ fn materializes_channelwise_nonoverlapping_max_pool_with_short_tail_and_global_w
 		.iter()
 		.map(|tensor| (tensor.id, tensor))
 		.collect::<BTreeMap<_, _>>();
-	let lowered = recipe_primitives::lower(&reduction.kernel, &tensors)?;
+	let lowered = recipe_primitives::lower(
+		&reduction.kernel,
+		&tensors,
+		LoweringHardware {
+			subgroup_lanes: 32,
+			maximum_workgroup_lanes: 256,
+			maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
+		},
+	)?;
 	assert!(lowered.stages.iter().all(|stage| match &stage.kind {
 		StageKind::FixedTreeReduce(stage) => stage.tie_break == ReductionTieBreak::LowestLogicalIndex,
 		_ => false,

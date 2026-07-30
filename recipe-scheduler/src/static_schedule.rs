@@ -669,22 +669,28 @@ fn resource_conflict_end(
 	candidate: ScheduleWindow,
 	reservations: &BTreeMap<Resource, Vec<ScheduleWindow>>,
 ) -> Option<Nanoseconds> {
-	reservations
-		.iter()
-		.filter(|(reserved, _)| resources_conflict(resource, **reserved))
-		.flat_map(|(_, windows)| windows)
-		.filter(|window| window.overlaps(candidate))
-		.map(|window| window.end)
-		.max()
-}
-
-fn resources_conflict(first: Resource, second: Resource) -> bool {
-	match (first, second) {
-		(
-			Resource::HalfDuplexDirection(first_resource, first_direction),
-			Resource::HalfDuplexDirection(second_resource, second_direction),
-		) => first_resource == second_resource && first_direction != second_direction,
-		_ => first == second,
+	match resource {
+		Resource::HalfDuplexDirection(capacity, direction) => reservations
+			.iter()
+			.filter_map(|(reserved, windows)| match reserved {
+				Resource::HalfDuplexDirection(reserved_capacity, reserved_direction)
+					if *reserved_capacity == capacity && *reserved_direction != direction =>
+				{
+					Some(windows)
+				}
+				_ => None,
+			})
+			.flatten()
+			.filter(|window| window.overlaps(candidate))
+			.map(|window| window.end)
+			.max(),
+		_ => reservations
+			.get(&resource)
+			.into_iter()
+			.flatten()
+			.filter(|window| window.overlaps(candidate))
+			.map(|window| window.end)
+			.max(),
 	}
 }
 
@@ -805,6 +811,9 @@ mod tests {
 						rate: measured(FlopsPerSecond::new(100).unwrap()),
 						asynchronous_submission: true,
 						maximum_concurrent_tasks: 2,
+						subgroup_lanes: 32,
+						maximum_workgroup_lanes: 256,
+						maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
 					}),
 				},
 				DiscoveredDevice {

@@ -7,7 +7,14 @@
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 
-use recipe_ingest::{PreparedDataset, VectorSchema};
+use recipe_ingest::{
+	PreparedDataset, PreparedValues, PreparedVector, SemanticType, VectorEncoding, VectorMetadata, VectorRole,
+	VectorSchema,
+};
+
+use crate::{TrainingCompileError, TrainingCompileErrorKind, TrainingCompileResult};
+
+pub const CATEGORICAL_BAYES_SMOOTHING: f32 = 1.0;
 
 /// One Bayesian child declaration in user order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,6 +188,598 @@ impl ResolvedBayesianSchema {
 			.ok()
 			.map(BayesianNodeId)
 	}
+}
+
+/// Exact categorical identity retained for one observed Bayesian node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BayesianCategoricalSchema {
+	pub(crate) source_index: usize,
+	pub(crate) name: Vec<u8>,
+	pub(crate) dictionary: Vec<Vec<u8>>,
+}
+
+impl BayesianCategoricalSchema {
+	#[must_use]
+	pub const fn source_index(&self) -> usize {
+		self.source_index
+	}
+
+	#[must_use]
+	pub fn name(&self) -> &[u8] {
+		&self.name
+	}
+
+	#[must_use]
+	pub fn dictionary(&self) -> &[Vec<u8>] {
+		&self.dictionary
+	}
+
+	#[must_use]
+	pub fn inference_cardinality(&self) -> Option<usize> {
+		self.dictionary.len().checked_add(1)
+	}
+}
+
+/// Saved observations for one executable categorical Bayesian conditional.
+///
+/// One declared categorical target is conditioned on one or more declared
+/// categorical feature parents. Codes remain row-major in parent declaration
+/// order. The artifact stores observations rather than host-computed counts;
+/// histogramming and posterior calculation therefore remain native payload
+/// calculations at inference time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BayesianCategoricalReferenceSet {
+	pub(crate) parents: Vec<BayesianCategoricalSchema>,
+	pub(crate) child: BayesianCategoricalSchema,
+	pub(crate) reference_source_rows: Vec<usize>,
+	pub(crate) reference_rows: usize,
+	pub(crate) parent_codes: Vec<i32>,
+	pub(crate) child_codes: Vec<i32>,
+	pub(crate) parent_cardinalities: Vec<i32>,
+	pub(crate) parent_multipliers: Vec<i32>,
+	pub(crate) parent_configurations: u64,
+}
+
+impl BayesianCategoricalReferenceSet {
+	#[must_use]
+	pub fn parents(&self) -> &[BayesianCategoricalSchema] {
+		&self.parents
+	}
+
+	#[must_use]
+	pub const fn child(&self) -> &BayesianCategoricalSchema {
+		&self.child
+	}
+
+	#[must_use]
+	pub fn reference_source_rows(&self) -> &[usize] {
+		&self.reference_source_rows
+	}
+
+	#[must_use]
+	pub const fn reference_rows(&self) -> usize {
+		self.reference_rows
+	}
+
+	#[must_use]
+	pub fn parent_codes(&self) -> &[i32] {
+		&self.parent_codes
+	}
+
+	#[must_use]
+	pub fn child_codes(&self) -> &[i32] {
+		&self.child_codes
+	}
+
+	#[must_use]
+	pub fn parent_cardinalities(&self) -> &[i32] {
+		&self.parent_cardinalities
+	}
+
+	#[must_use]
+	pub fn parent_multipliers(&self) -> &[i32] {
+		&self.parent_multipliers
+	}
+
+	#[must_use]
+	pub const fn parent_configurations(&self) -> u64 {
+		self.parent_configurations
+	}
+
+	#[must_use]
+	pub fn child_classes(&self) -> usize {
+		self.child.dictionary.len()
+	}
+
+	pub(crate) fn append(&mut self, current: Self) -> TrainingCompileResult<()> {
+		if self.parents != current.parents
+			|| self.child != current.child
+			|| self.parent_cardinalities != current.parent_cardinalities
+			|| self.parent_multipliers != current.parent_multipliers
+			|| self.parent_configurations != current.parent_configurations
+		{
+			return Err(bayes_compile_error(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"saved and current categorical Bayesian schemas or declaration order differ",
+			));
+		}
+		let rows = self
+			.reference_rows
+			.checked_add(current.reference_rows)
+			.ok_or_else(|| {
+				bayes_compile_error(
+					TrainingCompileErrorKind::ArithmeticOverflow,
+					"combined categorical Bayesian reference row count overflowed usize",
+				)
+			})?;
+		self.reference_source_rows
+			.try_reserve_exact(current.reference_source_rows.len())
+			.map_err(|error| {
+				bayes_compile_error(
+					TrainingCompileErrorKind::ArithmeticOverflow,
+					format!("reserve categorical Bayesian source rows: {error}"),
+				)
+			})?;
+		self.parent_codes
+			.try_reserve_exact(current.parent_codes.len())
+			.map_err(|error| {
+				bayes_compile_error(
+					TrainingCompileErrorKind::ArithmeticOverflow,
+					format!("reserve categorical Bayesian parent observations: {error}"),
+				)
+			})?;
+		self.child_codes
+			.try_reserve_exact(current.child_codes.len())
+			.map_err(|error| {
+				bayes_compile_error(
+					TrainingCompileErrorKind::ArithmeticOverflow,
+					format!("reserve categorical Bayesian child observations: {error}"),
+				)
+			})?;
+		self.reference_source_rows
+			.extend(current.reference_source_rows);
+		self.parent_codes.extend(current.parent_codes);
+		self.child_codes.extend(current.child_codes);
+		self.reference_rows = rows;
+		validate_categorical_reference_set(self)
+	}
+}
+
+/// Prepare one or more observed categorical target conditionals without
+/// performing any host-side model calculation.
+///
+/// Declarations and data targets have the same order. Every child is a target,
+/// every parent is an inference feature, and all nodes are observed
+/// dictionary-categorical vectors. A target-as-parent edge is rejected by that
+/// role boundary; inference for dependent unobserved children is a separate
+/// instrument rather than an implied ancestral or marginal calculation.
+pub fn prepare_categorical_bayesian_reference_sets(
+	dataset: &PreparedDataset,
+	dependencies: &[BayesianDependency],
+) -> TrainingCompileResult<Vec<BayesianCategoricalReferenceSet>> {
+	let schema = resolve_bayesian_schema(dataset, dependencies).map_err(|error| {
+		bayes_compile_error(
+			TrainingCompileErrorKind::InvalidNetwork,
+			format!("resolve Bayesian DAG: {error}"),
+		)
+	})?;
+	if dependencies.is_empty() {
+		return Err(bayes_compile_error(
+			TrainingCompileErrorKind::InvalidNetwork,
+			"observed categorical Bayesian preparation requires at least one `.bayes(child, parents)` declaration",
+		));
+	}
+	if schema.nodes().iter().any(BayesianNodeSchema::is_latent) {
+		return Err(bayes_compile_error(
+			TrainingCompileErrorKind::InvalidNetwork,
+			"latent Bayesian nodes need an explicit state space and are not part of the observed categorical slice",
+		));
+	}
+	if dataset.train().is_empty() {
+		return Err(bayes_compile_error(
+			TrainingCompileErrorKind::EmptyDataset,
+			"categorical Bayesian preparation requires at least one training row",
+		));
+	}
+
+	let mut target_sources = Vec::with_capacity(dependencies.len());
+	for dependency in dependencies {
+		if dependency.parents.is_empty() {
+			return Err(bayes_compile_error(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"each observed categorical Bayesian conditional requires at least one observed parent",
+			));
+		}
+		let child = find_vector(dataset, dependency.child())?;
+		if child.role() != VectorRole::Target {
+			return Err(bayes_vector_error(
+				child,
+				"each declared Bayesian child must be a declared data target",
+			));
+		}
+		target_sources.push(child.source_index());
+	}
+	if dataset.target_source_indices() != target_sources {
+		return Err(bayes_compile_error(
+			TrainingCompileErrorKind::InvalidTargetMatrix,
+			"observed categorical Bayesian targets must equal the declared children in repeated-call order",
+		));
+	}
+
+	dependencies
+		.iter()
+		.map(|dependency| prepare_categorical_bayesian_reference_set_for_dependency(dataset, dependency))
+		.collect()
+}
+
+/// Compatibility boundary for exactly one observed categorical conditional.
+pub fn prepare_categorical_bayesian_reference_set(
+	dataset: &PreparedDataset,
+	dependencies: &[BayesianDependency],
+) -> TrainingCompileResult<BayesianCategoricalReferenceSet> {
+	let [_dependency] = dependencies else {
+		return Err(bayes_compile_error(
+			TrainingCompileErrorKind::InvalidNetwork,
+			"the first executable Bayesian slice requires exactly one `.bayes(child, parents)` declaration",
+		));
+	};
+	let mut references = prepare_categorical_bayesian_reference_sets(dataset, dependencies)?;
+	Ok(references
+		.pop()
+		.expect("one dependency produces one reference set"))
+}
+
+fn prepare_categorical_bayesian_reference_set_for_dependency(
+	dataset: &PreparedDataset,
+	dependency: &BayesianDependency,
+) -> TrainingCompileResult<BayesianCategoricalReferenceSet> {
+	let child = find_vector(dataset, dependency.child())?;
+	let child_schema = categorical_schema(child, "child")?;
+	let mut parents = Vec::with_capacity(dependency.parents().len());
+	let mut parent_vectors = Vec::with_capacity(dependency.parents().len());
+	for parent_name in dependency.parents() {
+		let parent = find_vector(dataset, parent_name)?;
+		if parent.role() != VectorRole::Feature {
+			return Err(bayes_vector_error(
+				parent,
+				"the observed categorical Bayesian slice requires every parent to be an inference feature",
+			));
+		}
+		parents.push(categorical_schema(parent, "parent")?);
+		parent_vectors.push(parent);
+	}
+
+	let mut parent_cardinalities = Vec::with_capacity(parents.len());
+	for parent in &parents {
+		let cardinality = parent.inference_cardinality().ok_or_else(|| {
+			bayes_compile_error(
+				TrainingCompileErrorKind::ArithmeticOverflow,
+				format!(
+					"Bayesian parent {:?} cardinality overflowed usize",
+					String::from_utf8_lossy(parent.name())
+				),
+			)
+		})?;
+		parent_cardinalities.push(i32::try_from(cardinality).map_err(|error| {
+			bayes_compile_error(
+				TrainingCompileErrorKind::UnsupportedExtent,
+				format!(
+					"Bayesian parent {:?} cardinality exceeds int32: {error}",
+					String::from_utf8_lossy(parent.name())
+				),
+			)
+		})?);
+	}
+	let (parent_multipliers, parent_configurations) = mixed_radix_contract(&parent_cardinalities)?;
+	let child_classes = u64::try_from(child_schema.dictionary.len()).map_err(|error| {
+		bayes_compile_error(
+			TrainingCompileErrorKind::UnsupportedExtent,
+			format!("Bayesian child class count exceeds u64: {error}"),
+		)
+	})?;
+	if child_classes == 0
+		|| parent_configurations
+			.checked_mul(child_classes)
+			.is_none_or(|bins| bins > i32::MAX as u64 || bins > u32::MAX as u64)
+	{
+		return Err(bayes_compile_error(
+			TrainingCompileErrorKind::UnsupportedExtent,
+			"categorical Bayesian joint state space is empty or exceeds the checked histogram domain",
+		));
+	}
+
+	let child_values = categorical_values(child)?;
+	let mut parent_values = Vec::with_capacity(parent_vectors.len());
+	for parent in &parent_vectors {
+		parent_values.push(categorical_values(parent)?);
+	}
+	let parent_elements = dataset
+		.train()
+		.len()
+		.checked_mul(parents.len())
+		.ok_or_else(|| {
+			bayes_compile_error(
+				TrainingCompileErrorKind::ArithmeticOverflow,
+				"categorical Bayesian reference parent shape overflowed usize",
+			)
+		})?;
+	let mut parent_codes = Vec::with_capacity(parent_elements);
+	let mut child_codes = Vec::with_capacity(dataset.train().len());
+	for (&position, &source_row) in dataset
+		.train()
+		.retained_positions()
+		.iter()
+		.zip(dataset.train().source_rows())
+	{
+		for (parent_index, (parent, values)) in parent_vectors.iter().zip(&parent_values).enumerate() {
+			parent_codes.push(require_known_code(
+				parent,
+				values,
+				position,
+				source_row,
+				parents[parent_index].dictionary.len(),
+			)?);
+		}
+		child_codes.push(require_known_code(
+			child,
+			child_values,
+			position,
+			source_row,
+			child_schema.dictionary.len(),
+		)?);
+	}
+	let references = BayesianCategoricalReferenceSet {
+		parents,
+		child: child_schema,
+		reference_source_rows: dataset.train().source_rows().to_vec(),
+		reference_rows: dataset.train().len(),
+		parent_codes,
+		child_codes,
+		parent_cardinalities,
+		parent_multipliers,
+		parent_configurations,
+	};
+	validate_categorical_reference_set(&references)?;
+	Ok(references)
+}
+
+pub(crate) fn validate_categorical_reference_set(
+	references: &BayesianCategoricalReferenceSet,
+) -> TrainingCompileResult<()> {
+	if references.parents.is_empty()
+		|| references.reference_rows == 0
+		|| references.child.dictionary.is_empty()
+		|| references.parent_cardinalities.len() != references.parents.len()
+		|| references.parent_multipliers.len() != references.parents.len()
+		|| references.child_codes.len() != references.reference_rows
+		|| references.reference_source_rows.len() != references.reference_rows
+		|| references.parent_codes.len()
+			!= references
+				.reference_rows
+				.checked_mul(references.parents.len())
+				.unwrap_or(usize::MAX)
+	{
+		return Err(bayes_compile_error(
+			TrainingCompileErrorKind::InvalidNetwork,
+			"categorical Bayesian reference shapes are inconsistent",
+		));
+	}
+	let mut names = BTreeSet::new();
+	let mut sources = BTreeSet::new();
+	for vector in references
+		.parents
+		.iter()
+		.chain(core::iter::once(&references.child))
+	{
+		if vector.name.is_empty()
+			|| vector.dictionary.is_empty()
+			|| !names.insert(vector.name.as_slice())
+			|| !sources.insert(vector.source_index)
+		{
+			return Err(bayes_compile_error(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"categorical Bayesian node names, source identities, and dictionaries must be nonempty and unique",
+			));
+		}
+		let mut labels = BTreeSet::new();
+		if vector
+			.dictionary
+			.iter()
+			.any(|label| !labels.insert(label.as_slice()))
+		{
+			return Err(bayes_compile_error(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"categorical Bayesian dictionaries must contain unique labels",
+			));
+		}
+	}
+	for (parent_index, parent) in references.parents.iter().enumerate() {
+		let cardinality = usize::try_from(references.parent_cardinalities[parent_index]).map_err(|_| {
+			bayes_compile_error(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"categorical Bayesian parent cardinality is negative",
+			)
+		})?;
+		if cardinality != parent.dictionary.len() + 1 {
+			return Err(bayes_compile_error(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"categorical Bayesian parent cardinality does not reserve exactly one unseen route",
+			));
+		}
+	}
+	let (multipliers, configurations) = mixed_radix_contract(&references.parent_cardinalities)?;
+	if multipliers != references.parent_multipliers || configurations != references.parent_configurations {
+		return Err(bayes_compile_error(
+			TrainingCompileErrorKind::InvalidNetwork,
+			"categorical Bayesian mixed-radix metadata is inconsistent",
+		));
+	}
+	for (index, code) in references.parent_codes.iter().copied().enumerate() {
+		let parent = index % references.parents.len();
+		if usize::try_from(code).map_or(true, |code| {
+			code >= references.parents[parent].dictionary.len()
+		}) {
+			return Err(bayes_compile_error(
+				TrainingCompileErrorKind::InvalidNetwork,
+				format!("categorical Bayesian parent observation {index} has invalid code {code}"),
+			));
+		}
+	}
+	if references
+		.child_codes
+		.iter()
+		.copied()
+		.any(|code| usize::try_from(code).map_or(true, |code| code >= references.child.dictionary.len()))
+	{
+		return Err(bayes_compile_error(
+			TrainingCompileErrorKind::InvalidNetwork,
+			"categorical Bayesian child observations contain an invalid class code",
+		));
+	}
+	Ok(())
+}
+
+fn find_vector<'a>(dataset: &'a PreparedDataset, name: &[u8]) -> TrainingCompileResult<&'a PreparedVector> {
+	dataset
+		.vectors()
+		.iter()
+		.find(|vector| vector.name() == name)
+		.ok_or_else(|| {
+			bayes_compile_error(
+				TrainingCompileErrorKind::InvalidNetwork,
+				format!(
+					"Bayesian node {:?} is absent from prepared data",
+					String::from_utf8_lossy(name)
+				),
+			)
+		})
+}
+
+fn categorical_schema(vector: &PreparedVector, role: &str) -> TrainingCompileResult<BayesianCategoricalSchema> {
+	let (
+		SemanticType::Categorical,
+		VectorEncoding::DictionaryI32,
+		VectorMetadata::Categorical { dictionary },
+		PreparedValues::I32(_),
+	) = (
+		vector.semantic_type(),
+		vector.encoding(),
+		vector.metadata(),
+		vector.values(),
+	)
+	else {
+		return Err(bayes_vector_error(
+			vector,
+			format!("the executable Bayesian {role} must be dictionary-encoded categorical data"),
+		));
+	};
+	if dictionary.is_empty() {
+		return Err(bayes_vector_error(
+			vector,
+			"categorical dictionary is empty",
+		));
+	}
+	Ok(BayesianCategoricalSchema {
+		source_index: vector.source_index(),
+		name: vector.name().to_vec(),
+		dictionary: dictionary.clone(),
+	})
+}
+
+fn categorical_values(vector: &PreparedVector) -> TrainingCompileResult<&[Option<i32>]> {
+	let PreparedValues::I32(values) = vector.values() else {
+		return Err(bayes_vector_error(
+			vector,
+			"categorical values are not stored as int32 codes",
+		));
+	};
+	Ok(values)
+}
+
+fn require_known_code(
+	vector: &PreparedVector,
+	values: &[Option<i32>],
+	position: usize,
+	source_row: usize,
+	classes: usize,
+) -> TrainingCompileResult<i32> {
+	let code = values
+		.get(position)
+		.ok_or_else(|| {
+			bayes_vector_error(
+				vector,
+				format!("source row {source_row} is absent from prepared storage"),
+			)
+		})?
+		.ok_or_else(|| {
+			bayes_vector_error(
+				vector,
+				format!(
+					"source row {source_row} is missing; the observed categorical slice requires complete rows"
+				),
+			)
+		})?;
+	if usize::try_from(code).map_or(true, |code| code >= classes) {
+		return Err(bayes_vector_error(
+			vector,
+			format!("source row {source_row} has out-of-dictionary code {code}"),
+		));
+	}
+	Ok(code)
+}
+
+fn mixed_radix_contract(cardinalities: &[i32]) -> TrainingCompileResult<(Vec<i32>, u64)> {
+	let mut configurations = 1_u64;
+	let mut multipliers = vec![0_i32; cardinalities.len()];
+	for (index, cardinality) in cardinalities.iter().copied().enumerate().rev() {
+		let cardinality = u64::try_from(cardinality).map_err(|_| {
+			bayes_compile_error(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"categorical Bayesian parent cardinality must be positive",
+			)
+		})?;
+		if cardinality == 0 {
+			return Err(bayes_compile_error(
+				TrainingCompileErrorKind::InvalidNetwork,
+				"categorical Bayesian parent cardinality must be positive",
+			));
+		}
+		multipliers[index] = i32::try_from(configurations).map_err(|error| {
+			bayes_compile_error(
+				TrainingCompileErrorKind::UnsupportedExtent,
+				format!("categorical Bayesian parent multiplier exceeds int32: {error}"),
+			)
+		})?;
+		configurations = configurations.checked_mul(cardinality).ok_or_else(|| {
+			bayes_compile_error(
+				TrainingCompileErrorKind::ArithmeticOverflow,
+				"categorical Bayesian parent configuration count overflowed u64",
+			)
+		})?;
+	}
+	if configurations > i32::MAX as u64 {
+		return Err(bayes_compile_error(
+			TrainingCompileErrorKind::UnsupportedExtent,
+			"categorical Bayesian parent configuration count exceeds int32",
+		));
+	}
+	Ok((multipliers, configurations))
+}
+
+fn bayes_vector_error(vector: &PreparedVector, detail: impl Into<String>) -> TrainingCompileError {
+	bayes_compile_error(
+		TrainingCompileErrorKind::InvalidTargetMatrix,
+		format!(
+			"Bayesian vector {:?} at source index {}: {}",
+			String::from_utf8_lossy(vector.name()),
+			vector.source_index(),
+			detail.into()
+		),
+	)
+}
+
+fn bayes_compile_error(kind: TrainingCompileErrorKind, detail: impl Into<String>) -> TrainingCompileError {
+	TrainingCompileError::new(kind, detail)
 }
 
 /// Typed reason a Bayesian schema could not be resolved.

@@ -572,7 +572,7 @@ fn build_cache_identity(
 	gpus: &[GpuDescriptor],
 	peers: &[(&dyn PeerSession, PeerDescriptor)],
 ) -> CacheIdentity {
-	let mut digest = CanonicalDigest::new("recipe-probe-cache-v6", PROFILE_SCHEMA);
+	let mut digest = CanonicalDigest::new("recipe-probe-cache-v7", PROFILE_SCHEMA);
 	hash_seed(&mut digest, seed);
 	hash_machine(&mut digest, &host.machine);
 	for ram in &host.ram {
@@ -630,6 +630,9 @@ fn build_cache_identity(
 		digest.bool(gpu.asynchronous_submission);
 		digest.u64(u64::from(gpu.maximum_submission_queues));
 		digest.u64(u64::from(gpu.maximum_concurrent_tasks));
+		digest.u64(u64::from(gpu.subgroup_lanes));
+		digest.u64(u64::from(gpu.maximum_workgroup_lanes));
+		digest.u64(gpu.maximum_shared_memory_per_workgroup.get());
 		digest.bool(gpu.transfer_overlaps_calculation);
 		digest.bool(gpu.duplex == LinkDuplex::Full);
 		digest.u64(u64::from(gpu.host_to_device_maximum_inflight.get()));
@@ -1189,6 +1192,9 @@ fn build_discovery(
 				rate: measurement.calculation_rate,
 				asynchronous_submission: descriptor.asynchronous_submission,
 				maximum_concurrent_tasks: descriptor.maximum_concurrent_tasks,
+				subgroup_lanes: descriptor.subgroup_lanes,
+				maximum_workgroup_lanes: descriptor.maximum_workgroup_lanes,
+				maximum_shared_memory_per_workgroup: descriptor.maximum_shared_memory_per_workgroup,
 			}),
 		});
 	}
@@ -1375,6 +1381,9 @@ mod tests {
 				asynchronous_submission: true,
 				maximum_submission_queues: 2,
 				maximum_concurrent_tasks: 2,
+				subgroup_lanes: 32,
+				maximum_workgroup_lanes: 256,
+				maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
 				transfer_overlaps_calculation: true,
 			};
 			Ok(GpuInventory {

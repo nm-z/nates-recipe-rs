@@ -12,6 +12,7 @@ pub(crate) fn unavailable_validation_line(status: ValidationMetricStatus) -> Opt
 	let family = match family {
 		ValidationMetricFamily::Binary => "binary",
 		ValidationMetricFamily::Multiclass => "multiclass",
+		ValidationMetricFamily::Regression => "regression",
 	};
 	let (reason, known_rows) = match reason {
 		ValidationUnavailableReason::NoKnownTargets => ("no-known-targets", 0),

@@ -18,6 +18,11 @@ const I32_F32_F32: &[DType] = &[DType::I32, DType::F32, DType::F32];
 const F32_OUTPUT: &[DType] = &[DType::F32];
 const I32_OUTPUT: &[DType] = &[DType::I32];
 
+/// Fixed class weight used by Recipe's parameterless focal objective.
+pub const FOCAL_ALPHA: f32 = 0.25;
+/// Fixed focusing exponent used by Recipe's parameterless focal objective.
+pub const FOCAL_GAMMA: f32 = 2.0;
+
 /// A canonical scalar recipe. Tensor broadcasting and view selection are
 /// described by the surrounding elementwise primitive, while this value fixes
 /// the per-output-element calculation.
@@ -375,6 +380,96 @@ pub fn lower_scalar(descriptor: OperationDescriptor) -> OperationResult<ScalarPr
 	Ok(program)
 }
 
+/// Canonical parameterless leaky-ReLU forward program used by Recipe models.
+pub fn canonical_leaky_relu_program() -> OperationResult<ScalarProgram> {
+	let mut composer = Composer::new();
+	let value = composer.input(DType::F32)?;
+	let alpha = composer.f32(0.01)?;
+	let output = leaky_relu(&mut composer, value, alpha)?;
+	composer.finish(&[output])
+}
+
+/// Canonical parameterless leaky-ReLU backward program used by Recipe models.
+pub fn canonical_leaky_relu_backward_program() -> OperationResult<ScalarProgram> {
+	let mut composer = Composer::new();
+	let gradient = composer.input(DType::F32)?;
+	let value = composer.input(DType::F32)?;
+	let alpha = composer.f32(0.01)?;
+	let output = leaky_relu_backward(&mut composer, gradient, value, alpha)?;
+	composer.finish(&[output])
+}
+
+/// Canonical PReLU forward program. The second input is one learned scalar
+/// broadcast over the activation tensor by the enclosing elementwise node.
+pub fn canonical_prelu_program() -> OperationResult<ScalarProgram> {
+	let mut composer = Composer::new();
+	let value = composer.input(DType::F32)?;
+	let alpha = composer.input(DType::F32)?;
+	let output = leaky_relu(&mut composer, value, alpha)?;
+	composer.finish(&[output])
+}
+
+/// Canonical PReLU backward program.
+///
+/// The first output is the input gradient. The second is the per-element
+/// contribution to the learned scalar gradient; the model compiler reduces it
+/// over the complete logical training partition before optimizer clipping.
+pub fn canonical_prelu_backward_program() -> OperationResult<ScalarProgram> {
+	let mut composer = Composer::new();
+	let gradient = composer.input(DType::F32)?;
+	let value = composer.input(DType::F32)?;
+	let alpha = composer.input(DType::F32)?;
+	let input_gradient = leaky_relu_backward(&mut composer, gradient, value, alpha)?;
+	let zero = composer.f32(0.0)?;
+	let positive = composer.binary(ScalarOpcode::GreaterThan, value, zero)?;
+	let negative_value = composer.ternary(ScalarOpcode::Select, positive, zero, value)?;
+	let alpha_gradient = composer.binary(ScalarOpcode::Multiply, gradient, negative_value)?;
+	composer.finish(&[input_gradient, alpha_gradient])
+}
+
+/// Canonical parameterless ELU forward program with alpha equal to one.
+pub fn canonical_elu_program() -> OperationResult<ScalarProgram> {
+	let mut composer = Composer::new();
+	let value = composer.input(DType::F32)?;
+	let alpha = composer.f32(1.0)?;
+	let output = elu(&mut composer, value, alpha)?;
+	composer.finish(&[output])
+}
+
+/// Canonical parameterless ELU backward program with alpha equal to one.
+pub fn canonical_elu_backward_program() -> OperationResult<ScalarProgram> {
+	let mut composer = Composer::new();
+	let gradient = composer.input(DType::F32)?;
+	let value = composer.input(DType::F32)?;
+	let alpha = composer.f32(1.0)?;
+	let output = elu_backward(&mut composer, gradient, value, alpha)?;
+	composer.finish(&[output])
+}
+
+/// Canonical self-normalizing SELU forward program.
+pub fn canonical_selu_program() -> OperationResult<ScalarProgram> {
+	let mut composer = Composer::new();
+	let value = composer.input(DType::F32)?;
+	let alpha = composer.f32(1.673_263_2)?;
+	let lambda = composer.f32(1.050_701)?;
+	let activated = elu(&mut composer, value, alpha)?;
+	let output = composer.binary(ScalarOpcode::Multiply, lambda, activated)?;
+	composer.finish(&[output])
+}
+
+/// Canonical self-normalizing SELU backward program.
+pub fn canonical_selu_backward_program() -> OperationResult<ScalarProgram> {
+	let mut composer = Composer::new();
+	let gradient = composer.input(DType::F32)?;
+	let value = composer.input(DType::F32)?;
+	let alpha = composer.f32(1.673_263_2)?;
+	let lambda = composer.f32(1.050_701)?;
+	let derivative = elu_derivative(&mut composer, value, alpha)?;
+	let scaled = composer.binary(ScalarOpcode::Multiply, lambda, derivative)?;
+	let output = composer.binary(ScalarOpcode::Multiply, gradient, scaled)?;
+	composer.finish(&[output])
+}
+
 pub(crate) fn binary_cross_entropy_with_logits_program() -> OperationResult<ScalarProgram> {
 	let mut composer = Composer::new();
 	let logit = composer.input(DType::F32)?;
@@ -398,6 +493,62 @@ pub(crate) fn binary_cross_entropy_with_logits_program() -> OperationResult<Scal
 	let loss = composer.binary(ScalarOpcode::Subtract, softplus, weighted_logit)?;
 	let sigmoid = composer.inline_math(MathFunction::Sigmoid, &[logit])?;
 	let gradient = composer.binary(ScalarOpcode::Subtract, sigmoid, target)?;
+	composer.finish(&[loss, gradient])
+}
+
+/// Canonical binary focal loss evaluated directly from logits.
+///
+/// Recipe's public focal objective is parameterless, so it retains the
+/// historical alpha of 0.25 and gamma of 2.0. Targets must be exact zero or
+/// one. The program uses `sigmoid(-signed_logit)` and
+/// `softplus(-signed_logit)` so it never forms `log(sigmoid(logit))` by
+/// subtracting a rounded probability from one.
+pub fn canonical_focal_with_logits_program() -> OperationResult<ScalarProgram> {
+	let mut composer = Composer::new();
+	let logit = composer.input(DType::F32)?;
+	let target = composer.input(DType::F32)?;
+
+	let target_is_finite = composer.unary(ScalarOpcode::IsFinite, target)?;
+	composer.unary(ScalarOpcode::Require, target_is_finite)?;
+	let zero = composer.f32(0.0)?;
+	let one = composer.f32(1.0)?;
+	let target_is_zero = composer.binary(ScalarOpcode::Equal, target, zero)?;
+	let target_is_one = composer.binary(ScalarOpcode::Equal, target, one)?;
+	let target_is_binary = composer.binary(ScalarOpcode::BitOr, target_is_zero, target_is_one)?;
+	composer.unary(ScalarOpcode::Require, target_is_binary)?;
+
+	let negative_logit = composer.unary(ScalarOpcode::Negate, logit)?;
+	let signed_logit = composer.ternary(ScalarOpcode::Select, target_is_one, logit, negative_logit)?;
+	let negative_signed_logit = composer.unary(ScalarOpcode::Negate, signed_logit)?;
+	let target_probability = composer.inline_math(MathFunction::Sigmoid, &[signed_logit])?;
+	let focusing_weight = composer.inline_math(MathFunction::Sigmoid, &[negative_signed_logit])?;
+	let negative_log_probability = composer.inline_math(MathFunction::Softplus, &[negative_signed_logit])?;
+
+	let focusing_weight_squared = composer.binary(ScalarOpcode::Multiply, focusing_weight, focusing_weight)?;
+	let alpha = composer.f32(FOCAL_ALPHA)?;
+	let weighted_focus = composer.binary(ScalarOpcode::Multiply, alpha, focusing_weight_squared)?;
+	let loss = composer.binary(
+		ScalarOpcode::Multiply,
+		weighted_focus,
+		negative_log_probability,
+	)?;
+
+	let probability_log = composer.binary(
+		ScalarOpcode::Multiply,
+		target_probability,
+		negative_log_probability,
+	)?;
+	let gamma = composer.f32(FOCAL_GAMMA)?;
+	let focused_probability_log = composer.binary(ScalarOpcode::Multiply, gamma, probability_log)?;
+	let gradient_factor = composer.binary(ScalarOpcode::Add, focused_probability_log, focusing_weight)?;
+	let gradient_magnitude = composer.binary(ScalarOpcode::Multiply, weighted_focus, gradient_factor)?;
+	let negative_gradient = composer.unary(ScalarOpcode::Negate, gradient_magnitude)?;
+	let gradient = composer.ternary(
+		ScalarOpcode::Select,
+		target_is_one,
+		negative_gradient,
+		gradient_magnitude,
+	)?;
 	composer.finish(&[loss, gradient])
 }
 

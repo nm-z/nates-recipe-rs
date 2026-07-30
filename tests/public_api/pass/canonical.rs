@@ -1,6 +1,7 @@
 #![allow(dead_code)]
+#![deny(unused_must_use)]
 
-pub fn canonical_declarations_compile() {
+pub fn canonical_declarations_compile() -> Result<(), Box<dyn std::error::Error>> {
 	let data = recipe::recipe
 		.data(["train.csv", "more.zip"])
 		.set("images")
@@ -19,7 +20,6 @@ pub fn canonical_declarations_compile() {
 		.grad(recipe::clip(1.0));
 	let train = recipe::recipe
 		.train()
-		.batch(0.25)
 		.epochs(1)
 		.lr(0.0002)
 		.cos()
@@ -30,25 +30,28 @@ pub fn canonical_declarations_compile() {
 		.infer()
 		.log(recipe::Time)
 		.log([recipe::Time, recipe::Device]);
-	let _ = infer.evaluate();
+	let _inference_policy = infer;
 	let _knn = recipe::recipe.model().knn(3);
-	let _residual = recipe::recipe.model()
+	let _residual = recipe::recipe
+		.model()
 		.residual([recipe::layer(64), recipe::relu()]);
-	let _ = recipe::compile_training(&train, &data, &model);
+	let _logarithms = recipe::recipe.model().layer(4).log().layer(4).ln();
+	let _training = recipe::compile_training(&train, &data, &model)?;
+	Ok(())
 }
 
-pub fn canonical_sequence_compiles() {
+pub fn canonical_sequence_compiles() -> Result<(), Box<dyn std::error::Error>> {
 	recipe::recipe.data("train.csv").target("label").split(0.8);
 	recipe::recipe.model().layer(1).loss(recipe::mse);
-	recipe::recipe
+	let _report = recipe::recipe
 		.train()
-		.batch(0.5)
 		.epochs(1)
 		.lr(0.001)
 		.exp()
-		.run()
-		.save("model.ogdl");
+		.save("model.ogdl")
+		.run()?;
 	recipe::recipe.data("inference.csv");
 	recipe::recipe.model().load("model.ogdl");
-	let _ = recipe::recipe.infer().evaluate();
+	let _inference = recipe::recipe.infer().evaluate()?;
+	Ok(())
 }

@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fmt;
 use std::num::NonZeroU64;
 
 use crate::error::{ValidationCode, ValidationResult, Validator};
@@ -17,47 +18,52 @@ pub enum RunPhase {
 	Exit,
 }
 
-/// Exact number of times the immutable loop task graph executes.
+/// Declared lifetime of the immutable loop task graph.
 ///
-/// One is the compatibility default. Zero is deliberately unrepresentable:
-/// every finalized run enters its loop at least once before exit.
+/// A finite loop executes an exact nonzero number of iterations. An unbounded
+/// loop has no invented terminal iteration and may leave the loop only through
+/// an explicit graceful-stop boundary or failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LoopIterations(u64);
+pub enum LoopIterations {
+	Finite(NonZeroU64),
+	Unbounded,
+}
 
 impl LoopIterations {
-	pub const ONE: Self = Self(1);
+	pub const ONE: Self = Self::Finite(NonZeroU64::MIN);
+	pub const UNBOUNDED: Self = Self::Unbounded;
 
 	#[must_use]
 	pub const fn new(iterations: u64) -> Option<Self> {
-		match iterations {
-			0 => None,
-			_ => Some(Self(iterations)),
+		match NonZeroU64::new(iterations) {
+			Some(iterations) => Some(Self::Finite(iterations)),
+			None => None,
 		}
 	}
 
 	#[must_use]
-	pub const fn get(self) -> u64 {
-		self.0
+	pub const fn finite(self) -> Option<NonZeroU64> {
+		match self {
+			Self::Finite(iterations) => Some(iterations),
+			Self::Unbounded => None,
+		}
+	}
+
+	#[must_use]
+	pub const fn is_unbounded(self) -> bool {
+		matches!(self, Self::Unbounded)
 	}
 
 	#[must_use]
 	pub const fn from_nonzero(iterations: NonZeroU64) -> Self {
-		Self(iterations.get())
-	}
-
-	#[must_use]
-	pub const fn as_nonzero(self) -> NonZeroU64 {
-		match NonZeroU64::new(self.0) {
-			Some(iterations) => iterations,
-			None => unreachable!(),
-		}
+		Self::Finite(iterations)
 	}
 
 	#[must_use]
 	pub const fn iteration(self, index: u64) -> Option<LoopIteration> {
-		match index < self.0 {
-			true => Some(LoopIteration { index, total: self }),
-			false => None,
+		match self {
+			Self::Finite(iterations) if index >= iterations.get() => None,
+			Self::Finite(_) | Self::Unbounded => Some(LoopIteration { index, total: self }),
 		}
 	}
 }
@@ -71,6 +77,15 @@ impl Default for LoopIterations {
 impl From<NonZeroU64> for LoopIterations {
 	fn from(iterations: NonZeroU64) -> Self {
 		Self::from_nonzero(iterations)
+	}
+}
+
+impl fmt::Display for LoopIterations {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Finite(iterations) => iterations.fmt(formatter),
+			Self::Unbounded => formatter.write_str("unbounded"),
+		}
 	}
 }
 
@@ -93,15 +108,21 @@ impl LoopIteration {
 	}
 }
 
-/// One nonempty arithmetic progression within a bounded loop.
+/// One nonempty arithmetic progression within a finite or unbounded loop.
 ///
 /// Domains are zero-based and half-open. They select submissions without
 /// unrolling the immutable task graph or allocating per iteration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IterationDomain {
 	first: u64,
-	end_exclusive: u64,
+	end: IterationEnd,
 	stride: NonZeroU64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum IterationEnd {
+	Exclusive(u64),
+	Unbounded,
 }
 
 impl IterationDomain {
@@ -115,17 +136,36 @@ impl IterationDomain {
 		}
 		Some(Self {
 			first,
-			end_exclusive,
+			end: IterationEnd::Exclusive(end_exclusive),
+			stride,
+		})
+	}
+
+	#[must_use]
+	pub const fn unbounded(first: u64, stride: u64) -> Option<Self> {
+		let Some(stride) = NonZeroU64::new(stride) else {
+			return None;
+		};
+		Some(Self {
+			first,
+			end: IterationEnd::Unbounded,
 			stride,
 		})
 	}
 
 	#[must_use]
 	pub const fn every(iterations: LoopIterations) -> Self {
-		Self {
-			first: 0,
-			end_exclusive: iterations.get(),
-			stride: NonZeroU64::MIN,
+		match iterations {
+			LoopIterations::Finite(iterations) => Self {
+				first: 0,
+				end: IterationEnd::Exclusive(iterations.get()),
+				stride: NonZeroU64::MIN,
+			},
+			LoopIterations::Unbounded => Self {
+				first: 0,
+				end: IterationEnd::Unbounded,
+				stride: NonZeroU64::MIN,
+			},
 		}
 	}
 
@@ -133,14 +173,17 @@ impl IterationDomain {
 	pub const fn first() -> Self {
 		Self {
 			first: 0,
-			end_exclusive: 1,
+			end: IterationEnd::Exclusive(1),
 			stride: NonZeroU64::MIN,
 		}
 	}
 
 	#[must_use]
 	pub const fn periodic(offset: u64, period: NonZeroU64, iterations: LoopIterations) -> Option<Self> {
-		Self::new(offset, iterations.get(), period.get())
+		match iterations {
+			LoopIterations::Finite(iterations) => Self::new(offset, iterations.get(), period.get()),
+			LoopIterations::Unbounded => Self::unbounded(offset, period.get()),
+		}
 	}
 
 	#[must_use]
@@ -149,8 +192,16 @@ impl IterationDomain {
 	}
 
 	#[must_use]
-	pub const fn end_exclusive(self) -> u64 {
-		self.end_exclusive
+	pub const fn end_exclusive(self) -> Option<u64> {
+		match self.end {
+			IterationEnd::Exclusive(end) => Some(end),
+			IterationEnd::Unbounded => None,
+		}
+	}
+
+	#[must_use]
+	pub const fn is_unbounded(self) -> bool {
+		matches!(self.end, IterationEnd::Unbounded)
 	}
 
 	#[must_use]
@@ -161,13 +212,22 @@ impl IterationDomain {
 	#[must_use]
 	pub const fn contains(self, iteration: u64) -> bool {
 		iteration >= self.first
-			&& iteration < self.end_exclusive
-			&& (iteration - self.first).is_multiple_of(self.stride.get())
+			&& match self.end {
+				IterationEnd::Exclusive(end) => iteration < end,
+				IterationEnd::Unbounded => true,
+			} && (iteration - self.first).is_multiple_of(self.stride.get())
 	}
 
 	#[must_use]
 	pub const fn is_within(self, iterations: LoopIterations) -> bool {
-		self.first < self.end_exclusive && self.end_exclusive <= iterations.get()
+		match (self.end, iterations) {
+			(IterationEnd::Exclusive(end), LoopIterations::Finite(iterations)) => {
+				self.first < end && end <= iterations.get()
+			}
+			(IterationEnd::Exclusive(end), LoopIterations::Unbounded) => self.first < end,
+			(IterationEnd::Unbounded, LoopIterations::Unbounded) => true,
+			(IterationEnd::Unbounded, LoopIterations::Finite(_)) => false,
+		}
 	}
 }
 
@@ -181,7 +241,7 @@ pub struct LoopTaskDomain {
 	pub domain: IterationDomain,
 }
 
-/// Complete bounded activation schedule supplied to Finalize.
+/// Complete activation schedule supplied to Finalize.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoopSchedule {
 	iterations: LoopIterations,
@@ -565,16 +625,22 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn loop_iterations_are_nonzero_bounded_and_zero_based() {
+	fn loop_iterations_are_nonzero_or_explicitly_unbounded_and_zero_based() {
 		assert_eq!(LoopIterations::new(0), None);
 		assert_eq!(LoopIterations::default(), LoopIterations::ONE);
 
 		let iterations = LoopIterations::new(4).unwrap();
-		assert_eq!(iterations.get(), 4);
+		assert_eq!(iterations.finite().map(NonZeroU64::get), Some(4));
 		assert_eq!(iterations.iteration(0).unwrap().index(), 0);
 		assert_eq!(iterations.iteration(3).unwrap().index(), 3);
 		assert_eq!(iterations.iteration(3).unwrap().total(), iterations);
 		assert_eq!(iterations.iteration(4), None);
+
+		let unbounded = LoopIterations::UNBOUNDED;
+		assert_eq!(unbounded.finite(), None);
+		assert_eq!(unbounded.iteration(u64::MAX).unwrap().index(), u64::MAX);
+		assert!(IterationDomain::every(unbounded).is_unbounded());
+		assert!(IterationDomain::every(unbounded).contains(u64::MAX));
 	}
 
 	#[test]

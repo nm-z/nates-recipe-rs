@@ -12,15 +12,6 @@ use recipe_language::{
 use crate::error::{LoweringError, LoweringErrorKind, LoweringResult};
 use crate::model::*;
 
-const MAP_WORKGROUP_LANES: u32 = 64;
-const INDEX_WORKGROUP_LANES: u32 = 64;
-const SORT_WORKGROUP_LANES: u32 = 128;
-const CONTRACTION_TILE: ContractionTile = ContractionTile {
-	output_x: 16,
-	output_y: 16,
-	reduction: 16,
-};
-
 #[derive(Debug)]
 struct StageDraft {
 	geometry: DispatchGeometry,
@@ -55,9 +46,14 @@ macro_rules! push_stage {
 	};
 }
 
-pub fn lower(kernel: &PrimitiveKernel, tensors: &BTreeMap<ValueId, &Tensor>) -> LoweringResult<LoweredProgram> {
+pub fn lower(
+	kernel: &PrimitiveKernel,
+	tensors: &BTreeMap<ValueId, &Tensor>,
+	hardware: LoweringHardware,
+) -> LoweringResult<LoweredProgram> {
+	validate_hardware(kernel, hardware)?;
 	kernel.validate(tensors).map_err(LoweringError::from)?;
-	let mut builder = ProgramBuilder::new(kernel.id);
+	let mut builder = ProgramBuilder::new(kernel.id, hardware);
 	for value in kernel.inputs.iter().chain(&kernel.outputs) {
 		let tensor = tensor(tensors, *value, kernel.id)?;
 		builder.add_tensor(tensor)?;
@@ -94,6 +90,22 @@ pub fn lower(kernel: &PrimitiveKernel, tensors: &BTreeMap<ValueId, &Tensor>) -> 
 	)
 }
 
+fn validate_hardware(kernel: &PrimitiveKernel, hardware: LoweringHardware) -> LoweringResult<()> {
+	let valid = hardware.subgroup_lanes != 0
+		&& hardware.subgroup_lanes.is_power_of_two()
+		&& hardware.maximum_workgroup_lanes >= hardware.subgroup_lanes
+		&& hardware.maximum_shared_memory_per_workgroup.get() != 0;
+	if valid {
+		Ok(())
+	} else {
+		Err(LoweringError::new(
+			LoweringErrorKind::InvalidLoweredProgram,
+			format!("invalid measured lowering hardware limits: {hardware:?}"),
+		)
+		.for_kernel(kernel.id))
+	}
+}
+
 fn tensor<'a>(
 	tensors: &'a BTreeMap<ValueId, &Tensor>,
 	value: ValueId,
@@ -112,6 +124,7 @@ fn tensor<'a>(
 #[derive(Debug)]
 struct ProgramBuilder {
 	kernel: recipe_core::KernelTemplateId,
+	hardware: LoweringHardware,
 	buffers: Vec<ProgramBuffer>,
 	tensor_buffers: BTreeMap<ValueId, BufferId>,
 	stages: Vec<ProgramStage>,
@@ -120,15 +133,34 @@ struct ProgramBuilder {
 }
 
 impl ProgramBuilder {
-	fn new(kernel: recipe_core::KernelTemplateId) -> Self {
+	fn new(kernel: recipe_core::KernelTemplateId, hardware: LoweringHardware) -> Self {
 		Self {
 			kernel,
+			hardware,
 			buffers: Vec::new(),
 			tensor_buffers: BTreeMap::new(),
 			stages: Vec::new(),
 			scratch_ordinal: 0,
 			fault_buffer: None,
 		}
+	}
+
+	fn workgroup_lanes(&self, logical_lanes: u64) -> u32 {
+		let logical = u32::try_from(logical_lanes).unwrap_or(u32::MAX).max(1);
+		floor_power_of_two(logical.min(self.hardware.maximum_workgroup_lanes))
+	}
+
+	fn collective_lanes(&self, logical_width: u64, payload_words: u64, declared_maximum: u32) -> u32 {
+		let bytes_per_lane = payload_words.saturating_mul(4).max(1);
+		let shared_lanes = self.hardware.maximum_shared_memory_per_workgroup.get() / bytes_per_lane;
+		let shared_lanes = u32::try_from(shared_lanes).unwrap_or(u32::MAX).max(1);
+		let logical = u32::try_from(logical_width).unwrap_or(u32::MAX).max(1);
+		floor_power_of_two(
+			logical
+				.min(declared_maximum)
+				.min(self.hardware.maximum_workgroup_lanes)
+				.min(shared_lanes),
+		)
 	}
 
 	fn add_tensor(&mut self, tensor: &Tensor) -> LoweringResult<BufferId> {
@@ -359,6 +391,10 @@ impl ProgramBuilder {
 	}
 }
 
+fn floor_power_of_two(value: u32) -> u32 {
+	1_u32 << (31 - value.max(1).leading_zeros())
+}
+
 fn aggregate_resources(
 	buffers: &[ProgramBuffer],
 	stages: &[ProgramStage],
@@ -573,9 +609,10 @@ fn lower_elementwise(
 		.checked_mul(4)
 		.ok_or_else(|| builder.overflow("elementwise private bound"))?;
 	let atomic_bound = u64::from(fault.is_some()).saturating_mul(output.shape.elements());
+	let workgroup_lanes = builder.workgroup_lanes(output.shape.elements());
 	push_stage!(
 		builder,
-		geometry(output.shape.elements(), MAP_WORKGROUP_LANES),
+		geometry(output.shape.elements(), workgroup_lanes),
 		bindings,
 		Vec::new(),
 		atomics,
@@ -586,7 +623,7 @@ fn lower_elementwise(
 			atomic_bound,
 			0,
 			private_bytes,
-			MAP_WORKGROUP_LANES,
+			workgroup_lanes,
 		),
 		StageKind::ScalarMap { template },
 	)?;
@@ -640,9 +677,10 @@ fn lower_reduce(
 		return lower_empty_reduction(builder, kernel, spec, tensors);
 	};
 
-	let lanes = spec.tree_lanes;
-	let tree = reduction_tree(lanes);
 	let track_index = spec.result != ReduceResult::Value;
+	let payload_words = 1_u64 + u64::from(track_index);
+	let lanes = builder.collective_lanes(reduced_width, payload_words, spec.tree_lanes);
+	let tree = reduction_tree(lanes);
 	let mut current_value = builder.tensor_buffer(kernel.inputs[0])?;
 	let mut current_index = None;
 	let pass_widths = std::iter::successors(Some(reduced_width), |current_width| {
@@ -722,7 +760,6 @@ fn lower_reduce(
 			ReduceResult::Value | ReduceResult::Index => 1,
 		};
 		let flops = checked_mul(builder, combines, flop_multiplier, "reduction FLOP count")?;
-		let payload_words = 1_u64 + u64::from(track_index);
 		let shared = checked_mul(
 			builder,
 			checked_mul(
@@ -805,14 +842,15 @@ fn lower_empty_reduction(
 			false => identity,
 		};
 		let binding = builder.binding(builder.tensor_buffer(*output)?, AccessMode::Write)?;
+		let workgroup_lanes = builder.workgroup_lanes(tensor.shape.elements());
 		push_stage!(
 			builder,
-			geometry(tensor.shape.elements(), MAP_WORKGROUP_LANES),
+			geometry(tensor.shape.elements(), workgroup_lanes),
 			vec![binding],
 			Vec::new(),
 			Vec::new(),
 			None,
-			basic_resources(0, tensor.shape.elements(), 0, 0, 4, MAP_WORKGROUP_LANES),
+			basic_resources(0, tensor.shape.elements(), 0, 0, 4, workgroup_lanes),
 			StageKind::Fill { value: literal },
 		)?;
 	}
@@ -878,7 +916,7 @@ fn lower_scan(
 		return Ok(());
 	};
 	let sequences = input.shape.elements() / axis_width;
-	let lanes = spec.tree_lanes;
+	let lanes = builder.collective_lanes(axis_width, 1, spec.tree_lanes);
 	let tree = scan_tree(lanes);
 	let mut current_input = builder.tensor_buffer(kernel.inputs[0])?;
 	let mut levels = Vec::new();
@@ -992,9 +1030,10 @@ fn lower_scan(
 		let false = active == 0 else {
 			continue;
 		};
+		let workgroup_lanes = builder.workgroup_lanes(active);
 		push_stage!(
 			builder,
-			geometry(active, INDEX_WORKGROUP_LANES),
+			geometry(active, workgroup_lanes),
 			vec![
 				builder.binding(lower.output, AccessMode::ReadWrite)?,
 				builder.binding(upper.output, AccessMode::Read)?,
@@ -1002,7 +1041,7 @@ fn lower_scan(
 			Vec::new(),
 			Vec::new(),
 			None,
-			basic_resources(active, active, 0, 0, 12, INDEX_WORKGROUP_LANES),
+			basic_resources(active, active, 0, 0, 12, workgroup_lanes),
 			StageKind::ScanUniformCombine(ScanUniformStage {
 				level: lower.level,
 				operator: spec.operator,
@@ -1042,31 +1081,23 @@ fn lower_contraction(
 		"contraction output products",
 	)?;
 	let flops = checked_mul(builder, output_products, 2, "contraction FLOP count")?;
-	let left_tile_words = checked_mul(
+	let physical = contraction_physical_plan(
 		builder,
-		u64::from(CONTRACTION_TILE.output_x),
-		u64::from(CONTRACTION_TILE.reduction),
-		"left contraction tile",
+		left,
+		spec,
+		output.shape.elements(),
+		contracted_elements,
 	)?;
-	let right_tile_words = checked_mul(
-		builder,
-		u64::from(CONTRACTION_TILE.output_y),
-		u64::from(CONTRACTION_TILE.reduction),
-		"right contraction tile",
-	)?;
-	let tile_words = left_tile_words
-		.checked_add(right_tile_words)
-		.ok_or_else(|| builder.overflow("contraction shared tile"))?;
-	let shared = tile_words
-		.checked_mul(u64::from(left.dtype.byte_width()))
-		.ok_or_else(|| builder.overflow("contraction shared bytes"))?;
-	let reduction_tiles = contracted_elements.div_ceil(u64::from(CONTRACTION_TILE.reduction));
-	let synchronization_count = checked_mul(
-		builder,
-		reduction_tiles,
-		2,
-		"contraction synchronization count",
-	)?;
+	let reduction_tiles = contracted_elements.div_ceil(u64::from(physical.tile.reduction));
+	let synchronization_count = match physical.strategy {
+		ContractionStrategy::Direct => 0,
+		ContractionStrategy::Staged => checked_mul(
+			builder,
+			reduction_tiles,
+			2,
+			"contraction synchronization count",
+		)?,
+	};
 	let synchronization_count = u32::try_from(synchronization_count).map_err(|error| {
 		LoweringError::new(
 			LoweringErrorKind::ArithmeticOverflow,
@@ -1083,10 +1114,7 @@ fn lower_contraction(
 		.collect();
 	push_stage!(
 		builder,
-		geometry(
-			output.shape.elements(),
-			CONTRACTION_TILE.output_x * CONTRACTION_TILE.output_y,
-		),
+		geometry(output.shape.elements(), physical.workgroup_lanes),
 		vec![
 			builder.binding(builder.tensor_buffer(kernel.inputs[0])?, AccessMode::Read)?,
 			builder.binding(builder.tensor_buffer(kernel.inputs[1])?, AccessMode::Read)?,
@@ -1099,20 +1127,115 @@ fn lower_contraction(
 			flops,
 			output.shape.elements(),
 			0,
-			shared,
+			physical.shared_bytes,
 			24,
-			CONTRACTION_TILE.output_x * CONTRACTION_TILE.output_y,
+			physical.workgroup_lanes,
 		),
 		StageKind::TiledContraction(ContractionStage {
 			spec: spec.clone(),
 			dtype: left.dtype,
 			output_elements: output.shape.elements(),
 			contracted_elements,
-			tile: CONTRACTION_TILE,
+			strategy: physical.strategy,
+			tile: physical.tile,
 			canonical_contracted_order: true,
 		}),
 	)?;
 	Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ContractionPhysicalPlan {
+	strategy: ContractionStrategy,
+	tile: ContractionTile,
+	workgroup_lanes: u32,
+	shared_bytes: u64,
+}
+
+fn contraction_physical_plan(
+	builder: &ProgramBuilder,
+	left: &Tensor,
+	spec: &recipe_language::Contraction,
+	output_elements: u64,
+	contracted_elements: u64,
+) -> LoweringResult<ContractionPhysicalPlan> {
+	let free_extent = left
+		.shape
+		.extents()
+		.iter()
+		.copied()
+		.enumerate()
+		.filter(|(axis, _)| {
+			!spec.batch_axes.iter().any(|(left, _)| left == axis)
+				&& !spec.contract_axes.iter().any(|(left, _)| left == axis)
+		})
+		.try_fold(1_u64, |product, (_, extent)| product.checked_mul(extent))
+		.ok_or_else(|| builder.overflow("contraction free-axis extent"))?;
+	let right_extent = output_elements
+		.checked_div(free_extent.max(1))
+		.unwrap_or(1)
+		.max(1);
+	let maximum = builder.workgroup_lanes(output_elements);
+	let mut balanced = 1_u32;
+	while balanced
+		.checked_mul(2)
+		.is_some_and(|next| next <= maximum / next)
+	{
+		balanced *= 2;
+	}
+	let left_capacity = floor_power_of_two(
+		u32::try_from(free_extent)
+			.unwrap_or(u32::MAX)
+			.max(1)
+			.min(maximum),
+	);
+	let right_capacity = floor_power_of_two(
+		u32::try_from(right_extent)
+			.unwrap_or(u32::MAX)
+			.max(1)
+			.min(maximum),
+	);
+	let mut output_x = left_capacity.min(balanced).max(1);
+	let mut output_y = right_capacity.min(maximum / output_x).max(1);
+	while output_x < left_capacity && output_x <= maximum / 2 / output_y {
+		output_x *= 2;
+	}
+	while output_y < right_capacity && output_y <= maximum / 2 / output_x {
+		output_y *= 2;
+	}
+	let workgroup_lanes = output_x
+		.checked_mul(output_y)
+		.ok_or_else(|| builder.overflow("contraction workgroup width"))?;
+	let reduction = floor_power_of_two(
+		u32::try_from(contracted_elements)
+			.unwrap_or(u32::MAX)
+			.max(1)
+			.min(builder.hardware.subgroup_lanes),
+	);
+	let staged_bytes = u64::from(workgroup_lanes)
+		.checked_mul(u64::from(left.dtype.byte_width()))
+		.ok_or_else(|| builder.overflow("contraction staged accumulator bytes"))?;
+	let strategy = if workgroup_lanes >= builder.hardware.subgroup_lanes
+		&& contracted_elements >= u64::from(builder.hardware.subgroup_lanes)
+		&& staged_bytes <= builder.hardware.maximum_shared_memory_per_workgroup.get()
+	{
+		ContractionStrategy::Staged
+	} else {
+		ContractionStrategy::Direct
+	};
+	Ok(ContractionPhysicalPlan {
+		strategy,
+		tile: ContractionTile {
+			output_x,
+			output_y,
+			reduction,
+		},
+		workgroup_lanes,
+		shared_bytes: match strategy {
+			ContractionStrategy::Direct => 0,
+			ContractionStrategy::Staged => staged_bytes,
+		},
+	})
 }
 
 fn lower_gather(
@@ -1141,9 +1264,10 @@ fn lower_gather(
 		false => None,
 	};
 	let atomic_bound = u64::from(fault.is_some()).saturating_mul(output.shape.elements());
+	let workgroup_lanes = builder.workgroup_lanes(output.shape.elements());
 	push_stage!(
 		builder,
-		geometry(output.shape.elements(), INDEX_WORKGROUP_LANES),
+		geometry(output.shape.elements(), workgroup_lanes),
 		bindings,
 		Vec::new(),
 		atomics,
@@ -1154,7 +1278,7 @@ fn lower_gather(
 			atomic_bound,
 			0,
 			16,
-			INDEX_WORKGROUP_LANES,
+			workgroup_lanes,
 		),
 		StageKind::Gather {
 			axis: spec.axis,
@@ -1172,11 +1296,12 @@ fn lower_scatter(
 ) -> LoweringResult<()> {
 	let base = tensor(tensors, kernel.inputs[0], kernel.id)?;
 	let updates = tensor(tensors, kernel.inputs[2], kernel.id)?;
+	let copy_lanes = builder.workgroup_lanes(base.shape.elements());
 	let copy_stage = (!base.shape.is_empty())
 		.then(|| {
 			push_stage!(
 				builder,
-				geometry(base.shape.elements(), INDEX_WORKGROUP_LANES),
+				geometry(base.shape.elements(), copy_lanes),
 				vec![
 					builder.binding(builder.tensor_buffer(kernel.inputs[0])?, AccessMode::Read)?,
 					builder.binding(builder.tensor_buffer(kernel.outputs[0])?, AccessMode::Write)?,
@@ -1184,7 +1309,7 @@ fn lower_scatter(
 				Vec::new(),
 				Vec::new(),
 				None,
-				basic_resources(0, base.shape.elements(), 0, 0, 8, INDEX_WORKGROUP_LANES,),
+				basic_resources(0, base.shape.elements(), 0, 0, 8, copy_lanes,),
 				StageKind::Copy {
 					reason: CopyReason::ScatterBase,
 				},
@@ -1250,9 +1375,10 @@ fn lower_scatter(
 		.elements()
 		.checked_mul(flops_per_atomic)
 		.ok_or_else(|| builder.overflow("scatter FLOP count"))?;
+	let workgroup_lanes = builder.workgroup_lanes(updates.shape.elements());
 	push_stage!(
 		builder,
-		geometry(updates.shape.elements(), INDEX_WORKGROUP_LANES),
+		geometry(updates.shape.elements(), workgroup_lanes),
 		bindings,
 		Vec::new(),
 		atomics,
@@ -1263,7 +1389,7 @@ fn lower_scatter(
 			payload_atomic_count.saturating_add(fault_atomic_count),
 			0,
 			16,
-			INDEX_WORKGROUP_LANES,
+			workgroup_lanes,
 		),
 		StageKind::Scatter {
 			axis: spec.axis,
@@ -1283,14 +1409,15 @@ fn lower_histogram(
 	let input = tensor(tensors, kernel.inputs[0], kernel.id)?;
 	let output = tensor(tensors, kernel.outputs[0], kernel.id)?;
 	let output_buffer = builder.tensor_buffer(kernel.outputs[0])?;
+	let clear_lanes = builder.workgroup_lanes(output.shape.elements());
 	push_stage!(
 		builder,
-		geometry(output.shape.elements(), INDEX_WORKGROUP_LANES),
+		geometry(output.shape.elements(), clear_lanes),
 		vec![builder.binding(output_buffer, AccessMode::Write)?],
 		Vec::new(),
 		Vec::new(),
 		None,
-		basic_resources(0, output.shape.elements(), 0, 0, 4, INDEX_WORKGROUP_LANES,),
+		basic_resources(0, output.shape.elements(), 0, 0, 4, clear_lanes,),
 		StageKind::HistogramClear,
 	)?;
 	let false = input.shape.is_empty() else {
@@ -1321,9 +1448,10 @@ fn lower_histogram(
 		.transpose()?;
 	bindings.extend(weight_binding);
 	bindings.push(fault_binding);
+	let accumulate_lanes = builder.workgroup_lanes(input.shape.elements());
 	push_stage!(
 		builder,
-		geometry(input.shape.elements(), INDEX_WORKGROUP_LANES),
+		geometry(input.shape.elements(), accumulate_lanes),
 		bindings,
 		Vec::new(),
 		vec![atomic, fault_atomic],
@@ -1334,7 +1462,7 @@ fn lower_histogram(
 			input.shape.elements().saturating_mul(2),
 			0,
 			16,
-			INDEX_WORKGROUP_LANES,
+			accumulate_lanes,
 		),
 		StageKind::HistogramAccumulate {
 			bins: spec.bins,
@@ -1378,9 +1506,10 @@ fn lower_sort(
 		float_order: FloatSortOrder::Ieee754TotalOrder,
 		padding: SortPadding::AfterAllValidElements,
 	};
+	let initialize_lanes = builder.workgroup_lanes(scratch_elements);
 	push_stage!(
 		builder,
-		geometry(scratch_elements, SORT_WORKGROUP_LANES),
+		geometry(scratch_elements, initialize_lanes),
 		vec![
 			builder.binding(builder.tensor_buffer(kernel.inputs[0])?, AccessMode::Read)?,
 			builder.binding(values, AccessMode::Write)?,
@@ -1389,11 +1518,12 @@ fn lower_sort(
 		Vec::new(),
 		Vec::new(),
 		None,
-		basic_resources(0, scratch_elements, 0, 0, 16, SORT_WORKGROUP_LANES,),
+		basic_resources(0, scratch_elements, 0, 0, 16, initialize_lanes,),
 		StageKind::StableSortInitialize { network },
 	)?;
 
 	let comparisons = scratch_elements / 2;
+	let comparison_lanes = builder.workgroup_lanes(comparisons);
 	let network_levels = padded.trailing_zeros();
 	for merge_level in 1..=network_levels {
 		let merge_width = 1_u64 << merge_level;
@@ -1401,7 +1531,7 @@ fn lower_sort(
 			let distance = 1_u64 << distance_level;
 			push_stage!(
 				builder,
-				geometry(comparisons, SORT_WORKGROUP_LANES),
+				geometry(comparisons, comparison_lanes),
 				vec![
 					builder.binding(values, AccessMode::ReadWrite)?,
 					builder.binding(indices, AccessMode::ReadWrite)?,
@@ -1409,7 +1539,7 @@ fn lower_sort(
 				Vec::new(),
 				Vec::new(),
 				None,
-				basic_resources(comparisons, comparisons, 0, 0, 20, SORT_WORKGROUP_LANES,),
+				basic_resources(comparisons, comparisons, 0, 0, 20, comparison_lanes,),
 				StageKind::StableSortCompareExchange(SortCompareStage {
 					network,
 					merge_width,
@@ -1431,14 +1561,15 @@ fn lower_sort(
 		})
 		.transpose()?;
 	bindings.extend(index_output_binding);
+	let finalize_lanes = builder.workgroup_lanes(input.shape.elements());
 	push_stage!(
 		builder,
-		geometry(input.shape.elements(), SORT_WORKGROUP_LANES),
+		geometry(input.shape.elements(), finalize_lanes),
 		bindings,
 		Vec::new(),
 		Vec::new(),
 		None,
-		basic_resources(0, input.shape.elements(), 0, 0, 12, SORT_WORKGROUP_LANES,),
+		basic_resources(0, input.shape.elements(), 0, 0, 12, finalize_lanes,),
 		StageKind::StableSortFinalize {
 			network,
 			emit_indices: spec.emit_indices,
@@ -1469,14 +1600,15 @@ fn lower_random(
 		.elements()
 		.checked_mul(20)
 		.ok_or_else(|| builder.overflow("Philox integer-operation bound"))?;
+	let workgroup_lanes = builder.workgroup_lanes(output.shape.elements());
 	push_stage!(
 		builder,
-		geometry(output.shape.elements(), MAP_WORKGROUP_LANES),
+		geometry(output.shape.elements(), workgroup_lanes),
 		vec![builder.binding(builder.tensor_buffer(kernel.outputs[0])?, AccessMode::Write,)?],
 		Vec::new(),
 		Vec::new(),
 		None,
-		basic_resources(flops, integer_operations, 0, 0, 32, MAP_WORKGROUP_LANES,),
+		basic_resources(flops, integer_operations, 0, 0, 32, workgroup_lanes,),
 		StageKind::Philox4x32_10(Philox10Contract {
 			key: spec.key,
 			distribution: spec.distribution,
@@ -1515,9 +1647,10 @@ fn lower_index_map(
 	let integer_operations = logical
 		.checked_mul(INDEX_MAP_INTEGER_OPERATIONS_PER_LANE)
 		.ok_or_else(|| builder.overflow("index-map integer-operation bound"))?;
+	let workgroup_lanes = builder.workgroup_lanes(logical);
 	push_stage!(
 		builder,
-		geometry(logical, INDEX_WORKGROUP_LANES),
+		geometry(logical, workgroup_lanes),
 		vec![
 			builder.binding(builder.tensor_buffer(kernel.outputs[0])?, AccessMode::Write)?,
 			fault_binding,
@@ -1525,7 +1658,7 @@ fn lower_index_map(
 		Vec::new(),
 		vec![fault_atomic],
 		Some(fault),
-		basic_resources(0, integer_operations, logical, 0, 32, INDEX_WORKGROUP_LANES,),
+		basic_resources(0, integer_operations, logical, 0, 32, workgroup_lanes,),
 		StageKind::IndexMap(spec),
 	)?;
 	Ok(())

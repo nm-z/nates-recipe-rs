@@ -4,9 +4,10 @@ use crate::ffi::{
 	CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT, CU_DEVICE_ATTRIBUTE_CLOCK_RATE,
 	CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
 	CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS, CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH,
+	CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
 	CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID,
-	CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID, CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID, CUDA_ERROR_NOT_SUPPORTED, CuDevice, CuUuid,
-	DriverCapabilities,
+	CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID, CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID, CU_DEVICE_ATTRIBUTE_WARP_SIZE,
+	CUDA_ERROR_NOT_SUPPORTED, CuDevice, CuUuid, DriverCapabilities,
 };
 use core::ffi::{c_char, c_int};
 use core::fmt;
@@ -117,6 +118,9 @@ impl fmt::Display for DriverVersion {
 pub struct DeviceAttributes {
 	pub async_engine_count: u32,
 	pub concurrent_kernels: bool,
+	pub warp_size: u32,
+	pub maximum_threads_per_block: u32,
+	pub maximum_shared_memory_per_block_bytes: u32,
 	pub pci_domain_id: u32,
 	pub pci_bus_id: u32,
 	pub pci_device_id: u32,
@@ -233,6 +237,21 @@ impl Driver {
 				"cuDeviceGetAttribute(ASYNC_ENGINE_COUNT)",
 			)?,
 			concurrent_kernels,
+			warp_size: self.device_attribute(
+				handle,
+				CU_DEVICE_ATTRIBUTE_WARP_SIZE,
+				"cuDeviceGetAttribute(WARP_SIZE)",
+			)?,
+			maximum_threads_per_block: self.device_attribute(
+				handle,
+				CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+				"cuDeviceGetAttribute(MAX_THREADS_PER_BLOCK)",
+			)?,
+			maximum_shared_memory_per_block_bytes: self.device_attribute(
+				handle,
+				CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+				"cuDeviceGetAttribute(MAX_SHARED_MEMORY_PER_BLOCK)",
+			)?,
 			pci_domain_id: self.device_attribute(
 				handle,
 				CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID,

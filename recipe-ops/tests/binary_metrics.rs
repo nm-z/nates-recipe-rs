@@ -7,9 +7,24 @@ use recipe_ops::{
 	BinaryClassificationMetricRequest, IdentityNamespace, OperationErrorKind, RecallAtOutput,
 	append_binary_classification_metrics, binary_metric_requirements, materialize_binary_classification_metrics,
 };
-use recipe_primitives::lower;
+use recipe_primitives::{LoweredProgram, LoweringHardware, LoweringResult};
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+fn lower(
+	kernel: &recipe_language::PrimitiveKernel,
+	tensors: &BTreeMap<ValueId, &Tensor>,
+) -> LoweringResult<LoweredProgram> {
+	recipe_primitives::lower(
+		kernel,
+		tensors,
+		LoweringHardware {
+			subgroup_lanes: 32,
+			maximum_workgroup_lanes: 256,
+			maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
+		},
+	)
+}
 
 fn tensor(
 	id: u64,

@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::error::Error;
 
 use recipe_core::{ByteCount, DType, KernelTemplateId, ScalarOpcode, ScalarProgram, ValueId};
-use recipe_language::{IndexBounds, PrimitiveKind, ScatterConflict, Shape, SortDirection, Tensor};
+use recipe_language::{
+	IndexBounds, PrimitiveKind, ReduceOperator, ScanMode, ScatterConflict, Shape, SortDirection, Tensor,
+};
 
 use crate::{
 	IdentityNamespace, MaterializationRequest, MaterializedComposition, NamedTensor, OperationErrorKind,
@@ -22,6 +24,7 @@ const MATERIALIZED_SYMBOLS: &[&str] = &[
 	"gpu_one_hot",
 	"gpu_pack_upper_tri",
 	"gpu_partial_argsort",
+	"gpu_segment_sum",
 	"gpu_slice_cols",
 	"gpu_slice_lead_into",
 	"gpu_slice_rows",
@@ -121,7 +124,7 @@ fn elementwise_program(kind: &PrimitiveKind) -> TestResult<&ScalarProgram> {
 }
 
 #[test]
-fn owns_exactly_sixteen_source_qualified_descriptors() -> TestResult {
+fn owns_exactly_seventeen_source_qualified_descriptors() -> TestResult {
 	let remaining = remaining_composition_manifest()
 		.into_iter()
 		.map(|entry| (entry.symbol(), entry.source()))
@@ -163,6 +166,61 @@ fn owns_exactly_sixteen_source_qualified_descriptors() -> TestResult {
 	))
 	.expect_err("symbol-only dispatch accepted a mismatched source");
 	assert_eq!(error.kind, OperationErrorKind::MissingConcreteFormula);
+	Ok(())
+}
+
+#[test]
+fn segment_sum_stably_groups_then_uses_unique_scatter_and_a_fixed_reduction_tree() -> TestResult {
+	let values = input_tensor(1, DType::F32, &[6])?;
+	let segment_ids = input_tensor(2, DType::I32, &[6])?;
+	let sums = output_tensor(3, DType::F32, &[3])?;
+	let inputs = [
+		NamedTensor::new("values", &values),
+		NamedTensor::new("segment_ids", &segment_ids),
+	];
+	let outputs = [NamedTensor::new("sums", &sums)];
+	let prepared = parameters(&[
+		("elements", PreparedParameter::U64(6)),
+		("segments", PreparedParameter::U64(3)),
+		("maximum_segment_length", PreparedParameter::U64(3)),
+		("tree_lanes", PreparedParameter::U64(4)),
+	]);
+	let descriptor = operation_registry().resolve_exact("gpu_segment_sum", "gpu-core/src/reductions.rs:627")?;
+	let materialized = materialize_composition(MaterializationRequest::new(
+		descriptor,
+		&inputs,
+		&outputs,
+		"values",
+		&prepared,
+		namespace(70_000),
+		ByteCount::new(1_000_000),
+	))?;
+	assert_fragment(&materialized, 3, 14)?;
+	assert_stable_sort(&materialized.graph().nodes[0].kernel.kind, 0)?;
+	let scan = materialized
+		.graph()
+		.nodes
+		.iter()
+		.find_map(|node| match &node.kernel.kind {
+			PrimitiveKind::Scan(scan) => Some(scan),
+			_ => None,
+		})
+		.expect("segment sum emits its boundary scan");
+	assert_eq!(scan.operator, ReduceOperator::Maximum);
+	assert_eq!(scan.mode, ScanMode::Inclusive);
+	let scatter = materialized
+		.graph()
+		.nodes
+		.iter()
+		.find(|node| matches!(node.kernel.kind, PrimitiveKind::Scatter(_)))
+		.expect("segment sum emits its packed scatter");
+	assert_unique_scatter(&scatter.kernel.kind)?;
+	let PrimitiveKind::Reduce(reduction) = &materialized.graph().nodes.last().unwrap().kernel.kind else {
+		return Err("segment sum does not end in its fixed reduction".into());
+	};
+	assert_eq!(reduction.operator, ReduceOperator::Sum);
+	assert_eq!(reduction.axes.as_slice(), &[1]);
+	assert_eq!(reduction.tree_lanes, 4);
 	Ok(())
 }
 
@@ -725,7 +783,7 @@ fn rejects_unverified_tables_and_unsupported_domains() -> TestResult {
 		("k", PreparedParameter::U64(65)),
 		("prefix_indices_verified", PreparedParameter::Bool(true)),
 	]);
-	let error = materialize_composition(MaterializationRequest::new(
+	let topk = materialize_composition(MaterializationRequest::new(
 		operation_registry().resolve_unique("gpu_topk_per_row")?,
 		&topk_inputs,
 		&topk_outputs,
@@ -733,9 +791,8 @@ fn rejects_unverified_tables_and_unsupported_domains() -> TestResult {
 		&topk_parameters,
 		namespace(74_000),
 		ByteCount::new(520),
-	))
-	.expect_err("top-k width beyond the legacy local buffer was accepted");
-	assert_eq!(error.kind, OperationErrorKind::UnsupportedConcreteShape);
+	))?;
+	assert_fragment(&topk, 2, 2)?;
 
 	let slice_values = input_tensor(31, DType::F32, &[12])?;
 	let slice_indices = input_tensor(32, DType::I32, &[6])?;

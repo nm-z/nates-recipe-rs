@@ -25,6 +25,7 @@ const MATERIALIZED: &[&str] = &[
 	"gpu_gaussian_logprob",
 	"gpu_gcn_norm",
 	"gpu_neighbor_aggregate",
+	"gpu_pairwise_l2",
 	"gpu_td_targets",
 	"gpu_union_find_cc",
 ];
@@ -472,6 +473,31 @@ fn materializes_exact_finite_clustering_cases() -> TestResult {
 		ByteCount::new(72),
 	))?;
 	assert_fragment(&core, 72, 3, 7)?;
+
+	let query = input_tensor(21, DType::F32, &[2, 2])?;
+	let training = input_tensor(22, DType::F32, &[3, 2])?;
+	let distances = output_tensor(23, DType::F32, &[2, 3])?;
+	let inputs = [
+		NamedTensor::new("query", &query),
+		NamedTensor::new("training", &training),
+	];
+	let outputs = [NamedTensor::new("distances", &distances)];
+	let prepared = parameters(&[
+		("queries", PreparedParameter::U64(2)),
+		("training_rows", PreparedParameter::U64(3)),
+		("dimensions", PreparedParameter::U64(2)),
+		("tree_lanes", PreparedParameter::U64(2)),
+	]);
+	let pairwise = materialize_composition(MaterializationRequest::new(
+		operation_registry().resolve_unique("gpu_pairwise_l2")?,
+		&inputs,
+		&outputs,
+		"query",
+		&prepared,
+		namespace(125_000),
+		ByteCount::new(84),
+	))?;
+	assert_fragment(&pairwise, 84, 4, 6)?;
 
 	let points = input_tensor(11, DType::F32, &[2])?;
 	let counts = input_tensor(12, DType::I32, &[1])?;

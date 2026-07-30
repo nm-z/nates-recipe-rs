@@ -263,7 +263,9 @@ impl fmt::Display for ExecutorError {
 			Self::LoopRepetitionUnsupported { iterations } => write!(
 				formatter,
 				"backend does not support the finalized loop count of {}",
-				iterations.get()
+				iterations
+					.finite()
+					.map_or_else(|| "unbounded".to_owned(), |bound| bound.get().to_string())
 			),
 			Self::MetricSequenceOverflow => formatter.write_str("metric sequence counter overflowed"),
 			Self::PendingPollCountOverflow { task } => {

@@ -13,6 +13,12 @@ pub struct CalculationCapability {
 	pub rate: Property<FlopsPerSecond>,
 	pub asynchronous_submission: bool,
 	pub maximum_concurrent_tasks: u32,
+	/// Native SIMD/SIMT subgroup width reported by the calculation backend.
+	pub subgroup_lanes: u32,
+	/// Maximum lanes permitted in one native workgroup.
+	pub maximum_workgroup_lanes: u32,
+	/// Maximum workgroup-local/shared storage reported by the backend.
+	pub maximum_shared_memory_per_workgroup: ByteCount,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +158,27 @@ impl DiscoveryProfile {
 								ValidationCode::UnsupportedCapability,
 								format!("devices[{index}].calculation.maximum_concurrent_tasks"),
 								"GPU device must support at least one active calculation",
+							);
+							validator.require(
+								calculation.subgroup_lanes != 0
+									&& calculation.subgroup_lanes.is_power_of_two(),
+								ValidationCode::UnsupportedCapability,
+								format!("devices[{index}].calculation.subgroup_lanes"),
+								"GPU subgroup width must be a nonzero power of two",
+							);
+							validator.require(
+								calculation.maximum_workgroup_lanes >= calculation.subgroup_lanes,
+								ValidationCode::UnsupportedCapability,
+								format!("devices[{index}].calculation.maximum_workgroup_lanes"),
+								"GPU workgroup limit must contain at least one subgroup",
+							);
+							validator.require(
+								calculation.maximum_shared_memory_per_workgroup.get() != 0,
+								ValidationCode::UnsupportedCapability,
+								format!(
+									"devices[{index}].calculation.maximum_shared_memory_per_workgroup"
+								),
+								"GPU workgroup-local memory limit must be nonzero",
 							);
 						}
 					}

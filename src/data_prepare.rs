@@ -2,8 +2,8 @@ use core::fmt;
 
 use recipe_ingest::{
 	CategoricalEncodingModel, ColumnPattern, ComparisonOperator as IngestComparisonOperator, DatasetSourceError,
-	IngestError, IngestLimits, PredicateLiteral, PreparationRequest, PrepareError, PreparedDataset, RowPredicate,
-	SemanticError, TrainFraction, distill_datasets, prepare_inferred_table,
+	DistilledDataset, IngestError, IngestLimits, PredicateLiteral, PreparationRequest, PrepareError, PreparedDataset,
+	RawTable, RowPredicate, SemanticError, TrainFraction, distill_datasets, prepare_inferred_table, select_table,
 };
 
 use crate::api::{ComparisonOperator, Condition, ConditionValue, Data, DeclarationError};
@@ -84,14 +84,42 @@ pub type DataPreparationResult<T> = Result<T, DataPreparationError>;
 /// framing, semantic inference, selection, filtering, lossless encoding, and
 /// splitting errors are returned without a partial dataset.
 pub fn prepare_data(data: &Data) -> DataPreparationResult<PreparedDataset> {
-	let limits = IngestLimits::new(
-		DEFAULT_DATA_SOURCE_BYTES,
-		DEFAULT_DATA_RECORDS,
-		DEFAULT_DATA_FIELDS_PER_RECORD,
-		DEFAULT_DATA_FIELD_BYTES,
-	)
-	.map_err(DataPreparationError::Ingest)?;
+	let limits = default_data_limits()?;
 	prepare_data_with_limits(data, limits)
+}
+
+/// Distill one public data declaration without applying training-only target,
+/// split, exclusion, or normalization policy.
+///
+/// This is the shared bounded source boundary for target-free inference. It
+/// preserves declared source order and all filesystem/container semantics.
+pub fn distill_data(data: &Data) -> DataPreparationResult<DistilledDataset> {
+	distill_data_with_limits(data, default_data_limits()?)
+}
+
+/// Distill one public data declaration under caller-fixed aggregate bounds.
+pub fn distill_data_with_limits(data: &Data, limits: IngestLimits) -> DataPreparationResult<DistilledDataset> {
+	data.validate().map_err(DataPreparationError::Declaration)?;
+	distill_datasets(data.sources().iter().map(std::path::Path::new), limits).map_err(DataPreparationError::Source)
+}
+
+/// Apply row and column exclusions without target selection, semantic fitting,
+/// splitting, or normalization.
+///
+/// This is the target-free selection boundary used by inference. The saved
+/// model schema remains authoritative after selection.
+pub fn select_target_free_data(data: &Data, distilled: &DistilledDataset) -> DataPreparationResult<RawTable> {
+	let excluded_columns = data
+		.exclusions()
+		.iter()
+		.map(|pattern| ColumnPattern::new(pattern.as_bytes().to_vec()).map_err(DataPreparationError::Prepare))
+		.collect::<DataPreparationResult<Vec<_>>>()?;
+	let excluded_rows = data
+		.condition_exclusions()
+		.iter()
+		.map(map_condition)
+		.collect::<DataPreparationResult<Vec<_>>>()?;
+	select_table(distilled.table(), excluded_columns, excluded_rows).map_err(DataPreparationError::Prepare)
 }
 
 /// Load and prepare one public data declaration with caller-fixed bounds.
@@ -130,12 +158,21 @@ pub fn prepare_data_with_limits(data: &Data, limits: IngestLimits) -> DataPrepar
 	)
 	.exclude_columns(excluded_columns)
 	.exclude_rows(excluded_rows);
-	let distilled = distill_datasets(data.sources().iter().map(std::path::Path::new), limits)
-		.map_err(DataPreparationError::Source)?;
+	let distilled = distill_data_with_limits(data, limits)?;
 	let inferred = distilled
 		.infer_vectors(&CategoricalEncodingModel)
 		.map_err(DataPreparationError::Semantic)?;
 	prepare_inferred_table(distilled.table(), &inferred, &request).map_err(DataPreparationError::Prepare)
+}
+
+fn default_data_limits() -> DataPreparationResult<IngestLimits> {
+	IngestLimits::new(
+		DEFAULT_DATA_SOURCE_BYTES,
+		DEFAULT_DATA_RECORDS,
+		DEFAULT_DATA_FIELDS_PER_RECORD,
+		DEFAULT_DATA_FIELD_BYTES,
+	)
+	.map_err(DataPreparationError::Ingest)
 }
 
 fn map_condition(condition: &Condition) -> DataPreparationResult<RowPredicate> {

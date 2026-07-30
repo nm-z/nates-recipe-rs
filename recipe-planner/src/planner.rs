@@ -14,7 +14,8 @@ use recipe_core::{
 };
 use recipe_language::{CalculationGraph, Tensor};
 use recipe_primitives::{
-	AccessMode, BufferLifetime, BufferOrigin, LoweredProgram, ProgramBuffer, ProgramStage, StageKind,
+	AccessMode, BufferLifetime, BufferOrigin, LoweredProgram, LoweringHardware, ProgramBuffer, ProgramStage,
+	StageKind,
 };
 use recipe_program::{MetricEmission, StaticCalculationProgram};
 use recipe_scheduler::{ScheduleErrorKind, UnscheduledTask, pack_arenas, schedule};
@@ -218,7 +219,7 @@ pub fn plan_candidates(
 	})
 }
 
-/// Plans a bounded static calculation program without unrolling its graph or
+/// Plans a finite or unbounded static calculation program without unrolling its graph or
 /// duplicating stage artifacts.
 pub fn plan_program_candidates(
 	program: &StaticCalculationProgram,
@@ -259,7 +260,7 @@ pub fn plan_program_candidates(
 		.iter()
 		.map(|node| (node.kernel.id, node))
 		.collect::<BTreeMap<_, _>>();
-	let (programs, templates) = lower_programs(graph, &tensors)?;
+	let (programs, templates) = lower_programs(graph, &tensors, discovery)?;
 	validate_artifact_catalog(artifacts)?;
 	let choices = legal_choices(&order, topology, discovery)?;
 	let source_domains = program
@@ -360,15 +361,17 @@ fn tensor_index(graph: &CalculationGraph) -> BTreeMap<ValueId, &Tensor> {
 fn lower_programs(
 	graph: &CalculationGraph,
 	tensors: &BTreeMap<ValueId, &Tensor>,
+	discovery: &DiscoveryProfile,
 ) -> PlannerResult<(
 	BTreeMap<KernelTemplateId, LoweredKernelPlan>,
 	BTreeMap<KernelTemplateId, KernelTemplate>,
 )> {
+	let hardware = common_lowering_hardware(discovery)?;
 	let mut programs = BTreeMap::new();
 	let mut templates = BTreeMap::new();
 	let mut stage_identities = BTreeMap::<KernelTemplateId, (KernelTemplateId, u32)>::new();
 	for node in &graph.nodes {
-		let program = recipe_primitives::lower(&node.kernel, tensors).map_err(|error| {
+		let program = recipe_primitives::lower(&node.kernel, tensors, hardware).map_err(|error| {
 			PlannerError::new(
 				PlannerErrorKind::InvalidGraph,
 				format!(
@@ -433,6 +436,44 @@ fn lower_programs(
 		);
 	}
 	Ok((programs, templates))
+}
+
+fn common_lowering_hardware(discovery: &DiscoveryProfile) -> PlannerResult<LoweringHardware> {
+	let mut calculations = discovery
+		.devices
+		.iter()
+		.filter(|device| device.available)
+		.filter_map(|device| device.calculation.as_ref());
+	let first = calculations.next().ok_or_else(|| {
+		PlannerError::new(
+			PlannerErrorKind::InvalidDiscovery,
+			"measured discovery has no available calculation device",
+		)
+	})?;
+	let mut hardware = LoweringHardware {
+		subgroup_lanes: first.subgroup_lanes,
+		maximum_workgroup_lanes: first.maximum_workgroup_lanes,
+		maximum_shared_memory_per_workgroup: first.maximum_shared_memory_per_workgroup,
+	};
+	for calculation in calculations {
+		hardware.subgroup_lanes = hardware.subgroup_lanes.max(calculation.subgroup_lanes);
+		hardware.maximum_workgroup_lanes = hardware
+			.maximum_workgroup_lanes
+			.min(calculation.maximum_workgroup_lanes);
+		hardware.maximum_shared_memory_per_workgroup = ByteCount::new(
+			hardware
+				.maximum_shared_memory_per_workgroup
+				.get()
+				.min(calculation.maximum_shared_memory_per_workgroup.get()),
+		);
+	}
+	if hardware.subgroup_lanes > hardware.maximum_workgroup_lanes {
+		return Err(PlannerError::new(
+			PlannerErrorKind::InvalidDiscovery,
+			"available calculation devices have no common full-subgroup workgroup width",
+		));
+	}
+	Ok(hardware)
 }
 
 fn stage_template_identity(program: &LoweredProgram, stage: &ProgramStage) -> PlannerResult<KernelTemplateId> {
@@ -544,8 +585,8 @@ fn graph_digest(
 	source_domains: &BTreeMap<KernelTemplateId, IterationDomain>,
 	metrics: &[MetricEmission],
 ) -> PlannerResult<recipe_core::Digest> {
-	let mut digest = StableDigest::new("recipe-planner-graph-v6");
-	digest.u64(loop_iterations.get());
+	let mut digest = StableDigest::new("recipe-planner-graph-v7");
+	hash_loop_iterations(&mut digest, loop_iterations);
 	digest.length(tensors.len());
 	for tensor in tensors.values() {
 		digest.u64(tensor.id.get());
@@ -615,8 +656,14 @@ fn graph_digest(
 
 fn hash_iteration_domain(digest: &mut StableDigest, domain: IterationDomain) {
 	digest.u64(domain.first_iteration());
-	digest.u64(domain.end_exclusive());
+	digest.bool(domain.is_unbounded());
+	digest.u64(domain.end_exclusive().unwrap_or(0));
 	digest.u64(domain.stride().get());
+}
+
+fn hash_loop_iterations(digest: &mut StableDigest, iterations: LoopIterations) {
+	digest.bool(iterations.is_unbounded());
+	digest.u64(iterations.finite().map_or(0, |finite| finite.get()));
 }
 
 fn hash_kernel_template(digest: &mut StableDigest, template: &KernelTemplate) {
@@ -3218,24 +3265,27 @@ fn build_arena_contract(
 			));
 		}
 	};
-	let loop_window = (loop_iterations.get() > 1)
-		.then(|| {
-			let mut start = None;
-			let mut end = None;
-			for task in tasks.iter().filter(|task| task.phase == RunPhase::Loop) {
-				extend_lifetime(&mut start, &mut end, task.window);
-			}
-			match (start, end) {
-				(Some(start), Some(end)) => Ok(Some(ScheduleWindow { start, end })),
-				(None, None) => Ok(None),
-				_ => Err(PlannerError::new(
-					PlannerErrorKind::InvalidDraft,
-					"loop schedule has only one lifetime boundary",
-				)),
-			}
-		})
-		.transpose()?
-		.flatten();
+	let loop_window = (loop_iterations.is_unbounded()
+		|| loop_iterations
+			.finite()
+			.is_some_and(|iterations| iterations.get() > 1))
+	.then(|| {
+		let mut start = None;
+		let mut end = None;
+		for task in tasks.iter().filter(|task| task.phase == RunPhase::Loop) {
+			extend_lifetime(&mut start, &mut end, task.window);
+		}
+		match (start, end) {
+			(Some(start), Some(end)) => Ok(Some(ScheduleWindow { start, end })),
+			(None, None) => Ok(None),
+			_ => Err(PlannerError::new(
+				PlannerErrorKind::InvalidDraft,
+				"loop schedule has only one lifetime boundary",
+			)),
+		}
+	})
+	.transpose()?
+	.flatten();
 	let mut objects = Vec::with_capacity(blueprints.len());
 	for mut blueprint in blueprints {
 		blueprint.members.sort();
@@ -3370,7 +3420,10 @@ fn value_crosses_iteration_boundary(
 }
 
 fn domain_has_nonzero_activation(domain: IterationDomain) -> bool {
-	let span = domain.end_exclusive() - 1 - domain.first_iteration();
+	let Some(end) = domain.end_exclusive() else {
+		return true;
+	};
+	let span = end - 1 - domain.first_iteration();
 	let last = domain.first_iteration() + span / domain.stride().get() * domain.stride().get();
 	last > 0
 }
@@ -3379,15 +3432,19 @@ fn domain_covers(producer: IterationDomain, consumer: IterationDomain) -> bool {
 	if consumer.first_iteration() < producer.first_iteration() {
 		return false;
 	}
-	let consumer_span = consumer.end_exclusive() - 1 - consumer.first_iteration();
-	let consumer_last =
-		consumer.first_iteration() + consumer_span / consumer.stride().get() * consumer.stride().get();
-	if consumer_last >= producer.end_exclusive()
-		|| !(consumer.first_iteration() - producer.first_iteration()).is_multiple_of(producer.stride().get())
-	{
+	if !(consumer.first_iteration() - producer.first_iteration()).is_multiple_of(producer.stride().get()) {
 		return false;
 	}
-	consumer_last == consumer.first_iteration()
+	let consumer_last = consumer.end_exclusive().map(|end| {
+		let span = end - 1 - consumer.first_iteration();
+		consumer.first_iteration() + span / consumer.stride().get() * consumer.stride().get()
+	});
+	match (producer.end_exclusive(), consumer_last) {
+		(Some(producer_end), Some(last)) if last >= producer_end => return false,
+		(Some(_), None) => return false,
+		(Some(_), Some(_)) | (None, Some(_)) | (None, None) => {}
+	}
+	consumer_last == Some(consumer.first_iteration())
 		|| consumer
 			.stride()
 			.get()
@@ -3505,11 +3562,11 @@ struct DraftHashInput<'a> {
 }
 
 fn hash_draft(input: &DraftHashInput<'_>) -> DraftIdentity {
-	let mut digest = StableDigest::new("recipe-planner-draft-v9");
+	let mut digest = StableDigest::new("recipe-planner-draft-v10");
 	digest.digest(input.candidate.digest());
 	digest.digest(input.topology.identity.digest());
 	digest.digest(input.discovery.identity.digest());
-	digest.u64(input.loop_iterations.get());
+	hash_loop_iterations(&mut digest, input.loop_iterations);
 	digest.length(input.loop_domains.len());
 	for assignment in input.loop_domains {
 		digest.u64(assignment.task.get());

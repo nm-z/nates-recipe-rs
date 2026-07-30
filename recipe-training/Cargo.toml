@@ -18,6 +18,7 @@ recipe-prepare = { path = "../recipe-prepare" }
 recipe-probe = { path = "../recipe-probe" }
 recipe-program = { path = "../recipe-program" }
 rustix = { version = "0.38.44", features = ["fs"] }
+sha2 = "0.10"
 
 [lints]
 workspace = true

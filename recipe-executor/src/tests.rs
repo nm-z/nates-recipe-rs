@@ -510,6 +510,9 @@ fn build_fixture_with_iteration_domain(
 					rate: property(FlopsPerSecond::new(380_000_000_000).unwrap()),
 					asynchronous_submission: true,
 					maximum_concurrent_tasks: 2,
+					subgroup_lanes: 32,
+					maximum_workgroup_lanes: 256,
+					maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
 				}),
 			},
 			DiscoveredDevice {
@@ -1675,6 +1678,160 @@ fn loop_progress_preserves_every_preallocated_capacity() {
 	assert_eq!(running.capacities(), capacities);
 	assert_eq!(running.poll().unwrap(), LoopStatus::Complete);
 	assert_eq!(running.capacities(), capacities);
+}
+
+#[test]
+fn production_journal_capacity_is_independent_of_future_iteration_count() {
+	let one = build_fixture_with_iterations(false, LoopIterations::ONE);
+	let million = build_fixture_with_iterations(false, LoopIterations::new(1_000_000).unwrap());
+	let one_capacity = JournalCapacity::for_bundle_retaining::<FakeBackend>(&one, 1).unwrap();
+	let million_capacity = JournalCapacity::for_bundle_retaining::<FakeBackend>(&million, 1).unwrap();
+	assert_eq!(million_capacity, one_capacity);
+	let exhaustive = JournalCapacity::for_bundle_retaining::<FakeBackend>(&million, 1_000_000).unwrap();
+	assert!(exhaustive.logical_events > million_capacity.logical_events);
+	assert!(exhaustive.physical_calls > million_capacity.physical_calls);
+}
+
+#[test]
+fn production_journal_compacts_repeated_loop_detail_into_counters() {
+	let iterations = LoopIterations::new(3).unwrap();
+	let bundle = build_fixture_with_iterations(false, iterations);
+	let capacity = JournalCapacity::for_bundle_retaining::<FakeBackend>(&bundle, 1).unwrap();
+	let mut journal = RunJournal::with_loop_detail(capacity, bundle.tasks(), false);
+	for index in 0..3 {
+		let iteration = iterations.iteration(index).unwrap();
+		journal
+			.record_logical(LogicalEvent::LoopIterationStarted {
+				run: RunId::new(91),
+				iteration,
+			})
+			.unwrap();
+		journal
+			.record_logical(LogicalEvent::TaskSubmitted {
+				phase: RunPhase::Loop,
+				task: CALCULATION,
+				class: WorkClass::Calculation,
+			})
+			.unwrap();
+		journal
+			.record_physical(
+				PhysicalCallBatch::try_from_array([
+					PhysicalCall::SubmitCalculation { task: CALCULATION },
+					PhysicalCall::Poll {
+						task: CALCULATION,
+						status: PhysicalPollStatus::Complete,
+					},
+				])
+				.unwrap(),
+			)
+			.unwrap();
+		journal
+			.record_logical(LogicalEvent::TaskCompleted {
+				phase: RunPhase::Loop,
+				task: CALCULATION,
+			})
+			.unwrap();
+		journal
+			.record_logical(LogicalEvent::LoopIterationCompleted {
+				run: RunId::new(91),
+				iteration,
+			})
+			.unwrap();
+	}
+
+	assert_eq!(journal.logical_events().len(), 4);
+	assert_eq!(journal.physical_calls().len(), 2);
+	assert_eq!(
+		journal.summary(),
+		JournalSummary {
+			logical_events_observed: 12,
+			logical_events_compacted: 8,
+			physical_calls_observed: 6,
+			physical_calls_compacted: 4,
+		}
+	);
+}
+
+#[test]
+fn graceful_stop_finishes_the_active_iteration_then_allows_exit() {
+	let iterations = LoopIterations::new(3).unwrap();
+	let bundle = build_fixture_with_iterations(false, iterations);
+	let prepared = PreparedRun::prepare(
+		RunId::new(92),
+		bundle,
+		FakeBackend::new().repeatable(),
+		Watchdog::new(4).unwrap(),
+	)
+	.unwrap();
+	let initialized = prepared.initialize(images()).unwrap();
+	let mut running = initialized.start_loop().unwrap();
+	loop {
+		let (status, _) = running.poll_with_progress_or_stop(|| true).unwrap();
+		if status == LoopStatus::Complete {
+			break;
+		}
+	}
+	assert_eq!(running.current_iteration().index(), 0);
+	let exited = running
+		.into_exited_loop()
+		.unwrap_or_else(|_| panic!("safe-boundary stop did not permit exit"))
+		.exit()
+		.unwrap();
+	let (backend, _, _, journal) = exited.into_parts();
+	assert_eq!(backend.loop_submissions, 4);
+	assert!(journal.logical_events().iter().any(|event| {
+		matches!(
+			event,
+			LogicalEvent::LoopStopAccepted { after_iteration, .. } if after_iteration.index() == 0
+		)
+	}));
+}
+
+#[test]
+fn unbounded_loop_runs_until_an_explicit_safe_boundary_stop() {
+	let bundle = build_fixture_with_iterations(false, LoopIterations::UNBOUNDED);
+	let prepared = PreparedRun::prepare(
+		RunId::new(93),
+		bundle,
+		FakeBackend::new().repeatable(),
+		Watchdog::new(4).unwrap(),
+	)
+	.unwrap();
+	let initialized = prepared.initialize(images()).unwrap();
+	let mut running = initialized.start_loop().unwrap();
+	let capacities = running.capacities();
+	let mut completed_boundaries = 0_u64;
+	loop {
+		let (status, _) = running
+			.poll_with_progress_or_stop(|| {
+				completed_boundaries += 1;
+				completed_boundaries == 3
+			})
+			.unwrap();
+		if status == LoopStatus::Complete {
+			break;
+		}
+	}
+	assert_eq!(completed_boundaries, 3);
+	assert_eq!(running.current_iteration().index(), 2);
+	assert_eq!(
+		running.current_iteration().total(),
+		LoopIterations::UNBOUNDED
+	);
+	assert_eq!(running.capacities(), capacities);
+	let exited = running
+		.into_exited_loop()
+		.unwrap_or_else(|_| panic!("unbounded safe-boundary stop did not permit exit"))
+		.exit()
+		.unwrap();
+	let (backend, _, _, journal) = exited.into_parts();
+	assert_eq!(backend.loop_submissions, 12);
+	assert!(journal.logical_events().iter().any(|event| {
+		matches!(
+			event,
+			LogicalEvent::LoopStopAccepted { after_iteration, .. } if after_iteration.index() == 2
+		)
+	}));
 }
 
 #[test]

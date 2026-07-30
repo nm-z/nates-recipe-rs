@@ -10,6 +10,7 @@ calamine = "0.36"
 csv = "1"
 quick-xml = "0.41"
 recipe-core = { path = "../recipe-core" }
+recipe-ogdl = { path = "../recipe-ogdl" }
 serde = "1"
 serde_json = "1"
 sha2 = "0.10"

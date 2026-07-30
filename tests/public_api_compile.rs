@@ -124,11 +124,28 @@ fn public_surface_keeps_canonical_calls_and_rejects_banned_calls() {
 		("fail/try_run.rs", "method `try_run` is private"),
 		("fail/run_with.rs", "no method named `run_with`"),
 		("fail/try_run_with.rs", "method `try_run_with` is private"),
-		("fail/try_save.rs", "method `try_save` is private"),
+		("fail/try_save.rs", "no method named `try_save`"),
+		("fail/train_batch.rs", "no method named `batch`"),
+		(
+			"fail/report_checkpoint.rs",
+			"no method named `checkpoint_manifest`",
+		),
+		(
+			"fail/report_execution.rs",
+			"no method named `into_execution`",
+		),
+		(
+			"fail/save_unit.rs",
+			"the trait `From<()>` is not implemented",
+		),
 		("fail/calibrate.rs", "no method named `calibrate`"),
 		("fail/linear.rs", "no method named `linear`"),
 		(
 			"fail/load_with_input_width.rs",
+			"this method takes 1 argument but 2 arguments were supplied",
+		),
+		(
+			"fail/knn_outputs.rs",
 			"this method takes 1 argument but 2 arguments were supplied",
 		),
 		("fail/model_input_width.rs", "no method named `input_width`"),

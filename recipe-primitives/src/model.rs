@@ -10,8 +10,16 @@ use recipe_language::{
 
 use crate::error::ProgramValidationError;
 
-pub const LOWERED_PROGRAM_SCHEMA_VERSION: u32 = 1;
+pub const LOWERED_PROGRAM_SCHEMA_VERSION: u32 = 2;
 pub const INDEX_MAP_INTEGER_OPERATIONS_PER_LANE: u64 = 9;
+
+/// Measured device limits used to select immutable physical lowering geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoweringHardware {
+	pub subgroup_lanes: u32,
+	pub maximum_workgroup_lanes: u32,
+	pub maximum_shared_memory_per_workgroup: ByteCount,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProgramDigest([u8; 32]);
@@ -318,12 +326,23 @@ pub struct ContractionTile {
 	pub reduction: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContractionStrategy {
+	/// Each lane retains its ordered accumulator privately and requires no
+	/// workgroup synchronization.
+	Direct,
+	/// Each reduction tile checkpoints every lane's ordered accumulator through
+	/// measured-capacity workgroup-local storage at a fixed barrier boundary.
+	Staged,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContractionStage {
 	pub spec: Contraction,
 	pub dtype: DType,
 	pub output_elements: u64,
 	pub contracted_elements: u64,
+	pub strategy: ContractionStrategy,
 	pub tile: ContractionTile,
 	/// Contracted coordinates are visited in row-major axis-pair order. Each
 	/// output accumulator therefore has one backend-independent operation

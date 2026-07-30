@@ -25,7 +25,6 @@ use crate::identity::{
 use crate::native::Backend;
 
 const CUDA_KERNEL_ENTRY: &str = "recipe_probe_fma_f32";
-const CUDA_WORKGROUP_LANES: u32 = 256;
 const COMPLETION_POLL_INITIAL_DELAY: Duration = Duration::from_micros(50);
 const COMPLETION_POLL_MAXIMUM_DELAY: Duration = Duration::from_millis(2);
 const TIMED_OUT_CLEANUP_INITIAL_DELAY: Duration = Duration::from_millis(10);
@@ -196,6 +195,11 @@ impl CudaBackend {
 			asynchronous_submission: true,
 			maximum_submission_queues: CUDA_MAXIMUM_SUBMISSION_QUEUES,
 			maximum_concurrent_tasks: 1,
+			subgroup_lanes: device.attributes.warp_size,
+			maximum_workgroup_lanes: device.attributes.maximum_threads_per_block,
+			maximum_shared_memory_per_workgroup: recipe_core::ByteCount::new(u64::from(
+				device.attributes.maximum_shared_memory_per_block_bytes,
+			)),
 			transfer_overlaps_calculation: device.attributes.async_engine_count != 0
 				&& device.attributes.concurrent_kernels,
 		})
@@ -349,6 +353,12 @@ impl CudaBackend {
 	) -> ProbeResult<recipe_core::FlopsPerSecond> {
 		let bytes = compute_buffer_bytes(plan)?;
 		let template = fma_template(bytes, self.kernels.fma_chain_length)?;
+		let elements = u64::try_from(bytes / core::mem::size_of::<f32>())
+			.map_err(|_| ProbeError::Benchmark("CUDA benchmark element count does not fit u64".to_owned()))?;
+		let workgroup_lanes = cuda_workgroup_lanes(
+			context.device().attributes.maximum_threads_per_block,
+			elements,
+		)?;
 		let target = KernelTarget::Nvidia(NvidiaTarget {
 			sm_major: u8::try_from(context.device().compute_capability.major)
 				.map_err(|_| ProbeError::Benchmark("CUDA SM major does not fit u8".to_owned()))?,
@@ -361,7 +371,7 @@ impl CudaBackend {
 			&target,
 			&LoweringOptions {
 				entry_symbol: CUDA_KERNEL_ENTRY.to_owned(),
-				workgroup_lanes: CUDA_WORKGROUP_LANES,
+				workgroup_lanes,
 			},
 		)
 		.map_err(kernel_benchmark_error)?;
@@ -395,14 +405,14 @@ impl CudaBackend {
 			.map_err(cuda_benchmark_error)?;
 		let elements = lowered.abi.elements.get();
 		let blocks = elements
-			.checked_add(u64::from(CUDA_WORKGROUP_LANES) - 1)
+			.checked_add(u64::from(workgroup_lanes) - 1)
 			.ok_or_else(|| ProbeError::Benchmark("CUDA grid calculation overflowed".to_owned()))?
-			/ u64::from(CUDA_WORKGROUP_LANES);
+			/ u64::from(workgroup_lanes);
 		let grid_x =
 			u32::try_from(blocks).map_err(|_| ProbeError::Benchmark("CUDA grid does not fit u32".to_owned()))?;
 		let launch = LaunchConfig::new(
 			Dim3::new(grid_x, 1, 1).map_err(cuda_benchmark_error)?,
-			Dim3::new(CUDA_WORKGROUP_LANES, 1, 1).map_err(cuda_benchmark_error)?,
+			Dim3::new(workgroup_lanes, 1, 1).map_err(cuda_benchmark_error)?,
 		);
 		let timed = time_bounded(plan, |remaining| {
 			let mut input_address = input.device_ptr().map_err(cuda_benchmark_error)?;
@@ -517,6 +527,18 @@ fn kernel_benchmark_error(error: recipe_kernel::LoweringError) -> ProbeError {
 	ProbeError::Benchmark(format!("Recipe-owned GPU artifact: {error}"))
 }
 
+fn cuda_workgroup_lanes(maximum_workgroup_lanes: u32, elements: u64) -> ProbeResult<u32> {
+	let elements = u32::try_from(elements.min(u64::from(u32::MAX)))
+		.map_err(|_| ProbeError::Benchmark("CUDA benchmark element count does not fit u32".to_owned()))?;
+	let maximum = maximum_workgroup_lanes.min(elements);
+	if maximum == 0 {
+		return Err(ProbeError::Benchmark(
+			"CUDA workgroup limit or benchmark element count is zero".to_owned(),
+		));
+	}
+	Ok(1_u32 << (31 - maximum.leading_zeros()))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ParsedPci {
 	domain: u32,
@@ -572,6 +594,23 @@ fn parse_pci_bus_id(value: &str) -> ProbeResult<ParsedPci> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn workgroup_selection_uses_discovered_limit_and_realized_elements() {
+		assert_eq!(
+			cuda_workgroup_lanes(1_024, 900).expect("workgroup lanes"),
+			512
+		);
+		assert_eq!(
+			cuda_workgroup_lanes(192, 900).expect("workgroup lanes"),
+			128
+		);
+		assert_eq!(
+			cuda_workgroup_lanes(1_024, 17).expect("workgroup lanes"),
+			16
+		);
+		assert!(cuda_workgroup_lanes(1_024, 0).is_err());
+	}
 
 	#[test]
 	fn parses_exact_cuda_pci_function() {

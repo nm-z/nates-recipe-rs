@@ -13,6 +13,7 @@
 
 mod dataset;
 mod gguf;
+mod gguf_ogdl;
 mod image;
 mod image_header;
 mod inference;
@@ -31,6 +32,11 @@ pub use gguf::{
 	GgufArchive, GgufEndian, GgufError, GgufErrorKind, GgufLimits, GgufMetadataArray, GgufMetadataEntry,
 	GgufMetadataType, GgufMetadataValue, GgufResult, GgufTensor, GgufTensorType, parse_gguf,
 };
+pub use gguf_ogdl::{
+	GgufModelDescriptor, GgufOgdlError, GgufOgdlErrorKind, GgufOgdlResult, gguf_to_structural_ogdl,
+	gguf_to_structural_ogdl_stream, inspect_gguf_model_stream, structural_ogdl_declared_gguf_bytes,
+	structural_ogdl_to_gguf, structural_ogdl_to_gguf_stream,
+};
 pub use image::{
 	ExternalValue, ImagePackError, ImagePackErrorKind, ImagePackResult, PackedInitImage, pack_init_images,
 };
@@ -48,7 +54,7 @@ pub use prepare::{
 	CategoricalObservation, ColumnPattern, ComparisonOperator, DenseMatrix, PartitionKind, PredicateLiteral,
 	PreparationRequest, PrepareError, PrepareErrorKind, PrepareResult, PreparedDataset, PreparedPartition,
 	PreparedValues, PreparedVector, RowPredicate, TemporalOrigin, TrainFraction, VariableWidthVector, VectorMetadata,
-	VectorRole, VectorSchema, prepare_inferred_table, prepare_table,
+	VectorRole, VectorSchema, prepare_inferred_table, prepare_table, select_table,
 };
 pub use safetensors::{
 	SafeTensorArchive, SafeTensorDType, SafeTensorEntry, SafeTensorError, SafeTensorErrorKind, SafeTensorLimits,

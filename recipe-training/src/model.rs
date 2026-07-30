@@ -1,6 +1,7 @@
-use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use core::fmt;
+use core::num::{NonZeroU32, NonZeroU64};
 
-use recipe_core::{DType, IterationDomain, KernelTemplateId, MetricId, ValueId};
+use recipe_core::{DType, IterationDomain, KernelTemplateId, LoopIterations, MetricId, ValueId};
 use recipe_ingest::{
 	DenseMatrix, PartitionKind, PreparedDataset, PreparedValues, SemanticType, VectorEncoding, VectorMetadata,
 	VectorRole, VectorSchema,
@@ -10,17 +11,34 @@ use recipe_program::StaticCalculationProgram;
 
 use crate::{TrainingCompileError, TrainingCompileErrorKind, TrainingCompileResult};
 
+/// Semantic upper bound admitted by the Recipe reduction grammar. Physical
+/// lowering selects the realizable tree width from this bound and the exact
+/// tensor shape plus measured device limits.
+pub const MAXIMUM_REDUCTION_TREE_LANES: u32 = 1_024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DenseActivation {
 	Linear,
 	Cosine,
 	Exponential,
+	/// `sign(x) * ln(abs(x))` for finite, nonzero `x`.
 	Logarithm,
+	/// Ordinary `ln(x)` for finite, strictly positive `x`.
+	NaturalLogarithm,
+	/// Decoder-only compatibility for the pre-contract
+	/// `sign(x) * ln(1 + abs(x))` activation.
+	LegacySignedLogOnePlus,
 	Huber,
 	Tangent,
 	Relu,
+	LeakyRelu,
+	Sigmoid,
+	Tanh,
+	Selu,
 	Gelu,
 	Silu,
+	Elu,
+	PRelu,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +61,9 @@ pub enum DenseBlockKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DenseDataNormalization {
+	/// Preserve the prepared calculation dtype and values exactly. This is the
+	/// only valid input policy for integer token IDs consumed by an embedding.
+	Identity,
 	ZScore,
 	MinMax,
 	L2Norm,
@@ -51,6 +72,7 @@ pub enum DenseDataNormalization {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DenseLoss {
 	BinaryCrossEntropy,
+	Focal,
 	MeanSquaredError,
 	MeanAbsoluteError,
 	CrossEntropy,
@@ -59,9 +81,68 @@ pub enum DenseLoss {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LearningRateDecay {
+	Constant,
 	Linear,
 	Cosine,
 	Exponential,
+}
+
+/// Declared duration of one training phase.
+///
+/// An unbounded phase has no synthetic terminal epoch. It runs until the
+/// executor accepts an explicit graceful-stop request after a complete epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainingHorizon {
+	Finite(NonZeroU64),
+	Unbounded,
+}
+
+impl TrainingHorizon {
+	#[must_use]
+	pub const fn finite(epochs: NonZeroU64) -> Self {
+		Self::Finite(epochs)
+	}
+
+	#[must_use]
+	pub const fn unbounded() -> Self {
+		Self::Unbounded
+	}
+
+	#[must_use]
+	pub const fn bound(self) -> Option<NonZeroU64> {
+		match self {
+			Self::Finite(epochs) => Some(epochs),
+			Self::Unbounded => None,
+		}
+	}
+
+	#[must_use]
+	pub const fn is_unbounded(self) -> bool {
+		matches!(self, Self::Unbounded)
+	}
+
+	#[must_use]
+	pub const fn loop_iterations(self) -> LoopIterations {
+		match self {
+			Self::Finite(epochs) => LoopIterations::Finite(epochs),
+			Self::Unbounded => LoopIterations::Unbounded,
+		}
+	}
+}
+
+impl From<NonZeroU64> for TrainingHorizon {
+	fn from(epochs: NonZeroU64) -> Self {
+		Self::Finite(epochs)
+	}
+}
+
+impl fmt::Display for TrainingHorizon {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Finite(epochs) => epochs.fmt(formatter),
+			Self::Unbounded => formatter.write_str("unbounded"),
+		}
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +199,130 @@ impl DenseLayer {
 	}
 }
 
+/// One valid, stride-one one-dimensional convolution block.
+///
+/// The logical input length and channel count are resolved from the preceding
+/// block. `filters` becomes the output channel count and the kernel spans the
+/// logical length while consuming every input channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DenseConvolution {
+	filters: NonZeroU64,
+	kernel: NonZeroU64,
+	operations: Vec<DenseOperation>,
+}
+
+impl DenseConvolution {
+	#[must_use]
+	pub fn new(filters: NonZeroU64, kernel: NonZeroU64, activation: DenseActivation) -> Self {
+		Self {
+			filters,
+			kernel,
+			operations: match activation {
+				DenseActivation::Linear => Vec::new(),
+				activation => vec![DenseOperation::Activation(activation)],
+			},
+		}
+	}
+
+	#[must_use]
+	pub fn with_operations(
+		filters: NonZeroU64,
+		kernel: NonZeroU64,
+		operations: impl IntoIterator<Item = DenseOperation>,
+	) -> Self {
+		Self {
+			filters,
+			kernel,
+			operations: operations.into_iter().collect(),
+		}
+	}
+
+	#[must_use]
+	pub const fn filters(&self) -> NonZeroU64 {
+		self.filters
+	}
+
+	#[must_use]
+	pub const fn kernel(&self) -> NonZeroU64 {
+		self.kernel
+	}
+
+	#[must_use]
+	pub fn operations(&self) -> &[DenseOperation] {
+		&self.operations
+	}
+}
+
+/// Resolved logical shape of one convolution block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseConvolutionGeometry {
+	input_length: NonZeroU64,
+	input_channels: NonZeroU64,
+	output_length: NonZeroU64,
+	filters: NonZeroU64,
+	kernel: NonZeroU64,
+}
+
+impl DenseConvolutionGeometry {
+	#[must_use]
+	pub const fn new(
+		input_length: NonZeroU64,
+		input_channels: NonZeroU64,
+		output_length: NonZeroU64,
+		filters: NonZeroU64,
+		kernel: NonZeroU64,
+	) -> Self {
+		Self {
+			input_length,
+			input_channels,
+			output_length,
+			filters,
+			kernel,
+		}
+	}
+
+	#[must_use]
+	pub const fn input_length(self) -> NonZeroU64 {
+		self.input_length
+	}
+
+	#[must_use]
+	pub const fn input_channels(self) -> NonZeroU64 {
+		self.input_channels
+	}
+
+	#[must_use]
+	pub const fn output_length(self) -> NonZeroU64 {
+		self.output_length
+	}
+
+	#[must_use]
+	pub const fn filters(self) -> NonZeroU64 {
+		self.filters
+	}
+
+	#[must_use]
+	pub const fn kernel(self) -> NonZeroU64 {
+		self.kernel
+	}
+
+	#[must_use]
+	pub fn input_width(self) -> Option<NonZeroU64> {
+		self.input_length
+			.get()
+			.checked_mul(self.input_channels.get())
+			.and_then(NonZeroU64::new)
+	}
+
+	#[must_use]
+	pub fn output_width(self) -> Option<NonZeroU64> {
+		self.output_length
+			.get()
+			.checked_mul(self.filters.get())
+			.and_then(NonZeroU64::new)
+	}
+}
+
 /// One ordered residual branch and the operations applied after its merge.
 ///
 /// The final branch layer determines the residual output width. The compiler
@@ -164,6 +369,215 @@ impl DensePool {
 	pub fn routing(self, groups: NonZeroU64) -> Option<DenseGroupToNeuronRouting> {
 		self.group_to_neuron
 			.map(|neurons| DenseGroupToNeuronRouting::resolve(groups, neurons))
+	}
+}
+
+/// One deterministic K-means feature-reduction block.
+///
+/// The block emits one L2 distance per centroid. If a dense layer immediately
+/// follows it, `group_to_neuron` retains that layer's width so Recipe's shared
+/// divisible-or-fully-connected routing rule remains explicit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseKMeans {
+	clusters: NonZeroU64,
+	group_to_neuron: Option<NonZeroU64>,
+}
+
+/// One learned token embedding table.
+///
+/// The incoming feature columns are the fixed sequence positions of each row.
+/// Every value is an exact int32 token ID in `0..vocabulary`; the learned table
+/// maps each ID to `dimensions` binary32 channels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseEmbedding {
+	dimensions: NonZeroU64,
+	vocabulary: NonZeroU64,
+}
+
+impl DenseEmbedding {
+	#[must_use]
+	pub const fn new(dimensions: NonZeroU64, vocabulary: NonZeroU64) -> Self {
+		Self {
+			dimensions,
+			vocabulary,
+		}
+	}
+
+	#[must_use]
+	pub const fn dimensions(self) -> NonZeroU64 {
+		self.dimensions
+	}
+
+	#[must_use]
+	pub const fn vocabulary(self) -> NonZeroU64 {
+		self.vocabulary
+	}
+}
+
+/// One causal multi-head self-attention block over the immediately preceding
+/// fixed-sequence embedding.
+///
+/// The embedding dimension is divided evenly across `heads`. Recipe learns
+/// independent query, key, value, and output matrices and applies a causal
+/// mask; no tokenizer, padding, or positional vector is implied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseAttention {
+	heads: NonZeroU64,
+}
+
+impl DenseAttention {
+	#[must_use]
+	pub const fn new(heads: NonZeroU64) -> Self {
+		Self { heads }
+	}
+
+	#[must_use]
+	pub const fn heads(self) -> NonZeroU64 {
+		self.heads
+	}
+}
+
+/// One vanilla recurrent block over the numeric feature-column sequence.
+///
+/// Each row starts from an all-zero hidden state. One scalar feature is
+/// consumed per step in column order, `tanh` updates the hidden state, and the
+/// block returns only the final hidden state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseRnn {
+	width: NonZeroU64,
+}
+
+impl DenseRnn {
+	#[must_use]
+	pub const fn new(width: NonZeroU64) -> Self {
+		Self { width }
+	}
+
+	#[must_use]
+	pub const fn width(self) -> NonZeroU64 {
+		self.width
+	}
+}
+
+/// One reset-before gated recurrent-unit block over the numeric
+/// feature-column sequence.
+///
+/// Each row starts from an all-zero hidden state. One scalar feature is
+/// consumed per step in column order, and the block returns only the final
+/// hidden state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseGru {
+	width: NonZeroU64,
+}
+
+impl DenseGru {
+	#[must_use]
+	pub const fn new(width: NonZeroU64) -> Self {
+		Self { width }
+	}
+
+	#[must_use]
+	pub const fn width(self) -> NonZeroU64 {
+		self.width
+	}
+}
+
+/// One gated long short-term memory block over the numeric feature-column
+/// sequence.
+///
+/// Each row starts from all-zero hidden and cell state. One scalar feature is
+/// consumed per step in column order, and the block returns only the final
+/// hidden state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseLstm {
+	width: NonZeroU64,
+}
+
+impl DenseLstm {
+	#[must_use]
+	pub const fn new(width: NonZeroU64) -> Self {
+		Self { width }
+	}
+
+	#[must_use]
+	pub const fn width(self) -> NonZeroU64 {
+		self.width
+	}
+}
+
+impl DenseKMeans {
+	#[must_use]
+	pub const fn new(clusters: NonZeroU64, group_to_neuron: Option<NonZeroU64>) -> Self {
+		Self {
+			clusters,
+			group_to_neuron,
+		}
+	}
+
+	#[must_use]
+	pub const fn clusters(self) -> NonZeroU64 {
+		self.clusters
+	}
+
+	#[must_use]
+	pub const fn group_to_neuron(self) -> Option<NonZeroU64> {
+		self.group_to_neuron
+	}
+
+	#[must_use]
+	pub fn routing(self) -> Option<DenseGroupToNeuronRouting> {
+		self.group_to_neuron
+			.map(|neurons| DenseGroupToNeuronRouting::resolve(self.clusters, neurons))
+	}
+}
+
+/// Recipe-owned growth order for one supervised tree ensemble.
+///
+/// The public spellings remain `.lgbm`, `.cbst`, and `.xgbst`; this identity
+/// is retained explicitly so checkpoint and inference code cannot silently
+/// collapse the three construction rules into one generic tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseTreeFamily {
+	LightGbm,
+	CatBoost,
+	XGBoost,
+}
+
+/// One terminal supervised tree ensemble.
+///
+/// A standalone public booster declares exactly one tree. A preceding
+/// `.forest(trees)` declares exactly `trees` trees and does not add another
+/// hidden estimator or boosting-round count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseTree {
+	family: DenseTreeFamily,
+	trees: NonZeroU64,
+	depth: NonZeroU32,
+}
+
+impl DenseTree {
+	#[must_use]
+	pub const fn new(family: DenseTreeFamily, trees: NonZeroU64, depth: NonZeroU32) -> Self {
+		Self {
+			family,
+			trees,
+			depth,
+		}
+	}
+
+	#[must_use]
+	pub const fn family(self) -> DenseTreeFamily {
+		self.family
+	}
+
+	#[must_use]
+	pub const fn trees(self) -> NonZeroU64 {
+		self.trees
+	}
+
+	#[must_use]
+	pub const fn depth(self) -> NonZeroU32 {
+		self.depth
 	}
 }
 
@@ -218,7 +632,7 @@ impl DenseGroupToNeuronRouting {
 	}
 }
 
-/// Stable flattening order for a pooled logical `[batch, groups, channels]`
+/// Stable flattening order for a pooled logical `[rows, groups, channels]`
 /// tensor when it feeds a dense block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DensePoolGroupOrder {
@@ -295,13 +709,13 @@ impl DensePoolState {
 	}
 
 	#[must_use]
-	pub const fn logical_input_shape(self, batch: NonZeroU64) -> [u64; 3] {
-		[batch.get(), self.input_length.get(), self.channels.get()]
+	pub const fn logical_input_shape(self, rows: NonZeroU64) -> [u64; 3] {
+		[rows.get(), self.input_length.get(), self.channels.get()]
 	}
 
 	#[must_use]
-	pub const fn logical_output_shape(self, batch: NonZeroU64) -> [u64; 3] {
-		[batch.get(), self.output_length.get(), self.channels.get()]
+	pub const fn logical_output_shape(self, rows: NonZeroU64) -> [u64; 3] {
+		[rows.get(), self.output_length.get(), self.channels.get()]
 	}
 }
 
@@ -361,8 +775,16 @@ impl DenseResidual {
 /// A topology-preserving dense training block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DenseBlock {
+	Embedding(DenseEmbedding),
+	Attention(DenseAttention),
+	Rnn(DenseRnn),
+	Gru(DenseGru),
+	Lstm(DenseLstm),
 	Layer(DenseLayer),
+	Convolution(DenseConvolution),
 	Pool(DensePool),
+	KMeans(DenseKMeans),
+	Tree(DenseTree),
 	Residual(DenseResidual),
 }
 
@@ -370,8 +792,16 @@ impl DenseBlock {
 	#[must_use]
 	pub fn output_width(&self) -> Option<NonZeroU64> {
 		match self {
+			Self::Embedding(_) => None,
+			Self::Attention(_) => None,
+			Self::Rnn(rnn) => Some(rnn.width()),
+			Self::Gru(gru) => Some(gru.width()),
+			Self::Lstm(lstm) => Some(lstm.width()),
 			Self::Layer(layer) => Some(layer.width()),
+			Self::Convolution(_) => None,
 			Self::Pool(_) => None,
+			Self::KMeans(kmeans) => Some(kmeans.clusters()),
+			Self::Tree(_) => None,
 			Self::Residual(residual) => residual.output_width(),
 		}
 	}
@@ -379,10 +809,46 @@ impl DenseBlock {
 	#[must_use]
 	pub fn output_operations(&self) -> &[DenseOperation] {
 		match self {
+			Self::Embedding(_) => &[],
+			Self::Attention(_) => &[],
+			Self::Rnn(_) => &[],
+			Self::Gru(_) => &[],
+			Self::Lstm(_) => &[],
 			Self::Layer(layer) => layer.operations(),
-			Self::Pool(_) => &[],
+			Self::Convolution(convolution) => convolution.operations(),
+			Self::Pool(_) | Self::KMeans(_) | Self::Tree(_) => &[],
 			Self::Residual(residual) => residual.operations(),
 		}
+	}
+}
+
+impl From<DenseEmbedding> for DenseBlock {
+	fn from(embedding: DenseEmbedding) -> Self {
+		Self::Embedding(embedding)
+	}
+}
+
+impl From<DenseAttention> for DenseBlock {
+	fn from(attention: DenseAttention) -> Self {
+		Self::Attention(attention)
+	}
+}
+
+impl From<DenseRnn> for DenseBlock {
+	fn from(rnn: DenseRnn) -> Self {
+		Self::Rnn(rnn)
+	}
+}
+
+impl From<DenseGru> for DenseBlock {
+	fn from(gru: DenseGru) -> Self {
+		Self::Gru(gru)
+	}
+}
+
+impl From<DenseLstm> for DenseBlock {
+	fn from(lstm: DenseLstm) -> Self {
+		Self::Lstm(lstm)
 	}
 }
 
@@ -395,6 +861,24 @@ impl From<DenseLayer> for DenseBlock {
 impl From<DensePool> for DenseBlock {
 	fn from(pool: DensePool) -> Self {
 		Self::Pool(pool)
+	}
+}
+
+impl From<DenseKMeans> for DenseBlock {
+	fn from(kmeans: DenseKMeans) -> Self {
+		Self::KMeans(kmeans)
+	}
+}
+
+impl From<DenseConvolution> for DenseBlock {
+	fn from(convolution: DenseConvolution) -> Self {
+		Self::Convolution(convolution)
+	}
+}
+
+impl From<DenseTree> for DenseBlock {
+	fn from(tree: DenseTree) -> Self {
+		Self::Tree(tree)
 	}
 }
 
@@ -412,6 +896,23 @@ pub enum DenseTask {
 	ScalarRegression {
 		target_vector: usize,
 	},
+	/// Multiple declared numeric 0/1 targets, retained as one ordered matrix.
+	/// BCE or focal loss is evaluated independently at each matrix element.
+	MultiTargetBinaryClassification {
+		first_target_vector: usize,
+		target_count: usize,
+	},
+	/// Multiple declared numeric one-hot targets forming one categorical row.
+	/// Cross entropy couples the columns through one row-wise softmax.
+	JointMulticlassClassification {
+		first_target_vector: usize,
+		target_count: usize,
+	},
+	/// Multiple declared numeric targets forming one ordered regression vector.
+	MultiTargetRegression {
+		first_target_vector: usize,
+		target_count: usize,
+	},
 }
 
 impl DenseTask {
@@ -421,7 +922,41 @@ impl DenseTask {
 			Self::BinaryClassification { target_vector, .. }
 			| Self::MulticlassClassification { target_vector, .. }
 			| Self::ScalarRegression { target_vector } => target_vector,
+			Self::MultiTargetBinaryClassification {
+				first_target_vector,
+				..
+			}
+			| Self::JointMulticlassClassification {
+				first_target_vector,
+				..
+			}
+			| Self::MultiTargetRegression {
+				first_target_vector,
+				..
+			} => first_target_vector,
 		}
+	}
+
+	#[must_use]
+	pub const fn target_count(self) -> usize {
+		match self {
+			Self::BinaryClassification { .. }
+			| Self::MulticlassClassification { .. }
+			| Self::ScalarRegression { .. } => 1,
+			Self::MultiTargetBinaryClassification { target_count, .. }
+			| Self::JointMulticlassClassification { target_count, .. }
+			| Self::MultiTargetRegression { target_count, .. } => target_count,
+		}
+	}
+
+	#[must_use]
+	pub const fn uses_target_matrix(self) -> bool {
+		matches!(
+			self,
+			Self::MultiTargetBinaryClassification { .. }
+				| Self::JointMulticlassClassification { .. }
+				| Self::MultiTargetRegression { .. }
+		)
 	}
 
 	#[must_use]
@@ -429,6 +964,9 @@ impl DenseTask {
 		match self {
 			Self::BinaryClassification { .. } | Self::ScalarRegression { .. } => 1,
 			Self::MulticlassClassification { class_count, .. } => class_count,
+			Self::MultiTargetBinaryClassification { target_count, .. }
+			| Self::JointMulticlassClassification { target_count, .. }
+			| Self::MultiTargetRegression { target_count, .. } => target_count,
 		}
 	}
 }
@@ -515,7 +1053,8 @@ impl CompiledFeatureSpan {
 pub struct CompiledDatasetSchema {
 	vectors: Vec<VectorSchema>,
 	features: Vec<CompiledFeatureSpan>,
-	target: usize,
+	targets: Vec<usize>,
+	target_dtypes: Vec<DType>,
 	input_width: usize,
 	task: DenseTask,
 }
@@ -525,21 +1064,56 @@ impl CompiledDatasetSchema {
 		dataset: &PreparedDataset,
 		task: DenseTask,
 		features: Vec<CompiledFeatureSpan>,
-	) -> Self {
+	) -> TrainingCompileResult<Self> {
 		let vectors = dataset
 			.vectors()
 			.iter()
 			.map(|vector| vector.schema())
 			.collect::<Vec<_>>();
-		let target = task.target_vector();
+		let targets = dataset.target_source_indices().to_vec();
+		if targets.len() != task.target_count() || targets.first().copied() != Some(task.target_vector()) {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidTargetMatrix,
+				format!(
+					"declared target order {targets:?} disagrees with task primary target {} and count {}",
+					task.target_vector(),
+					task.target_count()
+				),
+			));
+		}
+		let target_dtypes = targets
+			.iter()
+			.copied()
+			.map(|target| {
+				let target_schema = vectors
+					.iter()
+					.find(|vector| vector.source_index() == target && vector.role() == VectorRole::Target)
+					.ok_or_else(|| {
+						TrainingCompileError::new(
+							TrainingCompileErrorKind::InvalidTargetMatrix,
+							format!("dense target vector {target} is absent from the compiled schema"),
+						)
+					})?;
+				target_schema.encoding().dtype().ok_or_else(|| {
+					TrainingCompileError::new(
+						TrainingCompileErrorKind::InvalidTargetMatrix,
+						format!(
+							"dense target vector {target} uses variable-width {:?} storage without a typed target lowering",
+							target_schema.encoding()
+						),
+					)
+				})
+			})
+			.collect::<TrainingCompileResult<Vec<_>>>()?;
 		let input_width = features.iter().map(|feature| feature.width).sum();
-		Self {
+		Ok(Self {
 			vectors,
 			features,
-			target,
+			targets,
+			target_dtypes,
 			input_width,
 			task,
-		}
+		})
 	}
 
 	#[must_use]
@@ -553,8 +1127,28 @@ impl CompiledDatasetSchema {
 	}
 
 	#[must_use]
-	pub const fn target(&self) -> usize {
-		self.target
+	pub fn target(&self) -> usize {
+		self.targets[0]
+	}
+
+	/// Target source identities in the user's declaration order.
+	#[must_use]
+	pub fn targets(&self) -> &[usize] {
+		&self.targets
+	}
+
+	/// Smallest fixed-width dtype selected by semantic distillation for the
+	/// target vector. Loss calculations may consume an explicit conversion,
+	/// but this source contract never changes.
+	#[must_use]
+	pub fn target_dtype(&self) -> DType {
+		self.target_dtypes[0]
+	}
+
+	/// Calculation-facing source dtypes in declared-target order.
+	#[must_use]
+	pub fn target_dtypes(&self) -> &[DType] {
+		&self.target_dtypes
 	}
 
 	#[must_use]
@@ -779,11 +1373,8 @@ impl DensePartition {
 			.all(|observation| *observation == TargetObservation::Known)
 	}
 
-	pub(crate) fn accepted_updates_per_epoch(&self, batch_size: usize) -> usize {
-		self.target_observations
-			.chunks(batch_size)
-			.filter(|batch| batch.contains(&TargetObservation::Known))
-			.count()
+	pub(crate) fn accepted_updates_per_epoch(&self) -> usize {
+		usize::from(self.target_observations.contains(&TargetObservation::Known))
 	}
 
 	pub(crate) fn target_supervision(&self) -> DenseMatrix {
@@ -918,11 +1509,10 @@ fn lower_dense_targets(
 	task: DenseTask,
 	partition_kind: PartitionKind,
 ) -> TrainingCompileResult<LoweredDenseTargets> {
-	let target_vector = match task {
-		DenseTask::BinaryClassification { target_vector, .. }
-		| DenseTask::ScalarRegression { target_vector }
-		| DenseTask::MulticlassClassification { target_vector, .. } => target_vector,
-	};
+	if task.uses_target_matrix() {
+		return lower_multi_dense_targets(dataset, task, partition_kind);
+	}
+	let target_vector = task.target_vector();
 	let target = dataset
 		.vectors()
 		.iter()
@@ -1001,6 +1591,181 @@ fn lower_dense_targets(
 			"dense target cannot use variable-width storage",
 		)),
 	}
+}
+
+fn lower_multi_dense_targets(
+	dataset: &PreparedDataset,
+	task: DenseTask,
+	partition_kind: PartitionKind,
+) -> TrainingCompileResult<LoweredDenseTargets> {
+	let target_count = task.target_count();
+	if target_count < 2 || dataset.target_source_indices().len() != target_count {
+		return Err(TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidTargetMatrix,
+			format!(
+				"multi-target task requires at least two declared targets and exact order width {target_count}, found {:?}",
+				dataset.target_source_indices()
+			),
+		));
+	}
+	let targets = dataset
+		.target_source_indices()
+		.iter()
+		.copied()
+		.map(|source_index| {
+			dataset
+				.vectors()
+				.iter()
+				.find(|vector| vector.source_index() == source_index && vector.role() == VectorRole::Target)
+				.ok_or_else(|| {
+					TrainingCompileError::new(
+						TrainingCompileErrorKind::InvalidTargetMatrix,
+						format!("declared target vector {source_index} is absent"),
+					)
+				})
+		})
+		.collect::<TrainingCompileResult<Vec<_>>>()?;
+	let partition = match partition_kind {
+		PartitionKind::Train => dataset.train(),
+		PartitionKind::Validation => dataset.validation(),
+	};
+	let capacity = partition.len().checked_mul(target_count).ok_or_else(|| {
+		TrainingCompileError::new(
+			TrainingCompileErrorKind::ArithmeticOverflow,
+			"multi-target matrix element count overflowed usize",
+		)
+	})?;
+	let mut lowered = Vec::with_capacity(capacity);
+	let mut observations = Vec::with_capacity(partition.len());
+	for (retained_position, source_row) in partition
+		.retained_positions()
+		.iter()
+		.copied()
+		.zip(partition.source_rows().iter().copied())
+	{
+		let row_start = lowered.len();
+		let mut row_known = true;
+		for target in &targets {
+			let value = match target.values() {
+				PreparedValues::I32(values) => {
+					let value = values.get(retained_position).ok_or_else(|| {
+						target_lowering_error(target.name(), source_row, "target value is absent")
+					})?;
+					match value {
+						Some(value) => {
+							let converted = *value as f32;
+							if f64::from(converted) != f64::from(*value) {
+								return Err(target_lowering_error(
+									target.name(),
+									source_row,
+									format!(
+										"int32 target {value} is not exactly representable as binary32"
+									),
+								));
+							}
+							Some(converted)
+						}
+						None => None,
+					}
+				}
+				PreparedValues::F32Bits(values) => {
+					let bits = values.get(retained_position).ok_or_else(|| {
+						target_lowering_error(target.name(), source_row, "target value is absent")
+					})?;
+					bits.map(f32::from_bits)
+				}
+				PreparedValues::VariableWidth(_) => {
+					return Err(target_lowering_error(
+						target.name(),
+						source_row,
+						"multi-target dense objectives require fixed numeric storage",
+					));
+				}
+			};
+			match value {
+				Some(value) if value.is_finite() => lowered.push(value.to_bits()),
+				Some(value) => {
+					return Err(target_lowering_error(
+						target.name(),
+						source_row,
+						format!("target contains non-finite value {value}"),
+					));
+				}
+				None => {
+					row_known = false;
+					lowered.push(0.0_f32.to_bits());
+				}
+			}
+		}
+		let row = &mut lowered[row_start..];
+		if !row_known {
+			row.fill(0.0_f32.to_bits());
+			observations.push(TargetObservation::Missing);
+			continue;
+		}
+		match task {
+			DenseTask::MultiTargetBinaryClassification { .. } => {
+				if let Some((column, value)) = row
+					.iter()
+					.copied()
+					.map(f32::from_bits)
+					.enumerate()
+					.find(|(_, value)| *value != 0.0 && *value != 1.0)
+				{
+					return Err(target_lowering_error(
+						targets[column].name(),
+						source_row,
+						format!(
+							"binary target matrix contains {value}; only exact zero and one are accepted"
+						),
+					));
+				}
+			}
+			DenseTask::JointMulticlassClassification { .. } => {
+				let mut ones = 0_usize;
+				for (column, value) in row.iter().copied().map(f32::from_bits).enumerate() {
+					if value == 1.0 {
+						ones += 1;
+					} else if value != 0.0 {
+						return Err(target_lowering_error(
+							targets[column].name(),
+							source_row,
+							format!(
+								"joint cross-entropy target contains {value}; rows must be exact one-hot vectors"
+							),
+						));
+					}
+				}
+				if ones != 1 {
+					return Err(target_lowering_error(
+						targets[0].name(),
+						source_row,
+						format!(
+							"joint cross-entropy row has {ones} active targets; exactly one is required"
+						),
+					));
+				}
+			}
+			DenseTask::MultiTargetRegression { .. } => {}
+			DenseTask::BinaryClassification { .. }
+			| DenseTask::MulticlassClassification { .. }
+			| DenseTask::ScalarRegression { .. } => {
+				return Err(TrainingCompileError::new(
+					TrainingCompileErrorKind::InvalidTargetMatrix,
+					"singular task reached multi-target lowering",
+				));
+			}
+		}
+		observations.push(TargetObservation::Known);
+	}
+	Ok(LoweredDenseTargets {
+		matrix: DenseMatrix::F32Bits {
+			rows: partition.len(),
+			columns: target_count,
+			values: lowered,
+		},
+		observations,
+	})
 }
 
 fn lower_i32_target(
@@ -1104,6 +1869,12 @@ fn lower_i32_target(
 			}
 			Ok((value, TargetObservation::Known))
 		}
+		DenseTask::MultiTargetBinaryClassification { .. }
+		| DenseTask::JointMulticlassClassification { .. }
+		| DenseTask::MultiTargetRegression { .. } => Err(TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidTargetMatrix,
+			"multi-target task reached singular int32 target lowering",
+		)),
 	}
 }
 
@@ -1212,7 +1983,7 @@ fn target_lowering_error(name: &[u8], source_row: usize, detail: impl core::fmt:
 	)
 }
 
-fn lower_dense_features(
+pub(crate) fn lower_dense_features(
 	dataset: &PreparedDataset,
 	plan: &DenseFeaturePlan,
 	partition_kind: PartitionKind,
@@ -1366,15 +2137,6 @@ fn lower_numeric_feature(
 }
 
 fn validate_categorical_dictionary(name: &[u8], dictionary: &[Vec<u8>]) -> TrainingCompileResult<()> {
-	if dictionary.is_empty() {
-		return Err(TrainingCompileError::new(
-			TrainingCompileErrorKind::InvalidFeatureMatrix,
-			format!(
-				"categorical feature {:?} has an empty dictionary",
-				String::from_utf8_lossy(name)
-			),
-		));
-	}
 	let mut labels = std::collections::BTreeSet::new();
 	if dictionary
 		.iter()
@@ -1451,11 +2213,10 @@ pub struct DenseTrainingConfig {
 	pub layers: Vec<DenseLayer>,
 	pub loss: DenseLoss,
 	pub data_normalization: DenseDataNormalization,
-	pub batch_size: NonZeroUsize,
-	pub epochs: NonZeroU64,
+	pub epochs: TrainingHorizon,
 	pub warmup_epochs: u64,
 	pub learning_rate_decay: LearningRateDecay,
-	pub gradient_clip_norm: f32,
+	pub gradient_clip_norm: Option<f32>,
 	pub normalization_epsilon: f32,
 	pub reduction_tree_lanes: u32,
 	pub random_seed: u64,
@@ -1466,7 +2227,6 @@ pub struct DenseTrainingConfig {
 pub struct BinaryValidationConfig {
 	calibration_bins: NonZeroU32,
 	recall_threshold_bits: Vec<u32>,
-	early_stopping_patience: Option<NonZeroU64>,
 	temperature_scaling: Option<TemperatureScalingConfig>,
 }
 
@@ -1474,21 +2234,19 @@ pub struct BinaryValidationConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MulticlassValidationConfig;
 
+/// Request epoch-bound coefficient of determination over the complete
+/// prepared regression validation partition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegressionValidationConfig;
+
 impl BinaryValidationConfig {
 	#[must_use]
 	pub fn new(calibration_bins: NonZeroU32, recall_thresholds: impl IntoIterator<Item = f32>) -> Self {
 		Self {
 			calibration_bins,
 			recall_threshold_bits: recall_thresholds.into_iter().map(f32::to_bits).collect(),
-			early_stopping_patience: None,
 			temperature_scaling: None,
 		}
-	}
-
-	#[must_use]
-	pub fn with_auprc_early_stopping(mut self, patience: NonZeroU64) -> Self {
-		self.early_stopping_patience = Some(patience);
-		self
 	}
 
 	#[must_use]
@@ -1508,11 +2266,6 @@ impl BinaryValidationConfig {
 			.iter()
 			.copied()
 			.map(f32::from_bits)
-	}
-
-	#[must_use]
-	pub const fn early_stopping_patience(&self) -> Option<NonZeroU64> {
-		self.early_stopping_patience
 	}
 
 	#[must_use]
@@ -1543,13 +2296,10 @@ impl Default for TemperatureScalingConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrainingBounds {
 	pub train_rows: u64,
-	pub batch_size: u64,
-	pub batches_per_epoch: u64,
-	pub padded_rows_per_epoch: u64,
-	pub epochs: NonZeroU64,
-	pub training_iterations: NonZeroU64,
+	pub epochs: TrainingHorizon,
+	pub training_iterations: LoopIterations,
 	pub calibration_iterations: u64,
-	pub iterations: NonZeroU64,
+	pub iterations: LoopIterations,
 	pub warmup_iterations: u64,
 }
 
@@ -1597,6 +2347,11 @@ impl OwnedExternalInput {
 			bytes,
 		}
 	}
+
+	pub(crate) fn replace_bytes(&mut self, bytes: &[u8]) {
+		self.bytes.clear();
+		self.bytes.extend_from_slice(bytes);
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1604,13 +2359,25 @@ pub enum ExternalInputRole {
 	TrainFeatures,
 	TrainTargets,
 	TrainTargetSupervision,
+	ResumeEnabled,
+	ResumeParameter { ordinal: usize },
+	ResumeFirstMoment { ordinal: usize },
+	ResumeSecondMoment { ordinal: usize },
+	ResumeKMeansCentroids { block: usize },
+	ResumeTreeSplitFeatures { block: usize },
+	ResumeTreeSplitThresholds { block: usize },
+	ResumeTreeLeafValues { block: usize },
 	TrainingPoolWindowIndices { block: usize },
 	TrainingPoolWinnerBases { block: usize },
 	TrainingPoolGradientBatchIndices { block: usize },
+	TrainingConvolutionWindowIndices { block: usize },
+	TrainingConvolutionInputGradientIndices { block: usize },
+	TrainingConvolutionInputGradientValidity { block: usize },
 	ValidationFeatures,
 	ValidationTargets,
 	ValidationPoolWindowIndices { block: usize },
 	ValidationPoolWinnerBases { block: usize },
+	ValidationConvolutionWindowIndices { block: usize },
 	FeatureNormalizationMask,
 }
 
@@ -1625,22 +2392,139 @@ pub struct ParameterState {
 	pub update_kernel: KernelTemplateId,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DenseLayerState {
 	pub weight: ParameterState,
 	pub bias: ParameterState,
+	/// Learned scalar state in ordered `.prelu()` occurrence order.
+	pub prelu: Vec<ParameterState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DenseConvolutionState {
+	pub geometry: DenseConvolutionGeometry,
+	pub weight: ParameterState,
+	pub bias: ParameterState,
+	/// Learned scalar state for the optional convolution PReLU activation.
+	pub prelu: Vec<ParameterState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseKMeansState {
+	pub input_width: NonZeroU64,
+	pub clusters: NonZeroU64,
+	pub initial_centroids: ValueId,
+	pub updated_centroids: ValueId,
+	pub update_kernel: KernelTemplateId,
+}
+
+/// Persistable state of one learned embedding table and its resolved fixed
+/// sequence length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseEmbeddingState {
+	pub sequence_length: NonZeroU64,
+	pub dimensions: NonZeroU64,
+	pub vocabulary: NonZeroU64,
+	pub table: ParameterState,
+}
+
+/// Persistable learned state and resolved geometry of one causal self-attention
+/// block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseAttentionState {
+	pub sequence_length: NonZeroU64,
+	pub dimensions: NonZeroU64,
+	pub heads: NonZeroU64,
+	pub head_dimension: NonZeroU64,
+	pub query: ParameterState,
+	pub key: ParameterState,
+	pub value: ParameterState,
+	pub output: ParameterState,
+}
+
+/// Persistable parameter state and fixed row-sequence geometry of one vanilla
+/// recurrent block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseRnnState {
+	pub sequence_length: NonZeroU64,
+	pub width: NonZeroU64,
+	pub input_weight: ParameterState,
+	pub recurrent_weight: ParameterState,
+	pub bias: ParameterState,
+}
+
+/// Persistable parameter state and fixed row-sequence geometry of one
+/// reset-before gated recurrent-unit block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseGruState {
+	pub sequence_length: NonZeroU64,
+	pub width: NonZeroU64,
+	pub reset_input_weight: ParameterState,
+	pub reset_recurrent_weight: ParameterState,
+	pub reset_bias: ParameterState,
+	pub update_input_weight: ParameterState,
+	pub update_recurrent_weight: ParameterState,
+	pub update_bias: ParameterState,
+	pub candidate_input_weight: ParameterState,
+	pub candidate_recurrent_weight: ParameterState,
+	pub candidate_bias: ParameterState,
+}
+
+/// Persistable parameter state and fixed row-sequence geometry of one LSTM
+/// block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseLstmState {
+	pub sequence_length: NonZeroU64,
+	pub width: NonZeroU64,
+	pub input_gate_input_weight: ParameterState,
+	pub input_gate_recurrent_weight: ParameterState,
+	pub input_gate_bias: ParameterState,
+	pub forget_gate_input_weight: ParameterState,
+	pub forget_gate_recurrent_weight: ParameterState,
+	pub forget_gate_bias: ParameterState,
+	pub output_gate_input_weight: ParameterState,
+	pub output_gate_recurrent_weight: ParameterState,
+	pub output_gate_bias: ParameterState,
+	pub candidate_input_weight: ParameterState,
+	pub candidate_recurrent_weight: ParameterState,
+	pub candidate_bias: ParameterState,
+}
+
+/// Persistable state of one terminal supervised tree ensemble.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseTreeState {
+	pub declaration: DenseTree,
+	pub input_width: NonZeroU64,
+	pub output_width: NonZeroU64,
+	pub internal_nodes_per_tree: NonZeroU64,
+	pub leaves_per_tree: NonZeroU64,
+	pub split_features: ValueId,
+	pub split_thresholds: ValueId,
+	pub leaf_values: ParameterState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DenseResidualState {
 	pub branch: Vec<DenseLayerState>,
+	/// Learned scalars owned by free activation steps in branch order.
+	pub branch_prelu: Vec<ParameterState>,
 	pub projection: Option<ParameterState>,
+	/// Learned scalars owned by post-merge operations in declaration order.
+	pub prelu: Vec<ParameterState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DenseBlockState {
+	Embedding(DenseEmbeddingState),
+	Attention(DenseAttentionState),
+	Rnn(DenseRnnState),
+	Gru(DenseGruState),
+	Lstm(DenseLstmState),
 	Layer(DenseLayerState),
+	Convolution(DenseConvolutionState),
 	Pool(DensePoolState),
+	KMeans(DenseKMeansState),
+	Tree(DenseTreeState),
 	Residual(DenseResidualState),
 }
 
@@ -1658,6 +2542,7 @@ pub struct MinMaxState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataNormalizationState {
+	Identity,
 	ZScore(ZScoreState),
 	MinMax(MinMaxState),
 	L2Norm,
@@ -1665,11 +2550,11 @@ pub enum DataNormalizationState {
 
 /// GPU-resident optimizer transition gate and accepted-update progress.
 ///
-/// Physical batches continue to execute, but optimizer state advances only
-/// when the batch has at least one known target and, when early stopping is enabled, its
-/// stopped latch is clear. Current checkpoint formats omit this counter, the
-/// beta powers, and the early-stopping latch. They are model snapshots rather
-/// than exact resume points; training resume remains rejected.
+/// Optimizer state advances once for a complete training partition only when
+/// that partition has at least one known target. The accepted-update counter
+/// and beta powers are bounded execution state rather than public artifacts;
+/// semantic resume restores model and optimizer tensors under the newly
+/// declared training schedule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OptimizerProgressState {
 	pub apply_update: ValueId,
@@ -1682,7 +2567,8 @@ pub struct OptimizerProgressState {
 	pub updated_beta_two_power: ValueId,
 	pub beta_update_kernel: KernelTemplateId,
 	pub accepted_updates_per_epoch: u64,
-	pub maximum_accepted_updates: u64,
+	pub maximum_accepted_updates: Option<u64>,
+	pub accepted_update_counter_limit: u64,
 	pub warmup_accepted_updates: u64,
 }
 
@@ -1690,6 +2576,7 @@ pub struct OptimizerProgressState {
 pub enum ValidationMetricFamily {
 	Binary,
 	Multiclass,
+	Regression,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1715,24 +2602,27 @@ pub enum ValidationMetricStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrainingOutputs {
-	pub batch_loss: ValueId,
-	pub batch_loss_domain: IterationDomain,
+	pub training_loss: ValueId,
+	pub training_loss_domain: IterationDomain,
 	pub normalization: DataNormalizationState,
 	pub optimizer_progress: Option<OptimizerProgressState>,
 	pub blocks: Vec<DenseBlockState>,
 	pub layers: Vec<DenseLayerState>,
 	pub validation: Option<BinaryValidationOutputs>,
 	pub multiclass_validation: Option<MulticlassValidationOutputs>,
+	pub regression_validation: Option<RegressionValidationOutputs>,
 	pub validation_status: ValidationMetricStatus,
 	pub metric_bindings: Vec<TrainingMetricBinding>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrainingMetricKind {
-	BatchLoss,
+	TrainingLoss,
+	LearningRate,
 	ValidationMeanBce,
 	ValidationMeanCrossEntropy,
 	Accuracy,
+	R2,
 	AuRoc,
 	AuPrc,
 	BrierScore,
@@ -1764,6 +2654,7 @@ impl RecallMetricOutput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BinaryMetricOutputs {
 	pub mean_bce: ValueId,
+	pub accuracy: ValueId,
 	pub auroc: ValueId,
 	pub auprc: ValueId,
 	pub brier_score: ValueId,
@@ -1778,14 +2669,15 @@ pub struct MulticlassMetricOutputs {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EarlyStoppingState {
-	pub initial_best_auprc: ValueId,
-	pub updated_best_auprc: ValueId,
-	pub initial_stale_epochs: ValueId,
-	pub updated_stale_epochs: ValueId,
-	pub initial_stopped: ValueId,
-	pub updated_stopped: ValueId,
-	pub update_kernel: KernelTemplateId,
+pub struct RegressionMetricOutputs {
+	pub r2: ValueId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegressionValidationOutputs {
+	pub predictions: ValueId,
+	pub metrics: RegressionMetricOutputs,
+	pub metric_domain: IterationDomain,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1801,7 +2693,6 @@ pub struct BinaryValidationOutputs {
 	pub logits: ValueId,
 	pub metrics: BinaryMetricOutputs,
 	pub metric_domain: IterationDomain,
-	pub early_stopping: Option<EarlyStoppingState>,
 	pub temperature_scaling: Option<TemperatureScalingState>,
 }
 

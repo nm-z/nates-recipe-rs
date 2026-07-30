@@ -132,6 +132,9 @@ fn fixture() -> Fixture {
 			rate: measured(FlopsPerSecond::new(1_000_000_000).unwrap()),
 			asynchronous_submission: true,
 			maximum_concurrent_tasks: lanes,
+			subgroup_lanes: 32,
+			maximum_workgroup_lanes: 256,
+			maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
 		}),
 	};
 	let discovery = DiscoveryProfile {
@@ -249,6 +252,9 @@ fn three_gpu_fixture() -> (Fixture, TargetIdentity) {
 			rate: measured(FlopsPerSecond::new(1_000_000_000).unwrap()),
 			asynchronous_submission: true,
 			maximum_concurrent_tasks: 2,
+			subgroup_lanes: 32,
+			maximum_workgroup_lanes: 256,
+			maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
 		}),
 	});
 	fixture.discovery.links = fixture
@@ -903,6 +909,46 @@ fn ogdl_program_domains_reach_every_lowered_stage_and_fault_readback() {
 				.unwrap()
 				.domain,
 			domain
+		);
+	}
+}
+
+#[test]
+fn unbounded_program_domains_remain_symbolic_through_candidate_planning() {
+	let fixture = fixture();
+	let iterations = LoopIterations::UNBOUNDED;
+	let domain = IterationDomain::every(iterations);
+	let program = StaticCalculationProgram::new(
+		faulting_graph(),
+		iterations,
+		vec![KernelIterationDomain {
+			kernel: KernelTemplateId::new(1),
+			domain,
+		}],
+	)
+	.unwrap();
+	let artifacts = [
+		artifact(1, 1, fixture.target_a.clone()),
+		artifact(2, 1, fixture.target_b.clone()),
+	];
+	let search = plan_program_candidates(
+		&program,
+		&fixture.topology,
+		&fixture.discovery,
+		&artifacts,
+		&fixture.reservations,
+		&fixture.capacity,
+	)
+	.unwrap();
+
+	for candidate in search.ranked_candidates() {
+		assert_eq!(candidate.loop_iterations, LoopIterations::UNBOUNDED);
+		assert!(!candidate.loop_domains.is_empty());
+		assert!(
+			candidate
+				.loop_domains
+				.iter()
+				.all(|assignment| assignment.domain == domain)
 		);
 	}
 }

@@ -2,7 +2,7 @@ use recipe::*;
 
 const DATASET: &str = "examples/datasets/no-show-appointments/KaggleV2-May-2016.csv";
 
-fn main() {
+fn main() -> TrainingResult<()> {
 	recipe.data(DATASET)
 		.target("No-show")
 		.exclude(["AppointmentID", "PatientId"])
@@ -21,13 +21,12 @@ fn main() {
 
 	recipe.train()
 		.optimizer(adamw)
-		.batch(0.02)
 		.epochs(100)
 		.lr(0.0001)
 		.warmup(5)
 		.cos()
-		.early_stop(AuPrc, 10)
 		.log([Loss, AuRoc, AuPrc, Brier, CalibrationError])
-		.run()
-		.save(());
+		.save("model.ogdl")
+		.run()?;
+	Ok(())
 }

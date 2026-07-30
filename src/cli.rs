@@ -1,15 +1,22 @@
+use std::collections::VecDeque;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::{BufReader, BufWriter, Read as _, Write as _};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Output};
+use std::process::{Command, ExitCode, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::JoinHandle;
 
 use recipe_core::{Digest, Label};
+use recipe_ingest::{
+	GgufLimits, gguf_to_structural_ogdl_stream, structural_ogdl_declared_gguf_bytes,
+	structural_ogdl_to_gguf_stream,
+};
 use recipe_kernel::{ArtifactDigest, OfflineToolchain, PinnedTool};
 use recipe_native_probe::{
 	BackendLibrary, CudaProbeConfig, HsaProbeConfig, KernelBuildConfig, NativeGpuProbe, NativeProbeConfig,
@@ -23,6 +30,8 @@ use recipe_probe::{
 const ACTIVE_NATIVE_RECEIPT: &str = "active-native-v1";
 const ACTIVE_NATIVE_MAGIC: &str = "recipe-active-native-v1";
 const ACTIVE_NATIVE_MAXIMUM_BYTES: usize = 64 * 1024;
+const RUN_OUTPUT_TAIL_BYTES: usize = 64 * 1024;
+const RUN_OUTPUT_BUFFER_BYTES: usize = 8 * 1024;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const PRIVATE_DIRECTORY_MASK: u32 = 0o077;
 const O_CLOEXEC: i32 = 0o2_000_000;
@@ -52,6 +61,7 @@ const USAGE: &str = "\
 Usage:
 	recipe run FILE.rs	[ARGS...]
 	recipe probe		[OPTIONS]
+	recipe convert INPUT OUTPUT
 ";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -123,7 +133,9 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
 	match command.to_str() {
 		Some("run") => {
 			let Some(path) = arguments.get(1) else {
-				return Err(format!("`recipe run` requires a Rust source file\n\n{USAGE}"));
+				return Err(format!(
+					"`recipe run` requires a Rust source file\n\n{USAGE}"
+				));
 			};
 			if path == "-h" || path == "--help" {
 				print!("{USAGE}");
@@ -139,29 +151,150 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
 			let options = parse_probe_options(&arguments[1..])?;
 			run_probe(options)
 		}
+		Some("convert") => {
+			if arguments.len() == 2 && (arguments[1] == "-h" || arguments[1] == "--help") {
+				print!("{USAGE}");
+				return Ok(());
+			}
+			run_model_conversion(&arguments[1..])
+		}
 		Some(_) => Err(format!(
-			"unknown command {:?}; expected `run` or `probe`\n\n{USAGE}",
+			"unknown command {:?}; expected `run`, `probe`, or `convert`\n\n{USAGE}",
 			command
 		)),
 		None => Err("commands must be valid UTF-8".to_owned()),
 	}
 }
 
+fn run_model_conversion(arguments: &[OsString]) -> Result<(), String> {
+	if arguments.len() != 2 {
+		return Err(format!(
+			"`recipe convert` requires exactly an input and output path\n\n{USAGE}"
+		));
+	}
+	let input = Path::new(&arguments[0]);
+	let output = Path::new(&arguments[1]);
+	let input_extension = input.extension();
+	let output_extension = output.extension();
+	match (input_extension, output_extension) {
+		(Some(input_extension), Some(output_extension))
+			if input_extension == OsStr::new("gguf") && output_extension == OsStr::new("ogdl") =>
+		{
+			let source = File::open(input)
+				.map_err(|error| format!("open conversion input {}: {error}", input.display()))?;
+			let source_bytes = source
+				.metadata()
+				.map_err(|error| format!("inspect conversion input {}: {error}", input.display()))?
+				.len();
+			let limits = conversion_limits(source_bytes, source_bytes)?;
+			let mut source = BufReader::new(source);
+			write_new_conversion_output(output, |destination| {
+				let mut destination = BufWriter::new(destination);
+				gguf_to_structural_ogdl_stream(&mut source, &mut destination, limits)
+					.map_err(|error| format!("convert {} to structural OGDL: {error}", input.display()))?;
+				destination
+					.flush()
+					.map_err(|error| format!("flush conversion output {}: {error}", output.display()))
+			})?;
+		}
+		(Some(input_extension), Some(output_extension))
+			if input_extension == OsStr::new("ogdl") && output_extension == OsStr::new("gguf") =>
+		{
+			let source = File::open(input)
+				.map_err(|error| format!("open conversion input {}: {error}", input.display()))?;
+			let source_bytes = source
+				.metadata()
+				.map_err(|error| format!("inspect conversion input {}: {error}", input.display()))?
+				.len();
+			let mut source = BufReader::new(source);
+			let output_bytes = structural_ogdl_declared_gguf_bytes(&mut source)
+				.map_err(|error| format!("inspect structural OGDL {}: {error}", input.display()))?;
+			let limits = conversion_limits(source_bytes, output_bytes)?;
+			write_new_conversion_output(output, |destination| {
+				structural_ogdl_to_gguf_stream(&mut source, destination, limits)
+					.map_err(|error| format!("convert {} to GGUF: {error}", input.display()))
+			})?;
+		}
+		_ => {
+			return Err(format!(
+				"`recipe convert` requires `.gguf .ogdl` or `.ogdl .gguf`, found {} -> {}",
+				input.display(),
+				output.display()
+			));
+		}
+	}
+	println!("Converted {} -> {}", input.display(), output.display());
+	Ok(())
+}
+
+fn conversion_limits(source_bytes: u64, output_bytes: u64) -> Result<GgufLimits, String> {
+	let source_bound = source_bytes.max(1);
+	GgufLimits::new(
+		output_bytes.max(1),
+		source_bound,
+		source_bound,
+		4,
+		source_bound,
+		source_bound,
+		source_bound,
+	)
+		.map_err(|error| format!("construct conversion bounds: {error}"))
+}
+
+fn write_new_conversion_output(
+	path: &Path,
+	write: impl FnOnce(&mut File) -> Result<(), String>,
+) -> Result<(), String> {
+	let mut file = OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create_new(true)
+		.mode(PRIVATE_FILE_MODE)
+		.open(path)
+		.map_err(|error| format!("create conversion output {}: {error}", path.display()))?;
+	if let Err(error) = write(&mut file).and_then(|()| {
+		file.sync_all()
+			.map_err(|error| format!("sync conversion output {}: {error}", path.display()))
+	}) {
+		drop(file);
+		let cleanup = fs::remove_file(path);
+		return match cleanup {
+			Ok(()) => Err(error),
+			Err(cleanup) => Err(format!(
+				"{error}; remove partial output {}: {cleanup}",
+				path.display(),
+			)),
+		};
+	}
+	Ok(())
+}
+
 fn run_source(path: &OsStr, arguments: &[OsString]) -> Result<(), String> {
 	let requested_source = Path::new(path);
-	let source = fs::canonicalize(requested_source)
-		.map_err(|error| format!("read training source {}: {error}", requested_source.display()))?;
-	let metadata = fs::metadata(&source)
-		.map_err(|error| format!("read training source {}: {error}", requested_source.display()))?;
+	let source = fs::canonicalize(requested_source).map_err(|error| {
+		format!(
+			"read training source {}: {error}",
+			requested_source.display()
+		)
+	})?;
+	let metadata = fs::metadata(&source).map_err(|error| {
+		format!(
+			"read training source {}: {error}",
+			requested_source.display()
+		)
+	})?;
 	if !metadata.is_file() {
 		return Err(format!(
 			"training source {} is not a regular file",
 			requested_source.display()
 		));
 	}
-	let source_directory = source
-		.parent()
-		.ok_or_else(|| format!("training source {} has no parent directory", source.display()))?;
+	let source_directory = source.parent().ok_or_else(|| {
+		format!(
+			"training source {} has no parent directory",
+			source.display()
+		)
+	})?;
 	let source_text = fs::read_to_string(&source)
 		.map_err(|error| format!("read training source {}: {error}", source.display()))?;
 
@@ -175,112 +308,310 @@ fn run_source(path: &OsStr, arguments: &[OsString]) -> Result<(), String> {
 	let mut recipe_external = OsString::from("recipe=");
 	recipe_external.push(library.as_os_str());
 
-	let named_grad_rewrite = if let Some(probe) = crate::source_frontend::named_grad_probe(&source_text) {
-		let probe_source = TransformedRunSource::create(&source, sequence, probe.generated())?;
-		let probe_binary = run_root.join(format!("recipe-run-{}-{sequence}-named-grad-probe", std::process::id()));
-		let probe_output = compile_run_source(
-			probe_source.path(),
-			&probe_binary,
-			&library_root,
-			&recipe_external,
-			None,
-		)?;
-		if let Err(error) = fs::remove_file(&probe_binary)
-			&& error.kind() != std::io::ErrorKind::NotFound
-		{
-			return Err(format!(
-				"remove named-gradient probe binary {}: {error}",
-				probe_binary.display()
-			));
-		}
-		let probe_diagnostics = crate::source_frontend::DiagnosticStream::parse(&probe_output.stderr);
-		let rewrite = crate::source_frontend::named_grad_rewrite(
-			&source,
-			probe_source.path(),
-			&probe,
-			&probe_diagnostics,
-		)?;
-		drop(probe_source);
-		rewrite
-	} else {
-		None
-	};
-	let named_grad_source = named_grad_rewrite
+	let lowering = crate::source_frontend::lower_recipe_source(&source, &source_text)?;
+	let transformed_source = lowering
 		.as_ref()
 		.map(|rewrite| TransformedRunSource::create(&source, sequence, rewrite.generated()))
 		.transpose()?;
-	let compiler_source = named_grad_source
+	let compiler_source = transformed_source
 		.as_ref()
 		.map_or(source.as_path(), |transformed| transformed.path());
-	let compiler_text = named_grad_rewrite
-		.as_ref()
-		.map_or(source_text.as_str(), |rewrite| rewrite.generated());
-	let remap = named_grad_source
+	let remap = transformed_source
 		.as_ref()
 		.map(|transformed| (source.as_path(), transformed.path()));
-	let diagnostic_source = if named_grad_source.is_some() {
-		source.as_path()
-	} else {
-		compiler_source
+	let compilation = compile_run_source(
+		compiler_source,
+		&binary,
+		&library_root,
+		&recipe_external,
+		remap,
+	)?;
+	let diagnostics = crate::source_frontend::DiagnosticStream::parse(&compilation.stderr);
+	let rendering = match (&lowering, &transformed_source) {
+		(Some(rewrite), Some(transformed)) => diagnostics.mapped_rendering(rewrite, transformed.path(), &source),
+		_ => diagnostics.original_rendering(),
 	};
-
-	let first = compile_run_source(compiler_source, &binary, &library_root, &recipe_external, remap)?;
-	let first_diagnostics = crate::source_frontend::DiagnosticStream::parse(&first.stderr);
-	let compile_status = if first.status.success() {
-		let rendering = match (&named_grad_rewrite, &named_grad_source) {
-			(Some(rewrite), Some(transformed)) => first_diagnostics.mapped_rendering(rewrite, transformed.path(), &source),
-			_ => first_diagnostics.original_rendering(),
-		};
-		emit_compiler_output(&first.stdout, &rendering)?;
-		first.status
-	} else if let Some(rewrite) =
-		crate::source_frontend::arity_rewrite(diagnostic_source, compiler_text, &first_diagnostics)
-	{
+	emit_compiler_output(&compilation.stdout, &rendering)?;
+	if !compilation.status.success() {
 		let _ = fs::remove_file(&binary);
-		let transformed = TransformedRunSource::create(compiler_source, sequence, rewrite.generated())?;
-		let second = compile_run_source(
-			transformed.path(),
-			&binary,
-			&library_root,
-			&recipe_external,
-			Some((compiler_source, transformed.path())),
-		)?;
-		let second_diagnostics = crate::source_frontend::DiagnosticStream::parse(&second.stderr);
-		let rendering = match (&named_grad_rewrite, &named_grad_source) {
-			(Some(named_rewrite), Some(named_source)) => second_diagnostics.mapped_rendering_chain(&[
-				(&rewrite, transformed.path(), compiler_source),
-				(named_rewrite, named_source.path(), &source),
-			]),
-			_ => second_diagnostics.mapped_rendering(&rewrite, transformed.path(), &source),
-		};
-		emit_compiler_output(&second.stdout, &rendering)?;
-		second.status
-	} else {
-		let rendering = match (&named_grad_rewrite, &named_grad_source) {
-			(Some(rewrite), Some(transformed)) => first_diagnostics.mapped_rendering(rewrite, transformed.path(), &source),
-			_ => first_diagnostics.original_rendering(),
-		};
-		emit_compiler_output(&first.stdout, &rendering)?;
-		first.status
-	};
-	if !compile_status.success() {
-		let _ = fs::remove_file(&binary);
-		return Err(format!("rustc failed for {} with {compile_status}", source.display()));
+		return Err(format!(
+			"rustc failed for {} with {}",
+			source.display(),
+			compilation.status
+		));
 	}
 
-	let run_status = Command::new(&binary)
-		.args(arguments)
-		.current_dir(source_directory)
-		.status()
-		.map_err(|error| format!("run {}: {error}", source.display()));
-	let cleanup = fs::remove_file(&binary)
-		.map_err(|error| format!("remove compiled training binary {}: {error}", binary.display()));
-	let run_status = run_status?;
+	let run_output = run_compiled_source_live(&binary, arguments, source_directory, &source);
+	let cleanup = fs::remove_file(&binary).map_err(|error| {
+		format!(
+			"remove compiled training binary {}: {error}",
+			binary.display()
+		)
+	});
+	let run_output = run_output?;
 	cleanup?;
-	if !run_status.success() {
-		return Err(format!("{} exited with {run_status}", source.display()));
+	if !run_output.status.success() {
+		return Err(run_status_message(
+			&source,
+			&run_output.status,
+			&run_output.stdout,
+			&run_output.stderr,
+		));
 	}
 	Ok(())
+}
+
+#[derive(Debug)]
+struct LiveRunOutput {
+	status: std::process::ExitStatus,
+	stdout: CapturedOutputTail,
+	stderr: CapturedOutputTail,
+}
+
+#[derive(Debug)]
+struct CapturedOutputTail {
+	bytes: Vec<u8>,
+	truncated: bool,
+}
+
+#[derive(Debug)]
+struct OutputTailBuffer {
+	bytes: VecDeque<u8>,
+	truncated: bool,
+}
+
+impl OutputTailBuffer {
+	fn new() -> Self {
+		Self {
+			bytes: VecDeque::with_capacity(RUN_OUTPUT_TAIL_BYTES),
+			truncated: false,
+		}
+	}
+
+	fn extend(&mut self, chunk: &[u8]) {
+		if chunk.len() >= RUN_OUTPUT_TAIL_BYTES {
+			self.bytes.clear();
+			self.bytes.extend(
+				chunk[chunk.len().saturating_sub(RUN_OUTPUT_TAIL_BYTES)..]
+					.iter()
+					.copied(),
+			);
+			self.truncated = true;
+			return;
+		}
+		self.bytes.extend(chunk.iter().copied());
+		let overflow = self.bytes.len().saturating_sub(RUN_OUTPUT_TAIL_BYTES);
+		if overflow != 0 {
+			self.bytes.drain(..overflow);
+			self.truncated = true;
+		}
+	}
+
+	fn finish(self) -> CapturedOutputTail {
+		CapturedOutputTail {
+			bytes: self.bytes.into(),
+			truncated: self.truncated,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RunOutputDestination {
+	Stdout,
+	Stderr,
+}
+
+impl RunOutputDestination {
+	const fn name(self) -> &'static str {
+		match self {
+			Self::Stdout => "stdout",
+			Self::Stderr => "stderr",
+		}
+	}
+}
+
+fn run_compiled_source_live(
+	command: &Path,
+	arguments: &[OsString],
+	current_directory: &Path,
+	source: &Path,
+) -> Result<LiveRunOutput, String> {
+	let interrupt = crate::signal::SigintGuard::install()
+		.map_err(|error| format!("install recipe run SIGINT handler: {error}"))?;
+	let mut child = Command::new(command)
+		.args(arguments)
+		.current_dir(current_directory)
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.map_err(|error| format!("run {}: {error}", source.display()))?;
+	let stdout = child
+		.stdout
+		.take()
+		.ok_or_else(|| format!("capture training stdout for {}", source.display()))?;
+	let stderr = child
+		.stderr
+		.take()
+		.ok_or_else(|| format!("capture training stderr for {}", source.display()))?;
+	let stdout_forwarder = match spawn_run_output_forwarder(stdout, RunOutputDestination::Stdout) {
+		Ok(forwarder) => forwarder,
+		Err(error) => {
+			let _ = child.kill();
+			let _ = child.wait();
+			return Err(format!("start training stdout forwarder: {error}"));
+		}
+	};
+	let stderr_forwarder = match spawn_run_output_forwarder(stderr, RunOutputDestination::Stderr) {
+		Ok(forwarder) => forwarder,
+		Err(error) => {
+			let _ = child.kill();
+			let _ = child.wait();
+			let _ = stdout_forwarder.join();
+			return Err(format!("start training stderr forwarder: {error}"));
+		}
+	};
+
+	let mut forwarded_interrupt = false;
+	let status = loop {
+		if interrupt.requested() && !forwarded_interrupt {
+			forwarded_interrupt = true;
+			match crate::signal::send_sigint(child.id()) {
+				Ok(()) => {}
+				Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+				Err(error) => {
+					let _ = child.kill();
+					let _ = child.wait();
+					break Err(format!(
+						"forward SIGINT to training child {}: {error}",
+						child.id()
+					));
+				}
+			}
+		}
+		match child.try_wait() {
+			Ok(Some(status)) => break Ok(status),
+			Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+			Err(error) => {
+				let _ = child.kill();
+				let _ = child.wait();
+				break Err(format!("wait for {}: {error}", source.display()));
+			}
+		}
+	};
+	let stdout = join_run_output_forwarder(stdout_forwarder, RunOutputDestination::Stdout);
+	let stderr = join_run_output_forwarder(stderr_forwarder, RunOutputDestination::Stderr);
+	Ok(LiveRunOutput {
+		status: status?,
+		stdout: stdout?,
+		stderr: stderr?,
+	})
+}
+
+fn spawn_run_output_forwarder<R>(
+	reader: R,
+	destination: RunOutputDestination,
+) -> std::io::Result<JoinHandle<Result<CapturedOutputTail, String>>>
+where
+	R: std::io::Read + Send + 'static,
+{
+	std::thread::Builder::new()
+		.name(format!("recipe-run-{}", destination.name()))
+		.spawn(move || match destination {
+			RunOutputDestination::Stdout => {
+				let output = std::io::stdout();
+				forward_run_output_stream(reader, output.lock(), destination)
+			}
+			RunOutputDestination::Stderr => {
+				let output = std::io::stderr();
+				forward_run_output_stream(reader, output.lock(), destination)
+			}
+		})
+}
+
+fn forward_run_output_stream<R: std::io::Read, W: std::io::Write>(
+	mut reader: R,
+	mut writer: W,
+	destination: RunOutputDestination,
+) -> Result<CapturedOutputTail, String> {
+	let mut captured = OutputTailBuffer::new();
+	let mut buffer = [0_u8; RUN_OUTPUT_BUFFER_BYTES];
+	loop {
+		let count = reader
+			.read(&mut buffer)
+			.map_err(|error| format!("read training {}: {error}", destination.name()))?;
+		if count == 0 {
+			break;
+		}
+		captured.extend(&buffer[..count]);
+		writer.write_all(&buffer[..count])
+			.map_err(|error| format!("write training {}: {error}", destination.name()))?;
+		writer.flush()
+			.map_err(|error| format!("flush training {}: {error}", destination.name()))?;
+	}
+	Ok(captured.finish())
+}
+
+fn join_run_output_forwarder(
+	forwarder: JoinHandle<Result<CapturedOutputTail, String>>,
+	destination: RunOutputDestination,
+) -> Result<CapturedOutputTail, String> {
+	forwarder.join().map_err(|panic| {
+		format!(
+			"training {} forwarder panicked: {}",
+			destination.name(),
+			thread_panic_detail(panic)
+		)
+	})?
+}
+
+fn thread_panic_detail(panic: Box<dyn std::any::Any + Send>) -> String {
+	if let Some(message) = panic.downcast_ref::<&str>() {
+		(*message).to_owned()
+	} else if let Some(message) = panic.downcast_ref::<String>() {
+		message.clone()
+	} else {
+		"non-string panic payload".to_owned()
+	}
+}
+
+fn run_status_message(
+	source: &Path,
+	status: &std::process::ExitStatus,
+	stdout: &CapturedOutputTail,
+	stderr: &CapturedOutputTail,
+) -> String {
+	let reason = if let Some(bytes) = allocation_bytes(&stderr.bytes) {
+		format!(
+			"out of memory while requesting {bytes} bytes ({:.3} GB)",
+			bytes_to_gb(bytes)
+		)
+	} else if let Some(signal) = status.signal() {
+		format!("terminated by signal {signal}")
+	} else if let Some(code) = status.code() {
+		format!("exited with code {code}")
+	} else {
+		format!("exited with {status}")
+	};
+	let truncated = match (stdout.truncated, stderr.truncated) {
+		(true, true) => "; captured stdout and stderr tails were truncated",
+		(true, false) => "; captured stdout tail was truncated",
+		(false, true) => "; captured stderr tail was truncated",
+		(false, false) => "",
+	};
+	format!("training source {} failed: {reason}{truncated}", source.display())
+}
+
+fn allocation_bytes(stderr: &[u8]) -> Option<u64> {
+	let stderr = std::str::from_utf8(stderr).ok()?;
+	let marker = "memory allocation of ";
+	let start = stderr.find(marker)? + marker.len();
+	let rest = &stderr[start..];
+	let bytes_end = rest.char_indices().find(|(_, ch)| !ch.is_ascii_digit())?.0;
+	rest[..bytes_end].parse().ok()
+}
+
+fn bytes_to_gb(bytes: u64) -> f64 {
+	(bytes as f64) / 1_000_000_000.0
 }
 
 fn compile_run_source(
@@ -290,7 +621,8 @@ fn compile_run_source(
 	recipe_external: &OsStr,
 	remap: Option<(&Path, &Path)>,
 ) -> Result<Output, String> {
-	let mut compiler = Command::new("rustc");
+	let compiler_path = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+	let mut compiler = Command::new(compiler_path);
 	compiler
 		.arg(source)
 		.args([
@@ -300,6 +632,7 @@ fn compile_run_source(
 			"bin",
 			"--edition",
 			"2024",
+			"-Dunused_must_use",
 			"--error-format=json",
 		])
 		.arg("-L")
@@ -338,9 +671,12 @@ struct TransformedRunSource {
 
 impl TransformedRunSource {
 	fn create(source: &Path, sequence: u64, contents: &str) -> Result<Self, String> {
-		let parent = source
-			.parent()
-			.ok_or_else(|| format!("training source {} has no parent directory", source.display()))?;
+		let parent = source.parent().ok_or_else(|| {
+			format!(
+				"training source {} has no parent directory",
+				source.display()
+			)
+		})?;
 		let file_name = source
 			.file_name()
 			.ok_or_else(|| format!("training source {} has no file name", source.display()))?;
@@ -354,10 +690,18 @@ impl TransformedRunSource {
 			.mode(PRIVATE_FILE_MODE)
 			.custom_flags(O_CLOEXEC | O_NOFOLLOW)
 			.open(&path)
-			.map_err(|error| format!("create transformed Recipe source {}: {error}", path.display()))?;
+			.map_err(|error| {
+				format!(
+					"create transformed Recipe source {}: {error}",
+					path.display()
+				)
+			})?;
 		if let Err(error) = file.write_all(contents.as_bytes()) {
 			let _ = fs::remove_file(&path);
-			return Err(format!("write transformed Recipe source {}: {error}", path.display()));
+			return Err(format!(
+				"write transformed Recipe source {}: {error}",
+				path.display()
+			));
 		}
 		Ok(Self { path })
 	}
@@ -560,8 +904,8 @@ pub(crate) fn current_native_inputs() -> Result<CurrentNativeInputs, String> {
 		}
 		None => {
 			let options = ProbeOptions::default();
-			let seed =
-				SeedContract::parse(include_str!("../topology/contract.toml")).map_err(|error| error.to_string())?;
+			let seed = SeedContract::parse(include_str!("../topology/contract.toml"))
+				.map_err(|error| error.to_string())?;
 			let scratch = state_root.join("scratch");
 			ensure_private_directory(&scratch)?;
 			let host_memory_key = host
@@ -597,17 +941,12 @@ pub(crate) fn current_native_inputs() -> Result<CurrentNativeInputs, String> {
 }
 
 impl ActiveNativeReceipt {
-	fn capture(
-		profile_path: &Path,
-		profile: &MeasuredProfile,
-		config: &NativeProbeConfig,
-	) -> Result<Self, String> {
+	fn capture(profile_path: &Path, profile: &MeasuredProfile, config: &NativeProbeConfig) -> Result<Self, String> {
 		let profile_path = inspect_private_regular_path(profile_path, "measured profile")?;
 		let pci_sysfs_root = inspect_canonical_directory(&config.pci_sysfs_root, "PCI sysfs root")?;
 		let scratch_parent = inspect_private_directory(&config.kernels.scratch_parent, "kernel scratch directory")?;
 		for backend in profile.discovery.devices.iter().filter_map(|device| {
-			device
-				.calculation
+			device.calculation
 				.as_ref()
 				.map(|calculation| calculation.target.backend.as_str())
 		}) {
@@ -675,8 +1014,7 @@ impl ActiveNativeReceipt {
 			));
 		}
 		let pci_sysfs_root = inspect_canonical_directory(&self.pci_sysfs_root, "active PCI sysfs root")?;
-		let scratch_parent =
-			inspect_private_directory(&self.scratch_parent, "active kernel scratch directory")?;
+		let scratch_parent = inspect_private_directory(&self.scratch_parent, "active kernel scratch directory")?;
 		Ok(NativeProbeConfig {
 			host_memory_key: self.host_memory_key.clone(),
 			pci_sysfs_root,
@@ -717,7 +1055,11 @@ impl ActiveNativeReceipt {
 	fn encode(&self) -> Vec<u8> {
 		let mut output = String::new();
 		writeln!(output, "{ACTIVE_NATIVE_MAGIC}").expect("writing to String");
-		write_receipt_field(&mut output, "profile", &encode_os(self.profile_path.as_os_str()));
+		write_receipt_field(
+			&mut output,
+			"profile",
+			&encode_os(self.profile_path.as_os_str()),
+		);
 		write_receipt_field(
 			&mut output,
 			"profile_schema",
@@ -851,7 +1193,8 @@ impl PinnedNativeFile {
 	}
 
 	fn reopen_tool(&self, name: &str) -> Result<PinnedTool, String> {
-		let inspected = PinnedTool::inspect(&self.path).map_err(|error| format!("reinspect active {name}: {error}"))?;
+		let inspected =
+			PinnedTool::inspect(&self.path).map_err(|error| format!("reinspect active {name}: {error}"))?;
 		if inspected.path != self.path {
 			return Err(format!(
 				"active {name} path {} resolves to {}",
@@ -871,8 +1214,7 @@ impl PinnedNativeFile {
 
 fn profile_uses_backend(profile: &MeasuredProfile, backend: &str) -> bool {
 	profile.discovery.devices.iter().any(|device| {
-		device
-			.calculation
+		device.calculation
 			.as_ref()
 			.is_some_and(|calculation| calculation.target.backend.as_str() == backend)
 	})
@@ -910,8 +1252,8 @@ fn required_selected_library(library: &BackendLibrary, name: &str) -> Result<Pin
 				path.display()
 			));
 		}
-		let bytes =
-			fs::read(&path).map_err(|error| format!("read selected {name} target {}: {error}", path.display()))?;
+		let bytes = fs::read(&path)
+			.map_err(|error| format!("read selected {name} target {}: {error}", path.display()))?;
 		return Ok(PinnedNativeFile {
 			path,
 			digest: ArtifactDigest::of(&bytes).bytes(),
@@ -938,7 +1280,10 @@ fn reopen_library(pin: &Option<PinnedNativeFile>, name: &str) -> Result<Vec<Path
 
 fn inspect_pinned_regular_file(path: &Path, name: &str) -> Result<PinnedNativeFile, String> {
 	if !path.is_absolute() {
-		return Err(format!("active {name} path {} is not absolute", path.display()));
+		return Err(format!(
+			"active {name} path {} is not absolute",
+			path.display()
+		));
 	}
 	let metadata =
 		fs::symlink_metadata(path).map_err(|error| format!("inspect active {name} {}: {error}", path.display()))?;
@@ -948,16 +1293,15 @@ fn inspect_pinned_regular_file(path: &Path, name: &str) -> Result<PinnedNativeFi
 			path.display()
 		));
 	}
-	let canonical =
-		fs::canonicalize(path).map_err(|error| format!("canonicalize active {name} {}: {error}", path.display()))?;
+	let canonical = fs::canonicalize(path)
+		.map_err(|error| format!("canonicalize active {name} {}: {error}", path.display()))?;
 	if canonical != path {
 		return Err(format!(
 			"active {name} path {} no longer resolves exactly",
 			path.display()
 		));
 	}
-	let bytes =
-		fs::read(path).map_err(|error| format!("read active {name} {}: {error}", path.display()))?;
+	let bytes = fs::read(path).map_err(|error| format!("read active {name} {}: {error}", path.display()))?;
 	Ok(PinnedNativeFile {
 		path: canonical,
 		digest: ArtifactDigest::of(&bytes).bytes(),
@@ -968,9 +1312,13 @@ fn inspect_private_regular_path(path: &Path, name: &str) -> Result<PathBuf, Stri
 	if !path.is_absolute() {
 		return Err(format!("{name} path {} is not absolute", path.display()));
 	}
-	let metadata = fs::symlink_metadata(path).map_err(|error| format!("inspect {name} {}: {error}", path.display()))?;
+	let metadata =
+		fs::symlink_metadata(path).map_err(|error| format!("inspect {name} {}: {error}", path.display()))?;
 	if metadata.file_type().is_symlink() || !metadata.is_file() {
-		return Err(format!("{name} path {} must be a regular non-symlink file", path.display()));
+		return Err(format!(
+			"{name} path {} must be a regular non-symlink file",
+			path.display()
+		));
 	}
 	if metadata.permissions().mode() & PRIVATE_DIRECTORY_MASK != 0 {
 		return Err(format!(
@@ -979,7 +1327,8 @@ fn inspect_private_regular_path(path: &Path, name: &str) -> Result<PathBuf, Stri
 		));
 	}
 	require_effective_user(metadata.uid(), path, name)?;
-	let canonical = fs::canonicalize(path).map_err(|error| format!("canonicalize {name} {}: {error}", path.display()))?;
+	let canonical =
+		fs::canonicalize(path).map_err(|error| format!("canonicalize {name} {}: {error}", path.display()))?;
 	if canonical != path {
 		return Err(format!("{name} path {} is not canonical", path.display()));
 	}
@@ -990,11 +1339,16 @@ fn inspect_canonical_directory(path: &Path, name: &str) -> Result<PathBuf, Strin
 	if !path.is_absolute() {
 		return Err(format!("{name} {} is not absolute", path.display()));
 	}
-	let metadata = fs::symlink_metadata(path).map_err(|error| format!("inspect {name} {}: {error}", path.display()))?;
+	let metadata =
+		fs::symlink_metadata(path).map_err(|error| format!("inspect {name} {}: {error}", path.display()))?;
 	if metadata.file_type().is_symlink() || !metadata.is_dir() {
-		return Err(format!("{name} {} must be a real directory", path.display()));
+		return Err(format!(
+			"{name} {} must be a real directory",
+			path.display()
+		));
 	}
-	let canonical = fs::canonicalize(path).map_err(|error| format!("canonicalize {name} {}: {error}", path.display()))?;
+	let canonical =
+		fs::canonicalize(path).map_err(|error| format!("canonicalize {name} {}: {error}", path.display()))?;
 	if canonical != path {
 		return Err(format!("{name} {} is not canonical", path.display()));
 	}
@@ -1038,13 +1392,22 @@ fn write_active_native_receipt(state_root: &Path, receipt: &ActiveNativeReceipt)
 		.as_mut()
 		.expect("active receipt temporary is open")
 		.write_all(&bytes)
-		.map_err(|error| format!("write active native receipt temporary {}: {error}", temporary.path.display()))?;
+		.map_err(|error| {
+			format!(
+				"write active native receipt temporary {}: {error}",
+				temporary.path.display()
+			)
+		})?;
 	let file = temporary
 		.file
 		.take()
 		.expect("active receipt temporary is open");
-	file.sync_all()
-		.map_err(|error| format!("sync active native receipt temporary {}: {error}", temporary.path.display()))?;
+	file.sync_all().map_err(|error| {
+		format!(
+			"sync active native receipt temporary {}: {error}",
+			temporary.path.display()
+		)
+	})?;
 	drop(file);
 	fs::rename(&temporary.path, &target).map_err(|error| {
 		format!(
@@ -1055,7 +1418,12 @@ fn write_active_native_receipt(state_root: &Path, receipt: &ActiveNativeReceipt)
 	temporary.committed = true;
 	File::open(state_root)
 		.and_then(|directory| directory.sync_all())
-		.map_err(|error| format!("sync active native receipt directory {}: {error}", state_root.display()))?;
+		.map_err(|error| {
+			format!(
+				"sync active native receipt directory {}: {error}",
+				state_root.display()
+			)
+		})?;
 	let metadata =
 		fs::symlink_metadata(&target).map_err(|error| format!("inspect active native receipt: {error}"))?;
 	if metadata.file_type().is_symlink()
@@ -1076,7 +1444,12 @@ fn load_active_native_receipt(state_root: &Path) -> Result<Option<ActiveNativeRe
 	let before = match fs::symlink_metadata(&path) {
 		Ok(metadata) => metadata,
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-		Err(error) => return Err(format!("inspect active native receipt {}: {error}", path.display())),
+		Err(error) => {
+			return Err(format!(
+				"inspect active native receipt {}: {error}",
+				path.display()
+			));
+		}
 	};
 	if before.file_type().is_symlink() || !before.is_file() {
 		return Err(format!(
@@ -1103,9 +1476,12 @@ fn load_active_native_receipt(state_root: &Path) -> Result<Option<ActiveNativeRe
 		.custom_flags(O_NOFOLLOW | O_CLOEXEC)
 		.open(&path)
 		.map_err(|error| format!("open active native receipt {}: {error}", path.display()))?;
-	let opened = file
-		.metadata()
-		.map_err(|error| format!("inspect opened active native receipt {}: {error}", path.display()))?;
+	let opened = file.metadata().map_err(|error| {
+		format!(
+			"inspect opened active native receipt {}: {error}",
+			path.display()
+		)
+	})?;
 	if opened.dev() != before.dev() || opened.ino() != before.ino() {
 		return Err("active native receipt changed while it was opened".to_owned());
 	}
@@ -1208,7 +1584,9 @@ fn decode_optional_pin(value: &str, field: &str) -> Result<Option<PinnedNativeFi
 
 fn decode_required_pin(value: &str, field: &str) -> Result<PinnedNativeFile, String> {
 	if value == "none" {
-		Err(format!("active native receipt field {field} cannot be absent"))
+		Err(format!(
+			"active native receipt field {field} cannot be absent"
+		))
 	} else {
 		decode_pin(value, field)
 	}
@@ -1239,7 +1617,9 @@ fn encode_hex(bytes: &[u8]) -> String {
 fn decode_path(value: &str, field: &str) -> Result<PathBuf, String> {
 	let bytes = decode_hex(value, field)?;
 	if bytes.is_empty() {
-		return Err(format!("active native receipt field {field} is an empty path"));
+		return Err(format!(
+			"active native receipt field {field} is an empty path"
+		));
 	}
 	Ok(PathBuf::from(OsString::from_vec(bytes)))
 }
@@ -1258,9 +1638,8 @@ fn decode_digest(value: &str, field: &str) -> Result<[u8; 32], String> {
 		));
 	}
 	let bytes = decode_hex(value, field)?;
-	bytes.try_into().map_err(|_| {
-		format!("active native receipt field {field} digest does not contain exactly 32 bytes")
-	})
+	bytes.try_into()
+		.map_err(|_| format!("active native receipt field {field} digest does not contain exactly 32 bytes"))
 }
 
 fn decode_hex(value: &str, field: &str) -> Result<Vec<u8>, String> {
@@ -1293,8 +1672,7 @@ where
 	T: std::str::FromStr,
 	T::Err: std::fmt::Display,
 {
-	value
-		.parse::<T>()
+	value.parse::<T>()
 		.map_err(|error| format!("active native receipt field {field} is not a valid decimal integer: {error}"))
 }
 
@@ -1573,10 +1951,7 @@ mod tests {
 				"recipe-active-native-{name}-{}-{nonce}",
 				std::process::id()
 			));
-			DirBuilder::new()
-				.mode(0o700)
-				.create(&path)
-				.unwrap();
+			DirBuilder::new().mode(0o700).create(&path).unwrap();
 			Self(fs::canonicalize(path).unwrap())
 		}
 
@@ -1604,8 +1979,7 @@ mod tests {
 		fn drop(&mut self) {
 			let expected = format!("recipe-active-native-");
 			assert!(
-				self.0
-					.file_name()
+				self.0.file_name()
 					.and_then(|name| name.to_str())
 					.is_some_and(|name| name.starts_with(&expected))
 			);
@@ -1665,8 +2039,7 @@ mod tests {
 		assert_eq!(loaded, receipt);
 		let config = loaded.reopen_config().unwrap();
 		assert_eq!(
-			config
-				.kernels
+			config.kernels
 				.toolchain
 				.ptx_assembler
 				.as_ref()
@@ -1714,7 +2087,11 @@ mod tests {
 		let root = TestRoot::new("tool-change");
 		let receipt = fixture(&root);
 		write_active_native_receipt(&root.0, &receipt).unwrap();
-		fs::write(&receipt.ptx_assembler.as_ref().unwrap().path, b"changed ptxas").unwrap();
+		fs::write(
+			&receipt.ptx_assembler.as_ref().unwrap().path,
+			b"changed ptxas",
+		)
+		.unwrap();
 		let loaded = load_active_native_receipt(&root.0).unwrap().unwrap();
 		let error = loaded.reopen_config().unwrap_err();
 		assert!(error.contains("NVIDIA ptxas digest changed"), "{error}");

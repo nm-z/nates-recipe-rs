@@ -8,7 +8,7 @@ use recipe_kernel::{BufferAccess, KernelAbi, KernelArgument};
 use recipe_planner::{KernelPlacement, PlannedCandidate};
 
 use crate::accounting::{completion_poll_call, submission_call};
-use crate::{CandidateArtifact, Error, ExecutionPlan, RuntimeArtifact, RuntimeArtifactKind};
+use crate::{CandidateArtifact, Error, ExecutionPlan, RuntimeArtifact, RuntimeArtifactKind, RuntimeImage};
 
 pub(crate) const GPU: DeviceId = DeviceId::new(1);
 pub(crate) const INIT: TaskId = TaskId::new(1);
@@ -76,12 +76,13 @@ fn kernel_abi() -> KernelAbi {
 }
 
 fn runtime_artifact(bytes: Arc<[u8]>, abi: KernelAbi) -> RuntimeArtifact {
-	let sha256 = recipe_kernel::ArtifactDigest::of(&bytes).bytes();
-	RuntimeArtifact {
-		id: ARTIFACT,
-		bytes,
+	let image = RuntimeImage::new(bytes);
+	let sha256 = image.digest().bytes();
+	RuntimeArtifact::from_image(
+		ARTIFACT,
+		image,
 		abi,
-		kind: RuntimeArtifactKind::Cuda {
+		RuntimeArtifactKind::Cuda {
 			identity: recipe_cuda::ArtifactIdentity {
 				sha256,
 				target: ComputeCapability::new(5, 2),
@@ -98,7 +99,7 @@ fn runtime_artifact(bytes: Arc<[u8]>, abi: KernelAbi) -> RuntimeArtifact {
 				required_driver_symbols: BTreeSet::from([DriverSymbol::Init, DriverSymbol::LaunchKernel]),
 			},
 		},
-	}
+	)
 }
 
 #[derive(Debug)]
@@ -157,6 +158,9 @@ pub(crate) fn candidate_fixture(bytes: &[u8]) -> CandidateFixture {
 				rate: property(success(FlopsPerSecond::new(380_000_000_000))),
 				asynchronous_submission: true,
 				maximum_concurrent_tasks: 1,
+				subgroup_lanes: 32,
+				maximum_workgroup_lanes: 256,
+				maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
 			}),
 		}],
 		links: vec![],

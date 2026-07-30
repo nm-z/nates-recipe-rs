@@ -622,6 +622,14 @@ pub enum DenseMatrix {
 
 impl DenseMatrix {
 	#[must_use]
+	pub const fn dtype(&self) -> recipe_core::DType {
+		match self {
+			Self::I32 { .. } => recipe_core::DType::I32,
+			Self::F32Bits { .. } => recipe_core::DType::F32,
+		}
+	}
+
+	#[must_use]
 	pub const fn rows(&self) -> usize {
 		match self {
 			Self::I32 { rows, .. } | Self::F32Bits { rows, .. } => *rows,
@@ -644,6 +652,7 @@ pub struct PreparedDataset {
 	retained_source_rows: Vec<usize>,
 	excluded_source_rows: Vec<usize>,
 	vectors: Vec<PreparedVector>,
+	target_source_indices: Vec<usize>,
 	train: PreparedPartition,
 	validation: PreparedPartition,
 }
@@ -667,6 +676,16 @@ impl PreparedDataset {
 	#[must_use]
 	pub fn vectors(&self) -> &[PreparedVector] {
 		&self.vectors
+	}
+
+	/// Target-vector source identities in the user's declaration order.
+	///
+	/// Prepared vectors retain source-column order. This separate ordering is
+	/// authoritative whenever one model produces one result per declared
+	/// target, so source layout cannot silently reorder model outputs.
+	#[must_use]
+	pub fn target_source_indices(&self) -> &[usize] {
+		&self.target_source_indices
 	}
 
 	#[must_use]
@@ -942,18 +961,82 @@ pub fn prepare_inferred_table(
 	)
 }
 
+/// Apply column and row exclusions without declaring targets, fitting
+/// semantics, or partitioning rows.
+///
+/// Column patterns and predicates are resolved against the original table.
+/// Predicates are evaluated before excluded columns are removed, so a helper
+/// column may select rows without becoming a model feature. Retained rows and
+/// columns preserve their original order.
+///
+/// # Errors
+///
+/// Returns the same typed selection failures as training preparation for
+/// duplicate names, unmatched patterns, invalid predicates, missing predicate
+/// values, an empty column set, or an empty row set.
+pub fn select_table(
+	table: &RawTable,
+	excluded_columns: impl IntoIterator<Item = ColumnPattern>,
+	excluded_rows: impl IntoIterator<Item = RowPredicate>,
+) -> PrepareResult<RawTable> {
+	let request = PreparationRequest::new(
+		core::iter::empty::<Vec<u8>>(),
+		TrainFraction::new(1, 2).expect("one half is a valid internal selection fraction"),
+	)
+	.exclude_columns(excluded_columns)
+	.exclude_rows(excluded_rows);
+	let names = build_header_name_index(table)?;
+	let excluded_columns = resolve_column_exclusions_from_headers(&request, table.headers(), &BTreeSet::new())?;
+	if excluded_columns.len() == table.headers().len() {
+		return Err(PrepareError::new(
+			PrepareErrorKind::NoFeatureVectors,
+			"column selection retained no vectors",
+		));
+	}
+	let predicates = resolve_predicates_before_fit(&request, &names)?;
+	let (retained_source_rows, _) = filter_rows(table, &predicates)?;
+	if retained_source_rows.is_empty() {
+		return Err(PrepareError::new(
+			PrepareErrorKind::NoRetainedRows,
+			"row exclusions retained no source rows",
+		));
+	}
+	let retained_columns = (0..table.headers().len())
+		.filter(|index| !excluded_columns.contains(index))
+		.collect::<Vec<_>>();
+	let headers = retained_columns
+		.iter()
+		.map(|index| table.headers()[*index].clone())
+		.collect::<Vec<_>>();
+	let rows = retained_source_rows
+		.into_iter()
+		.map(|source_row| {
+			retained_columns
+				.iter()
+				.map(|column| table.rows()[source_row][*column].clone())
+				.collect::<Vec<_>>()
+		})
+		.collect::<Vec<_>>();
+	RawTable::from_parts(headers, rows).map_err(|error| {
+		PrepareError::new(
+			PrepareErrorKind::InconsistentInference,
+			format!("selected table is not rectangular: {error}"),
+		)
+	})
+}
+
 fn select_rows_and_columns(
 	table: &RawTable,
 	inferred: &InferredVectorList,
 	request: &PreparationRequest,
-) -> PrepareResult<(BTreeSet<usize>, BTreeSet<usize>, Vec<usize>, Vec<usize>)> {
+) -> PrepareResult<(ResolvedTargets, BTreeSet<usize>, Vec<usize>, Vec<usize>)> {
 	let names = build_name_index(inferred)?;
-	let target_indices = resolve_targets(request, &names)?;
-	let excluded_columns = resolve_column_exclusions(request, inferred, &target_indices)?;
+	let targets = resolve_targets(request, &names)?;
+	let excluded_columns = resolve_column_exclusions(request, inferred, &targets.indices)?;
 	if inferred
 		.vectors()
 		.iter()
-		.all(|vector| target_indices.contains(&vector.index()) || excluded_columns.contains(&vector.index()))
+		.all(|vector| targets.indices.contains(&vector.index()) || excluded_columns.contains(&vector.index()))
 	{
 		return Err(PrepareError::new(
 			PrepareErrorKind::NoFeatureVectors,
@@ -969,7 +1052,7 @@ fn select_rows_and_columns(
 		));
 	}
 	Ok((
-		target_indices,
+		targets,
 		excluded_columns,
 		retained_source_rows,
 		excluded_source_rows,
@@ -979,15 +1062,15 @@ fn select_rows_and_columns(
 fn select_rows_and_columns_before_fit(
 	table: &RawTable,
 	request: &PreparationRequest,
-) -> PrepareResult<(BTreeSet<usize>, BTreeSet<usize>, Vec<usize>, Vec<usize>)> {
+) -> PrepareResult<(ResolvedTargets, BTreeSet<usize>, Vec<usize>, Vec<usize>)> {
 	let names = build_header_name_index(table)?;
-	let target_indices = resolve_targets(request, &names)?;
-	let excluded_columns = resolve_column_exclusions_from_headers(request, table.headers(), &target_indices)?;
+	let targets = resolve_targets(request, &names)?;
+	let excluded_columns = resolve_column_exclusions_from_headers(request, table.headers(), &targets.indices)?;
 	if table
 		.headers()
 		.iter()
 		.enumerate()
-		.all(|(index, _)| target_indices.contains(&index) || excluded_columns.contains(&index))
+		.all(|(index, _)| targets.indices.contains(&index) || excluded_columns.contains(&index))
 	{
 		return Err(PrepareError::new(
 			PrepareErrorKind::NoFeatureVectors,
@@ -1003,7 +1086,7 @@ fn select_rows_and_columns_before_fit(
 		));
 	}
 	Ok((
-		target_indices,
+		targets,
 		excluded_columns,
 		retained_source_rows,
 		excluded_source_rows,
@@ -1079,7 +1162,7 @@ fn fit_semantics_with_predicate_constraints(
 fn prepare_preselected_table(
 	table: &RawTable,
 	inferred: &InferredVectorList,
-	target_indices: &BTreeSet<usize>,
+	targets: &ResolvedTargets,
 	excluded_columns: &BTreeSet<usize>,
 	retained_source_rows: Vec<usize>,
 	excluded_source_rows: Vec<usize>,
@@ -1094,7 +1177,7 @@ fn prepare_preselected_table(
 			fit_vector_schema(
 				table,
 				vector,
-				if target_indices.contains(&vector.index()) {
+				if targets.indices.contains(&vector.index()) {
 					VectorRole::Target
 				} else {
 					VectorRole::Feature
@@ -1118,6 +1201,7 @@ fn prepare_preselected_table(
 		retained_source_rows,
 		excluded_source_rows,
 		vectors,
+		target_source_indices: targets.ordered.clone(),
 		train,
 		validation,
 	})
@@ -1187,14 +1271,21 @@ fn build_header_name_index(table: &RawTable) -> PrepareResult<BTreeMap<Vec<u8>, 
 	Ok(names)
 }
 
-fn resolve_targets(request: &PreparationRequest, names: &BTreeMap<Vec<u8>, usize>) -> PrepareResult<BTreeSet<usize>> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedTargets {
+	ordered: Vec<usize>,
+	indices: BTreeSet<usize>,
+}
+
+fn resolve_targets(request: &PreparationRequest, names: &BTreeMap<Vec<u8>, usize>) -> PrepareResult<ResolvedTargets> {
 	if request.targets.is_empty() {
 		return Err(PrepareError::new(
 			PrepareErrorKind::EmptyTargetSet,
 			"at least one target column is required",
 		));
 	}
-	let mut targets = BTreeSet::new();
+	let mut ordered = Vec::with_capacity(request.targets.len());
+	let mut indices = BTreeSet::new();
 	for name in &request.targets {
 		let index = names.get(name).copied().ok_or_else(|| {
 			PrepareError::new(
@@ -1203,15 +1294,16 @@ fn resolve_targets(request: &PreparationRequest, names: &BTreeMap<Vec<u8>, usize
 			)
 			.for_column(name)
 		})?;
-		if !targets.insert(index) {
+		if !indices.insert(index) {
 			return Err(PrepareError::new(
 				PrepareErrorKind::DuplicateTarget,
 				"target column was declared more than once",
 			)
 			.for_column(name));
 		}
+		ordered.push(index);
 	}
-	Ok(targets)
+	Ok(ResolvedTargets { ordered, indices })
 }
 
 fn resolve_column_exclusions(
@@ -2218,6 +2310,46 @@ mod tests {
 			bytes.push(b'\n');
 		}
 		table(&bytes, u64::try_from(images.len() + 1).unwrap())
+	}
+
+	#[test]
+	fn target_free_selection_filters_before_removing_helper_columns_and_preserves_order() {
+		let source = table(b"id,feature,helper\n1,10,drop\n2,20,keep\n3,30,drop\n", 4);
+		let selected = select_table(
+			&source,
+			[
+				ColumnPattern::new("id").unwrap(),
+				ColumnPattern::new("helper").unwrap(),
+			],
+			[RowPredicate::new(
+				"helper",
+				ComparisonOperator::Equal,
+				PredicateLiteral::Text("drop".to_owned()),
+			)],
+		)
+		.unwrap();
+
+		assert_eq!(selected.headers(), [b"feature".to_vec()]);
+		assert_eq!(selected.rows(), [vec![b"20".to_vec()]]);
+	}
+
+	#[test]
+	fn target_free_selection_reuses_fail_closed_pattern_and_empty_row_rules() {
+		let source = table(b"feature,helper\n10,drop\n", 2);
+		let unmatched = select_table(&source, [ColumnPattern::new("absent*").unwrap()], []).unwrap_err();
+		assert_eq!(unmatched.kind, PrepareErrorKind::UnmatchedColumnPattern);
+
+		let empty = select_table(
+			&source,
+			[],
+			[RowPredicate::new(
+				"helper",
+				ComparisonOperator::Equal,
+				PredicateLiteral::Text("drop".to_owned()),
+			)],
+		)
+		.unwrap_err();
+		assert_eq!(empty.kind, PrepareErrorKind::NoRetainedRows);
 	}
 
 	#[test]

@@ -8,11 +8,11 @@ use recipe_language::{
 	IndexBounds, IndexMap, RandomDistribution, ReduceOperator, ReduceResult, ScatterConflict, SortDirection,
 };
 use recipe_primitives::{
-	AccessMode, AtomicAddressDomain, ContractionStage, FaultContract, FixedTree, FloatSortOrder, HistogramBinMapping,
-	LoweredProgram, MemorySemantics, NormalF32Mapping, OwnedAtomicOperation, OwnedAtomicOrdering, Philox10Contract,
-	PhiloxCounterWord, ProgramStage, ReductionPadding, ReductionStage, ReductionTieBreak, ScanLocalStage,
-	ScanStageMode, ScanUniformStage, SortCompareStage, SortNetwork, SortPadding, SortTieBreak, StageKind,
-	SynchronizationScope, TreePhase, UniformI32Mapping,
+	AccessMode, AtomicAddressDomain, ContractionStage, ContractionStrategy, FaultContract, FixedTree, FloatSortOrder,
+	HistogramBinMapping, LoweredProgram, MemorySemantics, NormalF32Mapping, OwnedAtomicOperation,
+	OwnedAtomicOrdering, Philox10Contract, PhiloxCounterWord, ProgramStage, ReductionPadding, ReductionStage,
+	ReductionTieBreak, ScanLocalStage, ScanStageMode, ScanUniformStage, SortCompareStage, SortNetwork, SortPadding,
+	SortTieBreak, StageKind, SynchronizationScope, TreePhase, UniformI32Mapping,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -747,7 +747,9 @@ fn lower_owned_stage(
 			let axis = scan_axis(program, stage, scan.level)?;
 			emit_scan_uniform(&mut ir, &signature, scan, axis)?
 		}
-		StageKind::TiledContraction(contraction) => emit_contraction(&mut ir, &signature, contraction, target)?,
+		StageKind::TiledContraction(contraction) => {
+			emit_contraction(&mut ir, &signature, contraction, target, options)?
+		}
 		StageKind::Gather { axis, bounds } => emit_gather(&mut ir, &signature, stage.fault, *axis, *bounds)?,
 		StageKind::Scatter {
 			axis,
@@ -2450,6 +2452,7 @@ fn emit_contraction(
 	signature: &StageSignature,
 	contraction: &ContractionStage,
 	target: &KernelTarget,
+	options: &LoweringOptions,
 ) -> Result<(), LoweringError> {
 	let private_address_space = private_address_space(target);
 	let left = signature.pointer(0)?;
@@ -2495,6 +2498,21 @@ fn emit_contraction(
 		output.view.logical_extents.len() == expected_output_rank.max(1),
 		"contraction output rank differs from its canonical axis mapping",
 	)?;
+	let workgroup_lanes = contraction
+		.tile
+		.output_x
+		.checked_mul(contraction.tile.output_y)
+		.ok_or_else(|| stage_error("contraction workgroup width overflowed"))?;
+	let staged_global = match contraction.strategy {
+		ContractionStrategy::Direct => None,
+		ContractionStrategy::Staged => {
+			let name = format!("{}_contraction_accumulators", options.entry_symbol);
+			ir.globals.push(format!(
+				"@{name} = internal addrspace(3) global [{workgroup_lanes} x i32] undef, align 4"
+			));
+			Some(name)
+		}
+	};
 
 	// Every launched lane, including the final partial workgroup's inactive
 	// lanes, executes both barriers for every fixed reduction tile. Inactive
@@ -2578,7 +2596,6 @@ fn emit_contraction(
 	ir.line(format_args!(
 		"  store i64 0, ptr addrspace({private_address_space}) {inner_slot}, align 8"
 	));
-	ir.barrier(target);
 	ir.line(format_args!("  br label %{inner_check}"));
 	ir.line(format_args!("{inner_check}:"));
 	let inner = ir.temporary("contraction_inner");
@@ -2663,7 +2680,36 @@ fn emit_contraction(
 	));
 	ir.line(format_args!("  br label %{inner_check}"));
 	ir.line(format_args!("{inner_done}:"));
-	ir.barrier(target);
+	if let Some(staged_global) = &staged_global {
+		let checkpoint = ir.temporary("contraction_staged_checkpoint");
+		ir.line(format_args!(
+			"  {checkpoint} = load {}, ptr addrspace({private_address_space}) {accumulator}, align 4",
+			llvm_type(contraction.dtype)
+		));
+		shared_store(
+			ir,
+			staged_global,
+			workgroup_lanes,
+			"%local_id",
+			contraction.dtype,
+			&checkpoint,
+			"contraction_staged_checkpoint",
+		);
+		ir.barrier(target);
+		let restored = shared_load(
+			ir,
+			staged_global,
+			workgroup_lanes,
+			"%local_id",
+			contraction.dtype,
+			"contraction_staged_restore",
+		);
+		ir.line(format_args!(
+			"  store {} {restored}, ptr addrspace({private_address_space}) {accumulator}, align 4",
+			llvm_type(contraction.dtype)
+		));
+		ir.barrier(target);
+	}
 	let next_tile = ir.temporary("contraction_next_tile");
 	ir.line(format_args!(
 		"  {next_tile} = add i64 {tile_base}, {}",
@@ -4395,7 +4441,15 @@ mod tests {
 			.map(|tensor| (tensor.id, tensor))
 			.collect::<BTreeMap<_, _>>();
 		must(
-			recipe_primitives::lower(&kernel, &index),
+			recipe_primitives::lower(
+				&kernel,
+				&index,
+				recipe_primitives::LoweringHardware {
+					subgroup_lanes: 32,
+					maximum_workgroup_lanes: 256,
+					maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
+				},
+			),
 			"primitive lowering",
 		)
 	}

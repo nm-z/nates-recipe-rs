@@ -26,9 +26,34 @@ pub enum RuntimeArtifactKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeImage {
+	bytes: Arc<[u8]>,
+	digest: ArtifactDigest,
+}
+
+impl RuntimeImage {
+	#[must_use]
+	pub fn new(bytes: Arc<[u8]>) -> Self {
+		let digest = ArtifactDigest::of(&bytes);
+		Self { bytes, digest }
+	}
+
+	#[must_use]
+	pub fn bytes(&self) -> &Arc<[u8]> {
+		&self.bytes
+	}
+
+	#[must_use]
+	pub const fn digest(&self) -> ArtifactDigest {
+		self.digest
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeArtifact {
 	pub(crate) id: ArtifactId,
 	pub(crate) bytes: Arc<[u8]>,
+	pub(crate) digest: ArtifactDigest,
 	pub(crate) abi: KernelAbi,
 	pub(crate) kind: RuntimeArtifactKind,
 }
@@ -36,9 +61,15 @@ pub struct RuntimeArtifact {
 impl RuntimeArtifact {
 	#[must_use]
 	pub fn new(id: ArtifactId, bytes: Arc<[u8]>, abi: KernelAbi, kind: RuntimeArtifactKind) -> Self {
+		Self::from_image(id, RuntimeImage::new(bytes), abi, kind)
+	}
+
+	#[must_use]
+	pub fn from_image(id: ArtifactId, image: RuntimeImage, abi: KernelAbi, kind: RuntimeArtifactKind) -> Self {
 		Self {
 			id,
-			bytes,
+			bytes: image.bytes,
+			digest: image.digest,
 			abi,
 			kind,
 		}
@@ -52,6 +83,11 @@ impl RuntimeArtifact {
 	#[must_use]
 	pub fn bytes(&self) -> &Arc<[u8]> {
 		&self.bytes
+	}
+
+	#[must_use]
+	pub const fn digest(&self) -> ArtifactDigest {
+		self.digest
 	}
 
 	#[must_use]
@@ -251,7 +287,7 @@ pub(crate) fn validate_runtime_artifact(identity: &ArtifactIdentity, runtime: &R
 			runtime.id, identity.id
 		)),
 	)?;
-	let digest = ArtifactDigest::of(&runtime.bytes).bytes();
+	let digest = runtime.digest.bytes();
 	ensure(
 		digest == identity.digest.bytes(),
 		mismatch("image SHA-256 differs from finalized identity".to_owned()),

@@ -655,8 +655,8 @@ fn source_qualified_concrete_manifest_count_is_exact() {
 		})
 		.count();
 	assert_eq!(structured, 266);
-	assert_eq!(remaining.len(), 132);
-	assert_eq!(structured - remaining.len(), 134);
+	assert_eq!(remaining.len(), 130);
+	assert_eq!(structured - remaining.len(), 136);
 
 	let mapped = operation_registry()
 		.iter()
@@ -671,7 +671,7 @@ fn source_qualified_concrete_manifest_count_is_exact() {
 		})
 		.map(|descriptor| (descriptor.symbol, descriptor.source))
 		.collect::<BTreeSet<_>>();
-	assert_eq!(mapped.len(), 134);
+	assert_eq!(mapped.len(), 136);
 }
 
 #[test]

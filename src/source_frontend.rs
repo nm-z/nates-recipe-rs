@@ -11,39 +11,143 @@ use syn::visit::{self, Visit};
 use syn::{Expr, Ident, Token};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ArityRule {
-	EmptyData,
-	KnnReduction,
-	ResidualBranch,
+enum RecipeReceiver {
+	Facade,
+	Data,
+	Model,
+	Train,
+	Infer,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MethodCallLocation {
+	method: String,
 	method_start: usize,
 	method_end: usize,
 	open_end: usize,
 	close_start: usize,
 	argument_count: usize,
+	receiver: Option<RecipeReceiver>,
 }
 
-#[derive(Default)]
-struct MethodCallVisitor {
+struct MethodCallVisitor<'a> {
 	calls: Vec<MethodCallLocation>,
+	bindings: &'a BTreeMap<String, RecipeReceiver>,
 }
 
-impl<'ast> Visit<'ast> for MethodCallVisitor {
+impl<'ast> Visit<'ast> for MethodCallVisitor<'_> {
 	fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
 		let method = call.method.span().byte_range();
 		let open = call.paren_token.span.open().byte_range();
 		let close = call.paren_token.span.close().byte_range();
 		self.calls.push(MethodCallLocation {
+			method: call.method.to_string(),
 			method_start: method.start,
 			method_end: method.end,
 			open_end: open.end,
 			close_start: close.start,
 			argument_count: call.args.len(),
+			receiver: classify_recipe_expression(&call.receiver, self.bindings),
 		});
 		visit::visit_expr_method_call(self, call);
+	}
+}
+
+struct LocalBinding<'ast> {
+	name: String,
+	explicit: Option<RecipeReceiver>,
+	initializer: Option<&'ast Expr>,
+}
+
+#[derive(Default)]
+struct LocalBindingVisitor<'ast> {
+	bindings: Vec<LocalBinding<'ast>>,
+}
+
+impl<'ast> Visit<'ast> for LocalBindingVisitor<'ast> {
+	fn visit_local(&mut self, local: &'ast syn::Local) {
+		let (pattern, explicit) = match &local.pat {
+			syn::Pat::Type(typed) => (typed.pat.as_ref(), classify_recipe_type(&typed.ty)),
+			pattern => (pattern, None),
+		};
+		if let syn::Pat::Ident(identifier) = pattern {
+			self.bindings.push(LocalBinding {
+				name: identifier.ident.to_string(),
+				explicit,
+				initializer: local.init.as_ref().map(|init| init.expr.as_ref()),
+			});
+		}
+		visit::visit_local(self, local);
+	}
+}
+
+fn classify_recipe_type(ty: &syn::Type) -> Option<RecipeReceiver> {
+	let syn::Type::Path(path) = ty else {
+		return None;
+	};
+	match path.path.segments.last()?.ident.to_string().as_str() {
+		"Data" => Some(RecipeReceiver::Data),
+		"Model" => Some(RecipeReceiver::Model),
+		"Train" => Some(RecipeReceiver::Train),
+		"Infer" => Some(RecipeReceiver::Infer),
+		_ => None,
+	}
+}
+
+fn collect_recipe_bindings(syntax: &syn::File) -> BTreeMap<String, RecipeReceiver> {
+	let mut visitor = LocalBindingVisitor::default();
+	visitor.visit_file(syntax);
+	let mut resolved = BTreeMap::new();
+	loop {
+		let mut changed = false;
+		for binding in &visitor.bindings {
+			let kind = binding.explicit.or_else(|| {
+				binding
+					.initializer
+					.and_then(|expression| classify_recipe_expression(expression, &resolved))
+			});
+			if let Some(kind) = kind
+				&& resolved.get(&binding.name) != Some(&kind)
+			{
+				resolved.insert(binding.name.clone(), kind);
+				changed = true;
+			}
+		}
+		if !changed {
+			return resolved;
+		}
+	}
+}
+
+fn classify_recipe_expression(
+	expression: &Expr,
+	bindings: &BTreeMap<String, RecipeReceiver>,
+) -> Option<RecipeReceiver> {
+	match expression {
+		Expr::Path(path) => {
+			let last = path.path.segments.last()?.ident.to_string();
+			bindings
+				.get(&last)
+				.copied()
+				.or_else(|| (last == "recipe").then_some(RecipeReceiver::Facade))
+		}
+		Expr::MethodCall(call) => {
+			let receiver = classify_recipe_expression(&call.receiver, bindings)?;
+			match receiver {
+				RecipeReceiver::Facade => match call.method.to_string().as_str() {
+					"data" => Some(RecipeReceiver::Data),
+					"model" => Some(RecipeReceiver::Model),
+					"train" => Some(RecipeReceiver::Train),
+					"infer" => Some(RecipeReceiver::Infer),
+					_ => None,
+				},
+				kind => Some(kind),
+			}
+		}
+		Expr::Group(group) => classify_recipe_expression(&group.expr, bindings),
+		Expr::Paren(parenthesized) => classify_recipe_expression(&parenthesized.expr, bindings),
+		Expr::Reference(reference) => classify_recipe_expression(&reference.expr, bindings),
+		_ => None,
 	}
 }
 
@@ -155,18 +259,6 @@ struct NamedGradCandidate {
 	shape: NamedGradShape,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct NamedGradProbe {
-	candidates: Vec<NamedGradCandidate>,
-	rewrite: SourceRewrite,
-}
-
-impl NamedGradProbe {
-	pub(crate) fn generated(&self) -> &str {
-		self.rewrite.generated()
-	}
-}
-
 struct NamedGradField {
 	name: Ident,
 	colon: Token![:],
@@ -276,90 +368,68 @@ impl DiagnosticStream {
 		}
 		output
 	}
-
-	fn diagnostics(&self) -> impl Iterator<Item = &Value> {
-		self.entries.iter().filter_map(|entry| match entry {
-			DiagnosticEntry::Json(value) => Some(value),
-			DiagnosticEntry::Raw(_) => None,
-		})
-	}
 }
 
-/// Replaces only lexically named `.grad(...)` argument lists with a deliberate
-/// two-argument call. Rustc can then prove which receiver resolves to
-/// Recipe's `Model::grad` without accepting the non-Rust user syntax first.
-pub(crate) fn named_grad_probe(source: &str) -> Option<NamedGradProbe> {
-	let tokens = source.parse::<TokenStream>().ok()?;
-	let mut candidates = Vec::new();
-	collect_named_grad_candidates(tokens, &mut candidates);
-	if candidates.is_empty() {
-		return None;
-	}
+/// Perform the complete Recipe-only syntax lowering before invoking rustc.
+/// Receiver selection is derived from explicit Recipe facade chains and local
+/// `Data`/`Model`/`Train`/`Infer` bindings; compiler diagnostics never control
+/// parsing or trigger a retry.
+pub(crate) fn lower_recipe_source(source_path: &Path, source: &str) -> Result<Option<SourceRewrite>, String> {
+	let tokens = match source.parse::<TokenStream>() {
+		Ok(tokens) => tokens,
+		Err(_) => return Ok(None),
+	};
+	let mut named_grad_candidates = Vec::new();
+	collect_named_grad_candidates(tokens, &mut named_grad_candidates);
+	let probe_rewrite = if named_grad_candidates.is_empty() {
+		None
+	} else {
+		Some(build_rewrite(
+			source,
+			named_grad_candidates
+				.iter()
+				.map(|candidate| TextEdit {
+					start: candidate.arguments_start,
+					end: candidate.arguments_end,
+					replacement: "::recipe::clip(1.0)".to_owned(),
+				})
+				.collect(),
+		)
+		.ok_or_else(|| "could not construct the Recipe syntax-classification source".to_owned())?)
+	};
+	let classification_source = probe_rewrite
+		.as_ref()
+		.map_or(source, SourceRewrite::generated);
+	let syntax = match syn::parse_file(classification_source) {
+		Ok(syntax) => syntax,
+		Err(_) => return Ok(None),
+	};
+	let bindings = collect_recipe_bindings(&syntax);
+	let mut visitor = MethodCallVisitor {
+		calls: Vec::new(),
+		bindings: &bindings,
+	};
+	visitor.visit_file(&syntax);
 
-	let edits = candidates
+	let to_original = |offset| {
+		probe_rewrite
+			.as_ref()
+			.map_or(offset, |rewrite| rewrite.generated_to_original(offset))
+	};
+	let recipe_grad_calls = visitor
+		.calls
 		.iter()
-		.map(|candidate| TextEdit {
-			start: candidate.arguments_start,
-			end: candidate.arguments_end,
-			replacement: "(), ()".to_owned(),
-		})
-		.collect();
-	let rewrite = build_rewrite(source, edits)?;
-	Some(NamedGradProbe {
-		candidates,
-		rewrite,
-	})
-}
-
-pub(crate) fn named_grad_rewrite(
-	source_path: &Path,
-	probe_path: &Path,
-	probe: &NamedGradProbe,
-	diagnostics: &DiagnosticStream,
-) -> Result<Option<SourceRewrite>, String> {
-	let probe_name = probe_path.to_string_lossy();
-	let mut recipe_model_calls = Vec::new();
-	for diagnostic in diagnostics.diagnostics() {
-		if diagnostic.pointer("/code/code").and_then(Value::as_str) != Some("E0061")
-			|| !method_defined_here(diagnostic, "src/api.rs", "fn grad", "gradient: Grad")
+		.filter(|call| call.method == "grad" && call.receiver == Some(RecipeReceiver::Model))
+		.map(|call| (to_original(call.method_start), to_original(call.method_end)))
+		.collect::<Vec<_>>();
+	let mut edits = Vec::new();
+	for candidate in &named_grad_candidates {
+		if !recipe_grad_calls
+			.iter()
+			.any(|span| *span == (candidate.method_start, candidate.method_end))
 		{
 			continue;
 		}
-		let Some(primary) = primary_source_span(diagnostic, &probe_name) else {
-			continue;
-		};
-		let Some(start) = primary
-			.get("byte_start")
-			.and_then(Value::as_u64)
-			.and_then(|value| usize::try_from(value).ok())
-		else {
-			continue;
-		};
-		let Some(end) = primary
-			.get("byte_end")
-			.and_then(Value::as_u64)
-			.and_then(|value| usize::try_from(value).ok())
-		else {
-			continue;
-		};
-		let original_start = probe.rewrite.generated_to_original(start);
-		let original_end = probe.rewrite.generated_to_original(end);
-		if let Some(index) = probe.candidates.iter().position(|candidate| {
-			(candidate.method_start == original_start && candidate.method_end == original_end)
-				|| (original_start <= candidate.method_start && original_end >= candidate.method_end)
-		}) {
-			recipe_model_calls.push(index);
-		}
-	}
-	recipe_model_calls.sort_unstable();
-	recipe_model_calls.dedup();
-	if recipe_model_calls.is_empty() {
-		return Ok(None);
-	}
-
-	let mut edits = Vec::new();
-	for index in recipe_model_calls {
-		let candidate = &probe.candidates[index];
 		match &candidate.shape {
 			NamedGradShape::Exact {
 				field_start,
@@ -384,9 +454,12 @@ pub(crate) fn named_grad_rewrite(
 				});
 			}
 			NamedGradShape::Malformed(message) => {
+				let diagnostic_source = probe_rewrite
+					.as_ref()
+					.expect("named-gradient diagnostics require a classification rewrite");
 				return Err(render_named_grad_error(
 					source_path,
-					&probe.rewrite,
+					diagnostic_source,
 					candidate,
 					message,
 				));
@@ -394,8 +467,47 @@ pub(crate) fn named_grad_rewrite(
 		}
 	}
 
-	build_rewrite(&probe.rewrite.original, edits)
-		.ok_or_else(|| "could not safely rewrite Recipe Model `.grad(clip: EXPR)` source".to_owned())
+	for call in visitor.calls {
+		let method_start = to_original(call.method_start);
+		let method_end = to_original(call.method_end);
+		let open_end = to_original(call.open_end);
+		let close_start = to_original(call.close_start);
+		match (call.receiver, call.method.as_str(), call.argument_count) {
+			(Some(RecipeReceiver::Facade), "data", 0) => edits.push(TextEdit {
+				start: open_end,
+				end: open_end,
+				replacement: "()".to_owned(),
+			}),
+			(Some(RecipeReceiver::Model), "residual", 2..) => {
+				edits.push(TextEdit {
+					start: open_end,
+					end: open_end,
+					replacement: "[".to_owned(),
+				});
+				edits.push(TextEdit {
+					start: close_start,
+					end: close_start,
+					replacement: "]".to_owned(),
+				});
+			}
+			(Some(RecipeReceiver::Train), "save", 2) => edits.push(TextEdit {
+				start: method_start,
+				end: method_end,
+				replacement: "__recipe_save_pair".to_owned(),
+			}),
+			(Some(RecipeReceiver::Train), "resume", 2) => edits.push(TextEdit {
+				start: method_start,
+				end: method_end,
+				replacement: "__recipe_resume_pair".to_owned(),
+			}),
+			_ => {}
+		}
+	}
+	if edits.is_empty() {
+		return Ok(None);
+	}
+	build_rewrite(source, edits)
+		.ok_or_else(|| "Recipe syntax edits overlap or address an invalid source boundary".to_owned())
 		.map(Some)
 }
 
@@ -546,123 +658,6 @@ fn build_rewrite(source: &str, mut edits: Vec<TextEdit>) -> Option<SourceRewrite
 		generated,
 		ranges,
 		line_starts,
-	})
-}
-
-pub(crate) fn arity_rewrite(source_path: &Path, source: &str, diagnostics: &DiagnosticStream) -> Option<SourceRewrite> {
-	let syntax = syn::parse_file(source).ok()?;
-	let mut visitor = MethodCallVisitor::default();
-	visitor.visit_file(&syntax);
-
-	let source_name = source_path.to_string_lossy();
-	let mut edits = BTreeMap::<usize, &'static str>::new();
-	for diagnostic in diagnostics.diagnostics() {
-		let Some(rule) = recipe_arity_rule(diagnostic) else {
-			continue;
-		};
-		let Some(primary) = primary_source_span(diagnostic, &source_name) else {
-			continue;
-		};
-		let start = usize::try_from(primary.get("byte_start")?.as_u64()?).ok()?;
-		let end = usize::try_from(primary.get("byte_end")?.as_u64()?).ok()?;
-		let call = visitor
-			.calls
-			.iter()
-			.find(|call| call.method_start == start && call.method_end == end)?;
-		match rule {
-			ArityRule::EmptyData if call.argument_count == 0 => {
-				insert_edit(&mut edits, call.open_end, "()")?;
-			}
-			ArityRule::KnnReduction if call.argument_count == 2 => {
-				insert_edit(&mut edits, call.open_end, "[")?;
-				insert_edit(&mut edits, call.close_start, "]")?;
-			}
-			ArityRule::ResidualBranch if call.argument_count >= 2 => {
-				insert_edit(&mut edits, call.open_end, "[")?;
-				insert_edit(&mut edits, call.close_start, "]")?;
-			}
-			_ => return None,
-		}
-	}
-	if edits.is_empty() {
-		return None;
-	}
-	build_rewrite(
-		source,
-		edits.into_iter()
-			.map(|(offset, replacement)| TextEdit {
-				start: offset,
-				end: offset,
-				replacement: replacement.to_owned(),
-			})
-			.collect(),
-	)
-}
-
-fn insert_edit(edits: &mut BTreeMap<usize, &'static str>, offset: usize, edit: &'static str) -> Option<()> {
-	match edits.get(&offset) {
-		Some(existing) if *existing != edit => None,
-		Some(_) => Some(()),
-		None => {
-			edits.insert(offset, edit);
-			Some(())
-		}
-	}
-}
-
-fn recipe_arity_rule(diagnostic: &Value) -> Option<ArityRule> {
-	if diagnostic.pointer("/code/code").and_then(Value::as_str) != Some("E0061") {
-		return None;
-	}
-	if method_defined_here(diagnostic, "src/facade.rs", "fn data", "IntoDataSources") {
-		Some(ArityRule::EmptyData)
-	} else if method_defined_here(diagnostic, "src/api.rs", "fn knn", "IntoKnnSpec") {
-		Some(ArityRule::KnnReduction)
-	} else if method_defined_here(
-		diagnostic,
-		"src/api.rs",
-		"fn residual",
-		"IntoResidualBranch",
-	) {
-		Some(ArityRule::ResidualBranch)
-	} else {
-		None
-	}
-}
-
-fn method_defined_here(diagnostic: &Value, suffix: &str, method: &str, bound: &str) -> bool {
-	diagnostic
-		.get("children")
-		.and_then(Value::as_array)
-		.into_iter()
-		.flatten()
-		.filter(|child| child.get("message").and_then(Value::as_str) == Some("method defined here"))
-		.flat_map(|child| {
-			child.get("spans")
-				.and_then(Value::as_array)
-				.into_iter()
-				.flatten()
-		})
-		.any(|span| {
-			let file_matches = span
-				.get("file_name")
-				.and_then(Value::as_str)
-				.is_some_and(|file| Path::new(file).ends_with(suffix));
-			let signature_matches = span
-				.get("text")
-				.and_then(Value::as_array)
-				.into_iter()
-				.flatten()
-				.filter_map(|line| line.get("text").and_then(Value::as_str))
-				.any(|line| line.contains(method) && line.contains(bound));
-			file_matches && signature_matches
-		})
-}
-
-fn primary_source_span<'a>(diagnostic: &'a Value, source: &str) -> Option<&'a Value> {
-	diagnostic.get("spans")?.as_array()?.iter().find(|span| {
-		span.get("is_primary").and_then(Value::as_bool) == Some(true)
-			&& span.get("file_name").and_then(Value::as_str) == Some(source)
 	})
 }
 
