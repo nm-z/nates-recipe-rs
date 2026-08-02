@@ -1,5 +1,4 @@
-use std::fmt;
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 /// An input or collection failure. Audit errors always fail the gate.
 #[derive(Debug)]

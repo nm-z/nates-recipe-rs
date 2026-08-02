@@ -1,7 +1,9 @@
-use std::error::Error;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::{
+	error::Error,
+	fs,
+	path::{Path, PathBuf},
+	process::Command,
+};
 
 use sha2::{Digest as _, Sha256};
 

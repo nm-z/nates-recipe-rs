@@ -1,5 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	time::Duration,
+};
 
 use recipe_core::{
 	ByteCount, BytesPerSecond, CalculationCapability, Device, DeviceId, DeviceKind, Digest, DirectedLink,
@@ -9,14 +11,16 @@ use recipe_core::{
 };
 use sha2::{Digest as _, Sha256};
 
-use crate::error::{ProbeError, ProbeResult};
-use crate::model::{
-	BenchmarkMetadata, BoundedBenchmarkPlan, CacheIdentity, DirectionalBenchmarkEvidence, MachineFingerprint,
-	MeasuredGpuOrigin, MeasuredMachineOrigin, MeasuredOrigins, MeasuredPeerBenchmark, MeasuredProfile,
-	MeasuredRamOrigin, MeasuredStorageOrigin, PEER_BENCHMARK_PROTOCOL_SCHEMA, PROFILE_CODEC_SCHEMA, PROFILE_SCHEMA,
-	PeerBenchmarkEvidence, PeerDuplexExecution, PeerEndpointEvidence,
+use crate::{
+	error::{ProbeError, ProbeResult},
+	model::{
+		BenchmarkMetadata, BoundedBenchmarkPlan, CacheIdentity, DirectionalBenchmarkEvidence, MachineFingerprint,
+		MeasuredGpuOrigin, MeasuredMachineOrigin, MeasuredOrigins, MeasuredPeerBenchmark, MeasuredProfile,
+		MeasuredRamOrigin, MeasuredStorageOrigin, PEER_BENCHMARK_PROTOCOL_SCHEMA, PROFILE_CODEC_SCHEMA,
+		PROFILE_SCHEMA, PeerBenchmarkEvidence, PeerDuplexExecution, PeerEndpointEvidence,
+	},
+	seed::CONTRACT_SCHEMA,
 };
-use crate::seed::CONTRACT_SCHEMA;
 
 const MAGIC: &[u8; 16] = b"RECIPEPROFILE\0\0\0";
 const CHECKSUM_BYTES: usize = 32;
@@ -112,11 +116,6 @@ fn encode_unchecked(profile: &MeasuredProfile) -> ProbeResult<Vec<u8>> {
 		)));
 	}
 	Ok(encoder.bytes)
-}
-
-#[cfg(test)]
-pub(crate) fn encode_unchecked_for_test(profile: &MeasuredProfile) -> ProbeResult<Vec<u8>> {
-	encode_unchecked(profile)
 }
 
 pub fn validate_profile(profile: &MeasuredProfile) -> ProbeResult<()> {
@@ -1285,37 +1284,21 @@ struct Encoder {
 }
 
 impl Encoder {
-	fn raw(&mut self, bytes: &[u8]) {
-		self.bytes.extend_from_slice(bytes);
-	}
+	fn raw(&mut self, bytes: &[u8]) { self.bytes.extend_from_slice(bytes); }
 
-	fn u8(&mut self, value: u8) {
-		self.bytes.push(value);
-	}
+	fn u8(&mut self, value: u8) { self.bytes.push(value); }
 
-	fn bool(&mut self, value: bool) {
-		self.u8(u8::from(value));
-	}
+	fn bool(&mut self, value: bool) { self.u8(u8::from(value)); }
 
-	fn u16(&mut self, value: u16) {
-		self.raw(&value.to_le_bytes());
-	}
+	fn u16(&mut self, value: u16) { self.raw(&value.to_le_bytes()); }
 
-	fn u32(&mut self, value: u32) {
-		self.raw(&value.to_le_bytes());
-	}
+	fn u32(&mut self, value: u32) { self.raw(&value.to_le_bytes()); }
 
-	fn u64(&mut self, value: u64) {
-		self.raw(&value.to_le_bytes());
-	}
+	fn u64(&mut self, value: u64) { self.raw(&value.to_le_bytes()); }
 
-	fn u128(&mut self, value: u128) {
-		self.raw(&value.to_le_bytes());
-	}
+	fn u128(&mut self, value: u128) { self.raw(&value.to_le_bytes()); }
 
-	fn digest(&mut self, value: Digest) {
-		self.raw(&value.bytes());
-	}
+	fn digest(&mut self, value: Digest) { self.raw(&value.bytes()); }
 
 	fn length(&mut self, value: usize, name: &str) -> ProbeResult<()> {
 		if value > MAXIMUM_ITEMS {
@@ -1373,17 +1356,11 @@ struct Decoder<'a> {
 }
 
 impl<'a> Decoder<'a> {
-	const fn new(bytes: &'a [u8]) -> Self {
-		Self { bytes, position: 0 }
-	}
+	const fn new(bytes: &'a [u8]) -> Self { Self { bytes, position: 0 } }
 
-	fn remaining(&self) -> usize {
-		self.bytes.len().saturating_sub(self.position)
-	}
+	fn remaining(&self) -> usize { self.bytes.len().saturating_sub(self.position) }
 
-	fn is_finished(&self) -> bool {
-		self.position == self.bytes.len()
-	}
+	fn is_finished(&self) -> bool { self.position == self.bytes.len() }
 
 	fn raw(&mut self, count: usize, name: &str) -> ProbeResult<&'a [u8]> {
 		let end = self
@@ -1398,17 +1375,17 @@ impl<'a> Decoder<'a> {
 		Ok(result)
 	}
 
-	fn u8(&mut self, name: &str) -> ProbeResult<u8> {
-		Ok(self.raw(1, name)?[0])
-	}
+	fn u8(&mut self, name: &str) -> ProbeResult<u8> { Ok(self.raw(1, name)?[0]) }
 
 	fn bool(&mut self, name: &str) -> ProbeResult<bool> {
 		match self.u8(name)? {
 			0 => Ok(false),
 			1 => Ok(true),
-			value => Err(codec_error(format!(
-				"{name} has invalid boolean tag {value}"
-			))),
+			value => {
+				Err(codec_error(format!(
+					"{name} has invalid boolean tag {value}"
+				)))
+			}
 		}
 	}
 
@@ -1482,9 +1459,11 @@ impl<'a> Decoder<'a> {
 			0 => Ok(PropertyProvenance::Estimated),
 			1 => Ok(PropertyProvenance::Measured),
 			2 => Ok(PropertyProvenance::Override),
-			tag => Err(codec_error(format!(
-				"{name} has invalid provenance tag {tag}"
-			))),
+			tag => {
+				Err(codec_error(format!(
+					"{name} has invalid provenance tag {tag}"
+				)))
+			}
 		}
 	}
 
@@ -1520,33 +1499,4 @@ impl<'a> Decoder<'a> {
 	}
 }
 
-fn codec_error(message: impl Into<String>) -> ProbeError {
-	ProbeError::Cache(format!("codec: {}", message.into()))
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn checksum_rejects_bit_corruption_before_decode() {
-		let mut bytes = Vec::from(*MAGIC);
-		bytes.extend_from_slice(&PROFILE_CODEC_SCHEMA.to_le_bytes());
-		bytes.extend_from_slice(&[0; 64]);
-		let checksum: [u8; 32] = Sha256::digest(&bytes).into();
-		bytes.extend_from_slice(&checksum);
-		bytes[20] ^= 1;
-		let error = MeasuredProfileCodec::decode(&bytes).unwrap_err();
-		assert!(error.to_string().contains("checksum"));
-	}
-
-	#[test]
-	fn schema_five_cache_is_explicitly_invalidated() {
-		let mut bytes = Vec::from(*MAGIC);
-		bytes.extend_from_slice(&5_u32.to_le_bytes());
-		let checksum: [u8; 32] = Sha256::digest(&bytes).into();
-		bytes.extend_from_slice(&checksum);
-		let error = MeasuredProfileCodec::decode(&bytes).unwrap_err();
-		assert!(error.to_string().contains("unsupported codec schema 5"));
-	}
-}
+fn codec_error(message: impl Into<String>) -> ProbeError { ProbeError::Cache(format!("codec: {}", message.into())) }

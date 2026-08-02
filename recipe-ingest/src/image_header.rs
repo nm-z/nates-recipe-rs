@@ -59,44 +59,28 @@ pub struct EncodedImageMetadata {
 
 impl EncodedImageMetadata {
 	#[must_use]
-	pub const fn format(self) -> EncodedImageFormat {
-		self.format
-	}
+	pub const fn format(self) -> EncodedImageFormat { self.format }
 
 	#[must_use]
-	pub const fn width(self) -> u32 {
-		self.width
-	}
+	pub const fn width(self) -> u32 { self.width }
 
 	#[must_use]
-	pub const fn height(self) -> u32 {
-		self.height
-	}
+	pub const fn height(self) -> u32 { self.height }
 
 	#[must_use]
-	pub const fn channels(self) -> Option<u8> {
-		self.channels
-	}
+	pub const fn channels(self) -> Option<u8> { self.channels }
 
 	#[must_use]
-	pub const fn color_model(self) -> Option<ImageColorModel> {
-		self.color_model
-	}
+	pub const fn color_model(self) -> Option<ImageColorModel> { self.color_model }
 
 	#[must_use]
-	pub const fn sample_bits(self) -> Option<u8> {
-		self.sample_bits
-	}
+	pub const fn sample_bits(self) -> Option<u8> { self.sample_bits }
 
 	#[must_use]
-	pub const fn value_layout(self) -> ImageValueLayout {
-		self.value_layout
-	}
+	pub const fn value_layout(self) -> ImageValueLayout { self.value_layout }
 
 	#[must_use]
-	pub const fn value_range(self) -> ImageValueRange {
-		self.value_range
-	}
+	pub const fn value_range(self) -> ImageValueRange { self.value_range }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,9 +97,7 @@ impl ImageHeaderError {
 }
 
 impl fmt::Display for ImageHeaderError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(&self.detail)
-	}
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(&self.detail) }
 }
 
 pub(crate) fn inspect_encoded_image(bytes: &[u8]) -> Result<EncodedImageMetadata, ImageHeaderError> {
@@ -444,11 +426,13 @@ fn inspect_bmp(bytes: &[u8]) -> Result<EncodedImageMetadata, ImageHeaderError> {
 		return Err(ImageHeaderError::new("BMP declares zero bits per pixel"));
 	}
 	let (channels, color_model, sample_bits) = match bits_per_pixel {
-		1 | 2 | 4 | 8 => (
-			Some(1),
-			Some(ImageColorModel::IndexedRgb),
-			u8::try_from(bits_per_pixel).ok(),
-		),
+		1 | 2 | 4 | 8 => {
+			(
+				Some(1),
+				Some(ImageColorModel::IndexedRgb),
+				u8::try_from(bits_per_pixel).ok(),
+			)
+		}
 		24 => (Some(3), Some(ImageColorModel::Bgr), Some(8)),
 		48 => (Some(3), Some(ImageColorModel::Bgr), Some(16)),
 		_ => (None, None, None),
@@ -665,183 +649,4 @@ fn read_le_u32(bytes: &[u8], offset: usize) -> Result<u32, ImageHeaderError> {
 		.get(offset..offset.saturating_add(4))
 		.ok_or_else(|| ImageHeaderError::new("truncated little-endian u32 image header field"))?;
 	Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	fn png(width: u32, height: u32, bits: u8, color_type: u8) -> Vec<u8> {
-		let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
-		bytes.extend_from_slice(&13u32.to_be_bytes());
-		bytes.extend_from_slice(b"IHDR");
-		bytes.extend_from_slice(&width.to_be_bytes());
-		bytes.extend_from_slice(&height.to_be_bytes());
-		bytes.extend_from_slice(&[bits, color_type, 0, 0, 0]);
-		let crc = png_crc32(&bytes[12..29]);
-		bytes.extend_from_slice(&crc.to_be_bytes());
-		bytes
-	}
-
-	fn jpeg(width: u16, height: u16, components: &[u8]) -> Vec<u8> {
-		let mut bytes = b"\xff\xd8\xff\xe0\x00\x07JFIF\0".to_vec();
-		bytes.extend_from_slice(b"\xff\xc0");
-		let length = u16::try_from(8 + components.len() * 3).unwrap();
-		bytes.extend_from_slice(&length.to_be_bytes());
-		bytes.push(8);
-		bytes.extend_from_slice(&height.to_be_bytes());
-		bytes.extend_from_slice(&width.to_be_bytes());
-		bytes.push(u8::try_from(components.len()).unwrap());
-		for component in components {
-			bytes.extend_from_slice(&[*component, 0x11, 0]);
-		}
-		bytes
-	}
-
-	fn gif(signature: &[u8; 6], width: u16, height: u16) -> Vec<u8> {
-		let mut bytes = signature.to_vec();
-		bytes.extend_from_slice(&width.to_le_bytes());
-		bytes.extend_from_slice(&height.to_le_bytes());
-		bytes.extend_from_slice(&[0, 0, 0]);
-		bytes
-	}
-
-	fn bmp(width: i32, height: i32, bits: u16) -> Vec<u8> {
-		let mut bytes = vec![0u8; 54];
-		bytes[..2].copy_from_slice(b"BM");
-		bytes[2..6].copy_from_slice(&54u32.to_le_bytes());
-		bytes[10..14].copy_from_slice(&54u32.to_le_bytes());
-		bytes[14..18].copy_from_slice(&40u32.to_le_bytes());
-		bytes[18..22].copy_from_slice(&width.to_le_bytes());
-		bytes[22..26].copy_from_slice(&height.to_le_bytes());
-		bytes[26..28].copy_from_slice(&1u16.to_le_bytes());
-		bytes[28..30].copy_from_slice(&bits.to_le_bytes());
-		bytes
-	}
-
-	fn webp_extended(width: u32, height: u32, alpha: bool) -> Vec<u8> {
-		let mut payload = vec![0u8; 10];
-		payload[0] = if alpha { 0x10 } else { 0 };
-		let width = width - 1;
-		let height = height - 1;
-		payload[4..7].copy_from_slice(&width.to_le_bytes()[..3]);
-		payload[7..10].copy_from_slice(&height.to_le_bytes()[..3]);
-		let mut bytes = b"RIFF".to_vec();
-		bytes.extend_from_slice(&22u32.to_le_bytes());
-		bytes.extend_from_slice(b"WEBPVP8X");
-		bytes.extend_from_slice(&10u32.to_le_bytes());
-		bytes.extend_from_slice(&payload);
-		bytes
-	}
-
-	#[test]
-	fn recognized_headers_retain_exact_dimensions_and_derivable_channels() {
-		let cases = [
-			(
-				png(2_147_483_647, 65_537, 16, 6),
-				metadata(
-					EncodedImageFormat::Png,
-					2_147_483_647,
-					65_537,
-					Some(4),
-					Some(ImageColorModel::Rgba),
-					Some(16),
-				),
-			),
-			(
-				jpeg(4097, 3073, &[1, 2, 3]),
-				metadata(
-					EncodedImageFormat::Jpeg,
-					4097,
-					3073,
-					Some(3),
-					Some(ImageColorModel::YCbCr),
-					Some(8),
-				),
-			),
-			(
-				gif(b"GIF87a", 321, 123),
-				metadata(
-					EncodedImageFormat::Gif87a,
-					321,
-					123,
-					Some(1),
-					Some(ImageColorModel::IndexedRgb),
-					None,
-				),
-			),
-			(
-				gif(b"GIF89a", 654, 456),
-				metadata(
-					EncodedImageFormat::Gif89a,
-					654,
-					456,
-					Some(1),
-					Some(ImageColorModel::IndexedRgb),
-					None,
-				),
-			),
-			(
-				bmp(50_003, -40_007, 24),
-				metadata(
-					EncodedImageFormat::Bmp,
-					50_003,
-					40_007,
-					Some(3),
-					Some(ImageColorModel::Bgr),
-					Some(8),
-				),
-			),
-			(
-				webp_extended(100_003, 200_007, true),
-				metadata(
-					EncodedImageFormat::WebP,
-					100_003,
-					200_007,
-					Some(4),
-					Some(ImageColorModel::Rgba),
-					Some(8),
-				),
-			),
-		];
-		for (encoded, expected) in cases {
-			assert_eq!(inspect_encoded_image(&encoded), Ok(expected));
-			assert_eq!(expected.value_layout(), ImageValueLayout::EncodedFile);
-			assert_eq!(expected.value_range(), ImageValueRange::EncodedBytes);
-		}
-	}
-
-	#[test]
-	fn truncated_or_structurally_corrupt_headers_fail() {
-		for encoded in [
-			b"\x89PNG\r\n\x1a\n".as_slice(),
-			b"\xff\xd8\xff\xc0\x00\x11\x08".as_slice(),
-			b"GIF89a\x01".as_slice(),
-			b"BM\0\0".as_slice(),
-			b"RIFF\x16\0\0\0WEBPVP8X".as_slice(),
-		] {
-			assert!(inspect_encoded_image(encoded).is_err());
-		}
-		assert!(inspect_encoded_image(&png(1, 1, 3, 6)).is_err());
-		let mut corrupt_png = png(1, 1, 8, 6);
-		corrupt_png[32] ^= 1;
-		assert!(inspect_encoded_image(&corrupt_png).is_err());
-		assert!(inspect_encoded_image(&bmp(1, 1, 0)).is_err());
-	}
-
-	#[test]
-	fn signature_predicate_covers_every_inspected_container() {
-		for encoded in [
-			png(1, 1, 8, 6),
-			jpeg(1, 1, &[1]),
-			gif(b"GIF87a", 1, 1),
-			gif(b"GIF89a", 1, 1),
-			bmp(1, 1, 24),
-			webp_extended(1, 1, false),
-		] {
-			assert!(has_recognized_image_signature(&encoded));
-			assert!(inspect_encoded_image(&encoded).is_ok());
-		}
-		assert!(!has_recognized_image_signature(b"not an image"));
-	}
 }

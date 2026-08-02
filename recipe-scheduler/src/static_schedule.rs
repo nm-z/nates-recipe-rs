@@ -1,5 +1,7 @@
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::{
+	cmp::Reverse,
+	collections::{BTreeMap, BTreeSet, BinaryHeap},
+};
 
 use recipe_core::{
 	CalculationTask, DeviceId, DiscoveryProfile, DuplexMode, DuplexResourceId, LinkId, Nanoseconds, RunPhase,
@@ -122,16 +124,13 @@ pub fn schedule(
 		};
 		phase_end[phase_index] = phase_end[phase_index].max(window.end);
 		task_end.insert(id, window.end);
-		scheduled.insert(
+		scheduled.insert(id, Task {
 			id,
-			Task {
-				id,
-				phase: prepared_task.task.phase,
-				window,
-				dependencies: prepared_task.task.dependencies.clone(),
-				kind,
-			},
-		);
+			phase: prepared_task.task.phase,
+			window,
+			dependencies: prepared_task.task.dependencies.clone(),
+			kind,
+		});
 		for successor in successors.get(&id).into_iter().flatten() {
 			let count = remaining_dependencies
 				.get_mut(successor)
@@ -182,14 +181,11 @@ fn prepare_tasks(
 		};
 		resources.sort();
 		resources.dedup();
-		prepared.insert(
-			task.id,
-			PreparedTask {
-				task,
-				duration,
-				resources,
-			},
-		);
+		prepared.insert(task.id, PreparedTask {
+			task,
+			duration,
+			resources,
+		});
 	}
 	Ok(prepared)
 }
@@ -389,20 +385,26 @@ fn persist_transfer_lane_claims(
 	};
 	let mut claims = selected_resources
 		.iter()
-		.filter_map(|resource| match resource {
-			Resource::TransferLane(link, lane) => Some(TransferLaneClaim::Link {
-				link: *link,
-				lane: *lane,
-			}),
-			Resource::ExternalTransferLane(device, lane) => Some(TransferLaneClaim::External {
-				device: *device,
-				lane: *lane,
-			}),
-			Resource::Queue(_)
-			| Resource::Completion(_)
-			| Resource::ComputeLane(_, _)
-			| Resource::HalfDuplexDirection(_, _)
-			| Resource::NoComputeTransferOverlap(_) => None,
+		.filter_map(|resource| {
+			match resource {
+				Resource::TransferLane(link, lane) => {
+					Some(TransferLaneClaim::Link {
+						link: *link,
+						lane: *lane,
+					})
+				}
+				Resource::ExternalTransferLane(device, lane) => {
+					Some(TransferLaneClaim::External {
+						device: *device,
+						lane: *lane,
+					})
+				}
+				Resource::Queue(_)
+				| Resource::Completion(_)
+				| Resource::ComputeLane(_, _)
+				| Resource::HalfDuplexDirection(_, _)
+				| Resource::NoComputeTransferOverlap(_) => None,
+			}
 		})
 		.collect::<Vec<_>>();
 	claims.sort();
@@ -412,9 +414,11 @@ fn persist_transfer_lane_claims(
 			let expected = transfer.route.iter().copied().collect::<BTreeSet<_>>();
 			let claimed = claims
 				.iter()
-				.filter_map(|claim| match claim {
-					TransferLaneClaim::Link { link, .. } => Some(*link),
-					TransferLaneClaim::External { .. } => None,
+				.filter_map(|claim| {
+					match claim {
+						TransferLaneClaim::Link { link, .. } => Some(*link),
+						TransferLaneClaim::External { .. } => None,
+					}
 				})
 				.collect::<BTreeSet<_>>();
 			claims.iter()
@@ -670,539 +674,32 @@ fn resource_conflict_end(
 	reservations: &BTreeMap<Resource, Vec<ScheduleWindow>>,
 ) -> Option<Nanoseconds> {
 	match resource {
-		Resource::HalfDuplexDirection(capacity, direction) => reservations
-			.iter()
-			.filter_map(|(reserved, windows)| match reserved {
-				Resource::HalfDuplexDirection(reserved_capacity, reserved_direction)
-					if *reserved_capacity == capacity && *reserved_direction != direction =>
-				{
-					Some(windows)
-				}
-				_ => None,
-			})
-			.flatten()
-			.filter(|window| window.overlaps(candidate))
-			.map(|window| window.end)
-			.max(),
-		_ => reservations
-			.get(&resource)
-			.into_iter()
-			.flatten()
-			.filter(|window| window.overlaps(candidate))
-			.map(|window| window.end)
-			.max(),
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use recipe_core::{
-		ByteCount, BytesPerSecond, CalculationCapability, CompletionSlotId, Device, DeviceKind, Digest,
-		DirectedLink, DiscoveredDevice, DiscoveredLink, DiscoveryIdentity, DuplexResourceId, FlopCount,
-		FlopsPerSecond, Label, LinkId, Machine, MachineId, Node, NodeId, NodeRole, Property, PropertyProvenance,
-		QueueSlotId, TargetIdentity, TopologyIdentity, TransferCapability, TransferLaneCount, TransportId,
-		TransportKind, ValueId,
-	};
-
-	use super::*;
-
-	fn measured<T>(value: T) -> Property<T> {
-		Property::new(value, PropertyProvenance::Measured)
-	}
-
-	fn fixture(full_duplex: bool, overlaps: bool) -> (Topology, DiscoveryProfile) {
-		let machine = MachineId::new(1);
-		let gpu = DeviceId::new(1);
-		let ram = DeviceId::new(2);
-		let topology_id = TopologyIdentity::new(Digest::new([1; 32]));
-		let links = vec![
-			DirectedLink {
-				id: LinkId::new(1),
-				transport: TransportId::new(1),
-				kind: if full_duplex {
-					TransportKind::Pcie
-				} else {
-					TransportKind::Sata
-				},
-				duplex: if full_duplex {
-					DuplexMode::Full
-				} else {
-					DuplexMode::Half
-				},
-				from: ram,
-				to: gpu,
-				bandwidth: measured(BytesPerSecond::new(100).unwrap()),
-				maximum_inflight_transfers: measured(TransferLaneCount::new(1).unwrap()),
-				capacity_resource: DuplexResourceId::new(1),
-			},
-			DirectedLink {
-				id: LinkId::new(2),
-				transport: TransportId::new(1),
-				kind: if full_duplex {
-					TransportKind::Pcie
-				} else {
-					TransportKind::Sata
-				},
-				duplex: if full_duplex {
-					DuplexMode::Full
-				} else {
-					DuplexMode::Half
-				},
-				from: gpu,
-				to: ram,
-				bandwidth: measured(BytesPerSecond::new(100).unwrap()),
-				maximum_inflight_transfers: measured(TransferLaneCount::new(1).unwrap()),
-				capacity_resource: DuplexResourceId::new(if full_duplex { 2 } else { 1 }),
-			},
-		];
-		let topology = Topology {
-			identity: topology_id,
-			machines: vec![Machine {
-				id: machine,
-				name: Label::new("host").unwrap(),
-			}],
-			nodes: vec![Node {
-				id: NodeId::new(1),
-				role: NodeRole::Master,
-				machine,
-				devices: vec![gpu, ram],
-			}],
-			devices: vec![
-				Device {
-					id: gpu,
-					machine,
-					kind: DeviceKind::GpuMemory,
-					capacity: measured(ByteCount::new(8_000_000_000)),
-					transfer_rate: measured(BytesPerSecond::new(100).unwrap()),
-					calculation_rate: Some(measured(FlopsPerSecond::new(100).unwrap())),
-				},
-				Device {
-					id: ram,
-					machine,
-					kind: DeviceKind::Ram,
-					capacity: measured(ByteCount::new(8_000_000_000)),
-					transfer_rate: measured(BytesPerSecond::new(100).unwrap()),
-					calculation_rate: None,
-				},
-			],
-			links,
-		};
-		let discovery = DiscoveryProfile {
-			identity: DiscoveryIdentity::new(Digest::new([2; 32])),
-			topology: topology_id,
-			devices: vec![
-				DiscoveredDevice {
-					device: gpu,
-					available: true,
-					maximum_submission_queues: 64,
-					total_capacity: measured(ByteCount::new(8_000_000_000)),
-					transfer: TransferCapability {
-						rate: measured(BytesPerSecond::new(100).unwrap()),
-						maximum_inflight_transfers: measured(TransferLaneCount::new(1).unwrap()),
-						asynchronous_submission: true,
-						overlaps_calculation: overlaps,
-					},
-					calculation: Some(CalculationCapability {
-						target: TargetIdentity {
-							backend: Label::new("test").unwrap(),
-							architecture: Label::new("gpu").unwrap(),
-							abi: Label::new("1").unwrap(),
-						},
-						rate: measured(FlopsPerSecond::new(100).unwrap()),
-						asynchronous_submission: true,
-						maximum_concurrent_tasks: 2,
-						subgroup_lanes: 32,
-						maximum_workgroup_lanes: 256,
-						maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
-					}),
-				},
-				DiscoveredDevice {
-					device: ram,
-					available: true,
-					maximum_submission_queues: 64,
-					total_capacity: measured(ByteCount::new(8_000_000_000)),
-					transfer: TransferCapability {
-						rate: measured(BytesPerSecond::new(100).unwrap()),
-						maximum_inflight_transfers: measured(TransferLaneCount::new(1).unwrap()),
-						asynchronous_submission: true,
-						overlaps_calculation: true,
-					},
-					calculation: None,
-				},
-			],
-			links: vec![
-				DiscoveredLink {
-					link: LinkId::new(1),
-					available: true,
-					bandwidth: measured(BytesPerSecond::new(100).unwrap()),
-					maximum_inflight_transfers: measured(TransferLaneCount::new(1).unwrap()),
-					asynchronous_submission: true,
-				},
-				DiscoveredLink {
-					link: LinkId::new(2),
-					available: true,
-					bandwidth: measured(BytesPerSecond::new(100).unwrap()),
-					maximum_inflight_transfers: measured(TransferLaneCount::new(1).unwrap()),
-					asynchronous_submission: true,
-				},
-			],
-		};
-		(topology, discovery)
-	}
-
-	fn indirect_fixture() -> (Topology, DiscoveryProfile) {
-		let (mut topology, mut discovery) = fixture(true, true);
-		let gpu = DeviceId::new(1);
-		let remote_ram = DeviceId::new(3);
-		let machine = MachineId::new(1);
-		topology.nodes[0].devices.push(remote_ram);
-		topology.devices.push(Device {
-			id: remote_ram,
-			machine,
-			kind: DeviceKind::Ram,
-			capacity: measured(ByteCount::new(8_000_000_000)),
-			transfer_rate: measured(BytesPerSecond::new(100).unwrap()),
-			calculation_rate: None,
-		});
-		let link = |id, from, to, resource| DirectedLink {
-			id: LinkId::new(id),
-			transport: TransportId::new(2),
-			kind: TransportKind::Memory,
-			duplex: DuplexMode::Full,
-			from,
-			to,
-			bandwidth: measured(BytesPerSecond::new(100).unwrap()),
-			maximum_inflight_transfers: measured(TransferLaneCount::new(1).unwrap()),
-			capacity_resource: DuplexResourceId::new(resource),
-		};
-		topology
-			.links
-			.extend([link(3, gpu, remote_ram, 3), link(4, remote_ram, gpu, 4)]);
-		discovery.devices.push(DiscoveredDevice {
-			device: remote_ram,
-			available: true,
-			maximum_submission_queues: 64,
-			total_capacity: measured(ByteCount::new(8_000_000_000)),
-			transfer: TransferCapability {
-				rate: measured(BytesPerSecond::new(100).unwrap()),
-				maximum_inflight_transfers: measured(TransferLaneCount::new(1).unwrap()),
-				asynchronous_submission: true,
-				overlaps_calculation: true,
-			},
-			calculation: None,
-		});
-		discovery.links.extend([
-			DiscoveredLink {
-				link: LinkId::new(3),
-				available: true,
-				bandwidth: measured(BytesPerSecond::new(100).unwrap()),
-				maximum_inflight_transfers: measured(TransferLaneCount::new(1).unwrap()),
-				asynchronous_submission: true,
-			},
-			DiscoveredLink {
-				link: LinkId::new(4),
-				available: true,
-				bandwidth: measured(BytesPerSecond::new(100).unwrap()),
-				maximum_inflight_transfers: measured(TransferLaneCount::new(1).unwrap()),
-				asynchronous_submission: true,
-			},
-		]);
-		(topology, discovery)
-	}
-
-	fn submission(id: u64) -> SubmissionSlots {
-		SubmissionSlots {
-			queue: QueueSlotId::new(id),
-			completion: CompletionSlotId::new(id),
+		Resource::HalfDuplexDirection(capacity, direction) => {
+			reservations
+				.iter()
+				.filter_map(|(reserved, windows)| {
+					match reserved {
+						Resource::HalfDuplexDirection(reserved_capacity, reserved_direction)
+							if *reserved_capacity == capacity && *reserved_direction != direction =>
+						{
+							Some(windows)
+						}
+						_ => None,
+					}
+				})
+				.flatten()
+				.filter(|window| window.overlaps(candidate))
+				.map(|window| window.end)
+				.max()
 		}
-	}
-
-	fn transfer(id: u64, source: DeviceId, destination: DeviceId) -> UnscheduledTask {
-		UnscheduledTask {
-			id: TaskId::new(id),
-			phase: RunPhase::Loop,
-			dependencies: Vec::new(),
-			kind: TaskKind::Transfer(TransferTask {
-				source: TransferEndpoint::Device {
-					device: source,
-					value: ValueId::new(id * 2),
-				},
-				destination: TransferEndpoint::Device {
-					device: destination,
-					value: ValueId::new(id * 2 + 1),
-				},
-				bytes: ByteCount::new(100),
-				route: Vec::new(),
-				lane_claims: Vec::new(),
-				submission: submission(id),
-			}),
+		_ => {
+			reservations
+				.get(&resource)
+				.into_iter()
+				.flatten()
+				.filter(|window| window.overlaps(candidate))
+				.map(|window| window.end)
+				.max()
 		}
-	}
-
-	fn lane_claims(task: &Task) -> &[TransferLaneClaim] {
-		let TaskKind::Transfer(transfer) = &task.kind else {
-			panic!("expected a scheduled transfer");
-		};
-		&transfer.lane_claims
-	}
-
-	#[test]
-	fn full_duplex_opposing_transfers_overlap_and_half_duplex_serializes() {
-		let (topology, discovery) = fixture(true, true);
-		let tasks = [
-			transfer(1, DeviceId::new(2), DeviceId::new(1)),
-			transfer(2, DeviceId::new(1), DeviceId::new(2)),
-		];
-		let result = schedule(&topology, &discovery, &tasks).unwrap();
-		assert_eq!(result.tasks[0].window.start, result.tasks[1].window.start);
-		assert_eq!(
-			lane_claims(&result.tasks[0]),
-			[TransferLaneClaim::Link {
-				link: LinkId::new(1),
-				lane: 0,
-			}]
-		);
-		assert_eq!(
-			lane_claims(&result.tasks[1]),
-			[TransferLaneClaim::Link {
-				link: LinkId::new(2),
-				lane: 0,
-			}]
-		);
-
-		let (topology, discovery) = fixture(false, true);
-		let result = schedule(&topology, &discovery, &tasks).unwrap();
-		assert!(result.tasks[0].window.end <= result.tasks[1].window.start);
-		assert_eq!(
-			lane_claims(&result.tasks[0]),
-			[TransferLaneClaim::Link {
-				link: LinkId::new(1),
-				lane: 0,
-			}]
-		);
-		assert_eq!(
-			lane_claims(&result.tasks[1]),
-			[TransferLaneClaim::Link {
-				link: LinkId::new(2),
-				lane: 0,
-			}]
-		);
-	}
-
-	#[test]
-	fn rejects_composite_internal_transfers_and_indirect_auto_routes() {
-		let (topology, discovery) = indirect_fixture();
-		let mut explicit = transfer(1, DeviceId::new(2), DeviceId::new(3));
-		let TaskKind::Transfer(explicit_transfer) = &mut explicit.kind else {
-			panic!("helper must build an internal transfer");
-		};
-		explicit_transfer.route = vec![LinkId::new(1), LinkId::new(3)];
-		let error = schedule(&topology, &discovery, &[explicit]).unwrap_err();
-		assert_eq!(error.kind, ScheduleErrorKind::InvalidTransfer);
-
-		let automatic = transfer(2, DeviceId::new(2), DeviceId::new(3));
-		let error = schedule(&topology, &discovery, &[automatic]).unwrap_err();
-		assert_eq!(error.kind, ScheduleErrorKind::InvalidTransfer);
-	}
-
-	#[test]
-	fn same_device_copy_remains_an_explicit_zero_link_task() {
-		let (topology, discovery) = fixture(true, true);
-		let result = schedule(
-			&topology,
-			&discovery,
-			&[transfer(1, DeviceId::new(1), DeviceId::new(1))],
-		)
-		.unwrap();
-		let TaskKind::Transfer(transfer) = &result.tasks[0].kind else {
-			panic!("scheduled task must remain a transfer");
-		};
-		assert!(transfer.route.is_empty());
-		assert!(transfer.lane_claims.is_empty());
-		assert_eq!(result.tasks[0].window.end, Nanoseconds::new(1));
-	}
-
-	#[test]
-	fn measured_multiqueue_capacity_bounds_same_direction_concurrency() {
-		let (mut topology, mut discovery) = fixture(false, true);
-		for link in &mut topology.links {
-			link.maximum_inflight_transfers = measured(TransferLaneCount::new(2).unwrap());
-		}
-		for link in &mut discovery.links {
-			link.maximum_inflight_transfers = measured(TransferLaneCount::new(2).unwrap());
-		}
-		let tasks = [
-			transfer(1, DeviceId::new(2), DeviceId::new(1)),
-			transfer(2, DeviceId::new(2), DeviceId::new(1)),
-			transfer(3, DeviceId::new(2), DeviceId::new(1)),
-		];
-		let result = schedule(&topology, &discovery, &tasks).unwrap();
-		let by_id = result
-			.tasks
-			.iter()
-			.map(|task| (task.id, task))
-			.collect::<BTreeMap<_, _>>();
-		assert_eq!(
-			by_id[&TaskId::new(1)].window.start,
-			by_id[&TaskId::new(2)].window.start
-		);
-		assert!(by_id[&TaskId::new(1)].window.end <= by_id[&TaskId::new(3)].window.start);
-		assert_eq!(
-			lane_claims(by_id[&TaskId::new(1)]),
-			[TransferLaneClaim::Link {
-				link: LinkId::new(1),
-				lane: 0,
-			}]
-		);
-		assert_eq!(
-			lane_claims(by_id[&TaskId::new(2)]),
-			[TransferLaneClaim::Link {
-				link: LinkId::new(1),
-				lane: 1,
-			}]
-		);
-		assert_eq!(
-			lane_claims(by_id[&TaskId::new(3)]),
-			[TransferLaneClaim::Link {
-				link: LinkId::new(1),
-				lane: 0,
-			}]
-		);
-	}
-
-	#[test]
-	fn rejects_a_preselected_lane_on_an_unscheduled_transfer() {
-		let (topology, discovery) = fixture(true, true);
-		let mut task = transfer(1, DeviceId::new(2), DeviceId::new(1));
-		let TaskKind::Transfer(transfer) = &mut task.kind else {
-			unreachable!("helper returns a transfer");
-		};
-		transfer.lane_claims = vec![TransferLaneClaim::Link {
-			link: LinkId::new(1),
-			lane: 0,
-		}];
-		let error = schedule(&topology, &discovery, &[task]).unwrap_err();
-		assert_eq!(error.kind, ScheduleErrorKind::InvalidTransfer);
-	}
-
-	#[test]
-	fn independent_calculations_use_discovered_parallel_lanes() {
-		let (topology, discovery) = fixture(true, true);
-		let calculation = |id| UnscheduledTask {
-			id: TaskId::new(id),
-			phase: RunPhase::Loop,
-			dependencies: Vec::new(),
-			kind: TaskKind::Calculation(CalculationTask {
-				device: DeviceId::new(1),
-				kernel_template: recipe_core::KernelTemplateId::new(1),
-				artifact: recipe_core::ArtifactId::new(1),
-				inputs: Vec::new(),
-				outputs: Vec::new(),
-				fault_flag: None,
-				work: FlopCount::new(100),
-				submission: submission(id),
-			}),
-		};
-		let result = schedule(&topology, &discovery, &[calculation(1), calculation(2)]).unwrap();
-		assert_eq!(result.tasks[0].window.start, result.tasks[1].window.start);
-		assert_eq!(result.makespan, Nanoseconds::new(1_000_000_000));
-	}
-
-	#[test]
-	fn nonoverlap_capability_serializes_copy_and_calculation() {
-		let (topology, discovery) = fixture(true, false);
-		let calculation = UnscheduledTask {
-			id: TaskId::new(1),
-			phase: RunPhase::Loop,
-			dependencies: Vec::new(),
-			kind: TaskKind::Calculation(CalculationTask {
-				device: DeviceId::new(1),
-				kernel_template: recipe_core::KernelTemplateId::new(1),
-				artifact: recipe_core::ArtifactId::new(1),
-				inputs: Vec::new(),
-				outputs: Vec::new(),
-				fault_flag: None,
-				work: FlopCount::new(100),
-				submission: submission(1),
-			}),
-		};
-		let copy = transfer(2, DeviceId::new(2), DeviceId::new(1));
-		let result = schedule(&topology, &discovery, &[calculation, copy]).unwrap();
-		assert!(result.tasks[0].window.end <= result.tasks[1].window.start);
-	}
-
-	#[test]
-	fn lifecycle_phases_form_global_barriers() {
-		let (topology, discovery) = fixture(true, true);
-		let init = UnscheduledTask {
-			id: TaskId::new(1),
-			phase: RunPhase::Init,
-			dependencies: Vec::new(),
-			kind: TaskKind::Transfer(TransferTask {
-				source: TransferEndpoint::External,
-				destination: TransferEndpoint::Device {
-					device: DeviceId::new(2),
-					value: ValueId::new(1),
-				},
-				bytes: ByteCount::new(100),
-				route: Vec::new(),
-				lane_claims: Vec::new(),
-				submission: submission(1),
-			}),
-		};
-		let calculation = UnscheduledTask {
-			id: TaskId::new(2),
-			phase: RunPhase::Loop,
-			dependencies: Vec::new(),
-			kind: TaskKind::Calculation(CalculationTask {
-				device: DeviceId::new(1),
-				kernel_template: recipe_core::KernelTemplateId::new(1),
-				artifact: recipe_core::ArtifactId::new(1),
-				inputs: Vec::new(),
-				outputs: Vec::new(),
-				fault_flag: None,
-				work: FlopCount::new(10_000),
-				submission: submission(2),
-			}),
-		};
-		let exit = UnscheduledTask {
-			id: TaskId::new(3),
-			phase: RunPhase::Exit,
-			dependencies: Vec::new(),
-			kind: TaskKind::Transfer(TransferTask {
-				source: TransferEndpoint::Device {
-					device: DeviceId::new(2),
-					value: ValueId::new(1),
-				},
-				destination: TransferEndpoint::External,
-				bytes: ByteCount::new(100),
-				route: Vec::new(),
-				lane_claims: Vec::new(),
-				submission: submission(3),
-			}),
-		};
-
-		let result = schedule(&topology, &discovery, &[calculation, exit, init]).unwrap();
-		let by_id = result
-			.tasks
-			.iter()
-			.map(|task| (task.id, task))
-			.collect::<BTreeMap<_, _>>();
-		assert!(by_id[&TaskId::new(1)].window.end <= by_id[&TaskId::new(2)].window.start);
-		assert!(by_id[&TaskId::new(2)].window.end <= by_id[&TaskId::new(3)].window.start);
-		assert_eq!(
-			lane_claims(by_id[&TaskId::new(1)]),
-			[TransferLaneClaim::External {
-				device: DeviceId::new(2),
-				lane: 0,
-			}]
-		);
-		assert_eq!(
-			lane_claims(by_id[&TaskId::new(3)]),
-			[TransferLaneClaim::External {
-				device: DeviceId::new(2),
-				lane: 0,
-			}]
-		);
 	}
 }

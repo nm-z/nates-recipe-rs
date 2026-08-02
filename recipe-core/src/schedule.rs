@@ -1,15 +1,15 @@
-use std::collections::BTreeSet;
-use std::fmt;
-use std::num::NonZeroU64;
+use std::{collections::BTreeSet, fmt, num::NonZeroU64};
 
-use crate::error::{ValidationCode, ValidationResult, Validator};
-use crate::ids::{
-	ArenaObjectId, ArtifactId, CompletionSlotId, DeviceId, KernelTemplateId, LinkId, MetricId, MetricSlotId,
-	QueueSlotId, TaskId, ValueId,
+use crate::{
+	error::{ValidationCode, ValidationResult, Validator},
+	ids::{
+		ArenaObjectId, ArtifactId, CompletionSlotId, DeviceId, KernelTemplateId, LinkId, MetricId, MetricSlotId,
+		QueueSlotId, TaskId, ValueId,
+	},
+	scalar::{AliasPermission, DType},
+	topology::Topology,
+	units::{ByteCount, ByteOffset, FlopCount, Nanoseconds},
 };
-use crate::scalar::{AliasPermission, DType};
-use crate::topology::Topology;
-use crate::units::{ByteCount, ByteOffset, FlopCount, Nanoseconds};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RunPhase {
@@ -50,14 +50,10 @@ impl LoopIterations {
 	}
 
 	#[must_use]
-	pub const fn is_unbounded(self) -> bool {
-		matches!(self, Self::Unbounded)
-	}
+	pub const fn is_unbounded(self) -> bool { matches!(self, Self::Unbounded) }
 
 	#[must_use]
-	pub const fn from_nonzero(iterations: NonZeroU64) -> Self {
-		Self::Finite(iterations)
-	}
+	pub const fn from_nonzero(iterations: NonZeroU64) -> Self { Self::Finite(iterations) }
 
 	#[must_use]
 	pub const fn iteration(self, index: u64) -> Option<LoopIteration> {
@@ -69,15 +65,11 @@ impl LoopIterations {
 }
 
 impl Default for LoopIterations {
-	fn default() -> Self {
-		Self::ONE
-	}
+	fn default() -> Self { Self::ONE }
 }
 
 impl From<NonZeroU64> for LoopIterations {
-	fn from(iterations: NonZeroU64) -> Self {
-		Self::from_nonzero(iterations)
-	}
+	fn from(iterations: NonZeroU64) -> Self { Self::from_nonzero(iterations) }
 }
 
 impl fmt::Display for LoopIterations {
@@ -98,14 +90,10 @@ pub struct LoopIteration {
 
 impl LoopIteration {
 	#[must_use]
-	pub const fn index(self) -> u64 {
-		self.index
-	}
+	pub const fn index(self) -> u64 { self.index }
 
 	#[must_use]
-	pub const fn total(self) -> LoopIterations {
-		self.total
-	}
+	pub const fn total(self) -> LoopIterations { self.total }
 }
 
 /// One nonempty arithmetic progression within a finite or unbounded loop.
@@ -156,16 +144,20 @@ impl IterationDomain {
 	#[must_use]
 	pub const fn every(iterations: LoopIterations) -> Self {
 		match iterations {
-			LoopIterations::Finite(iterations) => Self {
-				first: 0,
-				end: IterationEnd::Exclusive(iterations.get()),
-				stride: NonZeroU64::MIN,
-			},
-			LoopIterations::Unbounded => Self {
-				first: 0,
-				end: IterationEnd::Unbounded,
-				stride: NonZeroU64::MIN,
-			},
+			LoopIterations::Finite(iterations) => {
+				Self {
+					first: 0,
+					end: IterationEnd::Exclusive(iterations.get()),
+					stride: NonZeroU64::MIN,
+				}
+			}
+			LoopIterations::Unbounded => {
+				Self {
+					first: 0,
+					end: IterationEnd::Unbounded,
+					stride: NonZeroU64::MIN,
+				}
+			}
 		}
 	}
 
@@ -187,9 +179,7 @@ impl IterationDomain {
 	}
 
 	#[must_use]
-	pub const fn first_iteration(self) -> u64 {
-		self.first
-	}
+	pub const fn first_iteration(self) -> u64 { self.first }
 
 	#[must_use]
 	pub const fn end_exclusive(self) -> Option<u64> {
@@ -200,14 +190,10 @@ impl IterationDomain {
 	}
 
 	#[must_use]
-	pub const fn is_unbounded(self) -> bool {
-		matches!(self.end, IterationEnd::Unbounded)
-	}
+	pub const fn is_unbounded(self) -> bool { matches!(self.end, IterationEnd::Unbounded) }
 
 	#[must_use]
-	pub const fn stride(self) -> NonZeroU64 {
-		self.stride
-	}
+	pub const fn stride(self) -> NonZeroU64 { self.stride }
 
 	#[must_use]
 	pub const fn contains(self, iteration: u64) -> bool {
@@ -258,19 +244,13 @@ impl LoopSchedule {
 	}
 
 	#[must_use]
-	pub const fn iterations(&self) -> LoopIterations {
-		self.iterations
-	}
+	pub const fn iterations(&self) -> LoopIterations { self.iterations }
 
 	#[must_use]
-	pub fn domains(&self) -> &[LoopTaskDomain] {
-		&self.domains
-	}
+	pub fn domains(&self) -> &[LoopTaskDomain] { &self.domains }
 
 	#[must_use]
-	pub fn into_parts(self) -> (LoopIterations, Vec<LoopTaskDomain>) {
-		(self.iterations, self.domains)
-	}
+	pub fn into_parts(self) -> (LoopIterations, Vec<LoopTaskDomain>) { (self.iterations, self.domains) }
 }
 
 /// Half-open interval in the deterministic schedule.
@@ -282,14 +262,10 @@ pub struct ScheduleWindow {
 
 impl ScheduleWindow {
 	#[must_use]
-	pub fn is_valid(self) -> bool {
-		self.start < self.end
-	}
+	pub fn is_valid(self) -> bool { self.start < self.end }
 
 	#[must_use]
-	pub fn overlaps(self, other: Self) -> bool {
-		self.start < other.end && other.start < self.end
-	}
+	pub fn overlaps(self, other: Self) -> bool { self.start < other.end && other.start < self.end }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -442,8 +418,9 @@ pub struct ResolvedTransferEndpoints {
 pub enum MetricPurpose {
 	/// User-facing, nonblocking, newest-value-wins telemetry.
 	User,
-	/// Mandatory fail-closed readback for one checked calculation.
-	FaultReadback { calculation: TaskId },
+	/// Mandatory fail-closed readback for every checked calculation sharing
+	/// this metric's preallocated device fault flag.
+	FaultReadback,
 }
 
 /// Asynchronous four-byte readback into a preallocated metric slot.
@@ -577,9 +554,7 @@ impl ResourceManifest {
 	}
 
 	#[must_use]
-	pub fn queue(&self, id: QueueSlotId) -> Option<&QueueSlot> {
-		self.queues.iter().find(|slot| slot.id == id)
-	}
+	pub fn queue(&self, id: QueueSlotId) -> Option<&QueueSlot> { self.queues.iter().find(|slot| slot.id == id) }
 
 	#[must_use]
 	pub fn completion(&self, id: CompletionSlotId) -> Option<&CompletionSlot> {
@@ -587,9 +562,7 @@ impl ResourceManifest {
 	}
 
 	#[must_use]
-	pub fn metric(&self, id: MetricSlotId) -> Option<&MetricSlot> {
-		self.metrics.iter().find(|slot| slot.id == id)
-	}
+	pub fn metric(&self, id: MetricSlotId) -> Option<&MetricSlot> { self.metrics.iter().find(|slot| slot.id == id) }
 }
 
 /// Logical object whose physical offset is deliberately absent from Draft.
@@ -618,43 +591,4 @@ pub struct ArenaLayout {
 	pub device: DeviceId,
 	pub size: ByteCount,
 	pub allocations: Vec<ArenaAllocation>,
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn loop_iterations_are_nonzero_or_explicitly_unbounded_and_zero_based() {
-		assert_eq!(LoopIterations::new(0), None);
-		assert_eq!(LoopIterations::default(), LoopIterations::ONE);
-
-		let iterations = LoopIterations::new(4).unwrap();
-		assert_eq!(iterations.finite().map(NonZeroU64::get), Some(4));
-		assert_eq!(iterations.iteration(0).unwrap().index(), 0);
-		assert_eq!(iterations.iteration(3).unwrap().index(), 3);
-		assert_eq!(iterations.iteration(3).unwrap().total(), iterations);
-		assert_eq!(iterations.iteration(4), None);
-
-		let unbounded = LoopIterations::UNBOUNDED;
-		assert_eq!(unbounded.finite(), None);
-		assert_eq!(unbounded.iteration(u64::MAX).unwrap().index(), u64::MAX);
-		assert!(IterationDomain::every(unbounded).is_unbounded());
-		assert!(IterationDomain::every(unbounded).contains(u64::MAX));
-	}
-
-	#[test]
-	fn iteration_domains_are_nonempty_bounded_arithmetic_progressions() {
-		let iterations = LoopIterations::new(12).unwrap();
-		let domain = IterationDomain::new(2, 11, 3).unwrap();
-		assert!(domain.is_within(iterations));
-		assert_eq!(
-			(0..12)
-				.filter(|iteration| domain.contains(*iteration))
-				.collect::<Vec<_>>(),
-			[2, 5, 8]
-		);
-		assert_eq!(IterationDomain::new(0, 1, 0), None);
-		assert_eq!(IterationDomain::new(2, 2, 1), None);
-	}
 }

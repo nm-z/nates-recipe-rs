@@ -70,17 +70,21 @@ impl KnnOutputRequest {
 		match self {
 			Self::Numeric {
 				known_references, ..
-			} => KnnOutputSpec::Numeric {
-				known_references: *known_references,
-			},
+			} => {
+				KnnOutputSpec::Numeric {
+					known_references: *known_references,
+				}
+			}
 			Self::Categorical {
 				known_references,
 				classes,
 				..
-			} => KnnOutputSpec::Categorical {
-				known_references: *known_references,
-				classes: *classes,
-			},
+			} => {
+				KnnOutputSpec::Categorical {
+					known_references: *known_references,
+					classes: *classes,
+				}
+			}
 		}
 	}
 
@@ -953,13 +957,15 @@ fn same_storage_contract(left: &Tensor, right: &Tensor) -> bool {
 fn insert_boundary(boundaries: &mut BTreeMap<ValueId, Tensor>, tensor: Tensor) -> OperationResult<()> {
 	match boundaries.get(&tensor.id) {
 		Some(existing) if same_storage_contract(existing, &tensor) => Ok(()),
-		Some(_) => Err(knn_error(
-			OperationErrorKind::InvalidMaterializationRequest,
-			format!(
-				"KNN boundary tensor {} has conflicting contracts",
-				tensor.id
-			),
-		)),
+		Some(_) => {
+			Err(knn_error(
+				OperationErrorKind::InvalidMaterializationRequest,
+				format!(
+					"KNN boundary tensor {} has conflicting contracts",
+					tensor.id
+				),
+			))
+		}
 		None => {
 			boundaries.insert(tensor.id, tensor);
 			Ok(())
@@ -1094,9 +1100,7 @@ fn require_finite(builder: &mut ScalarProgramBuilder, value: ScalarExpression) -
 	Ok(())
 }
 
-fn scalar_builder() -> OperationResult<ScalarProgramBuilder> {
-	ScalarProgramBuilder::new().map_err(graph_error)
-}
+fn scalar_builder() -> OperationResult<ScalarProgramBuilder> { ScalarProgramBuilder::new().map_err(graph_error) }
 
 fn scalar_input(builder: &mut ScalarProgramBuilder, dtype: DType) -> OperationResult<ScalarExpression> {
 	builder.input(dtype).map_err(graph_error)
@@ -1126,17 +1130,17 @@ fn scalar_finish(
 	builder.finish(outputs).map_err(graph_error)
 }
 
-fn shape(extents: &[u64]) -> OperationResult<Shape> {
-	Shape::new(extents.to_vec()).map_err(graph_error)
-}
+fn shape(extents: &[u64]) -> OperationResult<Shape> { Shape::new(extents.to_vec()).map_err(graph_error) }
 
 fn forbidden_aliases(input_count: usize, output_count: usize) -> Vec<PrimitiveAliasRule> {
 	(0..input_count)
 		.flat_map(|input| {
-			(0..output_count).map(move |output| PrimitiveAliasRule {
-				input,
-				output,
-				permission: AliasPermission::Forbidden,
+			(0..output_count).map(move |output| {
+				PrimitiveAliasRule {
+					input,
+					output,
+					permission: AliasPermission::Forbidden,
+				}
 			})
 		})
 		.collect()

@@ -125,9 +125,7 @@ fn push_identifier(contents: &str, bytes: &[u8], start: usize, line: u64, tokens
 	end
 }
 
-fn is_identifier_start(byte: u8) -> bool {
-	byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$' | b'.')
-}
+fn is_identifier_start(byte: u8) -> bool { byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$' | b'.') }
 
 fn is_identifier_continue(byte: u8) -> bool {
 	byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.' | b'-')
@@ -226,55 +224,4 @@ fn rust_raw_string_end(bytes: &[u8], mut index: usize, hashes: usize, mut line: 
 		index += 1;
 	}
 	None
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn comments_do_not_create_tokens() {
-		let tokens = lex(
-			"// hipMalloc\nlet relationship = \"libc.so\"; /* cublasCreate */",
-			SourceKind::Rust,
-		)
-		.unwrap();
-		let values = tokens
-			.iter()
-			.map(|token| token.text.as_str())
-			.collect::<Vec<_>>();
-		assert!(!values.contains(&"hipMalloc"));
-		assert!(!values.contains(&"cublasCreate"));
-		assert!(values.contains(&"relationship"));
-	}
-
-	#[test]
-	fn raw_strings_keep_contents_and_line() {
-		let tokens = lex("let x = r##\"libcudart.so\\n\"##;", SourceKind::Rust).unwrap();
-		assert!(tokens.iter().any(|token| {
-			token.kind == LexemeKind::String && token.text == "libcudart.so\\n" && token.line == 1
-		}));
-	}
-
-	#[test]
-	fn rust_lifetimes_are_not_character_literals() {
-		let tokens = lex(
-			"fn show<'a>(x: &'a str, f: &mut Formatter<'_>) -> &'static str { 'x' }",
-			SourceKind::Rust,
-		)
-		.unwrap();
-		assert!(tokens.iter().any(|token| token.text == "Formatter"));
-	}
-
-	#[test]
-	fn malformed_text_fails_closed() {
-		assert_eq!(
-			lex("/*", SourceKind::C).unwrap_err().reason,
-			"unterminated block comment"
-		);
-		assert_eq!(
-			lex("\"oops", SourceKind::Rust).unwrap_err().reason,
-			"unterminated string literal"
-		);
-	}
 }

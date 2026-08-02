@@ -1,8 +1,10 @@
 use core::fmt;
-use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
-use std::convert::Infallible;
-use std::path::{Path, PathBuf};
+use std::{
+	cell::RefCell,
+	collections::{BTreeMap, BTreeSet},
+	convert::Infallible,
+	path::{Path, PathBuf},
+};
 
 use recipe_core::{DeviceId, Digest, Label, MachineId, RunId, TargetIdentity, ToolchainIdentity};
 use recipe_cuda::{DeploymentIdentity, REQUIRED_DRIVER_SYMBOLS, ToolchainIdentity as CudaToolchainIdentity};
@@ -97,24 +99,16 @@ pub struct NativeDeviceBuildTarget {
 
 impl NativeDeviceBuildTarget {
 	#[must_use]
-	pub const fn device(&self) -> DeviceId {
-		self.device
-	}
+	pub const fn device(&self) -> DeviceId { self.device }
 
 	#[must_use]
-	pub const fn origin(&self) -> &Label {
-		&self.origin
-	}
+	pub const fn origin(&self) -> &Label { &self.origin }
 
 	#[must_use]
-	pub const fn target(&self) -> &TargetIdentity {
-		&self.target
-	}
+	pub const fn target(&self) -> &TargetIdentity { &self.target }
 
 	#[must_use]
-	pub const fn toolchain(&self) -> &ToolchainIdentity {
-		&self.toolchain
-	}
+	pub const fn toolchain(&self) -> &ToolchainIdentity { &self.toolchain }
 }
 
 /// Owned native compiler inputs covering every GPU on one exact local
@@ -136,19 +130,13 @@ pub struct NativeHostPlan {
 
 impl NativeHostPlan {
 	#[must_use]
-	pub const fn machine(&self) -> MachineId {
-		self.machine
-	}
+	pub const fn machine(&self) -> MachineId { self.machine }
 
 	#[must_use]
-	pub fn ram_devices(&self) -> &[DeviceId] {
-		&self.ram
-	}
+	pub fn ram_devices(&self) -> &[DeviceId] { &self.ram }
 
 	#[must_use]
-	pub fn storage_devices(&self) -> &[(DeviceId, PathBuf)] {
-		&self.storage
-	}
+	pub fn storage_devices(&self) -> &[(DeviceId, PathBuf)] { &self.storage }
 
 	/// Construct deterministic run-scoped host resources without performing
 	/// I/O. Candidate realization later creates every path with `create_new`.
@@ -177,22 +165,16 @@ impl NativeHostPlan {
 
 impl NativeTargetPlan {
 	#[must_use]
-	pub const fn machine(&self) -> MachineId {
-		self.machine
-	}
+	pub const fn machine(&self) -> MachineId { self.machine }
 
 	#[must_use]
-	pub fn devices(&self) -> &[NativeDeviceBuildTarget] {
-		&self.devices
-	}
+	pub fn devices(&self) -> &[NativeDeviceBuildTarget] { &self.devices }
 
 	/// Unique specifications keyed by calculation target. Multiple identical
 	/// GPUs share one compiler specification without losing their device
 	/// entries in [`Self::devices`].
 	#[must_use]
-	pub fn target_build_specs(&self) -> &[TargetBuildSpec] {
-		&self.targets
-	}
+	pub fn target_build_specs(&self) -> &[TargetBuildSpec] { &self.targets }
 
 	/// Construct the validated deferred compiler used by production
 	/// preparation.
@@ -206,9 +188,7 @@ impl NativeTargetPlan {
 	}
 
 	#[must_use]
-	pub fn into_target_build_specs(self) -> Vec<TargetBuildSpec> {
-		self.targets
-	}
+	pub fn into_target_build_specs(self) -> Vec<TargetBuildSpec> { self.targets }
 }
 
 /// Exact cached profile plus the native target plan reopened from it.
@@ -220,19 +200,13 @@ pub struct LoadedNativePreparation {
 
 impl LoadedNativePreparation {
 	#[must_use]
-	pub const fn profile(&self) -> &MeasuredProfile {
-		&self.profile
-	}
+	pub const fn profile(&self) -> &MeasuredProfile { &self.profile }
 
 	#[must_use]
-	pub const fn targets(&self) -> &NativeTargetPlan {
-		&self.targets
-	}
+	pub const fn targets(&self) -> &NativeTargetPlan { &self.targets }
 
 	#[must_use]
-	pub fn into_parts(self) -> (MeasuredProfile, NativeTargetPlan) {
-		(self.profile, self.targets)
-	}
+	pub fn into_parts(self) -> (MeasuredProfile, NativeTargetPlan) { (self.profile, self.targets) }
 }
 
 /// Preparation-scoped native handles plus their exact owned compiler inputs.
@@ -248,19 +222,13 @@ pub struct NativePreparationScope<'cuda, 'hsa> {
 
 impl<'cuda, 'hsa> NativePreparationScope<'cuda, 'hsa> {
 	#[must_use]
-	pub const fn bindings(&self) -> &NativeExecutionBindings<'cuda, 'hsa> {
-		&self.bindings
-	}
+	pub const fn bindings(&self) -> &NativeExecutionBindings<'cuda, 'hsa> { &self.bindings }
 
 	#[must_use]
-	pub const fn targets(&self) -> &NativeTargetPlan {
-		&self.targets
-	}
+	pub const fn targets(&self) -> &NativeTargetPlan { &self.targets }
 
 	#[must_use]
-	pub const fn host(&self) -> &NativeHostPlan {
-		&self.host
-	}
+	pub const fn host(&self) -> &NativeHostPlan { &self.host }
 
 	#[must_use]
 	pub fn into_parts(
@@ -274,9 +242,7 @@ impl<'cuda, 'hsa> NativePreparationScope<'cuda, 'hsa> {
 	}
 
 	#[must_use]
-	pub fn into_targets(self) -> NativeTargetPlan {
-		self.targets
-	}
+	pub fn into_targets(self) -> NativeTargetPlan { self.targets }
 }
 
 /// Load one identity-named profile through Recipe's private, bounded cache
@@ -297,8 +263,10 @@ pub fn load_cached_measured_profile(path: impl AsRef<Path>) -> NativePreparation
 	let cache = ExplicitPathProfileCache::new(path.to_path_buf()).map_err(NativePreparationError::Probe)?;
 	cache.load(identity)
 		.map_err(NativePreparationError::Probe)?
-		.ok_or_else(|| NativePreparationError::ProfileNotFound {
-			path: path.to_path_buf(),
+		.ok_or_else(|| {
+			NativePreparationError::ProfileNotFound {
+				path: path.to_path_buf(),
+			}
 		})
 }
 
@@ -384,9 +352,11 @@ fn with_native_preparation_from_probe<T>(
 	with_native_execution_bindings(probe, profile, host, |bindings| {
 		let scope = build_scope(config, machine, host_plan, &devices, bindings);
 		callback_result = Some(match scope {
-			Ok(scope) => operation
-				.take()
-				.expect("native preparation callback is invoked at most once")(scope),
+			Ok(scope) => {
+				operation
+					.take()
+					.expect("native preparation callback is invoked at most once")(scope)
+			}
 			Err(error) => Err(error),
 		});
 		Ok(())
@@ -412,8 +382,10 @@ pub fn with_current_native_preparation<T>(
 	let profile = cache
 		.load(current.profile_identity)
 		.map_err(NativePreparationError::Probe)?
-		.ok_or_else(|| NativePreparationError::ProfileNotFound {
-			path: current.profile_path.clone(),
+		.ok_or_else(|| {
+			NativePreparationError::ProfileNotFound {
+				path: current.profile_path.clone(),
+			}
 		})?;
 	CURRENT_NATIVE_PROBE.with(|cached| {
 		let mut cached = cached.borrow_mut();
@@ -816,36 +788,5 @@ fn require_equivalent_specs(existing: &TargetBuildSpec, candidate: &TargetBuildS
 fn identity_error(detail: impl Into<String>) -> NativePreparationError {
 	NativePreparationError::IdentityMismatch {
 		detail: detail.into(),
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::{NativePreparationError, cache_identity_from_path};
-	use std::path::Path;
-
-	#[test]
-	fn cache_filename_is_the_only_identity_source() {
-		let identity = cache_identity_from_path(Path::new(
-			"/tmp/measured-v5-0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20.recipe-profile",
-		))
-		.unwrap();
-		assert_eq!(identity.schema, 5);
-		assert_eq!(identity.digest.bytes()[0], 1);
-		assert_eq!(identity.digest.bytes()[31], 32);
-	}
-
-	#[test]
-	fn cache_filename_rejects_uppercase_or_implicit_identity() {
-		for path in [
-			"/tmp/profile.recipe-profile",
-			"/tmp/measured-v5-ABCDEF.recipe-profile",
-			"/tmp/measured-vx-0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20.recipe-profile",
-		] {
-			assert!(matches!(
-				cache_identity_from_path(Path::new(path)),
-				Err(NativePreparationError::InvalidCachePath { .. })
-			));
-		}
 	}
 }

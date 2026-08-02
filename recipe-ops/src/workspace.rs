@@ -71,16 +71,20 @@ impl WorkspaceFormula {
 			"gpu_sum_all_workspace_bytes"
 			| "gpu_max_all_workspace_bytes"
 			| "gpu_min_all_workspace_bytes"
-			| "gpu_mean_all_workspace_bytes" => Self::FixedTreeReduction {
-				dimensions: 1,
-				sequences_dimension: None,
-			},
+			| "gpu_mean_all_workspace_bytes" => {
+				Self::FixedTreeReduction {
+					dimensions: 1,
+					sequences_dimension: None,
+				}
+			}
 			"gpu_l2_norm_workspace_bytes" => Self::MapThenReduction { dimensions: 1 },
 			"gpu_dot_workspace_bytes" => Self::NoPersistentScratch { dimensions: 1 },
-			"gpu_reduce_sum_cols_workspace_bytes" => Self::FixedTreeReduction {
-				dimensions: 2,
-				sequences_dimension: Some(1),
-			},
+			"gpu_reduce_sum_cols_workspace_bytes" => {
+				Self::FixedTreeReduction {
+					dimensions: 2,
+					sequences_dimension: Some(1),
+				}
+			}
 			"gpu_cumprod_workspace_bytes" | "gpu_cummax_workspace_bytes" => Self::FixedTreeScan { dimensions: 1 },
 			"gpu_random_permutation_workspace_bytes" => Self::RandomKeySort { dimensions: 1 },
 			"gpu_count_distinct_workspace_bytes" | "gpu_run_length_workspace_bytes" => {
@@ -178,14 +182,18 @@ impl WorkspaceFormula {
 					scan_scratch(elements)?,
 				)?
 			}
-			Self::MapThenReduction { .. } => checked_add(
-				checked_mul(dimensions[0], WORD_BYTES)?,
-				reduction_scratch(dimensions[0], 1)?,
-			)?,
-			Self::RandomKeySort { .. } => checked_add(
-				checked_mul(dimensions[0], WORD_BYTES)?,
-				sort_scratch(dimensions[0])?,
-			)?,
+			Self::MapThenReduction { .. } => {
+				checked_add(
+					checked_mul(dimensions[0], WORD_BYTES)?,
+					reduction_scratch(dimensions[0], 1)?,
+				)?
+			}
+			Self::RandomKeySort { .. } => {
+				checked_add(
+					checked_mul(dimensions[0], WORD_BYTES)?,
+					sort_scratch(dimensions[0])?,
+				)?
+			}
 			Self::CholeskyFactor => {
 				let n = dimensions[0];
 				checked_add(
@@ -261,14 +269,18 @@ impl WorkspaceFormula {
 
 pub fn evaluate_workspace(descriptor: OperationDescriptor, dimensions: &[u64]) -> OperationResult<WorkspaceValue> {
 	match descriptor.lowering {
-		LoweringAvailability::Workspace(formula) => formula
-			.evaluate(dimensions)
-			.map_err(|error| error.for_operation(descriptor.id)),
-		_ => Err(OperationError::new(
-			OperationErrorKind::WrongLoweringKind,
-			"operation does not own a static workspace formula",
-		)
-		.for_operation(descriptor.id)),
+		LoweringAvailability::Workspace(formula) => {
+			formula
+				.evaluate(dimensions)
+				.map_err(|error| error.for_operation(descriptor.id))
+		}
+		_ => {
+			Err(OperationError::new(
+				OperationErrorKind::WrongLoweringKind,
+				"operation does not own a static workspace formula",
+			)
+			.for_operation(descriptor.id))
+		}
 	}
 }
 
@@ -307,9 +319,10 @@ fn scan_scratch(mut width: u64) -> OperationResult<u64> {
 fn sort_scratch(elements: u64) -> OperationResult<u64> {
 	let padded = match elements {
 		0 => 0,
-		value => value
-			.checked_next_power_of_two()
-			.ok_or_else(workspace_overflow)?,
+		value => {
+			value.checked_next_power_of_two()
+				.ok_or_else(workspace_overflow)?
+		}
 	};
 	checked_mul(padded, WORD_BYTES * 2)
 }
@@ -321,13 +334,9 @@ fn dense_image_with_fault(rows: u64, columns: u64) -> OperationResult<u64> {
 	)
 }
 
-fn checked_add(left: u64, right: u64) -> OperationResult<u64> {
-	left.checked_add(right).ok_or_else(workspace_overflow)
-}
+fn checked_add(left: u64, right: u64) -> OperationResult<u64> { left.checked_add(right).ok_or_else(workspace_overflow) }
 
-fn checked_mul(left: u64, right: u64) -> OperationResult<u64> {
-	left.checked_mul(right).ok_or_else(workspace_overflow)
-}
+fn checked_mul(left: u64, right: u64) -> OperationResult<u64> { left.checked_mul(right).ok_or_else(workspace_overflow) }
 
 fn workspace_overflow() -> OperationError {
 	OperationError::new(

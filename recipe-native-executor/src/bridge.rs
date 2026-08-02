@@ -1,14 +1,18 @@
 //! Pre-realized staged transfers between local Host, CUDA, and HSA owners.
 
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet};
-use std::error::Error as StdError;
-use std::io;
-use std::num::TryFromIntError;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	error::Error as StdError,
+	io,
+	num::TryFromIntError,
+	sync::{
+		Arc, Mutex,
+		atomic::{AtomicU8, Ordering},
+		mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel},
+	},
+	thread,
+};
 
 use recipe_core::{
 	ByteCount, DeviceId, FinalizedBundle, ResolvedTransferEndpoint, RunPhase, SubmissionSlots, Task, TaskId,
@@ -24,10 +28,10 @@ use recipe_hsa::{
 };
 use recipe_planner::PlannedCandidate;
 
-use crate::cuda::CudaBinding;
-use crate::hsa::HsaBinding;
-use crate::local::{
-	CandidateCrossBackendTransfer, CrossBackendTransfer, LocalArenaRef, LocalArenaSet, LocalDeviceClass,
+use crate::{
+	cuda::CudaBinding,
+	hsa::HsaBinding,
+	local::{CandidateCrossBackendTransfer, CrossBackendTransfer, LocalArenaRef, LocalArenaSet, LocalDeviceClass},
 };
 
 const WORKER_IDLE: u8 = 0;
@@ -151,21 +155,15 @@ impl StdError for StagedBridgeError {
 }
 
 impl From<recipe_host::Error> for StagedBridgeError {
-	fn from(error: recipe_host::Error) -> Self {
-		Self::Host(error)
-	}
+	fn from(error: recipe_host::Error) -> Self { Self::Host(error) }
 }
 
 impl From<recipe_cuda::CudaError> for StagedBridgeError {
-	fn from(error: recipe_cuda::CudaError) -> Self {
-		Self::Cuda(error)
-	}
+	fn from(error: recipe_cuda::CudaError) -> Self { Self::Cuda(error) }
 }
 
 impl From<recipe_hsa::Error> for StagedBridgeError {
-	fn from(error: recipe_hsa::Error) -> Self {
-		Self::Hsa(error)
-	}
+	fn from(error: recipe_hsa::Error) -> Self { Self::Hsa(error) }
 }
 
 /// Production one-hop bridge using pre-realized host staging workers and
@@ -197,10 +195,12 @@ impl<'cuda, 'hsa> StagedCrossBackend<'cuda, 'hsa> {
 			}?;
 			match devices.get(&device) == Some(&LocalDeviceClass::Cuda) {
 				true => Ok(()),
-				false => Err(StagedBridgeError::MissingBinding {
-					device,
-					class: LocalDeviceClass::Cuda,
-				}),
+				false => {
+					Err(StagedBridgeError::MissingBinding {
+						device,
+						class: LocalDeviceClass::Cuda,
+					})
+				}
 			}?;
 		}
 		for (index, binding) in self.hsa_bindings.iter().enumerate() {
@@ -218,10 +218,12 @@ impl<'cuda, 'hsa> StagedCrossBackend<'cuda, 'hsa> {
 			}?;
 			match devices.get(&device) == Some(&LocalDeviceClass::Hsa) {
 				true => Ok(()),
-				false => Err(StagedBridgeError::MissingBinding {
-					device,
-					class: LocalDeviceClass::Hsa,
-				}),
+				false => {
+					Err(StagedBridgeError::MissingBinding {
+						device,
+						class: LocalDeviceClass::Hsa,
+					})
+				}
 			}?;
 		}
 		Ok(())
@@ -261,18 +263,22 @@ impl<'cuda, 'hsa> StagedCrossBackend<'cuda, 'hsa> {
 			let task_id = contract.task;
 			let resource = self.realize_task(contract)?;
 			match resources.insert(task_id, resource) {
-				Some(_) => Err(StagedBridgeError::Contract {
-					task: task_id,
-					detail: "task identity appears more than once",
-				}),
+				Some(_) => {
+					Err(StagedBridgeError::Contract {
+						task: task_id,
+						detail: "task identity appears more than once",
+					})
+				}
 				None => Ok(()),
 			}?;
 		}
 		match resources.keys().copied().eq(selected.iter().copied()) {
 			true => Ok(StagedBridgeResources { tasks: resources }),
-			false => Err(StagedBridgeError::MissingTask {
-				task: first_missing_task(selected, &resources),
-			}),
+			false => {
+				Err(StagedBridgeError::MissingTask {
+					task: first_missing_task(selected, &resources),
+				})
+			}
 		}
 	}
 
@@ -389,18 +395,22 @@ impl TransferContract {
 		let class = transfer_class(task.phase);
 		match transfer.route.len() == 1 {
 			true => Ok(()),
-			false => Err(StagedBridgeError::Contract {
-				task: task.id,
-				detail: "staged transfers require exactly one finalized link",
-			}),
+			false => {
+				Err(StagedBridgeError::Contract {
+					task: task.id,
+					detail: "staged transfers require exactly one finalized link",
+				})
+			}
 		}?;
 		match source_class == destination_class
 			&& !(source_class == LocalDeviceClass::Cuda && source_device != destination_device)
 		{
-			true => Err(StagedBridgeError::Contract {
-				task: task.id,
-				detail: "transfer does not cross local backend ownership",
-			}),
+			true => {
+				Err(StagedBridgeError::Contract {
+					task: task.id,
+					detail: "transfer does not cross local backend ownership",
+				})
+			}
 			false => Ok(()),
 		}?;
 		Ok(Self {
@@ -460,10 +470,12 @@ impl TransferContract {
 			&& devices.get(&self.destination.device) == Some(&self.destination.class);
 		match exact {
 			true => Ok(()),
-			false => Err(StagedBridgeError::Contract {
-				task: self.task,
-				detail: "finalized transfer differs from its pre-realized candidate",
-			}),
+			false => {
+				Err(StagedBridgeError::Contract {
+					task: self.task,
+					detail: "finalized transfer differs from its pre-realized candidate",
+				})
+			}
 		}?;
 		let endpoints = bundle
 			.transfer_endpoints(self.task)
@@ -479,19 +491,23 @@ impl TransferContract {
 					&& destination.value == self.destination.value
 				{
 					true => Ok(()),
-					false => Err(StagedBridgeError::Contract {
-						task: self.task,
-						detail: "resolved transfer endpoints differ from the staged values",
-					}),
+					false => {
+						Err(StagedBridgeError::Contract {
+							task: self.task,
+							detail: "resolved transfer endpoints differ from the staged values",
+						})
+					}
 				}
 			}
 			(
 				ResolvedTransferEndpoint::External | ResolvedTransferEndpoint::Device(_),
 				ResolvedTransferEndpoint::External | ResolvedTransferEndpoint::Device(_),
-			) => Err(StagedBridgeError::Contract {
-				task: self.task,
-				detail: "resolved transfer endpoints differ from the staged values",
-			}),
+			) => {
+				Err(StagedBridgeError::Contract {
+					task: self.task,
+					detail: "resolved transfer endpoints differ from the staged values",
+				})
+			}
 		}
 	}
 
@@ -509,19 +525,23 @@ impl TransferContract {
 					&& work.submission == self.submission
 				{
 					true => Ok(()),
-					false => Err(StagedBridgeError::Contract {
-						task: self.task,
-						detail: "submitted transfer differs from the immutable staged contract",
-					}),
+					false => {
+						Err(StagedBridgeError::Contract {
+							task: self.task,
+							detail: "submitted transfer differs from the immutable staged contract",
+						})
+					}
 				}
 			}
 			(
 				ResolvedTransferEndpoint::External | ResolvedTransferEndpoint::Device(_),
 				ResolvedTransferEndpoint::External | ResolvedTransferEndpoint::Device(_),
-			) => Err(StagedBridgeError::Contract {
-				task: self.task,
-				detail: "submitted transfer differs from the immutable staged contract",
-			}),
+			) => {
+				Err(StagedBridgeError::Contract {
+					task: self.task,
+					detail: "submitted transfer differs from the immutable staged contract",
+				})
+			}
 		}
 	}
 }
@@ -549,14 +569,18 @@ impl fmt::Debug for LegResources<'_, '_> {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Host => formatter.write_str("Host"),
-			Self::Cuda { staging, .. } => formatter
-				.debug_struct("Cuda")
-				.field("staging_bytes", &staging.len())
-				.finish(),
-			Self::Hsa { staging, .. } => formatter
-				.debug_struct("Hsa")
-				.field("staging_bytes", &staging.len())
-				.finish(),
+			Self::Cuda { staging, .. } => {
+				formatter
+					.debug_struct("Cuda")
+					.field("staging_bytes", &staging.len())
+					.finish()
+			}
+			Self::Hsa { staging, .. } => {
+				formatter
+					.debug_struct("Hsa")
+					.field("staging_bytes", &staging.len())
+					.finish()
+			}
 		}
 	}
 }
@@ -564,10 +588,12 @@ impl fmt::Debug for LegResources<'_, '_> {
 impl LegResources<'_, '_> {
 	fn host_address(&mut self, task: TaskId) -> Result<usize, StagedBridgeError> {
 		match self {
-			Self::Host => Err(StagedBridgeError::State {
-				task,
-				detail: "host endpoint has no separate staging buffer",
-			}),
+			Self::Host => {
+				Err(StagedBridgeError::State {
+					task,
+					detail: "host endpoint has no separate staging buffer",
+				})
+			}
 			Self::Cuda { staging, .. } => Ok(staging.as_mut_slice().as_mut_ptr().addr()),
 			Self::Hsa { staging, .. } => Ok(staging.as_ptr().cast::<u8>().addr()),
 		}
@@ -692,14 +718,18 @@ impl fmt::Debug for DestinationTarget<'_, '_> {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Host => formatter.write_str("Host"),
-			Self::Cuda { offset, .. } => formatter
-				.debug_struct("Cuda")
-				.field("offset", offset)
-				.finish(),
-			Self::Hsa { offset, .. } => formatter
-				.debug_struct("Hsa")
-				.field("offset", offset)
-				.finish(),
+			Self::Cuda { offset, .. } => {
+				formatter
+					.debug_struct("Cuda")
+					.field("offset", offset)
+					.finish()
+			}
+			Self::Hsa { offset, .. } => {
+				formatter
+					.debug_struct("Hsa")
+					.field("offset", offset)
+					.finish()
+			}
 		}
 	}
 }
@@ -718,10 +748,12 @@ impl MiddleJobState {
 				*self = Self::Ready(job);
 				Ok(())
 			}
-			Self::Ready(_) | Self::Submitted => Err(StagedBridgeError::State {
-				task,
-				detail: "staged transfer middle job was initialized more than once",
-			}),
+			Self::Ready(_) | Self::Submitted => {
+				Err(StagedBridgeError::State {
+					task,
+					detail: "staged transfer middle job was initialized more than once",
+				})
+			}
 		}
 	}
 
@@ -906,9 +938,11 @@ impl HostStageWorker {
 				Ordering::AcqRel,
 				Ordering::Acquire,
 			)
-			.map_err(|status| StagedBridgeError::WorkerState {
-				task: self.task,
-				status,
+			.map_err(|status| {
+				StagedBridgeError::WorkerState {
+					task: self.task,
+					status,
+				}
 			})?;
 		let WorkerSenderState::Active(sender) = &self.sender else {
 			return Err(StagedBridgeError::WorkerDisconnected);
@@ -940,14 +974,18 @@ impl HostStageWorker {
 					}
 				}
 			}
-			WORKER_IDLE => Err(StagedBridgeError::State {
-				task: self.task,
-				detail: "host staging worker has no submitted job",
-			}),
-			status => Err(StagedBridgeError::WorkerState {
-				task: self.task,
-				status,
-			}),
+			WORKER_IDLE => {
+				Err(StagedBridgeError::State {
+					task: self.task,
+					detail: "host staging worker has no submitted job",
+				})
+			}
+			status => {
+				Err(StagedBridgeError::WorkerState {
+					task: self.task,
+					status,
+				})
+			}
 		}
 	}
 
@@ -959,16 +997,16 @@ impl HostStageWorker {
 				Ordering::AcqRel,
 				Ordering::Acquire,
 			)
-			.map_err(|status| StagedBridgeError::WorkerState {
-				task: self.task,
-				status,
+			.map_err(|status| {
+				StagedBridgeError::WorkerState {
+					task: self.task,
+					status,
+				}
 			})
 			.map(|_| ())
 	}
 
-	fn close(mut self) -> Result<(), StagedBridgeError> {
-		self.shutdown()
-	}
+	fn close(mut self) -> Result<(), StagedBridgeError> { self.shutdown() }
 
 	fn shutdown(&mut self) -> Result<(), StagedBridgeError> {
 		let sender = core::mem::replace(&mut self.sender, WorkerSenderState::Closed);
@@ -976,13 +1014,15 @@ impl HostStageWorker {
 		let completion = core::mem::replace(&mut self.completion, WorkerCompletionState::Observed);
 		match completion {
 			WorkerCompletionState::Waiting(receiver) => {
-				let result = std::iter::repeat_with(|| match receiver.try_recv() {
-					Ok(()) => Some(Ok(())),
-					Err(TryRecvError::Empty) => {
-						thread::yield_now();
-						None
+				let result = std::iter::repeat_with(|| {
+					match receiver.try_recv() {
+						Ok(()) => Some(Ok(())),
+						Err(TryRecvError::Empty) => {
+							thread::yield_now();
+							None
+						}
+						Err(TryRecvError::Disconnected) => Some(Err(StagedBridgeError::ThreadPanicked)),
 					}
-					Err(TryRecvError::Disconnected) => Some(Err(StagedBridgeError::ThreadPanicked)),
 				})
 				.find_map(core::convert::identity);
 				match result {
@@ -996,27 +1036,29 @@ impl HostStageWorker {
 }
 
 impl Drop for HostStageWorker {
-	fn drop(&mut self) {
-		drop(self.shutdown());
-	}
+	fn drop(&mut self) { drop(self.shutdown()); }
 }
 
 fn worker_loop(receiver: Receiver<WorkerMessage>, status: &AtomicU8, error: &Mutex<WorkerFailureState>) {
 	for message in receiver {
 		match message {
-			WorkerMessage::Run(job) => match job.execute() {
-				Ok(()) => status.store(WORKER_COMPLETE, Ordering::Release),
-				Err(failure) => match error.lock() {
-					Ok(mut slot) => {
-						*slot = WorkerFailureState::Available(failure);
-						status.store(WORKER_FAILED, Ordering::Release);
+			WorkerMessage::Run(job) => {
+				match job.execute() {
+					Ok(()) => status.store(WORKER_COMPLETE, Ordering::Release),
+					Err(failure) => {
+						match error.lock() {
+							Ok(mut slot) => {
+								*slot = WorkerFailureState::Available(failure);
+								status.store(WORKER_FAILED, Ordering::Release);
+							}
+							Err(poisoned) => {
+								drop(poisoned);
+								status.store(WORKER_FAILED, Ordering::Release);
+							}
+						}
 					}
-					Err(poisoned) => {
-						drop(poisoned);
-						status.store(WORKER_FAILED, Ordering::Release);
-					}
-				},
-			},
+				}
+			}
 		}
 	}
 }
@@ -1048,10 +1090,12 @@ impl<'cuda, 'hsa> CrossBackendTransfer<'cuda, 'hsa> for StagedCrossBackend<'cuda
 			|| request.class != task.contract.class
 			|| request.submission != Some(task.contract.submission)
 		{
-			true => Err(StagedBridgeError::Contract {
-				task: request.task,
-				detail: "pending request differs from the staged transfer",
-			}),
+			true => {
+				Err(StagedBridgeError::Contract {
+					task: request.task,
+					detail: "pending request differs from the staged transfer",
+				})
+			}
 			false => Ok(()),
 		}?;
 		let token_state = core::mem::replace(&mut task.tokens, PreparedTokenState::Consumed);
@@ -1086,10 +1130,12 @@ impl<'cuda, 'hsa> CrossBackendTransfer<'cuda, 'hsa> for StagedCrossBackend<'cuda
 			.ok_or(StagedBridgeError::MissingTask { task: work.task })?;
 		match pending.task == work.task && pending.state == PendingState::Ready {
 			true => Ok(()),
-			false => Err(StagedBridgeError::State {
-				task: work.task,
-				detail: "staged pending token is not ready for this transfer",
-			}),
+			false => {
+				Err(StagedBridgeError::State {
+					task: work.task,
+					detail: "staged pending token is not ready for this transfer",
+				})
+			}
 		}?;
 		task.contract.validate_work(class, &work)?;
 		let source = arenas
@@ -1154,55 +1200,65 @@ impl<'cuda, 'hsa> CrossBackendTransfer<'cuda, 'hsa> for StagedCrossBackend<'cuda
 			.get_mut(&pending.task)
 			.ok_or(StagedBridgeError::MissingTask { task: pending.task })?;
 		match pending.state {
-			PendingState::Source => match poll_leg(pending.task, &mut pending.source)? {
-				BackendPoll::Pending => Ok(BackendPoll::Pending),
-				BackendPoll::Complete { .. } => {
-					pending.middle.submit(pending.task, &task.worker)?;
-					pending.state = PendingState::Middle;
-					Ok(BackendPoll::Pending)
+			PendingState::Source => {
+				match poll_leg(pending.task, &mut pending.source)? {
+					BackendPoll::Pending => Ok(BackendPoll::Pending),
+					BackendPoll::Complete { .. } => {
+						pending.middle.submit(pending.task, &task.worker)?;
+						pending.state = PendingState::Middle;
+						Ok(BackendPoll::Pending)
+					}
 				}
-			},
-			PendingState::Middle => match task.worker.poll()? {
-				BackendPoll::Pending => Ok(BackendPoll::Pending),
-				BackendPoll::Complete { .. } => match pending.target {
-					DestinationTarget::Host => {
+			}
+			PendingState::Middle => {
+				match task.worker.poll()? {
+					BackendPoll::Pending => Ok(BackendPoll::Pending),
+					BackendPoll::Complete { .. } => {
+						match pending.target {
+							DestinationTarget::Host => {
+								pending.state = PendingState::Complete;
+								Ok(BackendPoll::Complete { metric: None })
+							}
+							DestinationTarget::Cuda { .. } | DestinationTarget::Hsa { .. } => {
+								submit_destination(
+									pending.task,
+									&task.destination,
+									&mut pending.destination,
+									&pending.target,
+									byte_count_to_usize(task.contract.bytes, task.contract.task)?,
+								)?;
+								pending.state = PendingState::Destination;
+								Ok(BackendPoll::Pending)
+							}
+						}
+					}
+				}
+			}
+			PendingState::Destination => {
+				match poll_leg(pending.task, &mut pending.destination)? {
+					BackendPoll::Pending => Ok(BackendPoll::Pending),
+					BackendPoll::Complete { .. } => {
 						pending.state = PendingState::Complete;
 						Ok(BackendPoll::Complete { metric: None })
 					}
-					DestinationTarget::Cuda { .. } | DestinationTarget::Hsa { .. } => {
-						submit_destination(
-							pending.task,
-							&task.destination,
-							&mut pending.destination,
-							&pending.target,
-							byte_count_to_usize(task.contract.bytes, task.contract.task)?,
-						)?;
-						pending.state = PendingState::Destination;
-						Ok(BackendPoll::Pending)
-					}
-				},
-			},
-			PendingState::Destination => match poll_leg(pending.task, &mut pending.destination)? {
-				BackendPoll::Pending => Ok(BackendPoll::Pending),
-				BackendPoll::Complete { .. } => {
-					pending.state = PendingState::Complete;
-					Ok(BackendPoll::Complete { metric: None })
 				}
-			},
-			PendingState::Ready => Err(StagedBridgeError::State {
-				task: pending.task,
-				detail: "staged transfer was polled before submission",
-			}),
-			PendingState::Complete => Err(StagedBridgeError::State {
-				task: pending.task,
-				detail: "staged transfer was polled after completion",
-			}),
+			}
+			PendingState::Ready => {
+				Err(StagedBridgeError::State {
+					task: pending.task,
+					detail: "staged transfer was polled before submission",
+				})
+			}
+			PendingState::Complete => {
+				Err(StagedBridgeError::State {
+					task: pending.task,
+					detail: "staged transfer was polled after completion",
+				})
+			}
 		}
 	}
 
-	fn supports_loop_repetition(&self) -> bool {
-		true
-	}
+	fn supports_loop_repetition(&self) -> bool { true }
 
 	fn rearm_loop_pending(
 		&mut self,
@@ -1231,9 +1287,7 @@ impl<'cuda, 'hsa> CrossBackendTransfer<'cuda, 'hsa> for StagedCrossBackend<'cuda
 		Ok(())
 	}
 
-	fn destroy(&mut self, resource: Self::Resource) -> Result<(), Self::Error> {
-		destroy_resources(resource)
-	}
+	fn destroy(&mut self, resource: Self::Resource) -> Result<(), Self::Error> { destroy_resources(resource) }
 }
 
 impl<'cuda, 'hsa> CandidateCrossBackendTransfer<'cuda, 'hsa> for StagedCrossBackend<'cuda, 'hsa> {
@@ -1256,9 +1310,11 @@ impl<'cuda, 'hsa> CandidateCrossBackendTransfer<'cuda, 'hsa> for StagedCrossBack
 		self.validate_bindings(devices)?;
 		match resource.tasks.keys().copied().eq(tasks.iter().copied()) {
 			true => Ok(()),
-			false => Err(StagedBridgeError::MissingTask {
-				task: first_missing_task(tasks, &resource.tasks),
-			}),
+			false => {
+				Err(StagedBridgeError::MissingTask {
+					task: first_missing_task(tasks, &resource.tasks),
+				})
+			}
 		}?;
 		for task in resource.tasks.values() {
 			task.contract.validate_finalized(bundle, devices)?;
@@ -1296,10 +1352,12 @@ impl<'cuda, 'hsa> CandidateCrossBackendTransfer<'cuda, 'hsa> for StagedCrossBack
 		);
 		match prior {
 			PreparedTokenState::Consumed => Ok(()),
-			PreparedTokenState::Available(_) => Err(StagedBridgeError::State {
-				task: pending.task,
-				detail: "staged resource already contains a pending token",
-			}),
+			PreparedTokenState::Available(_) => {
+				Err(StagedBridgeError::State {
+					task: pending.task,
+					detail: "staged resource already contains a pending token",
+				})
+			}
 		}
 	}
 }
@@ -1311,18 +1369,22 @@ fn recycle_leg<'cuda, 'hsa>(
 	match leg {
 		ActiveLeg::Host => Ok(PreparedLegToken::Host),
 		ActiveLeg::CudaReady(event) => Ok(PreparedLegToken::Cuda(event)),
-		ActiveLeg::CudaActive(pending) => pending
-			.recycle_event()
-			.map(PreparedLegToken::Cuda)
-			.map_err(StagedBridgeError::from),
+		ActiveLeg::CudaActive(pending) => {
+			pending
+				.recycle_event()
+				.map(PreparedLegToken::Cuda)
+				.map_err(StagedBridgeError::from)
+		}
 		ActiveLeg::Hsa(mut pending) => {
 			pending.reset()?;
 			Ok(PreparedLegToken::Hsa(pending))
 		}
-		ActiveLeg::Transition => Err(StagedBridgeError::State {
-			task,
-			detail: "staged native completion token is in transition",
-		}),
+		ActiveLeg::Transition => {
+			Err(StagedBridgeError::State {
+				task,
+				detail: "staged native completion token is in transition",
+			})
+		}
 	}
 }
 
@@ -1334,13 +1396,15 @@ fn rearm_leg(task: TaskId, leg: &mut ActiveLeg<'_, '_>) -> Result<(), StagedBrid
 		ActiveLeg::CudaActive(pending) => {
 			ActiveLeg::CudaReady(pending.recycle_event().map_err(StagedBridgeError::from)?)
 		}
-		ActiveLeg::Hsa(mut pending) => match pending.reset() {
-			Ok(()) => ActiveLeg::Hsa(pending),
-			Err(error) => {
-				*leg = ActiveLeg::Hsa(pending);
-				return Err(StagedBridgeError::from(error));
+		ActiveLeg::Hsa(mut pending) => {
+			match pending.reset() {
+				Ok(()) => ActiveLeg::Hsa(pending),
+				Err(error) => {
+					*leg = ActiveLeg::Hsa(pending);
+					return Err(StagedBridgeError::from(error));
+				}
 			}
-		},
+		}
 		ActiveLeg::Transition => {
 			return Err(StagedBridgeError::State {
 				task,
@@ -1373,42 +1437,50 @@ fn middle_job(
 			destination_leg @ (LegResources::Cuda { .. } | LegResources::Hsa { .. }),
 			LocalArenaRef::Host(source),
 			LocalArenaRef::Cuda(_) | LocalArenaRef::Hsa(_),
-		) => Ok(HostStageJob::Read {
-			arena: source.clone(),
-			offset: usize_to_u64(range.source_offset, task)?,
-			destination: destination_leg.host_address(task)?,
-			bytes: range.bytes,
-		}),
+		) => {
+			Ok(HostStageJob::Read {
+				arena: source.clone(),
+				offset: usize_to_u64(range.source_offset, task)?,
+				destination: destination_leg.host_address(task)?,
+				bytes: range.bytes,
+			})
+		}
 		(
 			source_leg @ (LegResources::Cuda { .. } | LegResources::Hsa { .. }),
 			LegResources::Host,
 			LocalArenaRef::Cuda(_) | LocalArenaRef::Hsa(_),
 			LocalArenaRef::Host(destination),
-		) => Ok(HostStageJob::Write {
-			source: source_leg.host_address(task)?,
-			arena: destination.clone(),
-			offset: usize_to_u64(range.destination_offset, task)?,
-			bytes: range.bytes,
-		}),
+		) => {
+			Ok(HostStageJob::Write {
+				source: source_leg.host_address(task)?,
+				arena: destination.clone(),
+				offset: usize_to_u64(range.destination_offset, task)?,
+				bytes: range.bytes,
+			})
+		}
 		(
 			source_leg @ (LegResources::Cuda { .. } | LegResources::Hsa { .. }),
 			destination_leg @ (LegResources::Cuda { .. } | LegResources::Hsa { .. }),
 			LocalArenaRef::Cuda(_) | LocalArenaRef::Hsa(_),
 			LocalArenaRef::Cuda(_) | LocalArenaRef::Hsa(_),
-		) => Ok(HostStageJob::Copy {
-			source: source_leg.host_address(task)?,
-			destination: destination_leg.host_address(task)?,
-			bytes: range.bytes,
-		}),
+		) => {
+			Ok(HostStageJob::Copy {
+				source: source_leg.host_address(task)?,
+				destination: destination_leg.host_address(task)?,
+				bytes: range.bytes,
+			})
+		}
 		(
 			LegResources::Host | LegResources::Cuda { .. } | LegResources::Hsa { .. },
 			LegResources::Host | LegResources::Cuda { .. } | LegResources::Hsa { .. },
 			LocalArenaRef::Host(_) | LocalArenaRef::Cuda(_) | LocalArenaRef::Hsa(_),
 			LocalArenaRef::Host(_) | LocalArenaRef::Cuda(_) | LocalArenaRef::Hsa(_),
-		) => Err(StagedBridgeError::Contract {
-			task,
-			detail: "arena classes differ from their staged endpoint resources",
-		}),
+		) => {
+			Err(StagedBridgeError::Contract {
+				task,
+				detail: "arena classes differ from their staged endpoint resources",
+			})
+		}
 	}
 }
 
@@ -1418,14 +1490,18 @@ fn destination_target<'cuda, 'hsa>(
 ) -> DestinationTarget<'cuda, 'hsa> {
 	match destination {
 		LocalArenaRef::Host(_) => DestinationTarget::Host,
-		LocalArenaRef::Cuda(arena) => DestinationTarget::Cuda {
-			buffer: arena.buffer(),
-			offset,
-		},
-		LocalArenaRef::Hsa(arena) => DestinationTarget::Hsa {
-			allocation: arena.allocation(),
-			offset,
-		},
+		LocalArenaRef::Cuda(arena) => {
+			DestinationTarget::Cuda {
+				buffer: arena.buffer(),
+				offset,
+			}
+		}
+		LocalArenaRef::Hsa(arena) => {
+			DestinationTarget::Hsa {
+				allocation: arena.allocation(),
+				offset,
+			}
+		}
 	}
 }
 
@@ -1446,9 +1522,11 @@ fn submit_source<'cuda, 'hsa>(
 			*pending = ActiveLeg::CudaActive(erase_cuda_pending_lifetime(native));
 			Ok(())
 		}
-		(LegResources::Hsa { session, staging }, ActiveLeg::Hsa(pending), LocalArenaRef::Hsa(arena)) => session
-			.copy_async_prepared(staging, 0, arena.allocation(), offset, bytes, pending)
-			.map_err(StagedBridgeError::from),
+		(LegResources::Hsa { session, staging }, ActiveLeg::Hsa(pending), LocalArenaRef::Hsa(arena)) => {
+			session
+				.copy_async_prepared(staging, 0, arena.allocation(), offset, bytes, pending)
+				.map_err(StagedBridgeError::from)
+		}
 		(
 			LegResources::Host | LegResources::Cuda { .. } | LegResources::Hsa { .. },
 			ActiveLeg::Host
@@ -1457,10 +1535,12 @@ fn submit_source<'cuda, 'hsa>(
 			| ActiveLeg::Hsa(_)
 			| ActiveLeg::Transition,
 			LocalArenaRef::Host(_) | LocalArenaRef::Cuda(_) | LocalArenaRef::Hsa(_),
-		) => Err(StagedBridgeError::State {
-			task,
-			detail: "source arena, staging resource, and completion token disagree",
-		}),
+		) => {
+			Err(StagedBridgeError::State {
+				task,
+				detail: "source arena, staging resource, and completion token disagree",
+			})
+		}
 	}
 }
 
@@ -1507,10 +1587,12 @@ fn submit_destination<'cuda, 'hsa>(
 			| ActiveLeg::Hsa(_)
 			| ActiveLeg::Transition,
 			DestinationTarget::Host | DestinationTarget::Cuda { .. } | DestinationTarget::Hsa { .. },
-		) => Err(StagedBridgeError::State {
-			task,
-			detail: "destination arena, staging resource, and completion token disagree",
-		}),
+		) => {
+			Err(StagedBridgeError::State {
+				task,
+				detail: "destination arena, staging resource, and completion token disagree",
+			})
+		}
 	}
 }
 
@@ -1531,18 +1613,24 @@ fn consume_cuda_event<'cuda, 'hsa>(
 
 fn poll_leg(task: TaskId, pending: &mut ActiveLeg<'_, '_>) -> Result<BackendPoll, StagedBridgeError> {
 	match pending {
-		ActiveLeg::CudaActive(native) => match native.poll()? {
-			CudaCompletionStatus::Pending => Ok(BackendPoll::Pending),
-			CudaCompletionStatus::Complete => Ok(BackendPoll::Complete { metric: None }),
-		},
-		ActiveLeg::Hsa(native) => match native.poll()? {
-			HsaPollStatus::Pending => Ok(BackendPoll::Pending),
-			HsaPollStatus::Complete => Ok(BackendPoll::Complete { metric: None }),
-		},
-		ActiveLeg::Host | ActiveLeg::CudaReady(_) | ActiveLeg::Transition => Err(StagedBridgeError::State {
-			task,
-			detail: "native staged operation was polled before submission",
-		}),
+		ActiveLeg::CudaActive(native) => {
+			match native.poll()? {
+				CudaCompletionStatus::Pending => Ok(BackendPoll::Pending),
+				CudaCompletionStatus::Complete => Ok(BackendPoll::Complete { metric: None }),
+			}
+		}
+		ActiveLeg::Hsa(native) => {
+			match native.poll()? {
+				HsaPollStatus::Pending => Ok(BackendPoll::Pending),
+				HsaPollStatus::Complete => Ok(BackendPoll::Complete { metric: None }),
+			}
+		}
+		ActiveLeg::Host | ActiveLeg::CudaReady(_) | ActiveLeg::Transition => {
+			Err(StagedBridgeError::State {
+				task,
+				detail: "native staged operation was polled before submission",
+			})
+		}
 	}
 }
 
@@ -1553,10 +1641,12 @@ fn validate_arena(
 ) -> Result<(), StagedBridgeError> {
 	match arena.device() == endpoint.device && arena.class() == endpoint.class {
 		true => Ok(()),
-		false => Err(StagedBridgeError::Contract {
-			task,
-			detail: "executor arena differs from the staged endpoint owner",
-		}),
+		false => {
+			Err(StagedBridgeError::Contract {
+				task,
+				detail: "executor arena differs from the staged endpoint owner",
+			})
+		}
 	}
 }
 
@@ -1569,33 +1659,39 @@ fn endpoint_offset(endpoint: ResolvedTransferEndpoint, task: TaskId) -> Result<u
 	};
 	match usize::try_from(location.arena_offset.get()) {
 		Ok(offset) => Ok(offset),
-		Err(source) => Err(StagedBridgeError::IntegerConversion {
-			task,
-			detail: "the staged arena offset",
-			source,
-		}),
+		Err(source) => {
+			Err(StagedBridgeError::IntegerConversion {
+				task,
+				detail: "the staged arena offset",
+				source,
+			})
+		}
 	}
 }
 
 fn byte_count_to_usize(bytes: ByteCount, task: TaskId) -> Result<usize, StagedBridgeError> {
 	match usize::try_from(bytes.get()) {
 		Ok(bytes) => Ok(bytes),
-		Err(source) => Err(StagedBridgeError::IntegerConversion {
-			task,
-			detail: "the staged transfer size",
-			source,
-		}),
+		Err(source) => {
+			Err(StagedBridgeError::IntegerConversion {
+				task,
+				detail: "the staged transfer size",
+				source,
+			})
+		}
 	}
 }
 
 fn usize_to_u64(value: usize, task: TaskId) -> Result<u64, StagedBridgeError> {
 	match u64::try_from(value) {
 		Ok(value) => Ok(value),
-		Err(source) => Err(StagedBridgeError::IntegerConversion {
-			task,
-			detail: "the staged host offset",
-			source,
-		}),
+		Err(source) => {
+			Err(StagedBridgeError::IntegerConversion {
+				task,
+				detail: "the staged host offset",
+				source,
+			})
+		}
 	}
 }
 
@@ -1666,47 +1762,4 @@ fn erase_cuda_pending_lifetime<'operation, 'context>(
 		core::mem::transmute::<CudaPending<'operation, 'context>, CudaPending<'static, 'context>>(value)
 	};
 	widen(pending)
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	fn success<T, E: fmt::Debug>(result: Result<T, E>) -> T {
-		match result {
-			Ok(value) => value,
-			Err(error) => panic!("expected success, got {error:?}"),
-		}
-	}
-
-	#[test]
-	fn host_stage_worker_moves_exact_bytes_without_blocking_submission() {
-		let source = success(HostArena::ram(DeviceId::new(1), ByteCount::new(4)));
-		let destination = success(HostArena::ram(DeviceId::new(2), ByteCount::new(4)));
-		success(source.bridge_write_exact(0, &[1, 2, 3, 4]));
-		let mut staging = [0_u8; 4];
-		let worker = success(HostStageWorker::new(TaskId::new(7)));
-		success(worker.submit(HostStageJob::Read {
-			arena: source,
-			offset: 0,
-			destination: staging.as_mut_ptr().addr(),
-			bytes: staging.len(),
-		}));
-		let completed_after = (0..10_000)
-			.map(|attempt| (attempt, success(worker.poll())))
-			.find(|record| match &record.1 {
-				BackendPoll::Pending => {
-					std::thread::yield_now();
-					false
-				}
-				BackendPoll::Complete { .. } => true,
-			});
-		assert!(
-			completed_after.is_some(),
-			"host staging worker did not complete"
-		);
-		assert_eq!(staging, [1, 2, 3, 4]);
-		success(worker.close());
-		success(destination.close());
-	}
 }

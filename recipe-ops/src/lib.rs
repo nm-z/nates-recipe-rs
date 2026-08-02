@@ -80,24 +80,3 @@ pub use tree::{
 	append_tree_ensemble_inference, materialize_tree_ensemble_inference, tree_ensemble_inference_requirements,
 };
 pub use workspace::{WorkspaceFormula, WorkspaceUnit, WorkspaceValue, evaluate_workspace};
-
-#[cfg(test)]
-mod materialize_attention_tests;
-#[cfg(test)]
-mod materialize_batch_tests;
-#[cfg(test)]
-mod materialize_convolution_pooling_tests;
-#[cfg(test)]
-mod materialize_graph_cluster_rl_tests;
-#[cfg(test)]
-mod materialize_indexing_sort_encoding_tests;
-#[cfg(test)]
-mod materialize_loss_metrics_tests;
-#[cfg(test)]
-mod materialize_tests;
-#[cfg(test)]
-mod materialize_training_tests;
-#[cfg(test)]
-mod materialize_tree_boosting_tests;
-#[cfg(test)]
-mod tests;

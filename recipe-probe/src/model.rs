@@ -1,8 +1,11 @@
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use std::time::Instant;
+use std::{
+	path::PathBuf,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
+	time::{Duration, Instant},
+};
 
 use recipe_core::{
 	ByteCount, BytesPerSecond, DeviceId, Digest, DiscoveryProfile, FlopsPerSecond, Label, MachineId, Property,
@@ -206,14 +209,10 @@ pub struct PeerBenchmarkCancellation {
 }
 
 impl PeerBenchmarkCancellation {
-	pub fn cancel(&self) {
-		self.cancelled.store(true, Ordering::Release);
-	}
+	pub fn cancel(&self) { self.cancelled.store(true, Ordering::Release); }
 
 	#[must_use]
-	pub fn is_cancelled(&self) -> bool {
-		self.cancelled.load(Ordering::Acquire)
-	}
+	pub fn is_cancelled(&self) -> bool { self.cancelled.load(Ordering::Acquire) }
 }
 
 /// Caller-provided control plane for a peer benchmark attempt.
@@ -249,14 +248,10 @@ impl PeerBenchmarkControl {
 	}
 
 	#[must_use]
-	pub const fn absolute_deadline(&self) -> Instant {
-		self.absolute_deadline
-	}
+	pub const fn absolute_deadline(&self) -> Instant { self.absolute_deadline }
 
 	#[must_use]
-	pub const fn cancellation(&self) -> &PeerBenchmarkCancellation {
-		&self.cancellation
-	}
+	pub const fn cancellation(&self) -> &PeerBenchmarkCancellation { &self.cancellation }
 
 	#[must_use]
 	pub fn failure(&self, phase: PeerBenchmarkPhase) -> Option<PeerBenchmarkFailure> {
@@ -334,10 +329,12 @@ impl PeerBenchmarkAttempt {
 	pub fn into_measurement(self) -> ProbeResult<PeerMeasurement> {
 		match self {
 			Self::Measured(measurement) => Ok(measurement),
-			Self::Failed(failure) => Err(crate::ProbeError::Benchmark(format!(
-				"peer benchmark failed during {:?} ({:?}): {}",
-				failure.phase, failure.kind, failure.detail
-			))),
+			Self::Failed(failure) => {
+				Err(crate::ProbeError::Benchmark(format!(
+					"peer benchmark failed during {:?} ({:?}): {}",
+					failure.phase, failure.kind, failure.detail
+				)))
+			}
 		}
 	}
 }
@@ -408,11 +405,13 @@ pub trait PeerSession: core::fmt::Debug {
 		}
 		match result {
 			Ok(measurement) => PeerBenchmarkAttempt::Measured(measurement),
-			Err(error) => PeerBenchmarkAttempt::Failed(PeerBenchmarkFailure::new(
-				PeerBenchmarkPhase::DirectionalTransfer,
-				PeerBenchmarkFailureKind::Transport,
-				error.to_string(),
-			)),
+			Err(error) => {
+				PeerBenchmarkAttempt::Failed(PeerBenchmarkFailure::new(
+					PeerBenchmarkPhase::DirectionalTransfer,
+					PeerBenchmarkFailureKind::Transport,
+					error.to_string(),
+				))
+			}
 		}
 	}
 }

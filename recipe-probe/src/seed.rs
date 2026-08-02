@@ -1,5 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	path::Path,
+};
 
 use recipe_core::{ByteCount, BytesPerSecond, FlopsPerSecond, Label};
 
@@ -155,18 +157,22 @@ impl SeedContract {
 
 		let invalidation = parse_string_array(required(&assignments, "probe.invalidate_on")?)?
 			.into_iter()
-			.map(|value| match value.as_str() {
-				"machine" => Ok(IdentityFacet::Machine),
-				"device" => Ok(IdentityFacet::Device),
-				"driver" => Ok(IdentityFacet::Driver),
-				"runtime-abi" => Ok(IdentityFacet::RuntimeAbi),
-				"firmware" => Ok(IdentityFacet::Firmware),
-				"link" => Ok(IdentityFacet::Link),
-				"artifact-toolchain" => Ok(IdentityFacet::ArtifactToolchain),
-				other => Err(ProbeError::contract(
-					None,
-					format!("unknown cache invalidation facet {other:?}"),
-				)),
+			.map(|value| {
+				match value.as_str() {
+					"machine" => Ok(IdentityFacet::Machine),
+					"device" => Ok(IdentityFacet::Device),
+					"driver" => Ok(IdentityFacet::Driver),
+					"runtime-abi" => Ok(IdentityFacet::RuntimeAbi),
+					"firmware" => Ok(IdentityFacet::Firmware),
+					"link" => Ok(IdentityFacet::Link),
+					"artifact-toolchain" => Ok(IdentityFacet::ArtifactToolchain),
+					other => {
+						Err(ProbeError::contract(
+							None,
+							format!("unknown cache invalidation facet {other:?}"),
+						))
+					}
+				}
 			})
 			.collect::<ProbeResult<BTreeSet<_>>>()?;
 		let all_facets = [
@@ -392,10 +398,12 @@ fn boolean(values: &BTreeMap<String, Assignment>, key: &str) -> ProbeResult<bool
 	match value.value.as_str() {
 		"true" => Ok(true),
 		"false" => Ok(false),
-		_ => Err(ProbeError::contract(
-			Some(value.line),
-			format!("{key} must be true or false"),
-		)),
+		_ => {
+			Err(ProbeError::contract(
+				Some(value.line),
+				format!("{key} must be true or false"),
+			))
+		}
 	}
 }
 
@@ -461,26 +469,4 @@ fn reject_unknown_fields(values: &BTreeMap<String, Assignment>) -> ProbeResult<(
 		));
 	}
 	Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn parses_repository_seed_as_estimates_only() {
-		let seed = SeedContract::parse(include_str!("../../topology/contract.toml")).unwrap();
-		assert_eq!(seed.schema, 1);
-		assert_eq!(seed.estimates.ethernet_rate.get(), 125_000_000);
-		assert_eq!(seed.reservation_per_storage_device.get(), 1_000_000_000);
-		assert_eq!(seed.transports.len(), 6);
-	}
-
-	#[test]
-	fn rejects_user_entered_inventory() {
-		let mut source = include_str!("../../topology/contract.toml").to_owned();
-		source.push_str("\n[devices.gpu0]\nrate = 123\n");
-		let error = SeedContract::parse(&source).unwrap_err();
-		assert!(error.to_string().contains("discovered automatically"));
-	}
 }

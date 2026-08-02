@@ -315,21 +315,13 @@ impl ContractDigest {
 		self.hasher.update(value);
 	}
 
-	fn digest(&mut self, value: Digest) {
-		self.hasher.update(value.bytes());
-	}
+	fn digest(&mut self, value: Digest) { self.hasher.update(value.bytes()); }
 
-	fn length(&mut self, value: usize) {
-		self.bytes(value.to_string().as_bytes());
-	}
+	fn length(&mut self, value: usize) { self.bytes(value.to_string().as_bytes()); }
 
-	fn u8(&mut self, value: u8) {
-		self.hasher.update([value]);
-	}
+	fn u8(&mut self, value: u8) { self.hasher.update([value]); }
 
-	fn u64(&mut self, value: u64) {
-		self.hasher.update(value.to_le_bytes());
-	}
+	fn u64(&mut self, value: u64) { self.hasher.update(value.to_le_bytes()); }
 
 	fn finish(self) -> Digest {
 		let finalized = self.hasher.finalize();
@@ -369,12 +361,14 @@ impl StageSignature {
 			.bindings
 			.iter()
 			.zip(&stage.bindings)
-			.map(|(build, stage)| BoundPointer {
-				dtype: build.dtype,
-				view: build.view.clone(),
-				read: None,
-				write: None,
-				fault: fault_buffer == Some(stage.buffer),
+			.map(|(build, stage)| {
+				BoundPointer {
+					dtype: build.dtype,
+					view: build.view.clone(),
+					read: None,
+					write: None,
+					fault: fault_buffer == Some(stage.buffer),
+				}
 			})
 			.collect::<Vec<_>>();
 		let mut arguments = Vec::new();
@@ -718,7 +712,13 @@ fn llvm_type(dtype: DType) -> &'static str {
 
 const fn private_address_space(target: &KernelTarget) -> u32 {
 	match target {
-		KernelTarget::Amd(_) | KernelTarget::Nvidia(_) => 5,
+		KernelTarget::Amd(_) => 5,
+		// NVPTXLowerAlloca recognizes generic-space allocas and rewrites their
+		// uses through the target's local address space. Emitting an alloca
+		// directly in address space 5 bypasses that lowering and can produce an
+		// invalid local pointer when the slot survives optimization (for
+		// example, the bounded retry state in uniform-i32 sampling).
+		KernelTarget::Nvidia(_) => 0,
 	}
 }
 
@@ -755,26 +755,25 @@ fn lower_owned_stage(
 			axis,
 			bounds,
 			conflict,
-		} => emit_scatter(
-			&mut ir,
-			&signature,
-			stage.fault,
-			stage,
-			*axis,
-			*bounds,
-			*conflict,
-		)?,
+		} => {
+			emit_scatter(
+				&mut ir,
+				&signature,
+				stage.fault,
+				stage,
+				*axis,
+				*bounds,
+				*conflict,
+			)?
+		}
 		StageKind::HistogramClear => emit_zero(&mut ir, &signature)?,
 		StageKind::HistogramAccumulate {
 			bins,
 			weighted,
 			bin_mapping,
 			ordering,
-		} => emit_histogram(
-			&mut ir,
-			&signature,
-			stage,
-			HistogramContract {
+		} => {
+			emit_histogram(&mut ir, &signature, stage, HistogramContract {
 				fault: stage
 					.fault
 					.ok_or_else(|| stage_error("histogram stage omitted its checked fault contract"))?,
@@ -782,8 +781,8 @@ fn lower_owned_stage(
 				weighted: *weighted,
 				mapping: *bin_mapping,
 				ordering: *ordering,
-			},
-		)?,
+			})?
+		}
 		StageKind::StableSortInitialize { network } => emit_sort_initialize(&mut ir, &signature, *network)?,
 		StageKind::StableSortCompareExchange(compare) => emit_sort_compare(&mut ir, &signature, *compare)?,
 		StageKind::StableSortFinalize {
@@ -806,13 +805,15 @@ fn lower_owned_stage(
 	let llvm_ir = assemble_stage_module(target, options, &signature, &ir);
 	let findings = audit_llvm_ir(&llvm_ir);
 	match findings.first() {
-		Some(finding) => Err(LoweringError::new(
-			LoweringErrorKind::ProhibitedInterface,
-			format!(
-				"generated stage LLVM IR failed audit at line {}: {:?} `{}`",
-				finding.line, finding.kind, finding.token
-			),
-		)),
+		Some(finding) => {
+			Err(LoweringError::new(
+				LoweringErrorKind::ProhibitedInterface,
+				format!(
+					"generated stage LLVM IR failed audit at line {}: {:?} `{}`",
+					finding.line, finding.kind, finding.token
+				),
+			))
+		}
 		None => Ok(()),
 	}?;
 	let lowered = LoweredKernel {
@@ -988,13 +989,15 @@ fn emit_index_map(
 	);
 	let iteration = match spec.iteration_step {
 		0 => "0".to_owned(),
-		step => checked_unsigned_scale(
-			ir,
-			"%loop_iteration",
-			step,
-			"index_map_iteration",
-			&mut rejected,
-		),
+		step => {
+			checked_unsigned_scale(
+				ir,
+				"%loop_iteration",
+				step,
+				"index_map_iteration",
+				&mut rejected,
+			)
+		}
 	};
 	let with_element = checked_signed_add(
 		ir,
@@ -1154,12 +1157,16 @@ fn scan_axis(program: &LoweredProgram, stage: &ProgramStage, level: u32) -> Resu
 	axes.dedup();
 	match axes.as_slice() {
 		[axis] => Ok(*axis),
-		[] => Err(stage_error(
-			"uniform scan stage has no same-level local stage carrying its axis",
-		)),
-		[_, _, ..] => Err(stage_error(
-			"uniform scan stage has ambiguous same-level scan axes",
-		)),
+		[] => {
+			Err(stage_error(
+				"uniform scan stage has no same-level local stage carrying its axis",
+			))
+		}
+		[_, _, ..] => {
+			Err(stage_error(
+				"uniform scan stage has ambiguous same-level scan axes",
+			))
+		}
 	}
 }
 
@@ -1225,44 +1232,51 @@ fn emit_reduction(
 		"reduction value input type differs from its stage contract",
 	)?;
 	let has_index = reduction.result != ReduceResult::Value;
-	let index_input =
-		match has_index && reduction.pass != 0 {
-			true => Some(signature
+	let index_input = match has_index && reduction.pass != 0 {
+		true => {
+			Some(signature
 				.pointer(*reads.get(1).ok_or_else(|| {
 					stage_error("later reduction pass omitted its readable index binding")
-				})?)?),
-			false => None,
-		};
+				})?)?)
+		}
+		false => None,
+	};
 	let final_pass = reduction.output_width == 1;
 	let (value_output, index_output) = match (final_pass, reduction.result) {
-		(_, ReduceResult::Value) => (
-			Some(signature.pointer(
-				*writes
-					.first()
-					.ok_or_else(|| stage_error("value reduction omitted its writable result"))?,
-			)?),
-			None,
-		),
-		(true, ReduceResult::Index) => (
-			None,
-			Some(signature.pointer(
-				*writes
-					.first()
-					.ok_or_else(|| stage_error("index reduction omitted its writable result"))?,
-			)?),
-		),
-		(false, ReduceResult::Index) | (_, ReduceResult::ValueAndIndex) => (
-			Some(signature.pointer(
-				*writes
-					.first()
-					.ok_or_else(|| stage_error("indexed reduction omitted its writable value"))?,
-			)?),
-			Some(signature.pointer(
-				*writes
-					.get(1)
-					.ok_or_else(|| stage_error("indexed reduction omitted its writable index"))?,
-			)?),
-		),
+		(_, ReduceResult::Value) => {
+			(
+				Some(signature.pointer(
+					*writes
+						.first()
+						.ok_or_else(|| stage_error("value reduction omitted its writable result"))?,
+				)?),
+				None,
+			)
+		}
+		(true, ReduceResult::Index) => {
+			(
+				None,
+				Some(signature.pointer(
+					*writes
+						.first()
+						.ok_or_else(|| stage_error("index reduction omitted its writable result"))?,
+				)?),
+			)
+		}
+		(false, ReduceResult::Index) | (_, ReduceResult::ValueAndIndex) => {
+			(
+				Some(signature.pointer(
+					*writes
+						.first()
+						.ok_or_else(|| stage_error("indexed reduction omitted its writable value"))?,
+				)?),
+				Some(signature.pointer(
+					*writes
+						.get(1)
+						.ok_or_else(|| stage_error("indexed reduction omitted its writable index"))?,
+				)?),
+			)
+		}
 	};
 	ensure_stage(
 		index_input
@@ -1457,18 +1471,15 @@ fn emit_reduction(
 	ir.line(format_args!(
 		"  {output_linear} = add i64 {output_linear_base}, {block}"
 	));
-	store_reduction_outputs(
-		ir,
-		ReductionOutputs {
-			value: value_output,
-			index: index_output,
-			value_global: &value_global,
-			index_global: index_global.as_deref(),
-			linear: &output_linear,
-			lanes: reduction.tree.lanes,
-			dtype: reduction.dtype,
-		},
-	)?;
+	store_reduction_outputs(ir, ReductionOutputs {
+		value: value_output,
+		index: index_output,
+		value_global: &value_global,
+		index_global: index_global.as_deref(),
+		linear: &output_linear,
+		lanes: reduction.tree.lanes,
+		dtype: reduction.dtype,
+	})?;
 	ir.line(format_args!("  br label %{done}"));
 	ir.line(format_args!("{done}:"));
 	ir.line(format_args!("  br label %exit"));
@@ -1548,9 +1559,11 @@ fn store_reduction_combined_index(
 			Ok(())
 		}
 		(None, None) => Ok(()),
-		(Some(_), None) | (None, Some(_)) => Err(stage_error(
-			"reduction index combine contract is incomplete",
-		)),
+		(Some(_), None) | (None, Some(_)) => {
+			Err(stage_error(
+				"reduction index combine contract is incomplete",
+			))
+		}
 	}
 }
 
@@ -1674,12 +1687,15 @@ fn reduction_first_pass_index(
 			.iter()
 			.position(|candidate| *candidate == axis)
 		{
-			Some(_) => reduced
-				.next()
-				.ok_or_else(|| stage_error("reduction coordinate underflow"))?,
-			None => free
-				.next()
-				.ok_or_else(|| stage_error("free reduction coordinate underflow"))?,
+			Some(_) => {
+				reduced
+					.next()
+					.ok_or_else(|| stage_error("reduction coordinate underflow"))?
+			}
+			None => {
+				free.next()
+					.ok_or_else(|| stage_error("free reduction coordinate underflow"))?
+			}
 		};
 		coordinates.push(coordinate);
 	}
@@ -1758,17 +1774,14 @@ fn emit_reduce_combine(
 ) -> Result<(String, Option<String>), LoweringError> {
 	match operator {
 		ReduceOperator::Minimum | ReduceOperator::Maximum => {
-			let choose_right = ordered_choose_right(
-				ir,
-				OrderedComparison {
-					dtype,
-					maximum: operator == ReduceOperator::Maximum,
-					left,
-					right,
-					indices: (left_index, right_index),
-					purpose: "reduce_order",
-				},
-			)?;
+			let choose_right = ordered_choose_right(ir, OrderedComparison {
+				dtype,
+				maximum: operator == ReduceOperator::Maximum,
+				left,
+				right,
+				indices: (left_index, right_index),
+				purpose: "reduce_order",
+			})?;
 			let value = ir.temporary("reduce_selected");
 			ir.line(format_args!(
 				"  {value} = select i1 {choose_right}, {} {right}, {} {left}",
@@ -1809,20 +1822,22 @@ fn emit_reduce_combine(
 					ir.line(format_args!("  {value} = {operation} i32 {left}, {right}"));
 					value
 				}
-				DType::F32 => constrained_binary(
-					ir,
-					match operator {
-						ReduceOperator::Sum => "fadd",
-						ReduceOperator::Product => "fmul",
-						ReduceOperator::Minimum
-						| ReduceOperator::Maximum
-						| ReduceOperator::Any
-						| ReduceOperator::All => unreachable!("arithmetic reduction operator"),
-					},
-					left,
-					right,
-					"reduce_float",
-				),
+				DType::F32 => {
+					constrained_binary(
+						ir,
+						match operator {
+							ReduceOperator::Sum => "fadd",
+							ReduceOperator::Product => "fmul",
+							ReduceOperator::Minimum
+							| ReduceOperator::Maximum
+							| ReduceOperator::Any
+							| ReduceOperator::All => unreachable!("arithmetic reduction operator"),
+						},
+						left,
+						right,
+						"reduce_float",
+					)
+				}
 			};
 			Ok((value, None))
 		}
@@ -1853,23 +1868,41 @@ fn emit_reduce_combine(
 
 fn constrained_binary(ir: &mut Ir, operation: &'static str, left: &str, right: &str, purpose: &str) -> String {
 	match operation {
-		"fadd" => ir.declare(
-			"llvm.experimental.constrained.fadd.f32",
-			"declare float @llvm.experimental.constrained.fadd.f32(float, float, metadata, metadata)",
-		),
-		"fmul" => ir.declare(
-			"llvm.experimental.constrained.fmul.f32",
-			"declare float @llvm.experimental.constrained.fmul.f32(float, float, metadata, metadata)",
-		),
-		"fsub" => ir.declare(
-			"llvm.experimental.constrained.fsub.f32",
-			"declare float @llvm.experimental.constrained.fsub.f32(float, float, metadata, metadata)",
-		),
+		"fadd" => {
+			ir.declare(
+				"llvm.experimental.constrained.fadd.f32",
+				"declare float @llvm.experimental.constrained.fadd.f32(float, float, metadata, metadata)",
+			)
+		}
+		"fmul" => {
+			ir.declare(
+				"llvm.experimental.constrained.fmul.f32",
+				"declare float @llvm.experimental.constrained.fmul.f32(float, float, metadata, metadata)",
+			)
+		}
+		"fsub" => {
+			ir.declare(
+				"llvm.experimental.constrained.fsub.f32",
+				"declare float @llvm.experimental.constrained.fsub.f32(float, float, metadata, metadata)",
+			)
+		}
 		operation => unreachable!("Recipe constrained binary opcode {operation}"),
 	}
 	let raw = ir.temporary(purpose);
 	ir.line(format_args!(
 		"  {raw} = call float @llvm.experimental.constrained.{operation}.f32(float {left}, float {right}, metadata !\"round.tonearest\", metadata !\"fpexcept.ignore\")"
+	));
+	canonicalize_nan(ir, &raw, &format!("{purpose}_canonical"))
+}
+
+fn constrained_fma(ir: &mut Ir, left: &str, right: &str, addend: &str, purpose: &str) -> String {
+	ir.declare(
+		"llvm.experimental.constrained.fma.f32",
+		"declare float @llvm.experimental.constrained.fma.f32(float, float, float, metadata, metadata)",
+	);
+	let raw = ir.temporary(purpose);
+	ir.line(format_args!(
+		"  {raw} = call float @llvm.experimental.constrained.fma.f32(float {left}, float {right}, float {addend}, metadata !\"round.tonearest\", metadata !\"fpexcept.ignore\")"
 	));
 	canonicalize_nan(ir, &raw, &format!("{purpose}_canonical"))
 }
@@ -2305,11 +2338,13 @@ fn scan_value_index(
 			ir.line(format_args!("  {linear} = add i64 {base}, {position}"));
 			return Ok(ir.affine_index(pointer, &linear, purpose));
 		}
-		0 | 2.. => ensure_stage(
-			scan.axis < pointer.view.logical_extents.len()
-				&& pointer.view.logical_extents[scan.axis] == scan.input_width,
-			"scan axis or width differs from its tensor binding",
-		)?,
+		0 | 2.. => {
+			ensure_stage(
+				scan.axis < pointer.view.logical_extents.len()
+					&& pointer.view.logical_extents[scan.axis] == scan.input_width,
+				"scan axis or width differs from its tensor binding",
+			)?
+		}
 	}
 	let free_extents = pointer
 		.view
@@ -2325,9 +2360,10 @@ fn scan_value_index(
 	for axis in 0..pointer.view.logical_extents.len() {
 		coordinates.push(match axis == scan.axis {
 			true => position.to_owned(),
-			false => free
-				.next()
-				.ok_or_else(|| stage_error("scan coordinate underflow"))?,
+			false => {
+				free.next()
+					.ok_or_else(|| stage_error("scan coordinate underflow"))?
+			}
 		});
 	}
 	Ok(ir.index_from_coordinates(pointer, &coordinates, purpose))
@@ -2418,10 +2454,12 @@ fn scan_uniform_target_index(
 			ir.line(format_args!("  {linear} = add i64 {base}, {position}"));
 			return Ok(ir.affine_index(pointer, &linear, "uniform_scan_target"));
 		}
-		0 | 2.. => ensure_stage(
-			axis < pointer.view.logical_extents.len() && pointer.view.logical_extents[axis] == scan.width,
-			"uniform scan axis or width differs from its target binding",
-		)?,
+		0 | 2.. => {
+			ensure_stage(
+				axis < pointer.view.logical_extents.len() && pointer.view.logical_extents[axis] == scan.width,
+				"uniform scan axis or width differs from its target binding",
+			)?
+		}
 	}
 	let free_extents = pointer
 		.view
@@ -2439,9 +2477,10 @@ fn scan_uniform_target_index(
 	for candidate in 0..pointer.view.logical_extents.len() {
 		coordinates.push(match candidate == axis {
 			true => position.to_owned(),
-			false => free
-				.next()
-				.ok_or_else(|| stage_error("uniform scan coordinate underflow"))?,
+			false => {
+				free.next()
+					.ok_or_else(|| stage_error("uniform scan coordinate underflow"))?
+			}
 		});
 	}
 	Ok(ir.index_from_coordinates(pointer, &coordinates, "uniform_scan_target"))
@@ -2498,6 +2537,11 @@ fn emit_contraction(
 		output.view.logical_extents.len() == expected_output_rank.max(1),
 		"contraction output rank differs from its canonical axis mapping",
 	)?;
+	if matches!(target, KernelTarget::Nvidia(nvidia) if nvidia.sm_major >= 8)
+		&& emit_nvidia_tf32_matrix_contraction(ir, left, right, output, contraction)?
+	{
+		return Ok(());
+	}
 	let workgroup_lanes = contraction
 		.tile
 		.output_x
@@ -2647,13 +2691,13 @@ fn emit_contraction(
 	let left_value = ir.load(left, &left_index, "contraction_left")?;
 	let right_value = ir.load(right, &right_index, "contraction_right")?;
 	let product = match contraction.dtype {
-		DType::F32 => constrained_binary(ir, "fmul", &left_value, &right_value, "contraction_product"),
+		DType::F32 => None,
 		DType::I32 => {
 			let value = ir.temporary("contraction_product");
 			ir.line(format_args!(
 				"  {value} = mul i32 {left_value}, {right_value}"
 			));
-			value
+			Some(value)
 		}
 	};
 	let accumulated = ir.temporary("contraction_accumulated");
@@ -2662,10 +2706,21 @@ fn emit_contraction(
 		llvm_type(contraction.dtype)
 	));
 	let sum = match contraction.dtype {
-		DType::F32 => constrained_binary(ir, "fadd", &accumulated, &product, "contraction_sum"),
+		DType::F32 => {
+			constrained_fma(
+				ir,
+				&left_value,
+				&right_value,
+				&accumulated,
+				"contraction_sum",
+			)
+		}
 		DType::I32 => {
 			let value = ir.temporary("contraction_sum");
-			ir.line(format_args!("  {value} = add i32 {accumulated}, {product}"));
+			ir.line(format_args!(
+				"  {value} = add i32 {accumulated}, {}",
+				product.expect("int32 contraction has a product")
+			));
 			value
 		}
 	};
@@ -2737,6 +2792,221 @@ fn emit_contraction(
 	Ok(())
 }
 
+/// Emit the dense rank-two `A * B^T` case directly with Recipe-owned PTX MMA.
+///
+/// The semantic tensors remain F32. Ampere TF32 conversion and accumulation
+/// are selected only for complete 16x8x4 tiles; every other shape and every
+/// AMD target retains the scalar F32 lowering below. One warp owns one output
+/// tile, and all of its lanes take the same active branch as required by the
+/// `mma.sync.aligned` contract.
+fn emit_nvidia_tf32_matrix_contraction(
+	ir: &mut Ir,
+	left: &BoundPointer,
+	right: &BoundPointer,
+	output: &BoundPointer,
+	contraction: &ContractionStage,
+) -> Result<bool, LoweringError> {
+	let ([rows, reduction], [columns, right_reduction], [output_rows, output_columns]) = (
+		left.view.logical_extents.as_slice(),
+		right.view.logical_extents.as_slice(),
+		output.view.logical_extents.as_slice(),
+	) else {
+		return Ok(false);
+	};
+	let eligible = contraction.dtype == DType::F32
+		&& contraction.spec.batch_axes.is_empty()
+		&& contraction.spec.contract_axes.as_slice() == [(1, 1)]
+		&& rows == output_rows
+		&& columns == output_columns
+		&& reduction == right_reduction
+		&& rows % 16 == 0
+		&& columns % 8 == 0
+		&& reduction % 4 == 0
+		&& left.view.offset_elements == 0
+		&& right.view.offset_elements == 0
+		&& output.view.offset_elements == 0
+		&& left.view.strides.as_slice() == [*reduction, 1]
+		&& right.view.strides.as_slice() == [*reduction, 1]
+		&& output.view.strides.as_slice() == [*columns, 1];
+	if !eligible {
+		return Ok(false);
+	}
+
+	let column_tiles = columns / 8;
+	let tile_count = (rows / 16)
+		.checked_mul(column_tiles)
+		.ok_or_else(|| stage_error("NVIDIA TF32 contraction tile count overflowed"))?;
+	let warps_per_group = u64::from(
+		contraction
+			.tile
+			.output_x
+			.checked_mul(contraction.tile.output_y)
+			.ok_or_else(|| stage_error("NVIDIA TF32 contraction workgroup width overflowed"))?
+			/ 32,
+	);
+	ensure_stage(
+		warps_per_group > 0,
+		"NVIDIA TF32 contraction requires complete warps",
+	)?;
+
+	let local_warp = ir.temporary("mma_local_warp");
+	ir.line(format_args!("  {local_warp} = udiv i64 %local_id, 32"));
+	let group_warp_base = ir.temporary("mma_group_warp_base");
+	ir.line(format_args!(
+		"  {group_warp_base} = mul i64 %group_id, {warps_per_group}"
+	));
+	let warp = ir.temporary("mma_warp");
+	ir.line(format_args!(
+		"  {warp} = add i64 {group_warp_base}, {local_warp}"
+	));
+	let active = ir.temporary("mma_active");
+	ir.line(format_args!(
+		"  {active} = icmp ult i64 {warp}, {tile_count}"
+	));
+	let body = ir.label("mma_body");
+	let exit = ir.label("mma_exit");
+	ir.line(format_args!(
+		"  br i1 {active}, label %{body}, label %{exit}"
+	));
+	ir.line(format_args!("{body}:"));
+
+	let lane = ir.temporary("mma_lane");
+	ir.line(format_args!("  {lane} = urem i64 %local_id, 32"));
+	let group = ir.temporary("mma_lane_group");
+	ir.line(format_args!("  {group} = udiv i64 {lane}, 4"));
+	let thread = ir.temporary("mma_group_thread");
+	ir.line(format_args!("  {thread} = urem i64 {lane}, 4"));
+	let row_tile = ir.temporary("mma_row_tile");
+	ir.line(format_args!(
+		"  {row_tile} = udiv i64 {warp}, {column_tiles}"
+	));
+	let column_tile = ir.temporary("mma_column_tile");
+	ir.line(format_args!(
+		"  {column_tile} = urem i64 {warp}, {column_tiles}"
+	));
+	let row_base = ir.temporary("mma_row_base");
+	ir.line(format_args!("  {row_base} = mul i64 {row_tile}, 16"));
+	let column_base = ir.temporary("mma_column_base");
+	ir.line(format_args!("  {column_base} = mul i64 {column_tile}, 8"));
+
+	let mut accumulators = [
+		"0.000000e+00".to_owned(),
+		"0.000000e+00".to_owned(),
+		"0.000000e+00".to_owned(),
+		"0.000000e+00".to_owned(),
+	];
+	for reduction_base in (0..*reduction).step_by(4) {
+		let reduction_index = ir.temporary("mma_reduction_index");
+		ir.line(format_args!(
+			"  {reduction_index} = add i64 {thread}, {reduction_base}"
+		));
+		let first_row = ir.temporary("mma_first_row");
+		ir.line(format_args!("  {first_row} = add i64 {row_base}, {group}"));
+		let second_row = ir.temporary("mma_second_row");
+		ir.line(format_args!("  {second_row} = add i64 {first_row}, 8"));
+		let column = ir.temporary("mma_column");
+		ir.line(format_args!("  {column} = add i64 {column_base}, {group}"));
+		let left_first_base = ir.temporary("mma_left_first_base");
+		ir.line(format_args!(
+			"  {left_first_base} = mul i64 {first_row}, {reduction}"
+		));
+		let left_first_index = ir.temporary("mma_left_first_index");
+		ir.line(format_args!(
+			"  {left_first_index} = add i64 {left_first_base}, {reduction_index}"
+		));
+		let left_second_base = ir.temporary("mma_left_second_base");
+		ir.line(format_args!(
+			"  {left_second_base} = mul i64 {second_row}, {reduction}"
+		));
+		let left_second_index = ir.temporary("mma_left_second_index");
+		ir.line(format_args!(
+			"  {left_second_index} = add i64 {left_second_base}, {reduction_index}"
+		));
+		let right_base = ir.temporary("mma_right_base");
+		ir.line(format_args!(
+			"  {right_base} = mul i64 {column}, {reduction}"
+		));
+		let right_index = ir.temporary("mma_right_index");
+		ir.line(format_args!(
+			"  {right_index} = add i64 {right_base}, {reduction_index}"
+		));
+		let left_first = ir.load(left, &left_first_index, "mma_left_first")?;
+		let left_second = ir.load(left, &left_second_index, "mma_left_second")?;
+		let right_value = ir.load(right, &right_index, "mma_right")?;
+		let left_first = tf32_fragment(ir, &left_first, "mma_left_first_tf32");
+		let left_second = tf32_fragment(ir, &left_second, "mma_left_second_tf32");
+		let right_value = tf32_fragment(ir, &right_value, "mma_right_tf32");
+		accumulators = tf32_mma(
+			ir,
+			[&left_first, &left_second],
+			&right_value,
+			accumulators.each_ref(),
+		);
+	}
+
+	for (index, accumulator) in accumulators.iter().enumerate() {
+		let row = match index < 2 {
+			true => {
+				let row = ir.temporary("mma_output_row");
+				ir.line(format_args!("  {row} = add i64 {row_base}, {group}"));
+				row
+			}
+			false => {
+				let first = ir.temporary("mma_output_first_row");
+				ir.line(format_args!("  {first} = add i64 {row_base}, {group}"));
+				let row = ir.temporary("mma_output_second_row");
+				ir.line(format_args!("  {row} = add i64 {first}, 8"));
+				row
+			}
+		};
+		let pair = ir.temporary("mma_output_pair");
+		ir.line(format_args!("  {pair} = mul i64 {thread}, 2"));
+		let column = ir.temporary("mma_output_column");
+		ir.line(format_args!("  {column} = add i64 {pair}, {}", index & 1));
+		let column = {
+			let absolute = ir.temporary("mma_output_absolute_column");
+			ir.line(format_args!(
+				"  {absolute} = add i64 {column_base}, {column}"
+			));
+			absolute
+		};
+		let row_offset = ir.temporary("mma_output_row_offset");
+		ir.line(format_args!("  {row_offset} = mul i64 {row}, {columns}"));
+		let output_index = ir.temporary("mma_output_index");
+		ir.line(format_args!(
+			"  {output_index} = add i64 {row_offset}, {column}"
+		));
+		ir.store(output, &output_index, accumulator, "mma_output")?;
+	}
+	ir.line(format_args!("  br label %{exit}"));
+	ir.line(format_args!("{exit}:"));
+	ir.line(format_args!("  ret void"));
+	Ok(true)
+}
+
+fn tf32_fragment(ir: &mut Ir, value: &str, purpose: &str) -> String {
+	let converted = ir.temporary(purpose);
+	ir.line(format_args!(
+		"  {converted} = call i32 asm \"cvt.rna.tf32.f32 $0, $1;\", \"=r,f\"(float {value})"
+	));
+	converted
+}
+
+fn tf32_mma(ir: &mut Ir, left: [&str; 2], right: &str, accumulators: [&String; 4]) -> [String; 4] {
+	let result = ir.temporary("mma_result");
+	ir.line(format_args!(
+		"  {result} = call {{ float, float, float, float }} asm sideeffect \"mma.sync.aligned.m16n8k4.row.col.f32.tf32.tf32.f32 {{$0, $1, $2, $3}}, {{$4, $5}}, {{$6}}, {{$7, $8, $9, $10}};\", \"=f,=f,=f,=f,r,r,r,f,f,f,f\"(i32 {}, i32 {}, i32 {right}, float {}, float {}, float {}, float {})",
+		left[0], left[1], accumulators[0], accumulators[1], accumulators[2], accumulators[3]
+	));
+	std::array::from_fn(|index| {
+		let value = ir.temporary("mma_accumulator");
+		ir.line(format_args!(
+			"  {value} = extractvalue {{ float, float, float, float }} {result}, {index}"
+		));
+		value
+	})
+}
+
 fn emit_gather(
 	ir: &mut Ir,
 	signature: &StageSignature,
@@ -2782,9 +3052,11 @@ fn emit_gather(
 		(IndexBounds::Clamp | IndexBounds::Wrap, None, None) => Ok(()),
 		(IndexBounds::Clamp | IndexBounds::Wrap, Some(_), None)
 		| (IndexBounds::Clamp | IndexBounds::Wrap, None, Some(_))
-		| (IndexBounds::Clamp | IndexBounds::Wrap, Some(_), Some(_)) => Err(stage_error(
-			"gather bounds policy and fault contract disagree",
-		)),
+		| (IndexBounds::Clamp | IndexBounds::Wrap, Some(_), Some(_)) => {
+			Err(stage_error(
+				"gather bounds policy and fault contract disagree",
+			))
+		}
 	}?;
 	let input_index = ir.index_from_coordinates(input, &mapping.payload_coordinates, "gather_input");
 	let value = ir.load(input, &input_index, "gather_value")?;
@@ -2845,9 +3117,11 @@ fn emit_scatter(
 		(IndexBounds::Clamp | IndexBounds::Wrap, None, None) => Ok(()),
 		(IndexBounds::Clamp | IndexBounds::Wrap, Some(_), None)
 		| (IndexBounds::Clamp | IndexBounds::Wrap, None, Some(_))
-		| (IndexBounds::Clamp | IndexBounds::Wrap, Some(_), Some(_)) => Err(stage_error(
-			"scatter bounds policy and fault contract disagree",
-		)),
+		| (IndexBounds::Clamp | IndexBounds::Wrap, Some(_), Some(_)) => {
+			Err(stage_error(
+				"scatter bounds policy and fault contract disagree",
+			))
+		}
 	}?;
 	let output_index = ir.index_from_coordinates(output, &mapping.payload_coordinates, "scatter_output");
 	match conflict {
@@ -3025,21 +3299,23 @@ fn emit_atomic_update(
 				atomic_ordering(ordering)
 			));
 		}
-		DType::F32 => match operation {
-			OwnedAtomicOperation::Exchange => {
-				let previous = ir.temporary(&format!("{purpose}_atomic_previous"));
-				ir.line(format_args!(
-					"  {previous} = atomicrmw xchg ptr addrspace(1) {address}, float {operand} {}, align 4",
-					atomic_ordering(ordering)
-				));
+		DType::F32 => {
+			match operation {
+				OwnedAtomicOperation::Exchange => {
+					let previous = ir.temporary(&format!("{purpose}_atomic_previous"));
+					ir.line(format_args!(
+						"  {previous} = atomicrmw xchg ptr addrspace(1) {address}, float {operand} {}, align 4",
+						atomic_ordering(ordering)
+					));
+				}
+				OwnedAtomicOperation::Add | OwnedAtomicOperation::Minimum | OwnedAtomicOperation::Maximum => {
+					let helper = ensure_f32_atomic_helper(ir, operation, ordering);
+					ir.line(format_args!(
+						"  call void @{helper}(ptr addrspace(1) {address}, float {operand})"
+					));
+				}
 			}
-			OwnedAtomicOperation::Add | OwnedAtomicOperation::Minimum | OwnedAtomicOperation::Maximum => {
-				let helper = ensure_f32_atomic_helper(ir, operation, ordering);
-				ir.line(format_args!(
-					"  call void @{helper}(ptr addrspace(1) {address}, float {operand})"
-				));
-			}
-		},
+		}
 	}
 	Ok(())
 }
@@ -3079,11 +3355,13 @@ fn ensure_f32_atomic_helper(ir: &mut Ir, operation: OwnedAtomicOperation, orderi
 	let name = format!("recipe_atomic_f32_{operation_name}_{ordering_name}");
 	declare_atomic_intrinsic(ir, operation);
 	let desired = match operation {
-		OwnedAtomicOperation::Add => String::from(
-			"  %raw = call float @llvm.experimental.constrained.fadd.f32(float %old, float %operand, metadata !\"round.tonearest\", metadata !\"fpexcept.ignore\")\n\
+		OwnedAtomicOperation::Add => {
+			String::from(
+				"  %raw = call float @llvm.experimental.constrained.fadd.f32(float %old, float %operand, metadata !\"round.tonearest\", metadata !\"fpexcept.ignore\")\n\
   %raw_nan = fcmp uno float %raw, %raw\n\
   %desired = select i1 %raw_nan, float 0x7FF8000000000000, float %raw\n",
-		),
+			)
+		}
 		OwnedAtomicOperation::Minimum | OwnedAtomicOperation::Maximum => {
 			let predicate = match operation {
 				OwnedAtomicOperation::Minimum => "ult",
@@ -3138,10 +3416,12 @@ exit:\n\
 
 fn declare_atomic_intrinsic(ir: &mut Ir, operation: OwnedAtomicOperation) {
 	let declaration = match operation {
-		OwnedAtomicOperation::Add => Some((
-			"llvm.experimental.constrained.fadd.f32",
-			"declare float @llvm.experimental.constrained.fadd.f32(float, float, metadata, metadata)",
-		)),
+		OwnedAtomicOperation::Add => {
+			Some((
+				"llvm.experimental.constrained.fadd.f32",
+				"declare float @llvm.experimental.constrained.fadd.f32(float, float, metadata, metadata)",
+			))
+		}
 		OwnedAtomicOperation::Exchange | OwnedAtomicOperation::Minimum | OwnedAtomicOperation::Maximum => None,
 	};
 	declaration
@@ -3422,26 +3702,20 @@ fn emit_sort_compare(ir: &mut Ir, signature: &StageSignature, compare: SortCompa
 	let right_value = ir.load(values, &right_value_index, "sort_right_value")?;
 	let left_index = ir.load(indices, &left_index_index, "sort_left_index")?;
 	let right_index = ir.load(indices, &right_index_index, "sort_right_index")?;
-	let right_before_left = sort_before(
-		ir,
-		SortComparison {
-			dtype: values.dtype,
-			direction: compare.network.direction,
-			left: (&right_value, &right_index),
-			right: (&left_value, &left_index),
-			purpose: "sort_right_before",
-		},
-	);
-	let left_before_right = sort_before(
-		ir,
-		SortComparison {
-			dtype: values.dtype,
-			direction: compare.network.direction,
-			left: (&left_value, &left_index),
-			right: (&right_value, &right_index),
-			purpose: "sort_left_before",
-		},
-	);
+	let right_before_left = sort_before(ir, SortComparison {
+		dtype: values.dtype,
+		direction: compare.network.direction,
+		left: (&right_value, &right_index),
+		right: (&left_value, &left_index),
+		purpose: "sort_right_before",
+	});
+	let left_before_right = sort_before(ir, SortComparison {
+		dtype: values.dtype,
+		direction: compare.network.direction,
+		left: (&left_value, &left_index),
+		right: (&right_value, &right_index),
+		purpose: "sort_left_before",
+	});
 	let merge_mask = compare.merge_width;
 	let masked = ir.temporary("sort_merge_masked");
 	ir.line(format_args!(
@@ -3579,9 +3853,10 @@ fn sort_tensor_index(
 	for axis in 0..pointer.view.logical_extents.len() {
 		coordinates.push(match axis == network.axis {
 			true => position.to_owned(),
-			false => free
-				.next()
-				.ok_or_else(|| stage_error("sort input coordinate underflow"))?,
+			false => {
+				free.next()
+					.ok_or_else(|| stage_error("sort input coordinate underflow"))?
+			}
 		});
 	}
 	Ok(ir.index_from_coordinates(pointer, &coordinates, purpose))
@@ -3804,27 +4079,21 @@ fn emit_philox(
 
 	let result = match contract.distribution {
 		RandomDistribution::UniformF32 => {
-			let words = emit_philox_call(
-				ir,
-				PhiloxCall {
-					helper: &helper,
-					counter: [&element_low, &element_high, &stream_low, &stream_high],
-					key: [&key_0, &key_1],
-					purpose: "philox_uniform",
-				},
-			);
+			let words = emit_philox_call(ir, PhiloxCall {
+				helper: &helper,
+				counter: [&element_low, &element_high, &stream_low, &stream_high],
+				key: [&key_0, &key_1],
+				purpose: "philox_uniform",
+			});
 			uniform_f32(ir, &words[0], "philox_uniform")
 		}
 		RandomDistribution::BernoulliI32 { probability_bits } => {
-			let words = emit_philox_call(
-				ir,
-				PhiloxCall {
-					helper: &helper,
-					counter: [&element_low, &element_high, &stream_low, &stream_high],
-					key: [&key_0, &key_1],
-					purpose: "philox_bernoulli",
-				},
-			);
+			let words = emit_philox_call(ir, PhiloxCall {
+				helper: &helper,
+				counter: [&element_low, &element_high, &stream_low, &stream_high],
+				key: [&key_0, &key_1],
+				purpose: "philox_bernoulli",
+			});
 			let probability = f32::from_bits(probability_bits);
 			let threshold = bernoulli_threshold(probability)?;
 			match threshold {
@@ -3845,30 +4114,29 @@ fn emit_philox(
 		RandomDistribution::UniformI32 {
 			low,
 			high_exclusive,
-		} => emit_uniform_i32(
-			ir,
-			PhiloxInputs {
-				helper: &helper,
-				element_low: &element_low,
-				element_high: &element_high,
-				stream_low: &stream_low,
-				stream_high: &stream_high,
-				key: [&key_0, &key_1],
-			},
-			low,
-			high_exclusive,
-			target,
-		)?,
-		RandomDistribution::NormalF32 => {
-			let words = emit_philox_call(
+		} => {
+			emit_uniform_i32(
 				ir,
-				PhiloxCall {
+				PhiloxInputs {
 					helper: &helper,
-					counter: [&element_low, &element_high, &stream_low, &stream_high],
+					element_low: &element_low,
+					element_high: &element_high,
+					stream_low: &stream_low,
+					stream_high: &stream_high,
 					key: [&key_0, &key_1],
-					purpose: "philox_normal",
 				},
-			);
+				low,
+				high_exclusive,
+				target,
+			)?
+		}
+		RandomDistribution::NormalF32 => {
+			let words = emit_philox_call(ir, PhiloxCall {
+				helper: &helper,
+				counter: [&element_low, &element_high, &stream_low, &stream_high],
+				key: [&key_0, &key_1],
+				purpose: "philox_normal",
+			});
 			owned_box_muller_v1(ir, &words[0], &words[1])
 		}
 	};
@@ -4120,20 +4388,17 @@ fn emit_uniform_i32(
 		"  {retry_counter} = xor i32 {}, {attempt}",
 		inputs.stream_high
 	));
-	let words = emit_philox_call(
-		ir,
-		PhiloxCall {
-			helper: inputs.helper,
-			counter: [
-				inputs.element_low,
-				inputs.element_high,
-				inputs.stream_low,
-				&retry_counter,
-			],
-			key: inputs.key,
-			purpose: "uniform_i32",
-		},
-	);
+	let words = emit_philox_call(ir, PhiloxCall {
+		helper: inputs.helper,
+		counter: [
+			inputs.element_low,
+			inputs.element_high,
+			inputs.stream_low,
+			&retry_counter,
+		],
+		key: inputs.key,
+		purpose: "uniform_i32",
+	});
 	let random = ir.temporary("uniform_i32_random");
 	ir.line(format_args!("  {random} = zext i32 {} to i64", words[0]));
 	let product = ir.temporary("uniform_i32_product");
@@ -4370,856 +4635,4 @@ fn owned_cos_v1(ir: &mut Ir, angle: &str) -> String {
 		"  {result} = select i1 {reflect}, float {negative}, float {positive}"
 	));
 	result
-}
-
-#[cfg(test)]
-mod tests {
-	use recipe_core::{
-		AliasPermission, ArtifactBuildBinding, ArtifactBuildProvenance, ArtifactBuildView,
-		ArtifactDispatchGeometry, ArtifactId, ArtifactWorkBounds, KernelTemplateId, ScalarInput, ScalarInstruction,
-		ScalarOpcode, ScalarProgram, ScalarValueId, ValueId,
-	};
-	use recipe_language::{
-		AtomicOperation, AtomicOrdering, AxisSet, Contraction, Elementwise, Gather, Histogram, IndexMap,
-		PrimitiveAliasRule, PrimitiveKernel, PrimitiveKind, RandomKey, RandomMap, Reduce, Scan, ScanMode, Scatter,
-		Shape, Sort, Tensor,
-	};
-	use std::collections::{BTreeMap, HashSet};
-	use std::io::Write as _;
-	use std::process::{Command, Stdio};
-
-	use super::*;
-	use crate::{AmdTarget, NvidiaTarget};
-
-	fn must<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) -> T {
-		match result {
-			Ok(value) => value,
-			Err(error) => panic!("{context}: {error:?}"),
-		}
-	}
-
-	fn must_some<T>(value: Option<T>, context: &str) -> T {
-		match value {
-			Some(value) => value,
-			None => panic!("{context}"),
-		}
-	}
-
-	fn tensor(id: u64, dtype: DType, shape: &[u64]) -> Tensor {
-		let shape = must(Shape::new(shape.to_vec()), "test shape");
-		must(
-			Tensor::contiguous(ValueId::new(id), dtype, shape, true, true),
-			"test tensor",
-		)
-	}
-
-	fn aliases(inputs: usize, outputs: usize) -> Vec<PrimitiveAliasRule> {
-		(0..inputs)
-			.flat_map(|input| {
-				(0..outputs).map(move |output| PrimitiveAliasRule {
-					input,
-					output,
-					permission: AliasPermission::Forbidden,
-				})
-			})
-			.collect()
-	}
-
-	fn primitive(id: u64, inputs: &[u64], outputs: &[u64], kind: PrimitiveKind) -> PrimitiveKernel {
-		PrimitiveKernel {
-			id: KernelTemplateId::new(id),
-			inputs: inputs.iter().copied().map(ValueId::new).collect(),
-			outputs: outputs.iter().copied().map(ValueId::new).collect(),
-			alias_rules: aliases(inputs.len(), outputs.len()),
-			kind,
-		}
-	}
-
-	fn lower_program(kernel: PrimitiveKernel, tensors: &[Tensor]) -> LoweredProgram {
-		let index = tensors
-			.iter()
-			.map(|tensor| (tensor.id, tensor))
-			.collect::<BTreeMap<_, _>>();
-		must(
-			recipe_primitives::lower(
-				&kernel,
-				&index,
-				recipe_primitives::LoweringHardware {
-					subgroup_lanes: 32,
-					maximum_workgroup_lanes: 256,
-					maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
-				},
-			),
-			"primitive lowering",
-		)
-	}
-
-	fn build(program: &LoweredProgram, stage: &ProgramStage) -> ArtifactBuildRecipe {
-		let template = must(stage_template_identity(program, stage), "stage identity");
-		let bindings = stage
-			.bindings
-			.iter()
-			.enumerate()
-			.map(|(index, binding)| ArtifactBuildBinding {
-				value: ValueId::new(must(u64::try_from(index + 100), "binding ID")),
-				dtype: binding.dtype,
-				access: access(binding.mode),
-				view: ArtifactBuildView {
-					logical_extents: binding.view.logical_extents.clone(),
-					offset_elements: binding.view.offset_elements,
-					strides: binding.view.strides.clone(),
-					storage_bytes: binding.view.storage_bytes,
-				},
-			})
-			.collect::<Vec<_>>();
-		let fault_flag = stage.fault.map(|fault| {
-			let position = must_some(
-				stage.bindings
-					.iter()
-					.position(|binding| binding.buffer == fault.flag),
-				"fault binding",
-			);
-			bindings[position].value
-		});
-		let mut build = ArtifactBuildRecipe {
-			artifact: ArtifactId::new(template.get()),
-			kernel_template: template,
-			source_kernel: program.source_kernel,
-			provenance: ArtifactBuildProvenance {
-				program_digest: Digest::new(program.digest.bytes()),
-				stage_ordinal: stage.id.get(),
-				contract_digest: Digest::ZERO,
-			},
-			bindings,
-			dispatch: ArtifactDispatchGeometry {
-				logical_lanes: stage.geometry.logical_lanes,
-				workgroup_lanes: stage.geometry.workgroup_lanes,
-				workgroups: stage.geometry.workgroups,
-			},
-			work: ArtifactWorkBounds {
-				flops: stage.resources.flops,
-				integer_operations: stage.resources.integer_operations,
-				atomic_operations: stage.resources.atomic_operations,
-			},
-			fault_flag,
-			resources: KernelResourceBounds {
-				private_bytes_per_lane: stage.resources.private_bytes_per_lane,
-				shared_bytes_per_workgroup: stage.resources.shared_bytes_per_workgroup,
-				scratch_bytes_per_dispatch: ByteCount::ZERO,
-				maximum_workgroup_lanes: stage.resources.maximum_workgroup_lanes,
-			},
-		};
-		build.provenance.contract_digest = artifact_build_contract_digest(&build);
-		build
-	}
-
-	fn targets() -> [KernelTarget; 2] {
-		[
-			KernelTarget::Amd(AmdTarget {
-				target_id: "gfx1101".to_owned(),
-				code_object_version: 6,
-			}),
-			KernelTarget::Nvidia(NvidiaTarget {
-				sm_major: 8,
-				sm_minor: 6,
-				ptx_isa: 75,
-			}),
-		]
-	}
-
-	fn programs() -> Vec<LoweredProgram> {
-		let scalar_tensors = [
-			tensor(1, DType::F32, &[16]),
-			tensor(2, DType::F32, &[16]),
-			tensor(3, DType::F32, &[16]),
-		];
-		let left = ScalarValueId::new(1);
-		let right = ScalarValueId::new(2);
-		let sum = ScalarValueId::new(3);
-		let scalar = lower_program(
-			primitive(
-				1,
-				&[1, 2],
-				&[3],
-				PrimitiveKind::Elementwise(Elementwise {
-					program: ScalarProgram {
-						inputs: vec![
-							ScalarInput {
-								id: left,
-								dtype: DType::F32,
-							},
-							ScalarInput {
-								id: right,
-								dtype: DType::F32,
-							},
-						],
-						constants: Vec::new(),
-						instructions: vec![ScalarInstruction {
-							result: sum,
-							dtype: DType::F32,
-							opcode: ScalarOpcode::Add,
-							operands: vec![left, right],
-						}],
-						outputs: vec![sum],
-					},
-				}),
-			),
-			&scalar_tensors,
-		);
-		let reduction_tensors = [
-			tensor(10, DType::F32, &[2, 9]),
-			tensor(11, DType::F32, &[2]),
-			tensor(12, DType::I32, &[2]),
-		];
-		let reduction = lower_program(
-			primitive(
-				2,
-				&[10],
-				&[11, 12],
-				PrimitiveKind::Reduce(Reduce {
-					operator: ReduceOperator::Maximum,
-					axes: must(AxisSet::new(vec![1]), "axes"),
-					keep_dimensions: false,
-					result: ReduceResult::ValueAndIndex,
-					tree_lanes: 4,
-				}),
-			),
-			&reduction_tensors,
-		);
-		let empty_tensors = [
-			tensor(20, DType::I32, &[2, 0]),
-			tensor(21, DType::I32, &[2]),
-		];
-		let fill = lower_program(
-			primitive(
-				3,
-				&[20],
-				&[21],
-				PrimitiveKind::Reduce(Reduce {
-					operator: ReduceOperator::Sum,
-					axes: must(AxisSet::new(vec![1]), "axes"),
-					keep_dimensions: false,
-					result: ReduceResult::Value,
-					tree_lanes: 4,
-				}),
-			),
-			&empty_tensors,
-		);
-		let scan_tensors = [
-			tensor(30, DType::F32, &[2, 35]),
-			tensor(31, DType::F32, &[2, 35]),
-		];
-		let scan = lower_program(
-			primitive(
-				4,
-				&[30],
-				&[31],
-				PrimitiveKind::Scan(Scan {
-					operator: ReduceOperator::Sum,
-					axis: 1,
-					mode: ScanMode::Inclusive,
-					reverse: false,
-					tree_lanes: 4,
-				}),
-			),
-			&scan_tensors,
-		);
-		let contraction_tensors = [
-			tensor(40, DType::F32, &[2, 3, 5]),
-			tensor(41, DType::F32, &[2, 5, 7]),
-			tensor(42, DType::F32, &[2, 3, 7]),
-		];
-		let contraction = lower_program(
-			primitive(
-				5,
-				&[40, 41],
-				&[42],
-				PrimitiveKind::Contraction(Contraction {
-					batch_axes: vec![(0, 0)],
-					contract_axes: vec![(2, 1)],
-				}),
-			),
-			&contraction_tensors,
-		);
-		let gather_tensors = [
-			tensor(50, DType::F32, &[4, 9]),
-			tensor(51, DType::I32, &[3]),
-			tensor(52, DType::F32, &[4, 3]),
-		];
-		let gather = lower_program(
-			primitive(
-				6,
-				&[50, 51],
-				&[52],
-				PrimitiveKind::Gather(Gather {
-					axis: 1,
-					bounds: IndexBounds::Reject,
-				}),
-			),
-			&gather_tensors,
-		);
-		let scatter_tensors = [
-			tensor(60, DType::F32, &[4, 9]),
-			tensor(61, DType::I32, &[3]),
-			tensor(62, DType::F32, &[4, 3]),
-			tensor(63, DType::F32, &[4, 9]),
-		];
-		let scatter = lower_program(
-			primitive(
-				7,
-				&[60, 61, 62],
-				&[63],
-				PrimitiveKind::Scatter(Scatter {
-					axis: 1,
-					bounds: IndexBounds::Reject,
-					conflict: ScatterConflict::Atomic {
-						operation: AtomicOperation::Add,
-						ordering: AtomicOrdering::SequentiallyConsistent,
-					},
-				}),
-			),
-			&scatter_tensors,
-		);
-		let histogram_tensors = [
-			tensor(70, DType::F32, &[33]),
-			tensor(71, DType::F32, &[33]),
-			tensor(72, DType::F32, &[7]),
-		];
-		let histogram = lower_program(
-			primitive(
-				8,
-				&[70, 71],
-				&[72],
-				PrimitiveKind::Histogram(Histogram {
-					bins: 7,
-					weighted: true,
-					ordering: AtomicOrdering::SequentiallyConsistent,
-				}),
-			),
-			&histogram_tensors,
-		);
-		let sort_tensors = [
-			tensor(80, DType::F32, &[2, 7]),
-			tensor(81, DType::F32, &[2, 7]),
-			tensor(82, DType::I32, &[2, 7]),
-		];
-		let sort = lower_program(
-			primitive(
-				9,
-				&[80],
-				&[81, 82],
-				PrimitiveKind::Sort(Sort {
-					axis: 1,
-					direction: SortDirection::Descending,
-					stable: true,
-					emit_indices: true,
-				}),
-			),
-			&sort_tensors,
-		);
-		let index_map_tensors = [tensor(89, DType::I32, &[64])];
-		let index_map = lower_program(
-			primitive(
-				89,
-				&[],
-				&[89],
-				PrimitiveKind::IndexMap(IndexMap {
-					start: -3,
-					element_step: 1,
-					iteration_step: 64,
-					modulus: Some(101),
-				}),
-			),
-			&index_map_tensors,
-		);
-		let mut result = vec![
-			scalar,
-			reduction,
-			fill,
-			scan,
-			contraction,
-			gather,
-			scatter,
-			histogram,
-			sort,
-			index_map,
-		];
-		for (ordinal, (distribution, dtype)) in [
-			(RandomDistribution::UniformF32, DType::F32),
-			(RandomDistribution::NormalF32, DType::F32),
-			(
-				RandomDistribution::BernoulliI32 {
-					probability_bits: 0.25_f32.to_bits(),
-				},
-				DType::I32,
-			),
-			(
-				RandomDistribution::UniformI32 {
-					low: -7,
-					high_exclusive: 19,
-				},
-				DType::I32,
-			),
-		]
-		.into_iter()
-		.enumerate()
-		{
-			let id = 90 + must(u64::try_from(ordinal), "random ID");
-			let tensors = [tensor(id, dtype, &[64])];
-			result.push(lower_program(
-				primitive(
-					id,
-					&[],
-					&[id],
-					PrimitiveKind::Random(RandomMap {
-						distribution,
-						key: RandomKey {
-							seed_low: 1,
-							seed_high: 2,
-							stream: 3,
-						},
-						philox_rounds: 10,
-					}),
-				),
-				&tensors,
-			));
-		}
-		result
-	}
-
-	#[test]
-	fn every_owned_stage_lowers_deterministically_for_amd_and_nvidia() {
-		let mut kinds = HashSet::new();
-		for program in programs() {
-			for stage in &program.stages {
-				let kind = std::mem::discriminant(&stage.kind);
-				kinds.insert(kind);
-				let build = build(&program, stage);
-				for target in targets() {
-					let options = LoweringOptions {
-						entry_symbol: format!(
-							"recipe_stage_{}_{}",
-							program.source_kernel.get(),
-							stage.id.get()
-						),
-						workgroup_lanes: stage.geometry.workgroup_lanes,
-					};
-					let first = must(
-						lower_stage(&program, &build, &target, &options),
-						"stage lowering",
-					);
-					let second = must(
-						lower_stage(&program, &build, &target, &options),
-						"stage lowering",
-					);
-					assert_eq!(first, second);
-					assert!(audit_llvm_ir(&first.llvm_ir).is_empty());
-					assert!(first.llvm_ir.contains("ret void"));
-				}
-			}
-		}
-		assert_eq!(kinds.len(), 16);
-	}
-
-	#[test]
-	fn stack_slots_use_the_explicit_private_address_space_on_both_backends() {
-		let programs = programs();
-		let stages = [
-			must_some(
-				programs
-					.iter()
-					.flat_map(|program| program.stages.iter().map(move |stage| (program, stage)))
-					.find(|(_, stage)| matches!(stage.kind, StageKind::TiledContraction(_))),
-				"contraction stage",
-			),
-			must_some(
-				programs
-					.iter()
-					.flat_map(|program| program.stages.iter().map(move |stage| (program, stage)))
-					.find(|(_, stage)| {
-						matches!(
-							stage.kind,
-							StageKind::Philox4x32_10(contract)
-								if matches!(contract.distribution, RandomDistribution::UniformI32 { .. })
-						)
-					}),
-				"uniform int32 stage",
-			),
-		];
-		for (program, stage) in stages {
-			for target in targets() {
-				let lowered = must(
-					lower_stage(
-						program,
-						&build(program, stage),
-						&target,
-						&LoweringOptions {
-							entry_symbol: "recipe_private_stack".to_owned(),
-							workgroup_lanes: stage.geometry.workgroup_lanes,
-						},
-					),
-					"private-stack lowering",
-				);
-				let allocas = lowered
-					.llvm_ir
-					.lines()
-					.filter(|line| line.contains(" = alloca "))
-					.collect::<Vec<_>>();
-				assert!(!allocas.is_empty());
-				assert!(
-					allocas.iter().all(|line| line.contains("addrspace(5)")),
-					"target {target:?} emitted a non-private stack slot:\n{}",
-					allocas.join("\n")
-				);
-				assert!(!lowered.llvm_ir.contains(", ptr %contraction_"));
-				assert!(!lowered.llvm_ir.contains(", ptr %uniform_i32_"));
-			}
-		}
-	}
-
-	#[test]
-	#[ignore = "requires the host LLVM AMDGPU backend"]
-	fn host_llc_accepts_amd_contraction_private_stack_slots() {
-		let programs = programs();
-		let contraction = must_some(
-			programs
-				.iter()
-				.flat_map(|program| program.stages.iter().map(move |stage| (program, stage)))
-				.find(|(_, stage)| matches!(stage.kind, StageKind::TiledContraction(_))),
-			"contraction stage",
-		);
-		let lowered = must(
-			lower_stage(
-				contraction.0,
-				&build(contraction.0, contraction.1),
-				&targets()[0],
-				&LoweringOptions {
-					entry_symbol: "recipe_contraction_private_stack".to_owned(),
-					workgroup_lanes: contraction.1.geometry.workgroup_lanes,
-				},
-			),
-			"contraction lowering",
-		);
-		let mut child = Command::new("/usr/bin/llc")
-			.args([
-				"-filetype=null",
-				"-march=amdgcn",
-				"-mcpu=gfx1101",
-				"--amdhsa-code-object-version=6",
-				"-",
-			])
-			.stdin(Stdio::piped())
-			.stdout(Stdio::null())
-			.stderr(Stdio::piped())
-			.spawn()
-			.expect("spawn host llc");
-		{
-			let mut stdin = child.stdin.take().expect("host llc stdin");
-			stdin.write_all(lowered.llvm_ir.as_bytes())
-				.expect("write LLVM IR");
-		}
-		let output = child.wait_with_output().expect("wait for host llc");
-		assert!(
-			output.status.success(),
-			"host llc rejected AMD contraction:\n{}",
-			String::from_utf8_lossy(&output.stderr)
-		);
-	}
-
-	#[test]
-	fn mismatched_build_recipe_fails_closed() {
-		let program = programs().remove(1);
-		let stage = &program.stages[0];
-		let mut build = build(&program, stage);
-		build.dispatch.logical_lanes += 1;
-		let error = match lower_stage(
-			&program,
-			&build,
-			&targets()[0],
-			&LoweringOptions {
-				entry_symbol: "recipe_mismatch".to_owned(),
-				workgroup_lanes: stage.geometry.workgroup_lanes,
-			},
-		) {
-			Ok(_) => panic!("tampered build must fail"),
-			Err(error) => error,
-		};
-		assert_eq!(error.kind, LoweringErrorKind::InvalidStageContract);
-	}
-
-	#[test]
-	fn checked_paths_guard_payload_addresses_and_random_abi_is_explicit() {
-		let programs = programs();
-		let gather = must_some(
-			programs
-				.iter()
-				.flat_map(|program| program.stages.iter().map(move |stage| (program, stage)))
-				.find(|(_, stage)| matches!(stage.kind, StageKind::Gather { .. })),
-			"gather stage",
-		);
-		let lowered = must(
-			lower_stage(
-				gather.0,
-				&build(gather.0, gather.1),
-				&targets()[1],
-				&LoweringOptions {
-					entry_symbol: "recipe_checked_gather".to_owned(),
-					workgroup_lanes: gather.1.geometry.workgroup_lanes,
-				},
-			),
-			"gather lowering",
-		);
-		let guard = must_some(lowered.llvm_ir.find("gather_valid_index"), "index guard");
-		let payload = must_some(
-			lowered.llvm_ir.find("gather_value_address"),
-			"payload address",
-		);
-		assert!(guard < payload);
-		assert!(lowered.llvm_ir.contains("atomicrmw xchg"));
-
-		let random = must_some(
-			programs
-				.iter()
-				.flat_map(|program| program.stages.iter().map(move |stage| (program, stage)))
-				.find(|(_, stage)| matches!(stage.kind, StageKind::Philox4x32_10(_))),
-			"random stage",
-		);
-		let lowered = must(
-			lower_stage(
-				random.0,
-				&build(random.0, random.1),
-				&targets()[0],
-				&LoweringOptions {
-					entry_symbol: "recipe_random".to_owned(),
-					workgroup_lanes: random.1.geometry.workgroup_lanes,
-				},
-			),
-			"random lowering",
-		);
-		assert!(lowered.abi.arguments.contains(&KernelArgument::RunId));
-		assert!(
-			lowered
-				.abi
-				.arguments
-				.contains(&KernelArgument::LoopIteration)
-		);
-		assert!(lowered.llvm_ir.contains("recipe_philox4x32_10_v1"));
-		assert!(lowered.llvm_ir.contains("xor i64 %loop_iteration"));
-		assert!(lowered.llvm_ir.contains("xor i32 %philox_run_low"));
-		assert!(!lowered.llvm_ir.contains("curand"));
-	}
-
-	#[test]
-	fn emits_backend_safe_plain_fdiv_for_amd_normal_initialization() {
-		let programs = programs();
-		let normal = must_some(
-			programs
-				.iter()
-				.flat_map(|program| program.stages.iter().map(move |stage| (program, stage)))
-				.find(|(_, stage)| {
-					matches!(
-						stage.kind,
-						StageKind::Philox4x32_10(contract)
-							if contract.distribution == RandomDistribution::NormalF32
-					)
-				}),
-			"normal random stage",
-		);
-		let lowered = must(
-			lower_stage(
-				normal.0,
-				&build(normal.0, normal.1),
-				&targets()[0],
-				&LoweringOptions {
-					entry_symbol: "recipe_normal_f32".to_owned(),
-					workgroup_lanes: normal.1.geometry.workgroup_lanes,
-				},
-			),
-			"normal random lowering",
-		);
-		assert!(lowered.llvm_ir.contains(" = fdiv float "));
-		assert!(!lowered.llvm_ir.contains("constrained.fdiv"));
-		assert!(lowered.llvm_ir.contains("owned_log_y_canonical"));
-		assert!(lowered.llvm_ir.contains("constrained.fmul"));
-		assert!(audit_llvm_ir(&lowered.llvm_ir).is_empty());
-	}
-
-	#[test]
-	fn emits_backend_safe_sqrt_intrinsic_for_amd_normal_initialization() {
-		let programs = programs();
-		let normal = must_some(
-			programs
-				.iter()
-				.flat_map(|program| program.stages.iter().map(move |stage| (program, stage)))
-				.find(|(_, stage)| {
-					matches!(
-						stage.kind,
-						StageKind::Philox4x32_10(contract)
-							if contract.distribution == RandomDistribution::NormalF32
-					)
-				}),
-			"normal random stage",
-		);
-		let lowered = must(
-			lower_stage(
-				normal.0,
-				&build(normal.0, normal.1),
-				&targets()[0],
-				&LoweringOptions {
-					entry_symbol: "recipe_normal_f32".to_owned(),
-					workgroup_lanes: normal.1.geometry.workgroup_lanes,
-				},
-			),
-			"normal random lowering",
-		);
-		assert!(
-			lowered
-				.llvm_ir
-				.contains("declare float @llvm.sqrt.f32(float)")
-		);
-		assert!(lowered.llvm_ir.contains("call float @llvm.sqrt.f32(float "));
-		assert!(!lowered.llvm_ir.contains("constrained.sqrt"));
-		assert!(lowered.llvm_ir.contains("normal_radial_canonical"));
-		assert!(lowered.llvm_ir.contains("constrained.fmul"));
-		assert!(audit_llvm_ir(&lowered.llvm_ir).is_empty());
-	}
-
-	#[test]
-	#[ignore = "requires the host LLVM AMDGPU backend"]
-	fn host_llc_compiles_amd_normal_initialization_with_backend_safe_divide_and_sqrt() {
-		let programs = programs();
-		let normal = must_some(
-			programs
-				.iter()
-				.flat_map(|program| program.stages.iter().map(move |stage| (program, stage)))
-				.find(|(_, stage)| {
-					matches!(
-						stage.kind,
-						StageKind::Philox4x32_10(contract)
-							if contract.distribution == RandomDistribution::NormalF32
-					)
-				}),
-			"normal random stage",
-		);
-		let lowered = must(
-			lower_stage(
-				normal.0,
-				&build(normal.0, normal.1),
-				&targets()[0],
-				&LoweringOptions {
-					entry_symbol: "recipe_normal_f32".to_owned(),
-					workgroup_lanes: normal.1.geometry.workgroup_lanes,
-				},
-			),
-			"normal random lowering",
-		);
-		let mut child = Command::new("/usr/bin/llc")
-			.args([
-				"-filetype=null",
-				"-march=amdgcn",
-				"-mcpu=gfx1101",
-				"--amdhsa-code-object-version=6",
-				"-",
-			])
-			.stdin(Stdio::piped())
-			.stdout(Stdio::null())
-			.stderr(Stdio::piped())
-			.spawn()
-			.expect("spawn host llc");
-		{
-			let mut stdin = child.stdin.take().expect("host llc stdin");
-			stdin.write_all(lowered.llvm_ir.as_bytes())
-				.expect("write LLVM IR");
-		}
-		let output = child.wait_with_output().expect("wait for host llc");
-		assert!(
-			output.status.success(),
-			"host llc rejected AMD normal initialization:\n{}",
-			String::from_utf8_lossy(&output.stderr)
-		);
-	}
-
-	#[test]
-	fn index_map_checks_affine_arithmetic_before_forming_output_addresses() {
-		let program = lower_program(
-			primitive(
-				200,
-				&[],
-				&[200],
-				PrimitiveKind::IndexMap(IndexMap {
-					start: i32::MIN,
-					element_step: -1,
-					iteration_step: i32::MAX,
-					modulus: Some(97),
-				}),
-			),
-			&[tensor(200, DType::I32, &[32])],
-		);
-		let stage = &program.stages[0];
-		let lowered = must(
-			lower_stage(
-				&program,
-				&build(&program, stage),
-				&targets()[1],
-				&LoweringOptions {
-					entry_symbol: "recipe_index_map".to_owned(),
-					workgroup_lanes: stage.geometry.workgroup_lanes,
-				},
-			),
-			"index-map lowering",
-		);
-		assert!(
-			lowered
-				.abi
-				.arguments
-				.contains(&KernelArgument::LoopIteration)
-		);
-		assert!(lowered.llvm_ir.contains("@llvm.smul.with.overflow.i64"));
-		assert!(lowered.llvm_ir.contains("@llvm.sadd.with.overflow.i64"));
-		assert!(lowered.llvm_ir.contains("srem i64"));
-		let fault = must_some(
-			lowered.llvm_ir.find("atomicrmw xchg"),
-			"index-map fault publication",
-		);
-		let address = must_some(
-			lowered.llvm_ir.find("index_map_output_address"),
-			"index-map output address",
-		);
-		assert!(fault < address);
-
-		let invariant = lower_program(
-			primitive(
-				201,
-				&[],
-				&[201],
-				PrimitiveKind::IndexMap(IndexMap {
-					start: 7,
-					element_step: 1,
-					iteration_step: 0,
-					modulus: None,
-				}),
-			),
-			&[tensor(201, DType::I32, &[32])],
-		);
-		let invariant_stage = &invariant.stages[0];
-		let invariant_lowered = must(
-			lower_stage(
-				&invariant,
-				&build(&invariant, invariant_stage),
-				&targets()[0],
-				&LoweringOptions {
-					entry_symbol: "recipe_index_map_invariant".to_owned(),
-					workgroup_lanes: invariant_stage.geometry.workgroup_lanes,
-				},
-			),
-			"iteration-invariant index-map lowering",
-		);
-		assert!(
-			!invariant_lowered
-				.abi
-				.arguments
-				.contains(&KernelArgument::LoopIteration)
-		);
-		assert!(!invariant_lowered.llvm_ir.contains("%loop_iteration"));
-	}
 }

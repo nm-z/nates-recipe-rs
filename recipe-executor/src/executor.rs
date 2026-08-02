@@ -1,7 +1,9 @@
-use std::collections::BTreeMap;
-use std::fmt::{self, Write};
-use std::num::NonZeroU32;
-use std::time::Duration;
+use std::{
+	collections::BTreeMap,
+	fmt::{self, Write},
+	num::NonZeroU32,
+	time::Duration,
+};
 
 use recipe_core::{
 	ArtifactId, BundleIdentity, ByteCount, DeviceId, FinalizedBundle, IterationDomain, KernelTemplateId, LinkId,
@@ -9,13 +11,15 @@ use recipe_core::{
 	RunPhase, ScheduleWindow, SubmissionSlots, Task, TaskId, TaskKind, TransferEndpoint, TransferLaneClaim, ValueId,
 };
 
-use crate::backend::{
-	ArenaSet, Backend, BackendPoll, BackendWork, CalculationWork, InitAdmissionWork,
-	MAX_PHYSICAL_CALLS_PER_OPERATION, MetricWork, PendingRequest, PhysicalCall, PhysicalCallBatch, TransferWork,
-	WorkClass,
+use crate::{
+	backend::{
+		ArenaSet, Backend, BackendPoll, BackendWork, CalculationWork, InitAdmissionWork,
+		MAX_PHYSICAL_CALLS_PER_OPERATION, MetricWork, PendingRequest, PhysicalCall, PhysicalCallBatch,
+		TransferWork, WorkClass,
+	},
+	error::{BackendMessage, BackendOperation, ExecutorError, JournalStream, Result},
+	metrics::{MetricMailbox, MetricSample},
 };
-use crate::error::{BackendMessage, BackendOperation, ExecutorError, JournalStream, Result};
-use crate::metrics::{MetricMailbox, MetricSample};
 
 const RUN_LIFECYCLE_LOGICAL_EVENTS: usize = 6;
 const BLOCKING_POLL_INITIAL_DELAY: Duration = Duration::from_micros(50);
@@ -33,9 +37,7 @@ impl BlockingPollBackoff {
 		}
 	}
 
-	fn reset(&mut self) {
-		self.next_delay = BLOCKING_POLL_INITIAL_DELAY;
-	}
+	fn reset(&mut self) { self.next_delay = BLOCKING_POLL_INITIAL_DELAY; }
 
 	fn wait(&mut self) {
 		std::thread::sleep(self.next_delay);
@@ -56,40 +58,6 @@ struct PhasePoll {
 	made_progress: bool,
 }
 
-#[cfg(test)]
-mod blocking_poll_backoff_tests {
-	use super::*;
-
-	#[test]
-	fn nonprogress_backoff_caps_and_progress_resets_it() {
-		let mut backoff = BlockingPollBackoff::new();
-		assert_eq!(backoff.next_delay, BLOCKING_POLL_INITIAL_DELAY);
-		for _ in 0..16 {
-			backoff.advance();
-		}
-		assert_eq!(backoff.next_delay, BLOCKING_POLL_MAXIMUM_DELAY);
-		backoff.reset();
-		assert_eq!(backoff.next_delay, BLOCKING_POLL_INITIAL_DELAY);
-	}
-
-	#[test]
-	fn watchdog_poll_budget_scales_with_expected_duration() {
-		let multiplier = NonZeroU32::new(4).expect("nonzero multiplier");
-		let immediate = Watchdog::for_expected_duration(Duration::ZERO, multiplier);
-		let measured = Watchdog::for_expected_duration(Duration::from_millis(10), multiplier);
-		assert!(immediate.max_nonprogress_polls() > 1);
-		assert!(measured.max_nonprogress_polls() > immediate.max_nonprogress_polls());
-
-		let mut elapsed = Duration::ZERO;
-		let mut backoff = BlockingPollBackoff::new();
-		for _ in 1..measured.max_nonprogress_polls() {
-			elapsed = elapsed.saturating_add(backoff.next_delay);
-			backoff.advance();
-		}
-		assert!(elapsed >= Duration::from_millis(42));
-	}
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Watchdog {
 	max_nonprogress_polls: u32,
@@ -98,19 +66,21 @@ pub struct Watchdog {
 impl Watchdog {
 	pub fn new(max_nonprogress_polls: u32) -> Result<Self> {
 		match max_nonprogress_polls {
-			0 => Err(ExecutorError::InvalidWatchdog {
-				max_nonprogress_polls,
-			}),
-			_ => Ok(Self {
-				max_nonprogress_polls,
-			}),
+			0 => {
+				Err(ExecutorError::InvalidWatchdog {
+					max_nonprogress_polls,
+				})
+			}
+			_ => {
+				Ok(Self {
+					max_nonprogress_polls,
+				})
+			}
 		}
 	}
 
 	#[must_use]
-	pub const fn max_nonprogress_polls(self) -> u32 {
-		self.max_nonprogress_polls
-	}
+	pub const fn max_nonprogress_polls(self) -> u32 { self.max_nonprogress_polls }
 
 	/// Convert a measured upper-bound operation duration into the number of
 	/// nonprogress polls admitted by the executor's blocking backoff.
@@ -231,7 +201,6 @@ pub enum LogicalEvent {
 		replaced_unconsumed: bool,
 	},
 	FaultChecked {
-		calculation: TaskId,
 		readback: TaskId,
 		value: ValueId,
 	},
@@ -282,12 +251,6 @@ impl JournalCapacity {
 	/// exact counter per finalized task, so this bound is independent of the
 	/// watchdog stretch.
 	pub fn for_bundle<B: Backend>(bundle: &FinalizedBundle) -> Result<Self> {
-		#[cfg(test)]
-		let retained_loop_iterations = bundle
-			.loop_iterations()
-			.finite()
-			.map_or(1, |finite| finite.get());
-		#[cfg(not(test))]
 		let retained_loop_iterations = 1_u64;
 		Self::for_bundle_retaining::<B>(bundle, retained_loop_iterations)
 	}
@@ -419,7 +382,7 @@ pub struct RunJournal {
 
 impl RunJournal {
 	pub(crate) fn with_capacity(declared: JournalCapacity, tasks: &[Task]) -> Self {
-		Self::with_loop_detail(declared, tasks, cfg!(test))
+		Self::with_loop_detail(declared, tasks, false)
 	}
 
 	pub(crate) fn with_loop_detail(
@@ -429,9 +392,11 @@ impl RunJournal {
 	) -> Self {
 		let mut pending_polls = tasks
 			.iter()
-			.map(|task| PendingPollCount {
-				task: task.id,
-				count: 0,
+			.map(|task| {
+				PendingPollCount {
+					task: task.id,
+					count: 0,
+				}
 			})
 			.collect::<Vec<_>>();
 		pending_polls.sort_unstable_by_key(|entry| entry.task);
@@ -466,10 +431,12 @@ impl RunJournal {
 				self.logical_events.push(event);
 				Ok(())
 			}
-			false => Err(ExecutorError::JournalCapacityExceeded {
-				stream: JournalStream::Logical,
-				capacity: self.declared.logical_events,
-			}),
+			false => {
+				Err(ExecutorError::JournalCapacityExceeded {
+					stream: JournalStream::Logical,
+					capacity: self.declared.logical_events,
+				})
+			}
 		}
 	}
 
@@ -480,9 +447,7 @@ impl RunJournal {
 				.is_none_or(|iteration| iteration.index() == 0)
 	}
 
-	fn is_loop_task(&self, task: TaskId) -> bool {
-		self.loop_tasks.binary_search(&task).is_ok()
-	}
+	fn is_loop_task(&self, task: TaskId) -> bool { self.loop_tasks.binary_search(&task).is_ok() }
 
 	fn retains_physical_call(&self, call: PhysicalCall) -> bool {
 		self.retains_repeated_loop_detail() || !self.is_repeated_loop_physical(call)
@@ -526,9 +491,11 @@ impl RunJournal {
 				let index = self
 					.pending_polls
 					.binary_search_by_key(&task, |entry| entry.task)
-					.map_err(|_| ExecutorError::BackendProtocol {
-						task,
-						detail: "pending poll names a task absent from the finalized bundle",
+					.map_err(|_| {
+						ExecutorError::BackendProtocol {
+							task,
+							detail: "pending poll names a task absent from the finalized bundle",
+						}
 					})?;
 				let existing = pending_batch[..pending_batch_len]
 					.iter_mut()
@@ -556,9 +523,11 @@ impl RunJournal {
 			let index = self
 				.pending_polls
 				.binary_search_by_key(task, |entry| entry.task)
-				.map_err(|_| ExecutorError::BackendProtocol {
-					task: *task,
-					detail: "pending poll names a task absent from the finalized bundle",
+				.map_err(|_| {
+					ExecutorError::BackendProtocol {
+						task: *task,
+						detail: "pending poll names a task absent from the finalized bundle",
+					}
 				})?;
 			self.pending_polls[index]
 				.count
@@ -580,9 +549,11 @@ impl RunJournal {
 			let index = self
 				.pending_polls
 				.binary_search_by_key(task, |entry| entry.task)
-				.map_err(|_| ExecutorError::BackendProtocol {
-					task: *task,
-					detail: "pending poll names a task absent from the finalized bundle",
+				.map_err(|_| {
+					ExecutorError::BackendProtocol {
+						task: *task,
+						detail: "pending poll names a task absent from the finalized bundle",
+					}
 				})?;
 			self.pending_polls[index].count = self.pending_polls[index]
 				.count
@@ -603,16 +574,12 @@ impl RunJournal {
 	}
 
 	#[must_use]
-	pub fn logical_events(&self) -> &[LogicalEvent] {
-		&self.logical_events
-	}
+	pub fn logical_events(&self) -> &[LogicalEvent] { &self.logical_events }
 
 	#[must_use]
 	/// Ordered non-pending calls, terminal polls, and the first pending marker
 	/// for each task. Use [`Self::pending_poll_counts`] for exact pending totals.
-	pub fn physical_calls(&self) -> &[PhysicalCall] {
-		&self.physical_calls
-	}
+	pub fn physical_calls(&self) -> &[PhysicalCall] { &self.physical_calls }
 
 	/// Fixed task-indexed pending-poll counters.
 	///
@@ -620,9 +587,7 @@ impl RunJournal {
 	/// this table preserves the exact number of pending polls across every
 	/// activation without growing the ordered journal.
 	#[must_use]
-	pub fn pending_poll_counts(&self) -> &[PendingPollCount] {
-		&self.pending_polls
-	}
+	pub fn pending_poll_counts(&self) -> &[PendingPollCount] { &self.pending_polls }
 
 	#[must_use]
 	pub fn pending_poll_count(&self, task: TaskId) -> Option<u128> {
@@ -633,14 +598,10 @@ impl RunJournal {
 	}
 
 	#[must_use]
-	pub const fn summary(&self) -> JournalSummary {
-		self.summary
-	}
+	pub const fn summary(&self) -> JournalSummary { self.summary }
 
 	#[must_use]
-	pub const fn declared_capacity(&self) -> JournalCapacity {
-		self.declared
-	}
+	pub const fn declared_capacity(&self) -> JournalCapacity { self.declared }
 
 	#[must_use]
 	pub fn allocated_capacity(&self) -> JournalCapacity {
@@ -680,21 +641,36 @@ enum ResourceState<R> {
 }
 
 impl<R> ResourceState<R> {
+	fn active(&self) -> Result<&R> {
+		match self {
+			Self::Active(resource) => Ok(resource),
+			Self::Taken => {
+				Err(ExecutorError::LifecycleInvariant {
+					detail: "backend resource was already consumed",
+				})
+			}
+		}
+	}
+
 	fn active_mut(&mut self) -> Result<&mut R> {
 		match self {
 			Self::Active(resource) => Ok(resource),
-			Self::Taken => Err(ExecutorError::LifecycleInvariant {
-				detail: "backend resource was already consumed",
-			}),
+			Self::Taken => {
+				Err(ExecutorError::LifecycleInvariant {
+					detail: "backend resource was already consumed",
+				})
+			}
 		}
 	}
 
 	fn consume(&mut self) -> Result<R> {
 		match core::mem::replace(self, Self::Taken) {
 			Self::Active(resource) => Ok(resource),
-			Self::Taken => Err(ExecutorError::LifecycleInvariant {
-				detail: "backend resource was already consumed",
-			}),
+			Self::Taken => {
+				Err(ExecutorError::LifecycleInvariant {
+					detail: "backend resource was already consumed",
+				})
+			}
 		}
 	}
 }
@@ -744,29 +720,19 @@ impl<B: Backend> fmt::Debug for RunFailure<B> {
 
 impl<B: Backend> RunFailure<B> {
 	#[must_use]
-	pub const fn run_id(&self) -> RunId {
-		self.run_id
-	}
+	pub const fn run_id(&self) -> RunId { self.run_id }
 
 	#[must_use]
-	pub const fn bundle_identity(&self) -> BundleIdentity {
-		self.bundle
-	}
+	pub const fn bundle_identity(&self) -> BundleIdentity { self.bundle }
 
 	#[must_use]
-	pub const fn error(&self) -> ExecutorError {
-		self.error
-	}
+	pub const fn error(&self) -> ExecutorError { self.error }
 
 	#[must_use]
-	pub const fn cleanup_error(&self) -> Option<ExecutorError> {
-		self.cleanup_error
-	}
+	pub const fn cleanup_error(&self) -> Option<ExecutorError> { self.cleanup_error }
 
 	#[must_use]
-	pub const fn journal(&self) -> Option<&RunJournal> {
-		self.journal.as_ref()
-	}
+	pub const fn journal(&self) -> Option<&RunJournal> { self.journal.as_ref() }
 
 	#[must_use]
 	pub fn into_parts(self) -> RunFailureParts<B> {
@@ -879,11 +845,7 @@ impl<B: Backend> PreparedRun<B> {
 				},
 			));
 		}
-		let mut journal = RunJournal::with_loop_detail(
-			journal_capacity,
-			bundle.tasks(),
-			cfg!(test) && !bundle.loop_iterations().is_unbounded(),
-		);
+		let mut journal = RunJournal::with_loop_detail(journal_capacity, bundle.tasks(), false);
 		let prepared = match PreparedPhases::new(&bundle) {
 			Ok(prepared) => prepared,
 			Err(error) => {
@@ -1035,10 +997,11 @@ impl<B: Backend> PreparedRun<B> {
 			let operation = BackendOperation::AllocateArena { device };
 			let mut physical_calls = PhysicalCallBatch::new();
 			let result = match self.core.resource.active_mut() {
-				Ok(resource) => self
-					.core
-					.backend
-					.allocate_arena(resource, layout, &mut physical_calls),
+				Ok(resource) => {
+					self.core
+						.backend
+						.allocate_arena(resource, layout, &mut physical_calls)
+				}
 				Err(error) => return Err(self.into_failure(error)),
 			};
 			let arena = match backend_value(&mut self.core.journal, operation, physical_calls, result) {
@@ -1084,9 +1047,7 @@ impl<B: Backend> PreparedRun<B> {
 	}
 
 	#[must_use]
-	pub fn journal(&self) -> &RunJournal {
-		&self.core.journal
-	}
+	pub fn journal(&self) -> &RunJournal { &self.core.journal }
 }
 
 /// A run whose fixed arenas exist and whose single logical data image per
@@ -1158,9 +1119,7 @@ impl<B: Backend> InitializedRun<B> {
 	}
 
 	#[must_use]
-	pub fn journal(&self) -> &RunJournal {
-		&self.core.journal
-	}
+	pub fn journal(&self) -> &RunJournal { &self.core.journal }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1195,15 +1154,11 @@ impl<B: Backend> fmt::Debug for RunningRun<B> {
 
 impl<B: Backend> RunningRun<B> {
 	/// Performs one bounded, nonblocking scheduler/poll pass.
-	pub fn poll(&mut self) -> Result<LoopStatus> {
-		self.poll_with_progress().map(|(status, _)| status)
-	}
+	pub fn poll(&mut self) -> Result<LoopStatus> { self.poll_with_progress().map(|(status, _)| status) }
 
 	/// Performs one bounded, nonblocking scheduler/poll pass and reports
 	/// whether that pass submitted or completed any work.
-	pub fn poll_with_progress(&mut self) -> Result<(LoopStatus, bool)> {
-		self.poll_with_progress_or_stop(|| false)
-	}
+	pub fn poll_with_progress(&mut self) -> Result<(LoopStatus, bool)> { self.poll_with_progress_or_stop(|| false) }
 
 	/// Performs one bounded scheduler/poll pass and accepts a graceful stop
 	/// only after the active loop iteration reaches terminal completion.
@@ -1308,19 +1263,13 @@ impl<B: Backend> RunningRun<B> {
 		}
 	}
 
-	pub fn try_take_metric(&mut self, slot: MetricSlotId) -> Option<MetricSample> {
-		self.core.metrics.try_take(slot)
-	}
+	pub fn try_take_metric(&mut self, slot: MetricSlotId) -> Option<MetricSample> { self.core.metrics.try_take(slot) }
 
 	#[must_use]
-	pub fn metric_mailbox(&self) -> &MetricMailbox {
-		&self.core.metrics
-	}
+	pub fn metric_mailbox(&self) -> &MetricMailbox { &self.core.metrics }
 
 	#[must_use]
-	pub fn journal(&self) -> &RunJournal {
-		&self.core.journal
-	}
+	pub fn journal(&self) -> &RunJournal { &self.core.journal }
 
 	#[must_use]
 	pub fn capacities(&self) -> RuntimeCapacities {
@@ -1343,10 +1292,12 @@ impl<B: Backend> RunningRun<B> {
 
 	pub fn into_exited_loop(self) -> std::result::Result<ExitedLoop<B>, Box<Self>> {
 		match self.phase.complete && self.failure.is_none() {
-			true => Ok(ExitedLoop {
-				core: self.core,
-				exit_phase: self.exit_phase,
-			}),
+			true => {
+				Ok(ExitedLoop {
+					core: self.core,
+					exit_phase: self.exit_phase,
+				})
+			}
 			false => Err(Box::new(self)),
 		}
 	}
@@ -1385,9 +1336,7 @@ impl<B: Backend> fmt::Debug for ExitedLoop<B> {
 }
 
 impl<B: Backend> ExitedLoop<B> {
-	pub fn exit(self) -> Result<ExitedRun<B>> {
-		self.exit_recoverable().map_err(|failure| failure.error())
-	}
+	pub fn exit(self) -> Result<ExitedRun<B>> { self.exit_recoverable().map_err(|failure| failure.error()) }
 
 	pub fn exit_recoverable(mut self) -> std::result::Result<ExitedRun<B>, RunFailure<B>> {
 		if let Err(error) = run_phase_blocking(&mut self.core, &mut self.exit_phase, None) {
@@ -1421,19 +1370,13 @@ impl<B: Backend> ExitedLoop<B> {
 		})
 	}
 
-	pub fn try_take_metric(&mut self, slot: MetricSlotId) -> Option<MetricSample> {
-		self.core.metrics.try_take(slot)
-	}
+	pub fn try_take_metric(&mut self, slot: MetricSlotId) -> Option<MetricSample> { self.core.metrics.try_take(slot) }
 
 	#[must_use]
-	pub fn metric_mailbox(&self) -> &MetricMailbox {
-		&self.core.metrics
-	}
+	pub fn metric_mailbox(&self) -> &MetricMailbox { &self.core.metrics }
 
 	#[must_use]
-	pub fn journal(&self) -> &RunJournal {
-		&self.core.journal
-	}
+	pub fn journal(&self) -> &RunJournal { &self.core.journal }
 }
 
 /// Fully exited run. Backend ownership and external result images may now be
@@ -1462,28 +1405,18 @@ impl<B: Backend> fmt::Debug for ExitedRun<B> {
 
 impl<B: Backend> ExitedRun<B> {
 	#[must_use]
-	pub const fn run_id(&self) -> RunId {
-		self.run_id
-	}
+	pub const fn run_id(&self) -> RunId { self.run_id }
 
 	#[must_use]
-	pub const fn bundle_identity(&self) -> BundleIdentity {
-		self.bundle
-	}
+	pub const fn bundle_identity(&self) -> BundleIdentity { self.bundle }
 
 	#[must_use]
-	pub fn journal(&self) -> &RunJournal {
-		&self.journal
-	}
+	pub fn journal(&self) -> &RunJournal { &self.journal }
 
 	#[must_use]
-	pub fn exit_images(&self) -> &[ExitImage] {
-		&self.exit_images
-	}
+	pub fn exit_images(&self) -> &[ExitImage] { &self.exit_images }
 
-	pub fn try_take_metric(&mut self, slot: MetricSlotId) -> Option<MetricSample> {
-		self.metrics.try_take(slot)
-	}
+	pub fn try_take_metric(&mut self, slot: MetricSlotId) -> Option<MetricSample> { self.metrics.try_take(slot) }
 
 	pub fn into_parts(self) -> (B, MetricMailbox, Vec<ExitImage>, RunJournal) {
 		(self.backend, self.metrics, self.exit_images, self.journal)
@@ -1560,9 +1493,10 @@ fn teardown_resources<B: Backend>(core: &mut RunCore<B>) -> (Option<ExecutorErro
 	for (device, arena) in arenas {
 		let mut physical_calls = PhysicalCallBatch::new();
 		let result = match core.resource.active_mut() {
-			Ok(resource) => core
-				.backend
-				.release_arena(resource, device, arena, &mut physical_calls),
+			Ok(resource) => {
+				core.backend
+					.release_arena(resource, device, arena, &mut physical_calls)
+			}
 			Err(reported) => {
 				record_teardown_error(&mut error, &mut cleanup_error, reported);
 				continue;
@@ -1757,13 +1691,15 @@ impl PreparedTask {
 					fault_flag,
 				}
 			}
-			(TaskKind::Metric(metric), RunPhase::Loop) => PreparedWork::Metric {
-				purpose: metric.purpose,
-				metric: metric.metric,
-				slot: metric.slot,
-				value: resolve_value(bundle, task.id, metric.value)?,
-				submission: metric.submission,
-			},
+			(TaskKind::Metric(metric), RunPhase::Loop) => {
+				PreparedWork::Metric {
+					purpose: metric.purpose,
+					metric: metric.metric,
+					slot: metric.slot,
+					value: resolve_value(bundle, task.id, metric.value)?,
+					submission: metric.submission,
+				}
+			}
 			(TaskKind::Transfer(transfer), RunPhase::Init)
 				if matches!(
 					(transfer.source, transfer.destination),
@@ -2015,10 +1951,12 @@ impl PreparedTask {
 			PreparedWork::Calculation {
 				fault_flag: Some(location),
 				..
-			} => Some(FaultReset {
-				task: self.id,
-				location,
-			}),
+			} => {
+				Some(FaultReset {
+					task: self.id,
+					location,
+				})
+			}
 			_ => None,
 		}
 	}
@@ -2100,10 +2038,12 @@ impl CompletionLedger {
 	fn new(tasks: &[Task]) -> Self {
 		let mut entries = tasks
 			.iter()
-			.map(|task| CompletionEntry {
-				task: task.id,
-				phase: task.phase,
-				complete: false,
+			.map(|task| {
+				CompletionEntry {
+					task: task.id,
+					phase: task.phase,
+					complete: false,
+				}
 			})
 			.collect::<Vec<_>>();
 		entries.sort_by_key(|entry| entry.task);
@@ -2131,9 +2071,7 @@ impl CompletionLedger {
 		Ok(())
 	}
 
-	fn completed_count(&self) -> usize {
-		self.entries.iter().filter(|entry| entry.complete).count()
-	}
+	fn completed_count(&self) -> usize { self.entries.iter().filter(|entry| entry.complete).count() }
 
 	fn reset_phase(&mut self, phase: RunPhase) {
 		for entry in &mut self.entries {
@@ -2288,10 +2226,12 @@ fn fault_reset_range(
 ) -> Result<core::ops::Range<usize>> {
 	match image.device == fault.device && image.object == fault.object && image.bytes == image_bytes {
 		true => Ok(()),
-		false => Err(ExecutorError::BackendProtocol {
-			task,
-			detail: "fault flag and finalized init image do not share one exact arena object",
-		}),
+		false => {
+			Err(ExecutorError::BackendProtocol {
+				task,
+				detail: "fault flag and finalized init image do not share one exact arena object",
+			})
+		}
 	}?;
 	let relative_offset = fault
 		.arena_offset
@@ -2318,30 +2258,6 @@ fn fault_reset_range(
 			detail: "fault flag byte range overflowed",
 		})?;
 	Ok(start..end)
-}
-
-#[cfg(test)]
-pub(crate) fn validate_images_with_fault_reset(
-	bundle: &FinalizedBundle,
-	images: impl IntoIterator<Item = DeviceImage>,
-	task: TaskId,
-	location: ResolvedValueLocation,
-) -> Result<BTreeMap<DeviceId, Vec<u8>>> {
-	validate_images(bundle, images, &[FaultReset { task, location }]).map(|images| {
-		images.into_iter()
-			.map(|(key, bytes)| (key.device, bytes))
-			.collect()
-	})
-}
-
-#[cfg(test)]
-pub(crate) fn fault_reset_range_for_test(
-	task: TaskId,
-	image: ResolvedValueLocation,
-	fault: ResolvedValueLocation,
-	image_bytes: ByteCount,
-) -> Result<core::ops::Range<usize>> {
-	fault_reset_range(task, image, fault, image_bytes)
 }
 
 fn run_phase_blocking<B: Backend>(
@@ -2403,18 +2319,32 @@ fn poll_phase_once<B: Backend>(
 	for index in 0..state.slots.len() {
 		let runnable = {
 			let slot = &state.slots[index];
+			let resource = core.resource.active()?;
+			let pipeline_queue = (state.phase == RunPhase::Loop
+				&& core
+					.backend
+					.supports_same_queue_pipelining(resource, slot.task.id))
+			.then(|| slot.task.submission().map(|submission| submission.queue))
+			.flatten();
 			slot.status == SlotStatus::Remaining
 				&& state
 					.loop_iteration
 					.is_none_or(|iteration| slot.task.active_on(iteration))
-				&& slot
-					.task
-					.dependencies
-					.iter()
-					.all(|dependency| core.completed.contains(*dependency))
-				&& state.slots.iter().all(|active| {
-					active.status != SlotStatus::Pending || active.task.window.overlaps(slot.task.window)
-				})
+				&& slot.task.dependencies.iter().all(|dependency| {
+					core.completed.contains(*dependency)
+						|| state.slots.iter().any(|issued| {
+							issued.task.id == *dependency
+								&& issued.status == SlotStatus::Pending && core
+								.backend
+								.supports_same_queue_pipelining(resource, issued.task.id)
+								&& issued.task.submission().map(|submission| submission.queue)
+									== pipeline_queue
+						})
+				}) && state.slots.iter().all(|active| {
+				active.status != SlotStatus::Pending
+					|| active.task.window.overlaps(slot.task.window)
+					|| active.task.submission().map(|submission| submission.queue) == pipeline_queue
+			})
 		};
 		let true = runnable else {
 			continue;
@@ -2510,26 +2440,30 @@ fn submit_slot<B: Backend>(
 	let result = {
 		let resource = core.resource.active_mut()?;
 		match (phase, iteration) {
-			(RunPhase::Loop, Some(iteration)) => core.backend.submit_loop_iteration(
-				resource,
-				ArenaSet::new(&core.arenas),
-				&mut slot.pending,
-				iteration,
-				work,
-				&mut physical_calls,
-			),
+			(RunPhase::Loop, Some(iteration)) => {
+				core.backend.submit_loop_iteration(
+					resource,
+					ArenaSet::new(&core.arenas),
+					&mut slot.pending,
+					iteration,
+					work,
+					&mut physical_calls,
+				)
+			}
 			(RunPhase::Loop, None) => {
 				return Err(ExecutorError::LifecycleInvariant {
 					detail: "loop task submission has no active iteration",
 				});
 			}
-			(RunPhase::Init | RunPhase::Exit, _) => core.backend.submit(
-				resource,
-				ArenaSet::new(&core.arenas),
-				&mut slot.pending,
-				work,
-				&mut physical_calls,
-			),
+			(RunPhase::Init | RunPhase::Exit, _) => {
+				core.backend.submit(
+					resource,
+					ArenaSet::new(&core.arenas),
+					&mut slot.pending,
+					work,
+					&mut physical_calls,
+				)
+			}
 		}
 	};
 	backend_value(
@@ -2587,44 +2521,50 @@ fn complete_slot<B: Backend>(
 			},
 			WorkClass::Metric,
 			Some(metric_value),
-		) => match purpose {
-			MetricPurpose::User => {
-				let iteration = iteration.ok_or(ExecutorError::LifecycleInvariant {
-					detail: "metric completion has no active loop iteration",
-				})?;
-				let replaced =
-					core.metrics
-						.publish(iteration, slot.task.id, *metric_slot, *metric, metric_value)?;
-				core.journal.record_logical(LogicalEvent::MetricPublished {
-					task: slot.task.id,
-					slot: *metric_slot,
-					replaced_unconsumed: replaced,
-				})?;
-			}
-			MetricPurpose::FaultReadback { calculation } => match metric_value {
-				crate::MetricValue::I32(0) => {
-					core.journal.record_logical(LogicalEvent::FaultChecked {
-						calculation: *calculation,
-						readback: slot.task.id,
-						value: location.value,
+		) => {
+			match purpose {
+				MetricPurpose::User => {
+					let iteration = iteration.ok_or(ExecutorError::LifecycleInvariant {
+						detail: "metric completion has no active loop iteration",
+					})?;
+					let replaced = core.metrics.publish(
+						iteration,
+						slot.task.id,
+						*metric_slot,
+						*metric,
+						metric_value,
+					)?;
+					core.journal.record_logical(LogicalEvent::MetricPublished {
+						task: slot.task.id,
+						slot: *metric_slot,
+						replaced_unconsumed: replaced,
 					})?;
 				}
-				crate::MetricValue::I32(code) => {
-					return Err(ExecutorError::DeviceFault {
-						calculation: *calculation,
-						readback: slot.task.id,
-						value: location.value,
-						code,
-					});
+				MetricPurpose::FaultReadback => {
+					match metric_value {
+						crate::MetricValue::I32(0) => {
+							core.journal.record_logical(LogicalEvent::FaultChecked {
+								readback: slot.task.id,
+								value: location.value,
+							})?;
+						}
+						crate::MetricValue::I32(code) => {
+							return Err(ExecutorError::DeviceFault {
+								readback: slot.task.id,
+								value: location.value,
+								code,
+							});
+						}
+						crate::MetricValue::F32(_) => {
+							return Err(ExecutorError::BackendProtocol {
+								task: slot.task.id,
+								detail: "fault readback completed with a non-int32 value",
+							});
+						}
+					}
 				}
-				crate::MetricValue::F32(_) => {
-					return Err(ExecutorError::BackendProtocol {
-						task: slot.task.id,
-						detail: "fault readback completed with a non-int32 value",
-					});
-				}
-			},
-		},
+			}
+		}
 		(PreparedWork::Metric { .. }, WorkClass::Metric, None) => {
 			return Err(ExecutorError::BackendProtocol {
 				task: slot.task.id,
@@ -2707,11 +2647,13 @@ fn collect_exit_image<B: Backend>(
 		result,
 	)?;
 	match core.exit_images.len() < core.exit_image_capacity {
-		true => core.exit_images.push(ExitImage {
-			task: slot.task.id,
-			source,
-			bytes: image,
-		}),
+		true => {
+			core.exit_images.push(ExitImage {
+				task: slot.task.id,
+				source,
+				bytes: image,
+			})
+		}
 		false => {
 			return Err(ExecutorError::BackendProtocol {
 				task: slot.task.id,

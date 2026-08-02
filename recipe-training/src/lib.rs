@@ -17,6 +17,7 @@ mod checkpoint;
 mod compile;
 mod error;
 mod execute;
+mod forward;
 mod inference;
 mod knn;
 mod knn_checkpoint;
@@ -51,11 +52,12 @@ pub use execute::{
 	CompletedInferenceExecution, CompletedKnnInferenceExecution, CompletedTrainingExecution, FinalTrainingMetric,
 	InferenceExecutionError, InferenceExecutionLimits, InferenceExecutionResult, InferencePrediction,
 	InferenceRunFailure, KnnInferencePrediction, NativeKernelFormat, RealizedNativeKernel, RealizedNativeKernelSet,
-	TrainingExecutionControl, TrainingExecutionError, TrainingExecutionLimits, TrainingExecutionResult,
-	TrainingMetricObserver, TrainingMetricObserverStats, TrainingMetricSample, bounded_training_metric_channel,
-	build_inference_device_images, build_knn_inference_device_images, build_training_device_images,
-	prepare_and_execute_local_inference, prepare_and_execute_local_knn_inference, prepare_and_execute_local_training,
-	prepare_and_execute_local_training_controlled, prepare_and_execute_local_training_with_observer,
+	TrainingExecutionControl, TrainingExecutionError, TrainingExecutionEvidence, TrainingExecutionLimits,
+	TrainingExecutionResult, TrainingMetricObserver, TrainingMetricObserverStats, TrainingMetricSample,
+	bounded_training_metric_channel, build_inference_device_images, build_knn_inference_device_images,
+	build_training_device_images, prepare_and_execute_local_inference, prepare_and_execute_local_knn_inference,
+	prepare_and_execute_local_training, prepare_and_execute_local_training_controlled,
+	prepare_and_execute_local_training_with_observer,
 };
 pub use inference::{
 	CompiledInference, CompiledKnnInference, GgufLlamaArtifact, GgufLlamaError, GgufLlamaErrorKind, GgufLlamaResult,

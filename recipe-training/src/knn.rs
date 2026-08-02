@@ -7,10 +7,10 @@ use recipe_ingest::{
 };
 use recipe_ops::KnnOutputSpec;
 
-use crate::model::{DenseFeaturePlan, lower_dense_features};
 use crate::{
 	CheckpointArtifactVector, CompiledFeatureSpan, TrainingCompileError, TrainingCompileErrorKind,
 	TrainingCompileResult,
+	model::{DenseFeaturePlan, lower_dense_features},
 };
 
 /// Exact semantic value represented by one calculation-facing KNN class code.
@@ -49,35 +49,31 @@ pub struct KnnReferenceOutput {
 
 impl KnnReferenceOutput {
 	#[must_use]
-	pub const fn schema(&self) -> &CheckpointArtifactVector {
-		&self.schema
-	}
+	pub const fn schema(&self) -> &CheckpointArtifactVector { &self.schema }
 
 	#[must_use]
-	pub fn known(&self) -> &[i32] {
-		&self.known
-	}
+	pub fn known(&self) -> &[i32] { &self.known }
 
 	#[must_use]
-	pub const fn known_references(&self) -> u64 {
-		self.known_references
-	}
+	pub const fn known_references(&self) -> u64 { self.known_references }
 
 	#[must_use]
-	pub const fn values(&self) -> &KnnReferenceValues {
-		&self.values
-	}
+	pub const fn values(&self) -> &KnnReferenceValues { &self.values }
 
 	#[must_use]
 	pub fn operation_spec(&self) -> KnnOutputSpec {
 		match &self.values {
-			KnnReferenceValues::NumericF32Bits(_) => KnnOutputSpec::Numeric {
-				known_references: self.known_references,
-			},
-			KnnReferenceValues::DiscreteI32 { labels, .. } => KnnOutputSpec::Categorical {
-				known_references: self.known_references,
-				classes: u64::try_from(labels.len()).expect("validated KNN label count fits u64"),
-			},
+			KnnReferenceValues::NumericF32Bits(_) => {
+				KnnOutputSpec::Numeric {
+					known_references: self.known_references,
+				}
+			}
+			KnnReferenceValues::DiscreteI32 { labels, .. } => {
+				KnnOutputSpec::Categorical {
+					known_references: self.known_references,
+					classes: u64::try_from(labels.len()).expect("validated KNN label count fits u64"),
+				}
+			}
 		}
 	}
 
@@ -115,49 +111,31 @@ pub struct KnnReferenceSet {
 
 impl KnnReferenceSet {
 	#[must_use]
-	pub const fn neighbors(&self) -> NonZeroU64 {
-		self.neighbors
-	}
+	pub const fn neighbors(&self) -> NonZeroU64 { self.neighbors }
 
 	#[must_use]
-	pub fn vectors(&self) -> &[CheckpointArtifactVector] {
-		&self.vectors
-	}
+	pub fn vectors(&self) -> &[CheckpointArtifactVector] { &self.vectors }
 
 	#[must_use]
-	pub fn feature_spans(&self) -> &[CompiledFeatureSpan] {
-		&self.feature_spans
-	}
+	pub fn feature_spans(&self) -> &[CompiledFeatureSpan] { &self.feature_spans }
 
 	#[must_use]
-	pub fn normalization_mask(&self) -> Option<&[u32]> {
-		self.normalization_mask.as_deref()
-	}
+	pub fn normalization_mask(&self) -> Option<&[u32]> { self.normalization_mask.as_deref() }
 
 	#[must_use]
-	pub fn reference_source_rows(&self) -> &[usize] {
-		&self.reference_source_rows
-	}
+	pub fn reference_source_rows(&self) -> &[usize] { &self.reference_source_rows }
 
 	#[must_use]
-	pub const fn reference_rows(&self) -> usize {
-		self.reference_rows
-	}
+	pub const fn reference_rows(&self) -> usize { self.reference_rows }
 
 	#[must_use]
-	pub const fn feature_width(&self) -> usize {
-		self.feature_width
-	}
+	pub const fn feature_width(&self) -> usize { self.feature_width }
 
 	#[must_use]
-	pub fn reference_feature_bits(&self) -> &[u32] {
-		&self.reference_feature_bits
-	}
+	pub fn reference_feature_bits(&self) -> &[u32] { &self.reference_feature_bits }
 
 	#[must_use]
-	pub fn outputs(&self) -> &[KnnReferenceOutput] {
-		&self.outputs
-	}
+	pub fn outputs(&self) -> &[KnnReferenceOutput] { &self.outputs }
 
 	#[must_use]
 	pub fn operation_specs(&self) -> Vec<KnnOutputSpec> {
@@ -298,31 +276,35 @@ fn prepare_output(dataset: &PreparedDataset, target: &PreparedVector) -> Trainin
 			VectorEncoding::DictionaryI32,
 			VectorMetadata::Categorical { dictionary },
 			PreparedValues::I32(values),
-		) => prepare_indexed_labels(
-			dataset,
-			target,
-			values,
-			dictionary
-				.iter()
-				.cloned()
-				.map(KnnLabelValue::Bytes)
-				.collect(),
-		),
+		) => {
+			prepare_indexed_labels(
+				dataset,
+				target,
+				values,
+				dictionary
+					.iter()
+					.cloned()
+					.map(KnnLabelValue::Bytes)
+					.collect(),
+			)
+		}
 		(
 			SemanticType::Ordinal,
 			VectorEncoding::OrdinalI32,
 			VectorMetadata::Ordinal { ordered_labels },
 			PreparedValues::I32(values),
-		) => prepare_indexed_labels(
-			dataset,
-			target,
-			values,
-			ordered_labels
-				.iter()
-				.cloned()
-				.map(KnnLabelValue::Bytes)
-				.collect(),
-		),
+		) => {
+			prepare_indexed_labels(
+				dataset,
+				target,
+				values,
+				ordered_labels
+					.iter()
+					.cloned()
+					.map(KnnLabelValue::Bytes)
+					.collect(),
+			)
+		}
 		(
 			SemanticType::Temporal,
 			VectorEncoding::RelativeSecondsI32,
@@ -342,16 +324,18 @@ fn prepare_output(dataset: &PreparedDataset, target: &PreparedVector) -> Trainin
 			VectorMetadata::Image { .. },
 			PreparedValues::VariableWidth(values),
 		) => prepare_byte_labels(dataset, target, values),
-		_ => Err(knn_target_error(
-			target,
-			0,
-			format!(
-				"incompatible prepared semantic tuple {:?}/{:?}/{:?}",
-				target.semantic_type(),
-				target.encoding(),
-				target.metadata()
-			),
-		)),
+		_ => {
+			Err(knn_target_error(
+				target,
+				0,
+				format!(
+					"incompatible prepared semantic tuple {:?}/{:?}/{:?}",
+					target.semantic_type(),
+					target.encoding(),
+					target.metadata()
+				),
+			))
+		}
 	}
 }
 
@@ -457,11 +441,10 @@ fn prepare_indexed_labels(
 			}
 		}
 	}
-	finish_output(
-		target,
-		known,
-		KnnReferenceValues::DiscreteI32 { codes, labels },
-	)
+	finish_output(target, known, KnnReferenceValues::DiscreteI32 {
+		codes,
+		labels,
+	})
 }
 
 fn prepare_temporal_labels(
@@ -520,11 +503,10 @@ fn prepare_remapped_i32(
 			}
 		}
 	}
-	finish_output(
-		target,
-		known,
-		KnnReferenceValues::DiscreteI32 { codes, labels },
-	)
+	finish_output(target, known, KnnReferenceValues::DiscreteI32 {
+		codes,
+		labels,
+	})
 }
 
 fn prepare_byte_labels(
@@ -579,11 +561,10 @@ fn prepare_byte_labels(
 			}
 		}
 	}
-	finish_output(
-		target,
-		known,
-		KnnReferenceValues::DiscreteI32 { codes, labels },
-	)
+	finish_output(target, known, KnnReferenceValues::DiscreteI32 {
+		codes,
+		labels,
+	})
 }
 
 fn validate_label_dictionary(target: &PreparedVector, labels: &[KnnLabelValue]) -> TrainingCompileResult<()> {

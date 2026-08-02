@@ -1,11 +1,13 @@
 use std::collections::BTreeSet;
 
-use crate::artifact::TargetIdentity;
-use crate::error::{ValidationCode, ValidationResult, Validator};
-use crate::identity::{DiscoveryIdentity, TopologyIdentity};
-use crate::ids::{DeviceId, LinkId};
-use crate::topology::{DeviceKind, Property, Topology};
-use crate::units::{ByteCount, BytesPerSecond, FlopsPerSecond, TransferLaneCount};
+use crate::{
+	artifact::TargetIdentity,
+	error::{ValidationCode, ValidationResult, Validator},
+	identity::{DiscoveryIdentity, TopologyIdentity},
+	ids::{DeviceId, LinkId},
+	topology::{DeviceKind, Property, Topology},
+	units::{ByteCount, BytesPerSecond, FlopsPerSecond, TransferLaneCount},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CalculationCapability {
@@ -182,12 +184,14 @@ impl DiscoveryProfile {
 							);
 						}
 					}
-					DeviceKind::Ram | DeviceKind::Disk => validator.require(
-						discovered.calculation.is_none(),
-						ValidationCode::WrongKind,
-						format!("devices[{index}].calculation"),
-						"non-GPU storage cannot expose calculation capability",
-					),
+					DeviceKind::Ram | DeviceKind::Disk => {
+						validator.require(
+							discovered.calculation.is_none(),
+							ValidationCode::WrongKind,
+							format!("devices[{index}].calculation"),
+							"non-GPU storage cannot expose calculation capability",
+						)
+					}
 				}
 			}
 		}

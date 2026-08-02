@@ -1,5 +1,7 @@
-use core::fmt;
-use core::num::{NonZeroU32, NonZeroU64};
+use core::{
+	fmt,
+	num::{NonZeroU32, NonZeroU64},
+};
 
 use recipe_core::{DType, IterationDomain, KernelTemplateId, LoopIterations, MetricId, ValueId};
 use recipe_ingest::{
@@ -41,6 +43,53 @@ pub enum DenseActivation {
 	PRelu,
 }
 
+impl DenseActivation {
+	pub(crate) const fn token(self) -> &'static str {
+		match self {
+			Self::Linear => "linear",
+			Self::Cosine => "cosine",
+			Self::Exponential => "exponential",
+			Self::Logarithm => "signed-logarithm",
+			Self::NaturalLogarithm => "natural-logarithm",
+			Self::LegacySignedLogOnePlus => "logarithm",
+			Self::Huber => "huber",
+			Self::Tangent => "tangent",
+			Self::Relu => "relu",
+			Self::LeakyRelu => "leaky-relu",
+			Self::Sigmoid => "sigmoid",
+			Self::Tanh => "tanh",
+			Self::Selu => "selu",
+			Self::Gelu => "gelu",
+			Self::Silu => "silu",
+			Self::Elu => "elu",
+			Self::PRelu => "prelu",
+		}
+	}
+
+	fn from_token(value: &str) -> Option<Self> {
+		Some(match value {
+			"linear" => Self::Linear,
+			"cosine" => Self::Cosine,
+			"exponential" => Self::Exponential,
+			"signed-logarithm" => Self::Logarithm,
+			"natural-logarithm" => Self::NaturalLogarithm,
+			"logarithm" => Self::LegacySignedLogOnePlus,
+			"huber" => Self::Huber,
+			"tangent" => Self::Tangent,
+			"relu" => Self::Relu,
+			"leaky-relu" => Self::LeakyRelu,
+			"sigmoid" => Self::Sigmoid,
+			"tanh" => Self::Tanh,
+			"selu" => Self::Selu,
+			"gelu" => Self::Gelu,
+			"silu" => Self::Silu,
+			"elu" => Self::Elu,
+			"prelu" => Self::PRelu,
+			_ => return None,
+		})
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DenseNormalization {
 	Layer,
@@ -51,6 +100,27 @@ pub enum DenseNormalization {
 pub enum DenseOperation {
 	Activation(DenseActivation),
 	Normalization(DenseNormalization),
+}
+
+impl DenseOperation {
+	pub(crate) const fn token(self) -> &'static str {
+		match self {
+			Self::Activation(activation) => activation.token(),
+			Self::Normalization(DenseNormalization::Layer) => "layer-normalization",
+			Self::Normalization(DenseNormalization::Batch) => "batch-normalization",
+		}
+	}
+
+	pub(crate) fn from_token(value: &str) -> Option<Self> {
+		if let Some(activation) = DenseActivation::from_token(value) {
+			return Some(Self::Activation(activation));
+		}
+		Some(match value {
+			"layer-normalization" => Self::Normalization(DenseNormalization::Layer),
+			"batch-normalization" => Self::Normalization(DenseNormalization::Batch),
+			_ => return None,
+		})
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,14 +169,10 @@ pub enum TrainingHorizon {
 
 impl TrainingHorizon {
 	#[must_use]
-	pub const fn finite(epochs: NonZeroU64) -> Self {
-		Self::Finite(epochs)
-	}
+	pub const fn finite(epochs: NonZeroU64) -> Self { Self::Finite(epochs) }
 
 	#[must_use]
-	pub const fn unbounded() -> Self {
-		Self::Unbounded
-	}
+	pub const fn unbounded() -> Self { Self::Unbounded }
 
 	#[must_use]
 	pub const fn bound(self) -> Option<NonZeroU64> {
@@ -117,9 +183,7 @@ impl TrainingHorizon {
 	}
 
 	#[must_use]
-	pub const fn is_unbounded(self) -> bool {
-		matches!(self, Self::Unbounded)
-	}
+	pub const fn is_unbounded(self) -> bool { matches!(self, Self::Unbounded) }
 
 	#[must_use]
 	pub const fn loop_iterations(self) -> LoopIterations {
@@ -131,9 +195,7 @@ impl TrainingHorizon {
 }
 
 impl From<NonZeroU64> for TrainingHorizon {
-	fn from(epochs: NonZeroU64) -> Self {
-		Self::Finite(epochs)
-	}
+	fn from(epochs: NonZeroU64) -> Self { Self::Finite(epochs) }
 }
 
 impl fmt::Display for TrainingHorizon {
@@ -184,19 +246,13 @@ impl DenseLayer {
 	}
 
 	#[must_use]
-	pub const fn kind(&self) -> DenseBlockKind {
-		self.kind
-	}
+	pub const fn kind(&self) -> DenseBlockKind { self.kind }
 
 	#[must_use]
-	pub const fn width(&self) -> NonZeroU64 {
-		self.width
-	}
+	pub const fn width(&self) -> NonZeroU64 { self.width }
 
 	#[must_use]
-	pub fn operations(&self) -> &[DenseOperation] {
-		&self.operations
-	}
+	pub fn operations(&self) -> &[DenseOperation] { &self.operations }
 }
 
 /// One valid, stride-one one-dimensional convolution block.
@@ -238,19 +294,13 @@ impl DenseConvolution {
 	}
 
 	#[must_use]
-	pub const fn filters(&self) -> NonZeroU64 {
-		self.filters
-	}
+	pub const fn filters(&self) -> NonZeroU64 { self.filters }
 
 	#[must_use]
-	pub const fn kernel(&self) -> NonZeroU64 {
-		self.kernel
-	}
+	pub const fn kernel(&self) -> NonZeroU64 { self.kernel }
 
 	#[must_use]
-	pub fn operations(&self) -> &[DenseOperation] {
-		&self.operations
-	}
+	pub fn operations(&self) -> &[DenseOperation] { &self.operations }
 }
 
 /// Resolved logical shape of one convolution block.
@@ -282,29 +332,19 @@ impl DenseConvolutionGeometry {
 	}
 
 	#[must_use]
-	pub const fn input_length(self) -> NonZeroU64 {
-		self.input_length
-	}
+	pub const fn input_length(self) -> NonZeroU64 { self.input_length }
 
 	#[must_use]
-	pub const fn input_channels(self) -> NonZeroU64 {
-		self.input_channels
-	}
+	pub const fn input_channels(self) -> NonZeroU64 { self.input_channels }
 
 	#[must_use]
-	pub const fn output_length(self) -> NonZeroU64 {
-		self.output_length
-	}
+	pub const fn output_length(self) -> NonZeroU64 { self.output_length }
 
 	#[must_use]
-	pub const fn filters(self) -> NonZeroU64 {
-		self.filters
-	}
+	pub const fn filters(self) -> NonZeroU64 { self.filters }
 
 	#[must_use]
-	pub const fn kernel(self) -> NonZeroU64 {
-		self.kernel
-	}
+	pub const fn kernel(self) -> NonZeroU64 { self.kernel }
 
 	#[must_use]
 	pub fn input_width(self) -> Option<NonZeroU64> {
@@ -356,14 +396,10 @@ impl DensePool {
 	}
 
 	#[must_use]
-	pub const fn size(self) -> NonZeroU64 {
-		self.size
-	}
+	pub const fn size(self) -> NonZeroU64 { self.size }
 
 	#[must_use]
-	pub const fn group_to_neuron(self) -> Option<NonZeroU64> {
-		self.group_to_neuron
-	}
+	pub const fn group_to_neuron(self) -> Option<NonZeroU64> { self.group_to_neuron }
 
 	#[must_use]
 	pub fn routing(self, groups: NonZeroU64) -> Option<DenseGroupToNeuronRouting> {
@@ -404,14 +440,10 @@ impl DenseEmbedding {
 	}
 
 	#[must_use]
-	pub const fn dimensions(self) -> NonZeroU64 {
-		self.dimensions
-	}
+	pub const fn dimensions(self) -> NonZeroU64 { self.dimensions }
 
 	#[must_use]
-	pub const fn vocabulary(self) -> NonZeroU64 {
-		self.vocabulary
-	}
+	pub const fn vocabulary(self) -> NonZeroU64 { self.vocabulary }
 }
 
 /// One causal multi-head self-attention block over the immediately preceding
@@ -427,14 +459,10 @@ pub struct DenseAttention {
 
 impl DenseAttention {
 	#[must_use]
-	pub const fn new(heads: NonZeroU64) -> Self {
-		Self { heads }
-	}
+	pub const fn new(heads: NonZeroU64) -> Self { Self { heads } }
 
 	#[must_use]
-	pub const fn heads(self) -> NonZeroU64 {
-		self.heads
-	}
+	pub const fn heads(self) -> NonZeroU64 { self.heads }
 }
 
 /// One vanilla recurrent block over the numeric feature-column sequence.
@@ -449,14 +477,10 @@ pub struct DenseRnn {
 
 impl DenseRnn {
 	#[must_use]
-	pub const fn new(width: NonZeroU64) -> Self {
-		Self { width }
-	}
+	pub const fn new(width: NonZeroU64) -> Self { Self { width } }
 
 	#[must_use]
-	pub const fn width(self) -> NonZeroU64 {
-		self.width
-	}
+	pub const fn width(self) -> NonZeroU64 { self.width }
 }
 
 /// One reset-before gated recurrent-unit block over the numeric
@@ -472,14 +496,10 @@ pub struct DenseGru {
 
 impl DenseGru {
 	#[must_use]
-	pub const fn new(width: NonZeroU64) -> Self {
-		Self { width }
-	}
+	pub const fn new(width: NonZeroU64) -> Self { Self { width } }
 
 	#[must_use]
-	pub const fn width(self) -> NonZeroU64 {
-		self.width
-	}
+	pub const fn width(self) -> NonZeroU64 { self.width }
 }
 
 /// One gated long short-term memory block over the numeric feature-column
@@ -495,14 +515,10 @@ pub struct DenseLstm {
 
 impl DenseLstm {
 	#[must_use]
-	pub const fn new(width: NonZeroU64) -> Self {
-		Self { width }
-	}
+	pub const fn new(width: NonZeroU64) -> Self { Self { width } }
 
 	#[must_use]
-	pub const fn width(self) -> NonZeroU64 {
-		self.width
-	}
+	pub const fn width(self) -> NonZeroU64 { self.width }
 }
 
 impl DenseKMeans {
@@ -515,14 +531,10 @@ impl DenseKMeans {
 	}
 
 	#[must_use]
-	pub const fn clusters(self) -> NonZeroU64 {
-		self.clusters
-	}
+	pub const fn clusters(self) -> NonZeroU64 { self.clusters }
 
 	#[must_use]
-	pub const fn group_to_neuron(self) -> Option<NonZeroU64> {
-		self.group_to_neuron
-	}
+	pub const fn group_to_neuron(self) -> Option<NonZeroU64> { self.group_to_neuron }
 
 	#[must_use]
 	pub fn routing(self) -> Option<DenseGroupToNeuronRouting> {
@@ -566,19 +578,13 @@ impl DenseTree {
 	}
 
 	#[must_use]
-	pub const fn family(self) -> DenseTreeFamily {
-		self.family
-	}
+	pub const fn family(self) -> DenseTreeFamily { self.family }
 
 	#[must_use]
-	pub const fn trees(self) -> NonZeroU64 {
-		self.trees
-	}
+	pub const fn trees(self) -> NonZeroU64 { self.trees }
 
 	#[must_use]
-	pub const fn depth(self) -> NonZeroU32 {
-		self.depth
-	}
+	pub const fn depth(self) -> NonZeroU32 { self.depth }
 }
 
 /// Recipe's shared connection rule from reduced groups to a following dense
@@ -668,29 +674,19 @@ impl DensePoolState {
 	}
 
 	#[must_use]
-	pub const fn input_length(self) -> NonZeroU64 {
-		self.input_length
-	}
+	pub const fn input_length(self) -> NonZeroU64 { self.input_length }
 
 	#[must_use]
-	pub const fn channels(self) -> NonZeroU64 {
-		self.channels
-	}
+	pub const fn channels(self) -> NonZeroU64 { self.channels }
 
 	#[must_use]
-	pub const fn output_length(self) -> NonZeroU64 {
-		self.output_length
-	}
+	pub const fn output_length(self) -> NonZeroU64 { self.output_length }
 
 	#[must_use]
-	pub const fn group_order(self) -> DensePoolGroupOrder {
-		self.group_order
-	}
+	pub const fn group_order(self) -> DensePoolGroupOrder { self.group_order }
 
 	#[must_use]
-	pub const fn winner_contract(self) -> DensePoolWinnerContract {
-		self.winner_contract
-	}
+	pub const fn winner_contract(self) -> DensePoolWinnerContract { self.winner_contract }
 
 	#[must_use]
 	pub fn input_width(self) -> Option<NonZeroU64> {
@@ -727,23 +723,17 @@ pub enum DenseResidualOperation {
 }
 
 impl From<DenseLayer> for DenseResidualOperation {
-	fn from(layer: DenseLayer) -> Self {
-		Self::Layer(layer)
-	}
+	fn from(layer: DenseLayer) -> Self { Self::Layer(layer) }
 }
 
 impl From<DenseOperation> for DenseResidualOperation {
-	fn from(operation: DenseOperation) -> Self {
-		Self::Operation(operation)
-	}
+	fn from(operation: DenseOperation) -> Self { Self::Operation(operation) }
 }
 
 impl DenseResidual {
 	#[must_use]
 	pub fn new<T>(branch: impl IntoIterator<Item = T>, operations: impl IntoIterator<Item = DenseOperation>) -> Self
-	where
-		T: Into<DenseResidualOperation>,
-	{
+	where T: Into<DenseResidualOperation> {
 		Self {
 			branch: branch.into_iter().map(Into::into).collect(),
 			operations: operations.into_iter().collect(),
@@ -751,24 +741,19 @@ impl DenseResidual {
 	}
 
 	#[must_use]
-	pub fn branch(&self) -> &[DenseResidualOperation] {
-		&self.branch
-	}
+	pub fn branch(&self) -> &[DenseResidualOperation] { &self.branch }
 
 	#[must_use]
-	pub fn operations(&self) -> &[DenseOperation] {
-		&self.operations
-	}
+	pub fn operations(&self) -> &[DenseOperation] { &self.operations }
 
 	#[must_use]
 	pub fn output_width(&self) -> Option<NonZeroU64> {
-		self.branch
-			.iter()
-			.rev()
-			.find_map(|operation| match operation {
+		self.branch.iter().rev().find_map(|operation| {
+			match operation {
 				DenseResidualOperation::Layer(layer) => Some(layer.width()),
 				DenseResidualOperation::Operation(_) => None,
-			})
+			}
+		})
 	}
 }
 
@@ -823,63 +808,43 @@ impl DenseBlock {
 }
 
 impl From<DenseEmbedding> for DenseBlock {
-	fn from(embedding: DenseEmbedding) -> Self {
-		Self::Embedding(embedding)
-	}
+	fn from(embedding: DenseEmbedding) -> Self { Self::Embedding(embedding) }
 }
 
 impl From<DenseAttention> for DenseBlock {
-	fn from(attention: DenseAttention) -> Self {
-		Self::Attention(attention)
-	}
+	fn from(attention: DenseAttention) -> Self { Self::Attention(attention) }
 }
 
 impl From<DenseRnn> for DenseBlock {
-	fn from(rnn: DenseRnn) -> Self {
-		Self::Rnn(rnn)
-	}
+	fn from(rnn: DenseRnn) -> Self { Self::Rnn(rnn) }
 }
 
 impl From<DenseGru> for DenseBlock {
-	fn from(gru: DenseGru) -> Self {
-		Self::Gru(gru)
-	}
+	fn from(gru: DenseGru) -> Self { Self::Gru(gru) }
 }
 
 impl From<DenseLstm> for DenseBlock {
-	fn from(lstm: DenseLstm) -> Self {
-		Self::Lstm(lstm)
-	}
+	fn from(lstm: DenseLstm) -> Self { Self::Lstm(lstm) }
 }
 
 impl From<DenseLayer> for DenseBlock {
-	fn from(layer: DenseLayer) -> Self {
-		Self::Layer(layer)
-	}
+	fn from(layer: DenseLayer) -> Self { Self::Layer(layer) }
 }
 
 impl From<DensePool> for DenseBlock {
-	fn from(pool: DensePool) -> Self {
-		Self::Pool(pool)
-	}
+	fn from(pool: DensePool) -> Self { Self::Pool(pool) }
 }
 
 impl From<DenseKMeans> for DenseBlock {
-	fn from(kmeans: DenseKMeans) -> Self {
-		Self::KMeans(kmeans)
-	}
+	fn from(kmeans: DenseKMeans) -> Self { Self::KMeans(kmeans) }
 }
 
 impl From<DenseConvolution> for DenseBlock {
-	fn from(convolution: DenseConvolution) -> Self {
-		Self::Convolution(convolution)
-	}
+	fn from(convolution: DenseConvolution) -> Self { Self::Convolution(convolution) }
 }
 
 impl From<DenseTree> for DenseBlock {
-	fn from(tree: DenseTree) -> Self {
-		Self::Tree(tree)
-	}
+	fn from(tree: DenseTree) -> Self { Self::Tree(tree) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -986,14 +951,10 @@ impl DenseOutputAdapter {
 	}
 
 	#[must_use]
-	pub const fn source_width(self) -> NonZeroU64 {
-		self.source_width
-	}
+	pub const fn source_width(self) -> NonZeroU64 { self.source_width }
 
 	#[must_use]
-	pub const fn target_width(self) -> NonZeroU64 {
-		self.target_width
-	}
+	pub const fn target_width(self) -> NonZeroU64 { self.target_width }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1029,24 +990,16 @@ impl CompiledFeatureSpan {
 	}
 
 	#[must_use]
-	pub const fn source_vector(&self) -> usize {
-		self.source_vector
-	}
+	pub const fn source_vector(&self) -> usize { self.source_vector }
 
 	#[must_use]
-	pub const fn start(&self) -> usize {
-		self.start
-	}
+	pub const fn start(&self) -> usize { self.start }
 
 	#[must_use]
-	pub const fn width(&self) -> usize {
-		self.width
-	}
+	pub const fn width(&self) -> usize { self.width }
 
 	#[must_use]
-	pub const fn lowering(&self) -> DenseFeatureLowering {
-		self.lowering
-	}
+	pub const fn lowering(&self) -> DenseFeatureLowering { self.lowering }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1117,54 +1070,36 @@ impl CompiledDatasetSchema {
 	}
 
 	#[must_use]
-	pub fn vectors(&self) -> &[VectorSchema] {
-		&self.vectors
-	}
+	pub fn vectors(&self) -> &[VectorSchema] { &self.vectors }
 
 	#[must_use]
-	pub fn features(&self) -> &[CompiledFeatureSpan] {
-		&self.features
-	}
+	pub fn features(&self) -> &[CompiledFeatureSpan] { &self.features }
 
 	#[must_use]
-	pub fn target(&self) -> usize {
-		self.targets[0]
-	}
+	pub fn target(&self) -> usize { self.targets[0] }
 
 	/// Target source identities in the user's declaration order.
 	#[must_use]
-	pub fn targets(&self) -> &[usize] {
-		&self.targets
-	}
+	pub fn targets(&self) -> &[usize] { &self.targets }
 
 	/// Smallest fixed-width dtype selected by semantic distillation for the
 	/// target vector. Loss calculations may consume an explicit conversion,
 	/// but this source contract never changes.
 	#[must_use]
-	pub fn target_dtype(&self) -> DType {
-		self.target_dtypes[0]
-	}
+	pub fn target_dtype(&self) -> DType { self.target_dtypes[0] }
 
 	/// Calculation-facing source dtypes in declared-target order.
 	#[must_use]
-	pub fn target_dtypes(&self) -> &[DType] {
-		&self.target_dtypes
-	}
+	pub fn target_dtypes(&self) -> &[DType] { &self.target_dtypes }
 
 	#[must_use]
-	pub const fn input_width(&self) -> usize {
-		self.input_width
-	}
+	pub const fn input_width(&self) -> usize { self.input_width }
 
 	#[must_use]
-	pub const fn task(&self) -> DenseTask {
-		self.task
-	}
+	pub const fn task(&self) -> DenseTask { self.task }
 
 	#[must_use]
-	pub const fn output_width(&self) -> usize {
-		self.task.output_width()
-	}
+	pub const fn output_width(&self) -> usize { self.task.output_width() }
 
 	/// Decode one multiclass output index under the fitted target dictionary.
 	///
@@ -1305,14 +1240,10 @@ impl DenseFeaturePlan {
 	}
 
 	#[must_use]
-	pub(crate) fn spans(&self) -> &[CompiledFeatureSpan] {
-		&self.spans
-	}
+	pub(crate) fn spans(&self) -> &[CompiledFeatureSpan] { &self.spans }
 
 	#[must_use]
-	pub(crate) fn normalization_mask(&self) -> Option<&[u32]> {
-		self.normalization_mask.as_deref()
-	}
+	pub(crate) fn normalization_mask(&self) -> Option<&[u32]> { self.normalization_mask.as_deref() }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1347,24 +1278,16 @@ impl DensePartition {
 	}
 
 	#[must_use]
-	pub const fn features(&self) -> &DenseMatrix {
-		&self.features
-	}
+	pub const fn features(&self) -> &DenseMatrix { &self.features }
 
 	#[must_use]
-	pub const fn targets(&self) -> &DenseMatrix {
-		&self.targets
-	}
+	pub const fn targets(&self) -> &DenseMatrix { &self.targets }
 
 	#[must_use]
-	pub const fn rows(&self) -> usize {
-		self.features.rows()
-	}
+	pub const fn rows(&self) -> usize { self.features.rows() }
 
 	#[must_use]
-	pub const fn feature_columns(&self) -> usize {
-		self.features.columns()
-	}
+	pub const fn feature_columns(&self) -> usize { self.features.columns() }
 
 	#[must_use]
 	pub fn all_targets_known(&self) -> bool {
@@ -1384,9 +1307,11 @@ impl DensePartition {
 			values: self
 				.target_observations
 				.iter()
-				.map(|observation| match observation {
-					TargetObservation::Known => 1.0_f32.to_bits(),
-					TargetObservation::Missing | TargetObservation::Unseen => 0.0_f32.to_bits(),
+				.map(|observation| {
+					match observation {
+						TargetObservation::Known => 1.0_f32.to_bits(),
+						TargetObservation::Missing | TargetObservation::Unseen => 0.0_f32.to_bits(),
+					}
 				})
 				.collect(),
 		}
@@ -1407,11 +1332,10 @@ impl DensePartition {
 		}
 		let features = compact_dense_rows(&self.features, &retained_rows, "validation feature")?;
 		let targets = compact_dense_rows(&self.targets, &retained_rows, "validation target")?;
-		Self::new(
-			features,
-			targets,
-			vec![TargetObservation::Known; retained_rows.len()],
-		)
+		Self::new(features, targets, vec![
+			TargetObservation::Known;
+			retained_rows.len()
+		])
 		.map(Some)
 	}
 }
@@ -1489,19 +1413,13 @@ impl LoweredDenseDataset {
 	}
 
 	#[must_use]
-	pub const fn train(&self) -> &DensePartition {
-		&self.train
-	}
+	pub const fn train(&self) -> &DensePartition { &self.train }
 
 	#[must_use]
-	pub const fn validation(&self) -> Option<&DensePartition> {
-		self.validation.as_ref()
-	}
+	pub const fn validation(&self) -> Option<&DensePartition> { self.validation.as_ref() }
 
 	#[must_use]
-	pub const fn validation_split_rows(&self) -> usize {
-		self.validation_split_rows
-	}
+	pub const fn validation_split_rows(&self) -> usize { self.validation_split_rows }
 }
 
 fn lower_dense_targets(
@@ -1585,11 +1503,13 @@ fn lower_dense_targets(
 				observations,
 			})
 		}
-		PreparedValues::VariableWidth(_) => Err(target_lowering_error(
-			target.name(),
-			0,
-			"dense target cannot use variable-width storage",
-		)),
+		PreparedValues::VariableWidth(_) => {
+			Err(target_lowering_error(
+				target.name(),
+				0,
+				"dense target cannot use variable-width storage",
+			))
+		}
 	}
 }
 
@@ -1871,10 +1791,12 @@ fn lower_i32_target(
 		}
 		DenseTask::MultiTargetBinaryClassification { .. }
 		| DenseTask::JointMulticlassClassification { .. }
-		| DenseTask::MultiTargetRegression { .. } => Err(TrainingCompileError::new(
-			TrainingCompileErrorKind::InvalidTargetMatrix,
-			"multi-target task reached singular int32 target lowering",
-		)),
+		| DenseTask::MultiTargetRegression { .. } => {
+			Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidTargetMatrix,
+				"multi-target task reached singular int32 target lowering",
+			))
+		}
 	}
 }
 
@@ -2118,21 +2040,24 @@ fn lower_numeric_feature(
 			}
 			Ok(converted.to_bits())
 		}
-		PreparedValues::F32Bits(values) => values
-			.get(retained_position)
-			.ok_or_else(|| {
-				feature_lowering_error(
-					feature.name(),
-					source_row,
-					"numeric value is absent from the prepared vector",
-				)
-			})?
-			.ok_or_else(|| feature_lowering_error(feature.name(), source_row, "numeric value is missing")),
-		PreparedValues::VariableWidth(_) => Err(feature_lowering_error(
-			feature.name(),
-			source_row,
-			"numeric feature unexpectedly contains variable-width values",
-		)),
+		PreparedValues::F32Bits(values) => {
+			values.get(retained_position)
+				.ok_or_else(|| {
+					feature_lowering_error(
+						feature.name(),
+						source_row,
+						"numeric value is absent from the prepared vector",
+					)
+				})?
+				.ok_or_else(|| feature_lowering_error(feature.name(), source_row, "numeric value is missing"))
+		}
+		PreparedValues::VariableWidth(_) => {
+			Err(feature_lowering_error(
+				feature.name(),
+				source_row,
+				"numeric feature unexpectedly contains variable-width values",
+			))
+		}
 	}
 }
 
@@ -2256,9 +2181,7 @@ impl BinaryValidationConfig {
 	}
 
 	#[must_use]
-	pub const fn calibration_bins(&self) -> NonZeroU32 {
-		self.calibration_bins
-	}
+	pub const fn calibration_bins(&self) -> NonZeroU32 { self.calibration_bins }
 
 	#[must_use]
 	pub fn recall_thresholds(&self) -> impl ExactSizeIterator<Item = f32> + '_ {
@@ -2269,9 +2192,7 @@ impl BinaryValidationConfig {
 	}
 
 	#[must_use]
-	pub const fn temperature_scaling(&self) -> Option<TemperatureScalingConfig> {
-		self.temperature_scaling
-	}
+	pub const fn temperature_scaling(&self) -> Option<TemperatureScalingConfig> { self.temperature_scaling }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2314,29 +2235,19 @@ pub struct OwnedExternalInput {
 
 impl OwnedExternalInput {
 	#[must_use]
-	pub const fn role(&self) -> ExternalInputRole {
-		self.role
-	}
+	pub const fn role(&self) -> ExternalInputRole { self.role }
 
 	#[must_use]
-	pub const fn value(&self) -> ValueId {
-		self.value
-	}
+	pub const fn value(&self) -> ValueId { self.value }
 
 	#[must_use]
-	pub const fn dtype(&self) -> DType {
-		self.dtype
-	}
+	pub const fn dtype(&self) -> DType { self.dtype }
 
 	#[must_use]
-	pub const fn shape(&self) -> &Shape {
-		&self.shape
-	}
+	pub const fn shape(&self) -> &Shape { &self.shape }
 
 	#[must_use]
-	pub fn bytes(&self) -> &[u8] {
-		&self.bytes
-	}
+	pub fn bytes(&self) -> &[u8] { &self.bytes }
 
 	pub(crate) fn new(role: ExternalInputRole, value: ValueId, dtype: DType, shape: Shape, bytes: Vec<u8>) -> Self {
 		Self {
@@ -2615,6 +2526,89 @@ pub struct TrainingOutputs {
 	pub metric_bindings: Vec<TrainingMetricBinding>,
 }
 
+impl TrainingOutputs {
+	pub(crate) fn visit_parameter_states(&self, mut visit: impl FnMut(ParameterState)) {
+		if self.blocks.is_empty() {
+			for layer in &self.layers {
+				visit_layer_parameter_states(layer, &mut visit);
+			}
+			return;
+		}
+		for block in &self.blocks {
+			match block {
+				DenseBlockState::Embedding(state) => visit(state.table),
+				DenseBlockState::Attention(state) => {
+					for parameter in [state.query, state.key, state.value, state.output] {
+						visit(parameter);
+					}
+				}
+				DenseBlockState::Rnn(state) => {
+					for parameter in [state.input_weight, state.recurrent_weight, state.bias] {
+						visit(parameter);
+					}
+				}
+				DenseBlockState::Gru(state) => {
+					for parameter in [
+						state.reset_input_weight,
+						state.reset_recurrent_weight,
+						state.reset_bias,
+						state.update_input_weight,
+						state.update_recurrent_weight,
+						state.update_bias,
+						state.candidate_input_weight,
+						state.candidate_recurrent_weight,
+						state.candidate_bias,
+					] {
+						visit(parameter);
+					}
+				}
+				DenseBlockState::Lstm(state) => {
+					for parameter in [
+						state.input_gate_input_weight,
+						state.input_gate_recurrent_weight,
+						state.input_gate_bias,
+						state.forget_gate_input_weight,
+						state.forget_gate_recurrent_weight,
+						state.forget_gate_bias,
+						state.output_gate_input_weight,
+						state.output_gate_recurrent_weight,
+						state.output_gate_bias,
+						state.candidate_input_weight,
+						state.candidate_recurrent_weight,
+						state.candidate_bias,
+					] {
+						visit(parameter);
+					}
+				}
+				DenseBlockState::Layer(state) => visit_layer_parameter_states(state, &mut visit),
+				DenseBlockState::Convolution(state) => {
+					visit(state.weight);
+					visit(state.bias);
+					state.prelu.iter().copied().for_each(&mut visit);
+				}
+				DenseBlockState::Pool(_) | DenseBlockState::KMeans(_) => {}
+				DenseBlockState::Tree(state) => visit(state.leaf_values),
+				DenseBlockState::Residual(state) => {
+					for layer in &state.branch {
+						visit_layer_parameter_states(layer, &mut visit);
+					}
+					state.branch_prelu.iter().copied().for_each(&mut visit);
+					if let Some(projection) = state.projection {
+						visit(projection);
+					}
+					state.prelu.iter().copied().for_each(&mut visit);
+				}
+			}
+		}
+	}
+}
+
+fn visit_layer_parameter_states(layer: &DenseLayerState, visit: &mut impl FnMut(ParameterState)) {
+	visit(layer.weight);
+	visit(layer.bias);
+	layer.prelu.iter().copied().for_each(visit);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrainingMetricKind {
 	TrainingLoss,
@@ -2646,9 +2640,7 @@ pub struct RecallMetricOutput {
 
 impl RecallMetricOutput {
 	#[must_use]
-	pub const fn threshold(self) -> f32 {
-		f32::from_bits(self.threshold_bits)
-	}
+	pub const fn threshold(self) -> f32 { f32::from_bits(self.threshold_bits) }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2718,54 +2710,34 @@ pub struct CompiledTraining {
 
 impl CompiledTraining {
 	#[must_use]
-	pub const fn graph(&self) -> &CalculationGraph {
-		self.program.graph()
-	}
+	pub const fn graph(&self) -> &CalculationGraph { self.program.graph() }
 
 	#[must_use]
-	pub const fn program(&self) -> &StaticCalculationProgram {
-		&self.program
-	}
+	pub const fn program(&self) -> &StaticCalculationProgram { &self.program }
 
 	#[must_use]
-	pub fn external_inputs(&self) -> &[OwnedExternalInput] {
-		&self.external_inputs
-	}
+	pub fn external_inputs(&self) -> &[OwnedExternalInput] { &self.external_inputs }
 
 	#[must_use]
-	pub const fn bounds(&self) -> TrainingBounds {
-		self.bounds
-	}
+	pub const fn bounds(&self) -> TrainingBounds { self.bounds }
 
 	#[must_use]
-	pub const fn outputs(&self) -> &TrainingOutputs {
-		&self.outputs
-	}
+	pub const fn outputs(&self) -> &TrainingOutputs { &self.outputs }
 
 	#[must_use]
-	pub const fn dataset_schema(&self) -> &CompiledDatasetSchema {
-		&self.dataset_schema
-	}
+	pub const fn dataset_schema(&self) -> &CompiledDatasetSchema { &self.dataset_schema }
 
 	#[must_use]
-	pub const fn config(&self) -> &DenseTrainingConfig {
-		&self.config
-	}
+	pub const fn config(&self) -> &DenseTrainingConfig { &self.config }
 
 	#[must_use]
-	pub fn layers(&self) -> &[DenseLayer] {
-		&self.layers
-	}
+	pub fn layers(&self) -> &[DenseLayer] { &self.layers }
 
 	#[must_use]
-	pub fn blocks(&self) -> &[DenseBlock] {
-		&self.blocks
-	}
+	pub fn blocks(&self) -> &[DenseBlock] { &self.blocks }
 
 	#[must_use]
-	pub const fn output_adapter(&self) -> Option<DenseOutputAdapter> {
-		self.output_adapter
-	}
+	pub const fn output_adapter(&self) -> Option<DenseOutputAdapter> { self.output_adapter }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2846,17 +2818,19 @@ fn validate_matrix_storage(matrix: &DenseMatrix, role: &str) -> TrainingCompileR
 
 pub(crate) fn validate_binary_targets(targets: &DenseMatrix) -> TrainingCompileResult<()> {
 	let invalid = match targets {
-		DenseMatrix::I32 { values, .. } => values
-			.iter()
-			.copied()
-			.find(|value| !matches!(value, 0 | 1))
-			.map(|value| value.to_string()),
-		DenseMatrix::F32Bits { values, .. } => values
-			.iter()
-			.copied()
-			.map(f32::from_bits)
-			.find(|value| *value != 0.0 && *value != 1.0)
-			.map(|value| value.to_string()),
+		DenseMatrix::I32 { values, .. } => {
+			values.iter()
+				.copied()
+				.find(|value| !matches!(value, 0 | 1))
+				.map(|value| value.to_string())
+		}
+		DenseMatrix::F32Bits { values, .. } => {
+			values.iter()
+				.copied()
+				.map(f32::from_bits)
+				.find(|value| *value != 0.0 && *value != 1.0)
+				.map(|value| value.to_string())
+		}
 	};
 	if let Some(value) = invalid {
 		return Err(TrainingCompileError::new(
@@ -2865,81 +2839,4 @@ pub(crate) fn validate_binary_targets(targets: &DenseMatrix) -> TrainingCompileR
 		));
 	}
 	Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	fn nonzero(value: u64) -> NonZeroU64 {
-		NonZeroU64::new(value).expect("test value is nonzero")
-	}
-
-	#[test]
-	fn group_to_neuron_routing_uses_divisible_ranges_and_full_fallback() {
-		assert_eq!(
-			DenseGroupToNeuronRouting::resolve(nonzero(4), nonzero(4)),
-			DenseGroupToNeuronRouting::Identity { width: nonzero(4) }
-		);
-		assert_eq!(
-			DenseGroupToNeuronRouting::resolve(nonzero(4), nonzero(8)),
-			DenseGroupToNeuronRouting::Expand {
-				groups: nonzero(4),
-				neurons: nonzero(8),
-				neurons_per_group: nonzero(2),
-			}
-		);
-		assert_eq!(
-			DenseGroupToNeuronRouting::resolve(nonzero(8), nonzero(4)),
-			DenseGroupToNeuronRouting::Contract {
-				groups: nonzero(8),
-				neurons: nonzero(4),
-				groups_per_neuron: nonzero(2),
-			}
-		);
-		assert_eq!(
-			DenseGroupToNeuronRouting::resolve(nonzero(5), nonzero(8)),
-			DenseGroupToNeuronRouting::FullyConnected {
-				groups: nonzero(5),
-				neurons: nonzero(8),
-			}
-		);
-	}
-
-	#[test]
-	fn pool_state_preserves_logical_shape_order_and_winner_contract() {
-		let state = DensePoolState::new(nonzero(7), nonzero(3), nonzero(3));
-		assert_eq!(state.input_width(), Some(nonzero(21)));
-		assert_eq!(state.output_width(), Some(nonzero(9)));
-		assert_eq!(state.logical_input_shape(nonzero(2)), [2, 7, 3]);
-		assert_eq!(state.logical_output_shape(nonzero(2)), [2, 3, 3]);
-		assert_eq!(
-			state.group_order(),
-			DensePoolGroupOrder::GroupMajorChannelMinor
-		);
-		assert_eq!(
-			state.winner_contract(),
-			DensePoolWinnerContract::LowestLogicalIndex
-		);
-	}
-
-	#[test]
-	fn categorical_codes_preserve_the_reserved_route_and_reject_corruption() {
-		assert_eq!(categorical_code_index(0, 3, b"color", 7).unwrap(), 0);
-		assert_eq!(categorical_code_index(2, 3, b"color", 7).unwrap(), 2);
-		assert_eq!(categorical_code_index(3, 3, b"color", 7).unwrap(), 3);
-
-		let negative = categorical_code_index(-1, 3, b"color", 7).unwrap_err();
-		assert_eq!(
-			negative.kind,
-			TrainingCompileErrorKind::InvalidFeatureMatrix
-		);
-		assert!(negative.detail.contains("negative category code -1"));
-		let overflow = categorical_code_index(4, 3, b"color", 7).unwrap_err();
-		assert_eq!(
-			overflow.kind,
-			TrainingCompileErrorKind::InvalidFeatureMatrix
-		);
-		assert!(overflow.detail.contains("reserved index 3"));
-	}
 }

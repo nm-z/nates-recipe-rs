@@ -41,14 +41,10 @@ impl BayesianDependency {
 	}
 
 	#[must_use]
-	pub fn child(&self) -> &[u8] {
-		&self.child
-	}
+	pub fn child(&self) -> &[u8] { &self.child }
 
 	#[must_use]
-	pub fn parents(&self) -> &[Vec<u8>] {
-		&self.parents
-	}
+	pub fn parents(&self) -> &[Vec<u8>] { &self.parents }
 }
 
 /// Stable node identity within one resolved schema.
@@ -60,9 +56,7 @@ pub struct BayesianNodeId(usize);
 
 impl BayesianNodeId {
 	#[must_use]
-	pub const fn index(self) -> usize {
-		self.0
-	}
+	pub const fn index(self) -> usize { self.0 }
 }
 
 /// Whether a Bayesian node is backed by prepared observations.
@@ -86,19 +80,13 @@ pub struct BayesianNodeSchema {
 
 impl BayesianNodeSchema {
 	#[must_use]
-	pub const fn id(&self) -> BayesianNodeId {
-		self.id
-	}
+	pub const fn id(&self) -> BayesianNodeId { self.id }
 
 	#[must_use]
-	pub fn name(&self) -> &[u8] {
-		&self.name
-	}
+	pub fn name(&self) -> &[u8] { &self.name }
 
 	#[must_use]
-	pub const fn source(&self) -> &BayesianNodeSource {
-		&self.source
-	}
+	pub const fn source(&self) -> &BayesianNodeSource { &self.source }
 
 	#[must_use]
 	pub const fn observed_schema(&self) -> Option<&VectorSchema> {
@@ -109,9 +97,7 @@ impl BayesianNodeSchema {
 	}
 
 	#[must_use]
-	pub const fn is_latent_root(&self) -> bool {
-		matches!(self.source, BayesianNodeSource::LatentRoot)
-	}
+	pub const fn is_latent_root(&self) -> bool { matches!(self.source, BayesianNodeSource::LatentRoot) }
 
 	#[must_use]
 	pub const fn is_latent(&self) -> bool {
@@ -133,19 +119,13 @@ pub struct ResolvedBayesianDependency {
 
 impl ResolvedBayesianDependency {
 	#[must_use]
-	pub const fn declaration_index(&self) -> usize {
-		self.declaration_index
-	}
+	pub const fn declaration_index(&self) -> usize { self.declaration_index }
 
 	#[must_use]
-	pub const fn child(&self) -> BayesianNodeId {
-		self.child
-	}
+	pub const fn child(&self) -> BayesianNodeId { self.child }
 
 	#[must_use]
-	pub fn parents(&self) -> &[BayesianNodeId] {
-		&self.parents
-	}
+	pub fn parents(&self) -> &[BayesianNodeId] { &self.parents }
 }
 
 /// A validated, row-free Bayesian schema.
@@ -161,24 +141,16 @@ pub struct ResolvedBayesianSchema {
 
 impl ResolvedBayesianSchema {
 	#[must_use]
-	pub fn nodes(&self) -> &[BayesianNodeSchema] {
-		&self.nodes
-	}
+	pub fn nodes(&self) -> &[BayesianNodeSchema] { &self.nodes }
 
 	#[must_use]
-	pub fn declarations(&self) -> &[ResolvedBayesianDependency] {
-		&self.declarations
-	}
+	pub fn declarations(&self) -> &[ResolvedBayesianDependency] { &self.declarations }
 
 	#[must_use]
-	pub fn execution_order(&self) -> &[BayesianNodeId] {
-		&self.execution_order
-	}
+	pub fn execution_order(&self) -> &[BayesianNodeId] { &self.execution_order }
 
 	#[must_use]
-	pub fn node(&self, id: BayesianNodeId) -> Option<&BayesianNodeSchema> {
-		self.nodes.get(id.index())
-	}
+	pub fn node(&self, id: BayesianNodeId) -> Option<&BayesianNodeSchema> { self.nodes.get(id.index()) }
 
 	#[must_use]
 	pub fn node_id(&self, name: impl AsRef<[u8]>) -> Option<BayesianNodeId> {
@@ -200,24 +172,16 @@ pub struct BayesianCategoricalSchema {
 
 impl BayesianCategoricalSchema {
 	#[must_use]
-	pub const fn source_index(&self) -> usize {
-		self.source_index
-	}
+	pub const fn source_index(&self) -> usize { self.source_index }
 
 	#[must_use]
-	pub fn name(&self) -> &[u8] {
-		&self.name
-	}
+	pub fn name(&self) -> &[u8] { &self.name }
 
 	#[must_use]
-	pub fn dictionary(&self) -> &[Vec<u8>] {
-		&self.dictionary
-	}
+	pub fn dictionary(&self) -> &[Vec<u8>] { &self.dictionary }
 
 	#[must_use]
-	pub fn inference_cardinality(&self) -> Option<usize> {
-		self.dictionary.len().checked_add(1)
-	}
+	pub fn inference_cardinality(&self) -> Option<usize> { self.dictionary.len().checked_add(1) }
 }
 
 /// Saved observations for one executable categorical Bayesian conditional.
@@ -242,54 +206,34 @@ pub struct BayesianCategoricalReferenceSet {
 
 impl BayesianCategoricalReferenceSet {
 	#[must_use]
-	pub fn parents(&self) -> &[BayesianCategoricalSchema] {
-		&self.parents
-	}
+	pub fn parents(&self) -> &[BayesianCategoricalSchema] { &self.parents }
 
 	#[must_use]
-	pub const fn child(&self) -> &BayesianCategoricalSchema {
-		&self.child
-	}
+	pub const fn child(&self) -> &BayesianCategoricalSchema { &self.child }
 
 	#[must_use]
-	pub fn reference_source_rows(&self) -> &[usize] {
-		&self.reference_source_rows
-	}
+	pub fn reference_source_rows(&self) -> &[usize] { &self.reference_source_rows }
 
 	#[must_use]
-	pub const fn reference_rows(&self) -> usize {
-		self.reference_rows
-	}
+	pub const fn reference_rows(&self) -> usize { self.reference_rows }
 
 	#[must_use]
-	pub fn parent_codes(&self) -> &[i32] {
-		&self.parent_codes
-	}
+	pub fn parent_codes(&self) -> &[i32] { &self.parent_codes }
 
 	#[must_use]
-	pub fn child_codes(&self) -> &[i32] {
-		&self.child_codes
-	}
+	pub fn child_codes(&self) -> &[i32] { &self.child_codes }
 
 	#[must_use]
-	pub fn parent_cardinalities(&self) -> &[i32] {
-		&self.parent_cardinalities
-	}
+	pub fn parent_cardinalities(&self) -> &[i32] { &self.parent_cardinalities }
 
 	#[must_use]
-	pub fn parent_multipliers(&self) -> &[i32] {
-		&self.parent_multipliers
-	}
+	pub fn parent_multipliers(&self) -> &[i32] { &self.parent_multipliers }
 
 	#[must_use]
-	pub const fn parent_configurations(&self) -> u64 {
-		self.parent_configurations
-	}
+	pub const fn parent_configurations(&self) -> u64 { self.parent_configurations }
 
 	#[must_use]
-	pub fn child_classes(&self) -> usize {
-		self.child.dictionary.len()
-	}
+	pub fn child_classes(&self) -> usize { self.child.dictionary.len() }
 
 	pub(crate) fn append(&mut self, current: Self) -> TrainingCompileResult<()> {
 		if self.parents != current.parents
@@ -832,19 +776,13 @@ impl BayesianSchemaError {
 	}
 
 	#[must_use]
-	pub const fn kind(&self) -> BayesianSchemaErrorKind {
-		self.kind
-	}
+	pub const fn kind(&self) -> BayesianSchemaErrorKind { self.kind }
 
 	#[must_use]
-	pub fn path(&self) -> &[BayesianSchemaPathSegment] {
-		&self.path
-	}
+	pub fn path(&self) -> &[BayesianSchemaPathSegment] { &self.path }
 
 	#[must_use]
-	pub fn detail(&self) -> &str {
-		&self.detail
-	}
+	pub fn detail(&self) -> &str { &self.detail }
 }
 
 impl fmt::Display for BayesianSchemaError {
@@ -934,10 +872,12 @@ pub fn resolve_bayesian_schema(
 	let nodes = sources
 		.into_iter()
 		.enumerate()
-		.map(|(index, (name, source))| BayesianNodeSchema {
-			id: BayesianNodeId(index),
-			name,
-			source,
+		.map(|(index, (name, source))| {
+			BayesianNodeSchema {
+				id: BayesianNodeId(index),
+				name,
+				source,
+			}
 		})
 		.collect::<Vec<_>>();
 	let ids = nodes
@@ -947,8 +887,8 @@ pub fn resolve_bayesian_schema(
 	let declarations = dependencies
 		.iter()
 		.enumerate()
-		.map(
-			|(declaration_index, dependency)| ResolvedBayesianDependency {
+		.map(|(declaration_index, dependency)| {
+			ResolvedBayesianDependency {
 				declaration_index,
 				child: ids[&dependency.child],
 				parents: dependency
@@ -956,8 +896,8 @@ pub fn resolve_bayesian_schema(
 					.iter()
 					.map(|parent| ids[parent])
 					.collect(),
-			},
-		)
+			}
+		})
 		.collect::<Vec<_>>();
 	let execution_order = deterministic_topological_order(&nodes, &declarations)?;
 

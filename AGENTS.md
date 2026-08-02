@@ -14,28 +14,27 @@ CLI. Implementation is divided into focused workspace crates:
 - `recipe-transport` and `recipe-remote` implement bounded master/worker
   communication.
 
-Package integration tests live under each crate's `tests/`; smaller unit tests
-usually live in `src/tests.rs`. Normative behavior is defined by
-`system-contract.md`, `topology/contract.toml`, and `operation-surface.txt`.
-Packaging files are under `pkg/`, while sample inputs belong in
-`examples/datasets/`.
+Public real-data workloads live under `examples/`; the hardware acceptance
+runner owns measured correctness, performance, and lifecycle gates. Normative
+behavior is defined by `system-contract.md`, `topology/contract.toml`, and
+`operation-surface.txt`. Packaging files are under `pkg/`, while sample inputs
+belong in `examples/datasets/`.
 
 ## Build, Test, and Development Commands
 
 ```bash
 cargo build --workspace
 cargo check --workspace --all-targets
-cargo test --workspace
-cargo test -p recipe-remote
+cargo build --examples --release
 cargo +nightly fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run --bin recipe -- probe --help
 ```
 
-Use package-specific tests while iterating, then run the full workspace suite.
-Ordinary builds and deterministic tests do not require GPU hardware. Live probe,
-CUDA, HSA, or artifact-building tests require the corresponding drivers and
-offline toolchains.
+Compilation, formatting, linting, and auditing are structural build hygiene;
+they are not runtime evidence. Acceptance runs execute public training or
+inference declarations on real datasets and real CUDA or HSA hardware with the
+corresponding drivers and offline toolchains.
 
 ## Coding Style & Naming Conventions
 
@@ -45,13 +44,20 @@ maximum, grouped imports, and formatted documentation examples. Use
 `SCREAMING_SNAKE_CASE` for constants. Keep unsafe code confined to reviewed FFI
 boundaries and document its invariants.
 
-## Testing Guidelines
+## Acceptance Guidelines
 
-Name tests after observable behavior, for example
-`shared_half_duplex_token_serializes_opposing_transfers`. Add deterministic
-tests for success, rejection, cleanup, and lifecycle ordering. There is no
-numeric coverage target; new behavior must exercise its public boundary.
-Hardware-dependent tests should remain explicitly ignored or feature-gated.
+Do not add inline, unit, mock, synthetic-data, compile-pass, or compile-fail
+tests. Runtime evidence must execute the public workflow end to end on a real
+dataset and real CUDA or HSA hardware, and it must fail when the observed
+correctness, performance, or architectural invariant is violated. Hardware is
+required rather than ignored or feature-gated; an unavailable prerequisite is
+an unsuccessful acceptance run, not a passing or skipped result.
+
+Use the Rust compiler, formatter, linter, and production audit for structural
+validity. They do not prove logical correctness. Prefer gates such as Recipe
+inference beating its pinned llama.cpp oracle on identical work and a complete
+training run proving one pre-loop native image load with no loop-time
+realization.
 
 ## Architecture and Security Constraints
 
@@ -61,6 +67,23 @@ only seed bounded probing. Preserve GPU-only f32/int32 payload calculation and
 the immutable `init -> loop -> exit` lifecycle. Kernel generation may use LLVM
 IR directly or MLIR, provided Recipe continues to own operation semantics,
 costs, scheduling, and equivalent AMD/NVIDIA lowering.
+
+Every executable training or inference workload must lower completely to a
+graph of calculations and transfers. `TaskKind::Metric` is a specialized
+four-byte device readback transfer, not a third fundamental kind of work. Init
+admission and output egress are transfers. Dependencies, routes, queues,
+synchronization, and lifecycle phases order or realize calculations and
+transfers; do not promote those implementation concerns into additional model
+semantics. Discovery, compilation, allocation, and native-image loading are
+pre-loop preparation and are not model work executed in the finalized loop.
+
+When analyzing or reducing the architecture, begin with this existing
+calculation/transfer reduction and the concrete `ScalarProgram`,
+`PrimitiveKind`, and scheduled-task representations. Do not invent a parallel
+ontology from repository nouns. A production-LOC proposal must identify the
+duplicated source regions, estimate replacement code, and state the net
+workspace percentage; reject abstractions that merely rename or relocate the
+same code.
 
 Training runs must never use a batch size smaller than the number of rows being
 trained on. Concretely: if `.split(...)` is set, the effective batch size must be

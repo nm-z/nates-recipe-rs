@@ -1,13 +1,12 @@
 use recipe_core::{DType, ScalarOpcode};
 use recipe_language::{AxisSet, Contraction, Elementwise, PrimitiveKind, Reduce, ReduceOperator, ReduceResult, Tensor};
 
-use crate::{OperationDescriptor, OperationId, OperationResult};
-
 use super::{
 	Emitter, FamilyDispatch, MaterializationRequest, input as requested_input, language_error, output,
 	prepared_tree_lanes, request_error, require_dtype, require_exact_abi, require_shape, scalar_binary,
 	scalar_builder, scalar_finish, scalar_input,
 };
+use crate::{OperationDescriptor, OperationId, OperationResult};
 
 const OPERATIONS: &[(&str, &str)] = &[
 	("gpu_bce_with_logits", "gpu-core/src/losses.rs:145"),
@@ -31,17 +30,21 @@ pub(super) fn supports(descriptor: OperationDescriptor) -> bool {
 pub(super) fn dispatch(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> FamilyDispatch {
 	let result = match supports(request.descriptor) {
 		false => return FamilyDispatch::NotOwned,
-		true => match request.descriptor.symbol {
-			"gpu_bce_with_logits" => emit_binary_cross_entropy_with_logits(request, emitter),
-			"gpu_linear_backward_full_into" => emit_linear_backward_full(request, emitter),
-			"gpu_linear_backward_weights_only_into" => emit_linear_backward_weights_only(request, emitter),
-			"gpu_linear_f32" | "gpu_linear_into" => emit_linear(request, emitter),
-			"gpu_matvec_bias_into" => emit_matvec_bias(request, emitter),
-			symbol => Err(request_error(
-				request,
-				format!("training-operation dispatch is incomplete for {symbol}"),
-			)),
-		},
+		true => {
+			match request.descriptor.symbol {
+				"gpu_bce_with_logits" => emit_binary_cross_entropy_with_logits(request, emitter),
+				"gpu_linear_backward_full_into" => emit_linear_backward_full(request, emitter),
+				"gpu_linear_backward_weights_only_into" => emit_linear_backward_weights_only(request, emitter),
+				"gpu_linear_f32" | "gpu_linear_into" => emit_linear(request, emitter),
+				"gpu_matvec_bias_into" => emit_matvec_bias(request, emitter),
+				symbol => {
+					Err(request_error(
+						request,
+						format!("training-operation dispatch is incomplete for {symbol}"),
+					))
+				}
+			}
+		}
 	};
 	FamilyDispatch::Owned(result)
 }
@@ -281,10 +284,12 @@ fn require_f32_matrix(
 	require_dtype(request, tensor, DType::F32, name)?;
 	match tensor.shape.extents() {
 		[rows, columns] => Ok((*rows, *columns)),
-		shape => Err(request_error(
-			request,
-			format!("{name} has shape {shape:?}, expected a rank-two f32 matrix"),
-		)),
+		shape => {
+			Err(request_error(
+				request,
+				format!("{name} has shape {shape:?}, expected a rank-two f32 matrix"),
+			))
+		}
 	}
 }
 

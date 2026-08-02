@@ -21,29 +21,17 @@ impl StableDigest {
 		self.hasher.update(value);
 	}
 
-	pub(crate) fn digest(&mut self, value: Digest) {
-		self.hasher.update(value.bytes());
-	}
+	pub(crate) fn digest(&mut self, value: Digest) { self.hasher.update(value.bytes()); }
 
-	pub(crate) fn label(&mut self, value: &Label) {
-		self.bytes(value.as_str().as_bytes());
-	}
+	pub(crate) fn label(&mut self, value: &Label) { self.bytes(value.as_str().as_bytes()); }
 
-	pub(crate) fn length(&mut self, value: usize) {
-		self.bytes(value.to_string().as_bytes());
-	}
+	pub(crate) fn length(&mut self, value: usize) { self.bytes(value.to_string().as_bytes()); }
 
-	pub(crate) fn bool(&mut self, value: bool) {
-		self.hasher.update([u8::from(value)]);
-	}
+	pub(crate) fn bool(&mut self, value: bool) { self.hasher.update([u8::from(value)]); }
 
-	pub(crate) fn u8(&mut self, value: u8) {
-		self.hasher.update([value]);
-	}
+	pub(crate) fn u8(&mut self, value: u8) { self.hasher.update([value]); }
 
-	pub(crate) fn u64(&mut self, value: u64) {
-		self.hasher.update(value.to_le_bytes());
-	}
+	pub(crate) fn u64(&mut self, value: u64) { self.hasher.update(value.to_le_bytes()); }
 
 	pub(crate) fn finish(self) -> Digest {
 		let finalized = self.hasher.finalize();

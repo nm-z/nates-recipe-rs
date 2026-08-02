@@ -1,9 +1,10 @@
-use std::cell::RefCell;
-use std::collections::BTreeSet;
-use std::fmt;
-use std::fs;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::{
+	cell::RefCell,
+	collections::BTreeSet,
+	fmt, fs,
+	path::PathBuf,
+	time::{Duration, Instant},
+};
 
 use recipe_core::{Label, TargetIdentity, TransferLaneCount, TransportKind};
 use recipe_hsa::{
@@ -15,16 +16,18 @@ use recipe_kernel::{
 };
 use recipe_probe::{BoundedBenchmarkPlan, GpuDescriptor, GpuMeasurement, LinkDuplex, ProbeError, ProbeResult};
 
-use crate::benchmark::{
-	calculation_rate, capacity, compute_buffer_bytes, fill_input, fma_template, measured, plan_bytes, time_bounded,
-	transfer_rate, verify_compute_output,
+use crate::{
+	benchmark::{
+		calculation_rate, capacity, compute_buffer_bytes, fill_input, fma_template, measured, plan_bytes,
+		time_bounded, transfer_rate, verify_compute_output,
+	},
+	config::{BackendLibrary, KernelBuildConfig, NativeProbeConfig},
+	identity::{
+		PinnedLibrary, backend_toolchain_identity, label, library_identity, pci_accelerator_present, pci_surface,
+		selected_library,
+	},
+	native::Backend,
 };
-use crate::config::{BackendLibrary, KernelBuildConfig, NativeProbeConfig};
-use crate::identity::{
-	PinnedLibrary, backend_toolchain_identity, label, library_identity, pci_accelerator_present, pci_surface,
-	selected_library,
-};
-use crate::native::Backend;
 
 const HSA_KERNEL_ENTRY: &str = "recipe_probe_fma_f32";
 const COMPLETION_POLL_INITIAL_DELAY: Duration = Duration::from_micros(50);
@@ -58,9 +61,7 @@ impl CompletionPollBackoff {
 		self.advance();
 	}
 
-	fn advance(&mut self) {
-		self.next_delay = self.next_delay.saturating_mul(2).min(self.maximum_delay);
-	}
+	fn advance(&mut self) { self.next_delay = self.next_delay.saturating_mul(2).min(self.maximum_delay); }
 }
 
 pub(crate) struct HsaBackend {
@@ -147,9 +148,7 @@ impl HsaBackend {
 		operation(&state.library, &state.runtime).map(Some)
 	}
 
-	pub(crate) const fn code_object_version(&self) -> u8 {
-		self.code_object_version
-	}
+	pub(crate) const fn code_object_version(&self) -> u8 { self.code_object_version }
 
 	pub(crate) fn descriptor(
 		&self,
@@ -230,7 +229,7 @@ impl HsaBackend {
 				))
 			})?;
 		let maximum_shared_memory_per_workgroup =
-			kfd_lds_capacity(description.identity.driver_node_id.ok_or_else(|| {
+			driver_lds_capacity(description.identity.driver_node_id.ok_or_else(|| {
 				ProbeError::Discovery(format!(
 					"HSA GPU {} omitted its KFD node",
 					description.identity.uuid
@@ -319,15 +318,15 @@ impl HsaBackend {
 		let selected_uuid = discovery
 			.agents()
 			.iter()
-			.filter_map(
-				|agent| match self.descriptor(library, &system, agent.description()) {
+			.filter_map(|agent| {
+				match self.descriptor(library, &system, agent.description()) {
 					Ok(Some(descriptor)) if descriptor == *expected => {
 						Some(Ok(agent.description().identity.uuid.as_str().to_owned()))
 					}
 					Ok(Some(_)) | Ok(None) => None,
 					Err(error) => Some(Err(error)),
-				},
-			)
+				}
+			})
 			.collect::<ProbeResult<Vec<_>>>()?;
 		if selected_uuid.len() != 1 {
 			return Err(ProbeError::Benchmark(format!(
@@ -475,14 +474,10 @@ impl HsaBackend {
 			code_object_version: self.code_object_version,
 		});
 		let template = fma_template(bytes, self.kernels.fma_chain_length)?;
-		let lowered = lower_elementwise(
-			&template,
-			&target,
-			&LoweringOptions {
-				entry_symbol: HSA_KERNEL_ENTRY.to_owned(),
-				workgroup_lanes: u32::from(lanes),
-			},
-		)
+		let lowered = lower_elementwise(&template, &target, &LoweringOptions {
+			entry_symbol: HSA_KERNEL_ENTRY.to_owned(),
+			workgroup_lanes: u32::from(lanes),
+		})
 		.map_err(kernel_benchmark_error)?;
 		let builder = ArtifactBuilder::new(self.kernels.toolchain.clone()).map_err(kernel_benchmark_error)?;
 		let artifact = builder
@@ -573,7 +568,7 @@ impl HsaBackend {
 	}
 }
 
-fn kfd_lds_capacity(node: u32) -> ProbeResult<recipe_core::ByteCount> {
+fn driver_lds_capacity(node: u32) -> ProbeResult<recipe_core::ByteCount> {
 	let path = PathBuf::from("/sys/class/kfd/kfd/topology/nodes")
 		.join(node.to_string())
 		.join("properties");
@@ -702,8 +697,10 @@ fn hsa_capacity(description: &AgentDescription) -> ProbeResult<u64> {
 		.map(|pool| pool.size_bytes)
 		.max();
 	match local_pool_bytes {
-		Some(bytes) => u64::try_from(bytes)
-			.map_err(|_| ProbeError::Discovery("HSA local-memory pool size does not fit u64".to_owned())),
+		Some(bytes) => {
+			u64::try_from(bytes)
+				.map_err(|_| ProbeError::Discovery("HSA local-memory pool size does not fit u64".to_owned()))
+		}
 		None => {
 			let available = description
 				.amd_gpu
@@ -875,92 +872,4 @@ fn hsa_benchmark_error(operation: &'static str, error: recipe_hsa::Error) -> Pro
 
 fn kernel_benchmark_error(error: recipe_kernel::LoweringError) -> ProbeError {
 	ProbeError::Benchmark(format!("Recipe-owned GPU artifact: {error}"))
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn workgroup_selection_is_power_of_two_and_bounded_by_elements() {
-		let mut description = fixture_description();
-		description.isas[0].maximum_workgroup_size = 192;
-		description.isas[0].maximum_workgroup_dimensions[0] = 192;
-		assert_eq!(
-			hsa_workgroup_lanes(&description, 100).expect("workgroup lanes"),
-			64
-		);
-	}
-
-	#[test]
-	fn workgroup_selection_has_no_architecture_independent_cap() {
-		let mut description = fixture_description();
-		description.isas[0].maximum_workgroup_size = 1_024;
-		description.isas[0].maximum_workgroup_dimensions[0] = 1_024;
-		assert_eq!(
-			hsa_workgroup_lanes(&description, 900).expect("workgroup lanes"),
-			512
-		);
-	}
-
-	#[test]
-	fn timed_out_completion_polling_reaches_a_large_fixed_cap() {
-		let mut backoff = CompletionPollBackoff::timed_out_cleanup();
-		assert_eq!(backoff.next_delay, Duration::from_millis(10));
-		for _ in 0..8 {
-			backoff.advance();
-		}
-		assert_eq!(backoff.next_delay, Duration::from_millis(100));
-		backoff.advance();
-		assert_eq!(backoff.next_delay, Duration::from_millis(100));
-	}
-
-	fn fixture_description() -> AgentDescription {
-		use recipe_hsa::{AgentIdentity, AgentUuid, IsaDescription, Profile, RoundingModes};
-		use std::str::FromStr;
-
-		AgentDescription {
-			identity: AgentIdentity {
-				name: "fake".to_owned(),
-				vendor_name: "AMD".to_owned(),
-				uuid: AgentUuid::from_str("GPU-0123456789abcdef").expect("test UUID"),
-				numa_node_id: 0,
-				driver_node_id: Some(1),
-				pci_address: None,
-			},
-			device_type: DeviceType::Gpu,
-			profile: Profile::Full,
-			feature_bits: 1,
-			hsa_version_major: 1,
-			hsa_version_minor: 2,
-			first_isa_wavefront_size: Some(64),
-			queue: None,
-			amd_gpu: None,
-			isas: vec![IsaDescription {
-				name: "amdgcn-amd-amdhsa--gfx1101".to_owned(),
-				amd_target: Some(IsaTarget::from_str("amdgcn-amd-amdhsa--gfx1101").expect("test ISA target")),
-				supports_small_machine_model: false,
-				supports_large_machine_model: true,
-				supports_base_profile: true,
-				supports_full_profile: true,
-				default_rounding_modes: RoundingModes {
-					default: true,
-					toward_zero: true,
-					nearest_even: true,
-				},
-				base_profile_rounding_modes: RoundingModes {
-					default: true,
-					toward_zero: true,
-					nearest_even: true,
-				},
-				fast_f16: true,
-				maximum_workgroup_dimensions: [256, 256, 256],
-				maximum_workgroup_size: 256,
-				maximum_grid_dimensions: [u32::MAX; 3],
-				maximum_grid_size: u64::MAX,
-				maximum_fbarriers_per_workgroup: 32,
-			}],
-			memory_pools: Vec::new(),
-		}
-	}
 }

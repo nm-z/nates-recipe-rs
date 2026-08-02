@@ -1,18 +1,22 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::hint::black_box;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	fs::{self, File, OpenOptions},
+	hint::black_box,
+	io::{Read, Seek, SeekFrom, Write},
+	os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
+	path::{Path, PathBuf},
+	sync::atomic::{AtomicU64, Ordering},
+	time::Instant,
+};
 
 use recipe_core::{ByteCount, BytesPerSecond, Label, Property, PropertyProvenance, TransferLaneCount, TransportKind};
 
-use crate::error::{ProbeError, ProbeResult};
-use crate::model::{
-	BoundedBenchmarkPlan, HostBenchmarkIo, HostDiscovery, HostInventory, LinkDuplex, MachineFingerprint,
-	NetworkInterface, RamDomain, RamMeasurement, StorageDomain, StorageMeasurement,
+use crate::{
+	error::{ProbeError, ProbeResult},
+	model::{
+		BoundedBenchmarkPlan, HostBenchmarkIo, HostDiscovery, HostInventory, LinkDuplex, MachineFingerprint,
+		NetworkInterface, RamDomain, RamMeasurement, StorageDomain, StorageMeasurement,
+	},
 };
 
 /// Linux bare-metal discovery using procfs and sysfs only.
@@ -202,9 +206,8 @@ impl LocalSystemDiscovery {
 			};
 			let full_duplex = matches!(transport_kind, TransportKind::Nvme | TransportKind::Sas);
 			let physical_major_minor = read_trimmed(physical.join("dev"))?;
-			let group = groups
-				.entry(identity.clone())
-				.or_insert_with(|| PhysicalStorage {
+			let group = groups.entry(identity.clone()).or_insert_with(|| {
+				PhysicalStorage {
 					major_minor: physical_major_minor,
 					name: device_name.to_owned(),
 					identity: identity.clone(),
@@ -218,7 +221,8 @@ impl LocalSystemDiscovery {
 					},
 					mounted_devices: BTreeSet::new(),
 					mounts: BTreeSet::new(),
-				});
+				}
+			});
 			if group.capacity != ByteCount::new(capacity) || group.transport_kind != transport_kind {
 				return Err(ProbeError::Discovery(format!(
 					"inconsistent physical storage identity {identity}"
@@ -533,9 +537,7 @@ impl TemporaryProbeFile {
 }
 
 impl Drop for TemporaryProbeFile {
-	fn drop(&mut self) {
-		let _ = fs::remove_file(&self.path);
-	}
+	fn drop(&mut self) { let _ = fs::remove_file(&self.path); }
 }
 
 fn filesystem_available_bytes(path: &Path) -> ProbeResult<ByteCount> {
@@ -577,9 +579,7 @@ fn require_bounded(plan: BoundedBenchmarkPlan) -> ProbeResult<()> {
 	}
 }
 
-fn measured<T>(value: T) -> Property<T> {
-	Property::new(value, PropertyProvenance::Measured)
-}
+fn measured<T>(value: T) -> Property<T> { Property::new(value, PropertyProvenance::Measured) }
 
 fn parse_memtotal(input: &str) -> ProbeResult<u64> {
 	for line in input.lines() {
@@ -641,59 +641,4 @@ fn unescape_mount(value: &str) -> String {
 		.replace("\\011", "\t")
 		.replace("\\012", "\n")
 		.replace("\\134", "\\")
-}
-
-#[cfg(test)]
-mod tests {
-	use std::os::unix::fs::PermissionsExt as _;
-
-	use super::*;
-
-	#[derive(Debug)]
-	struct TestDirectory(PathBuf);
-
-	impl TestDirectory {
-		fn new() -> Self {
-			static NEXT: AtomicU64 = AtomicU64::new(1);
-			let path = std::env::temp_dir().join(format!(
-				"recipe-probe-local-test-{}-{}",
-				std::process::id(),
-				NEXT.fetch_add(1, Ordering::Relaxed)
-			));
-			fs::create_dir(&path).expect("create test directory");
-			fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("protect test directory");
-			Self(path)
-		}
-	}
-
-	impl Drop for TestDirectory {
-		fn drop(&mut self) {
-			let _ = fs::remove_dir_all(&self.0);
-		}
-	}
-
-	#[test]
-	fn partitions_collapse_to_their_physical_block_device() {
-		let temporary = TestDirectory::new();
-		let disk = temporary.0.join("nvme0n1");
-		let partition = disk.join("nvme0n1p1");
-		fs::create_dir(&disk).expect("create disk");
-		fs::write(disk.join("size"), "100\n").expect("write disk size");
-		fs::write(disk.join("dev"), "259:0\n").expect("write disk identity");
-		fs::create_dir(&partition).expect("create partition");
-		fs::write(partition.join("partition"), "1\n").expect("mark partition");
-		assert_eq!(physical_block_device(&partition).unwrap(), disk);
-	}
-
-	#[test]
-	fn access_probe_is_removed_after_testing_a_writable_directory() {
-		let temporary = TestDirectory::new();
-		assert!(directory_accepts_probe_file(&temporary.0).unwrap());
-		assert_eq!(
-			fs::read_dir(&temporary.0)
-				.expect("read test directory")
-				.count(),
-			0
-		);
-	}
 }

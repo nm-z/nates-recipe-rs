@@ -148,10 +148,12 @@ impl fmt::Display for Error {
 				task,
 				completion,
 				owner,
-			} => write!(
-				formatter,
-				"{backend} task {task} cannot claim completion slot {completion}; task {owner} owns it"
-			),
+			} => {
+				write!(
+					formatter,
+					"{backend} task {task} cannot claim completion slot {completion}; task {owner} owns it"
+				)
+			}
 			Self::ArenaMismatch { device, detail } => {
 				write!(
 					formatter,
@@ -184,15 +186,19 @@ impl fmt::Display for Error {
 				device,
 				requested,
 				maximum,
-			} => write!(
-				formatter,
-				"{backend} device {device} requires {requested} physical submission queues, exceeding its discovered maximum of {maximum}"
-			),
+			} => {
+				write!(
+					formatter,
+					"{backend} device {device} requires {requested} physical submission queues, exceeding its discovered maximum of {maximum}"
+				)
+			}
 			Self::IntegerOverflow { field } => write!(formatter, "{field} does not fit the native ABI"),
-			Self::PhysicalAccountingOverflow => write!(
-				formatter,
-				"native backend exceeded the fixed physical-call accounting capacity"
-			),
+			Self::PhysicalAccountingOverflow => {
+				write!(
+					formatter,
+					"native backend exceeded the fixed physical-call accounting capacity"
+				)
+			}
 			Self::Cuda(detail) => write!(formatter, "CUDA Driver operation failed: {detail}"),
 			Self::CudaContract(detail) => {
 				write!(formatter, "CUDA Driver resource contract failed: {detail}")
@@ -202,16 +208,20 @@ impl fmt::Display for Error {
 				abi_entry,
 				runtime_symbol,
 				source,
-			} => write!(
-				formatter,
-				"HSACO artifact {artifact} logical ABI entry {abi_entry:?} failed ROCr lookup for descriptor symbol {runtime_symbol:?}: {source}"
-			),
+			} => {
+				write!(
+					formatter,
+					"HSACO artifact {artifact} logical ABI entry {abi_entry:?} failed ROCr lookup for descriptor symbol {runtime_symbol:?}: {source}"
+				)
+			}
 			Self::Hsa(detail) => write!(formatter, "ROCr/HSA operation failed: {detail}"),
 			Self::Kernel(detail) => write!(formatter, "kernel artifact validation failed: {detail}"),
-			Self::Protocol { task, detail } => write!(
-				formatter,
-				"task {task} violates the native protocol: {detail}"
-			),
+			Self::Protocol { task, detail } => {
+				write!(
+					formatter,
+					"task {task} violates the native protocol: {detail}"
+				)
+			}
 		}
 	}
 }
@@ -219,21 +229,15 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl From<recipe_cuda::CudaError> for Error {
-	fn from(error: recipe_cuda::CudaError) -> Self {
-		Self::Cuda(error)
-	}
+	fn from(error: recipe_cuda::CudaError) -> Self { Self::Cuda(error) }
 }
 
 impl From<recipe_hsa::Error> for Error {
-	fn from(error: recipe_hsa::Error) -> Self {
-		Self::Hsa(error)
-	}
+	fn from(error: recipe_hsa::Error) -> Self { Self::Hsa(error) }
 }
 
 impl From<recipe_kernel::LoweringError> for Error {
-	fn from(error: recipe_kernel::LoweringError) -> Self {
-		Self::Kernel(error)
-	}
+	fn from(error: recipe_kernel::LoweringError) -> Self { Self::Kernel(error) }
 }
 
 pub(crate) fn ensure_submission_queue_capacity(
@@ -251,31 +255,5 @@ pub(crate) fn ensure_submission_queue_capacity(
 			requested,
 			maximum,
 		})
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn submission_queue_capacity_accepts_exact_limit() {
-		assert_eq!(
-			ensure_submission_queue_capacity("ROCr/HSA", DeviceId::new(7), 4, 4),
-			Ok(())
-		);
-	}
-
-	#[test]
-	fn submission_queue_capacity_returns_typed_error_above_limit() {
-		assert_eq!(
-			ensure_submission_queue_capacity("ROCr/HSA", DeviceId::new(7), 5, 4),
-			Err(Error::SubmissionQueueLimitExceeded {
-				backend: "ROCr/HSA",
-				device: DeviceId::new(7),
-				requested: 5,
-				maximum: 4,
-			})
-		);
 	}
 }

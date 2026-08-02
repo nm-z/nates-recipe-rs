@@ -1,6 +1,6 @@
 //! Narrow CUDA launch-parameter FFI boundary.
 
-use recipe_cuda::{DeviceBuffer, Event, Function, LaunchConfig, Pending, Stream};
+use recipe_cuda::{DeviceBuffer, Function, LaunchConfig, Stream};
 
 use crate::{Error, Result};
 
@@ -26,13 +26,9 @@ impl ParameterBlock {
 		}
 	}
 
-	pub(crate) fn len(&self) -> usize {
-		self.values.len()
-	}
+	pub(crate) fn len(&self) -> usize { self.values.len() }
 
-	pub(crate) fn reset_keepalive(&mut self) {
-		self.keepalive.clear();
-	}
+	pub(crate) fn reset_keepalive(&mut self) { self.keepalive.clear(); }
 
 	pub(crate) fn set_value(&mut self, index: usize, value: u64) -> Result<()> {
 		let destination = self.values.get_mut(index).ok_or(Error::IntegerOverflow {
@@ -47,33 +43,25 @@ impl ParameterBlock {
 			.push(core::ptr::from_ref(buffer).cast::<DeviceBuffer<'static>>());
 	}
 
-	pub(crate) unsafe fn launch<'operation, 'context>(
-		&'operation mut self,
-		stream: &'operation Stream<'context>,
-		function: &'operation Function<'_, 'context>,
+	pub(crate) unsafe fn enqueue<'context>(
+		&mut self,
+		stream: &Stream<'context>,
+		function: &Function<'_, 'context>,
 		config: LaunchConfig,
 		argument_count: usize,
-		event: Event<'context>,
-	) -> recipe_cuda::Result<Pending<'operation, 'context>> {
+	) -> recipe_cuda::Result<()> {
 		let keepalive = unsafe {
-			// SAFETY: each pointer was made from a live arena buffer. The caller
-			// retains those arenas until the returned pending token is terminal.
+			// SAFETY: each pointer was made from an arena buffer retained until
+			// the executor observes this stream idle.
 			core::slice::from_raw_parts(
 				self.keepalive.as_ptr().cast::<&DeviceBuffer<'static>>(),
 				self.keepalive.len(),
 			)
 		};
-		let parameters = unsafe {
-			// SAFETY: a raw pointer has the same representation regardless of
-			// its pointee marker. CUDA reads only the pointer-sized entries.
-			core::slice::from_raw_parts_mut(self.parameters.as_mut_ptr().cast(), argument_count)
-		};
-		let pending = unsafe {
-			// SAFETY: the caller validated the artifact ABI, argument values,
-			// launch geometry, and keepalive set before entering this wrapper.
-			stream.launch(function, config, parameters, keepalive, event)
-		};
+		let parameters =
+			unsafe { core::slice::from_raw_parts_mut(self.parameters.as_mut_ptr().cast(), argument_count) };
+		let result = unsafe { stream.enqueue_launch(function, config, parameters, keepalive) };
 		debug_assert_eq!(self.parameters.len(), self.values.len());
-		pending
+		result
 	}
 }

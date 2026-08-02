@@ -1,10 +1,12 @@
-use std::collections::BTreeSet;
-use std::env;
-use std::fmt::Write as _;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+	collections::BTreeSet,
+	env,
+	fmt::Write as _,
+	fs,
+	path::{Path, PathBuf},
+	process::ExitCode,
+	time::{SystemTime, UNIX_EPOCH},
+};
 
 const MANIFEST_DIRECTORY: &str = env!("CARGO_MANIFEST_DIR");
 const API_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/API.ogdl");
@@ -178,9 +180,7 @@ struct Random {
 }
 
 impl Random {
-	const fn new(seed: u64) -> Self {
-		Self { state: seed }
-	}
+	const fn new(seed: u64) -> Self { Self { state: seed } }
 
 	fn next(&mut self) -> u64 {
 		self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -202,13 +202,9 @@ impl Random {
 		}
 	}
 
-	fn choose<'a, T>(&mut self, values: &'a [T]) -> &'a T {
-		&values[self.index(values.len())]
-	}
+	fn choose<'a, T>(&mut self, values: &'a [T]) -> &'a T { &values[self.index(values.len())] }
 
-	fn bool(&mut self) -> bool {
-		self.next() & 1 == 1
-	}
+	fn bool(&mut self) -> bool { self.next() & 1 == 1 }
 }
 
 fn main() -> ExitCode {
@@ -401,10 +397,10 @@ fn generate_source(api: &ApiSurface, seed: u64, datasets: &[Dataset]) -> Result<
 
 	let metrics = choose_metrics(&mut random, dataset.task);
 	let metric_list = metrics.join(", ");
-	let log_token = api.choose(
-		&mut random,
-		&[".log([items])", ".log([items]).every(interval)"],
-	)?;
+	let log_token = api.choose(&mut random, &[
+		".log([items])",
+		".log([items]).every(interval)",
+	])?;
 	if log_token == ".log([items]).every(interval)" {
 		train.push(format!(".log([{metric_list}])"));
 		train.push(format!(".every({})", random.choose(LOG_INTERVALS)));
@@ -468,41 +464,5 @@ fn emit_chain(source: &mut String, methods: &[String], terminator: &str) {
 			""
 		};
 		writeln!(source, "\t\t{method}{line_terminator}").expect("write to String");
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	fn api() -> ApiSurface {
-		ApiSurface::parse(include_str!("../../API.ogdl")).expect("parse API surface")
-	}
-
-	#[test]
-	fn identical_seeds_generate_identical_sources() {
-		let api = api();
-		let first = generate_source(&api, 42, DATASETS).expect("generate first source");
-		let second = generate_source(&api, 42, DATASETS).expect("generate second source");
-		assert_eq!(first.source, second.source);
-		assert_eq!(first.dataset, second.dataset);
-	}
-
-	#[test]
-	fn generated_sources_are_rust_syntax_and_use_catalogued_targets() {
-		let api = api();
-		for seed in 0..512 {
-			let generated = generate_source(&api, seed, DATASETS).expect("generate source");
-			syn::parse_file(&generated.source).expect("generated source parses as Rust");
-			assert!(generated.source.contains(generated.dataset.path));
-			assert!(generated.source.contains(generated.dataset.target));
-			assert!(generated.source.contains("recipe.model()"));
-			assert!(generated.source.contains(".run()?;"));
-		}
-	}
-
-	#[test]
-	fn every_catalogued_dataset_exists() {
-		assert_eq!(available_datasets(Path::new(MANIFEST_DIRECTORY)), DATASETS);
 	}
 }

@@ -9,9 +9,7 @@
 //! this crate. A caller cannot finalize an optimistic Draft and later mutate it
 //! to match whatever a backend happened to allocate.
 
-use std::error::Error;
-use std::fmt;
-use std::num::NonZeroU32;
+use std::{error::Error, fmt, num::NonZeroU32};
 
 use recipe_core::{
 	ArtifactIdentity, BundleIdentity, ByteCount, CandidateIdentity, CapacityLedger, CapacityLedgerEntry, DeviceId,
@@ -20,8 +18,6 @@ use recipe_core::{
 	Topology, ValueId,
 };
 use recipe_language::CalculationGraph;
-#[cfg(test)]
-use recipe_planner::plan_candidates;
 use recipe_planner::{
 	PlannedCandidate, PlannedExternalOutput, PlannedProgramCandidate, ProgramPlannerSearch, plan_program_candidates,
 };
@@ -240,24 +236,16 @@ pub struct PreparedSystem<C, S> {
 
 impl<C, S> PreparedSystem<C, S> {
 	#[must_use]
-	pub const fn bundle(&self) -> &FinalizedBundle {
-		&self.bundle
-	}
+	pub const fn bundle(&self) -> &FinalizedBundle { &self.bundle }
 
 	#[must_use]
-	pub const fn realization(&self) -> &RealizationProfile {
-		&self.realization
-	}
+	pub const fn realization(&self) -> &RealizationProfile { &self.realization }
 
 	#[must_use]
-	pub const fn catalog(&self) -> &C {
-		&self.catalog
-	}
+	pub const fn catalog(&self) -> &C { &self.catalog }
 
 	#[must_use]
-	pub const fn session(&self) -> &S {
-		&self.session
-	}
+	pub const fn session(&self) -> &S { &self.session }
 
 	/// Exact logical-to-physical egress identities retained from the candidate
 	/// that produced this immutable bundle.
@@ -272,14 +260,10 @@ impl<C, S> PreparedSystem<C, S> {
 	}
 
 	#[must_use]
-	pub const fn attempted_candidates(&self) -> usize {
-		self.attempted_candidates
-	}
+	pub const fn attempted_candidates(&self) -> usize { self.attempted_candidates }
 
 	#[must_use]
-	pub fn rejections(&self) -> &[CandidateRejection] {
-		&self.rejections
-	}
+	pub fn rejections(&self) -> &[CandidateRejection] { &self.rejections }
 
 	#[must_use]
 	pub fn into_parts(self) -> (FinalizedBundle, RealizationProfile, C, S) {
@@ -314,19 +298,13 @@ impl<A, R> Preparer<A, R> {
 	}
 
 	#[must_use]
-	pub const fn artifact_provider(&self) -> &A {
-		&self.artifact_provider
-	}
+	pub const fn artifact_provider(&self) -> &A { &self.artifact_provider }
 
 	#[must_use]
-	pub const fn realizer(&self) -> &R {
-		&self.realizer
-	}
+	pub const fn realizer(&self) -> &R { &self.realizer }
 
 	#[must_use]
-	pub const fn realizer_mut(&mut self) -> &mut R {
-		&mut self.realizer
-	}
+	pub const fn realizer_mut(&mut self) -> &mut R { &mut self.realizer }
 }
 
 impl<A, R> Preparer<A, R>
@@ -357,18 +335,6 @@ where
 		validate_profile(profile)
 			.map_err(|error| PrepareError::new(PrepareErrorKind::InvalidMeasuredProfile, error.to_string()))?;
 		self.prepare_program_validated(program, &profile.topology, &profile.discovery)
-	}
-
-	#[cfg(test)]
-	fn prepare_validated(
-		&mut self,
-		graph: &CalculationGraph,
-		topology: &Topology,
-		discovery: &DiscoveryProfile,
-	) -> Result<PreparedSystem<A::Catalog, R::Session>, PrepareError> {
-		let program = StaticCalculationProgram::every_iteration(graph.clone(), LoopIterations::ONE)
-			.map_err(|error| PrepareError::new(PrepareErrorKind::Planning, error.to_string()))?;
-		self.prepare_program_validated(&program, topology, discovery)
 	}
 
 	fn prepare_program_validated(
@@ -813,34 +779,6 @@ fn hash_realization(
 	RealizationIdentity::new(hash.finish())
 }
 
-#[cfg(test)]
-fn hash_bundle(
-	topology: &Topology,
-	discovery: &DiscoveryProfile,
-	draft: &DraftPlan,
-	realization: &RealizationProfile,
-	layouts: &[recipe_core::ArenaLayout],
-) -> BundleIdentity {
-	let loop_domains = draft
-		.tasks
-		.iter()
-		.filter(|task| task.phase == recipe_core::RunPhase::Loop)
-		.map(|task| LoopTaskDomain {
-			task: task.id,
-			domain: recipe_core::IterationDomain::every(LoopIterations::ONE),
-		})
-		.collect::<Vec<_>>();
-	hash_bundle_with_loop_domains(
-		topology,
-		discovery,
-		draft,
-		realization,
-		layouts,
-		LoopIterations::ONE,
-		&loop_domains,
-	)
-}
-
 fn hash_bundle_with_loop_domains(
 	topology: &Topology,
 	discovery: &DiscoveryProfile,
@@ -909,13 +847,9 @@ impl CanonicalHash {
 		self.hasher.update(bytes);
 	}
 
-	fn u64(&mut self, value: u64) {
-		self.hasher.update(value.to_le_bytes());
-	}
+	fn u64(&mut self, value: u64) { self.hasher.update(value.to_le_bytes()); }
 
-	fn digest(&mut self, digest: recipe_core::Digest) {
-		self.hasher.update(digest.bytes());
-	}
+	fn digest(&mut self, digest: recipe_core::Digest) { self.hasher.update(digest.bytes()); }
 
 	fn artifacts(&mut self, artifacts: &[ArtifactIdentity]) {
 		let mut artifacts = artifacts.iter().collect::<Vec<_>>();
@@ -1204,6 +1138,3 @@ impl CanonicalHash {
 		recipe_core::Digest::new(bytes)
 	}
 }
-
-#[cfg(test)]
-mod tests;

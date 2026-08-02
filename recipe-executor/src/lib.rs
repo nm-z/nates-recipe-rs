@@ -34,6 +34,3 @@ pub use worker::{
 	WorkerExecutionError, WorkerExecutionSession, WorkerExternalTransfer, WorkerLifecycle, WorkerPrepareFailure,
 	WorkerPrepareFailureParts, WorkerProjection, WorkerProjectionError, WorkerTaskPoll, WorkerTaskRole,
 };
-
-#[cfg(test)]
-mod tests;

@@ -49,10 +49,12 @@ impl fmt::Display for TransportError {
 			Self::BufferTooSmall {
 				required,
 				available,
-			} => write!(
-				formatter,
-				"receive buffer has {available} bytes but frame requires {required}"
-			),
+			} => {
+				write!(
+					formatter,
+					"receive buffer has {available} bytes but frame requires {required}"
+				)
+			}
 			Self::UnexpectedSequence { expected, received } => {
 				write!(
 					formatter,
@@ -79,9 +81,7 @@ impl fmt::Display for TransportError {
 impl std::error::Error for TransportError {}
 
 impl From<io::Error> for TransportError {
-	fn from(error: io::Error) -> Self {
-		Self::io(&error)
-	}
+	fn from(error: io::Error) -> Self { Self::io(&error) }
 }
 
 pub type TransportResult<T> = Result<T, TransportError>;

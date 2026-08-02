@@ -1,5 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	sync::Arc,
+};
 
 use recipe_core::{
 	ArtifactId, ArtifactIdentity, ByteCount, DeviceId, FinalizedBundle, InitDataImage, SubmissionSlots, Task, TaskId,
@@ -39,14 +41,10 @@ impl RuntimeImage {
 	}
 
 	#[must_use]
-	pub fn bytes(&self) -> &Arc<[u8]> {
-		&self.bytes
-	}
+	pub fn bytes(&self) -> &Arc<[u8]> { &self.bytes }
 
 	#[must_use]
-	pub const fn digest(&self) -> ArtifactDigest {
-		self.digest
-	}
+	pub const fn digest(&self) -> ArtifactDigest { self.digest }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,29 +74,19 @@ impl RuntimeArtifact {
 	}
 
 	#[must_use]
-	pub const fn id(&self) -> ArtifactId {
-		self.id
-	}
+	pub const fn id(&self) -> ArtifactId { self.id }
 
 	#[must_use]
-	pub fn bytes(&self) -> &Arc<[u8]> {
-		&self.bytes
-	}
+	pub fn bytes(&self) -> &Arc<[u8]> { &self.bytes }
 
 	#[must_use]
-	pub const fn digest(&self) -> ArtifactDigest {
-		self.digest
-	}
+	pub const fn digest(&self) -> ArtifactDigest { self.digest }
 
 	#[must_use]
-	pub const fn abi(&self) -> &KernelAbi {
-		&self.abi
-	}
+	pub const fn abi(&self) -> &KernelAbi { &self.abi }
 
 	#[must_use]
-	pub const fn kind(&self) -> &RuntimeArtifactKind {
-		&self.kind
-	}
+	pub const fn kind(&self) -> &RuntimeArtifactKind { &self.kind }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,33 +164,31 @@ impl ExecutionPlan {
 			bundle.tasks()
 				.iter()
 				.filter(|task| tasks.contains(&task.id))
-				.filter_map(|task| match &task.kind {
-					TaskKind::Calculation(calculation) => Some(calculation.artifact),
-					TaskKind::Transfer(_) | TaskKind::Metric(_) => None,
+				.filter_map(|task| {
+					match &task.kind {
+						TaskKind::Calculation(calculation) => Some(calculation.artifact),
+						TaskKind::Transfer(_) | TaskKind::Metric(_) => None,
+					}
 				})
 				.collect::<BTreeSet<_>>()
 		});
 		let mut artifacts = BTreeMap::new();
-		for identity in bundle
-			.artifacts()
-			.iter()
-			.filter(|identity| match &selected_artifacts {
+		for identity in bundle.artifacts().iter().filter(|identity| {
+			match &selected_artifacts {
 				Some(selected) => selected.contains(&identity.id),
 				None => true,
-			}) {
+			}
+		}) {
 			let runtime = runtime_by_id
 				.remove(&identity.id)
 				.ok_or(Error::MissingArtifact {
 					artifact: identity.id,
 				})?;
 			validate_artifact_contract(bundle, identity, &runtime)?;
-			artifacts.insert(
-				identity.id,
-				ArtifactContract {
-					identity: identity.clone(),
-					runtime,
-				},
-			);
+			artifacts.insert(identity.id, ArtifactContract {
+				identity: identity.clone(),
+				runtime,
+			});
 		}
 		reject_unexpected_artifact(runtime_by_id.keys().next().copied())?;
 
@@ -212,12 +198,9 @@ impl ExecutionPlan {
 				task: *task,
 				detail: "partition task has no immutable native submission",
 			})?;
-			ensure(
-				devices.contains(&submission.device),
-				Error::MissingDevice {
-					device: submission.device,
-				},
-			)?;
+			ensure(devices.contains(&submission.device), Error::MissingDevice {
+				device: submission.device,
+			})?;
 		}
 		Ok(Self {
 			artifacts,
@@ -238,9 +221,7 @@ impl ExecutionPlan {
 		self.submissions.get(&task).copied()
 	}
 
-	pub(crate) fn devices(&self) -> impl ExactSizeIterator<Item = DeviceId> + '_ {
-		self.devices.iter().copied()
-	}
+	pub(crate) fn devices(&self) -> impl ExactSizeIterator<Item = DeviceId> + '_ { self.devices.iter().copied() }
 }
 
 pub(crate) fn validate_artifact_contract(
@@ -249,9 +230,11 @@ pub(crate) fn validate_artifact_contract(
 	runtime: &RuntimeArtifact,
 ) -> Result<()> {
 	validate_runtime_artifact(identity, runtime)?;
-	let mismatch = |detail: String| Error::ArtifactMismatch {
-		artifact: identity.id,
-		detail,
+	let mismatch = |detail: String| {
+		Error::ArtifactMismatch {
+			artifact: identity.id,
+			detail,
+		}
 	};
 
 	for task in bundle.tasks() {
@@ -276,9 +259,11 @@ pub(crate) fn validate_artifact_contract(
 }
 
 pub(crate) fn validate_runtime_artifact(identity: &ArtifactIdentity, runtime: &RuntimeArtifact) -> Result<()> {
-	let mismatch = |detail: String| Error::ArtifactMismatch {
-		artifact: identity.id,
-		detail,
+	let mismatch = |detail: String| {
+		Error::ArtifactMismatch {
+			artifact: identity.id,
+			detail,
+		}
 	};
 	ensure(
 		runtime.id == identity.id,
@@ -321,9 +306,11 @@ pub(crate) fn validate_runtime_artifact(identity: &ArtifactIdentity, runtime: &R
 }
 
 fn validate_target(identity: &ArtifactIdentity, runtime: &RuntimeArtifact, digest: [u8; 32]) -> Result<()> {
-	let mismatch = |detail: String| Error::ArtifactMismatch {
-		artifact: identity.id,
-		detail,
+	let mismatch = |detail: String| {
+		Error::ArtifactMismatch {
+			artifact: identity.id,
+			detail,
+		}
 	};
 	match &runtime.kind {
 		RuntimeArtifactKind::Cuda { identity: driver } => {
@@ -603,37 +590,45 @@ fn validate_calculation_abi(
 	let run_id_index = buffer_arguments + usize::from(calculation.fault_flag.is_some());
 	match run_id_arguments {
 		0 => Ok(()),
-		1 => ensure(
-			matches!(abi.arguments.get(run_id_index), Some(KernelArgument::RunId)),
-			mismatch(format!(
-				"task {} ABI run id is not in its canonical suffix position",
+		1 => {
+			ensure(
+				matches!(abi.arguments.get(run_id_index), Some(KernelArgument::RunId)),
+				mismatch(format!(
+					"task {} ABI run id is not in its canonical suffix position",
+					task.id
+				)),
+			)
+		}
+		2.. => {
+			Err(mismatch(format!(
+				"task {} ABI repeats its dynamic run-id argument",
 				task.id
-			)),
-		),
-		2.. => Err(mismatch(format!(
-			"task {} ABI repeats its dynamic run-id argument",
-			task.id
-		))),
+			)))
+		}
 	}?;
 	let loop_iteration_index = run_id_index
 		.checked_add(run_id_arguments)
 		.ok_or_else(|| mismatch(format!("task {} argument index overflowed", task.id)))?;
 	match loop_iteration_arguments {
 		0 => Ok(()),
-		1 => ensure(
-			matches!(
-				abi.arguments.get(loop_iteration_index),
-				Some(KernelArgument::LoopIteration)
-			),
-			mismatch(format!(
-				"task {} ABI loop iteration is not in its canonical suffix position",
+		1 => {
+			ensure(
+				matches!(
+					abi.arguments.get(loop_iteration_index),
+					Some(KernelArgument::LoopIteration)
+				),
+				mismatch(format!(
+					"task {} ABI loop iteration is not in its canonical suffix position",
+					task.id
+				)),
+			)
+		}
+		2.. => {
+			Err(mismatch(format!(
+				"task {} ABI repeats its loop-iteration argument",
 				task.id
-			)),
-		),
-		2.. => Err(mismatch(format!(
-			"task {} ABI repeats its loop-iteration argument",
-			task.id
-		))),
+			)))
+		}
 	}?;
 	ensure(
 		matches!(abi.arguments.last(), Some(KernelArgument::ElementCount)),
@@ -650,10 +645,12 @@ fn plan_submissions(bundle: &FinalizedBundle) -> Result<BTreeMap<TaskId, Planned
 	for task in bundle.tasks() {
 		let (device, slots) = match &task.kind {
 			TaskKind::Calculation(calculation) => (calculation.device, calculation.submission),
-			TaskKind::Transfer(transfer) => (
-				transfer_submission_device(task.id, transfer.source, transfer.destination)?,
-				transfer.submission,
-			),
+			TaskKind::Transfer(transfer) => {
+				(
+					transfer_submission_device(task.id, transfer.source, transfer.destination)?,
+					transfer.submission,
+				)
+			}
 			TaskKind::Metric(metric) => {
 				let location = bundle
 					.value_location(metric.value)
@@ -665,14 +662,11 @@ fn plan_submissions(bundle: &FinalizedBundle) -> Result<BTreeMap<TaskId, Planned
 			}
 		};
 		validate_slots(bundle, task.id, device, slots)?;
-		result.insert(
-			task.id,
-			PlannedSubmission {
-				task: task.id,
-				device,
-				slots,
-			},
-		);
+		result.insert(task.id, PlannedSubmission {
+			task: task.id,
+			device,
+			slots,
+		});
 	}
 	Ok(result)
 }
@@ -684,13 +678,17 @@ fn transfer_submission_device(
 ) -> Result<DeviceId> {
 	match source {
 		recipe_core::TransferEndpoint::Device { device, .. } => Ok(device),
-		recipe_core::TransferEndpoint::External => match destination {
-			recipe_core::TransferEndpoint::Device { device, .. } => Ok(device),
-			recipe_core::TransferEndpoint::External => Err(Error::Protocol {
-				task,
-				detail: "external-to-external transfer has no native device",
-			}),
-		},
+		recipe_core::TransferEndpoint::External => {
+			match destination {
+				recipe_core::TransferEndpoint::Device { device, .. } => Ok(device),
+				recipe_core::TransferEndpoint::External => {
+					Err(Error::Protocol {
+						task,
+						detail: "external-to-external transfer has no native device",
+					})
+				}
+			}
+		}
 	}
 }
 

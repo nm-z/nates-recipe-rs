@@ -1,19 +1,25 @@
-use core::fmt;
-use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::{self, Write};
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Receiver;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use core::{
+	fmt,
+	num::{NonZeroU32, NonZeroU64, NonZeroUsize},
+};
+use std::{
+	collections::{BTreeMap, BTreeSet, VecDeque},
+	io::{self, Write},
+	path::Path,
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+		mpsc::Receiver,
+	},
+	thread::JoinHandle,
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use recipe_core::{
 	BundleIdentity, ByteCount, DeviceKind, DiscoveryIdentity, FlopCount, MachineId, MetricId, RunId, TargetIdentity,
 	ToolchainIdentity, TopologyIdentity, calculation_time_ceil, transfer_time_ceil,
 };
-use recipe_executor::{ExitImage, LogicalEvent, MetricValue, Watchdog};
+use recipe_executor::{ExitImage, LogicalEvent, MetricValue, RunJournal, Watchdog};
 use recipe_ingest::{SourceError, SourceLimit, read_source_snapshot};
 use recipe_language::CalculationGraph;
 use recipe_native_executor::{LocalCandidateFactory, StagedCrossBackend};
@@ -29,10 +35,11 @@ use recipe_training::{
 	DenseLoss, DenseLstm, DenseNormalization, DenseOperation, DensePool, DenseResidual, DenseResidualOperation,
 	DenseRnn, DenseTrainingConfig, DenseTree, DenseTreeFamily, FinalTrainingMetric, InferencePreparationError,
 	KnnModelArtifact, KnnModelDecodeLimits, LearningRateDecay, MAXIMUM_REDUCTION_TREE_LANES,
-	MulticlassValidationConfig, NativeKernelFormat, RegressionValidationConfig, TrainingBounds, TrainingCompileError,
-	TrainingExecutionControl, TrainingExecutionLimits, TrainingHorizon, TrainingMetricKind, TrainingMetricObserver,
-	TrainingMetricSample, ValidationMetricStatus, apply_checkpoint_resume, bounded_training_metric_channel,
-	compile_dense_training, compile_dense_training_with_binary_validation, compile_dense_training_with_blocks,
+	MulticlassValidationConfig, NativeKernelFormat, RealizedNativeKernelSet, RegressionValidationConfig,
+	TrainingBounds, TrainingCompileError, TrainingExecutionControl, TrainingExecutionEvidence,
+	TrainingExecutionLimits, TrainingHorizon, TrainingMetricKind, TrainingMetricObserver, TrainingMetricSample,
+	ValidationMetricStatus, apply_checkpoint_resume, bounded_training_metric_channel, compile_dense_training,
+	compile_dense_training_with_binary_validation, compile_dense_training_with_blocks,
 	compile_dense_training_with_blocks_and_binary_validation,
 	compile_dense_training_with_blocks_and_multiclass_validation,
 	compile_dense_training_with_blocks_and_regression_validation, compile_dense_training_with_multiclass_validation,
@@ -41,13 +48,15 @@ use recipe_training::{
 	prepare_categorical_bayesian_reference_sets, prepare_knn_reference_set,
 };
 
-use crate::api::{
-	Activation, Data, DataNormalization, DeclarationError, ForestBooster, LayerNormalization, LayerOperation,
-	LayerSpec, LearningRateSchedule, Loss, Metric, Model, Objective, Optimizer, ResidualOperation, ResidualSkip,
-	Train,
+use crate::{
+	api::{
+		Activation, Data, DataNormalization, DeclarationError, ForestBooster, LayerNormalization, LayerOperation,
+		LayerSpec, LearningRateSchedule, Loss, Metric, Model, Objective, Optimizer, ResidualOperation,
+		ResidualSkip, Train,
+	},
+	data_prepare::{DataPreparationError, prepare_data},
+	native_prepare::{NativePreparationError, with_current_native_preparation},
 };
-use crate::data_prepare::{DataPreparationError, prepare_data};
-use crate::native_prepare::{NativePreparationError, with_current_native_preparation};
 
 const LIVE_METRIC_CHANNEL_CAPACITY: usize = 256;
 const LIVE_METRIC_PALETTE: [(u8, u8, u8); 12] = [
@@ -113,9 +122,7 @@ impl fmt::Display for TrainingError {
 }
 
 impl fmt::Debug for TrainingError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		fmt::Display::fmt(self, formatter)
-	}
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(self, formatter) }
 }
 
 impl std::error::Error for TrainingError {
@@ -134,39 +141,27 @@ impl std::error::Error for TrainingError {
 }
 
 impl From<DeclarationError> for TrainingError {
-	fn from(error: DeclarationError) -> Self {
-		Self::Declaration(error)
-	}
+	fn from(error: DeclarationError) -> Self { Self::Declaration(error) }
 }
 
 impl From<DataPreparationError> for TrainingError {
-	fn from(error: DataPreparationError) -> Self {
-		Self::Data(error)
-	}
+	fn from(error: DataPreparationError) -> Self { Self::Data(error) }
 }
 
 impl From<TrainingCompileError> for TrainingError {
-	fn from(error: TrainingCompileError) -> Self {
-		Self::Compile(error)
-	}
+	fn from(error: TrainingCompileError) -> Self { Self::Compile(error) }
 }
 
 impl From<CheckpointError> for TrainingError {
-	fn from(error: CheckpointError) -> Self {
-		Self::Checkpoint(error)
-	}
+	fn from(error: CheckpointError) -> Self { Self::Checkpoint(error) }
 }
 
 impl From<InferencePreparationError> for TrainingError {
-	fn from(error: InferencePreparationError) -> Self {
-		Self::Resume(error)
-	}
+	fn from(error: InferencePreparationError) -> Self { Self::Resume(error) }
 }
 
 impl From<NativePreparationError> for TrainingError {
-	fn from(error: NativePreparationError) -> Self {
-		Self::Native(error)
-	}
+	fn from(error: NativePreparationError) -> Self { Self::Native(error) }
 }
 
 pub type TrainingResult<T> = Result<T, TrainingError>;
@@ -288,17 +283,52 @@ impl TrainingReport {
 		}
 	}
 
+	/// Completed native lifecycle journal for dense training. Reference-only
+	/// KNN and Bayesian preparation have no optimizer execution to report.
+	#[must_use]
+	pub const fn journal(&self) -> Option<&RunJournal> {
+		match &self.payload {
+			TrainingReportPayload::Dense(checkpoint) => Some(checkpoint.journal()),
+			TrainingReportPayload::Knn(_) | TrainingReportPayload::Bayes(_) => None,
+		}
+	}
+
+	/// Exact bundled native images built, loaded, warmed, and torn down by a
+	/// dense training run.
+	#[must_use]
+	pub const fn native_kernels(&self) -> Option<&RealizedNativeKernelSet> {
+		match &self.payload {
+			TrainingReportPayload::Dense(checkpoint) => Some(checkpoint.native_kernels()),
+			TrainingReportPayload::Knn(_) | TrainingReportPayload::Bayes(_) => None,
+		}
+	}
+
+	/// Driver-derived native image, entry, queue, completion, allocation, and
+	/// teardown evidence for dense training.
+	#[must_use]
+	pub const fn native_evidence(&self) -> Option<&recipe_native_executor::NativeExecutionEvidence> {
+		match &self.payload {
+			TrainingReportPayload::Dense(checkpoint) => Some(checkpoint.native_evidence()),
+			TrainingReportPayload::Knn(_) | TrainingReportPayload::Bayes(_) => None,
+		}
+	}
+
+	/// Full-partition and actual executor submission evidence for dense training.
+	#[must_use]
+	pub const fn training_evidence(&self) -> Option<&TrainingExecutionEvidence> {
+		match &self.payload {
+			TrainingReportPayload::Dense(checkpoint) => Some(checkpoint.training_evidence()),
+			TrainingReportPayload::Knn(_) | TrainingReportPayload::Bayes(_) => None,
+		}
+	}
+
 	/// Whether requested validation reporting had known target rows.
 	#[must_use]
-	pub const fn validation_status(&self) -> ValidationMetricStatus {
-		self.validation_status
-	}
+	pub const fn validation_status(&self) -> ValidationMetricStatus { self.validation_status }
 
 	/// Whether a host stop request was accepted after a complete epoch.
 	#[must_use]
-	pub const fn gracefully_stopped(&self) -> bool {
-		self.gracefully_stopped
-	}
+	pub const fn gracefully_stopped(&self) -> bool { self.gracefully_stopped }
 
 	/// Prepared KNN semantic model, or `None` for a dense training report.
 	#[must_use]
@@ -328,15 +358,21 @@ impl TrainingReport {
 
 	fn save_native_kernel(&self, path: impl AsRef<Path>, format: NativeKernelFormat) -> TrainingResult<()> {
 		match &self.payload {
-			TrainingReportPayload::Dense(checkpoint) => checkpoint
-				.save_native_kernel(path, format)
-				.map_err(TrainingError::from),
-			TrainingReportPayload::Knn(_) => Err(TrainingError::unsupported(
-				"KNN reference preparation has no native training kernel artifact",
-			)),
-			TrainingReportPayload::Bayes(_) => Err(TrainingError::unsupported(
-				"categorical Bayesian observation preparation has no native training kernel artifact",
-			)),
+			TrainingReportPayload::Dense(checkpoint) => {
+				checkpoint
+					.save_native_kernel(path, format)
+					.map_err(TrainingError::from)
+			}
+			TrainingReportPayload::Knn(_) => {
+				Err(TrainingError::unsupported(
+					"KNN reference preparation has no native training kernel artifact",
+				))
+			}
+			TrainingReportPayload::Bayes(_) => {
+				Err(TrainingError::unsupported(
+					"categorical Bayesian observation preparation has no native training kernel artifact",
+				))
+			}
 		}
 	}
 }
@@ -435,13 +471,13 @@ pub fn compile_knn_model(policy: &Train, data: &Data, model: &Model) -> Training
 		.ok_or_else(|| TrainingError::unsupported("KNN neighbor count must be nonzero"))?;
 	let prepared = prepare_data(data)?;
 	let references = prepare_knn_reference_set(&prepared, neighbors)?;
-	let normalization = data
-		.normalization()
-		.map(|normalization| match normalization {
+	let normalization = data.normalization().map(|normalization| {
+		match normalization {
 			DataNormalization::ZScore => DenseDataNormalization::ZScore,
 			DataNormalization::MinMax => DenseDataNormalization::MinMax,
 			DataNormalization::L2Norm => DenseDataNormalization::L2Norm,
-		});
+		}
+	});
 	let current = KnnModelArtifact::new(references, normalization, map_dense_operations(operations)?)?;
 	match resume {
 		Some(saved) => saved.continue_with(current).map_err(Into::into),
@@ -560,18 +596,20 @@ fn compile_training_graph(
 		.collect::<TrainingResult<Vec<_>>>()?;
 	let layers = blocks
 		.iter()
-		.map(|block| match block {
-			DenseBlock::Layer(layer) => Some(layer.clone()),
-			DenseBlock::Embedding(_)
-			| DenseBlock::Attention(_)
-			| DenseBlock::Rnn(_)
-			| DenseBlock::Gru(_)
-			| DenseBlock::Lstm(_)
-			| DenseBlock::Convolution(_)
-			| DenseBlock::Pool(_)
-			| DenseBlock::KMeans(_)
-			| DenseBlock::Tree(_)
-			| DenseBlock::Residual(_) => None,
+		.map(|block| {
+			match block {
+				DenseBlock::Layer(layer) => Some(layer.clone()),
+				DenseBlock::Embedding(_)
+				| DenseBlock::Attention(_)
+				| DenseBlock::Rnn(_)
+				| DenseBlock::Gru(_)
+				| DenseBlock::Lstm(_)
+				| DenseBlock::Convolution(_)
+				| DenseBlock::Pool(_)
+				| DenseBlock::KMeans(_)
+				| DenseBlock::Tree(_)
+				| DenseBlock::Residual(_) => None,
+			}
 		})
 		.collect::<Option<Vec<_>>>()
 		.unwrap_or_default();
@@ -691,9 +729,11 @@ fn compile_training_graph(
 		(true, None, None, None) => {
 			compile_dense_training_with_blocks(&prepared, &config, &blocks).map_err(TrainingError::from)
 		}
-		_ => Err(TrainingError::unsupported(
-			"one training run cannot request multiple validation metric families simultaneously",
-		)),
+		_ => {
+			Err(TrainingError::unsupported(
+				"one training run cannot request multiple validation metric families simultaneously",
+			))
+		}
 	}?;
 	let mut resume_checkpoint = None;
 	if let Some(source) = policy.resume_source() {
@@ -807,9 +847,7 @@ impl Train {
 	///
 	/// Expected declaration, preparation, execution, and artifact-write failures
 	/// are returned as typed Recipe errors.
-	pub fn run(&self) -> TrainingResult<TrainingReport> {
-		self.try_run()
-	}
+	pub fn run(&self) -> TrainingResult<TrainingReport> { self.try_run() }
 
 	fn try_run(&self) -> TrainingResult<TrainingReport> {
 		let (data, model) = crate::take_recipe_sequence().map_err(TrainingError::unsupported)?;
@@ -899,10 +937,12 @@ fn execute_current_training(
 			Ok(execution)
 		}
 		(Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-		(Err(execution), Err(presentation)) => Err(TrainingError::runtime(
-			"execute native training and present live metrics",
-			format!("execution error: {execution}; presentation error: {presentation}"),
-		)),
+		(Err(execution), Err(presentation)) => {
+			Err(TrainingError::runtime(
+				"execute native training and present live metrics",
+				format!("execution error: {execution}; presentation error: {presentation}"),
+			))
+		}
 	}
 }
 
@@ -1316,9 +1356,7 @@ struct LiveMetricPlan {
 }
 
 impl LiveMetricPlan {
-	fn is_empty(&self) -> bool {
-		self.metrics.is_empty()
-	}
+	fn is_empty(&self) -> bool { self.metrics.is_empty() }
 }
 
 fn live_metric_presentations(policy: &Train, training: &CompiledTraining) -> LiveMetricPlan {
@@ -1352,15 +1390,12 @@ fn live_metric_presentations(policy: &Train, training: &CompiledTraining) -> Liv
 		if !logged && !plotted {
 			continue;
 		}
-		plan.metrics.insert(
-			binding.metric,
-			LiveMetricPresentation {
-				label: metric_label(binding.kind),
-				width: metric_width(binding.kind),
-				log_cadence: logged.then(|| policy.metric_log_interval(metric)).flatten(),
-				plot: plotted,
-			},
-		);
+		plan.metrics.insert(binding.metric, LiveMetricPresentation {
+			label: metric_label(binding.kind),
+			width: metric_width(binding.kind),
+			log_cadence: logged.then(|| policy.metric_log_interval(metric)).flatten(),
+			plot: plotted,
+		});
 	}
 	if plan.host.requested()
 		&& let Some(trigger) = training
@@ -1369,14 +1404,14 @@ fn live_metric_presentations(policy: &Train, training: &CompiledTraining) -> Liv
 			.iter()
 			.find(|binding| binding.kind == TrainingMetricKind::TrainingLoss)
 	{
-		plan.metrics
-			.entry(trigger.metric)
-			.or_insert_with(|| LiveMetricPresentation {
+		plan.metrics.entry(trigger.metric).or_insert_with(|| {
+			LiveMetricPresentation {
 				label: metric_label(trigger.kind),
 				width: metric_width(trigger.kind),
 				log_cadence: None,
 				plot: false,
-			});
+			}
+		});
 	}
 	plan
 }
@@ -1399,12 +1434,14 @@ fn log_selects_binding_to_metric(binding: TrainingMetricKind) -> Option<Metric> 
 
 fn log_selects(requested: Metric, available: TrainingMetricKind) -> bool {
 	match requested {
-		Metric::Loss => matches!(
-			available,
-			TrainingMetricKind::TrainingLoss
-				| TrainingMetricKind::ValidationMeanBce
-				| TrainingMetricKind::ValidationMeanCrossEntropy
-		),
+		Metric::Loss => {
+			matches!(
+				available,
+				TrainingMetricKind::TrainingLoss
+					| TrainingMetricKind::ValidationMeanBce
+					| TrainingMetricKind::ValidationMeanCrossEntropy
+			)
+		}
 		Metric::Accuracy => available == TrainingMetricKind::Accuracy,
 		Metric::R2 => available == TrainingMetricKind::R2,
 		Metric::AuRoc => available == TrainingMetricKind::AuRoc,
@@ -1664,9 +1701,11 @@ impl BoundedPlotSeries {
 		let (minimum, maximum) = finite
 			.iter()
 			.copied()
-			.fold(None, |range, value| match range {
-				Some((minimum, maximum)) => Some((f64::min(minimum, value), f64::max(maximum, value))),
-				None => Some((value, value)),
+			.fold(None, |range, value| {
+				match range {
+					Some((minimum, maximum)) => Some((f64::min(minimum, value), f64::max(maximum, value))),
+					None => Some((value, value)),
+				}
 			})
 			.unwrap_or((f64::NAN, f64::NAN));
 		let levels = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -1743,12 +1782,16 @@ fn require_supported_model(model: &Model) -> TrainingResult<DenseLoss> {
 		Some(Objective::Builtin(Loss::CrossEntropy)) => Ok(DenseLoss::CrossEntropy),
 		Some(Objective::Builtin(Loss::Huber)) => Ok(DenseLoss::Huber),
 		Some(Objective::Builtin(Loss::Focal)) => Ok(DenseLoss::Focal),
-		Some(Objective::Reference(_)) => Err(TrainingError::unsupported(
-			"model-referenced objectives have no dense training lowering",
-		)),
-		None => Err(TrainingError::unsupported(
-			"dense training requires an explicit built-in objective",
-		)),
+		Some(Objective::Reference(_)) => {
+			Err(TrainingError::unsupported(
+				"model-referenced objectives have no dense training lowering",
+			))
+		}
+		None => {
+			Err(TrainingError::unsupported(
+				"dense training requires an explicit built-in objective",
+			))
+		}
 	}
 }
 
@@ -1821,9 +1864,11 @@ fn multiclass_validation_config(policy: &Train, loss: DenseLoss) -> TrainingResu
 	match loss {
 		DenseLoss::CrossEntropy => Ok(Some(MulticlassValidationConfig)),
 		DenseLoss::BinaryCrossEntropy | DenseLoss::Focal => Ok(None),
-		_ => Err(TrainingError::unsupported(
-			"accuracy validation requires binary or categorical cross entropy",
-		)),
+		_ => {
+			Err(TrainingError::unsupported(
+				"accuracy validation requires binary or categorical cross entropy",
+			))
+		}
 	}
 }
 
@@ -1861,10 +1906,12 @@ fn map_dense_block(layer: &LayerSpec) -> TrainingResult<DenseBlock> {
 				map_dense_width(vocabulary, "embedding vocabulary")?,
 			)))
 		}
-		LayerSpec::Attention { heads } => Ok(DenseBlock::Attention(DenseAttention::new(map_dense_width(
-			*heads,
-			"attention head count",
-		)?))),
+		LayerSpec::Attention { heads } => {
+			Ok(DenseBlock::Attention(DenseAttention::new(map_dense_width(
+				*heads,
+				"attention head count",
+			)?)))
+		}
 		LayerSpec::Rnn { width, operations } => {
 			if !operations.is_empty() {
 				return Err(TrainingError::unsupported(
@@ -1880,11 +1927,13 @@ fn map_dense_block(layer: &LayerSpec) -> TrainingResult<DenseBlock> {
 			filters,
 			kernel,
 			activation,
-		} => Ok(DenseBlock::Convolution(DenseConvolution::new(
-			map_dense_width(*filters, "convolution filter count")?,
-			map_dense_width(*kernel, "convolution kernel width")?,
-			map_dense_activation(*activation)?,
-		))),
+		} => {
+			Ok(DenseBlock::Convolution(DenseConvolution::new(
+				map_dense_width(*filters, "convolution filter count")?,
+				map_dense_width(*kernel, "convolution kernel width")?,
+				map_dense_activation(*activation)?,
+			)))
+		}
 		LayerSpec::Pool {
 			size,
 			group_to_neuron,
@@ -1983,14 +2032,18 @@ fn map_tree_block(family: DenseTreeFamily, trees: usize, depth: usize) -> Traini
 
 fn map_dense_residual_operation(operation: ResidualOperation) -> TrainingResult<DenseResidualOperation> {
 	match operation {
-		ResidualOperation::Layer { width } => Ok(DenseResidualOperation::Layer(DenseLayer::with_kind(
-			DenseBlockKind::Layer,
-			map_dense_width(width, "residual branch layer width")?,
-			[],
-		))),
-		ResidualOperation::Activation(activation) => Ok(DenseResidualOperation::Operation(
-			DenseOperation::Activation(map_dense_activation(activation)?),
-		)),
+		ResidualOperation::Layer { width } => {
+			Ok(DenseResidualOperation::Layer(DenseLayer::with_kind(
+				DenseBlockKind::Layer,
+				map_dense_width(width, "residual branch layer width")?,
+				[],
+			)))
+		}
+		ResidualOperation::Activation(activation) => {
+			Ok(DenseResidualOperation::Operation(
+				DenseOperation::Activation(map_dense_activation(activation)?),
+			))
+		}
 	}
 }
 
@@ -2032,15 +2085,17 @@ fn map_dense_operations(operations: &[LayerOperation]) -> TrainingResult<Vec<Den
 	let operations = operations
 		.iter()
 		.copied()
-		.map(|operation| match operation {
-			LayerOperation::Activation(activation) => {
-				map_dense_activation(activation).map(DenseOperation::Activation)
-			}
-			LayerOperation::Normalization(LayerNormalization::LayerNorm) => {
-				Ok(DenseOperation::Normalization(DenseNormalization::Layer))
-			}
-			LayerOperation::Normalization(LayerNormalization::BatchNorm) => {
-				Ok(DenseOperation::Normalization(DenseNormalization::Batch))
+		.map(|operation| {
+			match operation {
+				LayerOperation::Activation(activation) => {
+					map_dense_activation(activation).map(DenseOperation::Activation)
+				}
+				LayerOperation::Normalization(LayerNormalization::LayerNorm) => {
+					Ok(DenseOperation::Normalization(DenseNormalization::Layer))
+				}
+				LayerOperation::Normalization(LayerNormalization::BatchNorm) => {
+					Ok(DenseOperation::Normalization(DenseNormalization::Batch))
+				}
 			}
 		})
 		.collect::<TrainingResult<Vec<_>>>()?;
@@ -2065,1270 +2120,5 @@ fn map_dense_activation(activation: Activation) -> TrainingResult<DenseActivatio
 		Activation::Silu => Ok(DenseActivation::Silu),
 		Activation::Elu => Ok(DenseActivation::Elu),
 		Activation::PRelu => Ok(DenseActivation::PRelu),
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	struct BrokenMetricWriter;
-
-	impl Write for BrokenMetricWriter {
-		fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-			Err(io::Error::new(
-				io::ErrorKind::BrokenPipe,
-				"closed metric output",
-			))
-		}
-
-		fn flush(&mut self) -> io::Result<()> {
-			Ok(())
-		}
-	}
-
-	fn presentations() -> LiveMetricPlan {
-		let metrics = [
-			(
-				MetricId::new(1),
-				LiveMetricPresentation {
-					label: "loss".to_owned(),
-					width: 7,
-					log_cadence: NonZeroU64::new(1),
-					plot: false,
-				},
-			),
-			(
-				MetricId::new(2),
-				LiveMetricPresentation {
-					label: "auroc".to_owned(),
-					width: 6,
-					log_cadence: NonZeroU64::new(1),
-					plot: false,
-				},
-			),
-		]
-		.into_iter()
-		.collect();
-		LiveMetricPlan {
-			metrics,
-			host: LiveHostPresentation::default(),
-		}
-	}
-
-	#[test]
-	fn host_runtime_tuning_tracks_capabilities_and_realized_work() {
-		assert_eq!(select_host_worker_threads(32, 12, 100), 12);
-		assert_eq!(select_host_worker_threads(4, 12, 100), 4);
-		assert_eq!(select_host_worker_threads(32, 12, 3), 3);
-		assert_eq!(
-			select_host_staging_bytes(64 << 20, 8 << 20, 128 << 20, 4),
-			8 << 20
-		);
-		assert_eq!(
-			select_host_staging_bytes(2 << 20, 8 << 20, 128 << 20, 4),
-			2 << 20
-		);
-		assert_eq!(
-			select_host_staging_bytes(64 << 20, 64 << 20, 8 << 20, 4),
-			2 << 20
-		);
-	}
-
-	#[test]
-	fn live_metric_presenter_propagates_writer_failure() {
-		let (sender, receiver) = std::sync::mpsc::channel();
-		sender.send(TrainingMetricSample {
-			sequence: 1,
-			epoch: NonZeroU64::MIN,
-			zero_based_iteration: recipe_core::LoopIterations::ONE.iteration(0).unwrap(),
-			task: recipe_core::TaskId::new(1),
-			slot: recipe_core::MetricSlotId::new(1),
-			metric: MetricId::new(1),
-			value: MetricValue::F32(0.25),
-		})
-		.expect("send live metric sample");
-		drop(sender);
-		let bounds = TrainingBounds {
-			train_rows: 1,
-			epochs: TrainingHorizon::Finite(NonZeroU64::MIN),
-			training_iterations: recipe_core::LoopIterations::ONE,
-			calibration_iterations: 0,
-			iterations: recipe_core::LoopIterations::ONE,
-			warmup_iterations: 0,
-		};
-		let error = present_live_metrics(receiver, presentations(), bounds, &mut BrokenMetricWriter)
-			.expect_err("closed output must fail live metric presentation");
-		assert!(matches!(
-			error,
-			TrainingError::Runtime { stage: "write live metrics", detail } if detail.contains("closed metric output")
-		));
-	}
-
-	#[test]
-	fn loss_logging_uses_training_loss_without_requesting_validation() {
-		let policy = Train::new().log([crate::api::Loss]);
-
-		assert_eq!(
-			binary_validation_config(&policy, DenseLoss::MeanSquaredError).expect("valid policy"),
-			None
-		);
-		assert_eq!(
-			multiclass_validation_config(&policy, DenseLoss::CrossEntropy).expect("valid policy"),
-			None
-		);
-	}
-
-	#[test]
-	fn accuracy_logging_selects_binary_or_categorical_validation_from_the_loss() {
-		let policy = Train::new().log([crate::api::Accuracy]);
-
-		assert_eq!(
-			binary_validation_config(&policy, DenseLoss::BinaryCrossEntropy).expect("valid policy"),
-			Some(BinaryValidationConfig::new(
-				NonZeroU32::new(15).expect("nonzero bins"),
-				Vec::new()
-			))
-		);
-		assert_eq!(
-			binary_validation_config(&policy, DenseLoss::Focal).expect("valid policy"),
-			Some(BinaryValidationConfig::new(
-				NonZeroU32::new(15).expect("nonzero bins"),
-				Vec::new()
-			))
-		);
-		assert_eq!(
-			binary_validation_config(&policy, DenseLoss::CrossEntropy).expect("valid policy"),
-			None
-		);
-		assert_eq!(
-			multiclass_validation_config(&policy, DenseLoss::BinaryCrossEntropy).expect("valid policy"),
-			None
-		);
-		assert_eq!(
-			multiclass_validation_config(&policy, DenseLoss::Focal).expect("valid policy"),
-			None
-		);
-		assert_eq!(
-			multiclass_validation_config(&policy, DenseLoss::CrossEntropy).expect("valid policy"),
-			Some(MulticlassValidationConfig)
-		);
-		assert!(multiclass_validation_config(&policy, DenseLoss::MeanSquaredError).is_err());
-	}
-
-	#[test]
-	fn r2_logging_selects_only_scalar_regression_validation() {
-		let policy = Train::new().log([crate::api::R2]);
-
-		assert_eq!(
-			binary_validation_config(&policy, DenseLoss::MeanSquaredError).expect("valid policy"),
-			None
-		);
-		assert_eq!(
-			regression_validation_config(&policy, DenseLoss::MeanSquaredError).expect("valid policy"),
-			Some(RegressionValidationConfig)
-		);
-		assert!(regression_validation_config(&policy, DenseLoss::BinaryCrossEntropy).is_err());
-	}
-
-	#[test]
-	fn public_losses_map_to_distinct_dense_compiler_losses() {
-		for (loss, expected) in [
-			(Loss::BinaryCrossEntropy, DenseLoss::BinaryCrossEntropy),
-			(Loss::MeanSquaredError, DenseLoss::MeanSquaredError),
-			(Loss::MeanAbsoluteError, DenseLoss::MeanAbsoluteError),
-			(Loss::CrossEntropy, DenseLoss::CrossEntropy),
-			(Loss::Huber, DenseLoss::Huber),
-			(Loss::Focal, DenseLoss::Focal),
-		] {
-			let model = Model::new()
-				.layer(1)
-				.loss(loss)
-				.grad(crate::api::clip(0.75));
-			assert_eq!(
-				require_supported_model(&model).expect("supported loss"),
-				expected
-			);
-			assert_eq!(model.gradient_clip_value(), Some(0.75));
-		}
-	}
-
-	#[test]
-	fn public_activations_map_to_their_canonical_dense_identity() {
-		for (activation, expected) in [
-			(Activation::Logarithm, DenseActivation::Logarithm),
-			(
-				Activation::NaturalLogarithm,
-				DenseActivation::NaturalLogarithm,
-			),
-			(Activation::LeakyRelu, DenseActivation::LeakyRelu),
-			(Activation::Sigmoid, DenseActivation::Sigmoid),
-			(Activation::Tanh, DenseActivation::Tanh),
-			(Activation::Selu, DenseActivation::Selu),
-			(Activation::Elu, DenseActivation::Elu),
-			(Activation::PRelu, DenseActivation::PRelu),
-		] {
-			assert_eq!(
-				map_dense_activation(activation).expect("activation lowers"),
-				expected
-			);
-		}
-	}
-
-	#[test]
-	fn perc_lowers_as_a_distinct_dense_block_kind() {
-		let model = Model::new().perc(30).silu();
-		let block = map_dense_layer(&model.layers()[0]).expect("perc block lowers");
-
-		assert_eq!(block.kind(), DenseBlockKind::Perc);
-		assert_eq!(block.width().get(), 30);
-		assert_eq!(
-			block.operations(),
-			[DenseOperation::Activation(DenseActivation::Silu)]
-		);
-	}
-
-	#[test]
-	fn pool_lowering_preserves_size_and_immediate_dense_routing() {
-		let model = Model::new().pool(2).layer(8);
-		let block = map_dense_block(&model.layers()[0]).expect("pool block lowers");
-		let DenseBlock::Pool(pool) = block else {
-			panic!("pool facade block lowered as another block kind");
-		};
-
-		assert_eq!(pool.size().get(), 2);
-		assert_eq!(pool.group_to_neuron().map(NonZeroU64::get), Some(8));
-		assert!(matches!(
-			map_dense_block(&model.layers()[1]).expect("following dense layer lowers"),
-			DenseBlock::Layer(layer) if layer.width().get() == 8
-		));
-
-		let unconnected = Model::new().pool(3);
-		let DenseBlock::Pool(pool) = map_dense_block(&unconnected.layers()[0]).expect("terminal pool block lowers")
-		else {
-			panic!("terminal pool facade block lowered as another block kind");
-		};
-		assert_eq!(pool.size().get(), 3);
-		assert_eq!(pool.group_to_neuron(), None);
-	}
-
-	#[test]
-	fn residual_lowering_preserves_branch_and_post_add_operation_order() {
-		let model = Model::new()
-			.residual([
-				crate::api::relu(),
-				crate::api::layer(64),
-				crate::api::relu(),
-				crate::api::layer(32),
-			])
-			.norm(crate::api::layer_norm)
-			.silu();
-		let block = map_dense_block(&model.layers()[0]).expect("residual block lowers");
-		let DenseBlock::Residual(residual) = block else {
-			panic!("residual facade block lowered as an ordinary layer");
-		};
-
-		assert_eq!(residual.output_width().map(NonZeroU64::get), Some(32));
-		assert_eq!(
-			residual.branch(),
-			[
-				DenseResidualOperation::Operation(DenseOperation::Activation(DenseActivation::Relu)),
-				DenseResidualOperation::Layer(DenseLayer::with_operations(
-					NonZeroU64::new(64).unwrap(),
-					[]
-				)),
-				DenseResidualOperation::Operation(DenseOperation::Activation(DenseActivation::Relu)),
-				DenseResidualOperation::Layer(DenseLayer::with_operations(
-					NonZeroU64::new(32).unwrap(),
-					[]
-				)),
-			]
-		);
-		assert_eq!(
-			residual.operations(),
-			[
-				DenseOperation::Normalization(DenseNormalization::Layer),
-				DenseOperation::Activation(DenseActivation::Silu),
-			]
-		);
-	}
-
-	#[test]
-	fn residual_training_package_constructs_a_structured_checkpoint_manifest() {
-		static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
-
-		struct RemoveOnDrop(std::path::PathBuf);
-
-		impl Drop for RemoveOnDrop {
-			fn drop(&mut self) {
-				let _ = std::fs::remove_file(&self.0);
-			}
-		}
-
-		let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let path = std::env::temp_dir().join(format!(
-			"recipe-residual-package-{}-{sequence}.csv",
-			std::process::id(),
-		));
-		std::fs::write(&path, b"feature,target\n1,2\n2,3\n3,4\n4,5\n5,6\n6,7\n")
-			.expect("write residual package fixture");
-		let _fixture = RemoveOnDrop(path.clone());
-		let data = Data::empty()
-			.set(path.to_str().expect("temporary path is UTF-8"))
-			.target("target")
-			.norm(DataNormalization::ZScore)
-			.split(0.75);
-		let model = Model::new()
-			.residual([crate::api::relu(), crate::api::layer(4), crate::api::relu()])
-			.layer(1)
-			.loss(Loss::MeanSquaredError);
-		let policy = Train::new()
-			.optimizer(Optimizer::AdamW)
-			.epochs(1)
-			.lr(0.001)
-			.cos();
-
-		let package = compile_training_package(&policy, &data, &model).expect("residual package compiles");
-		assert!(matches!(
-			package.training.blocks()[0],
-			DenseBlock::Residual(_)
-		));
-		assert_eq!(package.checkpoint.format_version(), 9);
-	}
-
-	#[test]
-	fn public_embedding_and_attention_map_and_compile_without_numeric_token_normalization() {
-		static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
-
-		struct RemoveOnDrop(std::path::PathBuf);
-
-		impl Drop for RemoveOnDrop {
-			fn drop(&mut self) {
-				let _ = std::fs::remove_file(&self.0);
-			}
-		}
-
-		let model = Model::new()
-			.embed(4)
-			.vocab(8)
-			.attn(2)
-			.layer(1)
-			.loss(Loss::MeanSquaredError);
-		assert_eq!(
-			map_dense_block(&model.layers()[0]).expect("embedding lowers"),
-			DenseBlock::Embedding(DenseEmbedding::new(
-				NonZeroU64::new(4).unwrap(),
-				NonZeroU64::new(8).unwrap(),
-			))
-		);
-		assert_eq!(
-			map_dense_block(&model.layers()[1]).expect("attention lowers"),
-			DenseBlock::Attention(DenseAttention::new(NonZeroU64::new(2).unwrap()))
-		);
-		assert!(matches!(
-			map_dense_block(&Model::new().embed(4).layers()[0]),
-			Err(TrainingError::Unsupported { detail }) if detail.contains("requires an immediate `.vocab")
-		));
-
-		let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let path = std::env::temp_dir().join(format!(
-			"recipe-embedding-package-{}-{sequence}.csv",
-			std::process::id(),
-		));
-		std::fs::write(
-			&path,
-			b"token_zero,token_one,target\n0,1,0\n1,2,1\n2,3,0\n3,4,1\n4,5,0\n5,6,1\n6,7,0\n",
-		)
-		.expect("write embedding package fixture");
-		let _fixture = RemoveOnDrop(path.clone());
-		let data = Data::empty()
-			.set(path.to_str().expect("temporary path is UTF-8"))
-			.target("target")
-			.split(5.0 / 7.0);
-		let policy = Train::new()
-			.optimizer(Optimizer::AdamW)
-			.epochs(1)
-			.lr(0.001)
-			.cos();
-		let package = compile_training_package(&policy, &data, &model).expect("embedding package compiles");
-		assert_eq!(package.checkpoint.format_version(), 13);
-		assert_eq!(
-			package.training.config().data_normalization,
-			DenseDataNormalization::Identity
-		);
-		assert!(matches!(
-			package.training.blocks(),
-			[
-				DenseBlock::Embedding(_),
-				DenseBlock::Attention(_),
-				DenseBlock::Layer(_)
-			]
-		));
-
-		let normalized = data.clone().norm(DataNormalization::ZScore);
-		assert!(matches!(
-			compile_training_package(&policy, &normalized, &model),
-			Err(TrainingError::Unsupported { detail }) if detail.contains("exact int32 token IDs")
-		));
-	}
-
-	#[test]
-	fn public_rnn_maps_numeric_columns_to_one_final_hidden_state() {
-		static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
-
-		struct RemoveOnDrop(std::path::PathBuf);
-
-		impl Drop for RemoveOnDrop {
-			fn drop(&mut self) {
-				let _ = std::fs::remove_file(&self.0);
-			}
-		}
-
-		let model = Model::new().rnn(4).layer(1).loss(Loss::MeanSquaredError);
-		assert_eq!(
-			map_dense_block(&model.layers()[0]).expect("RNN lowers"),
-			DenseBlock::Rnn(DenseRnn::new(NonZeroU64::new(4).unwrap()))
-		);
-		assert!(matches!(
-			map_dense_block(&Model::new().rnn(4).relu().layers()[0]),
-			Err(TrainingError::Unsupported { detail }) if detail.contains("does not yet define chained")
-		));
-
-		let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let path = std::env::temp_dir().join(format!(
-			"recipe-rnn-package-{}-{sequence}.csv",
-			std::process::id(),
-		));
-		std::fs::write(
-			&path,
-			b"step_zero,step_one,step_two,target\n1,2,3,1\n2,3,4,2\n3,4,5,3\n4,5,6,4\n5,6,7,5\n6,7,8,6\n7,8,9,7\n",
-		)
-		.expect("write RNN package fixture");
-		let _fixture = RemoveOnDrop(path.clone());
-		let data = Data::empty()
-			.set(path.to_str().expect("temporary path is UTF-8"))
-			.target("target")
-			.norm(DataNormalization::ZScore)
-			.split(5.0 / 7.0);
-		let policy = Train::new()
-			.optimizer(Optimizer::AdamW)
-			.epochs(1)
-			.lr(0.001)
-			.cos();
-		let package = compile_training_package(&policy, &data, &model).expect("RNN package compiles");
-		assert_eq!(package.checkpoint.format_version(), 14);
-		assert!(matches!(
-			package.training.blocks(),
-			[DenseBlock::Rnn(_), DenseBlock::Layer(_)]
-		));
-	}
-
-	#[test]
-	fn public_gru_maps_numeric_columns_to_one_reset_before_final_hidden_state() {
-		static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
-
-		struct RemoveOnDrop(std::path::PathBuf);
-
-		impl Drop for RemoveOnDrop {
-			fn drop(&mut self) {
-				let _ = std::fs::remove_file(&self.0);
-			}
-		}
-
-		let model = Model::new().gru(4).layer(1).loss(Loss::MeanSquaredError);
-		assert_eq!(
-			map_dense_block(&model.layers()[0]).expect("GRU lowers"),
-			DenseBlock::Gru(DenseGru::new(NonZeroU64::new(4).unwrap()))
-		);
-		assert!(matches!(
-			map_dense_block(&Model::new().gru(4).relu().layers()[0]),
-			Err(TrainingError::Unsupported { detail }) if detail.contains("does not yet define chained")
-		));
-
-		let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let path = std::env::temp_dir().join(format!(
-			"recipe-gru-package-{}-{sequence}.csv",
-			std::process::id(),
-		));
-		std::fs::write(
-			&path,
-			b"step_zero,step_one,step_two,target\n1,2,3,1\n2,3,4,2\n3,4,5,3\n4,5,6,4\n5,6,7,5\n6,7,8,6\n7,8,9,7\n",
-		)
-		.expect("write GRU package fixture");
-		let _fixture = RemoveOnDrop(path.clone());
-		let data = Data::empty()
-			.set(path.to_str().expect("temporary path is UTF-8"))
-			.target("target")
-			.norm(DataNormalization::ZScore)
-			.split(5.0 / 7.0);
-		let policy = Train::new()
-			.optimizer(Optimizer::AdamW)
-			.epochs(1)
-			.lr(0.001)
-			.cos();
-		let package = compile_training_package(&policy, &data, &model).expect("GRU package compiles");
-		assert_eq!(package.checkpoint.format_version(), 15);
-		assert!(matches!(
-			package.training.blocks(),
-			[DenseBlock::Gru(_), DenseBlock::Layer(_)]
-		));
-	}
-
-	#[test]
-	fn public_lstm_maps_numeric_columns_to_one_zero_cell_final_hidden_state() {
-		static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
-
-		struct RemoveOnDrop(std::path::PathBuf);
-
-		impl Drop for RemoveOnDrop {
-			fn drop(&mut self) {
-				let _ = std::fs::remove_file(&self.0);
-			}
-		}
-
-		let model = Model::new().lstm(4).layer(1).loss(Loss::MeanSquaredError);
-		assert_eq!(
-			map_dense_block(&model.layers()[0]).expect("LSTM lowers"),
-			DenseBlock::Lstm(DenseLstm::new(NonZeroU64::new(4).unwrap()))
-		);
-		assert!(matches!(
-			map_dense_block(&Model::new().lstm(4).relu().layers()[0]),
-			Err(TrainingError::Unsupported { detail }) if detail.contains("does not yet define chained")
-		));
-
-		let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let path = std::env::temp_dir().join(format!(
-			"recipe-lstm-package-{}-{sequence}.csv",
-			std::process::id(),
-		));
-		std::fs::write(
-			&path,
-			b"step_zero,step_one,step_two,target\n1,2,3,1\n2,3,4,2\n3,4,5,3\n4,5,6,4\n5,6,7,5\n6,7,8,6\n7,8,9,7\n",
-		)
-		.expect("write LSTM package fixture");
-		let _fixture = RemoveOnDrop(path.clone());
-		let data = Data::empty()
-			.set(path.to_str().expect("temporary path is UTF-8"))
-			.target("target")
-			.norm(DataNormalization::ZScore)
-			.split(5.0 / 7.0);
-		let policy = Train::new()
-			.optimizer(Optimizer::AdamW)
-			.epochs(1)
-			.lr(0.001)
-			.cos();
-		let package = compile_training_package(&policy, &data, &model).expect("LSTM package compiles");
-		assert_eq!(package.checkpoint.format_version(), 16);
-		assert!(matches!(
-			package.training.blocks(),
-			[DenseBlock::Lstm(_), DenseBlock::Layer(_)]
-		));
-	}
-
-	#[test]
-	fn public_tree_and_forest_forms_compile_as_terminal_v12_models() {
-		static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
-
-		struct RemoveOnDrop(std::path::PathBuf);
-
-		impl Drop for RemoveOnDrop {
-			fn drop(&mut self) {
-				let _ = std::fs::remove_file(&self.0);
-			}
-		}
-
-		let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let path = std::env::temp_dir().join(format!(
-			"recipe-tree-package-{}-{sequence}.csv",
-			std::process::id(),
-		));
-		std::fs::write(
-			&path,
-			b"feature_one,feature_two,target\n1,10,1\n2,20,0\n3,30,1\n4,40,0\n5,50,1\n6,60,0\n7,70,1\n",
-		)
-		.expect("write tree package fixture");
-		let _fixture = RemoveOnDrop(path.clone());
-		let data = Data::empty()
-			.set(path.to_str().expect("temporary path is UTF-8"))
-			.target("target")
-			.norm(DataNormalization::ZScore)
-			.split(5.0 / 7.0);
-		let policy = Train::new()
-			.optimizer(Optimizer::AdamW)
-			.epochs(1)
-			.lr(0.001)
-			.cos();
-		let declarations = [
-			(
-				Model::new().lgbm(2).loss(Loss::MeanSquaredError),
-				DenseTree::new(
-					DenseTreeFamily::LightGbm,
-					NonZeroU64::MIN,
-					NonZeroU32::new(2).unwrap(),
-				),
-			),
-			(
-				Model::new().cbst(2).loss(Loss::MeanSquaredError),
-				DenseTree::new(
-					DenseTreeFamily::CatBoost,
-					NonZeroU64::MIN,
-					NonZeroU32::new(2).unwrap(),
-				),
-			),
-			(
-				Model::new().xgbst(2).loss(Loss::MeanSquaredError),
-				DenseTree::new(
-					DenseTreeFamily::XGBoost,
-					NonZeroU64::MIN,
-					NonZeroU32::new(2).unwrap(),
-				),
-			),
-			(
-				Model::new().forest(2).lgbm(2).loss(Loss::MeanSquaredError),
-				DenseTree::new(
-					DenseTreeFamily::LightGbm,
-					NonZeroU64::new(2).unwrap(),
-					NonZeroU32::new(2).unwrap(),
-				),
-			),
-			(
-				Model::new().forest(2).cbst(2).loss(Loss::MeanSquaredError),
-				DenseTree::new(
-					DenseTreeFamily::CatBoost,
-					NonZeroU64::new(2).unwrap(),
-					NonZeroU32::new(2).unwrap(),
-				),
-			),
-			(
-				Model::new().forest(2).xgbst(2).loss(Loss::MeanSquaredError),
-				DenseTree::new(
-					DenseTreeFamily::XGBoost,
-					NonZeroU64::new(2).unwrap(),
-					NonZeroU32::new(2).unwrap(),
-				),
-			),
-		];
-
-		for (model, expected) in declarations {
-			let package = compile_training_package(&policy, &data, &model).expect("tree package compiles");
-			assert_eq!(package.training.blocks(), [DenseBlock::Tree(expected)]);
-			assert_eq!(package.checkpoint.format_version(), 12);
-		}
-	}
-
-	#[test]
-	fn specialized_blocks_are_never_silently_treated_as_dense_layers() {
-		let bayes = Model::new()
-			.bayes("housing", ["age", "job"])
-			.loss(Loss::BinaryCrossEntropy);
-		assert!(matches!(
-			require_supported_model(&bayes),
-			Err(TrainingError::Unsupported { detail })
-				if detail.contains("Bayesian dependencies require a Bayesian model compiler")
-		));
-
-		for model in [
-			Model::new().rnn(30),
-			Model::new().gru(30),
-			Model::new().lstm(30),
-			Model::new().conv(12, 3),
-			Model::new().pool(2),
-			Model::new().lgbm(4),
-			Model::new().cbst(4),
-			Model::new().xgbst(4),
-			Model::new().forest(20).lgbm(4),
-			Model::new().kmeans(4),
-		] {
-			assert!(matches!(
-				map_dense_layer(&model.layers()[0]),
-				Err(TrainingError::Unsupported { detail })
-					if detail.contains("accepts layer, perc, and residual blocks only")
-			));
-		}
-	}
-
-	#[test]
-	fn knn_compilation_prepares_every_target_without_dense_training_policy() {
-		static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
-
-		struct RemoveOnDrop(std::path::PathBuf);
-
-		impl Drop for RemoveOnDrop {
-			fn drop(&mut self) {
-				let _ = std::fs::remove_file(&self.0);
-			}
-		}
-
-		let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let path = std::env::temp_dir().join(format!(
-			"recipe-knn-compilation-{}-{sequence}.csv",
-			std::process::id(),
-		));
-		std::fs::write(
-			&path,
-			b"feature,class,numeric\n1,red,1.5\n2,blue,2.5\n3,red,3.5\n4,blue,4.5\n",
-		)
-		.expect("write KNN compilation fixture");
-		let _fixture = RemoveOnDrop(path.clone());
-		let data = Data::empty()
-			.set(path.to_str().expect("temporary path is UTF-8"))
-			.target(["class", "numeric"])
-			.norm(DataNormalization::ZScore)
-			.split(0.75);
-		let artifact =
-			compile_knn_model(&Train::new(), &data, &Model::new().knn(2)).expect("standalone KNN model compiles");
-
-		assert_eq!(artifact.references().neighbors().get(), 2);
-		assert_eq!(artifact.references().reference_rows(), 3);
-		assert_eq!(artifact.references().outputs().len(), 2);
-		assert_eq!(
-			artifact.references().outputs()[0].schema().source_index(),
-			1
-		);
-		assert_eq!(
-			artifact.references().outputs()[1].schema().source_index(),
-			2
-		);
-		assert_eq!(
-			artifact.data_normalization(),
-			Some(DenseDataNormalization::ZScore)
-		);
-		assert!(artifact.operations().is_empty());
-	}
-
-	#[test]
-	fn knn_compilation_keeps_missing_resume_fresh_and_appends_an_existing_reference_set() {
-		static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
-
-		struct RemoveOnDrop(Vec<std::path::PathBuf>);
-
-		impl Drop for RemoveOnDrop {
-			fn drop(&mut self) {
-				for path in &self.0 {
-					let _ = std::fs::remove_file(path);
-				}
-			}
-		}
-
-		let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let csv = std::env::temp_dir().join(format!(
-			"recipe-knn-resume-{}-{sequence}.csv",
-			std::process::id(),
-		));
-		let model_path = csv.with_extension("ogdl");
-		std::fs::write(&csv, b"feature,target\n1,a\n2,b\n3,a\n4,b\n").expect("write KNN resume fixture");
-		let _fixture = RemoveOnDrop(vec![csv.clone(), model_path.clone()]);
-		let data = Data::empty()
-			.set(csv.to_str().expect("temporary path is UTF-8"))
-			.target("target")
-			.split(0.75);
-		let model = Model::new().knn(1);
-		let policy = Train::new().resume(model_path.to_str().expect("temporary path is UTF-8"));
-
-		let artifact = compile_knn_model(&policy, &data, &model).expect("missing KNN resume starts fresh");
-		artifact.save(&model_path).expect("save existing KNN model");
-		let continued = compile_knn_model(&policy, &data, &model).expect("existing KNN model continues");
-		assert_eq!(continued.references().reference_rows(), 6);
-		assert_eq!(
-			continued.references().reference_source_rows(),
-			[0, 1, 2, 0, 1, 2]
-		);
-		assert_eq!(
-			continued.references().reference_feature_bits(),
-			[
-				1.0_f32.to_bits(),
-				2.0_f32.to_bits(),
-				3.0_f32.to_bits(),
-				1.0_f32.to_bits(),
-				2.0_f32.to_bits(),
-				3.0_f32.to_bits(),
-			]
-		);
-	}
-
-	#[test]
-	fn knn_compilation_rejects_optimizer_and_native_training_artifacts_before_data_io() {
-		let data = Data::empty()
-			.set("not-read.csv")
-			.target("target")
-			.split(0.75);
-		let model = Model::new().knn(1);
-		let policy = Train::new().optimizer(Optimizer::AdamW);
-		let error = compile_knn_model(&policy, &data, &model).expect_err("KNN has no optimizer");
-		assert!(matches!(
-			error,
-			TrainingError::Unsupported { detail } if detail.contains("has no optimizer")
-		));
-
-		let policy = Train::new().__recipe_save_pair("model.ogdl", "kernel.cubin");
-		let error = compile_knn_model(&policy, &data, &model).expect_err("KNN has no training kernel");
-		assert!(matches!(
-			error,
-			TrainingError::Unsupported { detail } if detail.contains("does not realize a native training kernel")
-		));
-	}
-
-	#[test]
-	fn knn_run_prepares_and_saves_without_fabricating_native_training_evidence() {
-		static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
-
-		struct RemoveOnDrop(Vec<std::path::PathBuf>);
-
-		impl Drop for RemoveOnDrop {
-			fn drop(&mut self) {
-				for path in &self.0 {
-					let _ = std::fs::remove_file(path);
-				}
-			}
-		}
-
-		let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let csv = std::env::temp_dir().join(format!(
-			"recipe-knn-run-{}-{sequence}.csv",
-			std::process::id(),
-		));
-		let destination = csv.with_extension("ogdl");
-		std::fs::write(&csv, b"feature,target\n1,a\n2,b\n3,a\n4,b\n").expect("write KNN run fixture");
-		let _fixture = RemoveOnDrop(vec![csv.clone(), destination.clone()]);
-		let data = Data::empty()
-			.set(csv.to_str().expect("temporary path is UTF-8"))
-			.target("target")
-			.split(0.75);
-		let policy = Train::new().save(destination.to_str().expect("temporary path is UTF-8"));
-		let report = policy
-			.try_run_with(&data, &Model::new().knn(1))
-			.expect("KNN run prepares and saves");
-
-		assert_eq!(report.kind(), TrainingModelKind::Knn);
-		assert_eq!(report.run(), None);
-		assert_eq!(report.bundle(), None);
-		assert!(report.external_outputs().is_empty());
-		assert!(report.metrics().is_empty());
-		assert_eq!(
-			report.validation_status(),
-			ValidationMetricStatus::NotRequested
-		);
-		assert!(!report.gracefully_stopped());
-		let model = report
-			.knn_model()
-			.expect("KNN report retains its semantic model");
-		assert_eq!(
-			std::fs::read(&destination).expect("read saved KNN model"),
-			model.encode().unwrap()
-		);
-	}
-
-	#[test]
-	fn bayesian_compilation_saves_exact_observations_and_appends_an_existing_model() {
-		static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
-
-		struct RemoveOnDrop(Vec<std::path::PathBuf>);
-
-		impl Drop for RemoveOnDrop {
-			fn drop(&mut self) {
-				for path in &self.0 {
-					let _ = std::fs::remove_file(path);
-				}
-			}
-		}
-
-		let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let csv = std::env::temp_dir().join(format!(
-			"recipe-bayes-resume-{}-{sequence}.csv",
-			std::process::id(),
-		));
-		let model_path = csv.with_extension("ogdl");
-		std::fs::write(
-			&csv,
-			b"weather,wind,play\nsun,breeze,otter\nsun,gale,falcon\nrain,breeze,otter\nrain,gale,falcon\nsun,breeze,otter\n",
-		)
-		.expect("write Bayesian resume fixture");
-		let _fixture = RemoveOnDrop(vec![csv.clone(), model_path.clone()]);
-		let data = Data::empty()
-			.set(csv.to_str().expect("temporary path is UTF-8"))
-			.target("play")
-			.split(0.8);
-		let model = Model::new().bayes("play", ["weather", "wind"]);
-		let policy = Train::new().resume(model_path.to_str().expect("temporary path is UTF-8"));
-
-		let artifact = compile_bayes_model(&policy, &data, &model).expect("missing Bayesian resume starts fresh");
-		assert_eq!(artifact.references().reference_rows(), 4);
-		artifact
-			.save(&model_path)
-			.expect("save Bayesian semantic model");
-		let continued = compile_bayes_model(&policy, &data, &model).expect("existing Bayesian model continues");
-		assert_eq!(continued.references().reference_rows(), 8);
-		assert_eq!(
-			continued.references().reference_source_rows(),
-			[0, 1, 2, 3, 0, 1, 2, 3]
-		);
-	}
-
-	#[test]
-	fn bayesian_run_saves_without_fabricating_optimizer_or_native_training_evidence() {
-		static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
-
-		struct RemoveOnDrop(Vec<std::path::PathBuf>);
-
-		impl Drop for RemoveOnDrop {
-			fn drop(&mut self) {
-				for path in &self.0 {
-					let _ = std::fs::remove_file(path);
-				}
-			}
-		}
-
-		let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let csv = std::env::temp_dir().join(format!(
-			"recipe-bayes-run-{}-{sequence}.csv",
-			std::process::id(),
-		));
-		let destination = csv.with_extension("ogdl");
-		std::fs::write(
-			&csv,
-			b"weather,wind,play\nsun,breeze,otter\nsun,gale,falcon\nrain,breeze,otter\nrain,gale,falcon\nsun,breeze,otter\n",
-		)
-		.expect("write Bayesian run fixture");
-		let _fixture = RemoveOnDrop(vec![csv.clone(), destination.clone()]);
-		let data = Data::empty()
-			.set(csv.to_str().expect("temporary path is UTF-8"))
-			.target("play")
-			.split(0.8);
-		let policy = Train::new().save(destination.to_str().expect("temporary path is UTF-8"));
-		let report = policy
-			.try_run_with(&data, &Model::new().bayes("play", ["weather", "wind"]))
-			.expect("Bayesian run prepares and saves");
-
-		assert_eq!(report.kind(), TrainingModelKind::Bayes);
-		assert_eq!(report.run(), None);
-		assert_eq!(report.bundle(), None);
-		assert!(report.external_outputs().is_empty());
-		assert!(report.metrics().is_empty());
-		let model = report
-			.bayes_model()
-			.expect("Bayesian report retains its semantic model");
-		assert_eq!(
-			std::fs::read(&destination).expect("read saved Bayesian model"),
-			model.encode().unwrap()
-		);
-
-		let error = compile_bayes_model(
-			&Train::new().optimizer(Optimizer::AdamW),
-			&data,
-			&Model::new().bayes("play", ["weather", "wind"]),
-		)
-		.expect_err("Bayesian preparation has no optimizer");
-		assert!(matches!(
-			error,
-			TrainingError::Unsupported { detail } if detail.contains("has no optimizer")
-		));
-	}
-
-	#[test]
-	fn training_uses_one_full_partition_update_per_epoch() {
-		let csv = std::env::temp_dir().join("recipe-full-partition-training-fixture.csv");
-		let data_path = csv.to_str().expect("temporary path is UTF-8");
-		std::fs::write(&csv, "feature,target\n1,0\n2,1\n3,0\n4,1\n").expect("write training fixture");
-		let data = Data::empty()
-			.set(data_path)
-			.target("target")
-			.norm(DataNormalization::ZScore)
-			.split(0.8);
-		let model = Model::new().layer(1).loss(Loss::BinaryCrossEntropy);
-		let policy = Train::new()
-			.epochs(1)
-			.lr(0.001)
-			.cos()
-			.optimizer(Optimizer::AdamW);
-		let package = compile_training_package(&policy, &data, &model).expect("compile");
-		assert_eq!(package.training.bounds().train_rows, 3);
-		assert_eq!(
-			package.training.bounds().training_iterations,
-			recipe_core::LoopIterations::ONE
-		);
-		let _ = std::fs::remove_file(&csv);
-	}
-
-	#[test]
-	fn omitted_epoch_bound_compiles_as_unbounded_with_constant_post_warmup_rate() {
-		static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
-		let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let csv = std::env::temp_dir().join(format!(
-			"recipe-unbounded-training-{}-{sequence}.csv",
-			std::process::id(),
-		));
-		std::fs::write(&csv, "feature,target\n1,0\n2,1\n3,0\n4,1\n").expect("write unbounded training fixture");
-		let data = Data::empty()
-			.set(csv.to_str().expect("temporary path is UTF-8"))
-			.target("target")
-			.norm(DataNormalization::ZScore)
-			.split(0.8);
-		let model = Model::new().layer(1).loss(Loss::BinaryCrossEntropy);
-		let policy = Train::new().lr(0.001).warmup(2).optimizer(Optimizer::AdamW);
-		let package = compile_training_package(&policy, &data, &model).expect("compile unbounded training");
-		assert_eq!(package.training.config().epochs, TrainingHorizon::Unbounded);
-		assert_eq!(
-			package.training.config().learning_rate_decay,
-			LearningRateDecay::Constant
-		);
-		assert_eq!(
-			package.training.program().iterations(),
-			recipe_core::LoopIterations::UNBOUNDED
-		);
-		for schedule in [
-			Train::new().lr(0.001).cos().optimizer(Optimizer::AdamW),
-			Train::new().lr(0.001).exp().optimizer(Optimizer::AdamW),
-		] {
-			let error = compile_training_package(&schedule, &data, &model)
-				.expect_err("endpoint-dependent decay without epochs must fail");
-			assert!(matches!(
-				error,
-				TrainingError::Unsupported { detail } if detail.contains("requires `.epochs(...)` to define its endpoint")
-			));
-		}
-		let _ = std::fs::remove_file(&csv);
-	}
-
-	#[test]
-	fn live_metric_row_preserves_legacy_colors_widths_and_precision() {
-		let mut rows = LiveMetricRows::new(presentations(), NonZeroU64::new(2).expect("two epochs"));
-		assert_eq!(
-			rows.push(
-				0,
-				NonZeroU64::MIN,
-				MetricId::new(1),
-				MetricValue::F32(0.7451),
-			),
-			None
-		);
-		assert_eq!(
-			rows.push(
-				0,
-				NonZeroU64::MIN,
-				MetricId::new(2),
-				MetricValue::F32(0.5528),
-			),
-			None
-		);
-
-		let row = rows
-			.push(
-				1,
-				NonZeroU64::new(2).unwrap(),
-				MetricId::new(1),
-				MetricValue::F32(1.0),
-			)
-			.expect("the next iteration completes the epoch-final row");
-
-		assert_eq!(
-			row,
-			concat!(
-				"\u{1b}[38;2;242;40;60mepoch\u{1b}[0m     1  ",
-				"\u{1b}[38;2;39;125;255mloss\u{1b}[0m  0.7451  ",
-				"\u{1b}[38;2;0;174;107mauroc\u{1b}[0m 0.5528",
-			)
-		);
-		assert_eq!(
-			rows.finish(),
-			Some(concat!(
-				"\u{1b}[38;2;242;40;60mepoch\u{1b}[0m     2  ",
-				"\u{1b}[38;2;39;125;255mloss\u{1b}[0m  1.0000",
-			)
-			.to_owned())
-		);
-	}
-
-	#[test]
-	fn live_metric_epoch_cadence_keeps_configured_and_final_epochs() {
-		let mut presentations = presentations();
-		for presentation in presentations.metrics.values_mut() {
-			presentation.log_cadence = NonZeroU64::new(3);
-		}
-		let mut rows = LiveMetricRows::new(presentations, NonZeroU64::new(5).expect("five epochs"));
-		assert_eq!(
-			rows.push(
-				3,
-				NonZeroU64::new(2).unwrap(),
-				MetricId::new(1),
-				MetricValue::F32(1.0),
-			),
-			None,
-			"epoch two is not selected",
-		);
-		assert_eq!(
-			rows.pending_sample,
-			Some((3, NonZeroU64::new(2).unwrap())),
-			"off-cadence state is retained so an accepted stop can flush it",
-		);
-		assert_eq!(
-			rows.push(
-				5,
-				NonZeroU64::new(3).unwrap(),
-				MetricId::new(1),
-				MetricValue::F32(0.75),
-			),
-			None,
-			"epoch three is selected",
-		);
-		assert_eq!(
-			rows.push(
-				9,
-				NonZeroU64::new(5).unwrap(),
-				MetricId::new(1),
-				MetricValue::F32(0.5),
-			),
-			Some(concat!(
-				"\u{1b}[38;2;242;40;60mepoch\u{1b}[0m     3  ",
-				"\u{1b}[38;2;39;125;255mloss\u{1b}[0m  0.7500",
-			)
-			.to_owned(),),
-			"the selected third epoch is completed before the final epoch",
-		);
-		assert_eq!(
-			rows.pending_sample,
-			Some((9, NonZeroU64::new(5).unwrap())),
-			"the final epoch is selected even off cadence"
-		);
-		assert_eq!(
-			rows.finish(),
-			Some(concat!(
-				"\u{1b}[38;2;242;40;60mepoch\u{1b}[0m     5  ",
-				"\u{1b}[38;2;39;125;255mloss\u{1b}[0m  0.5000",
-			)
-			.to_owned(),),
-		);
-	}
-
-	#[test]
-	fn unbounded_live_metrics_flush_the_last_completed_epoch_off_cadence() {
-		let mut presentations = presentations();
-		for presentation in presentations.metrics.values_mut() {
-			presentation.log_cadence = NonZeroU64::new(3);
-		}
-		let mut rows = LiveMetricRows::new(presentations, TrainingHorizon::Unbounded);
-		assert_eq!(
-			rows.push(
-				1,
-				NonZeroU64::new(2).unwrap(),
-				MetricId::new(1),
-				MetricValue::F32(0.625),
-			),
-			None,
-		);
-		assert_eq!(
-			rows.finish(),
-			Some(concat!(
-				"\u{1b}[38;2;242;40;60mepoch\u{1b}[0m     2  ",
-				"\u{1b}[38;2;39;125;255mloss\u{1b}[0m  0.6250",
-			)
-			.to_owned()),
-		);
-	}
-
-	#[test]
-	fn epoch_and_time_logging_use_a_hidden_full_partition_tick() {
-		let trigger = MetricId::new(1);
-		let plan = LiveMetricPlan {
-			metrics: [(
-				trigger,
-				LiveMetricPresentation {
-					label: "loss".to_owned(),
-					width: 7,
-					log_cadence: None,
-					plot: false,
-				},
-			)]
-			.into_iter()
-			.collect(),
-			host: LiveHostPresentation {
-				epoch_log_cadence: NonZeroU64::new(2),
-				time_log_cadence: NonZeroU64::new(2),
-				..LiveHostPresentation::default()
-			},
-		};
-		let mut rows = LiveMetricRows::new(plan, NonZeroU64::new(3).unwrap());
-		assert_eq!(
-			rows.push(
-				0,
-				NonZeroU64::new(1).unwrap(),
-				trigger,
-				MetricValue::F32(1.0)
-			),
-			None
-		);
-		assert_eq!(
-			rows.push(
-				1,
-				NonZeroU64::new(2).unwrap(),
-				trigger,
-				MetricValue::F32(0.5)
-			),
-			None
-		);
-		let row = rows
-			.push(
-				2,
-				NonZeroU64::new(3).unwrap(),
-				trigger,
-				MetricValue::F32(0.25),
-			)
-			.expect("epoch two host metrics are due");
-		assert!(row.contains("epoch"));
-		assert!(row.contains("    2"));
-		assert!(row.contains("time"));
-		assert!(!row.contains("loss"));
-		let final_row = rows.finish().expect("final epoch is always due");
-		assert!(final_row.contains("    3"));
-	}
-
-	#[test]
-	fn plotting_executes_as_a_bounded_terminal_sparkline_without_implied_logging() {
-		let metric = MetricId::new(1);
-		let plan = LiveMetricPlan {
-			metrics: [(
-				metric,
-				LiveMetricPresentation {
-					label: "loss".to_owned(),
-					width: 7,
-					log_cadence: None,
-					plot: true,
-				},
-			)]
-			.into_iter()
-			.collect(),
-			host: LiveHostPresentation::default(),
-		};
-		let mut rows = LiveMetricRows::new(plan, NonZeroU64::new(70).unwrap());
-		for epoch in 1..=70 {
-			assert_eq!(
-				rows.push(
-					epoch - 1,
-					NonZeroU64::new(epoch).unwrap(),
-					metric,
-					MetricValue::F32(epoch as f32),
-				),
-				None,
-				"plot-only declarations must not masquerade as logs",
-			);
-		}
-		assert_eq!(rows.finish(), None);
-		let plots = rows.plot_lines();
-		assert_eq!(plots.len(), 1);
-		assert!(plots[0].starts_with("plot loss "));
-		assert!(plots[0].contains("samples 70"));
-		assert_eq!(rows.plots["loss"].values.len(), LIVE_PLOT_WIDTH);
-	}
-
-	#[test]
-	fn live_metric_value_uses_legacy_nan_and_integer_padding() {
-		assert_eq!(
-			render_live_metric_value(MetricValue::F32(f32::NAN), 7),
-			"    N/A"
-		);
-		assert_eq!(
-			render_live_metric_value(MetricValue::F32(123_456.79), 7),
-			"123456.7891"
-		);
-		assert_eq!(render_live_metric_value(MetricValue::I32(42), 5), "   42");
 	}
 }

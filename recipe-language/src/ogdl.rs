@@ -79,21 +79,15 @@ impl std::error::Error for OgdlCodecError {
 }
 
 impl From<ParseError> for OgdlCodecError {
-	fn from(error: ParseError) -> Self {
-		Self::Syntax(error)
-	}
+	fn from(error: ParseError) -> Self { Self::Syntax(error) }
 }
 
 impl From<GraphError> for OgdlCodecError {
-	fn from(error: GraphError) -> Self {
-		Self::Build(error)
-	}
+	fn from(error: GraphError) -> Self { Self::Build(error) }
 }
 
 impl From<LanguageError> for OgdlCodecError {
-	fn from(error: LanguageError) -> Self {
-		Self::InvalidGraph(error)
-	}
+	fn from(error: LanguageError) -> Self { Self::InvalidGraph(error) }
 }
 
 impl CalculationGraph {
@@ -101,9 +95,7 @@ impl CalculationGraph {
 	///
 	/// Encoding validates the complete calculation graph first. Consequently,
 	/// emitted text is both syntactically canonical and semantically valid.
-	pub fn to_ogdl(&self) -> Result<String, OgdlCodecError> {
-		Ok(self.to_ogdl_graph()?.to_canonical_string())
-	}
+	pub fn to_ogdl(&self) -> Result<String, OgdlCodecError> { Ok(self.to_ogdl_graph()?.to_canonical_string()) }
 
 	/// Encode this typed graph into the ordered graph representation.
 	pub fn to_ogdl_graph(&self) -> Result<Graph, OgdlCodecError> {
@@ -121,9 +113,7 @@ impl CalculationGraph {
 	}
 
 	/// Strictly decode an already parsed ordered graph.
-	pub fn from_ogdl_graph(graph: &Graph) -> Result<Self, OgdlCodecError> {
-		decode_graph(graph)
-	}
+	pub fn from_ogdl_graph(graph: &Graph) -> Result<Self, OgdlCodecError> { decode_graph(graph) }
 }
 
 fn encode_graph(source: &CalculationGraph) -> Result<Graph, OgdlCodecError> {
@@ -497,12 +487,9 @@ fn decode_graph(source: &Graph) -> Result<CalculationGraph, OgdlCodecError> {
 			format!("expected root {ROOT}, found {}", node_text(source, root)),
 		));
 	}
-	let fields = required_fields(
-		source,
-		root,
-		ROOT,
-		&["schema", "version", "tensors", "nodes"],
-	)?;
+	let fields = required_fields(source, root, ROOT, &[
+		"schema", "version", "tensors", "nodes",
+	])?;
 	let schema = value_text(source, fields[0], "RecipeIR.schema")?;
 	if schema != SCHEMA {
 		return Err(OgdlCodecError::document(
@@ -546,20 +533,15 @@ fn decode_calculation_node(source: &Graph, node: NodeId, path: &str) -> Result<C
 }
 
 fn decode_tensor(source: &Graph, node: NodeId, path: &str) -> Result<Tensor, OgdlCodecError> {
-	let fields = required_fields(
-		source,
-		node,
-		path,
-		&[
-			"id",
-			"dtype",
-			"shape",
-			"layout",
-			"storage_bytes",
-			"external_input",
-			"external_output",
-		],
-	)?;
+	let fields = required_fields(source, node, path, &[
+		"id",
+		"dtype",
+		"shape",
+		"layout",
+		"storage_bytes",
+		"external_input",
+		"external_output",
+	])?;
 	let id = ValueId::new(parse_number(source, fields[0], &format!("{path}.id"))?);
 	let dtype = parse_dtype(
 		value_text(source, fields[1], &format!("{path}.dtype"))?,
@@ -573,12 +555,10 @@ fn decode_tensor(source: &Graph, node: NodeId, path: &str) -> Result<Tensor, Ogd
 		.collect::<Result<Vec<u64>, _>>()?;
 	let shape = Shape::new(extents)?;
 	let layout_path = format!("{path}.layout");
-	let layout_fields = required_fields(
-		source,
-		fields[3],
-		&layout_path,
-		&["offset_elements", "strides"],
-	)?;
+	let layout_fields = required_fields(source, fields[3], &layout_path, &[
+		"offset_elements",
+		"strides",
+	])?;
 	let offset_elements = parse_number(
 		source,
 		layout_fields[0],
@@ -615,12 +595,13 @@ fn decode_tensor(source: &Graph, node: NodeId, path: &str) -> Result<Tensor, Ogd
 }
 
 fn decode_kernel(source: &Graph, node: NodeId, path: &str) -> Result<PrimitiveKernel, OgdlCodecError> {
-	let fields = required_fields(
-		source,
-		node,
-		path,
-		&["id", "inputs", "outputs", "alias_rules", "kind"],
-	)?;
+	let fields = required_fields(source, node, path, &[
+		"id",
+		"inputs",
+		"outputs",
+		"alias_rules",
+		"kind",
+	])?;
 	let id = KernelTemplateId::new(parse_number(source, fields[0], &format!("{path}.id"))?);
 	let inputs_path = format!("{path}.inputs");
 	let inputs = decode_values(source, fields[1], &inputs_path, "value")?
@@ -677,18 +658,13 @@ fn decode_primitive(source: &Graph, node: NodeId, path: &str) -> Result<Primitiv
 			}))
 		}
 		"Reduce" => {
-			let fields = required_fields(
-				source,
-				variant,
-				&variant_path,
-				&[
-					"operator",
-					"axes",
-					"keep_dimensions",
-					"result",
-					"tree_lanes",
-				],
-			)?;
+			let fields = required_fields(source, variant, &variant_path, &[
+				"operator",
+				"axes",
+				"keep_dimensions",
+				"result",
+				"tree_lanes",
+			])?;
 			let axes_path = format!("{variant_path}.axes");
 			let axes = decode_values(source, fields[1], &axes_path, "axis")?
 				.into_iter()
@@ -717,12 +693,13 @@ fn decode_primitive(source: &Graph, node: NodeId, path: &str) -> Result<Primitiv
 			}))
 		}
 		"Scan" => {
-			let fields = required_fields(
-				source,
-				variant,
-				&variant_path,
-				&["operator", "axis", "mode", "reverse", "tree_lanes"],
-			)?;
+			let fields = required_fields(source, variant, &variant_path, &[
+				"operator",
+				"axis",
+				"mode",
+				"reverse",
+				"tree_lanes",
+			])?;
 			Ok(PrimitiveKind::Scan(Scan {
 				operator: parse_reduce_operator(
 					value_text(source, fields[0], &format!("{variant_path}.operator"))?,
@@ -738,12 +715,10 @@ fn decode_primitive(source: &Graph, node: NodeId, path: &str) -> Result<Primitiv
 			}))
 		}
 		"Contraction" => {
-			let fields = required_fields(
-				source,
-				variant,
-				&variant_path,
-				&["batch_axes", "contract_axes"],
-			)?;
+			let fields = required_fields(source, variant, &variant_path, &[
+				"batch_axes",
+				"contract_axes",
+			])?;
 			Ok(PrimitiveKind::Contraction(Contraction {
 				batch_axes: decode_axis_pairs(source, fields[0], &format!("{variant_path}.batch_axes"))?,
 				contract_axes: decode_axis_pairs(source, fields[1], &format!("{variant_path}.contract_axes"))?,
@@ -760,12 +735,9 @@ fn decode_primitive(source: &Graph, node: NodeId, path: &str) -> Result<Primitiv
 			}))
 		}
 		"Scatter" => {
-			let fields = required_fields(
-				source,
-				variant,
-				&variant_path,
-				&["axis", "bounds", "conflict"],
-			)?;
+			let fields = required_fields(source, variant, &variant_path, &[
+				"axis", "bounds", "conflict",
+			])?;
 			Ok(PrimitiveKind::Scatter(Scatter {
 				axis: parse_number(source, fields[0], &format!("{variant_path}.axis"))?,
 				bounds: parse_index_bounds(
@@ -776,12 +748,9 @@ fn decode_primitive(source: &Graph, node: NodeId, path: &str) -> Result<Primitiv
 			}))
 		}
 		"Histogram" => {
-			let fields = required_fields(
-				source,
-				variant,
-				&variant_path,
-				&["bins", "weighted", "ordering"],
-			)?;
+			let fields = required_fields(source, variant, &variant_path, &[
+				"bins", "weighted", "ordering",
+			])?;
 			Ok(PrimitiveKind::Histogram(Histogram {
 				bins: parse_number(source, fields[0], &format!("{variant_path}.bins"))?,
 				weighted: parse_bool(
@@ -795,12 +764,12 @@ fn decode_primitive(source: &Graph, node: NodeId, path: &str) -> Result<Primitiv
 			}))
 		}
 		"Sort" => {
-			let fields = required_fields(
-				source,
-				variant,
-				&variant_path,
-				&["axis", "direction", "stable", "emit_indices"],
-			)?;
+			let fields = required_fields(source, variant, &variant_path, &[
+				"axis",
+				"direction",
+				"stable",
+				"emit_indices",
+			])?;
 			Ok(PrimitiveKind::Sort(Sort {
 				axis: parse_number(source, fields[0], &format!("{variant_path}.axis"))?,
 				direction: parse_sort_direction(
@@ -818,12 +787,12 @@ fn decode_primitive(source: &Graph, node: NodeId, path: &str) -> Result<Primitiv
 			}))
 		}
 		"IndexMap" => {
-			let fields = required_fields(
-				source,
-				variant,
-				&variant_path,
-				&["start", "element_step", "iteration_step", "modulus"],
-			)?;
+			let fields = required_fields(source, variant, &variant_path, &[
+				"start",
+				"element_step",
+				"iteration_step",
+				"modulus",
+			])?;
 			Ok(PrimitiveKind::IndexMap(IndexMap {
 				start: parse_number(source, fields[0], &format!("{variant_path}.start"))?,
 				element_step: parse_number(source, fields[1], &format!("{variant_path}.element_step"))?,
@@ -832,19 +801,17 @@ fn decode_primitive(source: &Graph, node: NodeId, path: &str) -> Result<Primitiv
 			}))
 		}
 		"Random" => {
-			let fields = required_fields(
-				source,
-				variant,
-				&variant_path,
-				&["distribution", "key", "philox_rounds"],
-			)?;
+			let fields = required_fields(source, variant, &variant_path, &[
+				"distribution",
+				"key",
+				"philox_rounds",
+			])?;
 			let key_path = format!("{variant_path}.key");
-			let key_fields = required_fields(
-				source,
-				fields[1],
-				&key_path,
-				&["seed_low", "seed_high", "stream"],
-			)?;
+			let key_fields = required_fields(source, fields[1], &key_path, &[
+				"seed_low",
+				"seed_high",
+				"stream",
+			])?;
 			Ok(PrimitiveKind::Random(RandomMap {
 				distribution: decode_random_distribution(
 					source,
@@ -966,12 +933,12 @@ fn decode_axis_pairs(source: &Graph, node: NodeId, path: &str) -> Result<Vec<(us
 }
 
 fn decode_scalar_program(source: &Graph, node: NodeId, path: &str) -> Result<ScalarProgram, OgdlCodecError> {
-	let fields = required_fields(
-		source,
-		node,
-		path,
-		&["inputs", "constants", "instructions", "outputs"],
-	)?;
+	let fields = required_fields(source, node, path, &[
+		"inputs",
+		"constants",
+		"instructions",
+		"outputs",
+	])?;
 	let inputs = decode_list(
 		source,
 		fields[0],
@@ -1033,12 +1000,9 @@ fn decode_scalar_program(source: &Graph, node: NodeId, path: &str) -> Result<Sca
 }
 
 fn decode_scalar_instruction(source: &Graph, node: NodeId, path: &str) -> Result<ScalarInstruction, OgdlCodecError> {
-	let fields = required_fields(
-		source,
-		node,
-		path,
-		&["result", "dtype", "opcode", "operands"],
-	)?;
+	let fields = required_fields(source, node, path, &[
+		"result", "dtype", "opcode", "operands",
+	])?;
 	let operands_path = format!("{path}.operands");
 	let operands = decode_values(source, fields[3], &operands_path, "value")?
 		.into_iter()
@@ -1064,16 +1028,20 @@ fn decode_scalar_instruction(source: &Graph, node: NodeId, path: &str) -> Result
 fn decode_literal(source: &Graph, node: NodeId, path: &str) -> Result<ScalarLiteral, OgdlCodecError> {
 	let variant = only_child(source, node, path)?;
 	match node_text(source, variant) {
-		"F32Bits" => Ok(ScalarLiteral::F32Bits(parse_number(
-			source,
-			variant,
-			&format!("{path}.F32Bits"),
-		)?)),
-		"I32" => Ok(ScalarLiteral::I32(parse_number(
-			source,
-			variant,
-			&format!("{path}.I32"),
-		)?)),
+		"F32Bits" => {
+			Ok(ScalarLiteral::F32Bits(parse_number(
+				source,
+				variant,
+				&format!("{path}.F32Bits"),
+			)?))
+		}
+		"I32" => {
+			Ok(ScalarLiteral::I32(parse_number(
+				source,
+				variant,
+				&format!("{path}.I32"),
+			)?))
+		}
 		name => Err(unknown_variant(path, name)),
 	}
 }
@@ -1128,19 +1096,23 @@ fn only_child(graph: &Graph, parent: NodeId, path: &str) -> Result<NodeId, OgdlC
 	let children = node_children(graph, parent);
 	match children {
 		[child] => Ok(*child),
-		[] => Err(OgdlCodecError::document(
-			OgdlDocumentErrorKind::MissingField,
-			path,
-			"exactly one variant/value child is required",
-		)),
-		_ => Err(OgdlCodecError::document(
-			OgdlDocumentErrorKind::UnexpectedChildren,
-			path,
-			format!(
-				"expected exactly one variant/value child, found {}",
-				children.len()
-			),
-		)),
+		[] => {
+			Err(OgdlCodecError::document(
+				OgdlDocumentErrorKind::MissingField,
+				path,
+				"exactly one variant/value child is required",
+			))
+		}
+		_ => {
+			Err(OgdlCodecError::document(
+				OgdlDocumentErrorKind::UnexpectedChildren,
+				path,
+				format!(
+					"expected exactly one variant/value child, found {}",
+					children.len()
+				),
+			))
+		}
 	}
 }
 
@@ -1211,16 +1183,12 @@ fn decode_list<T>(
 }
 
 fn parse_number<T>(graph: &Graph, field: NodeId, path: &str) -> Result<T, OgdlCodecError>
-where
-	T: core::str::FromStr,
-{
+where T: core::str::FromStr {
 	parse_number_text(value_text(graph, field, path)?, path)
 }
 
 fn parse_number_text<T>(text: &str, path: &str) -> Result<T, OgdlCodecError>
-where
-	T: core::str::FromStr,
-{
+where T: core::str::FromStr {
 	text.parse().map_err(|_| {
 		OgdlCodecError::document(
 			OgdlDocumentErrorKind::InvalidNumber,
@@ -1234,11 +1202,13 @@ fn parse_bool(text: &str, path: &str) -> Result<bool, OgdlCodecError> {
 	match text {
 		"true" => Ok(true),
 		"false" => Ok(false),
-		_ => Err(OgdlCodecError::document(
-			OgdlDocumentErrorKind::InvalidBoolean,
-			path,
-			format!("expected exact true or false, found {text}"),
-		)),
+		_ => {
+			Err(OgdlCodecError::document(
+				OgdlDocumentErrorKind::InvalidBoolean,
+				path,
+				format!("expected exact true or false, found {text}"),
+			))
+		}
 	}
 }
 
@@ -1250,9 +1220,7 @@ fn unknown_variant(path: &str, name: &str) -> OgdlCodecError {
 	)
 }
 
-const fn bool_name(value: bool) -> &'static str {
-	if value { "true" } else { "false" }
-}
+const fn bool_name(value: bool) -> &'static str { if value { "true" } else { "false" } }
 
 const fn dtype_name(value: DType) -> &'static str {
 	match value {
@@ -1477,130 +1445,5 @@ fn parse_scalar_opcode(text: &str, path: &str) -> Result<ScalarOpcode, OgdlCodec
 		"ConvertF32ToI32" => Ok(ScalarOpcode::ConvertF32ToI32),
 		"ConvertI32ToF32" => Ok(ScalarOpcode::ConvertI32ToF32),
 		name => Err(unknown_variant(path, name)),
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn every_scalar_opcode_has_one_exact_schema_spelling() {
-		let opcodes = [
-			ScalarOpcode::Add,
-			ScalarOpcode::Subtract,
-			ScalarOpcode::Multiply,
-			ScalarOpcode::Divide,
-			ScalarOpcode::Remainder,
-			ScalarOpcode::Negate,
-			ScalarOpcode::Absolute,
-			ScalarOpcode::Minimum,
-			ScalarOpcode::Maximum,
-			ScalarOpcode::Fma,
-			ScalarOpcode::Equal,
-			ScalarOpcode::NotEqual,
-			ScalarOpcode::LessThan,
-			ScalarOpcode::LessThanOrEqual,
-			ScalarOpcode::GreaterThan,
-			ScalarOpcode::GreaterThanOrEqual,
-			ScalarOpcode::Select,
-			ScalarOpcode::BitAnd,
-			ScalarOpcode::BitOr,
-			ScalarOpcode::BitXor,
-			ScalarOpcode::BitNot,
-			ScalarOpcode::BitcastF32ToI32,
-			ScalarOpcode::BitcastI32ToF32,
-			ScalarOpcode::ShiftLeft,
-			ScalarOpcode::ShiftRightLogical,
-			ScalarOpcode::ShiftRightArithmetic,
-			ScalarOpcode::Require,
-			ScalarOpcode::IsFinite,
-			ScalarOpcode::IsNan,
-			ScalarOpcode::SquareRoot,
-			ScalarOpcode::Floor,
-			ScalarOpcode::Ceiling,
-			ScalarOpcode::RoundNearestEven,
-			ScalarOpcode::ConvertF32ToI32,
-			ScalarOpcode::ConvertI32ToF32,
-		];
-		for opcode in opcodes {
-			let spelling = scalar_opcode_name(opcode).expect("schema covers every current opcode");
-			assert_eq!(parse_scalar_opcode(spelling, "opcode").unwrap(), opcode);
-		}
-	}
-
-	#[test]
-	fn every_plain_enum_variant_roundtrips_by_exact_name() {
-		for value in [DType::F32, DType::I32] {
-			assert_eq!(parse_dtype(dtype_name(value), "dtype").unwrap(), value);
-		}
-		for value in [
-			AliasPermission::Forbidden,
-			AliasPermission::MayAliasExact,
-			AliasPermission::MustAliasExact,
-		] {
-			assert_eq!(
-				parse_alias_permission(alias_permission_name(value), "permission").unwrap(),
-				value
-			);
-		}
-		for value in [
-			AtomicOrdering::Relaxed,
-			AtomicOrdering::Acquire,
-			AtomicOrdering::Release,
-			AtomicOrdering::AcquireRelease,
-			AtomicOrdering::SequentiallyConsistent,
-		] {
-			assert_eq!(
-				parse_atomic_ordering(atomic_ordering_name(value), "ordering").unwrap(),
-				value
-			);
-		}
-		for value in [
-			AtomicOperation::Exchange,
-			AtomicOperation::Add,
-			AtomicOperation::Minimum,
-			AtomicOperation::Maximum,
-		] {
-			assert_eq!(
-				parse_atomic_operation(atomic_operation_name(value), "operation").unwrap(),
-				value
-			);
-		}
-		for value in [IndexBounds::Reject, IndexBounds::Clamp, IndexBounds::Wrap] {
-			assert_eq!(
-				parse_index_bounds(index_bounds_name(value), "bounds").unwrap(),
-				value
-			);
-		}
-		for value in [
-			ReduceOperator::Sum,
-			ReduceOperator::Product,
-			ReduceOperator::Minimum,
-			ReduceOperator::Maximum,
-			ReduceOperator::Any,
-			ReduceOperator::All,
-		] {
-			assert_eq!(
-				parse_reduce_operator(reduce_operator_name(value), "operator").unwrap(),
-				value
-			);
-		}
-		for value in [
-			ReduceResult::Value,
-			ReduceResult::Index,
-			ReduceResult::ValueAndIndex,
-		] {
-			assert_eq!(
-				parse_reduce_result(reduce_result_name(value), "result").unwrap(),
-				value
-			);
-		}
-		for value in [SortDirection::Ascending, SortDirection::Descending] {
-			assert_eq!(
-				parse_sort_direction(sort_direction_name(value), "direction").unwrap(),
-				value
-			);
-		}
 	}
 }

@@ -1,10 +1,8 @@
+use std::{ffi::OsString, fs, path::PathBuf, process::ExitCode};
+
 use recipe_audit::{
 	AuditError, AuditInput, AuditMode, DependencyGraph, LegacyGrant, LinkerInput, collect_native_scope,
 };
-use std::ffi::OsString;
-use std::fs;
-use std::path::PathBuf;
-use std::process::ExitCode;
 
 const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -105,9 +103,11 @@ fn read_bounded_text(path: &PathBuf) -> Result<String, AuditError> {
 			path.display()
 		)));
 	}
-	let metadata = fs::metadata(path).map_err(|error| AuditError::Io {
-		path: path.clone(),
-		source: error,
+	let metadata = fs::metadata(path).map_err(|error| {
+		AuditError::Io {
+			path: path.clone(),
+			source: error,
+		}
 	})?;
 	if !metadata.is_file() || metadata.len() > MAX_JSON_BYTES {
 		return Err(AuditError::Configuration(format!(
@@ -115,9 +115,11 @@ fn read_bounded_text(path: &PathBuf) -> Result<String, AuditError> {
 			path.display()
 		)));
 	}
-	fs::read_to_string(path).map_err(|source| AuditError::Io {
-		path: path.clone(),
-		source,
+	fs::read_to_string(path).map_err(|source| {
+		AuditError::Io {
+			path: path.clone(),
+			source,
+		}
 	})
 }
 
@@ -215,50 +217,4 @@ fn usage() -> &'static str {
      \t[--link-input EXACT_LINKER_ARGUMENT ...] [--elf ABSOLUTE_ELF ...]\n\
      \t[--legacy-grants ABSOLUTE_JSON]\n\
      legacy mode requires exact grants; next mode rejects them"
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	fn strings(values: &[&str]) -> Vec<OsString> {
-		values.iter().map(OsString::from).collect()
-	}
-
-	#[test]
-	fn cli_requires_explicit_values_without_touching_filesystem() {
-		let cli = Cli::parse(strings(&[
-			"recipe-audit",
-			"--mode",
-			"next",
-			"--scope",
-			"/fake/scope",
-			"--package-id",
-			"next 0.1",
-			"--link-input",
-			"-lcublas",
-			"--elf",
-			"/fake/scope/app",
-		]))
-		.unwrap();
-		assert_eq!(cli.mode, Some(AuditMode::Next));
-		assert_eq!(cli.scope, Some(PathBuf::from("/fake/scope")));
-		assert_eq!(cli.linker_inputs, vec!["-lcublas"]);
-		assert_eq!(cli.elf_paths, vec![PathBuf::from("/fake/scope/app")]);
-	}
-
-	#[test]
-	fn cli_rejects_implicit_or_duplicate_configuration() {
-		assert!(Cli::parse(strings(&["recipe-audit", "--mode"])).is_err());
-		assert!(
-			Cli::parse(strings(&[
-				"recipe-audit",
-				"--mode",
-				"next",
-				"--mode",
-				"legacy"
-			]))
-			.is_err()
-		);
-	}
 }

@@ -1,7 +1,6 @@
 use recipe_core::{ByteCount, DeviceId, Digest, RunId, TaskId};
 
-use crate::model::ProvisionedProgram;
-use crate::session::RemoteMetricValue;
+use crate::{model::ProvisionedProgram, session::RemoteMetricValue};
 
 /// Allocation-free worker fault payload suitable for propagation in-loop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,9 +11,7 @@ pub struct DriverFault {
 
 impl DriverFault {
 	#[must_use]
-	pub const fn new(code: u32, detail: u64) -> Self {
-		Self { code, detail }
-	}
+	pub const fn new(code: u32, detail: u64) -> Self { Self { code, detail } }
 
 	#[must_use]
 	pub fn cleanup_failed(primary: Self, cleanup: Self) -> Self {
@@ -42,9 +39,7 @@ impl DriverFaultCode {
 	pub const EXECUTOR_CLEANUP_FAILED: Self = Self(0x5245_0008);
 
 	#[must_use]
-	pub const fn get(self) -> u32 {
-		self.0
-	}
+	pub const fn get(self) -> u32 { self.0 }
 }
 
 /// Nonblocking state of one already-submitted native worker task.

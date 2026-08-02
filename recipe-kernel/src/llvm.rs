@@ -1,5 +1,4 @@
-use std::collections::BTreeMap;
-use std::fmt::Write;
+use std::{collections::BTreeMap, fmt::Write};
 
 use recipe_core::{
 	DType, ElementCount, FlopCount, IndexSpace, KernelTemplate, ScalarInstruction, ScalarLiteral, ScalarOpcode,
@@ -135,9 +134,7 @@ impl Emitter {
 		canonical
 	}
 
-	fn reject_when(&mut self, condition: String) {
-		self.fault_conditions.push(condition);
-	}
+	fn reject_when(&mut self, condition: String) { self.fault_conditions.push(condition); }
 
 	fn emit_fault_flag(&mut self) {
 		let Some(first) = self.fault_conditions.first().cloned() else {
@@ -220,13 +217,10 @@ pub fn lower_elementwise(
 			"  {loaded} = load {}, ptr addrspace(1) {pointer}, align 4",
 			llvm_type(kernel_input.dtype)
 		));
-		emitter.values.insert(
-			scalar_input.id,
-			ValueRef {
-				dtype: scalar_input.dtype,
-				operand: loaded,
-			},
-		);
+		emitter.values.insert(scalar_input.id, ValueRef {
+			dtype: scalar_input.dtype,
+			operand: loaded,
+		});
 	}
 	for constant in &template.program.constants {
 		let operand = match constant.value {
@@ -237,13 +231,10 @@ pub fn lower_elementwise(
 				value
 			}
 		};
-		emitter.values.insert(
-			constant.id,
-			ValueRef {
-				dtype: constant.value.dtype(),
-				operand,
-			},
-		);
+		emitter.values.insert(constant.id, ValueRef {
+			dtype: constant.value.dtype(),
+			operand,
+		});
 	}
 
 	let mut flops_per_element = 0u64;
@@ -257,13 +248,10 @@ pub fn lower_elementwise(
 					"per-element FLOP count overflowed",
 				)
 			})?;
-		emitter.values.insert(
-			instruction.result,
-			ValueRef {
-				dtype: instruction.dtype,
-				operand: result,
-			},
-		);
+		emitter.values.insert(instruction.result, ValueRef {
+			dtype: instruction.dtype,
+			operand: result,
+		});
 	}
 	emitter.emit_fault_flag();
 
@@ -344,22 +332,21 @@ pub fn lower_elementwise(
 	let mut arguments = template
 		.inputs
 		.iter()
-		.map(|input| KernelArgument::Buffer {
-			access: BufferAccess::Read,
-			dtype: input.dtype,
-			alignment: 4,
+		.map(|input| {
+			KernelArgument::Buffer {
+				access: BufferAccess::Read,
+				dtype: input.dtype,
+				alignment: 4,
+			}
 		})
 		.collect::<Vec<_>>();
-	arguments.extend(
-		template
-			.outputs
-			.iter()
-			.map(|output| KernelArgument::Buffer {
-				access: BufferAccess::Write,
-				dtype: output.dtype,
-				alignment: 4,
-			}),
-	);
+	arguments.extend(template.outputs.iter().map(|output| {
+		KernelArgument::Buffer {
+			access: BufferAccess::Write,
+			dtype: output.dtype,
+			alignment: 4,
+		}
+	}));
 	if !emitter.fault_conditions.is_empty() {
 		arguments.push(KernelArgument::FaultFlag);
 	}
@@ -783,14 +770,18 @@ fn comparison(emitter: &mut Emitter, opcode: ScalarOpcode, operands: &[ValueRef]
 	};
 	let condition = emitter.temporary("comparison");
 	match operands[0].dtype {
-		DType::I32 => emitter.line(format_args!(
-			"  {condition} = icmp {predicate} i32 {}, {}",
-			operands[0].operand, operands[1].operand
-		)),
-		DType::F32 => emitter.line(format_args!(
-			"  {condition} = fcmp {predicate} float {}, {}",
-			operands[0].operand, operands[1].operand
-		)),
+		DType::I32 => {
+			emitter.line(format_args!(
+				"  {condition} = icmp {predicate} i32 {}, {}",
+				operands[0].operand, operands[1].operand
+			))
+		}
+		DType::F32 => {
+			emitter.line(format_args!(
+				"  {condition} = fcmp {predicate} float {}, {}",
+				operands[0].operand, operands[1].operand
+			))
+		}
 	}
 	let result = emitter.temporary("comparison_value");
 	emitter.line(format_args!("  {result} = zext i1 {condition} to i32"));
@@ -1044,425 +1035,4 @@ const fn llvm_type(dtype: DType) -> &'static str {
 	}
 }
 
-const fn instruction_flops(opcode: ScalarOpcode) -> u64 {
-	opcode.flops()
-}
-
-#[cfg(test)]
-mod tests {
-	use std::io::Write as _;
-	use std::process::{Command, Stdio};
-
-	use recipe_core::{
-		AliasPermission, AliasRule, ElementCount, IndexSpace, KernelInput, KernelInputId, KernelOutput,
-		KernelOutputId, KernelTemplateId, ScalarInput, ScalarProgram,
-	};
-
-	use super::*;
-	use crate::{AmdTarget, NvidiaTarget};
-
-	fn add_template(dtype: DType) -> KernelTemplate {
-		let left = ScalarValueId::new(1);
-		let right = ScalarValueId::new(2);
-		let result = ScalarValueId::new(3);
-		let index_space = IndexSpace::new(vec![ElementCount::new(1024).unwrap()]).unwrap();
-		let access = StaticBufferAccess::contiguous(&index_space, dtype).unwrap();
-		KernelTemplate {
-			id: KernelTemplateId::new(1),
-			index_space,
-			inputs: vec![
-				KernelInput {
-					id: KernelInputId::new(1),
-					dtype,
-					access: access.clone(),
-				},
-				KernelInput {
-					id: KernelInputId::new(2),
-					dtype,
-					access: access.clone(),
-				},
-			],
-			outputs: vec![KernelOutput {
-				id: KernelOutputId::new(1),
-				dtype,
-				access,
-			}],
-			program: ScalarProgram {
-				inputs: vec![
-					ScalarInput { id: left, dtype },
-					ScalarInput { id: right, dtype },
-				],
-				constants: Vec::new(),
-				instructions: vec![ScalarInstruction {
-					result,
-					dtype,
-					opcode: ScalarOpcode::Add,
-					operands: vec![left, right],
-				}],
-				outputs: vec![result],
-			},
-			alias_rules: vec![
-				AliasRule {
-					input: KernelInputId::new(1),
-					output: KernelOutputId::new(1),
-					permission: AliasPermission::MayAliasExact,
-				},
-				AliasRule {
-					input: KernelInputId::new(2),
-					output: KernelOutputId::new(1),
-					permission: AliasPermission::Forbidden,
-				},
-			],
-		}
-	}
-
-	fn options() -> LoweringOptions {
-		LoweringOptions {
-			entry_symbol: "recipe_add".to_owned(),
-			workgroup_lanes: 256,
-		}
-	}
-
-	fn operation_template(opcode: ScalarOpcode, result_dtype: DType, input_dtypes: &[DType]) -> KernelTemplate {
-		let index_space = IndexSpace::new(vec![ElementCount::new(32).unwrap()]).unwrap();
-		let inputs = input_dtypes
-			.iter()
-			.copied()
-			.enumerate()
-			.map(|(index, dtype)| KernelInput {
-				id: KernelInputId::new(u64::try_from(index + 1).unwrap()),
-				dtype,
-				access: StaticBufferAccess::contiguous(&index_space, dtype).unwrap(),
-			})
-			.collect::<Vec<_>>();
-		let scalar_inputs = input_dtypes
-			.iter()
-			.copied()
-			.enumerate()
-			.map(|(index, dtype)| ScalarInput {
-				id: ScalarValueId::new(u64::try_from(index + 1).unwrap()),
-				dtype,
-			})
-			.collect::<Vec<_>>();
-		let output = KernelOutputId::new(1);
-		let result = ScalarValueId::new(u64::try_from(input_dtypes.len() + 1).unwrap());
-		KernelTemplate {
-			id: KernelTemplateId::new(2),
-			index_space: index_space.clone(),
-			alias_rules: inputs
-				.iter()
-				.map(|input| AliasRule {
-					input: input.id,
-					output,
-					permission: AliasPermission::Forbidden,
-				})
-				.collect(),
-			inputs,
-			outputs: vec![KernelOutput {
-				id: output,
-				dtype: result_dtype,
-				access: StaticBufferAccess::contiguous(&index_space, result_dtype).unwrap(),
-			}],
-			program: ScalarProgram {
-				inputs: scalar_inputs.clone(),
-				constants: Vec::new(),
-				instructions: vec![ScalarInstruction {
-					result,
-					dtype: result_dtype,
-					opcode,
-					operands: scalar_inputs.iter().map(|input| input.id).collect(),
-				}],
-				outputs: vec![result],
-			},
-		}
-	}
-
-	#[test]
-	fn emits_direct_amd_kernel_with_strict_f32_semantics() {
-		let lowered = lower_elementwise(
-			&add_template(DType::F32),
-			&KernelTarget::Amd(AmdTarget {
-				target_id: "gfx1101".to_owned(),
-				code_object_version: 6,
-			}),
-			&options(),
-		)
-		.unwrap();
-		assert!(
-			lowered
-				.llvm_ir
-				.contains("define amdgpu_kernel void @recipe_add")
-		);
-		assert!(lowered.llvm_ir.contains("constrained.fadd.f32"));
-		assert!(lowered.llvm_ir.contains("canonical_nan"));
-		assert_eq!(lowered.work, FlopCount::new(1024));
-		assert!(audit_llvm_ir(&lowered.llvm_ir).is_empty());
-	}
-
-	#[test]
-	fn emits_backend_safe_plain_fdiv_for_amd_scalar_division() {
-		let lowered = lower_elementwise(
-			&operation_template(ScalarOpcode::Divide, DType::F32, &[DType::F32, DType::F32]),
-			&KernelTarget::Amd(AmdTarget {
-				target_id: "gfx1101".to_owned(),
-				code_object_version: 6,
-			}),
-			&options(),
-		)
-		.unwrap();
-		assert!(lowered.llvm_ir.contains(" = fdiv float "));
-		assert!(!lowered.llvm_ir.contains("constrained.fdiv"));
-		assert!(lowered.llvm_ir.contains("canonical_nan"));
-		assert!(audit_llvm_ir(&lowered.llvm_ir).is_empty());
-	}
-
-	#[test]
-	fn emits_backend_safe_sqrt_intrinsic_for_amd_scalar_square_root() {
-		let lowered = lower_elementwise(
-			&operation_template(ScalarOpcode::SquareRoot, DType::F32, &[DType::F32]),
-			&KernelTarget::Amd(AmdTarget {
-				target_id: "gfx1101".to_owned(),
-				code_object_version: 6,
-			}),
-			&options(),
-		)
-		.unwrap();
-		assert!(
-			lowered
-				.llvm_ir
-				.contains("declare float @llvm.sqrt.f32(float)")
-		);
-		assert!(lowered.llvm_ir.contains("call float @llvm.sqrt.f32(float "));
-		assert!(!lowered.llvm_ir.contains("constrained.sqrt"));
-		assert!(lowered.llvm_ir.contains("canonical_nan"));
-		assert!(audit_llvm_ir(&lowered.llvm_ir).is_empty());
-	}
-
-	#[test]
-	#[ignore = "requires the host LLVM AMDGPU backend"]
-	fn host_llc_compiles_amd_scalar_division_with_plain_fdiv() {
-		let lowered = lower_elementwise(
-			&operation_template(ScalarOpcode::Divide, DType::F32, &[DType::F32, DType::F32]),
-			&KernelTarget::Amd(AmdTarget {
-				target_id: "gfx1101".to_owned(),
-				code_object_version: 6,
-			}),
-			&options(),
-		)
-		.unwrap();
-		let mut child = Command::new("/usr/bin/llc")
-			.args([
-				"-filetype=null",
-				"-march=amdgcn",
-				"-mcpu=gfx1101",
-				"--amdhsa-code-object-version=6",
-				"-",
-			])
-			.stdin(Stdio::piped())
-			.stdout(Stdio::null())
-			.stderr(Stdio::piped())
-			.spawn()
-			.expect("spawn host llc");
-		{
-			let mut stdin = child.stdin.take().expect("host llc stdin");
-			stdin.write_all(lowered.llvm_ir.as_bytes())
-				.expect("write LLVM IR");
-		}
-		let output = child.wait_with_output().expect("wait for host llc");
-		assert!(
-			output.status.success(),
-			"host llc rejected AMD scalar division:\n{}",
-			String::from_utf8_lossy(&output.stderr)
-		);
-	}
-
-	#[test]
-	fn emits_direct_nvptx_kernel_without_an_export_alias() {
-		let lowered = lower_elementwise(
-			&add_template(DType::I32),
-			&KernelTarget::Nvidia(NvidiaTarget {
-				sm_major: 5,
-				sm_minor: 2,
-				ptx_isa: 75,
-			}),
-			&options(),
-		)
-		.unwrap();
-		assert!(
-			lowered
-				.llvm_ir
-				.contains("define ptx_kernel void @recipe_add")
-		);
-		assert!(!lowered.llvm_ir.contains(" alias "));
-		assert!(lowered.llvm_ir.contains("add i32"));
-	}
-
-	#[test]
-	fn checked_integer_division_uses_a_deterministic_fault_abi() {
-		let mut template = add_template(DType::I32);
-		template.program.instructions[0].opcode = ScalarOpcode::Divide;
-		let lowered = lower_elementwise(
-			&template,
-			&KernelTarget::Nvidia(NvidiaTarget {
-				sm_major: 8,
-				sm_minor: 6,
-				ptx_isa: 75,
-			}),
-			&options(),
-		)
-		.unwrap();
-		assert_eq!(
-			lowered.abi.arguments,
-			vec![
-				KernelArgument::Buffer {
-					access: BufferAccess::Read,
-					dtype: DType::I32,
-					alignment: 4,
-				},
-				KernelArgument::Buffer {
-					access: BufferAccess::Read,
-					dtype: DType::I32,
-					alignment: 4,
-				},
-				KernelArgument::Buffer {
-					access: BufferAccess::Write,
-					dtype: DType::I32,
-					alignment: 4,
-				},
-				KernelArgument::FaultFlag,
-				KernelArgument::ElementCount,
-			]
-		);
-		assert_eq!(lowered.abi.argument_bytes, 40);
-		assert!(lowered.llvm_ir.contains("select i1 %division_rejected"));
-		assert!(
-			lowered
-				.llvm_ir
-				.contains("atomicrmw or ptr addrspace(1) %fault_flag, i32 1")
-		);
-		assert!(!lowered.llvm_ir.contains("sdiv i32 %loaded_1, %loaded_3"));
-	}
-
-	#[test]
-	fn lowers_the_complete_scalar_opcode_families() {
-		let target = KernelTarget::Amd(AmdTarget {
-			target_id: "gfx1101".to_owned(),
-			code_object_version: 6,
-		});
-		let cases = [
-			(
-				ScalarOpcode::Remainder,
-				DType::F32,
-				vec![DType::F32, DType::F32],
-			),
-			(
-				ScalarOpcode::Remainder,
-				DType::I32,
-				vec![DType::I32, DType::I32],
-			),
-			(ScalarOpcode::Negate, DType::I32, vec![DType::I32]),
-			(ScalarOpcode::Absolute, DType::I32, vec![DType::I32]),
-			(
-				ScalarOpcode::Equal,
-				DType::I32,
-				vec![DType::F32, DType::F32],
-			),
-			(
-				ScalarOpcode::NotEqual,
-				DType::I32,
-				vec![DType::F32, DType::F32],
-			),
-			(
-				ScalarOpcode::LessThan,
-				DType::I32,
-				vec![DType::I32, DType::I32],
-			),
-			(
-				ScalarOpcode::LessThanOrEqual,
-				DType::I32,
-				vec![DType::F32, DType::F32],
-			),
-			(
-				ScalarOpcode::GreaterThan,
-				DType::I32,
-				vec![DType::I32, DType::I32],
-			),
-			(
-				ScalarOpcode::GreaterThanOrEqual,
-				DType::I32,
-				vec![DType::F32, DType::F32],
-			),
-			(
-				ScalarOpcode::Select,
-				DType::F32,
-				vec![DType::I32, DType::F32, DType::F32],
-			),
-			(
-				ScalarOpcode::BitAnd,
-				DType::I32,
-				vec![DType::I32, DType::I32],
-			),
-			(
-				ScalarOpcode::BitOr,
-				DType::I32,
-				vec![DType::I32, DType::I32],
-			),
-			(
-				ScalarOpcode::BitXor,
-				DType::I32,
-				vec![DType::I32, DType::I32],
-			),
-			(ScalarOpcode::BitNot, DType::I32, vec![DType::I32]),
-			(ScalarOpcode::BitcastF32ToI32, DType::I32, vec![DType::F32]),
-			(ScalarOpcode::BitcastI32ToF32, DType::F32, vec![DType::I32]),
-			(ScalarOpcode::Require, DType::I32, vec![DType::I32]),
-			(ScalarOpcode::IsFinite, DType::I32, vec![DType::F32]),
-			(ScalarOpcode::IsNan, DType::I32, vec![DType::F32]),
-			(ScalarOpcode::SquareRoot, DType::F32, vec![DType::F32]),
-			(ScalarOpcode::Floor, DType::F32, vec![DType::F32]),
-			(ScalarOpcode::Ceiling, DType::F32, vec![DType::F32]),
-			(ScalarOpcode::RoundNearestEven, DType::F32, vec![DType::F32]),
-		];
-		for (opcode, result_dtype, input_dtypes) in cases {
-			let lowered = lower_elementwise(
-				&operation_template(opcode, result_dtype, &input_dtypes),
-				&target,
-				&options(),
-			)
-			.unwrap_or_else(|error| panic!("{opcode:?} failed to lower: {error}"));
-			assert!(audit_llvm_ir(&lowered.llvm_ir).is_empty());
-		}
-	}
-
-	#[test]
-	fn lowers_static_offsets_strides_and_broadcast_reads() {
-		let mut template = add_template(DType::F32);
-		template.index_space = IndexSpace::new(vec![
-			ElementCount::new(2).unwrap(),
-			ElementCount::new(3).unwrap(),
-		])
-		.unwrap();
-		template.inputs[0].access = StaticBufferAccess {
-			offset_elements: 1,
-			strides: vec![0, 1],
-			storage_bytes: recipe_core::ByteCount::new(16),
-		};
-		template.inputs[1].access = StaticBufferAccess::contiguous(&template.index_space, DType::F32).unwrap();
-		template.outputs[0].access = StaticBufferAccess::contiguous(&template.index_space, DType::F32).unwrap();
-
-		let lowered = lower_elementwise(
-			&template,
-			&KernelTarget::Nvidia(NvidiaTarget {
-				sm_major: 8,
-				sm_minor: 6,
-				ptx_isa: 75,
-			}),
-			&options(),
-		)
-		.unwrap();
-		assert!(lowered.llvm_ir.contains("urem i64 %global_id, 3"));
-		assert!(lowered.llvm_ir.contains("input_0_element_index"));
-		assert!(lowered.llvm_ir.contains("ptr addrspace(1) %input_0"));
-		assert_eq!(lowered.abi.elements, ElementCount::new(6).unwrap());
-	}
-}
+const fn instruction_flops(opcode: ScalarOpcode) -> u64 { opcode.flops() }

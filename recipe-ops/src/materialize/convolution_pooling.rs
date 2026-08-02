@@ -4,14 +4,13 @@ use recipe_language::{
 	ReduceOperator, ReduceResult, Scatter, ScatterConflict,
 };
 
-use crate::{OperationDescriptor, OperationErrorKind, OperationResult};
-
 use super::{
 	Emitter, FamilyDispatch, MAX_I32_INDEX, MaterializationRequest, emit_checked_gather_identity, exact_f32_extent,
 	identity_program, input, language_error, operation_error, output, prepared_tree_lanes, prepared_u64,
 	request_error, require_dtype, require_exact_abi, require_same_tensor_contract, require_shape, require_true,
 	scalar_binary, scalar_builder, scalar_f32, scalar_finish, scalar_input,
 };
+use crate::{OperationDescriptor, OperationErrorKind, OperationResult};
 
 const OPERATIONS: &[(&str, &str)] = &[
 	("gpu_avg_pool_1d", "gpu-core/src/kernels.rs:4596"),
@@ -78,15 +77,17 @@ pub(super) fn dispatch(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 		"gpu_col2im_1d" => emit_col2im_1d(request, emitter),
 		"gpu_col2im_2d" => emit_col2im_2d(request, emitter, false),
 		"gpu_col2im_2d_ext" => emit_col2im_2d(request, emitter, true),
-		"gpu_im2col_1d" => emit_checked_gather_identity(
-			request,
-			emitter,
-			"image",
-			"receptive_field_indices",
-			"columns",
-			"axis",
-			Some("indices_encode_receptive_fields"),
-		),
+		"gpu_im2col_1d" => {
+			emit_checked_gather_identity(
+				request,
+				emitter,
+				"image",
+				"receptive_field_indices",
+				"columns",
+				"axis",
+				Some("indices_encode_receptive_fields"),
+			)
+		}
 		"gpu_im2col_2d" => emit_im2col_2d(request, emitter, false),
 		"gpu_im2col_2d_ext" => emit_im2col_2d(request, emitter, true),
 		"gpu_max_pool_1d" => emit_legacy_max_pool_1d(request, emitter),
@@ -97,11 +98,13 @@ pub(super) fn dispatch(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 		"gpu_upsample_nearest_2d" => emit_upsample_nearest_2d(request, emitter),
 		"recipe_max_pool_1d" => emit_channelwise_max_pool_1d(request, emitter),
 		"recipe_max_pool_1d_backward" => emit_channelwise_max_pool_1d_backward(request, emitter),
-		symbol => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::GraphMaterializationFailed,
-			format!("convolution/pooling dispatch is incomplete for {symbol}"),
-		)),
+		symbol => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::GraphMaterializationFailed,
+				format!("convolution/pooling dispatch is incomplete for {symbol}"),
+			))
+		}
 	};
 	FamilyDispatch::Owned(result)
 }
@@ -416,18 +419,13 @@ fn emit_column_scatter_with_patch_shape(
 }
 
 fn emit_average_pool_1d(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["values", "window_indices"],
-		&["pooled"],
-		&[
-			"batch",
-			"window_length",
-			"filters",
-			"tree_lanes",
-			"window_indices_verified",
-		],
-	)?;
+	require_exact_abi(request, &["values", "window_indices"], &["pooled"], &[
+		"batch",
+		"window_length",
+		"filters",
+		"tree_lanes",
+		"window_indices_verified",
+	])?;
 	let batch = prepared_extent(request, "batch")?;
 	let window = prepared_extent(request, "window_length")?;
 	let filters = prepared_extent(request, "filters")?;
@@ -450,23 +448,18 @@ fn emit_average_pool_1d(request: &MaterializationRequest<'_>, emitter: &mut Emit
 }
 
 fn emit_average_pool_2d(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["values", "window_indices"],
-		&["pooled"],
-		&[
-			"batch",
-			"channels",
-			"input_height",
-			"input_width",
-			"kernel_height",
-			"kernel_width",
-			"stride_height",
-			"stride_width",
-			"tree_lanes",
-			"window_indices_verified",
-		],
-	)?;
+	require_exact_abi(request, &["values", "window_indices"], &["pooled"], &[
+		"batch",
+		"channels",
+		"input_height",
+		"input_width",
+		"kernel_height",
+		"kernel_width",
+		"stride_height",
+		"stride_width",
+		"tree_lanes",
+		"window_indices_verified",
+	])?;
 	let geometry = pooling_2d_geometry(request)?;
 	emit_average_pool(request, emitter, geometry)
 }
@@ -740,13 +733,15 @@ fn emit_max_pool(
 				}),
 			)
 		}
-		false => emitter.emit(
-			vec![maxima, local_indices],
-			vec![pooled.id, winning_indices.id],
-			PrimitiveKind::Elementwise(Elementwise {
-				program: typed_pair_identity_program(request)?,
-			}),
-		),
+		false => {
+			emitter.emit(
+				vec![maxima, local_indices],
+				vec![pooled.id, winning_indices.id],
+				PrimitiveKind::Elementwise(Elementwise {
+					program: typed_pair_identity_program(request)?,
+				}),
+			)
+		}
 	}
 }
 
@@ -912,10 +907,12 @@ fn emit_average_backward(
 	)?;
 	let conflict = match destinations_unique {
 		true => ScatterConflict::UniqueIndices,
-		false => ScatterConflict::Atomic {
-			operation: AtomicOperation::Add,
-			ordering: AtomicOrdering::Relaxed,
-		},
+		false => {
+			ScatterConflict::Atomic {
+				operation: AtomicOperation::Add,
+				ordering: AtomicOrdering::Relaxed,
+			}
+		}
 	};
 	emitter.emit(
 		vec![gradient_base.id, destination_indices.id, mapped],
@@ -1180,10 +1177,12 @@ fn emit_max_backward(
 	)?;
 	let conflict = match destinations_unique {
 		true => ScatterConflict::UniqueIndices,
-		false => ScatterConflict::Atomic {
-			operation: AtomicOperation::Add,
-			ordering: AtomicOrdering::Relaxed,
-		},
+		false => {
+			ScatterConflict::Atomic {
+				operation: AtomicOperation::Add,
+				ordering: AtomicOrdering::Relaxed,
+			}
+		}
 	};
 	emitter.emit(
 		vec![gradient_base.id, destinations, mapped],
@@ -1197,20 +1196,15 @@ fn emit_max_backward(
 }
 
 fn emit_upsample_nearest_2d(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["values", "source_indices"],
-		&["upsampled"],
-		&[
-			"batch",
-			"channels",
-			"input_height",
-			"input_width",
-			"scale_height",
-			"scale_width",
-			"source_indices_verified",
-		],
-	)?;
+	require_exact_abi(request, &["values", "source_indices"], &["upsampled"], &[
+		"batch",
+		"channels",
+		"input_height",
+		"input_width",
+		"scale_height",
+		"scale_width",
+		"source_indices_verified",
+	])?;
 	let batch = prepared_extent(request, "batch")?;
 	let channels = prepared_extent(request, "channels")?;
 	let input_height = prepared_extent(request, "input_height")?;
@@ -1276,14 +1270,16 @@ fn convolution_2d_geometry(request: &MaterializationRequest<'_>, extended: bool)
 	let kernel_width = prepared_extent(request, "kernel_width")?;
 	let (stride_height, stride_width, padding_height, padding_width, dilation_height, dilation_width) = match extended
 	{
-		true => (
-			prepared_extent(request, "stride_height")?,
-			prepared_extent(request, "stride_width")?,
-			prepared_u64(request.descriptor.id, request.parameters, "padding_height")?,
-			prepared_u64(request.descriptor.id, request.parameters, "padding_width")?,
-			prepared_extent(request, "dilation_height")?,
-			prepared_extent(request, "dilation_width")?,
-		),
+		true => {
+			(
+				prepared_extent(request, "stride_height")?,
+				prepared_extent(request, "stride_width")?,
+				prepared_u64(request.descriptor.id, request.parameters, "padding_height")?,
+				prepared_u64(request.descriptor.id, request.parameters, "padding_width")?,
+				prepared_extent(request, "dilation_height")?,
+				prepared_extent(request, "dilation_width")?,
+			)
+		}
 		false => (1, 1, 0, 0, 1, 1),
 	};
 	let effective_height = checked_effective_kernel(request, kernel_height, dilation_height, "height")?;

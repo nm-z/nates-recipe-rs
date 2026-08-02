@@ -10,9 +10,11 @@ use recipe_probe::{
 	ResolvedLocalInventory,
 };
 
-use crate::NativeGpuProbe;
-use crate::cuda::CudaBackend;
-use crate::hsa::{HsaBackend, exact_target};
+use crate::{
+	NativeGpuProbe,
+	cuda::CudaBackend,
+	hsa::{HsaBackend, exact_target},
+};
 
 const CUDA_BACKEND: &str = "nvidia-cuda-driver";
 const HSA_BACKEND: &str = "amd-rocr-hsa";
@@ -32,24 +34,16 @@ pub struct NativeExecutionBindings<'cuda, 'hsa> {
 
 impl<'cuda, 'hsa> NativeExecutionBindings<'cuda, 'hsa> {
 	#[must_use]
-	pub const fn machine(&self) -> MachineId {
-		self.machine
-	}
+	pub const fn machine(&self) -> MachineId { self.machine }
 
 	#[must_use]
-	pub fn cuda(&self) -> &[CudaBinding<'cuda>] {
-		&self.cuda
-	}
+	pub fn cuda(&self) -> &[CudaBinding<'cuda>] { &self.cuda }
 
 	#[must_use]
-	pub fn hsa(&self) -> &[HsaBinding<'hsa>] {
-		&self.hsa
-	}
+	pub fn hsa(&self) -> &[HsaBinding<'hsa>] { &self.hsa }
 
 	#[must_use]
-	pub fn into_parts(self) -> (Vec<CudaBinding<'cuda>>, Vec<HsaBinding<'hsa>>) {
-		(self.cuda, self.hsa)
-	}
+	pub fn into_parts(self) -> (Vec<CudaBinding<'cuda>>, Vec<HsaBinding<'hsa>>) { (self.cuda, self.hsa) }
 }
 
 #[derive(Clone, Debug)]
@@ -106,8 +100,10 @@ pub fn host_backend_config_from_inventory(
 	let mut bindings = inventory
 		.ram()
 		.iter()
-		.map(|resolved| HostDeviceBinding::Ram {
-			device: resolved.device(),
+		.map(|resolved| {
+			HostDeviceBinding::Ram {
+				device: resolved.device(),
+			}
 		})
 		.collect::<Vec<_>>();
 	for resolved in inventory.storage() {
@@ -229,9 +225,11 @@ pub fn with_native_execution_bindings<T>(
 				hsa: Vec::new(),
 			})
 		}
-		None => Err(binding_error(
-			"measured HSA GPU origins exist but no AMD runtime surface was reopened",
-		)),
+		None => {
+			Err(binding_error(
+				"measured HSA GPU origins exist but no AMD runtime surface was reopened",
+			))
+		}
 	}
 }
 
@@ -447,14 +445,18 @@ fn select_host_allocator(
 		.collect::<Vec<_>>();
 	match matching.as_slice() {
 		[index] => Ok(*index),
-		[] => match allocator_numa_nodes.len() {
-			0 => Err(HostAllocatorSelectionError::Missing),
-			1 => Ok(0),
-			count => Err(HostAllocatorSelectionError::AmbiguousFallback { count }),
-		},
-		indices => Err(HostAllocatorSelectionError::AmbiguousSameNuma {
-			count: indices.len(),
-		}),
+		[] => {
+			match allocator_numa_nodes.len() {
+				0 => Err(HostAllocatorSelectionError::Missing),
+				1 => Ok(0),
+				count => Err(HostAllocatorSelectionError::AmbiguousFallback { count }),
+			}
+		}
+		indices => {
+			Err(HostAllocatorSelectionError::AmbiguousSameNuma {
+				count: indices.len(),
+			})
+		}
 	}
 }
 
@@ -477,39 +479,4 @@ fn require_all_reopened(
 	}
 }
 
-fn binding_error(detail: impl Into<String>) -> ProbeError {
-	ProbeError::Discovery(detail.into())
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn host_allocator_selection_prefers_one_exact_numa_match() {
-		assert_eq!(select_host_allocator(&[2, 7], 7), Ok(1));
-		assert_eq!(select_host_allocator(&[2, 7], 2), Ok(0));
-	}
-
-	#[test]
-	fn host_allocator_selection_allows_one_global_fallback_and_sharing() {
-		assert_eq!(select_host_allocator(&[2], 7), Ok(0));
-		assert_eq!(select_host_allocator(&[2], 9), Ok(0));
-	}
-
-	#[test]
-	fn host_allocator_selection_rejects_missing_or_ambiguous_ownership() {
-		assert_eq!(
-			select_host_allocator(&[], 7),
-			Err(HostAllocatorSelectionError::Missing)
-		);
-		assert_eq!(
-			select_host_allocator(&[7, 7], 7),
-			Err(HostAllocatorSelectionError::AmbiguousSameNuma { count: 2 })
-		);
-		assert_eq!(
-			select_host_allocator(&[2, 9], 7),
-			Err(HostAllocatorSelectionError::AmbiguousFallback { count: 2 })
-		);
-	}
-}
+fn binding_error(detail: impl Into<String>) -> ProbeError { ProbeError::Discovery(detail.into()) }

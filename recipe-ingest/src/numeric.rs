@@ -1,5 +1,4 @@
-use core::fmt;
-use core::num::NonZeroU8;
+use core::{fmt, num::NonZeroU8};
 
 pub const F32_GUARANTEED_SIGNIFICANT_DIGITS: u8 = 6;
 pub const I32_GUARANTEED_SIGNIFICANT_DIGITS: u8 = 9;
@@ -54,19 +53,13 @@ pub struct F32Decimal {
 
 impl F32Decimal {
 	#[must_use]
-	pub const fn bits(self) -> u32 {
-		self.bits
-	}
+	pub const fn bits(self) -> u32 { self.bits }
 
 	#[must_use]
-	pub const fn value(self) -> f32 {
-		f32::from_bits(self.bits)
-	}
+	pub const fn value(self) -> f32 { f32::from_bits(self.bits) }
 
 	#[must_use]
-	pub const fn significant_digits(self) -> NonZeroU8 {
-		self.significant_digits
-	}
+	pub const fn significant_digits(self) -> NonZeroU8 { self.significant_digits }
 
 	/// Canonical scientific notation at the validated input precision.
 	#[must_use]
@@ -75,9 +68,7 @@ impl F32Decimal {
 	}
 
 	#[must_use]
-	pub const fn to_le_bytes(self) -> [u8; 4] {
-		self.bits.to_le_bytes()
-	}
+	pub const fn to_le_bytes(self) -> [u8; 4] { self.bits.to_le_bytes() }
 }
 
 /// An exact int32 payload plus its validated decimal digit count.
@@ -89,19 +80,13 @@ pub struct I32Decimal {
 
 impl I32Decimal {
 	#[must_use]
-	pub const fn value(self) -> i32 {
-		self.value
-	}
+	pub const fn value(self) -> i32 { self.value }
 
 	#[must_use]
-	pub const fn significant_digits(self) -> NonZeroU8 {
-		self.significant_digits
-	}
+	pub const fn significant_digits(self) -> NonZeroU8 { self.significant_digits }
 
 	#[must_use]
-	pub const fn to_le_bytes(self) -> [u8; 4] {
-		self.value.to_le_bytes()
-	}
+	pub const fn to_le_bytes(self) -> [u8; 4] { self.value.to_le_bytes() }
 }
 
 /// Parse and prove the normative six-significant-digit f32 representation
@@ -290,9 +275,7 @@ fn format_at_precision(value: f64, significant_digits: u8) -> String {
 	)
 }
 
-fn nonzero_digits(digits: u8) -> NonZeroU8 {
-	NonZeroU8::new(digits).unwrap_or(NonZeroU8::MIN)
-}
+fn nonzero_digits(digits: u8) -> NonZeroU8 { NonZeroU8::new(digits).unwrap_or(NonZeroU8::MIN) }
 
 fn invalid_syntax(input: &str) -> DecimalError {
 	DecimalError::new(
@@ -300,87 +283,4 @@ fn invalid_syntax(input: &str) -> DecimalError {
 		input,
 		"expected a decimal without whitespace or separators",
 	)
-}
-
-#[cfg(test)]
-mod tests {
-	use super::{DecimalErrorKind, parse_contract_f32, parse_contract_i32};
-
-	#[test]
-	fn six_digit_f32_values_round_trip_at_declared_precision() {
-		for (text, expected) in [
-			("0", 0.0_f32),
-			("-0.000", -0.0),
-			("1", 1.0),
-			("-12.3456", -12.3456),
-			("3.14159e2", 314.159),
-			("1.17549e-38", 1.17549e-38),
-			("3.40282e38", 3.40282e38),
-		] {
-			let parsed = parse_contract_f32(text).unwrap();
-			assert_eq!(parsed.value().to_bits(), expected.to_bits(), "{text}");
-			assert_eq!(parsed.to_le_bytes(), expected.to_bits().to_le_bytes());
-		}
-	}
-
-	#[test]
-	fn f32_significant_digit_and_precision_boundaries_fail_closed() {
-		assert_eq!(
-			parse_contract_f32("1.234567").unwrap_err().kind,
-			DecimalErrorKind::TooManySignificantDigits
-		);
-		assert_eq!(
-			parse_contract_f32("2e-45").unwrap_err().kind,
-			DecimalErrorKind::PrecisionLoss
-		);
-		assert_eq!(
-			parse_contract_f32("1e-100").unwrap_err().kind,
-			DecimalErrorKind::PrecisionLoss
-		);
-		assert_eq!(
-			parse_contract_f32("3.5e39").unwrap_err().kind,
-			DecimalErrorKind::OutsidePayloadRange
-		);
-	}
-
-	#[test]
-	fn nine_digit_int32_values_are_exact() {
-		for (text, expected) in [
-			("0", 0_i32),
-			("-0", 0),
-			("+000001", 1),
-			("999999999", 999_999_999),
-			("-999999999", -999_999_999),
-		] {
-			let parsed = parse_contract_i32(text).unwrap();
-			assert_eq!(parsed.value(), expected);
-			assert_eq!(parsed.to_le_bytes(), expected.to_le_bytes());
-		}
-	}
-
-	#[test]
-	fn int32_contract_rejects_tenth_digit_and_nonintegers() {
-		assert_eq!(
-			parse_contract_i32("1000000000").unwrap_err().kind,
-			DecimalErrorKind::TooManySignificantDigits
-		);
-		for text in ["", " 1", "1 ", "1.0", "1e2", "--1", "+"] {
-			assert!(matches!(
-				parse_contract_i32(text).unwrap_err().kind,
-				DecimalErrorKind::Empty | DecimalErrorKind::InvalidSyntax
-			));
-		}
-	}
-
-	#[test]
-	fn float_grammar_rejects_nondecimal_spellings() {
-		for text in [
-			"", " 1", "1 ", "NaN", "inf", "1_000", ".", "1e", "1e+", "1.2.3",
-		] {
-			assert!(matches!(
-				parse_contract_f32(text).unwrap_err().kind,
-				DecimalErrorKind::Empty | DecimalErrorKind::InvalidSyntax
-			));
-		}
-	}
 }

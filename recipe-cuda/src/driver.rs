@@ -1,8 +1,13 @@
-use crate::error::{CudaError, DriverCallError, DriverStatus, Result};
-use crate::ffi::{Api, CUDA_SUCCESS, CuResult, DriverCapabilities, DriverSymbol, DynamicLibrary};
-use core::ffi::{CStr, c_char};
-use core::ptr;
+use core::{
+	ffi::{CStr, c_char},
+	ptr,
+};
 use std::sync::Arc;
+
+use crate::{
+	error::{CudaError, DriverCallError, DriverStatus, Result},
+	ffi::{Api, CUDA_SUCCESS, CuResult, DriverCapabilities, DriverSymbol, DynamicLibrary},
+};
 
 #[derive(Clone)]
 pub struct Driver {
@@ -16,8 +21,6 @@ pub(crate) struct DriverInner {
 
 enum LibraryOwner {
 	Dynamic(DynamicLibrary),
-	#[cfg(test)]
-	Test,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,18 +53,12 @@ impl Driver {
 	pub fn loaded_library(&self) -> &str {
 		match &self.inner.library {
 			LibraryOwner::Dynamic(library) => library.name(),
-			#[cfg(test)]
-			LibraryOwner::Test => "<test>",
 		}
 	}
 
-	pub fn capabilities(&self) -> &DriverCapabilities {
-		self.inner.api.capabilities()
-	}
+	pub fn capabilities(&self) -> &DriverCapabilities { self.inner.api.capabilities() }
 
-	pub fn supports(&self, symbol: DriverSymbol) -> bool {
-		self.capabilities().supports(symbol)
-	}
+	pub fn supports(&self, symbol: DriverSymbol) -> bool { self.capabilities().supports(symbol) }
 
 	pub fn module_loading_mode(&self) -> Result<Option<ModuleLoadingMode>> {
 		let Some(function) = self.inner.api.module_get_loading_mode else {
@@ -74,10 +71,12 @@ impl Driver {
 		match raw_mode {
 			1 => Ok(Some(ModuleLoadingMode::Eager)),
 			2 => Ok(Some(ModuleLoadingMode::Lazy)),
-			_ => Err(CudaError::InvalidDriverValue {
-				operation: "cuModuleGetLoadingMode",
-				detail: format!("unknown loading mode {raw_mode}"),
-			}),
+			_ => {
+				Err(CudaError::InvalidDriverValue {
+					operation: "cuModuleGetLoadingMode",
+					detail: format!("unknown loading mode {raw_mode}"),
+				})
+			}
 		}
 	}
 
@@ -131,16 +130,6 @@ impl Driver {
 			.to_string_lossy()
 			.into_owned())
 	}
-
-	#[cfg(test)]
-	pub(crate) fn from_test_api(api: Api) -> Self {
-		Self {
-			inner: Arc::new(DriverInner {
-				api,
-				library: LibraryOwner::Test,
-			}),
-		}
-	}
 }
 
 impl core::fmt::Debug for Driver {
@@ -149,32 +138,5 @@ impl core::fmt::Debug for Driver {
 			.field("loaded_library", &self.loaded_library())
 			.field("capabilities", self.capabilities())
 			.finish()
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::ffi::test_support;
-
-	#[test]
-	fn driver_clone_keeps_the_symbol_owner_alive() {
-		let driver = Driver::from_test_api(test_support::api(false));
-		let clone = driver.clone();
-		drop(driver);
-		assert_eq!(clone.loaded_library(), "<test>");
-		assert!(clone.supports(DriverSymbol::Init));
-	}
-
-	#[test]
-	fn loading_mode_query_is_optional() {
-		let r470 = Driver::from_test_api(test_support::api(false));
-		assert_eq!(r470.module_loading_mode().unwrap(), None);
-
-		let modern = Driver::from_test_api(test_support::api(true));
-		assert_eq!(
-			modern.module_loading_mode().unwrap(),
-			Some(ModuleLoadingMode::Eager)
-		);
 	}
 }

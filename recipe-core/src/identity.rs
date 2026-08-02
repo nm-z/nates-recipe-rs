@@ -15,15 +15,11 @@ impl Label {
 	}
 
 	#[must_use]
-	pub fn as_str(&self) -> &str {
-		&self.0
-	}
+	pub fn as_str(&self) -> &str { &self.0 }
 }
 
 impl fmt::Display for Label {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		self.0.fmt(formatter)
-	}
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(formatter) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,19 +41,13 @@ impl Digest {
 	pub const ZERO: Self = Self([0; 32]);
 
 	#[must_use]
-	pub const fn new(bytes: [u8; 32]) -> Self {
-		Self(bytes)
-	}
+	pub const fn new(bytes: [u8; 32]) -> Self { Self(bytes) }
 
 	#[must_use]
-	pub const fn bytes(self) -> [u8; 32] {
-		self.0
-	}
+	pub const fn bytes(self) -> [u8; 32] { self.0 }
 
 	#[must_use]
-	pub fn is_zero(self) -> bool {
-		self == Self::ZERO
-	}
+	pub fn is_zero(self) -> bool { self == Self::ZERO }
 }
 
 impl fmt::Debug for Digest {
@@ -104,17 +94,3 @@ digest_identities!(
 	RealizationIdentity,
 	BundleIdentity,
 );
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn identity_domains_do_not_compare_accidentally() {
-		let digest = Digest::new([7; 32]);
-		let discovery = DiscoveryIdentity::new(digest);
-		let draft = DraftIdentity::new(digest);
-		assert_eq!(discovery.digest(), draft.digest());
-		// The wrappers intentionally have no cross-domain PartialEq implementation.
-	}
-}

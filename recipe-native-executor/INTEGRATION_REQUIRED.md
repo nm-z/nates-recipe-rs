@@ -60,7 +60,7 @@ The remaining integration work is:
 1. Make poisoned-run teardown ordered and total. Native resources currently
    refuse destruction while unhealthy; cancellation, terminal observation, and
    release must remain possible after a device or transport failure.
-2. Execute the live-hardware matrix (NVIDIA K80/M60 and AMD V340L), including
-   init, concurrent loop work, scheduled metrics, exit readback, and ordered
-   release. Mock tests prove contract validation but do not substitute for the
-   driver and ISA acceptance runs.
+2. Execute the public real-dataset workflow matrix on NVIDIA K80/M60 and AMD
+   V340L, including init, concurrent loop work, scheduled metrics, exit
+   readback, and ordered release. Only observations from the real driver, ISA,
+   and complete workload count as acceptance evidence.

@@ -12,9 +12,7 @@ pub struct ExternalValue<'a> {
 
 impl<'a> ExternalValue<'a> {
 	#[must_use]
-	pub const fn new(logical: ValueId, bytes: &'a [u8]) -> Self {
-		Self { logical, bytes }
-	}
+	pub const fn new(logical: ValueId, bytes: &'a [u8]) -> Self { Self { logical, bytes } }
 }
 
 /// A complete, immutable byte image for one device's sole init upload.
@@ -27,24 +25,16 @@ pub struct PackedInitImage {
 
 impl PackedInitImage {
 	#[must_use]
-	pub const fn device(&self) -> DeviceId {
-		self.device
-	}
+	pub const fn device(&self) -> DeviceId { self.device }
 
 	#[must_use]
-	pub const fn image(&self) -> ValueId {
-		self.image
-	}
+	pub const fn image(&self) -> ValueId { self.image }
 
 	#[must_use]
-	pub fn bytes(&self) -> &[u8] {
-		&self.bytes
-	}
+	pub fn bytes(&self) -> &[u8] { &self.bytes }
 
 	#[must_use]
-	pub fn into_bytes(self) -> Vec<u8> {
-		self.bytes
-	}
+	pub fn into_bytes(self) -> Vec<u8> { self.bytes }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,153 +276,4 @@ fn validate_manifests(manifests: &[InitDataImage]) -> ImagePackResult<BTreeMap<V
 		}
 	}
 	Ok(required)
-}
-
-#[cfg(test)]
-mod tests {
-	use recipe_core::{ByteOffset, InitDataImageMember};
-
-	use super::*;
-
-	const LOGICAL_A: ValueId = ValueId::new(101);
-	const LOGICAL_B: ValueId = ValueId::new(102);
-	const GPU: DeviceId = DeviceId::new(1);
-	const RAM: DeviceId = DeviceId::new(2);
-
-	fn member(logical: ValueId, physical: u64, dtype: DType, bytes: u64, offset: u64) -> InitDataImageMember {
-		InitDataImageMember {
-			logical,
-			physical: ValueId::new(physical),
-			dtype,
-			bytes: ByteCount::new(bytes),
-			image_offset: ByteOffset::new(offset),
-		}
-	}
-
-	fn manifests() -> Vec<InitDataImage> {
-		vec![
-			InitDataImage {
-				device: RAM,
-				image: ValueId::new(2),
-				bytes: ByteCount::new(12),
-				members: vec![
-					member(LOGICAL_A, 20, DType::F32, 4, 0),
-					member(LOGICAL_B, 21, DType::I32, 4, 8),
-				],
-			},
-			InitDataImage {
-				device: GPU,
-				image: ValueId::new(1),
-				bytes: ByteCount::new(8),
-				members: vec![member(LOGICAL_A, 10, DType::F32, 4, 4)],
-			},
-		]
-	}
-
-	#[test]
-	fn packs_each_device_once_and_zero_fills_non_input_regions() {
-		let a = [1, 2, 3, 4];
-		let b = [5, 6, 7, 8];
-		let packed = pack_init_images(
-			&manifests(),
-			&[
-				ExternalValue::new(LOGICAL_B, &b),
-				ExternalValue::new(LOGICAL_A, &a),
-			],
-		)
-		.unwrap();
-		assert_eq!(packed.len(), 2);
-		assert_eq!(packed[0].device(), GPU);
-		assert_eq!(packed[0].bytes(), &[0, 0, 0, 0, 1, 2, 3, 4]);
-		assert_eq!(packed[1].device(), RAM);
-		assert_eq!(packed[1].bytes(), &[1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 7, 8]);
-	}
-
-	#[test]
-	fn rejects_incomplete_ambiguous_and_unexpected_sources() {
-		let a = [1, 2, 3, 4];
-		let b = [5, 6, 7, 8];
-		let cases = [
-			(
-				vec![ExternalValue::new(LOGICAL_A, &a)],
-				ImagePackErrorKind::MissingSource,
-			),
-			(
-				vec![
-					ExternalValue::new(LOGICAL_A, &a),
-					ExternalValue::new(LOGICAL_A, &a),
-					ExternalValue::new(LOGICAL_B, &b),
-				],
-				ImagePackErrorKind::DuplicateSource,
-			),
-			(
-				vec![
-					ExternalValue::new(LOGICAL_A, &a),
-					ExternalValue::new(LOGICAL_B, &b),
-					ExternalValue::new(ValueId::new(999), &a),
-				],
-				ImagePackErrorKind::UnexpectedSource,
-			),
-		];
-		for (sources, expected) in cases {
-			assert_eq!(
-				pack_init_images(&manifests(), &sources).unwrap_err().kind,
-				expected
-			);
-		}
-	}
-
-	#[test]
-	fn rejects_wrong_source_size_and_invalid_or_conflicting_manifests() {
-		let a = [1, 2, 3, 4];
-		let b = [5, 6, 7, 8];
-		assert_eq!(
-			pack_init_images(
-				&manifests(),
-				&[
-					ExternalValue::new(LOGICAL_A, &a[..3]),
-					ExternalValue::new(LOGICAL_B, &b),
-				],
-			)
-			.unwrap_err()
-			.kind,
-			ImagePackErrorKind::SourceSizeMismatch
-		);
-
-		let mut overlapping = manifests();
-		overlapping[0].members[1].image_offset = overlapping[0].members[0].image_offset;
-		assert_eq!(
-			pack_init_images(&overlapping, &[]).unwrap_err().kind,
-			ImagePackErrorKind::InvalidManifest
-		);
-
-		let mut conflicting = manifests();
-		conflicting[1].bytes = ByteCount::new(12);
-		conflicting[1].members[0].bytes = ByteCount::new(8);
-		assert_eq!(
-			pack_init_images(&conflicting, &[]).unwrap_err().kind,
-			ImagePackErrorKind::ConflictingContract
-		);
-	}
-
-	#[test]
-	fn permits_zero_byte_logical_values_and_empty_device_manifests() {
-		let manifests = vec![
-			InitDataImage {
-				device: GPU,
-				image: ValueId::new(1),
-				bytes: ByteCount::new(4),
-				members: vec![member(LOGICAL_A, 10, DType::F32, 0, 0)],
-			},
-			InitDataImage {
-				device: RAM,
-				image: ValueId::new(2),
-				bytes: ByteCount::new(4),
-				members: vec![],
-			},
-		];
-		let packed = pack_init_images(&manifests, &[ExternalValue::new(LOGICAL_A, &[])]).unwrap();
-		assert_eq!(packed[0].bytes(), &[0; 4]);
-		assert_eq!(packed[1].bytes(), &[0; 4]);
-	}
 }

@@ -19,6 +19,7 @@ mod bridge;
 pub mod candidate;
 mod cuda_ffi;
 mod error;
+mod evidence;
 mod local;
 mod plan;
 
@@ -32,6 +33,7 @@ pub use candidate::{
 };
 pub use cuda::{CUDA_MAXIMUM_SUBMISSION_QUEUES, CudaBackend, CudaBinding};
 pub use error::{Error, Result};
+pub use evidence::{NativeBackendKind, NativeDeviceExecutionEvidence, NativeExecutionEvidence};
 pub use hsa::{HsaBackend, HsaBinding};
 pub use local::{
 	CandidateCrossBackendTransfer, CrossBackendTransfer, CrossBackendUnavailable, LocalArena, LocalArenaRef,
@@ -39,9 +41,5 @@ pub use local::{
 	LocalPending, LocalPreparedSession, LocalResources, PreparedBridge, PreparedBridgeError, RejectCrossBackend,
 	UnavailableLocalStabilizer,
 };
-pub use plan::{RuntimeArtifact, RuntimeArtifactKind, RuntimeImage};
-
 pub(crate) use plan::{ExecutionPlan, PlannedSubmission};
-
-#[cfg(test)]
-mod tests;
+pub use plan::{RuntimeArtifact, RuntimeArtifactKind, RuntimeImage};

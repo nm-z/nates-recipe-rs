@@ -1,21 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::artifact::{ArtifactBuildRecipe, ArtifactIdentity};
-use crate::discovery::DiscoveryProfile;
-use crate::error::{ValidationCode, ValidationResult, Validator};
-use crate::identity::{
-	BundleIdentity, CandidateIdentity, DiscoveryIdentity, DraftIdentity, Label, RealizationIdentity, TopologyIdentity,
+use crate::{
+	artifact::{ArtifactBuildRecipe, ArtifactIdentity},
+	discovery::DiscoveryProfile,
+	error::{ValidationCode, ValidationResult, Validator},
+	identity::{
+		BundleIdentity, CandidateIdentity, DiscoveryIdentity, DraftIdentity, Label, RealizationIdentity,
+		TopologyIdentity,
+	},
+	ids::{ArenaObjectId, ArtifactId, DeviceId, TaskId, ValueId},
+	scalar::{AliasPermission, DType, KernelTemplate},
+	schedule::{
+		ArenaLayout, ArenaObject, ArenaRelease, InitDataImage, IterationDomain, LoopIterations, LoopSchedule,
+		LoopTaskDomain, MetricPurpose, ResolvedTransferEndpoint, ResolvedTransferEndpoints, ResolvedValueLocation,
+		ResourceManifest, RunPhase, Task, TaskKind, TransferEndpoint, TransferLaneClaim, ValueAliasContract,
+		ValueBinding, ValueSpec,
+	},
+	topology::{DeviceKind, Property, Topology},
+	units::{ByteCount, Nanoseconds},
 };
-use crate::ids::{ArenaObjectId, ArtifactId, DeviceId, TaskId, ValueId};
-use crate::scalar::{AliasPermission, DType, KernelTemplate};
-use crate::schedule::{
-	ArenaLayout, ArenaObject, ArenaRelease, InitDataImage, IterationDomain, LoopIterations, LoopSchedule,
-	LoopTaskDomain, MetricPurpose, ResolvedTransferEndpoint, ResolvedTransferEndpoints, ResolvedValueLocation,
-	ResourceManifest, RunPhase, Task, TaskKind, TransferEndpoint, TransferLaneClaim, ValueAliasContract,
-	ValueBinding, ValueSpec,
-};
-use crate::topology::{DeviceKind, Property, Topology};
-use crate::units::{ByteCount, Nanoseconds};
 
 pub const EXACT_USER_RESERVATION: ByteCount = ByteCount::new(1_000_000_000);
 
@@ -188,21 +191,25 @@ impl CapacityLedger {
 			.into_iter()
 			.try_fold(ByteCount::ZERO, ByteCount::checked_add);
 			match accounted {
-				Some(accounted) => validator.require(
-					accounted <= entry.total.value,
-					ValidationCode::CapacityOverflow,
-					format!("entries[{index}]"),
-					format!(
-						"accounted capacity {} exceeds total {}",
-						accounted.get(),
-						entry.total.value.get()
-					),
-				),
-				None => validator.error(
-					ValidationCode::CapacityOverflow,
-					format!("entries[{index}]"),
-					"capacity accounting overflowed",
-				),
+				Some(accounted) => {
+					validator.require(
+						accounted <= entry.total.value,
+						ValidationCode::CapacityOverflow,
+						format!("entries[{index}]"),
+						format!(
+							"accounted capacity {} exceeds total {}",
+							accounted.get(),
+							entry.total.value.get()
+						),
+					)
+				}
+				None => {
+					validator.error(
+						ValidationCode::CapacityOverflow,
+						format!("entries[{index}]"),
+						"capacity accounting overflowed",
+					)
+				}
 			}
 		}
 		for (index, device) in topology.devices.iter().enumerate() {
@@ -384,18 +391,12 @@ impl DraftPlan {
 			}
 		}
 
-		validate_tasks(
-			&mut validator,
-			self,
-			topology,
-			discovery,
-			&DraftIndexes {
-				values: &values,
-				kernels: &kernels,
-				artifacts: &artifacts,
-				artifact_builds: &artifact_builds,
-			},
-		);
+		validate_tasks(&mut validator, self, topology, discovery, &DraftIndexes {
+			values: &values,
+			kernels: &kernels,
+			artifacts: &artifacts,
+			artifact_builds: &artifact_builds,
+		});
 		validate_arena_objects(&mut validator, self, topology);
 		validate_value_bindings(&mut validator, self, &values, &kernels);
 		validate_init_images(&mut validator, self, topology, &values);
@@ -753,11 +754,13 @@ fn validate_tasks(
 							&draft.resources,
 						);
 					}
-					(TransferEndpoint::External, TransferEndpoint::External) => validator.error(
-						ValidationCode::InvalidExternalTransfer,
-						format!("{path}.source"),
-						"external-to-external transfer is not a run task",
-					),
+					(TransferEndpoint::External, TransferEndpoint::External) => {
+						validator.error(
+							ValidationCode::InvalidExternalTransfer,
+							format!("{path}.source"),
+							"external-to-external transfer is not a run task",
+						)
+					}
 				}
 				validate_transfer_lane_claims(validator, &path, transfer, topology, discovery);
 			}
@@ -791,32 +794,7 @@ fn validate_tasks(
 					format!("{path}.slot"),
 					"metric slot is absent or assigned to another metric",
 				);
-				if let MetricPurpose::FaultReadback { calculation } = metric.purpose {
-					let checked = tasks.get(&calculation).copied();
-					validator.require(
-						checked.is_some(),
-						ValidationCode::InvalidFaultReadback,
-						format!("{path}.purpose.calculation"),
-						format!("fault readback references unknown calculation {calculation}"),
-					);
-					validator.require(
-						checked.is_some_and(|checked| {
-							matches!(
-								&checked.kind,
-								TaskKind::Calculation(calculation_task)
-									if calculation_task.fault_flag == Some(metric.value)
-							)
-						}),
-						ValidationCode::InvalidFaultReadback,
-						format!("{path}.value"),
-						"fault readback must name the exact int32 flag of its checked calculation",
-					);
-					validator.require(
-						task.dependencies.contains(&calculation),
-						ValidationCode::InvalidFaultReadback,
-						format!("{path}.dependencies"),
-						"fault readback must depend directly on its checked calculation",
-					);
+				if metric.purpose == MetricPurpose::FaultReadback {
 					validator.require(
 						indexes.values.get(&metric.value).is_some_and(|value| {
 							value.dtype == DType::I32 && value.bytes == ByteCount::new(4)
@@ -834,20 +812,24 @@ fn validate_tasks(
 
 	for (index, device) in topology.devices.iter().enumerate() {
 		match upload_counts.get(&device.id).copied().unwrap_or(0) {
-			0 => validator.error(
-				ValidationCode::MissingUpload,
-				format!("topology.devices[{index}]"),
-				format!("device {} has no init data-image admission", device.id),
-			),
+			0 => {
+				validator.error(
+					ValidationCode::MissingUpload,
+					format!("topology.devices[{index}]"),
+					format!("device {} has no init data-image admission", device.id),
+				)
+			}
 			1 => {}
-			count => validator.error(
-				ValidationCode::DuplicateUpload,
-				format!("topology.devices[{index}]"),
-				format!(
-					"device {} has {count} init data-image admissions",
-					device.id
-				),
-			),
+			count => {
+				validator.error(
+					ValidationCode::DuplicateUpload,
+					format!("topology.devices[{index}]"),
+					format!(
+						"device {} has {count} init data-image admissions",
+						device.id
+					),
+				)
+			}
 		}
 	}
 
@@ -889,40 +871,35 @@ fn validate_tasks(
 }
 
 fn validate_fault_readbacks(validator: &mut Validator, draft: &DraftPlan, tasks: &BTreeMap<TaskId, &Task>) {
-	let mut checked_by_flag = BTreeMap::<ValueId, Vec<(&Task, &Task)>>::new();
-	let mut readbacks_by_calculation = BTreeMap::<TaskId, Vec<&Task>>::new();
+	let mut checked_by_flag = BTreeMap::<ValueId, Vec<&Task>>::new();
+	let mut readbacks_by_flag = BTreeMap::<ValueId, Vec<&Task>>::new();
 	let mut metric_slot_uses = BTreeMap::new();
-	let mut direct_dependents = BTreeMap::<TaskId, Vec<&Task>>::new();
 	for task in &draft.tasks {
-		for dependency in &task.dependencies {
-			direct_dependents.entry(*dependency).or_default().push(task);
+		if let TaskKind::Calculation(calculation) = &task.kind
+			&& let Some(fault_flag) = calculation.fault_flag
+		{
+			checked_by_flag.entry(fault_flag).or_default().push(task);
 		}
 		if let TaskKind::Metric(metric) = &task.kind {
 			*metric_slot_uses.entry(metric.slot).or_insert(0usize) += 1;
-			if let MetricPurpose::FaultReadback { calculation } = metric.purpose {
-				readbacks_by_calculation
-					.entry(calculation)
+			if metric.purpose == MetricPurpose::FaultReadback {
+				readbacks_by_flag
+					.entry(metric.value)
 					.or_default()
 					.push(task);
 			}
 		}
 	}
-	for (calculation_index, calculation_task) in draft.tasks.iter().enumerate() {
-		let TaskKind::Calculation(calculation) = &calculation_task.kind else {
-			continue;
-		};
-		let Some(fault_flag) = calculation.fault_flag else {
-			continue;
-		};
-		let readbacks = readbacks_by_calculation.get(&calculation_task.id);
+	for (fault_flag, calculations) in &checked_by_flag {
+		let readbacks = readbacks_by_flag.get(fault_flag);
 		let readback_count = readbacks.map_or(0, Vec::len);
 		validator.require(
 			readback_count == 1,
 			ValidationCode::InvalidFaultReadback,
-			format!("tasks[{calculation_index}].fault_flag"),
+			format!("values[{fault_flag}].fault_readback"),
 			format!(
-				"checked calculation {} requires exactly one fault readback, found {}",
-				calculation_task.id, readback_count
+				"fault cohort with {} checked calculations requires exactly one readback, found {readback_count}",
+				calculations.len()
 			),
 		);
 		let Some(readback) = readbacks
@@ -934,76 +911,50 @@ fn validate_fault_readbacks(validator: &mut Validator, draft: &DraftPlan, tasks:
 		let TaskKind::Metric(metric) = &readback.kind else {
 			continue;
 		};
-		validator.require(
-			metric.value == fault_flag,
-			ValidationCode::InvalidFaultReadback,
-			format!("tasks[{calculation_index}].fault_flag"),
-			format!(
-				"calculation {} fault flag {fault_flag} is miswired to readback value {}",
-				calculation_task.id, metric.value
-			),
-		);
 		let slot_uses = metric_slot_uses.get(&metric.slot).copied().unwrap_or(0);
 		validator.require(
 			slot_uses == 1,
 			ValidationCode::InvalidFaultReadback,
-			format!("tasks[{calculation_index}].fault_flag"),
+			format!("tasks[{}].slot", readback.id),
 			format!(
 				"fault readback {} requires an exclusive metric slot, but slot {} has {slot_uses} users",
 				readback.id, metric.slot
 			),
 		);
 
-		if let Some(dependents) = direct_dependents.get(&calculation_task.id) {
-			// Gating the direct successor frontier is equivalent to checking every
-			// transitive descendant: every path out of the calculation crosses one
-			// of these tasks, and all later descendants inherit that dependency.
-			for dependent in dependents
-				.iter()
-				.copied()
-				.filter(|dependent| dependent.id != readback.id)
-			{
-				validator.require(
-					task_depends_on(tasks, dependent.id, readback.id),
-					ValidationCode::InvalidFaultReadback,
-					format!("tasks[{}].dependencies", dependent.id),
-					format!(
-						"task {} can pass checked calculation {} without waiting for fault readback {}",
-						dependent.id, calculation_task.id, readback.id
-					),
-				);
-			}
+		for calculation in calculations {
+			validator.require(
+				readback.dependencies.contains(&calculation.id),
+				ValidationCode::InvalidFaultReadback,
+				format!("tasks[{}].dependencies", readback.id),
+				format!(
+					"fault readback {} must depend directly on checked calculation {}",
+					readback.id, calculation.id
+				),
+			);
 		}
-		checked_by_flag
-			.entry(fault_flag)
-			.or_default()
-			.push((calculation_task, readback));
+		for published in draft.tasks.iter().filter(|task| {
+			task.phase == RunPhase::Exit
+				|| matches!(&task.kind, TaskKind::Metric(metric) if metric.purpose == MetricPurpose::User)
+		}) {
+			validator.require(
+				task_depends_on(tasks, published.id, readback.id),
+				ValidationCode::InvalidFaultReadback,
+				format!("tasks[{}].dependencies", published.id),
+				format!(
+					"publishing task {} can complete before fault readback {}",
+					published.id, readback.id
+				),
+			);
+		}
 	}
-
-	for (fault_flag, calculations) in &mut checked_by_flag {
-		calculations.sort_by_key(|(calculation, _)| (calculation.window.start, calculation.id));
-		for pair in calculations.windows(2) {
-			let (_, previous_readback) = pair[0];
-			let (next_calculation, _) = pair[1];
-			validator.require(
-				task_depends_on(tasks, next_calculation.id, previous_readback.id),
-				ValidationCode::InvalidFaultReadback,
-				format!("tasks[{}].dependencies", next_calculation.id),
-				format!(
-					"calculation {} reuses fault flag {fault_flag} before readback {} gates it",
-					next_calculation.id, previous_readback.id
-				),
-			);
-			validator.require(
-				previous_readback.window.end <= next_calculation.window.start,
-				ValidationCode::InvalidFaultReadback,
-				format!("tasks[{}].window", next_calculation.id),
-				format!(
-					"calculation {} overlaps prior readback {} of shared fault flag {fault_flag}",
-					next_calculation.id, previous_readback.id
-				),
-			);
-		}
+	for (fault_flag, readbacks) in &readbacks_by_flag {
+		validator.require(
+			checked_by_flag.contains_key(fault_flag),
+			ValidationCode::InvalidFaultReadback,
+			format!("tasks[{}].value", readbacks[0].id),
+			format!("fault readback names unused flag {fault_flag}"),
+		);
 	}
 }
 
@@ -1292,11 +1243,13 @@ fn validate_resource_contention(
 		let events = draft
 			.tasks
 			.iter()
-			.filter_map(|task| match &task.kind {
-				TaskKind::Transfer(transfer) if transfer.route.contains(&link.id) => {
-					Some([(task.window.start, 1i8), (task.window.end, -1i8)])
+			.filter_map(|task| {
+				match &task.kind {
+					TaskKind::Transfer(transfer) if transfer.route.contains(&link.id) => {
+						Some([(task.window.start, 1i8), (task.window.end, -1i8)])
+					}
+					TaskKind::Calculation(_) | TaskKind::Transfer(_) | TaskKind::Metric(_) => None,
 				}
-				TaskKind::Calculation(_) | TaskKind::Transfer(_) | TaskKind::Metric(_) => None,
 			})
 			.flatten()
 			.collect::<Vec<_>>();
@@ -1312,19 +1265,21 @@ fn validate_resource_contention(
 		let events = draft
 			.tasks
 			.iter()
-			.filter_map(|task| match &task.kind {
-				TaskKind::Transfer(transfer)
-					if transfer.route.is_empty()
-						&& matches!(
-							(transfer.source, transfer.destination),
-							(TransferEndpoint::External, TransferEndpoint::Device { device, .. })
-								| (TransferEndpoint::Device { device, .. }, TransferEndpoint::External)
-								if device == discovered.device
-						) =>
-				{
-					Some([(task.window.start, 1i8), (task.window.end, -1i8)])
+			.filter_map(|task| {
+				match &task.kind {
+					TaskKind::Transfer(transfer)
+						if transfer.route.is_empty()
+							&& matches!(
+								(transfer.source, transfer.destination),
+								(TransferEndpoint::External, TransferEndpoint::Device { device, .. })
+									| (TransferEndpoint::Device { device, .. }, TransferEndpoint::External)
+									if device == discovered.device
+							) =>
+					{
+						Some([(task.window.start, 1i8), (task.window.end, -1i8)])
+					}
+					TaskKind::Calculation(_) | TaskKind::Transfer(_) | TaskKind::Metric(_) => None,
 				}
-				TaskKind::Calculation(_) | TaskKind::Transfer(_) | TaskKind::Metric(_) => None,
 			})
 			.flatten()
 			.collect::<Vec<_>>();
@@ -1343,11 +1298,13 @@ fn validate_resource_contention(
 		let mut events = draft
 			.tasks
 			.iter()
-			.filter_map(|task| match &task.kind {
-				TaskKind::Calculation(candidate) if candidate.device == discovered.device => {
-					Some([(task.window.start, 1i8), (task.window.end, -1i8)])
+			.filter_map(|task| {
+				match &task.kind {
+					TaskKind::Calculation(candidate) if candidate.device == discovered.device => {
+						Some([(task.window.start, 1i8), (task.window.end, -1i8)])
+					}
+					_ => None,
 				}
-				_ => None,
 			})
 			.flatten()
 			.collect::<Vec<_>>();
@@ -2078,17 +2035,21 @@ fn validate_releases(validator: &mut Validator, draft: &DraftPlan, topology: &To
 	}
 	for (index, device) in topology.devices.iter().enumerate() {
 		match counts.get(&device.id).copied().unwrap_or(0) {
-			0 => validator.error(
-				ValidationCode::MissingRelease,
-				format!("topology.devices[{index}]"),
-				format!("device {} has no exit arena release", device.id),
-			),
+			0 => {
+				validator.error(
+					ValidationCode::MissingRelease,
+					format!("topology.devices[{index}]"),
+					format!("device {} has no exit arena release", device.id),
+				)
+			}
 			1 => {}
-			count => validator.error(
-				ValidationCode::DuplicateRelease,
-				format!("topology.devices[{index}]"),
-				format!("device {} has {count} exit arena releases", device.id),
-			),
+			count => {
+				validator.error(
+					ValidationCode::DuplicateRelease,
+					format!("topology.devices[{index}]"),
+					format!("device {} has {count} exit arena releases", device.id),
+				)
+			}
 		}
 	}
 }
@@ -2339,18 +2300,26 @@ fn validate_loop_domains(
 			continue;
 		};
 		if let TaskKind::Metric(metric) = &task.kind
-			&& let MetricPurpose::FaultReadback { calculation } = metric.purpose
-			&& let Some(calculation_domain) = domains.get(&calculation).copied()
+			&& metric.purpose == MetricPurpose::FaultReadback
 		{
-			validator.require(
-				task_domain == calculation_domain,
-				ValidationCode::InvalidIterationDomain,
-				format!("tasks[{index}].iteration_domain"),
-				format!(
-					"fault readback {} must share calculation {calculation}'s iteration domain",
-					task.id
-				),
-			);
+			for checked in tasks.iter().filter(|candidate| {
+				matches!(
+					&candidate.kind,
+					TaskKind::Calculation(calculation) if calculation.fault_flag == Some(metric.value)
+				)
+			}) {
+				if let Some(calculation_domain) = domains.get(&checked.id).copied() {
+					validator.require(
+						task_domain == calculation_domain,
+						ValidationCode::InvalidIterationDomain,
+						format!("tasks[{index}].iteration_domain"),
+						format!(
+							"fault readback {} must share checked calculation {}'s iteration domain",
+							task.id, checked.id
+						),
+					);
+				}
+			}
 		}
 
 		let TaskKind::Transfer(transfer) = &task.kind else {
@@ -2463,9 +2432,11 @@ impl FinalizedBundle {
 			.tasks
 			.iter()
 			.filter(|task| task.phase == RunPhase::Loop)
-			.map(|task| LoopTaskDomain {
-				task: task.id,
-				domain: IterationDomain::every(loop_iterations),
+			.map(|task| {
+				LoopTaskDomain {
+					task: task.id,
+					domain: IterationDomain::every(loop_iterations),
+				}
 			})
 			.collect();
 		Self::finalize_with_loop_schedule(
@@ -2546,19 +2517,13 @@ impl FinalizedBundle {
 	}
 
 	#[must_use]
-	pub const fn identity(&self) -> BundleIdentity {
-		self.identity
-	}
+	pub const fn identity(&self) -> BundleIdentity { self.identity }
 
 	#[must_use]
-	pub const fn loop_iterations(&self) -> LoopIterations {
-		self.loop_iterations
-	}
+	pub const fn loop_iterations(&self) -> LoopIterations { self.loop_iterations }
 
 	#[must_use]
-	pub fn loop_domains(&self) -> &[LoopTaskDomain] {
-		&self.loop_domains
-	}
+	pub fn loop_domains(&self) -> &[LoopTaskDomain] { &self.loop_domains }
 
 	#[must_use]
 	pub fn iteration_domain(&self, task: TaskId) -> Option<IterationDomain> {
@@ -2569,39 +2534,25 @@ impl FinalizedBundle {
 	}
 
 	#[must_use]
-	pub const fn topology(&self) -> TopologyIdentity {
-		self.topology
-	}
+	pub const fn topology(&self) -> TopologyIdentity { self.topology }
 
 	#[must_use]
-	pub const fn discovery(&self) -> DiscoveryIdentity {
-		self.discovery
-	}
+	pub const fn discovery(&self) -> DiscoveryIdentity { self.discovery }
 
 	#[must_use]
-	pub const fn draft(&self) -> DraftIdentity {
-		self.draft
-	}
+	pub const fn draft(&self) -> DraftIdentity { self.draft }
 
 	#[must_use]
-	pub const fn realization(&self) -> RealizationIdentity {
-		self.realization
-	}
+	pub const fn realization(&self) -> RealizationIdentity { self.realization }
 
 	#[must_use]
-	pub const fn candidate(&self) -> CandidateIdentity {
-		self.candidate
-	}
+	pub const fn candidate(&self) -> CandidateIdentity { self.candidate }
 
 	#[must_use]
-	pub fn artifacts(&self) -> &[ArtifactIdentity] {
-		&self.artifacts
-	}
+	pub fn artifacts(&self) -> &[ArtifactIdentity] { &self.artifacts }
 
 	#[must_use]
-	pub fn artifact_builds(&self) -> &[ArtifactBuildRecipe] {
-		&self.artifact_builds
-	}
+	pub fn artifact_builds(&self) -> &[ArtifactBuildRecipe] { &self.artifact_builds }
 
 	#[must_use]
 	pub fn artifact_build(&self, artifact: ArtifactId) -> Option<&ArtifactBuildRecipe> {
@@ -2611,9 +2562,7 @@ impl FinalizedBundle {
 	}
 
 	#[must_use]
-	pub fn kernels(&self) -> &[KernelTemplate] {
-		&self.kernels
-	}
+	pub fn kernels(&self) -> &[KernelTemplate] { &self.kernels }
 
 	#[must_use]
 	pub fn kernel(&self, kernel: crate::ids::KernelTemplateId) -> Option<&KernelTemplate> {
@@ -2621,39 +2570,25 @@ impl FinalizedBundle {
 	}
 
 	#[must_use]
-	pub fn tasks(&self) -> &[Task] {
-		&self.tasks
-	}
+	pub fn tasks(&self) -> &[Task] { &self.tasks }
 
 	#[must_use]
-	pub const fn resources(&self) -> &ResourceManifest {
-		&self.resources
-	}
+	pub const fn resources(&self) -> &ResourceManifest { &self.resources }
 
 	#[must_use]
-	pub const fn reservations(&self) -> &ReservationLedger {
-		&self.reservations
-	}
+	pub const fn reservations(&self) -> &ReservationLedger { &self.reservations }
 
 	#[must_use]
-	pub fn arena_layouts(&self) -> &[ArenaLayout] {
-		&self.arena_layouts
-	}
+	pub fn arena_layouts(&self) -> &[ArenaLayout] { &self.arena_layouts }
 
 	#[must_use]
-	pub fn value_locations(&self) -> &[ResolvedValueLocation] {
-		&self.value_locations
-	}
+	pub fn value_locations(&self) -> &[ResolvedValueLocation] { &self.value_locations }
 
 	#[must_use]
-	pub fn value_aliases(&self) -> &[ValueAliasContract] {
-		&self.value_aliases
-	}
+	pub fn value_aliases(&self) -> &[ValueAliasContract] { &self.value_aliases }
 
 	#[must_use]
-	pub fn init_images(&self) -> &[InitDataImage] {
-		&self.init_images
-	}
+	pub fn init_images(&self) -> &[InitDataImage] { &self.init_images }
 
 	#[must_use]
 	pub fn init_image(&self, device: DeviceId) -> Option<&InitDataImage> {
@@ -2764,11 +2699,13 @@ fn validate_layouts(
 						"arena allocation exceeds its layout size",
 					);
 				}
-				None => validator.error(
-					ValidationCode::AllocationOutOfBounds,
-					allocation_path,
-					"arena allocation end overflowed",
-				),
+				None => {
+					validator.error(
+						ValidationCode::AllocationOutOfBounds,
+						allocation_path,
+						"arena allocation end overflowed",
+					)
+				}
 			}
 		}
 		validator.require(
@@ -2926,1289 +2863,4 @@ fn resolve_value_locations(
 	}
 	locations.sort_by_key(|location| location.value);
 	locations
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::artifact::{KernelResourceBounds, TargetIdentity, ToolchainIdentity};
-	use crate::discovery::{CalculationCapability, DiscoveredDevice, DiscoveredLink, TransferCapability};
-	use crate::identity::{Digest, Label};
-	use crate::ids::*;
-	use crate::scalar::{
-		AliasPermission, AliasRule, DType, IndexSpace, KernelInput, KernelOutput, ScalarInput, ScalarInstruction,
-		ScalarOpcode, ScalarProgram, StaticBufferAccess,
-	};
-	use crate::schedule::{
-		ArenaAllocation, CalculationTask, CompletionSlot, InitDataImageMember, MetricSlot, MetricTask, QueueSlot,
-		ScheduleWindow, SubmissionSlots, TransferTask, ValueBinding,
-	};
-	use crate::topology::{
-		Device, DirectedLink, DuplexMode, Machine, Node, NodeRole, PropertyProvenance, TransportKind,
-	};
-	use crate::units::{
-		ByteOffset, BytesPerSecond, ElementCount, FlopCount, FlopsPerSecond, Nanoseconds, TransferLaneCount,
-	};
-
-	fn digest(value: u8) -> Digest {
-		Digest::new([value; 32])
-	}
-
-	fn label(value: &str) -> Label {
-		Label::new(value).unwrap()
-	}
-
-	fn property<T>(value: T) -> Property<T> {
-		Property::new(value, PropertyProvenance::Measured)
-	}
-
-	fn fixture() -> (
-		Topology,
-		DiscoveryProfile,
-		DraftPlan,
-		RealizationProfile,
-		Vec<ArenaLayout>,
-	) {
-		let machine = MachineId::new(1);
-		let gpu = DeviceId::new(1);
-		let ram = DeviceId::new(2);
-		let topology_id = TopologyIdentity::new(digest(1));
-		let target = TargetIdentity {
-			backend: label("backend-a"),
-			architecture: label("arch-a"),
-			abi: label("abi-a"),
-		};
-		let topology = Topology {
-			identity: topology_id,
-			machines: vec![Machine {
-				id: machine,
-				name: label("machine-a"),
-			}],
-			nodes: vec![Node {
-				id: NodeId::new(1),
-				role: NodeRole::Master,
-				machine,
-				devices: vec![gpu, ram],
-			}],
-			devices: vec![
-				Device {
-					id: gpu,
-					machine,
-					kind: DeviceKind::GpuMemory,
-					capacity: property(ByteCount::new(12_000_000_000)),
-					transfer_rate: property(BytesPerSecond::new(432_000_000_000).unwrap()),
-					calculation_rate: Some(property(FlopsPerSecond::new(380_000_000_000).unwrap())),
-				},
-				Device {
-					id: ram,
-					machine,
-					kind: DeviceKind::Ram,
-					capacity: property(ByteCount::new(48_000_000_000)),
-					transfer_rate: property(BytesPerSecond::new(90_000_000_000).unwrap()),
-					calculation_rate: None,
-				},
-			],
-			links: vec![
-				DirectedLink {
-					id: LinkId::new(1),
-					transport: TransportId::new(1),
-					kind: TransportKind::Pcie,
-					duplex: DuplexMode::Full,
-					from: ram,
-					to: gpu,
-					bandwidth: property(BytesPerSecond::new(16_000_000_000).unwrap()),
-					maximum_inflight_transfers: property(TransferLaneCount::new(1).unwrap()),
-					capacity_resource: DuplexResourceId::new(1),
-				},
-				DirectedLink {
-					id: LinkId::new(2),
-					transport: TransportId::new(1),
-					kind: TransportKind::Pcie,
-					duplex: DuplexMode::Full,
-					from: gpu,
-					to: ram,
-					bandwidth: property(BytesPerSecond::new(16_000_000_000).unwrap()),
-					maximum_inflight_transfers: property(TransferLaneCount::new(1).unwrap()),
-					capacity_resource: DuplexResourceId::new(2),
-				},
-			],
-		};
-		let discovery_id = DiscoveryIdentity::new(digest(2));
-		let discovery = DiscoveryProfile {
-			identity: discovery_id,
-			topology: topology_id,
-			devices: vec![
-				DiscoveredDevice {
-					device: gpu,
-					available: true,
-					maximum_submission_queues: 2,
-					total_capacity: property(ByteCount::new(12_000_000_000)),
-					transfer: TransferCapability {
-						rate: property(BytesPerSecond::new(432_000_000_000).unwrap()),
-						maximum_inflight_transfers: property(TransferLaneCount::new(1).unwrap()),
-						asynchronous_submission: true,
-						overlaps_calculation: true,
-					},
-					calculation: Some(CalculationCapability {
-						target: target.clone(),
-						rate: property(FlopsPerSecond::new(380_000_000_000).unwrap()),
-						asynchronous_submission: true,
-						maximum_concurrent_tasks: 2,
-						subgroup_lanes: 32,
-						maximum_workgroup_lanes: 256,
-						maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
-					}),
-				},
-				DiscoveredDevice {
-					device: ram,
-					available: true,
-					maximum_submission_queues: 1,
-					total_capacity: property(ByteCount::new(48_000_000_000)),
-					transfer: TransferCapability {
-						rate: property(BytesPerSecond::new(90_000_000_000).unwrap()),
-						maximum_inflight_transfers: property(TransferLaneCount::new(1).unwrap()),
-						asynchronous_submission: true,
-						overlaps_calculation: true,
-					},
-					calculation: None,
-				},
-			],
-			links: vec![
-				DiscoveredLink {
-					link: LinkId::new(1),
-					available: true,
-					bandwidth: property(BytesPerSecond::new(16_000_000_000).unwrap()),
-					maximum_inflight_transfers: property(TransferLaneCount::new(1).unwrap()),
-					asynchronous_submission: true,
-				},
-				DiscoveredLink {
-					link: LinkId::new(2),
-					available: true,
-					bandwidth: property(BytesPerSecond::new(16_000_000_000).unwrap()),
-					maximum_inflight_transfers: property(TransferLaneCount::new(1).unwrap()),
-					asynchronous_submission: true,
-				},
-			],
-		};
-
-		let scalar_in = ScalarValueId::new(1);
-		let scalar_out = ScalarValueId::new(2);
-		let kernel_id = KernelTemplateId::new(1);
-		let kernel = KernelTemplate {
-			id: kernel_id,
-			index_space: IndexSpace::new(vec![ElementCount::new(4).unwrap()]).unwrap(),
-			inputs: vec![KernelInput {
-				id: KernelInputId::new(1),
-				dtype: DType::F32,
-				access: StaticBufferAccess::linear(ElementCount::new(4).unwrap(), DType::F32).unwrap(),
-			}],
-			outputs: vec![KernelOutput {
-				id: KernelOutputId::new(1),
-				dtype: DType::F32,
-				access: StaticBufferAccess::linear(ElementCount::new(4).unwrap(), DType::F32).unwrap(),
-			}],
-			program: ScalarProgram {
-				inputs: vec![ScalarInput {
-					id: scalar_in,
-					dtype: DType::F32,
-				}],
-				constants: vec![],
-				instructions: vec![ScalarInstruction {
-					result: scalar_out,
-					dtype: DType::F32,
-					opcode: ScalarOpcode::Negate,
-					operands: vec![scalar_in],
-				}],
-				outputs: vec![scalar_out],
-			},
-			alias_rules: vec![AliasRule {
-				input: KernelInputId::new(1),
-				output: KernelOutputId::new(1),
-				permission: AliasPermission::MustAliasExact,
-			}],
-		};
-		let artifact_id = ArtifactId::new(1);
-		let artifact = ArtifactIdentity {
-			id: artifact_id,
-			digest: digest(3),
-			format: label("object"),
-			target,
-			toolchain: ToolchainIdentity {
-				name: label("compiler"),
-				version: label("1"),
-				digest: digest(4),
-			},
-			entry_symbol: label("negate"),
-			kernel_template: kernel_id,
-			resources: KernelResourceBounds {
-				private_bytes_per_lane: ByteCount::ZERO,
-				shared_bytes_per_workgroup: ByteCount::ZERO,
-				scratch_bytes_per_dispatch: ByteCount::ZERO,
-				maximum_workgroup_lanes: 256,
-			},
-			build: None,
-		};
-		let queue_gpu = QueueSlotId::new(1);
-		let queue_ram = QueueSlotId::new(2);
-		let completion_gpu = CompletionSlotId::new(1);
-		let completion_ram = CompletionSlotId::new(2);
-		let resources = ResourceManifest {
-			queues: vec![
-				QueueSlot {
-					id: queue_gpu,
-					device: gpu,
-				},
-				QueueSlot {
-					id: queue_ram,
-					device: ram,
-				},
-			],
-			completions: vec![
-				CompletionSlot {
-					id: completion_gpu,
-					device: gpu,
-				},
-				CompletionSlot {
-					id: completion_ram,
-					device: ram,
-				},
-			],
-			metrics: vec![],
-			pinned_staging: vec![],
-			scratch: vec![],
-		};
-		let value_gpu = ValueId::new(1);
-		let value_ram = ValueId::new(2);
-		let init_gpu = TaskId::new(1);
-		let init_ram = TaskId::new(2);
-		let calculation = TaskId::new(3);
-		let draft_id = DraftIdentity::new(digest(5));
-		let candidate = CandidateIdentity::new(digest(6));
-		let draft = DraftPlan {
-			identity: draft_id,
-			candidate,
-			discovery: discovery_id,
-			topology: topology_id,
-			values: vec![
-				ValueSpec {
-					id: value_gpu,
-					dtype: DType::F32,
-					bytes: ByteCount::new(16),
-					device: gpu,
-					producer: Some(init_gpu),
-				},
-				ValueSpec {
-					id: value_ram,
-					dtype: DType::I32,
-					bytes: ByteCount::new(16),
-					device: ram,
-					producer: Some(init_ram),
-				},
-			],
-			kernels: vec![kernel],
-			artifacts: vec![artifact.clone()],
-			artifact_builds: vec![],
-			tasks: vec![
-				Task {
-					id: init_gpu,
-					phase: RunPhase::Init,
-					window: ScheduleWindow {
-						start: Nanoseconds::new(0),
-						end: Nanoseconds::new(1),
-					},
-					dependencies: vec![],
-					kind: TaskKind::Transfer(TransferTask {
-						source: TransferEndpoint::External,
-						destination: TransferEndpoint::Device {
-							device: gpu,
-							value: value_gpu,
-						},
-						bytes: ByteCount::new(16),
-						route: vec![],
-						lane_claims: vec![TransferLaneClaim::External {
-							device: gpu,
-							lane: 0,
-						}],
-						submission: SubmissionSlots {
-							queue: queue_gpu,
-							completion: completion_gpu,
-						},
-					}),
-				},
-				Task {
-					id: init_ram,
-					phase: RunPhase::Init,
-					window: ScheduleWindow {
-						start: Nanoseconds::new(0),
-						end: Nanoseconds::new(1),
-					},
-					dependencies: vec![],
-					kind: TaskKind::Transfer(TransferTask {
-						source: TransferEndpoint::External,
-						destination: TransferEndpoint::Device {
-							device: ram,
-							value: value_ram,
-						},
-						bytes: ByteCount::new(16),
-						route: vec![],
-						lane_claims: vec![TransferLaneClaim::External {
-							device: ram,
-							lane: 0,
-						}],
-						submission: SubmissionSlots {
-							queue: queue_ram,
-							completion: completion_ram,
-						},
-					}),
-				},
-				Task {
-					id: calculation,
-					phase: RunPhase::Loop,
-					window: ScheduleWindow {
-						start: Nanoseconds::new(1),
-						end: Nanoseconds::new(2),
-					},
-					dependencies: vec![init_gpu],
-					kind: TaskKind::Calculation(CalculationTask {
-						device: gpu,
-						kernel_template: kernel_id,
-						artifact: artifact_id,
-						inputs: vec![value_gpu],
-						outputs: vec![value_gpu],
-						fault_flag: None,
-						work: FlopCount::new(4),
-						submission: SubmissionSlots {
-							queue: queue_gpu,
-							completion: completion_gpu,
-						},
-					}),
-				},
-			],
-			resources: resources.clone(),
-			arena_objects: vec![
-				ArenaObject {
-					id: ArenaObjectId::new(1),
-					device: gpu,
-					bytes: ByteCount::new(16),
-					alignment: ByteCount::new(16),
-					lifetime: ScheduleWindow {
-						start: Nanoseconds::new(0),
-						end: Nanoseconds::new(3),
-					},
-				},
-				ArenaObject {
-					id: ArenaObjectId::new(2),
-					device: ram,
-					bytes: ByteCount::new(16),
-					alignment: ByteCount::new(16),
-					lifetime: ScheduleWindow {
-						start: Nanoseconds::new(0),
-						end: Nanoseconds::new(3),
-					},
-				},
-			],
-			value_bindings: vec![
-				ValueBinding {
-					value: value_gpu,
-					object: ArenaObjectId::new(1),
-					object_offset: ByteOffset::new(0),
-				},
-				ValueBinding {
-					value: value_ram,
-					object: ArenaObjectId::new(2),
-					object_offset: ByteOffset::new(0),
-				},
-			],
-			value_aliases: vec![],
-			init_images: vec![
-				InitDataImage {
-					device: gpu,
-					image: value_gpu,
-					bytes: ByteCount::new(16),
-					members: vec![InitDataImageMember {
-						logical: value_gpu,
-						physical: value_gpu,
-						dtype: DType::F32,
-						bytes: ByteCount::new(16),
-						image_offset: ByteOffset::new(0),
-					}],
-				},
-				InitDataImage {
-					device: ram,
-					image: value_ram,
-					bytes: ByteCount::new(16),
-					members: vec![InitDataImageMember {
-						logical: value_ram,
-						physical: value_ram,
-						dtype: DType::I32,
-						bytes: ByteCount::new(16),
-						image_offset: ByteOffset::new(0),
-					}],
-				},
-			],
-			releases: vec![ArenaRelease { device: gpu }, ArenaRelease { device: ram }],
-		};
-		let reservations = ReservationLedger {
-			entries: vec![
-				ReservationEntry {
-					device: gpu,
-					name: label("user-gpu"),
-					bytes: EXACT_USER_RESERVATION,
-					mechanism: ReservationMechanism::HeldAllocation,
-					evidence: ReservationEvidence::GpuDisplay {
-						enabled_connectors: 1,
-					},
-				},
-				ReservationEntry {
-					device: ram,
-					name: label("user-ram"),
-					bytes: EXACT_USER_RESERVATION,
-					mechanism: ReservationMechanism::EnforcedQuota,
-					evidence: ReservationEvidence::NonGpu,
-				},
-			],
-		};
-		let zero = property(ByteCount::ZERO);
-		let capacity = CapacityLedger {
-			entries: vec![
-				CapacityLedgerEntry {
-					device: gpu,
-					total: property(ByteCount::new(12_000_000_000)),
-					runtime_overhead: zero,
-					fragmentation: zero,
-					safety_headroom: zero,
-					recipe_usable: property(ByteCount::new(11_000_000_000)),
-				},
-				CapacityLedgerEntry {
-					device: ram,
-					total: property(ByteCount::new(48_000_000_000)),
-					runtime_overhead: zero,
-					fragmentation: zero,
-					safety_headroom: zero,
-					recipe_usable: property(ByteCount::new(47_000_000_000)),
-				},
-			],
-		};
-		let realization = RealizationProfile {
-			identity: RealizationIdentity::new(digest(7)),
-			draft: draft_id,
-			candidate,
-			discovery: discovery_id,
-			topology: topology_id,
-			artifacts: vec![artifact],
-			resources,
-			reservations,
-			capacity,
-		};
-		let layouts = vec![
-			ArenaLayout {
-				device: gpu,
-				size: ByteCount::new(16),
-				allocations: vec![ArenaAllocation {
-					object: ArenaObjectId::new(1),
-					offset: ByteOffset::new(0),
-				}],
-			},
-			ArenaLayout {
-				device: ram,
-				size: ByteCount::new(16),
-				allocations: vec![ArenaAllocation {
-					object: ArenaObjectId::new(2),
-					offset: ByteOffset::new(0),
-				}],
-			},
-		];
-		(topology, discovery, draft, realization, layouts)
-	}
-
-	fn add_internal_transfer(draft: &mut DraftPlan) -> TaskId {
-		let task = TaskId::new(4);
-		draft.values[1].dtype = DType::F32;
-		draft.init_images[1].members[0].dtype = DType::F32;
-		draft.tasks.push(Task {
-			id: task,
-			phase: RunPhase::Loop,
-			window: ScheduleWindow {
-				start: Nanoseconds::new(2),
-				end: Nanoseconds::new(3),
-			},
-			dependencies: vec![TaskId::new(2), TaskId::new(3)],
-			kind: TaskKind::Transfer(TransferTask {
-				source: TransferEndpoint::Device {
-					device: DeviceId::new(1),
-					value: ValueId::new(1),
-				},
-				destination: TransferEndpoint::Device {
-					device: DeviceId::new(2),
-					value: ValueId::new(2),
-				},
-				bytes: ByteCount::new(16),
-				route: vec![LinkId::new(2)],
-				lane_claims: vec![TransferLaneClaim::Link {
-					link: LinkId::new(2),
-					lane: 0,
-				}],
-				submission: SubmissionSlots {
-					queue: QueueSlotId::new(1),
-					completion: CompletionSlotId::new(1),
-				},
-			}),
-		});
-		task
-	}
-
-	fn add_fault_contract(draft: &mut DraftPlan) -> TaskId {
-		let calculation = TaskId::new(3);
-		let readback = TaskId::new(4);
-		let fault_flag = ValueId::new(3);
-		let finite = ScalarValueId::new(3);
-		let required = ScalarValueId::new(4);
-		draft.kernels[0].program.instructions.extend([
-			ScalarInstruction {
-				result: finite,
-				dtype: DType::I32,
-				opcode: ScalarOpcode::IsFinite,
-				operands: vec![ScalarValueId::new(2)],
-			},
-			ScalarInstruction {
-				result: required,
-				dtype: DType::I32,
-				opcode: ScalarOpcode::Require,
-				operands: vec![finite],
-			},
-		]);
-		let TaskKind::Calculation(task) = &mut draft.tasks[2].kind else {
-			panic!("fixture task 3 must be a calculation");
-		};
-		task.fault_flag = Some(fault_flag);
-		let submission = task.submission;
-		draft.values.push(ValueSpec {
-			id: fault_flag,
-			dtype: DType::I32,
-			bytes: ByteCount::new(4),
-			device: DeviceId::new(1),
-			producer: Some(TaskId::new(1)),
-		});
-		draft.arena_objects[0].bytes = ByteCount::new(20);
-		draft.value_bindings.push(ValueBinding {
-			value: fault_flag,
-			object: ArenaObjectId::new(1),
-			object_offset: ByteOffset::new(16),
-		});
-		draft.resources.metrics.push(MetricSlot {
-			id: MetricSlotId::new(1),
-			metric: MetricId::new(1),
-		});
-		draft.tasks.push(Task {
-			id: readback,
-			phase: RunPhase::Loop,
-			window: ScheduleWindow {
-				start: Nanoseconds::new(2),
-				end: Nanoseconds::new(3),
-			},
-			dependencies: vec![calculation],
-			kind: TaskKind::Metric(MetricTask {
-				purpose: MetricPurpose::FaultReadback { calculation },
-				metric: MetricId::new(1),
-				value: fault_flag,
-				slot: MetricSlotId::new(1),
-				submission,
-			}),
-		});
-		readback
-	}
-
-	#[test]
-	fn accepts_exactly_one_dependency_gating_fault_readback() {
-		let (topology, discovery, mut draft, _, _) = fixture();
-		let readback = add_fault_contract(&mut draft);
-		draft.validate(&topology, &discovery).unwrap();
-		assert!(matches!(
-			&draft.tasks[3].kind,
-			TaskKind::Metric(MetricTask {
-				purpose: MetricPurpose::FaultReadback { calculation },
-				value,
-				..
-			}) if *calculation == TaskId::new(3) && *value == ValueId::new(3)
-		));
-		assert_eq!(draft.tasks[3].id, readback);
-	}
-
-	#[test]
-	fn rejects_metric_submission_slots_on_the_wrong_device() {
-		let (topology, discovery, mut draft, _, _) = fixture();
-		add_fault_contract(&mut draft);
-		let TaskKind::Metric(metric) = &mut draft.tasks[3].kind else {
-			panic!("fault helper must append a metric readback");
-		};
-		metric.submission = SubmissionSlots {
-			queue: QueueSlotId::new(2),
-			completion: CompletionSlotId::new(2),
-		};
-
-		let errors = draft.validate(&topology, &discovery).unwrap_err();
-		assert!(errors.contains(ValidationCode::ResourceMismatch));
-	}
-
-	#[test]
-	fn rejects_missing_and_miswired_fault_readbacks() {
-		let (topology, discovery, mut draft, _, _) = fixture();
-		add_fault_contract(&mut draft);
-		draft.tasks.pop();
-		let errors = draft.validate(&topology, &discovery).unwrap_err();
-		assert!(errors.contains(ValidationCode::InvalidFaultReadback));
-
-		let (topology, discovery, mut draft, _, _) = fixture();
-		add_fault_contract(&mut draft);
-		let TaskKind::Metric(readback) = &mut draft.tasks[3].kind else {
-			panic!("fault helper must append a metric readback");
-		};
-		readback.value = ValueId::new(1);
-		let errors = draft.validate(&topology, &discovery).unwrap_err();
-		assert!(errors.contains(ValidationCode::InvalidFaultReadback));
-	}
-
-	#[test]
-	fn rejects_a_checked_dependent_that_bypasses_readback() {
-		let (topology, discovery, mut draft, _, _) = fixture();
-		add_fault_contract(&mut draft);
-		draft.tasks.push(Task {
-			id: TaskId::new(5),
-			phase: RunPhase::Exit,
-			window: ScheduleWindow {
-				start: Nanoseconds::new(2),
-				end: Nanoseconds::new(3),
-			},
-			dependencies: vec![TaskId::new(3)],
-			kind: TaskKind::Transfer(TransferTask {
-				source: TransferEndpoint::Device {
-					device: DeviceId::new(1),
-					value: ValueId::new(1),
-				},
-				destination: TransferEndpoint::External,
-				bytes: ByteCount::new(16),
-				route: vec![],
-				lane_claims: vec![TransferLaneClaim::External {
-					device: DeviceId::new(1),
-					lane: 0,
-				}],
-				submission: SubmissionSlots {
-					queue: QueueSlotId::new(1),
-					completion: CompletionSlotId::new(1),
-				},
-			}),
-		});
-		let errors = draft.validate(&topology, &discovery).unwrap_err();
-		assert!(errors.contains(ValidationCode::InvalidFaultReadback));
-	}
-
-	#[test]
-	fn fault_readback_frontier_gates_transitive_descendants_without_rescanning_them() {
-		let (_, _, mut draft, _, _) = fixture();
-		let readback = add_fault_contract(&mut draft);
-		let mut gated_successor = draft.tasks[1].clone();
-		gated_successor.id = TaskId::new(5);
-		gated_successor.dependencies = vec![TaskId::new(3), readback];
-		let mut transitive_descendant = draft.tasks[1].clone();
-		transitive_descendant.id = TaskId::new(6);
-		transitive_descendant.dependencies = vec![gated_successor.id];
-		draft.tasks.extend([gated_successor, transitive_descendant]);
-		let tasks = draft
-			.tasks
-			.iter()
-			.map(|task| (task.id, task))
-			.collect::<BTreeMap<_, _>>();
-		let mut validator = Validator::default();
-		validate_fault_readbacks(&mut validator, &draft, &tasks);
-		validator.finish().unwrap();
-	}
-
-	#[test]
-	fn finalizes_an_unchanged_static_candidate() {
-		let (topology, discovery, draft, realization, layouts) = fixture();
-		let bundle = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap();
-		assert_eq!(bundle.tasks().len(), 3);
-		assert_eq!(
-			bundle.reservations().entries[0].bytes,
-			ByteCount::new(1_000_000_000)
-		);
-		assert_eq!(
-			bundle.value_location(ValueId::new(1)),
-			Some(&ResolvedValueLocation {
-				value: ValueId::new(1),
-				dtype: DType::F32,
-				device: DeviceId::new(1),
-				bytes: ByteCount::new(16),
-				object: ArenaObjectId::new(1),
-				object_offset: ByteOffset::new(0),
-				arena_offset: ByteOffset::new(0),
-			})
-		);
-		assert_eq!(bundle.value_locations().len(), 2);
-		assert_eq!(bundle.init_images().len(), 2);
-		assert_eq!(
-			bundle.init_image(DeviceId::new(1)),
-			Some(&InitDataImage {
-				device: DeviceId::new(1),
-				image: ValueId::new(1),
-				bytes: ByteCount::new(16),
-				members: vec![InitDataImageMember {
-					logical: ValueId::new(1),
-					physical: ValueId::new(1),
-					dtype: DType::F32,
-					bytes: ByteCount::new(16),
-					image_offset: ByteOffset::new(0),
-				}],
-			})
-		);
-		assert_eq!(
-			bundle.transfer_endpoints(TaskId::new(1)),
-			Some(ResolvedTransferEndpoints {
-				source: ResolvedTransferEndpoint::External,
-				destination: ResolvedTransferEndpoint::Device(ResolvedValueLocation {
-					value: ValueId::new(1),
-					dtype: DType::F32,
-					device: DeviceId::new(1),
-					bytes: ByteCount::new(16),
-					object: ArenaObjectId::new(1),
-					object_offset: ByteOffset::new(0),
-					arena_offset: ByteOffset::new(0),
-				}),
-			})
-		);
-	}
-
-	#[test]
-	fn finalized_sparse_domains_are_complete_and_bounded() {
-		let iterations = LoopIterations::new(4).unwrap();
-		let domain = IterationDomain::new(1, 4, 2).unwrap();
-		let (topology, discovery, draft, realization, layouts) = fixture();
-		let bundle = FinalizedBundle::finalize_with_loop_schedule(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-			LoopSchedule::new(
-				iterations,
-				vec![LoopTaskDomain {
-					task: TaskId::new(3),
-					domain,
-				}],
-			),
-		)
-		.unwrap();
-		assert_eq!(bundle.loop_iterations(), iterations);
-		assert_eq!(bundle.iteration_domain(TaskId::new(3)), Some(domain));
-		assert_eq!(bundle.iteration_domain(TaskId::new(1)), None);
-
-		let (topology, discovery, draft, realization, layouts) = fixture();
-		let missing = FinalizedBundle::finalize_with_loop_schedule(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-			LoopSchedule::new(iterations, Vec::new()),
-		)
-		.unwrap_err();
-		assert!(missing.contains(ValidationCode::InvalidIterationDomain));
-
-		let (topology, discovery, draft, realization, layouts) = fixture();
-		let out_of_bounds = FinalizedBundle::finalize_with_loop_schedule(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-			LoopSchedule::new(
-				iterations,
-				vec![LoopTaskDomain {
-					task: TaskId::new(3),
-					domain: IterationDomain::new(0, 5, 1).unwrap(),
-				}],
-			),
-		)
-		.unwrap_err();
-		assert!(out_of_bounds.contains(ValidationCode::InvalidIterationDomain));
-	}
-
-	#[test]
-	fn validates_exact_init_image_membership_and_physical_layout() {
-		let (topology, discovery, mut draft, _, _) = fixture();
-		draft.init_images.pop();
-		let errors = draft.validate(&topology, &discovery).unwrap_err();
-		assert!(errors.contains(ValidationCode::MissingRequiredObject));
-
-		let (topology, discovery, mut draft, _, _) = fixture();
-		draft.init_images[0].image = ValueId::new(2);
-		let errors = draft.validate(&topology, &discovery).unwrap_err();
-		assert!(errors.contains(ValidationCode::InvalidDataImage));
-		assert!(errors.contains(ValidationCode::ResourceMismatch));
-
-		let (topology, discovery, mut draft, _, _) = fixture();
-		draft.init_images[0].members[0].image_offset = ByteOffset::new(4);
-		let errors = draft.validate(&topology, &discovery).unwrap_err();
-		assert!(errors.contains(ValidationCode::InvalidDataImage));
-		assert!(errors.contains(ValidationCode::ValueBindingOutOfBounds));
-
-		let (topology, discovery, mut draft, _, _) = fixture();
-		let duplicate = draft.init_images[0].members[0];
-		draft.init_images[0].members.push(duplicate);
-		let errors = draft.validate(&topology, &discovery).unwrap_err();
-		assert!(errors.contains(ValidationCode::DuplicateId));
-		assert!(errors.contains(ValidationCode::LiveAllocationOverlap));
-	}
-
-	#[test]
-	fn resolves_both_internal_transfer_endpoints() {
-		let (topology, discovery, mut draft, realization, layouts) = fixture();
-		let transfer = add_internal_transfer(&mut draft);
-		let bundle = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap();
-		assert_eq!(
-			bundle.transfer_endpoints(transfer),
-			Some(ResolvedTransferEndpoints {
-				source: ResolvedTransferEndpoint::Device(ResolvedValueLocation {
-					value: ValueId::new(1),
-					dtype: DType::F32,
-					device: DeviceId::new(1),
-					bytes: ByteCount::new(16),
-					object: ArenaObjectId::new(1),
-					object_offset: ByteOffset::new(0),
-					arena_offset: ByteOffset::new(0),
-				}),
-				destination: ResolvedTransferEndpoint::Device(ResolvedValueLocation {
-					value: ValueId::new(2),
-					dtype: DType::F32,
-					device: DeviceId::new(2),
-					bytes: ByteCount::new(16),
-					object: ArenaObjectId::new(2),
-					object_offset: ByteOffset::new(0),
-					arena_offset: ByteOffset::new(0),
-				}),
-			})
-		);
-	}
-
-	#[test]
-	fn rejects_internal_transfer_endpoint_mismatch_and_dtype_mismatch() {
-		let (topology, discovery, mut draft, realization, layouts) = fixture();
-		let transfer = add_internal_transfer(&mut draft);
-		draft.values[1].dtype = DType::I32;
-		let TaskKind::Transfer(task) = &mut draft
-			.tasks
-			.iter_mut()
-			.find(|task| task.id == transfer)
-			.unwrap()
-			.kind
-		else {
-			unreachable!("helper added a transfer task");
-		};
-		task.destination = TransferEndpoint::Device {
-			device: DeviceId::new(1),
-			value: ValueId::new(2),
-		};
-		let errors = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap_err();
-		assert!(errors.contains(ValidationCode::ResourceMismatch));
-	}
-
-	#[test]
-	fn rejects_missing_mismatched_and_out_of_range_transfer_lane_claims() {
-		let (topology, discovery, mut draft, _, _) = fixture();
-		let TaskKind::Transfer(transfer) = &mut draft.tasks[0].kind else {
-			unreachable!("fixture begins with an external admission");
-		};
-		transfer.lane_claims.clear();
-		let errors = draft.validate(&topology, &discovery).unwrap_err();
-		assert!(errors.contains(ValidationCode::InvalidLaneClaim));
-
-		let (topology, discovery, mut draft, _, _) = fixture();
-		let TaskKind::Transfer(transfer) = &mut draft.tasks[0].kind else {
-			unreachable!("fixture begins with an external admission");
-		};
-		transfer.lane_claims = vec![TransferLaneClaim::External {
-			device: DeviceId::new(1),
-			lane: 1,
-		}];
-		let errors = draft.validate(&topology, &discovery).unwrap_err();
-		assert!(errors.contains(ValidationCode::InvalidLaneClaim));
-
-		let (topology, discovery, mut draft, _, _) = fixture();
-		let transfer_id = add_internal_transfer(&mut draft);
-		let TaskKind::Transfer(transfer) = &mut draft
-			.tasks
-			.iter_mut()
-			.find(|task| task.id == transfer_id)
-			.unwrap()
-			.kind
-		else {
-			unreachable!("helper added an internal transfer");
-		};
-		transfer.lane_claims = vec![TransferLaneClaim::Link {
-			link: LinkId::new(1),
-			lane: 0,
-		}];
-		let errors = draft.validate(&topology, &discovery).unwrap_err();
-		assert!(errors.contains(ValidationCode::InvalidLaneClaim));
-	}
-
-	#[test]
-	fn rejects_executor_visible_composite_internal_transfer() {
-		let (topology, discovery, mut draft, _, _) = fixture();
-		let transfer_id = add_internal_transfer(&mut draft);
-		let TaskKind::Transfer(transfer) = &mut draft
-			.tasks
-			.iter_mut()
-			.find(|task| task.id == transfer_id)
-			.unwrap()
-			.kind
-		else {
-			panic!("helper must add an internal transfer");
-		};
-		transfer.route.push(LinkId::new(2));
-		let errors = draft.validate(&topology, &discovery).unwrap_err();
-		assert!(errors.contains(ValidationCode::InvalidRoute));
-	}
-
-	#[test]
-	fn rejects_overlapping_transfers_claiming_the_same_lane() {
-		let (topology, discovery, mut draft, _, _) = fixture();
-		let first = add_internal_transfer(&mut draft);
-		let mut second = draft
-			.tasks
-			.iter()
-			.find(|task| task.id == first)
-			.unwrap()
-			.clone();
-		second.id = TaskId::new(5);
-		let TaskKind::Transfer(transfer) = &mut second.kind else {
-			unreachable!("helper added an internal transfer");
-		};
-		transfer.submission = SubmissionSlots {
-			queue: QueueSlotId::new(3),
-			completion: CompletionSlotId::new(3),
-		};
-		draft.resources.queues.push(QueueSlot {
-			id: QueueSlotId::new(3),
-			device: DeviceId::new(1),
-		});
-		draft.resources.completions.push(CompletionSlot {
-			id: CompletionSlotId::new(3),
-			device: DeviceId::new(1),
-		});
-		draft.tasks.push(second);
-		let errors = draft.validate(&topology, &discovery).unwrap_err();
-		assert!(errors.contains(ValidationCode::ResourceContention));
-	}
-
-	#[test]
-	fn transfer_destination_participates_in_value_lifetime_validation() {
-		let (topology, discovery, mut draft, realization, layouts) = fixture();
-		add_internal_transfer(&mut draft);
-		draft.arena_objects[1].lifetime.end = Nanoseconds::new(2);
-		let errors = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap_err();
-		assert!(errors.contains(ValidationCode::ValueLifetimeMismatch));
-	}
-
-	#[test]
-	fn external_exit_preserves_a_resolved_source_and_external_destination() {
-		let (topology, discovery, mut draft, realization, layouts) = fixture();
-		let exit = TaskId::new(4);
-		draft.tasks.push(Task {
-			id: exit,
-			phase: RunPhase::Exit,
-			window: ScheduleWindow {
-				start: Nanoseconds::new(2),
-				end: Nanoseconds::new(3),
-			},
-			dependencies: vec![TaskId::new(3)],
-			kind: TaskKind::Transfer(TransferTask {
-				source: TransferEndpoint::Device {
-					device: DeviceId::new(1),
-					value: ValueId::new(1),
-				},
-				destination: TransferEndpoint::External,
-				bytes: ByteCount::new(16),
-				route: vec![],
-				lane_claims: vec![TransferLaneClaim::External {
-					device: DeviceId::new(1),
-					lane: 0,
-				}],
-				submission: SubmissionSlots {
-					queue: QueueSlotId::new(1),
-					completion: CompletionSlotId::new(1),
-				},
-			}),
-		});
-		let bundle = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap();
-		let endpoints = bundle.transfer_endpoints(exit).unwrap();
-		let ResolvedTransferEndpoint::Device(source) = endpoints.source else {
-			panic!("external exit source must resolve to a device value");
-		};
-		assert_eq!(source.value, ValueId::new(1));
-		assert_eq!(source.device, DeviceId::new(1));
-		assert_eq!(endpoints.destination, ResolvedTransferEndpoint::External);
-	}
-
-	#[test]
-	fn resolves_object_relative_value_offsets_after_layout() {
-		let (topology, discovery, mut draft, realization, mut layouts) = fixture();
-		draft.arena_objects[0].bytes = ByteCount::new(32);
-		draft.value_bindings[0].object_offset = ByteOffset::new(16);
-		layouts[0].allocations[0].offset = ByteOffset::new(16);
-		layouts[0].size = ByteCount::new(48);
-
-		let bundle = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap();
-		let location = bundle.value_location(ValueId::new(1)).unwrap();
-		assert_eq!(location.object_offset, ByteOffset::new(16));
-		assert_eq!(location.arena_offset, ByteOffset::new(32));
-	}
-
-	#[test]
-	fn requires_exactly_one_binding_for_every_value() {
-		let (topology, discovery, mut draft, realization, layouts) = fixture();
-		draft.value_bindings.pop();
-		draft.value_bindings.push(draft.value_bindings[0]);
-		let errors = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap_err();
-		assert!(errors.contains(ValidationCode::DuplicateValueBinding));
-		assert!(errors.contains(ValidationCode::MissingValueBinding));
-	}
-
-	#[test]
-	fn validates_binding_device_bounds_alignment_and_lifetime() {
-		let (topology, discovery, mut draft, realization, layouts) = fixture();
-		draft.value_bindings[0].object = ArenaObjectId::new(2);
-		draft.value_bindings[0].object_offset = ByteOffset::new(2);
-		draft.arena_objects[1].lifetime.start = Nanoseconds::new(1);
-		let errors = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap_err();
-		assert!(errors.contains(ValidationCode::ResourceMismatch));
-		assert!(errors.contains(ValidationCode::ValueBindingMisaligned));
-		assert!(errors.contains(ValidationCode::ValueBindingOutOfBounds));
-		assert!(errors.contains(ValidationCode::ValueLifetimeMismatch));
-	}
-
-	#[test]
-	fn rejects_finalized_value_address_overflow() {
-		let (topology, discovery, draft, realization, mut layouts) = fixture();
-		layouts[0].allocations[0].offset = ByteOffset::new(u64::MAX - 7);
-		layouts[0].size = ByteCount::new(u64::MAX);
-		let errors = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap_err();
-		assert!(errors.contains(ValidationCode::AddressOverflow));
-	}
-
-	#[test]
-	fn rejects_binary_gib_reservation_on_every_storage_kind() {
-		let (topology, discovery, draft, mut realization, layouts) = fixture();
-		realization.reservations.entries[0].bytes = ByteCount::new(1 << 30);
-		let errors = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap_err();
-		assert!(errors.contains(ValidationCode::WrongReservationSize));
-	}
-
-	#[test]
-	fn accepts_explicit_zero_headroom_for_a_headless_gpu() {
-		let (topology, discovery, draft, mut realization, layouts) = fixture();
-		realization.reservations.entries[0].bytes = ByteCount::ZERO;
-		realization.reservations.entries[0].evidence = ReservationEvidence::GpuDisplay {
-			enabled_connectors: 0,
-		};
-		realization.capacity.entries[0].recipe_usable = property(ByteCount::new(12_000_000_000));
-		let bundle = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap();
-		assert_eq!(bundle.reservations().entries[0].bytes, ByteCount::ZERO);
-		assert_eq!(
-			bundle.reservations().entries[0].evidence,
-			ReservationEvidence::GpuDisplay {
-				enabled_connectors: 0,
-			}
-		);
-	}
-
-	#[test]
-	fn reservation_evidence_must_match_device_kind() {
-		let (topology, discovery, draft, mut realization, layouts) = fixture();
-		realization.reservations.entries[0].evidence = ReservationEvidence::NonGpu;
-		let errors = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap_err();
-		assert!(errors.contains(ValidationCode::WrongKind));
-	}
-
-	#[test]
-	fn enabled_gpu_display_evidence_requires_exact_headroom() {
-		let (topology, discovery, draft, mut realization, layouts) = fixture();
-		realization.reservations.entries[0].bytes = ByteCount::ZERO;
-		let errors = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap_err();
-		assert!(errors.contains(ValidationCode::WrongReservationSize));
-	}
-
-	#[test]
-	fn rejects_realization_that_changes_artifact_identity() {
-		let (topology, discovery, draft, mut realization, layouts) = fixture();
-		realization.artifacts[0].digest = digest(99);
-		let errors = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap_err();
-		assert!(errors.contains(ValidationCode::ArtifactMismatch));
-	}
-
-	#[test]
-	fn rejects_external_ingress_during_loop() {
-		let (topology, discovery, mut draft, realization, layouts) = fixture();
-		draft.tasks[0].phase = RunPhase::Loop;
-		let errors = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap_err();
-		assert!(errors.contains(ValidationCode::InvalidExternalTransfer));
-	}
-
-	#[test]
-	fn rejects_estimated_properties_before_draft_scheduling() {
-		let (mut topology, discovery, draft, realization, layouts) = fixture();
-		topology.devices[0].capacity.provenance = PropertyProvenance::Estimated;
-		topology.links[0].bandwidth.provenance = PropertyProvenance::Estimated;
-		let errors = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap_err();
-		assert!(errors.contains(ValidationCode::UnmeasuredProperty));
-	}
-
-	#[test]
-	fn rejects_overlapping_use_of_one_submission_slot() {
-		let (topology, discovery, mut draft, realization, layouts) = fixture();
-		let mut overlapping = draft.tasks[2].clone();
-		overlapping.id = TaskId::new(4);
-		draft.tasks.push(overlapping);
-		let errors = FinalizedBundle::finalize(
-			BundleIdentity::new(digest(8)),
-			&topology,
-			&discovery,
-			draft,
-			realization,
-			layouts,
-		)
-		.unwrap_err();
-		assert!(errors.contains(ValidationCode::ResourceContention));
-	}
 }

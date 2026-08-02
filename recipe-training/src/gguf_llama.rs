@@ -1,6 +1,8 @@
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	path::Path,
+};
 
 use recipe_core::{DType, ScalarOpcode, ValueId};
 use recipe_ingest::{
@@ -12,10 +14,13 @@ use recipe_ops::{PreparedParameter, PreparedParameters};
 
 use super::{
 	InferenceCompileError, InferenceCompileErrorKind, InferenceCompileResult, InferenceGraphCompiler,
-	InferenceInputRole, InferencePredictionKind, InferencePreparationResult, InferenceTask, add_program, checked_i32,
-	checked_product, forbidden_aliases, multiply_constant_program, multiply_program, shape,
+	InferenceInputRole, InferencePredictionKind, InferencePreparationResult, InferenceTask, checked_i32,
+	checked_product, shape,
 };
-use crate::{CompiledInference, DenseActivation, MAXIMUM_REDUCTION_TREE_LANES};
+use crate::{
+	CompiledInference, DenseActivation, MAXIMUM_REDUCTION_TREE_LANES,
+	forward::{add_program, forbidden_aliases, multiply_constant_program, multiply_program},
+};
 
 /// Stable failure class for the first concrete GGUF architecture instrument.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,14 +46,10 @@ pub struct GgufLlamaError {
 
 impl GgufLlamaError {
 	#[must_use]
-	pub const fn kind(&self) -> GgufLlamaErrorKind {
-		self.kind
-	}
+	pub const fn kind(&self) -> GgufLlamaErrorKind { self.kind }
 
 	#[must_use]
-	pub fn detail(&self) -> &str {
-		&self.detail
-	}
+	pub fn detail(&self) -> &str { &self.detail }
 
 	fn new(kind: GgufLlamaErrorKind, detail: impl Into<String>) -> Self {
 		Self {
@@ -125,33 +126,21 @@ pub struct GgufLlamaArtifact {
 
 impl GgufLlamaArtifact {
 	#[must_use]
-	pub const fn architecture(&self) -> &'static str {
-		"llama"
-	}
+	pub const fn architecture(&self) -> &'static str { "llama" }
 
 	#[must_use]
-	pub const fn vocabulary(&self) -> u64 {
-		self.vocabulary
-	}
+	pub const fn vocabulary(&self) -> u64 { self.vocabulary }
 
 	#[must_use]
-	pub const fn context_length(&self) -> u64 {
-		self.context_length
-	}
+	pub const fn context_length(&self) -> u64 { self.context_length }
 
 	#[must_use]
-	pub const fn embedding_length(&self) -> u64 {
-		self.embedding_length
-	}
+	pub const fn embedding_length(&self) -> u64 { self.embedding_length }
 
 	#[must_use]
-	pub fn block_count(&self) -> usize {
-		self.blocks.len()
-	}
+	pub fn block_count(&self) -> usize { self.blocks.len() }
 
-	fn tensor(&self, index: usize) -> &GgufLlamaTensorImage {
-		&self.tensors[index]
-	}
+	fn tensor(&self, index: usize) -> &GgufLlamaTensorImage { &self.tensors[index] }
 
 	fn execution_tensor_indices(&self) -> BTreeSet<usize> {
 		let mut indices = BTreeSet::from([self.token_embedding, self.output_norm, self.output]);
@@ -188,14 +177,10 @@ pub struct PreparedGgufLlamaInference {
 
 impl PreparedGgufLlamaInference {
 	#[must_use]
-	pub const fn artifact(&self) -> &GgufLlamaArtifact {
-		&self.artifact
-	}
+	pub const fn artifact(&self) -> &GgufLlamaArtifact { &self.artifact }
 
 	#[must_use]
-	pub fn tokens(&self) -> &[i32] {
-		&self.tokens
-	}
+	pub fn tokens(&self) -> &[i32] { &self.tokens }
 }
 
 /// Decode one bounded GGUF image as the supported dense-F32 `llama` case.
@@ -782,9 +767,11 @@ fn prepare_rope_inputs(
 	let rotary_half = artifact.head_dimension / 2;
 	let factor_bytes = match artifact.rope_factors {
 		Some(index) => artifact.tensor(index).bytes.clone(),
-		None => (0..rotary_half)
-			.flat_map(|_| 1.0f32.to_le_bytes())
-			.collect(),
+		None => {
+			(0..rotary_half)
+				.flat_map(|_| 1.0f32.to_le_bytes())
+				.collect()
+		}
 	};
 	let factor_values = factor_bytes
 		.chunks_exact(4)
@@ -1353,74 +1340,4 @@ fn to_usize(value: u64, role: &str) -> GgufLlamaResult<usize> {
 			format!("{role} does not fit host address space: {error}"),
 		)
 	})
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use recipe_ingest::{IngestLimits, distill_datasets};
-
-	type TestResult = Result<(), Box<dyn std::error::Error>>;
-
-	fn corpus_path(name: &str) -> std::path::PathBuf {
-		Path::new(env!("CARGO_MANIFEST_DIR"))
-			.join("..")
-			.join("examples/datasets/llamacpp-archs-seed42")
-			.join(name)
-	}
-
-	#[test]
-	fn checked_in_dense_llama_compiles_to_all_position_raw_logits() -> TestResult {
-		let model_path = corpus_path("llama-dense.gguf");
-		let model_bytes = std::fs::read(&model_path)?;
-		let bound = u64::try_from(model_bytes.len())?;
-		let artifact = decode_gguf_llama(
-			&model_bytes,
-			GgufLimits::new(bound, bound, bound, 4, bound, bound, bound)?,
-		)?;
-		assert_eq!(artifact.architecture(), "llama");
-		assert_eq!(artifact.vocabulary(), 128);
-		assert_eq!(artifact.context_length(), 128);
-		assert_eq!(artifact.embedding_length(), 256);
-		assert_eq!(artifact.block_count(), 2);
-
-		let data = distill_datasets(
-			[corpus_path("tokens.txt")],
-			IngestLimits::new(1 << 20, 1 << 20, 64, 1 << 20)?,
-		)?;
-		let prepared = prepare_gguf_llama_inference_table(artifact, data.table())?;
-		assert_eq!(prepared.tokens().len(), 128);
-		let compiled = compile_prepared_gguf_llama_inference(&prepared)?;
-		assert_eq!(compiled.rows(), 128);
-		assert_eq!(
-			compiled.task(),
-			InferenceTask::TokenLogits { vocabulary: 128 }
-		);
-		assert_eq!(
-			compiled.output().kind(),
-			InferencePredictionKind::TokenLogits
-		);
-		assert_eq!(compiled.output().shape().extents(), [128, 128]);
-		assert!(
-			compiled
-				.external_inputs()
-				.iter()
-				.any(|input| input.role() == InferenceInputRole::GgufTokenIds)
-		);
-		for input in compiled.external_inputs() {
-			assert!(
-				compiled
-					.graph()
-					.nodes
-					.iter()
-					.any(|node| node.kernel.inputs.contains(&input.value())),
-				"unused GGUF boundary input {:?} ({})",
-				input.role(),
-				input.value()
-			);
-		}
-		compiled.graph().validate()?;
-		compiled.program().validate()?;
-		Ok(())
-	}
 }

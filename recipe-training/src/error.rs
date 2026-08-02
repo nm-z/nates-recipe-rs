@@ -48,33 +48,23 @@ impl fmt::Display for TrainingCompileError {
 impl std::error::Error for TrainingCompileError {}
 
 impl From<PrepareError> for TrainingCompileError {
-	fn from(error: PrepareError) -> Self {
-		Self::new(TrainingCompileErrorKind::Ingest, error.to_string())
-	}
+	fn from(error: PrepareError) -> Self { Self::new(TrainingCompileErrorKind::Ingest, error.to_string()) }
 }
 
 impl From<LanguageError> for TrainingCompileError {
-	fn from(error: LanguageError) -> Self {
-		Self::new(TrainingCompileErrorKind::Language, error.to_string())
-	}
+	fn from(error: LanguageError) -> Self { Self::new(TrainingCompileErrorKind::Language, error.to_string()) }
 }
 
 impl From<OperationError> for TrainingCompileError {
-	fn from(error: OperationError) -> Self {
-		Self::new(TrainingCompileErrorKind::Operation, error.to_string())
-	}
+	fn from(error: OperationError) -> Self { Self::new(TrainingCompileErrorKind::Operation, error.to_string()) }
 }
 
 impl From<ProgramError> for TrainingCompileError {
-	fn from(error: ProgramError) -> Self {
-		Self::new(TrainingCompileErrorKind::Program, error.to_string())
-	}
+	fn from(error: ProgramError) -> Self { Self::new(TrainingCompileErrorKind::Program, error.to_string()) }
 }
 
 impl From<OgdlCodecError> for TrainingCompileError {
-	fn from(error: OgdlCodecError) -> Self {
-		Self::new(TrainingCompileErrorKind::Ogdl, error.to_string())
-	}
+	fn from(error: OgdlCodecError) -> Self { Self::new(TrainingCompileErrorKind::Ogdl, error.to_string()) }
 }
 
 pub type TrainingCompileResult<T> = Result<T, TrainingCompileError>;

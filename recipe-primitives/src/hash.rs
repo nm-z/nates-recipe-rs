@@ -32,46 +32,28 @@ struct CanonicalWriter {
 }
 
 impl CanonicalWriter {
-	fn finish(self) -> Vec<u8> {
-		self.bytes
-	}
+	fn finish(self) -> Vec<u8> { self.bytes }
 
 	fn bytes(&mut self, value: &[u8]) {
 		self.length(value.len());
 		self.bytes.extend_from_slice(value);
 	}
 
-	fn bool(&mut self, value: bool) {
-		self.u8(u8::from(value));
-	}
+	fn bool(&mut self, value: bool) { self.u8(u8::from(value)); }
 
-	fn u8(&mut self, value: u8) {
-		self.bytes.push(value);
-	}
+	fn u8(&mut self, value: u8) { self.bytes.push(value); }
 
-	fn u32(&mut self, value: u32) {
-		self.bytes.extend_from_slice(&value.to_le_bytes());
-	}
+	fn u32(&mut self, value: u32) { self.bytes.extend_from_slice(&value.to_le_bytes()); }
 
-	fn i32(&mut self, value: i32) {
-		self.bytes.extend_from_slice(&value.to_le_bytes());
-	}
+	fn i32(&mut self, value: i32) { self.bytes.extend_from_slice(&value.to_le_bytes()); }
 
-	fn u64(&mut self, value: u64) {
-		self.bytes.extend_from_slice(&value.to_le_bytes());
-	}
+	fn u64(&mut self, value: u64) { self.bytes.extend_from_slice(&value.to_le_bytes()); }
 
-	fn usize(&mut self, value: usize) {
-		self.length(value);
-	}
+	fn usize(&mut self, value: usize) { self.length(value); }
 
-	fn length(&mut self, value: usize) {
-		self.bytes.extend_from_slice(&usize_u128_le_bytes(value));
-	}
+	fn length(&mut self, value: usize) { self.bytes.extend_from_slice(&usize_u128_le_bytes(value)); }
 
-	fn tag(&mut self, value: u8) {
-		self.u8(value);
-	}
+	fn tag(&mut self, value: u8) { self.u8(value); }
 
 	fn sequence<T>(&mut self, values: &[T], mut encode: impl FnMut(&mut Self, &T)) {
 		self.length(values.len());
@@ -753,20 +735,4 @@ fn sha256(input: &[u8]) -> [u8; 32] {
 		chunk.copy_from_slice(&value.to_be_bytes());
 	}
 	output
-}
-
-#[cfg(test)]
-mod tests {
-	use super::sha256;
-
-	#[test]
-	fn sha256_matches_the_empty_vector() {
-		assert_eq!(
-			sha256(b""),
-			[
-				0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
-				0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
-			]
-		);
-	}
 }

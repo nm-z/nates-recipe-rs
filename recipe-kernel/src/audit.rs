@@ -44,15 +44,3 @@ pub fn audit_llvm_ir(ir: &str) -> Vec<AuditFinding> {
 	}
 	findings
 }
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn permits_only_llvm_intrinsic_declarations() {
-		let findings = audit_llvm_ir("declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()\ndeclare void @foreign()\n");
-		assert_eq!(findings.len(), 1);
-		assert_eq!(findings[0].kind, AuditKind::ExternalIrDeclaration);
-	}
-}

@@ -1,7 +1,6 @@
+use std::{io, path::Path, time::Duration};
+
 use recipe_hsa::{DeviceType, DispatchGeometry, QueueConfig, QueueKind, Runtime, WaitOutcome};
-use std::io;
-use std::path::Path;
-use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let runtime = Runtime::open_default()?;

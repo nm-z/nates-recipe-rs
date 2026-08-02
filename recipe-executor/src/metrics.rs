@@ -53,13 +53,10 @@ impl MetricMailbox {
 					})
 				})
 				.map(|slot| {
-					(
-						slot.id,
-						SlotState {
-							metric: slot.metric,
-							sample: None,
-						},
-					)
+					(slot.id, SlotState {
+						metric: slot.metric,
+						sample: None,
+					})
 				})
 				.collect(),
 			next_sequence: 0,
@@ -120,12 +117,8 @@ impl MetricMailbox {
 	}
 
 	#[must_use]
-	pub fn capacity(&self) -> usize {
-		self.slots.len()
-	}
+	pub fn capacity(&self) -> usize { self.slots.len() }
 
 	#[must_use]
-	pub fn is_empty(&self) -> bool {
-		self.pending_len() == 0
-	}
+	pub fn is_empty(&self) -> bool { self.pending_len() == 0 }
 }

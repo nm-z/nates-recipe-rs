@@ -9,8 +9,10 @@ use recipe_language::{
 	ReduceOperator, ReduceResult, Scan, ScanMode, Scatter, ScatterConflict, Sort, Tensor,
 };
 
-use crate::error::{LoweringError, LoweringErrorKind, LoweringResult};
-use crate::model::*;
+use crate::{
+	error::{LoweringError, LoweringErrorKind, LoweringResult},
+	model::*,
+};
 
 #[derive(Debug)]
 struct StageDraft {
@@ -79,10 +81,12 @@ pub fn lower(
 	builder.finish(
 		kernel.alias_rules
 			.iter()
-			.map(|rule| SourceAliasContract {
-				input: rule.input,
-				output: rule.output,
-				permission: rule.permission,
+			.map(|rule| {
+				SourceAliasContract {
+					input: rule.input,
+					output: rule.output,
+					permission: rule.permission,
+				}
 			})
 			.collect(),
 		kernel.inputs.len(),
@@ -391,9 +395,7 @@ impl ProgramBuilder {
 	}
 }
 
-fn floor_power_of_two(value: u32) -> u32 {
-	1_u32 << (31 - value.max(1).leading_zeros())
-}
+fn floor_power_of_two(value: u32) -> u32 { 1_u32 << (31 - value.max(1).leading_zeros()) }
 
 fn aggregate_resources(
 	buffers: &[ProgramBuffer],
@@ -554,10 +556,12 @@ fn lower_elementwise(
 	let aliases = kernel
 		.alias_rules
 		.iter()
-		.map(|rule| AliasRule {
-			input: core_inputs[rule.input].id,
-			output: core_outputs[rule.output].id,
-			permission: rule.permission,
+		.map(|rule| {
+			AliasRule {
+				input: core_inputs[rule.input].id,
+				output: core_outputs[rule.output].id,
+				permission: rule.permission,
+			}
 		})
 		.collect();
 	let template = KernelTemplate {
@@ -702,31 +706,35 @@ fn lower_reduce(
 				Some(builder.tensor_buffer(kernel.outputs[0])?)
 			}
 			(true, ReduceResult::Index) => None,
-			(false, _) => Some(builder.scratch(
-				input.dtype,
-				checked_mul(
-					builder,
-					output_elements,
-					output_width,
-					"reduction value scratch",
-				)?,
-				ScratchPurpose::ReductionValues,
-			)?),
+			(false, _) => {
+				Some(builder.scratch(
+					input.dtype,
+					checked_mul(
+						builder,
+						output_elements,
+						output_width,
+						"reduction value scratch",
+					)?,
+					ScratchPurpose::ReductionValues,
+				)?)
+			}
 		};
 		let index_output = match (final_pass, spec.result) {
 			(true, ReduceResult::Index) => Some(builder.tensor_buffer(kernel.outputs[0])?),
 			(true, ReduceResult::ValueAndIndex) => Some(builder.tensor_buffer(kernel.outputs[1])?),
 			(true, ReduceResult::Value) => None,
-			(false, ReduceResult::Index | ReduceResult::ValueAndIndex) => Some(builder.scratch(
-				DType::I32,
-				checked_mul(
-					builder,
-					output_elements,
-					output_width,
-					"reduction index scratch",
-				)?,
-				ScratchPurpose::ReductionIndices,
-			)?),
+			(false, ReduceResult::Index | ReduceResult::ValueAndIndex) => {
+				Some(builder.scratch(
+					DType::I32,
+					checked_mul(
+						builder,
+						output_elements,
+						output_width,
+						"reduction index scratch",
+					)?,
+					ScratchPurpose::ReductionIndices,
+				)?)
+			}
 			(false, ReduceResult::Value) => None,
 		};
 		let mut bindings = vec![builder.binding(current_value, AccessMode::Read)?];
@@ -859,9 +867,11 @@ fn lower_empty_reduction(
 
 fn reduction_tree(lanes: u32) -> FixedTree {
 	let steps = (0..lanes.trailing_zeros())
-		.map(|level| TreeStep {
-			phase: TreePhase::Reduction,
-			stride: lanes >> (level + 1),
+		.map(|level| {
+			TreeStep {
+				phase: TreePhase::Reduction,
+				stride: lanes >> (level + 1),
+			}
 		})
 		.collect();
 	FixedTree { lanes, steps }
@@ -870,13 +880,17 @@ fn reduction_tree(lanes: u32) -> FixedTree {
 fn scan_tree(lanes: u32) -> FixedTree {
 	let levels = lanes.trailing_zeros();
 	let steps = (0..levels)
-		.map(|level| TreeStep {
-			phase: TreePhase::ScanUpsweep,
-			stride: 1 << level,
+		.map(|level| {
+			TreeStep {
+				phase: TreePhase::ScanUpsweep,
+				stride: 1 << level,
+			}
 		})
-		.chain((0..levels).rev().map(|level| TreeStep {
-			phase: TreePhase::ScanDownsweep,
-			stride: 1 << level,
+		.chain((0..levels).rev().map(|level| {
+			TreeStep {
+				phase: TreePhase::ScanDownsweep,
+				stride: 1 << level,
+			}
 		}))
 		.collect();
 	FixedTree { lanes, steps }
@@ -886,10 +900,12 @@ fn tree_synchronization(tree: &FixedTree) -> Vec<SynchronizationPoint> {
 	tree.steps
 		.iter()
 		.zip(0_u32..)
-		.map(|(_, index)| SynchronizationPoint {
-			after_step: index,
-			scope: SynchronizationScope::Workgroup,
-			memory: MemorySemantics::SharedAcquireRelease,
+		.map(|(_, index)| {
+			SynchronizationPoint {
+				after_step: index,
+				scope: SynchronizationScope::Workgroup,
+				memory: MemorySemantics::SharedAcquireRelease,
+			}
 		})
 		.collect()
 }
@@ -936,18 +952,22 @@ fn lower_scan(
 		let blocks = current_width.div_ceil(u64::from(lanes));
 		let output = match level == 0 {
 			true => builder.tensor_buffer(kernel.outputs[0])?,
-			false => builder.scratch(
-				input.dtype,
-				checked_mul(builder, sequences, current_width, "scan level output")?,
-				ScratchPurpose::ScanValues,
-			)?,
+			false => {
+				builder.scratch(
+					input.dtype,
+					checked_mul(builder, sequences, current_width, "scan level output")?,
+					ScratchPurpose::ScanValues,
+				)?
+			}
 		};
 		let totals = match blocks > 1 {
-			true => Some(builder.scratch(
-				input.dtype,
-				checked_mul(builder, sequences, blocks, "scan block totals")?,
-				ScratchPurpose::ScanBlockTotals,
-			)?),
+			true => {
+				Some(builder.scratch(
+					input.dtype,
+					checked_mul(builder, sequences, blocks, "scan block totals")?,
+					ScratchPurpose::ScanBlockTotals,
+				)?)
+			}
 			false => None,
 		};
 		let mut bindings = vec![
@@ -968,10 +988,12 @@ fn lower_scan(
 		)?;
 		let active = checked_mul(builder, sequences, current_width, "scan active elements")?;
 		let mode = match level == 0 {
-			true => match spec.mode {
-				ScanMode::Inclusive => ScanStageMode::UserInclusive,
-				ScanMode::Exclusive { identity } => ScanStageMode::UserExclusive { identity },
-			},
+			true => {
+				match spec.mode {
+					ScanMode::Inclusive => ScanStageMode::UserInclusive,
+					ScanMode::Exclusive { identity } => ScanStageMode::UserExclusive { identity },
+				}
+			}
 			false => ScanStageMode::HierarchyExclusiveIdentity,
 		};
 		let inclusive_combines = u64::from(matches!(mode, ScanStageMode::UserInclusive))
@@ -1091,12 +1113,14 @@ fn lower_contraction(
 	let reduction_tiles = contracted_elements.div_ceil(u64::from(physical.tile.reduction));
 	let synchronization_count = match physical.strategy {
 		ContractionStrategy::Direct => 0,
-		ContractionStrategy::Staged => checked_mul(
-			builder,
-			reduction_tiles,
-			2,
-			"contraction synchronization count",
-		)?,
+		ContractionStrategy::Staged => {
+			checked_mul(
+				builder,
+				reduction_tiles,
+				2,
+				"contraction synchronization count",
+			)?
+		}
 	};
 	let synchronization_count = u32::try_from(synchronization_count).map_err(|error| {
 		LoweringError::new(
@@ -1106,10 +1130,12 @@ fn lower_contraction(
 		.for_kernel(kernel.id)
 	})?;
 	let synchronization = (0..synchronization_count)
-		.map(|after_step| SynchronizationPoint {
-			after_step,
-			scope: SynchronizationScope::Workgroup,
-			memory: MemorySemantics::SharedAcquireRelease,
+		.map(|after_step| {
+			SynchronizationPoint {
+				after_step,
+				scope: SynchronizationScope::Workgroup,
+				memory: MemorySemantics::SharedAcquireRelease,
+			}
 		})
 		.collect();
 	push_stage!(
@@ -1212,17 +1238,11 @@ fn contraction_physical_plan(
 			.max(1)
 			.min(builder.hardware.subgroup_lanes),
 	);
-	let staged_bytes = u64::from(workgroup_lanes)
-		.checked_mul(u64::from(left.dtype.byte_width()))
-		.ok_or_else(|| builder.overflow("contraction staged accumulator bytes"))?;
-	let strategy = if workgroup_lanes >= builder.hardware.subgroup_lanes
-		&& contracted_elements >= u64::from(builder.hardware.subgroup_lanes)
-		&& staged_bytes <= builder.hardware.maximum_shared_memory_per_workgroup.get()
-	{
-		ContractionStrategy::Staged
-	} else {
-		ContractionStrategy::Direct
-	};
+	// Each lane owns one complete output accumulator. There is no cross-lane
+	// reduction to stage: storing a lane's accumulator in shared memory,
+	// synchronizing twice, and loading the same slot only adds traffic and
+	// barriers. Keep the value private across reduction tiles.
+	let strategy = ContractionStrategy::Direct;
 	Ok(ContractionPhysicalPlan {
 		strategy,
 		tile: ContractionTile {
@@ -1231,10 +1251,7 @@ fn contraction_physical_plan(
 			reduction,
 		},
 		workgroup_lanes,
-		shared_bytes: match strategy {
-			ContractionStrategy::Direct => 0,
-			ContractionStrategy::Staged => staged_bytes,
-		},
+		shared_bytes: 0,
 	})
 }
 
@@ -1336,13 +1353,15 @@ fn lower_scatter(
 		ScatterConflict::Atomic {
 			operation,
 			ordering,
-		} => Some(AtomicContract {
-			buffer: output_buffer,
-			dtype: base.dtype,
-			operation: operation.into(),
-			ordering: ordering.into(),
-			domain: AtomicAddressDomain::TensorElements,
-		}),
+		} => {
+			Some(AtomicContract {
+				buffer: output_buffer,
+				dtype: base.dtype,
+				operation: operation.into(),
+				ordering: ordering.into(),
+				domain: AtomicAddressDomain::TensorElements,
+			})
+		}
 	};
 	atomics.extend(payload_atomic);
 	let fault = match spec.bounds == IndexBounds::Reject {

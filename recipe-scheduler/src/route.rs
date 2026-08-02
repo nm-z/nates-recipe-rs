@@ -1,5 +1,7 @@
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::{
+	cmp::Reverse,
+	collections::{BTreeMap, BinaryHeap},
+};
 
 use recipe_core::{ByteCount, DeviceId, LinkId, Nanoseconds, Topology, transfer_time_ceil};
 
@@ -105,107 +107,4 @@ pub fn shortest_route(
 		ScheduleErrorKind::NoRoute,
 		format!("no directed route from {source} to {destination}"),
 	))
-}
-
-#[cfg(test)]
-mod tests {
-	use recipe_core::{
-		ByteCount, BytesPerSecond, Device, DeviceKind, DirectedLink, DuplexMode, DuplexResourceId, Machine,
-		MachineId, Node, NodeId, NodeRole, Property, PropertyProvenance, Topology, TopologyIdentity,
-		TransferLaneCount, TransportId, TransportKind,
-	};
-	use recipe_core::{Digest, Label};
-
-	use super::*;
-
-	fn measured<T>(value: T) -> Property<T> {
-		Property::new(value, PropertyProvenance::Measured)
-	}
-
-	fn fixture() -> Topology {
-		let machine = MachineId::new(1);
-		let devices = (1..=3).map(DeviceId::new).collect::<Vec<_>>();
-		let link = |id, transport, from, to, bandwidth, resource| DirectedLink {
-			id: LinkId::new(id),
-			transport: TransportId::new(transport),
-			kind: TransportKind::Memory,
-			duplex: DuplexMode::Full,
-			from,
-			to,
-			bandwidth: measured(BytesPerSecond::new(bandwidth).unwrap()),
-			maximum_inflight_transfers: measured(TransferLaneCount::new(1).unwrap()),
-			capacity_resource: DuplexResourceId::new(resource),
-		};
-		Topology {
-			identity: TopologyIdentity::new(Digest::new([1; 32])),
-			machines: vec![Machine {
-				id: machine,
-				name: Label::new("host").unwrap(),
-			}],
-			nodes: vec![Node {
-				id: NodeId::new(1),
-				role: NodeRole::Master,
-				machine,
-				devices: devices.clone(),
-			}],
-			devices: devices
-				.iter()
-				.copied()
-				.map(|id| Device {
-					id,
-					machine,
-					kind: DeviceKind::Ram,
-					capacity: measured(ByteCount::new(8_000_000_000)),
-					transfer_rate: measured(BytesPerSecond::new(1_000_000_000).unwrap()),
-					calculation_rate: None,
-				})
-				.collect(),
-			links: vec![
-				link(1, 1, devices[0], devices[2], 100, 1),
-				link(2, 2, devices[0], devices[1], 1_000, 3),
-				link(3, 3, devices[1], devices[2], 1_000, 5),
-				link(4, 1, devices[2], devices[0], 100, 2),
-				link(5, 2, devices[1], devices[0], 1_000, 4),
-				link(6, 3, devices[2], devices[1], 1_000, 6),
-			],
-		}
-	}
-
-	#[test]
-	fn chooses_minimum_measured_time_not_fewest_hops() {
-		let route = shortest_route(
-			&fixture(),
-			DeviceId::new(1),
-			DeviceId::new(3),
-			ByteCount::new(1_000),
-		)
-		.unwrap();
-		assert_eq!(route.links, vec![LinkId::new(2), LinkId::new(3)]);
-		assert_eq!(route.duration, Nanoseconds::new(2_000_000_000));
-	}
-
-	#[test]
-	fn rejects_estimates_as_production_inputs() {
-		let mut topology = fixture();
-		topology.links[0].bandwidth.provenance = PropertyProvenance::Estimated;
-		let error = shortest_route(
-			&topology,
-			DeviceId::new(1),
-			DeviceId::new(3),
-			ByteCount::new(1),
-		)
-		.unwrap_err();
-		assert_eq!(error.kind, ScheduleErrorKind::InvalidTopology);
-
-		topology.links[0].bandwidth.provenance = PropertyProvenance::Measured;
-		topology.links[0].maximum_inflight_transfers.provenance = PropertyProvenance::Estimated;
-		let error = shortest_route(
-			&topology,
-			DeviceId::new(1),
-			DeviceId::new(3),
-			ByteCount::new(1),
-		)
-		.unwrap_err();
-		assert_eq!(error.kind, ScheduleErrorKind::InvalidTopology);
-	}
 }

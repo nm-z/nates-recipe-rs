@@ -1,7 +1,9 @@
 use core::fmt;
-use std::collections::BTreeSet;
-use std::fmt::Write as _;
-use std::io::{BufRead, Read, Seek, SeekFrom, Write as IoWrite};
+use std::{
+	collections::BTreeSet,
+	fmt::Write as _,
+	io::{BufRead, Read, Seek, SeekFrom, Write as IoWrite},
+};
 
 use recipe_ogdl::{Graph, NodeId};
 
@@ -39,19 +41,13 @@ impl GgufOgdlError {
 	}
 
 	#[must_use]
-	pub const fn kind(&self) -> GgufOgdlErrorKind {
-		self.kind
-	}
+	pub const fn kind(&self) -> GgufOgdlErrorKind { self.kind }
 
 	#[must_use]
-	pub fn path(&self) -> &str {
-		&self.path
-	}
+	pub fn path(&self) -> &str { &self.path }
 
 	#[must_use]
-	pub fn detail(&self) -> &str {
-		&self.detail
-	}
+	pub fn detail(&self) -> &str { &self.detail }
 }
 
 impl fmt::Display for GgufOgdlError {
@@ -63,9 +59,7 @@ impl fmt::Display for GgufOgdlError {
 impl std::error::Error for GgufOgdlError {}
 
 impl From<GgufError> for GgufOgdlError {
-	fn from(error: GgufError) -> Self {
-		Self::new(GgufOgdlErrorKind::Gguf, "<gguf>", error.to_string())
-	}
+	fn from(error: GgufError) -> Self { Self::new(GgufOgdlErrorKind::Gguf, "<gguf>", error.to_string()) }
 }
 
 pub type GgufOgdlResult<T> = Result<T, GgufOgdlError>;
@@ -85,29 +79,19 @@ pub struct GgufModelDescriptor {
 
 impl GgufModelDescriptor {
 	#[must_use]
-	pub fn architecture(&self) -> &str {
-		&self.architecture
-	}
+	pub fn architecture(&self) -> &str { &self.architecture }
 
 	#[must_use]
-	pub const fn endian(&self) -> GgufEndian {
-		self.endian
-	}
+	pub const fn endian(&self) -> GgufEndian { self.endian }
 
 	#[must_use]
-	pub const fn alignment(&self) -> u32 {
-		self.alignment
-	}
+	pub const fn alignment(&self) -> u32 { self.alignment }
 
 	#[must_use]
-	pub const fn metadata_count(&self) -> u64 {
-		self.metadata_count
-	}
+	pub const fn metadata_count(&self) -> u64 { self.metadata_count }
 
 	#[must_use]
-	pub const fn tensor_count(&self) -> u64 {
-		self.tensor_count
-	}
+	pub const fn tensor_count(&self) -> u64 { self.tensor_count }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,14 +239,10 @@ pub fn gguf_to_structural_ogdl(bytes: &[u8], limits: GgufLimits) -> GgufOgdlResu
 	line(&mut output, 0, "gguf");
 	line(&mut output, 1, &format!("schema {STRUCTURAL_SCHEMA}"));
 	line(&mut output, 1, "version 3");
-	line(
-		&mut output,
-		1,
-		match archive.endian() {
-			GgufEndian::Little => "endian little",
-			GgufEndian::Big => "endian big",
-		},
-	);
+	line(&mut output, 1, match archive.endian() {
+		GgufEndian::Little => "endian little",
+		GgufEndian::Big => "endian big",
+	});
 	line(
 		&mut output,
 		1,
@@ -380,9 +360,7 @@ impl<'a, R: Read> StreamBinaryReader<'a, R> {
 		}
 	}
 
-	const fn position(&self) -> u64 {
-		self.position
-	}
+	const fn position(&self) -> u64 { self.position }
 
 	fn read_exact(&mut self, bytes: &mut [u8], context: &str) -> GgufOgdlResult<()> {
 		let length = host_u64(bytes.len(), context)?;
@@ -418,9 +396,7 @@ impl<'a, R: Read> StreamBinaryReader<'a, R> {
 		Ok(bytes[0])
 	}
 
-	fn i8(&mut self, context: &str) -> GgufOgdlResult<i8> {
-		Ok(i8::from_ne_bytes([self.u8(context)?]))
-	}
+	fn i8(&mut self, context: &str) -> GgufOgdlResult<i8> { Ok(i8::from_ne_bytes([self.u8(context)?])) }
 
 	fn u16(&mut self, context: &str) -> GgufOgdlResult<u16> {
 		let mut bytes = [0_u8; 2];
@@ -596,35 +572,45 @@ impl<'a, R: Read> StreamBinaryReader<'a, R> {
 
 	fn metadata_scalar(&mut self, value_type: GgufMetadataType, label: &str) -> GgufOgdlResult<StreamMetadataScalar> {
 		let (text, u32_value, string_value) = match value_type {
-			GgufMetadataType::U8 => (
-				format!("{label} u8 {}", self.u8("metadata.u8")?),
-				None,
-				None,
-			),
-			GgufMetadataType::I8 => (
-				format!("{label} i8 {}", self.i8("metadata.i8")?),
-				None,
-				None,
-			),
-			GgufMetadataType::U16 => (
-				format!("{label} u16 {}", self.u16("metadata.u16")?),
-				None,
-				None,
-			),
-			GgufMetadataType::I16 => (
-				format!("{label} i16 {}", self.i16("metadata.i16")?),
-				None,
-				None,
-			),
+			GgufMetadataType::U8 => {
+				(
+					format!("{label} u8 {}", self.u8("metadata.u8")?),
+					None,
+					None,
+				)
+			}
+			GgufMetadataType::I8 => {
+				(
+					format!("{label} i8 {}", self.i8("metadata.i8")?),
+					None,
+					None,
+				)
+			}
+			GgufMetadataType::U16 => {
+				(
+					format!("{label} u16 {}", self.u16("metadata.u16")?),
+					None,
+					None,
+				)
+			}
+			GgufMetadataType::I16 => {
+				(
+					format!("{label} i16 {}", self.i16("metadata.i16")?),
+					None,
+					None,
+				)
+			}
 			GgufMetadataType::U32 => {
 				let value = self.u32("metadata.u32")?;
 				(format!("{label} u32 {value}"), Some(value), None)
 			}
-			GgufMetadataType::I32 => (
-				format!("{label} i32 {}", self.i32("metadata.i32")?),
-				None,
-				None,
-			),
+			GgufMetadataType::I32 => {
+				(
+					format!("{label} i32 {}", self.i32("metadata.i32")?),
+					None,
+					None,
+				)
+			}
 			GgufMetadataType::F32 => {
 				let parts = split_float(u64::from(self.u32("metadata.f32")?), FloatFormat::F32);
 				(
@@ -657,16 +643,20 @@ impl<'a, R: Read> StreamBinaryReader<'a, R> {
 					Some(value),
 				)
 			}
-			GgufMetadataType::U64 => (
-				format!("{label} u64 {}", self.u64("metadata.u64")?),
-				None,
-				None,
-			),
-			GgufMetadataType::I64 => (
-				format!("{label} i64 {}", self.i64("metadata.i64")?),
-				None,
-				None,
-			),
+			GgufMetadataType::U64 => {
+				(
+					format!("{label} u64 {}", self.u64("metadata.u64")?),
+					None,
+					None,
+				)
+			}
+			GgufMetadataType::I64 => {
+				(
+					format!("{label} i64 {}", self.i64("metadata.i64")?),
+					None,
+					None,
+				)
+			}
 			GgufMetadataType::F64 => {
 				let parts = split_float(self.u64("metadata.f64")?, FloatFormat::F64);
 				(
@@ -699,9 +689,7 @@ impl<'a, R: Read> StreamBinaryReader<'a, R> {
 /// in memory. `general.architecture` must be a nonempty string because this
 /// boundary describes an executable model rather than a generic GGUF container.
 pub fn inspect_gguf_model_stream<R>(input: &mut R, limits: GgufLimits) -> GgufOgdlResult<GgufModelDescriptor>
-where
-	R: Read + Seek,
-{
+where R: Read + Seek {
 	let file_bytes = input
 		.seek(SeekFrom::End(0))
 		.map_err(|error| stream_io_error("gguf", error))?;
@@ -784,14 +772,10 @@ where
 	io_line(output, 0, "gguf")?;
 	io_line(output, 1, &format!("schema {STRUCTURAL_SCHEMA}"))?;
 	io_line(output, 1, "version 3")?;
-	io_line(
-		output,
-		1,
-		match header.endian {
-			GgufEndian::Little => "endian little",
-			GgufEndian::Big => "endian big",
-		},
-	)?;
+	io_line(output, 1, match header.endian {
+		GgufEndian::Little => "endian little",
+		GgufEndian::Big => "endian big",
+	})?;
 	io_line(output, 1, &format!("alignment {}", header.alignment))?;
 	io_line(output, 1, &format!("file_bytes {file_bytes}"))?;
 	io_line(output, 1, "metadata")?;
@@ -1338,9 +1322,7 @@ impl<'a, W: IoWrite + Seek> SeekBinaryWriter<'a, W> {
 		})
 	}
 
-	const fn position(&self) -> u64 {
-		self.position
-	}
+	const fn position(&self) -> u64 { self.position }
 
 	fn bytes(&mut self, bytes: &[u8], path: &str) -> GgufOgdlResult<()> {
 		self.output
@@ -1353,13 +1335,9 @@ impl<'a, W: IoWrite + Seek> SeekBinaryWriter<'a, W> {
 		Ok(())
 	}
 
-	fn u8(&mut self, value: u8) -> GgufOgdlResult<()> {
-		self.bytes(&[value], "<gguf-output>")
-	}
+	fn u8(&mut self, value: u8) -> GgufOgdlResult<()> { self.bytes(&[value], "<gguf-output>") }
 
-	fn i8(&mut self, value: i8) -> GgufOgdlResult<()> {
-		self.bytes(&value.to_ne_bytes(), "<gguf-output>")
-	}
+	fn i8(&mut self, value: i8) -> GgufOgdlResult<()> { self.bytes(&value.to_ne_bytes(), "<gguf-output>") }
 
 	fn u16(&mut self, value: u16) -> GgufOgdlResult<()> {
 		self.bytes(
@@ -1748,9 +1726,7 @@ fn parse_structural_preamble<R: BufRead + Seek>(
 /// The reader is rewound before returning so it can be passed directly to
 /// [`structural_ogdl_to_gguf_stream`].
 pub fn structural_ogdl_declared_gguf_bytes<R>(input: &mut R) -> GgufOgdlResult<u64>
-where
-	R: BufRead + Seek,
-{
+where R: BufRead + Seek {
 	let mut lines = CanonicalLines::new(input)?;
 	let (_, _, file_bytes) = parse_structural_preamble(&mut lines)?;
 	lines.reset()?;
@@ -2816,10 +2792,12 @@ fn parse_metadata_value(
 	}
 	match completed.len() {
 		1 => Ok(completed.pop().expect("one parsed metadata value exists")),
-		count => Err(invalid_structure(
-			path,
-			format!("metadata traversal produced {count} root values"),
-		)),
+		count => {
+			Err(invalid_structure(
+				path,
+				format!("metadata traversal produced {count} root values"),
+			))
+		}
 	}
 }
 
@@ -2850,54 +2828,74 @@ fn parse_metadata_scalar(
 		Ok(payload)
 	};
 	match kind {
-		"u8" => Ok(OwnedMetadataValue::U8(parse_number(
-			scalar("u8")?,
-			path,
-			"u8",
-		)?)),
-		"i8" => Ok(OwnedMetadataValue::I8(parse_number(
-			scalar("i8")?,
-			path,
-			"i8",
-		)?)),
-		"u16" => Ok(OwnedMetadataValue::U16(parse_number(
-			scalar("u16")?,
-			path,
-			"u16",
-		)?)),
-		"i16" => Ok(OwnedMetadataValue::I16(parse_number(
-			scalar("i16")?,
-			path,
-			"i16",
-		)?)),
-		"u32" => Ok(OwnedMetadataValue::U32(parse_number(
-			scalar("u32")?,
-			path,
-			"u32",
-		)?)),
-		"i32" => Ok(OwnedMetadataValue::I32(parse_number(
-			scalar("i32")?,
-			path,
-			"i32",
-		)?)),
-		"u64" => Ok(OwnedMetadataValue::U64(parse_number(
-			scalar("u64")?,
-			path,
-			"u64",
-		)?)),
-		"i64" => Ok(OwnedMetadataValue::I64(parse_number(
-			scalar("i64")?,
-			path,
-			"i64",
-		)?)),
-		"bool" => match scalar("bool")? {
-			"true" => Ok(OwnedMetadataValue::Bool(true)),
-			"false" => Ok(OwnedMetadataValue::Bool(false)),
-			other => Err(invalid_value(
+		"u8" => {
+			Ok(OwnedMetadataValue::U8(parse_number(
+				scalar("u8")?,
 				path,
-				format!("boolean must be true or false, found {other:?}"),
-			)),
-		},
+				"u8",
+			)?))
+		}
+		"i8" => {
+			Ok(OwnedMetadataValue::I8(parse_number(
+				scalar("i8")?,
+				path,
+				"i8",
+			)?))
+		}
+		"u16" => {
+			Ok(OwnedMetadataValue::U16(parse_number(
+				scalar("u16")?,
+				path,
+				"u16",
+			)?))
+		}
+		"i16" => {
+			Ok(OwnedMetadataValue::I16(parse_number(
+				scalar("i16")?,
+				path,
+				"i16",
+			)?))
+		}
+		"u32" => {
+			Ok(OwnedMetadataValue::U32(parse_number(
+				scalar("u32")?,
+				path,
+				"u32",
+			)?))
+		}
+		"i32" => {
+			Ok(OwnedMetadataValue::I32(parse_number(
+				scalar("i32")?,
+				path,
+				"i32",
+			)?))
+		}
+		"u64" => {
+			Ok(OwnedMetadataValue::U64(parse_number(
+				scalar("u64")?,
+				path,
+				"u64",
+			)?))
+		}
+		"i64" => {
+			Ok(OwnedMetadataValue::I64(parse_number(
+				scalar("i64")?,
+				path,
+				"i64",
+			)?))
+		}
+		"bool" => {
+			match scalar("bool")? {
+				"true" => Ok(OwnedMetadataValue::Bool(true)),
+				"false" => Ok(OwnedMetadataValue::Bool(false)),
+				other => {
+					Err(invalid_value(
+						path,
+						format!("boolean must be true or false, found {other:?}"),
+					))
+				}
+			}
+		}
 		"string" => {
 			let value = scalar("string")?;
 			serde_json::from_str(value)
@@ -2917,14 +2915,18 @@ fn parse_metadata_scalar(
 				FloatFormat::F64,
 			)?))
 		}
-		"array" => Err(invalid_structure(
-			path,
-			"array metadata reached the scalar parser",
-		)),
-		other => Err(invalid_value(
-			path,
-			format!("unknown metadata value type {other:?}"),
-		)),
+		"array" => {
+			Err(invalid_structure(
+				path,
+				"array metadata reached the scalar parser",
+			))
+		}
+		other => {
+			Err(invalid_value(
+				path,
+				format!("unknown metadata value type {other:?}"),
+			))
+		}
 	}
 }
 
@@ -2972,11 +2974,13 @@ fn parse_tensors(graph: &Graph, tensors: NodeId) -> GgufOgdlResult<Vec<ParsedTen
 		let dimensions_node = node_text(graph, fields[1], &format!("{path}.dimensions"))?;
 		let dimensions_text = match dimensions_node {
 			"dimensions" => "",
-			_ => strip_prefix(
-				dimensions_node,
-				"dimensions ",
-				&format!("{path}.dimensions"),
-			)?,
+			_ => {
+				strip_prefix(
+					dimensions_node,
+					"dimensions ",
+					&format!("{path}.dimensions"),
+				)?
+			}
 		};
 		let dimensions = dimensions_text
 			.split_whitespace()
@@ -3027,13 +3031,9 @@ impl BinaryWriter {
 		}
 	}
 
-	fn u8(&mut self, value: u8) {
-		self.bytes.push(value);
-	}
+	fn u8(&mut self, value: u8) { self.bytes.push(value); }
 
-	fn i8(&mut self, value: i8) {
-		self.bytes.extend_from_slice(&value.to_ne_bytes());
-	}
+	fn i8(&mut self, value: i8) { self.bytes.extend_from_slice(&value.to_ne_bytes()); }
 
 	fn u16(&mut self, value: u16) {
 		self.bytes.extend_from_slice(&match self.endian {
@@ -3264,122 +3264,150 @@ fn decode_block(tensor_type: GgufTensorType, endian: GgufEndian, block: &[u8]) -
 	let mut reader = BlockReader::new(block, endian);
 	let fields = match tensor_type {
 		GgufTensorType::F32 => vec![float_field("value", FloatFormat::F32, reader.u32("value")?)],
-		GgufTensorType::F16 => vec![float_field(
-			"value",
-			FloatFormat::F16,
-			u64::from(reader.u16("value")?),
-		)],
-		GgufTensorType::Bf16 => vec![float_field(
-			"value",
-			FloatFormat::Bf16,
-			u64::from(reader.u16("value")?),
-		)],
+		GgufTensorType::F16 => {
+			vec![float_field(
+				"value",
+				FloatFormat::F16,
+				u64::from(reader.u16("value")?),
+			)]
+		}
+		GgufTensorType::Bf16 => {
+			vec![float_field(
+				"value",
+				FloatFormat::Bf16,
+				u64::from(reader.u16("value")?),
+			)]
+		}
 		GgufTensorType::F64 => vec![float_field("value", FloatFormat::F64, reader.u64("value")?)],
-		GgufTensorType::I8 => vec![signed_field(
-			"value",
-			"i8",
-			i64::from(i8::from_ne_bytes([reader.u8("value")?])),
-			i64::from(i8::MIN),
-			i64::from(i8::MAX),
-		)],
-		GgufTensorType::I16 => vec![signed_field(
-			"value",
-			"i16",
-			i64::from(reader.i16("value")?),
-			i64::from(i16::MIN),
-			i64::from(i16::MAX),
-		)],
-		GgufTensorType::I32 => vec![signed_field(
-			"value",
-			"i32",
-			i64::from(reader.i32("value")?),
-			i64::from(i32::MIN),
-			i64::from(i32::MAX),
-		)],
-		GgufTensorType::I64 => vec![signed_field(
-			"value",
-			"i64",
-			reader.i64("value")?,
-			i64::MIN,
-			i64::MAX,
-		)],
-		GgufTensorType::Q1_0 => vec![
-			f16_from(&mut reader, "delta")?,
-			unsigned_values(
-				"sign_bits",
-				"u1",
-				1,
-				unpack_lsb(reader.take(16, "sign bits")?, 1),
-			),
-		],
-		GgufTensorType::Q2_0 => vec![
-			f16_from(&mut reader, "delta")?,
-			unsigned_values(
-				"quant_codes",
-				"u2",
-				3,
-				unpack_lsb(reader.take(16, "quant codes")?, 2),
-			),
-		],
-		GgufTensorType::Q4_0 => vec![
-			f16_from(&mut reader, "delta")?,
-			unsigned_values(
-				"quant_codes",
-				"u4",
-				15,
-				unpack_halves(reader.take(16, "quant codes")?),
-			),
-		],
-		GgufTensorType::Q4_1 => vec![
-			f16_from(&mut reader, "delta")?,
-			f16_from(&mut reader, "minimum")?,
-			unsigned_values(
-				"quant_codes",
-				"u4",
-				15,
-				unpack_halves(reader.take(16, "quant codes")?),
-			),
-		],
-		GgufTensorType::Q5_0 => vec![
-			f16_from(&mut reader, "delta")?,
-			unsigned_values(
-				"quant_high_bits",
-				"u1",
-				1,
-				unpack_lsb(reader.take(4, "quant high bits")?, 1),
-			),
-			unsigned_values(
-				"quant_low_codes",
-				"u4",
-				15,
-				unpack_halves(reader.take(16, "quant low codes")?),
-			),
-		],
-		GgufTensorType::Q5_1 => vec![
-			f16_from(&mut reader, "delta")?,
-			f16_from(&mut reader, "minimum")?,
-			unsigned_values(
-				"quant_high_bits",
-				"u1",
-				1,
-				unpack_lsb(reader.take(4, "quant high bits")?, 1),
-			),
-			unsigned_values(
-				"quant_low_codes",
-				"u4",
-				15,
-				unpack_halves(reader.take(16, "quant low codes")?),
-			),
-		],
-		GgufTensorType::Q8_0 => vec![
-			f16_from(&mut reader, "delta")?,
-			i8_array_from(&mut reader, "quant_codes", 32)?,
-		],
-		GgufTensorType::Q8_1 => vec![
-			f16_from(&mut reader, "delta")?,
-			f16_from(&mut reader, "scaled_sum")?,
-			i8_array_from(&mut reader, "quant_codes", 32)?,
-		],
+		GgufTensorType::I8 => {
+			vec![signed_field(
+				"value",
+				"i8",
+				i64::from(i8::from_ne_bytes([reader.u8("value")?])),
+				i64::from(i8::MIN),
+				i64::from(i8::MAX),
+			)]
+		}
+		GgufTensorType::I16 => {
+			vec![signed_field(
+				"value",
+				"i16",
+				i64::from(reader.i16("value")?),
+				i64::from(i16::MIN),
+				i64::from(i16::MAX),
+			)]
+		}
+		GgufTensorType::I32 => {
+			vec![signed_field(
+				"value",
+				"i32",
+				i64::from(reader.i32("value")?),
+				i64::from(i32::MIN),
+				i64::from(i32::MAX),
+			)]
+		}
+		GgufTensorType::I64 => {
+			vec![signed_field(
+				"value",
+				"i64",
+				reader.i64("value")?,
+				i64::MIN,
+				i64::MAX,
+			)]
+		}
+		GgufTensorType::Q1_0 => {
+			vec![
+				f16_from(&mut reader, "delta")?,
+				unsigned_values(
+					"sign_bits",
+					"u1",
+					1,
+					unpack_lsb(reader.take(16, "sign bits")?, 1),
+				),
+			]
+		}
+		GgufTensorType::Q2_0 => {
+			vec![
+				f16_from(&mut reader, "delta")?,
+				unsigned_values(
+					"quant_codes",
+					"u2",
+					3,
+					unpack_lsb(reader.take(16, "quant codes")?, 2),
+				),
+			]
+		}
+		GgufTensorType::Q4_0 => {
+			vec![
+				f16_from(&mut reader, "delta")?,
+				unsigned_values(
+					"quant_codes",
+					"u4",
+					15,
+					unpack_halves(reader.take(16, "quant codes")?),
+				),
+			]
+		}
+		GgufTensorType::Q4_1 => {
+			vec![
+				f16_from(&mut reader, "delta")?,
+				f16_from(&mut reader, "minimum")?,
+				unsigned_values(
+					"quant_codes",
+					"u4",
+					15,
+					unpack_halves(reader.take(16, "quant codes")?),
+				),
+			]
+		}
+		GgufTensorType::Q5_0 => {
+			vec![
+				f16_from(&mut reader, "delta")?,
+				unsigned_values(
+					"quant_high_bits",
+					"u1",
+					1,
+					unpack_lsb(reader.take(4, "quant high bits")?, 1),
+				),
+				unsigned_values(
+					"quant_low_codes",
+					"u4",
+					15,
+					unpack_halves(reader.take(16, "quant low codes")?),
+				),
+			]
+		}
+		GgufTensorType::Q5_1 => {
+			vec![
+				f16_from(&mut reader, "delta")?,
+				f16_from(&mut reader, "minimum")?,
+				unsigned_values(
+					"quant_high_bits",
+					"u1",
+					1,
+					unpack_lsb(reader.take(4, "quant high bits")?, 1),
+				),
+				unsigned_values(
+					"quant_low_codes",
+					"u4",
+					15,
+					unpack_halves(reader.take(16, "quant low codes")?),
+				),
+			]
+		}
+		GgufTensorType::Q8_0 => {
+			vec![
+				f16_from(&mut reader, "delta")?,
+				i8_array_from(&mut reader, "quant_codes", 32)?,
+			]
+		}
+		GgufTensorType::Q8_1 => {
+			vec![
+				f16_from(&mut reader, "delta")?,
+				f16_from(&mut reader, "scaled_sum")?,
+				i8_array_from(&mut reader, "quant_codes", 32)?,
+			]
+		}
 		GgufTensorType::Q2K => {
 			let scales = reader.take(16, "scale and minimum codes")?;
 			let (scale_codes, minimum_codes) = unpack_nibble_pairs(scales);
@@ -3447,27 +3475,31 @@ fn decode_block(tensor_type: GgufTensorType, endian: GgufEndian, block: &[u8]) -
 				),
 			]
 		}
-		GgufTensorType::Q6K => vec![
-			unsigned_values(
-				"quant_low_codes",
-				"u4",
-				15,
-				unpack_halves(reader.take(128, "quant low codes")?),
-			),
-			unsigned_values(
-				"quant_high_codes",
-				"u2",
-				3,
-				unpack_lsb(reader.take(64, "quant high codes")?, 2),
-			),
-			i8_array_from(&mut reader, "scale_codes", 16)?,
-			f16_from(&mut reader, "scale")?,
-		],
-		GgufTensorType::Q8K => vec![
-			f32_from(&mut reader, "delta")?,
-			i8_array_from(&mut reader, "quant_codes", 256)?,
-			i16_array_from(&mut reader, "block_sums", 16)?,
-		],
+		GgufTensorType::Q6K => {
+			vec![
+				unsigned_values(
+					"quant_low_codes",
+					"u4",
+					15,
+					unpack_halves(reader.take(128, "quant low codes")?),
+				),
+				unsigned_values(
+					"quant_high_codes",
+					"u2",
+					3,
+					unpack_lsb(reader.take(64, "quant high codes")?, 2),
+				),
+				i8_array_from(&mut reader, "scale_codes", 16)?,
+				f16_from(&mut reader, "scale")?,
+			]
+		}
+		GgufTensorType::Q8K => {
+			vec![
+				f32_from(&mut reader, "delta")?,
+				i8_array_from(&mut reader, "quant_codes", 256)?,
+				i16_array_from(&mut reader, "block_sums", 16)?,
+			]
+		}
 		GgufTensorType::Iq2Xxs => {
 			let delta = f16_from(&mut reader, "delta")?;
 			let mut grid_indices = Vec::with_capacity(32);
@@ -3551,59 +3583,65 @@ fn decode_block(tensor_type: GgufTensorType, endian: GgufEndian, block: &[u8]) -
 				unsigned_values("shift_bits", "u1", 1, shift_bits),
 			]
 		}
-		GgufTensorType::Iq4Nl => vec![
-			f16_from(&mut reader, "delta")?,
-			unsigned_values(
-				"nonlinear_quant_codes",
-				"u4",
-				15,
-				unpack_halves(reader.take(16, "nonlinear quant codes")?),
-			),
-		],
-		GgufTensorType::Iq3S => vec![
-			f16_from(&mut reader, "delta")?,
-			u8_array_from(&mut reader, "grid_index_low", 64)?,
-			unsigned_values(
-				"grid_index_high_bits",
-				"u1",
-				1,
-				unpack_lsb(reader.take(8, "grid index high bits")?, 1),
-			),
-			unsigned_values(
-				"sign_bits",
-				"u1",
-				1,
-				unpack_lsb(reader.take(32, "sign bits")?, 1),
-			),
-			unsigned_values(
-				"scale_codes",
-				"u4",
-				15,
-				unpack_lsb(reader.take(4, "scale codes")?, 4),
-			),
-		],
-		GgufTensorType::Iq2S => vec![
-			f16_from(&mut reader, "delta")?,
-			u8_array_from(&mut reader, "grid_index_low", 32)?,
-			unsigned_values(
-				"sign_bits",
-				"u1",
-				1,
-				unpack_lsb(reader.take(32, "sign bits")?, 1),
-			),
-			unsigned_values(
-				"grid_index_high_codes",
-				"u2",
-				3,
-				unpack_lsb(reader.take(8, "grid index high codes")?, 2),
-			),
-			unsigned_values(
-				"scale_codes",
-				"u4",
-				15,
-				unpack_lsb(reader.take(8, "scale codes")?, 4),
-			),
-		],
+		GgufTensorType::Iq4Nl => {
+			vec![
+				f16_from(&mut reader, "delta")?,
+				unsigned_values(
+					"nonlinear_quant_codes",
+					"u4",
+					15,
+					unpack_halves(reader.take(16, "nonlinear quant codes")?),
+				),
+			]
+		}
+		GgufTensorType::Iq3S => {
+			vec![
+				f16_from(&mut reader, "delta")?,
+				u8_array_from(&mut reader, "grid_index_low", 64)?,
+				unsigned_values(
+					"grid_index_high_bits",
+					"u1",
+					1,
+					unpack_lsb(reader.take(8, "grid index high bits")?, 1),
+				),
+				unsigned_values(
+					"sign_bits",
+					"u1",
+					1,
+					unpack_lsb(reader.take(32, "sign bits")?, 1),
+				),
+				unsigned_values(
+					"scale_codes",
+					"u4",
+					15,
+					unpack_lsb(reader.take(4, "scale codes")?, 4),
+				),
+			]
+		}
+		GgufTensorType::Iq2S => {
+			vec![
+				f16_from(&mut reader, "delta")?,
+				u8_array_from(&mut reader, "grid_index_low", 32)?,
+				unsigned_values(
+					"sign_bits",
+					"u1",
+					1,
+					unpack_lsb(reader.take(32, "sign bits")?, 1),
+				),
+				unsigned_values(
+					"grid_index_high_codes",
+					"u2",
+					3,
+					unpack_lsb(reader.take(8, "grid index high codes")?, 2),
+				),
+				unsigned_values(
+					"scale_codes",
+					"u4",
+					15,
+					unpack_lsb(reader.take(8, "scale codes")?, 4),
+				),
+			]
+		}
 		GgufTensorType::Iq4Xs => {
 			let delta = f16_from(&mut reader, "delta")?;
 			let scales_high = reader.u16("scale high bits")?;
@@ -3659,51 +3697,56 @@ fn decode_block(tensor_type: GgufTensorType, endian: GgufEndian, block: &[u8]) -
 				unsigned_values("subblock_scale_codes", "u3", 7, subblock_scales),
 			]
 		}
-		GgufTensorType::Tq1_0 => vec![
-			u8_array_from(&mut reader, "base3_pentad_codes", 48)?,
-			u8_array_from(&mut reader, "base3_quad_codes", 4)?,
-			f16_from(&mut reader, "delta")?,
-		],
-		GgufTensorType::Tq2_0 => vec![
-			unsigned_values(
-				"ternary_quant_codes",
-				"u2",
-				3,
-				unpack_lsb(reader.take(64, "ternary quant codes")?, 2),
-			),
-			f16_from(&mut reader, "delta")?,
-		],
-		GgufTensorType::Mxfp4 => vec![
-			unsigned_values(
-				"scale",
-				"e8m0",
-				255,
-				vec![u64::from(reader.u8("E8M0 scale")?)],
-			),
-			unsigned_values(
-				"quant_codes",
-				"e2m1",
-				15,
-				unpack_halves(reader.take(16, "E2M1 quant codes")?),
-			),
-		],
-		GgufTensorType::Nvfp4 => vec![
-			unsigned_values(
-				"subblock_scales",
-				"ue4m3",
-				255,
-				reader.take(4, "UE4M3 subblock scales")?
-					.iter()
-					.map(|value| u64::from(*value))
-					.collect(),
-			),
-			unsigned_values(
-				"quant_codes",
-				"e2m1",
-				15,
-				unpack_nvfp4(reader.take(32, "E2M1 quant codes")?),
-			),
-		],
+		GgufTensorType::Tq1_0 => {
+			vec![
+				u8_array_from(&mut reader, "base3_pentad_codes", 48)?,
+				u8_array_from(&mut reader, "base3_quad_codes", 4)?,
+				f16_from(&mut reader, "delta")?,
+			]
+		}
+		GgufTensorType::Tq2_0 => {
+			vec![
+				unsigned_values(
+					"ternary_quant_codes",
+					"u2",
+					3,
+					unpack_lsb(reader.take(64, "ternary quant codes")?, 2),
+				),
+				f16_from(&mut reader, "delta")?,
+			]
+		}
+		GgufTensorType::Mxfp4 => {
+			vec![
+				unsigned_values("scale", "e8m0", 255, vec![u64::from(
+					reader.u8("E8M0 scale")?,
+				)]),
+				unsigned_values(
+					"quant_codes",
+					"e2m1",
+					15,
+					unpack_halves(reader.take(16, "E2M1 quant codes")?),
+				),
+			]
+		}
+		GgufTensorType::Nvfp4 => {
+			vec![
+				unsigned_values(
+					"subblock_scales",
+					"ue4m3",
+					255,
+					reader.take(4, "UE4M3 subblock scales")?
+						.iter()
+						.map(|value| u64::from(*value))
+						.collect(),
+				),
+				unsigned_values(
+					"quant_codes",
+					"e2m1",
+					15,
+					unpack_nvfp4(reader.take(32, "E2M1 quant codes")?),
+				),
+			]
+		}
 	};
 	if reader.remaining() != 0 {
 		return Err(invalid_structure(
@@ -3734,9 +3777,7 @@ impl<'a> BlockReader<'a> {
 		}
 	}
 
-	const fn remaining(&self) -> usize {
-		self.bytes.len() - self.position
-	}
+	const fn remaining(&self) -> usize { self.bytes.len() - self.position }
 
 	fn take(&mut self, length: usize, context: &str) -> GgufOgdlResult<&'a [u8]> {
 		let end = self.position.checked_add(length).ok_or_else(|| {
@@ -3758,9 +3799,7 @@ impl<'a> BlockReader<'a> {
 		Ok(value)
 	}
 
-	fn u8(&mut self, context: &str) -> GgufOgdlResult<u8> {
-		Ok(self.take(1, context)?[0])
-	}
+	fn u8(&mut self, context: &str) -> GgufOgdlResult<u8> { Ok(self.take(1, context)?[0]) }
 
 	fn u16(&mut self, context: &str) -> GgufOgdlResult<u16> {
 		let bytes = exact_array::<2>(self.take(2, context)?, context)?;
@@ -4311,32 +4350,38 @@ fn field_value_at(field: &StructuralField, index: usize) -> GgufOgdlResult<Struc
 			kind,
 			maximum,
 			values,
-		} => FieldValues::Unsigned {
-			kind,
-			maximum: *maximum,
-			values: vec![*values
-				.get(index)
-				.ok_or_else(|| invalid_structure("tensor.payload", "missing scalar value"))?],
-		},
+		} => {
+			FieldValues::Unsigned {
+				kind,
+				maximum: *maximum,
+				values: vec![*values
+					.get(index)
+					.ok_or_else(|| invalid_structure("tensor.payload", "missing scalar value"))?],
+			}
+		}
 		FieldValues::Signed {
 			kind,
 			minimum,
 			maximum,
 			values,
-		} => FieldValues::Signed {
-			kind,
-			minimum: *minimum,
-			maximum: *maximum,
-			values: vec![*values
-				.get(index)
-				.ok_or_else(|| invalid_structure("tensor.payload", "missing scalar value"))?],
-		},
-		FieldValues::Float { format, values } => FieldValues::Float {
-			format: *format,
-			values: vec![*values
-				.get(index)
-				.ok_or_else(|| invalid_structure("tensor.payload", "missing scalar value"))?],
-		},
+		} => {
+			FieldValues::Signed {
+				kind,
+				minimum: *minimum,
+				maximum: *maximum,
+				values: vec![*values
+					.get(index)
+					.ok_or_else(|| invalid_structure("tensor.payload", "missing scalar value"))?],
+			}
+		}
+		FieldValues::Float { format, values } => {
+			FieldValues::Float {
+				format: *format,
+				values: vec![*values
+					.get(index)
+					.ok_or_else(|| invalid_structure("tensor.payload", "missing scalar value"))?],
+			}
+		}
 	};
 	Ok(StructuralField {
 		name: field.name,
@@ -4351,34 +4396,48 @@ fn encode_block(
 ) -> GgufOgdlResult<Vec<u8>> {
 	let mut writer = BlockWriter::new(endian);
 	match tensor_type {
-		GgufTensorType::F32 => writer.float(
-			FloatFormat::F32,
-			float_values(fields, 0, "value", FloatFormat::F32, 1)?[0],
-		)?,
-		GgufTensorType::F16 => writer.float(
-			FloatFormat::F16,
-			float_values(fields, 0, "value", FloatFormat::F16, 1)?[0],
-		)?,
-		GgufTensorType::Bf16 => writer.float(
-			FloatFormat::Bf16,
-			float_values(fields, 0, "value", FloatFormat::Bf16, 1)?[0],
-		)?,
-		GgufTensorType::F64 => writer.float(
-			FloatFormat::F64,
-			float_values(fields, 0, "value", FloatFormat::F64, 1)?[0],
-		)?,
-		GgufTensorType::I8 => writer.i8(exact_signed::<i8>(
-			signed_values_ref(fields, 0, "value", "i8", 1)?[0],
-			"value",
-		)?),
-		GgufTensorType::I16 => writer.i16(exact_signed::<i16>(
-			signed_values_ref(fields, 0, "value", "i16", 1)?[0],
-			"value",
-		)?),
-		GgufTensorType::I32 => writer.i32(exact_signed::<i32>(
-			signed_values_ref(fields, 0, "value", "i32", 1)?[0],
-			"value",
-		)?),
+		GgufTensorType::F32 => {
+			writer.float(
+				FloatFormat::F32,
+				float_values(fields, 0, "value", FloatFormat::F32, 1)?[0],
+			)?
+		}
+		GgufTensorType::F16 => {
+			writer.float(
+				FloatFormat::F16,
+				float_values(fields, 0, "value", FloatFormat::F16, 1)?[0],
+			)?
+		}
+		GgufTensorType::Bf16 => {
+			writer.float(
+				FloatFormat::Bf16,
+				float_values(fields, 0, "value", FloatFormat::Bf16, 1)?[0],
+			)?
+		}
+		GgufTensorType::F64 => {
+			writer.float(
+				FloatFormat::F64,
+				float_values(fields, 0, "value", FloatFormat::F64, 1)?[0],
+			)?
+		}
+		GgufTensorType::I8 => {
+			writer.i8(exact_signed::<i8>(
+				signed_values_ref(fields, 0, "value", "i8", 1)?[0],
+				"value",
+			)?)
+		}
+		GgufTensorType::I16 => {
+			writer.i16(exact_signed::<i16>(
+				signed_values_ref(fields, 0, "value", "i16", 1)?[0],
+				"value",
+			)?)
+		}
+		GgufTensorType::I32 => {
+			writer.i32(exact_signed::<i32>(
+				signed_values_ref(fields, 0, "value", "i32", 1)?[0],
+				"value",
+			)?)
+		}
 		GgufTensorType::I64 => writer.i64(signed_values_ref(fields, 0, "value", "i64", 1)?[0]),
 		GgufTensorType::Q1_0 => {
 			writer.float(
@@ -4865,11 +4924,13 @@ fn encode_block(
 		}
 	}
 	if fields.len()
-		!= decode_block(
-			tensor_type,
-			endian,
-			&vec![0; host_usize(tensor_type.block_bytes(), "block bytes")?],
-		)?
+		!= decode_block(tensor_type, endian, &vec![
+			0;
+			host_usize(
+				tensor_type.block_bytes(),
+				"block bytes"
+			)?
+		])?
 		.len()
 	{
 		return Err(invalid_structure(
@@ -4947,19 +5008,19 @@ impl BlockWriter {
 		});
 	}
 
-	fn i8(&mut self, value: i8) {
-		self.bytes.extend_from_slice(&value.to_ne_bytes());
-	}
+	fn i8(&mut self, value: i8) { self.bytes.extend_from_slice(&value.to_ne_bytes()); }
 
 	fn float(&mut self, format: FloatFormat, value: FloatParts) -> GgufOgdlResult<()> {
 		let bits = join_float(value, format)?;
 		match format {
-			FloatFormat::F16 | FloatFormat::Bf16 => self
-				.u16(u16::try_from(bits)
-					.map_err(|error| invalid_value("tensor.payload", error.to_string()))?),
-			FloatFormat::F32 => self
-				.u32(u32::try_from(bits)
-					.map_err(|error| invalid_value("tensor.payload", error.to_string()))?),
+			FloatFormat::F16 | FloatFormat::Bf16 => {
+				self.u16(u16::try_from(bits)
+					.map_err(|error| invalid_value("tensor.payload", error.to_string()))?)
+			}
+			FloatFormat::F32 => {
+				self.u32(u32::try_from(bits)
+					.map_err(|error| invalid_value("tensor.payload", error.to_string()))?)
+			}
 			FloatFormat::F64 => self.u64(bits),
 		}
 		Ok(())
@@ -4997,21 +5058,15 @@ trait WriteUnsigned<T> {
 }
 
 impl WriteUnsigned<u8> for BlockWriter {
-	fn write_unsigned(&mut self, value: u8) {
-		self.bytes.push(value);
-	}
+	fn write_unsigned(&mut self, value: u8) { self.bytes.push(value); }
 }
 
 impl WriteUnsigned<u16> for BlockWriter {
-	fn write_unsigned(&mut self, value: u16) {
-		self.u16(value);
-	}
+	fn write_unsigned(&mut self, value: u16) { self.u16(value); }
 }
 
 impl WriteUnsigned<u32> for BlockWriter {
-	fn write_unsigned(&mut self, value: u32) {
-		self.u32(value);
-	}
+	fn write_unsigned(&mut self, value: u32) { self.u32(value); }
 }
 
 trait WriteSigned<T> {
@@ -5019,15 +5074,11 @@ trait WriteSigned<T> {
 }
 
 impl WriteSigned<i8> for BlockWriter {
-	fn write_signed(&mut self, value: i8) {
-		self.i8(value);
-	}
+	fn write_signed(&mut self, value: i8) { self.i8(value); }
 }
 
 impl WriteSigned<i16> for BlockWriter {
-	fn write_signed(&mut self, value: i16) {
-		self.i16(value);
-	}
+	fn write_signed(&mut self, value: i16) { self.i16(value); }
 }
 
 fn unsigned_values_ref<'a>(
@@ -5362,10 +5413,12 @@ fn parse_metadata_type(name: &str, path: &str) -> GgufOgdlResult<GgufMetadataTyp
 		"u64" => Ok(GgufMetadataType::U64),
 		"i64" => Ok(GgufMetadataType::I64),
 		"f64" => Ok(GgufMetadataType::F64),
-		other => Err(invalid_value(
-			path,
-			format!("unknown metadata type {other:?}"),
-		)),
+		other => {
+			Err(invalid_value(
+				path,
+				format!("unknown metadata type {other:?}"),
+			))
+		}
 	}
 }
 
@@ -5446,10 +5499,12 @@ fn parse_tensor_type(name: &str, path: &str) -> GgufOgdlResult<GgufTensorType> {
 		"nvfp4" => Ok(GgufTensorType::Nvfp4),
 		"q1_0" => Ok(GgufTensorType::Q1_0),
 		"q2_0" => Ok(GgufTensorType::Q2_0),
-		other => Err(invalid_value(
-			path,
-			format!("unknown current GGUF tensor type {other:?}"),
-		)),
+		other => {
+			Err(invalid_value(
+				path,
+				format!("unknown current GGUF tensor type {other:?}"),
+			))
+		}
 	}
 }
 
@@ -5581,9 +5636,10 @@ fn align_up(value: u64, alignment: u64) -> GgufOgdlResult<u64> {
 	let remainder = value % alignment;
 	match remainder {
 		0 => Ok(value),
-		_ => value
-			.checked_add(alignment - remainder)
-			.ok_or_else(|| invalid_overflow("gguf.alignment", "alignment calculation overflowed u64")),
+		_ => {
+			value.checked_add(alignment - remainder)
+				.ok_or_else(|| invalid_overflow("gguf.alignment", "alignment calculation overflowed u64"))
+		}
 	}
 }
 
@@ -5609,604 +5665,4 @@ fn invalid_value(path: impl Into<String>, detail: impl Into<String>) -> GgufOgdl
 
 fn invalid_overflow(path: impl Into<String>, detail: impl Into<String>) -> GgufOgdlError {
 	GgufOgdlError::new(GgufOgdlErrorKind::ArithmeticOverflow, path, detail)
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	const TYPES: [GgufTensorType; 35] = [
-		GgufTensorType::F32,
-		GgufTensorType::F16,
-		GgufTensorType::Q4_0,
-		GgufTensorType::Q4_1,
-		GgufTensorType::Q5_0,
-		GgufTensorType::Q5_1,
-		GgufTensorType::Q8_0,
-		GgufTensorType::Q8_1,
-		GgufTensorType::Q2K,
-		GgufTensorType::Q3K,
-		GgufTensorType::Q4K,
-		GgufTensorType::Q5K,
-		GgufTensorType::Q6K,
-		GgufTensorType::Q8K,
-		GgufTensorType::Iq2Xxs,
-		GgufTensorType::Iq2Xs,
-		GgufTensorType::Iq3Xxs,
-		GgufTensorType::Iq1S,
-		GgufTensorType::Iq4Nl,
-		GgufTensorType::Iq3S,
-		GgufTensorType::Iq2S,
-		GgufTensorType::Iq4Xs,
-		GgufTensorType::I8,
-		GgufTensorType::I16,
-		GgufTensorType::I32,
-		GgufTensorType::I64,
-		GgufTensorType::F64,
-		GgufTensorType::Iq1M,
-		GgufTensorType::Bf16,
-		GgufTensorType::Tq1_0,
-		GgufTensorType::Tq2_0,
-		GgufTensorType::Mxfp4,
-		GgufTensorType::Nvfp4,
-		GgufTensorType::Q1_0,
-		GgufTensorType::Q2_0,
-	];
-
-	#[derive(Debug)]
-	struct TestWriter {
-		bytes: Vec<u8>,
-		endian: GgufEndian,
-	}
-
-	impl TestWriter {
-		fn new(endian: GgufEndian) -> Self {
-			Self {
-				bytes: b"GGUF".to_vec(),
-				endian,
-			}
-		}
-
-		fn u8(&mut self, value: u8) {
-			self.bytes.push(value);
-		}
-
-		fn i8(&mut self, value: i8) {
-			self.bytes.extend_from_slice(&value.to_ne_bytes());
-		}
-
-		fn u16(&mut self, value: u16) {
-			self.bytes.extend_from_slice(&match self.endian {
-				GgufEndian::Little => value.to_le_bytes(),
-				GgufEndian::Big => value.to_be_bytes(),
-			});
-		}
-
-		fn i16(&mut self, value: i16) {
-			self.bytes.extend_from_slice(&match self.endian {
-				GgufEndian::Little => value.to_le_bytes(),
-				GgufEndian::Big => value.to_be_bytes(),
-			});
-		}
-
-		fn u32(&mut self, value: u32) {
-			self.bytes.extend_from_slice(&match self.endian {
-				GgufEndian::Little => value.to_le_bytes(),
-				GgufEndian::Big => value.to_be_bytes(),
-			});
-		}
-
-		fn i32(&mut self, value: i32) {
-			self.bytes.extend_from_slice(&match self.endian {
-				GgufEndian::Little => value.to_le_bytes(),
-				GgufEndian::Big => value.to_be_bytes(),
-			});
-		}
-
-		fn u64(&mut self, value: u64) {
-			self.bytes.extend_from_slice(&match self.endian {
-				GgufEndian::Little => value.to_le_bytes(),
-				GgufEndian::Big => value.to_be_bytes(),
-			});
-		}
-
-		fn i64(&mut self, value: i64) {
-			self.bytes.extend_from_slice(&match self.endian {
-				GgufEndian::Little => value.to_le_bytes(),
-				GgufEndian::Big => value.to_be_bytes(),
-			});
-		}
-
-		fn string(&mut self, value: &str) {
-			self.u64(u64::try_from(value.len()).unwrap());
-			self.bytes.extend_from_slice(value.as_bytes());
-		}
-
-		fn key(&mut self, key: &str, value_type: GgufMetadataType) {
-			self.string(key);
-			self.u32(value_type.code());
-		}
-	}
-
-	fn architecture_fixture(
-		endian: GgufEndian,
-		architecture_type: Option<GgufMetadataType>,
-		architecture: &str,
-	) -> Vec<u8> {
-		let mut writer = TestWriter::new(endian);
-		writer.u32(3);
-		writer.u64(0);
-		writer.u64(u64::from(architecture_type.is_some()));
-		if let Some(value_type) = architecture_type {
-			writer.key("general.architecture", value_type);
-			match value_type {
-				GgufMetadataType::String => writer.string(architecture),
-				GgufMetadataType::U32 => writer.u32(7),
-				_ => panic!("architecture fixture only supports string or u32"),
-			}
-		}
-		writer.bytes
-	}
-
-	fn exhaustive_fixture(endian: GgufEndian, alignment: usize) -> Vec<u8> {
-		const METADATA_COUNT: u64 = 16;
-		let mut offsets = vec![0_u64; TYPES.len()];
-		let mut data_length = 0_u64;
-		for index in (0..TYPES.len()).rev() {
-			data_length = test_align(data_length, alignment as u64);
-			offsets[index] = data_length;
-			data_length += TYPES[index].block_bytes();
-		}
-
-		let mut writer = TestWriter::new(endian);
-		writer.u32(3);
-		writer.u64(TYPES.len() as u64);
-		writer.u64(METADATA_COUNT);
-
-		writer.key("general.alignment", GgufMetadataType::U32);
-		writer.u32(alignment as u32);
-		writer.key("command-r.context_length", GgufMetadataType::U8);
-		writer.u8(0xa5);
-		writer.key("test.i8", GgufMetadataType::I8);
-		writer.i8(-101);
-		writer.key("test.u16", GgufMetadataType::U16);
-		writer.u16(0xa1b2);
-		writer.key("test.i16", GgufMetadataType::I16);
-		writer.i16(-12_345);
-		writer.key("test.u32", GgufMetadataType::U32);
-		writer.u32(0x89ab_cdef);
-		writer.key("test.i32", GgufMetadataType::I32);
-		writer.i32(-1_234_567_890);
-		writer.key("test.f32", GgufMetadataType::F32);
-		writer.u32(0x7fc1_2345);
-		writer.key("test.bool", GgufMetadataType::Bool);
-		writer.u8(1);
-		writer.key("test.string", GgufMetadataType::String);
-		writer.string("human \0 text\nwith\ttabs and λ");
-		writer.key("test.array", GgufMetadataType::Array);
-		writer.u32(GgufMetadataType::I64.code());
-		writer.u64(3);
-		writer.i64(i64::MIN);
-		writer.i64(0);
-		writer.i64(i64::MAX);
-		writer.key("test.nested", GgufMetadataType::Array);
-		writer.u32(GgufMetadataType::Array.code());
-		writer.u64(2);
-		writer.u32(GgufMetadataType::U16.code());
-		writer.u64(2);
-		writer.u16(0x1122);
-		writer.u16(0x3344);
-		writer.u32(GgufMetadataType::String.code());
-		writer.u64(1);
-		writer.string("nested");
-		writer.key("test.u64", GgufMetadataType::U64);
-		writer.u64(0xfedc_ba98_7654_3210);
-		writer.key("test.i64", GgufMetadataType::I64);
-		writer.i64(-8_765_432_101_234_567_890);
-		writer.key("test.f64", GgufMetadataType::F64);
-		writer.u64(0x7ff8_1234_5678_9abc);
-		writer.key("test.empty", GgufMetadataType::Array);
-		writer.u32(GgufMetadataType::Bool.code());
-		writer.u64(0);
-
-		for (index, tensor_type) in TYPES.iter().copied().enumerate() {
-			let name = match index {
-				0 => String::new(),
-				_ => format!("tensor_{}", tensor_type.code()),
-			};
-			writer.string(&name);
-			writer.u32(u32::from(index != 0));
-			if index != 0 {
-				writer.u64(tensor_type.block_elements());
-			}
-			writer.u32(tensor_type.code());
-			writer.u64(offsets[index]);
-		}
-		let data_start = usize::try_from(test_align(writer.bytes.len() as u64, alignment as u64)).unwrap();
-		writer.bytes.resize(data_start, 0);
-		writer.bytes
-			.resize(data_start + usize::try_from(data_length).unwrap(), 0);
-		for (index, tensor_type) in TYPES.iter().copied().enumerate() {
-			let begin = data_start + usize::try_from(offsets[index]).unwrap();
-			let length = usize::try_from(tensor_type.block_bytes()).unwrap();
-			for byte_index in 0..length {
-				writer.bytes[begin + byte_index] = (tensor_type.code() as u8)
-					.wrapping_mul(37)
-					.wrapping_add((index as u8).wrapping_mul(11))
-					.wrapping_add((byte_index as u8).wrapping_mul(19))
-					.wrapping_add(7);
-			}
-		}
-		writer.bytes
-	}
-
-	fn deeply_nested_array_fixture(depth: u64) -> Vec<u8> {
-		assert!(depth > 0);
-		let mut writer = TestWriter::new(GgufEndian::Little);
-		writer.u32(3);
-		writer.u64(0);
-		writer.u64(1);
-		writer.key("test.deep", GgufMetadataType::Array);
-		for level in 0..depth {
-			writer.u32(if level + 1 == depth {
-				GgufMetadataType::U8
-			} else {
-				GgufMetadataType::Array
-			}
-			.code());
-			writer.u64(1);
-		}
-		writer.u8(0xa5);
-		writer.bytes
-	}
-
-	fn multi_block_fixture() -> Vec<u8> {
-		const ALIGNMENT: u64 = 64;
-		const SCALAR_VALUES: u64 = 300;
-		const QUANT_ELEMENTS: u64 = 512;
-		let scalar_bytes = SCALAR_VALUES * GgufTensorType::F32.block_bytes();
-		let quant_offset = test_align(scalar_bytes, ALIGNMENT);
-		let quant_bytes =
-			(QUANT_ELEMENTS / GgufTensorType::Q4K.block_elements()) * GgufTensorType::Q4K.block_bytes();
-
-		let mut writer = TestWriter::new(GgufEndian::Little);
-		writer.u32(3);
-		writer.u64(2);
-		writer.u64(1);
-		writer.key("general.alignment", GgufMetadataType::U32);
-		writer.u32(ALIGNMENT as u32);
-		writer.string("scalars");
-		writer.u32(1);
-		writer.u64(SCALAR_VALUES);
-		writer.u32(GgufTensorType::F32.code());
-		writer.u64(0);
-		writer.string("quantized");
-		writer.u32(1);
-		writer.u64(QUANT_ELEMENTS);
-		writer.u32(GgufTensorType::Q4K.code());
-		writer.u64(quant_offset);
-		let data_start = usize::try_from(test_align(writer.bytes.len() as u64, ALIGNMENT)).unwrap();
-		writer.bytes.resize(data_start, 0);
-		writer.bytes.resize(
-			data_start + usize::try_from(quant_offset + quant_bytes).unwrap(),
-			0,
-		);
-		for (index, byte) in writer.bytes[data_start..data_start + usize::try_from(scalar_bytes).unwrap()]
-			.iter_mut()
-			.enumerate()
-		{
-			*byte = (index as u8).wrapping_mul(29).wrapping_add(17);
-		}
-		for (index, byte) in writer.bytes[data_start + usize::try_from(quant_offset).unwrap()..]
-			.iter_mut()
-			.enumerate()
-		{
-			*byte = (index as u8).wrapping_mul(43).wrapping_add(91);
-		}
-		writer.bytes
-	}
-
-	fn zero_extent_fixture(endian: GgufEndian) -> Vec<u8> {
-		const ALIGNMENT: u64 = 32;
-		let mut writer = TestWriter::new(endian);
-		writer.u32(3);
-		writer.u64(1);
-		writer.u64(1);
-		writer.key("general.alignment", GgufMetadataType::U32);
-		writer.u32(ALIGNMENT as u32);
-		writer.string("empty");
-		writer.u32(3);
-		writer.u64(u64::MAX);
-		writer.u64(u64::MAX);
-		writer.u64(0);
-		writer.u32(GgufTensorType::F32.code());
-		writer.u64(ALIGNMENT);
-		let data_start = usize::try_from(test_align(writer.bytes.len() as u64, ALIGNMENT)).unwrap();
-		writer.bytes.resize(data_start + ALIGNMENT as usize, 0);
-		writer.bytes
-	}
-
-	fn tensor_free_fixture(endian: GgufEndian, padded: bool) -> Vec<u8> {
-		let mut writer = TestWriter::new(endian);
-		writer.u32(3);
-		writer.u64(0);
-		writer.u64(0);
-		if padded {
-			writer.bytes.resize(32, 0);
-		}
-		writer.bytes
-	}
-
-	fn test_align(value: u64, alignment: u64) -> u64 {
-		let remainder = value % alignment;
-		value + (alignment - remainder) % alignment
-	}
-
-	fn limits(bytes: usize) -> GgufLimits {
-		GgufLimits::new(
-			u64::try_from(bytes).unwrap(),
-			1_000,
-			1_000,
-			4,
-			1 << 20,
-			1 << 20,
-			16,
-		)
-		.unwrap()
-	}
-
-	fn limits_with_depth(bytes: usize, depth: u64) -> GgufLimits {
-		GgufLimits::new(
-			u64::try_from(bytes).unwrap(),
-			1_000,
-			1_000,
-			4,
-			1 << 20,
-			1 << 20,
-			depth,
-		)
-		.unwrap()
-	}
-
-	#[test]
-	fn model_inspection_recovers_exact_architecture_without_reading_tensor_payloads() {
-		for endian in [GgufEndian::Little, GgufEndian::Big] {
-			let source = architecture_fixture(endian, Some(GgufMetadataType::String), "qwen3");
-			let mut input = std::io::Cursor::new(source.as_slice());
-			let descriptor = inspect_gguf_model_stream(&mut input, limits(source.len())).unwrap();
-			assert_eq!(descriptor.architecture(), "qwen3");
-			assert_eq!(descriptor.endian(), endian);
-			assert_eq!(descriptor.alignment(), 32);
-			assert_eq!(descriptor.metadata_count(), 1);
-			assert_eq!(descriptor.tensor_count(), 0);
-		}
-	}
-
-	#[test]
-	fn model_inspection_rejects_missing_wrong_typed_and_empty_architecture() {
-		for (source, expected) in [
-			(
-				architecture_fixture(GgufEndian::Little, None, ""),
-				"missing general.architecture",
-			),
-			(
-				architecture_fixture(GgufEndian::Little, Some(GgufMetadataType::U32), ""),
-				"must be string, found u32",
-			),
-			(
-				architecture_fixture(GgufEndian::Little, Some(GgufMetadataType::String), ""),
-				"architecture is empty",
-			),
-		] {
-			let mut input = std::io::Cursor::new(source.as_slice());
-			let error = inspect_gguf_model_stream(&mut input, limits(source.len())).unwrap_err();
-			assert_eq!(error.path(), "gguf.metadata.general.architecture");
-			assert!(error.detail().contains(expected), "{error}");
-		}
-	}
-
-	#[test]
-	fn every_current_v3_encoding_roundtrips_byte_identically_in_both_endiannesses() {
-		for endian in [GgufEndian::Little, GgufEndian::Big] {
-			for alignment in [24, 64] {
-				let source = exhaustive_fixture(endian, alignment);
-				let text = gguf_to_structural_ogdl(&source, limits(source.len())).unwrap();
-				let mut input = std::io::Cursor::new(&source);
-				let mut streamed = Vec::new();
-				gguf_to_structural_ogdl_stream(&mut input, &mut streamed, limits(source.len())).unwrap();
-				assert_eq!(
-					streamed,
-					text.as_bytes(),
-					"streaming output changed canonical structural OGDL"
-				);
-				assert!(text.starts_with("gguf\n\tschema recipe-gguf-structural-v1\n\tversion 3\n"));
-				assert!(text.contains(&format!("\talignment {alignment}\n")));
-				assert!(text.contains("\t\t\tkey \"command-r.context_length\"\n"));
-				assert!(text.contains("\t\t\tvalue f32 0 255 4268869\n"));
-				assert!(text.contains("\t\t\tvalue string \"human \\u0000 text\\nwith\\ttabs and λ\"\n"));
-				assert!(text.contains("\t\t\tname \"\"\n\t\t\tdimensions\n\t\t\ttype f32\n"));
-				assert!(text.contains("\t\t\ttype nvfp4\n"));
-				assert!(text.contains("\t\t\t\t\tsubblock_scales ue4m3 "));
-				assert!(text.contains("\t\t\t\t\tquant_codes e2m1 "));
-				assert!(!text.contains("base64"));
-				assert!(!text.contains("payload_hex"));
-				assert!(!text.contains("raw_bytes"));
-
-				let rebuilt = structural_ogdl_to_gguf(&text, limits(source.len())).unwrap();
-				assert_eq!(
-					rebuilt, source,
-					"{endian:?} alignment {alignment} structural round trip changed bytes"
-				);
-				let mut structural = std::io::BufReader::new(std::io::Cursor::new(text.as_bytes()));
-				let mut streamed_binary = std::io::Cursor::new(Vec::new());
-				structural_ogdl_to_gguf_stream(&mut structural, &mut streamed_binary, limits(source.len()))
-					.unwrap();
-				assert_eq!(
-					streamed_binary.into_inner(),
-					source,
-					"{endian:?} alignment {alignment} streaming reconstruction changed bytes"
-				);
-			}
-		}
-	}
-
-	#[test]
-	fn current_tensor_files_preserve_optional_terminal_alignment_padding() {
-		for endian in [GgufEndian::Little, GgufEndian::Big] {
-			for alignment in [24, 64] {
-				let unpadded = exhaustive_fixture(endian, alignment);
-				let padded_length =
-					usize::try_from(test_align(unpadded.len() as u64, alignment as u64)).unwrap();
-				assert!(padded_length > unpadded.len());
-				let mut source = unpadded;
-				source.resize(padded_length, 0);
-
-				let text = gguf_to_structural_ogdl(&source, limits(source.len())).unwrap();
-				assert!(text.contains(&format!("\tfile_bytes {padded_length}\n")));
-				assert_eq!(
-					structural_ogdl_to_gguf(&text, limits(source.len())).unwrap(),
-					source
-				);
-
-				let mut binary = std::io::Cursor::new(&source);
-				let mut structural = Vec::new();
-				gguf_to_structural_ogdl_stream(&mut binary, &mut structural, limits(source.len())).unwrap();
-				let mut structural = std::io::BufReader::new(std::io::Cursor::new(structural));
-				let mut rebuilt = std::io::Cursor::new(Vec::new());
-				structural_ogdl_to_gguf_stream(&mut structural, &mut rebuilt, limits(source.len())).unwrap();
-				assert_eq!(rebuilt.into_inner(), source);
-			}
-		}
-	}
-
-	#[test]
-	fn deeply_nested_current_metadata_roundtrips_without_recursive_traversal() {
-		const DEPTH: u64 = 256;
-		let source = deeply_nested_array_fixture(DEPTH);
-		let limits = limits_with_depth(source.len(), DEPTH);
-		let text = gguf_to_structural_ogdl(&source, limits).unwrap();
-		let mut input = std::io::Cursor::new(&source);
-		let mut streamed = Vec::new();
-		gguf_to_structural_ogdl_stream(&mut input, &mut streamed, limits).unwrap();
-		assert_eq!(streamed, text.as_bytes());
-		assert_eq!(
-			text.matches("array array").count(),
-			usize::try_from(DEPTH - 1).unwrap()
-		);
-		let rebuilt = structural_ogdl_to_gguf(&text, limits).unwrap();
-		assert_eq!(rebuilt, source);
-		let mut structural = std::io::BufReader::new(std::io::Cursor::new(text.as_bytes()));
-		let mut streamed_binary = std::io::Cursor::new(Vec::new());
-		structural_ogdl_to_gguf_stream(&mut structural, &mut streamed_binary, limits).unwrap();
-		assert_eq!(streamed_binary.into_inner(), source);
-	}
-
-	#[test]
-	fn streaming_conversion_keeps_scalar_chunks_and_quantized_blocks_bounded() {
-		let source = multi_block_fixture();
-		let mut binary = std::io::Cursor::new(&source);
-		let mut structural = Vec::new();
-		gguf_to_structural_ogdl_stream(&mut binary, &mut structural, limits(source.len())).unwrap();
-		let text = std::str::from_utf8(&structural).unwrap();
-		assert!(text.contains("\t\t\t\tchunk 0\n"));
-		assert!(text.contains("\t\t\t\tchunk 128\n"));
-		assert!(text.contains("\t\t\t\tchunk 256\n"));
-		assert!(text.contains("\t\t\t\tblock 0\n"));
-		assert!(text.contains("\t\t\t\tblock 1\n"));
-
-		let mut structural = std::io::BufReader::new(std::io::Cursor::new(structural));
-		let mut rebuilt = std::io::Cursor::new(Vec::new());
-		structural_ogdl_to_gguf_stream(&mut structural, &mut rebuilt, limits(source.len())).unwrap();
-		assert_eq!(rebuilt.into_inner(), source);
-	}
-
-	#[test]
-	fn zero_extent_tensors_roundtrip_without_payload_or_product_overflow() {
-		for endian in [GgufEndian::Little, GgufEndian::Big] {
-			let source = zero_extent_fixture(endian);
-			let text = gguf_to_structural_ogdl(&source, limits(source.len())).unwrap();
-			assert!(text.contains("\t\t\tdimensions 18446744073709551615 18446744073709551615 0\n"));
-			assert!(text.contains("\t\t\tpayload\n"));
-			assert_eq!(
-				structural_ogdl_to_gguf(&text, limits(source.len())).unwrap(),
-				source
-			);
-
-			let mut binary = std::io::Cursor::new(&source);
-			let mut structural = Vec::new();
-			gguf_to_structural_ogdl_stream(&mut binary, &mut structural, limits(source.len())).unwrap();
-			assert_eq!(structural, text.as_bytes());
-			let mut structural = std::io::BufReader::new(std::io::Cursor::new(structural));
-			let mut rebuilt = std::io::Cursor::new(Vec::new());
-			structural_ogdl_to_gguf_stream(&mut structural, &mut rebuilt, limits(source.len())).unwrap();
-			assert_eq!(rebuilt.into_inner(), source);
-		}
-	}
-
-	#[test]
-	fn tensor_free_files_preserve_optional_canonical_header_padding() {
-		for endian in [GgufEndian::Little, GgufEndian::Big] {
-			for padded in [false, true] {
-				let source = tensor_free_fixture(endian, padded);
-				let text = gguf_to_structural_ogdl(&source, limits(source.len())).unwrap();
-				assert!(text.contains(&format!("\tfile_bytes {}\n", source.len())));
-				assert_eq!(
-					structural_ogdl_to_gguf(&text, limits(source.len())).unwrap(),
-					source
-				);
-
-				let mut binary = std::io::Cursor::new(&source);
-				let mut structural = Vec::new();
-				gguf_to_structural_ogdl_stream(&mut binary, &mut structural, limits(source.len())).unwrap();
-				assert_eq!(structural, text.as_bytes());
-				let mut structural = std::io::BufReader::new(std::io::Cursor::new(structural));
-				let mut rebuilt = std::io::Cursor::new(Vec::new());
-				structural_ogdl_to_gguf_stream(&mut structural, &mut rebuilt, limits(source.len())).unwrap();
-				assert_eq!(rebuilt.into_inner(), source);
-			}
-		}
-	}
-
-	#[test]
-	fn every_structural_block_codec_is_bijective_for_arbitrary_bit_patterns() {
-		for tensor_type in TYPES {
-			let length = usize::try_from(tensor_type.block_bytes()).unwrap();
-			let mut patterns = vec![vec![0; length], vec![u8::MAX; length]];
-			patterns.push((0..length).map(|index| index as u8).collect());
-			for seed in 0_u64..16 {
-				let mut state = 0x9e37_79b9_7f4a_7c15_u64 ^ seed;
-				let mut pattern = Vec::with_capacity(length);
-				for _ in 0..length {
-					state = state
-						.wrapping_mul(6_364_136_223_846_793_005)
-						.wrapping_add(1);
-					pattern.push((state >> 32) as u8);
-				}
-				patterns.push(pattern);
-			}
-			for endian in [GgufEndian::Little, GgufEndian::Big] {
-				for (pattern_index, pattern) in patterns.iter().enumerate() {
-					let fields = decode_block(tensor_type, endian, pattern).unwrap();
-					let rebuilt = encode_block(tensor_type, endian, &fields).unwrap();
-					assert_eq!(
-						&rebuilt, pattern,
-						"{tensor_type:?} {endian:?} pattern {pattern_index} was not bijective"
-					);
-				}
-			}
-		}
-	}
-
-	#[test]
-	fn tensor_payload_is_authoritative_structural_text_not_a_hidden_source_image() {
-		let source = exhaustive_fixture(GgufEndian::Little, 64);
-		let text = gguf_to_structural_ogdl(&source, limits(source.len())).unwrap();
-		let changed = text.replacen("scale e8m0 255", "scale e8m0 254", 1);
-		assert_ne!(
-			changed, text,
-			"fixture did not contain the expected structural scale"
-		);
-		let rebuilt = structural_ogdl_to_gguf(&changed, limits(source.len())).unwrap();
-		assert_ne!(rebuilt, source);
-	}
 }

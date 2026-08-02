@@ -56,14 +56,10 @@ impl NvidiaTarget {
 	}
 
 	#[must_use]
-	pub fn architecture(self) -> String {
-		format!("sm_{}{}", self.sm_major, self.sm_minor)
-	}
+	pub fn architecture(self) -> String { format!("sm_{}{}", self.sm_major, self.sm_minor) }
 
 	#[must_use]
-	pub fn llvm_ptx_feature(self) -> String {
-		format!("+ptx{}", self.ptx_isa)
-	}
+	pub fn llvm_ptx_feature(self) -> String { format!("+ptx{}", self.ptx_isa) }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

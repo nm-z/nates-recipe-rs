@@ -46,9 +46,8 @@ Basis: `[contract]` a training epoch is one optimizer update over the complete t
 updates and a production journal preallocation once expanded a small run into 1.272 TB of trace storage.
 
 - [x] `[contract]` `[audit]` Bound production lifecycle accounting independently of future iteration count. Retain
-      only bounded state required for failure handling and contract validation; keep exhaustive event streams under
-      `#[cfg(test)]` or an explicitly bounded debug mode, and do not expose journals through `TrainingReport` or model
-      artifacts.
+      only bounded state required for failure handling, contract validation, and read-only hardware acceptance
+      inspection. Never add execution controls or lifecycle evidence to semantic models or exported artifacts.
 - [x] `[contract]` `[audit]` Remove one-row optimizer updates and process the entire training partition as one logical
       matrix and one optimizer update per epoch.
 - [x] `[contract]` Separate logical full-set execution from physical realization: remove public minibatch controls and
@@ -149,9 +148,9 @@ insert topology, select labels, or accept metrics without implementing their dec
 Basis: `[api]` `API.ogdl` defines the root declaration facade; `[contract]` internal/inter-crate APIs may still be
 required for measured physical realization and lifecycle validation.
 
-- [x] `[api]` `[audit]` Inventory every `API.ogdl` entry as working, semantically wrong, partial, or unimplemented,
-      with links to its facade symbol, execution path, and acceptance tests.
-- [x] `[audit]` Rewrite canonical API and cookbook tests so ignored `Result` values cannot make broken execution appear
+- [x] `[api]` `[audit]` Inventory every `API.ogdl` entry as routed, partial, or unimplemented, with its production
+      boundary and an explicit separation between implementation status and dated real-hardware evidence.
+- [x] `[audit]` Make runnable cookbook programs propagate failures so a broken public execution cannot appear
       supported.
 - [x] `[contract]` `[api]` Make `.epochs(...)` optional end to end; an omitted bound trains indefinitely until graceful
       Ctrl+C without inventing a finite epoch count.
@@ -261,18 +260,18 @@ subfeature is wholly absent. Split an epic only after its current implementation
       ordering, exact scalar representations, offsets, alignment, and specified padding. A current-version construct
       may not be labeled unsupported to narrow completion; reject only genuinely newer or unknown extensions, without
       an opaque fallback, and enforce successful round trips with binary-equality acceptance tests.
-- [x] `[api]` Replace the monolithic nine-run cookbook with independent, copyable programs for every currently
-      executable family: data composition, dense layers, perceptrons, ordered multi-target objectives,
-      convolution/pooling, residuals, activations, normalization, losses, optimizer/schedules/observability,
-      fixed-token embedding/causal attention, scalar-sequence RNN, GRU, and LSTM, save/resume, and semantic-OGDL inference.
-      Use no cookbook-only abstraction and do not present declaration-only stubs as working examples.
+- [x] `[api]` Keep one `examples/cookbook.rs` containing runnable recipes for every currently executable family: data
+      composition, dense layers, perceptrons, ordered multi-target objectives, convolution/pooling, residuals,
+      activations, normalization, losses, optimizer/schedules/observability, fixed-token embedding/causal attention,
+      scalar-sequence RNN, GRU, and LSTM, save/resume, and semantic-OGDL inference. Do not multiply one cookbook into
+      one binary per recipe, and do not present declaration-only stubs as working examples.
 - [x] `[api]` Add a runnable observed-categorical Bayesian preparation/save/inference cookbook.
-- [x] `[api]` Add runnable cookbooks for the repeated observed categorical Bayesian and first dense-F32 llama GGUF
-      execution instruments. `examples/cookbook_bayes_multi.rs` completed native HSA inference with two ordered target
-      posteriors; `examples/cookbook_gguf_llama.rs` uses a checked-in llama.cpp logits oracle.
-- [x] `[contract]` `[api]` Completed the final deterministic and hardware gate on 2026-07-30. `cargo check
-      --workspace --all-targets`, `cargo test --workspace`, the available formatter check, and `git diff --check`
-      passed. Three literal `recipe run FILE.rs` programs executed multi-target signed-log training, tree/forest,
+- [x] `[api]` Add runnable cookbook recipes for the repeated observed categorical Bayesian and first dense-F32 llama
+      GGUF execution instruments. The `bayes_multi` recipe completed native HSA inference with two ordered target
+      posteriors; the `gguf_llama` recipe uses a checked-in llama.cpp logits oracle.
+- [x] `[contract]` `[api]` Historical 2026-07-30 HSA record: static workspace checks and three literal
+      `recipe run FILE.rs` programs executed multi-target signed-log training, tree/forest,
       embedding/attention, GRU, all-output KNN, repeated observed-categorical Bayesian inference, and dense-F32 llama
       GGUF inference on `hsa:GPU-bb788ef9613fd5b3@0000:03:00.0`; the llama.cpp oracle comparison retained
-      `9.580467046e-14` NMSE. Clippy was not run.
+      `9.580467046e-14` NMSE. This is not a current AMD acceptance result; only NVIDIA hardware is available for the
+      present acceptance pass.

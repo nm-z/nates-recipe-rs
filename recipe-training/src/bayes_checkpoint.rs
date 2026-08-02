@@ -1,15 +1,19 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
-use std::path::Path;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	io::Write,
+	path::Path,
+};
 
 use recipe_ogdl::{Graph, NodeId};
 
-use crate::bayes::{
-	BayesianCategoricalReferenceSet, BayesianCategoricalSchema, CATEGORICAL_BAYES_SMOOTHING,
-	validate_categorical_reference_set,
+use crate::{
+	CheckpointError, CheckpointResult,
+	bayes::{
+		BayesianCategoricalReferenceSet, BayesianCategoricalSchema, CATEGORICAL_BAYES_SMOOTHING,
+		validate_categorical_reference_set,
+	},
+	checkpoint::atomic_save,
 };
-use crate::checkpoint::atomic_save;
-use crate::{CheckpointError, CheckpointResult};
 
 const BAYES_MODEL_FORMAT_VERSION_ONE: u32 = 1;
 const BAYES_MODEL_FORMAT_VERSION_TWO: u32 = 2;
@@ -85,14 +89,10 @@ impl BayesModelArtifact {
 	}
 
 	#[must_use]
-	pub const fn format_version(&self) -> u32 {
-		self.format_version
-	}
+	pub const fn format_version(&self) -> u32 { self.format_version }
 
 	#[must_use]
-	pub const fn smoothing(&self) -> f32 {
-		f32::from_bits(self.smoothing_bits)
-	}
+	pub const fn smoothing(&self) -> f32 { f32::from_bits(self.smoothing_bits) }
 
 	#[must_use]
 	pub fn references(&self) -> &BayesianCategoricalReferenceSet {
@@ -102,9 +102,7 @@ impl BayesModelArtifact {
 	}
 
 	#[must_use]
-	pub fn conditionals(&self) -> &[BayesianCategoricalReferenceSet] {
-		&self.conditionals
-	}
+	pub fn conditionals(&self) -> &[BayesianCategoricalReferenceSet] { &self.conditionals }
 
 	/// Continue with another complete observed partition. Repeated rows remain
 	/// repeated evidence; saved observations remain before current observations.
@@ -407,19 +405,16 @@ impl Decoder {
 		let format_version = self.parse_u32(self.scalar(format_field)?, "format-version")?;
 		let conditionals = match format_version {
 			BAYES_MODEL_FORMAT_VERSION_ONE => {
-				let fields = self.fields(
-					*root,
-					&[
-						"format-version",
-						"smoothing",
-						"reference-rows",
-						"reference-source-rows",
-						"parents",
-						"child",
-						"reference-parent-codes",
-						"reference-child-codes",
-					],
-				)?;
+				let fields = self.fields(*root, &[
+					"format-version",
+					"smoothing",
+					"reference-rows",
+					"reference-source-rows",
+					"parents",
+					"child",
+					"reference-parent-codes",
+					"reference-child-codes",
+				])?;
 				self.require_laplace_one(fields["smoothing"])?;
 				vec![self.decode_reference_fields(&fields)?]
 			}
@@ -475,17 +470,14 @@ impl Decoder {
 	}
 
 	fn decode_reference(&mut self, node: NodeId) -> CheckpointResult<BayesianCategoricalReferenceSet> {
-		let fields = self.fields(
-			node,
-			&[
-				"reference-rows",
-				"reference-source-rows",
-				"parents",
-				"child",
-				"reference-parent-codes",
-				"reference-child-codes",
-			],
-		)?;
+		let fields = self.fields(node, &[
+			"reference-rows",
+			"reference-source-rows",
+			"parents",
+			"child",
+			"reference-parent-codes",
+			"reference-child-codes",
+		])?;
 		self.decode_reference_fields(&fields)
 	}
 

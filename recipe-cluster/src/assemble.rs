@@ -11,10 +11,13 @@ use recipe_probe::{
 	PROFILE_SCHEMA,
 };
 
-use crate::error::{ClusterError, ClusterResult};
-use crate::hash::cluster_digest;
-use crate::model::{
-	ClusterConfiguration, MeasuredNetworkPair, MemberProfileIdentity, PairKey, SubmittedProfile, index_submissions,
+use crate::{
+	error::{ClusterError, ClusterResult},
+	hash::cluster_digest,
+	model::{
+		ClusterConfiguration, MeasuredNetworkPair, MemberProfileIdentity, PairKey, SubmittedProfile,
+		index_submissions,
+	},
 };
 
 #[derive(Clone, Debug)]
@@ -83,17 +86,11 @@ impl IdAllocator {
 		Ok(MachineId::new(take_id(&mut self.next_machine, "machine")?))
 	}
 
-	fn node(&mut self) -> ClusterResult<NodeId> {
-		Ok(NodeId::new(take_id(&mut self.next_node, "node")?))
-	}
+	fn node(&mut self) -> ClusterResult<NodeId> { Ok(NodeId::new(take_id(&mut self.next_node, "node")?)) }
 
-	fn device(&mut self) -> ClusterResult<DeviceId> {
-		Ok(DeviceId::new(take_id(&mut self.next_device, "device")?))
-	}
+	fn device(&mut self) -> ClusterResult<DeviceId> { Ok(DeviceId::new(take_id(&mut self.next_device, "device")?)) }
 
-	fn link(&mut self) -> ClusterResult<LinkId> {
-		Ok(LinkId::new(take_id(&mut self.next_link, "link")?))
-	}
+	fn link(&mut self) -> ClusterResult<LinkId> { Ok(LinkId::new(take_id(&mut self.next_link, "link")?)) }
 
 	fn transport(&mut self) -> ClusterResult<TransportId> {
 		Ok(TransportId::new(take_id(
@@ -187,9 +184,11 @@ fn prepare_members(
 		let profile = indexed
 			.remove(spec.key())
 			.ok_or_else(|| ClusterError::MissingMember(spec.key().to_string()))?;
-		let identity = MemberProfileIdentity::derive(&profile).map_err(|error| ClusterError::InvalidMember {
-			member: spec.key().to_string(),
-			message: error.to_string(),
+		let identity = MemberProfileIdentity::derive(&profile).map_err(|error| {
+			ClusterError::InvalidMember {
+				member: spec.key().to_string(),
+				message: error.to_string(),
+			}
 		})?;
 		ensure(
 			identity == spec.expected(),
@@ -203,9 +202,11 @@ fn prepare_members(
 			.topology
 			.machines
 			.first()
-			.ok_or_else(|| ClusterError::InvalidMember {
-				member: spec.key().to_string(),
-				message: "profile contains no machine".to_owned(),
+			.ok_or_else(|| {
+				ClusterError::InvalidMember {
+					member: spec.key().to_string(),
+					message: "profile contains no machine".to_owned(),
+				}
 			})?
 			.name
 			.clone();
@@ -223,10 +224,12 @@ fn prepare_members(
 		});
 	}
 	match indexed.first_key_value() {
-		Some((key, _)) => Err(ClusterError::InvalidMember {
-			member: key.to_string(),
-			message: "profile was submitted by an unconfigured member".to_owned(),
-		}),
+		Some((key, _)) => {
+			Err(ClusterError::InvalidMember {
+				member: key.to_string(),
+				message: "profile was submitted by an unconfigured member".to_owned(),
+			})
+		}
 		None => Ok(()),
 	}?;
 	Ok(members)
@@ -277,10 +280,12 @@ fn resolve_network(
 		result.push(resolve_pair(&member_index, key, measurement, benchmarks)?);
 	}
 	match indexed.first_key_value() {
-		Some((key, _)) => Err(ClusterError::InvalidNetworkMeasurement(format!(
-			"unconfigured pair {} supplied probe evidence",
-			key.display()
-		))),
+		Some((key, _)) => {
+			Err(ClusterError::InvalidNetworkMeasurement(format!(
+				"unconfigured pair {} supplied probe evidence",
+				key.display()
+			)))
+		}
 		None => Ok(()),
 	}?;
 	Ok(result)
@@ -372,26 +377,30 @@ fn resolve_pair(
 		first_memory,
 		second_memory,
 	) = match local_is_first {
-		true => (
-			local_device,
-			remote_device,
-			outbound,
-			inbound,
-			evidence.descriptor.outbound_maximum_inflight,
-			evidence.descriptor.inbound_maximum_inflight,
-			local_memory,
-			remote_memory,
-		),
-		false => (
-			remote_device,
-			local_device,
-			inbound,
-			outbound,
-			evidence.descriptor.inbound_maximum_inflight,
-			evidence.descriptor.outbound_maximum_inflight,
-			remote_memory,
-			local_memory,
-		),
+		true => {
+			(
+				local_device,
+				remote_device,
+				outbound,
+				inbound,
+				evidence.descriptor.outbound_maximum_inflight,
+				evidence.descriptor.inbound_maximum_inflight,
+				local_memory,
+				remote_memory,
+			)
+		}
+		false => {
+			(
+				remote_device,
+				local_device,
+				inbound,
+				outbound,
+				evidence.descriptor.inbound_maximum_inflight,
+				evidence.descriptor.outbound_maximum_inflight,
+				remote_memory,
+				local_memory,
+			)
+		}
 	};
 	Ok(ResolvedNetworkPair {
 		key,
@@ -543,11 +552,13 @@ fn remap_profile(
 	};
 	let mut peer_benchmarks = network
 		.iter()
-		.map(|pair| MeasuredPeerBenchmark {
-			session_id: pair.evidence_session.clone(),
-			outbound_rate: pair.evidence_outbound_rate,
-			inbound_rate: pair.evidence_inbound_rate,
-			evidence: pair.benchmark_evidence,
+		.map(|pair| {
+			MeasuredPeerBenchmark {
+				session_id: pair.evidence_session.clone(),
+				outbound_rate: pair.evidence_outbound_rate,
+				inbound_rate: pair.evidence_inbound_rate,
+				evidence: pair.benchmark_evidence,
+			}
 		})
 		.collect::<Vec<_>>();
 	peer_benchmarks.sort_by(|left, right| left.session_id.cmp(&right.session_id));
@@ -808,17 +819,21 @@ fn validate_cluster_shape(profile: &MeasuredProfile) -> ClusterResult<()> {
 		let from = machine_by_device.get(&link.from);
 		let to = machine_by_device.get(&link.to);
 		match (from, to) {
-			(Some(from), Some(to)) => match from == to {
-				true => Ok(()),
-				false => {
-					adjacency.entry(*from).or_default().insert(*to);
-					adjacency.entry(*to).or_default().insert(*from);
-					Ok(())
+			(Some(from), Some(to)) => {
+				match from == to {
+					true => Ok(()),
+					false => {
+						adjacency.entry(*from).or_default().insert(*to);
+						adjacency.entry(*to).or_default().insert(*from);
+						Ok(())
+					}
 				}
-			},
-			(Some(_), None) | (None, Some(_)) | (None, None) => Err(ClusterError::InvalidClusterProfile(
-				"link references an unknown device".to_owned(),
-			)),
+			}
+			(Some(_), None) | (None, Some(_)) | (None, None) => {
+				Err(ClusterError::InvalidClusterProfile(
+					"link references an unknown device".to_owned(),
+				))
+			}
 		}?;
 	}
 	let first = profile

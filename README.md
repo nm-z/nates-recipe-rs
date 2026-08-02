@@ -50,17 +50,25 @@ It writes `model.ogdl` only after a successful `init -> loop -> exit`
 lifecycle. Inference builders remain checked declarations; the README does not
 advertise the retired `train`, `serve`, or `detect` CLI commands.
 
-## Build and test
+## Build and acceptance
 
 ```bash
 cargo build --workspace
-cargo test --workspace
+cargo check --workspace --all-targets
+cargo build --examples --release
 cargo run --bin recipe -- probe --help
 ```
 
-The native backends dynamically open driver libraries, so ordinary compilation
-and the deterministic test suite do not require a GPU. Live probing and
-execution require the corresponding hardware, driver, and offline toolchain.
+Real-data, real-hardware proof gates are documented in
+[`recipe-acceptance/README.md`](recipe-acceptance/README.md). They are explicit
+commands, not part of `cargo test`, and missing prerequisites fail rather than
+skip.
+
+Compilation is build hygiene, not runtime evidence. Acceptance executes public
+training and inference declarations on real datasets and real CUDA or HSA
+hardware. A missing device, driver, dataset, compiler, or comparison oracle
+makes that acceptance run unsuccessful rather than skipped. Standalone probing
+is useful diagnostics but does not establish workload correctness.
 
 The main pipeline is split into focused crates:
 

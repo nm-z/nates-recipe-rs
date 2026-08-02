@@ -1,8 +1,12 @@
-use crate::discovery::{ComputeCapability, DeviceInfo, DeviceUuid, Discovery, DriverVersion};
-use crate::ffi::{DriverCapabilities, DriverSymbol};
 use core::fmt;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+
+use sha2::{Digest, Sha256};
+
+use crate::{
+	discovery::{ComputeCapability, DeviceInfo, DeviceUuid, Discovery, DriverVersion},
+	ffi::{DriverCapabilities, DriverSymbol},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolchainIdentity {
@@ -251,90 +255,5 @@ fn validate_nonempty(identity: &ArtifactIdentity, issues: &mut Vec<ArtifactIssue
 		if text.trim().is_empty() {
 			issues.push(ArtifactIssue::EmptyIdentityField { field });
 		}
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::Driver;
-	use crate::ffi::{DriverSymbol, test_support};
-
-	fn identities() -> (
-		Vec<u8>,
-		ArtifactIdentity,
-		DeploymentIdentity,
-		crate::Discovery,
-	) {
-		let driver = Driver::from_test_api(test_support::api(false));
-		let discovery = driver.discover().unwrap();
-		let deployment = DeploymentIdentity::from_discovery(&discovery, &discovery.devices[1]).unwrap();
-		let cubin = b"\x7fELFfake-cubin".to_vec();
-		let identity = ArtifactIdentity {
-			sha256: Sha256::digest(&cubin).into(),
-			target: ComputeCapability::new(5, 2),
-			toolchain: ToolchainIdentity {
-				zig_version: "0.17.0-dev".to_owned(),
-				llvm_version: "21.1.8".to_owned(),
-				ptx_isa_version: "7.8".to_owned(),
-				ptxas_version: "11.4".to_owned(),
-				cuda_toolkit_version: "11.4".to_owned(),
-				cubin_format: "elf64-cuda".to_owned(),
-			},
-			minimum_driver: DriverVersion::new(11, 0).unwrap(),
-			maximum_driver: Some(DriverVersion::new(11, 9).unwrap()),
-			required_driver_symbols: BTreeSet::from([DriverSymbol::Init, DriverSymbol::CtxCreateV2]),
-		};
-		(cubin, identity, deployment, discovery)
-	}
-
-	#[test]
-	fn exact_r470_compatible_identity_passes() {
-		let (cubin, identity, deployment, _discovery) = identities();
-		validate_artifact_compatibility(&cubin, &identity, &identity, &deployment)
-			.expect("exact artifact should pass");
-	}
-
-	#[test]
-	fn near_match_sm_is_rejected() {
-		let (cubin, identity, mut deployment, _discovery) = identities();
-		deployment.target = ComputeCapability::new(8, 6);
-		let error = validate_artifact_compatibility(&cubin, &identity, &identity, &deployment).unwrap_err();
-		assert!(error.issues.contains(&ArtifactIssue::DeviceTargetMismatch {
-			artifact: ComputeCapability::new(5, 2),
-			device: ComputeCapability::new(8, 6),
-		}));
-	}
-
-	#[test]
-	fn optional_loading_mode_is_not_assumed() {
-		let (cubin, mut identity, deployment, _discovery) = identities();
-		identity
-			.required_driver_symbols
-			.insert(DriverSymbol::ModuleGetLoadingMode);
-		let error = validate_artifact_compatibility(&cubin, &identity, &identity, &deployment).unwrap_err();
-		assert!(error.issues.contains(&ArtifactIssue::MissingDriverSymbol {
-			symbol: DriverSymbol::ModuleGetLoadingMode,
-		}));
-	}
-
-	#[test]
-	fn content_hash_and_full_manifest_are_fail_closed() {
-		let (mut cubin, identity, deployment, _discovery) = identities();
-		cubin.push(0);
-		let mut observed = identity.clone();
-		observed.toolchain.ptxas_version = "13.3".to_owned();
-		let error = validate_artifact_compatibility(&cubin, &identity, &observed, &deployment).unwrap_err();
-		assert!(
-			error.issues
-				.iter()
-				.any(|issue| matches!(issue, ArtifactIssue::DigestMismatch { .. }))
-		);
-		assert!(
-			error.issues
-				.contains(&ArtifactIssue::IdentityFieldMismatch {
-					field: ArtifactField::PtxasVersion,
-				})
-		);
 	}
 }

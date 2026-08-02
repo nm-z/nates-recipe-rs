@@ -34,9 +34,7 @@ impl BackendMessage {
 	}
 
 	#[must_use]
-	pub const fn was_truncated(&self) -> bool {
-		self.truncated
-	}
+	pub const fn was_truncated(&self) -> bool { self.truncated }
 }
 
 impl Default for BackendMessage {
@@ -144,7 +142,6 @@ pub enum ExecutorError {
 		detail: &'static str,
 	},
 	DeviceFault {
-		calculation: TaskId,
 		readback: TaskId,
 		value: ValueId,
 		code: i32,
@@ -206,18 +203,22 @@ impl fmt::Display for ExecutorError {
 				device,
 				expected,
 				actual,
-			} => write!(
-				formatter,
-				"device {device} init image identifies value {actual}, expected {expected}"
-			),
+			} => {
+				write!(
+					formatter,
+					"device {device} init image identifies value {actual}, expected {expected}"
+				)
+			}
 			Self::AdmissionSizeMismatch {
 				device,
 				expected,
 				actual,
-			} => write!(
-				formatter,
-				"device {device} init image is {actual}, expected exactly {expected}"
-			),
+			} => {
+				write!(
+					formatter,
+					"device {device} init image is {actual}, expected exactly {expected}"
+				)
+			}
 			Self::InvalidPhaseTask {
 				phase,
 				task,
@@ -230,14 +231,15 @@ impl fmt::Display for ExecutorError {
 				)
 			}
 			Self::DeviceFault {
-				calculation,
 				readback,
 				value,
 				code,
-			} => write!(
-				formatter,
-				"checked calculation {calculation} reported device fault code {code} through value {value} at readback task {readback}"
-			),
+			} => {
+				write!(
+					formatter,
+					"checked device work reported fault code {code} through value {value} at readback task {readback}"
+				)
+			}
 			Self::LifecycleInvariant { detail } => {
 				write!(formatter, "executor lifecycle invariant failed: {detail}")
 			}
@@ -250,23 +252,29 @@ impl fmt::Display for ExecutorError {
 			Self::WatchdogExpired {
 				phase,
 				nonprogress_polls,
-			} => write!(
-				formatter,
-				"{phase:?} watchdog expired after {nonprogress_polls} nonprogress polls"
-			),
+			} => {
+				write!(
+					formatter,
+					"{phase:?} watchdog expired after {nonprogress_polls} nonprogress polls"
+				)
+			}
 			Self::InvalidWatchdog {
 				max_nonprogress_polls,
-			} => write!(
-				formatter,
-				"watchdog maximum must be nonzero, got {max_nonprogress_polls}"
-			),
-			Self::LoopRepetitionUnsupported { iterations } => write!(
-				formatter,
-				"backend does not support the finalized loop count of {}",
-				iterations
-					.finite()
-					.map_or_else(|| "unbounded".to_owned(), |bound| bound.get().to_string())
-			),
+			} => {
+				write!(
+					formatter,
+					"watchdog maximum must be nonzero, got {max_nonprogress_polls}"
+				)
+			}
+			Self::LoopRepetitionUnsupported { iterations } => {
+				write!(
+					formatter,
+					"backend does not support the finalized loop count of {}",
+					iterations
+						.finite()
+						.map_or_else(|| "unbounded".to_owned(), |bound| bound.get().to_string())
+				)
+			}
 			Self::MetricSequenceOverflow => formatter.write_str("metric sequence counter overflowed"),
 			Self::PendingPollCountOverflow { task } => {
 				write!(formatter, "pending-poll counter overflowed for task {task}")

@@ -6,14 +6,13 @@ use recipe_language::{
 };
 use recipe_math::MathFunction;
 
-use crate::{OperationDescriptor, OperationErrorKind, OperationId, OperationResult};
-
 use super::{
 	Emitter, FamilyDispatch, KernelEmission, MAX_I32_INDEX, MaterializationRequest, identity_program, input,
 	language_error, operation_error, output, prepared_f32, prepared_tree_lanes, prepared_u64, request_error,
 	require_dtype, require_exact_abi, require_shape, require_true, scalar_binary, scalar_builder, scalar_f32,
 	scalar_finish, scalar_input, scalar_ternary, scalar_unary,
 };
+use crate::{OperationDescriptor, OperationErrorKind, OperationId, OperationResult};
 
 const OPERATIONS: &[(&str, &str)] = &[
 	("gpu_boruvka_mst", "gpu-core/src/cluster.rs:395"),
@@ -59,11 +58,13 @@ pub(super) fn dispatch(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 				"gpu_pairwise_l2" => emit_pairwise_l2(request, emitter),
 				"gpu_td_targets" => emit_temporal_difference_targets(request, emitter),
 				"gpu_union_find_cc" => emit_union_find_two_nodes(request, emitter),
-				symbol => Err(operation_error(
-					request.descriptor.id,
-					OperationErrorKind::GraphMaterializationFailed,
-					format!("graph/clustering/RL dispatch is incomplete for {symbol}"),
-				)),
+				symbol => {
+					Err(operation_error(
+						request.descriptor.id,
+						OperationErrorKind::GraphMaterializationFailed,
+						format!("graph/clustering/RL dispatch is incomplete for {symbol}"),
+					))
+				}
 			};
 			FamilyDispatch::Owned(result)
 		}
@@ -71,12 +72,11 @@ pub(super) fn dispatch(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 }
 
 fn emit_degree(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["edge_destinations"],
-		&["degrees"],
-		&["nodes", "edges", "endpoint_indices_verified"],
-	)?;
+	require_exact_abi(request, &["edge_destinations"], &["degrees"], &[
+		"nodes",
+		"edges",
+		"endpoint_indices_verified",
+	])?;
 	let edge_destinations = input(request, "edge_destinations")?;
 	let degrees = output(request, "degrees")?;
 	let nodes = prepared_dimension(request, "nodes")?;
@@ -192,12 +192,11 @@ fn emit_gcn_normalization(request: &MaterializationRequest<'_>, emitter: &mut Em
 }
 
 fn emit_discounted_returns(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["rewards"],
-		&["returns"],
-		&["length", "gamma", "tree_lanes"],
-	)?;
+	require_exact_abi(request, &["rewards"], &["returns"], &[
+		"length",
+		"gamma",
+		"tree_lanes",
+	])?;
 	let rewards = input(request, "rewards")?;
 	let returns = output(request, "returns")?;
 	let length = prepared_dimension(request, "length")?;
@@ -1050,12 +1049,12 @@ fn emit_core_distance(request: &MaterializationRequest<'_>, emitter: &mut Emitte
 }
 
 fn emit_pairwise_l2(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["query", "training"],
-		&["distances"],
-		&["queries", "training_rows", "dimensions", "tree_lanes"],
-	)?;
+	require_exact_abi(request, &["query", "training"], &["distances"], &[
+		"queries",
+		"training_rows",
+		"dimensions",
+		"tree_lanes",
+	])?;
 	let query = input(request, "query")?;
 	let training = input(request, "training")?;
 	let distances = output(request, "distances")?;
@@ -1503,10 +1502,12 @@ fn prepared_dimension(request: &MaterializationRequest<'_>, name: &str) -> Opera
 	let value = prepared_u64(request.descriptor.id, request.parameters, name)?;
 	match value > 0 && value <= MAX_I32_INDEX {
 		true => Ok(value),
-		false => Err(unsupported(
-			request,
-			format!("{name} must be in 1..={MAX_I32_INDEX}, got {value}"),
-		)),
+		false => {
+			Err(unsupported(
+				request,
+				format!("{name} must be in 1..={MAX_I32_INDEX}, got {value}"),
+			))
+		}
 	}
 }
 
@@ -1514,10 +1515,12 @@ fn prepared_count(request: &MaterializationRequest<'_>, name: &str) -> Operation
 	let value = prepared_u64(request.descriptor.id, request.parameters, name)?;
 	match value <= MAX_I32_INDEX {
 		true => Ok(value),
-		false => Err(unsupported(
-			request,
-			format!("{name} must be in 0..={MAX_I32_INDEX}, got {value}"),
-		)),
+		false => {
+			Err(unsupported(
+				request,
+				format!("{name} must be in 0..={MAX_I32_INDEX}, got {value}"),
+			))
+		}
 	}
 }
 
@@ -1533,10 +1536,12 @@ fn checked_product(request: &MaterializationRequest<'_>, factors: &[u64], role: 
 	})?;
 	match product <= MAX_I32_INDEX {
 		true => Ok(product),
-		false => Err(unsupported(
-			request,
-			format!("{role} {product} exceeds the canonical int32 index domain"),
-		)),
+		false => {
+			Err(unsupported(
+				request,
+				format!("{role} {product} exceeds the canonical int32 index domain"),
+			))
+		}
 	}
 }
 
@@ -1544,36 +1549,44 @@ fn finite_parameter(request: &MaterializationRequest<'_>, name: &str) -> Operati
 	let value = prepared_f32(request, name)?;
 	match value.is_finite() {
 		true => Ok(value),
-		false => Err(request_error(
-			request,
-			format!("{name} must be a finite f32"),
-		)),
+		false => {
+			Err(request_error(
+				request,
+				format!("{name} must be a finite f32"),
+			))
+		}
 	}
 }
 
 fn prepared_bool(request: &MaterializationRequest<'_>, name: &str) -> OperationResult<bool> {
 	match request.parameters.get(name) {
 		Some(super::PreparedParameter::Bool(value)) => Ok(*value),
-		Some(value) => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::PreparedParameterTypeMismatch,
-			format!("prepared parameter {name:?} is {value:?}, expected Bool"),
-		)),
-		None => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::MissingPreparedParameter,
-			format!("prepared parameter {name:?} is required"),
-		)),
+		Some(value) => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::PreparedParameterTypeMismatch,
+				format!("prepared parameter {name:?} is {value:?}, expected Bool"),
+			))
+		}
+		None => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::MissingPreparedParameter,
+				format!("prepared parameter {name:?} is required"),
+			))
+		}
 	}
 }
 
 fn require_iteration_input(request: &MaterializationRequest<'_>, expected: &str) -> OperationResult<()> {
 	match request.iteration_shape_input == expected {
 		true => Ok(()),
-		false => Err(request_error(
-			request,
-			format!("iteration shape input must be {expected:?} for the statically bounded repeated graph"),
-		)),
+		false => {
+			Err(request_error(
+				request,
+				format!("iteration shape input must be {expected:?} for the statically bounded repeated graph"),
+			))
+		}
 	}
 }
 

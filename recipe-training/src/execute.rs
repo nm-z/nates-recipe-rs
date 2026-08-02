@@ -1,26 +1,32 @@
-use core::fmt;
-use core::num::{NonZeroU64, NonZeroUsize};
-use std::collections::{BTreeMap, BTreeSet};
-use std::error::Error as StdError;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::time::Duration;
+use core::{
+	fmt,
+	num::{NonZeroU64, NonZeroUsize},
+};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	error::Error as StdError,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+		mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
+	},
+	time::{Duration, Instant},
+};
 
 use recipe_core::{
-	ArtifactIdentity, BundleIdentity, ByteCount, DType, DeviceId, Digest, DiscoveryIdentity, FinalizedBundle,
-	InitDataImage, LoopIterations, MetricId, MetricPurpose, MetricSlotId, RealizationIdentity,
+	ArtifactIdentity, BundleIdentity, ByteCount, DType, DeviceId, DeviceKind, Digest, DiscoveryIdentity,
+	FinalizedBundle, InitDataImage, LoopIterations, MetricId, MetricPurpose, MetricSlotId, RealizationIdentity,
 	ResolvedTransferEndpoint, ResolvedValueLocation, RunId, RunPhase, TargetIdentity, TaskId, TaskKind,
 	ToolchainIdentity, TopologyIdentity, TransferEndpoint, ValueId,
 };
 use recipe_executor::{
-	Backend, DeviceImage, ExecutorError, ExitImage, LoopStatus, MetricSample, PreparedRun, RunFailure, RunJournal,
-	Watchdog,
+	Backend, DeviceImage, ExecutorError, ExitImage, LogicalEvent, LoopStatus, MetricSample, PhysicalCall,
+	PreparedRun, RunFailure, RunJournal, Watchdog,
 };
 use recipe_language::{ContiguousOrder, TensorLayout};
 use recipe_native_executor::{
-	CandidateCrossBackendTransfer, CrossBackendTransfer, LocalError, LocalPreparedSession, RuntimeArtifactKind,
-	ValidatedCandidateSession,
+	CandidateCrossBackendTransfer, CrossBackendTransfer, LocalError, LocalPreparedSession, NativeExecutionEvidence,
+	RuntimeArtifactKind, ValidatedCandidateSession,
 };
 use recipe_prepare::{
 	ArtifactProvider, CandidateRealizer, NativeArtifact, PrepareError, PreparedNativeSession, Preparer,
@@ -30,7 +36,7 @@ use recipe_probe::MeasuredProfile;
 use crate::{
 	CompiledInference, CompiledKnnInference, CompiledTraining, DenseTask, InferenceExternalInput, InferenceInputRole,
 	InferenceOutputContract, InferencePredictionKind, InferenceTask, KnnInferenceOutputContract,
-	KnnInferencePredictionKind, OwnedExternalInput,
+	KnnInferencePredictionKind, OwnedExternalInput, TrainingBounds,
 };
 
 pub type TrainingExecutionResult<T> = Result<T, TrainingExecutionError>;
@@ -51,9 +57,7 @@ impl BlockingPollBackoff {
 		}
 	}
 
-	fn reset(&mut self) {
-		self.next_delay = BLOCKING_POLL_INITIAL_DELAY;
-	}
+	fn reset(&mut self) { self.next_delay = BLOCKING_POLL_INITIAL_DELAY; }
 
 	fn wait(&mut self) {
 		std::thread::sleep(self.next_delay);
@@ -80,9 +84,7 @@ pub struct TrainingExecutionLimits {
 
 impl TrainingExecutionLimits {
 	#[must_use]
-	pub const fn new(watchdog: Watchdog) -> Self {
-		Self { watchdog }
-	}
+	pub const fn new(watchdog: Watchdog) -> Self { Self { watchdog } }
 }
 
 /// Host-owned, read-only control observed only at completed loop-iteration
@@ -113,9 +115,7 @@ impl<'a> TrainingExecutionControl<'a> {
 			.is_some_and(|requested| requested.load(Ordering::Acquire))
 	}
 
-	const fn has_stop_source(self) -> bool {
-		self.stop_requested.is_some()
-	}
+	const fn has_stop_source(self) -> bool { self.stop_requested.is_some() }
 }
 
 fn validate_training_execution_control(
@@ -136,9 +136,7 @@ pub struct InferenceExecutionLimits {
 
 impl InferenceExecutionLimits {
 	#[must_use]
-	pub const fn new(watchdog: Watchdog) -> Self {
-		Self { watchdog }
-	}
+	pub const fn new(watchdog: Watchdog) -> Self { Self { watchdog } }
 }
 
 /// Nonblocking observer accounting. A dropped sample never delays executor
@@ -166,9 +164,7 @@ pub struct TrainingMetricObserver {
 
 impl TrainingMetricObserver {
 	#[must_use]
-	pub const fn stats(&self) -> TrainingMetricObserverStats {
-		self.stats
-	}
+	pub const fn stats(&self) -> TrainingMetricObserverStats { self.stats }
 
 	fn try_observe(&mut self, sample: &TrainingMetricSample) {
 		let Some(observed) = self.selected.get_mut(&sample.metric) else {
@@ -290,34 +286,22 @@ pub struct RealizedNativeKernel {
 
 impl RealizedNativeKernel {
 	#[must_use]
-	pub const fn format(&self) -> NativeKernelFormat {
-		self.format
-	}
+	pub const fn format(&self) -> NativeKernelFormat { self.format }
 
 	#[must_use]
-	pub const fn target(&self) -> &TargetIdentity {
-		&self.target
-	}
+	pub const fn target(&self) -> &TargetIdentity { &self.target }
 
 	#[must_use]
-	pub const fn toolchain(&self) -> &ToolchainIdentity {
-		&self.toolchain
-	}
+	pub const fn toolchain(&self) -> &ToolchainIdentity { &self.toolchain }
 
 	#[must_use]
-	pub const fn digest(&self) -> Digest {
-		self.digest
-	}
+	pub const fn digest(&self) -> Digest { self.digest }
 
 	#[must_use]
-	pub fn bytes(&self) -> &[u8] {
-		&self.bytes
-	}
+	pub fn bytes(&self) -> &[u8] { &self.bytes }
 
 	#[must_use]
-	pub fn entries(&self) -> &[ArtifactIdentity] {
-		&self.entries
-	}
+	pub fn entries(&self) -> &[ArtifactIdentity] { &self.entries }
 }
 
 /// Exact measured-system identities and native images retained from the one
@@ -332,24 +316,16 @@ pub struct RealizedNativeKernelSet {
 
 impl RealizedNativeKernelSet {
 	#[must_use]
-	pub const fn realization(&self) -> RealizationIdentity {
-		self.realization
-	}
+	pub const fn realization(&self) -> RealizationIdentity { self.realization }
 
 	#[must_use]
-	pub const fn topology(&self) -> TopologyIdentity {
-		self.topology
-	}
+	pub const fn topology(&self) -> TopologyIdentity { self.topology }
 
 	#[must_use]
-	pub const fn discovery(&self) -> DiscoveryIdentity {
-		self.discovery
-	}
+	pub const fn discovery(&self) -> DiscoveryIdentity { self.discovery }
 
 	#[must_use]
-	pub fn kernels(&self) -> &[RealizedNativeKernel] {
-		&self.kernels
-	}
+	pub fn kernels(&self) -> &[RealizedNativeKernel] { &self.kernels }
 }
 
 fn retain_realized_native_kernels(
@@ -401,51 +377,101 @@ pub struct CompletedTrainingExecution {
 	external_output_values: Vec<ValueId>,
 	metrics: Vec<FinalTrainingMetric>,
 	native_kernels: RealizedNativeKernelSet,
+	native_evidence: NativeExecutionEvidence,
+	training_evidence: TrainingExecutionEvidence,
 	journal: RunJournal,
+}
+
+/// Facts joined from the compiled full partition, finalized device placement,
+/// and the completed real executor journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrainingExecutionEvidence {
+	bounds: TrainingBounds,
+	logical_updates_per_epoch: u64,
+	optimizer_parameter_kernels: usize,
+	optimizer_parameter_tasks: usize,
+	optimizer_parameter_submissions: usize,
+	loop_iterations_started: usize,
+	loop_iterations_completed: usize,
+	loop_calculation_tasks: usize,
+	non_gpu_calculation_tasks: usize,
+	non_gpu_calculation_submissions: usize,
+	logical_events_compacted: u128,
+	physical_calls_compacted: u128,
+}
+
+impl TrainingExecutionEvidence {
+	#[must_use]
+	pub const fn bounds(&self) -> TrainingBounds { self.bounds }
+
+	#[must_use]
+	pub const fn logical_updates_per_epoch(&self) -> u64 { self.logical_updates_per_epoch }
+
+	#[must_use]
+	pub const fn optimizer_parameter_kernels(&self) -> usize { self.optimizer_parameter_kernels }
+
+	#[must_use]
+	pub const fn optimizer_parameter_tasks(&self) -> usize { self.optimizer_parameter_tasks }
+
+	#[must_use]
+	pub const fn optimizer_parameter_submissions(&self) -> usize { self.optimizer_parameter_submissions }
+
+	#[must_use]
+	pub const fn loop_iterations_started(&self) -> usize { self.loop_iterations_started }
+
+	#[must_use]
+	pub const fn loop_iterations_completed(&self) -> usize { self.loop_iterations_completed }
+
+	#[must_use]
+	pub const fn loop_calculation_tasks(&self) -> usize { self.loop_calculation_tasks }
+
+	#[must_use]
+	pub const fn non_gpu_calculation_tasks(&self) -> usize { self.non_gpu_calculation_tasks }
+
+	#[must_use]
+	pub const fn non_gpu_calculation_submissions(&self) -> usize { self.non_gpu_calculation_submissions }
+
+	#[must_use]
+	pub const fn logical_events_compacted(&self) -> u128 { self.logical_events_compacted }
+
+	#[must_use]
+	pub const fn physical_calls_compacted(&self) -> u128 { self.physical_calls_compacted }
 }
 
 impl CompletedTrainingExecution {
 	#[must_use]
-	pub const fn run(&self) -> RunId {
-		self.run
-	}
+	pub const fn run(&self) -> RunId { self.run }
 
 	#[must_use]
-	pub const fn bundle(&self) -> BundleIdentity {
-		self.bundle
-	}
+	pub const fn bundle(&self) -> BundleIdentity { self.bundle }
 
 	/// Exact finalized egress images. Their task and resolved source preserve
 	/// the physical output identity selected by the planner.
 	#[must_use]
-	pub fn external_outputs(&self) -> &[ExitImage] {
-		&self.external_outputs
-	}
+	pub fn external_outputs(&self) -> &[ExitImage] { &self.external_outputs }
 
 	/// Logical tensor identity corresponding to each physical exit image.
 	///
 	/// Entries are aligned by index with [`Self::external_outputs`]. Physical
 	/// source identities remain available on each [`ExitImage`].
 	#[must_use]
-	pub fn external_output_values(&self) -> &[ValueId] {
-		&self.external_output_values
-	}
+	pub fn external_output_values(&self) -> &[ValueId] { &self.external_output_values }
 
 	#[must_use]
-	pub fn metrics(&self) -> &[FinalTrainingMetric] {
-		&self.metrics
-	}
+	pub fn metrics(&self) -> &[FinalTrainingMetric] { &self.metrics }
 
 	/// Exact native images retained from the successful prepared realization.
 	#[must_use]
-	pub const fn native_kernels(&self) -> &RealizedNativeKernelSet {
-		&self.native_kernels
-	}
+	pub const fn native_kernels(&self) -> &RealizedNativeKernelSet { &self.native_kernels }
 
 	#[must_use]
-	pub const fn journal(&self) -> &RunJournal {
-		&self.journal
-	}
+	pub const fn native_evidence(&self) -> &NativeExecutionEvidence { &self.native_evidence }
+
+	#[must_use]
+	pub const fn training_evidence(&self) -> &TrainingExecutionEvidence { &self.training_evidence }
+
+	#[must_use]
+	pub const fn journal(&self) -> &RunJournal { &self.journal }
 
 	/// Decompose execution evidence while preserving the logical identity for
 	/// every physical exit image. The two returned vectors are index-aligned.
@@ -459,6 +485,7 @@ impl CompletedTrainingExecution {
 		Vec<ValueId>,
 		Vec<FinalTrainingMetric>,
 		RealizedNativeKernelSet,
+		NativeExecutionEvidence,
 		RunJournal,
 	) {
 		(
@@ -468,6 +495,7 @@ impl CompletedTrainingExecution {
 			self.external_output_values,
 			self.metrics,
 			self.native_kernels,
+			self.native_evidence,
 			self.journal,
 		)
 	}
@@ -485,19 +513,13 @@ pub struct InferencePrediction {
 
 impl InferencePrediction {
 	#[must_use]
-	pub const fn contract(&self) -> &InferenceOutputContract {
-		&self.contract
-	}
+	pub const fn contract(&self) -> &InferenceOutputContract { &self.contract }
 
 	#[must_use]
-	pub fn bytes(&self) -> &[u8] {
-		&self.bytes
-	}
+	pub fn bytes(&self) -> &[u8] { &self.bytes }
 
 	#[must_use]
-	pub fn into_parts(self) -> (InferenceOutputContract, Vec<u8>) {
-		(self.contract, self.bytes)
-	}
+	pub fn into_parts(self) -> (InferenceOutputContract, Vec<u8>) { (self.contract, self.bytes) }
 }
 
 /// Fully exited inference evidence. Native resources have been destroyed
@@ -507,33 +529,58 @@ pub struct CompletedInferenceExecution {
 	run: RunId,
 	bundle: BundleIdentity,
 	prediction: InferencePrediction,
+	native_kernels: RealizedNativeKernelSet,
+	native_evidence: NativeExecutionEvidence,
+	elapsed: Duration,
 	journal: RunJournal,
 }
 
 impl CompletedInferenceExecution {
 	#[must_use]
-	pub const fn run(&self) -> RunId {
-		self.run
-	}
+	pub const fn run(&self) -> RunId { self.run }
 
 	#[must_use]
-	pub const fn bundle(&self) -> BundleIdentity {
-		self.bundle
-	}
+	pub const fn bundle(&self) -> BundleIdentity { self.bundle }
 
 	#[must_use]
-	pub const fn prediction(&self) -> &InferencePrediction {
-		&self.prediction
-	}
+	pub const fn prediction(&self) -> &InferencePrediction { &self.prediction }
 
 	#[must_use]
-	pub const fn journal(&self) -> &RunJournal {
-		&self.journal
-	}
+	pub const fn native_kernels(&self) -> &RealizedNativeKernelSet { &self.native_kernels }
 
 	#[must_use]
-	pub fn into_parts(self) -> (RunId, BundleIdentity, InferencePrediction, RunJournal) {
-		(self.run, self.bundle, self.prediction, self.journal)
+	pub const fn native_evidence(&self) -> &NativeExecutionEvidence { &self.native_evidence }
+
+	/// One complete checked native inference loop. Admission, model parsing,
+	/// compilation, resource realization, output collection, teardown, and the
+	/// required warm pass lie outside this throughput interval.
+	#[must_use]
+	pub const fn elapsed(&self) -> Duration { self.elapsed }
+
+	#[must_use]
+	pub const fn journal(&self) -> &RunJournal { &self.journal }
+
+	#[must_use]
+	pub fn into_parts(
+		self,
+	) -> (
+		RunId,
+		BundleIdentity,
+		InferencePrediction,
+		RealizedNativeKernelSet,
+		NativeExecutionEvidence,
+		Duration,
+		RunJournal,
+	) {
+		(
+			self.run,
+			self.bundle,
+			self.prediction,
+			self.native_kernels,
+			self.native_evidence,
+			self.elapsed,
+			self.journal,
+		)
 	}
 }
 
@@ -546,19 +593,13 @@ pub struct KnnInferencePrediction {
 
 impl KnnInferencePrediction {
 	#[must_use]
-	pub const fn contract(&self) -> &KnnInferenceOutputContract {
-		&self.contract
-	}
+	pub const fn contract(&self) -> &KnnInferenceOutputContract { &self.contract }
 
 	#[must_use]
-	pub fn bytes(&self) -> &[u8] {
-		&self.bytes
-	}
+	pub fn bytes(&self) -> &[u8] { &self.bytes }
 
 	#[must_use]
-	pub fn into_parts(self) -> (KnnInferenceOutputContract, Vec<u8>) {
-		(self.contract, self.bytes)
-	}
+	pub fn into_parts(self) -> (KnnInferenceOutputContract, Vec<u8>) { (self.contract, self.bytes) }
 }
 
 /// Fully exited all-output KNN inference evidence.
@@ -567,29 +608,29 @@ pub struct CompletedKnnInferenceExecution {
 	run: RunId,
 	bundle: BundleIdentity,
 	predictions: Vec<KnnInferencePrediction>,
+	native_evidence: NativeExecutionEvidence,
+	elapsed: Duration,
 	journal: RunJournal,
 }
 
 impl CompletedKnnInferenceExecution {
 	#[must_use]
-	pub const fn run(&self) -> RunId {
-		self.run
-	}
+	pub const fn run(&self) -> RunId { self.run }
 
 	#[must_use]
-	pub const fn bundle(&self) -> BundleIdentity {
-		self.bundle
-	}
+	pub const fn bundle(&self) -> BundleIdentity { self.bundle }
 
 	#[must_use]
-	pub fn predictions(&self) -> &[KnnInferencePrediction] {
-		&self.predictions
-	}
+	pub fn predictions(&self) -> &[KnnInferencePrediction] { &self.predictions }
 
 	#[must_use]
-	pub const fn journal(&self) -> &RunJournal {
-		&self.journal
-	}
+	pub const fn journal(&self) -> &RunJournal { &self.journal }
+
+	#[must_use]
+	pub const fn elapsed(&self) -> Duration { self.elapsed }
+
+	#[must_use]
+	pub const fn native_evidence(&self) -> &NativeExecutionEvidence { &self.native_evidence }
 
 	#[must_use]
 	pub fn into_parts(
@@ -598,9 +639,18 @@ impl CompletedKnnInferenceExecution {
 		RunId,
 		BundleIdentity,
 		Vec<KnnInferencePrediction>,
+		NativeExecutionEvidence,
+		Duration,
 		RunJournal,
 	) {
-		(self.run, self.bundle, self.predictions, self.journal)
+		(
+			self.run,
+			self.bundle,
+			self.predictions,
+			self.native_evidence,
+			self.elapsed,
+			self.journal,
+		)
 	}
 }
 
@@ -619,29 +669,19 @@ pub struct InferenceRunFailure {
 
 impl InferenceRunFailure {
 	#[must_use]
-	pub const fn run(&self) -> RunId {
-		self.run
-	}
+	pub const fn run(&self) -> RunId { self.run }
 
 	#[must_use]
-	pub const fn bundle(&self) -> BundleIdentity {
-		self.bundle
-	}
+	pub const fn bundle(&self) -> BundleIdentity { self.bundle }
 
 	#[must_use]
-	pub const fn journal(&self) -> Option<&RunJournal> {
-		self.journal.as_ref()
-	}
+	pub const fn journal(&self) -> Option<&RunJournal> { self.journal.as_ref() }
 
 	#[must_use]
-	pub const fn cleanup_error(&self) -> Option<ExecutorError> {
-		self.cleanup_error
-	}
+	pub const fn cleanup_error(&self) -> Option<ExecutorError> { self.cleanup_error }
 
 	#[must_use]
-	pub const fn cleanup_completed(&self) -> bool {
-		self.cleanup_error.is_none()
-	}
+	pub const fn cleanup_completed(&self) -> bool { self.cleanup_error.is_none() }
 }
 
 #[derive(Debug)]
@@ -819,15 +859,11 @@ impl StdError for TrainingExecutionError {
 }
 
 impl From<PrepareError> for TrainingExecutionError {
-	fn from(error: PrepareError) -> Self {
-		Self::Preparation(error)
-	}
+	fn from(error: PrepareError) -> Self { Self::Preparation(error) }
 }
 
 impl From<ExecutorError> for TrainingExecutionError {
-	fn from(error: ExecutorError) -> Self {
-		Self::Executor(error)
-	}
+	fn from(error: ExecutorError) -> Self { Self::Executor(error) }
 }
 
 #[derive(Debug)]
@@ -946,10 +982,12 @@ impl fmt::Display for InferenceExecutionError {
 					"completed inference prediction validation failed: {source}"
 				)
 			}
-			Self::InvalidLoopIterations { actual } => write!(
-				formatter,
-				"compiled inference must execute exactly one loop iteration, got {actual}"
-			),
+			Self::InvalidLoopIterations { actual } => {
+				write!(
+					formatter,
+					"compiled inference must execute exactly one loop iteration, got {actual}"
+				)
+			}
 			Self::InvalidInferenceBoundary { detail } => {
 				write!(
 					formatter,
@@ -972,62 +1010,80 @@ impl fmt::Display for InferenceExecutionError {
 				value,
 				expected,
 				actual,
-			} => write!(
-				formatter,
-				"inference external input {value} shape requires {} bytes, input provides {}",
-				expected.get(),
-				actual.get()
-			),
+			} => {
+				write!(
+					formatter,
+					"inference external input {value} shape requires {} bytes, input provides {}",
+					expected.get(),
+					actual.get()
+				)
+			}
 			Self::DuplicateInitDevice { device } => {
 				write!(
 					formatter,
 					"finalized inference init image repeats device {device}"
 				)
 			}
-			Self::DuplicateImageMember { device, value } => write!(
-				formatter,
-				"device {device} inference init image repeats logical input {value}"
-			),
-			Self::UnexpectedImageMember { device, value } => write!(
-				formatter,
-				"device {device} inference init image names undeclared input {value}"
-			),
-			Self::ImageMemberDTypeMismatch { device, value } => write!(
-				formatter,
-				"device {device} init member {value} has a different dtype than its inference input"
-			),
+			Self::DuplicateImageMember { device, value } => {
+				write!(
+					formatter,
+					"device {device} inference init image repeats logical input {value}"
+				)
+			}
+			Self::UnexpectedImageMember { device, value } => {
+				write!(
+					formatter,
+					"device {device} inference init image names undeclared input {value}"
+				)
+			}
+			Self::ImageMemberDTypeMismatch { device, value } => {
+				write!(
+					formatter,
+					"device {device} init member {value} has a different dtype than its inference input"
+				)
+			}
 			Self::ImageMemberSizeMismatch {
 				device,
 				value,
 				expected,
 				actual,
-			} => write!(
-				formatter,
-				"device {device} init member {value} needs {} bytes, inference input provides {}",
-				expected.get(),
-				actual.get()
-			),
-			Self::ImageSizeUnsupported { device, bytes } => write!(
-				formatter,
-				"device {device} inference init image size {} does not fit this host",
-				bytes.get()
-			),
-			Self::ImageMemberOutOfBounds { device, value } => write!(
-				formatter,
-				"device {device} inference init member {value} lies outside its finalized image"
-			),
+			} => {
+				write!(
+					formatter,
+					"device {device} init member {value} needs {} bytes, inference input provides {}",
+					expected.get(),
+					actual.get()
+				)
+			}
+			Self::ImageSizeUnsupported { device, bytes } => {
+				write!(
+					formatter,
+					"device {device} inference init image size {} does not fit this host",
+					bytes.get()
+				)
+			}
+			Self::ImageMemberOutOfBounds { device, value } => {
+				write!(
+					formatter,
+					"device {device} inference init member {value} lies outside its finalized image"
+				)
+			}
 			Self::ImageMembersOverlap {
 				device,
 				first,
 				second,
-			} => write!(
-				formatter,
-				"device {device} inference init members {first} and {second} overlap"
-			),
-			Self::LoopExternalTransfer { task } => write!(
-				formatter,
-				"finalized inference loop task {task} attempts an external data transfer"
-			),
+			} => {
+				write!(
+					formatter,
+					"device {device} inference init members {first} and {second} overlap"
+				)
+			}
+			Self::LoopExternalTransfer { task } => {
+				write!(
+					formatter,
+					"finalized inference loop task {task} attempts an external data transfer"
+				)
+			}
 			Self::MissingPredictionOutput => {
 				formatter.write_str("finalized inference prediction output is missing")
 			}
@@ -1037,36 +1093,53 @@ impl fmt::Display for InferenceExecutionError {
 					"finalized inference prediction {value} appears more than once"
 				)
 			}
-			Self::UnexpectedPredictionOutput { task, value } => match value {
-				Some(value) => write!(
+			Self::UnexpectedPredictionOutput { task, value } => {
+				match value {
+					Some(value) => {
+						write!(
+							formatter,
+							"finalized inference exit task {task} names unexpected logical output {value}"
+						)
+					}
+					None => {
+						write!(
+							formatter,
+							"finalized inference has unexpected exit task {task}"
+						)
+					}
+				}
+			}
+			Self::PredictionOutputImagesOverlap { first, second } => {
+				write!(
 					formatter,
-					"finalized inference exit task {task} names unexpected logical output {value}"
-				),
-				None => write!(
+					"finalized inference output images from tasks {first} and {second} overlap"
+				)
+			}
+			Self::PredictionOutputDTypeMismatch { expected, actual } => {
+				write!(
 					formatter,
-					"finalized inference has unexpected exit task {task}"
-				),
-			},
-			Self::PredictionOutputImagesOverlap { first, second } => write!(
-				formatter,
-				"finalized inference output images from tasks {first} and {second} overlap"
-			),
-			Self::PredictionOutputDTypeMismatch { expected, actual } => write!(
-				formatter,
-				"finalized inference prediction dtype is {actual:?}, expected {expected:?}"
-			),
-			Self::PredictionOutputSizeMismatch { expected, actual } => write!(
-				formatter,
-				"finalized inference prediction has {} bytes, expected {}",
-				actual.get(),
-				expected.get()
-			),
-			Self::PredictionOutputSourceMismatch { task } => write!(
-				formatter,
-				"completed inference output task {task} has a different physical source than its finalized plan"
-			),
-			Self::LoopDidNotReachTerminalState => formatter
-				.write_str("bounded inference wait returned before the one-iteration loop reached completion"),
+					"finalized inference prediction dtype is {actual:?}, expected {expected:?}"
+				)
+			}
+			Self::PredictionOutputSizeMismatch { expected, actual } => {
+				write!(
+					formatter,
+					"finalized inference prediction has {} bytes, expected {}",
+					actual.get(),
+					expected.get()
+				)
+			}
+			Self::PredictionOutputSourceMismatch { task } => {
+				write!(
+					formatter,
+					"completed inference output task {task} has a different physical source than its finalized plan"
+				)
+			}
+			Self::LoopDidNotReachTerminalState => {
+				formatter.write_str(
+					"bounded inference wait returned before the one-iteration loop reached completion",
+				)
+			}
 		}
 	}
 }
@@ -1105,9 +1178,7 @@ impl StdError for InferenceExecutionError {
 }
 
 impl From<PrepareError> for InferenceExecutionError {
-	fn from(error: PrepareError) -> Self {
-		Self::Preparation(error)
-	}
+	fn from(error: PrepareError) -> Self { Self::Preparation(error) }
 }
 
 /// Pack every declared inference input into the exact finalized admission
@@ -1169,8 +1240,9 @@ where
 		prepared_system.bundle(),
 		prepared_system.external_outputs(),
 	)?;
-	let (bundle, _realization, _catalog, native_session) = prepared_system.into_parts();
-	let (validated_session, _artifacts) = native_session.into_parts();
+	let (bundle, realization, _catalog, native_session) = prepared_system.into_parts();
+	let (validated_session, artifacts) = native_session.into_parts();
+	let native_kernels = retain_realized_native_kernels(&realization, artifacts);
 	let local_session = validated_session.into_inner();
 	let backend = local_session
 		.into_backend(&bundle)
@@ -1181,6 +1253,7 @@ where
 	let initialized = prepared
 		.initialize_recoverable(images)
 		.map_err(inference_executor_failure)?;
+	let loop_started = Instant::now();
 	let mut running = initialized
 		.start_loop_recoverable()
 		.map_err(inference_executor_failure)?;
@@ -1198,6 +1271,7 @@ where
 			false => backoff.wait(),
 		}
 	}
+	let elapsed = loop_started.elapsed();
 	let exited_loop = match running.into_exited_loop() {
 		Ok(exited_loop) => exited_loop,
 		Err(running) => {
@@ -1211,7 +1285,8 @@ where
 		.exit_recoverable()
 		.map_err(inference_executor_failure)?;
 	let bundle_identity = exited.bundle_identity();
-	let (_backend, _mailbox, external_outputs, journal) = exited.into_parts();
+	let (backend, _mailbox, external_outputs, journal) = exited.into_parts();
+	let native_evidence = backend.native_evidence().clone();
 	let prediction = match collect_inference_prediction(inference.output(), output_plan, external_outputs) {
 		Ok(prediction) => prediction,
 		Err(source) => {
@@ -1227,6 +1302,9 @@ where
 		run,
 		bundle: bundle_identity,
 		prediction,
+		native_kernels,
+		native_evidence,
+		elapsed,
 		journal,
 	})
 }
@@ -1293,6 +1371,7 @@ where
 	let initialized = prepared
 		.initialize_recoverable(images)
 		.map_err(inference_executor_failure)?;
+	let loop_started = Instant::now();
 	let mut running = initialized
 		.start_loop_recoverable()
 		.map_err(inference_executor_failure)?;
@@ -1310,6 +1389,7 @@ where
 			false => backoff.wait(),
 		}
 	}
+	let elapsed = loop_started.elapsed();
 	let exited_loop = match running.into_exited_loop() {
 		Ok(exited_loop) => exited_loop,
 		Err(running) => {
@@ -1323,7 +1403,8 @@ where
 		.exit_recoverable()
 		.map_err(inference_executor_failure)?;
 	let bundle_identity = exited.bundle_identity();
-	let (_backend, _mailbox, external_outputs, journal) = exited.into_parts();
+	let (backend, _mailbox, external_outputs, journal) = exited.into_parts();
+	let native_evidence = backend.native_evidence().clone();
 	let predictions = match collect_knn_inference_predictions(inference.outputs(), &output_plan, external_outputs) {
 		Ok(predictions) => predictions,
 		Err(source) => {
@@ -1339,6 +1420,8 @@ where
 		run,
 		bundle: bundle_identity,
 		predictions,
+		native_evidence,
+		elapsed,
 		journal,
 	})
 }
@@ -1370,10 +1453,11 @@ fn validate_compiled_inference_boundary(inference: &CompiledInference) -> Infere
 	}
 
 	let graph = inference.graph();
-	graph.validate()
-		.map_err(|error| InferenceExecutionError::InvalidInferenceBoundary {
+	graph.validate().map_err(|error| {
+		InferenceExecutionError::InvalidInferenceBoundary {
 			detail: format!("calculation graph is invalid: {error}"),
-		})?;
+		}
+	})?;
 	let graph_inputs = graph
 		.tensors
 		.iter()
@@ -1425,11 +1509,13 @@ fn validate_compiled_inference_boundary(inference: &CompiledInference) -> Infere
 			.tensors
 			.iter()
 			.find(|tensor| tensor.id == input.value())
-			.ok_or_else(|| InferenceExecutionError::InvalidInferenceBoundary {
-				detail: format!(
-					"declared external input {} is absent from the graph",
-					input.value()
-				),
+			.ok_or_else(|| {
+				InferenceExecutionError::InvalidInferenceBoundary {
+					detail: format!(
+						"declared external input {} is absent from the graph",
+						input.value()
+					),
+				}
 			})?;
 		if !tensor.external_input || tensor.dtype != input.dtype() || tensor.shape != *input.shape() {
 			return Err(InferenceExecutionError::InvalidInferenceBoundary {
@@ -1509,31 +1595,47 @@ fn validate_compiled_inference_boundary(inference: &CompiledInference) -> Infere
 		InferenceTask::Dense(DenseTask::BinaryClassification { .. }) => {
 			(1_u64, InferencePredictionKind::BinaryProbability)
 		}
-		InferenceTask::Dense(DenseTask::MulticlassClassification { class_count, .. }) => (
-			u64::try_from(class_count).map_err(|_| InferenceExecutionError::InvalidInferenceBoundary {
-				detail: "multiclass output width does not fit u64".to_string(),
-			})?,
-			InferencePredictionKind::MulticlassProbabilities,
-		),
+		InferenceTask::Dense(DenseTask::MulticlassClassification { class_count, .. }) => {
+			(
+				u64::try_from(class_count).map_err(|_| {
+					InferenceExecutionError::InvalidInferenceBoundary {
+						detail: "multiclass output width does not fit u64".to_string(),
+					}
+				})?,
+				InferencePredictionKind::MulticlassProbabilities,
+			)
+		}
 		InferenceTask::Dense(DenseTask::ScalarRegression { .. }) => (1_u64, InferencePredictionKind::Regression),
-		InferenceTask::Dense(DenseTask::MultiTargetBinaryClassification { target_count, .. }) => (
-			u64::try_from(target_count).map_err(|_| InferenceExecutionError::InvalidInferenceBoundary {
-				detail: "multi-target binary output width does not fit u64".to_string(),
-			})?,
-			InferencePredictionKind::MultiTargetBinaryProbabilities,
-		),
-		InferenceTask::Dense(DenseTask::JointMulticlassClassification { target_count, .. }) => (
-			u64::try_from(target_count).map_err(|_| InferenceExecutionError::InvalidInferenceBoundary {
-				detail: "joint target output width does not fit u64".to_string(),
-			})?,
-			InferencePredictionKind::JointTargetProbabilities,
-		),
-		InferenceTask::Dense(DenseTask::MultiTargetRegression { target_count, .. }) => (
-			u64::try_from(target_count).map_err(|_| InferenceExecutionError::InvalidInferenceBoundary {
-				detail: "multi-target regression output width does not fit u64".to_string(),
-			})?,
-			InferencePredictionKind::MultiTargetRegression,
-		),
+		InferenceTask::Dense(DenseTask::MultiTargetBinaryClassification { target_count, .. }) => {
+			(
+				u64::try_from(target_count).map_err(|_| {
+					InferenceExecutionError::InvalidInferenceBoundary {
+						detail: "multi-target binary output width does not fit u64".to_string(),
+					}
+				})?,
+				InferencePredictionKind::MultiTargetBinaryProbabilities,
+			)
+		}
+		InferenceTask::Dense(DenseTask::JointMulticlassClassification { target_count, .. }) => {
+			(
+				u64::try_from(target_count).map_err(|_| {
+					InferenceExecutionError::InvalidInferenceBoundary {
+						detail: "joint target output width does not fit u64".to_string(),
+					}
+				})?,
+				InferencePredictionKind::JointTargetProbabilities,
+			)
+		}
+		InferenceTask::Dense(DenseTask::MultiTargetRegression { target_count, .. }) => {
+			(
+				u64::try_from(target_count).map_err(|_| {
+					InferenceExecutionError::InvalidInferenceBoundary {
+						detail: "multi-target regression output width does not fit u64".to_string(),
+					}
+				})?,
+				InferencePredictionKind::MultiTargetRegression,
+			)
+		}
 	};
 	if output.kind() != expected_kind || output.shape().extents() != [inference.rows(), expected_width] {
 		return Err(InferenceExecutionError::InvalidInferenceBoundary {
@@ -1554,10 +1656,11 @@ fn validate_compiled_knn_inference_boundary(inference: &CompiledKnnInference) ->
 		});
 	}
 	let graph = inference.graph();
-	graph.validate()
-		.map_err(|error| InferenceExecutionError::InvalidInferenceBoundary {
+	graph.validate().map_err(|error| {
+		InferenceExecutionError::InvalidInferenceBoundary {
 			detail: format!("KNN calculation graph is invalid: {error}"),
-		})?;
+		}
+	})?;
 	let graph_inputs = graph
 		.tensors
 		.iter()
@@ -1609,11 +1712,13 @@ fn validate_compiled_knn_inference_boundary(inference: &CompiledKnnInference) ->
 			.tensors
 			.iter()
 			.find(|tensor| tensor.id == input.value())
-			.ok_or_else(|| InferenceExecutionError::InvalidInferenceBoundary {
-				detail: format!(
-					"declared KNN external input {} is absent from the graph",
-					input.value()
-				),
+			.ok_or_else(|| {
+				InferenceExecutionError::InvalidInferenceBoundary {
+					detail: format!(
+						"declared KNN external input {} is absent from the graph",
+						input.value()
+					),
+				}
 			})?;
 		if !tensor.external_input || tensor.dtype != input.dtype() || tensor.shape != *input.shape() {
 			return Err(InferenceExecutionError::InvalidInferenceBoundary {
@@ -1677,8 +1782,10 @@ fn validate_compiled_knn_inference_boundary(inference: &CompiledKnnInference) ->
 			.tensors
 			.iter()
 			.find(|tensor| tensor.id == output.value())
-			.ok_or_else(|| InferenceExecutionError::InvalidInferenceBoundary {
-				detail: format!("KNN output {} is absent from the graph", output.value()),
+			.ok_or_else(|| {
+				InferenceExecutionError::InvalidInferenceBoundary {
+					detail: format!("KNN output {} is absent from the graph", output.value()),
+				}
 			})?;
 		if !tensor.external_output
 			|| tensor.external_input
@@ -1815,15 +1922,14 @@ fn validate_canonical_boundary_tensor(
 			),
 		});
 	}
-	let expected_storage =
-		tensor.shape
-			.bytes(tensor.dtype)
-			.map_err(|error| InferenceExecutionError::InvalidInferenceBoundary {
-				detail: format!(
-					"{boundary} {} has an invalid typed shape: {error}",
-					tensor.id
-				),
-			})?;
+	let expected_storage = tensor.shape.bytes(tensor.dtype).map_err(|error| {
+		InferenceExecutionError::InvalidInferenceBoundary {
+			detail: format!(
+				"{boundary} {} has an invalid typed shape: {error}",
+				tensor.id
+			),
+		}
+	})?;
 	if tensor.storage_bytes != expected_storage {
 		return Err(InferenceExecutionError::InvalidInferenceBoundary {
 			detail: format!(
@@ -1843,10 +1949,12 @@ fn pack_inference_device_images(
 ) -> InferenceExecutionResult<Vec<DeviceImage>> {
 	let inputs = inputs
 		.iter()
-		.map(|input| InferenceInputImage {
-			value: input.value(),
-			dtype: input.dtype(),
-			bytes: input.bytes(),
+		.map(|input| {
+			InferenceInputImage {
+				value: input.value(),
+				dtype: input.dtype(),
+				bytes: input.bytes(),
+			}
 		})
 		.collect::<Vec<_>>();
 	pack_inference_input_images(&inputs, manifests)
@@ -1871,11 +1979,12 @@ fn pack_inference_input_images(
 				device: manifest.device,
 			});
 		}
-		let image_len =
-			usize::try_from(manifest.bytes.get()).map_err(|_| InferenceExecutionError::ImageSizeUnsupported {
+		let image_len = usize::try_from(manifest.bytes.get()).map_err(|_| {
+			InferenceExecutionError::ImageSizeUnsupported {
 				device: manifest.device,
 				bytes: manifest.bytes,
-			})?;
+			}
+		})?;
 		let mut bytes = vec![0_u8; image_len];
 		let mut members = manifest.members.iter().collect::<Vec<_>>();
 		members.sort_by_key(|member| (member.image_offset, member.logical));
@@ -1932,13 +2041,17 @@ fn pack_inference_input_images(
 					second: member.logical,
 				});
 			}
-			let start = usize::try_from(start).map_err(|_| InferenceExecutionError::ImageMemberOutOfBounds {
-				device: manifest.device,
-				value: member.logical,
+			let start = usize::try_from(start).map_err(|_| {
+				InferenceExecutionError::ImageMemberOutOfBounds {
+					device: manifest.device,
+					value: member.logical,
+				}
 			})?;
-			let end = usize::try_from(end).map_err(|_| InferenceExecutionError::ImageMemberOutOfBounds {
-				device: manifest.device,
-				value: member.logical,
+			let end = usize::try_from(end).map_err(|_| {
+				InferenceExecutionError::ImageMemberOutOfBounds {
+					device: manifest.device,
+					value: member.logical,
+				}
 			})?;
 			let destination =
 				bytes.get_mut(start..end)
@@ -1960,9 +2073,7 @@ fn pack_inference_input_images(
 	Ok(result)
 }
 
-fn host_byte_count(length: usize) -> ByteCount {
-	ByteCount::new(u64::try_from(length).unwrap_or(u64::MAX))
-}
+fn host_byte_count(length: usize) -> ByteCount { ByteCount::new(u64::try_from(length).unwrap_or(u64::MAX)) }
 
 /// Pack Recipe's owned external inputs into exactly one finalized admission
 /// image per device.
@@ -2093,6 +2204,8 @@ where
 	validate_training_execution_control(training.program().iterations(), control)?;
 	let prepared_system = preparer.prepare_program(training.program(), profile)?;
 	reject_loop_external_transfers(prepared_system.bundle())?;
+	let planned_training_evidence =
+		PlannedTrainingExecutionEvidence::new(training, profile, prepared_system.bundle());
 	let images = build_training_device_images(training, prepared_system.bundle())?;
 	let external_output_tasks = map_external_output_tasks(
 		training,
@@ -2101,10 +2214,12 @@ where
 	)?;
 	let mut metrics = user_metric_slots(prepared_system.bundle())
 		.into_iter()
-		.map(|(slot, metric)| FinalTrainingMetric {
-			slot,
-			metric,
-			sample: None,
+		.map(|(slot, metric)| {
+			FinalTrainingMetric {
+				slot,
+				metric,
+				sample: None,
+			}
 		})
 		.collect::<Vec<_>>();
 	let (bundle, realization, _catalog, native_session) = prepared_system.into_parts();
@@ -2143,7 +2258,8 @@ where
 	);
 	let exited = exited_loop.exit()?;
 	let bundle_identity = exited.bundle_identity();
-	let (_backend, mut mailbox, mut external_outputs, journal) = exited.into_parts();
+	let (backend, mut mailbox, mut external_outputs, journal) = exited.into_parts();
+	let native_evidence = backend.native_evidence().clone();
 	external_outputs.sort_by_key(|image| image.task);
 	let external_output_values = external_outputs
 		.iter()
@@ -2151,8 +2267,10 @@ where
 			external_output_tasks
 				.get(&image.task)
 				.copied()
-				.ok_or_else(|| TrainingExecutionError::ExternalOutputMapping {
-					detail: format!("completed exit task {} has no logical tensor", image.task),
+				.ok_or_else(|| {
+					TrainingExecutionError::ExternalOutputMapping {
+						detail: format!("completed exit task {} has no logical tensor", image.task),
+					}
 				})
 		})
 		.collect::<TrainingExecutionResult<Vec<_>>>()?;
@@ -2161,6 +2279,7 @@ where
 		|slot| mailbox.try_take(slot),
 		observer.as_deref_mut(),
 	);
+	let training_evidence = planned_training_evidence.complete(&journal);
 	Ok(CompletedTrainingExecution {
 		run,
 		bundle: bundle_identity,
@@ -2168,8 +2287,119 @@ where
 		external_output_values,
 		metrics,
 		native_kernels,
+		native_evidence,
+		training_evidence,
 		journal,
 	})
+}
+
+#[derive(Debug)]
+struct PlannedTrainingExecutionEvidence {
+	bounds: TrainingBounds,
+	logical_updates_per_epoch: u64,
+	optimizer_parameter_kernels: usize,
+	optimizer_parameter_tasks: BTreeSet<TaskId>,
+	loop_calculation_tasks: usize,
+	non_gpu_calculation_tasks: BTreeSet<TaskId>,
+}
+
+impl PlannedTrainingExecutionEvidence {
+	fn new(training: &CompiledTraining, profile: &MeasuredProfile, bundle: &FinalizedBundle) -> Self {
+		let optimizer = training.outputs().optimizer_progress;
+		let mut update_kernels = BTreeSet::new();
+		training.outputs().visit_parameter_states(|state| {
+			update_kernels.insert(state.update_kernel);
+		});
+		let optimizer_parameter_tasks = bundle
+			.tasks()
+			.iter()
+			.filter_map(|task| {
+				match &task.kind {
+					TaskKind::Calculation(calculation)
+						if task.phase == RunPhase::Loop
+							&& bundle
+								.artifact_build(calculation.artifact)
+								.is_some_and(|build| update_kernels.contains(&build.source_kernel)) =>
+					{
+						Some(task.id)
+					}
+					_ => None,
+				}
+			})
+			.collect();
+		let non_gpu_calculation_tasks = bundle
+			.tasks()
+			.iter()
+			.filter_map(|task| {
+				match &task.kind {
+					TaskKind::Calculation(calculation)
+						if profile
+							.topology
+							.device(calculation.device)
+							.is_none_or(|device| device.kind != DeviceKind::GpuMemory) =>
+					{
+						Some(task.id)
+					}
+					_ => None,
+				}
+			})
+			.collect();
+		let loop_calculation_tasks = bundle
+			.tasks()
+			.iter()
+			.filter(|task| task.phase == RunPhase::Loop && matches!(task.kind, TaskKind::Calculation(_)))
+			.count();
+		Self {
+			bounds: training.bounds(),
+			logical_updates_per_epoch: optimizer.map_or(1, |progress| progress.accepted_updates_per_epoch),
+			optimizer_parameter_kernels: update_kernels.len(),
+			optimizer_parameter_tasks,
+			loop_calculation_tasks,
+			non_gpu_calculation_tasks,
+		}
+	}
+
+	fn complete(self, journal: &RunJournal) -> TrainingExecutionEvidence {
+		let optimizer_parameter_submissions = journal
+			.physical_calls()
+			.iter()
+			.filter(
+				|call| matches!(call, PhysicalCall::SubmitCalculation { task } if self.optimizer_parameter_tasks.contains(task)),
+			)
+			.count();
+		let non_gpu_calculation_submissions = journal
+			.physical_calls()
+			.iter()
+			.filter(
+				|call| matches!(call, PhysicalCall::SubmitCalculation { task } if self.non_gpu_calculation_tasks.contains(task)),
+			)
+			.count();
+		let loop_iterations_started = journal
+			.logical_events()
+			.iter()
+			.filter(|event| matches!(event, LogicalEvent::LoopIterationStarted { .. }))
+			.count();
+		let loop_iterations_completed = journal
+			.logical_events()
+			.iter()
+			.filter(|event| matches!(event, LogicalEvent::LoopIterationCompleted { .. }))
+			.count();
+		let summary = journal.summary();
+		TrainingExecutionEvidence {
+			bounds: self.bounds,
+			logical_updates_per_epoch: self.logical_updates_per_epoch,
+			optimizer_parameter_kernels: self.optimizer_parameter_kernels,
+			optimizer_parameter_tasks: self.optimizer_parameter_tasks.len(),
+			optimizer_parameter_submissions,
+			loop_iterations_started,
+			loop_iterations_completed,
+			loop_calculation_tasks: self.loop_calculation_tasks,
+			non_gpu_calculation_tasks: self.non_gpu_calculation_tasks.len(),
+			non_gpu_calculation_submissions,
+			logical_events_compacted: summary.logical_events_compacted,
+			physical_calls_compacted: summary.physical_calls_compacted,
+		}
+	}
 }
 
 fn map_external_output_tasks(
@@ -2206,8 +2436,10 @@ fn map_external_output_tasks(
 			.tasks()
 			.iter()
 			.find(|candidate| candidate.id == task)
-			.ok_or_else(|| TrainingExecutionError::ExternalOutputMapping {
-				detail: format!("planned exit task {task} is absent from the finalized bundle"),
+			.ok_or_else(|| {
+				TrainingExecutionError::ExternalOutputMapping {
+					detail: format!("planned exit task {task} is absent from the finalized bundle"),
+				}
 			})?;
 		if finalized.phase != RunPhase::Exit
 			|| !matches!(
@@ -2221,11 +2453,11 @@ fn map_external_output_tasks(
 				detail: format!("planned output task {task} is not a finalized exit egress"),
 			});
 		}
-		let endpoints =
-			bundle.transfer_endpoints(task)
-				.ok_or_else(|| TrainingExecutionError::ExternalOutputMapping {
-					detail: format!("exit task {task} has no finalized endpoints"),
-				})?;
+		let endpoints = bundle.transfer_endpoints(task).ok_or_else(|| {
+			TrainingExecutionError::ExternalOutputMapping {
+				detail: format!("exit task {task} has no finalized endpoints"),
+			}
+		})?;
 		let ResolvedTransferEndpoint::Device(source) = endpoints.source else {
 			return Err(TrainingExecutionError::ExternalOutputMapping {
 				detail: format!("exit task {task} has no physical device source"),
@@ -2474,15 +2706,12 @@ fn map_knn_inference_outputs(
 				});
 			}
 		}
-		descriptors.insert(
+		descriptors.insert(logical, FinalizedInferenceOutput {
+			task,
 			logical,
-			FinalizedInferenceOutput {
-				task,
-				logical,
-				source,
-				bytes: transfer.bytes,
-			},
-		);
+			source,
+			bytes: transfer.bytes,
+		});
 	}
 
 	let finalized_tasks = bundle
@@ -2731,16 +2960,12 @@ fn drain_user_metrics(
 }
 
 fn native_handoff_error<E>(error: LocalError<E>) -> TrainingExecutionError
-where
-	E: StdError + Send + Sync + 'static,
-{
+where E: StdError + Send + Sync + 'static {
 	TrainingExecutionError::NativeHandoff(Box::new(error))
 }
 
 fn native_inference_handoff_error<E>(error: LocalError<E>) -> InferenceExecutionError
-where
-	E: StdError + Send + Sync + 'static,
-{
+where E: StdError + Send + Sync + 'static {
 	InferenceExecutionError::NativeHandoff(Box::new(error))
 }
 
@@ -2804,14 +3029,16 @@ fn reject_inference_loop_external_transfers(bundle: &FinalizedBundle) -> Inferen
 fn inference_loop_external_transfer(tasks: &[recipe_core::Task]) -> Option<TaskId> {
 	tasks.iter()
 		.filter(|task| task.phase == RunPhase::Loop)
-		.find_map(|task| match &task.kind {
-			TaskKind::Transfer(transfer)
-				if matches!(transfer.source, TransferEndpoint::External)
-					|| matches!(transfer.destination, TransferEndpoint::External) =>
-			{
-				Some(task.id)
+		.find_map(|task| {
+			match &task.kind {
+				TaskKind::Transfer(transfer)
+					if matches!(transfer.source, TransferEndpoint::External)
+						|| matches!(transfer.destination, TransferEndpoint::External) =>
+				{
+					Some(task.id)
+				}
+				_ => None,
 			}
-			_ => None,
 		})
 }
 
@@ -2833,11 +3060,13 @@ fn user_metric_slots(bundle: &FinalizedBundle) -> Vec<(MetricSlotId, MetricId)> 
 	let mut slots = bundle
 		.tasks()
 		.iter()
-		.filter_map(|task| match &task.kind {
-			TaskKind::Metric(metric) if metric.purpose == MetricPurpose::User => {
-				Some((metric.slot, metric.metric))
+		.filter_map(|task| {
+			match &task.kind {
+				TaskKind::Metric(metric) if metric.purpose == MetricPurpose::User => {
+					Some((metric.slot, metric.metric))
+				}
+				_ => None,
 			}
-			_ => None,
 		})
 		.collect::<Vec<_>>();
 	slots.sort_unstable();
@@ -2865,11 +3094,12 @@ fn pack_device_images(
 				device: manifest.device,
 			});
 		}
-		let image_len =
-			usize::try_from(manifest.bytes.get()).map_err(|_| TrainingExecutionError::ImageSizeUnsupported {
+		let image_len = usize::try_from(manifest.bytes.get()).map_err(|_| {
+			TrainingExecutionError::ImageSizeUnsupported {
 				device: manifest.device,
 				bytes: manifest.bytes,
-			})?;
+			}
+		})?;
 		let mut bytes = vec![0u8; image_len];
 		let mut members = manifest.members.iter().collect::<Vec<_>>();
 		members.sort_by_key(|member| (member.image_offset, member.logical));
@@ -2934,13 +3164,17 @@ fn pack_device_images(
 					second: member.logical,
 				});
 			}
-			let start = usize::try_from(start).map_err(|_| TrainingExecutionError::ImageMemberOutOfBounds {
-				device: manifest.device,
-				value: member.logical,
+			let start = usize::try_from(start).map_err(|_| {
+				TrainingExecutionError::ImageMemberOutOfBounds {
+					device: manifest.device,
+					value: member.logical,
+				}
 			})?;
-			let end_index = usize::try_from(end).map_err(|_| TrainingExecutionError::ImageMemberOutOfBounds {
-				device: manifest.device,
-				value: member.logical,
+			let end_index = usize::try_from(end).map_err(|_| {
+				TrainingExecutionError::ImageMemberOutOfBounds {
+					device: manifest.device,
+					value: member.logical,
+				}
 			})?;
 			let destination =
 				bytes.get_mut(start..end_index)
@@ -2956,587 +3190,3 @@ fn pack_device_images(
 	result.sort_by_key(|image| image.device);
 	Ok(result)
 }
-
-#[cfg(test)]
-mod tests {
-	use recipe_core::{
-		ArenaObjectId, ByteOffset, DType, InitDataImageMember, LoopIterations, MetricId, MetricSlotId,
-	};
-	use recipe_executor::{MetricSample, MetricValue};
-	use recipe_language::Shape;
-
-	use super::*;
-	use crate::ExternalInputRole;
-	use crate::inference::test_support::{
-		InferenceBoundaryFault, compiled_inference_boundary_fixture, compiled_inference_boundary_role_fixture,
-		inference_boundary_allowed_roles,
-	};
-
-	#[test]
-	fn training_nonprogress_backoff_caps_and_progress_resets_it() {
-		let mut backoff = BlockingPollBackoff::new();
-		assert_eq!(backoff.next_delay, BLOCKING_POLL_INITIAL_DELAY);
-		for _ in 0..16 {
-			backoff.advance();
-		}
-		assert_eq!(backoff.next_delay, BLOCKING_POLL_MAXIMUM_DELAY);
-		backoff.reset();
-		assert_eq!(backoff.next_delay, BLOCKING_POLL_INITIAL_DELAY);
-	}
-
-	#[test]
-	fn unbounded_training_requires_a_real_graceful_stop_source() {
-		assert!(
-			validate_training_execution_control(
-				LoopIterations::ONE,
-				TrainingExecutionControl::uninterrupted(),
-			)
-			.is_ok()
-		);
-		assert!(matches!(
-			validate_training_execution_control(
-				LoopIterations::UNBOUNDED,
-				TrainingExecutionControl::uninterrupted(),
-			),
-			Err(TrainingExecutionError::UnboundedTrainingRequiresStopControl)
-		));
-		let stop = std::sync::atomic::AtomicBool::new(false);
-		assert!(
-			validate_training_execution_control(
-				LoopIterations::UNBOUNDED,
-				TrainingExecutionControl::graceful_stop(&stop),
-			)
-			.is_ok()
-		);
-	}
-
-	fn input(value: u64, bytes: &[u8]) -> OwnedExternalInput {
-		OwnedExternalInput::new(
-			ExternalInputRole::TrainFeatures,
-			ValueId::new(value),
-			DType::F32,
-			Shape::new(vec![u64::try_from(bytes.len() / 4).unwrap()]).unwrap(),
-			bytes.to_vec(),
-		)
-	}
-
-	fn inference_input(value: u64, dtype: DType, bytes: &[u8]) -> InferenceInputImage<'_> {
-		InferenceInputImage {
-			value: ValueId::new(value),
-			dtype,
-			bytes,
-		}
-	}
-
-	fn member(logical: u64, physical: u64, bytes: u64, offset: u64) -> InitDataImageMember {
-		InitDataImageMember {
-			logical: ValueId::new(logical),
-			physical: ValueId::new(physical),
-			dtype: DType::F32,
-			bytes: ByteCount::new(bytes),
-			image_offset: ByteOffset::new(offset),
-		}
-	}
-
-	fn output_location(value: u64, dtype: DType, bytes: u64, device: u64, offset: u64) -> ResolvedValueLocation {
-		ResolvedValueLocation {
-			value: ValueId::new(value),
-			dtype,
-			device: DeviceId::new(device),
-			bytes: ByteCount::new(bytes),
-			object: ArenaObjectId::new(value),
-			object_offset: ByteOffset::new(offset),
-			arena_offset: ByteOffset::new(offset),
-		}
-	}
-
-	fn output_plan(task: u64, source: ResolvedValueLocation) -> FinalizedInferenceOutput {
-		FinalizedInferenceOutput {
-			task: TaskId::new(task),
-			logical: ValueId::new(50),
-			source,
-			bytes: source.bytes,
-		}
-	}
-
-	fn output_image(task: u64, source: ResolvedValueLocation, bytes: &[u8]) -> ExitImage {
-		ExitImage {
-			task: TaskId::new(task),
-			source,
-			bytes: bytes.to_vec(),
-		}
-	}
-
-	#[test]
-	fn knn_prediction_completion_preserves_declaration_order_and_mixed_dtypes() {
-		let contracts = vec![
-			KnnInferenceOutputContract::new(
-				ValueId::new(50),
-				DType::I32,
-				Shape::new(vec![2, 1]).unwrap(),
-				3,
-				KnnInferencePredictionKind::DiscreteMode,
-			),
-			KnnInferenceOutputContract::new(
-				ValueId::new(51),
-				DType::F32,
-				Shape::new(vec![2, 1]).unwrap(),
-				2,
-				KnnInferencePredictionKind::NumericMean,
-			),
-		];
-		let discrete_source = output_location(500, DType::I32, 8, 1, 0);
-		let numeric_source = output_location(501, DType::F32, 8, 1, 8);
-		let plans = vec![
-			FinalizedInferenceOutput {
-				task: TaskId::new(7),
-				logical: ValueId::new(50),
-				source: discrete_source,
-				bytes: ByteCount::new(8),
-			},
-			FinalizedInferenceOutput {
-				task: TaskId::new(8),
-				logical: ValueId::new(51),
-				source: numeric_source,
-				bytes: ByteCount::new(8),
-			},
-		];
-		let discrete = [1_i32, 0]
-			.into_iter()
-			.flat_map(i32::to_le_bytes)
-			.collect::<Vec<_>>();
-		let numeric = [2.5_f32, 3.5]
-			.into_iter()
-			.flat_map(f32::to_le_bytes)
-			.collect::<Vec<_>>();
-		let predictions = collect_knn_inference_predictions(
-			&contracts,
-			&plans,
-			vec![
-				output_image(8, numeric_source, &numeric),
-				output_image(7, discrete_source, &discrete),
-			],
-		)
-		.unwrap();
-		assert_eq!(predictions.len(), 2);
-		assert_eq!(predictions[0].contract().source_vector(), 3);
-		assert_eq!(predictions[0].bytes(), discrete);
-		assert_eq!(predictions[1].contract().source_vector(), 2);
-		assert_eq!(predictions[1].bytes(), numeric);
-	}
-
-	fn sample(sequence: u64, metric: u64, slot: u64, iteration: u64) -> MetricSample {
-		let iterations = LoopIterations::new(16).unwrap();
-		MetricSample {
-			sequence,
-			iteration: iterations.iteration(iteration).unwrap(),
-			task: TaskId::new(slot),
-			slot: MetricSlotId::new(slot),
-			metric: MetricId::new(metric),
-			value: MetricValue::F32(sequence as f32),
-		}
-	}
-
-	fn invalid_inference_boundary_detail(fault: InferenceBoundaryFault) -> String {
-		match validate_compiled_inference_boundary(&compiled_inference_boundary_fixture(fault)) {
-			Err(InferenceExecutionError::InvalidInferenceBoundary { detail }) => detail,
-			result => panic!("expected an invalid inference boundary, received {result:?}"),
-		}
-	}
-
-	#[test]
-	fn compiled_inference_boundary_accepts_the_exhaustive_target_and_optimizer_free_role_set() {
-		for role in inference_boundary_allowed_roles() {
-			validate_compiled_inference_boundary(&compiled_inference_boundary_role_fixture(role)).unwrap();
-		}
-	}
-
-	#[test]
-	fn compiled_inference_boundary_rejects_duplicate_semantic_roles() {
-		let detail = invalid_inference_boundary_detail(InferenceBoundaryFault::DuplicateSemanticRole);
-		assert!(detail.contains("semantic role"));
-		assert!(detail.contains("appears more than once"));
-	}
-
-	#[test]
-	fn compiled_inference_boundary_requires_disjoint_inputs_and_a_produced_prediction() {
-		let valid = compiled_inference_boundary_fixture(InferenceBoundaryFault::Valid);
-		assert!(
-			valid.graph()
-				.nodes
-				.iter()
-				.any(|node| node.kernel.outputs.contains(&valid.output().value()))
-		);
-		validate_compiled_inference_boundary(&valid).unwrap();
-
-		let detail = invalid_inference_boundary_detail(InferenceBoundaryFault::InputIsUnproducedPrediction);
-		assert!(detail.contains("both an inference input and prediction output"));
-	}
-
-	#[test]
-	fn compiled_inference_boundary_requires_canonical_exact_input_storage() {
-		let detail = invalid_inference_boundary_detail(InferenceBoundaryFault::NonCanonicalInputLayout);
-		assert!(detail.contains("external input"));
-		assert!(detail.contains("canonical contiguous row-major"));
-
-		let detail = invalid_inference_boundary_detail(InferenceBoundaryFault::PaddedInputStorage);
-		assert!(detail.contains("external input"));
-		assert!(detail.contains("storage is"));
-		assert!(detail.contains("expected exactly"));
-	}
-
-	#[test]
-	fn compiled_inference_boundary_requires_canonical_exact_output_storage() {
-		let detail = invalid_inference_boundary_detail(InferenceBoundaryFault::NonCanonicalOutputLayout);
-		assert!(detail.contains("prediction output"));
-		assert!(detail.contains("canonical contiguous row-major"));
-
-		let detail = invalid_inference_boundary_detail(InferenceBoundaryFault::PaddedOutputStorage);
-		assert!(detail.contains("prediction output"));
-		assert!(detail.contains("storage is"));
-		assert!(detail.contains("expected exactly"));
-	}
-
-	#[test]
-	fn compiled_inference_boundary_requires_f32_predictions() {
-		let detail = invalid_inference_boundary_detail(InferenceBoundaryFault::I32Prediction);
-		assert!(detail.contains("predictions must use F32 dtype"));
-	}
-
-	#[test]
-	fn metric_epochs_are_one_based_full_partition_iterations() {
-		for (iteration, expected_epoch) in [(0, 1), (1, 2), (3, 4), (11, 12)] {
-			let sample = TrainingMetricSample::from_executor(sample(iteration, 7, 9, iteration));
-			assert_eq!(sample.epoch.get(), expected_epoch);
-			assert_eq!(sample.zero_based_iteration.index(), iteration);
-		}
-	}
-
-	#[test]
-	fn separate_training_runs_each_begin_at_epoch_one() {
-		let first_run = TrainingMetricSample::from_executor(sample(0, 7, 9, 0));
-		let second_run = TrainingMetricSample::from_executor(sample(0, 7, 9, 0));
-
-		assert_eq!(first_run.epoch, NonZeroU64::MIN);
-		assert_eq!(second_run.epoch, NonZeroU64::MIN);
-	}
-
-	#[test]
-	fn packs_one_zero_filled_image_per_device_from_finalized_offsets() {
-		let inputs = vec![
-			input(1, &[1, 2, 3, 4]),
-			input(2, &[5, 6, 7, 8, 9, 10, 11, 12]),
-			input(99, &[13, 14, 15, 16]),
-		];
-		let manifests = vec![
-			InitDataImage {
-				device: DeviceId::new(2),
-				image: ValueId::new(200),
-				bytes: ByteCount::new(16),
-				members: vec![member(2, 202, 8, 8), member(1, 201, 4, 0)],
-			},
-			InitDataImage {
-				device: DeviceId::new(1),
-				image: ValueId::new(100),
-				bytes: ByteCount::new(8),
-				members: vec![member(1, 101, 4, 4)],
-			},
-		];
-		let images = pack_device_images(&inputs, &manifests).unwrap();
-		assert_eq!(images.len(), 2);
-		assert_eq!(images[0].device, DeviceId::new(1));
-		assert_eq!(images[0].image, ValueId::new(100));
-		assert_eq!(images[0].bytes, [0, 0, 0, 0, 1, 2, 3, 4]);
-		assert_eq!(images[1].device, DeviceId::new(2));
-		assert_eq!(
-			images[1].bytes,
-			[1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 7, 8, 9, 10, 11, 12]
-		);
-	}
-
-	#[test]
-	fn inference_packing_binds_every_and_only_declared_typed_input() {
-		let first = [1, 2, 3, 4];
-		let second = [5, 6, 7, 8, 9, 10, 11, 12];
-		let inputs = [
-			inference_input(1, DType::F32, &first),
-			inference_input(2, DType::I32, &second),
-		];
-		let mut second_member = member(2, 102, 8, 8);
-		second_member.dtype = DType::I32;
-		let manifests = [InitDataImage {
-			device: DeviceId::new(1),
-			image: ValueId::new(100),
-			bytes: ByteCount::new(16),
-			members: vec![second_member, member(1, 101, 4, 0)],
-		}];
-		let images = pack_inference_input_images(&inputs, &manifests).unwrap();
-		assert_eq!(images.len(), 1);
-		assert_eq!(
-			images[0].bytes,
-			[1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 7, 8, 9, 10, 11, 12]
-		);
-
-		let only_first = [InitDataImage {
-			device: DeviceId::new(1),
-			image: ValueId::new(100),
-			bytes: ByteCount::new(4),
-			members: vec![member(1, 101, 4, 0)],
-		}];
-		assert!(matches!(
-			pack_inference_input_images(&inputs, &only_first),
-			Err(InferenceExecutionError::UnboundExternalInput { value }) if value == ValueId::new(2)
-		));
-
-		let undeclared = [InitDataImage {
-			device: DeviceId::new(1),
-			image: ValueId::new(100),
-			bytes: ByteCount::new(4),
-			members: vec![member(3, 103, 4, 0)],
-		}];
-		assert!(matches!(
-			pack_inference_input_images(&inputs[..1], &undeclared),
-			Err(InferenceExecutionError::UnexpectedImageMember { value, .. }) if value == ValueId::new(3)
-		));
-
-		let duplicates = [inputs[0], inputs[0]];
-		assert!(matches!(
-			pack_inference_input_images(&duplicates, &only_first),
-			Err(InferenceExecutionError::DuplicateExternalInput { value }) if value == ValueId::new(1)
-		));
-
-		let mut wrong_dtype = member(1, 101, 4, 0);
-		wrong_dtype.dtype = DType::I32;
-		let wrong_dtype = [InitDataImage {
-			device: DeviceId::new(1),
-			image: ValueId::new(100),
-			bytes: ByteCount::new(4),
-			members: vec![wrong_dtype],
-		}];
-		assert!(matches!(
-			pack_inference_input_images(&inputs[..1], &wrong_dtype),
-			Err(InferenceExecutionError::ImageMemberDTypeMismatch { .. })
-		));
-
-		let wrong_size = [InitDataImage {
-			device: DeviceId::new(1),
-			image: ValueId::new(100),
-			bytes: ByteCount::new(8),
-			members: vec![member(1, 101, 8, 0)],
-		}];
-		assert!(matches!(
-			pack_inference_input_images(&inputs[..1], &wrong_size),
-			Err(InferenceExecutionError::ImageMemberSizeMismatch { .. })
-		));
-	}
-
-	#[test]
-	fn inference_prediction_completion_preserves_bytes_and_rejects_invalid_images() {
-		let prediction = [0, 0, 192, 127, 1, 2, 3, 4];
-		let source = output_location(500, DType::F32, 8, 1, 32);
-		let plan = output_plan(7, source);
-		let completed = validate_completed_prediction_images(
-			ValueId::new(50),
-			DType::F32,
-			ByteCount::new(8),
-			plan,
-			vec![output_image(7, source, &prediction)],
-		)
-		.unwrap();
-		assert_eq!(completed, prediction);
-
-		assert!(matches!(
-			validate_completed_prediction_images(
-				ValueId::new(50),
-				DType::F32,
-				ByteCount::new(8),
-				plan,
-				Vec::new(),
-			),
-			Err(InferenceExecutionError::MissingPredictionOutput)
-		));
-
-		let duplicate = vec![
-			output_image(7, source, &prediction),
-			output_image(7, source, &prediction),
-		];
-		assert!(matches!(
-			validate_completed_prediction_images(
-				ValueId::new(50),
-				DType::F32,
-				ByteCount::new(8),
-				plan,
-				duplicate,
-			),
-			Err(InferenceExecutionError::DuplicatePredictionOutput { .. })
-		));
-
-		assert!(matches!(
-			validate_completed_prediction_images(
-				ValueId::new(50),
-				DType::F32,
-				ByteCount::new(8),
-				plan,
-				vec![output_image(8, source, &prediction)],
-			),
-			Err(InferenceExecutionError::UnexpectedPredictionOutput { task, .. }) if task == TaskId::new(8)
-		));
-
-		let overlap = vec![
-			output_image(7, source, &prediction),
-			output_image(8, output_location(501, DType::F32, 8, 1, 36), &prediction),
-		];
-		assert!(matches!(
-			validate_completed_prediction_images(
-				ValueId::new(50),
-				DType::F32,
-				ByteCount::new(8),
-				plan,
-				overlap,
-			),
-			Err(InferenceExecutionError::PredictionOutputImagesOverlap { .. })
-		));
-
-		let wrong_dtype = output_location(500, DType::I32, 8, 1, 32);
-		assert!(matches!(
-			validate_completed_prediction_images(
-				ValueId::new(50),
-				DType::F32,
-				ByteCount::new(8),
-				plan,
-				vec![output_image(7, wrong_dtype, &prediction)],
-			),
-			Err(InferenceExecutionError::PredictionOutputDTypeMismatch { .. })
-		));
-
-		let wrong_size = output_location(500, DType::F32, 4, 1, 32);
-		assert!(matches!(
-			validate_completed_prediction_images(
-				ValueId::new(50),
-				DType::F32,
-				ByteCount::new(8),
-				plan,
-				vec![output_image(7, wrong_size, &[1, 2, 3, 4])],
-			),
-			Err(InferenceExecutionError::PredictionOutputSizeMismatch { .. })
-		));
-
-		let wrong_source = output_location(500, DType::F32, 8, 1, 64);
-		assert!(matches!(
-			validate_completed_prediction_images(
-				ValueId::new(50),
-				DType::F32,
-				ByteCount::new(8),
-				plan,
-				vec![output_image(7, wrong_source, &prediction)],
-			),
-			Err(InferenceExecutionError::PredictionOutputSourceMismatch { .. })
-		));
-	}
-
-	#[test]
-	fn rejects_missing_mismatched_and_overlapping_members() {
-		let inputs = vec![input(1, &[1, 2, 3, 4])];
-		let missing = [InitDataImage {
-			device: DeviceId::new(1),
-			image: ValueId::new(100),
-			bytes: ByteCount::new(4),
-			members: vec![member(2, 102, 4, 0)],
-		}];
-		assert!(matches!(
-			pack_device_images(&inputs, &missing),
-			Err(TrainingExecutionError::MissingExternalInput { .. })
-		));
-
-		let wrong_size = [InitDataImage {
-			device: DeviceId::new(1),
-			image: ValueId::new(100),
-			bytes: ByteCount::new(8),
-			members: vec![member(1, 101, 8, 0)],
-		}];
-		assert!(matches!(
-			pack_device_images(&inputs, &wrong_size),
-			Err(TrainingExecutionError::ImageMemberSizeMismatch { .. })
-		));
-
-		let overlap_inputs = vec![input(1, &[1, 2, 3, 4]), input(2, &[5, 6, 7, 8])];
-		let overlap = [InitDataImage {
-			device: DeviceId::new(1),
-			image: ValueId::new(100),
-			bytes: ByteCount::new(8),
-			members: vec![member(1, 101, 4, 0), member(2, 102, 4, 2)],
-		}];
-		assert!(matches!(
-			pack_device_images(&overlap_inputs, &overlap),
-			Err(TrainingExecutionError::ImageMembersOverlap { .. })
-		));
-	}
-
-	#[test]
-	fn live_drain_never_loses_the_newest_final_sample_when_observer_is_full() {
-		let (mut observer, receiver) = bounded_training_metric_channel(
-			NonZeroUsize::new(1).unwrap(),
-			[MetricId::new(7)],
-			NonZeroU64::MIN,
-		);
-		let mut metrics = vec![FinalTrainingMetric {
-			slot: MetricSlotId::new(11),
-			metric: MetricId::new(7),
-			sample: None,
-		}];
-		let mut first = Some(sample(1, 7, 11, 0));
-		drain_user_metrics(&mut metrics, |_| first.take(), Some(&mut observer));
-		let mut second = Some(sample(2, 7, 11, 1));
-		drain_user_metrics(&mut metrics, |_| second.take(), Some(&mut observer));
-
-		assert_eq!(metrics[0].sample.as_ref().unwrap().sequence, 2);
-		let observed = receiver.try_recv().unwrap();
-		assert_eq!(observed.sequence, 1);
-		assert_eq!(observed.epoch, NonZeroU64::MIN);
-		assert_eq!(observed.zero_based_iteration.index(), 0);
-		assert_eq!(
-			observer.stats(),
-			TrainingMetricObserverStats {
-				observed: 2,
-				cadence_eligible: 2,
-				delivered: 1,
-				dropped: 1,
-			}
-		);
-	}
-
-	#[test]
-	fn bounded_observer_filters_metrics_and_counts_cadence_before_try_send() {
-		let (mut observer, receiver) = bounded_training_metric_channel(
-			NonZeroUsize::new(4).unwrap(),
-			[MetricId::new(3)],
-			NonZeroU64::new(2).unwrap(),
-		);
-		for sequence in 0..4 {
-			let selected = TrainingMetricSample::from_executor(sample(sequence, 3, 9, sequence));
-			let filtered = TrainingMetricSample::from_executor(sample(sequence + 10, 4, 10, sequence));
-			observer.try_observe(&selected);
-			observer.try_observe(&filtered);
-		}
-		assert_eq!(
-			receiver
-				.try_iter()
-				.map(|sample| sample.sequence)
-				.collect::<Vec<_>>(),
-			[1, 3]
-		);
-		assert_eq!(
-			observer.stats(),
-			TrainingMetricObserverStats {
-				observed: 4,
-				cadence_eligible: 2,
-				delivered: 2,
-				dropped: 0,
-			}
-		);
-	}
-}
-
-#[cfg(test)]
-#[path = "execute_inference_bundle_tests.rs"]
-mod inference_bundle_tests;

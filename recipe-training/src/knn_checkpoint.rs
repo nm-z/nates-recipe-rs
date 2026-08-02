@@ -1,19 +1,20 @@
 use core::num::NonZeroU64;
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
-use std::path::Path;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	io::Write,
+	path::Path,
+};
 
 use recipe_ingest::{
 	EncodedImageFormat, ImageColorModel, ImageValueLayout, ImageValueRange, SemanticType, VectorEncoding, VectorRole,
 };
 use recipe_ogdl::{Graph, NodeId};
 
-use crate::checkpoint::{atomic_save, decode_error, validate_saved_vector};
 use crate::{
 	CheckpointArtifactMetadata, CheckpointArtifactVector, CheckpointDecodeErrorKind, CheckpointError,
-	CheckpointImageMetadata, CheckpointPath, CheckpointResult, CompiledFeatureSpan, DenseActivation,
-	DenseDataNormalization, DenseFeatureLowering, DenseNormalization, DenseOperation, KnnLabelValue,
-	KnnReferenceOutput, KnnReferenceSet, KnnReferenceValues,
+	CheckpointImageMetadata, CheckpointPath, CheckpointResult, CompiledFeatureSpan, DenseDataNormalization,
+	DenseFeatureLowering, DenseOperation, KnnLabelValue, KnnReferenceOutput, KnnReferenceSet, KnnReferenceValues,
+	checkpoint::{atomic_save, decode_error, validate_saved_vector},
 };
 
 const KNN_MODEL_FORMAT_VERSION: u32 = 1;
@@ -83,24 +84,16 @@ impl KnnModelArtifact {
 	}
 
 	#[must_use]
-	pub const fn format_version(&self) -> u32 {
-		self.format_version
-	}
+	pub const fn format_version(&self) -> u32 { self.format_version }
 
 	#[must_use]
-	pub const fn references(&self) -> &KnnReferenceSet {
-		&self.references
-	}
+	pub const fn references(&self) -> &KnnReferenceSet { &self.references }
 
 	#[must_use]
-	pub const fn data_normalization(&self) -> Option<DenseDataNormalization> {
-		self.data_normalization
-	}
+	pub const fn data_normalization(&self) -> Option<DenseDataNormalization> { self.data_normalization }
 
 	#[must_use]
-	pub fn operations(&self) -> &[DenseOperation] {
-		&self.operations
-	}
+	pub fn operations(&self) -> &[DenseOperation] { &self.operations }
 
 	/// Continue one KNN model with another prepared training partition.
 	///
@@ -913,23 +906,19 @@ impl Decoder {
 				format!("KNN model root must be {ROOT:?}"),
 			));
 		}
-		let fields = self.fields(
-			*root,
-			&CheckpointPath::root(),
-			&[
-				"format-version",
-				"neighbors",
-				"data-normalization",
-				"operations",
-				"vectors",
-				"feature-spans",
-				"normalization-mask",
-				"reference-shape",
-				"reference-source-rows",
-				"reference-feature-f32-bits",
-				"outputs",
-			],
-		)?;
+		let fields = self.fields(*root, &CheckpointPath::root(), &[
+			"format-version",
+			"neighbors",
+			"data-normalization",
+			"operations",
+			"vectors",
+			"feature-spans",
+			"normalization-mask",
+			"reference-shape",
+			"reference-source-rows",
+			"reference-feature-f32-bits",
+			"outputs",
+		])?;
 		let format_version = self.parse_u32(
 			self.scalar(
 				fields["format-version"],
@@ -1075,13 +1064,17 @@ impl Decoder {
 			data_normalization,
 			operations,
 		};
-		validate_artifact(&artifact).map_err(|error| match error {
-			CheckpointError::Decode(error) => CheckpointError::Decode(error),
-			other => decode_error(
-				CheckpointDecodeErrorKind::InconsistentValue,
-				CheckpointPath::root(),
-				other.to_string(),
-			),
+		validate_artifact(&artifact).map_err(|error| {
+			match error {
+				CheckpointError::Decode(error) => CheckpointError::Decode(error),
+				other => {
+					decode_error(
+						CheckpointDecodeErrorKind::InconsistentValue,
+						CheckpointPath::root(),
+						other.to_string(),
+					)
+				}
+			}
 		})?;
 		Ok(artifact)
 	}
@@ -1121,18 +1114,14 @@ impl Decoder {
 			if self.node(child, &item_path)?.text() != "vector" {
 				return Err(self.unknown(&item_path, "expected vector entry"));
 			}
-			let fields = self.fields(
-				child,
-				&item_path,
-				&[
-					"source-index",
-					"name-bytes",
-					"role",
-					"semantic-type",
-					"encoding",
-					"metadata",
-				],
-			)?;
+			let fields = self.fields(child, &item_path, &[
+				"source-index",
+				"name-bytes",
+				"role",
+				"semantic-type",
+				"encoding",
+				"metadata",
+			])?;
 			let source_index = self.parse_usize(
 				self.scalar(fields["source-index"], &item_path.field("source-index"))?,
 				&item_path.field("source-index"),
@@ -1194,15 +1183,21 @@ impl Decoder {
 					nanoseconds,
 				})
 			}
-			"categorical" => Ok(CheckpointArtifactMetadata::Categorical {
-				dictionary: self.parse_byte_entries(&children, path)?,
-			}),
-			"ordinal" => Ok(CheckpointArtifactMetadata::Ordinal {
-				ordered_labels: self.parse_byte_entries(&children, path)?,
-			}),
-			"image" => Ok(CheckpointArtifactMetadata::Image {
-				encoded_variants: self.parse_image_entries(&children, path)?,
-			}),
+			"categorical" => {
+				Ok(CheckpointArtifactMetadata::Categorical {
+					dictionary: self.parse_byte_entries(&children, path)?,
+				})
+			}
+			"ordinal" => {
+				Ok(CheckpointArtifactMetadata::Ordinal {
+					ordered_labels: self.parse_byte_entries(&children, path)?,
+				})
+			}
+			"image" => {
+				Ok(CheckpointArtifactMetadata::Image {
+					encoded_variants: self.parse_image_entries(&children, path)?,
+				})
+			}
 			_ => Err(self.invalid_value(path, format!("unknown vector metadata {text:?}"))),
 		}
 	}
@@ -1233,20 +1228,16 @@ impl Decoder {
 			if self.node(child, &item_path)?.text() != "variant" {
 				return Err(self.unknown(&item_path, "expected image variant"));
 			}
-			let fields = self.fields(
-				child,
-				&item_path,
-				&[
-					"format",
-					"width",
-					"height",
-					"channels",
-					"color-model",
-					"sample-bits",
-					"value-layout",
-					"value-range",
-				],
-			)?;
+			let fields = self.fields(child, &item_path, &[
+				"format",
+				"width",
+				"height",
+				"channels",
+				"color-model",
+				"sample-bits",
+				"value-layout",
+				"value-range",
+			])?;
 			let format = self.parse_image_format(
 				self.scalar(fields["format"], &item_path.field("format"))?,
 				&item_path.field("format"),
@@ -1313,11 +1304,12 @@ impl Decoder {
 			if self.node(child, &item_path)?.text() != "span" {
 				return Err(self.unknown(&item_path, "expected feature span"));
 			}
-			let fields = self.fields(
-				child,
-				&item_path,
-				&["source-index", "start", "width", "lowering"],
-			)?;
+			let fields = self.fields(child, &item_path, &[
+				"source-index",
+				"start",
+				"width",
+				"lowering",
+			])?;
 			let source_index = self.parse_usize(
 				self.scalar(fields["source-index"], &item_path.field("source-index"))?,
 				&item_path.field("source-index"),
@@ -1343,11 +1335,10 @@ impl Decoder {
 					DenseFeatureLowering::NumericScalar
 				}
 				"categorical-one-hot" => {
-					let tagged_fields = self.fields(
-						lowering_tag,
-						&item_path.field("lowering"),
-						&["dictionary-width", "reserved-index"],
-					)?;
+					let tagged_fields = self.fields(lowering_tag, &item_path.field("lowering"), &[
+						"dictionary-width",
+						"reserved-index",
+					])?;
 					DenseFeatureLowering::CategoricalOneHot {
 						dictionary_width: self.parse_usize(
 							self.scalar(
@@ -1723,21 +1714,13 @@ impl Decoder {
 		parse_canonical(value, path)
 	}
 
-	fn parse_u64(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<u64> {
-		parse_canonical(value, path)
-	}
+	fn parse_u64(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<u64> { parse_canonical(value, path) }
 
-	fn parse_u32(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<u32> {
-		parse_canonical(value, path)
-	}
+	fn parse_u32(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<u32> { parse_canonical(value, path) }
 
-	fn parse_i32(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<i32> {
-		parse_canonical(value, path)
-	}
+	fn parse_i32(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<i32> { parse_canonical(value, path) }
 
-	fn parse_i64(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<i64> {
-		parse_canonical(value, path)
-	}
+	fn parse_i64(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<i64> { parse_canonical(value, path) }
 
 	fn parse_optional_u8(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<Option<u8>> {
 		if value == "none" {
@@ -1947,54 +1930,9 @@ const fn data_normalization(value: DenseDataNormalization) -> &'static str {
 	}
 }
 
-const fn dense_operation(value: DenseOperation) -> &'static str {
-	match value {
-		DenseOperation::Activation(DenseActivation::Linear) => "linear",
-		DenseOperation::Activation(DenseActivation::Cosine) => "cosine",
-		DenseOperation::Activation(DenseActivation::Exponential) => "exponential",
-		DenseOperation::Activation(DenseActivation::Logarithm) => "signed-logarithm",
-		DenseOperation::Activation(DenseActivation::NaturalLogarithm) => "natural-logarithm",
-		DenseOperation::Activation(DenseActivation::LegacySignedLogOnePlus) => "logarithm",
-		DenseOperation::Activation(DenseActivation::Huber) => "huber",
-		DenseOperation::Activation(DenseActivation::Tangent) => "tangent",
-		DenseOperation::Activation(DenseActivation::Relu) => "relu",
-		DenseOperation::Activation(DenseActivation::LeakyRelu) => "leaky-relu",
-		DenseOperation::Activation(DenseActivation::Sigmoid) => "sigmoid",
-		DenseOperation::Activation(DenseActivation::Tanh) => "tanh",
-		DenseOperation::Activation(DenseActivation::Selu) => "selu",
-		DenseOperation::Activation(DenseActivation::Gelu) => "gelu",
-		DenseOperation::Activation(DenseActivation::Silu) => "silu",
-		DenseOperation::Activation(DenseActivation::Elu) => "elu",
-		DenseOperation::Activation(DenseActivation::PRelu) => "prelu",
-		DenseOperation::Normalization(DenseNormalization::Layer) => "layer-normalization",
-		DenseOperation::Normalization(DenseNormalization::Batch) => "batch-normalization",
-	}
-}
+const fn dense_operation(value: DenseOperation) -> &'static str { value.token() }
 
-fn parse_operation(value: &str) -> Option<DenseOperation> {
-	Some(match value {
-		"linear" => DenseOperation::Activation(DenseActivation::Linear),
-		"cosine" => DenseOperation::Activation(DenseActivation::Cosine),
-		"exponential" => DenseOperation::Activation(DenseActivation::Exponential),
-		"signed-logarithm" => DenseOperation::Activation(DenseActivation::Logarithm),
-		"natural-logarithm" => DenseOperation::Activation(DenseActivation::NaturalLogarithm),
-		"logarithm" => DenseOperation::Activation(DenseActivation::LegacySignedLogOnePlus),
-		"huber" => DenseOperation::Activation(DenseActivation::Huber),
-		"tangent" => DenseOperation::Activation(DenseActivation::Tangent),
-		"relu" => DenseOperation::Activation(DenseActivation::Relu),
-		"leaky-relu" => DenseOperation::Activation(DenseActivation::LeakyRelu),
-		"sigmoid" => DenseOperation::Activation(DenseActivation::Sigmoid),
-		"tanh" => DenseOperation::Activation(DenseActivation::Tanh),
-		"selu" => DenseOperation::Activation(DenseActivation::Selu),
-		"gelu" => DenseOperation::Activation(DenseActivation::Gelu),
-		"silu" => DenseOperation::Activation(DenseActivation::Silu),
-		"elu" => DenseOperation::Activation(DenseActivation::Elu),
-		"prelu" => DenseOperation::Activation(DenseActivation::PRelu),
-		"layer-normalization" => DenseOperation::Normalization(DenseNormalization::Layer),
-		"batch-normalization" => DenseOperation::Normalization(DenseNormalization::Batch),
-		_ => return None,
-	})
-}
+fn parse_operation(value: &str) -> Option<DenseOperation> { DenseOperation::from_token(value) }
 
 const fn image_format(value: EncodedImageFormat) -> &'static str {
 	match value {

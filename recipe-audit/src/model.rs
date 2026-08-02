@@ -1,6 +1,8 @@
-use crate::AuditError;
-use serde::{Deserialize, Serialize};
 use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::AuditError;
 
 /// Which product boundary is being audited.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -29,17 +31,17 @@ impl std::str::FromStr for AuditMode {
 		match value {
 			"next" => Ok(Self::Next),
 			"legacy" => Ok(Self::Legacy),
-			_ => Err(AuditError::Configuration(format!(
-				"unknown mode {value:?}; expected next or legacy"
-			))),
+			_ => {
+				Err(AuditError::Configuration(format!(
+					"unknown mode {value:?}; expected next or legacy"
+				)))
+			}
 		}
 	}
 }
 
 impl fmt::Display for AuditMode {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(self.as_str())
-	}
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(self.as_str()) }
 }
 
 /// Stable policy category for a finding or legacy grant.
@@ -75,9 +77,7 @@ impl FindingCategory {
 }
 
 impl fmt::Display for FindingCategory {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(self.as_str())
-	}
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(self.as_str()) }
 }
 
 /// Whether a finding blocks the selected mode.
@@ -236,9 +236,7 @@ pub struct ArtifactSymbol {
 
 impl ArtifactSymbol {
 	#[must_use]
-	pub fn new(name: impl Into<String>) -> Self {
-		Self { name: name.into() }
-	}
+	pub fn new(name: impl Into<String>) -> Self { Self { name: name.into() } }
 }
 
 /// Relevant facts from one ELF artifact.
@@ -317,9 +315,7 @@ impl AuditInput {
 }
 
 fn validate_unique_paths<T, F>(values: &[T], path: F, label: &str) -> Result<(), AuditError>
-where
-	F: Fn(&T) -> &str,
-{
+where F: Fn(&T) -> &str {
 	let mut seen = std::collections::BTreeSet::new();
 	for value in values {
 		let current = path(value);
@@ -371,6 +367,4 @@ impl AuditReport {
 	}
 }
 
-pub(crate) fn normalize_display_path(path: &str) -> String {
-	path.replace('\\', "/")
-}
+pub(crate) fn normalize_display_path(path: &str) -> String { path.replace('\\', "/") }

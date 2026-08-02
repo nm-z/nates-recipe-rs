@@ -163,35 +163,39 @@ impl ScalarRecipe {
 		Some(recipe)
 	}
 
-	const fn opcode(opcode: ScalarOpcode, inputs: &'static [DType]) -> Self {
-		Self::Opcode { opcode, inputs }
-	}
+	const fn opcode(opcode: ScalarOpcode, inputs: &'static [DType]) -> Self { Self::Opcode { opcode, inputs } }
 
 	#[must_use]
 	pub const fn dtype_contract(self) -> CanonicalDTypeContract {
 		match self {
-			Self::Opcode { opcode, inputs } => CanonicalDTypeContract::Exact {
-				inputs,
-				outputs: if matches!(
-					opcode,
-					ScalarOpcode::Equal
-						| ScalarOpcode::NotEqual | ScalarOpcode::LessThan
-						| ScalarOpcode::LessThanOrEqual
-						| ScalarOpcode::GreaterThan | ScalarOpcode::GreaterThanOrEqual
-				) {
-					I32_OUTPUT
-				} else {
-					F32_OUTPUT
-				},
-			},
-			Self::Math(function) => CanonicalDTypeContract::Exact {
-				inputs: if function.arity() == 1 { F32_1 } else { F32_2 },
-				outputs: F32_OUTPUT,
-			},
-			Self::Composite(composite) => CanonicalDTypeContract::Exact {
-				inputs: composite.inputs(),
-				outputs: F32_OUTPUT,
-			},
+			Self::Opcode { opcode, inputs } => {
+				CanonicalDTypeContract::Exact {
+					inputs,
+					outputs: if matches!(
+						opcode,
+						ScalarOpcode::Equal
+							| ScalarOpcode::NotEqual | ScalarOpcode::LessThan
+							| ScalarOpcode::LessThanOrEqual | ScalarOpcode::GreaterThan
+							| ScalarOpcode::GreaterThanOrEqual
+					) {
+						I32_OUTPUT
+					} else {
+						F32_OUTPUT
+					},
+				}
+			}
+			Self::Math(function) => {
+				CanonicalDTypeContract::Exact {
+					inputs: if function.arity() == 1 { F32_1 } else { F32_2 },
+					outputs: F32_OUTPUT,
+				}
+			}
+			Self::Composite(composite) => {
+				CanonicalDTypeContract::Exact {
+					inputs: composite.inputs(),
+					outputs: F32_OUTPUT,
+				}
+			}
 		}
 	}
 
@@ -844,9 +848,7 @@ impl Composer {
 		Ok(value)
 	}
 
-	fn f32(&mut self, value: f32) -> OperationResult<Value> {
-		self.constant(ScalarLiteral::F32Bits(value.to_bits()))
-	}
+	fn f32(&mut self, value: f32) -> OperationResult<Value> { self.constant(ScalarLiteral::F32Bits(value.to_bits())) }
 
 	fn constant(&mut self, literal: ScalarLiteral) -> OperationResult<Value> {
 		let value = self.next(literal.dtype())?;

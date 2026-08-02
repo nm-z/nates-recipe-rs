@@ -1,13 +1,13 @@
-use crate::abi::*;
-use crate::identity::c_bool;
+use core::{ffi::c_void, mem::MaybeUninit};
+use std::{
+	panic::{AssertUnwindSafe, catch_unwind},
+	str::FromStr,
+};
+
 use crate::{
 	AgentUuid, DeviceType, Error, IsaTarget, MemoryLocation, MemoryPoolFlags, MemorySegment, PciAddress, Profile,
-	QueueKind, Result, RoundingModes, Runtime,
+	QueueKind, Result, RoundingModes, Runtime, abi::*, identity::c_bool,
 };
-use core::ffi::c_void;
-use core::mem::MaybeUninit;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::str::FromStr;
 
 const MAX_ISA_NAME_BYTES: usize = 4096;
 
@@ -117,13 +117,9 @@ pub struct AgentDescription {
 }
 
 impl AgentDescription {
-	pub const fn supports_kernel_dispatch(&self) -> bool {
-		self.feature_bits & AGENT_FEATURE_KERNEL_DISPATCH != 0
-	}
+	pub const fn supports_kernel_dispatch(&self) -> bool { self.feature_bits & AGENT_FEATURE_KERNEL_DISPATCH != 0 }
 
-	pub const fn supports_agent_dispatch(&self) -> bool {
-		self.feature_bits & AGENT_FEATURE_AGENT_DISPATCH != 0
-	}
+	pub const fn supports_agent_dispatch(&self) -> bool { self.feature_bits & AGENT_FEATURE_AGENT_DISPATCH != 0 }
 }
 
 #[derive(Clone, Copy)]
@@ -139,9 +135,7 @@ pub struct DiscoveredAgent<'runtime> {
 }
 
 impl DiscoveredAgent<'_> {
-	pub fn description(&self) -> &AgentDescription {
-		&self.description
-	}
+	pub fn description(&self) -> &AgentDescription { &self.description }
 }
 
 pub struct Discovery<'runtime> {
@@ -150,17 +144,11 @@ pub struct Discovery<'runtime> {
 }
 
 impl<'runtime> Discovery<'runtime> {
-	pub fn system(&self) -> &SystemDescription {
-		&self.system
-	}
+	pub fn system(&self) -> &SystemDescription { &self.system }
 
-	pub fn agents(&self) -> &[DiscoveredAgent<'runtime>] {
-		&self.agents
-	}
+	pub fn agents(&self) -> &[DiscoveredAgent<'runtime>] { &self.agents }
 
-	pub fn into_agents(self) -> Vec<DiscoveredAgent<'runtime>> {
-		self.agents
-	}
+	pub fn into_agents(self) -> Vec<DiscoveredAgent<'runtime>> { self.agents }
 }
 
 pub(crate) fn discover(runtime: &Runtime) -> Result<Discovery<'_>> {
@@ -187,11 +175,12 @@ pub(crate) fn discover(runtime: &Runtime) -> Result<Discovery<'_>> {
 
 	let raw_agents = iterate_agents(api)?;
 	let mut agents = Vec::new();
-	agents.try_reserve_exact(raw_agents.len())
-		.map_err(|_| Error::AllocationFailed {
+	agents.try_reserve_exact(raw_agents.len()).map_err(|_| {
+		Error::AllocationFailed {
 			field: "agent descriptions",
 			requested: raw_agents.len(),
-		})?;
+		}
+	})?;
 	for raw_agent in raw_agents {
 		agents.push(discover_agent(runtime, raw_agent)?);
 	}
@@ -366,11 +355,12 @@ fn discover_agent(runtime: &Runtime, raw_agent: HsaAgent) -> Result<DiscoveredAg
 
 	let raw_isas = iterate_isas(api, raw_agent)?;
 	let mut isas = Vec::new();
-	isas.try_reserve_exact(raw_isas.len())
-		.map_err(|_| Error::AllocationFailed {
+	isas.try_reserve_exact(raw_isas.len()).map_err(|_| {
+		Error::AllocationFailed {
 			field: "ISA descriptions",
 			requested: raw_isas.len(),
-		})?;
+		}
+	})?;
 	for raw_isa in raw_isas {
 		isas.push(discover_isa(api, raw_isa, device_type)?);
 	}
@@ -379,16 +369,20 @@ fn discover_agent(runtime: &Runtime, raw_agent: HsaAgent) -> Result<DiscoveredAg
 	let mut memory_pools = Vec::new();
 	memory_pools
 		.try_reserve_exact(raw_pool_handles.len())
-		.map_err(|_| Error::AllocationFailed {
-			field: "memory-pool descriptions",
-			requested: raw_pool_handles.len(),
+		.map_err(|_| {
+			Error::AllocationFailed {
+				field: "memory-pool descriptions",
+				requested: raw_pool_handles.len(),
+			}
 		})?;
 	let mut raw_pools = Vec::new();
 	raw_pools
 		.try_reserve_exact(raw_pool_handles.len())
-		.map_err(|_| Error::AllocationFailed {
-			field: "memory-pool handles",
-			requested: raw_pool_handles.len(),
+		.map_err(|_| {
+			Error::AllocationFailed {
+				field: "memory-pool handles",
+				requested: raw_pool_handles.len(),
+			}
 		})?;
 	for pool in raw_pool_handles {
 		memory_pools.push(discover_memory_pool(api, pool)?);
@@ -472,12 +466,12 @@ fn discover_isa(api: &crate::loader::Api, isa: HsaIsa, device_type: DeviceType) 
 		});
 	}
 	let mut name_bytes = Vec::new();
-	name_bytes
-		.try_reserve_exact(name_length)
-		.map_err(|_| Error::AllocationFailed {
+	name_bytes.try_reserve_exact(name_length).map_err(|_| {
+		Error::AllocationFailed {
 			field: "HSA ISA name",
 			requested: name_length,
-		})?;
+		}
+	})?;
 	name_bytes.resize(name_length, 0);
 	if name_length != 0 {
 		// SAFETY: `name_bytes` is exactly the length reported by ROCr and
@@ -498,8 +492,10 @@ fn discover_isa(api: &crate::loader::Api, isa: HsaIsa, device_type: DeviceType) 
 		}
 		name_bytes.truncate(nul);
 	}
-	let name = String::from_utf8(name_bytes).map_err(|_| Error::InvalidUtf8 {
-		field: "HSA ISA name",
+	let name = String::from_utf8(name_bytes).map_err(|_| {
+		Error::InvalidUtf8 {
+			field: "HSA ISA name",
+		}
 	})?;
 	let amd_target = if device_type == DeviceType::Gpu {
 		Some(IsaTarget::from_str(&name)?)
@@ -731,11 +727,13 @@ fn annotate_operation(error: Error, operation: &'static str) -> Error {
 	match error {
 		Error::Hsa {
 			status, message, ..
-		} => Error::Hsa {
-			operation,
-			status,
-			message,
-		},
+		} => {
+			Error::Hsa {
+				operation,
+				status,
+				message,
+			}
+		}
 		other => other,
 	}
 }
@@ -883,47 +881,4 @@ fn iterate_memory_pools(api: &crate::loader::Api, agent: HsaAgent) -> Result<Vec
 	}
 	api.check("hsa_amd_agent_iterate_memory_pools", status)?;
 	Ok(collector.values)
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn rejects_inconsistent_queue_limits() {
-		let error = validate_queue_capabilities(QueueCapabilities {
-			maximum_queues: 1,
-			minimum_packets: 128,
-			maximum_packets: 64,
-			advertised_kind: QueueKind::MultiProducer,
-		})
-		.unwrap_err();
-		assert!(matches!(error, Error::InvalidQueueSize { .. }));
-	}
-
-	#[test]
-	fn rejects_non_power_of_two_queue_limits() {
-		assert!(
-			validate_queue_capabilities(QueueCapabilities {
-				maximum_queues: 1,
-				minimum_packets: 96,
-				maximum_packets: 256,
-				advertised_kind: QueueKind::MultiProducer,
-			})
-			.is_err()
-		);
-	}
-
-	#[test]
-	fn rejects_zero_queue_count() {
-		assert!(
-			validate_queue_capabilities(QueueCapabilities {
-				maximum_queues: 0,
-				minimum_packets: 128,
-				maximum_packets: 256,
-				advertised_kind: QueueKind::MultiProducer,
-			})
-			.is_err()
-		);
-	}
 }

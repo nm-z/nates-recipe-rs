@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::error::{ValidationCode, ValidationResult, Validator};
-use crate::identity::{Label, TopologyIdentity};
-use crate::ids::{DeviceId, DuplexResourceId, LinkId, MachineId, NodeId, TransportId};
-use crate::units::{ByteCount, BytesPerSecond, FlopsPerSecond, TransferLaneCount};
+use crate::{
+	error::{ValidationCode, ValidationResult, Validator},
+	identity::{Label, TopologyIdentity},
+	ids::{DeviceId, DuplexResourceId, LinkId, MachineId, NodeId, TransportId},
+	units::{ByteCount, BytesPerSecond, FlopsPerSecond, TransferLaneCount},
+};
 
 /// Origin of a declared or discovered property.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -22,9 +24,7 @@ pub struct Property<T> {
 
 impl<T> Property<T> {
 	#[must_use]
-	pub const fn new(value: T, provenance: PropertyProvenance) -> Self {
-		Self { value, provenance }
-	}
+	pub const fn new(value: T, provenance: PropertyProvenance) -> Self { Self { value, provenance } }
 
 	/// Whether this value is permitted to drive a production schedule.
 	#[must_use]
@@ -78,9 +78,7 @@ pub struct Device {
 
 impl Device {
 	#[must_use]
-	pub fn is_calculation_target(&self) -> bool {
-		self.kind == DeviceKind::GpuMemory
-	}
+	pub fn is_calculation_target(&self) -> bool { self.kind == DeviceKind::GpuMemory }
 }
 
 /// Physical transport family used by one bidirectional link pair.
@@ -186,18 +184,22 @@ impl Topology {
 			);
 			*devices_per_machine.entry(device.machine).or_default() += 1;
 			match device.kind {
-				DeviceKind::GpuMemory => validator.require(
-					device.calculation_rate.is_some(),
-					ValidationCode::MissingRequiredObject,
-					format!("devices[{index}].calculation_rate"),
-					"GPU storage device requires a calculation rate",
-				),
-				DeviceKind::Ram | DeviceKind::Disk => validator.require(
-					device.calculation_rate.is_none(),
-					ValidationCode::WrongKind,
-					format!("devices[{index}].calculation_rate"),
-					"non-GPU storage device cannot be a calculation target",
-				),
+				DeviceKind::GpuMemory => {
+					validator.require(
+						device.calculation_rate.is_some(),
+						ValidationCode::MissingRequiredObject,
+						format!("devices[{index}].calculation_rate"),
+						"GPU storage device requires a calculation rate",
+					)
+				}
+				DeviceKind::Ram | DeviceKind::Disk => {
+					validator.require(
+						device.calculation_rate.is_none(),
+						ValidationCode::WrongKind,
+						format!("devices[{index}].calculation_rate"),
+						"non-GPU storage device cannot be a calculation target",
+					)
+				}
 			}
 		}
 		for (index, machine) in self.machines.iter().enumerate() {
@@ -264,17 +266,21 @@ impl Topology {
 			}
 		}
 		match master_count {
-			0 => validator.error(
-				ValidationCode::MissingMaster,
-				"nodes",
-				"topology requires exactly one master node",
-			),
+			0 => {
+				validator.error(
+					ValidationCode::MissingMaster,
+					"nodes",
+					"topology requires exactly one master node",
+				)
+			}
 			1 => {}
-			_ => validator.error(
-				ValidationCode::MultipleMasters,
-				"nodes",
-				format!("topology has {master_count} master nodes"),
-			),
+			_ => {
+				validator.error(
+					ValidationCode::MultipleMasters,
+					"nodes",
+					format!("topology has {master_count} master nodes"),
+				)
+			}
 		}
 		for (index, device) in self.devices.iter().enumerate() {
 			validator.require(
@@ -374,20 +380,24 @@ impl Topology {
 					format!("transport {transport} declares asymmetric duplex modes"),
 				);
 				match first.duplex {
-					DuplexMode::Half => validator.require(
-						first.capacity_resource == second.capacity_resource,
-						ValidationCode::InvalidDuplex,
-						format!("links[{second_index}].capacity_resource"),
-						format!("half-duplex transport {transport} must share one capacity resource"),
-					),
-					DuplexMode::Full => validator.require(
-						first.capacity_resource != second.capacity_resource,
-						ValidationCode::InvalidDuplex,
-						format!("links[{second_index}].capacity_resource"),
-						format!(
-							"full-duplex transport {transport} requires one capacity resource per direction"
-						),
-					),
+					DuplexMode::Half => {
+						validator.require(
+							first.capacity_resource == second.capacity_resource,
+							ValidationCode::InvalidDuplex,
+							format!("links[{second_index}].capacity_resource"),
+							format!("half-duplex transport {transport} must share one capacity resource"),
+						)
+					}
+					DuplexMode::Full => {
+						validator.require(
+							first.capacity_resource != second.capacity_resource,
+							ValidationCode::InvalidDuplex,
+							format!("links[{second_index}].capacity_resource"),
+							format!(
+								"full-duplex transport {transport} requires one capacity resource per direction"
+							),
+						)
+					}
 				}
 			}
 			for (index, direction) in directions {
@@ -454,19 +464,13 @@ impl Topology {
 	}
 
 	#[must_use]
-	pub fn machine(&self, id: MachineId) -> Option<&Machine> {
-		self.machines.iter().find(|machine| machine.id == id)
-	}
+	pub fn machine(&self, id: MachineId) -> Option<&Machine> { self.machines.iter().find(|machine| machine.id == id) }
 
 	#[must_use]
-	pub fn device(&self, id: DeviceId) -> Option<&Device> {
-		self.devices.iter().find(|device| device.id == id)
-	}
+	pub fn device(&self, id: DeviceId) -> Option<&Device> { self.devices.iter().find(|device| device.id == id) }
 
 	#[must_use]
-	pub fn link(&self, id: LinkId) -> Option<&DirectedLink> {
-		self.links.iter().find(|link| link.id == id)
-	}
+	pub fn link(&self, id: LinkId) -> Option<&DirectedLink> { self.links.iter().find(|link| link.id == id) }
 
 	#[must_use]
 	pub fn duplex_mode(&self, first: LinkId, second: LinkId) -> Option<DuplexMode> {
@@ -522,186 +526,5 @@ impl Topology {
 			format!("route ends at {current}, expected {destination}"),
 		);
 		errors.finish()
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::identity::Digest;
-
-	fn label(value: &str) -> Label {
-		Label::new(value).unwrap()
-	}
-
-	fn bytes_per_second(value: u64) -> Property<BytesPerSecond> {
-		Property::new(
-			BytesPerSecond::new(value).unwrap(),
-			PropertyProvenance::Estimated,
-		)
-	}
-
-	fn fixture() -> Topology {
-		let machine = MachineId::new(1);
-		let gpu = DeviceId::new(1);
-		let ram = DeviceId::new(2);
-		Topology {
-			identity: TopologyIdentity::new(Digest::new([1; 32])),
-			machines: vec![Machine {
-				id: machine,
-				name: label("machine-a"),
-			}],
-			nodes: vec![Node {
-				id: NodeId::new(1),
-				role: NodeRole::Master,
-				machine,
-				devices: vec![gpu, ram],
-			}],
-			devices: vec![
-				Device {
-					id: gpu,
-					machine,
-					kind: DeviceKind::GpuMemory,
-					capacity: Property::new(
-						ByteCount::new(12_000_000_000),
-						PropertyProvenance::Estimated,
-					),
-					transfer_rate: bytes_per_second(432_000_000_000),
-					calculation_rate: Some(Property::new(
-						FlopsPerSecond::new(380_000_000_000).unwrap(),
-						PropertyProvenance::Estimated,
-					)),
-				},
-				Device {
-					id: ram,
-					machine,
-					kind: DeviceKind::Ram,
-					capacity: Property::new(
-						ByteCount::new(48_000_000_000),
-						PropertyProvenance::Estimated,
-					),
-					transfer_rate: bytes_per_second(90_000_000_000),
-					calculation_rate: None,
-				},
-			],
-			links: vec![
-				DirectedLink {
-					id: LinkId::new(1),
-					transport: TransportId::new(1),
-					kind: TransportKind::Pcie,
-					duplex: DuplexMode::Full,
-					from: ram,
-					to: gpu,
-					bandwidth: bytes_per_second(16_000_000_000),
-					maximum_inflight_transfers: Property::new(
-						TransferLaneCount::new(1).unwrap(),
-						PropertyProvenance::Estimated,
-					),
-					capacity_resource: DuplexResourceId::new(1),
-				},
-				DirectedLink {
-					id: LinkId::new(2),
-					transport: TransportId::new(1),
-					kind: TransportKind::Pcie,
-					duplex: DuplexMode::Full,
-					from: gpu,
-					to: ram,
-					bandwidth: bytes_per_second(16_000_000_000),
-					maximum_inflight_transfers: Property::new(
-						TransferLaneCount::new(1).unwrap(),
-						PropertyProvenance::Estimated,
-					),
-					capacity_resource: DuplexResourceId::new(2),
-				},
-			],
-		}
-	}
-
-	#[test]
-	fn validates_ownership_and_full_duplex_links() {
-		let topology = fixture();
-		topology.validate().unwrap();
-		assert_eq!(
-			topology.duplex_mode(LinkId::new(1), LinkId::new(2)),
-			Some(DuplexMode::Full)
-		);
-		topology
-			.validate_route(DeviceId::new(2), DeviceId::new(1), &[LinkId::new(1)])
-			.unwrap();
-	}
-
-	#[test]
-	fn rejects_unowned_device_and_missing_master() {
-		let mut topology = fixture();
-		topology.nodes[0].role = NodeRole::Worker;
-		topology.nodes[0].devices.pop();
-		let errors = topology.validate().unwrap_err();
-		assert!(errors.contains(ValidationCode::MissingMaster));
-		assert!(errors.contains(ValidationCode::UnownedDevice));
-	}
-
-	#[test]
-	fn opposing_edges_sharing_capacity_are_half_duplex() {
-		let mut topology = fixture();
-		topology.links[0].kind = TransportKind::Sata;
-		topology.links[1].kind = TransportKind::Sata;
-		topology.links[0].duplex = DuplexMode::Half;
-		topology.links[1].duplex = DuplexMode::Half;
-		topology.links[1].capacity_resource = topology.links[0].capacity_resource;
-		assert_eq!(
-			topology.duplex_mode(LinkId::new(1), LinkId::new(2)),
-			Some(DuplexMode::Half)
-		);
-		topology.validate().unwrap();
-	}
-
-	#[test]
-	fn validates_every_transport_kind_and_rejects_broken_reverse_pairs() {
-		for kind in [
-			TransportKind::Memory,
-			TransportKind::Pcie,
-			TransportKind::Sata,
-			TransportKind::Sas,
-			TransportKind::Nvme,
-			TransportKind::Ethernet,
-			TransportKind::Wlan,
-		] {
-			let mut topology = fixture();
-			topology.links[0].kind = kind;
-			topology.links[1].kind = kind;
-			topology.links[0].duplex = kind.required_duplex();
-			topology.links[1].duplex = kind.required_duplex();
-			if kind.required_duplex() == DuplexMode::Half {
-				topology.links[1].capacity_resource = topology.links[0].capacity_resource;
-			}
-			topology.validate().unwrap();
-		}
-
-		let mut missing_reverse = fixture();
-		missing_reverse.links.pop();
-		assert!(
-			missing_reverse
-				.validate()
-				.unwrap_err()
-				.contains(ValidationCode::InvalidTransport)
-		);
-
-		let mut asymmetric = fixture();
-		asymmetric.links[1].kind = TransportKind::Sata;
-		assert!(
-			asymmetric
-				.validate()
-				.unwrap_err()
-				.contains(ValidationCode::InvalidTransport)
-		);
-
-		let mut contradictory_duplex = fixture();
-		contradictory_duplex.links[1].duplex = DuplexMode::Half;
-		assert!(
-			contradictory_duplex
-				.validate()
-				.unwrap_err()
-				.contains(ValidationCode::InvalidDuplex)
-		);
 	}
 }

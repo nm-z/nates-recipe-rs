@@ -144,48 +144,66 @@ impl PrimitiveRecipe {
 				result: ReduceResult::Value,
 				..
 			}
-			| Self::Scan { .. } => CanonicalDTypeContract::Exact {
-				inputs: F32_INPUT,
-				outputs: F32_OUTPUT,
-			},
+			| Self::Scan { .. } => {
+				CanonicalDTypeContract::Exact {
+					inputs: F32_INPUT,
+					outputs: F32_OUTPUT,
+				}
+			}
 			Self::Reduce {
 				result: ReduceResult::Index,
 				..
-			} => CanonicalDTypeContract::Exact {
-				inputs: F32_INPUT,
-				outputs: I32_OUTPUT,
-			},
+			} => {
+				CanonicalDTypeContract::Exact {
+					inputs: F32_INPUT,
+					outputs: I32_OUTPUT,
+				}
+			}
 			Self::Reduce {
 				result: ReduceResult::ValueAndIndex,
 				..
-			} => CanonicalDTypeContract::Exact {
-				inputs: F32_INPUT,
-				outputs: &[DType::F32, DType::I32],
-			},
-			Self::Contraction(_) => CanonicalDTypeContract::Exact {
-				inputs: F32_PAIR,
-				outputs: F32_OUTPUT,
-			},
-			Self::Gather { .. } => CanonicalDTypeContract::Exact {
-				inputs: F32_I32,
-				outputs: F32_OUTPUT,
-			},
-			Self::ScatterAdd { .. } => CanonicalDTypeContract::Exact {
-				inputs: F32_I32_F32,
-				outputs: F32_OUTPUT,
-			},
-			Self::Sort { .. } => CanonicalDTypeContract::Exact {
-				inputs: F32_INPUT,
-				outputs: F32_OUTPUT,
-			},
-			Self::IndexMap => CanonicalDTypeContract::Exact {
-				inputs: NO_INPUTS,
-				outputs: I32_OUTPUT,
-			},
-			Self::Random(RandomRecipe::UniformF32 | RandomRecipe::NormalF32) => CanonicalDTypeContract::Exact {
-				inputs: NO_INPUTS,
-				outputs: F32_OUTPUT,
-			},
+			} => {
+				CanonicalDTypeContract::Exact {
+					inputs: F32_INPUT,
+					outputs: &[DType::F32, DType::I32],
+				}
+			}
+			Self::Contraction(_) => {
+				CanonicalDTypeContract::Exact {
+					inputs: F32_PAIR,
+					outputs: F32_OUTPUT,
+				}
+			}
+			Self::Gather { .. } => {
+				CanonicalDTypeContract::Exact {
+					inputs: F32_I32,
+					outputs: F32_OUTPUT,
+				}
+			}
+			Self::ScatterAdd { .. } => {
+				CanonicalDTypeContract::Exact {
+					inputs: F32_I32_F32,
+					outputs: F32_OUTPUT,
+				}
+			}
+			Self::Sort { .. } => {
+				CanonicalDTypeContract::Exact {
+					inputs: F32_INPUT,
+					outputs: F32_OUTPUT,
+				}
+			}
+			Self::IndexMap => {
+				CanonicalDTypeContract::Exact {
+					inputs: NO_INPUTS,
+					outputs: I32_OUTPUT,
+				}
+			}
+			Self::Random(RandomRecipe::UniformF32 | RandomRecipe::NormalF32) => {
+				CanonicalDTypeContract::Exact {
+					inputs: NO_INPUTS,
+					outputs: F32_OUTPUT,
+				}
+			}
 		}
 	}
 
@@ -311,13 +329,10 @@ impl PrimitiveRecipe {
 			(Self::ScatterAdd { axis }, PrimitiveKind::Scatter(spec)) => {
 				axis_matches(axis, spec.axis, kernel, tensors)
 					&& spec.bounds == IndexBounds::Reject
-					&& matches!(
-						spec.conflict,
-						ScatterConflict::Atomic {
-							operation: AtomicOperation::Add,
-							ordering: AtomicOrdering::SequentiallyConsistent,
-						}
-					) && kernel.alias_rules.iter().any(|rule| {
+					&& matches!(spec.conflict, ScatterConflict::Atomic {
+						operation: AtomicOperation::Add,
+						ordering: AtomicOrdering::SequentiallyConsistent,
+					}) && kernel.alias_rules.iter().any(|rule| {
 					rule.input == 0 && rule.output == 0 && rule.permission == AliasPermission::MustAliasExact
 				})
 			}
@@ -333,14 +348,18 @@ impl PrimitiveRecipe {
 					&& stable == spec.stable && axis_matches(axis, spec.axis, kernel, tensors)
 					&& !spec.emit_indices
 			}
-			(Self::Random(RandomRecipe::UniformF32), PrimitiveKind::Random(spec)) => matches!(
-				spec.distribution,
-				recipe_language::RandomDistribution::UniformF32
-			),
-			(Self::Random(RandomRecipe::NormalF32), PrimitiveKind::Random(spec)) => matches!(
-				spec.distribution,
-				recipe_language::RandomDistribution::NormalF32
-			),
+			(Self::Random(RandomRecipe::UniformF32), PrimitiveKind::Random(spec)) => {
+				matches!(
+					spec.distribution,
+					recipe_language::RandomDistribution::UniformF32
+				)
+			}
+			(Self::Random(RandomRecipe::NormalF32), PrimitiveKind::Random(spec)) => {
+				matches!(
+					spec.distribution,
+					recipe_language::RandomDistribution::NormalF32
+				)
+			}
 			(Self::IndexMap, PrimitiveKind::IndexMap(_)) => true,
 			(
 				Self::Reduce { .. }
@@ -413,16 +432,20 @@ fn lower_recipe(
 	hardware: LoweringHardware,
 ) -> OperationResult<LoweredProgram> {
 	match recipe.matches(request.kernel, request.tensors) {
-		true => recipe_primitives::lower(request.kernel, request.tensors, hardware).map_err(|error| {
-			OperationError::new(
-				OperationErrorKind::PrimitiveLoweringFailed,
-				error.to_string(),
-			)
-		}),
-		false => Err(OperationError::new(
-			OperationErrorKind::PrimitiveRecipeMismatch,
-			format!("kernel kind does not satisfy {}", recipe.definition()),
-		)),
+		true => {
+			recipe_primitives::lower(request.kernel, request.tensors, hardware).map_err(|error| {
+				OperationError::new(
+					OperationErrorKind::PrimitiveLoweringFailed,
+					error.to_string(),
+				)
+			})
+		}
+		false => {
+			Err(OperationError::new(
+				OperationErrorKind::PrimitiveRecipeMismatch,
+				format!("kernel kind does not satisfy {}", recipe.definition()),
+			))
+		}
 	}
 }
 
@@ -528,76 +551,52 @@ fn contraction_matches(
 }
 
 const SYMBOL_RECIPES: &[(&str, PrimitiveRecipe)] = &[
-	(
-		"gpu_argmax_f32",
-		PrimitiveRecipe::Reduce {
-			operator: ReduceOperator::Maximum,
-			result: ReduceResult::Index,
-			axes: AxisRequirement::All,
-		},
-	),
-	(
-		"gpu_argmax_rows",
-		PrimitiveRecipe::Reduce {
-			operator: ReduceOperator::Maximum,
-			result: ReduceResult::Index,
-			axes: AxisRequirement::Last,
-		},
-	),
-	(
-		"gpu_argmin_rows",
-		PrimitiveRecipe::Reduce {
-			operator: ReduceOperator::Minimum,
-			result: ReduceResult::Index,
-			axes: AxisRequirement::Last,
-		},
-	),
+	("gpu_argmax_f32", PrimitiveRecipe::Reduce {
+		operator: ReduceOperator::Maximum,
+		result: ReduceResult::Index,
+		axes: AxisRequirement::All,
+	}),
+	("gpu_argmax_rows", PrimitiveRecipe::Reduce {
+		operator: ReduceOperator::Maximum,
+		result: ReduceResult::Index,
+		axes: AxisRequirement::Last,
+	}),
+	("gpu_argmin_rows", PrimitiveRecipe::Reduce {
+		operator: ReduceOperator::Minimum,
+		result: ReduceResult::Index,
+		axes: AxisRequirement::Last,
+	}),
 	(
 		"gpu_bmm_into",
 		PrimitiveRecipe::Contraction(ContractionClass::Batched),
 	),
-	(
-		"gpu_cummax",
-		PrimitiveRecipe::Scan {
-			operator: ReduceOperator::Maximum,
-			exclusive: false,
-			axis: AxisRequirement::Any,
-		},
-	),
-	(
-		"gpu_cumprod",
-		PrimitiveRecipe::Scan {
-			operator: ReduceOperator::Product,
-			exclusive: false,
-			axis: AxisRequirement::Any,
-		},
-	),
-	(
-		"gpu_cumsum_cols",
-		PrimitiveRecipe::Scan {
-			operator: ReduceOperator::Sum,
-			exclusive: false,
-			axis: AxisRequirement::First,
-		},
-	),
-	(
-		"gpu_cumsum_rows",
-		PrimitiveRecipe::Scan {
-			operator: ReduceOperator::Sum,
-			exclusive: false,
-			axis: AxisRequirement::Last,
-		},
-	),
+	("gpu_cummax", PrimitiveRecipe::Scan {
+		operator: ReduceOperator::Maximum,
+		exclusive: false,
+		axis: AxisRequirement::Any,
+	}),
+	("gpu_cumprod", PrimitiveRecipe::Scan {
+		operator: ReduceOperator::Product,
+		exclusive: false,
+		axis: AxisRequirement::Any,
+	}),
+	("gpu_cumsum_cols", PrimitiveRecipe::Scan {
+		operator: ReduceOperator::Sum,
+		exclusive: false,
+		axis: AxisRequirement::First,
+	}),
+	("gpu_cumsum_rows", PrimitiveRecipe::Scan {
+		operator: ReduceOperator::Sum,
+		exclusive: false,
+		axis: AxisRequirement::Last,
+	}),
 	(
 		"gpu_dot",
 		PrimitiveRecipe::Contraction(ContractionClass::Vector),
 	),
-	(
-		"gpu_gather_rows_into",
-		PrimitiveRecipe::Gather {
-			axis: AxisRequirement::First,
-		},
-	),
+	("gpu_gather_rows_into", PrimitiveRecipe::Gather {
+		axis: AxisRequirement::First,
+	}),
 	(
 		"gpu_gemm",
 		PrimitiveRecipe::Contraction(ContractionClass::Matrix),
@@ -614,38 +613,26 @@ const SYMBOL_RECIPES: &[(&str, PrimitiveRecipe)] = &[
 		"gpu_gemm_bt_into",
 		PrimitiveRecipe::Contraction(ContractionClass::RightTransposedMatrix),
 	),
-	(
-		"gpu_max_all",
-		PrimitiveRecipe::Reduce {
-			operator: ReduceOperator::Maximum,
-			result: ReduceResult::Value,
-			axes: AxisRequirement::All,
-		},
-	),
-	(
-		"gpu_min_all",
-		PrimitiveRecipe::Reduce {
-			operator: ReduceOperator::Minimum,
-			result: ReduceResult::Value,
-			axes: AxisRequirement::All,
-		},
-	),
-	(
-		"gpu_prefix_sum_exclusive",
-		PrimitiveRecipe::Scan {
-			operator: ReduceOperator::Sum,
-			exclusive: true,
-			axis: AxisRequirement::Any,
-		},
-	),
-	(
-		"gpu_prefix_sum_inclusive",
-		PrimitiveRecipe::Scan {
-			operator: ReduceOperator::Sum,
-			exclusive: false,
-			axis: AxisRequirement::Any,
-		},
-	),
+	("gpu_max_all", PrimitiveRecipe::Reduce {
+		operator: ReduceOperator::Maximum,
+		result: ReduceResult::Value,
+		axes: AxisRequirement::All,
+	}),
+	("gpu_min_all", PrimitiveRecipe::Reduce {
+		operator: ReduceOperator::Minimum,
+		result: ReduceResult::Value,
+		axes: AxisRequirement::All,
+	}),
+	("gpu_prefix_sum_exclusive", PrimitiveRecipe::Scan {
+		operator: ReduceOperator::Sum,
+		exclusive: true,
+		axis: AxisRequirement::Any,
+	}),
+	("gpu_prefix_sum_inclusive", PrimitiveRecipe::Scan {
+		operator: ReduceOperator::Sum,
+		exclusive: false,
+		axis: AxisRequirement::Any,
+	}),
 	(
 		"gpu_rand_uniform_into",
 		PrimitiveRecipe::Random(RandomRecipe::UniformF32),
@@ -654,74 +641,47 @@ const SYMBOL_RECIPES: &[(&str, PrimitiveRecipe)] = &[
 		"gpu_randn",
 		PrimitiveRecipe::Random(RandomRecipe::NormalF32),
 	),
-	(
-		"gpu_reduce_max_cols",
-		PrimitiveRecipe::Reduce {
-			operator: ReduceOperator::Maximum,
-			result: ReduceResult::Value,
-			axes: AxisRequirement::First,
-		},
-	),
-	(
-		"gpu_reduce_max_rows",
-		PrimitiveRecipe::Reduce {
-			operator: ReduceOperator::Maximum,
-			result: ReduceResult::Value,
-			axes: AxisRequirement::Last,
-		},
-	),
-	(
-		"gpu_reduce_min_cols",
-		PrimitiveRecipe::Reduce {
-			operator: ReduceOperator::Minimum,
-			result: ReduceResult::Value,
-			axes: AxisRequirement::First,
-		},
-	),
-	(
-		"gpu_reduce_min_rows",
-		PrimitiveRecipe::Reduce {
-			operator: ReduceOperator::Minimum,
-			result: ReduceResult::Value,
-			axes: AxisRequirement::Last,
-		},
-	),
-	(
-		"gpu_reduce_sum_cols_into",
-		PrimitiveRecipe::Reduce {
-			operator: ReduceOperator::Sum,
-			result: ReduceResult::Value,
-			axes: AxisRequirement::First,
-		},
-	),
-	(
-		"gpu_reduce_sum_rows",
-		PrimitiveRecipe::Reduce {
-			operator: ReduceOperator::Sum,
-			result: ReduceResult::Value,
-			axes: AxisRequirement::Last,
-		},
-	),
-	(
-		"gpu_scatter_add",
-		PrimitiveRecipe::ScatterAdd {
-			axis: AxisRequirement::First,
-		},
-	),
-	(
-		"gpu_sort",
-		PrimitiveRecipe::Sort {
-			direction: SortDirection::Ascending,
-			stable: false,
-			axis: AxisRequirement::All,
-		},
-	),
-	(
-		"gpu_sum_all",
-		PrimitiveRecipe::Reduce {
-			operator: ReduceOperator::Sum,
-			result: ReduceResult::Value,
-			axes: AxisRequirement::All,
-		},
-	),
+	("gpu_reduce_max_cols", PrimitiveRecipe::Reduce {
+		operator: ReduceOperator::Maximum,
+		result: ReduceResult::Value,
+		axes: AxisRequirement::First,
+	}),
+	("gpu_reduce_max_rows", PrimitiveRecipe::Reduce {
+		operator: ReduceOperator::Maximum,
+		result: ReduceResult::Value,
+		axes: AxisRequirement::Last,
+	}),
+	("gpu_reduce_min_cols", PrimitiveRecipe::Reduce {
+		operator: ReduceOperator::Minimum,
+		result: ReduceResult::Value,
+		axes: AxisRequirement::First,
+	}),
+	("gpu_reduce_min_rows", PrimitiveRecipe::Reduce {
+		operator: ReduceOperator::Minimum,
+		result: ReduceResult::Value,
+		axes: AxisRequirement::Last,
+	}),
+	("gpu_reduce_sum_cols_into", PrimitiveRecipe::Reduce {
+		operator: ReduceOperator::Sum,
+		result: ReduceResult::Value,
+		axes: AxisRequirement::First,
+	}),
+	("gpu_reduce_sum_rows", PrimitiveRecipe::Reduce {
+		operator: ReduceOperator::Sum,
+		result: ReduceResult::Value,
+		axes: AxisRequirement::Last,
+	}),
+	("gpu_scatter_add", PrimitiveRecipe::ScatterAdd {
+		axis: AxisRequirement::First,
+	}),
+	("gpu_sort", PrimitiveRecipe::Sort {
+		direction: SortDirection::Ascending,
+		stable: false,
+		axis: AxisRequirement::All,
+	}),
+	("gpu_sum_all", PrimitiveRecipe::Reduce {
+		operator: ReduceOperator::Sum,
+		result: ReduceResult::Value,
+		axes: AxisRequirement::All,
+	}),
 ];

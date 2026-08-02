@@ -5,14 +5,13 @@ use recipe_language::{
 };
 use recipe_math::MathFunction;
 
-use crate::{OperationDescriptor, OperationErrorKind, OperationResult};
-
 use super::{
 	Emitter, FamilyDispatch, KernelEmission, MAX_I32_INDEX, MaterializationRequest, emit_checked_gather_identity,
 	identity_program, input, language_error, operation_error, output, prepared_f32, prepared_u64, request_error,
 	require_dtype, require_exact_abi, require_same_tensor_contract, require_shape, require_true, scalar_binary,
 	scalar_builder, scalar_f32, scalar_finish, scalar_input, scalar_ternary, scalar_unary,
 };
+use crate::{OperationDescriptor, OperationErrorKind, OperationResult};
 
 const OPERATIONS: &[(&str, &str)] = &[
 	("gpu_causal_softmax_rows", "gpu-core/src/attention.rs:191"),
@@ -55,22 +54,24 @@ pub(super) fn dispatch(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 		| "gpu_rope_partial_factors"
 		| "gpu_rope_partial_factors_pos"
 		| "gpu_rope_partial_pos" => emit_single_tensor_rope(request, emitter),
-		symbol => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::GraphMaterializationFailed,
-			format!("attention/sequence/embedding dispatch is incomplete for {symbol}"),
-		)),
+		symbol => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::GraphMaterializationFailed,
+				format!("attention/sequence/embedding dispatch is incomplete for {symbol}"),
+			))
+		}
 	};
 	FamilyDispatch::Owned(result)
 }
 
 fn emit_mha_merge(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["heads", "merge_indices"],
-		&["packed"],
-		&["seq", "n_heads", "head_dim", "merge_indices_verified"],
-	)?;
+	require_exact_abi(request, &["heads", "merge_indices"], &["packed"], &[
+		"seq",
+		"n_heads",
+		"head_dim",
+		"merge_indices_verified",
+	])?;
 	let heads = input(request, "heads")?;
 	let indices = input(request, "merge_indices")?;
 	let packed = output(request, "packed")?;
@@ -105,12 +106,11 @@ fn emit_mha_merge(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_
 }
 
 fn emit_repeat_rows(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["values", "repeat_indices"],
-		&["repeated"],
-		&["source_elements", "repeats", "repeat_indices_verified"],
-	)?;
+	require_exact_abi(request, &["values", "repeat_indices"], &["repeated"], &[
+		"source_elements",
+		"repeats",
+		"repeat_indices_verified",
+	])?;
 	let values = input(request, "values")?;
 	let indices = input(request, "repeat_indices")?;
 	let repeated = output(request, "repeated")?;
@@ -269,12 +269,11 @@ fn emit_embedding_backward(request: &MaterializationRequest<'_>, emitter: &mut E
 }
 
 fn emit_positional_encoding(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["angles", "channel_parity"],
-		&["encoding"],
-		&["seq", "dim", "angles_verified"],
-	)?;
+	require_exact_abi(request, &["angles", "channel_parity"], &["encoding"], &[
+		"seq",
+		"dim",
+		"angles_verified",
+	])?;
 	let angles = input(request, "angles")?;
 	let parity = input(request, "channel_parity")?;
 	let encoding = output(request, "encoding")?;
@@ -320,12 +319,12 @@ fn emit_positional_encoding(request: &MaterializationRequest<'_>, emitter: &mut 
 }
 
 fn emit_causal_softmax(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["values", "causal_mask"],
-		&["softmax"],
-		&["rows", "columns", "tree_lanes", "causal_mask_verified"],
-	)?;
+	require_exact_abi(request, &["values", "causal_mask"], &["softmax"], &[
+		"rows",
+		"columns",
+		"tree_lanes",
+		"causal_mask_verified",
+	])?;
 	let values = input(request, "values")?;
 	let mask = input(request, "causal_mask")?;
 	let softmax = output(request, "softmax")?;

@@ -1,5 +1,4 @@
-use std::error::Error;
-use std::fmt;
+use std::{error::Error, fmt};
 
 use recipe_core::{ByteCount, DeviceId, Digest, FinalizedBundle, RunId, RunPhase, TaskId, Topology};
 use recipe_executor::{
@@ -8,10 +7,9 @@ use recipe_executor::{
 	WorkerProjectionError, WorkerTaskPoll, WorkerTaskRole,
 };
 
-use crate::model::ProgramTaskKind;
 use crate::{
 	DataDirection, DriverFault, DriverFaultCode, DriverPoll, DriverTransferPoll, ProvisionedProgram,
-	RemoteMetricValue, WorkerDriver,
+	RemoteMetricValue, WorkerDriver, model::ProgramTaskKind,
 };
 
 /// Static construction failure for the concrete executor-backed worker driver.
@@ -46,9 +44,7 @@ impl Error for ExecutorDriverBuildError {
 }
 
 impl From<WorkerProjectionError> for ExecutorDriverBuildError {
-	fn from(error: WorkerProjectionError) -> Self {
-		Self::Projection(error)
-	}
+	fn from(error: WorkerProjectionError) -> Self { Self::Projection(error) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,27 +96,19 @@ impl<B: WorkerBackend + fmt::Debug> ExecutorWorkerDriver<B> {
 	}
 
 	#[must_use]
-	pub const fn projection(&self) -> &WorkerProjection {
-		&self.projection
-	}
+	pub const fn projection(&self) -> &WorkerProjection { &self.projection }
 
 	#[must_use]
-	pub const fn expected_program(&self) -> Digest {
-		self.expected_program
-	}
+	pub const fn expected_program(&self) -> Digest { self.expected_program }
 
 	#[must_use]
-	pub const fn active_run(&self) -> Option<RunId> {
-		self.run
-	}
+	pub const fn active_run(&self) -> Option<RunId> { self.run }
 
 	fn session_mut(&mut self) -> Result<&mut WorkerExecutionSession<B>, DriverFault> {
 		self.session.as_mut().ok_or_else(invalid_lifecycle)
 	}
 
-	fn current_run(&self) -> Result<RunId, DriverFault> {
-		self.run.ok_or_else(invalid_lifecycle)
-	}
+	fn current_run(&self) -> Result<RunId, DriverFault> { self.run.ok_or_else(invalid_lifecycle) }
 
 	fn active_phase(&self) -> Result<RunPhase, DriverFault> {
 		match self.session.as_ref().map(WorkerExecutionSession::lifecycle) {
@@ -184,10 +172,12 @@ impl<B: WorkerBackend + fmt::Debug> WorkerDriver for ExecutorWorkerDriver<B> {
 				self.backend = Some(parts.backend);
 				let primary = executor_fault(&parts.error, DriverFaultCode::EXECUTOR_PREPARE_FAILED);
 				match parts.cleanup_error {
-					Some(cleanup) => Err(DriverFault::cleanup_failed(
-						primary,
-						executor_fault(&cleanup, DriverFaultCode::EXECUTOR_CLEANUP_FAILED),
-					)),
+					Some(cleanup) => {
+						Err(DriverFault::cleanup_failed(
+							primary,
+							executor_fault(&cleanup, DriverFaultCode::EXECUTOR_CLEANUP_FAILED),
+						))
+					}
 					None => Err(primary),
 				}
 			}
@@ -258,14 +248,20 @@ impl<B: WorkerBackend + fmt::Debug> WorkerDriver for ExecutorWorkerDriver<B> {
 		let run = self.current_run()?;
 		self.session_mut()?
 			.poll_task(run, task)
-			.map(|poll| match poll {
-				WorkerTaskPoll::Pending => DriverPoll::Pending,
-				WorkerTaskPoll::Complete { metric } => DriverPoll::Complete {
-					metric: metric.map(|value| match value {
-						MetricValue::F32(value) => RemoteMetricValue::F32(value),
-						MetricValue::I32(value) => RemoteMetricValue::I32(value),
-					}),
-				},
+			.map(|poll| {
+				match poll {
+					WorkerTaskPoll::Pending => DriverPoll::Pending,
+					WorkerTaskPoll::Complete { metric } => {
+						DriverPoll::Complete {
+							metric: metric.map(|value| {
+								match value {
+									MetricValue::F32(value) => RemoteMetricValue::F32(value),
+									MetricValue::I32(value) => RemoteMetricValue::I32(value),
+								}
+							}),
+						}
+					}
+				}
 			})
 			.map_err(|error| executor_fault(&error, DriverFaultCode::EXECUTOR_OPERATION_FAILED))
 	}
@@ -347,10 +343,12 @@ impl<B: WorkerBackend + fmt::Debug> WorkerDriver for ExecutorWorkerDriver<B> {
 		};
 		let recovery = self.recover_finished_session();
 		match (cleanup_error, recovery) {
-			(Some(error), _) => Err(executor_fault(
-				&error,
-				DriverFaultCode::EXECUTOR_CLEANUP_FAILED,
-			)),
+			(Some(error), _) => {
+				Err(executor_fault(
+					&error,
+					DriverFaultCode::EXECUTOR_CLEANUP_FAILED,
+				))
+			}
 			(None, Err(error)) => Err(error),
 			(None, Ok(())) => Ok(()),
 		}
@@ -450,9 +448,7 @@ fn validate_program(
 	Ok(())
 }
 
-const fn invalid_lifecycle() -> DriverFault {
-	DriverFault::new(DriverFaultCode::INVALID_LIFECYCLE.get(), 0)
-}
+const fn invalid_lifecycle() -> DriverFault { DriverFault::new(DriverFaultCode::INVALID_LIFECYCLE.get(), 0) }
 
 const fn transfer_poll(poll: ExternalTransferPoll) -> DriverTransferPoll {
 	match poll {
@@ -480,9 +476,7 @@ fn executor_fault<E: Error + Send + Sync + 'static>(
 		WorkerExecutionError::WrongRole { task, .. }
 		| WorkerExecutionError::DependencyIncomplete { task, .. }
 		| WorkerExecutionError::ScheduleConflict { task, .. }
-		| WorkerExecutionError::DeviceFault {
-			calculation: task, ..
-		} => task.get(),
+		| WorkerExecutionError::DeviceFault { readback: task, .. } => task.get(),
 		WorkerExecutionError::WrongPhase { task, .. } | WorkerExecutionError::ByteCountMismatch { task, .. } => {
 			task.map_or(0, TaskId::get)
 		}

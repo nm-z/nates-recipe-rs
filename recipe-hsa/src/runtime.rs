@@ -1,9 +1,11 @@
-use crate::abi::STATUS_SUCCESS;
-use crate::discovery::{self, Discovery};
-use crate::loader::Api;
-use crate::{Error, Result};
-use std::ffi::OsStr;
-use std::sync::Arc;
+use std::{ffi::OsStr, sync::Arc};
+
+use crate::{
+	Error, Result,
+	abi::STATUS_SUCCESS,
+	discovery::{self, Discovery},
+	loader::Api,
+};
 
 /// One balanced ROCr initialization reference.
 ///

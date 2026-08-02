@@ -3,8 +3,7 @@ use std::collections::BTreeSet;
 
 use recipe_core::DType;
 
-use crate::image_header::has_recognized_image_signature;
-use crate::{RawTable, parse_contract_f32, parse_contract_i32};
+use crate::{RawTable, image_header::has_recognized_image_signature, parse_contract_f32, parse_contract_i32};
 
 /// Recipe's exhaustive semantic classification for digitally stored,
 /// learnable vectors.
@@ -182,29 +181,19 @@ pub struct InferredVector {
 
 impl InferredVector {
 	#[must_use]
-	pub const fn index(&self) -> usize {
-		self.index
-	}
+	pub const fn index(&self) -> usize { self.index }
 
 	#[must_use]
-	pub fn name(&self) -> &[u8] {
-		&self.name
-	}
+	pub fn name(&self) -> &[u8] { &self.name }
 
 	#[must_use]
-	pub const fn semantic_type(&self) -> SemanticType {
-		self.semantic_type
-	}
+	pub const fn semantic_type(&self) -> SemanticType { self.semantic_type }
 
 	#[must_use]
-	pub const fn encoding(&self) -> VectorEncoding {
-		self.encoding
-	}
+	pub const fn encoding(&self) -> VectorEncoding { self.encoding }
 
 	#[must_use]
-	pub const fn evidence(&self) -> VectorEvidence {
-		self.evidence
-	}
+	pub const fn evidence(&self) -> VectorEvidence { self.evidence }
 }
 
 /// A filesystem table object represented as its ordered list of feature
@@ -217,9 +206,7 @@ pub struct InferredVectorList {
 
 impl InferredVectorList {
 	#[must_use]
-	pub fn vectors(&self) -> &[InferredVector] {
-		&self.vectors
-	}
+	pub fn vectors(&self) -> &[InferredVector] { &self.vectors }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -463,9 +450,7 @@ fn ratio_per_thousand(numerator: usize, denominator: usize) -> u16 {
 	u16::try_from(scaled.min(1_000)).unwrap_or(1_000)
 }
 
-fn is_image_value(value: &[u8]) -> bool {
-	has_recognized_image_signature(value)
-}
+fn is_image_value(value: &[u8]) -> bool { has_recognized_image_signature(value) }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TemporalInstant {
@@ -567,9 +552,7 @@ pub(crate) fn parse_temporal_instant(value: &[u8]) -> Option<TemporalInstant> {
 	})
 }
 
-fn is_temporal_value(value: &[u8]) -> bool {
-	parse_temporal_instant(value).is_some()
-}
+fn is_temporal_value(value: &[u8]) -> bool { parse_temporal_instant(value).is_some() }
 
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 	let adjusted_year = year - i64::from(month <= 2);
@@ -646,116 +629,4 @@ pub(crate) fn fit_ordinal_vocabulary(values: &[&[u8]]) -> Option<&'static [&'sta
 	(!candidates.any(|_| true)).then_some(vocabulary)
 }
 
-fn is_ordinal_vector(values: &[&[u8]]) -> bool {
-	ordinal_vocabulary(values).is_some()
-}
-
-#[cfg(test)]
-mod tests {
-	use crate::{Delimiter, HeaderMode, IngestLimits, TableRequest, parse_table};
-
-	use super::*;
-
-	fn table(bytes: &[u8]) -> RawTable {
-		parse_table(
-			bytes,
-			TableRequest::new(
-				Delimiter::Comma,
-				HeaderMode::Present,
-				IngestLimits::new(16_384, 128, 32, 1_024).unwrap(),
-			),
-		)
-		.unwrap()
-	}
-
-	#[test]
-	fn infers_all_nonbinary_table_semantic_types() {
-		let raw = table(b"number,time,category,rank,prose,picture\n\
-			1,2024-02-29T12:00:00Z,red,low,\"a sentence with several spaces\",\xff\xd8\xffone\n\
-			2,2024-03-01T12:00:00Z,blue,medium,\"another sentence with several spaces\",\xff\xd8\xfftwo\n\
-			3,2024-03-02T12:00:00Z,red,high,\"a third sentence with several spaces\",\xff\xd8\xffthree\n");
-		assert_eq!(raw.width(), 6);
-		let inferred = infer_table_vectors(&raw, &CategoricalEncodingModel).unwrap();
-		assert_eq!(
-			inferred
-				.vectors()
-				.iter()
-				.map(InferredVector::semantic_type)
-				.collect::<Vec<_>>(),
-			[
-				SemanticType::Numeric,
-				SemanticType::Temporal,
-				SemanticType::Categorical,
-				SemanticType::Ordinal,
-				SemanticType::Text,
-				SemanticType::Image,
-			]
-		);
-	}
-
-	#[test]
-	fn recognizes_ordinals_only_when_the_vector_establishes_an_order_vocabulary() {
-		let raw = table(b"priority\nlow\nmedium\nhigh\n");
-		let inferred = infer_table_vectors(&raw, &CategoricalEncodingModel).unwrap();
-		assert_eq!(inferred.vectors()[0].semantic_type(), SemanticType::Ordinal);
-		assert_eq!(inferred.vectors()[0].encoding(), VectorEncoding::OrdinalI32);
-	}
-
-	#[test]
-	fn temporal_parser_validates_calendar_and_zone_syntax() {
-		assert!(is_temporal_value(b"2024-02-29"));
-		assert!(is_temporal_value(b"2016-04-29T18:38:08Z"));
-		assert!(is_temporal_value(b"2025-01-31 23:59:60-08:00"));
-		assert!(!is_temporal_value(b"2023-02-29"));
-		assert!(!is_temporal_value(b"2024-13-01"));
-		assert!(!is_temporal_value(b"2024-01-01T25:00:00Z"));
-	}
-
-	#[test]
-	fn exact_payload_limits_choose_i32_then_f32() {
-		let integers = table(b"x\n999999999\n-12\n");
-		let inferred = infer_table_vectors(&integers, &CategoricalEncodingModel).unwrap();
-		assert_eq!(inferred.vectors()[0].encoding(), VectorEncoding::I32);
-
-		let floats = table(b"x\n1.23456\n-0.125\n");
-		let inferred = infer_table_vectors(&floats, &CategoricalEncodingModel).unwrap();
-		assert_eq!(inferred.vectors()[0].encoding(), VectorEncoding::F32);
-	}
-
-	#[test]
-	fn every_distilled_fixed_width_encoding_has_one_authoritative_dtype() {
-		for encoding in [
-			VectorEncoding::I32,
-			VectorEncoding::RelativeSecondsI32,
-			VectorEncoding::DictionaryI32,
-			VectorEncoding::OrdinalI32,
-		] {
-			assert_eq!(encoding.dtype(), Some(DType::I32));
-		}
-		assert_eq!(VectorEncoding::F32.dtype(), Some(DType::F32));
-		assert_eq!(VectorEncoding::Utf8.dtype(), None);
-		assert_eq!(VectorEncoding::Bytes.dtype(), None);
-	}
-
-	#[test]
-	fn ambiguity_model_uses_complete_vector_storage_and_text_shape() {
-		let categories = table(b"x\nalpha\nbeta\nalpha\nbeta\n");
-		let prose = table(b"x\n\"this is a complete sentence with several words\"\n\
-			\"another distinct sentence containing several words\"\n\
-			\"a third distinct sentence containing several words\"\n");
-		assert_eq!(
-			infer_table_vectors(&categories, &CategoricalEncodingModel)
-				.unwrap()
-				.vectors()[0]
-				.semantic_type(),
-			SemanticType::Categorical
-		);
-		assert_eq!(
-			infer_table_vectors(&prose, &CategoricalEncodingModel)
-				.unwrap()
-				.vectors()[0]
-				.semantic_type(),
-			SemanticType::Text
-		);
-	}
-}
+fn is_ordinal_vector(values: &[&[u8]]) -> bool { ordinal_vocabulary(values).is_some() }

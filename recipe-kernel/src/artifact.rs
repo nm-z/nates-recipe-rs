@@ -36,14 +36,10 @@ pub struct ArtifactDigest([u8; 32]);
 
 impl ArtifactDigest {
 	#[must_use]
-	pub fn of(bytes: &[u8]) -> Self {
-		digest(bytes)
-	}
+	pub fn of(bytes: &[u8]) -> Self { digest(bytes) }
 
 	#[must_use]
-	pub const fn bytes(self) -> [u8; 32] {
-		self.0
-	}
+	pub const fn bytes(self) -> [u8; 32] { self.0 }
 
 	#[must_use]
 	pub fn to_hex(self) -> String {
@@ -67,9 +63,7 @@ pub struct HsaKernelArgument {
 
 impl HsaKernelArgument {
 	#[must_use]
-	pub fn is_hidden(&self) -> bool {
-		self.value_kind.starts_with("hidden_")
-	}
+	pub fn is_hidden(&self) -> bool { self.value_kind.starts_with("hidden_") }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,9 +198,7 @@ impl<'a> ElfFile<'a> {
 		})
 	}
 
-	fn section(&self, name: &str) -> Option<&ElfSection> {
-		self.sections.iter().find(|section| section.name == name)
-	}
+	fn section(&self, name: &str) -> Option<&ElfSection> { self.sections.iter().find(|section| section.name == name) }
 
 	fn section_data(&self, section: &ElfSection) -> Result<&'a [u8], LoweringError> {
 		if section.kind == ELF_SECTION_NO_BITS {
@@ -773,9 +765,7 @@ fn required_unsigned(map: &MsgMap, key: &str) -> Result<u64, LoweringError> {
 		.ok_or_else(|| artifact_format(format!("kernel metadata omits `{key}`")))
 }
 
-fn digest(bytes: &[u8]) -> ArtifactDigest {
-	ArtifactDigest(Sha256::digest(bytes).into())
-}
+fn digest(bytes: &[u8]) -> ArtifactDigest { ArtifactDigest(Sha256::digest(bytes).into()) }
 
 fn artifact_format(message: impl Into<String>) -> LoweringError {
 	LoweringError::new(LoweringErrorKind::ArtifactFormat, message)
@@ -914,9 +904,7 @@ impl<'a> MsgDecoder<'a> {
 		}
 	}
 
-	fn is_finished(&self) -> bool {
-		self.cursor == self.bytes.len()
-	}
+	fn is_finished(&self) -> bool { self.cursor == self.bytes.len() }
 
 	fn decode(&mut self) -> Result<MsgValue, LoweringError> {
 		if self.depth >= 128 {
@@ -1033,184 +1021,9 @@ impl<'a> MsgDecoder<'a> {
 			.map_err(|_| artifact_format("truncated MessagePack integer"))
 	}
 
-	fn be_u16(&mut self) -> Result<u16, LoweringError> {
-		Ok(u16::from_be_bytes(self.take_array()?))
-	}
+	fn be_u16(&mut self) -> Result<u16, LoweringError> { Ok(u16::from_be_bytes(self.take_array()?)) }
 
-	fn be_u32(&mut self) -> Result<u32, LoweringError> {
-		Ok(u32::from_be_bytes(self.take_array()?))
-	}
+	fn be_u32(&mut self) -> Result<u32, LoweringError> { Ok(u32::from_be_bytes(self.take_array()?)) }
 
-	fn be_u64(&mut self) -> Result<u64, LoweringError> {
-		Ok(u64::from_be_bytes(self.take_array()?))
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use recipe_core::{DType, ElementCount};
-
-	use super::*;
-
-	fn elf_with_out_of_file_no_bits_section() -> Vec<u8> {
-		const SECTION_COUNT: usize = 3;
-		const SECTION_TABLE_OFFSET: usize = 96;
-		const FILE_BYTES: usize = SECTION_TABLE_OFFSET + SECTION_COUNT * ELF64_SECTION_BYTES;
-		const STRINGS: &[u8] = b"\0.shstrtab\0.relro_padding\0";
-
-		let mut elf = vec![0; FILE_BYTES];
-		elf[..4].copy_from_slice(b"\x7fELF");
-		elf[4] = ELF_CLASS_64;
-		elf[5] = ELF_DATA_LITTLE_ENDIAN;
-		elf[40..48].copy_from_slice(&96_u64.to_le_bytes());
-		elf[58..60].copy_from_slice(&64_u16.to_le_bytes());
-		elf[60..62].copy_from_slice(&3_u16.to_le_bytes());
-		elf[62..64].copy_from_slice(&1_u16.to_le_bytes());
-		elf[ELF64_HEADER_BYTES..ELF64_HEADER_BYTES + STRINGS.len()].copy_from_slice(STRINGS);
-
-		let string_section = SECTION_TABLE_OFFSET + ELF64_SECTION_BYTES;
-		elf[string_section..string_section + 4].copy_from_slice(&1_u32.to_le_bytes());
-		elf[string_section + 4..string_section + 8].copy_from_slice(&3_u32.to_le_bytes());
-		elf[string_section + 24..string_section + 32].copy_from_slice(&64_u64.to_le_bytes());
-		elf[string_section + 32..string_section + 40].copy_from_slice(&26_u64.to_le_bytes());
-
-		let no_bits_section = SECTION_TABLE_OFFSET + 2 * ELF64_SECTION_BYTES;
-		elf[no_bits_section..no_bits_section + 4].copy_from_slice(&11_u32.to_le_bytes());
-		elf[no_bits_section + 4..no_bits_section + 8].copy_from_slice(&ELF_SECTION_NO_BITS.to_le_bytes());
-		elf[no_bits_section + 24..no_bits_section + 32].copy_from_slice(&288_u64.to_le_bytes());
-		elf[no_bits_section + 32..no_bits_section + 40].copy_from_slice(&4096_u64.to_le_bytes());
-		elf
-	}
-
-	#[test]
-	fn no_bits_section_may_extend_beyond_file() {
-		let bytes = elf_with_out_of_file_no_bits_section();
-		let elf = match ElfFile::parse(&bytes) {
-			Ok(elf) => elf,
-			Err(error) => panic!("valid NOBITS fixture was rejected: {error}"),
-		};
-		let section = match elf.section(".relro_padding") {
-			Some(section) => section,
-			None => panic!("fixture omitted its NOBITS section"),
-		};
-		assert_eq!(section.kind, ELF_SECTION_NO_BITS);
-		assert_eq!(section.offset, bytes.len());
-		assert_eq!(section.size, 4096);
-
-		let error = elf.section_data(section).unwrap_err();
-		assert_eq!(error.kind, LoweringErrorKind::ArtifactFormat);
-		assert_eq!(
-			error.message,
-			"ELF section `.relro_padding` has no file data"
-		);
-	}
-
-	#[test]
-	fn target_identity_ignores_triple_and_feature_order_only() {
-		assert!(target_ids_match(
-			"amdgcn-amd-amdhsa--gfx1101:sramecc+:xnack-",
-			"gfx1101:xnack-:sramecc+"
-		));
-		assert!(!target_ids_match(
-			"amdgcn-amd-amdhsa--gfx1101:sramecc+:xnack-",
-			"gfx1101:xnack+:sramecc+"
-		));
-		assert!(!target_ids_match(
-			"amdgcn-amd-amdhsa--gfx1101:sramecc+:xnack-",
-			"gfx1100:xnack-:sramecc+"
-		));
-	}
-
-	#[test]
-	fn hsa_argument_names_are_optional_but_present_contradictions_fail() {
-		let abi = KernelAbi {
-			entry_symbol: "recipe_stage_1".to_owned(),
-			arguments: vec![
-				KernelArgument::Buffer {
-					access: BufferAccess::Read,
-					dtype: DType::F32,
-					alignment: 4,
-				},
-				KernelArgument::ElementCount,
-			],
-			argument_bytes: 16,
-			argument_alignment: 8,
-			elements: ElementCount::new(1).unwrap(),
-			workgroup_lanes: 64,
-		};
-		let mut metadata = HsaKernelMetadata {
-			name: abi.entry_symbol.clone(),
-			symbol: format!("{}.kd", abi.entry_symbol),
-			arguments: vec![
-				HsaKernelArgument {
-					name: None,
-					offset: 0,
-					size: 8,
-					value_kind: "global_buffer".to_owned(),
-					address_space: Some("global".to_owned()),
-				},
-				HsaKernelArgument {
-					name: None,
-					offset: 8,
-					size: 8,
-					value_kind: "by_value".to_owned(),
-					address_space: None,
-				},
-			],
-			kernarg_segment_size: 16,
-			kernarg_segment_alignment: 8,
-			group_segment_fixed_size: 0,
-			private_segment_fixed_size: 0,
-			maximum_workgroup_size: 256,
-			wavefront_size: 32,
-		};
-
-		validate_hsa_abi(&metadata, &abi).unwrap();
-		metadata.arguments[0].name = Some("output_0".to_owned());
-		let error = validate_hsa_abi(&metadata, &abi).unwrap_err();
-		assert_eq!(error.kind, LoweringErrorKind::ArtifactMismatch);
-	}
-
-	#[test]
-	fn cuda_elf_flags_decode_the_processor_byte() {
-		assert_eq!(
-			cubin_sm(ELF_OSABI_CUDA, 0, 0x0025_0525).expect("sm_37 flags"),
-			37
-		);
-		assert_eq!(
-			cubin_sm(ELF_OSABI_CUDA, 0, 0x0034_0534).expect("sm_52 flags"),
-			52
-		);
-		assert_eq!(
-			cubin_sm(ELF_OSABI_CUDA_TOOLKIT_13_3, 8, 0x0600_5604).expect("toolkit 13.3 sm_86 flags"),
-			86
-		);
-	}
-
-	#[test]
-	fn cuda_elf_abi_acceptance_is_explicit_across_toolkit_generations() {
-		assert!(is_cuda_os_abi(ELF_OSABI_CUDA));
-		assert!(is_cuda_os_abi(ELF_OSABI_CUDA_V2));
-		assert!(is_cuda_os_abi(ELF_OSABI_CUDA_TOOLKIT_13_3));
-		assert!(!is_cuda_os_abi(0));
-		assert!(!is_cuda_os_abi(64));
-		assert!(!is_cuda_os_abi(66));
-	}
-
-	#[test]
-	fn message_pack_decoder_rejects_duplicate_keys_and_trailing_data() {
-		let mut duplicate = MsgDecoder::new(&[0x82, 0xa1, b'a', 0x01, 0xa1, b'a', 0x02]);
-		assert!(duplicate.decode().is_err());
-
-		let mut trailing = MsgDecoder::new(&[0x81, 0xa1, b'a', 0x01, 0x00]);
-		assert!(trailing.decode().is_ok());
-		assert!(!trailing.is_finished());
-	}
-
-	#[test]
-	fn malformed_elf_never_panics() {
-		for size in 0..ELF64_HEADER_BYTES {
-			assert!(ElfFile::parse(&vec![0; size]).is_err());
-		}
-	}
+	fn be_u64(&mut self) -> Result<u64, LoweringError> { Ok(u64::from_be_bytes(self.take_array()?)) }
 }

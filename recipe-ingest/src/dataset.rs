@@ -1,23 +1,26 @@
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::{Cursor, Read as _};
-use std::path::{Path, PathBuf};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	fs,
+	io::{Cursor, Read as _},
+	path::{Path, PathBuf},
+};
 
 use calamine::Reader as _;
-use quick_xml::Reader;
-use quick_xml::events::Event;
+use quick_xml::{Reader, events::Event};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
-use crate::gguf::{GgufLimits, GgufMetadataValue, parse_gguf};
-use crate::image_header::has_recognized_image_signature;
-use crate::prepare::prepare_table_with_semantics;
-use crate::semantic::{VectorSemantic, VectorSemanticRule, infer_table_vectors_with_semantics};
 use crate::{
 	AmbiguousVectorModel, Delimiter, HeaderMode, InferredVectorList, IngestLimits, PreparationRequest, PrepareResult,
 	PreparedDataset, RawTable, SafeTensorLimits, SemanticResult, SemanticType, SourceError, SourceErrorKind,
-	SourceLimit, TableRequest, VectorEncoding, parse_safetensors, parse_table, read_source_snapshot,
+	SourceLimit, TableRequest, VectorEncoding,
+	gguf::{GgufLimits, GgufMetadataValue, parse_gguf},
+	image_header::has_recognized_image_signature,
+	parse_safetensors, parse_table,
+	prepare::prepare_table_with_semantics,
+	read_source_snapshot,
+	semantic::{VectorSemantic, VectorSemanticRule, infer_table_vectors_with_semantics},
 };
 
 const ARCHIVE_DEPTH_LIMIT: usize = 32;
@@ -121,24 +124,16 @@ pub struct DistilledDataset {
 
 impl DistilledDataset {
 	#[must_use]
-	pub const fn table(&self) -> &RawTable {
-		&self.table
-	}
+	pub const fn table(&self) -> &RawTable { &self.table }
 
 	#[must_use]
-	pub fn sample_count(&self) -> usize {
-		self.table.rows().len()
-	}
+	pub fn sample_count(&self) -> usize { self.table.rows().len() }
 
 	#[must_use]
-	pub fn vector_count(&self) -> usize {
-		self.table.width()
-	}
+	pub fn vector_count(&self) -> usize { self.table.width() }
 
 	#[must_use]
-	pub const fn file_count(&self) -> usize {
-		self.file_count
-	}
+	pub const fn file_count(&self) -> usize { self.file_count }
 
 	pub fn infer_vectors(&self, model: &impl AmbiguousVectorModel) -> SemanticResult<InferredVectorList> {
 		infer_table_vectors_with_semantics(&self.table, model, &self.semantics)
@@ -158,9 +153,7 @@ impl DistilledDataset {
 	}
 
 	#[must_use]
-	pub fn into_table(self) -> RawTable {
-		self.table
-	}
+	pub fn into_table(self) -> RawTable { self.table }
 }
 
 #[derive(Clone, Debug)]
@@ -832,64 +825,80 @@ fn visit_archive(
 fn parse_leaf(context: &FileContext, bytes: &[u8], limits: IngestLimits) -> DatasetSourceResult<Vec<LogicalTable>> {
 	let extension = extension(&context.logical_path);
 	match extension.as_str() {
-		"csv" | "tsv" => Ok(vec![parse_delimited(
-			bytes,
-			&extension,
-			HeaderMode::Present,
-			context,
-			limits,
-		)?]),
-		"all-data" | "dat" | "data" | "data-numeric" | "tra" | "trn" => Ok(vec![parse_delimited(
-			bytes,
-			&extension,
-			HeaderMode::Absent,
-			context,
-			limits,
-		)?]),
+		"csv" | "tsv" => {
+			Ok(vec![parse_delimited(
+				bytes,
+				&extension,
+				HeaderMode::Present,
+				context,
+				limits,
+			)?])
+		}
+		"all-data" | "dat" | "data" | "data-numeric" | "tra" | "trn" => {
+			Ok(vec![parse_delimited(
+				bytes,
+				&extension,
+				HeaderMode::Absent,
+				context,
+				limits,
+			)?])
+		}
 		"json" => parse_json(bytes, context),
 		"gguf" => parse_gguf_tables(bytes, context),
 		"safetensors" => parse_safetensor_tables(bytes, context),
-		"png" if is_png(bytes) => Ok(vec![single_payload(
-			SourceFormat::Image,
-			b"image",
-			bytes,
-			SemanticType::Image,
-		)]),
+		"png" if is_png(bytes) => {
+			Ok(vec![single_payload(
+				SourceFormat::Image,
+				b"image",
+				bytes,
+				SemanticType::Image,
+			)])
+		}
 		"inp" | "out" | "patch" | "sh" => Ok(vec![parse_text(bytes, context)?]),
-		"txt" if looks_tabular(bytes) => Ok(vec![parse_delimited(
-			bytes,
-			&extension,
-			HeaderMode::Absent,
-			context,
-			limits,
-		)?]),
+		"txt" if looks_tabular(bytes) => {
+			Ok(vec![parse_delimited(
+				bytes,
+				&extension,
+				HeaderMode::Absent,
+				context,
+				limits,
+			)?])
+		}
 		"txt" => Ok(vec![parse_text(bytes, context)?]),
-		"bin" | "logits" | "model" => Ok(vec![single_payload(
-			SourceFormat::Binary,
-			b"binary",
-			bytes,
-			SemanticType::Binary,
-		)]),
-		_ if is_image(bytes) => Ok(vec![single_payload(
-			SourceFormat::Image,
-			b"image",
-			bytes,
-			SemanticType::Image,
-		)]),
-		_ if is_probably_text(bytes) && looks_tabular(bytes) => Ok(vec![parse_delimited(
-			bytes,
-			&extension,
-			HeaderMode::Absent,
-			context,
-			limits,
-		)?]),
+		"bin" | "logits" | "model" => {
+			Ok(vec![single_payload(
+				SourceFormat::Binary,
+				b"binary",
+				bytes,
+				SemanticType::Binary,
+			)])
+		}
+		_ if is_image(bytes) => {
+			Ok(vec![single_payload(
+				SourceFormat::Image,
+				b"image",
+				bytes,
+				SemanticType::Image,
+			)])
+		}
+		_ if is_probably_text(bytes) && looks_tabular(bytes) => {
+			Ok(vec![parse_delimited(
+				bytes,
+				&extension,
+				HeaderMode::Absent,
+				context,
+				limits,
+			)?])
+		}
 		_ if is_probably_text(bytes) => Ok(vec![parse_text(bytes, context)?]),
-		_ => Ok(vec![single_payload(
-			SourceFormat::Binary,
-			b"binary",
-			bytes,
-			SemanticType::Binary,
-		)]),
+		_ => {
+			Ok(vec![single_payload(
+				SourceFormat::Binary,
+				b"binary",
+				bytes,
+				SemanticType::Binary,
+			)])
+		}
 	}
 }
 
@@ -1319,25 +1328,29 @@ fn pptx_paragraphs(xml: &str, path: &str, slide: usize) -> DatasetSourceResult<V
 			)
 			.for_path(path)
 		})? {
-			Event::Start(element) => match element.local_name().as_ref() {
-				b"p" => in_paragraph = true,
-				b"t" => in_text = in_paragraph,
-				b"br" => paragraph.push(' '),
-				_ => {}
-			},
-			Event::Empty(element) if element.local_name().as_ref() == b"br" => paragraph.push(' '),
-			Event::End(element) => match element.local_name().as_ref() {
-				b"p" => {
-					in_paragraph = false;
-					let text = paragraph.trim();
-					if !text.is_empty() {
-						paragraphs.push(text.to_owned());
-					}
-					paragraph.clear();
+			Event::Start(element) => {
+				match element.local_name().as_ref() {
+					b"p" => in_paragraph = true,
+					b"t" => in_text = in_paragraph,
+					b"br" => paragraph.push(' '),
+					_ => {}
 				}
-				b"t" => in_text = false,
-				_ => {}
-			},
+			}
+			Event::Empty(element) if element.local_name().as_ref() == b"br" => paragraph.push(' '),
+			Event::End(element) => {
+				match element.local_name().as_ref() {
+					b"p" => {
+						in_paragraph = false;
+						let text = paragraph.trim();
+						if !text.is_empty() {
+							paragraphs.push(text.to_owned());
+						}
+						paragraph.clear();
+					}
+					b"t" => in_text = false,
+					_ => {}
+				}
+			}
 			Event::Text(text) if in_text => {
 				let decoded = text.xml10_content().map_err(|error| {
 					DatasetSourceError::new(
@@ -1798,13 +1811,9 @@ fn is_zip(bytes: &[u8]) -> bool {
 	)
 }
 
-fn is_png(bytes: &[u8]) -> bool {
-	bytes.starts_with(b"\x89PNG\r\n\x1a\n")
-}
+fn is_png(bytes: &[u8]) -> bool { bytes.starts_with(b"\x89PNG\r\n\x1a\n") }
 
-fn is_image(bytes: &[u8]) -> bool {
-	has_recognized_image_signature(bytes)
-}
+fn is_image(bytes: &[u8]) -> bool { has_recognized_image_signature(bytes) }
 
 fn is_probably_text(bytes: &[u8]) -> bool {
 	core::str::from_utf8(bytes).is_ok()
@@ -1813,9 +1822,7 @@ fn is_probably_text(bytes: &[u8]) -> bool {
 			.all(|byte| !byte.is_ascii_control() || matches!(byte, b'\t' | b'\n' | b'\r'))
 }
 
-fn looks_tabular(bytes: &[u8]) -> bool {
-	structural_delimiter(bytes).is_some()
-}
+fn looks_tabular(bytes: &[u8]) -> bool { structural_delimiter(bytes).is_some() }
 
 fn structural_delimiter(bytes: &[u8]) -> Option<Delimiter> {
 	let lines = bytes

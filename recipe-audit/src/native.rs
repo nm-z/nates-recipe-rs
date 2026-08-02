@@ -1,9 +1,12 @@
-use crate::model::normalize_display_path;
-use crate::{ArtifactSymbol, AuditError, ElfFacts, SourceKind, SourceUnit};
+use std::{
+	collections::BTreeSet,
+	fs,
+	path::{Path, PathBuf},
+};
+
 use goblin::elf::{Elf, section_header::SHN_UNDEF};
-use std::collections::BTreeSet;
-use std::fs;
-use std::path::{Path, PathBuf};
+
+use crate::{ArtifactSymbol, AuditError, ElfFacts, SourceKind, SourceUnit, model::normalize_display_path};
 
 const MAX_TEXT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ELF_BYTES: u64 = 1024 * 1024 * 1024;
@@ -120,9 +123,11 @@ fn read_elf_facts_with_display(path: &Path, display: String) -> Result<ElfFacts,
 		});
 	}
 	let bytes = fs::read(path).map_err(|error| AuditError::io(path, error))?;
-	let elf = Elf::parse(&bytes).map_err(|error| AuditError::InvalidElf {
-		path: path.to_path_buf(),
-		reason: error.to_string(),
+	let elf = Elf::parse(&bytes).map_err(|error| {
+		AuditError::InvalidElf {
+			path: path.to_path_buf(),
+			reason: error.to_string(),
+		}
 	})?;
 
 	let mut needed = elf
@@ -238,52 +243,5 @@ fn require_absolute(path: &Path, label: &str) -> Result<(), AuditError> {
 			"{label} must be explicit and absolute: {}",
 			path.display()
 		)))
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use std::sync::atomic::{AtomicU64, Ordering};
-
-	static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-
-	fn temp_scope() -> PathBuf {
-		let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-		let path = std::env::temp_dir().join(format!(
-			"recipe-audit-native-{}-{sequence}",
-			std::process::id()
-		));
-		fs::create_dir(&path).unwrap();
-		path
-	}
-
-	#[test]
-	fn collection_reads_only_the_explicit_fake_scope() {
-		let scope = temp_scope();
-		fs::create_dir(scope.join("src")).unwrap();
-		fs::write(scope.join("src/backend.rs"), "fn architecture() {}").unwrap();
-		fs::write(scope.join("README.md"), "hipMalloc is documentation").unwrap();
-
-		let collected = collect_native_scope(&scope, &[]).unwrap();
-		assert_eq!(collected.sources.len(), 1);
-		assert_eq!(collected.sources[0].path, "src/backend.rs");
-
-		fs::remove_dir_all(scope).unwrap();
-	}
-
-	#[test]
-	fn relative_or_symlinked_scopes_fail_closed() {
-		assert!(collect_native_scope(Path::new("relative"), &[]).is_err());
-
-		#[cfg(unix)]
-		{
-			let scope = temp_scope();
-			let link = scope.with_extension("link");
-			std::os::unix::fs::symlink(&scope, &link).unwrap();
-			assert!(collect_native_scope(&link, &[]).is_err());
-			fs::remove_file(link).unwrap();
-			fs::remove_dir_all(scope).unwrap();
-		}
 	}
 }

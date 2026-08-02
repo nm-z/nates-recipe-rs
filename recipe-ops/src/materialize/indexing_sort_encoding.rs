@@ -4,14 +4,13 @@ use recipe_language::{
 	ScanMode, Scatter, ScatterConflict, Shape, Sort, SortDirection,
 };
 
-use crate::{OperationDescriptor, OperationErrorKind, OperationResult};
-
 use super::{
 	Emitter, FamilyDispatch, KernelEmission, MAX_I32_INDEX, MaterializationRequest, exact_f32_extent,
 	identity_program, input, language_error, operation_error, output, prepared_u64, request_error, require_dtype,
 	require_exact_abi, require_shape, require_true, scalar_binary, scalar_builder, scalar_f32, scalar_finish,
 	scalar_input, scalar_ternary, scalar_unary,
 };
+use crate::{OperationDescriptor, OperationErrorKind, OperationResult};
 
 const OPERATIONS: &[(&str, &str)] = &[
 	("gpu_add_col", "gpu-core/src/kernels.rs:6839"),
@@ -40,30 +39,34 @@ pub(super) fn supports(descriptor: OperationDescriptor) -> bool {
 pub(super) fn dispatch(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> FamilyDispatch {
 	let result = match supports(request.descriptor) {
 		false => return FamilyDispatch::NotOwned,
-		true => match request.descriptor.symbol {
-			"gpu_add_col" => emit_column_update(request, emitter, ColumnUpdate::Add),
-			"gpu_add_col_scaled_inplace" => emit_column_update(request, emitter, ColumnUpdate::ScaledAdd),
-			"gpu_add_diag" => emit_diagonal_add(request, emitter),
-			"gpu_argsort" => emit_argsort(request, emitter),
-			"gpu_bin_edges_uniform" => emit_uniform_edges_single_row(request, emitter),
-			"gpu_concat_into" => emit_row_concatenation(request, emitter),
-			"gpu_one_hot" => emit_one_hot(request, emitter),
-			"gpu_pack_upper_tri" => emit_dense_upper_triangle(request, emitter),
-			"gpu_partial_argsort" => emit_partial_argsort(request, emitter),
-			"gpu_segment_sum" => emit_segment_sum(request, emitter),
-			"gpu_slice_cols" => emit_column_slice(request, emitter),
-			"gpu_slice_lead_into" => emit_leading_slice(request, emitter),
-			"gpu_slice_rows" => emit_row_slice(request, emitter),
-			"gpu_topk_per_row" => emit_topk_per_row(request, emitter),
-			"gpu_transpose" => emit_transpose(request, emitter),
-			"gpu_tril_mask" => emit_triangular_mask(request, emitter),
-			"gpu_vconcat" => emit_vector_concatenation(request, emitter),
-			symbol => Err(operation_error(
-				request.descriptor.id,
-				OperationErrorKind::GraphMaterializationFailed,
-				format!("indexing/sort/encoding dispatch is incomplete for {symbol}"),
-			)),
-		},
+		true => {
+			match request.descriptor.symbol {
+				"gpu_add_col" => emit_column_update(request, emitter, ColumnUpdate::Add),
+				"gpu_add_col_scaled_inplace" => emit_column_update(request, emitter, ColumnUpdate::ScaledAdd),
+				"gpu_add_diag" => emit_diagonal_add(request, emitter),
+				"gpu_argsort" => emit_argsort(request, emitter),
+				"gpu_bin_edges_uniform" => emit_uniform_edges_single_row(request, emitter),
+				"gpu_concat_into" => emit_row_concatenation(request, emitter),
+				"gpu_one_hot" => emit_one_hot(request, emitter),
+				"gpu_pack_upper_tri" => emit_dense_upper_triangle(request, emitter),
+				"gpu_partial_argsort" => emit_partial_argsort(request, emitter),
+				"gpu_segment_sum" => emit_segment_sum(request, emitter),
+				"gpu_slice_cols" => emit_column_slice(request, emitter),
+				"gpu_slice_lead_into" => emit_leading_slice(request, emitter),
+				"gpu_slice_rows" => emit_row_slice(request, emitter),
+				"gpu_topk_per_row" => emit_topk_per_row(request, emitter),
+				"gpu_transpose" => emit_transpose(request, emitter),
+				"gpu_tril_mask" => emit_triangular_mask(request, emitter),
+				"gpu_vconcat" => emit_vector_concatenation(request, emitter),
+				symbol => {
+					Err(operation_error(
+						request.descriptor.id,
+						OperationErrorKind::GraphMaterializationFailed,
+						format!("indexing/sort/encoding dispatch is incomplete for {symbol}"),
+					))
+				}
+			}
+		}
 	};
 	FamilyDispatch::Owned(result)
 }
@@ -93,17 +96,12 @@ fn emit_column_update(
 		ColumnUpdate::Add => &["matrix", "column", "column_indices"],
 		ColumnUpdate::ScaledAdd => &["matrix", "column", "scale", "column_indices"],
 	};
-	require_exact_abi(
-		request,
-		input_names,
-		&["updated_matrix"],
-		&[
-			"rows",
-			"columns",
-			"column_index",
-			"column_indices_verified_unique",
-		],
-	)?;
+	require_exact_abi(request, input_names, &["updated_matrix"], &[
+		"rows",
+		"columns",
+		"column_index",
+		"column_indices_verified_unique",
+	])?;
 	let matrix = input(request, "matrix")?;
 	let column = input(request, "column")?;
 	let indices = input(request, "column_indices")?;
@@ -113,10 +111,12 @@ fn emit_column_update(
 	let selected = prepared_u64(request.descriptor.id, request.parameters, "column_index")?;
 	match selected < columns {
 		true => Ok(()),
-		false => Err(request_error(
-			request,
-			"column_index must be smaller than columns",
-		)),
+		false => {
+			Err(request_error(
+				request,
+				"column_index must be smaller than columns",
+			))
+		}
 	}?;
 	let elements = checked_product(request, rows, columns, "matrix element count")?;
 	require_i32_indexable(request, elements, "matrix element count")?;
@@ -208,69 +208,57 @@ fn emit_diagonal_add(request: &MaterializationRequest<'_>, emitter: &mut Emitter
 }
 
 fn emit_argsort(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["values", "exposure_indices"],
-		&["indices"],
-		&["elements", "exposure_indices_verified_identity"],
-	)?;
+	require_exact_abi(request, &["values", "exposure_indices"], &["indices"], &[
+		"elements",
+		"exposure_indices_verified_identity",
+	])?;
 	let elements = positive_parameter(request, "elements")?;
-	emit_sorted_prefix(
-		request,
-		emitter,
-		SortedPrefix {
-			elements,
-			prefix: elements,
-			axis: 0,
-			prefix_name: "exposure_indices",
-			output_name: "indices",
-			verification_fact: "exposure_indices_verified_identity",
-		},
-	)
+	emit_sorted_prefix(request, emitter, SortedPrefix {
+		elements,
+		prefix: elements,
+		axis: 0,
+		prefix_name: "exposure_indices",
+		output_name: "indices",
+		verification_fact: "exposure_indices_verified_identity",
+	})
 }
 
 fn emit_partial_argsort(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["values", "prefix_indices"],
-		&["indices"],
-		&["elements", "prefix", "prefix_indices_verified"],
-	)?;
+	require_exact_abi(request, &["values", "prefix_indices"], &["indices"], &[
+		"elements",
+		"prefix",
+		"prefix_indices_verified",
+	])?;
 	let elements = positive_parameter(request, "elements")?;
 	let prefix = positive_parameter(request, "prefix")?;
 	match prefix == elements {
-		true => emit_sorted_prefix(
-			request,
-			emitter,
-			SortedPrefix {
+		true => {
+			emit_sorted_prefix(request, emitter, SortedPrefix {
 				elements,
 				prefix,
 				axis: 0,
 				prefix_name: "prefix_indices",
 				output_name: "indices",
 				verification_fact: "prefix_indices_verified",
-			},
-		),
-		false => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::UnsupportedConcreteShape,
-			"legacy gpu_partial_argsort writes the complete sorted index vector; a shorter prefix needs a distinct source operation",
-		)),
+			})
+		}
+		false => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::UnsupportedConcreteShape,
+				"legacy gpu_partial_argsort writes the complete sorted index vector; a shorter prefix needs a distinct source operation",
+			))
+		}
 	}
 }
 
 fn emit_segment_sum(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["values", "segment_ids"],
-		&["sums"],
-		&[
-			"elements",
-			"segments",
-			"maximum_segment_length",
-			"tree_lanes",
-		],
-	)?;
+	require_exact_abi(request, &["values", "segment_ids"], &["sums"], &[
+		"elements",
+		"segments",
+		"maximum_segment_length",
+		"tree_lanes",
+	])?;
 	let values = input(request, "values")?;
 	let segment_ids = input(request, "segment_ids")?;
 	let sums = output(request, "sums")?;
@@ -442,12 +430,12 @@ fn emit_segment_sum(request: &MaterializationRequest<'_>, emitter: &mut Emitter<
 }
 
 fn emit_topk_per_row(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["values", "prefix_indices"],
-		&["indices"],
-		&["rows", "columns", "k", "prefix_indices_verified"],
-	)?;
+	require_exact_abi(request, &["values", "prefix_indices"], &["indices"], &[
+		"rows",
+		"columns",
+		"k",
+		"prefix_indices_verified",
+	])?;
 	let values = input(request, "values")?;
 	let prefix_indices = input(request, "prefix_indices")?;
 	let indices = output(request, "indices")?;
@@ -491,10 +479,12 @@ fn emit_sorted_prefix(
 	require_i32_indexable(request, specification.elements, "sort extent")?;
 	match specification.prefix <= specification.elements {
 		true => Ok(()),
-		false => Err(request_error(
-			request,
-			"sorted prefix exceeds the input extent",
-		)),
+		false => {
+			Err(request_error(
+				request,
+				"sorted prefix exceeds the input extent",
+			))
+		}
 	}?;
 	require_true(request, specification.verification_fact)?;
 	require_dtype(request, values, DType::F32, "values")?;
@@ -536,12 +526,12 @@ fn emit_uniform_edges_single_row(
 	request: &MaterializationRequest<'_>,
 	emitter: &mut Emitter<'_>,
 ) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["feature_values", "bin_indices"],
-		&["edges"],
-		&["rows", "columns", "bins", "bin_indices_verified"],
-	)?;
+	require_exact_abi(request, &["feature_values", "bin_indices"], &["edges"], &[
+		"rows",
+		"columns",
+		"bins",
+		"bin_indices_verified",
+	])?;
 	let values = input(request, "feature_values")?;
 	let bin_indices = input(request, "bin_indices")?;
 	let edges = output(request, "edges")?;
@@ -550,13 +540,15 @@ fn emit_uniform_edges_single_row(
 	let bins = positive_parameter(request, "bins")?;
 	match rows {
 		1 => Ok(()),
-		other_rows => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::UnsupportedConcreteShape,
-			format!(
-				"gpu_bin_edges_uniform needs a reduction stage for {other_rows} rows; the normative recipe currently contains only Elementwise"
-			),
-		)),
+		other_rows => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::UnsupportedConcreteShape,
+				format!(
+					"gpu_bin_edges_uniform needs a reduction stage for {other_rows} rows; the normative recipe currently contains only Elementwise"
+				),
+			))
+		}
 	}?;
 	let edge_count = bins.checked_add(1).ok_or_else(|| {
 		operation_error(
@@ -785,10 +777,12 @@ fn emit_dense_upper_triangle(request: &MaterializationRequest<'_>, emitter: &mut
 	let dimension = positive_parameter(request, "dimension")?;
 	match factor_rows >= dimension {
 		true => Ok(()),
-		false => Err(request_error(
-			request,
-			"factor_rows must be at least dimension",
-		)),
+		false => {
+			Err(request_error(
+				request,
+				"factor_rows must be at least dimension",
+			))
+		}
 	}?;
 	let factor_elements = checked_product(
 		request,
@@ -833,18 +827,13 @@ fn emit_dense_upper_triangle(request: &MaterializationRequest<'_>, emitter: &mut
 }
 
 fn emit_column_slice(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["values", "slice_indices"],
-		&["sliced"],
-		&[
-			"rows",
-			"columns",
-			"start",
-			"count",
-			"slice_indices_verified",
-		],
-	)?;
+	require_exact_abi(request, &["values", "slice_indices"], &["sliced"], &[
+		"rows",
+		"columns",
+		"start",
+		"count",
+		"slice_indices_verified",
+	])?;
 	let rows = positive_parameter(request, "rows")?;
 	let columns = positive_parameter(request, "columns")?;
 	let start = prepared_u64(request.descriptor.id, request.parameters, "start")?;
@@ -856,12 +845,12 @@ fn emit_column_slice(request: &MaterializationRequest<'_>, emitter: &mut Emitter
 }
 
 fn emit_leading_slice(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["values", "slice_indices"],
-		&["sliced"],
-		&["rows", "source_columns", "take", "slice_indices_verified"],
-	)?;
+	require_exact_abi(request, &["values", "slice_indices"], &["sliced"], &[
+		"rows",
+		"source_columns",
+		"take",
+		"slice_indices_verified",
+	])?;
 	let rows = positive_parameter(request, "rows")?;
 	let columns = positive_parameter(request, "source_columns")?;
 	let take = positive_parameter(request, "take")?;
@@ -872,18 +861,13 @@ fn emit_leading_slice(request: &MaterializationRequest<'_>, emitter: &mut Emitte
 }
 
 fn emit_row_slice(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["values", "slice_indices"],
-		&["sliced"],
-		&[
-			"rows",
-			"columns",
-			"start",
-			"count",
-			"slice_indices_verified",
-		],
-	)?;
+	require_exact_abi(request, &["values", "slice_indices"], &["sliced"], &[
+		"rows",
+		"columns",
+		"start",
+		"count",
+		"slice_indices_verified",
+	])?;
 	let rows = positive_parameter(request, "rows")?;
 	let columns = positive_parameter(request, "columns")?;
 	let start = prepared_u64(request.descriptor.id, request.parameters, "start")?;
@@ -995,24 +979,30 @@ fn emit_triangular_mask(request: &MaterializationRequest<'_>, emitter: &mut Emit
 	require_shape(request, fill, &[1], "fill_value")?;
 	require_shape(request, mask, &[dimension, dimension], "mask")?;
 	match elements {
-		0 => Err(request_error(
-			request,
-			"triangular mask dimension must be positive",
-		)),
+		0 => {
+			Err(request_error(
+				request,
+				"triangular mask dimension must be positive",
+			))
+		}
 		positive_elements => {
 			let confirmed_elements = positive_elements;
 			match confirmed_elements == mask.shape.elements() {
-				true => emitter.emit(
-					vec![rows.id, columns.id, fill.id],
-					vec![mask.id],
-					PrimitiveKind::Elementwise(Elementwise {
-						program: triangular_mask_program(request)?,
-					}),
-				),
-				false => Err(request_error(
-					request,
-					"triangular mask element count is inconsistent",
-				)),
+				true => {
+					emitter.emit(
+						vec![rows.id, columns.id, fill.id],
+						vec![mask.id],
+						PrimitiveKind::Elementwise(Elementwise {
+							program: triangular_mask_program(request)?,
+						}),
+					)
+				}
+				false => {
+					Err(request_error(
+						request,
+						"triangular mask element count is inconsistent",
+					))
+				}
 			}
 		}
 	}
@@ -1044,10 +1034,12 @@ fn ascending_stable_sort(axis: usize) -> PrimitiveKind {
 
 fn positive_parameter(request: &MaterializationRequest<'_>, name: &str) -> OperationResult<u64> {
 	match prepared_u64(request.descriptor.id, request.parameters, name)? {
-		0 => Err(request_error(
-			request,
-			format!("{name} must be greater than zero"),
-		)),
+		0 => {
+			Err(request_error(
+				request,
+				format!("{name} must be greater than zero"),
+			))
+		}
 		value => Ok(value),
 	}
 }
@@ -1213,16 +1205,20 @@ fn zero_from_i32_program(request: &MaterializationRequest<'_>) -> OperationResul
 fn require_i32_indexable(request: &MaterializationRequest<'_>, extent: u64, label: &str) -> OperationResult<()> {
 	match (extent > 0, extent <= MAX_I32_INDEX) {
 		(true, true) => Ok(()),
-		(false, true) | (false, false) => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::UnsupportedConcreteShape,
-			format!("{label} must be positive"),
-		)),
-		(true, false) => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::UnsupportedConcreteShape,
-			format!("{label} must fit checked int32 indexes"),
-		)),
+		(false, true) | (false, false) => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::UnsupportedConcreteShape,
+				format!("{label} must be positive"),
+			))
+		}
+		(true, false) => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::UnsupportedConcreteShape,
+				format!("{label} must fit checked int32 indexes"),
+			))
+		}
 	}
 }
 
@@ -1238,11 +1234,13 @@ fn require_range(
 		.ok_or_else(|| request_error(request, format!("{label} start plus count overflowed u64")))?;
 	match end <= extent {
 		true => Ok(()),
-		false => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::UnsupportedConcreteShape,
-			format!("{label} end {end} exceeds extent {extent}"),
-		)),
+		false => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::UnsupportedConcreteShape,
+				format!("{label} end {end} exceeds extent {extent}"),
+			))
+		}
 	}
 }
 

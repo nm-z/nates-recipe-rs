@@ -1,7 +1,9 @@
 use core::fmt;
-use std::io::{self, Write};
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::{
+	io::{self, Write},
+	path::Path,
+	time::Duration,
+};
 
 use recipe_core::{BundleIdentity, RunId};
 use recipe_executor::RunJournal;
@@ -22,10 +24,12 @@ use recipe_training::{
 	prepare_gguf_llama_inference_table, prepare_knn_inference_table,
 };
 
-use crate::api::{Data, DeclarationError, Infer, InferenceDeclaration, Metric, Model};
-use crate::data_prepare::{DataPreparationError, distill_data, select_target_free_data};
-use crate::native_prepare::{NativePreparationError, with_current_native_preparation};
-use crate::training::{derive_native_runtime_tuning, next_run_id};
+use crate::{
+	api::{Data, DeclarationError, Infer, InferenceDeclaration, Metric, Model},
+	data_prepare::{DataPreparationError, distill_data, select_target_free_data},
+	native_prepare::{NativePreparationError, with_current_native_preparation},
+	training::{derive_native_runtime_tuning, next_run_id},
+};
 
 /// The public inference boundary failed before native execution.
 #[derive(Debug)]
@@ -86,39 +90,27 @@ impl std::error::Error for InferenceError {
 }
 
 impl From<DeclarationError> for InferenceError {
-	fn from(error: DeclarationError) -> Self {
-		Self::Declaration(error)
-	}
+	fn from(error: DeclarationError) -> Self { Self::Declaration(error) }
 }
 
 impl From<DataPreparationError> for InferenceError {
-	fn from(error: DataPreparationError) -> Self {
-		Self::Data(error)
-	}
+	fn from(error: DataPreparationError) -> Self { Self::Data(error) }
 }
 
 impl From<InferencePreparationError> for InferenceError {
-	fn from(error: InferencePreparationError) -> Self {
-		Self::Model(error)
-	}
+	fn from(error: InferencePreparationError) -> Self { Self::Model(error) }
 }
 
 impl From<InferenceCompileError> for InferenceError {
-	fn from(error: InferenceCompileError) -> Self {
-		Self::Compile(error)
-	}
+	fn from(error: InferenceCompileError) -> Self { Self::Compile(error) }
 }
 
 impl From<NativePreparationError> for InferenceError {
-	fn from(error: NativePreparationError) -> Self {
-		Self::Native(error)
-	}
+	fn from(error: NativePreparationError) -> Self { Self::Native(error) }
 }
 
 impl From<InferenceExecutionError> for InferenceError {
-	fn from(error: InferenceExecutionError) -> Self {
-		Self::Execute(error)
-	}
+	fn from(error: InferenceExecutionError) -> Self { Self::Execute(error) }
 }
 
 pub type InferenceResult<T> = Result<T, InferenceError>;
@@ -179,6 +171,15 @@ enum CompletedModelInference {
 	Knn(CompletedKnnInferenceExecution),
 	Bayes(CompletedInferenceExecution),
 	GgufLlama(CompletedInferenceExecution),
+}
+
+impl CompletedModelInference {
+	const fn elapsed(&self) -> Duration {
+		match self {
+			Self::Dense(execution) | Self::Bayes(execution) | Self::GgufLlama(execution) => execution.elapsed(),
+			Self::Knn(execution) => execution.elapsed(),
+		}
+	}
 }
 
 #[derive(Clone, Debug)]
@@ -260,15 +261,38 @@ impl InferenceReport {
 		}
 	}
 
+	/// Exact bundled native images built, loaded, warmed, and torn down by this
+	/// inference run. KNN currently exposes its typed predictions but not its
+	/// retained realization image.
 	#[must_use]
-	pub const fn elapsed(&self) -> Duration {
-		self.elapsed
+	pub const fn native_kernels(&self) -> Option<&recipe_training::RealizedNativeKernelSet> {
+		match &self.payload {
+			InferenceReportPayload::Dense { execution, .. }
+			| InferenceReportPayload::Bayes { execution, .. }
+			| InferenceReportPayload::GgufLlama { execution, .. } => Some(execution.native_kernels()),
+			InferenceReportPayload::Knn { .. } => None,
+		}
 	}
 
+	/// Driver-derived realization and teardown evidence for the completed run.
 	#[must_use]
-	pub fn devices(&self) -> &[String] {
-		&self.devices
+	pub const fn native_evidence(&self) -> &recipe_native_executor::NativeExecutionEvidence {
+		match &self.payload {
+			InferenceReportPayload::Dense { execution, .. }
+			| InferenceReportPayload::Bayes { execution, .. }
+			| InferenceReportPayload::GgufLlama { execution, .. } => execution.native_evidence(),
+			InferenceReportPayload::Knn { execution, .. } => execution.native_evidence(),
+		}
 	}
+
+	/// One complete checked native inference loop. Lifecycle setup, output
+	/// collection, and teardown are excluded from this throughput interval and
+	/// remain covered by the report's native lifecycle evidence.
+	#[must_use]
+	pub const fn elapsed(&self) -> Duration { self.elapsed }
+
+	#[must_use]
+	pub fn devices(&self) -> &[String] { &self.devices }
 
 	/// Exact dense, Bayesian, or GGUF-logit payload interpreted as little-endian
 	/// binary32 values. KNN reports return an empty iterator because their outputs
@@ -297,9 +321,7 @@ impl InferenceReport {
 	/// Decode one categorical Bayesian child class through the saved dictionary.
 	/// This compatibility accessor addresses the first repeated declaration.
 	#[must_use]
-	pub fn decode_bayes_class(&self, class: usize) -> Option<&[u8]> {
-		self.decode_bayes_output_class(0, class)
-	}
+	pub fn decode_bayes_class(&self, class: usize) -> Option<&[u8]> { self.decode_bayes_output_class(0, class) }
 
 	/// Number of observed categorical Bayesian target outputs in declaration
 	/// order, or zero for another model family.
@@ -317,10 +339,12 @@ impl InferenceReport {
 	#[must_use]
 	pub fn bayes_output_name(&self, output: usize) -> Option<&[u8]> {
 		match &self.payload {
-			InferenceReportPayload::Bayes { artifact, .. } => artifact
-				.conditionals()
-				.get(output)
-				.map(|conditional| conditional.child().name()),
+			InferenceReportPayload::Bayes { artifact, .. } => {
+				artifact
+					.conditionals()
+					.get(output)
+					.map(|conditional| conditional.child().name())
+			}
 			InferenceReportPayload::Dense { .. }
 			| InferenceReportPayload::Knn { .. }
 			| InferenceReportPayload::GgufLlama { .. } => None,
@@ -331,10 +355,12 @@ impl InferenceReport {
 	#[must_use]
 	pub fn bayes_output_classes(&self, output: usize) -> Option<usize> {
 		match &self.payload {
-			InferenceReportPayload::Bayes { artifact, .. } => artifact
-				.conditionals()
-				.get(output)
-				.map(|conditional| conditional.child_classes()),
+			InferenceReportPayload::Bayes { artifact, .. } => {
+				artifact
+					.conditionals()
+					.get(output)
+					.map(|conditional| conditional.child_classes())
+			}
 			InferenceReportPayload::Dense { .. }
 			| InferenceReportPayload::Knn { .. }
 			| InferenceReportPayload::GgufLlama { .. } => None,
@@ -363,13 +389,15 @@ impl InferenceReport {
 	#[must_use]
 	pub fn decode_bayes_output_class(&self, output: usize, class: usize) -> Option<&[u8]> {
 		match &self.payload {
-			InferenceReportPayload::Bayes { artifact, .. } => artifact
-				.conditionals()
-				.get(output)?
-				.child()
-				.dictionary()
-				.get(class)
-				.map(Vec::as_slice),
+			InferenceReportPayload::Bayes { artifact, .. } => {
+				artifact
+					.conditionals()
+					.get(output)?
+					.child()
+					.dictionary()
+					.get(class)
+					.map(Vec::as_slice)
+			}
 			InferenceReportPayload::Dense { .. }
 			| InferenceReportPayload::Knn { .. }
 			| InferenceReportPayload::GgufLlama { .. } => None,
@@ -384,11 +412,13 @@ impl InferenceReport {
 			InferenceReportPayload::Dense { .. }
 			| InferenceReportPayload::Bayes { .. }
 			| InferenceReportPayload::GgufLlama { .. } => None,
-			InferenceReportPayload::Knn { artifact, .. } => artifact
-				.references()
-				.outputs()
-				.get(output)
-				.and_then(|output| output.decode_class(code)),
+			InferenceReportPayload::Knn { artifact, .. } => {
+				artifact
+					.references()
+					.outputs()
+					.get(output)
+					.and_then(|output| output.decode_class(code))
+			}
 		}
 	}
 }
@@ -401,30 +431,36 @@ pub(crate) struct CompiledInferencePackage {
 
 pub(crate) fn evaluate_inference_declaration(declaration: &InferenceDeclaration) -> InferenceResult<InferenceReport> {
 	let package = compile_inference_declaration(declaration)?;
-	let started = Instant::now();
 	let (execution, devices) = execute_current_inference_native(&package.inference)?;
+	let elapsed = execution.elapsed();
 	let payload = match (package.model, execution) {
 		(
 			LoadedInferenceModel::Semantic(SemanticModelArtifact::Dense(checkpoint)),
 			CompletedModelInference::Dense(execution),
-		) => InferenceReportPayload::Dense {
-			checkpoint,
-			execution,
-		},
+		) => {
+			InferenceReportPayload::Dense {
+				checkpoint,
+				execution,
+			}
+		}
 		(
 			LoadedInferenceModel::Semantic(SemanticModelArtifact::Knn(artifact)),
 			CompletedModelInference::Knn(execution),
-		) => InferenceReportPayload::Knn {
-			artifact,
-			execution,
-		},
+		) => {
+			InferenceReportPayload::Knn {
+				artifact,
+				execution,
+			}
+		}
 		(
 			LoadedInferenceModel::Semantic(SemanticModelArtifact::Bayes(artifact)),
 			CompletedModelInference::Bayes(execution),
-		) => InferenceReportPayload::Bayes {
-			artifact,
-			execution,
-		},
+		) => {
+			InferenceReportPayload::Bayes {
+				artifact,
+				execution,
+			}
+		}
 		(LoadedInferenceModel::GgufLlama(artifact), CompletedModelInference::GgufLlama(execution)) => {
 			InferenceReportPayload::GgufLlama {
 				artifact,
@@ -435,7 +471,7 @@ pub(crate) fn evaluate_inference_declaration(declaration: &InferenceDeclaration)
 	};
 	let report = InferenceReport {
 		payload,
-		elapsed: started.elapsed(),
+		elapsed,
 		devices,
 	};
 	write_inference_report(&mut io::stdout().lock(), declaration.policy(), &report)
@@ -468,15 +504,19 @@ fn compile_inference_package(policy: &Infer, data: &Data, model: &Model) -> Infe
 	require_target_free_data_policy(data)?;
 	let source = require_inference_model_source(model)?;
 	let model = match source.extension().and_then(|extension| extension.to_str()) {
-		Some("ogdl") => LoadedInferenceModel::Semantic(load_semantic_model_file(
-			source,
-			CheckpointDecodeLimits::default(),
-			KnnModelDecodeLimits::default(),
-		)?),
-		Some("gguf") => LoadedInferenceModel::GgufLlama(load_gguf_llama_model_file(
-			source,
-			gguf_limits_for_file(source)?,
-		)?),
+		Some("ogdl") => {
+			LoadedInferenceModel::Semantic(load_semantic_model_file(
+				source,
+				CheckpointDecodeLimits::default(),
+				KnnModelDecodeLimits::default(),
+			)?)
+		}
+		Some("gguf") => {
+			LoadedInferenceModel::GgufLlama(load_gguf_llama_model_file(
+				source,
+				gguf_limits_for_file(source)?,
+			)?)
+		}
 		_ => unreachable!("model extension was validated before loading"),
 	};
 	let distilled = distill_data(data)?;
@@ -528,12 +568,16 @@ fn require_inference_model_source(model: &Model) -> InferenceResult<&Path> {
 	let path = Path::new(source);
 	match path.extension().and_then(|extension| extension.to_str()) {
 		Some("ogdl" | "gguf") => Ok(path),
-		Some(extension) => Err(InferenceError::unsupported(format!(
-			"inference model extension .{extension} is neither .ogdl nor .gguf"
-		))),
-		None => Err(InferenceError::unsupported(
-			"inference model path has no .ogdl or .gguf extension",
-		)),
+		Some(extension) => {
+			Err(InferenceError::unsupported(format!(
+				"inference model extension .{extension} is neither .ogdl nor .gguf"
+			)))
+		}
+		None => {
+			Err(InferenceError::unsupported(
+				"inference model path has no .ogdl or .gguf extension",
+			))
+		}
 	}
 }
 
@@ -1056,343 +1100,4 @@ fn write_quoted_bytes(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 		}
 	}
 	writer.write_all(b"\"")
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::api::{DataNormalization, Loss, Train};
-	use std::path::PathBuf;
-	use std::sync::atomic::{AtomicU64, Ordering};
-
-	static NEXT_GGUF_FIXTURE: AtomicU64 = AtomicU64::new(0);
-
-	struct GgufFixture {
-		path: PathBuf,
-	}
-
-	impl GgufFixture {
-		fn architecture(name: &str) -> Self {
-			let sequence = NEXT_GGUF_FIXTURE.fetch_add(1, Ordering::Relaxed);
-			let path = std::env::temp_dir().join(format!(
-				"recipe-gguf-architecture-{}-{sequence}.gguf",
-				std::process::id()
-			));
-			let mut bytes = b"GGUF".to_vec();
-			bytes.extend_from_slice(&3_u32.to_le_bytes());
-			bytes.extend_from_slice(&0_u64.to_le_bytes());
-			bytes.extend_from_slice(&1_u64.to_le_bytes());
-			bytes.extend_from_slice(
-				&u64::try_from("general.architecture".len())
-					.unwrap()
-					.to_le_bytes(),
-			);
-			bytes.extend_from_slice(b"general.architecture");
-			bytes.extend_from_slice(&8_u32.to_le_bytes());
-			bytes.extend_from_slice(&u64::try_from(name.len()).unwrap().to_le_bytes());
-			bytes.extend_from_slice(name.as_bytes());
-			std::fs::write(&path, bytes).unwrap();
-			Self { path }
-		}
-	}
-
-	impl Drop for GgufFixture {
-		fn drop(&mut self) {
-			let _ = std::fs::remove_file(&self.path);
-		}
-	}
-
-	fn data() -> Data {
-		Data::empty().set("not-read.csv")
-	}
-
-	#[test]
-	fn compile_boundary_rejects_a_tensorless_llama_before_reading_data() {
-		let fixture = GgufFixture::architecture("llama");
-		let model = Model::new().load(fixture.path.to_str().unwrap());
-		let error = compile_inference(&Infer::new(), &data(), &model).unwrap_err();
-		assert!(matches!(error, InferenceError::Model(_)));
-		assert!(error.to_string().contains("llama.vocab_size"));
-	}
-
-	#[test]
-	fn compile_boundary_names_an_unsupported_gguf_architecture_before_reading_data() {
-		let fixture = GgufFixture::architecture("not-llama");
-		let model = Model::new().load(fixture.path.to_str().unwrap());
-		let error = compile_inference(&Infer::new(), &data(), &model).unwrap_err();
-		assert!(matches!(error, InferenceError::Model(_)));
-		assert!(error.to_string().contains("architecture \"not-llama\""));
-		assert!(error.to_string().contains("no Recipe execution instrument"));
-	}
-
-	#[test]
-	fn compile_boundary_dispatches_checked_in_dense_llama_to_raw_logits() {
-		let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/datasets/llamacpp-archs-seed42");
-		let data = Data::empty().set(corpus
-			.join("tokens.txt")
-			.to_str()
-			.expect("corpus path is UTF-8"));
-		let model = Model::new().load(corpus
-			.join("llama-dense.gguf")
-			.to_str()
-			.expect("corpus path is UTF-8"));
-		let compiled = compile_inference(&Infer::new(), &data, &model).expect("compile GGUF llama inference");
-		let CompiledModelInference::GgufLlama(compiled) = compiled else {
-			panic!("GGUF llama model dispatched to another inference family");
-		};
-		assert_eq!(compiled.rows(), 128);
-		assert_eq!(
-			compiled.output().kind(),
-			InferencePredictionKind::TokenLogits
-		);
-		assert_eq!(compiled.output().shape().extents(), [128, 128]);
-	}
-
-	#[test]
-	fn compile_boundary_requires_a_checkpoint_model_before_reading_data() {
-		let model = Model::new().layer(1).loss(Loss::MeanSquaredError);
-		let error = compile_inference(&Infer::new(), &data(), &model).unwrap_err();
-		assert!(
-			error.to_string()
-				.contains("recipe.model().load(MODEL_PATH)")
-		);
-	}
-
-	#[test]
-	fn compile_boundary_rejects_training_only_data_policy_before_reading_sources() {
-		let model = Model::new().load("model.ogdl");
-		for declared in [
-			data().target("target"),
-			data().split(0.8),
-			data().norm(DataNormalization::ZScore),
-		] {
-			let error = compile_inference(&Infer::new(), &declared, &model).unwrap_err();
-			assert!(matches!(error, InferenceError::Unsupported { .. }));
-		}
-	}
-
-	#[test]
-	fn compile_boundary_dispatches_a_saved_knn_model_to_all_outputs() {
-		static NEXT_KNN_FIXTURE: AtomicU64 = AtomicU64::new(0);
-
-		struct RemoveOnDrop(Vec<PathBuf>);
-
-		impl Drop for RemoveOnDrop {
-			fn drop(&mut self) {
-				for path in &self.0 {
-					let _ = std::fs::remove_file(path);
-				}
-			}
-		}
-
-		let sequence = NEXT_KNN_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let prefix = std::env::temp_dir().join(format!(
-			"recipe-public-knn-inference-{}-{sequence}",
-			std::process::id(),
-		));
-		let training_path = prefix.with_extension("training.csv");
-		let query_path = prefix.with_extension("query.csv");
-		let model_path = prefix.with_extension("ogdl");
-		std::fs::write(
-			&training_path,
-			b"feature,class,numeric\n1,red,1.5\n2,blue,2.5\n3,red,3.5\n4,blue,4.5\n",
-		)
-		.expect("write KNN training fixture");
-		std::fs::write(&query_path, b"feature\n2\n3\n").expect("write KNN query fixture");
-		let _fixture = RemoveOnDrop(vec![
-			training_path.clone(),
-			query_path.clone(),
-			model_path.clone(),
-		]);
-		let training_data = Data::empty()
-			.set(training_path.to_str().expect("temporary path is UTF-8"))
-			.target(["class", "numeric"])
-			.split(0.75);
-		let artifact = crate::training::compile_knn_model(&Train::new(), &training_data, &Model::new().knn(1))
-			.expect("compile KNN semantic model");
-		artifact.save(&model_path).expect("save KNN semantic model");
-		let query_data = Data::empty().set(query_path.to_str().expect("temporary path is UTF-8"));
-		let model = Model::new().load(model_path.to_str().expect("temporary path is UTF-8"));
-
-		let compiled = compile_inference(&Infer::new(), &query_data, &model).expect("compile public KNN inference");
-		let CompiledModelInference::Knn(compiled) = compiled else {
-			panic!("KNN root dispatched to a dense compiler");
-		};
-		assert_eq!(compiled.rows(), 2);
-		assert_eq!(compiled.outputs().len(), 2);
-		assert_eq!(
-			compiled
-				.outputs()
-				.iter()
-				.map(|output| output.kind())
-				.collect::<Vec<_>>(),
-			[
-				KnnInferencePredictionKind::DiscreteMode,
-				KnnInferencePredictionKind::NumericMean,
-			]
-		);
-	}
-
-	#[test]
-	fn compile_boundary_dispatches_a_saved_bayesian_model_to_native_posterior() {
-		struct RemoveOnDrop(Vec<PathBuf>);
-
-		impl Drop for RemoveOnDrop {
-			fn drop(&mut self) {
-				for path in &self.0 {
-					let _ = std::fs::remove_file(path);
-				}
-			}
-		}
-
-		let sequence = NEXT_GGUF_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let prefix = std::env::temp_dir().join(format!(
-			"recipe-public-bayes-inference-{}-{sequence}",
-			std::process::id(),
-		));
-		let training_path = prefix.with_extension("training.csv");
-		let query_path = prefix.with_extension("query.csv");
-		let model_path = prefix.with_extension("ogdl");
-		std::fs::write(
-			&training_path,
-			b"weather,wind,play\nsun,breeze,otter\nsun,gale,falcon\nrain,breeze,otter\nrain,gale,falcon\nsun,breeze,otter\n",
-		)
-		.expect("write Bayesian training fixture");
-		std::fs::write(&query_path, b"wind,weather\nbreeze,sun\nstorm,cloud\n")
-			.expect("write Bayesian query fixture");
-		let _fixture = RemoveOnDrop(vec![
-			training_path.clone(),
-			query_path.clone(),
-			model_path.clone(),
-		]);
-		let training_data = Data::empty()
-			.set(training_path.to_str().expect("temporary path is UTF-8"))
-			.target("play")
-			.split(0.8);
-		let artifact = crate::training::compile_bayes_model(
-			&Train::new(),
-			&training_data,
-			&Model::new().bayes("play", ["weather", "wind"]),
-		)
-		.expect("compile Bayesian semantic model");
-		artifact
-			.save(&model_path)
-			.expect("save Bayesian semantic model");
-		let query_data = Data::empty().set(query_path.to_str().expect("temporary path is UTF-8"));
-		let model = Model::new().load(model_path.to_str().expect("temporary path is UTF-8"));
-
-		let compiled =
-			compile_inference(&Infer::new(), &query_data, &model).expect("compile public Bayesian inference");
-		let CompiledModelInference::Bayes(compiled) = compiled else {
-			panic!("Bayesian root dispatched to another model compiler");
-		};
-		assert_eq!(compiled.rows(), 2);
-		assert_eq!(compiled.output().shape().extents(), [2, 2]);
-		assert_eq!(
-			compiled.output().kind(),
-			InferencePredictionKind::BayesProbabilities
-		);
-	}
-
-	#[test]
-	fn compile_boundary_preserves_repeated_bayesian_target_order() {
-		struct RemoveOnDrop(Vec<PathBuf>);
-
-		impl Drop for RemoveOnDrop {
-			fn drop(&mut self) {
-				for path in &self.0 {
-					let _ = std::fs::remove_file(path);
-				}
-			}
-		}
-
-		let sequence = NEXT_GGUF_FIXTURE.fetch_add(1, Ordering::Relaxed);
-		let prefix = std::env::temp_dir().join(format!(
-			"recipe-public-bayes-multi-inference-{}-{sequence}",
-			std::process::id(),
-		));
-		let training_path = prefix.with_extension("training.csv");
-		let query_path = prefix.with_extension("query.csv");
-		let model_path = prefix.with_extension("ogdl");
-		std::fs::write(
-			&training_path,
-			b"weather,wind,play,travel\nsun,breeze,otter,walk\nsun,gale,falcon,drive\nrain,breeze,otter,drive\nrain,gale,falcon,stay\nsun,breeze,otter,walk\n",
-		)
-		.expect("write repeated Bayesian training fixture");
-		std::fs::write(&query_path, b"wind,weather\nbreeze,sun\nstorm,cloud\n")
-			.expect("write repeated Bayesian query fixture");
-		let _fixture = RemoveOnDrop(vec![
-			training_path.clone(),
-			query_path.clone(),
-			model_path.clone(),
-		]);
-		let training_data = Data::empty()
-			.set(training_path.to_str().expect("temporary path is UTF-8"))
-			.target(["play", "travel"])
-			.split(0.8);
-		let artifact = crate::training::compile_bayes_model(
-			&Train::new(),
-			&training_data,
-			&Model::new()
-				.bayes("play", ["weather", "wind"])
-				.bayes("travel", ["weather"]),
-		)
-		.expect("compile repeated Bayesian semantic model");
-		assert_eq!(artifact.conditionals().len(), 2);
-		artifact
-			.save(&model_path)
-			.expect("save repeated Bayesian semantic model");
-		let query_data = Data::empty().set(query_path.to_str().expect("temporary path is UTF-8"));
-		let model = Model::new().load(model_path.to_str().expect("temporary path is UTF-8"));
-
-		let compiled =
-			compile_inference(&Infer::new(), &query_data, &model).expect("compile repeated Bayesian inference");
-		let CompiledModelInference::Bayes(compiled) = compiled else {
-			panic!("repeated Bayesian root dispatched to another model compiler");
-		};
-		assert_eq!(compiled.rows(), 2);
-		assert_eq!(compiled.output().shape().extents(), [2, 5]);
-		assert_eq!(
-			compiled.output().kind(),
-			InferencePredictionKind::BayesProbabilities
-		);
-	}
-
-	#[test]
-	fn compile_boundary_rejects_an_unknown_semantic_model_root_before_data_io() {
-		let path = std::env::temp_dir().join(format!(
-			"recipe-unknown-model-root-{}-{}.ogdl",
-			std::process::id(),
-			NEXT_GGUF_FIXTURE.fetch_add(1, Ordering::Relaxed),
-		));
-		std::fs::write(&path, b"some-other-model\n\tversion\t1\n").expect("write unknown model fixture");
-		let model = Model::new().load(path.to_str().expect("temporary path is UTF-8"));
-		let error = compile_inference(&Infer::new(), &data(), &model).expect_err("unknown model root must fail");
-		let _ = std::fs::remove_file(path);
-		assert!(matches!(error, InferenceError::Model(_)));
-		assert!(error.to_string().contains("unknown semantic-model root"));
-	}
-
-	#[test]
-	fn multiclass_argmax_keeps_the_lowest_index_on_an_exact_tie() {
-		let image = [0.25f32, 0.75, 0.75, 0.5]
-			.into_iter()
-			.flat_map(f32::to_le_bytes)
-			.collect::<Vec<_>>();
-		assert_eq!(multiclass_argmax(&image), 1);
-	}
-
-	#[test]
-	fn prediction_labels_escape_arbitrary_saved_bytes_losslessly() {
-		let mut output = Vec::new();
-		write_multiclass_label(
-			&mut output,
-			Some(DecodedMulticlassClass::Label(b"a\\\"\n\x00\xff")),
-		)
-		.unwrap();
-		assert_eq!(output, br#""a\\\"\n\x00\xff""#);
-		output.clear();
-		write_multiclass_label(&mut output, Some(DecodedMulticlassClass::ReservedUnseen)).unwrap();
-		assert_eq!(output, b"<reserved-unseen>");
-	}
 }

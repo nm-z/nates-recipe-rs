@@ -4,13 +4,12 @@ use recipe_language::{
 };
 use recipe_math::MathFunction;
 
-use crate::{OperationDescriptor, OperationId, OperationResult};
-
 use super::{
 	Emitter, FamilyDispatch, KernelEmission, MaterializationRequest, exact_f32_extent, input, language_error, output,
 	prepared_f32, prepared_tree_lanes, request_error, require_dtype, require_exact_abi, require_same_tensor_contract,
 	scalar_binary, scalar_builder, scalar_f32, scalar_finish, scalar_input, scalar_ternary, scalar_unary,
 };
+use crate::{OperationDescriptor, OperationId, OperationResult};
 
 const MAX_I32_INDEX: u64 = 2_147_483_647;
 const OPERATIONS: &[(&str, &str)] = &[
@@ -38,38 +37,39 @@ pub(super) fn supports(descriptor: OperationDescriptor) -> bool {
 pub(super) fn dispatch(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> FamilyDispatch {
 	let result = match supports(request.descriptor) {
 		false => return FamilyDispatch::NotOwned,
-		true => match request.descriptor.symbol {
-			"gpu_accuracy" => emit_multiclass_correct_count(request, emitter),
-			"gpu_accuracy_into" => emit_binary_accuracy(request, emitter),
-			"gpu_argmax_accuracy_into" => emit_dense_multiclass_accuracy(request, emitter),
-			"gpu_contrastive_loss" => emit_contrastive_loss(request, emitter),
-			"gpu_cosine_embedding_loss" => emit_cosine_embedding_loss(request, emitter),
-			"gpu_has_nan" => emit_finite_metric(request, emitter, false),
-			"gpu_hinge_loss" => emit_hinge_loss(request, emitter),
-			"gpu_isfinite_all" => emit_finite_metric(request, emitter, true),
-			"gpu_kl_div_loss" => emit_kl_divergence_loss(request, emitter),
-			"gpu_mean_all" => emit_global_mean(request, emitter),
-			"gpu_mse_into" => emit_mean_squared_error(request, emitter),
-			"gpu_reduce_mean_cols" => emit_column_mean(request, emitter),
-			"gpu_reduce_var_cols" => emit_column_variance(request, emitter),
-			"gpu_ss_res_into" => emit_sum_squared_residuals(request, emitter),
-			"gpu_triplet_loss" => emit_triplet_loss(request, emitter),
-			symbol => Err(request_error(
-				request,
-				format!("loss/metric dispatch is incomplete for {symbol}"),
-			)),
-		},
+		true => {
+			match request.descriptor.symbol {
+				"gpu_accuracy" => emit_multiclass_correct_count(request, emitter),
+				"gpu_accuracy_into" => emit_binary_accuracy(request, emitter),
+				"gpu_argmax_accuracy_into" => emit_dense_multiclass_accuracy(request, emitter),
+				"gpu_contrastive_loss" => emit_contrastive_loss(request, emitter),
+				"gpu_cosine_embedding_loss" => emit_cosine_embedding_loss(request, emitter),
+				"gpu_has_nan" => emit_finite_metric(request, emitter, false),
+				"gpu_hinge_loss" => emit_hinge_loss(request, emitter),
+				"gpu_isfinite_all" => emit_finite_metric(request, emitter, true),
+				"gpu_kl_div_loss" => emit_kl_divergence_loss(request, emitter),
+				"gpu_mean_all" => emit_global_mean(request, emitter),
+				"gpu_mse_into" => emit_mean_squared_error(request, emitter),
+				"gpu_reduce_mean_cols" => emit_column_mean(request, emitter),
+				"gpu_reduce_var_cols" => emit_column_variance(request, emitter),
+				"gpu_ss_res_into" => emit_sum_squared_residuals(request, emitter),
+				"gpu_triplet_loss" => emit_triplet_loss(request, emitter),
+				symbol => {
+					Err(request_error(
+						request,
+						format!("loss/metric dispatch is incomplete for {symbol}"),
+					))
+				}
+			}
+		}
 	};
 	FamilyDispatch::Owned(result)
 }
 
 fn emit_binary_accuracy(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["predictions", "targets"],
-		&["accuracy"],
-		&["tree_lanes"],
-	)?;
+	require_exact_abi(request, &["predictions", "targets"], &["accuracy"], &[
+		"tree_lanes",
+	])?;
 	let predictions = input(request, "predictions")?;
 	let targets = input(request, "targets")?;
 	let accuracy = output(request, "accuracy")?;
@@ -111,12 +111,9 @@ fn emit_multiclass_correct_count(
 	request: &MaterializationRequest<'_>,
 	emitter: &mut Emitter<'_>,
 ) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["predictions", "targets"],
-		&["correct_count"],
-		&["tree_lanes"],
-	)?;
+	require_exact_abi(request, &["predictions", "targets"], &["correct_count"], &[
+		"tree_lanes",
+	])?;
 	let predictions = input(request, "predictions")?;
 	let targets = input(request, "targets")?;
 	let correct_count = output(request, "correct_count")?;
@@ -171,12 +168,9 @@ fn emit_dense_multiclass_accuracy(
 	request: &MaterializationRequest<'_>,
 	emitter: &mut Emitter<'_>,
 ) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["predictions", "targets"],
-		&["accuracy"],
-		&["tree_lanes"],
-	)?;
+	require_exact_abi(request, &["predictions", "targets"], &["accuracy"], &[
+		"tree_lanes",
+	])?;
 	let predictions = input(request, "predictions")?;
 	let targets = input(request, "targets")?;
 	let accuracy = output(request, "accuracy")?;
@@ -280,25 +274,17 @@ fn emit_finite_metric(
 }
 
 fn emit_hinge_loss(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["scores", "labels"],
-		&["losses", "gradients"],
-		&[],
-	)?;
+	require_exact_abi(request, &["scores", "labels"], &["losses", "gradients"], &[
+	])?;
 	let scores = input(request, "scores")?;
 	let labels = input(request, "labels")?;
 	let losses = output(request, "losses")?;
 	let gradients = output(request, "gradients")?;
-	require_equal_nonempty_f32(
-		request,
-		scores,
-		[
-			("labels", labels),
-			("losses", losses),
-			("gradients", gradients),
-		],
-	)?;
+	require_equal_nonempty_f32(request, scores, [
+		("labels", labels),
+		("losses", losses),
+		("gradients", gradients),
+	])?;
 	emitter.emit(
 		vec![scores.id, labels.id],
 		vec![losses.id, gradients.id],
@@ -313,11 +299,10 @@ fn emit_kl_divergence_loss(request: &MaterializationRequest<'_>, emitter: &mut E
 	let log_probabilities = input(request, "log_probabilities")?;
 	let targets = input(request, "targets")?;
 	let losses = output(request, "losses")?;
-	require_equal_nonempty_f32(
-		request,
-		log_probabilities,
-		[("targets", targets), ("losses", losses)],
-	)?;
+	require_equal_nonempty_f32(request, log_probabilities, [
+		("targets", targets),
+		("losses", losses),
+	])?;
 	let safe_targets = emitter.intermediate(DType::F32, targets.shape.clone())?;
 	let logarithms = emitter.intermediate(DType::F32, targets.shape.clone())?;
 	let logarithm = recipe_core::ScalarProgram::try_from(MathFunction::Log)
@@ -560,12 +545,10 @@ fn emit_column_variance(request: &MaterializationRequest<'_>, emitter: &mut Emit
 }
 
 fn emit_contrastive_loss(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["left", "right", "labels"],
-		&["losses"],
-		&["margin", "tree_lanes"],
-	)?;
+	require_exact_abi(request, &["left", "right", "labels"], &["losses"], &[
+		"margin",
+		"tree_lanes",
+	])?;
 	let left = input(request, "left")?;
 	let right = input(request, "right")?;
 	let labels = input(request, "labels")?;
@@ -606,12 +589,10 @@ fn emit_contrastive_loss(request: &MaterializationRequest<'_>, emitter: &mut Emi
 }
 
 fn emit_cosine_embedding_loss(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["left", "right", "labels"],
-		&["losses"],
-		&["margin", "tree_lanes"],
-	)?;
+	require_exact_abi(request, &["left", "right", "labels"], &["losses"], &[
+		"margin",
+		"tree_lanes",
+	])?;
 	let left = input(request, "left")?;
 	let right = input(request, "right")?;
 	let labels = input(request, "labels")?;
@@ -733,10 +714,12 @@ fn require_nonempty_f32(request: &MaterializationRequest<'_>, tensor: &Tensor, n
 	require_dtype(request, tensor, DType::F32, name)?;
 	let elements = tensor.shape.elements();
 	match elements == 0 || elements > MAX_I32_INDEX {
-		true => Err(request_error(
-			request,
-			format!("{name} element count must be in 1..={MAX_I32_INDEX}"),
-		)),
+		true => {
+			Err(request_error(
+				request,
+				format!("{name} element count must be in 1..={MAX_I32_INDEX}"),
+			))
+		}
 		false => Ok(()),
 	}
 }
@@ -764,17 +747,21 @@ fn require_f32_matrix(
 			let rows = tensor.shape.extents()[0];
 			let columns = tensor.shape.extents()[1];
 			match rows == 0 || columns == 0 || rows > MAX_I32_INDEX || columns > MAX_I32_INDEX {
-				true => Err(request_error(
-					request,
-					format!("{name} dimensions must each be in 1..={MAX_I32_INDEX}"),
-				)),
+				true => {
+					Err(request_error(
+						request,
+						format!("{name} dimensions must each be in 1..={MAX_I32_INDEX}"),
+					))
+				}
 				false => Ok((rows, columns)),
 			}
 		}
-		false => Err(request_error(
-			request,
-			format!("{name} must be rank-two [rows, columns]"),
-		)),
+		false => {
+			Err(request_error(
+				request,
+				format!("{name} must be rank-two [rows, columns]"),
+			))
+		}
 	}
 }
 
@@ -812,13 +799,15 @@ fn require_shape(
 ) -> OperationResult<()> {
 	match tensor.shape.extents() == shape {
 		true => Ok(()),
-		false => Err(request_error(
-			request,
-			format!(
-				"{name} has shape {:?}, expected {shape:?}",
-				tensor.shape.extents()
-			),
-		)),
+		false => {
+			Err(request_error(
+				request,
+				format!(
+					"{name} has shape {:?}, expected {shape:?}",
+					tensor.shape.extents()
+				),
+			))
+		}
 	}
 }
 
@@ -826,10 +815,12 @@ fn finite_parameter(request: &MaterializationRequest<'_>, name: &str) -> Operati
 	let value = prepared_f32(request, name)?;
 	match value.is_finite() {
 		true => Ok(value),
-		false => Err(request_error(
-			request,
-			format!("{name} must be a finite f32"),
-		)),
+		false => {
+			Err(request_error(
+				request,
+				format!("{name} must be a finite f32"),
+			))
+		}
 	}
 }
 
@@ -863,10 +854,12 @@ fn reduction(
 	});
 	match supports(request.descriptor) {
 		true => Ok(kind),
-		false => Err(request_error(
-			request,
-			"reduction requested by a descriptor outside the loss/metric family",
-		)),
+		false => {
+			Err(request_error(
+				request,
+				"reduction requested by a descriptor outside the loss/metric family",
+			))
+		}
 	}
 }
 

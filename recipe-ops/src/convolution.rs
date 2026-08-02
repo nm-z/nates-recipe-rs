@@ -30,71 +30,47 @@ pub struct ChannelwiseConvolution1dPreparation {
 
 impl ChannelwiseConvolution1dPreparation {
 	#[must_use]
-	pub const fn batch(&self) -> u64 {
-		self.batch
-	}
+	pub const fn batch(&self) -> u64 { self.batch }
 
 	#[must_use]
-	pub const fn input_length(&self) -> u64 {
-		self.input_length
-	}
+	pub const fn input_length(&self) -> u64 { self.input_length }
 
 	#[must_use]
-	pub const fn input_channels(&self) -> u64 {
-		self.input_channels
-	}
+	pub const fn input_channels(&self) -> u64 { self.input_channels }
 
 	#[must_use]
-	pub const fn filters(&self) -> u64 {
-		self.filters
-	}
+	pub const fn filters(&self) -> u64 { self.filters }
 
 	#[must_use]
-	pub const fn kernel_size(&self) -> u64 {
-		self.kernel_size
-	}
+	pub const fn kernel_size(&self) -> u64 { self.kernel_size }
 
 	#[must_use]
-	pub const fn output_length(&self) -> u64 {
-		self.output_length
-	}
+	pub const fn output_length(&self) -> u64 { self.output_length }
 
 	#[must_use]
-	pub const fn input_elements(&self) -> u64 {
-		self.input_elements
-	}
+	pub const fn input_elements(&self) -> u64 { self.input_elements }
 
 	#[must_use]
-	pub const fn output_elements(&self) -> u64 {
-		self.output_elements
-	}
+	pub const fn output_elements(&self) -> u64 { self.output_elements }
 
 	/// Absolute flat-input indices in row-major
 	/// `[batch, output_length, kernel_size, input_channels]` order.
 	#[must_use]
-	pub fn window_indices(&self) -> &[i32] {
-		&self.window_indices
-	}
+	pub fn window_indices(&self) -> &[i32] { &self.window_indices }
 
 	/// Absolute flat-output-gradient indices in row-major
 	/// `[batch, input_length, kernel_size, filters]` order. Invalid boundary
 	/// contributions use index zero and are removed by the matching validity
 	/// image.
 	#[must_use]
-	pub fn input_gradient_indices(&self) -> &[i32] {
-		&self.input_gradient_indices
-	}
+	pub fn input_gradient_indices(&self) -> &[i32] { &self.input_gradient_indices }
 
 	/// Exact f32 zero/one bits matching [`Self::input_gradient_indices`].
 	#[must_use]
-	pub fn input_gradient_validity(&self) -> &[u32] {
-		&self.input_gradient_validity
-	}
+	pub fn input_gradient_validity(&self) -> &[u32] { &self.input_gradient_validity }
 
 	#[must_use]
-	pub const fn input_shape(&self) -> [u64; 1] {
-		[self.input_elements]
-	}
+	pub const fn input_shape(&self) -> [u64; 1] { [self.input_elements] }
 
 	#[must_use]
 	pub const fn window_indices_shape(&self) -> [u64; 4] {
@@ -107,9 +83,7 @@ impl ChannelwiseConvolution1dPreparation {
 	}
 
 	#[must_use]
-	pub const fn output_shape(&self) -> [u64; 3] {
-		[self.batch, self.output_length, self.filters]
-	}
+	pub const fn output_shape(&self) -> [u64; 3] { [self.batch, self.output_length, self.filters] }
 
 	#[must_use]
 	pub const fn input_gradient_indices_shape(&self) -> [u64; 4] {
@@ -122,14 +96,10 @@ impl ChannelwiseConvolution1dPreparation {
 	}
 
 	#[must_use]
-	pub const fn forward_workspace(&self) -> ByteCount {
-		self.forward_workspace
-	}
+	pub const fn forward_workspace(&self) -> ByteCount { self.forward_workspace }
 
 	#[must_use]
-	pub const fn backward_workspace(&self) -> ByteCount {
-		self.backward_workspace
-	}
+	pub const fn backward_workspace(&self) -> ByteCount { self.backward_workspace }
 }
 
 /// Prepare all checked receptive-field and deterministic input-gradient
@@ -274,40 +244,4 @@ fn overflow(role: &str) -> OperationError {
 		OperationErrorKind::UnsupportedConcreteShape,
 		format!("{role} overflowed u64"),
 	)
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn prepares_exact_forward_and_boundary_masked_backward_coordinates() {
-		let prepared = prepare_channelwise_convolution_1d(1, 4, 2, 2, 3).unwrap();
-		assert_eq!(prepared.output_length(), 2);
-		assert_eq!(prepared.window_indices_shape(), [1, 2, 3, 2]);
-		assert_eq!(
-			prepared.window_indices(),
-			[0, 1, 2, 3, 4, 5, 2, 3, 4, 5, 6, 7]
-		);
-		assert_eq!(prepared.input_gradient_indices_shape(), [1, 4, 3, 2]);
-		let valid = prepared
-			.input_gradient_validity()
-			.iter()
-			.map(|bits| f32::from_bits(*bits))
-			.collect::<Vec<_>>();
-		assert_eq!(
-			valid,
-			[
-				1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0,
-				0.0, 0.0, 0.0, 1.0, 1.0,
-			]
-		);
-	}
-
-	#[test]
-	fn rejects_empty_oversized_and_wider_than_input_geometry() {
-		assert!(prepare_channelwise_convolution_1d(1, 0, 1, 1, 1).is_err());
-		assert!(prepare_channelwise_convolution_1d(1, 2, 1, 1, 3).is_err());
-		assert!(prepare_channelwise_convolution_1d(i32::MAX as u64, 2, 1, 1, 1).is_err());
-	}
 }

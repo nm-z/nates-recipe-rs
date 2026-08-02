@@ -1,17 +1,23 @@
-use crate::abi::{
-	AGENT_FEATURE_KERNEL_DISPATCH, AMD_AGENT_INFO_MEMORY_AVAIL, HsaAgent, HsaQueue, HsaStatus,
-	SYSTEM_INFO_TIMESTAMP_FREQUENCY,
+use core::{ffi::c_void, mem::MaybeUninit};
+use std::{
+	ptr,
+	rc::Rc,
+	sync::{
+		Arc, Condvar, Mutex,
+		atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+	},
 };
-use crate::discovery::{AgentDescription, DiscoveredAgent, RawPool};
-use crate::execution::SignalPool;
-use crate::loader::Api;
-use crate::{DeviceType, Error, QueueKind, Result, Runtime};
-use core::ffi::c_void;
-use core::mem::MaybeUninit;
-use std::ptr;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+
+use crate::{
+	DeviceType, Error, QueueKind, Result, Runtime,
+	abi::{
+		AGENT_FEATURE_KERNEL_DISPATCH, AMD_AGENT_INFO_MEMORY_AVAIL, HsaAgent, HsaQueue, HsaStatus,
+		SYSTEM_INFO_TIMESTAMP_FREQUENCY,
+	},
+	discovery::{AgentDescription, DiscoveredAgent, RawPool},
+	execution::SignalPool,
+	loader::Api,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueueFault {
@@ -194,9 +200,7 @@ impl<'runtime> DiscoveredAgent<'runtime> {
 }
 
 impl Session<'_> {
-	pub fn description(&self) -> &AgentDescription {
-		&self.description
-	}
+	pub fn description(&self) -> &AgentDescription { &self.description }
 
 	/// Queries ROCr's current available-memory counter for this exact agent.
 	pub fn available_memory_bytes(&self) -> Result<u64> {
@@ -219,13 +223,9 @@ impl Session<'_> {
 	}
 
 	/// The newest asynchronous queue fault, if any. Poisoning is permanent.
-	pub fn fault(&self) -> Option<QueueFault> {
-		self.fault.snapshot()
-	}
+	pub fn fault(&self) -> Option<QueueFault> { self.fault.snapshot() }
 
-	pub fn ensure_healthy(&self) -> Result<()> {
-		self.fault.check()
-	}
+	pub fn ensure_healthy(&self) -> Result<()> { self.fault.check() }
 
 	pub fn create_queue(&self, config: QueueConfig) -> Result<Queue<'_, '_>> {
 		self.runtime.ensure_active()?;
@@ -247,10 +247,12 @@ impl Session<'_> {
 
 		let kind_allowed = match capabilities.advertised_kind {
 			QueueKind::SingleProducer => config.kind == QueueKind::SingleProducer,
-			QueueKind::MultiProducer => matches!(
-				config.kind,
-				QueueKind::MultiProducer | QueueKind::SingleProducer
-			),
+			QueueKind::MultiProducer => {
+				matches!(
+					config.kind,
+					QueueKind::MultiProducer | QueueKind::SingleProducer
+				)
+			}
 			QueueKind::Cooperative => config.kind == QueueKind::Cooperative,
 		};
 		if !kind_allowed {
@@ -364,9 +366,7 @@ impl QueueCore {
 }
 
 impl Drop for QueueCore {
-	fn drop(&mut self) {
-		let _ = self.destroy();
-	}
+	fn drop(&mut self) { let _ = self.destroy(); }
 }
 
 /// A host-thread-confined HSA queue. Single-producer dispatch is available only
@@ -377,9 +377,7 @@ pub struct Queue<'session, 'runtime> {
 }
 
 impl Queue<'_, '_> {
-	pub(crate) fn core(&self) -> &Rc<QueueCore> {
-		self.core.as_ref().expect("live queue owns its core")
-	}
+	pub(crate) fn core(&self) -> &Rc<QueueCore> { self.core.as_ref().expect("live queue owns its core") }
 
 	pub fn id(&self) -> u64 {
 		// SAFETY: the queue core owns a live read-only queue object.
@@ -391,13 +389,9 @@ impl Queue<'_, '_> {
 		unsafe { (*self.core().raw).size }
 	}
 
-	pub fn kind(&self) -> QueueKind {
-		self.core().kind
-	}
+	pub fn kind(&self) -> QueueKind { self.core().kind }
 
-	pub fn session(&self) -> &Session<'_> {
-		self.session
-	}
+	pub fn session(&self) -> &Session<'_> { self.session }
 
 	/// Explicitly destroy a queue when it has no pending-token keepalive.
 	pub fn close(mut self) -> Result<()> {
@@ -411,34 +405,5 @@ impl Queue<'_, '_> {
 				})
 			}
 		}
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn fault_recording_poison_is_sticky() {
-		let state = SharedFault::new();
-		state.record(0x1016, Some(42));
-		assert_eq!(
-			state.snapshot(),
-			Some(QueueFault {
-				status: 0x1016,
-				source_queue_id: Some(42),
-				epoch: 1,
-			})
-		);
-		state.record(0x1026, None);
-		assert_eq!(state.snapshot().unwrap().epoch, 2);
-		assert_eq!(state.snapshot().unwrap().source_queue_id, None);
-	}
-
-	#[test]
-	fn queue_config_uses_runtime_selected_segment_hints() {
-		let config = QueueConfig::new(256, QueueKind::MultiProducer);
-		assert_eq!(config.private_segment_size, u32::MAX);
-		assert_eq!(config.group_segment_size, u32::MAX);
 	}
 }

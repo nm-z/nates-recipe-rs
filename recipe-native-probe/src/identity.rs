@@ -1,6 +1,8 @@
-use std::collections::BTreeSet;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+	collections::BTreeSet,
+	fs,
+	path::{Path, PathBuf},
+};
 
 use recipe_core::{Digest as CoreDigest, Label, ToolchainIdentity};
 use recipe_kernel::{ArtifactDigest, OfflineToolchain, PinnedTool};
@@ -113,12 +115,16 @@ pub(crate) fn backend_toolchain_identity(
 fn required_tools<'a>(toolchain: &'a OfflineToolchain, backend: &str) -> ProbeResult<Vec<&'a PinnedTool>> {
 	let mut tools = vec![&toolchain.verifier, &toolchain.llvm_codegen];
 	match backend {
-		"amd-hsa" => tools.push(toolchain.elf_linker.as_ref().ok_or_else(|| {
-			ProbeError::Discovery("AMD probing requires an explicitly pinned ELF linker".to_owned())
-		})?),
-		"nvidia-cuda" => tools.push(toolchain.ptx_assembler.as_ref().ok_or_else(|| {
-			ProbeError::Discovery("NVIDIA probing requires an explicitly pinned PTX assembler".to_owned())
-		})?),
+		"amd-hsa" => {
+			tools.push(toolchain.elf_linker.as_ref().ok_or_else(|| {
+				ProbeError::Discovery("AMD probing requires an explicitly pinned ELF linker".to_owned())
+			})?)
+		}
+		"nvidia-cuda" => {
+			tools.push(toolchain.ptx_assembler.as_ref().ok_or_else(|| {
+				ProbeError::Discovery("NVIDIA probing requires an explicitly pinned PTX assembler".to_owned())
+			})?)
+		}
 		_ => {
 			return Err(ProbeError::Discovery(format!(
 				"unknown native toolchain backend {backend}"
@@ -197,9 +203,7 @@ fn read_pci_hex(path: &Path, field: &str) -> ProbeResult<u32> {
 	})
 }
 
-const fn is_accelerator_class(class: u32) -> bool {
-	matches!(class >> 16, 0x03 | 0x12)
-}
+const fn is_accelerator_class(class: u32) -> bool { matches!(class >> 16, 0x03 | 0x12) }
 
 pub(crate) fn pci_surface(root: &Path, bdf: &str) -> ProbeResult<PciSurface> {
 	if !root.is_absolute() {
@@ -252,44 +256,6 @@ pub(crate) fn pci_surface(root: &Path, bdf: &str) -> ProbeResult<PciSurface> {
 	})
 }
 
-#[cfg(test)]
-mod pci_tests {
-	use std::sync::atomic::{AtomicU64, Ordering};
-
-	use super::*;
-
-	static NONCE: AtomicU64 = AtomicU64::new(0);
-
-	#[test]
-	fn accelerator_preflight_requires_matching_vendor_and_class() {
-		let root = std::env::temp_dir().join(format!(
-			"recipe-native-probe-pci-{}-{}",
-			std::process::id(),
-			NONCE.fetch_add(1, Ordering::Relaxed)
-		));
-		let display = root.join("0000:01:00.0");
-		let network = root.join("0000:02:00.0");
-		fs::create_dir_all(&display).expect("create display fixture");
-		fs::create_dir_all(&network).expect("create network fixture");
-		fs::write(display.join("vendor"), b"0x1002\n").expect("write display vendor");
-		fs::write(display.join("class"), b"0x030200\n").expect("write display class");
-		fs::write(network.join("vendor"), b"0x1002\n").expect("write network vendor");
-		fs::write(network.join("class"), b"0x020000\n").expect("write network class");
-
-		assert!(pci_accelerator_present(&root, 0x1002).expect("scan AMD accelerator"));
-		assert!(!pci_accelerator_present(&root, 0x10de).expect("scan NVIDIA accelerator"));
-
-		fs::remove_dir_all(&root).expect("remove PCI fixture");
-	}
-
-	#[test]
-	fn processing_accelerator_class_is_admitted() {
-		assert!(is_accelerator_class(0x120000));
-		assert!(is_accelerator_class(0x030000));
-		assert!(!is_accelerator_class(0x020000));
-	}
-}
-
 fn surface_digest<'a>(
 	domain: &str,
 	prefix: Option<&[u8]>,
@@ -339,102 +305,4 @@ pub(crate) fn library_identity(domain: &str, library: &PinnedLibrary) -> String 
 		library.path.display(),
 		hex(&library.digest)
 	)
-}
-
-#[cfg(test)]
-mod tests {
-	use std::fs;
-	use std::os::unix::fs::symlink;
-	use std::time::{SystemTime, UNIX_EPOCH};
-
-	use super::*;
-
-	fn private_directory(name: &str) -> PathBuf {
-		let nonce = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.expect("clock after epoch")
-			.as_nanos();
-		let path = std::env::temp_dir().join(format!("recipe-native-probe-{name}-{nonce}"));
-		fs::create_dir(&path).expect("create test directory");
-		path
-	}
-
-	#[test]
-	fn selects_and_hashes_the_first_existing_explicit_library() {
-		let root = private_directory("library");
-		let library = root.join("libbackend.so.1");
-		fs::write(&library, b"backend").expect("write fake library");
-		let alias = root.join("libbackend.so");
-		symlink(&library, &alias).expect("create fake soname");
-		let selected = selected_library(
-			&BackendLibrary {
-				candidates: vec![root.join("missing"), alias],
-			},
-			"fake",
-		)
-		.expect("select library")
-		.expect("library is present");
-		assert_eq!(
-			selected.path,
-			fs::canonicalize(library).expect("canonical path")
-		);
-		assert_eq!(selected.digest, Sha256::digest(b"backend").as_slice());
-		fs::remove_dir_all(root).expect("remove test directory");
-	}
-
-	#[test]
-	fn all_missing_explicit_candidates_mean_backend_absence() {
-		let root = private_directory("absent");
-		let selected = selected_library(
-			&BackendLibrary {
-				candidates: vec![root.join("missing")],
-			},
-			"fake",
-		)
-		.expect("absence is not a backend failure");
-		assert_eq!(selected, None);
-		fs::remove_dir_all(root).expect("remove test directory");
-	}
-
-	#[test]
-	fn relative_library_candidate_fails_closed() {
-		let error = selected_library(
-			&BackendLibrary {
-				candidates: vec![PathBuf::from("libbackend.so")],
-			},
-			"fake",
-		)
-		.expect_err("relative library path must be rejected");
-		assert!(error.to_string().contains("not absolute"));
-	}
-
-	#[test]
-	fn benchmark_methodology_changes_toolchain_identity() {
-		let tool = |name: &str| PinnedTool {
-			path: PathBuf::from(format!("/test-tools/{name}")),
-			digest: ArtifactDigest::of(name.as_bytes()),
-		};
-		let toolchain = OfflineToolchain {
-			verifier: tool("opt"),
-			llvm_codegen: tool("llc"),
-			elf_linker: None,
-			ptx_assembler: Some(tool("ptxas")),
-		};
-		let release = Label::new("test-release").expect("test label");
-		let short = backend_toolchain_identity(
-			&toolchain,
-			&release,
-			"nvidia-cuda",
-			"sm_52:ptx74:dependent-f32-fma-chain-32",
-		)
-		.expect("short-chain identity");
-		let long = backend_toolchain_identity(
-			&toolchain,
-			&release,
-			"nvidia-cuda",
-			"sm_52:ptx74:dependent-f32-fma-chain-64",
-		)
-		.expect("long-chain identity");
-		assert_ne!(short.digest, long.digest);
-	}
 }

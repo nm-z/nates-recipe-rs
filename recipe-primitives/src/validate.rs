@@ -3,8 +3,7 @@ use std::collections::BTreeSet;
 use recipe_core::{ByteCount, DType, FlopCount};
 use recipe_language::{AtomicOperation, IndexBounds, ReduceResult, ScatterConflict};
 
-use crate::error::ProgramValidationError;
-use crate::model::*;
+use crate::{error::ProgramValidationError, model::*};
 
 pub(crate) fn validate(program: &LoweredProgram) -> Result<(), Vec<ProgramValidationError>> {
 	let mut errors = Vec::new();
@@ -504,18 +503,20 @@ fn validate_kind(stage: &ProgramStage, path: &str, errors: &mut Vec<ProgramValid
 				errors,
 			);
 		}
-		StageKind::HistogramAccumulate { .. } => require(
-			matches!(
-				stage.fault,
-				Some(FaultContract {
-					reason: FaultReason::HistogramBinOutOfBounds,
-					..
-				})
-			),
-			format!("{path}.fault"),
-			"histogram accumulation must reject invalid bins through the fault flag",
-			errors,
-		),
+		StageKind::HistogramAccumulate { .. } => {
+			require(
+				matches!(
+					stage.fault,
+					Some(FaultContract {
+						reason: FaultReason::HistogramBinOutOfBounds,
+						..
+					})
+				),
+				format!("{path}.fault"),
+				"histogram accumulation must reject invalid bins through the fault flag",
+				errors,
+			)
+		}
 		StageKind::StableSortInitialize { network } | StageKind::StableSortFinalize { network, .. } => {
 			validate_sort_network(*network, path, errors);
 		}
@@ -582,30 +583,38 @@ fn validate_kind(stage: &ProgramStage, path: &str, errors: &mut Vec<ProgramValid
 				errors,
 			);
 		}
-		StageKind::Fill { .. } => require(
-			stage.bindings.len() == 1,
-			format!("{path}.bindings"),
-			"fill stage requires exactly one output binding",
-			errors,
-		),
-		StageKind::Copy { .. } => require(
-			stage.bindings.len() == 2,
-			format!("{path}.bindings"),
-			"copy stage requires one input and one output binding",
-			errors,
-		),
-		StageKind::ScanUniformCombine(_) => require(
-			stage.bindings.len() == 2,
-			format!("{path}.bindings"),
-			"uniform scan combine requires target and offset bindings",
-			errors,
-		),
-		StageKind::HistogramClear => require(
-			stage.bindings.len() == 1,
-			format!("{path}.bindings"),
-			"histogram clear requires exactly one output binding",
-			errors,
-		),
+		StageKind::Fill { .. } => {
+			require(
+				stage.bindings.len() == 1,
+				format!("{path}.bindings"),
+				"fill stage requires exactly one output binding",
+				errors,
+			)
+		}
+		StageKind::Copy { .. } => {
+			require(
+				stage.bindings.len() == 2,
+				format!("{path}.bindings"),
+				"copy stage requires one input and one output binding",
+				errors,
+			)
+		}
+		StageKind::ScanUniformCombine(_) => {
+			require(
+				stage.bindings.len() == 2,
+				format!("{path}.bindings"),
+				"uniform scan combine requires target and offset bindings",
+				errors,
+			)
+		}
+		StageKind::HistogramClear => {
+			require(
+				stage.bindings.len() == 1,
+				format!("{path}.bindings"),
+				"histogram clear requires exactly one output binding",
+				errors,
+			)
+		}
 	}
 }
 
@@ -644,9 +653,11 @@ fn validate_scan_tree(tree: &FixedTree, path: &str, errors: &mut Vec<ProgramVali
 fn expected_reduction_steps(lanes: u32) -> Vec<TreeStep> {
 	let count = lanes.trailing_zeros();
 	(0..count)
-		.map(|level| TreeStep {
-			phase: TreePhase::Reduction,
-			stride: lanes >> (level + 1),
+		.map(|level| {
+			TreeStep {
+				phase: TreePhase::Reduction,
+				stride: lanes >> (level + 1),
+			}
 		})
 		.collect()
 }
@@ -654,13 +665,17 @@ fn expected_reduction_steps(lanes: u32) -> Vec<TreeStep> {
 fn expected_scan_steps(lanes: u32) -> Vec<TreeStep> {
 	let count = lanes.trailing_zeros();
 	(0..count)
-		.map(|level| TreeStep {
-			phase: TreePhase::ScanUpsweep,
-			stride: 1 << level,
+		.map(|level| {
+			TreeStep {
+				phase: TreePhase::ScanUpsweep,
+				stride: 1 << level,
+			}
 		})
-		.chain((0..count).rev().map(|level| TreeStep {
-			phase: TreePhase::ScanDownsweep,
-			stride: 1 << level,
+		.chain((0..count).rev().map(|level| {
+			TreeStep {
+				phase: TreePhase::ScanDownsweep,
+				stride: 1 << level,
+			}
 		}))
 		.collect()
 }
@@ -693,16 +708,22 @@ fn validate_sort_network(network: SortNetwork, path: &str, errors: &mut Vec<Prog
 fn validate_stage_resources(stage: &ProgramStage, path: &str, errors: &mut Vec<ProgramValidationError>) {
 	let expected = expected_stage_resources(stage);
 	match expected {
-		Some(expected) => require(
-			stage.resources == expected,
-			format!("{path}.resources"),
-			format!("stage resource bounds differ from the exact kind/geometry bounds: expected {expected:?}"),
-			errors,
-		),
-		None => errors.push(ProgramValidationError::new(
-			format!("{path}.resources"),
-			"stage resource arithmetic overflowed",
-		)),
+		Some(expected) => {
+			require(
+				stage.resources == expected,
+				format!("{path}.resources"),
+				format!(
+					"stage resource bounds differ from the exact kind/geometry bounds: expected {expected:?}"
+				),
+				errors,
+			)
+		}
+		None => {
+			errors.push(ProgramValidationError::new(
+				format!("{path}.resources"),
+				"stage resource arithmetic overflowed",
+			))
+		}
 	}
 	let expected_sync = match &stage.kind {
 		StageKind::FixedTreeReduce(reduction) => Some(tree_sync(&reduction.tree)),
@@ -710,10 +731,12 @@ fn validate_stage_resources(stage: &ProgramStage, path: &str, errors: &mut Vec<P
 		StageKind::TiledContraction(contraction) => {
 			let count = match contraction.strategy {
 				ContractionStrategy::Direct => 0,
-				ContractionStrategy::Staged => contraction
-					.contracted_elements
-					.div_ceil(u64::from(contraction.tile.reduction))
-					.saturating_mul(2),
+				ContractionStrategy::Staged => {
+					contraction
+						.contracted_elements
+						.div_ceil(u64::from(contraction.tile.reduction))
+						.saturating_mul(2)
+				}
 			};
 			match usize::try_from(count) {
 				Ok(count) => Some(count),
@@ -741,22 +764,24 @@ fn validate_stage_resources(stage: &ProgramStage, path: &str, errors: &mut Vec<P
 		| StageKind::Philox4x32_10(_) => Some(0),
 	};
 	match expected_sync {
-		Some(expected_sync) => require(
-			stage.synchronization.len() == expected_sync,
-			format!("{path}.synchronization"),
-			"synchronization count differs from the fixed algorithm",
-			errors,
-		),
-		None => errors.push(ProgramValidationError::new(
-			format!("{path}.synchronization"),
-			"synchronization count cannot be represented",
-		)),
+		Some(expected_sync) => {
+			require(
+				stage.synchronization.len() == expected_sync,
+				format!("{path}.synchronization"),
+				"synchronization count differs from the fixed algorithm",
+				errors,
+			)
+		}
+		None => {
+			errors.push(ProgramValidationError::new(
+				format!("{path}.synchronization"),
+				"synchronization count cannot be represented",
+			))
+		}
 	}
 }
 
-fn tree_sync(tree: &FixedTree) -> usize {
-	tree.steps.len()
-}
+fn tree_sync(tree: &FixedTree) -> usize { tree.steps.len() }
 
 fn expected_stage_resources(stage: &ProgramStage) -> Option<StageResourceBounds> {
 	let lanes = stage.geometry.workgroup_lanes;
@@ -838,13 +863,15 @@ fn expected_stage_resources(stage: &ProgramStage) -> Option<StageResourceBounds>
 				24,
 			)
 		}
-		StageKind::Gather { .. } => (
-			0,
-			logical,
-			u64::from(stage.fault.is_some()).checked_mul(logical)?,
-			0,
-			16,
-		),
+		StageKind::Gather { .. } => {
+			(
+				0,
+				logical,
+				u64::from(stage.fault.is_some()).checked_mul(logical)?,
+				0,
+				16,
+			)
+		}
 		StageKind::Scatter { conflict, .. } => {
 			let payload_atomic = u64::from(matches!(conflict, ScatterConflict::Atomic { .. }));
 			let fault_atomic = u64::from(stage.fault.is_some());
@@ -872,22 +899,26 @@ fn expected_stage_resources(stage: &ProgramStage) -> Option<StageResourceBounds>
 		StageKind::StableSortInitialize { .. } => (0, logical, 0, 0, 16),
 		StageKind::StableSortCompareExchange(_) => (logical, logical, 0, 0, 20),
 		StageKind::StableSortFinalize { .. } => (0, logical, 0, 0, 12),
-		StageKind::IndexMap(_) => (
-			0,
-			logical.checked_mul(INDEX_MAP_INTEGER_OPERATIONS_PER_LANE)?,
-			logical,
-			0,
-			32,
-		),
-		StageKind::Philox4x32_10(contract) => (
-			logical
-				.checked_mul(u64::from(contract.rounds))?
-				.checked_mul(4)?,
-			logical.checked_mul(20)?,
-			0,
-			0,
-			32,
-		),
+		StageKind::IndexMap(_) => {
+			(
+				0,
+				logical.checked_mul(INDEX_MAP_INTEGER_OPERATIONS_PER_LANE)?,
+				logical,
+				0,
+				32,
+			)
+		}
+		StageKind::Philox4x32_10(contract) => {
+			(
+				logical
+					.checked_mul(u64::from(contract.rounds))?
+					.checked_mul(4)?,
+				logical.checked_mul(20)?,
+				0,
+				0,
+				32,
+			)
+		}
 	};
 	Some(StageResourceBounds {
 		flops: FlopCount::new(flops),
@@ -919,14 +950,18 @@ fn validate_resources(program: &LoweredProgram, errors: &mut Vec<ProgramValidati
 		.try_fold((0_u64, 0_u64), |(scratch, fault), buffer| {
 			match buffer.lifetime {
 				BufferLifetime::ExternalValue => Some((scratch, fault)),
-				BufferLifetime::ProgramScratch => Some((
-					scratch.checked_add(buffer.access.storage_bytes.get())?,
-					fault,
-				)),
-				BufferLifetime::ProgramFaultFlag => Some((
-					scratch,
-					fault.checked_add(buffer.access.storage_bytes.get())?,
-				)),
+				BufferLifetime::ProgramScratch => {
+					Some((
+						scratch.checked_add(buffer.access.storage_bytes.get())?,
+						fault,
+					))
+				}
+				BufferLifetime::ProgramFaultFlag => {
+					Some((
+						scratch,
+						fault.checked_add(buffer.access.storage_bytes.get())?,
+					))
+				}
 			}
 		});
 	let Some((flops, integer, atomic, shared, private, lanes)) = totals else {

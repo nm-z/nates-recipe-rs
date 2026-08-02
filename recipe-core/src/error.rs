@@ -106,19 +106,13 @@ impl ValidationErrors {
 	}
 
 	#[must_use]
-	pub fn as_slice(&self) -> &[ValidationError] {
-		&self.errors
-	}
+	pub fn as_slice(&self) -> &[ValidationError] { &self.errors }
 
 	#[must_use]
-	pub fn into_vec(self) -> Vec<ValidationError> {
-		self.errors
-	}
+	pub fn into_vec(self) -> Vec<ValidationError> { self.errors }
 
 	#[must_use]
-	pub fn contains(&self, code: ValidationCode) -> bool {
-		self.errors.iter().any(|error| error.code == code)
-	}
+	pub fn contains(&self, code: ValidationCode) -> bool { self.errors.iter().any(|error| error.code == code) }
 }
 
 impl fmt::Display for ValidationErrors {

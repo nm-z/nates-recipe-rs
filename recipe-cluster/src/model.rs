@@ -64,24 +64,16 @@ impl MemberProfileIdentity {
 	}
 
 	#[must_use]
-	pub const fn endpoint(self) -> EndpointIdentity {
-		self.endpoint
-	}
+	pub const fn endpoint(self) -> EndpointIdentity { self.endpoint }
 
 	#[must_use]
-	pub const fn cache(self) -> CacheIdentity {
-		self.cache
-	}
+	pub const fn cache(self) -> CacheIdentity { self.cache }
 
 	#[must_use]
-	pub const fn topology(self) -> TopologyIdentity {
-		self.topology
-	}
+	pub const fn topology(self) -> TopologyIdentity { self.topology }
 
 	#[must_use]
-	pub const fn discovery(self) -> DiscoveryIdentity {
-		self.discovery
-	}
+	pub const fn discovery(self) -> DiscoveryIdentity { self.discovery }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,19 +94,13 @@ impl MemberSpec {
 	}
 
 	#[must_use]
-	pub const fn key(&self) -> &Label {
-		&self.key
-	}
+	pub const fn key(&self) -> &Label { &self.key }
 
 	#[must_use]
-	pub const fn address(&self) -> &Label {
-		&self.address
-	}
+	pub const fn address(&self) -> &Label { &self.address }
 
 	#[must_use]
-	pub const fn expected(&self) -> MemberProfileIdentity {
-		self.expected
-	}
+	pub const fn expected(&self) -> MemberProfileIdentity { self.expected }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -127,19 +113,21 @@ impl PairKey {
 	pub(crate) fn new(first: Label, second: Label) -> ClusterResult<Self> {
 		match first.cmp(&second) {
 			core::cmp::Ordering::Less => Ok(Self { first, second }),
-			core::cmp::Ordering::Greater => Ok(Self {
-				first: second,
-				second: first,
-			}),
-			core::cmp::Ordering::Equal => Err(ClusterError::InvalidConfiguration(format!(
-				"network pair {first} references the same member twice"
-			))),
+			core::cmp::Ordering::Greater => {
+				Ok(Self {
+					first: second,
+					second: first,
+				})
+			}
+			core::cmp::Ordering::Equal => {
+				Err(ClusterError::InvalidConfiguration(format!(
+					"network pair {first} references the same member twice"
+				)))
+			}
 		}
 	}
 
-	pub(crate) fn display(&self) -> String {
-		format!("{}<->{}", self.first, self.second)
-	}
+	pub(crate) fn display(&self) -> String { format!("{}<->{}", self.first, self.second) }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,14 +143,10 @@ impl NetworkPairSpec {
 	}
 
 	#[must_use]
-	pub const fn first(&self) -> &Label {
-		&self.pair.first
-	}
+	pub const fn first(&self) -> &Label { &self.pair.first }
 
 	#[must_use]
-	pub const fn second(&self) -> &Label {
-		&self.pair.second
-	}
+	pub const fn second(&self) -> &Label { &self.pair.second }
 }
 
 /// User-controlled cluster membership. It deliberately has no hardware,
@@ -245,19 +229,13 @@ impl ClusterConfiguration {
 	}
 
 	#[must_use]
-	pub const fn master(&self) -> &Label {
-		&self.master
-	}
+	pub const fn master(&self) -> &Label { &self.master }
 
 	#[must_use]
-	pub fn members(&self) -> &[MemberSpec] {
-		&self.members
-	}
+	pub fn members(&self) -> &[MemberSpec] { &self.members }
 
 	#[must_use]
-	pub fn network_pairs(&self) -> &[NetworkPairSpec] {
-		&self.pairs
-	}
+	pub fn network_pairs(&self) -> &[NetworkPairSpec] { &self.pairs }
 }
 
 fn require_connected(keys: &BTreeSet<Label>, pairs: &[NetworkPairSpec]) -> ClusterResult<()> {
@@ -301,23 +279,9 @@ pub struct SubmittedProfile {
 
 impl SubmittedProfile {
 	#[must_use]
-	pub const fn new(key: Label, profile: MeasuredProfile) -> Self {
-		Self { key, profile }
-	}
+	pub const fn new(key: Label, profile: MeasuredProfile) -> Self { Self { key, profile } }
 
-	pub(crate) fn into_parts(self) -> (Label, MeasuredProfile) {
-		(self.key, self.profile)
-	}
-
-	#[cfg(test)]
-	pub(crate) const fn key(&self) -> &Label {
-		&self.key
-	}
-
-	#[cfg(test)]
-	pub(crate) fn profile_mut(&mut self) -> &mut MeasuredProfile {
-		&mut self.profile
-	}
+	pub(crate) fn into_parts(self) -> (Label, MeasuredProfile) { (self.key, self.profile) }
 }
 
 /// Probe-produced evidence for both directions of one established peer
@@ -501,9 +465,7 @@ fn validate_peer_evidence(
 	Ok(())
 }
 
-fn sha256(bytes: &[u8]) -> Digest {
-	Digest::new(<[u8; 32]>::from(Sha256::digest(bytes)))
-}
+fn sha256(bytes: &[u8]) -> Digest { Digest::new(<[u8; 32]>::from(Sha256::digest(bytes))) }
 
 pub(crate) fn index_submissions(submissions: Vec<SubmittedProfile>) -> ClusterResult<BTreeMap<Label, MeasuredProfile>> {
 	let mut indexed = BTreeMap::new();

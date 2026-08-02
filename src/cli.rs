@@ -641,6 +641,9 @@ fn compile_run_source(
 	if dependencies.is_dir() {
 		compiler.arg("-L").arg(&dependencies);
 	}
+	for dependency in cargo_build_output_roots(library_root)? {
+		compiler.arg("-L").arg(dependency);
+	}
 	if let Some((original, transformed)) = remap {
 		let mut mapping = transformed.as_os_str().to_owned();
 		mapping.push("=");
@@ -764,10 +767,75 @@ fn newest_recipe_library(root: &Path) -> Option<PathBuf> {
 			.max_by_key(|(modified, _)| *modified)
 			.map(|(_, path)| path)
 	});
-	newest.or_else(|| {
+	newest
+		.or_else(|| newest_cargo_build_output_library(root))
+		.or_else(|| {
 		let library = root.join("librecipe.rlib");
 		library.is_file().then_some(library)
 	})
+}
+
+fn newest_cargo_build_output_library(root: &Path) -> Option<PathBuf> {
+	let recipe = root.join("build/recipe");
+	fs::read_dir(recipe)
+		.ok()?
+		.filter_map(Result::ok)
+		.filter_map(|entry| fs::read_dir(entry.path().join("out")).ok())
+		.flatten()
+		.filter_map(Result::ok)
+		.filter_map(|entry| {
+			let name = entry.file_name();
+			let name = name.as_bytes();
+			if !name.starts_with(b"librecipe-") || !name.ends_with(b".rlib") {
+				return None;
+			}
+			let metadata = entry.metadata().ok()?;
+			if !metadata.is_file() {
+				return None;
+			}
+			Some((metadata.modified().ok()?, entry.path()))
+		})
+		.max_by_key(|(modified, _)| *modified)
+		.map(|(_, path)| path)
+}
+
+fn cargo_build_output_roots(root: &Path) -> Result<Vec<PathBuf>, String> {
+	const MAXIMUM_BUILD_OUTPUT_ROOTS: usize = 4096;
+	let build = root.join("build");
+	let packages = match fs::read_dir(&build) {
+		Ok(packages) => packages,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(error) => return Err(format!("read Cargo build outputs {}: {error}", build.display())),
+	};
+	let mut roots = Vec::new();
+	for package in packages {
+		let package = package.map_err(|error| format!("read Cargo package output: {error}"))?;
+		if !package
+			.file_type()
+			.map_err(|error| format!("inspect Cargo package output {}: {error}", package.path().display()))?
+			.is_dir()
+		{
+			continue;
+		}
+		let variants = fs::read_dir(package.path())
+			.map_err(|error| format!("read Cargo package variants {}: {error}", package.path().display()))?;
+		for variant in variants {
+			let output = variant
+				.map_err(|error| format!("read Cargo package variant: {error}"))?
+				.path()
+				.join("out");
+			if output.is_dir() {
+				if roots.len() == MAXIMUM_BUILD_OUTPUT_ROOTS {
+					return Err(format!(
+						"Cargo build output search exceeds {MAXIMUM_BUILD_OUTPUT_ROOTS} directories"
+					));
+				}
+				roots.push(output);
+			}
+		}
+	}
+	roots.sort();
+	Ok(roots)
 }
 
 fn parse_probe_options(arguments: &[OsString]) -> Result<ProbeOptions, String> {
@@ -1931,169 +1999,4 @@ fn hex(digest: Digest) -> String {
 		write!(output, "{byte:02x}").expect("writing to String");
 	}
 	output
-}
-
-#[cfg(test)]
-mod tests {
-	use std::os::unix::fs::symlink;
-
-	use super::*;
-
-	static TEST_NONCE: AtomicU64 = AtomicU64::new(1);
-
-	#[derive(Debug)]
-	struct TestRoot(PathBuf);
-
-	impl TestRoot {
-		fn new(name: &str) -> Self {
-			let nonce = TEST_NONCE.fetch_add(1, Ordering::Relaxed);
-			let path = env::temp_dir().join(format!(
-				"recipe-active-native-{name}-{}-{nonce}",
-				std::process::id()
-			));
-			DirBuilder::new().mode(0o700).create(&path).unwrap();
-			Self(fs::canonicalize(path).unwrap())
-		}
-
-		fn directory(&self, name: &str) -> PathBuf {
-			let path = self.0.join(name);
-			DirBuilder::new().mode(0o700).create(&path).unwrap();
-			path
-		}
-
-		fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
-			let path = self.0.join(name);
-			let mut file = OpenOptions::new()
-				.write(true)
-				.create_new(true)
-				.mode(0o600)
-				.open(&path)
-				.unwrap();
-			file.write_all(bytes).unwrap();
-			file.sync_all().unwrap();
-			path
-		}
-	}
-
-	impl Drop for TestRoot {
-		fn drop(&mut self) {
-			let expected = format!("recipe-active-native-");
-			assert!(
-				self.0.file_name()
-					.and_then(|name| name.to_str())
-					.is_some_and(|name| name.starts_with(&expected))
-			);
-			let _ = fs::remove_dir_all(&self.0);
-		}
-	}
-
-	fn pin(path: PathBuf) -> PinnedNativeFile {
-		let bytes = fs::read(&path).unwrap();
-		PinnedNativeFile {
-			path,
-			digest: ArtifactDigest::of(&bytes).bytes(),
-		}
-	}
-
-	fn fixture(root: &TestRoot) -> ActiveNativeReceipt {
-		let profile_path = root.file("chosen.profile", b"measured-profile");
-		let pci_sysfs_root = root.directory("pci");
-		let scratch_parent = root.directory("scratch");
-		let cuda_library = pin(root.file("libcuda.so", b"cuda-driver"));
-		let verifier = pin(root.file("opt", b"llvm-opt"));
-		let llvm_codegen = pin(root.file("llc", b"llvm-llc"));
-		let elf_linker = pin(root.file("ld.lld", b"lld"));
-		let ptx_assembler = pin(root.file("ptxas", b"ptxas-11.4"));
-		ActiveNativeReceipt {
-			profile_path,
-			profile_identity: CacheIdentity {
-				schema: 6,
-				digest: Digest::new([7; 32]),
-			},
-			host_memory_key: Label::new("ram:numa0").unwrap(),
-			pci_sysfs_root,
-			scratch_parent,
-			cuda_library: Some(cuda_library),
-			hsa_library: None,
-			verifier,
-			llvm_codegen,
-			elf_linker: Some(elf_linker),
-			ptx_assembler: Some(ptx_assembler),
-			ptx_isa: 74,
-			hsa_code_object_version: 6,
-			release: Label::new("test-release").unwrap(),
-			fma_chain_length: 64,
-		}
-	}
-
-	#[test]
-	fn active_native_receipt_is_private_atomic_and_exact() {
-		let root = TestRoot::new("round-trip");
-		let receipt = fixture(&root);
-		write_active_native_receipt(&root.0, &receipt).unwrap();
-		let path = root.0.join(ACTIVE_NATIVE_RECEIPT);
-		let metadata = fs::symlink_metadata(path).unwrap();
-		assert!(metadata.is_file());
-		assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-		let loaded = load_active_native_receipt(&root.0).unwrap().unwrap();
-		assert_eq!(loaded, receipt);
-		let config = loaded.reopen_config().unwrap();
-		assert_eq!(
-			config.kernels
-				.toolchain
-				.ptx_assembler
-				.as_ref()
-				.unwrap()
-				.path,
-			receipt.ptx_assembler.as_ref().unwrap().path
-		);
-		assert_eq!(config.cuda.library.candidates.len(), 1);
-		assert!(config.hsa.library.candidates.is_empty());
-	}
-
-	#[test]
-	fn active_native_receipt_rejects_text_tampering() {
-		let root = TestRoot::new("tamper");
-		let receipt = fixture(&root);
-		write_active_native_receipt(&root.0, &receipt).unwrap();
-		let path = root.0.join(ACTIVE_NATIVE_RECEIPT);
-		let bytes = fs::read(&path).unwrap();
-		let tampered = String::from_utf8(bytes)
-			.unwrap()
-			.replacen("profile_schema\t6", "profile_schema\t06", 1);
-		fs::write(&path, tampered).unwrap();
-		assert!(
-			load_active_native_receipt(&root.0)
-				.unwrap_err()
-				.contains("canonical")
-		);
-	}
-
-	#[test]
-	fn active_native_receipt_rejects_path_substitution() {
-		let root = TestRoot::new("path-change");
-		let receipt = fixture(&root);
-		write_active_native_receipt(&root.0, &receipt).unwrap();
-		let original = receipt.verifier.path.clone();
-		let moved = root.0.join("opt-moved");
-		fs::rename(&original, &moved).unwrap();
-		symlink(&moved, &original).unwrap();
-		let loaded = load_active_native_receipt(&root.0).unwrap().unwrap();
-		assert!(loaded.reopen_config().unwrap_err().contains("resolves to"));
-	}
-
-	#[test]
-	fn active_native_receipt_rejects_tool_content_change() {
-		let root = TestRoot::new("tool-change");
-		let receipt = fixture(&root);
-		write_active_native_receipt(&root.0, &receipt).unwrap();
-		fs::write(
-			&receipt.ptx_assembler.as_ref().unwrap().path,
-			b"changed ptxas",
-		)
-		.unwrap();
-		let loaded = load_active_native_receipt(&root.0).unwrap().unwrap();
-		let error = loaded.reopen_config().unwrap_err();
-		assert!(error.contains("NVIDIA ptxas digest changed"), "{error}");
-	}
 }

@@ -46,11 +46,13 @@ impl fmt::Display for RemoteError {
 			Self::CapacityExhausted(resource) => write!(formatter, "remote {resource} capacity is exhausted"),
 			Self::Backpressured(resource) => write!(formatter, "remote {resource} is backpressured"),
 			Self::Codec(detail) => write!(formatter, "remote codec rejected a message: {detail}"),
-			Self::Driver(fault) => write!(
-				formatter,
-				"worker driver fault {} with detail {}",
-				fault.code, fault.detail
-			),
+			Self::Driver(fault) => {
+				write!(
+					formatter,
+					"worker driver fault {} with detail {}",
+					fault.code, fault.detail
+				)
+			}
 			Self::Transport(error) => write!(formatter, "remote transport failed: {error}"),
 			Self::Poisoned => formatter.write_str("remote session is poisoned"),
 		}
@@ -60,7 +62,5 @@ impl fmt::Display for RemoteError {
 impl std::error::Error for RemoteError {}
 
 impl From<recipe_transport::TransportError> for RemoteError {
-	fn from(error: recipe_transport::TransportError) -> Self {
-		Self::Transport(error)
-	}
+	fn from(error: recipe_transport::TransportError) -> Self { Self::Transport(error) }
 }

@@ -28,14 +28,10 @@ impl ProgramDigest {
 	pub const ZERO: Self = Self([0; 32]);
 
 	#[must_use]
-	pub const fn new(bytes: [u8; 32]) -> Self {
-		Self(bytes)
-	}
+	pub const fn new(bytes: [u8; 32]) -> Self { Self(bytes) }
 
 	#[must_use]
-	pub const fn bytes(self) -> [u8; 32] {
-		self.0
-	}
+	pub const fn bytes(self) -> [u8; 32] { self.0 }
 }
 
 impl fmt::Debug for ProgramDigest {
@@ -53,14 +49,10 @@ pub struct BufferId(u32);
 
 impl BufferId {
 	#[must_use]
-	pub const fn new(value: u32) -> Self {
-		Self(value)
-	}
+	pub const fn new(value: u32) -> Self { Self(value) }
 
 	#[must_use]
-	pub const fn get(self) -> u32 {
-		self.0
-	}
+	pub const fn get(self) -> u32 { self.0 }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -68,14 +60,10 @@ pub struct StageId(u32);
 
 impl StageId {
 	#[must_use]
-	pub const fn new(value: u32) -> Self {
-		Self(value)
-	}
+	pub const fn new(value: u32) -> Self { Self(value) }
 
 	#[must_use]
-	pub const fn get(self) -> u32 {
-		self.0
-	}
+	pub const fn get(self) -> u32 { self.0 }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -531,13 +519,9 @@ pub struct LoweredProgram {
 impl LoweredProgram {
 	/// Revalidate all structural, synchronization, resource, and digest
 	/// invariants without consulting runtime state.
-	pub fn validate(&self) -> Result<(), Vec<ProgramValidationError>> {
-		crate::validate::validate(self)
-	}
+	pub fn validate(&self) -> Result<(), Vec<ProgramValidationError>> { crate::validate::validate(self) }
 
 	/// Recompute the domain-separated canonical program digest.
 	#[must_use]
-	pub fn canonical_digest(&self) -> ProgramDigest {
-		crate::hash::program_digest(self)
-	}
+	pub fn canonical_digest(&self) -> ProgramDigest { crate::hash::program_digest(self) }
 }

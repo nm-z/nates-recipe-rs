@@ -1,9 +1,10 @@
-use core::fmt;
-use core::num::NonZeroU64;
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use core::{fmt, num::NonZeroU64};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	path::Path,
+};
 
-use recipe_core::{AliasPermission, ByteCount, DType, KernelTemplateId, ScalarOpcode, ValueId};
+use recipe_core::{ByteCount, DType, KernelTemplateId, ScalarOpcode, ValueId};
 use recipe_ingest::{
 	DistilledDataset, InferenceFeatureEncoding, InferenceFeatureSchema, InferencePrepareError,
 	PreparedInferenceDataset, PreparedInferenceFeature, PreparedInferenceValues, RawTable, SemanticType, SourceError,
@@ -17,21 +18,28 @@ use recipe_language::{
 use recipe_ops::{
 	CategoricalBayesInferenceRequest, IdentityNamespace, KnnAllOutputRequest, KnnOutputRequest,
 	MaterializationRequest, NamedTensor, PreparedParameter, PreparedParameters, TreeEnsembleInferenceRequest,
-	append_categorical_bayes_inference, append_knn_all_outputs, canonical_elu_program, canonical_leaky_relu_program,
-	canonical_prelu_program, canonical_selu_program, categorical_bayes_inference_requirements,
+	append_categorical_bayes_inference, append_knn_all_outputs, categorical_bayes_inference_requirements,
 	knn_all_output_requirements, lower_scalar, materialize_composition, materialize_tree_ensemble_inference,
 	operation_registry, prepare_channelwise_convolution_1d, prepare_channelwise_max_pool_1d,
 	tree_ensemble_inference_requirements,
 };
 use recipe_program::{IterationDomain, KernelIterationDomain, StaticCalculationProgram};
 
-use crate::checkpoint::decode_error;
 use crate::{
 	BayesModelArtifact, BayesModelDecodeLimits, CheckpointArtifact, CheckpointArtifactMetadata,
 	CheckpointArtifactVector, CheckpointDecodeErrorKind, CheckpointDecodeLimits, CheckpointError, CheckpointPath,
 	CheckpointTensorImage, CompiledFeatureSpan, DenseActivation, DenseDataNormalization, DenseFeatureLowering,
 	DenseNormalization, DenseOperation, DenseOutputAdapter, DenseTask, KnnModelArtifact, KnnModelDecodeLimits,
-	KnnReferenceValues, MAXIMUM_REDUCTION_TREE_LANES, decode_bayes_model, decode_checkpoint, decode_knn_model,
+	KnnReferenceValues, MAXIMUM_REDUCTION_TREE_LANES,
+	checkpoint::decode_error,
+	decode_bayes_model, decode_checkpoint, decode_knn_model,
+	forward::{
+		ForwardActivation, GruForwardParameters, LstmForwardParameters, RecurrentForwardGraph,
+		RecurrentGateParameters, add_program, causal_mask_program, divide_constant_program, divide_program,
+		forbidden_aliases, head_major_source_index_program, l2_norm_program, l2_square_program, lower_activation,
+		lower_gru_sequence, lower_lstm_sequence, lower_rnn_sequence, min_max_program, multiply_constant_program,
+		multiply_program, square_program, subtract_program, z_score_program,
+	},
 };
 
 #[path = "gguf_llama.rs"]
@@ -75,10 +83,12 @@ impl fmt::Display for InferencePreparationError {
 				feature,
 				source_vector,
 				detail,
-			} => write!(
-				formatter,
-				"inconsistent checkpoint inference.feature[{feature}].source-vector[{source_vector}]: {detail}"
-			),
+			} => {
+				write!(
+					formatter,
+					"inconsistent checkpoint inference.feature[{feature}].source-vector[{source_vector}]: {detail}"
+				)
+			}
 			Self::ArithmeticOverflow { detail } => write!(formatter, "prepare inference data: {detail}"),
 		}
 	}
@@ -97,27 +107,19 @@ impl std::error::Error for InferencePreparationError {
 }
 
 impl From<SourceError> for InferencePreparationError {
-	fn from(error: SourceError) -> Self {
-		Self::CheckpointSource(error)
-	}
+	fn from(error: SourceError) -> Self { Self::CheckpointSource(error) }
 }
 
 impl From<CheckpointError> for InferencePreparationError {
-	fn from(error: CheckpointError) -> Self {
-		Self::Checkpoint(error)
-	}
+	fn from(error: CheckpointError) -> Self { Self::Checkpoint(error) }
 }
 
 impl From<InferencePrepareError> for InferencePreparationError {
-	fn from(error: InferencePrepareError) -> Self {
-		Self::Data(error)
-	}
+	fn from(error: InferencePrepareError) -> Self { Self::Data(error) }
 }
 
 impl From<GgufLlamaError> for InferencePreparationError {
-	fn from(error: GgufLlamaError) -> Self {
-		Self::GgufLlama(error)
-	}
+	fn from(error: GgufLlamaError) -> Self { Self::GgufLlama(error) }
 }
 
 pub type InferencePreparationResult<T> = Result<T, InferencePreparationError>;
@@ -157,14 +159,10 @@ pub struct InferenceCompileError {
 
 impl InferenceCompileError {
 	#[must_use]
-	pub const fn kind(&self) -> InferenceCompileErrorKind {
-		self.kind
-	}
+	pub const fn kind(&self) -> InferenceCompileErrorKind { self.kind }
 
 	#[must_use]
-	pub fn detail(&self) -> &str {
-		&self.detail
-	}
+	pub fn detail(&self) -> &str { &self.detail }
 
 	fn new(kind: InferenceCompileErrorKind, detail: impl Into<String>) -> Self {
 		Self {
@@ -412,29 +410,19 @@ pub struct InferenceExternalInput {
 
 impl InferenceExternalInput {
 	#[must_use]
-	pub const fn role(&self) -> InferenceInputRole {
-		self.role
-	}
+	pub const fn role(&self) -> InferenceInputRole { self.role }
 
 	#[must_use]
-	pub const fn value(&self) -> ValueId {
-		self.value
-	}
+	pub const fn value(&self) -> ValueId { self.value }
 
 	#[must_use]
-	pub const fn dtype(&self) -> DType {
-		self.dtype
-	}
+	pub const fn dtype(&self) -> DType { self.dtype }
 
 	#[must_use]
-	pub const fn shape(&self) -> &Shape {
-		&self.shape
-	}
+	pub const fn shape(&self) -> &Shape { &self.shape }
 
 	#[must_use]
-	pub fn bytes(&self) -> &[u8] {
-		&self.bytes
-	}
+	pub fn bytes(&self) -> &[u8] { &self.bytes }
 }
 
 /// Interpretation of the single inference egress matrix.
@@ -473,38 +461,26 @@ pub struct InferenceOutputContract {
 
 impl InferenceOutputContract {
 	#[must_use]
-	pub const fn value(&self) -> ValueId {
-		self.value
-	}
+	pub const fn value(&self) -> ValueId { self.value }
 
 	#[must_use]
-	pub const fn dtype(&self) -> DType {
-		self.dtype
-	}
+	pub const fn dtype(&self) -> DType { self.dtype }
 
 	/// First dtype selected by semantic distillation. This compatibility accessor
 	/// is the complete target dtype only for singular-target tasks.
 	#[must_use]
-	pub fn target_dtype(&self) -> DType {
-		self.target_dtypes[0]
-	}
+	pub fn target_dtype(&self) -> DType { self.target_dtypes[0] }
 
 	/// Source target dtypes in the saved declaration order. Prediction tensors
 	/// remain one f32 matrix regardless of these source representations.
 	#[must_use]
-	pub fn target_dtypes(&self) -> &[DType] {
-		&self.target_dtypes
-	}
+	pub fn target_dtypes(&self) -> &[DType] { &self.target_dtypes }
 
 	#[must_use]
-	pub const fn shape(&self) -> &Shape {
-		&self.shape
-	}
+	pub const fn shape(&self) -> &Shape { &self.shape }
 
 	#[must_use]
-	pub const fn kind(&self) -> InferencePredictionKind {
-		self.kind
-	}
+	pub const fn kind(&self) -> InferencePredictionKind { self.kind }
 }
 
 /// One deterministic, target-free, single-iteration inference program.
@@ -520,39 +496,25 @@ pub struct CompiledInference {
 
 impl CompiledInference {
 	#[must_use]
-	pub const fn graph(&self) -> &CalculationGraph {
-		self.program.graph()
-	}
+	pub const fn graph(&self) -> &CalculationGraph { self.program.graph() }
 
 	#[must_use]
-	pub const fn program(&self) -> &StaticCalculationProgram {
-		&self.program
-	}
+	pub const fn program(&self) -> &StaticCalculationProgram { &self.program }
 
 	#[must_use]
-	pub fn external_inputs(&self) -> &[InferenceExternalInput] {
-		&self.external_inputs
-	}
+	pub fn external_inputs(&self) -> &[InferenceExternalInput] { &self.external_inputs }
 
 	#[must_use]
-	pub const fn output(&self) -> &InferenceOutputContract {
-		&self.output
-	}
+	pub const fn output(&self) -> &InferenceOutputContract { &self.output }
 
 	#[must_use]
-	pub const fn rows(&self) -> u64 {
-		self.rows
-	}
+	pub const fn rows(&self) -> u64 { self.rows }
 
 	#[must_use]
-	pub const fn task(&self) -> InferenceTask {
-		self.task
-	}
+	pub const fn task(&self) -> InferenceTask { self.task }
 
 	#[must_use]
-	pub const fn output_adapter(&self) -> Option<DenseOutputAdapter> {
-		self.output_adapter
-	}
+	pub const fn output_adapter(&self) -> Option<DenseOutputAdapter> { self.output_adapter }
 }
 
 /// Aggregation represented by one independently typed KNN prediction tensor.
@@ -590,29 +552,19 @@ impl KnnInferenceOutputContract {
 	}
 
 	#[must_use]
-	pub const fn value(&self) -> ValueId {
-		self.value
-	}
+	pub const fn value(&self) -> ValueId { self.value }
 
 	#[must_use]
-	pub const fn dtype(&self) -> DType {
-		self.dtype
-	}
+	pub const fn dtype(&self) -> DType { self.dtype }
 
 	#[must_use]
-	pub const fn shape(&self) -> &Shape {
-		&self.shape
-	}
+	pub const fn shape(&self) -> &Shape { &self.shape }
 
 	#[must_use]
-	pub const fn source_vector(&self) -> usize {
-		self.source_vector
-	}
+	pub const fn source_vector(&self) -> usize { self.source_vector }
 
 	#[must_use]
-	pub const fn kind(&self) -> KnnInferencePredictionKind {
-		self.kind
-	}
+	pub const fn kind(&self) -> KnnInferencePredictionKind { self.kind }
 }
 
 /// One deterministic, target-free KNN program with one egress tensor per
@@ -627,29 +579,19 @@ pub struct CompiledKnnInference {
 
 impl CompiledKnnInference {
 	#[must_use]
-	pub const fn graph(&self) -> &CalculationGraph {
-		self.program.graph()
-	}
+	pub const fn graph(&self) -> &CalculationGraph { self.program.graph() }
 
 	#[must_use]
-	pub const fn program(&self) -> &StaticCalculationProgram {
-		&self.program
-	}
+	pub const fn program(&self) -> &StaticCalculationProgram { &self.program }
 
 	#[must_use]
-	pub fn external_inputs(&self) -> &[InferenceExternalInput] {
-		&self.external_inputs
-	}
+	pub fn external_inputs(&self) -> &[InferenceExternalInput] { &self.external_inputs }
 
 	#[must_use]
-	pub fn outputs(&self) -> &[KnnInferenceOutputContract] {
-		&self.outputs
-	}
+	pub fn outputs(&self) -> &[KnnInferenceOutputContract] { &self.outputs }
 
 	#[must_use]
-	pub const fn rows(&self) -> u64 {
-		self.rows
-	}
+	pub const fn rows(&self) -> u64 { self.rows }
 }
 
 /// A decoded KNN model and target-free rows bound to its saved feature schema.
@@ -668,36 +610,24 @@ pub struct PreparedBayesInference {
 
 impl PreparedBayesInference {
 	#[must_use]
-	pub const fn artifact(&self) -> &BayesModelArtifact {
-		&self.artifact
-	}
+	pub const fn artifact(&self) -> &BayesModelArtifact { &self.artifact }
 
 	#[must_use]
-	pub const fn data(&self) -> &PreparedInferenceDataset {
-		&self.data
-	}
+	pub const fn data(&self) -> &PreparedInferenceDataset { &self.data }
 
 	#[must_use]
-	pub fn into_artifact(self) -> BayesModelArtifact {
-		self.artifact
-	}
+	pub fn into_artifact(self) -> BayesModelArtifact { self.artifact }
 }
 
 impl PreparedKnnInference {
 	#[must_use]
-	pub const fn artifact(&self) -> &KnnModelArtifact {
-		&self.artifact
-	}
+	pub const fn artifact(&self) -> &KnnModelArtifact { &self.artifact }
 
 	#[must_use]
-	pub const fn data(&self) -> &PreparedInferenceDataset {
-		&self.data
-	}
+	pub const fn data(&self) -> &PreparedInferenceDataset { &self.data }
 
 	#[must_use]
-	pub fn into_artifact(self) -> KnnModelArtifact {
-		self.artifact
-	}
+	pub fn into_artifact(self) -> KnnModelArtifact { self.artifact }
 }
 
 /// A decoded model and its unnormalized, schema-bound inference rows.
@@ -713,49 +643,31 @@ pub struct PreparedInference {
 
 impl PreparedInference {
 	#[must_use]
-	pub const fn checkpoint(&self) -> &CheckpointArtifact {
-		&self.checkpoint
-	}
+	pub const fn checkpoint(&self) -> &CheckpointArtifact { &self.checkpoint }
 
 	#[must_use]
-	pub const fn data(&self) -> &PreparedInferenceDataset {
-		&self.data
-	}
+	pub const fn data(&self) -> &PreparedInferenceDataset { &self.data }
 
 	#[must_use]
-	pub fn features(&self) -> &[PreparedInferenceFeature] {
-		self.data.features()
-	}
+	pub fn features(&self) -> &[PreparedInferenceFeature] { self.data.features() }
 
 	#[must_use]
-	pub fn feature_spans(&self) -> &[CompiledFeatureSpan] {
-		self.checkpoint.feature_spans()
-	}
+	pub fn feature_spans(&self) -> &[CompiledFeatureSpan] { self.checkpoint.feature_spans() }
 
 	#[must_use]
-	pub const fn normalization(&self) -> DenseDataNormalization {
-		self.checkpoint.config().data_normalization
-	}
+	pub const fn normalization(&self) -> DenseDataNormalization { self.checkpoint.config().data_normalization }
 
 	#[must_use]
-	pub fn normalization_tensors(&self) -> &[CheckpointTensorImage] {
-		self.checkpoint.normalization()
-	}
+	pub fn normalization_tensors(&self) -> &[CheckpointTensorImage] { self.checkpoint.normalization() }
 
 	#[must_use]
-	pub fn feature_normalization_mask(&self) -> &[u32] {
-		self.checkpoint.feature_normalization_mask()
-	}
+	pub fn feature_normalization_mask(&self) -> &[u32] { self.checkpoint.feature_normalization_mask() }
 
 	#[must_use]
-	pub fn normalization_epsilon(&self) -> f32 {
-		self.checkpoint.config().normalization_epsilon
-	}
+	pub fn normalization_epsilon(&self) -> f32 { self.checkpoint.config().normalization_epsilon }
 
 	#[must_use]
-	pub fn into_checkpoint(self) -> CheckpointArtifact {
-		self.checkpoint
-	}
+	pub fn into_checkpoint(self) -> CheckpointArtifact { self.checkpoint }
 }
 
 /// Read and decode one checkpoint from a bounded regular-file snapshot.
@@ -772,10 +684,11 @@ pub fn load_checkpoint_file(
 	path: impl AsRef<Path>,
 	limits: CheckpointDecodeLimits,
 ) -> InferencePreparationResult<CheckpointArtifact> {
-	let source_bytes =
-		u64::try_from(limits.source_bytes).map_err(|error| InferencePreparationError::ArithmeticOverflow {
+	let source_bytes = u64::try_from(limits.source_bytes).map_err(|error| {
+		InferencePreparationError::ArithmeticOverflow {
 			detail: format!("checkpoint source-byte bound cannot be represented as u64: {error}"),
-		})?;
+		}
+	})?;
 	let source = read_source_snapshot(path.as_ref(), SourceLimit::new(source_bytes)?)?;
 	decode_checkpoint(source.bytes(), limits).map_err(Into::into)
 }
@@ -786,10 +699,11 @@ pub fn load_knn_model_file(
 	path: impl AsRef<Path>,
 	limits: KnnModelDecodeLimits,
 ) -> InferencePreparationResult<KnnModelArtifact> {
-	let source_bytes =
-		u64::try_from(limits.source_bytes).map_err(|error| InferencePreparationError::ArithmeticOverflow {
+	let source_bytes = u64::try_from(limits.source_bytes).map_err(|error| {
+		InferencePreparationError::ArithmeticOverflow {
 			detail: format!("KNN model source-byte bound cannot be represented as u64: {error}"),
-		})?;
+		}
+	})?;
 	let source = read_source_snapshot(path.as_ref(), SourceLimit::new(source_bytes)?)?;
 	decode_knn_model(source.bytes(), limits).map_err(Into::into)
 }
@@ -799,10 +713,11 @@ pub fn load_bayes_model_file(
 	path: impl AsRef<Path>,
 	limits: BayesModelDecodeLimits,
 ) -> InferencePreparationResult<BayesModelArtifact> {
-	let source_bytes =
-		u64::try_from(limits.source_bytes).map_err(|error| InferencePreparationError::ArithmeticOverflow {
+	let source_bytes = u64::try_from(limits.source_bytes).map_err(|error| {
+		InferencePreparationError::ArithmeticOverflow {
 			detail: format!("Bayesian model source-byte bound cannot be represented as u64: {error}"),
-		})?;
+		}
+	})?;
 	let source = read_source_snapshot(path.as_ref(), SourceLimit::new(source_bytes)?)?;
 	decode_bayes_model(source.bytes(), limits).map_err(Into::into)
 }
@@ -820,10 +735,11 @@ pub fn load_semantic_model_file(
 ) -> InferencePreparationResult<SemanticModelArtifact> {
 	let source_bytes = checkpoint_limits.source_bytes.max(knn_limits.source_bytes);
 	let source_bytes = source_bytes.max(BayesModelDecodeLimits::default().source_bytes);
-	let source_bytes =
-		u64::try_from(source_bytes).map_err(|error| InferencePreparationError::ArithmeticOverflow {
+	let source_bytes = u64::try_from(source_bytes).map_err(|error| {
+		InferencePreparationError::ArithmeticOverflow {
 			detail: format!("semantic-model source-byte bound cannot be represented as u64: {error}"),
-		})?;
+		}
+	})?;
 	let source = read_source_snapshot(path.as_ref(), SourceLimit::new(source_bytes)?)?;
 	let root = source
 		.bytes()
@@ -838,21 +754,29 @@ pub fn load_semantic_model_file(
 		)
 	})?;
 	match root {
-		"recipe" => decode_checkpoint(source.bytes(), checkpoint_limits)
-			.map(SemanticModelArtifact::Dense)
-			.map_err(Into::into),
-		"recipe-knn-model" => decode_knn_model(source.bytes(), knn_limits)
-			.map(SemanticModelArtifact::Knn)
-			.map_err(Into::into),
-		"recipe-bayes-model" => decode_bayes_model(source.bytes(), BayesModelDecodeLimits::default())
-			.map(SemanticModelArtifact::Bayes)
-			.map_err(Into::into),
-		other => Err(decode_error(
-			CheckpointDecodeErrorKind::InvalidValue,
-			CheckpointPath::root(),
-			format!("unknown semantic-model root {other:?}"),
-		)
-		.into()),
+		"recipe" => {
+			decode_checkpoint(source.bytes(), checkpoint_limits)
+				.map(SemanticModelArtifact::Dense)
+				.map_err(Into::into)
+		}
+		"recipe-knn-model" => {
+			decode_knn_model(source.bytes(), knn_limits)
+				.map(SemanticModelArtifact::Knn)
+				.map_err(Into::into)
+		}
+		"recipe-bayes-model" => {
+			decode_bayes_model(source.bytes(), BayesModelDecodeLimits::default())
+				.map(SemanticModelArtifact::Bayes)
+				.map_err(Into::into)
+		}
+		other => {
+			Err(decode_error(
+				CheckpointDecodeErrorKind::InvalidValue,
+				CheckpointPath::root(),
+				format!("unknown semantic-model root {other:?}"),
+			)
+			.into())
+		}
 	}
 }
 
@@ -1017,9 +941,11 @@ pub fn compile_prepared_inference(prepared: &PreparedInference) -> InferenceComp
 	}
 
 	let mut compiler = InferenceGraphCompiler::new();
-	let leading_embedding = checkpoint.blocks().first().and_then(|block| match block {
-		crate::CheckpointBlockImage::Embedding(embedding) => Some(embedding),
-		_ => None,
+	let leading_embedding = checkpoint.blocks().first().and_then(|block| {
+		match block {
+			crate::CheckpointBlockImage::Embedding(embedding) => Some(embedding),
+			_ => None,
+		}
 	});
 	let lowered = if let Some(embedding) = leading_embedding {
 		compiler.compile_token_features(
@@ -1481,15 +1407,14 @@ fn compile_bayes_conditional(
 		nodes: core::mem::take(&mut compiler.nodes),
 	};
 	let materialized = append_categorical_bayes_inference(&mut graph, &request)?;
-	compiler.domains.extend(
-		materialized
-			.kernels
-			.iter()
-			.map(|kernel| KernelIterationDomain {
+	compiler
+		.domains
+		.extend(materialized.kernels.iter().map(|kernel| {
+			KernelIterationDomain {
 				kernel: *kernel,
 				domain: IterationDomain::first(),
-			}),
-	);
+			}
+		}));
 	compiler.tensors = graph
 		.tensors
 		.into_iter()
@@ -1829,15 +1754,14 @@ pub fn compile_prepared_knn_inference(prepared: &PreparedKnnInference) -> Infere
 		nodes: compiler.nodes,
 	};
 	let materialized = append_knn_all_outputs(&mut graph, &request)?;
-	compiler.domains.extend(
-		materialized
-			.kernels
-			.iter()
-			.map(|kernel| KernelIterationDomain {
+	compiler
+		.domains
+		.extend(materialized.kernels.iter().map(|kernel| {
+			KernelIterationDomain {
 				kernel: *kernel,
 				domain: IterationDomain::first(),
-			}),
-	);
+			}
+		}));
 	graph.validate()?;
 	let graph = CalculationGraph::from_ogdl(&graph.to_ogdl()?)?;
 	let iterations = NonZeroU64::new(1).expect("one KNN inference iteration is nonzero");
@@ -1874,6 +1798,54 @@ struct InferenceGraphCompiler {
 	next_kernel: u64,
 	external_inputs: Vec<InferenceExternalInput>,
 	external_input_ids: BTreeSet<ValueId>,
+}
+
+impl RecurrentForwardGraph for InferenceGraphCompiler {
+	type Error = InferenceCompileError;
+
+	fn zero_f32(&mut self, shape: Shape) -> InferenceCompileResult<ValueId> {
+		InferenceGraphCompiler::zero_f32(self, shape)
+	}
+
+	fn gather_matrix_column(
+		&mut self,
+		matrix: ValueId,
+		rows: u64,
+		columns: u64,
+		column: u64,
+	) -> InferenceCompileResult<ValueId> {
+		InferenceGraphCompiler::gather_matrix_column(self, matrix, rows, columns, column)
+	}
+
+	fn bias_free_linear(
+		&mut self,
+		input: ValueId,
+		weight: ValueId,
+		rows: u64,
+		output_width: u64,
+	) -> InferenceCompileResult<ValueId> {
+		InferenceGraphCompiler::bias_free_linear(self, input, weight, rows, output_width)
+	}
+
+	fn elementwise_f32(
+		&mut self,
+		shape: Shape,
+		inputs: Vec<ValueId>,
+		program: recipe_core::ScalarProgram,
+	) -> InferenceCompileResult<ValueId> {
+		let output = self.tensor(DType::F32, shape)?;
+		self.emit_elementwise(inputs, vec![output], program)?;
+		Ok(output)
+	}
+
+	fn activate(
+		&mut self,
+		input: ValueId,
+		activation: DenseActivation,
+		shape: Shape,
+	) -> InferenceCompileResult<ValueId> {
+		self.apply_activation(input, activation, None, shape)
+	}
 }
 
 impl InferenceGraphCompiler {
@@ -2116,13 +2088,15 @@ impl InferenceGraphCompiler {
 			{
 				Ok(())
 			}
-			Some(_) => Err(InferenceCompileError::new(
-				InferenceCompileErrorKind::Language,
-				format!(
-					"materialized tensor {} conflicts with an existing inference contract",
-					tensor.id
-				),
-			)),
+			Some(_) => {
+				Err(InferenceCompileError::new(
+					InferenceCompileErrorKind::Language,
+					format!(
+						"materialized tensor {} conflicts with an existing inference contract",
+						tensor.id
+					),
+				))
+			}
 			None => {
 				self.tensors.insert(tensor.id, tensor);
 				Ok(())
@@ -2720,17 +2694,19 @@ impl InferenceGraphCompiler {
 					)?,
 				))
 			}
-			DenseDataNormalization::L2Norm => Ok((
-				self.apply_knn_l2(query, query_rows, columns, mask, EPSILON, tree_lanes)?,
-				self.apply_knn_l2(
-					reference,
-					reference_rows,
-					columns,
-					mask,
-					EPSILON,
-					tree_lanes,
-				)?,
-			)),
+			DenseDataNormalization::L2Norm => {
+				Ok((
+					self.apply_knn_l2(query, query_rows, columns, mask, EPSILON, tree_lanes)?,
+					self.apply_knn_l2(
+						reference,
+						reference_rows,
+						columns,
+						mask,
+						EPSILON,
+						tree_lanes,
+					)?,
+				))
+			}
 		}
 	}
 
@@ -3094,25 +3070,19 @@ impl InferenceGraphCompiler {
 			InferenceInputRole::RnnBias { block: block_index },
 			rnn.bias().parameter(),
 		)?;
-		let mut hidden = self.zero_f32(shape(&[rows, width])?)?;
-		for step in 0..input_width {
-			let step_input = self.gather_matrix_column(input, rows, input_width, step)?;
-			let input_projection = self.bias_free_linear(step_input, input_weight, rows, width)?;
-			let recurrent_projection = self.bias_free_linear(hidden, recurrent_weight, rows, width)?;
-			let preactivation = self.tensor(DType::F32, shape(&[rows, width])?)?;
-			self.emit_elementwise(
-				vec![input_projection, recurrent_projection, bias],
-				vec![preactivation],
-				sum_program(3)?,
-			)?;
-			hidden = self.apply_activation(
-				preactivation,
-				DenseActivation::Tanh,
-				None,
-				shape(&[rows, width])?,
-			)?;
-		}
-		Ok(hidden)
+		Ok(lower_rnn_sequence(
+			self,
+			input,
+			rows,
+			input_width,
+			width,
+			RecurrentGateParameters {
+				input_weight,
+				recurrent_weight,
+				bias,
+			},
+		)?
+		.0)
 	}
 
 	fn compile_gru(
@@ -3205,81 +3175,31 @@ impl InferenceGraphCompiler {
 			gru.candidate_bias().parameter(),
 		)?;
 
-		let hidden_shape = shape(&[rows, width])?;
-		let mut hidden = self.zero_f32(hidden_shape.clone())?;
-		for step in 0..input_width {
-			let step_input = self.gather_matrix_column(input, rows, input_width, step)?;
-			let reset_input_projection = self.bias_free_linear(step_input, reset_input_weight, rows, width)?;
-			let reset_recurrent_projection =
-				self.bias_free_linear(hidden, reset_recurrent_weight, rows, width)?;
-			let reset_preactivation = self.tensor(DType::F32, hidden_shape.clone())?;
-			self.emit_elementwise(
-				vec![
-					reset_input_projection,
-					reset_recurrent_projection,
-					reset_bias,
-				],
-				vec![reset_preactivation],
-				sum_program(3)?,
-			)?;
-			let reset = self.apply_activation(
-				reset_preactivation,
-				DenseActivation::Sigmoid,
-				None,
-				hidden_shape.clone(),
-			)?;
-
-			let update_input_projection = self.bias_free_linear(step_input, update_input_weight, rows, width)?;
-			let update_recurrent_projection =
-				self.bias_free_linear(hidden, update_recurrent_weight, rows, width)?;
-			let update_preactivation = self.tensor(DType::F32, hidden_shape.clone())?;
-			self.emit_elementwise(
-				vec![
-					update_input_projection,
-					update_recurrent_projection,
-					update_bias,
-				],
-				vec![update_preactivation],
-				sum_program(3)?,
-			)?;
-			let update = self.apply_activation(
-				update_preactivation,
-				DenseActivation::Sigmoid,
-				None,
-				hidden_shape.clone(),
-			)?;
-
-			let reset_hidden = self.tensor(DType::F32, hidden_shape.clone())?;
-			self.emit_elementwise(vec![reset, hidden], vec![reset_hidden], multiply_program()?)?;
-			let candidate_input_projection =
-				self.bias_free_linear(step_input, candidate_input_weight, rows, width)?;
-			let candidate_recurrent_projection =
-				self.bias_free_linear(reset_hidden, candidate_recurrent_weight, rows, width)?;
-			let candidate_preactivation = self.tensor(DType::F32, hidden_shape.clone())?;
-			self.emit_elementwise(
-				vec![
-					candidate_input_projection,
-					candidate_recurrent_projection,
-					candidate_bias,
-				],
-				vec![candidate_preactivation],
-				sum_program(3)?,
-			)?;
-			let candidate = self.apply_activation(
-				candidate_preactivation,
-				DenseActivation::Tanh,
-				None,
-				hidden_shape.clone(),
-			)?;
-			let next_hidden = self.tensor(DType::F32, hidden_shape.clone())?;
-			self.emit_elementwise(
-				vec![candidate, update, hidden],
-				vec![next_hidden],
-				gru_hidden_program()?,
-			)?;
-			hidden = next_hidden;
-		}
-		Ok(hidden)
+		Ok(lower_gru_sequence(
+			self,
+			input,
+			rows,
+			input_width,
+			width,
+			GruForwardParameters {
+				reset: RecurrentGateParameters {
+					input_weight: reset_input_weight,
+					recurrent_weight: reset_recurrent_weight,
+					bias: reset_bias,
+				},
+				update: RecurrentGateParameters {
+					input_weight: update_input_weight,
+					recurrent_weight: update_recurrent_weight,
+					bias: update_bias,
+				},
+				candidate: RecurrentGateParameters {
+					input_weight: candidate_input_weight,
+					recurrent_weight: candidate_recurrent_weight,
+					bias: candidate_bias,
+				},
+			},
+		)?
+		.0)
 	}
 
 	fn compile_lstm(
@@ -3396,97 +3316,36 @@ impl InferenceGraphCompiler {
 			lstm.candidate_bias().parameter(),
 		)?;
 
-		let state_shape = shape(&[rows, width])?;
-		let mut hidden = self.zero_f32(state_shape.clone())?;
-		let mut cell = self.zero_f32(state_shape.clone())?;
-		for step in 0..input_width {
-			let step_input = self.gather_matrix_column(input, rows, input_width, step)?;
-			let input_gate = self.compile_lstm_gate(
-				step_input,
-				hidden,
-				input_gate_input_weight,
-				input_gate_recurrent_weight,
-				input_gate_bias,
-				DenseActivation::Sigmoid,
-				rows,
-				width,
-				&state_shape,
-			)?;
-			let forget_gate = self.compile_lstm_gate(
-				step_input,
-				hidden,
-				forget_gate_input_weight,
-				forget_gate_recurrent_weight,
-				forget_gate_bias,
-				DenseActivation::Sigmoid,
-				rows,
-				width,
-				&state_shape,
-			)?;
-			let output_gate = self.compile_lstm_gate(
-				step_input,
-				hidden,
-				output_gate_input_weight,
-				output_gate_recurrent_weight,
-				output_gate_bias,
-				DenseActivation::Sigmoid,
-				rows,
-				width,
-				&state_shape,
-			)?;
-			let candidate = self.compile_lstm_gate(
-				step_input,
-				hidden,
-				candidate_input_weight,
-				candidate_recurrent_weight,
-				candidate_bias,
-				DenseActivation::Tanh,
-				rows,
-				width,
-				&state_shape,
-			)?;
-			let next_cell = self.tensor(DType::F32, state_shape.clone())?;
-			self.emit_elementwise(
-				vec![forget_gate, cell, input_gate, candidate],
-				vec![next_cell],
-				lstm_cell_program()?,
-			)?;
-			let cell_activation =
-				self.apply_activation(next_cell, DenseActivation::Tanh, None, state_shape.clone())?;
-			let next_hidden = self.tensor(DType::F32, state_shape.clone())?;
-			self.emit_elementwise(
-				vec![output_gate, cell_activation],
-				vec![next_hidden],
-				multiply_program()?,
-			)?;
-			cell = next_cell;
-			hidden = next_hidden;
-		}
-		Ok(hidden)
-	}
-
-	#[allow(clippy::too_many_arguments)]
-	fn compile_lstm_gate(
-		&mut self,
-		step_input: ValueId,
-		hidden: ValueId,
-		input_weight: ValueId,
-		recurrent_weight: ValueId,
-		bias: ValueId,
-		activation: DenseActivation,
-		rows: u64,
-		width: u64,
-		state_shape: &Shape,
-	) -> InferenceCompileResult<ValueId> {
-		let input_projection = self.bias_free_linear(step_input, input_weight, rows, width)?;
-		let recurrent_projection = self.bias_free_linear(hidden, recurrent_weight, rows, width)?;
-		let preactivation = self.tensor(DType::F32, state_shape.clone())?;
-		self.emit_elementwise(
-			vec![input_projection, recurrent_projection, bias],
-			vec![preactivation],
-			sum_program(3)?,
-		)?;
-		self.apply_activation(preactivation, activation, None, state_shape.clone())
+		Ok(lower_lstm_sequence(
+			self,
+			input,
+			rows,
+			input_width,
+			width,
+			LstmForwardParameters {
+				input: RecurrentGateParameters {
+					input_weight: input_gate_input_weight,
+					recurrent_weight: input_gate_recurrent_weight,
+					bias: input_gate_bias,
+				},
+				forget: RecurrentGateParameters {
+					input_weight: forget_gate_input_weight,
+					recurrent_weight: forget_gate_recurrent_weight,
+					bias: forget_gate_bias,
+				},
+				output: RecurrentGateParameters {
+					input_weight: output_gate_input_weight,
+					recurrent_weight: output_gate_recurrent_weight,
+					bias: output_gate_bias,
+				},
+				candidate: RecurrentGateParameters {
+					input_weight: candidate_input_weight,
+					recurrent_weight: candidate_recurrent_weight,
+					bias: candidate_bias,
+				},
+			},
+		)?
+		.0)
 	}
 
 	fn gather_matrix_column(
@@ -3607,14 +3466,16 @@ impl InferenceGraphCompiler {
 					};
 					self.apply_activation(current, activation, alpha, output_shape.clone())?
 				}
-				DenseOperation::Normalization(normalization) => self.apply_model_normalization(
-					current,
-					normalization,
-					rows,
-					output_width,
-					normalization_epsilon,
-					tree_lanes,
-				)?,
+				DenseOperation::Normalization(normalization) => {
+					self.apply_model_normalization(
+						current,
+						normalization,
+						rows,
+						output_width,
+						normalization_epsilon,
+						tree_lanes,
+					)?
+				}
 			};
 		}
 		if prelu.next().is_some() {
@@ -4179,14 +4040,16 @@ impl InferenceGraphCompiler {
 			DenseOperation::Activation(activation) => {
 				self.apply_activation(input, activation, prelu, shape(&[rows, width])?)
 			}
-			DenseOperation::Normalization(normalization) => self.apply_model_normalization(
-				input,
-				normalization,
-				rows,
-				width,
-				normalization_epsilon,
-				tree_lanes,
-			),
+			DenseOperation::Normalization(normalization) => {
+				self.apply_model_normalization(
+					input,
+					normalization,
+					rows,
+					width,
+					normalization_epsilon,
+					tree_lanes,
+				)
+			}
 		}
 	}
 
@@ -4496,77 +4359,36 @@ impl InferenceGraphCompiler {
 		prelu: Option<ValueId>,
 		output_shape: Shape,
 	) -> InferenceCompileResult<ValueId> {
-		if activation == DenseActivation::Linear {
+		let activation = lower_activation::<InferenceCompileError>(activation)?;
+		if matches!(activation, ForwardActivation::Identity) {
 			return Ok(input);
 		}
 		let output = self.tensor(DType::F32, output_shape.clone())?;
 		match activation {
-			DenseActivation::Linear => {}
-			DenseActivation::Cosine => {
-				self.emit_owned_scalar("gpu_cos", vec![input], vec![output])?;
+			ForwardActivation::Identity => unreachable!("linear activation returned its input"),
+			ForwardActivation::Owned(symbol) => {
+				self.emit_owned_scalar(symbol, vec![input], vec![output])?;
 			}
-			DenseActivation::Exponential => {
-				self.emit_owned_scalar("gpu_exp", vec![input], vec![output])?;
+			ForwardActivation::Program(program) => {
+				self.emit_elementwise(vec![input], vec![output], program)?;
 			}
-			DenseActivation::Logarithm => {
+			ForwardActivation::SignedMagnitude(magnitude_symbol) => {
 				let absolute = self.tensor(DType::F32, output_shape.clone())?;
 				self.emit_owned_scalar("gpu_abs_into", vec![input], vec![absolute])?;
 				let magnitude = self.tensor(DType::F32, output_shape.clone())?;
-				self.emit_owned_scalar("gpu_log_into", vec![absolute], vec![magnitude])?;
+				self.emit_owned_scalar(magnitude_symbol, vec![absolute], vec![magnitude])?;
 				let sign = self.tensor(DType::F32, output_shape)?;
 				self.emit_owned_scalar("gpu_sign_into", vec![input], vec![sign])?;
 				self.emit_elementwise(vec![sign, magnitude], vec![output], multiply_program()?)?;
 			}
-			DenseActivation::NaturalLogarithm => {
-				self.emit_owned_scalar("gpu_log_into", vec![input], vec![output])?;
-			}
-			DenseActivation::LegacySignedLogOnePlus => {
-				let absolute = self.tensor(DType::F32, output_shape.clone())?;
-				self.emit_owned_scalar("gpu_abs_into", vec![input], vec![absolute])?;
-				let magnitude = self.tensor(DType::F32, output_shape.clone())?;
-				self.emit_owned_scalar("gpu_log1p", vec![absolute], vec![magnitude])?;
-				let sign = self.tensor(DType::F32, output_shape)?;
-				self.emit_owned_scalar("gpu_sign_into", vec![input], vec![sign])?;
-				self.emit_elementwise(vec![sign, magnitude], vec![output], multiply_program()?)?;
-			}
-			DenseActivation::Huber => {
-				self.emit_elementwise(vec![input], vec![output], huber_activation_program()?)?;
-			}
-			DenseActivation::Tangent => {
-				self.emit_owned_scalar("gpu_tan", vec![input], vec![output])?;
-			}
-			DenseActivation::Relu => {
-				self.emit_owned_scalar("gpu_relu_into", vec![input], vec![output])?;
-			}
-			DenseActivation::LeakyRelu => {
-				self.emit_elementwise(vec![input], vec![output], canonical_leaky_relu_program()?)?;
-			}
-			DenseActivation::Sigmoid => {
-				self.emit_owned_scalar("gpu_sigmoid_into", vec![input], vec![output])?;
-			}
-			DenseActivation::Tanh => {
-				self.emit_owned_scalar("gpu_tanh_into", vec![input], vec![output])?;
-			}
-			DenseActivation::Selu => {
-				self.emit_elementwise(vec![input], vec![output], canonical_selu_program()?)?;
-			}
-			DenseActivation::Gelu => {
-				self.emit_owned_scalar("gpu_gelu_into", vec![input], vec![output])?;
-			}
-			DenseActivation::Silu => {
-				self.emit_owned_scalar("gpu_silu_into", vec![input], vec![output])?;
-			}
-			DenseActivation::Elu => {
-				self.emit_elementwise(vec![input], vec![output], canonical_elu_program()?)?;
-			}
-			DenseActivation::PRelu => {
+			ForwardActivation::PRelu(program) => {
 				let alpha = prelu.ok_or_else(|| {
 					InferenceCompileError::new(
 						InferenceCompileErrorKind::InconsistentCheckpoint,
 						"PReLU inference omitted its learned scalar",
 					)
 				})?;
-				self.emit_elementwise(vec![input, alpha], vec![output], canonical_prelu_program()?)?;
+				self.emit_elementwise(vec![input, alpha], vec![output], program)?;
 			}
 		}
 		Ok(output)
@@ -4838,16 +4660,20 @@ impl InferenceGraphCompiler {
 
 fn inference_feature_bytes(values: &PreparedInferenceValues) -> (DType, Vec<u8>) {
 	match values {
-		PreparedInferenceValues::I32(values) => (
-			DType::I32,
-			values.iter()
-				.flat_map(|value| value.to_le_bytes())
-				.collect(),
-		),
-		PreparedInferenceValues::F32Bits(values) => (
-			DType::F32,
-			values.iter().flat_map(|bits| bits.to_le_bytes()).collect(),
-		),
+		PreparedInferenceValues::I32(values) => {
+			(
+				DType::I32,
+				values.iter()
+					.flat_map(|value| value.to_le_bytes())
+					.collect(),
+			)
+		}
+		PreparedInferenceValues::F32Bits(values) => {
+			(
+				DType::F32,
+				values.iter().flat_map(|bits| bits.to_le_bytes()).collect(),
+			)
+		}
 	}
 }
 
@@ -4888,9 +4714,7 @@ fn validate_checkpoint_parameter_image(
 	Ok(())
 }
 
-fn shape(extents: &[u64]) -> InferenceCompileResult<Shape> {
-	Ok(Shape::new(extents.to_vec())?)
-}
+fn shape(extents: &[u64]) -> InferenceCompileResult<Shape> { Ok(Shape::new(extents.to_vec())?) }
 
 fn checked_product(values: &[u64], name: &str) -> InferenceCompileResult<u64> {
 	values.iter().copied().try_fold(1_u64, |product, value| {
@@ -4927,18 +4751,6 @@ fn identity_exhausted() -> InferenceCompileError {
 		InferenceCompileErrorKind::IdentityExhausted,
 		"deterministic inference graph identity space exhausted",
 	)
-}
-
-fn forbidden_aliases(inputs: usize, outputs: usize) -> Vec<PrimitiveAliasRule> {
-	(0..inputs)
-		.flat_map(|input| {
-			(0..outputs).map(move |output| PrimitiveAliasRule {
-				input,
-				output,
-				permission: AliasPermission::Forbidden,
-			})
-		})
-		.collect()
 }
 
 fn zero_f32_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
@@ -5026,221 +4838,6 @@ fn feature_destination_program(
 	let destination = builder.binary(ScalarOpcode::Add, row_offset, start)?;
 	let destination = builder.binary(ScalarOpcode::Add, destination, column)?;
 	Ok(builder.finish(&[destination])?)
-}
-
-fn causal_mask_program(sequence_length: u64) -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let position = builder.input(DType::I32)?;
-	let sequence = builder.i32(checked_i32(
-		sequence_length,
-		"causal-attention sequence length",
-	)?)?;
-	let key = builder.binary(ScalarOpcode::Remainder, position, sequence)?;
-	let row = builder.binary(ScalarOpcode::Divide, position, sequence)?;
-	let query = builder.binary(ScalarOpcode::Remainder, row, sequence)?;
-	let visible = builder.binary(ScalarOpcode::LessThanOrEqual, key, query)?;
-	Ok(builder.finish(&[visible])?)
-}
-
-fn head_major_source_index_program(
-	sequence_length: u64,
-	heads: u64,
-	head_dimension: u64,
-) -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let position = builder.input(DType::I32)?;
-	let sequence = builder.i32(checked_i32(sequence_length, "attention sequence length")?)?;
-	let heads = builder.i32(checked_i32(heads, "attention head count")?)?;
-	let dimension = builder.i32(checked_i32(head_dimension, "attention head dimension")?)?;
-	let channel = builder.binary(ScalarOpcode::Remainder, position, dimension)?;
-	let packed = builder.binary(ScalarOpcode::Divide, position, dimension)?;
-	let head = builder.binary(ScalarOpcode::Remainder, packed, heads)?;
-	let sequence_packed = builder.binary(ScalarOpcode::Divide, packed, heads)?;
-	let token = builder.binary(ScalarOpcode::Remainder, sequence_packed, sequence)?;
-	let row = builder.binary(ScalarOpcode::Divide, sequence_packed, sequence)?;
-	let source = builder.binary(ScalarOpcode::Multiply, row, heads)?;
-	let source = builder.binary(ScalarOpcode::Add, source, head)?;
-	let source = builder.binary(ScalarOpcode::Multiply, source, sequence)?;
-	let source = builder.binary(ScalarOpcode::Add, source, token)?;
-	let source = builder.binary(ScalarOpcode::Multiply, source, dimension)?;
-	let source = builder.binary(ScalarOpcode::Add, source, channel)?;
-	Ok(builder.finish(&[source])?)
-}
-
-fn multiply_constant_program(constant: f32) -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let value = builder.input(DType::F32)?;
-	let constant = builder.f32(constant)?;
-	let result = builder.binary(ScalarOpcode::Multiply, value, constant)?;
-	Ok(builder.finish(&[result])?)
-}
-
-fn multiply_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let left = builder.input(DType::F32)?;
-	let right = builder.input(DType::F32)?;
-	let result = builder.binary(ScalarOpcode::Multiply, left, right)?;
-	Ok(builder.finish(&[result])?)
-}
-
-fn gru_hidden_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let candidate = builder.input(DType::F32)?;
-	let update = builder.input(DType::F32)?;
-	let previous = builder.input(DType::F32)?;
-	let difference = builder.binary(ScalarOpcode::Subtract, previous, candidate)?;
-	let retained = builder.binary(ScalarOpcode::Multiply, update, difference)?;
-	let hidden = builder.binary(ScalarOpcode::Add, candidate, retained)?;
-	Ok(builder.finish(&[hidden])?)
-}
-
-fn lstm_cell_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let forget = builder.input(DType::F32)?;
-	let previous_cell = builder.input(DType::F32)?;
-	let input = builder.input(DType::F32)?;
-	let candidate = builder.input(DType::F32)?;
-	let retained = builder.binary(ScalarOpcode::Multiply, forget, previous_cell)?;
-	let admitted = builder.binary(ScalarOpcode::Multiply, input, candidate)?;
-	let cell = builder.binary(ScalarOpcode::Add, retained, admitted)?;
-	Ok(builder.finish(&[cell])?)
-}
-
-fn add_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let left = builder.input(DType::F32)?;
-	let right = builder.input(DType::F32)?;
-	let result = builder.binary(ScalarOpcode::Add, left, right)?;
-	Ok(builder.finish(&[result])?)
-}
-
-fn sum_program(inputs: usize) -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let mut values = Vec::with_capacity(inputs);
-	for _ in 0..inputs {
-		values.push(builder.input(DType::F32)?);
-	}
-	let mut sum = *values.first().ok_or_else(|| {
-		InferenceCompileError::new(
-			InferenceCompileErrorKind::InconsistentCheckpoint,
-			"scalar sum requires at least one input",
-		)
-	})?;
-	for value in values.into_iter().skip(1) {
-		sum = builder.binary(ScalarOpcode::Add, sum, value)?;
-	}
-	Ok(builder.finish(&[sum])?)
-}
-
-fn divide_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let numerator = builder.input(DType::F32)?;
-	let denominator = builder.input(DType::F32)?;
-	let result = builder.binary(ScalarOpcode::Divide, numerator, denominator)?;
-	Ok(builder.finish(&[result])?)
-}
-
-fn subtract_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let left = builder.input(DType::F32)?;
-	let right = builder.input(DType::F32)?;
-	let result = builder.binary(ScalarOpcode::Subtract, left, right)?;
-	Ok(builder.finish(&[result])?)
-}
-
-fn square_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let value = builder.input(DType::F32)?;
-	let result = builder.binary(ScalarOpcode::Multiply, value, value)?;
-	Ok(builder.finish(&[result])?)
-}
-
-fn divide_constant_program(divisor: f32) -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let value = builder.input(DType::F32)?;
-	let divisor = builder.f32(divisor)?;
-	let result = builder.binary(ScalarOpcode::Divide, value, divisor)?;
-	Ok(builder.finish(&[result])?)
-}
-
-fn z_score_program(epsilon: f32, masked: bool) -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let value = builder.input(DType::F32)?;
-	let mean = builder.input(DType::F32)?;
-	let variance = builder.input(DType::F32)?;
-	let mask = masked.then(|| builder.input(DType::F32)).transpose()?;
-	let epsilon = builder.f32(epsilon)?;
-	let variance = builder.binary(ScalarOpcode::Maximum, variance, epsilon)?;
-	let standard_deviation = builder.unary(ScalarOpcode::SquareRoot, variance)?;
-	let centered = builder.binary(ScalarOpcode::Subtract, value, mean)?;
-	let mut normalized = builder.binary(ScalarOpcode::Divide, centered, standard_deviation)?;
-	if let Some(mask) = mask {
-		let zero = builder.f32(0.0)?;
-		let normalize = builder.binary(ScalarOpcode::GreaterThan, mask, zero)?;
-		normalized = builder.ternary(ScalarOpcode::Select, normalize, normalized, value)?;
-	}
-	Ok(builder.finish(&[normalized])?)
-}
-
-fn min_max_program(epsilon: f32, masked: bool) -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let value = builder.input(DType::F32)?;
-	let minimum = builder.input(DType::F32)?;
-	let maximum = builder.input(DType::F32)?;
-	let mask = masked.then(|| builder.input(DType::F32)).transpose()?;
-	let range = builder.binary(ScalarOpcode::Subtract, maximum, minimum)?;
-	let epsilon = builder.f32(epsilon)?;
-	let denominator = builder.binary(ScalarOpcode::Maximum, range, epsilon)?;
-	let centered = builder.binary(ScalarOpcode::Subtract, value, minimum)?;
-	let mut normalized = builder.binary(ScalarOpcode::Divide, centered, denominator)?;
-	if let Some(mask) = mask {
-		let zero = builder.f32(0.0)?;
-		let normalize = builder.binary(ScalarOpcode::GreaterThan, mask, zero)?;
-		normalized = builder.ternary(ScalarOpcode::Select, normalize, normalized, value)?;
-	}
-	Ok(builder.finish(&[normalized])?)
-}
-
-fn l2_square_program(masked: bool) -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let value = builder.input(DType::F32)?;
-	let mask = masked.then(|| builder.input(DType::F32)).transpose()?;
-	let mut square = builder.binary(ScalarOpcode::Multiply, value, value)?;
-	if let Some(mask) = mask {
-		square = builder.binary(ScalarOpcode::Multiply, square, mask)?;
-	}
-	Ok(builder.finish(&[square])?)
-}
-
-fn l2_norm_program(epsilon: f32, masked: bool) -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let value = builder.input(DType::F32)?;
-	let norm_squared = builder.input(DType::F32)?;
-	let mask = masked.then(|| builder.input(DType::F32)).transpose()?;
-	let epsilon = builder.f32(epsilon)?;
-	let norm_squared = builder.binary(ScalarOpcode::Maximum, norm_squared, epsilon)?;
-	let norm = builder.unary(ScalarOpcode::SquareRoot, norm_squared)?;
-	let mut normalized = builder.binary(ScalarOpcode::Divide, value, norm)?;
-	if let Some(mask) = mask {
-		let zero = builder.f32(0.0)?;
-		let normalize = builder.binary(ScalarOpcode::GreaterThan, mask, zero)?;
-		normalized = builder.ternary(ScalarOpcode::Select, normalize, normalized, value)?;
-	}
-	Ok(builder.finish(&[normalized])?)
-}
-
-fn huber_activation_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
-	let mut builder = ScalarProgramBuilder::new()?;
-	let value = builder.input(DType::F32)?;
-	let absolute = builder.unary(ScalarOpcode::Absolute, value)?;
-	let one = builder.f32(1.0)?;
-	let quadratic_domain = builder.binary(ScalarOpcode::LessThanOrEqual, absolute, one)?;
-	let square = builder.binary(ScalarOpcode::Multiply, value, value)?;
-	let half = builder.f32(0.5)?;
-	let quadratic = builder.binary(ScalarOpcode::Multiply, half, square)?;
-	let linear = builder.binary(ScalarOpcode::Subtract, absolute, half)?;
-	let result = builder.ternary(ScalarOpcode::Select, quadratic_domain, quadratic, linear)?;
-	Ok(builder.finish(&[result])?)
 }
 
 fn saved_feature_schema(checkpoint: &CheckpointArtifact) -> InferencePreparationResult<Vec<InferenceFeatureSchema>> {
@@ -5376,1460 +4973,5 @@ fn inconsistent_feature(
 		feature,
 		source_vector: span.source_vector(),
 		detail: detail.into(),
-	}
-}
-
-#[cfg(test)]
-pub(crate) mod test_support {
-	use recipe_language::{ContiguousOrder, TensorLayout};
-
-	use super::*;
-
-	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-	pub(crate) enum InferenceBoundaryFault {
-		Valid,
-		DuplicateSemanticRole,
-		InputIsUnproducedPrediction,
-		NonCanonicalInputLayout,
-		PaddedInputStorage,
-		NonCanonicalOutputLayout,
-		PaddedOutputStorage,
-		I32Prediction,
-	}
-
-	pub(crate) fn inference_boundary_allowed_roles() -> [InferenceInputRole; 68] {
-		[
-			InferenceInputRole::Feature {
-				feature: 0,
-				source_vector: 0,
-			},
-			InferenceInputRole::FeatureNormalizationMask,
-			InferenceInputRole::DataNormalizationMean,
-			InferenceInputRole::DataNormalizationVariance,
-			InferenceInputRole::DataNormalizationMinimum,
-			InferenceInputRole::DataNormalizationMaximum,
-			InferenceInputRole::LayerWeight { layer: 0 },
-			InferenceInputRole::LayerBias { layer: 0 },
-			InferenceInputRole::LayerPRelu {
-				layer: 0,
-				occurrence: 0,
-			},
-			InferenceInputRole::EmbeddingTable { block: 0 },
-			InferenceInputRole::AttentionQuery { block: 0 },
-			InferenceInputRole::AttentionKey { block: 0 },
-			InferenceInputRole::AttentionValue { block: 0 },
-			InferenceInputRole::AttentionOutput { block: 0 },
-			InferenceInputRole::RnnInputWeight { block: 0 },
-			InferenceInputRole::RnnRecurrentWeight { block: 0 },
-			InferenceInputRole::RnnBias { block: 0 },
-			InferenceInputRole::GruResetInputWeight { block: 0 },
-			InferenceInputRole::GruResetRecurrentWeight { block: 0 },
-			InferenceInputRole::GruResetBias { block: 0 },
-			InferenceInputRole::GruUpdateInputWeight { block: 0 },
-			InferenceInputRole::GruUpdateRecurrentWeight { block: 0 },
-			InferenceInputRole::GruUpdateBias { block: 0 },
-			InferenceInputRole::GruCandidateInputWeight { block: 0 },
-			InferenceInputRole::GruCandidateRecurrentWeight { block: 0 },
-			InferenceInputRole::GruCandidateBias { block: 0 },
-			InferenceInputRole::LstmInputGateInputWeight { block: 0 },
-			InferenceInputRole::LstmInputGateRecurrentWeight { block: 0 },
-			InferenceInputRole::LstmInputGateBias { block: 0 },
-			InferenceInputRole::LstmForgetGateInputWeight { block: 0 },
-			InferenceInputRole::LstmForgetGateRecurrentWeight { block: 0 },
-			InferenceInputRole::LstmForgetGateBias { block: 0 },
-			InferenceInputRole::LstmOutputGateInputWeight { block: 0 },
-			InferenceInputRole::LstmOutputGateRecurrentWeight { block: 0 },
-			InferenceInputRole::LstmOutputGateBias { block: 0 },
-			InferenceInputRole::LstmCandidateInputWeight { block: 0 },
-			InferenceInputRole::LstmCandidateRecurrentWeight { block: 0 },
-			InferenceInputRole::LstmCandidateBias { block: 0 },
-			InferenceInputRole::ConvolutionWindowIndices { block: 0 },
-			InferenceInputRole::ConvolutionWeight { block: 0 },
-			InferenceInputRole::ConvolutionBias { block: 0 },
-			InferenceInputRole::ConvolutionPRelu {
-				block: 0,
-				occurrence: 0,
-			},
-			InferenceInputRole::PoolWindowIndices { block: 0 },
-			InferenceInputRole::PoolWinnerBases { block: 0 },
-			InferenceInputRole::KMeansCentroids { block: 0 },
-			InferenceInputRole::TreeSplitFeatures { block: 0 },
-			InferenceInputRole::TreeSplitThresholds { block: 0 },
-			InferenceInputRole::TreeLeafValues { block: 0 },
-			InferenceInputRole::ResidualProjectionWeight { block: 0 },
-			InferenceInputRole::ResidualBranchPRelu {
-				block: 0,
-				occurrence: 0,
-			},
-			InferenceInputRole::ResidualOutputPRelu {
-				block: 0,
-				occurrence: 0,
-			},
-			InferenceInputRole::Temperature,
-			InferenceInputRole::KnnReferenceFeatures,
-			InferenceInputRole::KnnReferenceValues { output: 0 },
-			InferenceInputRole::KnnReferenceKnown { output: 0 },
-			InferenceInputRole::BayesQueryParents { conditional: 0 },
-			InferenceInputRole::BayesReferenceParents { conditional: 0 },
-			InferenceInputRole::BayesReferenceChild { conditional: 0 },
-			InferenceInputRole::BayesParentMultipliers { conditional: 0 },
-			InferenceInputRole::BayesParentCardinalities { conditional: 0 },
-			InferenceInputRole::BayesConcatenationLeftIndices { join: 1 },
-			InferenceInputRole::BayesConcatenationRightIndices { join: 1 },
-			InferenceInputRole::BayesConcatenationSelectLeft { join: 1 },
-			InferenceInputRole::GgufTokenIds,
-			InferenceInputRole::GgufTensor { tensor: 0 },
-			InferenceInputRole::GgufRopePartnerIndices,
-			InferenceInputRole::GgufRopeCosines,
-			InferenceInputRole::GgufRopeSignedSines,
-		]
-	}
-
-	pub(crate) fn compiled_inference_boundary_role_fixture(role: InferenceInputRole) -> CompiledInference {
-		let role = match role {
-			InferenceInputRole::Feature { .. }
-			| InferenceInputRole::FeatureNormalizationMask
-			| InferenceInputRole::DataNormalizationMean
-			| InferenceInputRole::DataNormalizationVariance
-			| InferenceInputRole::DataNormalizationMinimum
-			| InferenceInputRole::DataNormalizationMaximum
-			| InferenceInputRole::LayerWeight { .. }
-			| InferenceInputRole::LayerBias { .. }
-			| InferenceInputRole::LayerPRelu { .. }
-			| InferenceInputRole::EmbeddingTable { .. }
-			| InferenceInputRole::AttentionQuery { .. }
-			| InferenceInputRole::AttentionKey { .. }
-			| InferenceInputRole::AttentionValue { .. }
-			| InferenceInputRole::AttentionOutput { .. }
-			| InferenceInputRole::RnnInputWeight { .. }
-			| InferenceInputRole::RnnRecurrentWeight { .. }
-			| InferenceInputRole::RnnBias { .. }
-			| InferenceInputRole::GruResetInputWeight { .. }
-			| InferenceInputRole::GruResetRecurrentWeight { .. }
-			| InferenceInputRole::GruResetBias { .. }
-			| InferenceInputRole::GruUpdateInputWeight { .. }
-			| InferenceInputRole::GruUpdateRecurrentWeight { .. }
-			| InferenceInputRole::GruUpdateBias { .. }
-			| InferenceInputRole::GruCandidateInputWeight { .. }
-			| InferenceInputRole::GruCandidateRecurrentWeight { .. }
-			| InferenceInputRole::GruCandidateBias { .. }
-			| InferenceInputRole::LstmInputGateInputWeight { .. }
-			| InferenceInputRole::LstmInputGateRecurrentWeight { .. }
-			| InferenceInputRole::LstmInputGateBias { .. }
-			| InferenceInputRole::LstmForgetGateInputWeight { .. }
-			| InferenceInputRole::LstmForgetGateRecurrentWeight { .. }
-			| InferenceInputRole::LstmForgetGateBias { .. }
-			| InferenceInputRole::LstmOutputGateInputWeight { .. }
-			| InferenceInputRole::LstmOutputGateRecurrentWeight { .. }
-			| InferenceInputRole::LstmOutputGateBias { .. }
-			| InferenceInputRole::LstmCandidateInputWeight { .. }
-			| InferenceInputRole::LstmCandidateRecurrentWeight { .. }
-			| InferenceInputRole::LstmCandidateBias { .. }
-			| InferenceInputRole::ConvolutionWindowIndices { .. }
-			| InferenceInputRole::ConvolutionWeight { .. }
-			| InferenceInputRole::ConvolutionBias { .. }
-			| InferenceInputRole::ConvolutionPRelu { .. }
-			| InferenceInputRole::PoolWindowIndices { .. }
-			| InferenceInputRole::PoolWinnerBases { .. }
-			| InferenceInputRole::KMeansCentroids { .. }
-			| InferenceInputRole::TreeSplitFeatures { .. }
-			| InferenceInputRole::TreeSplitThresholds { .. }
-			| InferenceInputRole::TreeLeafValues { .. }
-			| InferenceInputRole::ResidualProjectionWeight { .. }
-			| InferenceInputRole::ResidualBranchPRelu { .. }
-			| InferenceInputRole::ResidualOutputPRelu { .. }
-			| InferenceInputRole::Temperature
-			| InferenceInputRole::KnnReferenceFeatures
-			| InferenceInputRole::KnnReferenceValues { .. }
-			| InferenceInputRole::KnnReferenceKnown { .. }
-			| InferenceInputRole::BayesQueryParents { .. }
-			| InferenceInputRole::BayesReferenceParents { .. }
-			| InferenceInputRole::BayesReferenceChild { .. }
-			| InferenceInputRole::BayesParentMultipliers { .. }
-			| InferenceInputRole::BayesParentCardinalities { .. }
-			| InferenceInputRole::BayesConcatenationLeftIndices { .. }
-			| InferenceInputRole::BayesConcatenationRightIndices { .. }
-			| InferenceInputRole::BayesConcatenationSelectLeft { .. }
-			| InferenceInputRole::GgufTokenIds
-			| InferenceInputRole::GgufTensor { .. }
-			| InferenceInputRole::GgufRopePartnerIndices
-			| InferenceInputRole::GgufRopeCosines
-			| InferenceInputRole::GgufRopeSignedSines => role,
-		};
-		compiled_inference_boundary_fixture_with_role(InferenceBoundaryFault::Valid, role)
-	}
-
-	pub(crate) fn compiled_inference_boundary_fixture(fault: InferenceBoundaryFault) -> CompiledInference {
-		compiled_inference_boundary_fixture_with_role(
-			fault,
-			InferenceInputRole::Feature {
-				feature: 0,
-				source_vector: 0,
-			},
-		)
-	}
-
-	fn compiled_inference_boundary_fixture_with_role(
-		fault: InferenceBoundaryFault,
-		role: InferenceInputRole,
-	) -> CompiledInference {
-		let mut compiler = InferenceGraphCompiler::new();
-		let dtype = match fault {
-			InferenceBoundaryFault::I32Prediction => DType::I32,
-			_ => DType::F32,
-		};
-		let shape = Shape::new(vec![2, 1]).unwrap();
-		let bytes = vec![0; usize::try_from(shape.bytes(dtype).unwrap().get()).unwrap()];
-		let input = compiler
-			.external(role, dtype, shape.clone(), bytes.clone())
-			.unwrap();
-
-		if fault == InferenceBoundaryFault::DuplicateSemanticRole {
-			compiler
-				.external(role, dtype, shape.clone(), bytes)
-				.unwrap();
-		}
-		if fault == InferenceBoundaryFault::NonCanonicalInputLayout {
-			compiler.tensors.get_mut(&input).unwrap().layout =
-				TensorLayout::contiguous(&shape, ContiguousOrder::ColumnMajor).unwrap();
-		}
-		if fault == InferenceBoundaryFault::PaddedInputStorage {
-			compiler.tensors.get_mut(&input).unwrap().storage_bytes =
-				ByteCount::new(shape.bytes(dtype).unwrap().get() + u64::from(dtype.byte_width()));
-		}
-
-		let prediction = if fault == InferenceBoundaryFault::InputIsUnproducedPrediction {
-			input
-		} else {
-			let prediction = compiler.tensor(dtype, shape.clone()).unwrap();
-			if fault == InferenceBoundaryFault::NonCanonicalOutputLayout {
-				compiler.tensors.get_mut(&prediction).unwrap().layout =
-					TensorLayout::contiguous(&shape, ContiguousOrder::ColumnMajor).unwrap();
-			}
-			if fault == InferenceBoundaryFault::PaddedOutputStorage {
-				compiler.tensors.get_mut(&prediction).unwrap().storage_bytes =
-					ByteCount::new(shape.bytes(dtype).unwrap().get() + u64::from(dtype.byte_width()));
-			}
-			let mut builder = ScalarProgramBuilder::new().unwrap();
-			let value = builder.input(dtype).unwrap();
-			let program = builder.finish(&[value]).unwrap();
-			compiler
-				.emit_elementwise(vec![input], vec![prediction], program)
-				.unwrap();
-			prediction
-		};
-
-		compiler
-			.finish(
-				prediction,
-				InferencePredictionKind::Regression,
-				2,
-				InferenceTask::Dense(DenseTask::ScalarRegression { target_vector: 0 }),
-				vec![DType::F32],
-				None,
-			)
-			.unwrap()
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use std::collections::BTreeMap;
-	use std::fs;
-	use std::sync::atomic::{AtomicU64, Ordering};
-
-	use recipe_core::{ScalarLiteral, ScalarProgram, ScalarValueId};
-	use recipe_ingest::{
-		Delimiter, HeaderMode, InferencePrepareErrorKind, IngestLimits, TableRequest, distill_dataset, parse_table,
-	};
-
-	use super::*;
-
-	#[derive(Debug)]
-	struct TestPath(std::path::PathBuf);
-
-	impl TestPath {
-		fn new(name: &str) -> Self {
-			static NEXT: AtomicU64 = AtomicU64::new(1);
-			let path = std::env::temp_dir().join(format!(
-				"recipe-training-inference-{}-{}-{name}",
-				std::process::id(),
-				NEXT.fetch_add(1, Ordering::Relaxed)
-			));
-			Self(path)
-		}
-	}
-
-	impl Drop for TestPath {
-		fn drop(&mut self) {
-			let _ = fs::remove_file(&self.0);
-			let _ = fs::remove_dir_all(&self.0);
-		}
-	}
-
-	fn table(source: &[u8]) -> RawTable {
-		parse_table(
-			source,
-			TableRequest::new(
-				Delimiter::Comma,
-				HeaderMode::Present,
-				IngestLimits::new(4_096, 32, 16, 1_024).unwrap(),
-			),
-		)
-		.unwrap()
-	}
-
-	#[derive(Clone, Copy, Debug)]
-	enum TestScalar {
-		F32(f32),
-		I32(i32),
-	}
-
-	impl TestScalar {
-		fn f32(self) -> f32 {
-			match self {
-				Self::F32(value) => value,
-				Self::I32(_) => panic!("expected f32 test value"),
-			}
-		}
-
-		fn i32(self) -> i32 {
-			match self {
-				Self::I32(value) => value,
-				Self::F32(_) => panic!("expected i32 test value"),
-			}
-		}
-	}
-
-	#[derive(Clone, Copy, Debug)]
-	struct TestEvaluation {
-		output: f32,
-		faulted: bool,
-	}
-
-	fn evaluate_test_program(program: &ScalarProgram, inputs: &[f32]) -> TestEvaluation {
-		assert_eq!(program.inputs.len(), inputs.len());
-		let mut values = BTreeMap::<ScalarValueId, TestScalar>::new();
-		for (input, value) in program.inputs.iter().zip(inputs) {
-			assert_eq!(input.dtype, DType::F32);
-			values.insert(input.id, TestScalar::F32(*value));
-		}
-		for constant in &program.constants {
-			let value = match constant.value {
-				ScalarLiteral::F32Bits(bits) => TestScalar::F32(f32::from_bits(bits)),
-				ScalarLiteral::I32(value) => TestScalar::I32(value),
-			};
-			values.insert(constant.id, value);
-		}
-
-		let mut faulted = false;
-		for instruction in &program.instructions {
-			let operands = instruction
-				.operands
-				.iter()
-				.map(|operand| values[operand])
-				.collect::<Vec<_>>();
-			let unary = || operands[0];
-			let binary = || (operands[0], operands[1]);
-			let value = match instruction.opcode {
-				ScalarOpcode::Add => {
-					let (left, right) = binary();
-					match (left, right) {
-						(TestScalar::F32(left), TestScalar::F32(right)) => TestScalar::F32(left + right),
-						(TestScalar::I32(left), TestScalar::I32(right)) => {
-							TestScalar::I32(left.wrapping_add(right))
-						}
-						_ => panic!("mixed test add"),
-					}
-				}
-				ScalarOpcode::Multiply => {
-					let (left, right) = binary();
-					TestScalar::F32(left.f32() * right.f32())
-				}
-				ScalarOpcode::Divide => {
-					let (left, right) = binary();
-					TestScalar::F32(left.f32() / right.f32())
-				}
-				ScalarOpcode::Negate => TestScalar::F32(-unary().f32()),
-				ScalarOpcode::Absolute => TestScalar::F32(unary().f32().abs()),
-				ScalarOpcode::Maximum => {
-					let (left, right) = binary();
-					TestScalar::F32(left.f32().max(right.f32()))
-				}
-				ScalarOpcode::Fma => TestScalar::F32(
-					operands[0]
-						.f32()
-						.mul_add(operands[1].f32(), operands[2].f32()),
-				),
-				ScalarOpcode::LessThan => {
-					let (left, right) = binary();
-					let result = match (left, right) {
-						(TestScalar::F32(left), TestScalar::F32(right)) => left < right,
-						(TestScalar::I32(left), TestScalar::I32(right)) => left < right,
-						_ => panic!("mixed test comparison"),
-					};
-					TestScalar::I32(i32::from(result))
-				}
-				ScalarOpcode::LessThanOrEqual => {
-					let (left, right) = binary();
-					let result = match (left, right) {
-						(TestScalar::F32(left), TestScalar::F32(right)) => left <= right,
-						(TestScalar::I32(left), TestScalar::I32(right)) => left <= right,
-						_ => panic!("mixed test comparison"),
-					};
-					TestScalar::I32(i32::from(result))
-				}
-				ScalarOpcode::GreaterThanOrEqual => {
-					let (left, right) = binary();
-					TestScalar::I32(i32::from(left.f32() >= right.f32()))
-				}
-				ScalarOpcode::Select => match operands[0].i32() != 0 {
-					true => operands[1],
-					false => operands[2],
-				},
-				ScalarOpcode::ShiftLeft => {
-					let (left, right) = binary();
-					TestScalar::I32(left.i32().wrapping_shl(right.i32() as u32))
-				}
-				ScalarOpcode::BitcastI32ToF32 => TestScalar::F32(f32::from_bits(unary().i32() as u32)),
-				ScalarOpcode::Require => {
-					faulted |= unary().i32() == 0;
-					unary()
-				}
-				ScalarOpcode::IsFinite => TestScalar::I32(i32::from(unary().f32().is_finite())),
-				ScalarOpcode::RoundNearestEven => TestScalar::F32(unary().f32().round_ties_even()),
-				ScalarOpcode::ConvertF32ToI32 => TestScalar::I32(unary().f32() as i32),
-				opcode => panic!("unsupported inference test opcode {opcode:?}"),
-			};
-			values.insert(instruction.result, value);
-		}
-
-		assert_eq!(program.outputs.len(), 1);
-		TestEvaluation {
-			output: values[&program.outputs[0]].f32(),
-			faulted,
-		}
-	}
-
-	#[test]
-	fn saved_spans_align_raw_numeric_and_reserved_categorical_routes_without_host_calculation() {
-		let schema = [
-			InferenceFeatureSchema::new(3, b"amount", InferenceFeatureEncoding::NumericI32),
-			InferenceFeatureSchema::new(
-				8,
-				b"color",
-				InferenceFeatureEncoding::CategoricalDictionary {
-					dictionary: vec![b"blue".to_vec(), b"red".to_vec()],
-				},
-			),
-		];
-		let prepared =
-			recipe_ingest::prepare_inference_table(&table(b"color,amount\nred,10\npurple,20\n"), &schema)
-				.unwrap();
-		let spans = [
-			CompiledFeatureSpan::new(3, 0, 1, DenseFeatureLowering::NumericScalar),
-			CompiledFeatureSpan::new(
-				8,
-				1,
-				3,
-				DenseFeatureLowering::CategoricalOneHot {
-					dictionary_width: 2,
-					reserved_index: 2,
-				},
-			),
-		];
-		validate_prepared_feature_spans(&prepared, &spans).unwrap();
-		assert_eq!(
-			prepared.features()[0].values(),
-			&PreparedInferenceValues::I32(vec![10, 20])
-		);
-		assert_eq!(
-			prepared.features()[1].values(),
-			&PreparedInferenceValues::I32(vec![1, 2])
-		);
-	}
-
-	#[test]
-	fn checkpoint_file_loader_enforces_regular_file_and_source_bound() {
-		let directory = TestPath::new("directory");
-		fs::create_dir(&directory.0).unwrap();
-		let error = load_checkpoint_file(&directory.0, CheckpointDecodeLimits::default()).unwrap_err();
-		assert!(matches!(
-			error,
-			InferencePreparationError::CheckpointSource(_)
-		));
-
-		let file = TestPath::new("large.ogdl");
-		fs::write(&file.0, b"12345").unwrap();
-		let mut limits = CheckpointDecodeLimits::default();
-		limits.source_bytes = 4;
-		let error = load_checkpoint_file(&file.0, limits).unwrap_err();
-		assert!(matches!(
-			error,
-			InferencePreparationError::CheckpointSource(_)
-		));
-	}
-
-	#[test]
-	fn loaded_v5_artifact_prepares_reordered_target_free_rows_and_retains_normalization() {
-		let file = TestPath::new("valid.ogdl");
-		fs::write(
-			&file.0,
-			crate::checkpoint::encoded_test_checkpoint_fixture(),
-		)
-		.unwrap();
-		let checkpoint = load_checkpoint_file(&file.0, CheckpointDecodeLimits::default()).unwrap();
-		let data_file = TestPath::new("inference.csv");
-		fs::write(&data_file.0, b"extra,\"feature\nbytes\"\nignored,1.5\n").unwrap();
-		let dataset = distill_dataset(
-			&data_file.0,
-			IngestLimits::new(4_096, 32, 16, 1_024).unwrap(),
-		)
-		.unwrap();
-		let prepared = prepare_checkpoint_inference(checkpoint, &dataset).unwrap();
-		assert_eq!(
-			prepared.features()[0].values(),
-			&PreparedInferenceValues::F32Bits(vec![1.5f32.to_bits()])
-		);
-		assert_eq!(prepared.feature_spans().len(), 1);
-		assert_eq!(prepared.normalization(), DenseDataNormalization::ZScore);
-		assert_eq!(prepared.normalization_tensors().len(), 2);
-		assert_eq!(prepared.feature_normalization_mask(), &[1.0f32.to_bits()]);
-		assert_eq!(prepared.normalization_epsilon().to_bits(), 0x3586_37bd);
-	}
-
-	#[test]
-	fn loaded_v5_dictionary_routes_unseen_and_missing_values_without_refitting() {
-		let file = TestPath::new("categorical.ogdl");
-		fs::write(
-			&file.0,
-			crate::checkpoint::encoded_categorical_feature_test_checkpoint_fixture(),
-		)
-		.unwrap();
-		let checkpoint = load_checkpoint_file(&file.0, CheckpointDecodeLimits::default()).unwrap();
-		let data_file = TestPath::new("categorical-inference.csv");
-		fs::write(
-			&data_file.0,
-			b"extra,\"feature\nbytes\"\nignored,red\nignored,purple\nignored,\"\"\n",
-		)
-		.unwrap();
-		let dataset = distill_dataset(
-			&data_file.0,
-			IngestLimits::new(4_096, 32, 16, 1_024).unwrap(),
-		)
-		.unwrap();
-		let prepared = prepare_checkpoint_inference(checkpoint, &dataset).unwrap();
-		assert_eq!(
-			prepared.features()[0].values(),
-			&PreparedInferenceValues::I32(vec![1, 2, 2])
-		);
-		assert_eq!(prepared.feature_spans()[0].start(), 0);
-		assert_eq!(prepared.feature_spans()[0].width(), 3);
-		assert_eq!(
-			prepared.feature_normalization_mask(),
-			&[0.0f32.to_bits(), 0.0f32.to_bits(), 0.0f32.to_bits()]
-		);
-	}
-
-	#[test]
-	fn loaded_v5_schema_rejects_a_missing_required_feature_with_its_typed_path() {
-		let file = TestPath::new("missing-feature.ogdl");
-		fs::write(
-			&file.0,
-			crate::checkpoint::encoded_test_checkpoint_fixture(),
-		)
-		.unwrap();
-		let checkpoint = load_checkpoint_file(&file.0, CheckpointDecodeLimits::default()).unwrap();
-		let error = prepare_checkpoint_inference_table(checkpoint, &table(b"extra\n1\n")).unwrap_err();
-		let InferencePreparationError::Data(error) = error else {
-			panic!("expected typed inference data error");
-		};
-		assert_eq!(
-			error.kind(),
-			InferencePrepareErrorKind::MissingRequiredFeature
-		);
-		let path = error.path().unwrap();
-		assert_eq!(path.feature(), 0);
-		assert_eq!(path.source_vector(), 0);
-		assert_eq!(path.column(), b"feature\nbytes");
-		assert_eq!(path.source_row(), None);
-	}
-
-	#[test]
-	fn checkpoint_schema_errors_remain_typed_through_training_boundary() {
-		let schema = [InferenceFeatureSchema::new(
-			4,
-			b"required",
-			InferenceFeatureEncoding::NumericF32,
-		)];
-		let error = recipe_ingest::prepare_inference_table(&table(b"other\n1\n"), &schema).unwrap_err();
-		let error = InferencePreparationError::from(error);
-		let InferencePreparationError::Data(error) = error else {
-			panic!("expected typed inference data error");
-		};
-		assert_eq!(
-			error.kind(),
-			InferencePrepareErrorKind::MissingRequiredFeature
-		);
-		assert_eq!(error.path().unwrap().source_vector(), 4);
-	}
-
-	fn prepared_fixture(checkpoint: &[u8], source: &[u8]) -> PreparedInference {
-		let checkpoint = decode_checkpoint(checkpoint, CheckpointDecodeLimits::default()).unwrap();
-		prepare_checkpoint_inference_table(checkpoint, &table(source)).unwrap()
-	}
-
-	fn external_output_count(compiled: &CompiledInference) -> usize {
-		compiled
-			.graph()
-			.tensors
-			.iter()
-			.filter(|tensor| tensor.external_output)
-			.count()
-	}
-
-	#[test]
-	fn binary_inference_compiles_one_target_free_probability_output_deterministically() {
-		let encoded = crate::checkpoint::encoded_test_checkpoint_fixture();
-		let prepared = prepared_fixture(
-			&encoded,
-			b"extra,\"feature\nbytes\"\nignored,1.5\nignored,2.5\n",
-		);
-		let first = compile_prepared_inference(&prepared).unwrap();
-		let second = compile_prepared_inference(&prepared).unwrap();
-
-		assert_eq!(first.rows(), 2);
-		assert_eq!(
-			first.output().kind(),
-			InferencePredictionKind::BinaryProbability
-		);
-		assert_eq!(first.output().dtype(), DType::F32);
-		assert_eq!(first.output().target_dtype(), DType::F32);
-		assert_eq!(first.output().shape().extents(), [2, 1]);
-		assert_eq!(external_output_count(&first), 1);
-		assert_eq!(
-			first.program().iterations(),
-			recipe_core::LoopIterations::ONE
-		);
-		assert!(
-			first.program()
-				.domains()
-				.iter()
-				.all(|domain| domain.domain == IterationDomain::first())
-		);
-		assert_eq!(
-			first.program().to_ogdl().unwrap(),
-			second.program().to_ogdl().unwrap()
-		);
-		assert!(
-			first.graph()
-				.nodes
-				.iter()
-				.all(|node| !matches!(node.kernel.kind, PrimitiveKind::Random(_)))
-		);
-		let gradual_underflow_exp = recipe_math::exp_with_gradual_underflow_program().unwrap();
-		assert!(first.graph().nodes.iter().any(|node| {
-			matches!(
-				&node.kernel.kind,
-				PrimitiveKind::Elementwise(map) if map.program == gradual_underflow_exp
-			)
-		}));
-		assert_eq!(
-			first.external_inputs()
-				.iter()
-				.map(InferenceExternalInput::role)
-				.collect::<Vec<_>>(),
-			[
-				InferenceInputRole::Feature {
-					feature: 0,
-					source_vector: 0,
-				},
-				InferenceInputRole::FeatureNormalizationMask,
-				InferenceInputRole::DataNormalizationMean,
-				InferenceInputRole::DataNormalizationVariance,
-				InferenceInputRole::LayerWeight { layer: 0 },
-				InferenceInputRole::LayerBias { layer: 0 },
-			]
-		);
-		let feature = &first.external_inputs()[0];
-		assert_eq!(feature.dtype(), DType::F32);
-		assert_eq!(feature.shape().extents(), [2]);
-		assert_eq!(
-			feature.bytes(),
-			[
-				1.5f32.to_le_bytes().as_slice(),
-				2.5f32.to_le_bytes().as_slice(),
-			]
-			.concat()
-		);
-	}
-
-	#[test]
-	fn prelu_inference_admits_saved_scalars_in_occurrence_order() {
-		let encoded = crate::checkpoint::encoded_prelu_test_checkpoint_fixture();
-		let prepared = prepared_fixture(&encoded, b"\"feature\nbytes\"\n1.5\n");
-		let compiled = compile_prepared_inference(&prepared).unwrap();
-
-		let slopes = compiled
-			.external_inputs()
-			.iter()
-			.filter(|input| matches!(input.role(), InferenceInputRole::LayerPRelu { .. }))
-			.collect::<Vec<_>>();
-		assert_eq!(slopes.len(), 2);
-		assert_eq!(
-			slopes.iter().map(|input| input.role()).collect::<Vec<_>>(),
-			[
-				InferenceInputRole::LayerPRelu {
-					layer: 0,
-					occurrence: 0,
-				},
-				InferenceInputRole::LayerPRelu {
-					layer: 0,
-					occurrence: 1,
-				},
-			]
-		);
-		assert_eq!(slopes[0].bytes(), 0.25f32.to_le_bytes());
-		assert_eq!(slopes[1].bytes(), 0.5f32.to_le_bytes());
-
-		let slope_values = slopes
-			.iter()
-			.map(|input| input.value())
-			.collect::<BTreeSet<_>>();
-		let expected_program = canonical_prelu_program().unwrap();
-		let applications = compiled
-			.graph()
-			.nodes
-			.iter()
-			.filter(|node| {
-				matches!(
-					&node.kernel.kind,
-					PrimitiveKind::Elementwise(elementwise)
-						if elementwise.program == expected_program
-							&& node.kernel.inputs.get(1).is_some_and(|value| slope_values.contains(value))
-				)
-			})
-			.count();
-		assert_eq!(applications, 2);
-	}
-
-	#[test]
-	fn logarithm_inference_preserves_signed_natural_and_legacy_program_identities() {
-		let encoded = crate::checkpoint::encoded_logarithm_test_checkpoint_fixture();
-		let prepared = prepared_fixture(&encoded, b"\"feature\nbytes\"\n1.5\n");
-		let compiled = compile_prepared_inference(&prepared).unwrap();
-		let signed_and_natural = ScalarProgram::try_from(recipe_math::MathFunction::Log).unwrap();
-		let legacy = ScalarProgram::try_from(recipe_math::MathFunction::LogOnePlus).unwrap();
-
-		let signed_and_natural_count = compiled
-			.graph()
-			.nodes
-			.iter()
-			.filter(|node| {
-				matches!(
-					&node.kernel.kind,
-					PrimitiveKind::Elementwise(elementwise) if elementwise.program == signed_and_natural
-				)
-			})
-			.count();
-		let legacy_count = compiled
-			.graph()
-			.nodes
-			.iter()
-			.filter(|node| {
-				matches!(
-					&node.kernel.kind,
-					PrimitiveKind::Elementwise(elementwise) if elementwise.program == legacy
-				)
-			})
-			.count();
-
-		assert_eq!(signed_and_natural_count, 2);
-		assert_eq!(legacy_count, 1);
-	}
-
-	#[test]
-	fn categorical_inference_one_hot_and_dense_assembly_are_device_calculations() {
-		let encoded = crate::checkpoint::encoded_categorical_feature_test_checkpoint_fixture();
-		let prepared = prepared_fixture(
-			&encoded,
-			b"extra,\"feature\nbytes\"\nignored,red\nignored,purple\nignored,\"\"\n",
-		);
-		let compiled = compile_prepared_inference(&prepared).unwrap();
-		let feature = compiled
-			.external_inputs()
-			.iter()
-			.find(|input| matches!(input.role(), InferenceInputRole::Feature { .. }))
-			.unwrap();
-		assert_eq!(feature.dtype(), DType::I32);
-		assert_eq!(feature.shape().extents(), [3]);
-		assert_eq!(
-			feature.bytes(),
-			[1_i32, 2, 2]
-				.into_iter()
-				.flat_map(i32::to_le_bytes)
-				.collect::<Vec<_>>()
-		);
-		assert!(
-			compiled
-				.external_inputs()
-				.iter()
-				.all(|input| { !(input.dtype() == DType::F32 && input.shape().extents() == [3, 3]) })
-		);
-		assert!(
-			compiled
-				.graph()
-				.nodes
-				.iter()
-				.filter(|node| matches!(node.kernel.kind, PrimitiveKind::Scatter(_)))
-				.count() >= 2
-		);
-		assert_eq!(compiled.output().shape().extents(), [3, 1]);
-		assert_eq!(external_output_count(&compiled), 1);
-	}
-
-	#[test]
-	fn embedding_inference_keeps_token_ids_int32_and_gathers_the_saved_table() {
-		let encoded = crate::checkpoint::encoded_embedding_test_checkpoint_fixture();
-		let prepared = prepared_fixture(&encoded, b"\"feature\nbytes\"\n3\n7\n");
-		let compiled = compile_prepared_inference(&prepared).unwrap();
-		let feature = compiled
-			.external_inputs()
-			.iter()
-			.find(|input| matches!(input.role(), InferenceInputRole::Feature { .. }))
-			.expect("raw token feature exists");
-		assert_eq!(feature.dtype(), DType::I32);
-		assert_eq!(feature.shape().extents(), [2]);
-		let table = compiled
-			.external_inputs()
-			.iter()
-			.find(|input| {
-				matches!(
-					input.role(),
-					InferenceInputRole::EmbeddingTable { block: 0 }
-				)
-			})
-			.expect("saved embedding table exists");
-		assert_eq!(table.dtype(), DType::F32);
-		assert_eq!(table.shape().extents(), [8, 2]);
-		assert!(
-			compiled
-				.external_inputs()
-				.iter()
-				.all(|input| input.role() != InferenceInputRole::FeatureNormalizationMask)
-		);
-		assert!(compiled.graph().nodes.iter().any(|node| {
-			matches!(node.kernel.kind, PrimitiveKind::Gather(_))
-				&& node.kernel.inputs.first() == Some(&table.value())
-		}));
-		assert_eq!(compiled.output().shape().extents(), [2, 1]);
-		assert_eq!(external_output_count(&compiled), 1);
-
-		let out_of_range = prepared_fixture(&encoded, b"\"feature\nbytes\"\n8\n");
-		let error = compile_prepared_inference(&out_of_range).unwrap_err();
-		assert_eq!(
-			error.kind(),
-			InferenceCompileErrorKind::InconsistentCheckpoint
-		);
-		assert!(error.detail().contains("outside 0..8"));
-	}
-
-	#[test]
-	fn attention_inference_loads_all_projections_and_materializes_causal_softmax() {
-		let encoded = crate::checkpoint::encoded_attention_test_checkpoint_fixture();
-		let prepared = prepared_fixture(&encoded, b"\"feature\nbytes\"\n3\n7\n");
-		let compiled = compile_prepared_inference(&prepared).unwrap();
-		for role in [
-			InferenceInputRole::AttentionQuery { block: 1 },
-			InferenceInputRole::AttentionKey { block: 1 },
-			InferenceInputRole::AttentionValue { block: 1 },
-			InferenceInputRole::AttentionOutput { block: 1 },
-		] {
-			let parameter = compiled
-				.external_inputs()
-				.iter()
-				.find(|input| input.role() == role)
-				.expect("saved attention projection exists");
-			assert_eq!(parameter.dtype(), DType::F32);
-			assert_eq!(parameter.shape().extents(), [2, 2]);
-		}
-		assert!(compiled.graph().nodes.iter().any(|node| {
-			matches!(
-				&node.kernel.kind,
-				PrimitiveKind::Contraction(contraction)
-					if contraction.batch_axes == [(0, 0), (2, 2)]
-						&& contraction.contract_axes == [(3, 3)]
-			)
-		}));
-		let reductions = compiled
-			.graph()
-			.nodes
-			.iter()
-			.filter_map(|node| match &node.kernel.kind {
-				PrimitiveKind::Reduce(reduce) => Some(reduce.operator),
-				_ => None,
-			})
-			.collect::<Vec<_>>();
-		assert!(reductions.contains(&ReduceOperator::Maximum));
-		assert!(reductions.contains(&ReduceOperator::Sum));
-		assert_eq!(compiled.output().shape().extents(), [2, 1]);
-		assert_eq!(external_output_count(&compiled), 1);
-	}
-
-	#[test]
-	fn rnn_inference_loads_recurrent_parameters_and_returns_only_the_final_hidden_state() {
-		let encoded = crate::checkpoint::encoded_rnn_test_checkpoint_fixture();
-		let prepared = prepared_fixture(&encoded, b"\"feature\nbytes\"\n1.5\n2.5\n");
-		let compiled = compile_prepared_inference(&prepared).unwrap();
-		let recurrent_weight = compiled
-			.external_inputs()
-			.iter()
-			.find(|input| input.role() == InferenceInputRole::RnnRecurrentWeight { block: 0 })
-			.expect("saved RNN recurrent weight exists");
-		assert_eq!(recurrent_weight.dtype(), DType::F32);
-		assert_eq!(recurrent_weight.shape().extents(), [2, 2]);
-		for (role, expected_shape) in [
-			(InferenceInputRole::RnnInputWeight { block: 0 }, &[1, 2][..]),
-			(InferenceInputRole::RnnBias { block: 0 }, &[2][..]),
-		] {
-			let parameter = compiled
-				.external_inputs()
-				.iter()
-				.find(|input| input.role() == role)
-				.expect("saved RNN parameter exists");
-			assert_eq!(parameter.shape().extents(), expected_shape);
-		}
-		assert!(compiled.graph().nodes.iter().any(|node| {
-			matches!(node.kernel.kind, PrimitiveKind::Contraction(_))
-				&& node.kernel.inputs.get(1) == Some(&recurrent_weight.value())
-		}));
-		assert_eq!(compiled.output().shape().extents(), [2, 1]);
-		assert_eq!(external_output_count(&compiled), 1);
-	}
-
-	#[test]
-	fn gru_inference_loads_all_gates_and_returns_only_the_final_hidden_state() {
-		let encoded = crate::checkpoint::encoded_gru_test_checkpoint_fixture();
-		let prepared = prepared_fixture(&encoded, b"\"feature\nbytes\"\n1.5\n2.5\n");
-		let compiled = compile_prepared_inference(&prepared).unwrap();
-		for (role, expected_shape) in [
-			(
-				InferenceInputRole::GruResetInputWeight { block: 0 },
-				&[1, 2][..],
-			),
-			(
-				InferenceInputRole::GruResetRecurrentWeight { block: 0 },
-				&[2, 2][..],
-			),
-			(InferenceInputRole::GruResetBias { block: 0 }, &[2][..]),
-			(
-				InferenceInputRole::GruUpdateInputWeight { block: 0 },
-				&[1, 2][..],
-			),
-			(
-				InferenceInputRole::GruUpdateRecurrentWeight { block: 0 },
-				&[2, 2][..],
-			),
-			(InferenceInputRole::GruUpdateBias { block: 0 }, &[2][..]),
-			(
-				InferenceInputRole::GruCandidateInputWeight { block: 0 },
-				&[1, 2][..],
-			),
-			(
-				InferenceInputRole::GruCandidateRecurrentWeight { block: 0 },
-				&[2, 2][..],
-			),
-			(InferenceInputRole::GruCandidateBias { block: 0 }, &[2][..]),
-		] {
-			let parameter = compiled
-				.external_inputs()
-				.iter()
-				.find(|input| input.role() == role)
-				.expect("saved GRU parameter exists");
-			assert_eq!(parameter.dtype(), DType::F32);
-			assert_eq!(parameter.shape().extents(), expected_shape);
-		}
-		for role in [
-			InferenceInputRole::GruResetRecurrentWeight { block: 0 },
-			InferenceInputRole::GruUpdateRecurrentWeight { block: 0 },
-			InferenceInputRole::GruCandidateRecurrentWeight { block: 0 },
-		] {
-			let recurrent_weight = compiled
-				.external_inputs()
-				.iter()
-				.find(|input| input.role() == role)
-				.expect("saved GRU recurrent weight exists");
-			assert!(compiled.graph().nodes.iter().any(|node| {
-				matches!(node.kernel.kind, PrimitiveKind::Contraction(_))
-					&& node.kernel.inputs.get(1) == Some(&recurrent_weight.value())
-			}));
-		}
-		assert_eq!(compiled.output().shape().extents(), [2, 1]);
-		assert_eq!(external_output_count(&compiled), 1);
-	}
-
-	#[test]
-	fn lstm_inference_loads_all_gates_and_returns_only_the_final_hidden_state() {
-		let encoded = crate::checkpoint::encoded_lstm_test_checkpoint_fixture();
-		let prepared = prepared_fixture(&encoded, b"\"feature\nbytes\"\n1.5\n2.5\n");
-		let compiled = compile_prepared_inference(&prepared).unwrap();
-		for (role, expected_shape) in [
-			(
-				InferenceInputRole::LstmInputGateInputWeight { block: 0 },
-				&[1, 2][..],
-			),
-			(
-				InferenceInputRole::LstmInputGateRecurrentWeight { block: 0 },
-				&[2, 2][..],
-			),
-			(InferenceInputRole::LstmInputGateBias { block: 0 }, &[2][..]),
-			(
-				InferenceInputRole::LstmForgetGateInputWeight { block: 0 },
-				&[1, 2][..],
-			),
-			(
-				InferenceInputRole::LstmForgetGateRecurrentWeight { block: 0 },
-				&[2, 2][..],
-			),
-			(
-				InferenceInputRole::LstmForgetGateBias { block: 0 },
-				&[2][..],
-			),
-			(
-				InferenceInputRole::LstmOutputGateInputWeight { block: 0 },
-				&[1, 2][..],
-			),
-			(
-				InferenceInputRole::LstmOutputGateRecurrentWeight { block: 0 },
-				&[2, 2][..],
-			),
-			(
-				InferenceInputRole::LstmOutputGateBias { block: 0 },
-				&[2][..],
-			),
-			(
-				InferenceInputRole::LstmCandidateInputWeight { block: 0 },
-				&[1, 2][..],
-			),
-			(
-				InferenceInputRole::LstmCandidateRecurrentWeight { block: 0 },
-				&[2, 2][..],
-			),
-			(InferenceInputRole::LstmCandidateBias { block: 0 }, &[2][..]),
-		] {
-			let parameter = compiled
-				.external_inputs()
-				.iter()
-				.find(|input| input.role() == role)
-				.expect("saved LSTM parameter exists");
-			assert_eq!(parameter.dtype(), DType::F32);
-			assert_eq!(parameter.shape().extents(), expected_shape);
-		}
-		for role in [
-			InferenceInputRole::LstmInputGateRecurrentWeight { block: 0 },
-			InferenceInputRole::LstmForgetGateRecurrentWeight { block: 0 },
-			InferenceInputRole::LstmOutputGateRecurrentWeight { block: 0 },
-			InferenceInputRole::LstmCandidateRecurrentWeight { block: 0 },
-		] {
-			let recurrent_weight = compiled
-				.external_inputs()
-				.iter()
-				.find(|input| input.role() == role)
-				.expect("saved LSTM recurrent weight exists");
-			assert!(compiled.graph().nodes.iter().any(|node| {
-				matches!(node.kernel.kind, PrimitiveKind::Contraction(_))
-					&& node.kernel.inputs.get(1) == Some(&recurrent_weight.value())
-			}));
-		}
-		assert_eq!(compiled.output().shape().extents(), [2, 1]);
-		assert_eq!(external_output_count(&compiled), 1);
-	}
-
-	#[test]
-	fn multiclass_inference_runs_each_effective_adapter_layer_once_then_stable_softmax() {
-		let encoded = crate::checkpoint::encoded_multiclass_test_checkpoint_fixture();
-		let prepared = prepared_fixture(&encoded, b"\"feature\nbytes\"\n1.5\n2.5\n");
-		let compiled = compile_prepared_inference(&prepared).unwrap();
-
-		assert_eq!(
-			compiled.output().kind(),
-			InferencePredictionKind::MulticlassProbabilities
-		);
-		assert_eq!(compiled.output().shape().extents(), [2, 4]);
-		assert!(compiled.output_adapter().is_some());
-		assert_eq!(
-			compiled
-				.graph()
-				.nodes
-				.iter()
-				.filter(|node| matches!(node.kernel.kind, PrimitiveKind::Contraction(_)))
-				.count(),
-			2
-		);
-		let reductions = compiled
-			.graph()
-			.nodes
-			.iter()
-			.filter_map(|node| match &node.kernel.kind {
-				PrimitiveKind::Reduce(reduce) => Some(reduce.operator),
-				_ => None,
-			})
-			.collect::<Vec<_>>();
-		assert!(reductions.contains(&ReduceOperator::Maximum));
-		assert!(reductions.contains(&ReduceOperator::Sum));
-		let gradual_underflow_exp = recipe_math::exp_with_gradual_underflow_program().unwrap();
-		assert!(compiled.graph().nodes.iter().any(|node| {
-			matches!(
-				&node.kernel.kind,
-				PrimitiveKind::Elementwise(map) if map.program == gradual_underflow_exp
-			)
-		}));
-		assert_eq!(
-			compiled
-				.external_inputs()
-				.iter()
-				.filter(|input| matches!(input.role(), InferenceInputRole::LayerWeight { .. }))
-				.count(),
-			2
-		);
-		assert_eq!(
-			compiled
-				.external_inputs()
-				.iter()
-				.filter(|input| matches!(input.role(), InferenceInputRole::LayerBias { .. }))
-				.count(),
-			2
-		);
-		assert_eq!(external_output_count(&compiled), 1);
-	}
-
-	#[test]
-	fn regression_inference_exposes_the_raw_effective_model_output() {
-		let encoded = crate::checkpoint::encoded_regression_test_checkpoint_fixture();
-		let prepared = prepared_fixture(&encoded, b"\"feature\nbytes\"\n1.5\n2.5\n");
-		let compiled = compile_prepared_inference(&prepared).unwrap();
-
-		assert_eq!(
-			compiled.output().kind(),
-			InferencePredictionKind::Regression
-		);
-		assert_eq!(compiled.output().shape().extents(), [2, 1]);
-		assert_eq!(compiled.output().target_dtype(), DType::F32);
-		assert!(
-			compiled
-				.graph()
-				.nodes
-				.last()
-				.unwrap()
-				.kernel
-				.outputs
-				.contains(&compiled.output().value())
-		);
-		assert_eq!(external_output_count(&compiled), 1);
-	}
-
-	#[test]
-	fn multi_target_inference_preserves_saved_width_and_prediction_interpretation() {
-		for (task, expected_kind) in [
-			(
-				DenseTask::MultiTargetBinaryClassification {
-					first_target_vector: 2,
-					target_count: 3,
-				},
-				InferencePredictionKind::MultiTargetBinaryProbabilities,
-			),
-			(
-				DenseTask::JointMulticlassClassification {
-					first_target_vector: 2,
-					target_count: 3,
-				},
-				InferencePredictionKind::JointTargetProbabilities,
-			),
-			(
-				DenseTask::MultiTargetRegression {
-					first_target_vector: 2,
-					target_count: 3,
-				},
-				InferencePredictionKind::MultiTargetRegression,
-			),
-		] {
-			let encoded = crate::checkpoint::encoded_multi_target_test_checkpoint_fixture(task);
-			let prepared = prepared_fixture(&encoded, b"\"feature\nbytes\"\n1.5\n2.5\n");
-			assert_eq!(prepared.checkpoint().target_source_indices(), [2, 1, 3]);
-			let compiled = compile_prepared_inference(&prepared).unwrap();
-
-			assert_eq!(compiled.task(), InferenceTask::Dense(task));
-			assert_eq!(compiled.output().kind(), expected_kind);
-			assert_eq!(compiled.output().dtype(), DType::F32);
-			assert_eq!(compiled.output().target_dtype(), DType::F32);
-			assert_eq!(compiled.output().target_dtypes(), [DType::F32; 3]);
-			assert_eq!(compiled.output().shape().extents(), [2, 3]);
-			assert_eq!(external_output_count(&compiled), 1);
-			compiled.graph().validate().unwrap();
-			compiled.program().validate().unwrap();
-		}
-	}
-
-	#[test]
-	fn saved_binary_temperature_is_a_parameter_input_to_device_scaling() {
-		let encoded = crate::checkpoint::encoded_calibrated_test_checkpoint_fixture();
-		let prepared = prepared_fixture(&encoded, b"\"feature\nbytes\"\n1.5\n");
-		let compiled = compile_prepared_inference(&prepared).unwrap();
-		let temperature = compiled
-			.external_inputs()
-			.iter()
-			.find(|input| input.role() == InferenceInputRole::Temperature)
-			.unwrap();
-		assert_eq!(temperature.dtype(), DType::F32);
-		assert_eq!(temperature.shape().extents(), [1]);
-		assert_eq!(temperature.bytes(), 2.0f32.to_le_bytes());
-		assert!(compiled.graph().nodes.iter().any(|node| {
-			node.kernel.inputs.contains(&temperature.value())
-				&& matches!(
-					&node.kernel.kind,
-					PrimitiveKind::Elementwise(map)
-						if map
-							.program
-							.instructions
-							.iter()
-							.any(|instruction| instruction.opcode == ScalarOpcode::Divide)
-				)
-		}));
-	}
-
-	#[test]
-	fn prediction_tail_programs_preserve_subnormal_probabilities_without_legacy_range_faults() {
-		let sigmoid_exponent = stable_sigmoid_exponent_program().unwrap();
-		assert_eq!(
-			sigmoid_exponent
-				.instructions
-				.iter()
-				.map(|instruction| instruction.opcode)
-				.collect::<Vec<_>>(),
-			[ScalarOpcode::Absolute, ScalarOpcode::Negate]
-		);
-		let sigmoid_result = stable_sigmoid_result_program().unwrap();
-		assert!(
-			sigmoid_result
-				.instructions
-				.iter()
-				.any(|instruction| instruction.opcode == ScalarOpcode::Select)
-		);
-		assert!(
-			sigmoid_result
-				.instructions
-				.iter()
-				.all(|instruction| instruction.opcode != ScalarOpcode::Require)
-		);
-		let gradual_underflow_exp = recipe_math::exp_with_gradual_underflow_program().unwrap();
-		let exponent_argument = evaluate_test_program(&sigmoid_exponent, &[-100.0]);
-		assert!(!exponent_argument.faulted);
-		assert_eq!(exponent_argument.output, -100.0);
-		let exponent = evaluate_test_program(&gradual_underflow_exp, &[exponent_argument.output]);
-		assert!(!exponent.faulted);
-		assert!(exponent.output.is_subnormal());
-		assert!(exponent.output > 0.0);
-		let sigmoid = evaluate_test_program(&sigmoid_result, &[-100.0, exponent.output]);
-		assert!(!sigmoid.faulted);
-		assert_eq!(sigmoid.output.to_bits(), exponent.output.to_bits());
-
-		let softmax_exponent_input = softmax_exponent_input_program().unwrap();
-		let exp_zero = evaluate_test_program(&gradual_underflow_exp, &[0.0]);
-		let gap_ninety = evaluate_test_program(&softmax_exponent_input, &[-90.0]);
-		let gap_one_hundred = evaluate_test_program(&softmax_exponent_input, &[-100.0]);
-		let exp_gap_ninety = evaluate_test_program(&gradual_underflow_exp, &[gap_ninety.output]);
-		let exp_gap_one_hundred = evaluate_test_program(&gradual_underflow_exp, &[gap_one_hundred.output]);
-		for evaluation in [exp_zero, exp_gap_ninety, exp_gap_one_hundred] {
-			assert!(!evaluation.faulted);
-		}
-		let sum = exp_zero.output + exp_gap_ninety.output + exp_gap_one_hundred.output;
-		let probability_ninety = exp_gap_ninety.output / sum;
-		let probability_one_hundred = exp_gap_one_hundred.output / sum;
-		assert!(probability_ninety.is_subnormal());
-		assert!(probability_one_hundred.is_subnormal());
-		assert!(probability_ninety > probability_one_hundred);
-		assert!(probability_one_hundred > 0.0);
-
-		let finite_logit_shift = -f32::MAX - f32::MAX;
-		assert_eq!(finite_logit_shift, f32::NEG_INFINITY);
-		let overflowed_shift = evaluate_test_program(&softmax_exponent_input, &[finite_logit_shift]);
-		assert!(!overflowed_shift.faulted);
-		assert_eq!(overflowed_shift.output, -104.0);
-		let overflowed_tail = evaluate_test_program(&gradual_underflow_exp, &[overflowed_shift.output]);
-		assert!(!overflowed_tail.faulted);
-		assert_eq!(overflowed_tail.output.to_bits(), 0.0_f32.to_bits());
-		assert!(evaluate_test_program(&softmax_exponent_input, &[f32::INFINITY]).faulted);
-		assert!(evaluate_test_program(&softmax_exponent_input, &[f32::NAN]).faulted);
-
-		let true_underflow = evaluate_test_program(&gradual_underflow_exp, &[-104.0]);
-		assert!(!true_underflow.faulted);
-		assert_eq!(true_underflow.output.to_bits(), 0.0_f32.to_bits());
-		let v5_i32_conversion = checked_i32_to_f32_program().unwrap();
-		assert_eq!(
-			v5_i32_conversion
-				.instructions
-				.iter()
-				.map(|instruction| instruction.opcode)
-				.collect::<Vec<_>>(),
-			[
-				ScalarOpcode::ConvertI32ToF32,
-				ScalarOpcode::ConvertF32ToI32,
-				ScalarOpcode::Equal,
-				ScalarOpcode::NotEqual,
-				ScalarOpcode::BitAnd,
-				ScalarOpcode::Require,
-			]
-		);
-	}
-
-	#[test]
-	fn structured_residual_checkpoint_compiles_branch_projection_merge_and_adapter() {
-		let encoded = crate::checkpoint::encoded_residual_test_checkpoint_fixture();
-		let prepared = prepared_fixture(&encoded, b"\"feature\nbytes\"\n1.5\n");
-		let compiled = compile_prepared_inference(&prepared).unwrap();
-
-		assert_eq!(compiled.output().shape().extents(), [1, 1]);
-		assert!(
-			compiled
-				.external_inputs()
-				.iter()
-				.any(|input| { input.role() == InferenceInputRole::ResidualProjectionWeight { block: 0 } })
-		);
-		assert!(
-			compiled
-				.external_inputs()
-				.iter()
-				.any(|input| { input.role() == InferenceInputRole::LayerWeight { layer: 0 } })
-		);
-		assert!(
-			compiled
-				.external_inputs()
-				.iter()
-				.any(|input| { input.role() == InferenceInputRole::LayerWeight { layer: 1 } })
-		);
-		assert!(
-			compiled
-				.graph()
-				.nodes
-				.iter()
-				.filter(|node| matches!(node.kernel.kind, PrimitiveKind::Contraction(_)))
-				.count() >= 3
-		);
-	}
-
-	#[test]
-	fn structured_pool_checkpoint_compiles_saved_shape_and_bounded_index_images() {
-		let encoded = crate::checkpoint::encoded_pool_test_checkpoint_fixture();
-		let prepared = prepared_fixture(
-			&encoded,
-			b"feature-0,feature-1,feature-2,feature-3,feature-4,feature-5\n1,2,3,4,5,6\n",
-		);
-		let first = compile_prepared_inference(&prepared).unwrap();
-		let second = compile_prepared_inference(&prepared).unwrap();
-
-		assert_eq!(first.output().shape().extents(), [1, 1]);
-		let windows = first
-			.external_inputs()
-			.iter()
-			.find(|input| input.role() == InferenceInputRole::PoolWindowIndices { block: 0 })
-			.unwrap();
-		assert_eq!(windows.dtype(), DType::I32);
-		assert_eq!(windows.shape().extents(), [1, 3, 1, 2]);
-		let bases = first
-			.external_inputs()
-			.iter()
-			.find(|input| input.role() == InferenceInputRole::PoolWinnerBases { block: 0 })
-			.unwrap();
-		assert_eq!(bases.shape().extents(), [1, 3, 1]);
-		assert_eq!(
-			first.program().to_ogdl().unwrap(),
-			second.program().to_ogdl().unwrap()
-		);
-	}
-
-	#[test]
-	fn structured_kmeans_checkpoint_compiles_saved_centroid_distances() {
-		let encoded = crate::checkpoint::encoded_kmeans_test_checkpoint_fixture();
-		let prepared = prepared_fixture(
-			&encoded,
-			b"feature-0,feature-1,feature-2,feature-3\n1,2,3,4\n",
-		);
-		let first = compile_prepared_inference(&prepared).unwrap();
-		let second = compile_prepared_inference(&prepared).unwrap();
-
-		assert_eq!(first.output().shape().extents(), [1, 1]);
-		let centroids = first
-			.external_inputs()
-			.iter()
-			.find(|input| input.role() == InferenceInputRole::KMeansCentroids { block: 0 })
-			.expect("saved K-means centroid input exists");
-		assert_eq!(centroids.dtype(), DType::F32);
-		assert_eq!(centroids.shape().extents(), [3, 4]);
-		assert!(
-			first.graph()
-				.nodes
-				.iter()
-				.any(|node| matches!(node.kernel.kind, PrimitiveKind::Contraction(_)))
-		);
-		assert_eq!(
-			first.program().to_ogdl().unwrap(),
-			second.program().to_ogdl().unwrap()
-		);
-	}
-
-	#[test]
-	fn structured_convolution_checkpoint_compiles_saved_geometry_and_parameter_images() {
-		let encoded = crate::checkpoint::encoded_convolution_test_checkpoint_fixture();
-		let prepared = prepared_fixture(
-			&encoded,
-			b"feature-0,feature-1,feature-2,feature-3\n1,2,3,4\n",
-		);
-		let first = compile_prepared_inference(&prepared).unwrap();
-		let second = compile_prepared_inference(&prepared).unwrap();
-
-		assert_eq!(first.output().shape().extents(), [1, 1]);
-		for (role, shape) in [
-			(
-				InferenceInputRole::ConvolutionWindowIndices { block: 0 },
-				&[1, 3, 2, 1][..],
-			),
-			(
-				InferenceInputRole::ConvolutionWeight { block: 0 },
-				&[2, 1, 2][..],
-			),
-			(InferenceInputRole::ConvolutionBias { block: 0 }, &[2][..]),
-			(
-				InferenceInputRole::ConvolutionWindowIndices { block: 1 },
-				&[1, 2, 2, 2][..],
-			),
-			(
-				InferenceInputRole::ConvolutionWeight { block: 1 },
-				&[2, 2, 3][..],
-			),
-			(InferenceInputRole::ConvolutionBias { block: 1 }, &[3][..]),
-			(
-				InferenceInputRole::ConvolutionPRelu {
-					block: 1,
-					occurrence: 0,
-				},
-				&[1][..],
-			),
-		] {
-			let input = first
-				.external_inputs()
-				.iter()
-				.find(|input| input.role() == role)
-				.unwrap_or_else(|| panic!("missing saved convolution input {role:?}"));
-			assert_eq!(input.shape().extents(), shape);
-		}
-		assert!(
-			first.external_inputs()
-				.iter()
-				.any(|input| { input.role() == InferenceInputRole::PoolWindowIndices { block: 2 } })
-		);
-		assert_eq!(
-			first.program().to_ogdl().unwrap(),
-			second.program().to_ogdl().unwrap()
-		);
 	}
 }

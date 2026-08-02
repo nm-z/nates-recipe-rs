@@ -1,5 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	time::Duration,
+};
 
 use recipe_core::{
 	ByteCount, BytesPerSecond, CalculationCapability, Device, DeviceId, DeviceKind, DirectedLink, DiscoveredDevice,
@@ -8,16 +10,18 @@ use recipe_core::{
 	TransferLaneCount, TransportId, TransportKind,
 };
 
-use crate::error::{ProbeError, ProbeResult};
-use crate::hash::CanonicalDigest;
-use crate::model::{
-	BenchmarkMetadata, BoundedBenchmarkPlan, CacheIdentity, GpuBenchmarkIo, GpuDescriptor, GpuDiscovery,
-	GpuMeasurement, HostBenchmarkIo, HostDiscovery, HostInventory, LinkDuplex, MeasuredGpuOrigin,
-	MeasuredMachineOrigin, MeasuredOrigins, MeasuredPeerBenchmark, MeasuredProfile, MeasuredRamOrigin,
-	MeasuredStorageOrigin, PEER_BENCHMARK_PROTOCOL_SCHEMA, PROFILE_SCHEMA, PeerBenchmarkControl, PeerDescriptor,
-	PeerDuplexExecution, PeerMeasurement, PeerSession, RamMeasurement, StorageMeasurement,
+use crate::{
+	error::{ProbeError, ProbeResult},
+	hash::CanonicalDigest,
+	model::{
+		BenchmarkMetadata, BoundedBenchmarkPlan, CacheIdentity, GpuBenchmarkIo, GpuDescriptor, GpuDiscovery,
+		GpuMeasurement, HostBenchmarkIo, HostDiscovery, HostInventory, LinkDuplex, MeasuredGpuOrigin,
+		MeasuredMachineOrigin, MeasuredOrigins, MeasuredPeerBenchmark, MeasuredProfile, MeasuredRamOrigin,
+		MeasuredStorageOrigin, PEER_BENCHMARK_PROTOCOL_SCHEMA, PROFILE_SCHEMA, PeerBenchmarkControl,
+		PeerDescriptor, PeerDuplexExecution, PeerMeasurement, PeerSession, RamMeasurement, StorageMeasurement,
+	},
+	seed::{IdentityFacet, SeedContract, SeedDuplex},
 };
-use crate::seed::{IdentityFacet, SeedContract, SeedDuplex};
 
 const MAXIMUM_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 const MINIMUM_BUFFER_BYTES: u64 = 4 * 1024;
@@ -134,15 +138,17 @@ impl<'a> ProbeEngine<'a> {
 			peer_benchmarks: measurements
 				.peers
 				.iter()
-				.map(|(descriptor, measurement)| MeasuredPeerBenchmark {
-					session_id: descriptor.session_id.clone(),
-					outbound_rate: measurement
-						.outbound_rate
-						.expect("peer measurement was validated"),
-					inbound_rate: measurement
-						.inbound_rate
-						.expect("peer measurement was validated"),
-					evidence: measurement.evidence,
+				.map(|(descriptor, measurement)| {
+					MeasuredPeerBenchmark {
+						session_id: descriptor.session_id.clone(),
+						outbound_rate: measurement
+							.outbound_rate
+							.expect("peer measurement was validated"),
+						inbound_rate: measurement
+							.inbound_rate
+							.expect("peer measurement was validated"),
+						evidence: measurement.evidence,
+					}
 				})
 				.collect(),
 			topology,
@@ -467,18 +473,18 @@ fn validate_peer_measurement(
 		&measurement.remote_memory_rate,
 		&format!("peer {} remote memory rate", descriptor.session_id),
 	)?;
-	let outbound = measurement
-		.outbound_rate
-		.ok_or_else(|| ProbeError::IncompletePeerMeasurement {
+	let outbound = measurement.outbound_rate.ok_or_else(|| {
+		ProbeError::IncompletePeerMeasurement {
 			peer: descriptor.session_id.to_string(),
 			direction: "outbound",
-		})?;
-	let inbound = measurement
-		.inbound_rate
-		.ok_or_else(|| ProbeError::IncompletePeerMeasurement {
+		}
+	})?;
+	let inbound = measurement.inbound_rate.ok_or_else(|| {
+		ProbeError::IncompletePeerMeasurement {
 			peer: descriptor.session_id.to_string(),
 			direction: "inbound",
-		})?;
+		}
+	})?;
 	require_measured(
 		&outbound,
 		&format!("peer {} outbound throughput", descriptor.session_id),
@@ -852,9 +858,11 @@ fn build_origins(host: &HostInventory, gpus: &[GpuDescriptor], measurements: &Me
 	let mut ram = host
 		.ram
 		.iter()
-		.map(|domain| MeasuredRamOrigin {
-			device: ids.ram[&domain.key],
-			key: domain.key.clone(),
+		.map(|domain| {
+			MeasuredRamOrigin {
+				device: ids.ram[&domain.key],
+				key: domain.key.clone(),
+			}
 		})
 		.collect::<Vec<_>>();
 	for (peer, _) in &measurements.peers {
@@ -866,16 +874,20 @@ fn build_origins(host: &HostInventory, gpus: &[GpuDescriptor], measurements: &Me
 	let storage = host
 		.storage
 		.iter()
-		.map(|domain| MeasuredStorageOrigin {
-			device: ids.storage[&domain.key],
-			key: domain.key.clone(),
+		.map(|domain| {
+			MeasuredStorageOrigin {
+				device: ids.storage[&domain.key],
+				key: domain.key.clone(),
+			}
 		})
 		.collect();
 	let gpu = gpus
 		.iter()
-		.map(|device| MeasuredGpuOrigin {
-			device: ids.gpu[&device.key],
-			key: device.key.clone(),
+		.map(|device| {
+			MeasuredGpuOrigin {
+				device: ids.gpu[&device.key],
+				key: device.key.clone(),
+			}
 		})
 		.collect();
 	MeasuredOrigins {
@@ -1237,12 +1249,14 @@ fn build_discovery(
 		.links
 		.iter()
 		.zip(link_async)
-		.map(|(link, asynchronous_submission)| DiscoveredLink {
-			link: link.id,
-			available: true,
-			bandwidth: link.bandwidth,
-			maximum_inflight_transfers: link.maximum_inflight_transfers,
-			asynchronous_submission,
+		.map(|(link, asynchronous_submission)| {
+			DiscoveredLink {
+				link: link.id,
+				available: true,
+				bandwidth: link.bandwidth,
+				maximum_inflight_transfers: link.maximum_inflight_transfers,
+				asynchronous_submission,
+			}
 		})
 		.collect();
 	Ok(DiscoveryProfile {
@@ -1253,891 +1267,10 @@ fn build_discovery(
 	})
 }
 
-fn measured<T>(value: T) -> Property<T> {
-	Property::new(value, PropertyProvenance::Measured)
-}
+fn measured<T>(value: T) -> Property<T> { Property::new(value, PropertyProvenance::Measured) }
 
-fn min_rate(left: BytesPerSecond, right: BytesPerSecond) -> BytesPerSecond {
-	if left <= right { left } else { right }
-}
+fn min_rate(left: BytesPerSecond, right: BytesPerSecond) -> BytesPerSecond { if left <= right { left } else { right } }
 
 fn min_lanes(left: TransferLaneCount, right: TransferLaneCount) -> TransferLaneCount {
 	if left <= right { left } else { right }
-}
-
-#[cfg(test)]
-mod tests {
-	use std::fs;
-	use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
-	use std::path::{Path, PathBuf};
-	use std::sync::atomic::{AtomicU64, Ordering};
-
-	use super::*;
-	use recipe_core::{Digest, FlopsPerSecond, ToolchainIdentity};
-
-	use crate::cache::ExplicitPathProfileCache;
-	use crate::codec::MeasuredProfileCodec;
-	use crate::model::{GpuInventory, MachineFingerprint, NetworkInterface, ProfileCache, RamDomain, StorageDomain};
-
-	fn label(value: &str) -> Label {
-		Label::new(value).unwrap()
-	}
-
-	fn measured_bytes(value: u64) -> Property<ByteCount> {
-		measured(ByteCount::new(value))
-	}
-
-	fn measured_rate(value: u64) -> Property<BytesPerSecond> {
-		measured(BytesPerSecond::new(value).unwrap())
-	}
-
-	fn measured_flops(value: u64) -> Property<FlopsPerSecond> {
-		measured(FlopsPerSecond::new(value).unwrap())
-	}
-
-	fn lanes(value: u32) -> TransferLaneCount {
-		TransferLaneCount::new(value).unwrap()
-	}
-
-	#[derive(Debug)]
-	struct FakeHost;
-
-	impl HostDiscovery for FakeHost {
-		fn discover_host(&self) -> ProbeResult<HostInventory> {
-			Ok(HostInventory {
-				machine: MachineFingerprint {
-					hostname: label("local-machine"),
-					stable_id: label("machine-id-1"),
-					runtime_abi: label("kernel-1"),
-					firmware: label("firmware-1"),
-				},
-				ram: vec![RamDomain {
-					key: label("ram-0"),
-					capacity_hint: ByteCount::new(64_000_000_000),
-					link_identity: label("ram-link-0"),
-					maximum_inflight_transfers: lanes(2),
-				}],
-				storage: vec![StorageDomain {
-					key: label("disk-0"),
-					name: label("disk"),
-					benchmark_root: "/not-used-by-fake".into(),
-					capacity_hint: ByteCount::new(2_000_000_000_000),
-					host_memory_key: label("ram-0"),
-					driver: label("disk-driver-1"),
-					firmware: label("disk-firmware-1"),
-					link_identity: label("disk-link-1"),
-					transport_kind: TransportKind::Sata,
-					duplex: LinkDuplex::Half,
-					maximum_concurrent_reads: lanes(2),
-					maximum_concurrent_writes: lanes(2),
-					asynchronous_submission: true,
-				}],
-				network: vec![NetworkInterface {
-					key: label("net-0"),
-					name: label("net"),
-					address: label("00:11:22:33:44:55"),
-					driver: label("net-driver-1"),
-					firmware: label("net-firmware-1"),
-					link_identity: label("net-link-1"),
-					transport_kind: TransportKind::Ethernet,
-					duplex: LinkDuplex::Full,
-					asynchronous_submission: true,
-				}],
-			})
-		}
-	}
-
-	#[derive(Debug)]
-	struct FakeGpuDiscovery {
-		driver: &'static str,
-		exhaustive: bool,
-	}
-
-	impl GpuDiscovery for FakeGpuDiscovery {
-		fn discover_all(&self) -> ProbeResult<GpuInventory> {
-			let device = |key: &str, arch: &str| GpuDescriptor {
-				key: label(key),
-				name: label(key),
-				host_memory_key: label("ram-0"),
-				target: recipe_core::TargetIdentity {
-					backend: label("backend"),
-					architecture: label(arch),
-					abi: label("abi-1"),
-				},
-				capacity_hint: ByteCount::new(16_000_000_000),
-				driver: label(self.driver),
-				runtime_abi: label("runtime-1"),
-				firmware: label("gpu-firmware-1"),
-				link_identity: label(&format!("pcie-{key}")),
-				transport_kind: TransportKind::Pcie,
-				toolchain: ToolchainIdentity {
-					name: label("toolchain"),
-					version: label("1"),
-					digest: Digest::new([9; 32]),
-				},
-				duplex: LinkDuplex::Full,
-				host_to_device_maximum_inflight: lanes(2),
-				device_to_host_maximum_inflight: lanes(2),
-				asynchronous_submission: true,
-				maximum_submission_queues: 2,
-				maximum_concurrent_tasks: 2,
-				subgroup_lanes: 32,
-				maximum_workgroup_lanes: 256,
-				maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
-				transfer_overlaps_calculation: true,
-			};
-			Ok(GpuInventory {
-				exhaustive: self.exhaustive,
-				devices: vec![device("gpu-1", "arch-1"), device("gpu-0", "arch-0")],
-			})
-		}
-	}
-
-	#[derive(Debug)]
-	struct FakeHostBenchmarks {
-		provenance: PropertyProvenance,
-	}
-
-	impl HostBenchmarkIo for FakeHostBenchmarks {
-		fn benchmark_ram(
-			&self,
-			_domain: &crate::model::RamDomain,
-			_plan: BoundedBenchmarkPlan,
-		) -> ProbeResult<RamMeasurement> {
-			Ok(RamMeasurement {
-				capacity: Property::new(ByteCount::new(64_000_000_000), self.provenance),
-				transfer_rate: Property::new(
-					BytesPerSecond::new(100_000_000_000).unwrap(),
-					self.provenance,
-				),
-			})
-		}
-
-		fn benchmark_storage(
-			&self,
-			_domain: &crate::model::StorageDomain,
-			_plan: BoundedBenchmarkPlan,
-		) -> ProbeResult<StorageMeasurement> {
-			Ok(StorageMeasurement {
-				capacity: Property::new(ByteCount::new(2_000_000_000_000), self.provenance),
-				read_rate: Property::new(BytesPerSecond::new(700_000_000).unwrap(), self.provenance),
-				write_rate: Property::new(BytesPerSecond::new(600_000_000).unwrap(), self.provenance),
-			})
-		}
-	}
-
-	#[derive(Debug)]
-	struct FakeGpuBenchmarks;
-
-	impl GpuBenchmarkIo for FakeGpuBenchmarks {
-		fn benchmark_gpu(
-			&self,
-			_device: &GpuDescriptor,
-			_plan: BoundedBenchmarkPlan,
-		) -> ProbeResult<GpuMeasurement> {
-			Ok(GpuMeasurement {
-				capacity: measured_bytes(16_000_000_000),
-				calculation_rate: measured_flops(400_000_000_000),
-				memory_rate: measured_rate(500_000_000_000),
-				host_to_device_rate: measured_rate(15_000_000_000),
-				device_to_host_rate: measured_rate(14_000_000_000),
-			})
-		}
-	}
-
-	#[derive(Debug)]
-	struct FakePeer {
-		complete: bool,
-	}
-
-	impl PeerSession for FakePeer {
-		fn descriptor(&self) -> ProbeResult<PeerDescriptor> {
-			Ok(PeerDescriptor {
-				session_id: label("peer-session-1"),
-				machine: MachineFingerprint {
-					hostname: label("remote-machine"),
-					stable_id: label("machine-id-2"),
-					runtime_abi: label("kernel-2"),
-					firmware: label("firmware-2"),
-				},
-				remote_memory_key: label("remote-ram-0"),
-				local_memory_key: label("ram-0"),
-				local_interface_key: label("net-0"),
-				remote_interface_identity: label("remote-net-0"),
-				remote_driver: label("remote-net-driver"),
-				remote_firmware: label("remote-net-firmware"),
-				link_identity: label("peer-link-1"),
-				transport_kind: TransportKind::Ethernet,
-				duplex: LinkDuplex::Full,
-				outbound_maximum_inflight: lanes(2),
-				inbound_maximum_inflight: lanes(2),
-				asynchronous_submission: true,
-			})
-		}
-
-		fn benchmark(&self, plan: BoundedBenchmarkPlan) -> ProbeResult<PeerMeasurement> {
-			let outbound = fake_peer_direction(plan, 1_000_000);
-			let inbound = fake_peer_direction(plan, 1_200_000);
-			Ok(PeerMeasurement {
-				remote_memory_capacity: measured_bytes(32_000_000_000),
-				remote_memory_rate: measured_rate(80_000_000_000),
-				outbound_rate: Some(measured_rate(rate_from_evidence(outbound))),
-				inbound_rate: self
-					.complete
-					.then(|| measured_rate(rate_from_evidence(inbound))),
-				evidence: crate::model::PeerBenchmarkEvidence {
-					protocol_schema: PEER_BENCHMARK_PROTOCOL_SCHEMA,
-					local_endpoint: crate::model::PeerEndpointEvidence {
-						machine: Digest::new([1; 32]),
-						profile: Digest::new([2; 32]),
-					},
-					remote_endpoint: crate::model::PeerEndpointEvidence {
-						machine: Digest::new([3; 32]),
-						profile: Digest::new([4; 32]),
-					},
-					execution: PeerDuplexExecution::Simultaneous,
-					outbound,
-					inbound,
-				},
-			})
-		}
-	}
-
-	#[derive(Debug)]
-	struct ControlledOnlyPeer {
-		inner: FakePeer,
-		controlled_calls: AtomicU64,
-	}
-
-	impl PeerSession for ControlledOnlyPeer {
-		fn descriptor(&self) -> ProbeResult<PeerDescriptor> {
-			self.inner.descriptor()
-		}
-
-		fn benchmark(&self, _plan: BoundedBenchmarkPlan) -> ProbeResult<PeerMeasurement> {
-			Err(ProbeError::Benchmark(
-				"probe engine bypassed controlled peer benchmark path".to_owned(),
-			))
-		}
-
-		fn benchmark_controlled(
-			&self,
-			plan: BoundedBenchmarkPlan,
-			control: &PeerBenchmarkControl,
-		) -> crate::model::PeerBenchmarkAttempt {
-			self.controlled_calls.fetch_add(1, Ordering::Relaxed);
-			if let Some(failure) = control.failure(crate::model::PeerBenchmarkPhase::Validation) {
-				return crate::model::PeerBenchmarkAttempt::Failed(failure);
-			}
-			match self.inner.benchmark(plan) {
-				Ok(measurement) => crate::model::PeerBenchmarkAttempt::Measured(measurement),
-				Err(error) => {
-					crate::model::PeerBenchmarkAttempt::Failed(crate::model::PeerBenchmarkFailure::new(
-						crate::model::PeerBenchmarkPhase::DirectionalTransfer,
-						crate::model::PeerBenchmarkFailureKind::Transport,
-						error.to_string(),
-					))
-				}
-			}
-		}
-	}
-
-	fn fake_peer_direction(
-		plan: BoundedBenchmarkPlan,
-		elapsed_nanoseconds: u64,
-	) -> crate::model::DirectionalBenchmarkEvidence {
-		let total_bytes = plan
-			.buffer_bytes
-			.get()
-			.checked_mul(u64::from(plan.iterations))
-			.unwrap();
-		let mean = (elapsed_nanoseconds / u64::from(plan.iterations)).max(1);
-		crate::model::DirectionalBenchmarkEvidence {
-			total_bytes: ByteCount::new(total_bytes),
-			elapsed_nanoseconds,
-			sample_count: plan.iterations,
-			minimum_sample_nanoseconds: mean,
-			maximum_sample_nanoseconds: mean,
-			mean_sample_nanoseconds: mean,
-			variance_nanoseconds_squared: 0,
-		}
-	}
-
-	fn rate_from_evidence(evidence: crate::model::DirectionalBenchmarkEvidence) -> u64 {
-		u64::try_from(
-			u128::from(evidence.total_bytes.get()) * 1_000_000_000 / u128::from(evidence.elapsed_nanoseconds),
-		)
-		.unwrap()
-	}
-
-	fn seed() -> SeedContract {
-		SeedContract::parse(include_str!("../../topology/contract.toml")).unwrap()
-	}
-
-	fn engine<'a>(gpu: &'a FakeGpuDiscovery, host_benchmarks: &'a FakeHostBenchmarks) -> ProbeEngine<'a> {
-		ProbeEngine::new(&FakeHost, gpu, host_benchmarks, &FakeGpuBenchmarks)
-	}
-
-	#[derive(Debug)]
-	struct TestDirectory(PathBuf);
-
-	impl TestDirectory {
-		fn new() -> Self {
-			static NEXT: AtomicU64 = AtomicU64::new(1);
-			for _ in 0..64 {
-				let path = std::env::temp_dir().join(format!(
-					"recipe-probe-test-{}-{}",
-					std::process::id(),
-					NEXT.fetch_add(1, Ordering::Relaxed)
-				));
-				match fs::create_dir(&path) {
-					Ok(()) => {
-						fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-						return Self(path);
-					}
-					Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-					Err(error) => panic!("create test directory: {error}"),
-				}
-			}
-			panic!("could not allocate test directory");
-		}
-
-		fn path(&self) -> &Path {
-			&self.0
-		}
-	}
-
-	impl Drop for TestDirectory {
-		fn drop(&mut self) {
-			let _ = fs::remove_dir_all(&self.0);
-		}
-	}
-
-	#[test]
-	fn automatically_enumerates_every_backend_gpu() {
-		let gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let benchmarks = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Measured,
-		};
-		let profile = engine(&gpu, &benchmarks).probe(&seed(), &[]).unwrap();
-		assert_eq!(
-			profile
-				.topology
-				.devices
-				.iter()
-				.filter(|device| device.kind == DeviceKind::GpuMemory)
-				.count(),
-			2
-		);
-		assert!(
-			profile
-				.topology
-				.devices
-				.iter()
-				.all(|device| device.capacity.provenance == PropertyProvenance::Measured)
-		);
-		assert_eq!(
-			profile.topology.machines.len(),
-			1,
-			"a discovered interface alone must not fabricate a measured peer link"
-		);
-		assert_eq!(
-			profile
-				.origins
-				.storage
-				.iter()
-				.map(|origin| origin.key.as_str())
-				.collect::<Vec<_>>(),
-			vec!["disk-0"]
-		);
-		assert_eq!(
-			profile
-				.origins
-				.gpu
-				.iter()
-				.map(|origin| origin.key.as_str())
-				.collect::<Vec<_>>(),
-			vec!["gpu-0", "gpu-1"]
-		);
-		for device in &profile.topology.devices {
-			match device.kind {
-				DeviceKind::Ram => assert_eq!(
-					profile
-						.ram_origin(device.id)
-						.map(|origin| origin.key.as_str()),
-					Some("ram-0")
-				),
-				DeviceKind::Disk => assert_eq!(
-					profile
-						.storage_origin(device.id)
-						.map(|origin| origin.key.as_str()),
-					Some("disk-0")
-				),
-				DeviceKind::GpuMemory => assert!(profile.gpu_origin(device.id).is_some()),
-			}
-		}
-		let host = FakeHost.discover_host().unwrap();
-		let live_gpus = gpu.discover_all().unwrap();
-		let resolved = profile.resolve_local_inventory(&host, &live_gpus).unwrap();
-		assert_eq!(resolved.machine(), profile.topology.machines[0].id);
-		assert_eq!(resolved.ram().len(), 1);
-		assert_eq!(resolved.storage().len(), 1);
-		assert_eq!(resolved.gpu().len(), 2);
-	}
-
-	#[test]
-	fn theoretical_seed_values_only_bound_benchmarks_and_never_become_profile_values() {
-		let gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let benchmarks = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Measured,
-		};
-		let contract = seed();
-		let profile = engine(&gpu, &benchmarks).probe(&contract, &[]).unwrap();
-
-		let ram = profile
-			.topology
-			.devices
-			.iter()
-			.find(|device| device.kind == DeviceKind::Ram)
-			.unwrap();
-		assert_eq!(ram.capacity.value.get(), 64_000_000_000);
-		assert_ne!(ram.capacity.value, contract.estimates.ram_capacity);
-		assert_eq!(ram.transfer_rate.value.get(), 100_000_000_000);
-		assert_ne!(
-			ram.transfer_rate.value,
-			contract.estimates.ram_transfer_rate
-		);
-
-		let storage = profile
-			.topology
-			.devices
-			.iter()
-			.find(|device| device.kind == DeviceKind::Disk)
-			.unwrap();
-		assert_eq!(storage.capacity.value.get(), 2_000_000_000_000);
-		assert_ne!(storage.capacity.value, contract.estimates.disk_capacity);
-
-		for gpu_device in profile
-			.topology
-			.devices
-			.iter()
-			.filter(|device| device.kind == DeviceKind::GpuMemory)
-		{
-			assert_eq!(gpu_device.capacity.value.get(), 16_000_000_000);
-			assert_ne!(
-				gpu_device.capacity.value,
-				contract.estimates.gpu_memory_capacity
-			);
-			assert_eq!(
-				gpu_device.calculation_rate.unwrap().value.get(),
-				400_000_000_000
-			);
-			assert_ne!(
-				gpu_device.calculation_rate.unwrap().value,
-				contract.estimates.gpu_calculation_rate
-			);
-			assert_eq!(gpu_device.transfer_rate.value.get(), 500_000_000_000);
-			assert_ne!(
-				gpu_device.transfer_rate.value,
-				contract.estimates.gpu_memory_rate
-			);
-		}
-	}
-
-	#[test]
-	fn local_inventory_resolution_never_falls_back_to_similar_hardware() {
-		let gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let benchmarks = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Measured,
-		};
-		let profile = engine(&gpu, &benchmarks).probe(&seed(), &[]).unwrap();
-		let host = FakeHost.discover_host().unwrap();
-		let mut live_gpus = gpu.discover_all().unwrap();
-		live_gpus.devices[0].key = label("gpu-similar");
-		assert!(profile.resolve_local_inventory(&host, &live_gpus).is_err());
-		let mut duplicate_gpus = gpu.discover_all().unwrap();
-		let duplicate = duplicate_gpus.devices[0].clone();
-		duplicate_gpus.devices.push(duplicate);
-		assert!(
-			profile
-				.resolve_local_inventory(&host, &duplicate_gpus)
-				.is_err()
-		);
-
-		let mut live_host = host;
-		live_host.storage[0].key = label("disk-similar");
-		assert!(
-			profile
-				.resolve_local_inventory(&live_host, &gpu.discover_all().unwrap())
-				.is_err()
-		);
-	}
-
-	#[test]
-	fn deterministic_inputs_produce_deterministic_profile_ids() {
-		let gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let benchmarks = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Measured,
-		};
-		let engine = engine(&gpu, &benchmarks);
-		let first = engine.probe(&seed(), &[]).unwrap();
-		let second = engine.probe(&seed(), &[]).unwrap();
-		assert_eq!(first.cache_identity, second.cache_identity);
-		assert_eq!(first.topology.identity, second.topology.identity);
-		assert_eq!(first.discovery.identity, second.discovery.identity);
-	}
-
-	#[test]
-	fn changed_driver_invalidates_cache_identity() {
-		let benchmarks = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Measured,
-		};
-		let first_gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let second_gpu = FakeGpuDiscovery {
-			driver: "driver-2",
-			exhaustive: true,
-		};
-		let first = engine(&first_gpu, &benchmarks).probe(&seed(), &[]).unwrap();
-		let second = engine(&second_gpu, &benchmarks)
-			.probe(&seed(), &[])
-			.unwrap();
-		assert_ne!(first.cache_identity, second.cache_identity);
-		assert!(!first.is_cache_valid_for(second.cache_identity));
-	}
-
-	#[test]
-	fn changed_submission_queue_limit_invalidates_cache_identity() {
-		let host = FakeHost.discover_host().unwrap();
-		let mut gpus = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		}
-		.discover_all()
-		.unwrap()
-		.devices;
-		let first = build_cache_identity(&seed(), &host, &gpus, &[]);
-		gpus[0].maximum_submission_queues += 1;
-		let second = build_cache_identity(&seed(), &host, &gpus, &[]);
-		assert_ne!(first, second);
-	}
-
-	#[test]
-	fn changed_stable_ram_origin_invalidates_cache_identity() {
-		let mut host = FakeHost.discover_host().unwrap();
-		let gpu_discovery = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let mut gpus = gpu_discovery.discover_all().unwrap().devices;
-		gpus.sort_by(|left, right| left.key.cmp(&right.key));
-		let first = build_cache_identity(&seed(), &host, &gpus, &[]);
-		host.ram[0].key = label("ram-renamed");
-		host.storage[0].host_memory_key = label("ram-renamed");
-		for gpu in &mut gpus {
-			gpu.host_memory_key = label("ram-renamed");
-		}
-		let second = build_cache_identity(&seed(), &host, &gpus, &[]);
-		assert_ne!(first, second);
-		assert_eq!(first.schema, PROFILE_SCHEMA);
-		assert_eq!(second.schema, PROFILE_SCHEMA);
-	}
-
-	#[test]
-	fn estimate_only_benchmark_results_fail_closed() {
-		let gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let estimates = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Estimated,
-		};
-		let error = engine(&gpu, &estimates).probe(&seed(), &[]).unwrap_err();
-		assert!(matches!(error, ProbeError::MissingMeasurement(_)));
-	}
-
-	#[test]
-	fn incomplete_peer_measurement_fails_closed() {
-		let gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let benchmarks = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Measured,
-		};
-		let peer = FakePeer { complete: false };
-		let error = engine(&gpu, &benchmarks)
-			.probe(&seed(), &[&peer])
-			.unwrap_err();
-		assert!(matches!(
-			error,
-			ProbeError::IncompletePeerMeasurement {
-				direction: "inbound",
-				..
-			}
-		));
-	}
-
-	#[test]
-	fn probe_engine_uses_the_controlled_peer_attempt_path() {
-		let gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let benchmarks = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Measured,
-		};
-		let peer = ControlledOnlyPeer {
-			inner: FakePeer { complete: true },
-			controlled_calls: AtomicU64::new(0),
-		};
-		let profile = engine(&gpu, &benchmarks).probe(&seed(), &[&peer]).unwrap();
-		assert_eq!(profile.peer_benchmarks.len(), 1);
-		assert_eq!(peer.controlled_calls.load(Ordering::Relaxed), 1);
-	}
-
-	#[test]
-	fn complete_explicit_peer_adds_measured_bidirectional_link() {
-		let gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let benchmarks = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Measured,
-		};
-		let peer = FakePeer { complete: true };
-		let profile = engine(&gpu, &benchmarks).probe(&seed(), &[&peer]).unwrap();
-		assert_eq!(profile.topology.machines.len(), 2);
-		assert_eq!(profile.origins.machines.len(), 2);
-		assert_eq!(
-			profile
-				.origins
-				.machines
-				.iter()
-				.map(|origin| origin.fingerprint.stable_id.as_str())
-				.collect::<Vec<_>>(),
-			vec!["machine-id-1", "machine-id-2"]
-		);
-		assert_eq!(
-			profile
-				.origins
-				.ram
-				.iter()
-				.map(|origin| origin.key.as_str())
-				.collect::<Vec<_>>(),
-			vec!["ram-0", "remote-ram-0"]
-		);
-		assert!(
-			profile
-				.topology
-				.links
-				.iter()
-				.all(|link| link.bandwidth.provenance == PropertyProvenance::Measured)
-		);
-	}
-
-	#[test]
-	fn canonical_codec_round_trips_complete_profile_without_loss() {
-		let gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let benchmarks = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Measured,
-		};
-		let peer = FakePeer { complete: true };
-		let profile = engine(&gpu, &benchmarks).probe(&seed(), &[&peer]).unwrap();
-		let encoded = MeasuredProfileCodec::encode(&profile).unwrap();
-		let decoded = MeasuredProfileCodec::decode(&encoded).unwrap();
-		assert_eq!(decoded, profile);
-		assert_eq!(decoded.benchmarks.seed_schema, seed().schema);
-	}
-
-	fn assert_codec_rejects_semantic_tamper(profile: &MeasuredProfile) {
-		assert!(MeasuredProfileCodec::encode(profile).is_err());
-		let bytes = crate::codec::encode_unchecked_for_test(profile).unwrap();
-		assert!(MeasuredProfileCodec::decode(&bytes).is_err());
-	}
-
-	#[test]
-	fn cached_peer_evidence_is_bound_to_measured_rate_and_duplex() {
-		let gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let benchmarks = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Measured,
-		};
-		let peer = FakePeer { complete: true };
-		let profile = engine(&gpu, &benchmarks).probe(&seed(), &[&peer]).unwrap();
-
-		let mut wrong_execution = profile.clone();
-		wrong_execution.peer_benchmarks[0].evidence.execution = PeerDuplexExecution::Serialized;
-		assert_codec_rejects_semantic_tamper(&wrong_execution);
-
-		let mut wrong_evidence = profile.clone();
-		wrong_evidence.peer_benchmarks[0]
-			.evidence
-			.outbound
-			.elapsed_nanoseconds += 1;
-		assert_codec_rejects_semantic_tamper(&wrong_evidence);
-
-		let mut missing_evidence = profile.clone();
-		missing_evidence.peer_benchmarks.clear();
-		assert_codec_rejects_semantic_tamper(&missing_evidence);
-
-		let mut wrong_topology_rate = profile;
-		let remote_machine = wrong_topology_rate.topology.machines[1].id;
-		let remote_ram = wrong_topology_rate
-			.topology
-			.devices
-			.iter()
-			.find(|device| device.machine == remote_machine && device.kind == DeviceKind::Ram)
-			.unwrap()
-			.id;
-		let link = wrong_topology_rate
-			.topology
-			.links
-			.iter_mut()
-			.find(|link| link.to == remote_ram)
-			.unwrap();
-		link.bandwidth = measured_rate(link.bandwidth.value.get() + 1);
-		let discovery_link = wrong_topology_rate
-			.discovery
-			.links
-			.iter_mut()
-			.find(|candidate| candidate.link == link.id)
-			.unwrap();
-		discovery_link.bandwidth = link.bandwidth;
-		assert_codec_rejects_semantic_tamper(&wrong_topology_rate);
-	}
-
-	#[test]
-	fn codec_rejects_estimated_or_wrong_schema_profiles() {
-		let gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let benchmarks = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Measured,
-		};
-		let mut profile = engine(&gpu, &benchmarks).probe(&seed(), &[]).unwrap();
-		profile.topology.devices[0].capacity.provenance = PropertyProvenance::Estimated;
-		assert!(MeasuredProfileCodec::encode(&profile).is_err());
-		let estimated_bytes = crate::codec::encode_unchecked_for_test(&profile).unwrap();
-		assert!(MeasuredProfileCodec::decode(&estimated_bytes).is_err());
-		profile.topology.devices[0].capacity.provenance = PropertyProvenance::Measured;
-		let ram_origin = profile.origins.ram.pop().unwrap();
-		assert!(MeasuredProfileCodec::encode(&profile).is_err());
-		profile.origins.ram.push(ram_origin);
-		let storage_origin = profile.origins.storage.pop().unwrap();
-		assert!(MeasuredProfileCodec::encode(&profile).is_err());
-		profile.origins.storage.push(storage_origin);
-		let gpu_origin = profile.origins.gpu.pop().unwrap();
-		assert!(MeasuredProfileCodec::encode(&profile).is_err());
-		profile.origins.gpu.push(gpu_origin);
-		profile.schema += 1;
-		assert!(MeasuredProfileCodec::encode(&profile).is_err());
-	}
-
-	#[test]
-	fn explicit_cache_atomically_round_trips_with_private_permissions() {
-		let gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let benchmarks = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Measured,
-		};
-		let directory = TestDirectory::new();
-		let path = directory.path().join("measured.profile");
-		let cache = ExplicitPathProfileCache::new(&path).unwrap();
-		let profile = engine(&gpu, &benchmarks)
-			.load_or_probe_and_store(&seed(), &[], &cache)
-			.unwrap();
-		let cached = engine(&gpu, &benchmarks)
-			.load_or_probe_and_store(&seed(), &[], &cache)
-			.unwrap();
-		assert_eq!(cached, profile);
-		let loaded = cache.load(profile.cache_identity).unwrap().unwrap();
-		assert_eq!(loaded, profile);
-		assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
-		let entries = fs::read_dir(directory.path()).unwrap().count();
-		assert_eq!(entries, 1, "temporary file must be removed after rename");
-	}
-
-	#[test]
-	fn cache_rejects_corruption_stale_identity_symlinks_and_overwrite() {
-		let gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: true,
-		};
-		let benchmarks = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Measured,
-		};
-
-		let stale_directory = TestDirectory::new();
-		let stale_path = stale_directory.path().join("measured.profile");
-		let stale_cache = ExplicitPathProfileCache::new(&stale_path).unwrap();
-		let profile = engine(&gpu, &benchmarks).probe(&seed(), &[]).unwrap();
-		stale_cache.store(&profile).unwrap();
-		let stale_identity = CacheIdentity {
-			schema: profile.cache_identity.schema,
-			digest: Digest::new([0x55; 32]),
-		};
-		assert!(stale_cache.load(stale_identity).is_err());
-		let mut different = profile.clone();
-		different.cache_identity = stale_identity;
-		assert!(stale_cache.store(&different).is_err());
-		assert_eq!(
-			stale_cache.load(profile.cache_identity).unwrap().unwrap(),
-			profile
-		);
-
-		let corrupt_directory = TestDirectory::new();
-		let corrupt_path = corrupt_directory.path().join("measured.profile");
-		let corrupt_cache = ExplicitPathProfileCache::new(&corrupt_path).unwrap();
-		corrupt_cache.store(&profile).unwrap();
-		let mut bytes = fs::read(&corrupt_path).unwrap();
-		let middle = bytes.len() / 2;
-		bytes[middle] ^= 1;
-		fs::write(&corrupt_path, bytes).unwrap();
-		assert!(corrupt_cache.load(profile.cache_identity).is_err());
-
-		let symlink_directory = TestDirectory::new();
-		let victim = symlink_directory.path().join("victim");
-		fs::write(&victim, b"not a profile").unwrap();
-		fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
-		let link = symlink_directory.path().join("measured.profile");
-		symlink(&victim, &link).unwrap();
-		let symlink_cache = ExplicitPathProfileCache::new(link).unwrap();
-		assert!(symlink_cache.load(profile.cache_identity).is_err());
-	}
-
-	#[test]
-	fn exhaustive_enumeration_is_mandatory() {
-		let gpu = FakeGpuDiscovery {
-			driver: "driver-1",
-			exhaustive: false,
-		};
-		let benchmarks = FakeHostBenchmarks {
-			provenance: PropertyProvenance::Measured,
-		};
-		let error = engine(&gpu, &benchmarks).probe(&seed(), &[]).unwrap_err();
-		assert_eq!(error, ProbeError::IncompleteGpuEnumeration);
-	}
 }

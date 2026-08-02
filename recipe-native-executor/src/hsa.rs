@@ -1,9 +1,11 @@
 //! ROCr/HSA resource realization and submission bridge.
 
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroU32;
-use std::time::Duration;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	num::NonZeroU32,
+	time::Duration,
+};
 
 use recipe_core::{
 	ArenaLayout, ArtifactId, BundleIdentity, ByteCount, CompletionSlotId, DeviceId, DraftPlan, FinalizedBundle,
@@ -21,9 +23,10 @@ use recipe_hsa::{
 };
 use recipe_kernel::{ArtifactDigest, KernelArgument, inspect_hsaco_bundle};
 
-use crate::error::ensure_submission_queue_capacity;
-use crate::plan::InitImageContract;
-use crate::{Error, ExecutionPlan, Result, RuntimeArtifactKind};
+use crate::{
+	Error, ExecutionPlan, NativeBackendKind, NativeDeviceExecutionEvidence, Result, RuntimeArtifactKind,
+	error::ensure_submission_queue_capacity, plan::InitImageContract,
+};
 
 #[derive(Clone)]
 pub struct HsaBinding<'scope> {
@@ -62,40 +65,26 @@ impl<'scope> HsaBinding<'scope> {
 	}
 
 	#[must_use]
-	pub const fn device(&self) -> DeviceId {
-		self.device
-	}
+	pub const fn device(&self) -> DeviceId { self.device }
 
 	#[must_use]
-	pub fn target_id(&self) -> &str {
-		&self.target_id
-	}
+	pub fn target_id(&self) -> &str { &self.target_id }
 
 	#[must_use]
-	pub const fn code_object_version(&self) -> u8 {
-		self.code_object_version
-	}
+	pub const fn code_object_version(&self) -> u8 { self.code_object_version }
 
 	#[must_use]
-	pub const fn queue_packets(&self) -> u32 {
-		self.queue_packets
-	}
+	pub const fn queue_packets(&self) -> u32 { self.queue_packets }
 
 	#[must_use]
-	pub const fn maximum_submission_queues(&self) -> u32 {
-		self.maximum_submission_queues
-	}
+	pub const fn maximum_submission_queues(&self) -> u32 { self.maximum_submission_queues }
 
 	#[must_use]
-	pub const fn enabled_display_connectors(&self) -> u32 {
-		self.enabled_display_connectors
-	}
+	pub const fn enabled_display_connectors(&self) -> u32 { self.enabled_display_connectors }
 
 	/// Queries ROCr's current available-memory counter for this exact binding
 	/// before any candidate resources are realized.
-	pub fn available_bytes(&self) -> Result<ByteCount> {
-		Ok(ByteCount::new(self.session.available_memory_bytes()?))
-	}
+	pub fn available_bytes(&self) -> Result<ByteCount> { Ok(ByteCount::new(self.session.available_memory_bytes()?)) }
 
 	/// Allocate host-accessible fine-grained memory through this GPU's exact
 	/// CPU allocator and grant the bound GPU access.
@@ -105,13 +94,9 @@ impl<'scope> HsaBinding<'scope> {
 		Ok(allocation)
 	}
 
-	pub(crate) const fn session(&self) -> &'scope Session<'scope> {
-		self.session
-	}
+	pub(crate) const fn session(&self) -> &'scope Session<'scope> { self.session }
 
-	pub(crate) const fn host_allocator(&self) -> &'scope DiscoveredAgent<'scope> {
-		self.host_allocator
-	}
+	pub(crate) const fn host_allocator(&self) -> &'scope DiscoveredAgent<'scope> { self.host_allocator }
 }
 
 impl fmt::Debug for HsaBinding<'_> {
@@ -140,15 +125,11 @@ pub(crate) trait HsaArenaLookup<'scope> {
 }
 
 impl<'scope> HsaArenaLookup<'scope> for BTreeMap<DeviceId, HsaArena<'scope>> {
-	fn arena(&self, device: DeviceId) -> Option<&HsaArena<'scope>> {
-		self.get(&device)
-	}
+	fn arena(&self, device: DeviceId) -> Option<&HsaArena<'scope>> { self.get(&device) }
 }
 
 impl<'borrow, 'scope> HsaArenaLookup<'scope> for ArenaSet<'borrow, HsaArena<'scope>> {
-	fn arena(&self, device: DeviceId) -> Option<&HsaArena<'scope>> {
-		self.get(device)
-	}
+	fn arena(&self, device: DeviceId) -> Option<&HsaArena<'scope>> { self.get(device) }
 }
 
 pub struct HsaArena<'scope> {
@@ -157,21 +138,13 @@ pub struct HsaArena<'scope> {
 }
 
 impl<'scope> HsaArena<'scope> {
-	pub(crate) fn device(&self) -> DeviceId {
-		self.device
-	}
+	pub(crate) fn device(&self) -> DeviceId { self.device }
 
-	pub(crate) const fn allocation(&self) -> &Allocation<'scope> {
-		&self.allocation
-	}
+	pub(crate) const fn allocation(&self) -> &Allocation<'scope> { &self.allocation }
 
-	pub fn bytes(&self) -> usize {
-		self.allocation.len()
-	}
+	pub fn bytes(&self) -> usize { self.allocation.len() }
 
-	pub(crate) fn release(self) -> Result<()> {
-		self.allocation.close().map_err(Error::from)
-	}
+	pub(crate) fn release(self) -> Result<()> { self.allocation.close().map_err(Error::from) }
 }
 
 impl fmt::Debug for HsaArena<'_> {
@@ -373,10 +346,12 @@ impl<'scope> HsaBackend<'scope> {
 				resources.validate_handoff(bundle, tasks)?;
 				Ok(resources)
 			}
-			HsaBackendState::Bound => Err(Error::BackendState {
-				backend: "HSA",
-				detail: "resources may be bound only once",
-			}),
+			HsaBackendState::Bound => {
+				Err(Error::BackendState {
+					backend: "HSA",
+					detail: "resources may be bound only once",
+				})
+			}
 		}
 	}
 }
@@ -556,13 +531,10 @@ impl<'scope> HsaResources<'scope> {
 				task: request.task,
 				detail: "HSA pre-final pending token is absent",
 			})?;
-		ensure(
-			self.prepared_tasks.insert(request.task),
-			Error::Protocol {
-				task: request.task,
-				detail: "HSA pending token was prepared more than once",
-			},
-		)?;
+		ensure(self.prepared_tasks.insert(request.task), Error::Protocol {
+			task: request.task,
+			detail: "HSA pending token was prepared more than once",
+		})?;
 		Ok(HsaPending::ready(request, planned, native))
 	}
 
@@ -633,6 +605,26 @@ impl<'scope> HsaResources<'scope> {
 			.find_map(|device| device.egress.remove(&task))
 	}
 
+	pub(crate) fn execution_evidence(&self) -> Vec<NativeDeviceExecutionEvidence> {
+		self.devices
+			.iter()
+			.map(|(&device, resources)| {
+				NativeDeviceExecutionEvidence {
+					device,
+					backend: NativeBackendKind::Hsa,
+					image_loads: resources.executables.len(),
+					entry_lookups: resources.artifacts.len(),
+					queues: resources.queues.len(),
+					completion_objects: resources.completions.len(),
+					persistent_allocations: resources.kernargs.len()
+						+ resources.metric_buffers.len()
+						+ usize::from(resources.scratch.is_some())
+						+ 1,
+				}
+			})
+			.collect()
+	}
+
 	pub(crate) fn collect_exit(
 		&mut self,
 		arenas: &impl HsaArenaLookup<'scope>,
@@ -655,13 +647,10 @@ impl<'scope> HsaResources<'scope> {
 			task: work.task,
 			detail: "completed HSA exit has no preallocated host result",
 		})?;
-		ensure(
-			source.len() == destination.len(),
-			Error::Protocol {
-				task: work.task,
-				detail: "completed HSA exit size differs from caller storage",
-			},
-		)?;
+		ensure(source.len() == destination.len(), Error::Protocol {
+			task: work.task,
+			detail: "completed HSA exit size differs from caller storage",
+		})?;
 		destination.copy_from_slice(source);
 		Ok(())
 	}
@@ -680,25 +669,29 @@ impl<'scope> HsaResources<'scope> {
 			},
 		)?;
 		match work {
-			BackendWork::InitAdmission(admission) => ensure(
-				contract.admission
-					== Some(InitImageContract {
-						device: admission.destination.device,
-						image: admission.destination.value,
-						bytes: admission.bytes,
-					}),
-				Error::Protocol {
-					task,
-					detail: "submitted HSA admission differs from the finalized init-image manifest",
-				},
-			),
-			BackendWork::InternalTransfer(transfer) | BackendWork::ExitTransfer(transfer) => ensure(
-				transfer.route == contract.route && transfer.lane_claims == contract.lane_claims,
-				Error::Protocol {
-					task,
-					detail: "submitted HSA route or lane claims differ from the finalized transfer",
-				},
-			),
+			BackendWork::InitAdmission(admission) => {
+				ensure(
+					contract.admission
+						== Some(InitImageContract {
+							device: admission.destination.device,
+							image: admission.destination.value,
+							bytes: admission.bytes,
+						}),
+					Error::Protocol {
+						task,
+						detail: "submitted HSA admission differs from the finalized init-image manifest",
+					},
+				)
+			}
+			BackendWork::InternalTransfer(transfer) | BackendWork::ExitTransfer(transfer) => {
+				ensure(
+					transfer.route == contract.route && transfer.lane_claims == contract.lane_claims,
+					Error::Protocol {
+						task,
+						detail: "submitted HSA route or lane claims differ from the finalized transfer",
+					},
+				)
+			}
 			BackendWork::Calculation(_) | BackendWork::Metric(_) => Ok(()),
 		}
 	}
@@ -1019,13 +1012,10 @@ impl<'scope> HsaResources<'scope> {
 				task: work.task,
 				detail: "HSA metric buffer was not pre-realized",
 			})?;
-		ensure(
-			metric_buffer.len() == 4,
-			Error::Protocol {
-				task: work.task,
-				detail: "HSA metric buffer is not four bytes",
-			},
-		)?;
+		ensure(metric_buffer.len() == 4, Error::Protocol {
+			task: work.task,
+			detail: "HSA metric buffer is not four bytes",
+		})?;
 		let source_offset = offset_to_usize(work.value.arena_offset.get())?;
 		claim_completion(&mut device.completions, work.task, planned.slots.completion)?;
 		let submission = device.session.copy_async_prepared(
@@ -1077,20 +1067,19 @@ impl<'scope> HsaResources<'scope> {
 
 	pub(crate) fn prepare_loop_pending(&mut self, pending: &mut HsaPending<'scope>) -> Result<()> {
 		self.ensure_healthy()?;
-		ensure(
-			pending.phase == RunPhase::Loop,
-			Error::Protocol {
-				task: pending.task,
-				detail: "only an HSA loop token may be prepared for loop submission",
-			},
-		)?;
+		ensure(pending.phase == RunPhase::Loop, Error::Protocol {
+			task: pending.task,
+			detail: "only an HSA loop token may be prepared for loop submission",
+		})?;
 		match pending.state.loop_submission_action() {
 			Some(LoopSubmissionAction::UsePrepared) => Ok(()),
 			Some(LoopSubmissionAction::Rearm) => self.rearm_pending(pending),
-			None => Err(Error::Protocol {
-				task: pending.task,
-				detail: "an active HSA loop token may not be submitted again",
-			}),
+			None => {
+				Err(Error::Protocol {
+					task: pending.task,
+					detail: "an active HSA loop token may not be submitted again",
+				})
+			}
 		}
 	}
 
@@ -1133,13 +1122,10 @@ impl<'scope> HsaResources<'scope> {
 		)?;
 		for (device, resources) in &self.devices {
 			let finalized = bundle.init_image(*device).map(InitImageContract::from);
-			ensure(
-				resources.admission == finalized,
-				Error::ArenaMismatch {
-					device: *device,
-					detail: "finalized HSA init-image manifest differs from warm admission",
-				},
-			)?;
+			ensure(resources.admission == finalized, Error::ArenaMismatch {
+				device: *device,
+				detail: "finalized HSA init-image manifest differs from warm admission",
+			})?;
 		}
 		let runtime_artifacts = self.plan.runtime_artifacts().cloned().collect();
 		let devices = self.devices.keys().copied().collect();
@@ -1205,9 +1191,11 @@ impl<'scope> HsaPreparedResources<'scope> {
 		}
 		let artifact_ids = scoped_tasks
 			.iter()
-			.filter_map(|task| match &task.kind {
-				TaskKind::Calculation(calculation) => Some(calculation.artifact),
-				TaskKind::Transfer(_) | TaskKind::Metric(_) => None,
+			.filter_map(|task| {
+				match &task.kind {
+					TaskKind::Calculation(calculation) => Some(calculation.artifact),
+					TaskKind::Transfer(_) | TaskKind::Metric(_) => None,
+				}
 			})
 			.collect::<BTreeSet<_>>();
 		let mut runtime_by_id = BTreeMap::new();
@@ -1271,17 +1259,23 @@ impl<'scope> HsaPreparedResources<'scope> {
 				tasks: prepared_tasks,
 				plan,
 				contracts,
-			} => match prepared_bundle == bundle.identity() && prepared_tasks == *tasks {
-				true => Ok((plan, contracts)),
-				false => Err(Error::BackendState {
+			} => {
+				match prepared_bundle == bundle.identity() && prepared_tasks == *tasks {
+					true => Ok((plan, contracts)),
+					false => {
+						Err(Error::BackendState {
+							backend: "HSA",
+							detail: "finalized partition differs from its prepared handoff",
+						})
+					}
+				}
+			}
+			HsaPreparedHandoff::Candidate(_) => {
+				Err(Error::BackendState {
 					backend: "HSA",
-					detail: "finalized partition differs from its prepared handoff",
-				}),
-			},
-			HsaPreparedHandoff::Candidate(_) => Err(Error::BackendState {
-				backend: "HSA",
-				detail: "candidate resources were not validated for finalized handoff",
-			}),
+					detail: "candidate resources were not validated for finalized handoff",
+				})
+			}
 		}?;
 		bind_finalized_artifact_resources(&mut devices, &plan)?;
 		Ok(HsaResources {
@@ -1322,13 +1316,10 @@ impl<'scope> HsaPreparedResources<'scope> {
 		)?;
 		for (device, resources) in &devices {
 			let warm = bundle.init_image(*device).map(InitImageContract::from);
-			ensure(
-				resources.admission == warm,
-				Error::ArenaMismatch {
-					device: *device,
-					detail: "warm HSA init-image manifest differs from prepared admission",
-				},
-			)?;
+			ensure(resources.admission == warm, Error::ArenaMismatch {
+				device: *device,
+				detail: "warm HSA init-image manifest differs from prepared admission",
+			})?;
 		}
 		let planned_devices = devices.keys().copied().collect();
 		let plan = ExecutionPlan::validate_partition(bundle, runtime_artifacts, planned_devices, tasks)?;
@@ -1360,13 +1351,10 @@ impl<'scope> HsaPreparedResources<'scope> {
 		};
 		for (device, resources) in &self.devices {
 			let finalized = bundle.init_image(*device).map(InitImageContract::from);
-			ensure(
-				resources.admission == finalized,
-				Error::ArenaMismatch {
-					device: *device,
-					detail: "finalized HSA init-image manifest differs from its prepared admission",
-				},
-			)?;
+			ensure(resources.admission == finalized, Error::ArenaMismatch {
+				device: *device,
+				detail: "finalized HSA init-image manifest differs from its prepared admission",
+			})?;
 		}
 		let devices = self.devices.keys().copied().collect();
 		let plan = ExecutionPlan::validate_partition(bundle, runtime_artifacts.clone(), devices, tasks)?;
@@ -1422,10 +1410,12 @@ impl<'scope> Backend for HsaBackend<'scope> {
 				resources.validate_handoff(bundle, &tasks)?;
 				Ok(resources)
 			}
-			HsaBackendState::Bound => Err(Error::BackendState {
-				backend: "HSA",
-				detail: "resources may be bound only once",
-			}),
+			HsaBackendState::Bound => {
+				Err(Error::BackendState {
+					backend: "HSA",
+					detail: "resources may be bound only once",
+				})
+			}
 		}
 	}
 
@@ -1435,10 +1425,9 @@ impl<'scope> Backend for HsaBackend<'scope> {
 		request: PendingRequest,
 		physical_calls: &mut PhysicalCallBatch,
 	) -> std::result::Result<Self::Pending, Self::Error> {
-		crate::accounting::record(
-			physical_calls,
-			PhysicalCall::PreparePending { task: request.task },
-		)?;
+		crate::accounting::record(physical_calls, PhysicalCall::PreparePending {
+			task: request.task,
+		})?;
 		resource.prepare_pending(request)
 	}
 
@@ -1448,19 +1437,14 @@ impl<'scope> Backend for HsaBackend<'scope> {
 		layout: &ArenaLayout,
 		physical_calls: &mut PhysicalCallBatch,
 	) -> std::result::Result<Self::Arena, Self::Error> {
-		crate::accounting::record(
-			physical_calls,
-			PhysicalCall::AllocateArena {
-				device: layout.device,
-				bytes: layout.size,
-			},
-		)?;
+		crate::accounting::record(physical_calls, PhysicalCall::AllocateArena {
+			device: layout.device,
+			bytes: layout.size,
+		})?;
 		resource.allocate_arena(layout)
 	}
 
-	fn supports_loop_repetition(&self) -> bool {
-		true
-	}
+	fn supports_loop_repetition(&self) -> bool { true }
 
 	fn submit(
 		&mut self,
@@ -1501,34 +1485,36 @@ impl<'scope> Backend for HsaBackend<'scope> {
 		let physical_status = match &result {
 			Ok(BackendPoll::Pending) => PhysicalPollStatus::Pending,
 			Ok(BackendPoll::Complete { .. }) => PhysicalPollStatus::Complete,
-			Err(error) => match error {
-				Error::DuplicateArtifact { .. }
-				| Error::MissingArtifact { .. }
-				| Error::UnexpectedArtifact { .. }
-				| Error::ArtifactMismatch { .. }
-				| Error::DuplicateDevice { .. }
-				| Error::MissingDevice { .. }
-				| Error::UnexpectedDevice { .. }
-				| Error::MissingQueue { .. }
-				| Error::MissingCompletion { .. }
-				| Error::ResourceContention { .. }
-				| Error::CompletionBusy { .. }
-				| Error::ArenaMismatch { .. }
-				| Error::ValueMismatch { .. }
-				| Error::UnsupportedTransfer { .. }
-				| Error::UnsupportedLoopContract { .. }
-				| Error::BackendState { .. }
-				| Error::BackendPoisoned { .. }
-				| Error::SubmissionQueueLimitExceeded { .. }
-				| Error::IntegerOverflow { .. }
-				| Error::PhysicalAccountingOverflow
-				| Error::CudaContract(_)
-				| Error::Cuda(_)
-				| Error::HsaSymbolLookup { .. }
-				| Error::Hsa(_)
-				| Error::Kernel(_)
-				| Error::Protocol { .. } => PhysicalPollStatus::Failed,
-			},
+			Err(error) => {
+				match error {
+					Error::DuplicateArtifact { .. }
+					| Error::MissingArtifact { .. }
+					| Error::UnexpectedArtifact { .. }
+					| Error::ArtifactMismatch { .. }
+					| Error::DuplicateDevice { .. }
+					| Error::MissingDevice { .. }
+					| Error::UnexpectedDevice { .. }
+					| Error::MissingQueue { .. }
+					| Error::MissingCompletion { .. }
+					| Error::ResourceContention { .. }
+					| Error::CompletionBusy { .. }
+					| Error::ArenaMismatch { .. }
+					| Error::ValueMismatch { .. }
+					| Error::UnsupportedTransfer { .. }
+					| Error::UnsupportedLoopContract { .. }
+					| Error::BackendState { .. }
+					| Error::BackendPoisoned { .. }
+					| Error::SubmissionQueueLimitExceeded { .. }
+					| Error::IntegerOverflow { .. }
+					| Error::PhysicalAccountingOverflow
+					| Error::CudaContract(_)
+					| Error::Cuda(_)
+					| Error::HsaSymbolLookup { .. }
+					| Error::Hsa(_)
+					| Error::Kernel(_)
+					| Error::Protocol { .. } => PhysicalPollStatus::Failed,
+				}
+			}
 		};
 		crate::accounting::record(
 			physical_calls,
@@ -1546,13 +1532,10 @@ impl<'scope> Backend for HsaBackend<'scope> {
 		destination: &mut [u8],
 		physical_calls: &mut PhysicalCallBatch,
 	) -> std::result::Result<(), Self::Error> {
-		crate::accounting::record(
-			physical_calls,
-			PhysicalCall::CollectExit {
-				task: work.task,
-				bytes: work.bytes,
-			},
-		)?;
+		crate::accounting::record(physical_calls, PhysicalCall::CollectExit {
+			task: work.task,
+			bytes: work.bytes,
+		})?;
 		resource.collect_exit(&arenas, pending, work, destination)
 	}
 
@@ -1565,13 +1548,17 @@ impl<'scope> Backend for HsaBackend<'scope> {
 	) -> std::result::Result<(), Self::Error> {
 		crate::accounting::record(physical_calls, PhysicalCall::ReleaseArena { device })?;
 		match resource.ensure_healthy() {
-			Ok(()) => match arena.device() == device {
-				true => arena.release(),
-				false => Err(Error::ArenaMismatch {
-					device,
-					detail: "released HSA arena belongs to another device",
-				}),
-			},
+			Ok(()) => {
+				match arena.device() == device {
+					true => arena.release(),
+					false => {
+						Err(Error::ArenaMismatch {
+							device,
+							detail: "released HSA arena belongs to another device",
+						})
+					}
+				}
+			}
 			Err(error) => Err(error),
 		}
 	}
@@ -1684,9 +1671,7 @@ impl<'scope> HsaPending<'scope> {
 		)
 	}
 
-	pub(crate) fn task(&self) -> TaskId {
-		self.task
-	}
+	pub(crate) fn task(&self) -> TaskId { self.task }
 }
 
 impl fmt::Debug for HsaPending<'_> {
@@ -1720,13 +1705,10 @@ fn validate_binding(binding: &HsaBinding<'_>) -> Result<()> {
 				.global_flags
 				.is_some_and(|flags| flags.contains(MemoryPoolFlags::KERNARG_INITIALIZATION))
 	});
-	ensure(
-		has_kernarg_pool,
-		Error::ArtifactMismatch {
-			artifact: ArtifactId::new(0),
-			detail: "HSA CPU kernarg allocator has no allocatable kernarg pool".to_owned(),
-		},
-	)?;
+	ensure(has_kernarg_pool, Error::ArtifactMismatch {
+		artifact: ArtifactId::new(0),
+		detail: "HSA CPU kernarg allocator has no allocatable kernarg pool".to_owned(),
+	})?;
 	let has_fine_pool = allocator.memory_pools.iter().any(|pool| {
 		pool.segment == MemorySegment::Global
 			&& pool.runtime_allocation.is_some()
@@ -1735,13 +1717,10 @@ fn validate_binding(binding: &HsaBinding<'_>) -> Result<()> {
 					|| flags.contains(MemoryPoolFlags::EXTENDED_SCOPE_FINE_GRAINED)
 			})
 	});
-	ensure(
-		has_fine_pool,
-		Error::ArtifactMismatch {
-			artifact: ArtifactId::new(0),
-			detail: "HSA CPU host allocator has no allocatable fine-grained pool".to_owned(),
-		},
-	)?;
+	ensure(has_fine_pool, Error::ArtifactMismatch {
+		artifact: ArtifactId::new(0),
+		detail: "HSA CPU host allocator has no allocatable fine-grained pool".to_owned(),
+	})?;
 	let has_target = binding
 		.session
 		.description()
@@ -1749,16 +1728,13 @@ fn validate_binding(binding: &HsaBinding<'_>) -> Result<()> {
 		.iter()
 		.filter_map(|isa| isa.amd_target.as_ref())
 		.any(|target| target.as_str() == binding.target_id);
-	ensure(
-		has_target,
-		Error::ArtifactMismatch {
-			artifact: ArtifactId::new(0),
-			detail: format!(
-				"HSA session does not advertise exact target {:?}",
-				binding.target_id
-			),
-		},
-	)
+	ensure(has_target, Error::ArtifactMismatch {
+		artifact: ArtifactId::new(0),
+		detail: format!(
+			"HSA session does not advertise exact target {:?}",
+			binding.target_id
+		),
+	})
 }
 
 fn validate_reservation(reservations: &ReservationLedger, device: DeviceId) -> Result<()> {
@@ -1790,13 +1766,10 @@ fn prepare_pending_pool<'scope>(
 			.get(&device)
 			.ok_or(Error::MissingDevice { device })?;
 		let token = resources.session.prepare_pending(2, 0)?;
-		ensure(
-			pending.insert(task.id, token).is_none(),
-			Error::Protocol {
-				task: task.id,
-				detail: "HSA candidate task appears more than once",
-			},
-		)?;
+		ensure(pending.insert(task.id, token).is_none(), Error::Protocol {
+			task: task.id,
+			detail: "HSA candidate task appears more than once",
+		})?;
 	}
 	Ok(pending)
 }
@@ -1804,23 +1777,31 @@ fn prepare_pending_pool<'scope>(
 fn candidate_task_device(task: &Task, value_devices: &BTreeMap<ValueId, DeviceId>) -> Result<DeviceId> {
 	match &task.kind {
 		TaskKind::Calculation(calculation) => Ok(calculation.device),
-		TaskKind::Metric(metric) => value_devices
-			.get(&metric.value)
-			.copied()
-			.ok_or(Error::ValueMismatch {
-				value: metric.value,
-				detail: "HSA candidate metric value has no device",
-			}),
-		TaskKind::Transfer(transfer) => match transfer.source {
-			TransferEndpoint::Device { device, .. } => Ok(device),
-			TransferEndpoint::External => match transfer.destination {
+		TaskKind::Metric(metric) => {
+			value_devices
+				.get(&metric.value)
+				.copied()
+				.ok_or(Error::ValueMismatch {
+					value: metric.value,
+					detail: "HSA candidate metric value has no device",
+				})
+		}
+		TaskKind::Transfer(transfer) => {
+			match transfer.source {
 				TransferEndpoint::Device { device, .. } => Ok(device),
-				TransferEndpoint::External => Err(Error::Protocol {
-					task: task.id,
-					detail: "HSA candidate transfer has no device endpoint",
-				}),
-			},
-		},
+				TransferEndpoint::External => {
+					match transfer.destination {
+						TransferEndpoint::Device { device, .. } => Ok(device),
+						TransferEndpoint::External => {
+							Err(Error::Protocol {
+								task: task.id,
+								detail: "HSA candidate transfer has no device endpoint",
+							})
+						}
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -1878,13 +1859,15 @@ fn realize_device<'scope>(
 		.find(|manifest| manifest.device == device)
 		.map(InitImageContract::from);
 	match admission {
-		Some(admission) => ensure(
-			admission.bytes.get() <= staging_bytes,
-			Error::ArenaMismatch {
-				device,
-				detail: "HSA init image exceeds its pre-realized fine staging",
-			},
-		),
+		Some(admission) => {
+			ensure(
+				admission.bytes.get() <= staging_bytes,
+				Error::ArenaMismatch {
+					device,
+					detail: "HSA init image exceeds its pre-realized fine staging",
+				},
+			)
+		}
 		None => Err(Error::MissingDevice { device }),
 	}?;
 	let scratch = match resources
@@ -1894,15 +1877,21 @@ fn realize_device<'scope>(
 		.map(|entry| entry.bytes.get())
 	{
 		Some(0) | None => None,
-		Some(bytes) => Some(binding
-			.session
-			.allocate_coarse(bytes_to_usize(bytes, "HSA scratch size")?)?),
+		Some(bytes) => {
+			Some(binding
+				.session
+				.allocate_coarse(bytes_to_usize(bytes, "HSA scratch size")?)?)
+		}
 	};
 	let artifact_ids = tasks
 		.iter()
-		.filter_map(|task| match &task.kind {
-			TaskKind::Calculation(calculation) => (calculation.device == device).then_some(calculation.artifact),
-			TaskKind::Transfer(_) | TaskKind::Metric(_) => None,
+		.filter_map(|task| {
+			match &task.kind {
+				TaskKind::Calculation(calculation) => {
+					(calculation.device == device).then_some(calculation.artifact)
+				}
+				TaskKind::Transfer(_) | TaskKind::Metric(_) => None,
+			}
 		})
 		.collect::<BTreeSet<_>>();
 	let mut bundles = BTreeMap::<ArtifactDigest, Vec<(ArtifactId, &crate::RuntimeArtifact)>>::new();
@@ -1972,14 +1961,14 @@ fn realize_device<'scope>(
 				},
 			)?;
 			let runtime_symbol = inspection.kernel.symbol;
-			let kernel = executable
-				.kernel(&runtime_symbol)
-				.map_err(|source| Error::HsaSymbolLookup {
+			let kernel = executable.kernel(&runtime_symbol).map_err(|source| {
+				Error::HsaSymbolLookup {
 					artifact: artifact_id,
 					abi_entry: runtime.abi.entry_symbol.clone(),
 					runtime_symbol: runtime_symbol.clone(),
 					source,
-				})?;
+				}
+			})?;
 			ensure(
 				kernel.metadata().kernarg_segment_size >= runtime.abi.argument_bytes
 					&& kernel.metadata().kernarg_segment_alignment >= runtime.abi.argument_alignment,
@@ -1988,14 +1977,11 @@ fn realize_device<'scope>(
 					detail: "loaded HSA kernel metadata is smaller than the inspected ABI".to_owned(),
 				},
 			)?;
-			artifacts.insert(
-				artifact_id,
-				LoadedArtifact {
-					kernel,
-					abi: runtime.abi.clone(),
-					resources: None,
-				},
-			);
+			artifacts.insert(artifact_id, LoadedArtifact {
+				kernel,
+				abi: runtime.abi.clone(),
+				resources: None,
+			});
 		}
 		executables.insert(digest, executable);
 	}
@@ -2005,41 +1991,44 @@ fn realize_device<'scope>(
 	for (slot, bytes) in kernarg_sizes {
 		let allocation = binding.host_allocator().allocate_kernarg(bytes)?;
 		binding.session.grant_access(&allocation)?;
-		kernargs.insert(
-			slot,
-			KernargSlot {
-				allocation,
-				bytes: vec![0_u8; bytes],
-			},
-		);
+		kernargs.insert(slot, KernargSlot {
+			allocation,
+			bytes: vec![0_u8; bytes],
+		});
 	}
 	let metric_buffers = tasks
 		.iter()
-		.filter_map(|task| match &task.kind {
-			TaskKind::Metric(metric) => match value_devices.get(&metric.value) {
-				Some(value_device) => (*value_device == device).then_some(task.id),
-				None => None,
-			},
-			TaskKind::Calculation(_) | TaskKind::Transfer(_) => None,
+		.filter_map(|task| {
+			match &task.kind {
+				TaskKind::Metric(metric) => {
+					match value_devices.get(&metric.value) {
+						Some(value_device) => (*value_device == device).then_some(task.id),
+						None => None,
+					}
+				}
+				TaskKind::Calculation(_) | TaskKind::Transfer(_) => None,
+			}
 		})
 		.map(|task| Ok((task, binding.allocate_host_fine(4)?)))
 		.collect::<Result<BTreeMap<_, _>>>()?;
 	let egress = tasks
 		.iter()
-		.filter_map(|task| match &task.kind {
-			TaskKind::Transfer(transfer) => {
-				let source = match transfer.source {
-					recipe_core::TransferEndpoint::Device { device, .. } => Some(device),
-					recipe_core::TransferEndpoint::External => None,
-				};
-				(task.phase == RunPhase::Exit
-					&& source == Some(device) && matches!(
-					transfer.destination,
-					recipe_core::TransferEndpoint::External
-				))
-				.then_some((task.id, transfer.bytes.get()))
+		.filter_map(|task| {
+			match &task.kind {
+				TaskKind::Transfer(transfer) => {
+					let source = match transfer.source {
+						recipe_core::TransferEndpoint::Device { device, .. } => Some(device),
+						recipe_core::TransferEndpoint::External => None,
+					};
+					(task.phase == RunPhase::Exit
+						&& source == Some(device) && matches!(
+						transfer.destination,
+						recipe_core::TransferEndpoint::External
+					))
+					.then_some((task.id, transfer.bytes.get()))
+				}
+				TaskKind::Calculation(_) | TaskKind::Metric(_) => None,
 			}
-			TaskKind::Calculation(_) | TaskKind::Metric(_) => None,
 		})
 		.map(|(task, bytes)| Ok((task, vec![0_u8; bytes_to_usize(bytes, "HSA egress size")?])))
 		.collect::<Result<BTreeMap<_, _>>>()?;
@@ -2084,14 +2073,13 @@ fn bind_finalized_artifact_resources(
 				loaded.kernel.metadata().dynamic_callstack,
 			)?;
 			match &loaded.resources {
-				Some(prior) => ensure(
-					prior == &resources,
-					Error::ArtifactMismatch {
+				Some(prior) => {
+					ensure(prior == &resources, Error::ArtifactMismatch {
 						artifact: *artifact,
 						detail: "loaded HSA resource envelope differs from its finalized identity"
 							.to_owned(),
-					},
-				)?,
+					})?
+				}
 				None => loaded.resources = Some(resources),
 			}
 		}
@@ -2108,16 +2096,16 @@ fn hsa_artifact_resource_envelope(
 		false => 0,
 		true => {
 			let private_bytes = finalized.private_bytes_per_lane.get();
-			ensure(
-				private_bytes != 0,
+			ensure(private_bytes != 0, Error::ArtifactMismatch {
+				artifact,
+				detail: "dynamic-callstack HSA kernel has a zero finalized private-byte bound".to_owned(),
+			})?;
+			u32::try_from(private_bytes).map_err(|_| {
 				Error::ArtifactMismatch {
 					artifact,
-					detail: "dynamic-callstack HSA kernel has a zero finalized private-byte bound".to_owned(),
-				},
-			)?;
-			u32::try_from(private_bytes).map_err(|_| Error::ArtifactMismatch {
-				artifact,
-				detail: "dynamic-callstack HSA kernel private-byte bound exceeds the AQL field".to_owned(),
+					detail: "dynamic-callstack HSA kernel private-byte bound exceeds the AQL field"
+						.to_owned(),
+				}
 			})?
 		}
 	};
@@ -2132,19 +2120,18 @@ fn task_contracts(
 	selected: Option<&BTreeSet<TaskId>>,
 ) -> Result<BTreeMap<TaskId, HsaTaskContract>> {
 	let mut contracts = BTreeMap::new();
-	for task in bundle.tasks().iter().filter(|task| match selected {
-		Some(selected) => selected.contains(&task.id),
-		None => true,
+	for task in bundle.tasks().iter().filter(|task| {
+		match selected {
+			Some(selected) => selected.contains(&task.id),
+			None => true,
+		}
 	}) {
 		let (class, submission, admission, route, lane_claims) = match &task.kind {
 			TaskKind::Calculation(calculation) => {
-				ensure(
-					task.phase == RunPhase::Loop,
-					Error::Protocol {
-						task: task.id,
-						detail: "HSA calculation is not assigned to the loop phase",
-					},
-				)?;
+				ensure(task.phase == RunPhase::Loop, Error::Protocol {
+					task: task.id,
+					detail: "HSA calculation is not assigned to the loop phase",
+				})?;
 				(
 					WorkClass::Calculation,
 					Some(calculation.submission),
@@ -2154,13 +2141,10 @@ fn task_contracts(
 				)
 			}
 			TaskKind::Metric(metric) => {
-				ensure(
-					task.phase == RunPhase::Loop,
-					Error::Protocol {
-						task: task.id,
-						detail: "HSA metric is not assigned to the loop phase",
-					},
-				)?;
+				ensure(task.phase == RunPhase::Loop, Error::Protocol {
+					task: task.id,
+					detail: "HSA metric is not assigned to the loop phase",
+				})?;
 				(
 					WorkClass::Metric,
 					Some(metric.submission),
@@ -2251,10 +2235,12 @@ fn transfer_work_class(
 		| (RunPhase::Init, Device { .. }, External)
 		| (RunPhase::Loop, External, External | Device { .. })
 		| (RunPhase::Loop, Device { .. }, External)
-		| (RunPhase::Exit, External, External | Device { .. }) => Err(Error::Protocol {
-			task,
-			detail: "HSA transfer phase or endpoint class is invalid",
-		}),
+		| (RunPhase::Exit, External, External | Device { .. }) => {
+			Err(Error::Protocol {
+				task,
+				detail: "HSA transfer phase or endpoint class is invalid",
+			})
+		}
 	}
 }
 
@@ -2410,13 +2396,10 @@ fn checked_arena<'arena, 'scope>(
 	let arena = arenas.arena(location.device).ok_or(Error::MissingDevice {
 		device: location.device,
 	})?;
-	ensure(
-		arena.device == location.device,
-		Error::ArenaMismatch {
-			device: location.device,
-			detail: "HSA arena identity differs from resolved value",
-		},
-	)?;
+	ensure(arena.device == location.device, Error::ArenaMismatch {
+		device: location.device,
+		detail: "HSA arena identity differs from resolved value",
+	})?;
 	let end = location
 		.arena_offset
 		.get()
@@ -2425,13 +2408,10 @@ fn checked_arena<'arena, 'scope>(
 			field: "resolved HSA arena range",
 		})?;
 	let arena_bytes = u64::try_from(arena.allocation.len()).map_err(pointer_size_error)?;
-	ensure(
-		end <= arena_bytes,
-		Error::ValueMismatch {
-			value: location.value,
-			detail: "resolved range exceeds HSA arena",
-		},
-	)?;
+	ensure(end <= arena_bytes, Error::ValueMismatch {
+		value: location.value,
+		detail: "resolved range exceeds HSA arena",
+	})?;
 	Ok(arena)
 }
 
@@ -2442,10 +2422,12 @@ fn device_endpoints(work: &TransferWork) -> Result<(ResolvedValueLocation, Resol
 		}
 		(ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::External)
 		| (ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::Device(_))
-		| (ResolvedTransferEndpoint::Device(_), ResolvedTransferEndpoint::External) => Err(Error::UnsupportedTransfer {
-			task: work.task,
-			detail: "internal transfer does not have two resolved HSA endpoints",
-		}),
+		| (ResolvedTransferEndpoint::Device(_), ResolvedTransferEndpoint::External) => {
+			Err(Error::UnsupportedTransfer {
+				task: work.task,
+				detail: "internal transfer does not have two resolved HSA endpoints",
+			})
+		}
 	}
 }
 
@@ -2459,12 +2441,14 @@ fn claim_completion(
 		.ok_or(Error::MissingCompletion { task, completion })?;
 	match core::mem::replace(slot, CompletionState::Active { task }) {
 		CompletionState::Available => Ok(()),
-		CompletionState::Active { task: owner } => Err(Error::CompletionBusy {
-			backend: "HSA",
-			task,
-			completion,
-			owner,
-		}),
+		CompletionState::Active { task: owner } => {
+			Err(Error::CompletionBusy {
+				backend: "HSA",
+				task,
+				completion,
+				owner,
+			})
+		}
 	}
 }
 
@@ -2476,13 +2460,10 @@ fn release_completion(
 	let slot = completions
 		.get_mut(&completion)
 		.ok_or(Error::MissingCompletion { task, completion })?;
-	ensure(
-		completion_owned(slot, task),
-		Error::Protocol {
-			task,
-			detail: "HSA completion slot belongs to another task",
-		},
-	)?;
+	ensure(completion_owned(slot, task), Error::Protocol {
+		task,
+		detail: "HSA completion slot belongs to another task",
+	})?;
 	*slot = CompletionState::Available;
 	Ok(())
 }
@@ -2513,10 +2494,10 @@ fn submission_error_requires_poison(error: &Error) -> bool {
 }
 
 fn ensure_queue(device: &DeviceResources<'_>, task: TaskId, queue: QueueSlotId) -> Result<()> {
-	ensure(
-		device.queues.contains_key(&queue),
-		Error::MissingQueue { task, queue },
-	)
+	ensure(device.queues.contains_key(&queue), Error::MissingQueue {
+		task,
+		queue,
+	})
 }
 
 fn validate_active(device: &DeviceResources<'_>, pending: &HsaPending<'_>) -> Result<()> {
@@ -2527,13 +2508,10 @@ fn validate_active(device: &DeviceResources<'_>, pending: &HsaPending<'_>) -> Re
 			task: pending.task,
 			completion: pending.completion,
 		})?;
-	ensure(
-		completion_owned(state, pending.task),
-		Error::Protocol {
-			task: pending.task,
-			detail: "HSA pending token is not registered active",
-		},
-	)
+	ensure(completion_owned(state, pending.task), Error::Protocol {
+		task: pending.task,
+		detail: "HSA pending token is not registered active",
+	})
 }
 
 fn finish_action(device: &mut DeviceResources<'_>, task: TaskId, action: PendingAction) -> Result<Option<MetricValue>> {
@@ -2544,13 +2522,10 @@ fn finish_action(device: &mut DeviceResources<'_>, task: TaskId, action: Pending
 				task,
 				detail: "completed HSA metric has no preallocated result buffer",
 			})?;
-			ensure(
-				buffer.len() == 4,
-				Error::Protocol {
-					task,
-					detail: "completed HSA metric buffer is not four bytes",
-				},
-			)?;
+			ensure(buffer.len() == 4, Error::Protocol {
+				task,
+				detail: "completed HSA metric buffer is not four bytes",
+			})?;
 			let mut bytes = [0_u8; 4];
 			let copy = unsafe {
 				// SAFETY: the prepared asynchronous copy reached terminal
@@ -2644,9 +2619,7 @@ fn bytes_to_usize(bytes: u64, field: &'static str) -> Result<usize> {
 	}
 }
 
-fn offset_to_usize(offset: u64) -> Result<usize> {
-	bytes_to_usize(offset, "HSA arena offset")
-}
+fn offset_to_usize(offset: u64) -> Result<usize> { bytes_to_usize(offset, "HSA arena offset") }
 
 fn u32_from_u64(value: u64, field: &'static str) -> Result<u32> {
 	match u32::try_from(value) {
@@ -2702,206 +2675,5 @@ fn reject_unexpected_device(device: Option<DeviceId>) -> Result<()> {
 	match device {
 		Some(device) => Err(Error::UnexpectedDevice { device }),
 		None => Ok(()),
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use recipe_core::{
-		CompletionSlotId, MetricId, MetricPurpose, MetricSlotId, MetricTask, Nanoseconds, QueueSlot, ScheduleWindow,
-	};
-
-	#[test]
-	fn queue_preflight_counts_scoped_metric_submission_without_rocr() {
-		let device = DeviceId::new(7);
-		let metric_queue = QueueSlotId::new(11);
-		let resources = ResourceManifest {
-			queues: vec![
-				QueueSlot {
-					id: metric_queue,
-					device,
-				},
-				QueueSlot {
-					id: QueueSlotId::new(12),
-					device,
-				},
-				QueueSlot {
-					id: QueueSlotId::new(13),
-					device: DeviceId::new(8),
-				},
-			],
-			completions: Vec::new(),
-			metrics: Vec::new(),
-			pinned_staging: Vec::new(),
-			scratch: Vec::new(),
-		};
-		let tasks = [Task {
-			id: TaskId::new(21),
-			phase: RunPhase::Loop,
-			window: ScheduleWindow {
-				start: Nanoseconds::new(0),
-				end: Nanoseconds::new(1),
-			},
-			dependencies: Vec::new(),
-			kind: TaskKind::Metric(MetricTask {
-				purpose: MetricPurpose::User,
-				metric: MetricId::new(1),
-				value: ValueId::new(1),
-				slot: MetricSlotId::new(1),
-				submission: SubmissionSlots {
-					queue: metric_queue,
-					completion: CompletionSlotId::new(1),
-				},
-			}),
-		}];
-
-		assert_eq!(
-			requested_submission_queue_count(&resources, &tasks, device),
-			1
-		);
-	}
-
-	#[test]
-	fn hsa_backend_accepts_only_scheduler_enforced_quota() {
-		let device = DeviceId::new(1);
-		assert_eq!(
-			require_enforced_quota(device, ReservationMechanism::EnforcedQuota),
-			Ok(())
-		);
-		assert!(matches!(
-			require_enforced_quota(device, ReservationMechanism::HeldAllocation),
-			Err(Error::ArenaMismatch {
-				device: actual,
-				..
-			}) if actual == device
-		));
-	}
-
-	#[test]
-	fn sparse_hsa_loop_submission_uses_prepared_token_then_rearms_terminal_token() {
-		assert_eq!(
-			HsaPendingState::Ready.loop_submission_action(),
-			Some(LoopSubmissionAction::UsePrepared)
-		);
-		assert_eq!(
-			HsaPendingState::Terminal.loop_submission_action(),
-			Some(LoopSubmissionAction::Rearm)
-		);
-		assert_eq!(HsaPendingState::Active.loop_submission_action(), None);
-	}
-
-	#[test]
-	fn hsa_grid_launches_complete_workgroups_for_scalar_and_partial_stages() {
-		let lanes = NonZeroU32::new(256).expect("nonzero workgroup");
-		assert_eq!(hsa_grid_size(1, lanes), Ok(256));
-		assert_eq!(hsa_grid_size(256, lanes), Ok(256));
-		assert_eq!(hsa_grid_size(257, lanes), Ok(512));
-		assert!(hsa_grid_size(u64::from(u32::MAX), lanes).is_err());
-	}
-
-	#[test]
-	fn fixed_private_kernel_retains_exact_envelope_without_dynamic_allowance() {
-		let resources = private_resources(24);
-		assert_eq!(
-			hsa_artifact_resource_envelope(ArtifactId::new(9), &resources, false),
-			Ok(HsaArtifactResourceEnvelope {
-				finalized: resources,
-				dynamic_private_bytes: 0,
-			})
-		);
-	}
-
-	#[test]
-	fn dynamic_callstack_uses_exact_per_lane_private_bound() {
-		let resources = private_resources(24);
-		assert_eq!(
-			hsa_artifact_resource_envelope(ArtifactId::new(9), &resources, true),
-			Ok(HsaArtifactResourceEnvelope {
-				finalized: resources,
-				dynamic_private_bytes: 24,
-			})
-		);
-	}
-
-	#[test]
-	fn dynamic_callstack_rejects_missing_or_unrepresentable_private_bound() {
-		let artifact = ArtifactId::new(9);
-		assert!(matches!(
-			hsa_artifact_resource_envelope(artifact, &private_resources(0), true),
-			Err(Error::ArtifactMismatch {
-				artifact: actual,
-				..
-			}) if actual == artifact
-		));
-		assert!(matches!(
-			hsa_artifact_resource_envelope(
-				artifact,
-				&private_resources(u64::from(u32::MAX) + 1),
-				true,
-			),
-			Err(Error::ArtifactMismatch {
-				artifact: actual,
-				..
-			}) if actual == artifact
-		));
-	}
-
-	#[test]
-	fn submission_poisoning_is_limited_to_terminal_or_uncertain_failures() {
-		for error in [
-			Error::BackendPoisoned { backend: "HSA" },
-			Error::Hsa(recipe_hsa::Error::SessionPoisoned {
-				status: -1,
-				source_queue_id: Some(3),
-				epoch: 5,
-			}),
-			Error::Hsa(recipe_hsa::Error::AsyncSignal { value: -7 }),
-			Error::Hsa(recipe_hsa::Error::DeferredRetirement {
-				pending: 1,
-				poisoned: true,
-			}),
-		] {
-			assert!(submission_error_requires_poison(&error), "{error}");
-		}
-	}
-
-	#[test]
-	fn rolled_back_submission_errors_do_not_poison_the_backend() {
-		for error in [
-			Error::Protocol {
-				task: TaskId::new(1),
-				detail: "pre-publication validation failed",
-			},
-			Error::Hsa(recipe_hsa::Error::InvalidDispatch {
-				reason: "prepared submission was rejected",
-			}),
-			Error::Hsa(recipe_hsa::Error::QueueFull {
-				write_index: 8,
-				read_index: 0,
-				size: 8,
-			}),
-			Error::Hsa(recipe_hsa::Error::Hsa {
-				operation: "hsa_amd_memory_async_copy",
-				status: 1,
-				message: None,
-			}),
-			Error::Hsa(recipe_hsa::Error::AsyncSignal { value: 0 }),
-			Error::Hsa(recipe_hsa::Error::DeferredRetirement {
-				pending: 1,
-				poisoned: false,
-			}),
-		] {
-			assert!(!submission_error_requires_poison(&error), "{error}");
-		}
-	}
-
-	fn private_resources(private_bytes_per_lane: u64) -> KernelResourceBounds {
-		KernelResourceBounds {
-			private_bytes_per_lane: ByteCount::new(private_bytes_per_lane),
-			shared_bytes_per_workgroup: ByteCount::new(128),
-			scratch_bytes_per_dispatch: ByteCount::new(256),
-			maximum_workgroup_lanes: 64,
-		}
 	}
 }

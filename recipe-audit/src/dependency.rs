@@ -1,8 +1,8 @@
-use crate::model::normalize_display_path;
-use crate::policy::classify_dependency;
-use crate::{AuditError, Finding, FindingCategory};
-use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use serde_json::Value;
+
+use crate::{AuditError, Finding, FindingCategory, model::normalize_display_path, policy::classify_dependency};
 
 /// One Cargo package in an injected dependency graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -250,49 +250,4 @@ fn required_string<'a>(value: Option<&'a Value>, field: &str) -> Result<&'a str,
 	value.and_then(Value::as_str)
 		.filter(|value| !value.is_empty())
 		.ok_or_else(|| AuditError::InvalidCargoMetadata(format!("{field} must be a nonempty string")))
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	fn metadata() -> String {
-		serde_json::json!({
-		    "version": 1,
-		    "packages": [
-			  {"id": "root 0.1", "name": "next-root", "manifest_path": "/scope/Cargo.toml"},
-			  {"id": "clean 1.0", "name": "architecture", "manifest_path": "/registry/architecture/Cargo.toml"},
-			  {"id": "bad 1.0", "name": "rocblas-sys", "manifest_path": "/registry/rocblas/Cargo.toml"},
-			  {"id": "unused 1.0", "name": "hip-sys", "manifest_path": "/registry/hip/Cargo.toml"}
-		    ],
-		    "resolve": {
-			  "nodes": [
-				{"id": "root 0.1", "dependencies": ["clean 1.0", "bad 1.0"]},
-				{"id": "clean 1.0", "dependencies": []},
-				{"id": "bad 1.0", "dependencies": []},
-				{"id": "unused 1.0", "dependencies": []}
-			  ]
-		    }
-		})
-		.to_string()
-	}
-
-	#[test]
-	fn cargo_metadata_audits_only_explicit_reachable_closure() {
-		let graph = DependencyGraph::from_cargo_metadata_json(&metadata(), &["root 0.1".into()]).unwrap();
-		let findings = graph.audit().unwrap();
-		assert_eq!(findings.len(), 1);
-		assert_eq!(findings[0].symbol, "rocblas-sys");
-	}
-
-	#[test]
-	fn missing_or_partial_graph_fails_closed() {
-		let graph = DependencyGraph::new(
-			vec![DependencyPackage::new("root", "root", "/root/Cargo.toml")],
-			vec![DependencyEdge::new("root", "absent")],
-			vec!["root".into()],
-		);
-		assert!(graph.audit().is_err());
-		assert!(DependencyGraph::from_cargo_metadata_json("{}", &["root".into()]).is_err());
-	}
 }

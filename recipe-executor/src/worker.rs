@@ -1,6 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::error::Error;
-use std::fmt;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	error::Error,
+	fmt,
+};
 
 use recipe_core::{
 	ArtifactId, BundleIdentity, ByteCount, DType, DeviceId, Digest, FinalizedBundle, KernelTemplateId, LinkId,
@@ -10,12 +12,14 @@ use recipe_core::{
 };
 use sha2::{Digest as _, Sha256};
 
-use crate::backend::{
-	ArenaSet, Backend, BackendPoll, BackendWork, CalculationWork, InitAdmissionWork, MetricWork, PendingRequest,
-	PhysicalCallBatch, TransferWork, WorkClass,
+use crate::{
+	backend::{
+		ArenaSet, Backend, BackendPoll, BackendWork, CalculationWork, InitAdmissionWork, MetricWork,
+		PendingRequest, PhysicalCallBatch, TransferWork, WorkClass,
+	},
+	executor::{JournalCapacity, LogicalEvent, RunJournal, Watchdog},
+	metrics::MetricValue,
 };
-use crate::executor::{JournalCapacity, LogicalEvent, RunJournal, Watchdog};
-use crate::metrics::MetricValue;
 
 /// Exact machine/node ownership selected for one remote worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,19 +30,13 @@ pub struct WorkerAssignment {
 
 impl WorkerAssignment {
 	#[must_use]
-	pub const fn new(machine: MachineId, node: NodeId) -> Self {
-		Self { machine, node }
-	}
+	pub const fn new(machine: MachineId, node: NodeId) -> Self { Self { machine, node } }
 
 	#[must_use]
-	pub const fn machine(self) -> MachineId {
-		self.machine
-	}
+	pub const fn machine(self) -> MachineId { self.machine }
 
 	#[must_use]
-	pub const fn node(self) -> NodeId {
-		self.node
-	}
+	pub const fn node(self) -> NodeId { self.node }
 }
 
 /// Closed ownership role of one task in a worker projection.
@@ -72,44 +70,28 @@ pub struct WorkerExternalTransfer {
 
 impl WorkerExternalTransfer {
 	#[must_use]
-	pub const fn task(&self) -> TaskId {
-		self.task
-	}
+	pub const fn task(&self) -> TaskId { self.task }
 
 	#[must_use]
-	pub const fn phase(&self) -> RunPhase {
-		self.phase
-	}
+	pub const fn phase(&self) -> RunPhase { self.phase }
 
 	#[must_use]
-	pub const fn direction(&self) -> ExternalTransferDirection {
-		self.direction
-	}
+	pub const fn direction(&self) -> ExternalTransferDirection { self.direction }
 
 	#[must_use]
-	pub const fn local(&self) -> ResolvedValueLocation {
-		self.local
-	}
+	pub const fn local(&self) -> ResolvedValueLocation { self.local }
 
 	#[must_use]
-	pub const fn bytes(&self) -> ByteCount {
-		self.bytes
-	}
+	pub const fn bytes(&self) -> ByteCount { self.bytes }
 
 	#[must_use]
-	pub fn route(&self) -> &[LinkId] {
-		&self.route
-	}
+	pub fn route(&self) -> &[LinkId] { &self.route }
 
 	#[must_use]
-	pub fn lane_claims(&self) -> &[TransferLaneClaim] {
-		&self.lane_claims
-	}
+	pub fn lane_claims(&self) -> &[TransferLaneClaim] { &self.lane_claims }
 
 	#[must_use]
-	pub const fn submission(&self) -> SubmissionSlots {
-		self.submission
-	}
+	pub const fn submission(&self) -> SubmissionSlots { self.submission }
 }
 
 /// A projection cannot be derived without preserving these global contracts.
@@ -163,10 +145,12 @@ impl fmt::Display for WorkerProjectionError {
 				node,
 				expected,
 				actual,
-			} => write!(
-				formatter,
-				"worker node {node} belongs to machine {actual}, expected {expected}"
-			),
+			} => {
+				write!(
+					formatter,
+					"worker node {node} belongs to machine {actual}, expected {expected}"
+				)
+			}
 			Self::EmptyWorker(node) => write!(formatter, "worker node {node} owns no devices"),
 			Self::MissingArena(device) => write!(formatter, "worker device {device} has no finalized arena"),
 			Self::MissingReservation(device) => {
@@ -250,10 +234,12 @@ impl PreparedWorkerWork {
 			Self::Calculation { .. } | Self::InternalTransfer { .. } | Self::Metric { .. } => {
 				WorkerTaskRole::Local
 			}
-			Self::External(transfer) => match transfer.direction {
-				ExternalTransferDirection::Ingress => WorkerTaskRole::ExternalIngress,
-				ExternalTransferDirection::Egress => WorkerTaskRole::ExternalEgress,
-			},
+			Self::External(transfer) => {
+				match transfer.direction {
+					ExternalTransferDirection::Ingress => WorkerTaskRole::ExternalIngress,
+					ExternalTransferDirection::Egress => WorkerTaskRole::ExternalEgress,
+				}
+			}
 		}
 	}
 
@@ -290,15 +276,17 @@ impl PreparedWorkerWork {
 				bytes,
 				submission,
 				..
-			} => image.map(|image| {
-				BackendWork::InitAdmission(InitAdmissionWork {
-					task,
-					destination: *destination,
-					bytes: *bytes,
-					submission: *submission,
-					image,
+			} => {
+				image.map(|image| {
+					BackendWork::InitAdmission(InitAdmissionWork {
+						task,
+						destination: *destination,
+						bytes: *bytes,
+						submission: *submission,
+						image,
+					})
 				})
-			}),
+			}
 			Self::Calculation {
 				device,
 				kernel_template,
@@ -307,18 +295,20 @@ impl PreparedWorkerWork {
 				inputs,
 				outputs,
 				fault_flag,
-			} => Some(BackendWork::Calculation(CalculationWork {
-				task,
-				run,
-				iteration: iteration?,
-				device: *device,
-				kernel_template: *kernel_template,
-				artifact: *artifact,
-				submission: *submission,
-				inputs,
-				outputs,
-				fault_flag: *fault_flag,
-			})),
+			} => {
+				Some(BackendWork::Calculation(CalculationWork {
+					task,
+					run,
+					iteration: iteration?,
+					device: *device,
+					kernel_template: *kernel_template,
+					artifact: *artifact,
+					submission: *submission,
+					inputs,
+					outputs,
+					fault_flag: *fault_flag,
+				}))
+			}
 			Self::InternalTransfer {
 				source,
 				destination,
@@ -349,15 +339,17 @@ impl PreparedWorkerWork {
 				slot,
 				value,
 				submission,
-			} => Some(BackendWork::Metric(MetricWork {
-				task,
-				iteration: iteration?,
-				purpose: *purpose,
-				metric: *metric,
-				slot: *slot,
-				value: *value,
-				submission: *submission,
-			})),
+			} => {
+				Some(BackendWork::Metric(MetricWork {
+					task,
+					iteration: iteration?,
+					purpose: *purpose,
+					metric: *metric,
+					slot: *slot,
+					value: *value,
+					submission: *submission,
+				}))
+			}
 			Self::External(_) => None,
 		}
 	}
@@ -374,9 +366,7 @@ struct ProjectedTask {
 }
 
 impl ProjectedTask {
-	const fn role(&self) -> WorkerTaskRole {
-		self.work.role()
-	}
+	const fn role(&self) -> WorkerTaskRole { self.work.role() }
 }
 
 /// Immutable, validated task/device/resource projection for one worker node.
@@ -536,9 +526,11 @@ impl WorkerProjection {
 
 		let artifacts = tasks
 			.iter()
-			.filter_map(|task| match task.work {
-				PreparedWorkerWork::Calculation { artifact, .. } => Some(artifact),
-				_ => None,
+			.filter_map(|task| {
+				match task.work {
+					PreparedWorkerWork::Calculation { artifact, .. } => Some(artifact),
+					_ => None,
+				}
 			})
 			.collect::<BTreeSet<_>>()
 			.into_iter()
@@ -558,34 +550,22 @@ impl WorkerProjection {
 	}
 
 	#[must_use]
-	pub const fn identity(&self) -> Digest {
-		self.identity
-	}
+	pub const fn identity(&self) -> Digest { self.identity }
 
 	#[must_use]
-	pub const fn bundle(&self) -> BundleIdentity {
-		self.bundle
-	}
+	pub const fn bundle(&self) -> BundleIdentity { self.bundle }
 
 	#[must_use]
-	pub const fn topology(&self) -> TopologyIdentity {
-		self.topology
-	}
+	pub const fn topology(&self) -> TopologyIdentity { self.topology }
 
 	#[must_use]
-	pub const fn assignment(&self) -> WorkerAssignment {
-		self.assignment
-	}
+	pub const fn assignment(&self) -> WorkerAssignment { self.assignment }
 
 	#[must_use]
-	pub fn devices(&self) -> &[DeviceId] {
-		&self.devices
-	}
+	pub fn devices(&self) -> &[DeviceId] { &self.devices }
 
 	#[must_use]
-	pub fn layouts(&self) -> &[recipe_core::ArenaLayout] {
-		&self.layouts
-	}
+	pub fn layouts(&self) -> &[recipe_core::ArenaLayout] { &self.layouts }
 
 	pub fn tasks(&self) -> impl ExactSizeIterator<Item = (TaskId, RunPhase, WorkerTaskRole)> + '_ {
 		self.tasks
@@ -594,26 +574,28 @@ impl WorkerProjection {
 	}
 
 	#[must_use]
-	pub fn artifacts(&self) -> &[ArtifactId] {
-		&self.artifacts
-	}
+	pub fn artifacts(&self) -> &[ArtifactId] { &self.artifacts }
 
 	#[must_use]
 	pub fn init_image_bytes(&self, device: DeviceId) -> Option<ByteCount> {
-		self.tasks.iter().find_map(|task| match task.work {
-			PreparedWorkerWork::InitAdmission {
-				device: candidate,
-				bytes,
-				..
-			} if candidate == device => Some(bytes),
-			_ => None,
+		self.tasks.iter().find_map(|task| {
+			match task.work {
+				PreparedWorkerWork::InitAdmission {
+					device: candidate,
+					bytes,
+					..
+				} if candidate == device => Some(bytes),
+				_ => None,
+			}
 		})
 	}
 
 	pub fn external_transfers(&self) -> impl Iterator<Item = &WorkerExternalTransfer> {
-		self.tasks.iter().filter_map(|task| match &task.work {
-			PreparedWorkerWork::External(transfer) => Some(transfer),
-			_ => None,
+		self.tasks.iter().filter_map(|task| {
+			match &task.work {
+				PreparedWorkerWork::External(transfer) => Some(transfer),
+				_ => None,
+			}
 		})
 	}
 
@@ -670,13 +652,15 @@ fn classify_task(
 						detail: "metric value has no finalized location",
 					})?;
 			match local.contains(&location.device) {
-				true => Ok(Some(PreparedWorkerWork::Metric {
-					purpose: metric.purpose,
-					metric: metric.metric,
-					slot: metric.slot,
-					value: location,
-					submission: metric.submission,
-				})),
+				true => {
+					Ok(Some(PreparedWorkerWork::Metric {
+						purpose: metric.purpose,
+						metric: metric.metric,
+						slot: metric.slot,
+						value: location,
+						submission: metric.submission,
+					}))
+				}
 				false => Ok(None),
 			}
 		}
@@ -756,32 +740,38 @@ fn classify_task(
 					ResolvedTransferEndpoint::Device(_),
 					true,
 					false,
-				) => Ok(Some(PreparedWorkerWork::External(external_transfer(
-					topology,
-					task,
-					transfer,
-					ExternalTransferDirection::Egress,
-					source,
-				)?))),
+				) => {
+					Ok(Some(PreparedWorkerWork::External(external_transfer(
+						topology,
+						task,
+						transfer,
+						ExternalTransferDirection::Egress,
+						source,
+					)?)))
+				}
 				(
 					ResolvedTransferEndpoint::Device(_),
 					ResolvedTransferEndpoint::Device(destination),
 					false,
 					true,
-				) => Ok(Some(PreparedWorkerWork::External(external_transfer(
-					topology,
-					task,
-					transfer,
-					ExternalTransferDirection::Ingress,
-					destination,
-				)?))),
+				) => {
+					Ok(Some(PreparedWorkerWork::External(external_transfer(
+						topology,
+						task,
+						transfer,
+						ExternalTransferDirection::Ingress,
+						destination,
+					)?)))
+				}
 				(ResolvedTransferEndpoint::Device(_), ResolvedTransferEndpoint::Device(_), false, false) => {
 					Ok(None)
 				}
-				_ => Err(WorkerProjectionError::InvalidTask {
-					task: task.id,
-					detail: "transfer endpoint ownership is not representable",
-				}),
+				_ => {
+					Err(WorkerProjectionError::InvalidTask {
+						task: task.id,
+						detail: "transfer endpoint ownership is not representable",
+					})
+				}
 			}
 		}
 	}
@@ -816,9 +806,11 @@ fn external_transfer(
 			detail: "cross-machine route direction differs from the worker endpoint",
 		});
 	}
-	let mut link_claims = transfer.lane_claims.iter().filter_map(|claim| match claim {
-		TransferLaneClaim::Link { link, lane } => Some((*link, *lane)),
-		TransferLaneClaim::External { .. } => None,
+	let mut link_claims = transfer.lane_claims.iter().filter_map(|claim| {
+		match claim {
+			TransferLaneClaim::Link { link, lane } => Some((*link, *lane)),
+			TransferLaneClaim::External { .. } => None,
+		}
 	});
 	let Some((claimed_link, lane)) = link_claims.next() else {
 		return Err(WorkerProjectionError::InvalidResource {
@@ -931,15 +923,17 @@ fn validate_task_resources(
 					});
 				};
 				let expected = match transfer.direction {
-					ExternalTransferDirection::Ingress => match task_transfer.source {
-						recipe_core::TransferEndpoint::Device { device, .. } => device,
-						recipe_core::TransferEndpoint::External => {
-							return Err(WorkerProjectionError::InvalidResource {
-								task: task.id,
-								detail: "cross-machine ingress has no source submission device",
-							});
+					ExternalTransferDirection::Ingress => {
+						match task_transfer.source {
+							recipe_core::TransferEndpoint::Device { device, .. } => device,
+							recipe_core::TransferEndpoint::External => {
+								return Err(WorkerProjectionError::InvalidResource {
+									task: task.id,
+									detail: "cross-machine ingress has no source submission device",
+								});
+							}
 						}
-					},
+					}
 					ExternalTransferDirection::Egress => transfer.local.device,
 				};
 				queue.device == expected
@@ -1179,7 +1173,6 @@ pub enum WorkerExecutionError<E: Error + Send + Sync + 'static> {
 		detail: &'static str,
 	},
 	DeviceFault {
-		calculation: TaskId,
 		readback: TaskId,
 		code: i32,
 	},
@@ -1209,36 +1202,44 @@ impl<E: Error + Send + Sync + 'static> fmt::Display for WorkerExecutionError<E> 
 			}
 			Self::BundleMismatch => formatter.write_str("worker projection and finalized bundle differ"),
 			Self::UnknownTask(task) => write!(formatter, "task {task} is outside the worker projection"),
-			Self::UnknownDevice(device) => write!(
-				formatter,
-				"device {device} is outside the worker projection"
-			),
+			Self::UnknownDevice(device) => {
+				write!(
+					formatter,
+					"device {device} is outside the worker projection"
+				)
+			}
 			Self::WrongRole {
 				task,
 				expected,
 				actual,
-			} => write!(
-				formatter,
-				"worker task {task} has role {actual:?}, expected {expected:?}"
-			),
+			} => {
+				write!(
+					formatter,
+					"worker task {task} has role {actual:?}, expected {expected:?}"
+				)
+			}
 			Self::WrongPhase {
 				task,
 				expected,
 				actual,
-			} => write!(
-				formatter,
-				"worker task {task:?} belongs to {actual:?}, active phase is {expected:?}"
-			),
+			} => {
+				write!(
+					formatter,
+					"worker task {task:?} belongs to {actual:?}, active phase is {expected:?}"
+				)
+			}
 			Self::InvalidLifecycle { state, detail } => {
 				write!(
 					formatter,
 					"worker lifecycle {state:?} rejected operation: {detail}"
 				)
 			}
-			Self::DuplicateDispatch(task) => write!(
-				formatter,
-				"worker task {task} was dispatched more than once"
-			),
+			Self::DuplicateDispatch(task) => {
+				write!(
+					formatter,
+					"worker task {task} was dispatched more than once"
+				)
+			}
 			Self::TaskNotActive(task) => write!(formatter, "worker task {task} is not active"),
 			Self::DependencyIncomplete { task, dependency } => {
 				write!(
@@ -1262,18 +1263,22 @@ impl<E: Error + Send + Sync + 'static> fmt::Display for WorkerExecutionError<E> 
 				task,
 				expected,
 				actual,
-			} => write!(
-				formatter,
-				"worker task {task:?} received {actual} bytes, expected {expected}"
-			),
+			} => {
+				write!(
+					formatter,
+					"worker task {task:?} received {actual} bytes, expected {expected}"
+				)
+			}
 			Self::InitOffsetMismatch {
 				device,
 				expected,
 				actual,
-			} => write!(
-				formatter,
-				"worker device {device} init offset {actual} differs from expected {expected}"
-			),
+			} => {
+				write!(
+					formatter,
+					"worker device {device} init offset {actual} differs from expected {expected}"
+				)
+			}
 			Self::InitDigestMismatch(device) => {
 				write!(formatter, "worker device {device} init digest differs")
 			}
@@ -1283,14 +1288,12 @@ impl<E: Error + Send + Sync + 'static> fmt::Display for WorkerExecutionError<E> 
 					"worker metric task {task} violated its contract: {detail}"
 				)
 			}
-			Self::DeviceFault {
-				calculation,
-				readback,
-				code,
-			} => write!(
-				formatter,
-				"worker calculation {calculation} reported device fault {code} through task {readback}"
-			),
+			Self::DeviceFault { readback, code } => {
+				write!(
+					formatter,
+					"worker checked device work reported fault {code} through task {readback}"
+				)
+			}
 			Self::WatchdogExpired { task, polls } => {
 				write!(
 					formatter,
@@ -1328,14 +1331,10 @@ pub struct WorkerPrepareFailure<B: WorkerBackend> {
 
 impl<B: WorkerBackend> WorkerPrepareFailure<B> {
 	#[must_use]
-	pub fn error(&self) -> &WorkerExecutionError<B::Error> {
-		&self.error
-	}
+	pub fn error(&self) -> &WorkerExecutionError<B::Error> { &self.error }
 
 	#[must_use]
-	pub fn cleanup_error(&self) -> Option<&WorkerExecutionError<B::Error>> {
-		self.cleanup_error.as_deref()
-	}
+	pub fn cleanup_error(&self) -> Option<&WorkerExecutionError<B::Error>> { self.cleanup_error.as_deref() }
 
 	pub fn into_parts(self) -> WorkerPrepareFailureParts<B> {
 		WorkerPrepareFailureParts {
@@ -1478,13 +1477,17 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		for contract in projection.tasks.iter().cloned() {
 			let mut calls = PhysicalCallBatch::new();
 			let pending = match &contract.work {
-				PreparedWorkerWork::External(transfer) => backend
-					.prepare_external(&mut resource, transfer, &mut calls)
-					.map(WorkerPending::External)
-					.map_err(|source| WorkerExecutionError::Backend {
-						operation: WorkerBackendOperation::PrepareExternal(contract.id),
-						source,
-					}),
+				PreparedWorkerWork::External(transfer) => {
+					backend
+						.prepare_external(&mut resource, transfer, &mut calls)
+						.map(WorkerPending::External)
+						.map_err(|source| {
+							WorkerExecutionError::Backend {
+								operation: WorkerBackendOperation::PrepareExternal(contract.id),
+								source,
+							}
+						})
+				}
 				work => {
 					let request = PendingRequest {
 						task: contract.id,
@@ -1510,9 +1513,11 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 					backend
 						.prepare_pending(&mut resource, request, &mut calls)
 						.map(WorkerPending::Local)
-						.map_err(|source| WorkerExecutionError::Backend {
-							operation: WorkerBackendOperation::PrepareLocal(contract.id),
-							source,
+						.map_err(|source| {
+							WorkerExecutionError::Backend {
+								operation: WorkerBackendOperation::PrepareLocal(contract.id),
+								source,
+							}
 						})
 				}
 			};
@@ -1582,24 +1587,16 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 	}
 
 	#[must_use]
-	pub const fn run_id(&self) -> RunId {
-		self.run
-	}
+	pub const fn run_id(&self) -> RunId { self.run }
 
 	#[must_use]
-	pub const fn projection(&self) -> &WorkerProjection {
-		&self.projection
-	}
+	pub const fn projection(&self) -> &WorkerProjection { &self.projection }
 
 	#[must_use]
-	pub const fn lifecycle(&self) -> WorkerLifecycle {
-		self.lifecycle
-	}
+	pub const fn lifecycle(&self) -> WorkerLifecycle { self.lifecycle }
 
 	#[must_use]
-	pub const fn journal(&self) -> &RunJournal {
-		&self.journal
-	}
+	pub const fn journal(&self) -> &RunJournal { &self.journal }
 
 	pub fn begin_init_image(
 		&mut self,
@@ -1807,10 +1804,12 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 						.map_err(|_| WorkerExecutionError::CapacityOverflow)?,
 				})
 			}
-			BackendPoll::Complete { metric: Some(_) } => Err(WorkerExecutionError::MetricContract {
-				task,
-				detail: "init admission completed with a metric",
-			}),
+			BackendPoll::Complete { metric: Some(_) } => {
+				Err(WorkerExecutionError::MetricContract {
+					task,
+					detail: "init admission completed with a metric",
+				})
+			}
 		}
 	}
 
@@ -2393,30 +2392,33 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 				);
 				match dtype_matches {
 					true => Ok(Some(metric)),
-					false => Err(WorkerExecutionError::MetricContract {
-						task: task.id,
-						detail: "user metric dtype differs from its finalized value",
-					}),
+					false => {
+						Err(WorkerExecutionError::MetricContract {
+							task: task.id,
+							detail: "user metric dtype differs from its finalized value",
+						})
+					}
 				}
 			}
 			(
 				PreparedWorkerWork::Metric {
-					purpose: MetricPurpose::FaultReadback { calculation: _ },
+					purpose: MetricPurpose::FaultReadback,
 					..
 				},
 				Some(MetricValue::I32(0)),
 			) => Ok(None),
 			(
 				PreparedWorkerWork::Metric {
-					purpose: MetricPurpose::FaultReadback { calculation },
+					purpose: MetricPurpose::FaultReadback,
 					..
 				},
 				Some(MetricValue::I32(code)),
-			) => Err(WorkerExecutionError::DeviceFault {
-				calculation: *calculation,
-				readback: task.id,
-				code,
-			}),
+			) => {
+				Err(WorkerExecutionError::DeviceFault {
+					readback: task.id,
+					code,
+				})
+			}
 			(PreparedWorkerWork::Metric { .. }, Some(MetricValue::F32(_)) | None) => {
 				Err(WorkerExecutionError::MetricContract {
 					task: task.id,
@@ -2426,15 +2428,19 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 			(PreparedWorkerWork::InitAdmission { .. }, None)
 			| (PreparedWorkerWork::Calculation { .. }, None)
 			| (PreparedWorkerWork::InternalTransfer { .. }, None) => Ok(None),
-			(PreparedWorkerWork::External(_), _) => Err(WorkerExecutionError::WrongRole {
-				task: task.id,
-				expected: WorkerTaskRole::Local,
-				actual: task.role(),
-			}),
-			(_, Some(_)) => Err(WorkerExecutionError::MetricContract {
-				task: task.id,
-				detail: "non-metric task completed with a metric",
-			}),
+			(PreparedWorkerWork::External(_), _) => {
+				Err(WorkerExecutionError::WrongRole {
+					task: task.id,
+					expected: WorkerTaskRole::Local,
+					actual: task.role(),
+				})
+			}
+			(_, Some(_)) => {
+				Err(WorkerExecutionError::MetricContract {
+					task: task.id,
+					detail: "non-metric task completed with a metric",
+				})
+			}
 		}
 	}
 
@@ -2569,10 +2575,12 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 	fn ensure_run(&self, run: RunId) -> Result<(), WorkerExecutionError<B::Error>> {
 		match run == self.run {
 			true => Ok(()),
-			false => Err(WorkerExecutionError::RunMismatch {
-				expected: self.run,
-				actual: run,
-			}),
+			false => {
+				Err(WorkerExecutionError::RunMismatch {
+					expected: self.run,
+					actual: run,
+				})
+			}
 		}
 	}
 
@@ -2580,10 +2588,12 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		match self.lifecycle {
 			WorkerLifecycle::Loop => Ok(RunPhase::Loop),
 			WorkerLifecycle::Exit => Ok(RunPhase::Exit),
-			state => Err(WorkerExecutionError::InvalidLifecycle {
-				state,
-				detail: "worker has no dispatchable phase",
-			}),
+			state => {
+				Err(WorkerExecutionError::InvalidLifecycle {
+					state,
+					detail: "worker has no dispatchable phase",
+				})
+			}
 		}
 	}
 
@@ -2609,11 +2619,13 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 	fn external_contract(&self, index: usize) -> Result<&WorkerExternalTransfer, WorkerExecutionError<B::Error>> {
 		match &self.tasks[index].contract.work {
 			PreparedWorkerWork::External(transfer) => Ok(transfer),
-			_ => Err(WorkerExecutionError::WrongRole {
-				task: self.tasks[index].contract.id,
-				expected: WorkerTaskRole::ExternalIngress,
-				actual: self.tasks[index].contract.role(),
-			}),
+			_ => {
+				Err(WorkerExecutionError::WrongRole {
+					task: self.tasks[index].contract.id,
+					expected: WorkerTaskRole::ExternalIngress,
+					actual: self.tasks[index].contract.role(),
+				})
+			}
 		}
 	}
 
@@ -2642,11 +2654,13 @@ fn prepare_images<B: WorkerBackend>(
 		let (task, image_bytes) = projection
 			.tasks
 			.iter()
-			.find_map(|task| match task.work {
-				PreparedWorkerWork::InitAdmission { device, bytes, .. } if device == layout.device => {
-					Some((task, bytes))
+			.find_map(|task| {
+				match task.work {
+					PreparedWorkerWork::InitAdmission { device, bytes, .. } if device == layout.device => {
+						Some((task, bytes))
+					}
+					_ => None,
 				}
-				_ => None,
 			})
 			.ok_or(WorkerExecutionError::Projection(
 				WorkerProjectionError::MissingInitAdmission(layout.device),

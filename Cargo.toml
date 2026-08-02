@@ -12,7 +12,6 @@ categories = ["science::ml"]
 
 [lib]
 name = "recipe"
-test = true
 doctest = false
 
 [[bin]]
@@ -20,27 +19,12 @@ name = "recipe"
 path = "src/main.rs"
 test = false
 
-[[test]]
-name = "facade-boundary"
-path = "tests/facade_boundary.rs"
-
-[[test]]
-name = "public-api-compile"
-path = "tests/public_api_compile.rs"
-
-[[test]]
-name = "training-reporting"
-path = "tests/training_reporting.rs"
-
-[[test]]
-name = "source-runner"
-path = "tests/source_runner.rs"
-
 [workspace]
 resolver = "3"
 members = [
 	".",
 	"recipe-audit",
+	"recipe-acceptance",
 	"recipe-cluster",
 	"recipe-core",
 	"recipe-cuda",

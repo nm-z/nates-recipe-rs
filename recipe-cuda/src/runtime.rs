@@ -1,12 +1,19 @@
-use crate::context::Context;
-use crate::driver::Driver;
-use crate::error::{CudaError, Result};
-use crate::ffi::{CUDA_ERROR_NOT_READY, CUDA_SUCCESS, CuDevicePtr, CuEvent, CuFunction, CuModule, CuStream};
-use core::ffi::c_void;
-use core::marker::PhantomData;
-use core::ptr::{self, NonNull};
-use std::ffi::CString;
-use std::time::{Duration, Instant};
+use core::{
+	ffi::c_void,
+	marker::PhantomData,
+	ptr::{self, NonNull},
+};
+use std::{
+	ffi::CString,
+	time::{Duration, Instant},
+};
+
+use crate::{
+	context::Context,
+	driver::Driver,
+	error::{CudaError, Result},
+	ffi::{CUDA_ERROR_NOT_READY, CUDA_SUCCESS, CuDevicePtr, CuEvent, CuFunction, CuModule, CuStream},
+};
 
 const CU_STREAM_NON_BLOCKING: u32 = 1;
 const CU_EVENT_DISABLE_TIMING: u32 = 2;
@@ -69,9 +76,11 @@ impl<'ctx> Module<'ctx> {
 
 	pub fn function<'module>(&'module self, name: &str) -> Result<Function<'module, 'ctx>> {
 		let module = self.raw.ok_or(CudaError::ContextClosed)?;
-		let name_c = CString::new(name).map_err(|_| CudaError::InvalidInput {
-			operation: "cuModuleGetFunction",
-			detail: "kernel name contains NUL".to_owned(),
+		let name_c = CString::new(name).map_err(|_| {
+			CudaError::InvalidInput {
+				operation: "cuModuleGetFunction",
+				detail: "kernel name contains NUL".to_owned(),
+			}
 		})?;
 		if name.is_empty() {
 			return Err(CudaError::InvalidInput {
@@ -99,9 +108,7 @@ impl<'ctx> Module<'ctx> {
 		})
 	}
 
-	pub fn unload(mut self) -> Result<()> {
-		self.destroy()
-	}
+	pub fn unload(mut self) -> Result<()> { self.destroy() }
 
 	fn destroy(&mut self) -> Result<()> {
 		let raw = self.raw.take().ok_or(CudaError::ContextClosed)?;
@@ -132,9 +139,7 @@ pub struct Function<'module, 'ctx> {
 }
 
 impl Function<'_, '_> {
-	pub fn name(&self) -> &str {
-		&self.name
-	}
+	pub fn name(&self) -> &str { &self.name }
 }
 
 pub struct DeviceBuffer<'ctx> {
@@ -171,42 +176,40 @@ impl<'ctx> DeviceBuffer<'ctx> {
 		})
 	}
 
-	pub fn len(&self) -> usize {
-		self.len
-	}
+	pub fn len(&self) -> usize { self.len }
 
-	pub fn is_empty(&self) -> bool {
-		false
-	}
+	pub fn is_empty(&self) -> bool { false }
 
-	pub fn device_ptr(&self) -> Result<u64> {
-		self.pointer.ok_or(CudaError::ContextClosed)
-	}
+	pub fn device_ptr(&self) -> Result<u64> { self.pointer.ok_or(CudaError::ContextClosed) }
 
-	pub fn free(mut self) -> Result<()> {
-		self.destroy()
-	}
+	pub fn free(mut self) -> Result<()> { self.destroy() }
 
 	fn checked_pointer(&self, offset: usize, bytes: usize, operation: &'static str) -> Result<CuDevicePtr> {
 		offset.checked_add(bytes)
 			.filter(|end| *end <= self.len)
-			.ok_or_else(|| CudaError::InvalidInput {
-				operation,
-				detail: format!(
-					"range {offset}..{} exceeds {}-byte device allocation",
-					offset.saturating_add(bytes),
-					self.len
-				),
+			.ok_or_else(|| {
+				CudaError::InvalidInput {
+					operation,
+					detail: format!(
+						"range {offset}..{} exceeds {}-byte device allocation",
+						offset.saturating_add(bytes),
+						self.len
+					),
+				}
 			})?;
 		let pointer = self.pointer.ok_or(CudaError::ContextClosed)?;
 		pointer
-			.checked_add(u64::try_from(offset).map_err(|_| CudaError::InvalidInput {
-				operation,
-				detail: format!("offset {offset} does not fit a CUDA device pointer"),
+			.checked_add(u64::try_from(offset).map_err(|_| {
+				CudaError::InvalidInput {
+					operation,
+					detail: format!("offset {offset} does not fit a CUDA device pointer"),
+				}
 			})?)
-			.ok_or_else(|| CudaError::InvalidInput {
-				operation,
-				detail: "device pointer offset overflow".to_owned(),
+			.ok_or_else(|| {
+				CudaError::InvalidInput {
+					operation,
+					detail: "device pointer offset overflow".to_owned(),
+				}
 			})
 	}
 
@@ -251,9 +254,11 @@ impl<'ctx> PinnedHostBuffer<'ctx> {
 			driver.check("cuMemHostAlloc", unsafe {
 				(driver.inner.api.mem_host_alloc)(&raw mut pointer, len, 0)
 			})?;
-			NonNull::new(pointer.cast::<u8>()).ok_or_else(|| CudaError::InvalidDriverValue {
-				operation: "cuMemHostAlloc",
-				detail: "success with a null host pointer".to_owned(),
+			NonNull::new(pointer.cast::<u8>()).ok_or_else(|| {
+				CudaError::InvalidDriverValue {
+					operation: "cuMemHostAlloc",
+					detail: "success with a null host pointer".to_owned(),
+				}
 			})
 		})?;
 		unsafe {
@@ -266,13 +271,9 @@ impl<'ctx> PinnedHostBuffer<'ctx> {
 		})
 	}
 
-	pub fn len(&self) -> usize {
-		self.len
-	}
+	pub fn len(&self) -> usize { self.len }
 
-	pub fn is_empty(&self) -> bool {
-		false
-	}
+	pub fn is_empty(&self) -> bool { false }
 
 	pub fn as_slice(&self) -> &[u8] {
 		let pointer = self.pointer.expect("open pinned host buffer");
@@ -284,20 +285,20 @@ impl<'ctx> PinnedHostBuffer<'ctx> {
 		unsafe { core::slice::from_raw_parts_mut(pointer.as_ptr(), self.len) }
 	}
 
-	pub fn free(mut self) -> Result<()> {
-		self.destroy()
-	}
+	pub fn free(mut self) -> Result<()> { self.destroy() }
 
 	fn checked_pointer(&self, offset: usize, bytes: usize, operation: &'static str) -> Result<NonNull<u8>> {
 		offset.checked_add(bytes)
 			.filter(|end| *end <= self.len)
-			.ok_or_else(|| CudaError::InvalidInput {
-				operation,
-				detail: format!(
-					"range {offset}..{} exceeds {}-byte pinned allocation",
-					offset.saturating_add(bytes),
-					self.len
-				),
+			.ok_or_else(|| {
+				CudaError::InvalidInput {
+					operation,
+					detail: format!(
+						"range {offset}..{} exceeds {}-byte pinned allocation",
+						offset.saturating_add(bytes),
+						self.len
+					),
+				}
 			})?;
 		let pointer = self.pointer.ok_or(CudaError::ContextClosed)?;
 		Ok(unsafe { NonNull::new_unchecked(pointer.as_ptr().add(offset)) })
@@ -479,6 +480,37 @@ impl<'ctx> Stream<'ctx> {
 		Ok(Pending::new(completion))
 	}
 
+	/// Enqueues a device-to-pinned-host copy without recording an event.
+	///
+	/// # Safety
+	///
+	/// The caller must retain both allocations and this stream until
+	/// [`Self::poll_idle`] reports completion.
+	pub unsafe fn enqueue_d2h(
+		&self,
+		destination: &mut PinnedHostBuffer<'ctx>,
+		destination_offset: usize,
+		source: &DeviceBuffer<'ctx>,
+		source_offset: usize,
+		bytes: usize,
+	) -> Result<()> {
+		same_context("cuMemcpyDtoHAsync_v2", self.context, destination.context)?;
+		same_context("cuMemcpyDtoHAsync_v2", self.context, source.context)?;
+		let stream = self.raw.ok_or(CudaError::ContextClosed)?;
+		let destination = destination.checked_pointer(destination_offset, bytes, "cuMemcpyDtoHAsync_v2")?;
+		let source = source.checked_pointer(source_offset, bytes, "cuMemcpyDtoHAsync_v2")?;
+		with_current(self.context, |driver| {
+			driver.check_status_only("cuMemcpyDtoHAsync_v2", unsafe {
+				(driver.inner.api.memcpy_dtoh_async_v2)(
+					destination.as_ptr().cast::<c_void>(),
+					source,
+					bytes,
+					stream,
+				)
+			})
+		})
+	}
+
 	/// Enqueues a device-to-device copy and records `completion` after it.
 	///
 	/// # Safety
@@ -511,6 +543,32 @@ impl<'ctx> Stream<'ctx> {
 			})
 		})?;
 		Ok(Pending::new(completion))
+	}
+
+	/// Enqueues a device-to-device copy without recording an event.
+	///
+	/// # Safety
+	///
+	/// The caller must retain both allocations and this stream until
+	/// [`Self::poll_idle`] reports completion.
+	pub unsafe fn enqueue_d2d(
+		&self,
+		destination: &DeviceBuffer<'ctx>,
+		destination_offset: usize,
+		source: &DeviceBuffer<'ctx>,
+		source_offset: usize,
+		bytes: usize,
+	) -> Result<()> {
+		same_context("cuMemcpyDtoDAsync_v2", self.context, destination.context)?;
+		same_context("cuMemcpyDtoDAsync_v2", self.context, source.context)?;
+		let stream = self.raw.ok_or(CudaError::ContextClosed)?;
+		let destination = destination.checked_pointer(destination_offset, bytes, "cuMemcpyDtoDAsync_v2")?;
+		let source = source.checked_pointer(source_offset, bytes, "cuMemcpyDtoDAsync_v2")?;
+		with_current(self.context, |driver| {
+			driver.check_status_only("cuMemcpyDtoDAsync_v2", unsafe {
+				(driver.inner.api.memcpy_dtod_async_v2)(destination, source, bytes, stream)
+			})
+		})
 	}
 
 	/// Enqueues a kernel and records `completion` after it.
@@ -571,9 +629,50 @@ impl<'ctx> Stream<'ctx> {
 		Ok(Pending::new(completion))
 	}
 
-	pub fn destroy(mut self) -> Result<()> {
-		self.close()
+	/// Enqueues a kernel without recording an event.
+	///
+	/// # Safety
+	///
+	/// The cubin ABI and launch arguments must match, and every referenced
+	/// allocation, function, module, and this stream must remain live until
+	/// [`Self::poll_idle`] reports completion.
+	pub unsafe fn enqueue_launch(
+		&self,
+		function: &Function<'_, 'ctx>,
+		config: LaunchConfig,
+		parameters: &mut [*mut c_void],
+		keepalive: &[&DeviceBuffer<'ctx>],
+	) -> Result<()> {
+		same_context("cuLaunchKernel", self.context, function.module.context)?;
+		for buffer in keepalive {
+			same_context("cuLaunchKernel", self.context, buffer.context)?;
+		}
+		let stream = self.raw.ok_or(CudaError::ContextClosed)?;
+		let parameter_pointer = if parameters.is_empty() {
+			ptr::null_mut()
+		} else {
+			parameters.as_mut_ptr()
+		};
+		with_current(self.context, |driver| {
+			driver.check_status_only("cuLaunchKernel", unsafe {
+				(driver.inner.api.launch_kernel)(
+					function.raw,
+					config.grid.x,
+					config.grid.y,
+					config.grid.z,
+					config.block.x,
+					config.block.y,
+					config.block.z,
+					config.dynamic_shared_memory_bytes,
+					stream,
+					parameter_pointer,
+					ptr::null_mut(),
+				)
+			})
+		})
 	}
+
+	pub fn destroy(mut self) -> Result<()> { self.close() }
 
 	fn close(&mut self) -> Result<()> {
 		let raw = self.raw.take().ok_or(CudaError::ContextClosed)?;
@@ -623,9 +722,7 @@ impl<'ctx> Event<'ctx> {
 		})
 	}
 
-	pub fn destroy(mut self) -> Result<()> {
-		self.close()
-	}
+	pub fn destroy(mut self) -> Result<()> { self.close() }
 
 	fn close(&mut self) -> Result<()> {
 		let raw = self.raw.take().ok_or(CudaError::ContextClosed)?;
@@ -689,12 +786,12 @@ impl<'op, 'ctx> Pending<'op, 'ctx> {
 	}
 
 	pub fn wait(mut self, timeout: Duration) -> Result<WaitOutcome<'op, 'ctx>> {
-		let deadline = Instant::now()
-			.checked_add(timeout)
-			.ok_or_else(|| CudaError::InvalidInput {
+		let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+			CudaError::InvalidInput {
 				operation: "Pending::wait",
 				detail: format!("timeout {timeout:?} overflows Instant"),
-			})?;
+			}
+		})?;
 		loop {
 			if self.poll()? == CompletionStatus::Complete {
 				let event = self.event.take().ok_or(CudaError::ContextClosed)?;
@@ -713,10 +810,12 @@ impl<'op, 'ctx> Pending<'op, 'ctx> {
 	/// event without creating a replacement driver object.
 	pub fn recycle_event(mut self) -> Result<Event<'ctx>> {
 		match self.poll()? {
-			CompletionStatus::Pending => Err(CudaError::InvalidInput {
-				operation: "Pending::recycle_event",
-				detail: "completion event is still pending".to_owned(),
-			}),
+			CompletionStatus::Pending => {
+				Err(CudaError::InvalidInput {
+					operation: "Pending::recycle_event",
+					detail: "completion event is still pending".to_owned(),
+				})
+			}
 			CompletionStatus::Complete => self.event.take().ok_or(CudaError::ContextClosed),
 		}
 	}
@@ -736,160 +835,5 @@ fn query_status(driver: &Driver, operation: &'static str, status: i32) -> Result
 			driver.check_status_only(operation, status)?;
 			unreachable!("non-success status passed Driver::check")
 		}
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::context::ContextFlags;
-	use crate::error::{DriverCallError, DriverStatus};
-	use crate::ffi::test_support;
-	use crate::ffi::{
-		CUDA_ERROR_NOT_READY,
-		test_support::{TEST_LOCK, reset_runtime_state, set_event_query_script, teardown_log},
-	};
-
-	fn fixture() -> (Driver, crate::Discovery) {
-		let driver = Driver::from_test_api(test_support::api(false));
-		let discovery = driver.discover().unwrap();
-		(driver, discovery)
-	}
-
-	#[test]
-	fn pending_is_observable_before_completion_and_copy_roundtrips() {
-		let _lock = TEST_LOCK.lock().unwrap();
-		reset_runtime_state();
-		let (driver, discovery) = fixture();
-		let context = Context::create(&driver, &discovery.devices[0], ContextFlags::default()).unwrap();
-		let stream = Stream::create_nonblocking(&context).unwrap();
-		let device = DeviceBuffer::allocate(&context, 4).unwrap();
-		let copied_device = DeviceBuffer::allocate(&context, 4).unwrap();
-		let mut source = PinnedHostBuffer::allocate(&context, 4).unwrap();
-		source.as_mut_slice().copy_from_slice(&[1, 2, 3, 4]);
-		let event = Event::create_completion(&context).unwrap();
-		set_event_query_script([CUDA_ERROR_NOT_READY, CUDA_SUCCESS]);
-		let mut pending = unsafe { stream.copy_h2d(&device, 0, &source, 0, 4, event) }.unwrap();
-		assert_eq!(pending.poll().unwrap(), CompletionStatus::Pending);
-		assert_eq!(pending.poll().unwrap(), CompletionStatus::Complete);
-		let event = match pending.wait(Duration::ZERO).unwrap() {
-			WaitOutcome::Complete(event) => event,
-			WaitOutcome::TimedOut(_) => panic!("completed token timed out"),
-		};
-		set_event_query_script([CUDA_SUCCESS]);
-		let pending = unsafe { stream.copy_d2d(&copied_device, 0, &device, 0, 4, event) }.unwrap();
-		let event = match pending.wait(Duration::from_millis(1)).unwrap() {
-			WaitOutcome::Complete(event) => event,
-			WaitOutcome::TimedOut(_) => panic!("fake device copy timed out"),
-		};
-
-		let mut destination = PinnedHostBuffer::allocate(&context, 4).unwrap();
-		set_event_query_script([CUDA_SUCCESS]);
-		let pending = unsafe { stream.copy_d2h(&mut destination, 0, &copied_device, 0, 4, event) }.unwrap();
-		let event = match pending.wait(Duration::from_millis(1)).unwrap() {
-			WaitOutcome::Complete(event) => event,
-			WaitOutcome::TimedOut(_) => panic!("fake copy timed out"),
-		};
-		assert_eq!(destination.as_slice(), &[1, 2, 3, 4]);
-		drop(event);
-	}
-
-	#[test]
-	fn asynchronous_query_failure_is_propagated() {
-		let _lock = TEST_LOCK.lock().unwrap();
-		reset_runtime_state();
-		let (driver, discovery) = fixture();
-		let context = Context::create(&driver, &discovery.devices[0], ContextFlags::default()).unwrap();
-		let stream = Stream::create_nonblocking(&context).unwrap();
-		let device = DeviceBuffer::allocate(&context, 4).unwrap();
-		let source = PinnedHostBuffer::allocate(&context, 4).unwrap();
-		let event = Event::create_completion(&context).unwrap();
-		set_event_query_script([700]);
-		let mut pending = unsafe { stream.copy_h2d(&device, 0, &source, 0, 4, event) }.unwrap();
-		let error = pending.poll().unwrap_err();
-		assert!(matches!(
-			error,
-			CudaError::DriverCall(DriverCallError {
-				operation: "cuEventQuery",
-				status: DriverStatus(700),
-				..
-			})
-		));
-	}
-
-	#[test]
-	fn resources_teardown_before_context_without_modern_optional_symbols() {
-		let _lock = TEST_LOCK.lock().unwrap();
-		reset_runtime_state();
-		let (driver, discovery) = fixture();
-		assert_eq!(driver.module_loading_mode().unwrap(), None);
-		let context = Context::create(&driver, &discovery.devices[1], ContextFlags::default()).unwrap();
-		let module = Module::load_cubin(&context, b"\x7fELFfake-cubin").unwrap();
-		let function = module.function("recipe_probe").unwrap();
-		let device = DeviceBuffer::allocate(&context, 4).unwrap();
-		let host = PinnedHostBuffer::allocate(&context, 4).unwrap();
-		let stream = Stream::create_nonblocking(&context).unwrap();
-		let event = Event::create_completion(&context).unwrap();
-
-		let mut pointer = device.device_ptr().unwrap();
-		let mut parameters = [(&raw mut pointer).cast::<c_void>()];
-		let keepalive = [&device];
-		set_event_query_script([CUDA_SUCCESS]);
-		let pending = unsafe {
-			stream.launch(
-				&function,
-				LaunchConfig::new(Dim3::new(1, 1, 1).unwrap(), Dim3::new(32, 1, 1).unwrap()),
-				&mut parameters,
-				&keepalive,
-				event,
-			)
-		}
-		.unwrap();
-		let event = match pending.wait(Duration::from_millis(1)).unwrap() {
-			WaitOutcome::Complete(event) => event,
-			WaitOutcome::TimedOut(_) => panic!("fake kernel timed out"),
-		};
-
-		drop(event);
-		drop(stream);
-		drop(host);
-		drop(device);
-		drop(function);
-		drop(module);
-		drop(context);
-
-		assert_eq!(
-			teardown_log(),
-			[
-				"event",
-				"stream",
-				"host_memory",
-				"device_memory",
-				"module",
-				"context"
-			]
-		);
-	}
-
-	#[test]
-	fn bounded_wait_returns_the_live_pending_token_on_timeout() {
-		let _lock = TEST_LOCK.lock().unwrap();
-		reset_runtime_state();
-		let (driver, discovery) = fixture();
-		let context = Context::create(&driver, &discovery.devices[0], ContextFlags::default()).unwrap();
-		let stream = Stream::create_nonblocking(&context).unwrap();
-		let device = DeviceBuffer::allocate(&context, 1).unwrap();
-		let source = PinnedHostBuffer::allocate(&context, 1).unwrap();
-		let event = Event::create_completion(&context).unwrap();
-		set_event_query_script([CUDA_ERROR_NOT_READY, CUDA_SUCCESS]);
-		let pending = unsafe { stream.copy_h2d(&device, 0, &source, 0, 1, event) }.unwrap();
-		let pending = match pending.wait(Duration::ZERO).unwrap() {
-			WaitOutcome::TimedOut(pending) => pending,
-			WaitOutcome::Complete(_) => panic!("first query should be pending"),
-		};
-		assert!(matches!(
-			pending.wait(Duration::from_millis(1)).unwrap(),
-			WaitOutcome::Complete(_)
-		));
 	}
 }

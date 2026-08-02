@@ -1,15 +1,21 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+	fs::{self, File, OpenOptions},
+	io::{Read, Write},
+	os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+	path::{Path, PathBuf},
+	sync::atomic::{AtomicU64, Ordering},
+};
 
-use rustix::fs::{CWD, RenameFlags, renameat_with};
-use rustix::process::geteuid;
+use rustix::{
+	fs::{CWD, RenameFlags, renameat_with},
+	process::geteuid,
+};
 
-use crate::codec::{MAXIMUM_PROFILE_BYTES, MeasuredProfileCodec};
-use crate::error::{ProbeError, ProbeResult};
-use crate::model::{CacheIdentity, MeasuredProfile, ProfileCache};
+use crate::{
+	codec::{MAXIMUM_PROFILE_BYTES, MeasuredProfileCodec},
+	error::{ProbeError, ProbeResult},
+	model::{CacheIdentity, MeasuredProfile, ProfileCache},
+};
 
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const PRIVATE_DIRECTORY_MASK: u32 = 0o077;
@@ -39,9 +45,7 @@ impl ExplicitPathProfileCache {
 	}
 
 	#[must_use]
-	pub fn path(&self) -> &Path {
-		&self.path
-	}
+	pub fn path(&self) -> &Path { &self.path }
 
 	fn parent(&self) -> ProbeResult<&Path> {
 		let parent = self
@@ -136,9 +140,7 @@ impl ExplicitPathProfileCache {
 }
 
 impl ProfileCache for ExplicitPathProfileCache {
-	fn load(&self, identity: CacheIdentity) -> ProbeResult<Option<MeasuredProfile>> {
-		self.load_existing(identity)
-	}
+	fn load(&self, identity: CacheIdentity) -> ProbeResult<Option<MeasuredProfile>> { self.load_existing(identity) }
 
 	fn store(&self, profile: &MeasuredProfile) -> ProbeResult<()> {
 		let bytes = MeasuredProfileCodec::encode(profile)?;
@@ -247,6 +249,4 @@ impl Drop for PendingFile {
 	}
 }
 
-fn cache_error(message: impl Into<String>) -> ProbeError {
-	ProbeError::Cache(message.into())
-}
+fn cache_error(message: impl Into<String>) -> ProbeError { ProbeError::Cache(message.into()) }

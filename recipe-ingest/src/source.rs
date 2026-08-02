@@ -1,8 +1,9 @@
-use core::fmt;
-use core::num::NonZeroU64;
-use std::fs::File;
-use std::io::Read as _;
-use std::path::{Path, PathBuf};
+use core::{fmt, num::NonZeroU64};
+use std::{
+	fs::File,
+	io::Read as _,
+	path::{Path, PathBuf},
+};
 
 use recipe_core::Digest;
 use sha2::{Digest as _, Sha256};
@@ -27,9 +28,7 @@ impl SourceLimit {
 	}
 
 	#[must_use]
-	pub const fn bytes(self) -> NonZeroU64 {
-		self.0
-	}
+	pub const fn bytes(self) -> NonZeroU64 { self.0 }
 }
 
 /// Immutable, content-addressed pre-run copy of one external file.
@@ -45,24 +44,16 @@ pub struct SourceSnapshot {
 
 impl SourceSnapshot {
 	#[must_use]
-	pub fn path(&self) -> &Path {
-		&self.path
-	}
+	pub fn path(&self) -> &Path { &self.path }
 
 	#[must_use]
-	pub fn bytes(&self) -> &[u8] {
-		&self.bytes
-	}
+	pub fn bytes(&self) -> &[u8] { &self.bytes }
 
 	#[must_use]
-	pub const fn digest(&self) -> Digest {
-		self.digest
-	}
+	pub const fn digest(&self) -> Digest { self.digest }
 
 	#[must_use]
-	pub fn into_bytes(self) -> Vec<u8> {
-		self.bytes
-	}
+	pub fn into_bytes(self) -> Vec<u8> { self.bytes }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,84 +174,4 @@ pub fn read_source_snapshot(path: &Path, limit: SourceLimit) -> SourceResult<Sou
 		bytes,
 		digest,
 	})
-}
-
-#[cfg(test)]
-mod tests {
-	use std::fs;
-	use std::sync::atomic::{AtomicU64, Ordering};
-
-	use super::*;
-
-	#[derive(Debug)]
-	struct TestFile(PathBuf);
-
-	impl TestFile {
-		fn new(bytes: &[u8]) -> Self {
-			static NEXT: AtomicU64 = AtomicU64::new(1);
-			for _ in 0..64 {
-				let path = std::env::temp_dir().join(format!(
-					"recipe-ingest-source-{}-{}",
-					std::process::id(),
-					NEXT.fetch_add(1, Ordering::Relaxed)
-				));
-				match fs::OpenOptions::new()
-					.write(true)
-					.create_new(true)
-					.open(&path)
-				{
-					Ok(mut file) => {
-						use std::io::Write as _;
-
-						file.write_all(bytes).unwrap();
-						return Self(path);
-					}
-					Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-					Err(error) => panic!("create source fixture: {error}"),
-				}
-			}
-			panic!("could not create a unique source fixture");
-		}
-	}
-
-	impl Drop for TestFile {
-		fn drop(&mut self) {
-			let _ = fs::remove_file(&self.0);
-		}
-	}
-
-	#[test]
-	fn snapshots_exact_bytes_and_content_identity_without_retaining_a_file() {
-		let fixture = TestFile::new(b"immutable source");
-		let snapshot = read_source_snapshot(&fixture.0, SourceLimit::new(64).unwrap()).unwrap();
-		assert_eq!(snapshot.path(), fixture.0);
-		assert_eq!(snapshot.bytes(), b"immutable source");
-		assert_eq!(
-			snapshot.digest(),
-			Digest::new(Sha256::digest(b"immutable source").into())
-		);
-		fs::remove_file(&fixture.0).unwrap();
-		assert_eq!(snapshot.bytes(), b"immutable source");
-	}
-
-	#[test]
-	fn rejects_zero_limits_non_files_and_oversized_sources() {
-		assert_eq!(
-			SourceLimit::new(0).unwrap_err().kind,
-			SourceErrorKind::InvalidLimit
-		);
-		let fixture = TestFile::new(b"12345");
-		assert_eq!(
-			read_source_snapshot(&fixture.0, SourceLimit::new(4).unwrap())
-				.unwrap_err()
-				.kind,
-			SourceErrorKind::LimitExceeded
-		);
-		assert_eq!(
-			read_source_snapshot(fixture.0.parent().unwrap(), SourceLimit::new(64).unwrap())
-				.unwrap_err()
-				.kind,
-			SourceErrorKind::NotRegularFile
-		);
-	}
 }

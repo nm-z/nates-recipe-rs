@@ -32,9 +32,7 @@ impl RecallAtOutput {
 	}
 
 	#[must_use]
-	pub const fn threshold(&self) -> f32 {
-		f32::from_bits(self.threshold_bits)
-	}
+	pub const fn threshold(&self) -> f32 { f32::from_bits(self.threshold_bits) }
 }
 
 /// Fully typed boundary for GPU-only binary-classification metrics.
@@ -933,9 +931,7 @@ fn inclusive_sum_scan(tree_lanes: u32) -> PrimitiveKind {
 	})
 }
 
-fn gather(bounds: IndexBounds) -> PrimitiveKind {
-	PrimitiveKind::Gather(Gather { axis: 0, bounds })
-}
+fn gather(bounds: IndexBounds) -> PrimitiveKind { PrimitiveKind::Gather(Gather { axis: 0, bounds }) }
 
 fn elementwise(program: recipe_core::ScalarProgram) -> PrimitiveKind {
 	PrimitiveKind::Elementwise(Elementwise { program })
@@ -1369,10 +1365,12 @@ fn scalar_finish(
 fn forbidden_aliases(inputs: usize, outputs: usize) -> Vec<PrimitiveAliasRule> {
 	(0..inputs)
 		.flat_map(|input| {
-			(0..outputs).map(move |output| PrimitiveAliasRule {
-				input,
-				output,
-				permission: AliasPermission::Forbidden,
+			(0..outputs).map(move |output| {
+				PrimitiveAliasRule {
+					input,
+					output,
+					permission: AliasPermission::Forbidden,
+				}
 			})
 		})
 		.collect()

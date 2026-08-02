@@ -1,8 +1,10 @@
-use crate::error::{ValidationCode, ValidationResult, Validator};
-use crate::identity::{Digest, Label};
-use crate::ids::{ArtifactId, KernelTemplateId, ValueId};
-use crate::scalar::DType;
-use crate::units::{ByteCount, FlopCount};
+use crate::{
+	error::{ValidationCode, ValidationResult, Validator},
+	identity::{Digest, Label},
+	ids::{ArtifactId, KernelTemplateId, ValueId},
+	scalar::DType,
+	units::{ByteCount, FlopCount},
+};
 
 /// Opaque calculation-target identity selected through discovered capability.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -49,14 +51,10 @@ pub enum ArtifactBuildAccess {
 
 impl ArtifactBuildAccess {
 	#[must_use]
-	pub const fn reads(self) -> bool {
-		matches!(self, Self::Read | Self::ReadWrite | Self::ReadWriteAtomic)
-	}
+	pub const fn reads(self) -> bool { matches!(self, Self::Read | Self::ReadWrite | Self::ReadWriteAtomic) }
 
 	#[must_use]
-	pub const fn writes(self) -> bool {
-		matches!(self, Self::Write | Self::ReadWrite | Self::ReadWriteAtomic)
-	}
+	pub const fn writes(self) -> bool { matches!(self, Self::Write | Self::ReadWrite | Self::ReadWriteAtomic) }
 }
 
 /// Complete immutable affine view compiled into one stage argument.

@@ -15,14 +15,10 @@ pub struct ResolvedRamDomain<'inventory> {
 
 impl<'inventory> ResolvedRamDomain<'inventory> {
 	#[must_use]
-	pub const fn device(self) -> DeviceId {
-		self.device
-	}
+	pub const fn device(self) -> DeviceId { self.device }
 
 	#[must_use]
-	pub const fn domain(self) -> &'inventory RamDomain {
-		self.domain
-	}
+	pub const fn domain(self) -> &'inventory RamDomain { self.domain }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -33,14 +29,10 @@ pub struct ResolvedStorageDomain<'inventory> {
 
 impl<'inventory> ResolvedStorageDomain<'inventory> {
 	#[must_use]
-	pub const fn device(self) -> DeviceId {
-		self.device
-	}
+	pub const fn device(self) -> DeviceId { self.device }
 
 	#[must_use]
-	pub const fn domain(self) -> &'inventory StorageDomain {
-		self.domain
-	}
+	pub const fn domain(self) -> &'inventory StorageDomain { self.domain }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -51,14 +43,10 @@ pub struct ResolvedGpuDevice<'inventory> {
 
 impl<'inventory> ResolvedGpuDevice<'inventory> {
 	#[must_use]
-	pub const fn device(self) -> DeviceId {
-		self.device
-	}
+	pub const fn device(self) -> DeviceId { self.device }
 
 	#[must_use]
-	pub const fn descriptor(self) -> &'inventory GpuDescriptor {
-		self.descriptor
-	}
+	pub const fn descriptor(self) -> &'inventory GpuDescriptor { self.descriptor }
 }
 
 /// Exact association between one current bare-metal inventory and the
@@ -73,24 +61,16 @@ pub struct ResolvedLocalInventory<'inventory> {
 
 impl<'inventory> ResolvedLocalInventory<'inventory> {
 	#[must_use]
-	pub const fn machine(&self) -> MachineId {
-		self.machine
-	}
+	pub const fn machine(&self) -> MachineId { self.machine }
 
 	#[must_use]
-	pub fn ram(&self) -> &[ResolvedRamDomain<'inventory>] {
-		&self.ram
-	}
+	pub fn ram(&self) -> &[ResolvedRamDomain<'inventory>] { &self.ram }
 
 	#[must_use]
-	pub fn storage(&self) -> &[ResolvedStorageDomain<'inventory>] {
-		&self.storage
-	}
+	pub fn storage(&self) -> &[ResolvedStorageDomain<'inventory>] { &self.storage }
 
 	#[must_use]
-	pub fn gpu(&self) -> &[ResolvedGpuDevice<'inventory>] {
-		&self.gpu
-	}
+	pub fn gpu(&self) -> &[ResolvedGpuDevice<'inventory>] { &self.gpu }
 }
 
 impl MeasuredProfile {
@@ -314,6 +294,4 @@ fn require_unique_live_keys(kind: &str, original_count: usize, unique_count: usi
 	}
 }
 
-fn profile_mismatch(detail: impl Into<String>) -> ProbeError {
-	ProbeError::InvalidProfile(detail.into())
-}
+fn profile_mismatch(detail: impl Into<String>) -> ProbeError { ProbeError::InvalidProfile(detail.into()) }

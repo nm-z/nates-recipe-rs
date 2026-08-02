@@ -19,8 +19,10 @@ pub use native_prepare::{
 	NativePreparationResult, NativePreparationScope, NativeTargetPlan, build_native_target_plan,
 	load_cached_measured_profile, load_native_preparation, with_current_native_preparation, with_native_preparation,
 };
+pub use recipe_native_executor::{NativeBackendKind, NativeDeviceExecutionEvidence, NativeExecutionEvidence};
 pub use recipe_training::{
 	BayesModelArtifact, KnnInferencePrediction, KnnInferencePredictionKind, KnnLabelValue, KnnModelArtifact,
+	NativeKernelFormat, RealizedNativeKernel, RealizedNativeKernelSet, TrainingExecutionEvidence,
 	ValidationMetricFamily, ValidationMetricStatus, ValidationUnavailableReason,
 };
 pub use training::{

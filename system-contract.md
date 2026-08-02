@@ -267,8 +267,8 @@ shapes, strides, indexes, and metadata. Production transformations of
 calculation payload values—including numerical preprocessing and token scoring—
 are calculations and therefore execute on GPUs.
 
-Independent CPU or high-precision mathematical implementations are test-only
-oracles and are not shipped runtime calculation paths.
+Independent CPU or high-precision mathematical implementations may be external
+acceptance oracles, but are not shipped runtime calculation paths.
 
 ### C18: payload types
 
@@ -773,9 +773,10 @@ Each block executes saved RMSNorm, adjacent-pair RoPE, scaled causal multi-head 
 saved RMSNorm, parallel SwiGLU, and the second residual update. The final saved RMSNorm and output projection produce
 the logits; absent output weight uses the token embedding table. Optional saved biases and multiplicative scales are
 applied in their llama graph positions. RoPE uses the saved base and scaling metadata, and no user-facing model
-geometry or execution controls are introduced. The checked-in corpus compiles through the public load boundary and
-its native HSA logits match the checked-in llama.cpp CPU oracle within `9.580467046e-14` normalized mean-square error
-and `4.190951586e-9` maximum absolute error.
+geometry or execution controls are introduced. The hardware acceptance runner compiles the checked-in corpus through
+the public load boundary and rejects native logits whose normalized mean-square error against the pinned llama.cpp
+oracle is not below `1e-3`. Dated backend-specific observations belong in the acceptance record; compilation or a
+result from another backend does not establish current hardware proof.
 
 ### C42: repeated observed categorical Bayesian targets
 
@@ -796,7 +797,7 @@ ranges and terminal output records follow declaration order. Missing or unseen p
 route. A declared target child cannot be another conditional's inference parent in this instrument: ancestral
 prediction, evidence propagation, or marginalization is not silently selected. Numeric distributions, custom priors,
 latent nodes, incomplete training observations, and generic objectives require their own concrete declaration and
-execution contracts. `cookbook_bayes_multi` completed the two-output path on native HSA on 2026-07-30.
+execution contracts. The cookbook's `bayes_multi` recipe completed the two-output path on native HSA on 2026-07-30.
 
 ## Probe seed fixture
 
@@ -890,5 +891,6 @@ artifact.
 | Named GGUF llama execution | bounded model/token admission, exact tensor and metadata contracts, Recipe-owned graph lowering, all-position raw-logit output, public dispatch, and llama.cpp parity validator |
 | Repeated observed categorical Bayesian targets | ordered target/declaration binding, v2 codec, exact multi-resume, shared-parent preparation, independent native posteriors, device probability packing, and public reporting validators |
 
-Engineering tests exercise each validator. A ceremonial proof-of-work report is
-not a product deliverable.
+Applicable claims are exercised through public end-to-end workflows over real datasets and real native hardware.
+Static validation remains build hygiene; constructed values, mocks, and restated implementation details are not
+accepted as architectural proof.

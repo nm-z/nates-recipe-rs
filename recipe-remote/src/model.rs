@@ -31,27 +31,19 @@ impl Capabilities {
 	pub const REQUIRED: Self = Self(REQUIRED_CAPABILITIES);
 
 	#[must_use]
-	pub const fn from_bits(bits: u64) -> Self {
-		Self(bits)
-	}
+	pub const fn from_bits(bits: u64) -> Self { Self(bits) }
 
 	#[must_use]
-	pub const fn bits(self) -> u64 {
-		self.0
-	}
+	pub const fn bits(self) -> u64 { self.0 }
 
 	#[must_use]
-	pub const fn contains(self, required: Self) -> bool {
-		self.0 & required.0 == required.0
-	}
+	pub const fn contains(self, required: Self) -> bool { self.0 & required.0 == required.0 }
 }
 
 impl core::ops::BitOr for Capabilities {
 	type Output = Self;
 
-	fn bitor(self, right: Self) -> Self::Output {
-		Self(self.0 | right.0)
-	}
+	fn bitor(self, right: Self) -> Self::Output { Self(self.0 | right.0) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,14 +63,10 @@ impl RemoteIdentity {
 	}
 
 	#[must_use]
-	pub const fn local(self) -> EndpointIdentity {
-		self.local
-	}
+	pub const fn local(self) -> EndpointIdentity { self.local }
 
 	#[must_use]
-	pub const fn remote(self) -> EndpointIdentity {
-		self.remote
-	}
+	pub const fn remote(self) -> EndpointIdentity { self.remote }
 
 	#[must_use]
 	pub const fn reversed(self) -> Self {
@@ -177,24 +165,16 @@ impl RemoteLimits {
 	}
 
 	#[must_use]
-	pub const fn max_message_bytes(self) -> usize {
-		self.max_message_bytes
-	}
+	pub const fn max_message_bytes(self) -> usize { self.max_message_bytes }
 
 	#[must_use]
-	pub const fn task_slots(self) -> usize {
-		self.task_slots
-	}
+	pub const fn task_slots(self) -> usize { self.task_slots }
 
 	#[must_use]
-	pub const fn data_slots(self) -> usize {
-		self.data_slots
-	}
+	pub const fn data_slots(self) -> usize { self.data_slots }
 
 	#[must_use]
-	pub const fn metric_slots(self) -> usize {
-		self.metric_slots
-	}
+	pub const fn metric_slots(self) -> usize { self.metric_slots }
 
 	pub(crate) const fn wire_tuple(self) -> [u64; 8] {
 		[
@@ -307,9 +287,11 @@ impl Manifest {
 		let mut artifacts = bundle
 			.artifacts()
 			.iter()
-			.map(|artifact| ManifestArtifact {
-				id: artifact.id,
-				digest: artifact.digest,
+			.map(|artifact| {
+				ManifestArtifact {
+					id: artifact.id,
+					digest: artifact.digest,
+				}
 			})
 			.collect::<Vec<_>>();
 		artifacts.sort_by_key(|artifact| artifact.id);
@@ -522,14 +504,10 @@ impl ProvisionedProgram {
 	}
 
 	#[must_use]
-	pub const fn manifest(&self) -> &Manifest {
-		&self.manifest
-	}
+	pub const fn manifest(&self) -> &Manifest { &self.manifest }
 
 	#[must_use]
-	pub const fn digest(&self) -> Digest {
-		self.digest
-	}
+	pub const fn digest(&self) -> Digest { self.digest }
 
 	#[must_use]
 	pub fn worker_devices(&self) -> impl ExactSizeIterator<Item = DeviceId> + '_ {
@@ -537,21 +515,13 @@ impl ProvisionedProgram {
 	}
 
 	#[must_use]
-	pub fn transfers(&self) -> &[CrossTransfer] {
-		&self.transfers
-	}
+	pub fn transfers(&self) -> &[CrossTransfer] { &self.transfers }
 
-	pub(crate) fn tasks(&self) -> &[ProgramTask] {
-		&self.tasks
-	}
+	pub(crate) fn tasks(&self) -> &[ProgramTask] { &self.tasks }
 
-	pub(crate) fn devices(&self) -> &[ProgramDevice] {
-		&self.devices
-	}
+	pub(crate) fn devices(&self) -> &[ProgramDevice] { &self.devices }
 
-	pub(crate) fn half_duplex_resources(&self) -> &[DuplexResourceId] {
-		&self.half_duplex_resources
-	}
+	pub(crate) fn half_duplex_resources(&self) -> &[DuplexResourceId] { &self.half_duplex_resources }
 
 	fn compute_digest(&self) -> Digest {
 		let mut hash = Sha256::new();
@@ -644,9 +614,11 @@ fn derive_cross_transfer(
 			"remote transfer direction differs from its measured topology link",
 		));
 	}
-	let mut link_claims = transfer.lane_claims.iter().filter_map(|claim| match claim {
-		TransferLaneClaim::Link { link, .. } => Some(*link),
-		TransferLaneClaim::External { .. } => None,
+	let mut link_claims = transfer.lane_claims.iter().filter_map(|claim| {
+		match claim {
+			TransferLaneClaim::Link { link, .. } => Some(*link),
+			TransferLaneClaim::External { .. } => None,
+		}
 	});
 	if link_claims.next() != Some(link_id) || link_claims.next().is_some() {
 		return Err(RemoteError::InvalidConfiguration(
@@ -763,10 +735,12 @@ fn classify_task(
 	worker_devices: &BTreeSet<DeviceId>,
 ) -> RemoteResult<TaskOwnership> {
 	match &task.kind {
-		TaskKind::Calculation(calculation) => match worker_devices.contains(&calculation.device) {
-			true => Ok(TaskOwnership::WorkerDriver),
-			false => Ok(TaskOwnership::Master),
-		},
+		TaskKind::Calculation(calculation) => {
+			match worker_devices.contains(&calculation.device) {
+				true => Ok(TaskOwnership::WorkerDriver),
+				false => Ok(TaskOwnership::Master),
+			}
+		}
 		TaskKind::Metric(metric) => {
 			let location = bundle
 				.value_location(metric.value)
@@ -790,14 +764,18 @@ fn classify_task(
 				}
 				(_, true, true) => Ok(TaskOwnership::WorkerDriver),
 				(_, false, false) => Ok(TaskOwnership::Master),
-				(_, false, true) => Ok(TaskOwnership::Cross(
-					DataDirection::MasterToWorker,
-					transfer.bytes,
-				)),
-				(_, true, false) => Ok(TaskOwnership::Cross(
-					DataDirection::WorkerToMaster,
-					transfer.bytes,
-				)),
+				(_, false, true) => {
+					Ok(TaskOwnership::Cross(
+						DataDirection::MasterToWorker,
+						transfer.bytes,
+					))
+				}
+				(_, true, false) => {
+					Ok(TaskOwnership::Cross(
+						DataDirection::WorkerToMaster,
+						transfer.bytes,
+					))
+				}
 			}
 		}
 	}

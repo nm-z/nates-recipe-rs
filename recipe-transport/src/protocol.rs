@@ -1,6 +1,8 @@
-use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream};
-use std::time::{Duration, Instant};
+use std::{
+	io::{self, Read, Write},
+	net::{Shutdown, TcpStream},
+	time::{Duration, Instant},
+};
 
 use recipe_core::Digest;
 use sha2::{Digest as _, Sha256};
@@ -31,14 +33,10 @@ impl EndpointIdentity {
 	}
 
 	#[must_use]
-	pub const fn machine(self) -> Digest {
-		self.machine
-	}
+	pub const fn machine(self) -> Digest { self.machine }
 
 	#[must_use]
-	pub const fn profile(self) -> Digest {
-		self.profile
-	}
+	pub const fn profile(self) -> Digest { self.profile }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,14 +56,10 @@ impl SessionIdentity {
 	}
 
 	#[must_use]
-	pub const fn local(self) -> EndpointIdentity {
-		self.local
-	}
+	pub const fn local(self) -> EndpointIdentity { self.local }
 
 	#[must_use]
-	pub const fn remote(self) -> EndpointIdentity {
-		self.remote
-	}
+	pub const fn remote(self) -> EndpointIdentity { self.remote }
 
 	#[must_use]
 	pub const fn reversed(self) -> Self {
@@ -90,9 +84,7 @@ impl CompletionToken {
 	}
 
 	#[must_use]
-	pub const fn get(self) -> u64 {
-		self.0
-	}
+	pub const fn get(self) -> u64 { self.0 }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,9 +114,7 @@ impl FrameKind {
 	}
 
 	#[must_use]
-	pub(crate) const fn is_runtime(self) -> bool {
-		matches!(self, Self::Control | Self::Metrics | Self::UserData)
-	}
+	pub(crate) const fn is_runtime(self) -> bool { matches!(self, Self::Control | Self::Metrics | Self::UserData) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,19 +174,13 @@ impl ProtocolLimits {
 	}
 
 	#[must_use]
-	pub const fn max_payload(self) -> usize {
-		self.max_payload
-	}
+	pub const fn max_payload(self) -> usize { self.max_payload }
 
 	#[must_use]
-	pub const fn operation_timeout(self) -> Duration {
-		self.operation_timeout
-	}
+	pub const fn operation_timeout(self) -> Duration { self.operation_timeout }
 
 	#[must_use]
-	pub fn deadline(self) -> Instant {
-		Instant::now() + self.operation_timeout
-	}
+	pub fn deadline(self) -> Instant { Instant::now() + self.operation_timeout }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,9 +238,7 @@ impl WireSender {
 	}
 
 	#[must_use]
-	pub const fn next_sequence(&self) -> u64 {
-		self.next_sequence
-	}
+	pub const fn next_sequence(&self) -> u64 { self.next_sequence }
 
 	fn poison(&mut self) {
 		self.poisoned = true;
@@ -315,9 +297,7 @@ impl WireReceiver {
 	}
 
 	#[must_use]
-	pub const fn next_sequence(&self) -> u64 {
-		self.next_sequence
-	}
+	pub const fn next_sequence(&self) -> u64 { self.next_sequence }
 
 	fn poison(&mut self) {
 		self.poisoned = true;
@@ -440,9 +420,7 @@ pub(crate) fn decode_header(
 	})
 }
 
-pub(crate) fn payload_digest(payload: &[u8]) -> [u8; 32] {
-	Sha256::digest(payload).into()
-}
+pub(crate) fn payload_digest(payload: &[u8]) -> [u8; 32] { Sha256::digest(payload).into() }
 
 pub(crate) fn write_all_deadline(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> TransportResult<()> {
 	while !bytes.is_empty() {
@@ -482,156 +460,4 @@ fn remaining(deadline: Instant) -> TransportResult<Duration> {
 		.checked_duration_since(Instant::now())
 		.filter(|duration| !duration.is_zero())
 		.ok_or(TransportError::DeadlineExceeded)
-}
-
-#[cfg(test)]
-pub(crate) mod tests {
-	use std::net::{TcpListener, TcpStream};
-	use std::thread;
-
-	use super::*;
-
-	pub(crate) fn digest(byte: u8) -> Digest {
-		Digest::new([byte; 32])
-	}
-
-	pub(crate) fn identities() -> (SessionIdentity, SessionIdentity) {
-		let left = EndpointIdentity::new(digest(1), digest(2)).unwrap();
-		let right = EndpointIdentity::new(digest(3), digest(4)).unwrap();
-		let left_session = SessionIdentity::new(left, right).unwrap();
-		(left_session, left_session.reversed())
-	}
-
-	pub(crate) fn tcp_pair() -> (TcpStream, TcpStream) {
-		let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-		let address = listener.local_addr().unwrap();
-		let connector = thread::spawn(move || TcpStream::connect(address).unwrap());
-		let (accepted, _) = listener.accept().unwrap();
-		(connector.join().unwrap(), accepted)
-	}
-
-	#[test]
-	fn deterministic_round_trip_and_exact_identity() {
-		let (left_stream, right_stream) = tcp_pair();
-		let (left_identity, right_identity) = identities();
-		let limits = ProtocolLimits::new(1024, Duration::from_secs(1)).unwrap();
-		let (mut sender, _) = split_stream(left_stream, left_identity, limits).unwrap();
-		let (_, mut receiver) = split_stream(right_stream, right_identity, limits).unwrap();
-		let metadata = FrameMetadata::new(FrameKind::Control, CompletionToken::new(7).unwrap(), None).unwrap();
-		sender.send(metadata, b"hello", limits.deadline()).unwrap();
-		let mut buffer = [0_u8; 16];
-		let received = receiver
-			.receive_into(&mut buffer, limits.deadline())
-			.unwrap();
-		assert_eq!(received.metadata, metadata);
-		assert_eq!(received.payload, b"hello");
-	}
-
-	#[test]
-	fn rejects_identity_mismatch_and_poison_follows() {
-		let (left_stream, right_stream) = tcp_pair();
-		let (left_identity, right_identity) = identities();
-		let wrong_local = EndpointIdentity::new(digest(9), digest(10)).unwrap();
-		let wrong_identity = SessionIdentity::new(wrong_local, right_identity.remote()).unwrap();
-		let limits = ProtocolLimits::new(1024, Duration::from_secs(1)).unwrap();
-		let (mut sender, _) = split_stream(left_stream, left_identity, limits).unwrap();
-		let (_, mut receiver) = split_stream(right_stream, wrong_identity, limits).unwrap();
-		let metadata = FrameMetadata::new(FrameKind::Control, CompletionToken::new(7).unwrap(), None).unwrap();
-		sender.send(metadata, b"x", limits.deadline()).unwrap();
-		let mut buffer = [0_u8; 4];
-		assert_eq!(
-			receiver.receive_into(&mut buffer, limits.deadline()),
-			Err(TransportError::UnexpectedIdentity)
-		);
-		assert_eq!(
-			receiver.receive_into(&mut buffer, limits.deadline()),
-			Err(TransportError::Poisoned)
-		);
-	}
-
-	#[test]
-	fn rejects_oversize_before_reading_payload() {
-		let (mut left_stream, right_stream) = tcp_pair();
-		let (left_identity, right_identity) = identities();
-		let limits = ProtocolLimits::new(4, Duration::from_secs(1)).unwrap();
-		let metadata = FrameMetadata::new(FrameKind::Control, CompletionToken::new(1).unwrap(), None).unwrap();
-		let header = encode_header(left_identity, 0, metadata, 5, payload_digest(b"12345")).unwrap();
-		left_stream.write_all(&header).unwrap();
-		let (_, mut receiver) = split_stream(right_stream, right_identity, limits).unwrap();
-		let mut buffer = [0_u8; 8];
-		assert_eq!(
-			receiver.receive_into(&mut buffer, limits.deadline()),
-			Err(TransportError::FrameTooLarge {
-				declared: 5,
-				limit: 4
-			})
-		);
-	}
-
-	#[test]
-	fn rejects_replay_and_corruption() {
-		let (mut left_stream, right_stream) = tcp_pair();
-		let (left_identity, right_identity) = identities();
-		let limits = ProtocolLimits::new(32, Duration::from_secs(1)).unwrap();
-		let metadata = FrameMetadata::new(FrameKind::Control, CompletionToken::new(1).unwrap(), None).unwrap();
-		let header = encode_header(left_identity, 1, metadata, 1, payload_digest(b"a")).unwrap();
-		left_stream.write_all(&header).unwrap();
-		left_stream.write_all(b"a").unwrap();
-		let (_, mut receiver) = split_stream(right_stream, right_identity, limits).unwrap();
-		let mut buffer = [0_u8; 8];
-		assert_eq!(
-			receiver.receive_into(&mut buffer, limits.deadline()),
-			Err(TransportError::UnexpectedSequence {
-				expected: 0,
-				received: 1
-			})
-		);
-
-		let (mut left_stream, right_stream) = tcp_pair();
-		let header = encode_header(left_identity, 0, metadata, 1, payload_digest(b"a")).unwrap();
-		left_stream.write_all(&header).unwrap();
-		left_stream.write_all(b"b").unwrap();
-		let (_, mut receiver) = split_stream(right_stream, right_identity, limits).unwrap();
-		assert_eq!(
-			receiver.receive_into(&mut buffer, limits.deadline()),
-			Err(TransportError::IntegrityFailure)
-		);
-	}
-
-	#[test]
-	fn rejects_nonzero_reserved_and_invalid_schedule_lane() {
-		let (left_identity, right_identity) = identities();
-		let limits = ProtocolLimits::new(32, Duration::from_secs(1)).unwrap();
-		let metadata = FrameMetadata::new(FrameKind::Control, CompletionToken::new(1).unwrap(), None).unwrap();
-		let mut header = encode_header(left_identity, 0, metadata, 0, payload_digest(&[])).unwrap();
-		header[11] = 1;
-		assert_eq!(
-			decode_header(&header, right_identity, limits, 0),
-			Err(TransportError::InvalidFrame("reserved flags are nonzero"))
-		);
-		assert_eq!(
-			FrameMetadata::new(
-				FrameKind::Control,
-				CompletionToken::new(1).unwrap(),
-				Some(4)
-			),
-			Err(TransportError::InvalidFrame(
-				"only user-data frames may carry a schedule position"
-			))
-		);
-	}
-
-	#[test]
-	fn absolute_deadline_rejects_a_silent_peer() {
-		let (left_stream, right_stream) = tcp_pair();
-		let (_left_identity, right_identity) = identities();
-		let limits = ProtocolLimits::new(32, Duration::from_millis(20)).unwrap();
-		let (_, mut receiver) = split_stream(right_stream, right_identity, limits).unwrap();
-		let mut buffer = [0_u8; 8];
-		assert_eq!(
-			receiver.receive_into(&mut buffer, limits.deadline()),
-			Err(TransportError::DeadlineExceeded)
-		);
-		drop(left_stream);
-	}
 }

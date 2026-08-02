@@ -2,13 +2,15 @@ use recipe_core::{ByteCount, DeviceId, Digest, DuplexMode, DuplexResourceId, Run
 use recipe_transport::{CompletionToken, FrameKind, ReceivedFrame, RuntimeChannel, RuntimeLane, ScheduleStamp};
 use sha2::{Digest as _, Sha256};
 
-use crate::codec::{self, Decoded, Message, PeerRole};
-use crate::driver::{DriverFault, DriverPoll, DriverTransferPoll, WorkerDriver};
-use crate::model::{
-	DataDirection, ProgramTaskKind, ProvisionedProgram, RemoteIdentity, RemoteLimits, RuntimeCapacities,
-	init_chunk_count, validate_run_id,
+use crate::{
+	RemoteError, RemoteResult,
+	codec::{self, Decoded, Message, PeerRole},
+	driver::{DriverFault, DriverPoll, DriverTransferPoll, WorkerDriver},
+	model::{
+		DataDirection, ProgramTaskKind, ProvisionedProgram, RemoteIdentity, RemoteLimits, RuntimeCapacities,
+		init_chunk_count, validate_run_id,
+	},
 };
-use crate::{RemoteError, RemoteResult};
 
 /// A connected transport plus Recipe's connection-global run epoch.
 ///
@@ -30,15 +32,11 @@ impl RemoteChannel {
 	}
 
 	#[must_use]
-	pub const fn identity(&self) -> recipe_transport::SessionIdentity {
-		self.channel.identity()
-	}
+	pub const fn identity(&self) -> recipe_transport::SessionIdentity { self.channel.identity() }
 }
 
 impl From<RuntimeChannel> for RemoteChannel {
-	fn from(channel: RuntimeChannel) -> Self {
-		Self::new(channel)
-	}
+	fn from(channel: RuntimeChannel) -> Self { Self::new(channel) }
 }
 
 #[derive(Debug)]
@@ -64,14 +62,10 @@ pub struct CancelReason(u32);
 
 impl CancelReason {
 	#[must_use]
-	pub const fn new(code: u32) -> Self {
-		Self(code)
-	}
+	pub const fn new(code: u32) -> Self { Self(code) }
 
 	#[must_use]
-	pub const fn code(self) -> u32 {
-		self.0
-	}
+	pub const fn code(self) -> u32 { self.0 }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,11 +236,13 @@ impl MasterStorage {
 		let tasks = program
 			.tasks()
 			.iter()
-			.map(|task| MasterTaskState {
-				task: task.id,
-				phase: task.phase,
-				kind: task.kind,
-				status: TaskStatus::Idle,
+			.map(|task| {
+				MasterTaskState {
+					task: task.id,
+					phase: task.phase,
+					kind: task.kind,
+					status: TaskStatus::Idle,
+				}
 			})
 			.collect::<Vec<_>>()
 			.into_boxed_slice();
@@ -258,18 +254,22 @@ impl MasterStorage {
 		let half_duplex = program
 			.half_duplex_resources()
 			.iter()
-			.map(|resource| HalfDuplexToken {
-				resource: *resource,
-				owner: None,
+			.map(|resource| {
+				HalfDuplexToken {
+					resource: *resource,
+					owner: None,
+				}
 			})
 			.collect::<Vec<_>>()
 			.into_boxed_slice();
 		let releases = program
 			.devices()
 			.iter()
-			.map(|device| ReleaseState {
-				device: device.id,
-				status: ReleaseStatus::Needed,
+			.map(|device| {
+				ReleaseState {
+					device: device.id,
+					status: ReleaseStatus::Needed,
+				}
 			})
 			.collect::<Vec<_>>()
 			.into_boxed_slice();
@@ -968,10 +968,12 @@ impl MasterInit {
 			.program
 			.devices()
 			.iter()
-			.map(|device| DeviceImageState {
-				device: device.id,
-				bytes: device.image_bytes,
-				status: DeviceImageStatus::Needed,
+			.map(|device| {
+				DeviceImageState {
+					device: device.id,
+					bytes: device.image_bytes,
+					status: DeviceImageStatus::Needed,
+				}
 			})
 			.collect::<Vec<_>>()
 			.into_boxed_slice();
@@ -1193,10 +1195,12 @@ impl<D: WorkerDriver> WorkerInit<D> {
 			.program
 			.devices()
 			.iter()
-			.map(|device| DeviceImageState {
-				device: device.id,
-				bytes: device.image_bytes,
-				status: DeviceImageStatus::Needed,
+			.map(|device| {
+				DeviceImageState {
+					device: device.id,
+					bytes: device.image_bytes,
+					status: DeviceImageStatus::Needed,
+				}
 			})
 			.collect::<Vec<_>>()
 			.into_boxed_slice();
@@ -1388,8 +1392,10 @@ impl<D: WorkerDriver> WorkerInit<D> {
 						detail: "init chunk device or offset is out of order",
 					});
 				}
-				let length = u64::try_from(bytes.len()).map_err(|_| RemoteError::Protocol {
-					detail: "init chunk length does not fit the wire ABI",
+				let length = u64::try_from(bytes.len()).map_err(|_| {
+					RemoteError::Protocol {
+						detail: "init chunk length does not fit the wire ABI",
+					}
 				})?;
 				let end = offset.checked_add(length).ok_or(RemoteError::Protocol {
 					detail: "init chunk range overflowed",
@@ -1708,9 +1714,7 @@ impl MasterRuntime {
 			.all(|task| task.status == TaskStatus::Complete)
 	}
 
-	fn capacities(&self) -> RuntimeCapacities {
-		self.storage.capacities(self.core.scratch.len())
-	}
+	fn capacities(&self) -> RuntimeCapacities { self.storage.capacities(self.core.scratch.len()) }
 
 	fn data(&self, slot: usize) -> Option<(TaskId, &[u8])> {
 		let slot = self.storage.data.get(slot)?;
@@ -1749,9 +1753,7 @@ impl MasterRun {
 		}
 	}
 
-	pub fn submit_task(&mut self, task: TaskId) -> RemoteResult<()> {
-		self.runtime.submit_task(RunPhase::Loop, task)
-	}
+	pub fn submit_task(&mut self, task: TaskId) -> RemoteResult<()> { self.runtime.submit_task(RunPhase::Loop, task) }
 
 	pub fn send_user_data(&mut self, task: TaskId, bytes: &[u8]) -> RemoteResult<()> {
 		self.runtime.send_user_data(RunPhase::Loop, task, bytes)
@@ -1761,27 +1763,17 @@ impl MasterRun {
 		self.runtime.request_user_data(RunPhase::Loop, task)
 	}
 
-	pub fn progress(&mut self) -> RemoteResult<Option<MasterRunEvent>> {
-		self.runtime.progress(RunPhase::Loop)
-	}
+	pub fn progress(&mut self) -> RemoteResult<Option<MasterRunEvent>> { self.runtime.progress(RunPhase::Loop) }
 
 	#[must_use]
-	pub fn capacities(&self) -> RuntimeCapacities {
-		self.runtime.capacities()
-	}
+	pub fn capacities(&self) -> RuntimeCapacities { self.runtime.capacities() }
 
 	#[must_use]
-	pub fn data(&self, slot: usize) -> Option<(TaskId, &[u8])> {
-		self.runtime.data(slot)
-	}
+	pub fn data(&self, slot: usize) -> Option<(TaskId, &[u8])> { self.runtime.data(slot) }
 
-	pub fn release_data(&mut self, slot: usize) -> RemoteResult<()> {
-		self.runtime.release_data(slot)
-	}
+	pub fn release_data(&mut self, slot: usize) -> RemoteResult<()> { self.runtime.release_data(slot) }
 
-	pub fn take_metric(&mut self, slot: usize) -> Option<MetricSample> {
-		self.runtime.take_metric(slot)
-	}
+	pub fn take_metric(&mut self, slot: usize) -> Option<MetricSample> { self.runtime.take_metric(slot) }
 
 	pub fn begin_exit(self) -> RemoteResult<MasterExit> {
 		if !self.runtime.phase_complete(RunPhase::Loop) {
@@ -1871,11 +1863,13 @@ impl WorkerStorage {
 			tasks: program
 				.tasks()
 				.iter()
-				.map(|task| MasterTaskState {
-					task: task.id,
-					phase: task.phase,
-					kind: task.kind,
-					status: TaskStatus::Idle,
+				.map(|task| {
+					MasterTaskState {
+						task: task.id,
+						phase: task.phase,
+						kind: task.kind,
+						status: TaskStatus::Idle,
+					}
 				})
 				.collect::<Vec<_>>()
 				.into_boxed_slice(),
@@ -1884,18 +1878,22 @@ impl WorkerStorage {
 			half_duplex: program
 				.half_duplex_resources()
 				.iter()
-				.map(|resource| HalfDuplexToken {
-					resource: *resource,
-					owner: None,
+				.map(|resource| {
+					HalfDuplexToken {
+						resource: *resource,
+						owner: None,
+					}
 				})
 				.collect::<Vec<_>>()
 				.into_boxed_slice(),
 			releases: program
 				.devices()
 				.iter()
-				.map(|device| ReleaseState {
-					device: device.id,
-					status: ReleaseStatus::Needed,
+				.map(|device| {
+					ReleaseState {
+						device: device.id,
+						status: ReleaseStatus::Needed,
+					}
 				})
 				.collect::<Vec<_>>()
 				.into_boxed_slice(),
@@ -2309,9 +2307,11 @@ impl<D: WorkerDriver> WorkerRuntime<D> {
 				storage.release_transfer(task)?;
 				Ok(Some(WorkerRunEvent::DataAcknowledged(task)))
 			}
-			_ => Err(RemoteError::Protocol {
-				detail: "worker received a message invalid for active execution",
-			}),
+			_ => {
+				Err(RemoteError::Protocol {
+					detail: "worker received a message invalid for active execution",
+				})
+			}
 		}
 	}
 }
@@ -2639,9 +2639,7 @@ impl MasterExit {
 	}
 
 	#[must_use]
-	pub const fn is_complete(&self) -> bool {
-		matches!(self.state, MasterExitState::Done)
-	}
+	pub const fn is_complete(&self) -> bool { matches!(self.state, MasterExitState::Done) }
 
 	pub fn into_complete(self) -> RemoteResult<MasterComplete> {
 		if self.state != MasterExitState::Done {
@@ -2656,22 +2654,14 @@ impl MasterExit {
 	}
 
 	#[must_use]
-	pub fn capacities(&self) -> RuntimeCapacities {
-		self.runtime.capacities()
-	}
+	pub fn capacities(&self) -> RuntimeCapacities { self.runtime.capacities() }
 
 	#[must_use]
-	pub fn data(&self, slot: usize) -> Option<(TaskId, &[u8])> {
-		self.runtime.data(slot)
-	}
+	pub fn data(&self, slot: usize) -> Option<(TaskId, &[u8])> { self.runtime.data(slot) }
 
-	pub fn release_data(&mut self, slot: usize) -> RemoteResult<()> {
-		self.runtime.release_data(slot)
-	}
+	pub fn release_data(&mut self, slot: usize) -> RemoteResult<()> { self.runtime.release_data(slot) }
 
-	pub fn take_metric(&mut self, slot: usize) -> Option<MetricSample> {
-		self.runtime.take_metric(slot)
-	}
+	pub fn take_metric(&mut self, slot: usize) -> Option<MetricSample> { self.runtime.take_metric(slot) }
 
 	#[must_use]
 	pub fn cancel(self, reason: CancelReason) -> MasterCancelling {
@@ -2764,19 +2754,13 @@ pub struct MasterComplete {
 
 impl MasterComplete {
 	#[must_use]
-	pub const fn was_cancelled(&self) -> bool {
-		self.cancelled
-	}
+	pub const fn was_cancelled(&self) -> bool { self.cancelled }
 
 	#[must_use]
-	pub fn run_id(&self) -> RunId {
-		self.core.run
-	}
+	pub fn run_id(&self) -> RunId { self.core.run }
 
 	#[must_use]
-	pub fn into_channel(self) -> RemoteChannel {
-		self.core.into_channel()
-	}
+	pub fn into_channel(self) -> RemoteChannel { self.core.into_channel() }
 }
 
 #[derive(Debug)]
@@ -3142,17 +3126,11 @@ pub struct WorkerComplete<D: WorkerDriver> {
 
 impl<D: WorkerDriver> WorkerComplete<D> {
 	#[must_use]
-	pub const fn was_cancelled(&self) -> bool {
-		self.cancelled
-	}
+	pub const fn was_cancelled(&self) -> bool { self.cancelled }
 
 	#[must_use]
-	pub fn run_id(&self) -> RunId {
-		self.core.run
-	}
+	pub fn run_id(&self) -> RunId { self.core.run }
 
 	#[must_use]
-	pub fn into_parts(self) -> (RemoteChannel, D) {
-		(self.core.into_channel(), self.driver)
-	}
+	pub fn into_parts(self) -> (RemoteChannel, D) { (self.core.into_channel(), self.driver) }
 }

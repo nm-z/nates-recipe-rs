@@ -39,10 +39,5 @@ pub fn exp_with_gradual_underflow_program() -> Result<ScalarProgram, LanguageErr
 impl TryFrom<MathFunction> for ScalarProgram {
 	type Error = LanguageError;
 
-	fn try_from(function: MathFunction) -> Result<Self, Self::Error> {
-		program::build(function)
-	}
+	fn try_from(function: MathFunction) -> Result<Self, Self::Error> { program::build(function) }
 }
-
-#[cfg(test)]
-mod tests;

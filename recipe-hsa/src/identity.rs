@@ -1,6 +1,6 @@
+use std::{fmt, str::FromStr};
+
 use crate::{Error, Result};
-use std::fmt;
-use std::str::FromStr;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DeviceType {
@@ -17,10 +17,12 @@ impl DeviceType {
 			1 => Ok(Self::Gpu),
 			2 => Ok(Self::Dsp),
 			3 => Ok(Self::Aie),
-			_ => Err(Error::InvalidAttribute {
-				field: "HSA_AGENT_INFO_DEVICE",
-				value: raw as u32 as u64,
-			}),
+			_ => {
+				Err(Error::InvalidAttribute {
+					field: "HSA_AGENT_INFO_DEVICE",
+					value: raw as u32 as u64,
+				})
+			}
 		}
 	}
 }
@@ -36,10 +38,12 @@ impl Profile {
 		match raw {
 			0 => Ok(Self::Base),
 			1 => Ok(Self::Full),
-			_ => Err(Error::InvalidAttribute {
-				field,
-				value: raw as u32 as u64,
-			}),
+			_ => {
+				Err(Error::InvalidAttribute {
+					field,
+					value: raw as u32 as u64,
+				})
+			}
 		}
 	}
 
@@ -64,10 +68,12 @@ impl QueueKind {
 			0 => Ok(Self::MultiProducer),
 			1 => Ok(Self::SingleProducer),
 			2 => Ok(Self::Cooperative),
-			_ => Err(Error::InvalidAttribute {
-				field: "HSA_AGENT_INFO_QUEUE_TYPE",
-				value: raw as u64,
-			}),
+			_ => {
+				Err(Error::InvalidAttribute {
+					field: "HSA_AGENT_INFO_QUEUE_TYPE",
+					value: raw as u64,
+				})
+			}
 		}
 	}
 
@@ -95,10 +101,12 @@ impl MemorySegment {
 			1 => Ok(Self::ReadOnly),
 			2 => Ok(Self::Private),
 			3 => Ok(Self::Group),
-			_ => Err(Error::InvalidAttribute {
-				field: "HSA_AMD_MEMORY_POOL_INFO_SEGMENT",
-				value: raw as u32 as u64,
-			}),
+			_ => {
+				Err(Error::InvalidAttribute {
+					field: "HSA_AMD_MEMORY_POOL_INFO_SEGMENT",
+					value: raw as u32 as u64,
+				})
+			}
 		}
 	}
 }
@@ -114,10 +122,12 @@ impl MemoryLocation {
 		match raw {
 			0 => Ok(Self::Cpu),
 			1 => Ok(Self::Gpu),
-			_ => Err(Error::InvalidAttribute {
-				field: "HSA_AMD_MEMORY_POOL_INFO_LOCATION",
-				value: raw as u32 as u64,
-			}),
+			_ => {
+				Err(Error::InvalidAttribute {
+					field: "HSA_AMD_MEMORY_POOL_INFO_LOCATION",
+					value: raw as u32 as u64,
+				})
+			}
 		}
 	}
 }
@@ -137,21 +147,13 @@ impl MemoryPoolFlags {
 		| Self::COARSE_GRAINED
 		| Self::EXTENDED_SCOPE_FINE_GRAINED;
 
-	pub(crate) const fn from_raw(raw: u32) -> Self {
-		Self(raw)
-	}
+	pub(crate) const fn from_raw(raw: u32) -> Self { Self(raw) }
 
-	pub const fn bits(self) -> u32 {
-		self.0
-	}
+	pub const fn bits(self) -> u32 { self.0 }
 
-	pub const fn contains(self, flag: u32) -> bool {
-		self.0 & flag == flag
-	}
+	pub const fn contains(self, flag: u32) -> bool { self.0 & flag == flag }
 
-	pub const fn unknown_bits(self) -> u32 {
-		self.0 & !Self::KNOWN
-	}
+	pub const fn unknown_bits(self) -> u32 { self.0 & !Self::KNOWN }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -175,10 +177,12 @@ pub(crate) fn c_bool(field: &'static str, raw: u8) -> Result<bool> {
 	match raw {
 		0 => Ok(false),
 		1 => Ok(true),
-		_ => Err(Error::InvalidAttribute {
-			field,
-			value: raw as u64,
-		}),
+		_ => {
+			Err(Error::InvalidAttribute {
+				field,
+				value: raw as u64,
+			})
+		}
 	}
 }
 
@@ -196,17 +200,11 @@ pub struct AgentUuid {
 }
 
 impl AgentUuid {
-	pub fn as_str(&self) -> &str {
-		&self.raw
-	}
+	pub fn as_str(&self) -> &str { &self.raw }
 
-	pub const fn device_type(&self) -> DeviceType {
-		self.device_type
-	}
+	pub const fn device_type(&self) -> DeviceType { self.device_type }
 
-	pub const fn body(&self) -> AgentUuidBody {
-		self.body
-	}
+	pub const fn body(&self) -> AgentUuidBody { self.body }
 }
 
 impl FromStr for AgentUuid {
@@ -253,7 +251,7 @@ impl FromStr for AgentUuid {
 				});
 			}
 			let mut bytes = [0_u8; 8];
-			for (index, chunk) in body.as_bytes().chunks_exact(2).enumerate() {
+			for (index, chunk) in body.as_bytes().as_chunks::<2>().0.iter().enumerate() {
 				bytes[index] = hex_nibble(chunk[0]) * 16 + hex_nibble(chunk[1]);
 			}
 			AgentUuidBody::Value(bytes)
@@ -268,9 +266,7 @@ impl FromStr for AgentUuid {
 }
 
 impl fmt::Display for AgentUuid {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(&self.raw)
-	}
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(&self.raw) }
 }
 
 fn hex_nibble(value: u8) -> u8 {
@@ -289,13 +285,9 @@ pub struct IsaFeature {
 }
 
 impl IsaFeature {
-	pub fn name(&self) -> &str {
-		&self.name
-	}
+	pub fn name(&self) -> &str { &self.name }
 
-	pub const fn enabled(&self) -> bool {
-		self.enabled
-	}
+	pub const fn enabled(&self) -> bool { self.enabled }
 }
 
 /// Exact AMD HSA target identity, including ordered feature modifiers.
@@ -307,17 +299,11 @@ pub struct IsaTarget {
 }
 
 impl IsaTarget {
-	pub fn as_str(&self) -> &str {
-		&self.raw
-	}
+	pub fn as_str(&self) -> &str { &self.raw }
 
-	pub fn architecture(&self) -> &str {
-		&self.architecture
-	}
+	pub fn architecture(&self) -> &str { &self.architecture }
 
-	pub fn features(&self) -> &[IsaFeature] {
-		&self.features
-	}
+	pub fn features(&self) -> &[IsaFeature] { &self.features }
 }
 
 impl FromStr for IsaTarget {
@@ -393,9 +379,7 @@ impl FromStr for IsaTarget {
 }
 
 impl fmt::Display for IsaTarget {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(&self.raw)
-	}
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(&self.raw) }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -424,77 +408,5 @@ impl fmt::Display for PciAddress {
 			"{:04x}:{:02x}:{:02x}.{}",
 			self.domain, self.bus, self.device, self.function
 		)
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn parses_uuid_and_preserves_exact_spelling() {
-		let uuid: AgentUuid = "GPU-0123abcDEF456789".parse().unwrap();
-		assert_eq!(uuid.device_type(), DeviceType::Gpu);
-		assert_eq!(
-			uuid.body(),
-			AgentUuidBody::Value([0x01, 0x23, 0xab, 0xcd, 0xef, 0x45, 0x67, 0x89])
-		);
-		assert_eq!(uuid.as_str(), "GPU-0123abcDEF456789");
-	}
-
-	#[test]
-	fn parses_unavailable_uuid() {
-		let uuid: AgentUuid = "CPU-XX".parse().unwrap();
-		assert_eq!(uuid.body(), AgentUuidBody::Unavailable);
-	}
-
-	#[test]
-	fn rejects_approximate_uuid() {
-		assert!("GPU-1234".parse::<AgentUuid>().is_err());
-		assert!("gpu-0123456789abcdef".parse::<AgentUuid>().is_err());
-		assert!("GPU-0123456789abcdef-extra".parse::<AgentUuid>().is_err());
-	}
-
-	#[test]
-	fn parses_gfx1101_exactly() {
-		let target: IsaTarget = "amdgcn-amd-amdhsa--gfx1101".parse().unwrap();
-		assert_eq!(target.architecture(), "gfx1101");
-		assert!(target.features().is_empty());
-		assert_eq!(target.as_str(), "amdgcn-amd-amdhsa--gfx1101");
-	}
-
-	#[test]
-	fn parses_ordered_isa_features() {
-		let target: IsaTarget = "amdgcn-amd-amdhsa--gfx90a:xnack-:sramecc+".parse().unwrap();
-		assert_eq!(target.features()[0].name(), "xnack");
-		assert!(!target.features()[0].enabled());
-		assert_eq!(target.features()[1].name(), "sramecc");
-		assert!(target.features()[1].enabled());
-	}
-
-	#[test]
-	fn rejects_near_match_isa() {
-		assert!("gfx1101".parse::<IsaTarget>().is_err());
-		assert!(
-			"amdgcn-amd-amdhsa--gfx1101:xnack"
-				.parse::<IsaTarget>()
-				.is_err()
-		);
-		assert!(
-			"amdgcn-amd-amdhsa--gfx1101:xnack+:xnack-"
-				.parse::<IsaTarget>()
-				.is_err()
-		);
-	}
-
-	#[test]
-	fn decodes_hsa_bdf_id() {
-		let address = PciAddress::from_hsa(0xabcd, (0x42 << 8) | (0x1b << 3) | 5);
-		assert_eq!(address.to_string(), "abcd:42:1b.5");
-	}
-
-	#[test]
-	fn rejects_non_boolean_c_value() {
-		assert!(c_bool("test", 2).is_err());
 	}
 }

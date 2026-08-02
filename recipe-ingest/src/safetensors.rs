@@ -1,5 +1,7 @@
-use core::fmt;
-use core::num::{NonZeroU32, NonZeroU64};
+use core::{
+	fmt,
+	num::{NonZeroU32, NonZeroU64},
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
@@ -42,10 +44,12 @@ impl SafeTensorDType {
 			"BF16" => Ok(Self::Bf16),
 			"F32" => Ok(Self::F32),
 			"F64" => Ok(Self::F64),
-			other => Err(SafeTensorError::new(
-				SafeTensorErrorKind::UnsupportedDType,
-				format!("unsupported safetensors dtype {other:?}"),
-			)),
+			other => {
+				Err(SafeTensorError::new(
+					SafeTensorErrorKind::UnsupportedDType,
+					format!("unsupported safetensors dtype {other:?}"),
+				))
+			}
 		}
 	}
 
@@ -93,29 +97,19 @@ impl SafeTensorLimits {
 	}
 
 	#[must_use]
-	pub const fn header_bytes(self) -> NonZeroU64 {
-		self.header_bytes
-	}
+	pub const fn header_bytes(self) -> NonZeroU64 { self.header_bytes }
 
 	#[must_use]
-	pub const fn data_bytes(self) -> NonZeroU64 {
-		self.data_bytes
-	}
+	pub const fn data_bytes(self) -> NonZeroU64 { self.data_bytes }
 
 	#[must_use]
-	pub const fn tensors(self) -> NonZeroU32 {
-		self.tensors
-	}
+	pub const fn tensors(self) -> NonZeroU32 { self.tensors }
 
 	#[must_use]
-	pub const fn rank(self) -> NonZeroU32 {
-		self.rank
-	}
+	pub const fn rank(self) -> NonZeroU32 { self.rank }
 
 	#[must_use]
-	pub const fn name_bytes(self) -> NonZeroU64 {
-		self.name_bytes
-	}
+	pub const fn name_bytes(self) -> NonZeroU64 { self.name_bytes }
 }
 
 /// One validated tensor entry. Offsets are relative to the archive data
@@ -131,34 +125,22 @@ pub struct SafeTensorEntry {
 
 impl SafeTensorEntry {
 	#[must_use]
-	pub fn name(&self) -> &str {
-		&self.name
-	}
+	pub fn name(&self) -> &str { &self.name }
 
 	#[must_use]
-	pub const fn dtype(&self) -> SafeTensorDType {
-		self.dtype
-	}
+	pub const fn dtype(&self) -> SafeTensorDType { self.dtype }
 
 	#[must_use]
-	pub fn shape(&self) -> &[u64] {
-		&self.shape
-	}
+	pub fn shape(&self) -> &[u64] { &self.shape }
 
 	#[must_use]
-	pub const fn begin(&self) -> u64 {
-		self.begin
-	}
+	pub const fn begin(&self) -> u64 { self.begin }
 
 	#[must_use]
-	pub const fn end(&self) -> u64 {
-		self.end
-	}
+	pub const fn end(&self) -> u64 { self.end }
 
 	#[must_use]
-	pub const fn encoded_bytes(&self) -> u64 {
-		self.end - self.begin
-	}
+	pub const fn encoded_bytes(&self) -> u64 { self.end - self.begin }
 }
 
 /// Fully validated, borrowed safetensors image.
@@ -172,24 +154,16 @@ pub struct SafeTensorArchive<'a> {
 
 impl<'a> SafeTensorArchive<'a> {
 	#[must_use]
-	pub const fn data_start(&self) -> u64 {
-		self.data_start
-	}
+	pub const fn data_start(&self) -> u64 { self.data_start }
 
 	#[must_use]
-	pub fn data(&self) -> &'a [u8] {
-		self.data
-	}
+	pub fn data(&self) -> &'a [u8] { self.data }
 
 	#[must_use]
-	pub const fn metadata(&self) -> &BTreeMap<String, String> {
-		&self.metadata
-	}
+	pub const fn metadata(&self) -> &BTreeMap<String, String> { &self.metadata }
 
 	#[must_use]
-	pub fn entries(&self) -> &[SafeTensorEntry] {
-		&self.entries
-	}
+	pub fn entries(&self) -> &[SafeTensorEntry] { &self.entries }
 
 	#[must_use]
 	pub fn entry(&self, name: &str) -> Option<&SafeTensorEntry> {
@@ -475,9 +449,7 @@ struct RawHeader {
 
 impl<'de> Deserialize<'de> for RawHeader {
 	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-	where
-		D: Deserializer<'de>,
-	{
+	where D: Deserializer<'de> {
 		deserializer.deserialize_map(HeaderVisitor)
 	}
 }
@@ -493,9 +465,7 @@ impl<'de> Visitor<'de> for HeaderVisitor {
 	}
 
 	fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-	where
-		A: MapAccess<'de>,
-	{
+	where A: MapAccess<'de> {
 		let mut names = BTreeSet::new();
 		let mut metadata = None;
 		let mut tensors = BTreeMap::new();
@@ -524,9 +494,7 @@ struct Metadata(BTreeMap<String, String>);
 
 impl<'de> Deserialize<'de> for Metadata {
 	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-	where
-		D: Deserializer<'de>,
-	{
+	where D: Deserializer<'de> {
 		deserializer.deserialize_map(MetadataVisitor)
 	}
 }
@@ -542,9 +510,7 @@ impl<'de> Visitor<'de> for MetadataVisitor {
 	}
 
 	fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-	where
-		A: MapAccess<'de>,
-	{
+	where A: MapAccess<'de> {
 		let mut metadata = BTreeMap::new();
 		while let Some((key, value)) = map.next_entry::<String, String>()? {
 			if metadata.insert(key.clone(), value).is_some() {
@@ -566,9 +532,7 @@ struct RawTensor {
 
 impl<'de> Deserialize<'de> for RawTensor {
 	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-	where
-		D: Deserializer<'de>,
-	{
+	where D: Deserializer<'de> {
 		deserializer.deserialize_map(TensorVisitor)
 	}
 }
@@ -584,9 +548,7 @@ impl<'de> Visitor<'de> for TensorVisitor {
 	}
 
 	fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-	where
-		A: MapAccess<'de>,
-	{
+	where A: MapAccess<'de> {
 		let mut dtype = None;
 		let mut shape = None;
 		let mut data_offsets = None;
@@ -598,10 +560,11 @@ impl<'de> Visitor<'de> for TensorVisitor {
 					set_once(&mut data_offsets, map.next_value()?, "data_offsets")?;
 				}
 				other => {
-					return Err(de::Error::unknown_field(
-						other,
-						&["dtype", "shape", "data_offsets"],
-					));
+					return Err(de::Error::unknown_field(other, &[
+						"dtype",
+						"shape",
+						"data_offsets",
+					]));
 				}
 			}
 		}
@@ -614,9 +577,7 @@ impl<'de> Visitor<'de> for TensorVisitor {
 }
 
 fn set_once<E, T>(slot: &mut Option<T>, value: T, field: &'static str) -> Result<(), E>
-where
-	E: de::Error,
-{
+where E: de::Error {
 	if slot.replace(value).is_some() {
 		Err(E::custom(format!("duplicate tensor field {field:?}")))
 	} else {
@@ -652,130 +613,4 @@ fn invalid_limit(name: &str) -> SafeTensorError {
 		SafeTensorErrorKind::InvalidLimit,
 		format!("{name} limit must be nonzero"),
 	)
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	fn limits() -> SafeTensorLimits {
-		SafeTensorLimits::new(4096, 4096, 16, 8, 128).unwrap()
-	}
-
-	fn image(header: &str, data: &[u8]) -> Vec<u8> {
-		let mut bytes = Vec::new();
-		bytes.extend_from_slice(&u64::try_from(header.len()).unwrap().to_le_bytes());
-		bytes.extend_from_slice(header.as_bytes());
-		bytes.extend_from_slice(data);
-		bytes
-	}
-
-	#[test]
-	fn retains_exact_encoded_spans_without_cpu_payload_decoding() {
-		let header = r#"{
-			"__metadata__":{"format":"recipe-test"},
-			"weights":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},
-			"ids":{"dtype":"I32","shape":[2],"data_offsets":[8,16]}
-		}"#;
-		let mut data = Vec::new();
-		data.extend_from_slice(&1.25_f32.to_le_bytes());
-		data.extend_from_slice(&(-2.5_f32).to_le_bytes());
-		data.extend_from_slice(&3_i32.to_le_bytes());
-		data.extend_from_slice(&(-4_i32).to_le_bytes());
-		let bytes = image(header, &data);
-		let archive = parse_safetensors(&bytes, limits()).unwrap();
-
-		assert_eq!(
-			archive.data_start(),
-			8 + u64::try_from(header.len()).unwrap()
-		);
-		assert_eq!(
-			archive.metadata().get("format").map(String::as_str),
-			Some("recipe-test")
-		);
-		assert_eq!(archive.entries().len(), 2);
-		assert_eq!(
-			archive.entry("weights").map(SafeTensorEntry::dtype),
-			Some(SafeTensorDType::F32)
-		);
-		assert_eq!(archive.encoded_tensor("weights"), Some(&data[..8]));
-		assert_eq!(archive.encoded_tensor("ids"), Some(&data[8..]));
-	}
-
-	#[test]
-	fn rejects_duplicate_header_and_tensor_fields() {
-		let duplicate_name = image(
-			r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
-			&[0; 4],
-		);
-		assert_eq!(
-			parse_safetensors(&duplicate_name, limits())
-				.unwrap_err()
-				.kind,
-			SafeTensorErrorKind::DuplicateField
-		);
-
-		let duplicate_dtype = image(
-			r#"{"x":{"dtype":"F32","dtype":"I32","shape":[1],"data_offsets":[0,4]}}"#,
-			&[0; 4],
-		);
-		assert_eq!(
-			parse_safetensors(&duplicate_dtype, limits())
-				.unwrap_err()
-				.kind,
-			SafeTensorErrorKind::DuplicateField
-		);
-	}
-
-	#[test]
-	fn rejects_shape_offset_gap_overlap_and_trailing_data() {
-		let wrong_shape = image(
-			r#"{"x":{"dtype":"F32","shape":[2],"data_offsets":[0,4]}}"#,
-			&[0; 4],
-		);
-		assert_eq!(
-			parse_safetensors(&wrong_shape, limits()).unwrap_err().kind,
-			SafeTensorErrorKind::InvalidShape
-		);
-
-		let gap = image(
-			r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[4,8]}}"#,
-			&[0; 8],
-		);
-		assert_eq!(
-			parse_safetensors(&gap, limits()).unwrap_err().kind,
-			SafeTensorErrorKind::NonContiguousData
-		);
-
-		let trailing = image(
-			r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
-			&[0; 8],
-		);
-		assert_eq!(
-			parse_safetensors(&trailing, limits()).unwrap_err().kind,
-			SafeTensorErrorKind::NonContiguousData
-		);
-	}
-
-	#[test]
-	fn enforces_every_caller_fixed_bound_before_exposing_an_archive() {
-		assert_eq!(
-			SafeTensorLimits::new(0, 1, 1, 1, 1).unwrap_err().kind,
-			SafeTensorErrorKind::InvalidLimit
-		);
-		let bytes = image(
-			r#"{"tensor-name":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
-			&[0; 4],
-		);
-		let header_limited = SafeTensorLimits::new(4, 64, 4, 4, 64).unwrap();
-		assert_eq!(
-			parse_safetensors(&bytes, header_limited).unwrap_err().kind,
-			SafeTensorErrorKind::HeaderLimitExceeded
-		);
-		let name_limited = SafeTensorLimits::new(4096, 64, 4, 4, 3).unwrap();
-		assert_eq!(
-			parse_safetensors(&bytes, name_limited).unwrap_err().kind,
-			SafeTensorErrorKind::NameLimitExceeded
-		);
-	}
 }

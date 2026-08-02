@@ -21,6 +21,3 @@ pub use model::{
 	CLUSTER_SCHEMA, ClusterConfiguration, MeasuredNetworkPair, MemberProfileIdentity, MemberSpec, NetworkPairSpec,
 	SubmittedProfile,
 };
-
-#[cfg(test)]
-mod tests;

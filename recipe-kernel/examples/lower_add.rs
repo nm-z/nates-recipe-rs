@@ -1,6 +1,4 @@
-use std::env;
-use std::fs;
-use std::path::PathBuf;
+use std::{env, fs, path::PathBuf};
 
 use recipe_core::{
 	AliasPermission, AliasRule, DType, ElementCount, IndexSpace, KernelInput, KernelInputId, KernelOutput,
@@ -102,14 +100,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			},
 		],
 	};
-	let lowered = lower_elementwise(
-		&template,
-		&target,
-		&LoweringOptions {
-			entry_symbol: "recipe_add_f32".to_owned(),
-			workgroup_lanes: 256,
-		},
-	)?;
+	let lowered = lower_elementwise(&template, &target, &LoweringOptions {
+		entry_symbol: "recipe_add_f32".to_owned(),
+		workgroup_lanes: 256,
+	})?;
 	fs::write(output, lowered.llvm_ir)?;
 	Ok(())
 }

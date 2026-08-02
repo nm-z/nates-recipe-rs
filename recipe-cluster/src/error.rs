@@ -20,10 +20,12 @@ impl fmt::Display for ClusterError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::InvalidConfiguration(message) => write!(formatter, "invalid cluster configuration: {message}"),
-			Self::MissingMember(member) => write!(
-				formatter,
-				"member {member} did not submit a measured profile"
-			),
+			Self::MissingMember(member) => {
+				write!(
+					formatter,
+					"member {member} did not submit a measured profile"
+				)
+			}
 			Self::DuplicateMember(member) => write!(formatter, "member {member} appears more than once"),
 			Self::StaleMember(member) => {
 				write!(

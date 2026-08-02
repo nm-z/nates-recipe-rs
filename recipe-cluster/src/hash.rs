@@ -2,9 +2,11 @@ use recipe_core::{Digest, DuplexMode, PropertyProvenance, TransportKind};
 use recipe_probe::{BenchmarkMetadata, BoundedBenchmarkPlan};
 use sha2::{Digest as _, Sha256};
 
-use crate::assemble::{PreparedMember, ResolvedNetworkPair};
-use crate::error::{ClusterError, ClusterResult};
-use crate::model::{CLUSTER_SCHEMA, ClusterConfiguration};
+use crate::{
+	assemble::{PreparedMember, ResolvedNetworkPair},
+	error::{ClusterError, ClusterResult},
+	model::{CLUSTER_SCHEMA, ClusterConfiguration},
+};
 
 #[derive(Clone, Debug)]
 struct CanonicalDigest {
@@ -30,33 +32,19 @@ impl CanonicalDigest {
 		Ok(())
 	}
 
-	fn string(&mut self, value: &str) -> ClusterResult<()> {
-		self.bytes(value.as_bytes())
-	}
+	fn string(&mut self, value: &str) -> ClusterResult<()> { self.bytes(value.as_bytes()) }
 
-	fn digest(&mut self, value: Digest) {
-		self.hasher.update(value.bytes());
-	}
+	fn digest(&mut self, value: Digest) { self.hasher.update(value.bytes()); }
 
-	fn u8(&mut self, value: u8) {
-		self.hasher.update([value]);
-	}
+	fn u8(&mut self, value: u8) { self.hasher.update([value]); }
 
-	fn u32(&mut self, value: u32) {
-		self.hasher.update(value.to_le_bytes());
-	}
+	fn u32(&mut self, value: u32) { self.hasher.update(value.to_le_bytes()); }
 
-	fn u64(&mut self, value: u64) {
-		self.hasher.update(value.to_le_bytes());
-	}
+	fn u64(&mut self, value: u64) { self.hasher.update(value.to_le_bytes()); }
 
-	fn bool(&mut self, value: bool) {
-		self.u8(u8::from(value));
-	}
+	fn bool(&mut self, value: bool) { self.u8(u8::from(value)); }
 
-	fn finish(self) -> Digest {
-		Digest::new(<[u8; 32]>::from(self.hasher.finalize()))
-	}
+	fn finish(self) -> Digest { Digest::new(<[u8; 32]>::from(self.hasher.finalize())) }
 }
 
 pub(crate) fn cluster_digest(

@@ -8,29 +8,19 @@ impl ByteCount {
 	pub const ZERO: Self = Self(0);
 
 	#[must_use]
-	pub const fn new(bytes: u64) -> Self {
-		Self(bytes)
-	}
+	pub const fn new(bytes: u64) -> Self { Self(bytes) }
 
 	#[must_use]
-	pub const fn get(self) -> u64 {
-		self.0
-	}
+	pub const fn get(self) -> u64 { self.0 }
 
 	#[must_use]
-	pub fn checked_add(self, other: Self) -> Option<Self> {
-		self.0.checked_add(other.0).map(Self)
-	}
+	pub fn checked_add(self, other: Self) -> Option<Self> { self.0.checked_add(other.0).map(Self) }
 
 	#[must_use]
-	pub fn checked_sub(self, other: Self) -> Option<Self> {
-		self.0.checked_sub(other.0).map(Self)
-	}
+	pub fn checked_sub(self, other: Self) -> Option<Self> { self.0.checked_sub(other.0).map(Self) }
 
 	#[must_use]
-	pub fn checked_mul(self, factor: u64) -> Option<Self> {
-		self.0.checked_mul(factor).map(Self)
-	}
+	pub fn checked_mul(self, factor: u64) -> Option<Self> { self.0.checked_mul(factor).map(Self) }
 
 	pub fn checked_align_up(self, alignment: Self) -> Result<Self, UnitError> {
 		if alignment.0 == 0 || !alignment.0.is_power_of_two() {
@@ -44,9 +34,7 @@ impl ByteCount {
 }
 
 impl fmt::Display for ByteCount {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(formatter, "{} B", self.0)
-	}
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { write!(formatter, "{} B", self.0) }
 }
 
 /// Exact byte offset within an arena.
@@ -55,14 +43,10 @@ pub struct ByteOffset(u64);
 
 impl ByteOffset {
 	#[must_use]
-	pub const fn new(bytes: u64) -> Self {
-		Self(bytes)
-	}
+	pub const fn new(bytes: u64) -> Self { Self(bytes) }
 
 	#[must_use]
-	pub const fn get(self) -> u64 {
-		self.0
-	}
+	pub const fn get(self) -> u64 { self.0 }
 
 	#[must_use]
 	pub fn checked_end(self, size: ByteCount) -> Option<ByteCount> {
@@ -84,9 +68,7 @@ impl BytesPerSecond {
 	}
 
 	#[must_use]
-	pub const fn get(self) -> u64 {
-		self.0
-	}
+	pub const fn get(self) -> u64 { self.0 }
 }
 
 /// Nonzero number of transfers that may be inflight in one direction.
@@ -103,9 +85,7 @@ impl TransferLaneCount {
 	}
 
 	#[must_use]
-	pub const fn get(self) -> u32 {
-		self.0
-	}
+	pub const fn get(self) -> u32 { self.0 }
 }
 
 /// Exact operation FLOP count.
@@ -116,24 +96,16 @@ impl FlopCount {
 	pub const ZERO: Self = Self(0);
 
 	#[must_use]
-	pub const fn new(value: u64) -> Self {
-		Self(value)
-	}
+	pub const fn new(value: u64) -> Self { Self(value) }
 
 	#[must_use]
-	pub const fn get(self) -> u64 {
-		self.0
-	}
+	pub const fn get(self) -> u64 { self.0 }
 
 	#[must_use]
-	pub fn checked_add(self, other: Self) -> Option<Self> {
-		self.0.checked_add(other.0).map(Self)
-	}
+	pub fn checked_add(self, other: Self) -> Option<Self> { self.0.checked_add(other.0).map(Self) }
 
 	#[must_use]
-	pub fn checked_mul(self, factor: u64) -> Option<Self> {
-		self.0.checked_mul(factor).map(Self)
-	}
+	pub fn checked_mul(self, factor: u64) -> Option<Self> { self.0.checked_mul(factor).map(Self) }
 }
 
 /// Nonzero floating-point operations per second.
@@ -150,9 +122,7 @@ impl FlopsPerSecond {
 	}
 
 	#[must_use]
-	pub const fn get(self) -> u64 {
-		self.0
-	}
+	pub const fn get(self) -> u64 { self.0 }
 }
 
 /// Integer nanoseconds used by a deterministic schedule.
@@ -163,19 +133,13 @@ impl Nanoseconds {
 	pub const ZERO: Self = Self(0);
 
 	#[must_use]
-	pub const fn new(value: u64) -> Self {
-		Self(value)
-	}
+	pub const fn new(value: u64) -> Self { Self(value) }
 
 	#[must_use]
-	pub const fn get(self) -> u64 {
-		self.0
-	}
+	pub const fn get(self) -> u64 { self.0 }
 
 	#[must_use]
-	pub fn checked_add(self, other: Self) -> Option<Self> {
-		self.0.checked_add(other.0).map(Self)
-	}
+	pub fn checked_add(self, other: Self) -> Option<Self> { self.0.checked_add(other.0).map(Self) }
 }
 
 /// Number of elements in a parallel index space.
@@ -192,9 +156,7 @@ impl ElementCount {
 	}
 
 	#[must_use]
-	pub const fn get(self) -> u64 {
-		self.0
-	}
+	pub const fn get(self) -> u64 { self.0 }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -247,36 +209,4 @@ fn ratio_time_ceil(work: u64, rate: u64) -> Result<Nanoseconds, UnitError> {
 	u64::try_from(value)
 		.map(Nanoseconds::new)
 		.map_err(|_| UnitError::Overflow)
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn uses_decimal_conformance_rates() {
-		let one_gb = ByteCount::new(1_000_000_000);
-		let one_gbe = BytesPerSecond::new(125_000_000).unwrap();
-		assert_eq!(
-			transfer_time_ceil(one_gb, one_gbe).unwrap(),
-			Nanoseconds::new(8_000_000_000)
-		);
-	}
-
-	#[test]
-	fn checked_units_reject_invalid_values_and_overflow() {
-		assert_eq!(BytesPerSecond::new(0), Err(UnitError::ZeroRate));
-		assert_eq!(
-			TransferLaneCount::new(0),
-			Err(UnitError::ZeroTransferLaneCount)
-		);
-		assert_eq!(
-			ByteCount::new(3).checked_align_up(ByteCount::new(3)),
-			Err(UnitError::InvalidAlignment(3))
-		);
-		assert_eq!(
-			ByteCount::new(u64::MAX).checked_add(ByteCount::new(1)),
-			None
-		);
-	}
 }

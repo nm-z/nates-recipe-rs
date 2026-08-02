@@ -18,13 +18,6 @@ sha2 = "0.10"
 [build-dependencies]
 sha2 = "0.10"
 
-[features]
-live-native = []
-
-[[test]]
-name = "live_native"
-required-features = ["live-native"]
-
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 

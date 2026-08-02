@@ -8,9 +8,7 @@ pub struct NodeId(usize);
 
 impl NodeId {
 	#[must_use]
-	pub const fn index(self) -> usize {
-		self.0
-	}
+	pub const fn index(self) -> usize { self.0 }
 }
 
 /// One immutable-text node and its ordered tree relationships.
@@ -23,19 +21,13 @@ pub struct Node {
 
 impl Node {
 	#[must_use]
-	pub fn text(&self) -> &str {
-		&self.text
-	}
+	pub fn text(&self) -> &str { &self.text }
 
 	#[must_use]
-	pub const fn parent(&self) -> Option<NodeId> {
-		self.parent
-	}
+	pub const fn parent(&self) -> Option<NodeId> { self.parent }
 
 	#[must_use]
-	pub fn children(&self) -> &[NodeId] {
-		&self.children
-	}
+	pub fn children(&self) -> &[NodeId] { &self.children }
 }
 
 /// An ordered forest stored in an append-only arena.
@@ -57,29 +49,19 @@ impl Graph {
 		}
 	}
 
-	pub fn parse(input: &str) -> Result<Self, ParseError> {
-		crate::parser::parse(input)
-	}
+	pub fn parse(input: &str) -> Result<Self, ParseError> { crate::parser::parse(input) }
 
 	#[must_use]
-	pub fn len(&self) -> usize {
-		self.nodes.len()
-	}
+	pub fn len(&self) -> usize { self.nodes.len() }
 
 	#[must_use]
-	pub fn is_empty(&self) -> bool {
-		self.nodes.is_empty()
-	}
+	pub fn is_empty(&self) -> bool { self.nodes.is_empty() }
 
 	#[must_use]
-	pub fn roots(&self) -> &[NodeId] {
-		&self.roots
-	}
+	pub fn roots(&self) -> &[NodeId] { &self.roots }
 
 	#[must_use]
-	pub fn node(&self, id: NodeId) -> Option<&Node> {
-		self.nodes.get(id.0)
-	}
+	pub fn node(&self, id: NodeId) -> Option<&Node> { self.nodes.get(id.0) }
 
 	pub fn nodes(&self) -> impl ExactSizeIterator<Item = (NodeId, &Node)> {
 		self.nodes
@@ -104,9 +86,7 @@ impl Graph {
 	}
 
 	#[must_use]
-	pub fn to_canonical_string(&self) -> String {
-		crate::serializer::serialize(self)
-	}
+	pub fn to_canonical_string(&self) -> String { crate::serializer::serialize(self) }
 
 	pub(crate) fn push_node(&mut self, parent: Option<NodeId>, text: String) -> NodeId {
 		let id = NodeId(self.nodes.len());
@@ -157,9 +137,7 @@ impl Eq for Graph {}
 impl FromStr for Graph {
 	type Err = ParseError;
 
-	fn from_str(input: &str) -> Result<Self, Self::Err> {
-		Self::parse(input)
-	}
+	fn from_str(input: &str) -> Result<Self, Self::Err> { Self::parse(input) }
 }
 
 impl fmt::Display for Graph {

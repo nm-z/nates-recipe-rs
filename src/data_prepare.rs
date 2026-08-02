@@ -35,18 +35,24 @@ impl fmt::Display for DataPreparationError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Declaration(error) => write!(formatter, "invalid data declaration: {error}"),
-			Self::MissingTargets => write!(
-				formatter,
-				"dataset preparation requires at least one target vector"
-			),
-			Self::MissingSplit => write!(
-				formatter,
-				"dataset preparation requires an explicit train split"
-			),
-			Self::FloatPredicateOutsideF32 { column, value } => write!(
-				formatter,
-				"predicate for column {column:?} cannot be represented as a finite, non-underflowing f32: {value}"
-			),
+			Self::MissingTargets => {
+				write!(
+					formatter,
+					"dataset preparation requires at least one target vector"
+				)
+			}
+			Self::MissingSplit => {
+				write!(
+					formatter,
+					"dataset preparation requires an explicit train split"
+				)
+			}
+			Self::FloatPredicateOutsideF32 { column, value } => {
+				write!(
+					formatter,
+					"predicate for column {column:?} cannot be represented as a finite, non-underflowing f32: {value}"
+				)
+			}
 			Self::Ingest(error) => write!(formatter, "load data source: {error}"),
 			Self::Source(error) => write!(formatter, "distill data source: {error}"),
 			Self::Semantic(error) => write!(formatter, "infer data vectors: {error}"),

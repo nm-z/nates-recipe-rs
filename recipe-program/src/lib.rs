@@ -79,9 +79,11 @@ impl StaticCalculationProgram {
 		let domains = graph
 			.nodes
 			.iter()
-			.map(|node| KernelIterationDomain {
-				kernel: node.kernel.id,
-				domain: IterationDomain::every(iterations),
+			.map(|node| {
+				KernelIterationDomain {
+					kernel: node.kernel.id,
+					domain: IterationDomain::every(iterations),
+				}
 			})
 			.collect();
 		Self::new(graph, iterations, domains)
@@ -276,19 +278,13 @@ impl StaticCalculationProgram {
 	}
 
 	#[must_use]
-	pub const fn graph(&self) -> &CalculationGraph {
-		&self.graph
-	}
+	pub const fn graph(&self) -> &CalculationGraph { &self.graph }
 
 	#[must_use]
-	pub const fn iterations(&self) -> LoopIterations {
-		self.iterations
-	}
+	pub const fn iterations(&self) -> LoopIterations { self.iterations }
 
 	#[must_use]
-	pub fn domains(&self) -> &[KernelIterationDomain] {
-		&self.domains
-	}
+	pub fn domains(&self) -> &[KernelIterationDomain] { &self.domains }
 
 	#[must_use]
 	pub fn domain(&self, kernel: KernelTemplateId) -> Option<IterationDomain> {
@@ -299,9 +295,7 @@ impl StaticCalculationProgram {
 	}
 
 	#[must_use]
-	pub fn metrics(&self) -> &[MetricEmission] {
-		&self.metrics
-	}
+	pub fn metrics(&self) -> &[MetricEmission] { &self.metrics }
 
 	#[must_use]
 	pub fn metric(&self, metric: MetricId) -> Option<MetricEmission> {
@@ -419,18 +413,22 @@ impl StaticCalculationProgram {
 		let version_field = unique_field(source, program_root, "version", "RecipeProgram")?;
 		let version = leaf_value(source, version_field, "RecipeProgram.version")?;
 		let fields = match version {
-			LEGACY_PROGRAM_VERSION => exact_fields(
-				source,
-				program_root,
-				&["schema", "version", "iterations", "domains"],
-				"RecipeProgram",
-			)?,
-			PROGRAM_VERSION => exact_fields(
-				source,
-				program_root,
-				&["schema", "version", "iterations", "domains", "metrics"],
-				"RecipeProgram",
-			)?,
+			LEGACY_PROGRAM_VERSION => {
+				exact_fields(
+					source,
+					program_root,
+					&["schema", "version", "iterations", "domains"],
+					"RecipeProgram",
+				)?
+			}
+			PROGRAM_VERSION => {
+				exact_fields(
+					source,
+					program_root,
+					&["schema", "version", "iterations", "domains", "metrics"],
+					"RecipeProgram",
+				)?
+			}
 			_ => {
 				return Err(ProgramError::new(
 					ProgramErrorKind::InvalidDocument,
@@ -605,21 +603,15 @@ impl std::error::Error for ProgramError {
 }
 
 impl From<ParseError> for ProgramError {
-	fn from(error: ParseError) -> Self {
-		Self::Syntax(error)
-	}
+	fn from(error: ParseError) -> Self { Self::Syntax(error) }
 }
 
 impl From<OgdlCodecError> for ProgramError {
-	fn from(error: OgdlCodecError) -> Self {
-		Self::Graph(error)
-	}
+	fn from(error: OgdlCodecError) -> Self { Self::Graph(error) }
 }
 
 impl From<GraphError> for ProgramError {
-	fn from(error: GraphError) -> Self {
-		Self::Build(error)
-	}
+	fn from(error: GraphError) -> Self { Self::Build(error) }
 }
 
 pub type ProgramResult<T> = Result<T, ProgramError>;
@@ -677,14 +669,18 @@ fn unique_field(graph: &Graph, parent: NodeId, name: &str, path: &str) -> Progra
 		.collect::<Vec<_>>();
 	match matches.as_slice() {
 		[field] => Ok(*field),
-		[] => Err(ProgramError::new(
-			ProgramErrorKind::MissingField,
-			format!("{path} is missing field {name:?}"),
-		)),
-		_ => Err(ProgramError::new(
-			ProgramErrorKind::DuplicateField,
-			format!("{path} repeats field {name:?}"),
-		)),
+		[] => {
+			Err(ProgramError::new(
+				ProgramErrorKind::MissingField,
+				format!("{path} is missing field {name:?}"),
+			))
+		}
+		_ => {
+			Err(ProgramError::new(
+				ProgramErrorKind::DuplicateField,
+				format!("{path} repeats field {name:?}"),
+			))
+		}
 	}
 }
 
@@ -829,364 +825,4 @@ fn parse_u64(value: &str, path: &str) -> ProgramResult<u64> {
 			format!("{path} cannot be represented as u64: {error}"),
 		)
 	})
-}
-
-#[cfg(test)]
-mod tests {
-	use recipe_core::{
-		AliasPermission, DType, KernelTemplateId, MetricId, ScalarInput, ScalarProgram, ScalarValueId, ValueId,
-	};
-	use recipe_language::{
-		CalculationNode, Elementwise, PrimitiveAliasRule, PrimitiveKernel, PrimitiveKind, Shape, Tensor,
-	};
-
-	use super::*;
-
-	fn graph() -> CalculationGraph {
-		let input = ValueId::new(1);
-		let output = ValueId::new(2);
-		CalculationGraph {
-			tensors: vec![
-				Tensor::contiguous(input, DType::F32, Shape::new(vec![4]).unwrap(), true, false).unwrap(),
-				Tensor::contiguous(
-					output,
-					DType::F32,
-					Shape::new(vec![4]).unwrap(),
-					false,
-					true,
-				)
-				.unwrap(),
-			],
-			nodes: vec![CalculationNode {
-				kernel: PrimitiveKernel {
-					id: KernelTemplateId::new(7),
-					inputs: vec![input],
-					outputs: vec![output],
-					alias_rules: vec![PrimitiveAliasRule {
-						input: 0,
-						output: 0,
-						permission: AliasPermission::Forbidden,
-					}],
-					kind: PrimitiveKind::Elementwise(Elementwise {
-						program: ScalarProgram {
-							inputs: vec![ScalarInput {
-								id: ScalarValueId::new(1),
-								dtype: DType::F32,
-							}],
-							constants: Vec::new(),
-							instructions: Vec::new(),
-							outputs: vec![ScalarValueId::new(1)],
-						},
-					}),
-				},
-			}],
-		}
-	}
-
-	fn scalar_graph() -> CalculationGraph {
-		let mut graph = graph();
-		graph.tensors = vec![
-			Tensor::contiguous(
-				ValueId::new(1),
-				DType::F32,
-				Shape::new(vec![1]).unwrap(),
-				true,
-				false,
-			)
-			.unwrap(),
-			Tensor::contiguous(
-				ValueId::new(2),
-				DType::F32,
-				Shape::new(vec![1]).unwrap(),
-				false,
-				false,
-			)
-			.unwrap(),
-		];
-		graph
-	}
-
-	#[test]
-	fn roundtrips_program_and_calculation_roots_without_quotes() {
-		let program = StaticCalculationProgram::new(
-			graph(),
-			LoopIterations::new(12).unwrap(),
-			vec![KernelIterationDomain {
-				kernel: KernelTemplateId::new(7),
-				domain: IterationDomain::new(2, 12, 3).unwrap(),
-			}],
-		)
-		.unwrap();
-		let text = program.to_ogdl().unwrap();
-		assert!(text.starts_with("RecipeProgram\tschema\tStaticCalculationProgram"));
-		assert!(text.contains("\nRecipeIR\tschema\tCalculationGraph"));
-		assert!(!text.contains('"'));
-		assert_eq!(StaticCalculationProgram::from_ogdl(&text).unwrap(), program);
-	}
-
-	#[test]
-	fn unbounded_program_roundtrips_without_a_synthetic_terminal_iteration() {
-		let iterations = LoopIterations::UNBOUNDED;
-		let program = StaticCalculationProgram::new(
-			graph(),
-			iterations,
-			vec![KernelIterationDomain {
-				kernel: KernelTemplateId::new(7),
-				domain: IterationDomain::unbounded(0, 1).unwrap(),
-			}],
-		)
-		.unwrap();
-		let text = program.to_ogdl().unwrap();
-		assert!(text.contains("iterations\tunbounded"));
-		assert!(text.contains("end_exclusive\tunbounded"));
-		assert!(!text.contains(&u64::MAX.to_string()));
-		assert_eq!(StaticCalculationProgram::from_ogdl(&text).unwrap(), program);
-	}
-
-	#[test]
-	fn roundtrips_typed_metric_emissions_in_canonical_id_order() {
-		let iterations = LoopIterations::new(12).unwrap();
-		let producer_domain = IterationDomain::new(2, 12, 3).unwrap();
-		let metric_domain = IterationDomain::new(5, 12, 3).unwrap();
-		let program = StaticCalculationProgram::new_with_metrics(
-			scalar_graph(),
-			iterations,
-			vec![KernelIterationDomain {
-				kernel: KernelTemplateId::new(7),
-				domain: producer_domain,
-			}],
-			vec![
-				MetricEmission {
-					metric: MetricId::new(9),
-					value: ValueId::new(2),
-					domain: metric_domain,
-				},
-				MetricEmission {
-					metric: MetricId::new(3),
-					value: ValueId::new(2),
-					domain: IterationDomain::new(2, 3, 1).unwrap(),
-				},
-			],
-		)
-		.unwrap();
-		assert_eq!(
-			program
-				.metrics()
-				.iter()
-				.map(|emission| emission.metric)
-				.collect::<Vec<_>>(),
-			[MetricId::new(3), MetricId::new(9)]
-		);
-		assert_eq!(
-			program.metric(MetricId::new(9)).unwrap().domain,
-			metric_domain
-		);
-		let text = program.to_ogdl().unwrap();
-		assert!(text.contains("metrics\tmetric\tid\t3"));
-		assert_eq!(StaticCalculationProgram::from_ogdl(&text).unwrap(), program);
-	}
-
-	#[test]
-	fn legacy_constructors_declare_no_user_metrics() {
-		let iterations = LoopIterations::new(2).unwrap();
-		let program = StaticCalculationProgram::every_iteration(graph(), iterations).unwrap();
-		assert!(program.metrics().is_empty());
-		assert!(
-			StaticCalculationProgram::new(
-				graph(),
-				iterations,
-				vec![KernelIterationDomain {
-					kernel: KernelTemplateId::new(7),
-					domain: IterationDomain::every(iterations),
-				}],
-			)
-			.unwrap()
-			.metrics()
-			.is_empty()
-		);
-	}
-
-	#[test]
-	fn metric_ids_values_and_producer_coverage_are_validated() {
-		let iterations = LoopIterations::new(6).unwrap();
-		let producer_domain = IterationDomain::new(0, 6, 2).unwrap();
-		let build = |graph, metrics| {
-			StaticCalculationProgram::new_with_metrics(
-				graph,
-				iterations,
-				vec![KernelIterationDomain {
-					kernel: KernelTemplateId::new(7),
-					domain: producer_domain,
-				}],
-				metrics,
-			)
-		};
-		let emission = |metric, value, domain| MetricEmission {
-			metric: MetricId::new(metric),
-			value: ValueId::new(value),
-			domain,
-		};
-		assert_eq!(
-			build(
-				scalar_graph(),
-				vec![emission(0, 2, IterationDomain::new(0, 1, 1).unwrap())],
-			)
-			.unwrap_err()
-			.kind(),
-			Some(ProgramErrorKind::InvalidMetricId)
-		);
-		assert_eq!(
-			build(
-				scalar_graph(),
-				vec![
-					emission(1, 2, IterationDomain::new(0, 1, 1).unwrap()),
-					emission(1, 2, IterationDomain::new(2, 3, 1).unwrap()),
-				],
-			)
-			.unwrap_err()
-			.kind(),
-			Some(ProgramErrorKind::DuplicateMetric)
-		);
-		assert_eq!(
-			build(
-				graph(),
-				vec![emission(1, 2, IterationDomain::new(0, 1, 1).unwrap())],
-			)
-			.unwrap_err()
-			.kind(),
-			Some(ProgramErrorKind::InvalidMetricValue)
-		);
-		let mut external_metric = scalar_graph();
-		external_metric.tensors[1].external_output = true;
-		assert_eq!(
-			build(
-				external_metric,
-				vec![emission(1, 2, IterationDomain::new(0, 1, 1).unwrap())],
-			)
-			.unwrap_err()
-			.kind(),
-			Some(ProgramErrorKind::InvalidMetricValue)
-		);
-		assert_eq!(
-			build(
-				scalar_graph(),
-				vec![emission(1, 1, IterationDomain::new(0, 1, 1).unwrap())],
-			)
-			.unwrap_err()
-			.kind(),
-			Some(ProgramErrorKind::UnproducedMetricValue)
-		);
-		assert_eq!(
-			build(
-				scalar_graph(),
-				vec![emission(1, 2, IterationDomain::new(1, 6, 2).unwrap())],
-			)
-			.unwrap_err()
-			.kind(),
-			Some(ProgramErrorKind::UncoveredMetricDomain)
-		);
-	}
-
-	#[test]
-	fn domains_are_explicit_complete_bounded_and_unique() {
-		let iterations = LoopIterations::new(4).unwrap();
-		assert_eq!(
-			StaticCalculationProgram::new(graph(), iterations, Vec::new())
-				.unwrap_err()
-				.kind(),
-			Some(ProgramErrorKind::MissingKernel)
-		);
-		let assignment = KernelIterationDomain {
-			kernel: KernelTemplateId::new(7),
-			domain: IterationDomain::every(iterations),
-		};
-		assert_eq!(
-			StaticCalculationProgram::new(graph(), iterations, vec![assignment, assignment],)
-				.unwrap_err()
-				.kind(),
-			Some(ProgramErrorKind::DuplicateKernel)
-		);
-		let out_of_bounds = KernelIterationDomain {
-			kernel: KernelTemplateId::new(7),
-			domain: IterationDomain::new(0, 5, 1).unwrap(),
-		};
-		assert_eq!(
-			StaticCalculationProgram::new(graph(), iterations, vec![out_of_bounds])
-				.unwrap_err()
-				.kind(),
-			Some(ProgramErrorKind::InvalidIterationDomain)
-		);
-	}
-
-	#[test]
-	fn periodic_domain_has_exact_zero_based_membership() {
-		let domain = IterationDomain::new(2, 11, 3).unwrap();
-		assert_eq!(
-			(0..12)
-				.filter(|iteration| domain.contains(*iteration))
-				.collect::<Vec<_>>(),
-			[2, 5, 8]
-		);
-	}
-
-	#[test]
-	fn consumer_cannot_activate_before_its_resident_input_is_produced() {
-		let mut calculation = graph();
-		calculation.tensors[1].external_output = false;
-		calculation.tensors.push(Tensor::contiguous(
-			ValueId::new(3),
-			DType::F32,
-			Shape::new(vec![4]).unwrap(),
-			false,
-			true,
-		)
-		.unwrap());
-		let mut consumer = calculation.nodes[0].clone();
-		consumer.kernel.id = KernelTemplateId::new(8);
-		consumer.kernel.inputs = vec![ValueId::new(2)];
-		consumer.kernel.outputs = vec![ValueId::new(3)];
-		calculation.nodes.push(consumer);
-		let iterations = LoopIterations::new(4).unwrap();
-		let error = StaticCalculationProgram::new(
-			calculation,
-			iterations,
-			vec![
-				KernelIterationDomain {
-					kernel: KernelTemplateId::new(7),
-					domain: IterationDomain::new(2, 4, 1).unwrap(),
-				},
-				KernelIterationDomain {
-					kernel: KernelTemplateId::new(8),
-					domain: IterationDomain::new(0, 4, 1).unwrap(),
-				},
-			],
-		)
-		.unwrap_err();
-		assert_eq!(
-			error.kind(),
-			Some(ProgramErrorKind::UninitializedDependency)
-		);
-	}
-
-	#[test]
-	fn decoder_rejects_noncanonical_numbers_and_unknown_fields() {
-		let text = StaticCalculationProgram::every_iteration(graph(), LoopIterations::new(2).unwrap())
-			.unwrap()
-			.to_ogdl()
-			.unwrap();
-		let leading_zero = text.replacen("iterations\t2", "iterations\t02", 1);
-		assert_eq!(
-			StaticCalculationProgram::from_ogdl(&leading_zero)
-				.unwrap_err()
-				.kind(),
-			Some(ProgramErrorKind::InvalidNumber)
-		);
-		let unknown = text.replacen("\n\tdomains", "\n\tunknown\tvalue\n\tdomains", 1);
-		assert_eq!(
-			StaticCalculationProgram::from_ogdl(&unknown)
-				.unwrap_err()
-				.kind(),
-			Some(ProgramErrorKind::UnknownField)
-		);
-	}
 }

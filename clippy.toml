@@ -1,12 +1,6 @@
 # overrides
 too-many-lines-threshold = 200
 cognitive-complexity-threshold = 35
-allow-unwrap-in-tests = true
-allow-expect-in-tests = true
-allow-panic-in-tests = true
-allow-dbg-in-tests = true
-allow-indexing-slicing-in-tests = true
-
 # defaults
 too-many-arguments-threshold = 7
 type-complexity-threshold = 250

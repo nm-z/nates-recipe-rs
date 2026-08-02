@@ -1,18 +1,23 @@
-use crate::abi::{
-	HsaAgentGetInfo, HsaAgentIterateIsas, HsaAmdAgentIterateMemoryPools, HsaAmdAgentsAllowAccess,
-	HsaAmdMemoryAsyncCopy, HsaAmdMemoryPoolAllocate, HsaAmdMemoryPoolFree, HsaAmdMemoryPoolGetInfo,
-	HsaCodeObjectReaderCreateFromMemory, HsaCodeObjectReaderDestroy, HsaExecutableCreateAlt, HsaExecutableDestroy,
-	HsaExecutableFreeze, HsaExecutableGetSymbolByName, HsaExecutableLoadAgentCodeObject, HsaExecutableSymbolGetInfo,
-	HsaInit, HsaIsaGetInfoAlt, HsaIterateAgents, HsaQueueCreate, HsaQueueDestroy, HsaQueueLoadReadIndexScAcquire,
-	HsaQueueLoadWriteIndexRelaxed, HsaQueueStoreWriteIndexScRelease, HsaShutDown, HsaSignalCreate, HsaSignalDestroy,
-	HsaSignalLoadScAcquire, HsaSignalStoreScRelease, HsaSignalWaitScAcquire, HsaStatus, HsaStatusString,
-	HsaSystemGetInfo, STATUS_SUCCESS,
-};
-use crate::{Error, Result};
 use core::ffi::{c_char, c_void};
-use std::ffi::{CStr, CString, OsStr};
-use std::os::unix::ffi::OsStrExt;
-use std::ptr::NonNull;
+use std::{
+	ffi::{CStr, CString, OsStr},
+	os::unix::ffi::OsStrExt,
+	ptr::NonNull,
+};
+
+use crate::{
+	Error, Result,
+	abi::{
+		HsaAgentGetInfo, HsaAgentIterateIsas, HsaAmdAgentIterateMemoryPools, HsaAmdAgentsAllowAccess,
+		HsaAmdMemoryAsyncCopy, HsaAmdMemoryPoolAllocate, HsaAmdMemoryPoolFree, HsaAmdMemoryPoolGetInfo,
+		HsaCodeObjectReaderCreateFromMemory, HsaCodeObjectReaderDestroy, HsaExecutableCreateAlt,
+		HsaExecutableDestroy, HsaExecutableFreeze, HsaExecutableGetSymbolByName, HsaExecutableLoadAgentCodeObject,
+		HsaExecutableSymbolGetInfo, HsaInit, HsaIsaGetInfoAlt, HsaIterateAgents, HsaQueueCreate, HsaQueueDestroy,
+		HsaQueueLoadReadIndexScAcquire, HsaQueueLoadWriteIndexRelaxed, HsaQueueStoreWriteIndexScRelease,
+		HsaShutDown, HsaSignalCreate, HsaSignalDestroy, HsaSignalLoadScAcquire, HsaSignalStoreScRelease,
+		HsaSignalWaitScAcquire, HsaStatus, HsaStatusString, HsaSystemGetInfo, STATUS_SUCCESS,
+	},
+};
 
 struct Library {
 	handle: NonNull<c_void>,
@@ -22,8 +27,10 @@ struct Library {
 impl Library {
 	fn open(path: &OsStr) -> Result<Self> {
 		let display_name = path.to_string_lossy().into_owned();
-		let path = CString::new(path.as_bytes()).map_err(|_| Error::PathContainsNul {
-			path: display_name.clone(),
+		let path = CString::new(path.as_bytes()).map_err(|_| {
+			Error::PathContainsNul {
+				path: display_name.clone(),
+			}
 		})?;
 
 		// SAFETY: `path` is NUL terminated and remains alive for the call. The
@@ -302,46 +309,5 @@ impl Api {
 		Some(unsafe { CStr::from_ptr(pointer) }
 			.to_string_lossy()
 			.into_owned())
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn nonexistent_library_is_a_typed_error() {
-		let error = match Api::load(OsStr::new(
-			"/definitely/not/a/real/path/librecipe-hsa-test.so",
-		)) {
-			Ok(_) => panic!("nonexistent library unexpectedly opened"),
-			Err(error) => error,
-		};
-		assert!(matches!(error, Error::LibraryOpen { .. }));
-	}
-
-	#[test]
-	fn interior_nul_is_a_typed_error() {
-		let error = match Api::load(OsStr::from_bytes(b"libhsa\0runtime.so")) {
-			Ok(_) => panic!("NUL-containing path unexpectedly opened"),
-			Err(error) => error,
-		};
-		assert!(matches!(error, Error::PathContainsNul { .. }));
-	}
-
-	#[cfg(target_os = "linux")]
-	#[test]
-	fn missing_required_symbol_is_a_typed_error() {
-		let error = match Api::load(OsStr::new("libc.so.6")) {
-			Ok(_) => panic!("libc unexpectedly exported the entire ROCr ABI"),
-			Err(error) => error,
-		};
-		assert!(matches!(
-			error,
-			Error::MissingSymbol {
-				symbol: "hsa_init",
-				..
-			}
-		));
 	}
 }

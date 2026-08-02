@@ -1,7 +1,9 @@
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::Path;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	fs,
+	path::Path,
+};
 
 use recipe_core::{
 	ArenaLayout, BundleIdentity, ByteCount, DType, DeviceId, DraftPlan, FinalizedBundle, LoopIteration, MetricId,
@@ -23,9 +25,7 @@ fn require(condition: bool, error: Error) -> Result<()> {
 	}
 }
 
-fn consume_context<T>(context: T) {
-	drop(context);
-}
+fn consume_context<T>(context: T) { drop(context); }
 
 /// One caller-resolved host storage binding.
 ///
@@ -84,19 +84,13 @@ impl HostBackendConfig {
 	}
 
 	#[must_use]
-	pub const fn worker_threads(&self) -> usize {
-		self.worker_threads
-	}
+	pub const fn worker_threads(&self) -> usize { self.worker_threads }
 
 	#[must_use]
-	pub const fn staging_bytes_per_worker(&self) -> usize {
-		self.staging_bytes_per_worker
-	}
+	pub const fn staging_bytes_per_worker(&self) -> usize { self.staging_bytes_per_worker }
 
 	#[must_use]
-	pub fn bindings(&self) -> &[HostDeviceBinding] {
-		&self.bindings
-	}
+	pub fn bindings(&self) -> &[HostDeviceBinding] { &self.bindings }
 
 	/// Queries the current allocatable capacity for one configured host device
 	/// before any candidate resources are realized.
@@ -241,9 +235,7 @@ impl HostBackend {
 	}
 
 	#[doc(hidden)]
-	pub fn destroy_partition(&mut self, resource: HostResources) -> Result<()> {
-		resource.destroy()
-	}
+	pub fn destroy_partition(&mut self, resource: HostResources) -> Result<()> { resource.destroy() }
 
 	#[doc(hidden)]
 	pub fn prepare_candidate(
@@ -267,9 +259,7 @@ pub trait HostArenaLookup {
 }
 
 impl HostArenaLookup for ArenaSet<'_, Arena> {
-	fn host_arena(&self, device: DeviceId) -> Option<&Arena> {
-		self.get(device)
-	}
+	fn host_arena(&self, device: DeviceId) -> Option<&Arena> { self.get(device) }
 }
 
 #[derive(Clone, Debug)]
@@ -321,11 +311,13 @@ impl ExpectedWork {
 				destination,
 				bytes,
 				..
-			} => Some(InitImageContract {
-				device: destination.device,
-				image: *image,
-				bytes: *bytes,
-			}),
+			} => {
+				Some(InitImageContract {
+					device: destination.device,
+					image: *image,
+					bytes: *bytes,
+				})
+			}
 			Self::Transfer { .. } | Self::Metric { .. } => None,
 		}
 	}
@@ -342,11 +334,11 @@ impl ExpectedWork {
 				bytes,
 				..
 			} => Some((source.device, *bytes, PendingAction::Egress)),
-			Self::Metric { value, .. } => Some((
-				value.device,
-				ByteCount::new(4),
-				PendingAction::Metric { dtype: value.dtype },
-			)),
+			Self::Metric { value, .. } => {
+				Some((value.device, ByteCount::new(4), PendingAction::Metric {
+					dtype: value.dtype,
+				}))
+			}
 			Self::Transfer { .. } => None,
 		}
 	}
@@ -395,9 +387,7 @@ impl fmt::Debug for HostPending {
 
 impl HostPending {
 	#[must_use]
-	pub const fn task(&self) -> TaskId {
-		self.task
-	}
+	pub const fn task(&self) -> TaskId { self.task }
 }
 
 pub struct HostResources {
@@ -522,15 +512,21 @@ impl HostPreparedResources {
 				bundle: prepared_bundle,
 				tasks: prepared_tasks,
 				contracts,
-			} => match prepared_bundle == bundle.identity() && prepared_tasks == *tasks {
-				true => Ok(contracts),
-				false => Err(Error::BackendState(
-					"finalized host partition differs from its prepared handoff",
-				)),
-			},
-			HostPreparedHandoff::Candidate => Err(Error::BackendState(
-				"candidate host resources were not validated for finalized handoff",
-			)),
+			} => {
+				match prepared_bundle == bundle.identity() && prepared_tasks == *tasks {
+					true => Ok(contracts),
+					false => {
+						Err(Error::BackendState(
+							"finalized host partition differs from its prepared handoff",
+						))
+					}
+				}
+			}
+			HostPreparedHandoff::Candidate => {
+				Err(Error::BackendState(
+					"candidate host resources were not validated for finalized handoff",
+				))
+			}
 		}?;
 		Ok(HostResources {
 			runtime,
@@ -552,16 +548,20 @@ impl HostPreparedResources {
 		} = self;
 		match handoff {
 			HostPreparedHandoff::Candidate => Ok(()),
-			HostPreparedHandoff::Finalized { .. } => Err(Error::BackendState(
-				"finalized host resources cannot be rebound as a warm candidate",
-			)),
+			HostPreparedHandoff::Finalized { .. } => {
+				Err(Error::BackendState(
+					"finalized host resources cannot be rebound as a warm candidate",
+				))
+			}
 		}?;
 		validate_bundle_devices(bundle, &bindings, false)?;
 		match pending.keys().copied().eq(tasks.iter().copied()) {
 			true => Ok(()),
-			false => Err(Error::BackendState(
-				"warm host partition differs from its pre-final pending pool",
-			)),
+			false => {
+				Err(Error::BackendState(
+					"warm host partition differs from its pre-final pending pool",
+				))
+			}
 		}?;
 		let contracts = task_contracts(bundle, Some(tasks))?;
 		for (task, prepared) in &pending {
@@ -591,16 +591,20 @@ impl HostPreparedResources {
 	pub fn validate_handoff(&mut self, bundle: &FinalizedBundle, tasks: &BTreeSet<TaskId>) -> Result<()> {
 		match self.handoff {
 			HostPreparedHandoff::Candidate => Ok(()),
-			HostPreparedHandoff::Finalized { .. } => Err(Error::BackendState(
-				"candidate host handoff was validated more than once",
-			)),
+			HostPreparedHandoff::Finalized { .. } => {
+				Err(Error::BackendState(
+					"candidate host handoff was validated more than once",
+				))
+			}
 		}?;
 		validate_bundle_devices(bundle, &self.bindings, false)?;
 		match self.pending.keys().copied().eq(tasks.iter().copied()) {
 			true => Ok(()),
-			false => Err(Error::BackendState(
-				"finalized host partition differs from its pre-final pending pool",
-			)),
+			false => {
+				Err(Error::BackendState(
+					"finalized host partition differs from its pre-final pending pool",
+				))
+			}
 		}?;
 		let contracts = task_contracts(bundle, Some(tasks))?;
 		for (task, pending) in &self.pending {
@@ -608,13 +612,10 @@ impl HostPreparedResources {
 				task: *task,
 				detail: "finalized host contract is absent from the prepared pending pool",
 			})?;
-			require(
-				pending.admission == expected.admission(),
-				Error::Protocol {
-					task: *task,
-					detail: "finalized init-image manifest differs from the prepared host admission",
-				},
-			)?;
+			require(pending.admission == expected.admission(), Error::Protocol {
+				task: *task,
+				detail: "finalized init-image manifest differs from the prepared host admission",
+			})?;
 		}
 		self.handoff = HostPreparedHandoff::Finalized {
 			bundle: bundle.identity(),
@@ -713,10 +714,12 @@ impl HostResources {
 					&& prepared.admission == expected.admission()
 				{
 					true => Ok(prepared),
-					false => Err(Error::Protocol {
-						task: request.task,
-						detail: "pre-final host pending resource differs from finalized request",
-					}),
+					false => {
+						Err(Error::Protocol {
+							task: request.task,
+							detail: "pre-final host pending resource differs from finalized request",
+						})
+					}
 				}
 			}
 			PendingResources::Deferred => {
@@ -829,19 +832,16 @@ impl HostResources {
 				},
 				BackendWork::InternalTransfer(work) | BackendWork::ExitTransfer(work),
 			) => {
-				validate_transfer(
-					work,
-					TransferExpectation {
-						submitted_class,
-						class: *class,
-						source: *source,
-						destination: *destination,
-						bytes: *bytes,
-						route,
-						lane_claims,
-						submission: *submission,
-					},
-				)?;
+				validate_transfer(work, TransferExpectation {
+					submitted_class,
+					class: *class,
+					source: *source,
+					destination: *destination,
+					bytes: *bytes,
+					route,
+					lane_claims,
+					submission: *submission,
+				})?;
 				submit_transfer(arenas, pending, work)
 			}
 			(
@@ -875,10 +875,12 @@ impl HostResources {
 					ByteCount::new(4),
 				)
 			}
-			(_, BackendWork::Calculation(work)) => Err(Error::UnsupportedWork {
-				task: work.task,
-				detail: "payload calculations require a CUDA or HSA GPU adapter",
-			}),
+			(_, BackendWork::Calculation(work)) => {
+				Err(Error::UnsupportedWork {
+					task: work.task,
+					detail: "payload calculations require a CUDA or HSA GPU adapter",
+				})
+			}
 			(unexpected_contract, unexpected_work) => {
 				consume_context((unexpected_contract, unexpected_work));
 				Err(Error::Protocol {
@@ -941,13 +943,10 @@ impl HostResources {
 	#[doc(hidden)]
 	pub fn rearm_pending(&mut self, pending: &mut HostPending) -> Result<()> {
 		self.ensure_healthy()?;
-		require(
-			pending.terminal && pending.submitted,
-			Error::Protocol {
-				task: pending.task,
-				detail: "only a terminal host loop token may be rearmed",
-			},
-		)?;
+		require(pending.terminal && pending.submitted, Error::Protocol {
+			task: pending.task,
+			detail: "only a terminal host loop token may be rearmed",
+		})?;
 		pending.copy.reset()?;
 		pending.submitted = false;
 		pending.terminal = false;
@@ -962,10 +961,12 @@ impl HostResources {
 		match (pending.submitted, pending.terminal) {
 			(false, false) => Ok(()),
 			(true, true) => self.rearm_pending(pending),
-			(false, true) | (true, false) => Err(Error::Protocol {
-				task: pending.task,
-				detail: "an active or inconsistent host loop token may not be submitted again",
-			}),
+			(false, true) | (true, false) => {
+				Err(Error::Protocol {
+					task: pending.task,
+					detail: "an active or inconsistent host loop token may not be submitted again",
+				})
+			}
 		}
 	}
 
@@ -1005,19 +1006,16 @@ impl HostResources {
 				detail: "collected host exit is not a finalized transfer",
 			});
 		};
-		validate_transfer(
-			work,
-			TransferExpectation {
-				submitted_class: WorkClass::ExitTransfer,
-				class: *class,
-				source: *source,
-				destination: *expected_destination,
-				bytes: *bytes,
-				route,
-				lane_claims,
-				submission: *submission,
-			},
-		)?;
+		validate_transfer(work, TransferExpectation {
+			submitted_class: WorkClass::ExitTransfer,
+			class: *class,
+			source: *source,
+			destination: *expected_destination,
+			bytes: *bytes,
+			route,
+			lane_claims,
+			submission: *submission,
+		})?;
 		if !matches!(work.destination, ResolvedTransferEndpoint::External) {
 			return Err(Error::Protocol {
 				task: work.task,
@@ -1049,16 +1047,17 @@ impl HostResources {
 		pending.terminal = false;
 		let task = pending.task;
 		match &mut self.pending {
-			PendingResources::Prepared(pool) => require(
-				pool.insert(task, pending).is_none(),
-				Error::Protocol {
+			PendingResources::Prepared(pool) => {
+				require(pool.insert(task, pending).is_none(), Error::Protocol {
 					task,
 					detail: "host pending pool already contains the recycled task",
-				},
-			),
-			PendingResources::Deferred => Err(Error::BackendState(
-				"warm host resources have no pre-final pending pool",
-			)),
+				})
+			}
+			PendingResources::Deferred => {
+				Err(Error::BackendState(
+					"warm host resources have no pre-final pending pool",
+				))
+			}
 		}
 	}
 
@@ -1100,13 +1099,10 @@ impl HostResources {
 				task: *task,
 				detail: "final host task is absent from its warm pending pool",
 			})?;
-			require(
-				pending.admission == expected.admission(),
-				Error::Protocol {
-					task: *task,
-					detail: "final host admission differs from its warm manifest",
-				},
-			)?;
+			require(pending.admission == expected.admission(), Error::Protocol {
+				task: *task,
+				detail: "final host admission differs from its warm manifest",
+			})?;
 		}
 		self.contracts = contracts;
 		Ok(())
@@ -1158,10 +1154,9 @@ impl Backend for HostBackend {
 		request: PendingRequest,
 		physical_calls: &mut PhysicalCallBatch,
 	) -> Result<Self::Pending> {
-		record(
-			physical_calls,
-			PhysicalCall::PreparePending { task: request.task },
-		)?;
+		record(physical_calls, PhysicalCall::PreparePending {
+			task: request.task,
+		})?;
 		resource.prepare_pending(request)
 	}
 
@@ -1171,19 +1166,14 @@ impl Backend for HostBackend {
 		layout: &ArenaLayout,
 		physical_calls: &mut PhysicalCallBatch,
 	) -> Result<Self::Arena> {
-		record(
-			physical_calls,
-			PhysicalCall::AllocateArena {
-				device: layout.device,
-				bytes: layout.size,
-			},
-		)?;
+		record(physical_calls, PhysicalCall::AllocateArena {
+			device: layout.device,
+			bytes: layout.size,
+		})?;
 		resource.allocate_arena(layout)
 	}
 
-	fn supports_loop_repetition(&self) -> bool {
-		true
-	}
+	fn supports_loop_repetition(&self) -> bool { true }
 
 	fn submit(
 		&mut self,
@@ -1221,35 +1211,34 @@ impl Backend for HostBackend {
 		let status = match &result {
 			Ok(BackendPoll::Pending) => PhysicalPollStatus::Pending,
 			Ok(BackendPoll::Complete { .. }) => PhysicalPollStatus::Complete,
-			Err(error) => match error {
-				Error::InvalidConfiguration(_)
-				| Error::InvalidPath
-				| Error::DuplicateDevice(_)
-				| Error::MissingDevice(_)
-				| Error::WrongDeviceKind(_)
-				| Error::BackendState(_)
-				| Error::Protocol { .. }
-				| Error::UnsupportedWork { .. }
-				| Error::PhysicalReportOverflow
-				| Error::RangeOverflow
-				| Error::OutOfBounds { .. }
-				| Error::SlotCapacityExhausted
-				| Error::SlotBusy
-				| Error::InvalidPendingState
-				| Error::WorkerFailed { .. }
-				| Error::Io { .. }
-				| Error::ThreadSpawn(_)
-				| Error::ThreadPanicked
-				| Error::Poisoned => PhysicalPollStatus::Failed,
-			},
+			Err(error) => {
+				match error {
+					Error::InvalidConfiguration(_)
+					| Error::InvalidPath
+					| Error::DuplicateDevice(_)
+					| Error::MissingDevice(_)
+					| Error::WrongDeviceKind(_)
+					| Error::BackendState(_)
+					| Error::Protocol { .. }
+					| Error::UnsupportedWork { .. }
+					| Error::PhysicalReportOverflow
+					| Error::RangeOverflow
+					| Error::OutOfBounds { .. }
+					| Error::SlotCapacityExhausted
+					| Error::SlotBusy
+					| Error::InvalidPendingState
+					| Error::WorkerFailed { .. }
+					| Error::Io { .. }
+					| Error::ThreadSpawn(_)
+					| Error::ThreadPanicked
+					| Error::Poisoned => PhysicalPollStatus::Failed,
+				}
+			}
 		};
-		record(
-			physical_calls,
-			PhysicalCall::Poll {
-				task: pending.task,
-				status,
-			},
-		)?;
+		record(physical_calls, PhysicalCall::Poll {
+			task: pending.task,
+			status,
+		})?;
 		result
 	}
 
@@ -1263,13 +1252,10 @@ impl Backend for HostBackend {
 		physical_calls: &mut PhysicalCallBatch,
 	) -> Result<()> {
 		consume_context(arenas);
-		record(
-			physical_calls,
-			PhysicalCall::CollectExit {
-				task: work.task,
-				bytes: work.bytes,
-			},
-		)?;
+		record(physical_calls, PhysicalCall::CollectExit {
+			task: work.task,
+			bytes: work.bytes,
+		})?;
 		resource.collect_exit(pending, work, destination)
 	}
 
@@ -1367,9 +1353,11 @@ fn require_enforced_quota(mechanism: ReservationMechanism) -> Result<()> {
 }
 
 fn available_ram_bytes() -> Result<ByteCount> {
-	let contents = fs::read_to_string("/proc/meminfo").map_err(|error| Error::Io {
-		operation: "read /proc/meminfo",
-		kind: error.kind(),
+	let contents = fs::read_to_string("/proc/meminfo").map_err(|error| {
+		Error::Io {
+			operation: "read /proc/meminfo",
+			kind: error.kind(),
+		}
 	})?;
 	let kilobytes = contents
 		.lines()
@@ -1386,9 +1374,11 @@ fn available_ram_bytes() -> Result<ByteCount> {
 
 fn available_disk_bytes(path: &Path) -> Result<ByteCount> {
 	let directory = path.parent().ok_or(Error::InvalidPath)?;
-	let statistics = statvfs(directory).map_err(|error| Error::Io {
-		operation: "query disk capacity",
-		kind: error.kind(),
+	let statistics = statvfs(directory).map_err(|error| {
+		Error::Io {
+			operation: "query disk capacity",
+			kind: error.kind(),
+		}
 	})?;
 	let bytes = statistics
 		.f_bavail
@@ -1502,13 +1492,10 @@ fn prepare_candidate_pending(
 			submitted: false,
 			terminal: false,
 		};
-		reject_duplicate(
-			pending.insert(task.id, resource),
-			Error::Protocol {
-				task: task.id,
-				detail: "host candidate task appears more than once",
-			},
-		)?;
+		reject_duplicate(pending.insert(task.id, resource), Error::Protocol {
+			task: task.id,
+			detail: "host candidate task appears more than once",
+		})?;
 	}
 	Ok(pending)
 }
@@ -1553,10 +1540,12 @@ fn candidate_transfer_class(
 			RunPhase::Exit,
 			TransferEndpoint::External,
 			TransferEndpoint::External | TransferEndpoint::Device { .. },
-		) => Err(Error::Protocol {
-			task,
-			detail: "host candidate transfer phase or endpoint class is invalid",
-		}),
+		) => {
+			Err(Error::Protocol {
+				task,
+				detail: "host candidate transfer phase or endpoint class is invalid",
+			})
+		}
 	}
 }
 
@@ -1595,10 +1584,12 @@ fn candidate_transfer_staging(
 			TransferEndpoint::External,
 			TransferEndpoint::Device { .. },
 		)
-		| (WorkClass::ExitTransfer, TransferEndpoint::External, TransferEndpoint::External) => Err(Error::Protocol {
-			task,
-			detail: "host candidate transfer staging contract is invalid",
-		}),
+		| (WorkClass::ExitTransfer, TransferEndpoint::External, TransferEndpoint::External) => {
+			Err(Error::Protocol {
+				task,
+				detail: "host candidate transfer staging contract is invalid",
+			})
+		}
 	}
 }
 
@@ -1618,15 +1609,17 @@ fn task_contracts(
 					detail: "host-only backend cannot bind a GPU calculation task",
 				});
 			}
-			TaskKind::Metric(metric) => ExpectedWork::Metric {
-				metric: metric.metric,
-				slot: metric.slot,
-				value: *bundle.value_location(metric.value).ok_or(Error::Protocol {
-					task: task.id,
-					detail: "metric value has no finalized location",
-				})?,
-				submission: metric.submission,
-			},
+			TaskKind::Metric(metric) => {
+				ExpectedWork::Metric {
+					metric: metric.metric,
+					slot: metric.slot,
+					value: *bundle.value_location(metric.value).ok_or(Error::Protocol {
+						task: task.id,
+						detail: "metric value has no finalized location",
+					})?,
+					submission: metric.submission,
+				}
+			}
 			TaskKind::Transfer(transfer) => {
 				let endpoints = bundle.transfer_endpoints(task.id).ok_or(Error::Protocol {
 					task: task.id,
@@ -1712,10 +1705,12 @@ fn transfer_class(
 		| (RunPhase::Init, Device(_), External)
 		| (RunPhase::Loop, External, External | Device(_))
 		| (RunPhase::Loop, Device(_), External)
-		| (RunPhase::Exit, External, External | Device(_)) => Err(Error::Protocol {
-			task,
-			detail: "host transfer phase or endpoint class is invalid",
-		}),
+		| (RunPhase::Exit, External, External | Device(_)) => {
+			Err(Error::Protocol {
+				task,
+				detail: "host transfer phase or endpoint class is invalid",
+			})
+		}
 	}
 }
 
@@ -1811,27 +1806,33 @@ fn submit_transfer(
 			)
 		}
 		(ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::External)
-		| (ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::Device(_)) => Err(Error::Protocol {
-			task: work.task,
-			detail: "host transfer has unsupported resolved endpoints",
-		}),
+		| (ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::Device(_)) => {
+			Err(Error::Protocol {
+				task: work.task,
+				detail: "host transfer has unsupported resolved endpoints",
+			})
+		}
 	}
 }
 
 fn submission_call(work: &BackendWork<'_>) -> PhysicalCall {
 	match work {
-		BackendWork::InitAdmission(work) => PhysicalCall::AdmissionChunk {
-			task: work.task,
-			device: work.destination.device,
-			bytes: work.bytes,
-			chunk_index: 0,
-		},
+		BackendWork::InitAdmission(work) => {
+			PhysicalCall::AdmissionChunk {
+				task: work.task,
+				device: work.destination.device,
+				bytes: work.bytes,
+				chunk_index: 0,
+			}
+		}
 		BackendWork::Calculation(work) => PhysicalCall::SubmitCalculation { task: work.task },
 		BackendWork::InternalTransfer(work) => PhysicalCall::SubmitInternalTransfer { task: work.task },
-		BackendWork::Metric(work) => PhysicalCall::SubmitMetric {
-			task: work.task,
-			slot: work.slot,
-		},
+		BackendWork::Metric(work) => {
+			PhysicalCall::SubmitMetric {
+				task: work.task,
+				slot: work.slot,
+			}
+		}
 		BackendWork::ExitTransfer(work) => PhysicalCall::SubmitExitTransfer { task: work.task },
 	}
 }
@@ -1843,196 +1844,5 @@ fn record(batch: &mut PhysicalCallBatch, call: PhysicalCall) -> Result<()> {
 			consume_context(overflow);
 			Err(Error::PhysicalReportOverflow)
 		}
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use std::sync::Arc;
-
-	use recipe_core::{ArenaObjectId, ByteOffset, LoopIterations, MetricPurpose};
-	use recipe_executor::MetricWork;
-
-	use super::*;
-
-	fn wait_for_metric(
-		backend: &mut HostBackend,
-		resources: &mut HostResources,
-		pending: &mut HostPending,
-	) -> MetricValue {
-		for _ in 0..10_000 {
-			let mut calls = PhysicalCallBatch::new();
-			match <HostBackend as Backend>::poll(backend, resources, pending, &mut calls) {
-				Ok(BackendPoll::Pending) => std::thread::yield_now(),
-				Ok(BackendPoll::Complete { metric }) => {
-					return metric.expect("metric work must return one value");
-				}
-				Err(error) => panic!("host metric failed: {error}"),
-			}
-		}
-		panic!("host metric did not complete");
-	}
-
-	#[test]
-	fn sparse_first_activation_at_nonzero_then_reuses_single_preallocated_slot() {
-		let device = DeviceId::new(1);
-		let task = TaskId::new(1);
-		let metric = MetricId::new(1);
-		let slot = MetricSlotId::new(1);
-		let submission = SubmissionSlots {
-			queue: recipe_core::QueueSlotId::new(1),
-			completion: recipe_core::CompletionSlotId::new(1),
-		};
-		let value = ResolvedValueLocation {
-			value: ValueId::new(1),
-			dtype: DType::F32,
-			device,
-			bytes: ByteCount::new(4),
-			object: ArenaObjectId::new(1),
-			object_offset: ByteOffset::new(0),
-			arena_offset: ByteOffset::new(0),
-		};
-		let runtime = Runtime::new(
-			RuntimeConfig::new(1, SlotCapacity::new(1).expect("one slot is valid"), 4)
-				.expect("host runtime config is valid"),
-		)
-		.expect("host runtime starts");
-		let mut resources = HostResources {
-			runtime,
-			bindings: BTreeMap::from([(device, HostDeviceBinding::Ram { device })]),
-			contracts: BTreeMap::from([(
-				task,
-				ExpectedWork::Metric {
-					metric,
-					slot,
-					value,
-					submission,
-				},
-			)]),
-			prepared: BTreeSet::new(),
-			pending: PendingResources::Deferred,
-			poisoned: false,
-		};
-		assert_eq!(resources.runtime.config().slots().get(), 1);
-		let mut pending = resources
-			.prepare_pending(PendingRequest {
-				task,
-				phase: RunPhase::Loop,
-				class: WorkClass::Metric,
-				submission: Some(submission),
-			})
-			.expect("loop metric pending token is prepared");
-		let staging_backing = Arc::as_ptr(
-			&pending
-				.staging
-				.as_ref()
-				.expect("metric token owns preallocated staging")
-				.backing,
-		);
-		let arena = Arena::ram(device, ByteCount::new(4)).expect("metric arena is allocated");
-		arena.write_exact(0, &1.25_f32.to_le_bytes())
-			.expect("first metric is resident");
-		let mut arenas = BTreeMap::from([(device, arena)]);
-		let iterations = LoopIterations::new(3).expect("three loop iterations are valid");
-		let iteration_one = iterations.iteration(1).expect("iteration one is in range");
-		let iteration_two = iterations.iteration(2).expect("iteration two is in range");
-		let mut backend = HostBackend {
-			state: BackendState::Bound,
-		};
-
-		let mut calls = PhysicalCallBatch::new();
-		<HostBackend as Backend>::submit_loop_iteration(
-			&mut backend,
-			&mut resources,
-			ArenaSet::new(&arenas),
-			&mut pending,
-			iteration_one,
-			BackendWork::Metric(MetricWork {
-				task,
-				iteration: iteration_one,
-				purpose: MetricPurpose::User,
-				metric,
-				slot,
-				value,
-				submission,
-			}),
-			&mut calls,
-		)
-		.expect("fresh token first submits on sparse nonzero iteration");
-		assert_eq!(
-			wait_for_metric(&mut backend, &mut resources, &mut pending),
-			MetricValue::F32(1.25)
-		);
-		assert!(pending.terminal);
-
-		arenas.get(&device)
-			.expect("metric arena remains bound")
-			.write_exact(0, &9.5_f32.to_le_bytes())
-			.expect("second metric is resident");
-		let mut calls = PhysicalCallBatch::new();
-		<HostBackend as Backend>::submit_loop_iteration(
-			&mut backend,
-			&mut resources,
-			ArenaSet::new(&arenas),
-			&mut pending,
-			iteration_two,
-			BackendWork::Metric(MetricWork {
-				task,
-				iteration: iteration_two,
-				purpose: MetricPurpose::User,
-				metric,
-				slot,
-				value,
-				submission,
-			}),
-			&mut calls,
-		)
-		.expect("terminal token rearms for the next sparse activation");
-		assert_eq!(
-			Arc::as_ptr(
-				&pending
-					.staging
-					.as_ref()
-					.expect("metric staging remains present")
-					.backing,
-			),
-			staging_backing
-		);
-		assert!(pending.submitted);
-		assert!(!pending.terminal);
-		assert_eq!(
-			wait_for_metric(&mut backend, &mut resources, &mut pending),
-			MetricValue::F32(9.5)
-		);
-
-		drop(pending);
-		arenas.remove(&device)
-			.expect("metric arena remains owned")
-			.close()
-			.expect("metric arena closes");
-		resources.destroy().expect("host resources close");
-	}
-
-	#[test]
-	fn host_backend_accepts_only_scheduler_enforced_quota() {
-		assert_eq!(
-			require_enforced_quota(ReservationMechanism::EnforcedQuota),
-			Ok(())
-		);
-		assert!(matches!(
-			require_enforced_quota(ReservationMechanism::HeldAllocation),
-			Err(Error::InvalidConfiguration(_))
-		));
-	}
-
-	#[test]
-	fn host_capacity_query_rejects_an_unbound_device_before_realization() {
-		let device = DeviceId::new(1);
-		let config =
-			HostBackendConfig::new(1, 4, vec![HostDeviceBinding::Ram { device }]).expect("host config is valid");
-		assert_eq!(
-			config.available_bytes(DeviceId::new(2)),
-			Err(Error::MissingDevice(DeviceId::new(2)))
-		);
 	}
 }

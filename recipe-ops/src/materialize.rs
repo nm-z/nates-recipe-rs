@@ -43,19 +43,13 @@ pub struct NamedTensor<'a> {
 
 impl<'a> NamedTensor<'a> {
 	#[must_use]
-	pub const fn new(name: &'a str, tensor: &'a Tensor) -> Self {
-		Self { name, tensor }
-	}
+	pub const fn new(name: &'a str, tensor: &'a Tensor) -> Self { Self { name, tensor } }
 
 	#[must_use]
-	pub const fn name(self) -> &'a str {
-		self.name
-	}
+	pub const fn name(self) -> &'a str { self.name }
 
 	#[must_use]
-	pub const fn tensor(self) -> &'a Tensor {
-		self.tensor
-	}
+	pub const fn tensor(self) -> &'a Tensor { self.tensor }
 }
 
 /// Typed values fixed before the static calculation graph is built.
@@ -100,24 +94,16 @@ impl IdentityNamespace {
 	}
 
 	#[must_use]
-	pub const fn first_value(self) -> ValueId {
-		self.first_value
-	}
+	pub const fn first_value(self) -> ValueId { self.first_value }
 
 	#[must_use]
-	pub const fn value_capacity(self) -> u64 {
-		self.value_capacity
-	}
+	pub const fn value_capacity(self) -> u64 { self.value_capacity }
 
 	#[must_use]
-	pub const fn first_kernel(self) -> KernelTemplateId {
-		self.first_kernel
-	}
+	pub const fn first_kernel(self) -> KernelTemplateId { self.first_kernel }
 
 	#[must_use]
-	pub const fn kernel_capacity(self) -> u64 {
-		self.kernel_capacity
-	}
+	pub const fn kernel_capacity(self) -> u64 { self.kernel_capacity }
 }
 
 /// Immutable request used to turn a structured operation into a concrete
@@ -166,19 +152,13 @@ pub struct ResolvedIteration {
 
 impl ResolvedIteration {
 	#[must_use]
-	pub const fn role(self) -> &'static str {
-		self.role
-	}
+	pub const fn role(self) -> &'static str { self.role }
 
 	#[must_use]
-	pub const fn index(self) -> u64 {
-		self.index
-	}
+	pub const fn index(self) -> u64 { self.index }
 
 	#[must_use]
-	pub const fn count(self) -> u64 {
-		self.count
-	}
+	pub const fn count(self) -> u64 { self.count }
 }
 
 /// One repeat bound and its exact preparation-time value.
@@ -192,24 +172,16 @@ pub struct ResolvedBound {
 
 impl ResolvedBound {
 	#[must_use]
-	pub const fn role(&self) -> &'static str {
-		self.role
-	}
+	pub const fn role(&self) -> &'static str { self.role }
 
 	#[must_use]
-	pub const fn bound(&self) -> IterationBound {
-		self.bound
-	}
+	pub const fn bound(&self) -> IterationBound { self.bound }
 
 	#[must_use]
-	pub const fn value(&self) -> u64 {
-		self.value
-	}
+	pub const fn value(&self) -> u64 { self.value }
 
 	#[must_use]
-	pub fn outer_iterations(&self) -> &[ResolvedIteration] {
-		&self.outer_iterations
-	}
+	pub fn outer_iterations(&self) -> &[ResolvedIteration] { &self.outer_iterations }
 }
 
 /// One primitive after all surrounding repeats have been unrolled.
@@ -224,29 +196,19 @@ pub struct ResolvedStep {
 
 impl ResolvedStep {
 	#[must_use]
-	pub const fn ordinal(&self) -> usize {
-		self.ordinal
-	}
+	pub const fn ordinal(&self) -> usize { self.ordinal }
 
 	#[must_use]
-	pub const fn family(&self) -> PrimitiveFamily {
-		self.family
-	}
+	pub const fn family(&self) -> PrimitiveFamily { self.family }
 
 	#[must_use]
-	pub const fn role(&self) -> &'static str {
-		self.role
-	}
+	pub const fn role(&self) -> &'static str { self.role }
 
 	#[must_use]
-	pub fn iterations(&self) -> &[ResolvedIteration] {
-		&self.iterations
-	}
+	pub fn iterations(&self) -> &[ResolvedIteration] { &self.iterations }
 
 	#[must_use]
-	pub fn dependencies(&self) -> &[usize] {
-		&self.dependencies
-	}
+	pub fn dependencies(&self) -> &[usize] { &self.dependencies }
 }
 
 /// Finite dependency expansion of a descriptive composition recipe.
@@ -259,19 +221,13 @@ pub struct ResolvedComposition {
 
 impl ResolvedComposition {
 	#[must_use]
-	pub const fn operation(&self) -> OperationId {
-		self.operation
-	}
+	pub const fn operation(&self) -> OperationId { self.operation }
 
 	#[must_use]
-	pub fn bounds(&self) -> &[ResolvedBound] {
-		&self.bounds
-	}
+	pub fn bounds(&self) -> &[ResolvedBound] { &self.bounds }
 
 	#[must_use]
-	pub fn steps(&self) -> &[ResolvedStep] {
-		&self.steps
-	}
+	pub fn steps(&self) -> &[ResolvedStep] { &self.steps }
 }
 
 /// One intermediate tensor reserved before the run loop.
@@ -285,24 +241,16 @@ pub struct WorkspaceObject {
 
 impl WorkspaceObject {
 	#[must_use]
-	pub const fn value(&self) -> ValueId {
-		self.value
-	}
+	pub const fn value(&self) -> ValueId { self.value }
 
 	#[must_use]
-	pub const fn dtype(&self) -> DType {
-		self.dtype
-	}
+	pub const fn dtype(&self) -> DType { self.dtype }
 
 	#[must_use]
-	pub const fn shape(&self) -> &Shape {
-		&self.shape
-	}
+	pub const fn shape(&self) -> &Shape { &self.shape }
 
 	#[must_use]
-	pub const fn bytes(&self) -> ByteCount {
-		self.bytes
-	}
+	pub const fn bytes(&self) -> ByteCount { self.bytes }
 }
 
 /// Checked, exact scratch reservation for the emitted graph.
@@ -314,14 +262,10 @@ pub struct WorkspaceAllocation {
 
 impl WorkspaceAllocation {
 	#[must_use]
-	pub fn objects(&self) -> &[WorkspaceObject] {
-		&self.objects
-	}
+	pub fn objects(&self) -> &[WorkspaceObject] { &self.objects }
 
 	#[must_use]
-	pub const fn bytes(&self) -> ByteCount {
-		self.bytes
-	}
+	pub const fn bytes(&self) -> ByteCount { self.bytes }
 }
 
 /// Mapping from one resolved composition step to its concrete kernel.
@@ -333,14 +277,10 @@ pub struct StageEmission {
 
 impl StageEmission {
 	#[must_use]
-	pub const fn step(&self) -> usize {
-		self.step
-	}
+	pub const fn step(&self) -> usize { self.step }
 
 	#[must_use]
-	pub fn kernels(&self) -> &[KernelTemplateId] {
-		&self.kernels
-	}
+	pub fn kernels(&self) -> &[KernelTemplateId] { &self.kernels }
 }
 
 /// Fully concrete, validated output of composition preparation.
@@ -356,34 +296,22 @@ pub struct MaterializedComposition {
 
 impl MaterializedComposition {
 	#[must_use]
-	pub const fn operation(&self) -> OperationId {
-		self.operation
-	}
+	pub const fn operation(&self) -> OperationId { self.operation }
 
 	#[must_use]
-	pub const fn graph(&self) -> &CalculationGraph {
-		&self.graph
-	}
+	pub const fn graph(&self) -> &CalculationGraph { &self.graph }
 
 	#[must_use]
-	pub const fn resolved(&self) -> &ResolvedComposition {
-		&self.resolved
-	}
+	pub const fn resolved(&self) -> &ResolvedComposition { &self.resolved }
 
 	#[must_use]
-	pub fn stages(&self) -> &[StageEmission] {
-		&self.stages
-	}
+	pub fn stages(&self) -> &[StageEmission] { &self.stages }
 
 	#[must_use]
-	pub const fn workspace(&self) -> &WorkspaceAllocation {
-		&self.workspace
-	}
+	pub const fn workspace(&self) -> &WorkspaceAllocation { &self.workspace }
 
 	#[must_use]
-	pub const fn identity_namespace(&self) -> IdentityNamespace {
-		self.identity_namespace
-	}
+	pub const fn identity_namespace(&self) -> IdentityNamespace { self.identity_namespace }
 }
 
 /// Reject overlapping caller reservations before independently materialized
@@ -439,29 +367,19 @@ pub struct RemainingComposition {
 
 impl RemainingComposition {
 	#[must_use]
-	pub const fn operation(self) -> OperationId {
-		self.operation
-	}
+	pub const fn operation(self) -> OperationId { self.operation }
 
 	#[must_use]
-	pub const fn symbol(self) -> &'static str {
-		self.symbol
-	}
+	pub const fn symbol(self) -> &'static str { self.symbol }
 
 	#[must_use]
-	pub const fn source(self) -> &'static str {
-		self.source
-	}
+	pub const fn source(self) -> &'static str { self.source }
 
 	#[must_use]
-	pub const fn recipe(self) -> &'static str {
-		self.recipe
-	}
+	pub const fn recipe(self) -> &'static str { self.recipe }
 
 	#[must_use]
-	pub const fn missing(self) -> &'static [MissingConcreteComponent] {
-		self.missing
-	}
+	pub const fn missing(self) -> &'static [MissingConcreteComponent] { self.missing }
 }
 
 /// Resolve all shape and prepared-parameter bounds and unroll the composition
@@ -660,13 +578,15 @@ impl<'a> Expansion<'a> {
 		match bound {
 			IterationBound::Fixed(value) => Ok(u64::from(value)),
 			IterationBound::ShapeExtent { axis } => self.extent(axis),
-			IterationBound::MinimumShapeExtent => self.shape.extents().iter().copied().min().ok_or_else(|| {
-				operation_error(
-					self.operation,
-					OperationErrorKind::IterationBoundUnresolved,
-					"minimum shape extent requires a nonempty shape",
-				)
-			}),
+			IterationBound::MinimumShapeExtent => {
+				self.shape.extents().iter().copied().min().ok_or_else(|| {
+					operation_error(
+						self.operation,
+						OperationErrorKind::IterationBoundUnresolved,
+						"minimum shape extent requires a nonempty shape",
+					)
+				})
+			}
 			IterationBound::CeilingLog2ShapeExtent { axis } => self.extent(axis).map(ceiling_log_two),
 			IterationBound::PreparedParameter { name } => prepared_u64(self.operation, self.parameters, name),
 		}
@@ -919,13 +839,10 @@ impl GraphBuilder {
 		};
 		graph.validate()
 			.map_err(|error| language_error(self.operation, error.to_string()))?;
-		Ok((
-			graph,
-			WorkspaceAllocation {
-				objects: self.workspace,
-				bytes: ByteCount::new(self.workspace_bytes),
-			},
-		))
+		Ok((graph, WorkspaceAllocation {
+			objects: self.workspace,
+			bytes: ByteCount::new(self.workspace_bytes),
+		}))
 	}
 }
 
@@ -1000,13 +917,15 @@ fn emit_radix_two_fft(request: &MaterializationRequest<'_>, emitter: &mut Emitte
 		let left_imaginary = emitter.intermediate(DType::F32, vector_shape.clone())?;
 		let right_real = emitter.intermediate(DType::F32, vector_shape.clone())?;
 		let right_imaginary = emitter.intermediate(DType::F32, vector_shape.clone())?;
-		let gather = |value, indices, result| KernelEmission {
-			inputs: vec![value, indices],
-			outputs: vec![result],
-			kind: PrimitiveKind::Gather(Gather {
-				axis: 0,
-				bounds: IndexBounds::Reject,
-			}),
+		let gather = |value, indices, result| {
+			KernelEmission {
+				inputs: vec![value, indices],
+				outputs: vec![result],
+				kind: PrimitiveKind::Gather(Gather {
+					axis: 0,
+					bounds: IndexBounds::Reject,
+				}),
+			}
 		};
 		emitter.emit_stage([
 			gather(current_real, left_indices.id, left_real),
@@ -1070,14 +989,16 @@ fn emit_radix_two_fft(request: &MaterializationRequest<'_>, emitter: &mut Emitte
 		} else {
 			emitter.intermediate(DType::F32, vector_shape.clone())?
 		};
-		let scatter = |base, updates, result| KernelEmission {
-			inputs: vec![base, destinations.id, updates],
-			outputs: vec![result],
-			kind: PrimitiveKind::Scatter(Scatter {
-				axis: 0,
-				bounds: IndexBounds::Reject,
-				conflict: ScatterConflict::UniqueIndices,
-			}),
+		let scatter = |base, updates, result| {
+			KernelEmission {
+				inputs: vec![base, destinations.id, updates],
+				outputs: vec![result],
+				kind: PrimitiveKind::Scatter(Scatter {
+					axis: 0,
+					bounds: IndexBounds::Reject,
+					conflict: ScatterConflict::UniqueIndices,
+				}),
+			}
 		};
 		emitter.emit_stage([
 			scatter(real_base.id, updated_real, next_real),
@@ -1514,17 +1435,13 @@ fn emit_batch_normalization_running_update(
 	let running_variance = input(request, "running_variance")?;
 	let updated_running_mean = output(request, "updated_running_mean")?;
 	let updated_running_variance = output(request, "updated_running_variance")?;
-	require_equal_f32_tensors(
-		request,
-		running_mean,
-		[
-			("saved_mean", saved_mean),
-			("saved_variance", saved_variance),
-			("running_variance", running_variance),
-			("updated_running_mean", updated_running_mean),
-			("updated_running_variance", updated_running_variance),
-		],
-	)?;
+	require_equal_f32_tensors(request, running_mean, [
+		("saved_mean", saved_mean),
+		("saved_variance", saved_variance),
+		("running_variance", running_variance),
+		("updated_running_mean", updated_running_mean),
+		("updated_running_variance", updated_running_variance),
+	])?;
 	if running_mean.shape.rank() != 1 {
 		return Err(operation_error(
 			request.descriptor.id,
@@ -1774,12 +1691,10 @@ fn emit_rms_normalization(request: &MaterializationRequest<'_>, emitter: &mut Em
 		true => &["values", "scale"],
 		false => &["values"],
 	};
-	require_exact_abi(
-		request,
-		input_names,
-		&["normalized"],
-		&["epsilon", "tree_lanes"],
-	)?;
+	require_exact_abi(request, input_names, &["normalized"], &[
+		"epsilon",
+		"tree_lanes",
+	])?;
 	let values = input(request, "values")?;
 	let normalized = output(request, "normalized")?;
 	let (rows, columns, _, column_divisor) = normalization_matrix(request, values, "values")?;
@@ -1967,16 +1882,12 @@ fn emit_adagrad_update(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 	let accumulator = input(request, "accumulator")?;
 	let updated_accumulator = output(request, "updated_accumulator")?;
 	let updated_weight = output(request, "updated_weight")?;
-	require_equal_f32_tensors(
-		request,
-		weight,
-		[
-			("gradient", gradient),
-			("accumulator", accumulator),
-			("updated_accumulator", updated_accumulator),
-			("updated_weight", updated_weight),
-		],
-	)?;
+	require_equal_f32_tensors(request, weight, [
+		("gradient", gradient),
+		("accumulator", accumulator),
+		("updated_accumulator", updated_accumulator),
+		("updated_weight", updated_weight),
+	])?;
 	let learning_rate = finite_nonnegative_parameter(request, "learning_rate")?;
 	let epsilon = finite_positive_parameter(request, "epsilon")?;
 	emitter.emit(
@@ -2007,16 +1918,12 @@ fn emit_rmsprop_update(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 	let cache = input(request, "cache")?;
 	let updated_cache = output(request, "updated_cache")?;
 	let updated_weight = output(request, "updated_weight")?;
-	require_equal_f32_tensors(
-		request,
-		weight,
-		[
-			("gradient", gradient),
-			("cache", cache),
-			("updated_cache", updated_cache),
-			("updated_weight", updated_weight),
-		],
-	)?;
+	require_equal_f32_tensors(request, weight, [
+		("gradient", gradient),
+		("cache", cache),
+		("updated_cache", updated_cache),
+		("updated_weight", updated_weight),
+	])?;
 	let learning_rate = finite_nonnegative_parameter(request, "learning_rate")?;
 	let decay = unit_interval_parameter(request, "decay", true)?;
 	let epsilon = finite_positive_parameter(request, "epsilon")?;
@@ -2042,14 +1949,16 @@ fn emit_adam_update(
 	decoupled_weight_decay: bool,
 ) -> OperationResult<()> {
 	let parameter_names: &[&str] = match decoupled_weight_decay {
-		true => &[
-			"learning_rate",
-			"beta_one",
-			"beta_two",
-			"epsilon",
-			"weight_decay",
-			"step",
-		],
+		true => {
+			&[
+				"learning_rate",
+				"beta_one",
+				"beta_two",
+				"epsilon",
+				"weight_decay",
+				"step",
+			]
+		}
 		false => &["learning_rate", "beta_one", "beta_two", "epsilon", "step"],
 	};
 	require_exact_abi(
@@ -2069,18 +1978,14 @@ fn emit_adam_update(
 	let updated_first_moment = output(request, "updated_first_moment")?;
 	let updated_second_moment = output(request, "updated_second_moment")?;
 	let updated_weight = output(request, "updated_weight")?;
-	require_equal_f32_tensors(
-		request,
-		weight,
-		[
-			("gradient", gradient),
-			("first_moment", first_moment),
-			("second_moment", second_moment),
-			("updated_first_moment", updated_first_moment),
-			("updated_second_moment", updated_second_moment),
-			("updated_weight", updated_weight),
-		],
-	)?;
+	require_equal_f32_tensors(request, weight, [
+		("gradient", gradient),
+		("first_moment", first_moment),
+		("second_moment", second_moment),
+		("updated_first_moment", updated_first_moment),
+		("updated_second_moment", updated_second_moment),
+		("updated_weight", updated_weight),
+	])?;
 	let moments = adam_moment_parameters(request)?;
 	let learning_rate = finite_nonnegative_parameter(request, "learning_rate")?;
 	let weight_decay = match decoupled_weight_decay {
@@ -2127,18 +2032,14 @@ fn emit_nadam_update(request: &MaterializationRequest<'_>, emitter: &mut Emitter
 	let updated_first_moment = output(request, "updated_first_moment")?;
 	let updated_second_moment = output(request, "updated_second_moment")?;
 	let updated_weight = output(request, "updated_weight")?;
-	require_equal_f32_tensors(
-		request,
-		weight,
-		[
-			("gradient", gradient),
-			("first_moment", first_moment),
-			("second_moment", second_moment),
-			("updated_first_moment", updated_first_moment),
-			("updated_second_moment", updated_second_moment),
-			("updated_weight", updated_weight),
-		],
-	)?;
+	require_equal_f32_tensors(request, weight, [
+		("gradient", gradient),
+		("first_moment", first_moment),
+		("second_moment", second_moment),
+		("updated_first_moment", updated_first_moment),
+		("updated_second_moment", updated_second_moment),
+		("updated_weight", updated_weight),
+	])?;
 	let moments = adam_moment_parameters(request)?;
 	let learning_rate = finite_nonnegative_parameter(request, "learning_rate")?;
 	emitter.emit(
@@ -2174,16 +2075,12 @@ fn emit_lion_update(request: &MaterializationRequest<'_>, emitter: &mut Emitter<
 	let moment = input(request, "moment")?;
 	let updated_moment = output(request, "updated_moment")?;
 	let updated_weight = output(request, "updated_weight")?;
-	require_equal_f32_tensors(
-		request,
-		weight,
-		[
-			("gradient", gradient),
-			("moment", moment),
-			("updated_moment", updated_moment),
-			("updated_weight", updated_weight),
-		],
-	)?;
+	require_equal_f32_tensors(request, weight, [
+		("gradient", gradient),
+		("moment", moment),
+		("updated_moment", updated_moment),
+		("updated_weight", updated_weight),
+	])?;
 	let learning_rate = finite_nonnegative_parameter(request, "learning_rate")?;
 	let beta_one = unit_interval_parameter(request, "beta_one", true)?;
 	let beta_two = unit_interval_parameter(request, "beta_two", true)?;
@@ -2234,18 +2131,14 @@ fn emit_lamb_phase_one(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 	let update = output(request, "update")?;
 	let weight_norm_squared = output(request, "weight_norm_squared")?;
 	let update_norm_squared = output(request, "update_norm_squared")?;
-	require_equal_f32_tensors(
-		request,
-		weight,
-		[
-			("gradient", gradient),
-			("moment", moment),
-			("velocity", velocity),
-			("updated_moment", updated_moment),
-			("updated_velocity", updated_velocity),
-			("update", update),
-		],
-	)?;
+	require_equal_f32_tensors(request, weight, [
+		("gradient", gradient),
+		("moment", moment),
+		("velocity", velocity),
+		("updated_moment", updated_moment),
+		("updated_velocity", updated_velocity),
+		("update", update),
+	])?;
 	for (name, tensor) in [
 		("weight_norm_squared", weight_norm_squared),
 		("update_norm_squared", update_norm_squared),
@@ -2311,11 +2204,10 @@ fn emit_lamb_phase_two(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 	let update_norm_squared = input(request, "update_norm_squared")?;
 	let weight = input(request, "weight")?;
 	let updated_weight = output(request, "updated_weight")?;
-	require_equal_f32_tensors(
-		request,
-		weight,
-		[("update", update), ("updated_weight", updated_weight)],
-	)?;
+	require_equal_f32_tensors(request, weight, [
+		("update", update),
+		("updated_weight", updated_weight),
+	])?;
 	for (name, tensor) in [
 		("weight_norm_squared", weight_norm_squared),
 		("update_norm_squared", update_norm_squared),
@@ -2375,12 +2267,10 @@ fn emit_lamb_phase_two(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 }
 
 fn emit_gradient_clip_norm(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["values"],
-		&["clipped"],
-		&["maximum_norm", "tree_lanes"],
-	)?;
+	require_exact_abi(request, &["values"], &["clipped"], &[
+		"maximum_norm",
+		"tree_lanes",
+	])?;
 	let values = input(request, "values")?;
 	let clipped = output(request, "clipped")?;
 	require_dtype(request, values, DType::F32, "values")?;
@@ -2487,26 +2377,18 @@ fn fft_linear_stage_program(operation: OperationId) -> OperationResult<recipe_co
 	let imaginary_from_left_imaginary = scalar_input(operation, &mut builder, DType::F32)?;
 	let imaginary_from_right_real = scalar_input(operation, &mut builder, DType::F32)?;
 	let imaginary_from_right_imaginary = scalar_input(operation, &mut builder, DType::F32)?;
-	let real = weighted_sum_four(
-		operation,
-		&mut builder,
-		[
-			(left_real, real_from_left_real),
-			(left_imaginary, real_from_left_imaginary),
-			(right_real, real_from_right_real),
-			(right_imaginary, real_from_right_imaginary),
-		],
-	)?;
-	let imaginary = weighted_sum_four(
-		operation,
-		&mut builder,
-		[
-			(left_real, imaginary_from_left_real),
-			(left_imaginary, imaginary_from_left_imaginary),
-			(right_real, imaginary_from_right_real),
-			(right_imaginary, imaginary_from_right_imaginary),
-		],
-	)?;
+	let real = weighted_sum_four(operation, &mut builder, [
+		(left_real, real_from_left_real),
+		(left_imaginary, real_from_left_imaginary),
+		(right_real, real_from_right_real),
+		(right_imaginary, real_from_right_imaginary),
+	])?;
+	let imaginary = weighted_sum_four(operation, &mut builder, [
+		(left_real, imaginary_from_left_real),
+		(left_imaginary, imaginary_from_left_imaginary),
+		(right_real, imaginary_from_right_real),
+		(right_imaginary, imaginary_from_right_imaginary),
+	])?;
 	scalar_finish(operation, builder, &[real, imaginary])
 }
 
@@ -2792,11 +2674,11 @@ fn batch_normalization_gradient_program(
 		output_gradient,
 		normalized,
 	)?;
-	scalar_finish(
-		operation,
-		builder,
-		&[input_gradient, scale_gradient, output_gradient],
-	)
+	scalar_finish(operation, builder, &[
+		input_gradient,
+		scale_gradient,
+		output_gradient,
+	])
 }
 
 fn running_statistics_update_program(
@@ -2954,11 +2836,12 @@ fn layer_normalization_backward_terms_program(
 		output_gradient,
 		normalized,
 	)?;
-	scalar_finish(
-		operation,
-		builder,
-		&[first_term, second_term, scale_gradient, output_gradient],
-	)
+	scalar_finish(operation, builder, &[
+		first_term,
+		second_term,
+		scale_gradient,
+		output_gradient,
+	])
 }
 
 fn layer_normalization_input_gradient_program(
@@ -3073,13 +2956,15 @@ fn rms_normalization_program(
 		inverse,
 	)?;
 	let normalized = match scale {
-		Some(scale) => scalar_binary(
-			operation,
-			&mut builder,
-			ScalarOpcode::Multiply,
-			normalized,
-			scale,
-		)?,
+		Some(scale) => {
+			scalar_binary(
+				operation,
+				&mut builder,
+				ScalarOpcode::Multiply,
+				normalized,
+				scale,
+			)?
+		}
 		None => normalized,
 	};
 	scalar_finish(operation, builder, &[normalized])
@@ -3856,17 +3741,13 @@ fn lamb_phase_one_program(
 		update,
 		update,
 	)?;
-	scalar_finish(
-		operation,
-		builder,
-		&[
-			updated_moment,
-			updated_velocity,
-			update,
-			weight_squared,
-			update_squared,
-		],
-	)
+	scalar_finish(operation, builder, &[
+		updated_moment,
+		updated_velocity,
+		update,
+		weight_squared,
+		update_squared,
+	])
 }
 
 fn lamb_phase_two_program(operation: OperationId, learning_rate: f32) -> OperationResult<recipe_core::ScalarProgram> {
@@ -4106,16 +3987,20 @@ fn exact_f32_extent(request: &MaterializationRequest<'_>, value: u64, name: &str
 fn prepared_bool(request: &MaterializationRequest<'_>, name: &str) -> OperationResult<bool> {
 	match request.parameters.get(name) {
 		Some(PreparedParameter::Bool(value)) => Ok(*value),
-		Some(value) => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::PreparedParameterTypeMismatch,
-			format!("prepared parameter {name:?} is {value:?}, expected Bool"),
-		)),
-		None => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::MissingPreparedParameter,
-			format!("prepared parameter {name:?} is required"),
-		)),
+		Some(value) => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::PreparedParameterTypeMismatch,
+				format!("prepared parameter {name:?} is {value:?}, expected Bool"),
+			))
+		}
+		None => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::MissingPreparedParameter,
+				format!("prepared parameter {name:?} is required"),
+			))
+		}
 	}
 }
 
@@ -4533,52 +4418,66 @@ fn require_same_tensor_contract(
 fn prepared_u64(operation: OperationId, parameters: &PreparedParameters, name: &str) -> OperationResult<u64> {
 	match parameters.get(name) {
 		Some(PreparedParameter::U64(value)) => Ok(*value),
-		Some(value) => Err(operation_error(
-			operation,
-			OperationErrorKind::PreparedParameterTypeMismatch,
-			format!("prepared parameter {name:?} is {value:?}, expected U64"),
-		)),
-		None => Err(operation_error(
-			operation,
-			OperationErrorKind::MissingPreparedParameter,
-			format!("prepared parameter {name:?} is required"),
-		)),
+		Some(value) => {
+			Err(operation_error(
+				operation,
+				OperationErrorKind::PreparedParameterTypeMismatch,
+				format!("prepared parameter {name:?} is {value:?}, expected U64"),
+			))
+		}
+		None => {
+			Err(operation_error(
+				operation,
+				OperationErrorKind::MissingPreparedParameter,
+				format!("prepared parameter {name:?} is required"),
+			))
+		}
 	}
 }
 
 fn prepared_f32(request: &MaterializationRequest<'_>, name: &str) -> OperationResult<f32> {
 	match request.parameters.get(name) {
 		Some(PreparedParameter::F32Bits(bits)) => Ok(f32::from_bits(*bits)),
-		Some(value) => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::PreparedParameterTypeMismatch,
-			format!("prepared parameter {name:?} is {value:?}, expected F32Bits"),
-		)),
-		None => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::MissingPreparedParameter,
-			format!("prepared parameter {name:?} is required"),
-		)),
+		Some(value) => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::PreparedParameterTypeMismatch,
+				format!("prepared parameter {name:?} is {value:?}, expected F32Bits"),
+			))
+		}
+		None => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::MissingPreparedParameter,
+				format!("prepared parameter {name:?} is required"),
+			))
+		}
 	}
 }
 
 fn require_true(request: &MaterializationRequest<'_>, name: &str) -> OperationResult<()> {
 	match request.parameters.get(name) {
 		Some(PreparedParameter::Bool(true)) => Ok(()),
-		Some(PreparedParameter::Bool(false)) => Err(request_error(
-			request,
-			format!("prepared fact {name:?} must be true"),
-		)),
-		Some(value) => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::PreparedParameterTypeMismatch,
-			format!("prepared parameter {name:?} is {value:?}, expected Bool"),
-		)),
-		None => Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::MissingPreparedParameter,
-			format!("prepared fact {name:?} is required"),
-		)),
+		Some(PreparedParameter::Bool(false)) => {
+			Err(request_error(
+				request,
+				format!("prepared fact {name:?} must be true"),
+			))
+		}
+		Some(value) => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::PreparedParameterTypeMismatch,
+				format!("prepared parameter {name:?} is {value:?}, expected Bool"),
+			))
+		}
+		None => {
+			Err(operation_error(
+				request.descriptor.id,
+				OperationErrorKind::MissingPreparedParameter,
+				format!("prepared fact {name:?} is required"),
+			))
+		}
 	}
 }
 
@@ -4648,10 +4547,12 @@ fn scalar_finish(
 fn forbidden_aliases(inputs: usize, outputs: usize) -> Vec<PrimitiveAliasRule> {
 	(0..inputs)
 		.flat_map(|input| {
-			(0..outputs).map(move |output| PrimitiveAliasRule {
-				input,
-				output,
-				permission: AliasPermission::Forbidden,
+			(0..outputs).map(move |output| {
+				PrimitiveAliasRule {
+					input,
+					output,
+					permission: AliasPermission::Forbidden,
+				}
 			})
 		})
 		.collect()

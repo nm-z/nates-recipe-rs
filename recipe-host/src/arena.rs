@@ -1,8 +1,10 @@
 use core::fmt;
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::{
+	fs::{File, OpenOptions},
+	os::unix::fs::FileExt,
+	path::{Path, PathBuf},
+	sync::{Arc, Mutex},
+};
 
 use recipe_core::{ByteCount, DeviceId};
 use rustix::fs::{FallocateFlags, fallocate};
@@ -30,9 +32,7 @@ impl DiskFileSpec {
 	}
 
 	#[must_use]
-	pub fn path(&self) -> &Path {
-		&self.path
-	}
+	pub fn path(&self) -> &Path { &self.path }
 }
 
 pub(crate) enum Backing {
@@ -50,15 +50,19 @@ pub(crate) enum Backing {
 impl fmt::Debug for Backing {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::Ram { bytes, .. } => formatter
-				.debug_struct("RamBacking")
-				.field("bytes", bytes)
-				.finish(),
-			Self::Disk { path, bytes, .. } => formatter
-				.debug_struct("DiskBacking")
-				.field("path", path)
-				.field("bytes", bytes)
-				.finish_non_exhaustive(),
+			Self::Ram { bytes, .. } => {
+				formatter
+					.debug_struct("RamBacking")
+					.field("bytes", bytes)
+					.finish()
+			}
+			Self::Disk { path, bytes, .. } => {
+				formatter
+					.debug_struct("DiskBacking")
+					.field("path", path)
+					.field("bytes", bytes)
+					.finish_non_exhaustive()
+			}
 		}
 	}
 }
@@ -126,19 +130,13 @@ impl Arena {
 	}
 
 	#[must_use]
-	pub const fn device(&self) -> DeviceId {
-		self.device
-	}
+	pub const fn device(&self) -> DeviceId { self.device }
 
 	#[must_use]
-	pub const fn kind(&self) -> ArenaKind {
-		self.kind
-	}
+	pub const fn kind(&self) -> ArenaKind { self.kind }
 
 	#[must_use]
-	pub fn bytes(&self) -> ByteCount {
-		ByteCount::new(self.backing.len())
-	}
+	pub fn bytes(&self) -> ByteCount { ByteCount::new(self.backing.len()) }
 
 	pub fn close(self) -> Result<()> {
 		let backing = Arc::try_unwrap(self.backing).map_err(|_| Error::SlotBusy)?;
@@ -153,9 +151,7 @@ impl Arena {
 
 	/// Write one exact range for a pre-realized heterogeneous transfer bridge.
 	#[doc(hidden)]
-	pub fn bridge_write_exact(&self, offset: u64, source: &[u8]) -> Result<()> {
-		self.write_exact(offset, source)
-	}
+	pub fn bridge_write_exact(&self, offset: u64, source: &[u8]) -> Result<()> { self.write_exact(offset, source) }
 
 	pub(crate) fn write_exact(&self, offset: u64, source: &[u8]) -> Result<()> {
 		let count = u64::try_from(source.len()).map_err(|_| Error::RangeOverflow)?;
@@ -253,12 +249,12 @@ fn host_range(offset: u64, bytes: u64) -> Result<std::ops::Range<usize>> {
 
 fn read_exact_at(file: &File, mut destination: &mut [u8], mut offset: u64) -> Result<()> {
 	while !destination.is_empty() {
-		let count = file
-			.read_at(destination, offset)
-			.map_err(|error| Error::Io {
+		let count = file.read_at(destination, offset).map_err(|error| {
+			Error::Io {
 				operation: "read host arena",
 				kind: error.kind(),
-			})?;
+			}
+		})?;
 		if count == 0 {
 			return Err(Error::Io {
 				operation: "read host arena",
@@ -275,9 +271,11 @@ fn read_exact_at(file: &File, mut destination: &mut [u8], mut offset: u64) -> Re
 
 fn write_all_at(file: &File, mut source: &[u8], mut offset: u64) -> Result<()> {
 	while !source.is_empty() {
-		let count = file.write_at(source, offset).map_err(|error| Error::Io {
-			operation: "write host arena",
-			kind: error.kind(),
+		let count = file.write_at(source, offset).map_err(|error| {
+			Error::Io {
+				operation: "write host arena",
+				kind: error.kind(),
+			}
 		})?;
 		if count == 0 {
 			return Err(Error::Io {

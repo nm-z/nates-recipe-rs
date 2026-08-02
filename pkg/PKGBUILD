@@ -48,9 +48,7 @@ build() {
 check() {
     cd nates-recipe-rs
     export CARGO_TARGET_DIR="$srcdir/target-pkg"
-    # recipe-text's tokenizer corpus is Git LFS data; source-only AUR builds
-    # deliberately skip the multi-gigabyte dataset checkout.
-    cargo test --workspace --exclude recipe-text --locked
+    cargo check --workspace --all-targets --locked
 }
 
 package() {

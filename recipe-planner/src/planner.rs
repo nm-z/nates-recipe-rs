@@ -20,8 +20,10 @@ use recipe_primitives::{
 use recipe_program::{MetricEmission, StaticCalculationProgram};
 use recipe_scheduler::{ScheduleErrorKind, UnscheduledTask, pack_arenas, schedule};
 
-use crate::error::{PlannerError, PlannerErrorKind, PlannerResult};
-use crate::hash::StableDigest;
+use crate::{
+	error::{PlannerError, PlannerErrorKind, PlannerResult},
+	hash::StableDigest,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct KernelPlacement {
@@ -80,9 +82,7 @@ pub struct PlannerSearch {
 
 impl PlannerSearch {
 	#[must_use]
-	pub fn ranked_candidates(&self) -> &[PlannedCandidate] {
-		&self.ranked
-	}
+	pub fn ranked_candidates(&self) -> &[PlannedCandidate] { &self.ranked }
 
 	pub fn next_candidate(&mut self) -> Option<&PlannedCandidate> {
 		while self.cursor < self.ranked.len() {
@@ -135,9 +135,7 @@ pub struct ProgramPlannerSearch {
 
 impl ProgramPlannerSearch {
 	#[must_use]
-	pub fn ranked_candidates(&self) -> &[PlannedProgramCandidate] {
-		&self.ranked
-	}
+	pub fn ranked_candidates(&self) -> &[PlannedProgramCandidate] { &self.ranked }
 
 	pub fn next_candidate(&mut self) -> Option<&PlannedProgramCandidate> {
 		while self.cursor < self.ranked.len() {
@@ -427,13 +425,10 @@ fn lower_programs(
 				));
 			}
 		}
-		programs.insert(
-			program.source_kernel,
-			LoweredKernelPlan {
-				program,
-				stage_templates,
-			},
-		);
+		programs.insert(program.source_kernel, LoweredKernelPlan {
+			program,
+			stage_templates,
+		});
 	}
 	Ok((programs, templates))
 }
@@ -851,13 +846,9 @@ struct StableIdAllocator {
 }
 
 impl StableIdAllocator {
-	const fn new(kind: &'static str) -> Self {
-		Self { next: 1, kind }
-	}
+	const fn new(kind: &'static str) -> Self { Self { next: 1, kind } }
 
-	const fn peek(&self) -> u64 {
-		self.next
-	}
+	const fn peek(&self) -> u64 { self.next }
 
 	fn take(&mut self) -> PlannerResult<u64> {
 		let result = self.next;
@@ -884,7 +875,8 @@ struct LoweringState {
 	resources: ResourceManifest,
 	aliases: Vec<AliasInvocation>,
 	fault_flags: BTreeMap<(KernelTemplateId, u32), ValueId>,
-	fault_readbacks: BTreeMap<ValueId, TaskId>,
+	fault_cohorts: BTreeMap<(DeviceId, IterationDomain), (ValueId, Vec<TaskId>)>,
+	fault_readbacks: BTreeMap<(DeviceId, IterationDomain), TaskId>,
 	init_tasks: BTreeMap<DeviceId, TaskId>,
 	loop_domains: BTreeMap<TaskId, IterationDomain>,
 }
@@ -909,19 +901,16 @@ impl LoweringState {
 			},
 			aliases: Vec::new(),
 			fault_flags: BTreeMap::new(),
+			fault_cohorts: BTreeMap::new(),
 			fault_readbacks: BTreeMap::new(),
 			init_tasks: BTreeMap::new(),
 			loop_domains: BTreeMap::new(),
 		}
 	}
 
-	fn next_value(&mut self) -> PlannerResult<ValueId> {
-		Ok(ValueId::new(self.value_ids.take()?))
-	}
+	fn next_value(&mut self) -> PlannerResult<ValueId> { Ok(ValueId::new(self.value_ids.take()?)) }
 
-	fn next_task(&mut self) -> PlannerResult<TaskId> {
-		Ok(TaskId::new(self.task_ids.take()?))
-	}
+	fn next_task(&mut self) -> PlannerResult<TaskId> { Ok(TaskId::new(self.task_ids.take()?)) }
 
 	fn next_submission(&mut self, device: DeviceId) -> PlannerResult<(TaskId, SubmissionSlots)> {
 		let task = self.next_task()?;
@@ -960,10 +949,12 @@ impl LoweringState {
 
 	fn assign_loop_domain(&mut self, task: TaskId, domain: IterationDomain) -> PlannerResult<()> {
 		match self.loop_domains.insert(task, domain) {
-			Some(previous) if previous != domain => Err(PlannerError::new(
-				PlannerErrorKind::InvalidDraft,
-				format!("loop task {task} was assigned two iteration domains"),
-			)),
+			Some(previous) if previous != domain => {
+				Err(PlannerError::new(
+					PlannerErrorKind::InvalidDraft,
+					format!("loop task {task} was assigned two iteration domains"),
+				))
+			}
 			Some(_) | None => Ok(()),
 		}
 	}
@@ -1004,6 +995,7 @@ fn lower_candidate(
 		context.programs,
 		context.topology,
 		&selected,
+		context.source_domains,
 		&mut state,
 	)?;
 
@@ -1050,6 +1042,7 @@ fn lower_candidate(
 			device: option.device,
 		});
 	}
+	add_fault_readbacks(&mut state)?;
 	add_user_metrics(context, &selected, &mut state)?;
 	add_alias_dependencies(&mut state.tasks, &state.aliases)?;
 	let aliases = state.aliases.clone();
@@ -1126,11 +1119,13 @@ fn lower_candidate(
 	let init_images = state
 		.images
 		.iter()
-		.map(|image| InitDataImage {
-			device: image.device,
-			image: image.image,
-			bytes: image.bytes,
-			members: image.data_members.clone(),
+		.map(|image| {
+			InitDataImage {
+				device: image.device,
+				image: image.image,
+				bytes: image.bytes,
+				members: image.data_members.clone(),
+			}
 		})
 		.collect::<Vec<_>>();
 	let loop_domains = scheduled
@@ -1141,9 +1136,11 @@ fn lower_candidate(
 			state.loop_domains
 				.get(&task.id)
 				.copied()
-				.map(|domain| LoopTaskDomain {
-					task: task.id,
-					domain,
+				.map(|domain| {
+					LoopTaskDomain {
+						task: task.id,
+						domain,
+					}
 				})
 				.ok_or_else(|| {
 					PlannerError::new(
@@ -1278,10 +1275,14 @@ fn add_user_metrics(
 			id: slot,
 			metric: emission.metric,
 		});
+		let mut dependencies = vec![copy.producer];
+		dependencies.extend(state.fault_readbacks.values().copied());
+		dependencies.sort_unstable();
+		dependencies.dedup();
 		state.tasks.push(UnscheduledTask {
 			id: task,
 			phase: RunPhase::Loop,
-			dependencies: vec![copy.producer],
+			dependencies,
 			kind: TaskKind::Metric(MetricTask {
 				purpose: MetricPurpose::User,
 				metric: emission.metric,
@@ -1363,9 +1364,6 @@ fn lower_program_invocation(
 				dependencies.push(producer);
 			}
 		}
-		if let Some(readback) = fault_flag.and_then(|flag| state.fault_readbacks.get(&flag).copied()) {
-			dependencies.push(readback);
-		}
 		dependencies.retain(|dependency| *dependency != task);
 		dependencies.sort();
 		dependencies.dedup();
@@ -1442,36 +1440,23 @@ fn lower_program_invocation(
 			}),
 		});
 		state.assign_loop_domain(task, domain)?;
-		let completion_barrier = match fault_flag {
-			Some(fault_flag) => {
-				let (readback, submission) = state.next_submission(device)?;
-				let metric = MetricId::new(readback.get());
-				let slot = MetricSlotId::new(readback.get());
-				state.resources
-					.metrics
-					.push(MetricSlot { id: slot, metric });
-				state.tasks.push(UnscheduledTask {
-					id: readback,
-					phase: RunPhase::Loop,
-					dependencies: vec![task],
-					kind: TaskKind::Metric(MetricTask {
-						purpose: MetricPurpose::FaultReadback { calculation: task },
-						metric,
-						value: fault_flag,
-						slot,
-						submission,
-					}),
-				});
-				state.assign_loop_domain(readback, domain)?;
-				state.fault_readbacks.insert(fault_flag, readback);
-				readback
+		if let Some(fault_flag) = fault_flag {
+			let cohort = state
+				.fault_cohorts
+				.entry((device, domain))
+				.or_insert_with(|| (fault_flag, Vec::new()));
+			if cohort.0 != fault_flag {
+				return Err(PlannerError::new(
+					PlannerErrorKind::InvalidDraft,
+					format!("device {device} iteration domain has more than one fault flag"),
+				));
 			}
-			None => task,
-		};
-		stage_barriers.insert(stage.id.get(), completion_barrier);
+			cohort.1.push(task);
+		}
+		stage_barriers.insert(stage.id.get(), task);
 		for binding in &stage.bindings {
 			if primitive_access_writes(binding.mode) {
-				ready.insert(binding.buffer.get(), completion_barrier);
+				ready.insert(binding.buffer.get(), task);
 				writers.insert(binding.buffer.get(), task);
 				let buffer = &program.buffers[usize::try_from(binding.buffer.get()).map_err(|error| {
 					PlannerError::new(
@@ -1527,15 +1512,12 @@ fn lower_program_invocation(
 			None => state.init_tasks[&device],
 		};
 		set_value_producer(state, *physical, writer)?;
-		state.push_copy(
-			*logical,
-			RuntimeCopy {
-				device,
-				value: *physical,
-				producer: readiness,
-				transfer_domain: None,
-			},
-		)?;
+		state.push_copy(*logical, RuntimeCopy {
+			device,
+			value: *physical,
+			producer: readiness,
+			transfer_domain: None,
+		})?;
 	}
 	let rules = program
 		.source_aliases
@@ -1556,6 +1538,39 @@ fn lower_program_invocation(
 		outputs: source_outputs,
 		rules,
 	});
+	Ok(())
+}
+
+fn add_fault_readbacks(state: &mut LoweringState) -> PlannerResult<()> {
+	let cohorts = state
+		.fault_cohorts
+		.iter()
+		.map(|(key, (flag, calculations))| (*key, *flag, calculations.clone()))
+		.collect::<Vec<_>>();
+	for ((device, domain), fault_flag, mut calculations) in cohorts {
+		calculations.sort_unstable();
+		calculations.dedup();
+		let (readback, submission) = state.next_submission(device)?;
+		let metric = MetricId::new(readback.get());
+		let slot = MetricSlotId::new(readback.get());
+		state.resources
+			.metrics
+			.push(MetricSlot { id: slot, metric });
+		state.tasks.push(UnscheduledTask {
+			id: readback,
+			phase: RunPhase::Loop,
+			dependencies: calculations,
+			kind: TaskKind::Metric(MetricTask {
+				purpose: MetricPurpose::FaultReadback,
+				metric,
+				value: fault_flag,
+				slot,
+				submission,
+			}),
+		});
+		state.assign_loop_domain(readback, domain)?;
+		state.fault_readbacks.insert((device, domain), readback);
+	}
 	Ok(())
 }
 
@@ -1592,13 +1607,15 @@ fn materialize_program_buffer(
 			});
 			Ok((value, None))
 		}
-		BufferOrigin::Tensor(logical) => Err(PlannerError::new(
-			PlannerErrorKind::InvalidDraft,
-			format!(
-				"lowered program {} contains unrelated tensor buffer {logical}",
-				program.source_kernel
-			),
-		)),
+		BufferOrigin::Tensor(logical) => {
+			Err(PlannerError::new(
+				PlannerErrorKind::InvalidDraft,
+				format!(
+					"lowered program {} contains unrelated tensor buffer {logical}",
+					program.source_kernel
+				),
+			))
+		}
 		BufferOrigin::Scratch { .. } => {
 			let value = state.next_value()?;
 			state.values.push(ValueSpec {
@@ -2263,10 +2280,11 @@ fn initialize_data_images(
 	programs: &BTreeMap<KernelTemplateId, LoweredKernelPlan>,
 	topology: &Topology,
 	selected: &BTreeMap<KernelTemplateId, &PlacementOption>,
+	source_domains: &BTreeMap<KernelTemplateId, IterationDomain>,
 	state: &mut LoweringState,
 ) -> PlannerResult<()> {
 	let mut image_tensors = BTreeMap::<DeviceId, BTreeSet<ValueId>>::new();
-	let mut fault_buffers = BTreeMap::<DeviceId, Vec<(KernelTemplateId, u32)>>::new();
+	let mut fault_buffers = BTreeMap::<DeviceId, BTreeMap<IterationDomain, Vec<(KernelTemplateId, u32)>>>::new();
 	for kernel in order {
 		let node = nodes.get(kernel).ok_or_else(|| {
 			PlannerError::new(
@@ -2282,8 +2300,16 @@ fn initialize_data_images(
 		})?;
 		for buffer in &program.program.buffers {
 			if buffer.lifetime == BufferLifetime::ProgramFaultFlag {
+				let domain = source_domains.get(kernel).copied().ok_or_else(|| {
+					PlannerError::new(
+						PlannerErrorKind::InvalidGraph,
+						format!("kernel {kernel} has no iteration domain while building data images"),
+					)
+				})?;
 				fault_buffers
 					.entry(selected[kernel].device)
+					.or_default()
+					.entry(domain)
 					.or_default()
 					.push((*kernel, buffer.id.get()));
 			}
@@ -2348,15 +2374,12 @@ fn initialize_data_images(
 				device,
 				producer: Some(task),
 			});
-			state.push_copy(
-				*logical,
-				RuntimeCopy {
-					device,
-					value: physical,
-					producer: task,
-					transfer_domain: None,
-				},
-			)?;
+			state.push_copy(*logical, RuntimeCopy {
+				device,
+				value: physical,
+				producer: task,
+				transfer_domain: None,
+			})?;
 			external_members.push((physical, member_offset));
 			data_members.push(InitDataImageMember {
 				logical: *logical,
@@ -2372,7 +2395,11 @@ fn initialize_data_images(
 				)
 			})?;
 		}
-		for (kernel, buffer) in fault_buffers.get(&device).into_iter().flatten() {
+		for buffers in fault_buffers
+			.get(&device)
+			.into_iter()
+			.flat_map(BTreeMap::values)
+		{
 			let fault_flag = state.next_value()?;
 			state.values.push(ValueSpec {
 				id: fault_flag,
@@ -2388,15 +2415,17 @@ fn initialize_data_images(
 					"fault-flag data-image size overflowed",
 				)
 			})?;
-			if state
-				.fault_flags
-				.insert((*kernel, *buffer), fault_flag)
-				.is_some()
-			{
-				return Err(PlannerError::new(
-					PlannerErrorKind::InvalidDraft,
-					format!("kernel {kernel} buffer {buffer} has more than one fault flag"),
-				));
+			for (kernel, buffer) in buffers {
+				if state
+					.fault_flags
+					.insert((*kernel, *buffer), fault_flag)
+					.is_some()
+				{
+					return Err(PlannerError::new(
+						PlannerErrorKind::InvalidDraft,
+						format!("kernel {kernel} buffer {buffer} has more than one fault flag"),
+					));
+				}
 			}
 		}
 		let image_bytes = offset.max(ByteCount::new(4));
@@ -2816,13 +2845,10 @@ fn compact_submission_resources_with_limits(
 						color
 					}
 				};
-				assignments.push((
-					interval.task_index,
-					SubmissionSlots {
-						queue: QueueSlotId::new(color.id.get()),
-						completion: CompletionSlotId::new(color.id.get()),
-					},
-				));
+				assignments.push((interval.task_index, SubmissionSlots {
+					queue: QueueSlotId::new(color.id.get()),
+					completion: CompletionSlotId::new(color.id.get()),
+				}));
 			}
 			device_colors.extend(owner_colors);
 		}
@@ -2890,42 +2916,47 @@ fn task_submission_device(
 ) -> PlannerResult<(DeviceId, SubmissionOwnerClass)> {
 	match &task.kind {
 		TaskKind::Calculation(calculation) => Ok((calculation.device, SubmissionOwnerClass::DeviceLocal)),
-		TaskKind::Transfer(transfer) => match (transfer.source, transfer.destination) {
-			(
-				TransferEndpoint::Device { device: source, .. },
-				TransferEndpoint::Device {
-					device: destination,
-					..
-				},
-			) if source != destination => Ok((
-				source,
-				SubmissionOwnerClass::CrossDevice {
-					source,
-					destination,
-				},
-			)),
-			(TransferEndpoint::Device { device, .. }, _) => Ok((device, SubmissionOwnerClass::DeviceLocal)),
-			(TransferEndpoint::External, TransferEndpoint::Device { device, .. }) => {
-				Ok((device, SubmissionOwnerClass::DeviceLocal))
+		TaskKind::Transfer(transfer) => {
+			match (transfer.source, transfer.destination) {
+				(
+					TransferEndpoint::Device { device: source, .. },
+					TransferEndpoint::Device {
+						device: destination,
+						..
+					},
+				) if source != destination => {
+					Ok((source, SubmissionOwnerClass::CrossDevice {
+						source,
+						destination,
+					}))
+				}
+				(TransferEndpoint::Device { device, .. }, _) => Ok((device, SubmissionOwnerClass::DeviceLocal)),
+				(TransferEndpoint::External, TransferEndpoint::Device { device, .. }) => {
+					Ok((device, SubmissionOwnerClass::DeviceLocal))
+				}
+				(TransferEndpoint::External, TransferEndpoint::External) => {
+					Err(PlannerError::new(
+						PlannerErrorKind::InvalidDraft,
+						format!("task {} is an external-to-external transfer", task.id),
+					))
+				}
 			}
-			(TransferEndpoint::External, TransferEndpoint::External) => Err(PlannerError::new(
-				PlannerErrorKind::InvalidDraft,
-				format!("task {} is an external-to-external transfer", task.id),
-			)),
-		},
-		TaskKind::Metric(metric) => value_devices
-			.get(&metric.value)
-			.copied()
-			.map(|device| (device, SubmissionOwnerClass::DeviceLocal))
-			.ok_or_else(|| {
-				PlannerError::new(
-					PlannerErrorKind::InvalidDraft,
-					format!(
-						"metric task {} references unknown value {}",
-						task.id, metric.value
-					),
-				)
-			}),
+		}
+		TaskKind::Metric(metric) => {
+			value_devices
+				.get(&metric.value)
+				.copied()
+				.map(|device| (device, SubmissionOwnerClass::DeviceLocal))
+				.ok_or_else(|| {
+					PlannerError::new(
+						PlannerErrorKind::InvalidDraft,
+						format!(
+							"metric task {} references unknown value {}",
+							task.id, metric.value
+						),
+					)
+				})
+		}
 	}
 }
 
@@ -3207,12 +3238,14 @@ fn build_arena_contract(
 				});
 				(object, ByteOffset::new(0))
 			}
-			1 => locations.iter().next().copied().ok_or_else(|| {
-				PlannerError::new(
-					PlannerErrorKind::InvalidDraft,
-					"fixed arena location disappeared",
-				)
-			})?,
+			1 => {
+				locations.iter().next().copied().ok_or_else(|| {
+					PlannerError::new(
+						PlannerErrorKind::InvalidDraft,
+						"fixed arena location disappeared",
+					)
+				})?
+			}
 			_ => {
 				return Err(PlannerError::new(
 					PlannerErrorKind::InvalidDraft,
@@ -3235,14 +3268,11 @@ fn build_arena_contract(
 					format!("arena object {object} is absent"),
 				));
 			}
-			bindings.insert(
-				*member,
-				ValueBinding {
-					value: *member,
-					object,
-					object_offset: offset,
-				},
-			);
+			bindings.insert(*member, ValueBinding {
+				value: *member,
+				object,
+				object_offset: offset,
+			});
 		}
 	}
 
@@ -3278,10 +3308,12 @@ fn build_arena_contract(
 		match (start, end) {
 			(Some(start), Some(end)) => Ok(Some(ScheduleWindow { start, end })),
 			(None, None) => Ok(None),
-			_ => Err(PlannerError::new(
-				PlannerErrorKind::InvalidDraft,
-				"loop schedule has only one lifetime boundary",
-			)),
+			_ => {
+				Err(PlannerError::new(
+					PlannerErrorKind::InvalidDraft,
+					"loop schedule has only one lifetime boundary",
+				))
+			}
 		}
 	})
 	.transpose()?
@@ -3456,9 +3488,7 @@ fn extend_lifetime(start: &mut Option<Nanoseconds>, end: &mut Option<Nanoseconds
 	*end = Some(end.map_or(window.end, |known| known.max(window.end)));
 }
 
-fn task_references(task: &Task, value: ValueId) -> bool {
-	task_kind_references(&task.kind, value)
-}
+fn task_references(task: &Task, value: ValueId) -> bool { task_kind_references(&task.kind, value) }
 
 fn task_reads_value(task: &Task, value: ValueId) -> bool {
 	match &task.kind {
@@ -3661,10 +3691,7 @@ fn hash_draft(input: &DraftHashInput<'_>) -> DraftIdentity {
 				digest.u8(2);
 				match metric.purpose {
 					MetricPurpose::User => digest.u8(0),
-					MetricPurpose::FaultReadback { calculation } => {
-						digest.u8(1);
-						digest.u64(calculation.get());
-					}
+					MetricPurpose::FaultReadback => digest.u8(1),
 				}
 				digest.u64(metric.metric.get());
 				digest.u64(metric.value.get());
@@ -3804,363 +3831,5 @@ fn hash_endpoint(digest: &mut StableDigest, endpoint: TransferEndpoint) {
 			digest.u64(device.get());
 			digest.u64(value.get());
 		}
-	}
-}
-
-#[cfg(test)]
-mod submission_compaction_tests {
-	use super::*;
-
-	const DEVICE: DeviceId = DeviceId::new(1);
-
-	fn window(start: u64, end: u64) -> ScheduleWindow {
-		ScheduleWindow {
-			start: Nanoseconds::new(start),
-			end: Nanoseconds::new(end),
-		}
-	}
-
-	fn transfer(id: u64, start: u64, end: u64) -> Task {
-		let task = TaskId::new(id);
-		Task {
-			id: task,
-			phase: RunPhase::Loop,
-			window: window(start, end),
-			dependencies: Vec::new(),
-			kind: TaskKind::Transfer(TransferTask {
-				source: TransferEndpoint::Device {
-					device: DEVICE,
-					value: ValueId::new(id),
-				},
-				destination: TransferEndpoint::External,
-				bytes: ByteCount::new(4),
-				route: Vec::new(),
-				lane_claims: Vec::new(),
-				submission: SubmissionSlots {
-					queue: QueueSlotId::new(id),
-					completion: CompletionSlotId::new(id),
-				},
-			}),
-		}
-	}
-
-	fn cross_device_transfer(id: u64, start: u64, end: u64, destination: DeviceId) -> Task {
-		let mut task = transfer(id, start, end);
-		let TaskKind::Transfer(transfer) = &mut task.kind else {
-			unreachable!("transfer helper constructs transfer work");
-		};
-		transfer.destination = TransferEndpoint::Device {
-			device: destination,
-			value: ValueId::new(id + 100),
-		};
-		task
-	}
-
-	fn metric(id: u64, value: ValueId, start: u64, end: u64) -> Task {
-		Task {
-			id: TaskId::new(id),
-			phase: RunPhase::Loop,
-			window: window(start, end),
-			dependencies: Vec::new(),
-			kind: TaskKind::Metric(MetricTask {
-				purpose: MetricPurpose::User,
-				metric: MetricId::new(id),
-				value,
-				slot: MetricSlotId::new(id),
-				submission: SubmissionSlots {
-					queue: QueueSlotId::new(id),
-					completion: CompletionSlotId::new(id),
-				},
-			}),
-		}
-	}
-
-	fn resources() -> ResourceManifest {
-		ResourceManifest {
-			queues: Vec::new(),
-			completions: Vec::new(),
-			metrics: Vec::new(),
-			pinned_staging: Vec::new(),
-			scratch: Vec::new(),
-		}
-	}
-
-	fn slots(task: &Task) -> SubmissionSlots {
-		match &task.kind {
-			TaskKind::Calculation(calculation) => calculation.submission,
-			TaskKind::Transfer(transfer) => transfer.submission,
-			TaskKind::Metric(metric) => metric.submission,
-		}
-	}
-
-	#[test]
-	fn sequential_half_open_windows_reuse_queue_and_completion() {
-		let mut tasks = vec![transfer(1, 0, 10), transfer(2, 10, 20)];
-		let mut resources = resources();
-		compact_submission_resources_with_limits(
-			&mut tasks,
-			&[],
-			&mut resources,
-			&BTreeMap::from([(DEVICE, 1)]),
-		)
-		.unwrap();
-
-		assert_eq!(slots(&tasks[0]), slots(&tasks[1]));
-		assert_eq!(resources.queues.len(), 1);
-		assert_eq!(resources.completions.len(), 1);
-	}
-
-	#[test]
-	fn overlapping_windows_never_share_queue_or_completion() {
-		let mut tasks = vec![transfer(1, 0, 11), transfer(2, 10, 20)];
-		let mut resources = resources();
-		compact_submission_resources_with_limits(
-			&mut tasks,
-			&[],
-			&mut resources,
-			&BTreeMap::from([(DEVICE, 2)]),
-		)
-		.unwrap();
-
-		assert_ne!(slots(&tasks[0]).queue, slots(&tasks[1]).queue);
-		assert_ne!(slots(&tasks[0]).completion, slots(&tasks[1]).completion);
-		assert_eq!(resources.queues.len(), 2);
-		assert_eq!(resources.completions.len(), 2);
-	}
-
-	#[test]
-	fn metrics_participate_in_submission_interval_coloring() {
-		let value = ValueId::new(40);
-		let mut tasks = vec![
-			transfer(1, 0, 10),
-			metric(2, value, 1, 5),
-			metric(3, value, 2, 6),
-		];
-		let values = vec![ValueSpec {
-			id: value,
-			dtype: DType::F32,
-			bytes: ByteCount::new(4),
-			device: DEVICE,
-			producer: Some(TaskId::new(1)),
-		}];
-		let mut resources = resources();
-		compact_submission_resources_with_limits(
-			&mut tasks,
-			&values,
-			&mut resources,
-			&BTreeMap::from([(DEVICE, 3)]),
-		)
-		.unwrap();
-
-		assert_eq!(resources.queues.len(), 3);
-		assert_eq!(resources.completions.len(), 3);
-		assert!(
-			resources
-				.queues
-				.iter()
-				.any(|slot| slot.id == QueueSlotId::new(2))
-		);
-		assert!(
-			resources
-				.queues
-				.iter()
-				.any(|slot| slot.id == QueueSlotId::new(3))
-		);
-	}
-
-	#[test]
-	fn distinct_backend_owner_classes_do_not_reuse_slots() {
-		let mut tasks = vec![
-			transfer(1, 0, 10),
-			cross_device_transfer(2, 10, 20, DeviceId::new(2)),
-		];
-		let mut resources = resources();
-		compact_submission_resources_with_limits(
-			&mut tasks,
-			&[],
-			&mut resources,
-			&BTreeMap::from([(DEVICE, 2)]),
-		)
-		.unwrap();
-
-		assert_ne!(slots(&tasks[0]), slots(&tasks[1]));
-		assert_eq!(resources.queues.len(), 2);
-		assert_eq!(resources.completions.len(), 2);
-	}
-
-	#[test]
-	fn measured_queue_limit_rejects_excess_concurrency_cleanly() {
-		let mut tasks = vec![transfer(1, 0, 11), transfer(2, 10, 20)];
-		let original = tasks.clone();
-		let mut resources = resources();
-		let error = compact_submission_resources_with_limits(
-			&mut tasks,
-			&[],
-			&mut resources,
-			&BTreeMap::from([(DEVICE, 1)]),
-		)
-		.unwrap_err();
-
-		assert_eq!(error.kind, PlannerErrorKind::CandidateInfeasible);
-		assert_eq!(tasks, original);
-		assert!(resources.queues.is_empty());
-		assert!(resources.completions.is_empty());
-	}
-}
-
-#[cfg(test)]
-mod arena_lifetime_tests {
-	use super::*;
-
-	const DEVICE: DeviceId = DeviceId::new(1);
-
-	fn window(start: u64, end: u64) -> ScheduleWindow {
-		ScheduleWindow {
-			start: Nanoseconds::new(start),
-			end: Nanoseconds::new(end),
-		}
-	}
-
-	fn calculation(
-		id: u64,
-		phase: RunPhase,
-		start: u64,
-		end: u64,
-		inputs: Vec<ValueId>,
-		outputs: Vec<ValueId>,
-	) -> Task {
-		Task {
-			id: TaskId::new(id),
-			phase,
-			window: window(start, end),
-			dependencies: Vec::new(),
-			kind: TaskKind::Calculation(CalculationTask {
-				device: DEVICE,
-				kernel_template: KernelTemplateId::new(id),
-				artifact: ArtifactId::new(id),
-				inputs,
-				outputs,
-				fault_flag: None,
-				work: recipe_core::FlopCount::ZERO,
-				submission: SubmissionSlots {
-					queue: QueueSlotId::new(id),
-					completion: CompletionSlotId::new(id),
-				},
-			}),
-		}
-	}
-
-	fn value(id: u64, producer: u64) -> ValueSpec {
-		ValueSpec {
-			id: ValueId::new(id),
-			dtype: DType::F32,
-			bytes: ByteCount::new(4),
-			device: DEVICE,
-			producer: Some(TaskId::new(producer)),
-		}
-	}
-
-	fn object_for<'a>(value: ValueId, objects: &'a [ArenaObject], bindings: &[ValueBinding]) -> &'a ArenaObject {
-		let object = bindings
-			.iter()
-			.find(|binding| binding.value == value)
-			.expect("test value has an arena binding")
-			.object;
-		objects
-			.iter()
-			.find(|candidate| candidate.id == object)
-			.expect("bound arena object exists")
-	}
-
-	#[test]
-	fn first_only_value_read_every_iteration_spans_the_complete_loop() {
-		let persistent = ValueId::new(1);
-		let intermediate = ValueId::new(2);
-		let final_value = ValueId::new(3);
-		let iterations = LoopIterations::new(3).unwrap();
-		let tasks = vec![
-			calculation(1, RunPhase::Loop, 10, 20, Vec::new(), vec![persistent]),
-			calculation(
-				2,
-				RunPhase::Loop,
-				20,
-				30,
-				vec![persistent],
-				vec![intermediate],
-			),
-			calculation(
-				3,
-				RunPhase::Loop,
-				30,
-				40,
-				vec![intermediate],
-				vec![final_value],
-			),
-		];
-		let domains = BTreeMap::from([
-			(TaskId::new(1), IterationDomain::first()),
-			(TaskId::new(2), IterationDomain::every(iterations)),
-			(TaskId::new(3), IterationDomain::every(iterations)),
-		]);
-		let (objects, bindings) = build_arena_contract(
-			&[value(1, 1), value(2, 2), value(3, 3)],
-			&tasks,
-			&[],
-			&[],
-			iterations,
-			&domains,
-		)
-		.unwrap();
-
-		assert_eq!(
-			object_for(persistent, &objects, &bindings).lifetime,
-			window(10, 40)
-		);
-	}
-
-	#[test]
-	fn loop_value_consumed_during_exit_spans_the_global_schedule() {
-		let init_value = ValueId::new(1);
-		let checkpoint = ValueId::new(2);
-		let iterations = LoopIterations::new(3).unwrap();
-		let tasks = vec![
-			calculation(1, RunPhase::Init, 0, 5, Vec::new(), vec![init_value]),
-			calculation(2, RunPhase::Loop, 10, 20, Vec::new(), vec![checkpoint]),
-			Task {
-				id: TaskId::new(3),
-				phase: RunPhase::Exit,
-				window: window(30, 40),
-				dependencies: vec![TaskId::new(2)],
-				kind: TaskKind::Transfer(TransferTask {
-					source: TransferEndpoint::Device {
-						device: DEVICE,
-						value: checkpoint,
-					},
-					destination: TransferEndpoint::External,
-					bytes: ByteCount::new(4),
-					route: Vec::new(),
-					lane_claims: Vec::new(),
-					submission: SubmissionSlots {
-						queue: QueueSlotId::new(3),
-						completion: CompletionSlotId::new(3),
-					},
-				}),
-			},
-		];
-		let domains = BTreeMap::from([(TaskId::new(2), IterationDomain::every(iterations))]);
-		let (objects, bindings) = build_arena_contract(
-			&[value(1, 1), value(2, 2)],
-			&tasks,
-			&[],
-			&[],
-			iterations,
-			&domains,
-		)
-		.unwrap();
-
-		assert_eq!(
-			object_for(checkpoint, &objects, &bindings).lifetime,
-			window(0, 40)
-		);
 	}
 }

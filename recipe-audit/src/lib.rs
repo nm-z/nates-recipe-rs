@@ -14,6 +14,8 @@ mod native;
 mod policy;
 mod source;
 
+use std::collections::{BTreeMap, BTreeSet};
+
 pub use artifact::{audit_elf_facts, audit_linker_inputs};
 pub use dependency::{DependencyEdge, DependencyGraph, DependencyPackage};
 pub use error::AuditError;
@@ -26,8 +28,6 @@ pub use policy::{
 	CUDA_DRIVER_API_ALLOWLIST, InterfaceClassification, NativeInterface, classify_interface_symbol, classify_library,
 };
 pub use source::audit_source;
-
-use std::collections::{BTreeMap, BTreeSet};
 
 /// Evaluate all injected facts and return a deterministic report.
 ///

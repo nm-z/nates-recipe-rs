@@ -21,19 +21,13 @@ impl SourceLocation {
 	}
 
 	#[must_use]
-	pub const fn line(self) -> usize {
-		self.line
-	}
+	pub const fn line(self) -> usize { self.line }
 
 	#[must_use]
-	pub const fn column(self) -> usize {
-		self.column
-	}
+	pub const fn column(self) -> usize { self.column }
 
 	#[must_use]
-	pub const fn offset(self) -> usize {
-		self.offset
-	}
+	pub const fn offset(self) -> usize { self.offset }
 }
 
 /// Why text supplied through the arena-building API cannot form one node.
@@ -91,19 +85,13 @@ pub struct ParseError {
 
 impl ParseError {
 	#[must_use]
-	pub const fn new(kind: ParseErrorKind, location: SourceLocation) -> Self {
-		Self { kind, location }
-	}
+	pub const fn new(kind: ParseErrorKind, location: SourceLocation) -> Self { Self { kind, location } }
 
 	#[must_use]
-	pub const fn kind(&self) -> &ParseErrorKind {
-		&self.kind
-	}
+	pub const fn kind(&self) -> &ParseErrorKind { &self.kind }
 
 	#[must_use]
-	pub const fn location(&self) -> SourceLocation {
-		self.location
-	}
+	pub const fn location(&self) -> SourceLocation { self.location }
 }
 
 impl fmt::Display for ParseError {

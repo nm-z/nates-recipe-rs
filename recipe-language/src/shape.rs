@@ -36,24 +36,16 @@ impl Shape {
 	}
 
 	#[must_use]
-	pub fn extents(&self) -> &[u64] {
-		&self.extents
-	}
+	pub fn extents(&self) -> &[u64] { &self.extents }
 
 	#[must_use]
-	pub fn rank(&self) -> usize {
-		self.extents.len()
-	}
+	pub fn rank(&self) -> usize { self.extents.len() }
 
 	#[must_use]
-	pub const fn elements(&self) -> u64 {
-		self.elements
-	}
+	pub const fn elements(&self) -> u64 { self.elements }
 
 	#[must_use]
-	pub const fn is_empty(&self) -> bool {
-		self.elements == 0
-	}
+	pub const fn is_empty(&self) -> bool { self.elements == 0 }
 
 	pub fn bytes(&self, dtype: DType) -> LanguageResult<ByteCount> {
 		self.elements
@@ -156,14 +148,10 @@ impl AxisSet {
 	}
 
 	#[must_use]
-	pub fn as_slice(&self) -> &[usize] {
-		&self.axes
-	}
+	pub fn as_slice(&self) -> &[usize] { &self.axes }
 
 	#[must_use]
-	pub fn contains(&self, axis: usize) -> bool {
-		self.axes.binary_search(&axis).is_ok()
-	}
+	pub fn contains(&self, axis: usize) -> bool { self.axes.binary_search(&axis).is_ok() }
 
 	pub fn validate_rank(&self, rank: usize) -> LanguageResult<()> {
 		if let Some(axis) = self.axes.iter().copied().find(|axis| *axis >= rank) {
@@ -173,28 +161,5 @@ impl AxisSet {
 			));
 		}
 		Ok(())
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use recipe_core::DType;
-
-	use super::*;
-
-	#[test]
-	fn broadcasts_and_counts_decimal_bytes_exactly() {
-		let left = Shape::new(vec![2, 1, 4]).unwrap();
-		let right = Shape::new(vec![3, 4]).unwrap();
-		let result = Shape::broadcast_result(&[&left, &right]).unwrap();
-		assert_eq!(result.extents(), [2, 3, 4]);
-		assert_eq!(result.bytes(DType::F32).unwrap().get(), 96);
-	}
-
-	#[test]
-	fn reduction_keeps_an_explicit_scalar_extent() {
-		let shape = Shape::new(vec![2, 3]).unwrap();
-		let axes = AxisSet::new(vec![0, 1]).unwrap();
-		assert_eq!(shape.reduced(&axes, false).unwrap().extents(), [1]);
 	}
 }

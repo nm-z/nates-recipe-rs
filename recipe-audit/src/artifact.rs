@@ -1,5 +1,7 @@
-use crate::policy::classify_interface_symbol;
-use crate::{ElfFacts, Finding, FindingCategory, InterfaceClassification, LinkerInput, classify_library};
+use crate::{
+	ElfFacts, Finding, FindingCategory, InterfaceClassification, LinkerInput, classify_library,
+	policy::classify_interface_symbol,
+};
 
 /// Audit declarative and command-line linker inputs.
 #[must_use]
@@ -77,47 +79,4 @@ fn linker_candidates(argument: &str) -> Vec<&str> {
 	candidates.sort_unstable();
 	candidates.dedup();
 	candidates
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::ArtifactSymbol;
-
-	#[test]
-	fn static_link_inputs_are_caught_without_substring_matches() {
-		let findings = audit_linker_inputs(&[
-			LinkerInput::new("build.rs", 9, "-Wl,-Bstatic,-lrocblas,-Bdynamic"),
-			LinkerInput::new("build.rs", 10, "/opt/cuda/lib64/libcublas_static.a"),
-			LinkerInput::new("build.rs", 11, "-lrelationship"),
-		]);
-		assert_eq!(findings.len(), 2);
-		assert!(findings.iter().any(|finding| finding.symbol == "-lrocblas"));
-		assert!(
-			findings
-				.iter()
-				.any(|finding| finding.symbol == "/opt/cuda/lib64/libcublas_static.a")
-		);
-	}
-
-	#[test]
-	fn dynamic_needed_and_undefined_symbols_are_distinct() {
-		let facts = ElfFacts::new(
-			"target/app",
-			vec!["libcudart.so.11".into(), "libcuda.so.1".into()],
-			vec![
-				ArtifactSymbol::new("cudnnCreate"),
-				ArtifactSymbol::new("cuLaunchKernel"),
-				ArtifactSymbol::new("relationship"),
-			],
-		);
-		let findings = audit_elf_facts(&facts);
-		assert_eq!(findings.len(), 2);
-		assert!(findings.iter().any(|finding| {
-			finding.category == FindingCategory::DynamicNeeded && finding.symbol == "libcudart.so.11"
-		}));
-		assert!(findings.iter().any(|finding| {
-			finding.category == FindingCategory::UndefinedSymbol && finding.symbol == "cudnnCreate"
-		}));
-	}
 }

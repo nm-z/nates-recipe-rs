@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::error::{ValidationCode, ValidationResult, Validator};
-use crate::ids::{KernelInputId, KernelOutputId, KernelTemplateId, ScalarValueId};
-use crate::units::{ByteCount, ElementCount, UnitError};
+use crate::{
+	error::{ValidationCode, ValidationResult, Validator},
+	ids::{KernelInputId, KernelOutputId, KernelTemplateId, ScalarValueId},
+	units::{ByteCount, ElementCount, UnitError},
+};
 
 /// The complete calculation-payload type domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -127,14 +129,18 @@ impl ScalarOpcode {
 			| Self::Negate
 			| Self::Absolute
 			| Self::Minimum
-			| Self::Maximum => operands
-				.iter()
-				.all(|dtype| *dtype == operands[0])
-				.then_some(operands[0]),
-			Self::Fma => operands
-				.iter()
-				.all(|dtype| *dtype == DType::F32)
-				.then_some(DType::F32),
+			| Self::Maximum => {
+				operands
+					.iter()
+					.all(|dtype| *dtype == operands[0])
+					.then_some(operands[0])
+			}
+			Self::Fma => {
+				operands
+					.iter()
+					.all(|dtype| *dtype == DType::F32)
+					.then_some(DType::F32)
+			}
 			Self::Equal
 			| Self::NotEqual
 			| Self::LessThan
@@ -149,10 +155,12 @@ impl ScalarOpcode {
 			| Self::ShiftLeft
 			| Self::ShiftRightLogical
 			| Self::ShiftRightArithmetic
-			| Self::Require => operands
-				.iter()
-				.all(|dtype| *dtype == DType::I32)
-				.then_some(DType::I32),
+			| Self::Require => {
+				operands
+					.iter()
+					.all(|dtype| *dtype == DType::I32)
+					.then_some(DType::I32)
+			}
 			Self::BitcastF32ToI32 | Self::IsFinite | Self::IsNan | Self::ConvertF32ToI32 => {
 				(operands == [DType::F32]).then_some(DType::I32)
 			}
@@ -405,19 +413,13 @@ impl IndexSpace {
 	}
 
 	#[must_use]
-	pub fn dimensions(&self) -> &[ElementCount] {
-		&self.dimensions
-	}
+	pub fn dimensions(&self) -> &[ElementCount] { &self.dimensions }
 
 	#[must_use]
-	pub const fn elements(&self) -> ElementCount {
-		self.elements
-	}
+	pub const fn elements(&self) -> ElementCount { self.elements }
 
 	#[must_use]
-	pub fn is_structural_singleton(&self) -> bool {
-		self.elements.get() == 1
-	}
+	pub fn is_structural_singleton(&self) -> bool { self.elements.get() == 1 }
 }
 
 /// Immutable mapping from the kernel's logical index space into one backing
@@ -699,124 +701,5 @@ impl KernelTemplate {
 		}
 
 		validator.finish()
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	fn inplace_add_template() -> KernelTemplate {
-		let lhs = ScalarValueId::new(1);
-		let rhs = ScalarValueId::new(2);
-		let result = ScalarValueId::new(3);
-		KernelTemplate {
-			id: KernelTemplateId::new(1),
-			index_space: IndexSpace::new(vec![ElementCount::new(1024).unwrap()]).unwrap(),
-			inputs: vec![
-				KernelInput {
-					id: KernelInputId::new(1),
-					dtype: DType::F32,
-					access: StaticBufferAccess::linear(ElementCount::new(1024).unwrap(), DType::F32).unwrap(),
-				},
-				KernelInput {
-					id: KernelInputId::new(2),
-					dtype: DType::F32,
-					access: StaticBufferAccess::linear(ElementCount::new(1024).unwrap(), DType::F32).unwrap(),
-				},
-			],
-			outputs: vec![KernelOutput {
-				id: KernelOutputId::new(1),
-				dtype: DType::F32,
-				access: StaticBufferAccess::linear(ElementCount::new(1024).unwrap(), DType::F32).unwrap(),
-			}],
-			program: ScalarProgram {
-				inputs: vec![
-					ScalarInput {
-						id: lhs,
-						dtype: DType::F32,
-					},
-					ScalarInput {
-						id: rhs,
-						dtype: DType::F32,
-					},
-				],
-				constants: vec![],
-				instructions: vec![ScalarInstruction {
-					result,
-					dtype: DType::F32,
-					opcode: ScalarOpcode::Add,
-					operands: vec![lhs, rhs],
-				}],
-				outputs: vec![result],
-			},
-			alias_rules: vec![
-				AliasRule {
-					input: KernelInputId::new(1),
-					output: KernelOutputId::new(1),
-					permission: AliasPermission::MustAliasExact,
-				},
-				AliasRule {
-					input: KernelInputId::new(2),
-					output: KernelOutputId::new(1),
-					permission: AliasPermission::Forbidden,
-				},
-			],
-		}
-	}
-
-	#[test]
-	fn validates_typed_ssa_and_complete_in_place_policy() {
-		inplace_add_template().validate().unwrap();
-	}
-
-	#[test]
-	fn validates_static_buffer_bounds_and_rejects_overlapping_writes() {
-		let mut overlapping = inplace_add_template();
-		overlapping.outputs[0].access.strides[0] = 0;
-		let errors = overlapping.validate().unwrap_err();
-		assert!(errors.contains(ValidationCode::InvalidMemoryAccess));
-
-		let mut out_of_bounds = inplace_add_template();
-		out_of_bounds.inputs[0].access.offset_elements = 1024;
-		let errors = out_of_bounds.validate().unwrap_err();
-		assert!(errors.contains(ValidationCode::InvalidMemoryAccess));
-	}
-
-	#[test]
-	fn rejects_use_before_definition_and_type_mismatch() {
-		let mut template = inplace_add_template();
-		template.program.instructions[0].operands[1] = ScalarValueId::new(99);
-		template.program.instructions[0].dtype = DType::I32;
-		let errors = template.validate().unwrap_err();
-		assert!(errors.contains(ValidationCode::ScalarUseBeforeDefinition));
-		assert!(errors.contains(ValidationCode::ScalarTypeMismatch));
-	}
-
-	#[test]
-	fn rejects_incomplete_alias_matrix() {
-		let mut template = inplace_add_template();
-		template.alias_rules.pop();
-		let errors = template.validate().unwrap_err();
-		assert!(errors.contains(ValidationCode::MissingAliasRule));
-	}
-
-	#[test]
-	fn opcode_signatures_and_work_are_canonical() {
-		assert_eq!(ScalarOpcode::Select.arity(), 3);
-		assert_eq!(
-			ScalarOpcode::Select.result_dtype(&[DType::I32, DType::F32, DType::F32]),
-			Some(DType::F32)
-		);
-		assert_eq!(
-			ScalarOpcode::Select.result_dtype(&[DType::F32, DType::F32, DType::F32]),
-			None
-		);
-		assert_eq!(
-			ScalarOpcode::BitcastF32ToI32.result_dtype(&[DType::F32]),
-			Some(DType::I32)
-		);
-		assert_eq!(ScalarOpcode::Fma.flops(), 2);
-		assert_eq!(ScalarOpcode::Require.flops(), 0);
 	}
 }

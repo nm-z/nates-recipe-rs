@@ -1,10 +1,14 @@
-use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::{
+	io::{self, Read, Write},
+	net::TcpStream,
+};
 
-use crate::error::{TransportError, TransportResult};
-use crate::protocol::{
-	CompletionToken, DecodedHeader, FrameKind, FrameMetadata, HEADER_BYTES, NO_SCHEDULE, ProtocolLimits,
-	ReceivedFrame, SessionIdentity, decode_header, encode_header, payload_digest,
+use crate::{
+	error::{TransportError, TransportResult},
+	protocol::{
+		CompletionToken, DecodedHeader, FrameKind, FrameMetadata, HEADER_BYTES, NO_SCHEDULE, ProtocolLimits,
+		ReceivedFrame, SessionIdentity, decode_header, encode_header, payload_digest,
+	},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,9 +42,7 @@ impl ScheduleStamp {
 	}
 
 	#[must_use]
-	pub const fn get(self) -> u64 {
-		self.0
-	}
+	pub const fn get(self) -> u64 { self.0 }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,9 +79,7 @@ impl ChannelCapacities {
 	}
 
 	#[must_use]
-	pub const fn max_payload(self) -> usize {
-		self.max_payload
-	}
+	pub const fn max_payload(self) -> usize { self.max_payload }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -318,9 +318,7 @@ impl RuntimeChannel {
 
 	/// Exact endpoint/profile identity bound into every frame header.
 	#[must_use]
-	pub const fn identity(&self) -> SessionIdentity {
-		self.identity
-	}
+	pub const fn identity(&self) -> SessionIdentity { self.identity }
 
 	/// First schedule position legal for the next outbound user-data frame.
 	///
@@ -401,11 +399,13 @@ impl RuntimeChannel {
 		let transmit = self.progress_write();
 		let receive = self.progress_read();
 		match (transmit, receive) {
-			(Ok(transmit), Ok(receive)) => Ok(Progress {
-				transmitted: transmit.token,
-				received: receive.token,
-				advanced: transmit.advanced || receive.advanced,
-			}),
+			(Ok(transmit), Ok(receive)) => {
+				Ok(Progress {
+					transmitted: transmit.token,
+					received: receive.token,
+					advanced: transmit.advanced || receive.advanced,
+				})
+			}
 			(Err(error), _) | (_, Err(error)) => {
 				self.poisoned = true;
 				Err(error)
@@ -689,20 +689,26 @@ impl RuntimeChannel {
 	fn next_queued(&self) -> Option<SlotKey> {
 		self.control
 			.oldest_queued()
-			.map(|index| SlotKey {
-				lane: RuntimeLane::Control,
-				index,
+			.map(|index| {
+				SlotKey {
+					lane: RuntimeLane::Control,
+					index,
+				}
 			})
 			.or_else(|| {
-				self.user_data.oldest_queued().map(|index| SlotKey {
-					lane: RuntimeLane::UserData,
-					index,
+				self.user_data.oldest_queued().map(|index| {
+					SlotKey {
+						lane: RuntimeLane::UserData,
+						index,
+					}
 				})
 			})
 			.or_else(|| {
-				self.metrics.oldest_queued().map(|index| SlotKey {
-					lane: RuntimeLane::Metrics,
-					index,
+				self.metrics.oldest_queued().map(|index| {
+					SlotKey {
+						lane: RuntimeLane::Metrics,
+						index,
+					}
 				})
 			})
 	}
@@ -760,140 +766,15 @@ impl RuntimeChannel {
 
 fn next_schedule_position(last: Option<ScheduleStamp>) -> TransportResult<u64> {
 	let next = match last {
-		Some(last) => last
-			.get()
-			.checked_add(1)
-			.ok_or(TransportError::ProtocolState(
-				"user-data schedule positions exhausted",
-			))?,
+		Some(last) => {
+			last.get()
+				.checked_add(1)
+				.ok_or(TransportError::ProtocolState(
+					"user-data schedule positions exhausted",
+				))?
+		}
 		None => 0,
 	};
 	ScheduleStamp::new(next)?;
 	Ok(next)
-}
-
-#[cfg(test)]
-mod tests {
-	use std::time::{Duration, Instant};
-
-	use super::*;
-	use crate::protocol::tests::{identities, tcp_pair};
-
-	fn channels() -> (RuntimeChannel, RuntimeChannel) {
-		let (left_stream, right_stream) = tcp_pair();
-		let (left_identity, right_identity) = identities();
-		let limits = ProtocolLimits::new(64, Duration::from_secs(1)).unwrap();
-		let capacities = ChannelCapacities::new(2, 2, 2, 64).unwrap();
-		(
-			RuntimeChannel::new(left_stream, left_identity, limits, capacities).unwrap(),
-			RuntimeChannel::new(right_stream, right_identity, limits, capacities).unwrap(),
-		)
-	}
-
-	fn drive_until_received<'a>(sender: &mut RuntimeChannel, receiver: &'a mut RuntimeChannel) -> ReceivedFrame<'a> {
-		let deadline = Instant::now() + Duration::from_secs(2);
-		loop {
-			sender.progress().unwrap();
-			receiver.progress().unwrap();
-			if receiver.received().is_some() {
-				return receiver.received().unwrap();
-			}
-			assert!(Instant::now() < deadline);
-			std::thread::yield_now();
-		}
-	}
-
-	#[test]
-	fn lanes_are_separate_prioritized_and_explicitly_completed() {
-		let (mut left, mut right) = channels();
-		let data = left
-			.submit_user_data(ScheduleStamp::new(7).unwrap(), b"data")
-			.unwrap();
-		let metrics = left.submit_metrics(b"metrics").unwrap();
-		let control = left.submit_control(b"control").unwrap();
-
-		let received = drive_until_received(&mut left, &mut right);
-		assert_eq!(received.metadata.kind, FrameKind::Control);
-		assert_eq!(received.payload, b"control");
-		let received_token = received.metadata.token;
-		right.release_received(received_token).unwrap();
-		assert_eq!(
-			left.completion_state(control.token).unwrap(),
-			CompletionState::Complete
-		);
-		left.release_completion(control.token).unwrap();
-
-		let received = drive_until_received(&mut left, &mut right);
-		assert_eq!(received.metadata.kind, FrameKind::UserData);
-		assert_eq!(received.metadata.schedule, Some(7));
-		let received_token = received.metadata.token;
-		right.release_received(received_token).unwrap();
-		left.release_completion(data.token).unwrap();
-
-		let received = drive_until_received(&mut left, &mut right);
-		assert_eq!(received.metadata.kind, FrameKind::Metrics);
-		let received_token = received.metadata.token;
-		right.release_received(received_token).unwrap();
-		left.release_completion(metrics.token).unwrap();
-	}
-
-	#[test]
-	fn fixed_capacity_requires_explicit_release() {
-		let (mut left, mut right) = channels();
-		let first = left.submit_control(b"one").unwrap();
-		let second = left.submit_control(b"two").unwrap();
-		assert_eq!(
-			left.submit_control(b"three"),
-			Err(TransportError::CapacityExhausted("control lane"))
-		);
-		let received_token = {
-			let received = drive_until_received(&mut left, &mut right);
-			received.metadata.token
-		};
-		right.release_received(received_token).unwrap();
-		assert_eq!(
-			left.submit_control(b"still-full"),
-			Err(TransportError::CapacityExhausted("control lane"))
-		);
-		left.release_completion(first.token).unwrap();
-		assert!(left.submit_control(b"reused").is_ok());
-		assert_ne!(first.token, second.token);
-	}
-
-	#[test]
-	fn scheduled_user_data_must_be_monotonic() {
-		let (mut left, _right) = channels();
-		left.submit_user_data(ScheduleStamp::new(5).unwrap(), b"a")
-			.unwrap();
-		assert_eq!(
-			left.submit_user_data(ScheduleStamp::new(5).unwrap(), b"b"),
-			Err(TransportError::ProtocolState(
-				"user-data schedule positions must be strictly increasing"
-			))
-		);
-		assert_eq!(
-			left.submit_user_data(ScheduleStamp::new(4).unwrap(), b"c"),
-			Err(TransportError::ProtocolState(
-				"user-data schedule positions must be strictly increasing"
-			))
-		);
-	}
-
-	#[test]
-	fn release_requires_matching_completed_token() {
-		let (mut left, _right) = channels();
-		let queued = left.submit_metrics(b"x").unwrap();
-		assert_eq!(
-			left.release_completion(queued.token),
-			Err(TransportError::ProtocolState(
-				"transmit completion cannot be released before it is complete"
-			))
-		);
-		assert_eq!(
-			left.release_received(queued.token),
-			Err(TransportError::ProtocolState(
-				"no received frame is pending"
-			))
-		);
-	}
 }

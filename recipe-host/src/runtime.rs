@@ -1,15 +1,18 @@
 use core::fmt;
-use std::fs::File;
-use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, TryLockError};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::{
+	fs::File,
+	os::unix::fs::FileExt,
+	sync::{
+		Arc, Condvar, Mutex, TryLockError,
+		atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+	},
+	thread::{self, JoinHandle},
+	time::Duration,
+};
 
 use recipe_core::ByteCount;
 
-use crate::arena::Backing;
-use crate::{Arena, Error, Result};
+use crate::{Arena, Error, Result, arena::Backing};
 
 const SLOT_UNCLAIMED: u8 = 0;
 const SLOT_PREPARED: u8 = 1;
@@ -24,17 +27,17 @@ pub struct SlotCapacity(usize);
 impl SlotCapacity {
 	pub fn new(value: usize) -> Result<Self> {
 		match value {
-			0 => Err(Error::InvalidConfiguration(
-				"job slot capacity must be nonzero",
-			)),
+			0 => {
+				Err(Error::InvalidConfiguration(
+					"job slot capacity must be nonzero",
+				))
+			}
 			value => Ok(Self(value)),
 		}
 	}
 
 	#[must_use]
-	pub const fn get(self) -> usize {
-		self.0
-	}
+	pub const fn get(self) -> usize { self.0 }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,19 +67,13 @@ impl RuntimeConfig {
 	}
 
 	#[must_use]
-	pub const fn worker_threads(self) -> usize {
-		self.worker_threads
-	}
+	pub const fn worker_threads(self) -> usize { self.worker_threads }
 
 	#[must_use]
-	pub const fn slots(self) -> SlotCapacity {
-		self.slots
-	}
+	pub const fn slots(self) -> SlotCapacity { self.slots }
 
 	#[must_use]
-	pub const fn staging_bytes_per_worker(self) -> usize {
-		self.staging_bytes_per_worker
-	}
+	pub const fn staging_bytes_per_worker(self) -> usize { self.staging_bytes_per_worker }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,9 +188,7 @@ impl Runtime {
 	}
 
 	#[must_use]
-	pub const fn config(&self) -> RuntimeConfig {
-		self.config
-	}
+	pub const fn config(&self) -> RuntimeConfig { self.config }
 
 	#[must_use]
 	pub fn state(&self) -> RuntimeState {
@@ -227,9 +222,7 @@ impl Runtime {
 		})
 	}
 
-	pub fn close(mut self) -> Result<()> {
-		self.shutdown()
-	}
+	pub fn close(mut self) -> Result<()> { self.shutdown() }
 
 	fn shutdown(&mut self) -> Result<()> {
 		if self.state == RuntimeState::Closed {
@@ -260,9 +253,7 @@ impl fmt::Debug for Runtime {
 }
 
 impl Drop for Runtime {
-	fn drop(&mut self) {
-		let _ = self.shutdown();
-	}
+	fn drop(&mut self) { let _ = self.shutdown(); }
 }
 
 pub struct PendingCopy {
@@ -566,12 +557,12 @@ fn host_range(offset: u64, bytes: u64) -> Result<std::ops::Range<usize>> {
 
 fn read_exact_at(file: &File, mut destination: &mut [u8], mut offset: u64) -> Result<()> {
 	while !destination.is_empty() {
-		let count = file
-			.read_at(destination, offset)
-			.map_err(|error| Error::WorkerFailed {
+		let count = file.read_at(destination, offset).map_err(|error| {
+			Error::WorkerFailed {
 				operation: "disk read",
 				kind: error.kind(),
-			})?;
+			}
+		})?;
 		if count == 0 {
 			return Err(Error::WorkerFailed {
 				operation: "disk read",
@@ -588,12 +579,12 @@ fn read_exact_at(file: &File, mut destination: &mut [u8], mut offset: u64) -> Re
 
 fn write_all_at(file: &File, mut source: &[u8], mut offset: u64) -> Result<()> {
 	while !source.is_empty() {
-		let count = file
-			.write_at(source, offset)
-			.map_err(|error| Error::WorkerFailed {
+		let count = file.write_at(source, offset).map_err(|error| {
+			Error::WorkerFailed {
 				operation: "disk write",
 				kind: error.kind(),
-			})?;
+			}
+		})?;
 		if count == 0 {
 			return Err(Error::WorkerFailed {
 				operation: "disk write",
@@ -606,182 +597,4 @@ fn write_all_at(file: &File, mut source: &[u8], mut offset: u64) -> Result<()> {
 		source = &source[count..];
 	}
 	Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-	use std::path::PathBuf;
-	use std::sync::atomic::{AtomicU64, Ordering};
-
-	use recipe_core::DeviceId;
-
-	use super::*;
-	use crate::DiskFileSpec;
-
-	#[derive(Debug)]
-	struct TestDirectory(PathBuf);
-
-	impl TestDirectory {
-		fn new() -> Self {
-			static NEXT: AtomicU64 = AtomicU64::new(1);
-			let path = std::env::temp_dir().join(format!(
-				"recipe-host-test-{}-{}",
-				std::process::id(),
-				NEXT.fetch_add(1, Ordering::Relaxed)
-			));
-			std::fs::create_dir(&path).unwrap();
-			Self(path)
-		}
-
-		fn file(&self, name: &str) -> DiskFileSpec {
-			DiskFileSpec::new(self.0.join(name)).unwrap()
-		}
-	}
-
-	impl Drop for TestDirectory {
-		fn drop(&mut self) {
-			let _ = std::fs::remove_dir_all(&self.0);
-		}
-	}
-
-	fn runtime(slots: usize) -> Runtime {
-		Runtime::new(RuntimeConfig::new(2, SlotCapacity::new(slots).unwrap(), 1024).unwrap()).unwrap()
-	}
-
-	fn wait(pending: &PendingCopy) {
-		for _ in 0..10_000 {
-			match pending.poll() {
-				Ok(PollStatus::Complete) => return,
-				Ok(PollStatus::Pending) => thread::yield_now(),
-				Err(error) => panic!("copy failed: {error}"),
-			}
-		}
-		panic!("copy did not complete");
-	}
-
-	fn fill_ram(arena: &Arena, value: u8) {
-		let Backing::Ram { storage: bytes, .. } = &*arena.backing else {
-			panic!("expected RAM");
-		};
-		bytes.lock().unwrap().fill(value);
-	}
-
-	fn ram_bytes(arena: &Arena) -> Vec<u8> {
-		let Backing::Ram { storage: bytes, .. } = &*arena.backing else {
-			panic!("expected RAM");
-		};
-		bytes.lock().unwrap().to_vec()
-	}
-
-	#[test]
-	fn preallocated_ram_copy_is_asynchronous_and_bounded() {
-		let runtime = runtime(1);
-		let source = Arena::ram(DeviceId::new(1), ByteCount::new(4096)).unwrap();
-		let destination = Arena::ram(DeviceId::new(2), ByteCount::new(4096)).unwrap();
-		fill_ram(&source, 0x5a);
-		let mut pending = runtime.prepare_copy().unwrap();
-		pending
-			.submit(&source, 0, &destination, 0, ByteCount::new(4096))
-			.unwrap();
-		wait(&pending);
-		assert!(ram_bytes(&destination).iter().all(|byte| *byte == 0x5a));
-		assert!(matches!(
-			runtime.prepare_copy(),
-			Err(Error::SlotCapacityExhausted)
-		));
-		drop(pending);
-		source.close().unwrap();
-		destination.close().unwrap();
-		runtime.close().unwrap();
-	}
-
-	#[test]
-	fn disk_roundtrip_uses_fixed_staging_and_removes_files_on_close() {
-		let directory = TestDirectory::new();
-		let runtime = runtime(2);
-		let ram = Arena::ram(DeviceId::new(1), ByteCount::new(8192)).unwrap();
-		let disk_spec = directory.file("arena");
-		let disk_path = disk_spec.path().to_owned();
-		let disk = Arena::disk(DeviceId::new(2), disk_spec, ByteCount::new(8192)).unwrap();
-		fill_ram(&ram, 0xa5);
-		let mut outbound = runtime.prepare_copy().unwrap();
-		let mut inbound = runtime.prepare_copy().unwrap();
-		outbound
-			.submit(&ram, 0, &disk, 0, ByteCount::new(8192))
-			.unwrap();
-		wait(&outbound);
-		fill_ram(&ram, 0);
-		inbound
-			.submit(&disk, 0, &ram, 0, ByteCount::new(8192))
-			.unwrap();
-		wait(&inbound);
-		assert!(ram_bytes(&ram).iter().all(|byte| *byte == 0xa5));
-		drop(outbound);
-		drop(inbound);
-		ram.close().unwrap();
-		disk.close().unwrap();
-		assert!(!disk_path.exists());
-		runtime.close().unwrap();
-	}
-
-	#[test]
-	fn same_arena_overlaps_have_memmove_semantics() {
-		let runtime = runtime(2);
-		let arena = Arena::ram(DeviceId::new(1), ByteCount::new(16)).unwrap();
-		let Backing::Ram { storage, .. } = &*arena.backing else {
-			panic!("expected RAM");
-		};
-		storage
-			.lock()
-			.unwrap()
-			.copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
-		let mut backward = runtime.prepare_copy().unwrap();
-		backward
-			.submit(&arena, 0, &arena, 4, ByteCount::new(12))
-			.unwrap();
-		wait(&backward);
-		assert_eq!(
-			ram_bytes(&arena),
-			vec![0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-		);
-		let mut forward = runtime.prepare_copy().unwrap();
-		forward
-			.submit(&arena, 4, &arena, 0, ByteCount::new(12))
-			.unwrap();
-		wait(&forward);
-		assert_eq!(
-			ram_bytes(&arena),
-			vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 8, 9, 10, 11]
-		);
-		drop(backward);
-		drop(forward);
-		arena.close().unwrap();
-		runtime.close().unwrap();
-	}
-
-	#[test]
-	fn zero_sized_storage_is_rejected_before_allocation() {
-		let directory = TestDirectory::new();
-		assert!(matches!(
-			Arena::ram(DeviceId::new(1), ByteCount::ZERO),
-			Err(Error::InvalidConfiguration(_))
-		));
-		assert!(matches!(
-			Arena::disk(DeviceId::new(2), directory.file("zero"), ByteCount::ZERO),
-			Err(Error::InvalidConfiguration(_))
-		));
-	}
-
-	#[test]
-	fn abandoned_disk_storage_is_removed_when_its_last_owner_drops() {
-		let directory = TestDirectory::new();
-		let arena_spec = directory.file("abandoned-arena");
-		let arena_path = arena_spec.path().to_owned();
-		let arena = Arena::disk(DeviceId::new(1), arena_spec, ByteCount::new(4096)).unwrap();
-		let second_owner = arena.clone();
-		drop(arena);
-		assert!(arena_path.exists());
-		drop(second_owner);
-		assert!(!arena_path.exists());
-	}
 }

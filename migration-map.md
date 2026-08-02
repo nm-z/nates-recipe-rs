@@ -21,7 +21,7 @@ they do not import, compile, link, or dispatch the retired implementation.
 | model parsing | `recipe-ingest` | bounded dependency-clean framing |
 | tokenization and chat rendering | `recipe-text` | bounded pre-init host transformation |
 | training, inference, tree, and boosting behavior | the operation registry plus planner/executor pipeline | dense-binary training is end-to-end; remaining workflow families retain owned declarations and operation contracts |
-| legacy tests and examples | package-scoped replacement tests and examples | retired tests remain on `legacy`; replacement tests are authoritative on `main` |
+| legacy tests and examples | public real-data workloads and hardware acceptance commands | retired tests remain on `legacy`; only end-to-end native acceptance evidence is authoritative on `main` |
 
 ## Main-branch invariant
 

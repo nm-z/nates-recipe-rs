@@ -2,10 +2,12 @@ use recipe_core::{ByteCount, DeviceId, Digest, RunId, TaskId};
 use recipe_transport::RuntimeLane;
 use sha2::{Digest as _, Sha256};
 
-use crate::driver::DriverFault;
-use crate::model::{Capabilities, Manifest, RemoteIdentity, RemoteLimits};
-use crate::session::{CancelReason, RemoteMetricValue};
-use crate::{PROTOCOL_VERSION, RemoteError, RemoteResult};
+use crate::{
+	PROTOCOL_VERSION, RemoteError, RemoteResult,
+	driver::DriverFault,
+	model::{Capabilities, Manifest, RemoteIdentity, RemoteLimits},
+	session::{CancelReason, RemoteMetricValue},
+};
 
 const MAGIC: [u8; 8] = *b"RCPREM01";
 const HEADER_BYTES: usize = 28;
@@ -400,24 +402,26 @@ pub(crate) fn decode(payload: &[u8], limits: RemoteLimits) -> RemoteResult<Decod
 	let sequence = reader.u64()?;
 	let run = RunId::new(reader.u64()?);
 	let message = match tag {
-		1 => Message::Hello(WireHello {
-			role: PeerRole::decode(reader.u8()?)?,
-			capabilities: Capabilities::from_bits(reader.u64()?),
-			local_machine: reader.digest()?,
-			local_profile: reader.digest()?,
-			remote_machine: reader.digest()?,
-			remote_profile: reader.digest()?,
-			limits: [
-				reader.u64()?,
-				reader.u64()?,
-				reader.u64()?,
-				reader.u64()?,
-				reader.u64()?,
-				reader.u64()?,
-				reader.u64()?,
-				reader.u64()?,
-			],
-		}),
+		1 => {
+			Message::Hello(WireHello {
+				role: PeerRole::decode(reader.u8()?)?,
+				capabilities: Capabilities::from_bits(reader.u64()?),
+				local_machine: reader.digest()?,
+				local_profile: reader.digest()?,
+				remote_machine: reader.digest()?,
+				remote_profile: reader.digest()?,
+				limits: [
+					reader.u64()?,
+					reader.u64()?,
+					reader.u64()?,
+					reader.u64()?,
+					reader.u64()?,
+					reader.u64()?,
+					reader.u64()?,
+					reader.u64()?,
+				],
+			})
+		}
 		2 => {
 			let bundle = reader.digest()?;
 			let draft = reader.digest()?;
@@ -444,17 +448,21 @@ pub(crate) fn decode(payload: &[u8], limits: RemoteLimits) -> RemoteResult<Decod
 				artifact_bytes: reader.take(bytes)?,
 			})
 		}
-		3 => Message::ManifestAck {
-			manifest: reader.digest()?,
-			program: reader.digest()?,
-		},
+		3 => {
+			Message::ManifestAck {
+				manifest: reader.digest()?,
+				program: reader.digest()?,
+			}
+		}
 		4 => Message::Prepare,
 		5 => Message::PrepareAck,
-		6 => Message::InitBegin {
-			device: DeviceId::new(reader.u64()?),
-			bytes: ByteCount::new(reader.u64()?),
-			digest: reader.digest()?,
-		},
+		6 => {
+			Message::InitBegin {
+				device: DeviceId::new(reader.u64()?),
+				bytes: ByteCount::new(reader.u64()?),
+				digest: reader.digest()?,
+			}
+		}
 		7 => {
 			let device = DeviceId::new(reader.u64()?);
 			let offset = reader.u64()?;
@@ -466,31 +474,43 @@ pub(crate) fn decode(payload: &[u8], limits: RemoteLimits) -> RemoteResult<Decod
 				bytes: reader.take(bytes)?,
 			}
 		}
-		8 => Message::InitEnd {
-			device: DeviceId::new(reader.u64()?),
-			bytes: ByteCount::new(reader.u64()?),
-		},
-		9 => Message::InitAck {
-			device: DeviceId::new(reader.u64()?),
-		},
+		8 => {
+			Message::InitEnd {
+				device: DeviceId::new(reader.u64()?),
+				bytes: ByteCount::new(reader.u64()?),
+			}
+		}
+		9 => {
+			Message::InitAck {
+				device: DeviceId::new(reader.u64()?),
+			}
+		}
 		10 => Message::InitComplete,
 		11 => Message::InitCompleteAck,
-		12 => Message::Execute {
-			task: TaskId::new(reader.u64()?),
-		},
-		13 => Message::TaskComplete {
-			task: TaskId::new(reader.u64()?),
-		},
-		14 => Message::TaskFailed {
-			task: TaskId::new(reader.u64()?),
-			fault: DriverFault {
-				code: reader.u32()?,
-				detail: reader.u64()?,
-			},
-		},
-		15 => Message::DataRequest {
-			task: TaskId::new(reader.u64()?),
-		},
+		12 => {
+			Message::Execute {
+				task: TaskId::new(reader.u64()?),
+			}
+		}
+		13 => {
+			Message::TaskComplete {
+				task: TaskId::new(reader.u64()?),
+			}
+		}
+		14 => {
+			Message::TaskFailed {
+				task: TaskId::new(reader.u64()?),
+				fault: DriverFault {
+					code: reader.u32()?,
+					detail: reader.u64()?,
+				},
+			}
+		}
+		15 => {
+			Message::DataRequest {
+				task: TaskId::new(reader.u64()?),
+			}
+		}
 		16 => {
 			let task = TaskId::new(reader.u64()?);
 			let bytes = usize::try_from(reader.u32()?)
@@ -500,9 +520,11 @@ pub(crate) fn decode(payload: &[u8], limits: RemoteLimits) -> RemoteResult<Decod
 				bytes: reader.take(bytes)?,
 			}
 		}
-		17 => Message::DataAck {
-			task: TaskId::new(reader.u64()?),
-		},
+		17 => {
+			Message::DataAck {
+				task: TaskId::new(reader.u64()?),
+			}
+		}
 		18 => {
 			let task = TaskId::new(reader.u64()?);
 			let kind = reader.u8()?;
@@ -514,26 +536,34 @@ pub(crate) fn decode(payload: &[u8], limits: RemoteLimits) -> RemoteResult<Decod
 			};
 			Message::Metric { task, value }
 		}
-		19 => Message::Cancel {
-			reason: CancelReason::new(reader.u32()?),
-		},
+		19 => {
+			Message::Cancel {
+				reason: CancelReason::new(reader.u32()?),
+			}
+		}
 		20 => Message::CancelAck,
 		21 => Message::BeginExit,
 		22 => Message::ExitReady,
-		23 => Message::Release {
-			device: DeviceId::new(reader.u64()?),
-		},
-		24 => Message::ReleaseAck {
-			device: DeviceId::new(reader.u64()?),
-		},
+		23 => {
+			Message::Release {
+				device: DeviceId::new(reader.u64()?),
+			}
+		}
+		24 => {
+			Message::ReleaseAck {
+				device: DeviceId::new(reader.u64()?),
+			}
+		}
 		25 => Message::ExitComplete,
 		26 => Message::ExitAck,
-		27 => Message::DriverFault {
-			fault: DriverFault {
-				code: reader.u32()?,
-				detail: reader.u64()?,
-			},
-		},
+		27 => {
+			Message::DriverFault {
+				fault: DriverFault {
+					code: reader.u32()?,
+					detail: reader.u64()?,
+				},
+			}
+		}
 		_ => return Err(RemoteError::Codec("unknown message tag")),
 	};
 	if !reader.is_empty() {
@@ -584,9 +614,7 @@ struct Writer<'a> {
 }
 
 impl<'a> Writer<'a> {
-	const fn new(buffer: &'a mut [u8]) -> Self {
-		Self { buffer, cursor: 0 }
-	}
+	const fn new(buffer: &'a mut [u8]) -> Self { Self { buffer, cursor: 0 } }
 
 	fn bytes(&mut self, bytes: &[u8]) -> RemoteResult<()> {
 		let end = self
@@ -602,29 +630,17 @@ impl<'a> Writer<'a> {
 		Ok(())
 	}
 
-	fn u8(&mut self, value: u8) -> RemoteResult<()> {
-		self.bytes(&[value])
-	}
+	fn u8(&mut self, value: u8) -> RemoteResult<()> { self.bytes(&[value]) }
 
-	fn u16(&mut self, value: u16) -> RemoteResult<()> {
-		self.bytes(&value.to_le_bytes())
-	}
+	fn u16(&mut self, value: u16) -> RemoteResult<()> { self.bytes(&value.to_le_bytes()) }
 
-	fn u32(&mut self, value: u32) -> RemoteResult<()> {
-		self.bytes(&value.to_le_bytes())
-	}
+	fn u32(&mut self, value: u32) -> RemoteResult<()> { self.bytes(&value.to_le_bytes()) }
 
-	fn u64(&mut self, value: u64) -> RemoteResult<()> {
-		self.bytes(&value.to_le_bytes())
-	}
+	fn u64(&mut self, value: u64) -> RemoteResult<()> { self.bytes(&value.to_le_bytes()) }
 
-	fn digest(&mut self, value: Digest) -> RemoteResult<()> {
-		self.bytes(&value.bytes())
-	}
+	fn digest(&mut self, value: Digest) -> RemoteResult<()> { self.bytes(&value.bytes()) }
 
-	const fn finish(self) -> usize {
-		self.cursor
-	}
+	const fn finish(self) -> usize { self.cursor }
 }
 
 struct Reader<'a> {
@@ -633,9 +649,7 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-	const fn new(bytes: &'a [u8]) -> Self {
-		Self { bytes, cursor: 0 }
-	}
+	const fn new(bytes: &'a [u8]) -> Self { Self { bytes, cursor: 0 } }
 
 	fn take(&mut self, length: usize) -> RemoteResult<&'a [u8]> {
 		let end = self
@@ -656,27 +670,15 @@ impl<'a> Reader<'a> {
 			.map_err(|_| RemoteError::Codec("fixed-width field is truncated"))
 	}
 
-	fn u8(&mut self) -> RemoteResult<u8> {
-		Ok(self.array::<1>()?[0])
-	}
+	fn u8(&mut self) -> RemoteResult<u8> { Ok(self.array::<1>()?[0]) }
 
-	fn u16(&mut self) -> RemoteResult<u16> {
-		Ok(u16::from_le_bytes(self.array()?))
-	}
+	fn u16(&mut self) -> RemoteResult<u16> { Ok(u16::from_le_bytes(self.array()?)) }
 
-	fn u32(&mut self) -> RemoteResult<u32> {
-		Ok(u32::from_le_bytes(self.array()?))
-	}
+	fn u32(&mut self) -> RemoteResult<u32> { Ok(u32::from_le_bytes(self.array()?)) }
 
-	fn u64(&mut self) -> RemoteResult<u64> {
-		Ok(u64::from_le_bytes(self.array()?))
-	}
+	fn u64(&mut self) -> RemoteResult<u64> { Ok(u64::from_le_bytes(self.array()?)) }
 
-	fn digest(&mut self) -> RemoteResult<Digest> {
-		Ok(Digest::new(self.array()?))
-	}
+	fn digest(&mut self) -> RemoteResult<Digest> { Ok(Digest::new(self.array()?)) }
 
-	fn is_empty(&self) -> bool {
-		self.cursor == self.bytes.len()
-	}
+	fn is_empty(&self) -> bool { self.cursor == self.bytes.len() }
 }

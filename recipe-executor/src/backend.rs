@@ -1,6 +1,4 @@
-use std::collections::BTreeMap;
-use std::error::Error;
-use std::fmt::Debug;
+use std::{collections::BTreeMap, error::Error, fmt::Debug};
 
 use recipe_core::{
 	ArenaLayout, ArtifactId, ByteCount, DeviceId, FinalizedBundle, KernelTemplateId, LinkId, LoopIteration, MetricId,
@@ -134,28 +132,20 @@ impl<'a, A> ArenaSet<'a, A> {
 	/// This is public only for composite backends and pre-final warm
 	/// executors. Callers cannot mutate or extend the arena map through it.
 	#[doc(hidden)]
-	pub const fn new(arenas: &'a BTreeMap<DeviceId, A>) -> Self {
-		Self { arenas }
-	}
+	pub const fn new(arenas: &'a BTreeMap<DeviceId, A>) -> Self { Self { arenas } }
 
 	#[must_use]
-	pub fn get(&self, device: DeviceId) -> Option<&A> {
-		self.arenas.get(&device)
-	}
+	pub fn get(&self, device: DeviceId) -> Option<&A> { self.arenas.get(&device) }
 
 	pub fn iter(&self) -> impl ExactSizeIterator<Item = (DeviceId, &A)> {
 		self.arenas.iter().map(|(device, arena)| (*device, arena))
 	}
 
 	#[must_use]
-	pub fn len(&self) -> usize {
-		self.arenas.len()
-	}
+	pub fn len(&self) -> usize { self.arenas.len() }
 
 	#[must_use]
-	pub fn is_empty(&self) -> bool {
-		self.arenas.is_empty()
-	}
+	pub fn is_empty(&self) -> bool { self.arenas.is_empty() }
 }
 
 /// Nonblocking result of querying one backend completion token.
@@ -291,27 +281,23 @@ impl PhysicalCallBatch {
 	}
 
 	pub fn iter(&self) -> impl Iterator<Item = PhysicalCall> + '_ {
-		self.calls[..self.len()].iter().map(|call| match call {
-			Some(call) => *call,
-			None => unreachable!("the initialized physical-call prefix contains records"),
+		self.calls[..self.len()].iter().map(|call| {
+			match call {
+				Some(call) => *call,
+				None => unreachable!("the initialized physical-call prefix contains records"),
+			}
 		})
 	}
 
 	#[must_use]
-	pub fn len(&self) -> usize {
-		usize::from(self.len)
-	}
+	pub fn len(&self) -> usize { usize::from(self.len) }
 
 	#[must_use]
-	pub const fn is_empty(&self) -> bool {
-		self.len == 0
-	}
+	pub const fn is_empty(&self) -> bool { self.len == 0 }
 }
 
 impl Default for PhysicalCallBatch {
-	fn default() -> Self {
-		Self::new()
-	}
+	fn default() -> Self { Self::new() }
 }
 
 /// A backend attempted to exceed its fixed per-operation reporting bound.
@@ -381,9 +367,17 @@ pub trait Backend: sealed::Sealed {
 	/// The compatibility default is one-shot only. Executors reject bundles
 	/// whose loop count exceeds one unless the backend opts in.
 	#[must_use]
-	fn supports_loop_repetition(&self) -> bool {
-		false
-	}
+	fn supports_loop_repetition(&self) -> bool { false }
+
+	/// Reports whether one loop task may be submitted behind an incomplete
+	/// predecessor on the same native submission queue.
+	///
+	/// The default preserves completion-token ownership for backends whose
+	/// pending objects must reach terminal state before another submission can
+	/// reuse the queue. Backends opting in must make queue ordering sufficient
+	/// and keep every submitted task's resources live until the queue is idle.
+	#[must_use]
+	fn supports_same_queue_pipelining(&self, _resource: &Self::Resource, _task: TaskId) -> bool { false }
 
 	fn submit(
 		&mut self,

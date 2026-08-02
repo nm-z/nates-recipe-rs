@@ -1,11 +1,12 @@
-use crate::discovery::DeviceInfo;
-use crate::driver::Driver;
-use crate::error::{CudaError, Result};
-use crate::ffi::CuContext;
-use core::marker::PhantomData;
-use core::ops::Deref;
-use core::ptr;
+use core::{marker::PhantomData, ops::Deref, ptr};
 use std::rc::Rc;
+
+use crate::{
+	discovery::DeviceInfo,
+	driver::Driver,
+	error::{CudaError, Result},
+	ffi::CuContext,
+};
 
 const CU_CTX_SCHED_MASK: u32 = 0x07;
 const CU_CTX_SCHED_AUTO: u32 = 0x00;
@@ -132,9 +133,7 @@ impl Context {
 		})
 	}
 
-	pub fn device(&self) -> &DeviceInfo {
-		&self.device
-	}
+	pub fn device(&self) -> &DeviceInfo { &self.device }
 
 	pub fn enter(&self) -> Result<ContextGuard<'_>> {
 		let raw = self.raw.ok_or(CudaError::ContextClosed)?;
@@ -147,9 +146,7 @@ impl Context {
 		})
 	}
 
-	pub fn as_raw(&self) -> Result<*mut core::ffi::c_void> {
-		self.raw.ok_or(CudaError::ContextClosed)
-	}
+	pub fn as_raw(&self) -> Result<*mut core::ffi::c_void> { self.raw.ok_or(CudaError::ContextClosed) }
 
 	/// Returns the driver's current free and total memory counters for this
 	/// exact context device.
@@ -168,17 +165,11 @@ impl Context {
 		})
 	}
 
-	pub(crate) fn driver(&self) -> &Driver {
-		&self.driver
-	}
+	pub(crate) fn driver(&self) -> &Driver { &self.driver }
 
-	pub(crate) fn same_context(&self, other: &Self) -> bool {
-		core::ptr::eq(self, other)
-	}
+	pub(crate) fn same_context(&self, other: &Self) -> bool { core::ptr::eq(self, other) }
 
-	pub fn close(mut self) -> Result<()> {
-		self.destroy()
-	}
+	pub fn close(mut self) -> Result<()> { self.destroy() }
 
 	fn destroy(&mut self) -> Result<()> {
 		let raw = self.raw.take().ok_or(CudaError::ContextClosed)?;
@@ -218,9 +209,7 @@ pub struct ContextGuard<'a> {
 }
 
 impl ContextGuard<'_> {
-	pub fn leave(mut self) -> Result<()> {
-		self.pop()
-	}
+	pub fn leave(mut self) -> Result<()> { self.pop() }
 
 	fn pop(&mut self) -> Result<()> {
 		let expected = self.context.raw.ok_or(CudaError::ContextClosed)?;
@@ -239,9 +228,7 @@ impl ContextGuard<'_> {
 impl Deref for ContextGuard<'_> {
 	type Target = Context;
 
-	fn deref(&self) -> &Self::Target {
-		self.context
-	}
+	fn deref(&self) -> &Self::Target { self.context }
 }
 
 impl Drop for ContextGuard<'_> {
@@ -249,51 +236,5 @@ impl Drop for ContextGuard<'_> {
 		if self.active {
 			let _ = self.pop();
 		}
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::ffi::test_support;
-	use crate::ffi::test_support::{
-		CONTEXT_CREATES, CONTEXT_DESTROYS, CONTEXT_POPS, CONTEXT_PUSHES, reset_context_counts,
-	};
-	use core::sync::atomic::Ordering;
-	use std::sync::Mutex;
-
-	static CONTEXT_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-	#[test]
-	fn context_is_detached_then_explicitly_scoped_and_destroyed() {
-		let _lock = CONTEXT_TEST_LOCK.lock().unwrap();
-		reset_context_counts();
-		let driver = Driver::from_test_api(test_support::api(false));
-		let discovery = driver.discover().unwrap();
-		let context = Context::create(
-			&driver,
-			&discovery.devices[0],
-			ContextFlags::new(SchedulingPolicy::BlockingSync).with_map_host(true),
-		)
-		.unwrap();
-		assert_eq!(CONTEXT_CREATES.load(Ordering::SeqCst), 1);
-		assert_eq!(CONTEXT_POPS.load(Ordering::SeqCst), 1);
-		{
-			let guard = context.enter().unwrap();
-			assert_eq!(guard.device().ordinal.get(), 0);
-			guard.leave().unwrap();
-		}
-		assert_eq!(CONTEXT_PUSHES.load(Ordering::SeqCst), 1);
-		assert_eq!(CONTEXT_POPS.load(Ordering::SeqCst), 2);
-		context.close().unwrap();
-		assert_eq!(CONTEXT_DESTROYS.load(Ordering::SeqCst), 1);
-	}
-
-	#[test]
-	fn invalid_combined_scheduling_flags_fail_closed() {
-		assert!(matches!(
-			ContextFlags::from_bits(CU_CTX_SCHED_SPIN | CU_CTX_SCHED_YIELD),
-			Err(CudaError::InvalidContextFlags { .. })
-		));
 	}
 }

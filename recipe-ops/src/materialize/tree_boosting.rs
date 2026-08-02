@@ -5,14 +5,13 @@ use recipe_language::{
 	ScatterConflict, Shape, Sort, SortDirection, Tensor,
 };
 
-use crate::{OperationDescriptor, OperationErrorKind, OperationId, OperationResult};
-
 use super::{
 	Emitter, FamilyDispatch, KernelEmission, MAX_I32_INDEX, MaterializationRequest, emit_tree_leaf_split,
 	identity_program, input, language_error, operation_error, output, prepared_f32, prepared_tree_lanes,
 	prepared_u64, request_error, require_dtype, require_exact_abi, require_shape, require_true, scalar_binary,
 	scalar_builder, scalar_f32, scalar_finish, scalar_input, scalar_ternary, scalar_unary,
 };
+use crate::{OperationDescriptor, OperationErrorKind, OperationId, OperationResult};
 
 const OPERATIONS: &[(&str, &str)] = &[
 	("gpu_argmax_write_split", "gpu-core/src/kernels.rs:4155"),
@@ -73,11 +72,13 @@ pub(super) fn dispatch(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 					emit_leaf_prediction(request, emitter)
 				}
 				"gpu_write_split" => emit_write_split(request, emitter),
-				symbol => Err(operation_error(
-					request.descriptor.id,
-					OperationErrorKind::GraphMaterializationFailed,
-					format!("tree/boosting dispatch is incomplete for {symbol}"),
-				)),
+				symbol => {
+					Err(operation_error(
+						request.descriptor.id,
+						OperationErrorKind::GraphMaterializationFailed,
+						format!("tree/boosting dispatch is incomplete for {symbol}"),
+					))
+				}
 			};
 			FamilyDispatch::Owned(result)
 		}
@@ -127,12 +128,13 @@ fn emit_argmax_split(request: &MaterializationRequest<'_>, emitter: &mut Emitter
 }
 
 fn emit_bootstrap_sample(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["row_ids"],
-		&["sampled_rows"],
-		&["rows", "samples", "seed_low", "seed_high", "stream"],
-	)?;
+	require_exact_abi(request, &["row_ids"], &["sampled_rows"], &[
+		"rows",
+		"samples",
+		"seed_low",
+		"seed_high",
+		"stream",
+	])?;
 	let row_ids = input(request, "row_ids")?;
 	let sampled_rows = output(request, "sampled_rows")?;
 	let rows = prepared_dimension(request, "rows")?;
@@ -316,27 +318,31 @@ fn emit_tree_histogram(
 	)?;
 	let histogram_bins =
 		u32::try_from(bins).map_err(|conversion_error| request_error(request, conversion_error.to_string()))?;
-	let weighted = |weights, destination| KernelEmission {
-		inputs: vec![mapped_bins, weights],
-		outputs: vec![destination],
-		kind: PrimitiveKind::Histogram(Histogram {
-			bins: histogram_bins,
-			weighted: true,
-			ordering: AtomicOrdering::SequentiallyConsistent,
-		}),
+	let weighted = |weights, destination| {
+		KernelEmission {
+			inputs: vec![mapped_bins, weights],
+			outputs: vec![destination],
+			kind: PrimitiveKind::Histogram(Histogram {
+				bins: histogram_bins,
+				weighted: true,
+				ordering: AtomicOrdering::SequentiallyConsistent,
+			}),
+		}
 	};
 	let mut kernels = vec![
 		weighted(mapped_gradients, gradient_histogram.id),
 		weighted(mapped_hessians, hessian_histogram.id),
 	];
-	kernels.extend(count_histogram.map(|tensor| KernelEmission {
-		inputs: vec![mapped_bins],
-		outputs: vec![tensor.id],
-		kind: PrimitiveKind::Histogram(Histogram {
-			bins: histogram_bins,
-			weighted: false,
-			ordering: AtomicOrdering::SequentiallyConsistent,
-		}),
+	kernels.extend(count_histogram.map(|tensor| {
+		KernelEmission {
+			inputs: vec![mapped_bins],
+			outputs: vec![tensor.id],
+			kind: PrimitiveKind::Histogram(Histogram {
+				bins: histogram_bins,
+				weighted: false,
+				ordering: AtomicOrdering::SequentiallyConsistent,
+			}),
+		}
 	}));
 	emitter.emit_stage(kernels)
 }
@@ -371,10 +377,12 @@ fn emit_regularized_leaf(
 	let hessians = input(request, "hessian_contributions")?;
 	let leaf_value = output(request, "leaf_value")?;
 	let sum_outputs = match expose_sums {
-		true => Some((
-			output(request, "leaf_gradient")?,
-			output(request, "leaf_hessian")?,
-		)),
+		true => {
+			Some((
+				output(request, "leaf_gradient")?,
+				output(request, "leaf_hessian")?,
+			))
+		}
 		false => None,
 	};
 	let contributions = prepared_dimension(request, "contributions")?;
@@ -406,14 +414,16 @@ fn emit_regularized_leaf(
 
 	let gradient_histogram = emitter.intermediate(DType::F32, scalar_shape(request)?)?;
 	let hessian_histogram = emitter.intermediate(DType::F32, scalar_shape(request)?)?;
-	let histogram = |weights, destination| KernelEmission {
-		inputs: vec![leaf_indices.id, weights],
-		outputs: vec![destination],
-		kind: PrimitiveKind::Histogram(Histogram {
-			bins: 1,
-			weighted: true,
-			ordering: AtomicOrdering::SequentiallyConsistent,
-		}),
+	let histogram = |weights, destination| {
+		KernelEmission {
+			inputs: vec![leaf_indices.id, weights],
+			outputs: vec![destination],
+			kind: PrimitiveKind::Histogram(Histogram {
+				bins: 1,
+				weighted: true,
+				ordering: AtomicOrdering::SequentiallyConsistent,
+			}),
+		}
 	};
 	emitter.emit_stage([
 		histogram(gradients.id, gradient_histogram),
@@ -683,14 +693,16 @@ fn emit_two_bin_split(request: &MaterializationRequest<'_>, emitter: &mut Emitte
 
 	let copied_gradients = emitter.intermediate(DType::F32, gradients.shape.clone())?;
 	let copied_hessians = emitter.intermediate(DType::F32, hessians.shape.clone())?;
-	let weighted_histogram = |weights, destination| KernelEmission {
-		inputs: vec![bin_indices.id, weights],
-		outputs: vec![destination],
-		kind: PrimitiveKind::Histogram(Histogram {
-			bins: 2,
-			weighted: true,
-			ordering: AtomicOrdering::SequentiallyConsistent,
-		}),
+	let weighted_histogram = |weights, destination| {
+		KernelEmission {
+			inputs: vec![bin_indices.id, weights],
+			outputs: vec![destination],
+			kind: PrimitiveKind::Histogram(Histogram {
+				bins: 2,
+				weighted: true,
+				ordering: AtomicOrdering::SequentiallyConsistent,
+			}),
+		}
 	};
 	emitter.emit_stage([
 		weighted_histogram(gradients.id, copied_gradients),
@@ -880,12 +892,11 @@ fn emit_ordered_target_statistics(
 }
 
 fn emit_random_threshold(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
-		&["minimum", "maximum"],
-		&["threshold"],
-		&["seed_low", "seed_high", "stream"],
-	)?;
+	require_exact_abi(request, &["minimum", "maximum"], &["threshold"], &[
+		"seed_low",
+		"seed_high",
+		"stream",
+	])?;
 	let minimum = input(request, "minimum")?;
 	let maximum = input(request, "maximum")?;
 	let threshold = output(request, "threshold")?;
@@ -1089,18 +1100,18 @@ fn shape(request: &MaterializationRequest<'_>, extents: &[u64]) -> OperationResu
 	Shape::new(extents.to_vec()).map_err(|error| language_error(request.descriptor.id, error.to_string()))
 }
 
-fn scalar_shape(request: &MaterializationRequest<'_>) -> OperationResult<Shape> {
-	shape(request, &[1])
-}
+fn scalar_shape(request: &MaterializationRequest<'_>) -> OperationResult<Shape> { shape(request, &[1]) }
 
 fn prepared_dimension(request: &MaterializationRequest<'_>, name: &str) -> OperationResult<u64> {
 	let value = prepared_u64(request.descriptor.id, request.parameters, name)?;
 	match value > 0 && value <= MAX_I32_INDEX {
 		true => Ok(value),
-		false => Err(unsupported(
-			request,
-			format!("{name} must be in 1..={MAX_I32_INDEX}, got {value}"),
-		)),
+		false => {
+			Err(unsupported(
+				request,
+				format!("{name} must be in 1..={MAX_I32_INDEX}, got {value}"),
+			))
+		}
 	}
 }
 
@@ -1129,10 +1140,12 @@ fn finite_nonnegative(request: &MaterializationRequest<'_>, name: &str) -> Opera
 	let value = finite_parameter(request, name)?;
 	match value >= 0.0 {
 		true => Ok(value),
-		false => Err(request_error(
-			request,
-			format!("{name} must be nonnegative"),
-		)),
+		false => {
+			Err(request_error(
+				request,
+				format!("{name} must be nonnegative"),
+			))
+		}
 	}
 }
 

@@ -1,5 +1,4 @@
-use std::env;
-use std::fs;
+use std::{env, fs};
 
 use recipe_core::{
 	AliasPermission, AliasRule, DType, ElementCount, IndexSpace, KernelInput, KernelInputId, KernelOutput,
@@ -81,25 +80,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	};
 	let target_text = target.to_string_lossy();
 	let target = match target_text.as_ref() {
-		"gfx1101" => KernelTarget::Amd(AmdTarget {
-			target_id: "gfx1101".to_owned(),
-			code_object_version: 6,
-		}),
-		"sm_86" => KernelTarget::Nvidia(NvidiaTarget {
-			sm_major: 8,
-			sm_minor: 6,
-			ptx_isa: 75,
-		}),
+		"gfx1101" => {
+			KernelTarget::Amd(AmdTarget {
+				target_id: "gfx1101".to_owned(),
+				code_object_version: 6,
+			})
+		}
+		"sm_86" => {
+			KernelTarget::Nvidia(NvidiaTarget {
+				sm_major: 8,
+				sm_minor: 6,
+				ptx_isa: 75,
+			})
+		}
 		_ => return Err("example accepts gfx1101 or sm_86".into()),
 	};
-	let lowered = lower_elementwise(
-		&template,
-		&target,
-		&LoweringOptions {
-			entry_symbol: "recipe_add_f32".to_owned(),
-			workgroup_lanes: 256,
-		},
-	)?;
+	let lowered = lower_elementwise(&template, &target, &LoweringOptions {
+		entry_symbol: "recipe_add_f32".to_owned(),
+		workgroup_lanes: 256,
+	})?;
 	let artifact = fs::read(artifact)?;
 	match target {
 		KernelTarget::Amd(target) => {

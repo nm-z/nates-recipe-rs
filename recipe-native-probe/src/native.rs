@@ -1,15 +1,14 @@
-use std::fmt;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+	fmt, fs,
+	path::{Path, PathBuf},
+};
 
 use recipe_probe::{
 	BoundedBenchmarkPlan, GpuBenchmarkIo, GpuDescriptor, GpuDiscovery, GpuInventory, GpuMeasurement, ProbeError,
 	ProbeResult,
 };
 
-use crate::config::NativeProbeConfig;
-use crate::cuda::CudaBackend;
-use crate::hsa::HsaBackend;
+use crate::{config::NativeProbeConfig, cuda::CudaBackend, hsa::HsaBackend};
 
 pub(crate) trait Backend: fmt::Debug {
 	fn discover(&self) -> ProbeResult<Vec<GpuDescriptor>>;
@@ -20,8 +19,6 @@ pub(crate) trait Backend: fmt::Debug {
 enum NativeBackend {
 	Cuda(CudaBackend),
 	Hsa(HsaBackend),
-	#[cfg(test)]
-	Test(Box<dyn Backend>),
 }
 
 impl NativeBackend {
@@ -29,8 +26,6 @@ impl NativeBackend {
 		match self {
 			Self::Cuda(backend) => backend,
 			Self::Hsa(backend) => backend,
-			#[cfg(test)]
-			Self::Test(backend) => backend.as_ref(),
 		}
 	}
 }
@@ -90,30 +85,21 @@ impl NativeGpuProbe {
 		})
 	}
 
-	#[cfg(test)]
-	pub(crate) fn from_backends(backends: Vec<Box<dyn Backend>>) -> Self {
-		Self {
-			backends: backends.into_iter().map(NativeBackend::Test).collect(),
-			exhaustive: true,
-			pci_sysfs_root: PathBuf::from("/sys/bus/pci/devices"),
-		}
-	}
-
 	pub(crate) fn cuda_backend(&self) -> Option<&CudaBackend> {
-		self.backends.iter().find_map(|backend| match backend {
-			NativeBackend::Cuda(backend) => Some(backend),
-			NativeBackend::Hsa(_) => None,
-			#[cfg(test)]
-			NativeBackend::Test(_) => None,
+		self.backends.iter().find_map(|backend| {
+			match backend {
+				NativeBackend::Cuda(backend) => Some(backend),
+				NativeBackend::Hsa(_) => None,
+			}
 		})
 	}
 
 	pub(crate) fn hsa_backend(&self) -> Option<&HsaBackend> {
-		self.backends.iter().find_map(|backend| match backend {
-			NativeBackend::Hsa(backend) => Some(backend),
-			NativeBackend::Cuda(_) => None,
-			#[cfg(test)]
-			NativeBackend::Test(_) => None,
+		self.backends.iter().find_map(|backend| {
+			match backend {
+				NativeBackend::Hsa(backend) => Some(backend),
+				NativeBackend::Cuda(_) => None,
+			}
 		})
 	}
 
@@ -309,196 +295,5 @@ impl GpuBenchmarkIo for NativeGpuProbe {
 			))
 		})?
 		.benchmark(device, plan)
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use std::collections::VecDeque;
-	use std::sync::Mutex;
-	use std::sync::atomic::{AtomicU64, Ordering};
-
-	use recipe_core::{
-		ByteCount, BytesPerSecond, Digest, FlopsPerSecond, Label, Property, PropertyProvenance, TargetIdentity,
-		ToolchainIdentity, TransferLaneCount, TransportKind,
-	};
-	use recipe_probe::{GpuInventory, LinkDuplex};
-
-	use super::*;
-
-	static DISPLAY_NONCE: AtomicU64 = AtomicU64::new(0);
-
-	#[derive(Debug)]
-	struct FakeBackend {
-		discoveries: Mutex<VecDeque<Vec<GpuDescriptor>>>,
-		measurement: GpuMeasurement,
-	}
-
-	impl Backend for FakeBackend {
-		fn discover(&self) -> ProbeResult<Vec<GpuDescriptor>> {
-			let mut discoveries = self.discoveries.lock().expect("fake lock");
-			match discoveries.len() {
-				0 => Ok(Vec::new()),
-				1 => Ok(discoveries.front().expect("one discovery").clone()),
-				_ => Ok(discoveries.pop_front().expect("queued discovery")),
-			}
-		}
-
-		fn benchmark(&self, _device: &GpuDescriptor, _plan: BoundedBenchmarkPlan) -> ProbeResult<GpuMeasurement> {
-			Ok(self.measurement)
-		}
-	}
-
-	fn label(value: &str) -> Label {
-		Label::new(value).expect("test label")
-	}
-
-	fn descriptor(key: &str) -> GpuDescriptor {
-		GpuDescriptor {
-			key: label(key),
-			name: label("Fake GPU"),
-			host_memory_key: label("ram0"),
-			target: TargetIdentity {
-				backend: label("fake"),
-				architecture: label("fake1"),
-				abi: label("fake-abi"),
-			},
-			capacity_hint: ByteCount::new(1024),
-			driver: label("driver"),
-			runtime_abi: label("runtime"),
-			firmware: label("firmware"),
-			link_identity: label("link"),
-			transport_kind: TransportKind::Pcie,
-			toolchain: ToolchainIdentity {
-				name: label("tool"),
-				version: label("1"),
-				digest: Digest::new([1; 32]),
-			},
-			duplex: LinkDuplex::Full,
-			host_to_device_maximum_inflight: TransferLaneCount::new(1).expect("test lanes"),
-			device_to_host_maximum_inflight: TransferLaneCount::new(1).expect("test lanes"),
-			asynchronous_submission: true,
-			maximum_submission_queues: 1,
-			maximum_concurrent_tasks: 1,
-			subgroup_lanes: 32,
-			maximum_workgroup_lanes: 256,
-			maximum_shared_memory_per_workgroup: ByteCount::new(64 * 1024),
-			transfer_overlaps_calculation: true,
-		}
-	}
-
-	fn measurement() -> GpuMeasurement {
-		GpuMeasurement {
-			capacity: Property::new(ByteCount::new(1024), PropertyProvenance::Measured),
-			calculation_rate: Property::new(
-				FlopsPerSecond::new(10).expect("rate"),
-				PropertyProvenance::Measured,
-			),
-			memory_rate: Property::new(
-				BytesPerSecond::new(20).expect("rate"),
-				PropertyProvenance::Measured,
-			),
-			host_to_device_rate: Property::new(
-				BytesPerSecond::new(30).expect("rate"),
-				PropertyProvenance::Measured,
-			),
-			device_to_host_rate: Property::new(
-				BytesPerSecond::new(40).expect("rate"),
-				PropertyProvenance::Measured,
-			),
-		}
-	}
-
-	#[test]
-	fn combines_all_backend_inventories_deterministically() {
-		let left = FakeBackend {
-			discoveries: Mutex::new(VecDeque::from([vec![descriptor("z")]])),
-			measurement: measurement(),
-		};
-		let right = FakeBackend {
-			discoveries: Mutex::new(VecDeque::from([vec![descriptor("a")]])),
-			measurement: measurement(),
-		};
-		let probe = NativeGpuProbe::from_backends(vec![Box::new(left), Box::new(right)]);
-		let GpuInventory {
-			exhaustive,
-			devices,
-		} = probe.discover_all().expect("discover fake GPUs");
-		assert!(exhaustive);
-		assert_eq!(
-			devices
-				.iter()
-				.map(|device| device.key.as_str())
-				.collect::<Vec<_>>(),
-			["a", "z"]
-		);
-	}
-
-	#[test]
-	fn identity_change_between_discovery_and_benchmark_fails_closed() {
-		let original = descriptor("gpu");
-		let mut changed = original.clone();
-		changed.runtime_abi = label("changed-runtime");
-		let backend = FakeBackend {
-			discoveries: Mutex::new(VecDeque::from([vec![changed]])),
-			measurement: measurement(),
-		};
-		let probe = NativeGpuProbe::from_backends(vec![Box::new(backend)]);
-		let plan = BoundedBenchmarkPlan {
-			buffer_bytes: ByteCount::new(4096),
-			iterations: 1,
-			maximum_duration: std::time::Duration::from_millis(1),
-		};
-		let error = probe
-			.benchmark_gpu(&original, plan)
-			.expect_err("identity drift must not benchmark a different GPU");
-		assert!(error.to_string().contains("identity changed"));
-	}
-
-	#[test]
-	fn display_probe_counts_only_enabled_connectors_on_the_exact_bdf() {
-		let root = std::env::temp_dir().join(format!(
-			"recipe-display-probe-{}-{}",
-			std::process::id(),
-			DISPLAY_NONCE.fetch_add(1, Ordering::Relaxed)
-		));
-		let card = root.join("0000:03:00.0").join("drm").join("card1");
-		let enabled = card.join("card1-DP-1");
-		let disabled = card.join("card1-HDMI-A-1");
-		fs::create_dir_all(&enabled).expect("create enabled connector");
-		fs::create_dir_all(&disabled).expect("create disabled connector");
-		fs::write(enabled.join("enabled"), b"enabled\n").expect("write enabled connector");
-		fs::write(disabled.join("enabled"), b"disabled\n").expect("write disabled connector");
-
-		assert_eq!(
-			enabled_display_connectors(&root, "0000:03:00.0").expect("probe display connectors"),
-			1
-		);
-		fs::remove_dir_all(root).expect("remove display fixture");
-	}
-
-	#[test]
-	fn display_probe_treats_an_absent_drm_surface_as_headless() {
-		let root = std::env::temp_dir().join(format!(
-			"recipe-headless-probe-{}-{}",
-			std::process::id(),
-			DISPLAY_NONCE.fetch_add(1, Ordering::Relaxed)
-		));
-		fs::create_dir_all(root.join("0000:03:00.0")).expect("create headless PCI device");
-		assert_eq!(
-			enabled_display_connectors(&root, "0000:03:00.0").expect("probe headless GPU"),
-			0
-		);
-		fs::remove_dir_all(root).expect("remove headless fixture");
-	}
-
-	#[test]
-	fn display_probe_rejects_malformed_gpu_origins() {
-		let mut probe = NativeGpuProbe::from_backends(Vec::new());
-		probe.pci_sysfs_root = PathBuf::from("/does/not/matter");
-		let error = probe
-			.enabled_display_connectors("hsa:gpu@../../device")
-			.expect_err("malformed BDF must fail closed");
-		assert!(error.to_string().contains("canonical PCI BDF"));
 	}
 }

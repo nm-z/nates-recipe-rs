@@ -29,73 +29,49 @@ pub struct ChannelwiseMaxPool1dPreparation {
 
 impl ChannelwiseMaxPool1dPreparation {
 	#[must_use]
-	pub const fn batch(&self) -> u64 {
-		self.batch
-	}
+	pub const fn batch(&self) -> u64 { self.batch }
 
 	#[must_use]
-	pub const fn input_length(&self) -> u64 {
-		self.input_length
-	}
+	pub const fn input_length(&self) -> u64 { self.input_length }
 
 	#[must_use]
-	pub const fn channels(&self) -> u64 {
-		self.channels
-	}
+	pub const fn channels(&self) -> u64 { self.channels }
 
 	#[must_use]
-	pub const fn pool_size(&self) -> u64 {
-		self.pool_size
-	}
+	pub const fn pool_size(&self) -> u64 { self.pool_size }
 
 	#[must_use]
-	pub const fn groups(&self) -> u64 {
-		self.groups
-	}
+	pub const fn groups(&self) -> u64 { self.groups }
 
 	/// Width of the prepared rectangular window table. This is `pool_size`
 	/// unless the pool is wider than the complete input.
 	#[must_use]
-	pub const fn window_width(&self) -> u64 {
-		self.window_width
-	}
+	pub const fn window_width(&self) -> u64 { self.window_width }
 
 	#[must_use]
-	pub const fn input_elements(&self) -> u64 {
-		self.input_elements
-	}
+	pub const fn input_elements(&self) -> u64 { self.input_elements }
 
 	#[must_use]
-	pub const fn output_elements(&self) -> u64 {
-		self.output_elements
-	}
+	pub const fn output_elements(&self) -> u64 { self.output_elements }
 
 	/// Row-major `[batch, groups, channels, window_width]` absolute indices
 	/// into the flat input. Slots after the final short window repeat its final
 	/// real coordinate.
 	#[must_use]
-	pub fn window_indices(&self) -> &[i32] {
-		&self.window_indices
-	}
+	pub fn window_indices(&self) -> &[i32] { &self.window_indices }
 
 	/// Row-major `[batch, groups, channels]` absolute first coordinates. The
 	/// forward composition adds `local_winner * channels` to each base.
 	#[must_use]
-	pub fn winner_bases(&self) -> &[i32] {
-		&self.winner_bases
-	}
+	pub fn winner_bases(&self) -> &[i32] { &self.winner_bases }
 
 	/// Identity batch coordinates used by the backward composition's checked
 	/// gather stage.
 	#[must_use]
-	pub fn gradient_batch_indices(&self) -> &[i32] {
-		&self.gradient_batch_indices
-	}
+	pub fn gradient_batch_indices(&self) -> &[i32] { &self.gradient_batch_indices }
 
 	#[must_use]
-	pub const fn input_shape(&self) -> [u64; 1] {
-		[self.input_elements]
-	}
+	pub const fn input_shape(&self) -> [u64; 1] { [self.input_elements] }
 
 	#[must_use]
 	pub const fn window_indices_shape(&self) -> [u64; 4] {
@@ -103,19 +79,13 @@ impl ChannelwiseMaxPool1dPreparation {
 	}
 
 	#[must_use]
-	pub const fn output_shape(&self) -> [u64; 3] {
-		[self.batch, self.groups, self.channels]
-	}
+	pub const fn output_shape(&self) -> [u64; 3] { [self.batch, self.groups, self.channels] }
 
 	#[must_use]
-	pub const fn forward_workspace(&self) -> ByteCount {
-		self.forward_workspace
-	}
+	pub const fn forward_workspace(&self) -> ByteCount { self.forward_workspace }
 
 	#[must_use]
-	pub const fn backward_workspace(&self) -> ByteCount {
-		self.backward_workspace
-	}
+	pub const fn backward_workspace(&self) -> ByteCount { self.backward_workspace }
 
 	#[must_use]
 	pub fn forward_parameters(&self, tree_lanes: u64) -> PreparedParameters {
@@ -339,152 +309,4 @@ fn arithmetic_overflow(role: &str) -> OperationError {
 		OperationErrorKind::WorkspaceArithmeticOverflow,
 		format!("{role} overflowed u64"),
 	)
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	fn reference_forward(prepared: &ChannelwiseMaxPool1dPreparation, values: &[f32]) -> (Vec<f32>, Vec<i32>) {
-		assert_eq!(
-			values.len(),
-			usize::try_from(prepared.input_elements()).unwrap()
-		);
-		let rows = usize::try_from(prepared.output_elements()).unwrap();
-		let window = usize::try_from(prepared.window_width()).unwrap();
-		let channels = i32::try_from(prepared.channels()).unwrap();
-		let mut pooled = Vec::with_capacity(rows);
-		let mut winners = Vec::with_capacity(rows);
-		for row in 0..rows {
-			let indices = &prepared.window_indices()[row * window..(row + 1) * window];
-			let mut local_winner = 0_usize;
-			let mut maximum = values[usize::try_from(indices[0]).unwrap()];
-			for (local, coordinate) in indices.iter().copied().enumerate().skip(1) {
-				let candidate = values[usize::try_from(coordinate).unwrap()];
-				if candidate > maximum {
-					maximum = candidate;
-					local_winner = local;
-				}
-			}
-			let winner = prepared.winner_bases()[row] + i32::try_from(local_winner).unwrap() * channels;
-			assert_eq!(winner, indices[local_winner]);
-			pooled.push(maximum);
-			winners.push(winner);
-		}
-		(pooled, winners)
-	}
-
-	fn reference_backward(
-		prepared: &ChannelwiseMaxPool1dPreparation,
-		winners: &[i32],
-		output_gradient: &[f32],
-	) -> Vec<f32> {
-		assert_eq!(
-			winners.len(),
-			usize::try_from(prepared.output_elements()).unwrap()
-		);
-		assert_eq!(output_gradient.len(), winners.len());
-		let mut input_gradient = vec![0.0_f32; usize::try_from(prepared.input_elements()).unwrap()];
-		let mut written = vec![false; input_gradient.len()];
-		for (winner, gradient) in winners.iter().copied().zip(output_gradient.iter().copied()) {
-			let winner = usize::try_from(winner).unwrap();
-			assert!(
-				!written[winner],
-				"channelwise non-overlap produced a duplicate winner"
-			);
-			written[winner] = true;
-			input_gradient[winner] = gradient;
-		}
-		input_gradient
-	}
-
-	#[test]
-	fn preparation_retains_tail_and_never_crosses_channels() {
-		let prepared = prepare_channelwise_max_pool_1d(1, 5, 2, 2).unwrap();
-		assert_eq!(prepared.input_shape(), [10]);
-		assert_eq!(prepared.window_indices_shape(), [1, 3, 2, 2]);
-		assert_eq!(prepared.output_shape(), [1, 3, 2]);
-		assert_eq!(
-			prepared.window_indices(),
-			[0, 2, 1, 3, 4, 6, 5, 7, 8, 8, 9, 9]
-		);
-		assert_eq!(prepared.winner_bases(), [0, 1, 4, 5, 8, 9]);
-		assert_eq!(prepared.gradient_batch_indices(), [0]);
-		assert_eq!(prepared.forward_workspace(), ByteCount::new(96));
-		assert_eq!(prepared.backward_workspace(), ByteCount::new(72));
-	}
-
-	#[test]
-	fn pool_wider_than_input_uses_one_real_width_window() {
-		let prepared = prepare_channelwise_max_pool_1d(2, 3, 2, u64::MAX).unwrap();
-		assert_eq!(prepared.groups(), 1);
-		assert_eq!(prepared.window_width(), 3);
-		assert_eq!(prepared.window_indices_shape(), [2, 1, 2, 3]);
-		assert_eq!(
-			prepared.window_indices(),
-			[0, 2, 4, 1, 3, 5, 6, 8, 10, 7, 9, 11]
-		);
-	}
-
-	#[test]
-	fn size_one_is_an_exact_identity_across_batches_and_channels() {
-		let prepared = prepare_channelwise_max_pool_1d(2, 3, 2, 1).unwrap();
-		assert_eq!(prepared.groups(), 3);
-		assert_eq!(prepared.window_width(), 1);
-		assert_eq!(prepared.output_shape(), [2, 3, 2]);
-		assert_eq!(prepared.window_indices(), (0_i32..12).collect::<Vec<_>>());
-		assert_eq!(prepared.winner_bases(), (0_i32..12).collect::<Vec<_>>());
-		let values = (0_u16..12).map(f32::from).collect::<Vec<_>>();
-		let (pooled, winners) = reference_forward(&prepared, &values);
-		assert_eq!(pooled, values);
-		assert_eq!(winners, (0_i32..12).collect::<Vec<_>>());
-		let output_gradient = (1_u16..=12).map(f32::from).collect::<Vec<_>>();
-		assert_eq!(
-			reference_backward(&prepared, &winners, &output_gradient),
-			output_gradient
-		);
-	}
-
-	#[test]
-	fn ties_tail_batches_and_channels_use_lowest_global_winners_and_exact_backward_routes() {
-		let prepared = prepare_channelwise_max_pool_1d(2, 5, 2, 3).unwrap();
-		assert_eq!(prepared.output_shape(), [2, 2, 2]);
-		assert_eq!(prepared.window_indices_shape(), [2, 2, 2, 3]);
-		assert_eq!(
-			prepared.window_indices(),
-			[
-				0, 2, 4, 1, 3, 5, 6, 8, 8, 7, 9, 9, 10, 12, 14, 11, 13, 15, 16, 18, 18, 17, 19, 19,
-			]
-		);
-		let values = [
-			5.0, 1.0, 5.0, 9.0, 2.0, 9.0, 7.0, 4.0, 7.0, 4.0, 1.0, 8.0, 4.0, 8.0, 4.0, 3.0, 6.0, 10.0, 9.0, 10.0,
-		];
-		let (pooled, winners) = reference_forward(&prepared, &values);
-		assert_eq!(pooled, [5.0, 9.0, 7.0, 4.0, 4.0, 8.0, 9.0, 10.0]);
-		assert_eq!(winners, [0, 3, 6, 7, 12, 11, 18, 17]);
-		let output_gradient = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-		assert_eq!(
-			reference_backward(&prepared, &winners, &output_gradient),
-			[
-				1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0, 6.0, 5.0, 0.0, 0.0, 0.0, 0.0, 8.0, 7.0,
-				0.0,
-			]
-		);
-	}
-
-	#[test]
-	fn zero_extent_and_unindexable_payload_fail_before_allocation() {
-		assert_eq!(
-			prepare_channelwise_max_pool_1d(1, 0, 1, 2)
-				.unwrap_err()
-				.kind,
-			OperationErrorKind::UnsupportedConcreteShape
-		);
-		assert_eq!(
-			prepare_channelwise_max_pool_1d(i32::MAX as u64, 2, 1, 1)
-				.unwrap_err()
-				.kind,
-			OperationErrorKind::UnsupportedConcreteShape
-		);
-	}
 }

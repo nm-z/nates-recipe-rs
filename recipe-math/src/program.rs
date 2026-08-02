@@ -223,33 +223,23 @@ fn emit_sine_cosine_core(
 	let reduced = builder.ternary(ScalarOpcode::Fma, nearest, negative_low, reduced_high)?;
 	let squared = builder.binary(ScalarOpcode::Multiply, reduced, reduced)?;
 
-	let sine_polynomial = horner(
-		builder,
-		squared,
-		1.589_691e-10,
-		&[
-			-2.505_076e-8,
-			2.755_731_4e-6,
-			-1.984_127e-4,
-			8.333_334e-3,
-			-1.666_666_7e-1,
-		],
-	)?;
+	let sine_polynomial = horner(builder, squared, 1.589_691e-10, &[
+		-2.505_076e-8,
+		2.755_731_4e-6,
+		-1.984_127e-4,
+		8.333_334e-3,
+		-1.666_666_7e-1,
+	])?;
 	let reduced_cubed = builder.binary(ScalarOpcode::Multiply, reduced, squared)?;
 	let sine = builder.ternary(ScalarOpcode::Fma, reduced_cubed, sine_polynomial, reduced)?;
 
-	let cosine_polynomial = horner(
-		builder,
-		squared,
-		-1.135_965e-11,
-		&[
-			2.087_572_3e-9,
-			-2.755_731_4e-7,
-			2.480_158_8e-5,
-			-1.388_888_9e-3,
-			4.166_666_8e-2,
-		],
-	)?;
+	let cosine_polynomial = horner(builder, squared, -1.135_965e-11, &[
+		2.087_572_3e-9,
+		-2.755_731_4e-7,
+		2.480_158_8e-5,
+		-1.388_888_9e-3,
+		4.166_666_8e-2,
+	])?;
 	let negative_half = builder.f32(-0.5)?;
 	let cosine_inner = builder.ternary(ScalarOpcode::Fma, squared, cosine_polynomial, negative_half)?;
 	let one = builder.f32(1.0)?;
@@ -282,19 +272,14 @@ fn emit_sine_cosine_core(
 
 fn emit_atan_polynomial(builder: &mut ScalarProgramBuilder, x: ScalarExpression) -> LanguageResult<ScalarExpression> {
 	let squared = builder.binary(ScalarOpcode::Multiply, x, x)?;
-	let polynomial = horner(
-		builder,
-		squared,
-		-1.0 / 15.0,
-		&[
-			1.0 / 13.0,
-			-1.0 / 11.0,
-			1.0 / 9.0,
-			-1.0 / 7.0,
-			1.0 / 5.0,
-			-1.0 / 3.0,
-		],
-	)?;
+	let polynomial = horner(builder, squared, -1.0 / 15.0, &[
+		1.0 / 13.0,
+		-1.0 / 11.0,
+		1.0 / 9.0,
+		-1.0 / 7.0,
+		1.0 / 5.0,
+		-1.0 / 3.0,
+	])?;
 	let cubed = builder.binary(ScalarOpcode::Multiply, x, squared)?;
 	builder.ternary(ScalarOpcode::Fma, cubed, polynomial, x)
 }
@@ -371,20 +356,15 @@ fn emit_exp_reconstruction(
 	let reduced_high = builder.ternary(ScalarOpcode::Fma, nearest, negative_high, x)?;
 	let negative_low = builder.f32(-LOG_TWO_LOW)?;
 	let reduced = builder.ternary(ScalarOpcode::Fma, nearest, negative_low, reduced_high)?;
-	let polynomial = horner(
-		builder,
-		reduced,
-		1.0 / 5040.0,
-		&[
-			1.0 / 720.0,
-			1.0 / 120.0,
-			1.0 / 24.0,
-			1.0 / 6.0,
-			0.5,
-			1.0,
-			1.0,
-		],
-	)?;
+	let polynomial = horner(builder, reduced, 1.0 / 5040.0, &[
+		1.0 / 720.0,
+		1.0 / 120.0,
+		1.0 / 24.0,
+		1.0 / 6.0,
+		0.5,
+		1.0,
+		1.0,
+	])?;
 
 	let exponent = builder.unary(ScalarOpcode::ConvertF32ToI32, nearest)?;
 	let bias = builder.i32(127)?;
@@ -424,20 +404,15 @@ fn emit_expm1_core(builder: &mut ScalarProgramBuilder, x: ScalarExpression) -> L
 	let absolute = builder.unary(ScalarOpcode::Absolute, x)?;
 	let cutoff = builder.f32(0.25)?;
 	let use_series = builder.binary(ScalarOpcode::LessThanOrEqual, absolute, cutoff)?;
-	let series_polynomial = horner(
-		builder,
-		x,
-		1.0 / 40320.0,
-		&[
-			1.0 / 5040.0,
-			1.0 / 720.0,
-			1.0 / 120.0,
-			1.0 / 24.0,
-			1.0 / 6.0,
-			0.5,
-			1.0,
-		],
-	)?;
+	let series_polynomial = horner(builder, x, 1.0 / 40320.0, &[
+		1.0 / 5040.0,
+		1.0 / 720.0,
+		1.0 / 120.0,
+		1.0 / 24.0,
+		1.0 / 6.0,
+		0.5,
+		1.0,
+	])?;
 	let series = builder.binary(ScalarOpcode::Multiply, x, series_polynomial)?;
 	let exponential = emit_exp_core(builder, x)?;
 	let one = builder.f32(1.0)?;
@@ -499,12 +474,14 @@ fn emit_log_core(builder: &mut ScalarProgramBuilder, x: ScalarExpression) -> Lan
 	let denominator = builder.binary(ScalarOpcode::Add, mantissa, one)?;
 	let y = builder.binary(ScalarOpcode::Divide, numerator, denominator)?;
 	let y_squared = builder.binary(ScalarOpcode::Multiply, y, y)?;
-	let series = horner(
-		builder,
-		y_squared,
-		1.0 / 13.0,
-		&[1.0 / 11.0, 1.0 / 9.0, 1.0 / 7.0, 1.0 / 5.0, 1.0 / 3.0, 1.0],
-	)?;
+	let series = horner(builder, y_squared, 1.0 / 13.0, &[
+		1.0 / 11.0,
+		1.0 / 9.0,
+		1.0 / 7.0,
+		1.0 / 5.0,
+		1.0 / 3.0,
+		1.0,
+	])?;
 	let twice_y = builder.binary(ScalarOpcode::Add, y, y)?;
 	let mantissa_log = builder.binary(ScalarOpcode::Multiply, twice_y, series)?;
 	let exponent = builder.unary(ScalarOpcode::ConvertI32ToF32, exponent)?;
@@ -518,24 +495,19 @@ fn emit_log1p_core(builder: &mut ScalarProgramBuilder, x: ScalarExpression) -> L
 	let absolute = builder.unary(ScalarOpcode::Absolute, x)?;
 	let cutoff = builder.f32(0.25)?;
 	let use_series = builder.binary(ScalarOpcode::LessThanOrEqual, absolute, cutoff)?;
-	let series_polynomial = horner(
-		builder,
-		x,
-		-1.0 / 12.0,
-		&[
-			1.0 / 11.0,
-			-1.0 / 10.0,
-			1.0 / 9.0,
-			-1.0 / 8.0,
-			1.0 / 7.0,
-			-1.0 / 6.0,
-			1.0 / 5.0,
-			-0.25,
-			1.0 / 3.0,
-			-0.5,
-			1.0,
-		],
-	)?;
+	let series_polynomial = horner(builder, x, -1.0 / 12.0, &[
+		1.0 / 11.0,
+		-1.0 / 10.0,
+		1.0 / 9.0,
+		-1.0 / 8.0,
+		1.0 / 7.0,
+		-1.0 / 6.0,
+		1.0 / 5.0,
+		-0.25,
+		1.0 / 3.0,
+		-0.5,
+		1.0,
+	])?;
 	let series = builder.binary(ScalarOpcode::Multiply, x, series_polynomial)?;
 	let one = builder.f32(1.0)?;
 	let shifted = builder.binary(ScalarOpcode::Add, one, x)?;
@@ -608,12 +580,12 @@ fn emit_erf_core(builder: &mut ScalarProgramBuilder, x: ScalarExpression) -> Lan
 	let one = builder.f32(1.0)?;
 	let denominator = builder.binary(ScalarOpcode::Add, one, scaled)?;
 	let t = builder.binary(ScalarOpcode::Divide, one, denominator)?;
-	let polynomial = horner(
-		builder,
-		t,
-		1.061_405_4,
-		&[-1.453_152_1, 1.421_413_8, -0.284_496_72, 0.254_829_6],
-	)?;
+	let polynomial = horner(builder, t, 1.061_405_4, &[
+		-1.453_152_1,
+		1.421_413_8,
+		-0.284_496_72,
+		0.254_829_6,
+	])?;
 	let polynomial = builder.binary(ScalarOpcode::Multiply, polynomial, t)?;
 	let squared = builder.binary(ScalarOpcode::Multiply, absolute, absolute)?;
 	let negative_squared = builder.unary(ScalarOpcode::Negate, squared)?;

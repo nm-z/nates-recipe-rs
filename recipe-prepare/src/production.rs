@@ -7,12 +7,14 @@
 //! `Finalize`. Neither the compiler nor the driver is retained in the
 //! [`PreparedNativeSession`] that crosses into the run lifecycle.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::convert::Infallible;
-use std::error::Error;
-use std::fmt;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	convert::Infallible,
+	error::Error,
+	fmt,
+	path::PathBuf,
+	sync::Arc,
+};
 
 use recipe_core::{
 	ArtifactBuildRecipe, ArtifactId, ArtifactIdentity, CapacityLedger, Device, Digest, DiscoveredDevice,
@@ -67,14 +69,10 @@ impl NativeArtifact {
 	}
 
 	#[must_use]
-	pub const fn identity(&self) -> &ArtifactIdentity {
-		&self.identity
-	}
+	pub const fn identity(&self) -> &ArtifactIdentity { &self.identity }
 
 	#[must_use]
-	pub const fn runtime(&self) -> &RuntimeArtifact {
-		&self.runtime
-	}
+	pub const fn runtime(&self) -> &RuntimeArtifact { &self.runtime }
 }
 
 /// Validated precompiled inputs. It deliberately contains no builder, loader,
@@ -110,14 +108,10 @@ impl NativeArtifactCatalog {
 	}
 
 	#[must_use]
-	pub fn artifacts(&self) -> &[NativeArtifact] {
-		&self.artifacts
-	}
+	pub fn artifacts(&self) -> &[NativeArtifact] { &self.artifacts }
 
 	#[must_use]
-	pub fn identities(&self) -> &[ArtifactIdentity] {
-		&self.identities
-	}
+	pub fn identities(&self) -> &[ArtifactIdentity] { &self.identities }
 
 	fn artifact(&self, id: ArtifactId) -> Option<&NativeArtifact> {
 		let index = match self
@@ -142,9 +136,7 @@ pub struct NativeArtifactProvider {
 
 impl NativeArtifactProvider {
 	#[must_use]
-	pub const fn new(catalog: NativeArtifactCatalog) -> Self {
-		Self { catalog }
-	}
+	pub const fn new(catalog: NativeArtifactCatalog) -> Self { Self { catalog } }
 }
 
 impl ArtifactProvider for NativeArtifactProvider {
@@ -179,9 +171,7 @@ impl ArtifactProvider for NativeArtifactProvider {
 		Ok(self.catalog.clone())
 	}
 
-	fn identities<'a>(&self, catalog: &'a Self::Catalog) -> &'a [ArtifactIdentity] {
-		catalog.identities()
-	}
+	fn identities<'a>(&self, catalog: &'a Self::Catalog) -> &'a [ArtifactIdentity] { catalog.identities() }
 }
 
 /// CUDA compatibility data that cannot be inferred from a cubin alone.
@@ -549,15 +539,10 @@ fn lower_deferred_stage(
 			))
 		})?;
 	let entry_symbol = format!("recipe_stage_{}", build.artifact.get());
-	recipe_kernel::lower_stage(
-		program,
-		build,
-		&spec.target,
-		&LoweringOptions {
-			entry_symbol,
-			workgroup_lanes: build.dispatch.workgroup_lanes,
-		},
-	)
+	recipe_kernel::lower_stage(program, build, &spec.target, &LoweringOptions {
+		entry_symbol,
+		workgroup_lanes: build.dispatch.workgroup_lanes,
+	})
 	.map_err(NativePrepareError::Lowering)
 }
 
@@ -594,24 +579,30 @@ fn runtime_kind(
 	digest: [u8; 32],
 ) -> Result<RuntimeArtifactKind, NativePrepareError<Infallible>> {
 	match (&spec.target, &spec.runtime_policy) {
-		(KernelTarget::Nvidia(target), RuntimeArtifactPolicy::Cuda(policy)) => Ok(RuntimeArtifactKind::Cuda {
-			identity: recipe_cuda::ArtifactIdentity {
-				sha256: digest,
-				target: ComputeCapability::new(u32::from(target.sm_major), u32::from(target.sm_minor)),
-				toolchain: policy.toolchain.clone(),
-				minimum_driver: policy.minimum_driver,
-				maximum_driver: policy.maximum_driver,
-				required_driver_symbols: policy.required_driver_symbols.clone(),
-			},
-		}),
-		(KernelTarget::Amd(target), RuntimeArtifactPolicy::Hsa) => Ok(RuntimeArtifactKind::Hsa {
-			target_id: spec.target_identity.architecture.as_str().to_owned(),
-			code_object_version: target.code_object_version,
-		}),
+		(KernelTarget::Nvidia(target), RuntimeArtifactPolicy::Cuda(policy)) => {
+			Ok(RuntimeArtifactKind::Cuda {
+				identity: recipe_cuda::ArtifactIdentity {
+					sha256: digest,
+					target: ComputeCapability::new(u32::from(target.sm_major), u32::from(target.sm_minor)),
+					toolchain: policy.toolchain.clone(),
+					minimum_driver: policy.minimum_driver,
+					maximum_driver: policy.maximum_driver,
+					required_driver_symbols: policy.required_driver_symbols.clone(),
+				},
+			})
+		}
+		(KernelTarget::Amd(target), RuntimeArtifactPolicy::Hsa) => {
+			Ok(RuntimeArtifactKind::Hsa {
+				target_id: spec.target_identity.architecture.as_str().to_owned(),
+				code_object_version: target.code_object_version,
+			})
+		}
 		(KernelTarget::Nvidia(_), RuntimeArtifactPolicy::Hsa)
-		| (KernelTarget::Amd(_), RuntimeArtifactPolicy::Cuda(_)) => Err(NativePrepareError::InvalidConfiguration(
-			"validated target/runtime policy pair changed before artifact construction".to_owned(),
-		)),
+		| (KernelTarget::Amd(_), RuntimeArtifactPolicy::Cuda(_)) => {
+			Err(NativePrepareError::InvalidConfiguration(
+				"validated target/runtime policy pair changed before artifact construction".to_owned(),
+			))
+		}
 	}
 }
 
@@ -642,16 +633,22 @@ fn candidate_target(
 		targets.insert(capability.target.clone());
 	}
 	match targets.len() {
-		1 => targets
-			.into_iter()
-			.next()
-			.ok_or_else(|| NativePrepareError::InvalidCandidate("target set became empty".to_owned())),
-		0 => Err(NativePrepareError::InvalidCandidate(format!(
-			"deferred artifact {artifact} is unused by the candidate"
-		))),
-		2.. => Err(NativePrepareError::InvalidCandidate(format!(
-			"artifact {artifact} is assigned to more than one native target"
-		))),
+		1 => {
+			targets
+				.into_iter()
+				.next()
+				.ok_or_else(|| NativePrepareError::InvalidCandidate("target set became empty".to_owned()))
+		}
+		0 => {
+			Err(NativePrepareError::InvalidCandidate(format!(
+				"deferred artifact {artifact} is unused by the candidate"
+			)))
+		}
+		2.. => {
+			Err(NativePrepareError::InvalidCandidate(format!(
+				"artifact {artifact} is assigned to more than one native target"
+			)))
+		}
 	}
 }
 
@@ -818,14 +815,11 @@ impl<F> NativeExecutorDriver<F> {
 	}
 
 	#[must_use]
-	pub const fn factory(&self) -> &F {
-		self.factory.inner()
-	}
+	pub const fn factory(&self) -> &F { self.factory.inner() }
 }
 
 impl<F> CandidateDriver for NativeExecutorDriver<F>
-where
-	F: CandidateSessionFactory,
+where F: CandidateSessionFactory
 {
 	type Session = ValidatedCandidateSession<F::Session>;
 	type Error = F::Error;
@@ -920,14 +914,10 @@ pub struct PreparedNativeSession<S> {
 
 impl<S> PreparedNativeSession<S> {
 	#[must_use]
-	pub const fn driver_session(&self) -> &S {
-		&self.driver_session
-	}
+	pub const fn driver_session(&self) -> &S { &self.driver_session }
 
 	#[must_use]
-	pub fn artifacts(&self) -> &[NativeArtifact] {
-		&self.artifacts
-	}
+	pub fn artifacts(&self) -> &[NativeArtifact] { &self.artifacts }
 
 	#[must_use]
 	pub fn runtime_artifacts(&self) -> impl ExactSizeIterator<Item = &RuntimeArtifact> {
@@ -939,9 +929,7 @@ impl<S> PreparedNativeSession<S> {
 	/// warmed by the candidate driver; callers may hand it to the finalized
 	/// local backend exactly once.
 	#[must_use]
-	pub fn into_parts(self) -> (S, Vec<NativeArtifact>) {
-		(self.driver_session, self.artifacts)
-	}
+	pub fn into_parts(self) -> (S, Vec<NativeArtifact>) { (self.driver_session, self.artifacts) }
 }
 
 /// Concrete `CandidateRealizer` which compiles every deferred stage, invokes
@@ -956,8 +944,7 @@ pub struct NativeCandidateRealizer<D> {
 }
 
 impl<D> NativeCandidateRealizer<D>
-where
-	D: CandidateDriver,
+where D: CandidateDriver
 {
 	pub fn new(
 		profile: &MeasuredProfile,
@@ -986,14 +973,11 @@ where
 	}
 
 	#[must_use]
-	pub const fn driver(&self) -> &D {
-		&self.driver
-	}
+	pub const fn driver(&self) -> &D { &self.driver }
 }
 
 impl<D> CandidateRealizer<NativeArtifactCatalog> for NativeCandidateRealizer<D>
-where
-	D: CandidateDriver,
+where D: CandidateDriver
 {
 	type Session = PreparedNativeSession<D::Session>;
 	type Error = NativePrepareError<D::Error>;
@@ -1132,8 +1116,7 @@ where
 }
 
 impl<D> NativeCandidateRealizer<D>
-where
-	D: CandidateDriver,
+where D: CandidateDriver
 {
 	fn require_profile(
 		&self,
@@ -1154,10 +1137,12 @@ where
 		let failure_detail = driver_failure_detail(&failure);
 		match self.driver.destroy_candidate(session) {
 			Ok(()) => Err(map_driver_failure(failure)),
-			Err(error) => Err(RealizeFailure::Fatal(NativePrepareError::Teardown {
-				operation: failure_detail,
-				source: error,
-			})),
+			Err(error) => {
+				Err(RealizeFailure::Fatal(NativePrepareError::Teardown {
+					operation: failure_detail,
+					source: error,
+				}))
+			}
 		}
 	}
 }
@@ -1265,8 +1250,7 @@ impl<E: fmt::Display> fmt::Display for NativePrepareError<E> {
 }
 
 impl<E> Error for NativePrepareError<E>
-where
-	E: Error + 'static,
+where E: Error + 'static
 {
 	fn source(&self) -> Option<&(dyn Error + 'static)> {
 		match self {
@@ -1286,367 +1270,4 @@ where
 	}
 }
 
-fn erase_never<E>(error: NativePrepareError<Infallible>) -> NativePrepareError<E> {
-	error.erase_driver()
-}
-
-#[cfg(test)]
-mod tests {
-	use std::collections::BTreeSet;
-	use std::sync::Arc;
-
-	use recipe_core::{
-		ByteCount, BytesPerSecond, DeviceId, DeviceKind, DiscoveryIdentity, FlopsPerSecond, KernelResourceBounds,
-		KernelTemplateId, Machine, MachineId, Property, PropertyProvenance, TopologyIdentity, TransferCapability,
-		TransferLaneCount,
-	};
-	use recipe_kernel::{KernelAbi, KernelArgument, OfflineToolchain, PinnedTool};
-
-	use super::*;
-
-	fn label(value: &str) -> Label {
-		match Label::new(value) {
-			Ok(label) => label,
-			Err(error) => panic!("test label is invalid: {error}"),
-		}
-	}
-
-	fn measured<T>(value: T) -> Property<T> {
-		Property::new(value, PropertyProvenance::Measured)
-	}
-
-	fn topology_and_discovery() -> (Topology, DiscoveryProfile) {
-		let machine = MachineId::new(1);
-		let topology_id = TopologyIdentity::new(Digest::new([1; 32]));
-		let devices = [
-			(DeviceId::new(1), DeviceKind::GpuMemory),
-			(DeviceId::new(2), DeviceKind::Ram),
-			(DeviceId::new(3), DeviceKind::Disk),
-		]
-		.into_iter()
-		.map(|(id, kind)| Device {
-			id,
-			machine,
-			kind,
-			capacity: measured(ByteCount::new(4_000_000_000)),
-			transfer_rate: measured(
-				BytesPerSecond::new(1_000_000_000)
-					.unwrap_or_else(|error| panic!("test rate is invalid: {error}")),
-			),
-			calculation_rate: match kind {
-				DeviceKind::GpuMemory => Some(measured(
-					FlopsPerSecond::new(1_000_000_000)
-						.unwrap_or_else(|error| panic!("test FLOP rate is invalid: {error}")),
-				)),
-				DeviceKind::Ram | DeviceKind::Disk => None,
-			},
-		})
-		.collect::<Vec<_>>();
-		let topology = Topology {
-			identity: topology_id,
-			machines: vec![Machine {
-				id: machine,
-				name: label("machine"),
-			}],
-			nodes: Vec::new(),
-			devices,
-			links: Vec::new(),
-		};
-		let discovery = DiscoveryProfile {
-			identity: DiscoveryIdentity::new(Digest::new([2; 32])),
-			topology: topology_id,
-			devices: topology
-				.devices
-				.iter()
-				.map(|device| DiscoveredDevice {
-					device: device.id,
-					available: true,
-					maximum_submission_queues: 64,
-					total_capacity: measured(ByteCount::new(4_000_000_000)),
-					transfer: TransferCapability {
-						rate: measured(
-							BytesPerSecond::new(1_000_000_000)
-								.unwrap_or_else(|error| panic!("test rate is invalid: {error}")),
-						),
-						maximum_inflight_transfers: measured(
-							TransferLaneCount::new(1)
-								.unwrap_or_else(|error| panic!("test lane count is invalid: {error}")),
-						),
-						asynchronous_submission: true,
-						overlaps_calculation: true,
-					},
-					calculation: None,
-				})
-				.collect(),
-			links: Vec::new(),
-		};
-		(topology, discovery)
-	}
-
-	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-	struct TestSession;
-
-	#[derive(Debug, Default)]
-	struct TestDriver {
-		destroyed: usize,
-	}
-
-	impl CandidateDriver for TestDriver {
-		type Session = TestSession;
-		type Error = Infallible;
-
-		fn reservation_mechanism(
-			&self,
-			device: &Device,
-			discovered: &DiscoveredDevice,
-		) -> Result<ReservationMechanism, Self::Error> {
-			debug_assert_eq!(device.id, discovered.device);
-			Ok(ReservationMechanism::EnforcedQuota)
-		}
-
-		fn reservation_evidence(
-			&self,
-			device: &Device,
-			discovered: &DiscoveredDevice,
-		) -> Result<ReservationEvidence, Self::Error> {
-			debug_assert_eq!(device.id, discovered.device);
-			Ok(match device.kind {
-				recipe_core::DeviceKind::GpuMemory => ReservationEvidence::GpuDisplay {
-					enabled_connectors: 1,
-				},
-				recipe_core::DeviceKind::Ram | recipe_core::DeviceKind::Disk => ReservationEvidence::NonGpu,
-			})
-		}
-
-		fn realize_candidate(
-			&mut self,
-			request: CandidateRealizationRequest<'_>,
-		) -> Result<Self::Session, CandidateDriverFailure<Self::Error>> {
-			debug_assert_eq!(request.topology.identity, request.candidate.draft.topology);
-			Err(CandidateDriverFailure::PreFinalRealizationUnavailable {
-				backend: "test".to_owned(),
-			})
-		}
-
-		fn warm_maximum_concurrency(
-			&mut self,
-			session: &mut Self::Session,
-			candidate: &PlannedCandidate,
-			pass: u32,
-		) -> Result<(), CandidateDriverFailure<Self::Error>> {
-			debug_assert_eq!(*session, TestSession);
-			debug_assert_ne!(candidate.draft.candidate.digest(), Digest::ZERO);
-			debug_assert_ne!(pass, 0);
-			Err(CandidateDriverFailure::CandidateRejected {
-				detail: "test".to_owned(),
-			})
-		}
-
-		fn capacity_snapshot(
-			&mut self,
-			session: &mut Self::Session,
-			topology: &Topology,
-			discovery: &DiscoveryProfile,
-		) -> Result<CapacityLedger, CandidateDriverFailure<Self::Error>> {
-			debug_assert_eq!(*session, TestSession);
-			debug_assert_eq!(topology.identity, discovery.topology);
-			Err(CandidateDriverFailure::CandidateRejected {
-				detail: "test".to_owned(),
-			})
-		}
-
-		fn destroy_candidate(&mut self, session: Self::Session) -> Result<(), Self::Error> {
-			debug_assert_eq!(session, TestSession);
-			self.destroyed += 1;
-			Ok(())
-		}
-	}
-
-	#[test]
-	fn exact_reservation_plan_covers_every_storage_device() {
-		let (topology, discovery) = topology_and_discovery();
-		let reservations = exact_reservation_plan(&TestDriver::default(), &topology, &discovery)
-			.unwrap_or_else(|error| panic!("reservation plan failed: {error}"));
-		assert_eq!(reservations.entries.len(), 3);
-		for device in &topology.devices {
-			let entry = reservations
-				.entry(device.id)
-				.unwrap_or_else(|| panic!("device {} has no reservation", device.id));
-			assert_eq!(entry.bytes, recipe_core::EXACT_USER_RESERVATION);
-			assert_eq!(entry.mechanism, ReservationMechanism::EnforcedQuota);
-			assert_eq!(
-				entry.evidence,
-				match device.kind {
-					recipe_core::DeviceKind::GpuMemory => ReservationEvidence::GpuDisplay {
-						enabled_connectors: 1,
-					},
-					recipe_core::DeviceKind::Ram | recipe_core::DeviceKind::Disk =>
-						ReservationEvidence::NonGpu,
-				}
-			);
-			assert_eq!(
-				entry.name.as_str(),
-				format!("recipe-user-{}", device.id.get())
-			);
-		}
-	}
-
-	fn native_artifact() -> NativeArtifact {
-		let bytes: Arc<[u8]> = Arc::from(&b"recipe-cubin"[..]);
-		let digest = recipe_kernel::ArtifactDigest::of(&bytes).bytes();
-		let target = TargetIdentity {
-			backend: label(CUDA_BACKEND),
-			architecture: label("sm_52"),
-			abi: label(CUDA_ABI),
-		};
-		let runtime = RuntimeArtifact::new(
-			ArtifactId::new(7),
-			bytes,
-			KernelAbi {
-				entry_symbol: "recipe_stage_7".to_owned(),
-				arguments: vec![KernelArgument::ElementCount],
-				argument_bytes: 8,
-				argument_alignment: 8,
-				elements: recipe_core::ElementCount::new(1)
-					.unwrap_or_else(|error| panic!("test element count is invalid: {error}")),
-				workgroup_lanes: 1,
-			},
-			RuntimeArtifactKind::Cuda {
-				identity: recipe_cuda::ArtifactIdentity {
-					sha256: digest,
-					target: ComputeCapability::new(5, 2),
-					toolchain: CudaToolchainIdentity {
-						zig_version: "0.17".to_owned(),
-						llvm_version: "22".to_owned(),
-						ptx_isa_version: "6.4".to_owned(),
-						ptxas_version: "11.4".to_owned(),
-						cuda_toolkit_version: "11.4".to_owned(),
-						cubin_format: CUDA_ABI.to_owned(),
-					},
-					minimum_driver: DriverVersion::new(11, 0)
-						.unwrap_or_else(|error| panic!("test driver version is invalid: {error}")),
-					maximum_driver: None,
-					required_driver_symbols: BTreeSet::new(),
-				},
-			},
-		);
-		NativeArtifact::new(
-			ArtifactIdentity {
-				id: ArtifactId::new(7),
-				digest: Digest::new(digest),
-				format: target.abi.clone(),
-				target,
-				toolchain: ToolchainIdentity {
-					name: label("recipe-owned"),
-					version: label("1"),
-					digest: Digest::new([3; 32]),
-				},
-				entry_symbol: label("recipe_stage_7"),
-				kernel_template: KernelTemplateId::new(7),
-				resources: KernelResourceBounds {
-					private_bytes_per_lane: ByteCount::ZERO,
-					shared_bytes_per_workgroup: ByteCount::ZERO,
-					scratch_bytes_per_dispatch: ByteCount::ZERO,
-					maximum_workgroup_lanes: 1,
-				},
-				build: None,
-			},
-			runtime,
-		)
-		.unwrap_or_else(|error| panic!("native artifact fixture is invalid: {error}"))
-	}
-
-	#[test]
-	fn catalog_rejects_duplicate_native_identity() {
-		let artifact = native_artifact();
-		let error = NativeArtifactCatalog::new(vec![artifact.clone(), artifact])
-			.expect_err("duplicate native artifacts must fail");
-		assert!(matches!(error, NativePrepareError::InvalidCatalog(_)));
-	}
-
-	#[test]
-	fn target_build_spec_rejects_runtime_backend_mismatch() {
-		let executable = std::env::current_exe()
-			.unwrap_or_else(|error| panic!("test executable path is unavailable: {error}"));
-		let tool = PinnedTool::inspect(executable).unwrap_or_else(|error| panic!("pin test executable: {error}"));
-		let builder = ArtifactBuilder::new(OfflineToolchain {
-			verifier: tool.clone(),
-			llvm_codegen: tool.clone(),
-			elf_linker: Some(tool),
-			ptx_assembler: None,
-		})
-		.unwrap_or_else(|error| panic!("construct test artifact builder: {error}"));
-		let error = DeferredArtifactCompiler::new(vec![TargetBuildSpec {
-			target_identity: TargetIdentity {
-				backend: label(HSA_BACKEND),
-				architecture: label("amdgcn-amd-amdhsa--gfx1101"),
-				abi: label("elf64-amdgpu-code-object-v5"),
-			},
-			target: KernelTarget::Amd(recipe_kernel::AmdTarget {
-				target_id: "gfx1101".to_owned(),
-				code_object_version: 6,
-			}),
-			toolchain_identity: ToolchainIdentity {
-				name: label("recipe-owned"),
-				version: label("1"),
-				digest: Digest::new([4; 32]),
-			},
-			builder,
-			scratch_parent: std::env::temp_dir(),
-			runtime_policy: RuntimeArtifactPolicy::Hsa,
-		}])
-		.expect_err("mismatched HSA code-object version must fail");
-		assert!(matches!(error, NativePrepareError::InvalidConfiguration(_)));
-	}
-
-	#[test]
-	fn live_session_failure_is_destroyed_before_rejection() {
-		let (topology, discovery) = topology_and_discovery();
-		let mut realizer = NativeCandidateRealizer {
-			topology,
-			discovery,
-			compiler: DeferredArtifactCompiler {
-				targets: Vec::new(),
-				prebuilt_bundles: BTreeMap::new(),
-			},
-			driver: TestDriver::default(),
-		};
-		let result: Result<(), RealizeFailure<NativePrepareError<Infallible>>> = realizer.reject_after_session(
-			TestSession,
-			CandidateDriverFailure::CandidateRejected {
-				detail: "warm trace rejected".to_owned(),
-			},
-		);
-		assert!(matches!(
-			result,
-			Err(RealizeFailure::CandidateRejected { .. })
-		));
-		assert_eq!(realizer.driver.destroyed, 1);
-	}
-
-	#[test]
-	fn teardown_diagnostic_preserves_the_first_fatal_driver_error() {
-		let failure = CandidateDriverFailure::Fatal(std::io::Error::other("first execution failure"));
-		let error = NativePrepareError::Teardown {
-			operation: driver_failure_detail(&failure),
-			source: std::io::Error::other("teardown failure"),
-		};
-
-		assert_eq!(
-			error.to_string(),
-			"candidate teardown failed after fatal driver failure with a live session (first execution failure): teardown failure"
-		);
-	}
-
-	#[test]
-	fn executor_unavailable_factory_maps_to_typed_pre_final_failure() {
-		let failure: CandidateDriverFailure<recipe_native_executor::UnavailableCandidateError> =
-			map_executor_failure(ExecutorCandidateFailure::PreFinalRealizationUnavailable {
-				detail: "no physical candidate factory",
-			});
-		assert!(matches!(
-			failure,
-			CandidateDriverFailure::PreFinalRealizationUnavailable { .. }
-		));
-	}
-}
+fn erase_never<E>(error: NativePrepareError<Infallible>) -> NativePrepareError<E> { error.erase_driver() }

@@ -1,17 +1,22 @@
-use crate::driver::Driver;
-use crate::error::{CudaError, Result};
-use crate::ffi::{
-	CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT, CU_DEVICE_ATTRIBUTE_CLOCK_RATE,
-	CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-	CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS, CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH,
-	CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
-	CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID,
-	CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID, CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID, CU_DEVICE_ATTRIBUTE_WARP_SIZE,
-	CUDA_ERROR_NOT_SUPPORTED, CuDevice, CuUuid, DriverCapabilities,
+use core::{
+	ffi::{c_char, c_int},
+	fmt,
 };
-use core::ffi::{c_char, c_int};
-use core::fmt;
 use std::collections::BTreeMap;
+
+use crate::{
+	driver::Driver,
+	error::{CudaError, Result},
+	ffi::{
+		CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT, CU_DEVICE_ATTRIBUTE_CLOCK_RATE,
+		CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+		CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS, CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH,
+		CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+		CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+		CU_DEVICE_ATTRIBUTE_PCI_BUS_ID, CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID, CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID,
+		CU_DEVICE_ATTRIBUTE_WARP_SIZE, CUDA_ERROR_NOT_SUPPORTED, CuDevice, CuUuid, DriverCapabilities,
+	},
+};
 
 const DEVICE_NAME_CAPACITY: usize = 256;
 const PCI_BUS_ID_CAPACITY: usize = 32;
@@ -20,22 +25,16 @@ const PCI_BUS_ID_CAPACITY: usize = 32;
 pub struct DeviceOrdinal(i32);
 
 impl DeviceOrdinal {
-	pub fn get(self) -> i32 {
-		self.0
-	}
+	pub fn get(self) -> i32 { self.0 }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DeviceUuid([u8; 16]);
 
 impl DeviceUuid {
-	pub const fn from_bytes(bytes: [u8; 16]) -> Self {
-		Self(bytes)
-	}
+	pub const fn from_bytes(bytes: [u8; 16]) -> Self { Self(bytes) }
 
-	pub const fn as_bytes(&self) -> &[u8; 16] {
-		&self.0
-	}
+	pub const fn as_bytes(&self) -> &[u8; 16] { &self.0 }
 }
 
 impl fmt::Display for DeviceUuid {
@@ -56,15 +55,11 @@ pub struct ComputeCapability {
 }
 
 impl ComputeCapability {
-	pub const fn new(major: u32, minor: u32) -> Self {
-		Self { major, minor }
-	}
+	pub const fn new(major: u32, minor: u32) -> Self { Self { major, minor } }
 }
 
 impl fmt::Display for ComputeCapability {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "sm_{}{}", self.major, self.minor)
-	}
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "sm_{}{}", self.major, self.minor) }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -88,24 +83,20 @@ impl DriverVersion {
 			.checked_mul(1_000)
 			.and_then(|value| value.checked_add(minor.checked_mul(10)?))
 			.and_then(|value| i32::try_from(value).ok())
-			.ok_or_else(|| CudaError::InvalidDriverValue {
-				operation: "DriverVersion::new",
-				detail: format!("{major}.{minor} is out of range"),
+			.ok_or_else(|| {
+				CudaError::InvalidDriverValue {
+					operation: "DriverVersion::new",
+					detail: format!("{major}.{minor} is out of range"),
+				}
 			})?;
 		Ok(Self { raw })
 	}
 
-	pub const fn raw(self) -> i32 {
-		self.raw
-	}
+	pub const fn raw(self) -> i32 { self.raw }
 
-	pub fn major(self) -> u32 {
-		u32::try_from(self.raw / 1_000).unwrap_or_default()
-	}
+	pub fn major(self) -> u32 { u32::try_from(self.raw / 1_000).unwrap_or_default() }
 
-	pub fn minor(self) -> u32 {
-		u32::try_from((self.raw % 1_000) / 10).unwrap_or_default()
-	}
+	pub fn minor(self) -> u32 { u32::try_from((self.raw % 1_000) / 10).unwrap_or_default() }
 }
 
 impl fmt::Display for DriverVersion {
@@ -170,9 +161,11 @@ impl Driver {
 		self.check("cuDeviceGetCount", unsafe {
 			(self.inner.api.device_get_count)(&raw mut raw_count)
 		})?;
-		let count = usize::try_from(raw_count).map_err(|_| CudaError::InvalidDriverValue {
-			operation: "cuDeviceGetCount",
-			detail: format!("negative device count {raw_count}"),
+		let count = usize::try_from(raw_count).map_err(|_| {
+			CudaError::InvalidDriverValue {
+				operation: "cuDeviceGetCount",
+				detail: format!("negative device count {raw_count}"),
+			}
 		})?;
 
 		let mut devices = Vec::with_capacity(count);
@@ -310,21 +303,24 @@ impl Driver {
 				handle,
 			)
 		})?;
-		let nul = bytes
-			.iter()
-			.position(|byte| *byte == 0)
-			.ok_or_else(|| CudaError::InvalidDriverValue {
+		let nul = bytes.iter().position(|byte| *byte == 0).ok_or_else(|| {
+			CudaError::InvalidDriverValue {
 				operation: "cuDeviceGetPCIBusId",
 				detail: format!("device {ordinal} bus ID is not NUL-terminated"),
-			})?;
-		let raw = unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), nul) };
-		let value = core::str::from_utf8(raw).map_err(|error| CudaError::InvalidDriverValue {
-			operation: "cuDeviceGetPCIBusId",
-			detail: format!("device {ordinal} bus ID is not UTF-8: {error}"),
+			}
 		})?;
-		validate_pci_bus_id(value).map_err(|detail| CudaError::InvalidDriverValue {
-			operation: "cuDeviceGetPCIBusId",
-			detail: format!("device {ordinal} returned {value:?}: {detail}"),
+		let raw = unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), nul) };
+		let value = core::str::from_utf8(raw).map_err(|error| {
+			CudaError::InvalidDriverValue {
+				operation: "cuDeviceGetPCIBusId",
+				detail: format!("device {ordinal} bus ID is not UTF-8: {error}"),
+			}
+		})?;
+		validate_pci_bus_id(value).map_err(|detail| {
+			CudaError::InvalidDriverValue {
+				operation: "cuDeviceGetPCIBusId",
+				detail: format!("device {ordinal} returned {value:?}: {detail}"),
+			}
 		})?;
 		Ok(value.to_owned())
 	}
@@ -338,18 +334,19 @@ impl Driver {
 				handle,
 			)
 		})?;
-		let nul = bytes
-			.iter()
-			.position(|byte| *byte == 0)
-			.ok_or_else(|| CudaError::InvalidDeviceName {
+		let nul = bytes.iter().position(|byte| *byte == 0).ok_or_else(|| {
+			CudaError::InvalidDeviceName {
 				ordinal,
 				detail: format!("not NUL-terminated within {DEVICE_NAME_CAPACITY} bytes"),
-			})?;
+			}
+		})?;
 		let name_bytes = unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), nul) };
 		let name = core::str::from_utf8(name_bytes)
-			.map_err(|error| CudaError::InvalidDeviceName {
-				ordinal,
-				detail: error.to_string(),
+			.map_err(|error| {
+				CudaError::InvalidDeviceName {
+					ordinal,
+					detail: error.to_string(),
+				}
 			})?
 			.trim()
 			.to_owned();
@@ -384,9 +381,11 @@ impl Driver {
 		self.check("cuDeviceTotalMem_v2", unsafe {
 			(self.inner.api.device_total_mem_v2)(&raw mut bytes, handle)
 		})?;
-		u64::try_from(bytes).map_err(|_| CudaError::InvalidDriverValue {
-			operation: "cuDeviceTotalMem_v2",
-			detail: format!("{bytes} does not fit u64"),
+		u64::try_from(bytes).map_err(|_| {
+			CudaError::InvalidDriverValue {
+				operation: "cuDeviceTotalMem_v2",
+				detail: format!("{bytes} does not fit u64"),
+			}
 		})
 	}
 
@@ -395,9 +394,11 @@ impl Driver {
 		self.check(operation, unsafe {
 			(self.inner.api.device_get_attribute)(&raw mut value, attribute, handle)
 		})?;
-		u32::try_from(value).map_err(|_| CudaError::InvalidDriverValue {
-			operation,
-			detail: format!("negative attribute value {value}"),
+		u32::try_from(value).map_err(|_| {
+			CudaError::InvalidDriverValue {
+				operation,
+				detail: format!("negative attribute value {value}"),
+			}
 		})
 	}
 }
@@ -424,48 +425,4 @@ fn validate_pci_bus_id(value: &str) -> core::result::Result<(), &'static str> {
 		return Err("expected dddd:bb:dd.f");
 	}
 	Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::ffi::{DriverSymbol, test_support};
-
-	#[test]
-	fn discovery_records_stable_device_identity() {
-		let driver = Driver::from_test_api(test_support::api(false));
-		let discovery = driver.discover().expect("fake discovery");
-		assert_eq!(discovery.driver_version, DriverVersion::new(11, 4).unwrap());
-		assert_eq!(discovery.devices.len(), 2);
-		assert_eq!(discovery.devices[0].ordinal.get(), 0);
-		assert_eq!(discovery.devices[1].ordinal.get(), 1);
-		assert_eq!(discovery.devices[0].name, "Tesla K80");
-		assert_eq!(
-			discovery.devices[0].compute_capability,
-			ComputeCapability::new(3, 7)
-		);
-		assert_eq!(discovery.devices[0].total_memory_bytes, 12_000_000_000);
-		assert_eq!(discovery.devices[0].attributes.async_engine_count, 2);
-		assert!(discovery.devices[0].attributes.concurrent_kernels);
-		assert_eq!(discovery.devices[0].attributes.pci_bus_id, 3);
-		assert_eq!(
-			discovery.devices[0].attributes.global_memory_bus_width_bits,
-			384
-		);
-		assert_eq!(
-			discovery.devices[0].uuid.to_string(),
-			"GPU-01000000-0000-0000-0000-000000000000"
-		);
-		assert!(
-			!discovery
-				.capabilities
-				.supports(DriverSymbol::ModuleGetLoadingMode)
-		);
-	}
-
-	#[test]
-	fn compute_capability_uses_exact_sm_identity() {
-		assert_eq!(ComputeCapability::new(5, 2).to_string(), "sm_52");
-		assert_ne!(ComputeCapability::new(5, 2), ComputeCapability::new(8, 6));
-	}
 }

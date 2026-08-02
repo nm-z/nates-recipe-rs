@@ -1,14 +1,14 @@
-use std::collections::BTreeMap;
-use std::fmt::Write as _;
-use std::path::Path;
+use std::{collections::BTreeMap, fmt::Write as _, path::Path};
 
 use proc_macro2::{Spacing, TokenStream, TokenTree};
 use serde_json::{Map, Value};
-use syn::parse::{Parse, ParseStream};
-use syn::punctuated::Punctuated;
-use syn::spanned::Spanned as _;
-use syn::visit::{self, Visit};
-use syn::{Expr, Ident, Token};
+use syn::{
+	Expr, Ident, Token,
+	parse::{Parse, ParseStream},
+	punctuated::Punctuated,
+	spanned::Spanned as _,
+	visit::{self, Visit},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecipeReceiver {
@@ -134,13 +134,15 @@ fn classify_recipe_expression(
 		Expr::MethodCall(call) => {
 			let receiver = classify_recipe_expression(&call.receiver, bindings)?;
 			match receiver {
-				RecipeReceiver::Facade => match call.method.to_string().as_str() {
-					"data" => Some(RecipeReceiver::Data),
-					"model" => Some(RecipeReceiver::Model),
-					"train" => Some(RecipeReceiver::Train),
-					"infer" => Some(RecipeReceiver::Infer),
-					_ => None,
-				},
+				RecipeReceiver::Facade => {
+					match call.method.to_string().as_str() {
+						"data" => Some(RecipeReceiver::Data),
+						"model" => Some(RecipeReceiver::Model),
+						"train" => Some(RecipeReceiver::Train),
+						"infer" => Some(RecipeReceiver::Infer),
+						_ => None,
+					}
+				}
 				kind => Some(kind),
 			}
 		}
@@ -175,9 +177,7 @@ pub(crate) struct SourceRewrite {
 }
 
 impl SourceRewrite {
-	pub(crate) fn generated(&self) -> &str {
-		&self.generated
-	}
+	pub(crate) fn generated(&self) -> &str { &self.generated }
 
 	fn generated_to_original(&self, offset: usize) -> usize {
 		let mut original_cursor = 0usize;
@@ -307,9 +307,11 @@ impl DiagnosticStream {
 				Ok(value) if value.get("$message_type").and_then(Value::as_str) == Some("diagnostic") => {
 					entries.push(DiagnosticEntry::Json(value));
 				}
-				_ => entries.push(DiagnosticEntry::Raw(
-					String::from_utf8_lossy(line).into_owned(),
-				)),
+				_ => {
+					entries.push(DiagnosticEntry::Raw(
+						String::from_utf8_lossy(line).into_owned(),
+					))
+				}
 			}
 		}
 		Self { entries }
@@ -388,10 +390,12 @@ pub(crate) fn lower_recipe_source(source_path: &Path, source: &str) -> Result<Op
 			source,
 			named_grad_candidates
 				.iter()
-				.map(|candidate| TextEdit {
-					start: candidate.arguments_start,
-					end: candidate.arguments_end,
-					replacement: "::recipe::clip(1.0)".to_owned(),
+				.map(|candidate| {
+					TextEdit {
+						start: candidate.arguments_start,
+						end: candidate.arguments_end,
+						replacement: "::recipe::clip(1.0)".to_owned(),
+					}
 				})
 				.collect(),
 		)
@@ -473,11 +477,13 @@ pub(crate) fn lower_recipe_source(source_path: &Path, source: &str) -> Result<Op
 		let open_end = to_original(call.open_end);
 		let close_start = to_original(call.close_start);
 		match (call.receiver, call.method.as_str(), call.argument_count) {
-			(Some(RecipeReceiver::Facade), "data", 0) => edits.push(TextEdit {
-				start: open_end,
-				end: open_end,
-				replacement: "()".to_owned(),
-			}),
+			(Some(RecipeReceiver::Facade), "data", 0) => {
+				edits.push(TextEdit {
+					start: open_end,
+					end: open_end,
+					replacement: "()".to_owned(),
+				})
+			}
 			(Some(RecipeReceiver::Model), "residual", 2..) => {
 				edits.push(TextEdit {
 					start: open_end,
@@ -490,16 +496,20 @@ pub(crate) fn lower_recipe_source(source_path: &Path, source: &str) -> Result<Op
 					replacement: "]".to_owned(),
 				});
 			}
-			(Some(RecipeReceiver::Train), "save", 2) => edits.push(TextEdit {
-				start: method_start,
-				end: method_end,
-				replacement: "__recipe_save_pair".to_owned(),
-			}),
-			(Some(RecipeReceiver::Train), "resume", 2) => edits.push(TextEdit {
-				start: method_start,
-				end: method_end,
-				replacement: "__recipe_resume_pair".to_owned(),
-			}),
+			(Some(RecipeReceiver::Train), "save", 2) => {
+				edits.push(TextEdit {
+					start: method_start,
+					end: method_end,
+					replacement: "__recipe_save_pair".to_owned(),
+				})
+			}
+			(Some(RecipeReceiver::Train), "resume", 2) => {
+				edits.push(TextEdit {
+					start: method_start,
+					end: method_end,
+					replacement: "__recipe_resume_pair".to_owned(),
+				})
+			}
 			_ => {}
 		}
 	}

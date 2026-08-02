@@ -141,10 +141,12 @@ impl fmt::Display for Error {
 				library,
 				symbol,
 				detail,
-			} => write!(
-				formatter,
-				"shared library {library:?} lacks required symbol {symbol}: {detail}"
-			),
+			} => {
+				write!(
+					formatter,
+					"shared library {library:?} lacks required symbol {symbol}: {detail}"
+				)
+			}
 			Self::Hsa {
 				operation,
 				status,
@@ -170,10 +172,12 @@ impl fmt::Display for Error {
 			Self::CallbackPanicked { operation } => {
 				write!(formatter, "{operation} callback panicked")
 			}
-			Self::AllocationFailed { field, requested } => write!(
-				formatter,
-				"could not reserve {requested} bytes while reading {field}"
-			),
+			Self::AllocationFailed { field, requested } => {
+				write!(
+					formatter,
+					"could not reserve {requested} bytes while reading {field}"
+				)
+			}
 			Self::RuntimeClosed => write!(formatter, "the HSA runtime is already closed"),
 			Self::UnsupportedAgent { reason } => {
 				write!(
@@ -186,32 +190,40 @@ impl fmt::Display for Error {
 				minimum,
 				maximum,
 				reason,
-			} => write!(
-				formatter,
-				"queue size {requested} is invalid for [{minimum}, {maximum}]: {reason}"
-			),
+			} => {
+				write!(
+					formatter,
+					"queue size {requested} is invalid for [{minimum}, {maximum}]: {reason}"
+				)
+			}
 			Self::UnsupportedQueueKind {
 				requested,
 				advertised,
-			} => write!(
-				formatter,
-				"queue kind {requested:?} is incompatible with advertised kind {advertised:?}"
-			),
+			} => {
+				write!(
+					formatter,
+					"queue kind {requested:?} is incompatible with advertised kind {advertised:?}"
+				)
+			}
 			Self::NullQueue => write!(formatter, "ROCr reported success but returned a null queue"),
 			Self::InvalidQueueReturned {
 				kind,
 				features,
 				size,
 				base_is_null,
-			} => write!(
-				formatter,
-				"ROCr returned invalid queue fields: kind={kind}, features={features:#x}, size={size}, base_is_null={base_is_null}"
-			),
+			} => {
+				write!(
+					formatter,
+					"ROCr returned invalid queue fields: kind={kind}, features={features:#x}, size={size}, base_is_null={base_is_null}"
+				)
+			}
 			Self::EmptyCodeObject => write!(formatter, "HSACO code object is empty"),
-			Self::InvalidMemoryPoolIndex { index, pool_count } => write!(
-				formatter,
-				"memory-pool index {index} is outside the discovered pool count {pool_count}"
-			),
+			Self::InvalidMemoryPoolIndex { index, pool_count } => {
+				write!(
+					formatter,
+					"memory-pool index {index} is outside the discovered pool count {pool_count}"
+				)
+			}
 			Self::MemoryPoolNotAllocatable { index } => {
 				write!(formatter, "memory pool {index} is not runtime allocatable")
 			}
@@ -221,10 +233,12 @@ impl fmt::Display for Error {
 					"no allocatable {kind} memory pool was discovered"
 				)
 			}
-			Self::InvalidAllocationSize { requested, maximum } => write!(
-				formatter,
-				"allocation size {requested} is invalid for maximum {maximum:?}"
-			),
+			Self::InvalidAllocationSize { requested, maximum } => {
+				write!(
+					formatter,
+					"allocation size {requested} is invalid for maximum {maximum:?}"
+				)
+			}
 			Self::NullAllocation => {
 				write!(
 					formatter,
@@ -246,26 +260,32 @@ impl fmt::Display for Error {
 				write_index,
 				read_index,
 				size,
-			} => write!(
-				formatter,
-				"HSA queue is full at write index {write_index}, read index {read_index}, size {size}"
-			),
+			} => {
+				write!(
+					formatter,
+					"HSA queue is full at write index {write_index}, read index {read_index}, size {size}"
+				)
+			}
 			Self::InvalidProgressRequest {
 				required_packets,
 				queue_size,
-			} => write!(
-				formatter,
-				"capacity request for {required_packets} packets is invalid for queue size {queue_size}"
-			),
+			} => {
+				write!(
+					formatter,
+					"capacity request for {required_packets} packets is invalid for queue size {queue_size}"
+				)
+			}
 			Self::CopyOutOfBounds {
 				buffer,
 				offset,
 				size,
 				capacity,
-			} => write!(
-				formatter,
-				"{buffer} copy range offset {offset} plus size {size} exceeds capacity {capacity}"
-			),
+			} => {
+				write!(
+					formatter,
+					"{buffer} copy range offset {offset} plus size {size} exceeds capacity {capacity}"
+				)
+			}
 			Self::NullSignal => write!(formatter, "ROCr returned an invalid zero signal handle"),
 			Self::AsyncSignal { value } => {
 				write!(
@@ -277,14 +297,18 @@ impl fmt::Display for Error {
 				status,
 				source_queue_id,
 				epoch,
-			} => write!(
-				formatter,
-				"HSA session is poisoned by async status {status:#x} from queue {source_queue_id:?} at epoch {epoch}"
-			),
-			Self::DeferredRetirement { pending, poisoned } => write!(
-				formatter,
-				"{pending} deferred HSA operation(s) remain unresolved (session_poisoned={poisoned}); their signals and referenced resources were retained"
-			),
+			} => {
+				write!(
+					formatter,
+					"HSA session is poisoned by async status {status:#x} from queue {source_queue_id:?} at epoch {epoch}"
+				)
+			}
+			Self::DeferredRetirement { pending, poisoned } => {
+				write!(
+					formatter,
+					"{pending} deferred HSA operation(s) remain unresolved (session_poisoned={poisoned}); their signals and referenced resources were retained"
+				)
+			}
 		}
 	}
 }

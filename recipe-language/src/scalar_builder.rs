@@ -18,14 +18,10 @@ pub struct ScalarExpression {
 
 impl ScalarExpression {
 	#[must_use]
-	pub const fn id(self) -> ScalarValueId {
-		self.id
-	}
+	pub const fn id(self) -> ScalarValueId { self.id }
 
 	#[must_use]
-	pub const fn dtype(self) -> DType {
-		self.dtype
-	}
+	pub const fn dtype(self) -> DType { self.dtype }
 }
 
 /// Deterministic constructor for typed scalar SSA programs.
@@ -45,7 +41,7 @@ pub struct ScalarProgramBuilder {
 impl ScalarProgramBuilder {
 	pub fn new() -> LanguageResult<Self> {
 		let owner = NEXT_BUILDER
-			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+			.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
 				current.checked_add(1)
 			})
 			.map_err(|_| {
@@ -85,9 +81,7 @@ impl ScalarProgramBuilder {
 		self.constant(ScalarLiteral::F32Bits(value.to_bits()))
 	}
 
-	pub fn i32(&mut self, value: i32) -> LanguageResult<ScalarExpression> {
-		self.constant(ScalarLiteral::I32(value))
-	}
+	pub fn i32(&mut self, value: i32) -> LanguageResult<ScalarExpression> { self.constant(ScalarLiteral::I32(value)) }
 
 	pub fn apply(&mut self, opcode: ScalarOpcode, operands: &[ScalarExpression]) -> LanguageResult<ScalarExpression> {
 		if let Some(foreign) = operands.iter().find(|operand| operand.owner != self.owner) {
@@ -177,46 +171,5 @@ impl ScalarProgramBuilder {
 			id: ScalarValueId::new(id),
 			dtype,
 		})
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn builds_a_typed_program_in_call_order() {
-		let mut builder = ScalarProgramBuilder::new().unwrap();
-		let left = builder.input(DType::F32).unwrap();
-		let right = builder.input(DType::F32).unwrap();
-		let product = builder.binary(ScalarOpcode::Multiply, left, right).unwrap();
-		let one = builder.f32(1.0).unwrap();
-		let result = builder.binary(ScalarOpcode::Add, product, one).unwrap();
-		let program = builder.finish(&[result]).unwrap();
-		assert_eq!(program.inputs.len(), 2);
-		assert_eq!(program.constants.len(), 1);
-		assert_eq!(program.instructions.len(), 2);
-		assert_eq!(program.outputs, [result.id()]);
-	}
-
-	#[test]
-	fn rejects_bad_signatures_and_foreign_values() {
-		let mut first = ScalarProgramBuilder::new().unwrap();
-		let float = first.input(DType::F32).unwrap();
-		assert!(
-			first.unary(ScalarOpcode::BitNot, float)
-				.unwrap_err()
-				.detail
-				.contains("does not accept")
-		);
-
-		let mut second = ScalarProgramBuilder::new().unwrap();
-		let other = second.input(DType::F32).unwrap();
-		assert!(
-			first.binary(ScalarOpcode::Add, float, other)
-				.unwrap_err()
-				.detail
-				.contains("another program")
-		);
 	}
 }

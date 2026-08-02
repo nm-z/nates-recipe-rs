@@ -11,6 +11,8 @@ Kernel generation may lower Recipe-owned operations through either:
 - or through the MLIR 
 Recipe retains its own internal semantic interpetations, cost modeling, scheduling, and AMD/NVIDIA parity.
 
+Do not add inline, unit, mock, or synthetic-data tests: a Recipe test must execute the public workflow end to end on a real dataset and real CUDA or HSA hardware, proving observed correctness, performance, or an architectural invariant. Use Rust compilation and type checking for structural validity; only real training and inference runs count as evidence against logical errors.
+
 ## Data Semantics
 Recipe treats all digitally stored, learnable data as vectors belonging to six
 semantically detected types: 

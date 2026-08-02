@@ -7,8 +7,10 @@
 //! It contains no finalized arena offsets.
 
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet};
-use std::error::Error as StdError;
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	error::Error as StdError,
+};
 
 use recipe_core::{
 	ArtifactBuildRecipe, ArtifactId, ArtifactIdentity, CapacityLedger, DeviceId, DiscoveryIdentity, DiscoveryProfile,
@@ -16,8 +18,7 @@ use recipe_core::{
 };
 use recipe_planner::PlannedCandidate;
 
-use crate::RuntimeArtifact;
-use crate::plan::validate_runtime_artifact;
+use crate::{RuntimeArtifact, plan::validate_runtime_artifact};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CandidateArtifact {
@@ -27,24 +28,16 @@ pub struct CandidateArtifact {
 
 impl CandidateArtifact {
 	#[must_use]
-	pub const fn new(identity: ArtifactIdentity, runtime: RuntimeArtifact) -> Self {
-		Self { identity, runtime }
-	}
+	pub const fn new(identity: ArtifactIdentity, runtime: RuntimeArtifact) -> Self { Self { identity, runtime } }
 
 	#[must_use]
-	pub const fn identity(&self) -> &ArtifactIdentity {
-		&self.identity
-	}
+	pub const fn identity(&self) -> &ArtifactIdentity { &self.identity }
 
 	#[must_use]
-	pub const fn runtime(&self) -> &RuntimeArtifact {
-		&self.runtime
-	}
+	pub const fn runtime(&self) -> &RuntimeArtifact { &self.runtime }
 
 	#[must_use]
-	pub fn into_parts(self) -> (ArtifactIdentity, RuntimeArtifact) {
-		(self.identity, self.runtime)
-	}
+	pub fn into_parts(self) -> (ArtifactIdentity, RuntimeArtifact) { (self.identity, self.runtime) }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -237,8 +230,7 @@ impl<E: fmt::Display> fmt::Display for CandidateFailure<E> {
 }
 
 impl<E> StdError for CandidateFailure<E>
-where
-	E: StdError + 'static,
+where E: StdError + 'static
 {
 	fn source(&self) -> Option<&(dyn StdError + 'static)> {
 		match self {
@@ -296,24 +288,16 @@ pub struct ValidatedCandidateFactory<F> {
 
 impl<F> ValidatedCandidateFactory<F> {
 	#[must_use]
-	pub const fn new(inner: F) -> Self {
-		Self { inner }
-	}
+	pub const fn new(inner: F) -> Self { Self { inner } }
 
 	#[must_use]
-	pub const fn inner(&self) -> &F {
-		&self.inner
-	}
+	pub const fn inner(&self) -> &F { &self.inner }
 
 	#[must_use]
-	pub const fn inner_mut(&mut self) -> &mut F {
-		&mut self.inner
-	}
+	pub const fn inner_mut(&mut self) -> &mut F { &mut self.inner }
 
 	#[must_use]
-	pub fn into_inner(self) -> F {
-		self.inner
-	}
+	pub fn into_inner(self) -> F { self.inner }
 }
 
 #[derive(Debug)]
@@ -327,24 +311,17 @@ pub struct ValidatedCandidateSession<S> {
 
 impl<S> ValidatedCandidateSession<S> {
 	#[must_use]
-	pub const fn inner(&self) -> &S {
-		&self.inner
-	}
+	pub const fn inner(&self) -> &S { &self.inner }
 
 	#[must_use]
-	pub const fn inner_mut(&mut self) -> &mut S {
-		&mut self.inner
-	}
+	pub const fn inner_mut(&mut self) -> &mut S { &mut self.inner }
 
 	#[must_use]
-	pub fn into_inner(self) -> S {
-		self.inner
-	}
+	pub fn into_inner(self) -> S { self.inner }
 }
 
 impl<F> CandidateSessionFactory for ValidatedCandidateFactory<F>
-where
-	F: CandidateSessionFactory,
+where F: CandidateSessionFactory
 {
 	type Error = F::Error;
 	type Session = ValidatedCandidateSession<F::Session>;
@@ -357,11 +334,11 @@ where
 		&mut self,
 		request: CandidateRealizationRequest<'_>,
 	) -> Result<Self::Session, CandidateFailure<Self::Error>> {
-		request
-			.validate()
-			.map_err(|error| CandidateFailure::CandidateRejected {
+		request.validate().map_err(|error| {
+			CandidateFailure::CandidateRejected {
 				detail: error.to_string(),
-			})?;
+			}
+		})?;
 		let candidate = request.candidate.clone();
 		let topology = request.topology.identity;
 		let discovery = request.discovery.identity;
@@ -383,16 +360,20 @@ where
 		pass: u32,
 	) -> Result<(), CandidateFailure<Self::Error>> {
 		match pass {
-			0 => Err(CandidateFailure::CandidateRejected {
-				detail: "warm pass numbering must start at one".to_owned(),
-			}),
+			0 => {
+				Err(CandidateFailure::CandidateRejected {
+					detail: "warm pass numbering must start at one".to_owned(),
+				})
+			}
 			1..=u32::MAX => Ok(()),
 		}?;
 		match *candidate == session.candidate {
 			true => Ok(()),
-			false => Err(CandidateFailure::CandidateRejected {
-				detail: "warm trace names a different candidate".to_owned(),
-			}),
+			false => {
+				Err(CandidateFailure::CandidateRejected {
+					detail: "warm trace names a different candidate".to_owned(),
+				})
+			}
 		}?;
 		self.inner
 			.warm_maximum_concurrency(&mut session.inner, candidate, pass)
@@ -406,17 +387,21 @@ where
 	) -> Result<CapacityLedger, CandidateFailure<Self::Error>> {
 		match topology.identity == session.topology && discovery.identity == session.discovery {
 			true => Ok(()),
-			false => Err(CandidateFailure::CandidateRejected {
-				detail: "capacity snapshot topology or discovery identity changed".to_owned(),
-			}),
+			false => {
+				Err(CandidateFailure::CandidateRejected {
+					detail: "capacity snapshot topology or discovery identity changed".to_owned(),
+				})
+			}
 		}?;
 		let snapshot = self
 			.inner
 			.capacity_snapshot(&mut session.inner, topology, discovery)?;
 		snapshot
 			.validate(topology, &session.reservations)
-			.map_err(|errors| CandidateFailure::CandidateRejected {
-				detail: format!("native capacity snapshot is invalid: {errors}"),
+			.map_err(|errors| {
+				CandidateFailure::CandidateRejected {
+					detail: format!("native capacity snapshot is invalid: {errors}"),
+				}
 			})?;
 		Ok(snapshot)
 	}
@@ -515,29 +500,37 @@ fn validate_artifacts(request: &CandidateRealizationRequest<'_>) -> Result<(), C
 	let mut observed = BTreeSet::new();
 	for artifact in request.artifacts {
 		let identity = artifact.identity();
-		identity
-			.validate()
-			.map_err(|errors| CandidateRequestError::InvalidArtifact {
+		identity.validate().map_err(|errors| {
+			CandidateRequestError::InvalidArtifact {
 				artifact: identity.id,
 				errors,
-			})?;
+			}
+		})?;
 		match observed.insert(identity.id) {
 			true => Ok(()),
-			false => Err(CandidateRequestError::DuplicateArtifact {
-				artifact: identity.id,
-			}),
+			false => {
+				Err(CandidateRequestError::DuplicateArtifact {
+					artifact: identity.id,
+				})
+			}
 		}?;
 		let identity_result = match (static_artifacts.get(&identity.id), builds.get(&identity.id)) {
-			(Some(expected), None) => match *expected == identity {
-				true => Ok(()),
-				false => Err(CandidateRequestError::StaticArtifactMismatch {
-					artifact: identity.id,
-				}),
-			},
+			(Some(expected), None) => {
+				match *expected == identity {
+					true => Ok(()),
+					false => {
+						Err(CandidateRequestError::StaticArtifactMismatch {
+							artifact: identity.id,
+						})
+					}
+				}
+			}
 			(None, Some(build)) => validate_built_identity(request, build, identity),
-			(None, None) | (Some(_), Some(_)) => Err(CandidateRequestError::UnexpectedArtifact {
-				artifact: identity.id,
-			}),
+			(None, None) | (Some(_), Some(_)) => {
+				Err(CandidateRequestError::UnexpectedArtifact {
+					artifact: identity.id,
+				})
+			}
 		};
 		identity_result?;
 		validate_runtime_artifact(identity, artifact.runtime()).map_err(|source| {
@@ -549,10 +542,12 @@ fn validate_artifacts(request: &CandidateRealizationRequest<'_>) -> Result<(), C
 	}
 	match observed == expected {
 		true => Ok(()),
-		false => match expected.difference(&observed).next() {
-			Some(missing) => Err(CandidateRequestError::MissingRuntimeArtifact { artifact: *missing }),
-			None => Err(CandidateRequestError::RuntimeArtifactSetMismatch),
-		},
+		false => {
+			match expected.difference(&observed).next() {
+				Some(missing) => Err(CandidateRequestError::MissingRuntimeArtifact { artifact: *missing }),
+				None => Err(CandidateRequestError::RuntimeArtifactSetMismatch),
+			}
+		}
 	}
 }
 
@@ -566,10 +561,12 @@ fn validate_built_identity(
 		&& identity.build == Some(build.provenance)
 	{
 		true => Ok(()),
-		false => Err(CandidateRequestError::DeferredArtifactMismatch {
-			artifact: identity.id,
-			build: build.artifact,
-		}),
+		false => {
+			Err(CandidateRequestError::DeferredArtifactMismatch {
+				artifact: identity.id,
+				build: build.artifact,
+			})
+		}
 	}?;
 	let placement = match request
 		.candidate
@@ -607,166 +604,10 @@ fn validate_built_identity(
 	};
 	match identity.target == discovered.target {
 		true => Ok(()),
-		false => Err(CandidateRequestError::TargetMismatch {
-			artifact: identity.id,
-		}),
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	use crate::tests::{CandidateFixture, candidate_fixture};
-
-	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-	struct FakeError;
-
-	impl fmt::Display for FakeError {
-		fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-			formatter.write_str("fake candidate factory failure")
-		}
-	}
-
-	impl StdError for FakeError {}
-
-	#[derive(Debug)]
-	struct FakeSession {
-		candidate: PlannedCandidate,
-		topology: TopologyIdentity,
-		discovery: DiscoveryIdentity,
-		warm_passes: Vec<u32>,
-	}
-
-	#[derive(Debug)]
-	struct FakeFactory {
-		capacity: CapacityLedger,
-		realizations: usize,
-		destroys: usize,
-	}
-
-	impl CandidateSessionFactory for FakeFactory {
-		type Error = FakeError;
-		type Session = FakeSession;
-
-		fn reservation_evidence(&self, device: DeviceId) -> Result<ReservationEvidence, Self::Error> {
-			let _ = device;
-			Ok(ReservationEvidence::NonGpu)
-		}
-
-		fn realize_candidate(
-			&mut self,
-			request: CandidateRealizationRequest<'_>,
-		) -> Result<Self::Session, CandidateFailure<Self::Error>> {
-			self.realizations += 1;
-			Ok(FakeSession {
-				candidate: request.candidate.clone(),
-				topology: request.topology.identity,
-				discovery: request.discovery.identity,
-				warm_passes: Vec::new(),
+		false => {
+			Err(CandidateRequestError::TargetMismatch {
+				artifact: identity.id,
 			})
 		}
-
-		fn warm_maximum_concurrency(
-			&mut self,
-			session: &mut Self::Session,
-			candidate: &PlannedCandidate,
-			pass: u32,
-		) -> Result<(), CandidateFailure<Self::Error>> {
-			match *candidate == session.candidate {
-				true => Ok(()),
-				false => Err(CandidateFailure::CandidateRejected {
-					detail: "fake received a different candidate".to_owned(),
-				}),
-			}?;
-			session.warm_passes.push(pass);
-			Ok(())
-		}
-
-		fn capacity_snapshot(
-			&mut self,
-			session: &mut Self::Session,
-			topology: &Topology,
-			discovery: &DiscoveryProfile,
-		) -> Result<CapacityLedger, CandidateFailure<Self::Error>> {
-			match topology.identity == session.topology && discovery.identity == session.discovery {
-				true => Ok(self.capacity.clone()),
-				false => Err(CandidateFailure::CandidateRejected {
-					detail: "fake received different capacity identities".to_owned(),
-				}),
-			}
-		}
-
-		fn destroy_candidate(&mut self, session: Self::Session) -> Result<(), Self::Error> {
-			match session.warm_passes == [1] {
-				true => {
-					self.destroys += 1;
-					Ok(())
-				}
-				false => Err(FakeError),
-			}
-		}
-	}
-
-	fn request(fixture: &CandidateFixture) -> CandidateRealizationRequest<'_> {
-		CandidateRealizationRequest {
-			topology: &fixture.topology,
-			discovery: &fixture.discovery,
-			candidate: &fixture.candidate,
-			artifacts: &fixture.artifacts,
-			reservations: &fixture.reservations,
-		}
-	}
-
-	fn success<T, E: fmt::Debug>(result: Result<T, E>) -> T {
-		match result {
-			Ok(value) => value,
-			Err(error) => panic!("test setup failed: {error:?}"),
-		}
-	}
-
-	#[test]
-	fn exact_candidate_request_and_validated_factory_lifecycle_are_enforced() {
-		let fixture = candidate_fixture(b"candidate-session");
-		success(request(&fixture).validate());
-		let mut factory = ValidatedCandidateFactory::new(FakeFactory {
-			capacity: fixture.capacity.clone(),
-			realizations: 0,
-			destroys: 0,
-		});
-		let mut session = success(factory.realize_candidate(request(&fixture)));
-
-		let zero_pass = factory.warm_maximum_concurrency(&mut session, &fixture.candidate, 0);
-		assert!(matches!(
-			zero_pass,
-			Err(CandidateFailure::CandidateRejected { .. })
-		));
-		let mut altered = fixture.candidate.clone();
-		altered.makespan = recipe_core::Nanoseconds::new(4);
-		let altered_candidate = factory.warm_maximum_concurrency(&mut session, &altered, 1);
-		assert!(matches!(
-			altered_candidate,
-			Err(CandidateFailure::CandidateRejected { .. })
-		));
-		success(factory.warm_maximum_concurrency(&mut session, &fixture.candidate, 1));
-		let observed = success(factory.capacity_snapshot(&mut session, &fixture.topology, &fixture.discovery));
-		assert_eq!(observed, fixture.capacity);
-		assert_eq!(session.inner().warm_passes, vec![1]);
-		success(factory.destroy_candidate(session));
-		assert_eq!(
-			(factory.inner().realizations, factory.inner().destroys),
-			(1, 1)
-		);
-	}
-
-	#[test]
-	fn missing_runtime_artifact_fails_before_physical_realization() {
-		let mut fixture = candidate_fixture(b"candidate-missing-artifact");
-		fixture.artifacts.clear();
-		let error = match request(&fixture).validate() {
-			Ok(()) => panic!("candidate without its runtime artifact validated"),
-			Err(error) => error,
-		};
-		assert!(error.to_string().contains("has no exact runtime image"));
 	}
 }

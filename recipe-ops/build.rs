@@ -1,7 +1,4 @@
-use std::collections::BTreeMap;
-use std::env;
-use std::fs;
-use std::path::PathBuf;
+use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
 fn main() {
 	println!("cargo:rerun-if-changed=../operation-surface.txt");

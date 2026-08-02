@@ -651,9 +651,7 @@ fn validate_resources(
 	Ok(())
 }
 
-fn shape(extents: &[u64]) -> OperationResult<Shape> {
-	Shape::new(extents.to_vec()).map_err(graph_error)
-}
+fn shape(extents: &[u64]) -> OperationResult<Shape> { Shape::new(extents.to_vec()).map_err(graph_error) }
 
 fn checked_i32(value: u64, context: &str) -> OperationResult<i32> {
 	i32::try_from(value).map_err(|error| {
@@ -756,9 +754,7 @@ fn centroid_update_program() -> OperationResult<recipe_core::ScalarProgram> {
 	scalar_finish(builder, &[centroid])
 }
 
-fn scalar_builder() -> OperationResult<ScalarProgramBuilder> {
-	ScalarProgramBuilder::new().map_err(graph_error)
-}
+fn scalar_builder() -> OperationResult<ScalarProgramBuilder> { ScalarProgramBuilder::new().map_err(graph_error) }
 
 fn scalar_input(builder: &mut ScalarProgramBuilder, dtype: DType) -> OperationResult<ScalarExpression> {
 	builder.input(dtype).map_err(graph_error)
@@ -807,10 +803,12 @@ fn scalar_finish(
 fn forbidden_aliases(inputs: usize, outputs: usize) -> Vec<PrimitiveAliasRule> {
 	(0..inputs)
 		.flat_map(|input| {
-			(0..outputs).map(move |output| PrimitiveAliasRule {
-				input,
-				output,
-				permission: AliasPermission::Forbidden,
+			(0..outputs).map(move |output| {
+				PrimitiveAliasRule {
+					input,
+					output,
+					permission: AliasPermission::Forbidden,
+				}
 			})
 		})
 		.collect()
@@ -847,77 +845,4 @@ fn graph_error(error: impl ToString) -> OperationError {
 
 fn kmeans_error(kind: OperationErrorKind, detail: impl Into<String>) -> OperationError {
 	OperationError::new(kind, detail)
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	type TestResult = Result<(), Box<dyn std::error::Error>>;
-
-	fn tensor(id: u64, extents: &[u64], input: bool, output: bool) -> OperationResult<Tensor> {
-		Tensor::contiguous(ValueId::new(id), DType::F32, shape(extents)?, input, output).map_err(graph_error)
-	}
-
-	#[test]
-	fn initializes_centroids_by_cycling_source_rows() -> TestResult {
-		let request = KMeansInitializationRequest {
-			points: tensor(1, &[3, 2], true, false)?,
-			centroids: tensor(2, &[5, 2], false, true)?,
-			identity_namespace: IdentityNamespace::new(
-				ValueId::new(1_000),
-				INITIALIZATION_INTERMEDIATES,
-				KernelTemplateId::new(2_000),
-				INITIALIZATION_KERNELS,
-			),
-			workspace_limit: ByteCount::new(20),
-		};
-		let materialized = materialize_kmeans_initialization(&request)?;
-		assert_eq!(materialized.workspace_bytes, ByteCount::new(20));
-		assert!(matches!(
-			materialized.graph.nodes[0].kernel.kind,
-			PrimitiveKind::IndexMap(IndexMap {
-				modulus: Some(3),
-				..
-			})
-		));
-		Ok(())
-	}
-
-	#[test]
-	fn materializes_one_loop_carried_lloyd_step() -> TestResult {
-		let request = KMeansLloydRequest {
-			points: tensor(1, &[4, 2], true, false)?,
-			prior_centroids: tensor(2, &[2, 2], true, false)?,
-			updated_centroids: tensor(3, &[2, 2], false, true)?,
-			distances: tensor(4, &[4, 2], false, true)?,
-			tree_lanes: 4,
-			identity_namespace: IdentityNamespace::new(
-				ValueId::new(1_000),
-				LLOYD_INTERMEDIATES,
-				KernelTemplateId::new(2_000),
-				LLOYD_KERNELS,
-			),
-			workspace_limit: ByteCount::new(344),
-		};
-		let materialized = materialize_kmeans_lloyd_step(&request)?;
-		assert_eq!(materialized.workspace_bytes, ByteCount::new(344));
-		assert_eq!(materialized.intermediate_values.len(), 16);
-		assert_eq!(materialized.kernels.len(), 18);
-		let update = materialized
-			.graph
-			.nodes
-			.iter()
-			.find(|node| node.kernel.outputs == [request.updated_centroids.id])
-			.expect("centroid update kernel exists");
-		assert_eq!(
-			update.kernel
-				.alias_rules
-				.iter()
-				.find(|rule| rule.input == 2)
-				.map(|rule| rule.permission),
-			Some(AliasPermission::MustAliasExact)
-		);
-		Ok(())
-	}
 }

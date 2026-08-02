@@ -1,16 +1,14 @@
-use core::cmp::Ordering;
-use core::fmt;
-use core::num::NonZeroU64;
+use core::{cmp::Ordering, fmt, num::NonZeroU64};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::image_header::{EncodedImageMetadata, inspect_encoded_image};
-use crate::semantic::{
-	TemporalInstant, VectorSemantic, VectorSemanticRule, fit_ordinal_vocabulary, infer_table_vectors_with_semantics,
-	parse_temporal_instant,
-};
 use crate::{
 	AmbiguousVectorModel, InferredVector, InferredVectorList, RawTable, SemanticError, SemanticType, VectorEncoding,
+	image_header::{EncodedImageMetadata, inspect_encoded_image},
 	parse_contract_f32, parse_contract_i32,
+	semantic::{
+		TemporalInstant, VectorSemantic, VectorSemanticRule, fit_ordinal_vocabulary,
+		infer_table_vectors_with_semantics, parse_temporal_instant,
+	},
 };
 
 /// An exact rational train share. No randomization or host floating-point
@@ -105,14 +103,10 @@ impl TrainFraction {
 	}
 
 	#[must_use]
-	pub const fn numerator(self) -> u64 {
-		self.numerator
-	}
+	pub const fn numerator(self) -> u64 { self.numerator }
 
 	#[must_use]
-	pub const fn denominator(self) -> NonZeroU64 {
-		self.denominator
-	}
+	pub const fn denominator(self) -> NonZeroU64 { self.denominator }
 
 	fn train_rows(self, retained_rows: usize) -> PrepareResult<usize> {
 		let rows = u128::try_from(retained_rows).map_err(|error| {
@@ -142,9 +136,7 @@ impl TrainFraction {
 impl TryFrom<f32> for TrainFraction {
 	type Error = PrepareError;
 
-	fn try_from(value: f32) -> Result<Self, Self::Error> {
-		Self::from_f32(value)
-	}
+	fn try_from(value: f32) -> Result<Self, Self::Error> { Self::from_f32(value) }
 }
 
 const fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
@@ -183,13 +175,9 @@ impl ColumnPattern {
 	}
 
 	#[must_use]
-	pub fn as_bytes(&self) -> &[u8] {
-		&self.pattern
-	}
+	pub fn as_bytes(&self) -> &[u8] { &self.pattern }
 
-	fn matches(&self, name: &[u8]) -> bool {
-		glob_matches(&self.pattern, name)
-	}
+	fn matches(&self, name: &[u8]) -> bool { glob_matches(&self.pattern, name) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,9 +202,7 @@ pub enum PredicateLiteral {
 
 impl PredicateLiteral {
 	#[must_use]
-	pub const fn f32(value: f32) -> Self {
-		Self::F32Bits(value.to_bits())
-	}
+	pub const fn f32(value: f32) -> Self { Self::F32Bits(value.to_bits()) }
 }
 
 /// A source-row exclusion. A row is removed when this predicate evaluates
@@ -239,19 +225,13 @@ impl RowPredicate {
 	}
 
 	#[must_use]
-	pub fn column(&self) -> &[u8] {
-		&self.column
-	}
+	pub fn column(&self) -> &[u8] { &self.column }
 
 	#[must_use]
-	pub const fn operator(&self) -> ComparisonOperator {
-		self.operator
-	}
+	pub const fn operator(&self) -> ComparisonOperator { self.operator }
 
 	#[must_use]
-	pub const fn literal(&self) -> &PredicateLiteral {
-		&self.literal
-	}
+	pub const fn literal(&self) -> &PredicateLiteral { &self.literal }
 }
 
 /// Complete, declarative table preparation policy.
@@ -291,24 +271,16 @@ impl PreparationRequest {
 	}
 
 	#[must_use]
-	pub fn targets(&self) -> &[Vec<u8>] {
-		&self.targets
-	}
+	pub fn targets(&self) -> &[Vec<u8>] { &self.targets }
 
 	#[must_use]
-	pub fn excluded_columns(&self) -> &[ColumnPattern] {
-		&self.excluded_columns
-	}
+	pub fn excluded_columns(&self) -> &[ColumnPattern] { &self.excluded_columns }
 
 	#[must_use]
-	pub fn excluded_rows(&self) -> &[RowPredicate] {
-		&self.excluded_rows
-	}
+	pub fn excluded_rows(&self) -> &[RowPredicate] { &self.excluded_rows }
 
 	#[must_use]
-	pub const fn train_fraction(&self) -> TrainFraction {
-		self.train_fraction
-	}
+	pub const fn train_fraction(&self) -> TrainFraction { self.train_fraction }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -400,9 +372,7 @@ impl PreparedValues {
 	}
 
 	#[must_use]
-	pub fn is_empty(&self) -> bool {
-		self.len() == 0
-	}
+	pub fn is_empty(&self) -> bool { self.len() == 0 }
 }
 
 /// Lossless offset/payload representation for text and image vectors.
@@ -415,29 +385,19 @@ pub struct VariableWidthVector {
 
 impl VariableWidthVector {
 	#[must_use]
-	pub fn len(&self) -> usize {
-		self.valid.len()
-	}
+	pub fn len(&self) -> usize { self.valid.len() }
 
 	#[must_use]
-	pub fn is_empty(&self) -> bool {
-		self.valid.is_empty()
-	}
+	pub fn is_empty(&self) -> bool { self.valid.is_empty() }
 
 	#[must_use]
-	pub fn offsets(&self) -> &[u64] {
-		&self.offsets
-	}
+	pub fn offsets(&self) -> &[u64] { &self.offsets }
 
 	#[must_use]
-	pub fn payload(&self) -> &[u8] {
-		&self.payload
-	}
+	pub fn payload(&self) -> &[u8] { &self.payload }
 
 	#[must_use]
-	pub fn validity(&self) -> &[bool] {
-		&self.valid
-	}
+	pub fn validity(&self) -> &[bool] { &self.valid }
 
 	#[must_use]
 	pub fn value(&self, retained_row: usize) -> Option<Option<&[u8]>> {
@@ -473,34 +433,22 @@ pub struct VectorSchema {
 
 impl VectorSchema {
 	#[must_use]
-	pub const fn source_index(&self) -> usize {
-		self.source_index
-	}
+	pub const fn source_index(&self) -> usize { self.source_index }
 
 	#[must_use]
-	pub fn name(&self) -> &[u8] {
-		&self.name
-	}
+	pub fn name(&self) -> &[u8] { &self.name }
 
 	#[must_use]
-	pub const fn role(&self) -> VectorRole {
-		self.role
-	}
+	pub const fn role(&self) -> VectorRole { self.role }
 
 	#[must_use]
-	pub const fn semantic_type(&self) -> SemanticType {
-		self.semantic_type
-	}
+	pub const fn semantic_type(&self) -> SemanticType { self.semantic_type }
 
 	#[must_use]
-	pub const fn encoding(&self) -> VectorEncoding {
-		self.encoding
-	}
+	pub const fn encoding(&self) -> VectorEncoding { self.encoding }
 
 	#[must_use]
-	pub const fn metadata(&self) -> &VectorMetadata {
-		&self.metadata
-	}
+	pub const fn metadata(&self) -> &VectorMetadata { &self.metadata }
 }
 
 impl PreparedVector {
@@ -517,39 +465,25 @@ impl PreparedVector {
 	}
 
 	#[must_use]
-	pub const fn source_index(&self) -> usize {
-		self.source_index
-	}
+	pub const fn source_index(&self) -> usize { self.source_index }
 
 	#[must_use]
-	pub fn name(&self) -> &[u8] {
-		&self.name
-	}
+	pub fn name(&self) -> &[u8] { &self.name }
 
 	#[must_use]
-	pub const fn role(&self) -> VectorRole {
-		self.role
-	}
+	pub const fn role(&self) -> VectorRole { self.role }
 
 	#[must_use]
-	pub const fn semantic_type(&self) -> SemanticType {
-		self.semantic_type
-	}
+	pub const fn semantic_type(&self) -> SemanticType { self.semantic_type }
 
 	#[must_use]
-	pub const fn encoding(&self) -> VectorEncoding {
-		self.encoding
-	}
+	pub const fn encoding(&self) -> VectorEncoding { self.encoding }
 
 	#[must_use]
-	pub const fn metadata(&self) -> &VectorMetadata {
-		&self.metadata
-	}
+	pub const fn metadata(&self) -> &VectorMetadata { &self.metadata }
 
 	#[must_use]
-	pub const fn values(&self) -> &PreparedValues {
-		&self.values
-	}
+	pub const fn values(&self) -> &PreparedValues { &self.values }
 
 	/// Typed categorical observations in retained-row order.
 	///
@@ -578,29 +512,19 @@ pub struct PreparedPartition {
 
 impl PreparedPartition {
 	#[must_use]
-	pub const fn kind(&self) -> PartitionKind {
-		self.kind
-	}
+	pub const fn kind(&self) -> PartitionKind { self.kind }
 
 	#[must_use]
-	pub fn retained_positions(&self) -> &[usize] {
-		&self.retained_positions
-	}
+	pub fn retained_positions(&self) -> &[usize] { &self.retained_positions }
 
 	#[must_use]
-	pub fn source_rows(&self) -> &[usize] {
-		&self.source_rows
-	}
+	pub fn source_rows(&self) -> &[usize] { &self.source_rows }
 
 	#[must_use]
-	pub fn len(&self) -> usize {
-		self.retained_positions.len()
-	}
+	pub fn len(&self) -> usize { self.retained_positions.len() }
 
 	#[must_use]
-	pub fn is_empty(&self) -> bool {
-		self.retained_positions.is_empty()
-	}
+	pub fn is_empty(&self) -> bool { self.retained_positions.is_empty() }
 }
 
 /// Homogeneous, row-major projection requested explicitly from prepared
@@ -659,24 +583,16 @@ pub struct PreparedDataset {
 
 impl PreparedDataset {
 	#[must_use]
-	pub const fn source_row_count(&self) -> usize {
-		self.source_row_count
-	}
+	pub const fn source_row_count(&self) -> usize { self.source_row_count }
 
 	#[must_use]
-	pub fn retained_source_rows(&self) -> &[usize] {
-		&self.retained_source_rows
-	}
+	pub fn retained_source_rows(&self) -> &[usize] { &self.retained_source_rows }
 
 	#[must_use]
-	pub fn excluded_source_rows(&self) -> &[usize] {
-		&self.excluded_source_rows
-	}
+	pub fn excluded_source_rows(&self) -> &[usize] { &self.excluded_source_rows }
 
 	#[must_use]
-	pub fn vectors(&self) -> &[PreparedVector] {
-		&self.vectors
-	}
+	pub fn vectors(&self) -> &[PreparedVector] { &self.vectors }
 
 	/// Target-vector source identities in the user's declaration order.
 	///
@@ -684,19 +600,13 @@ impl PreparedDataset {
 	/// authoritative whenever one model produces one result per declared
 	/// target, so source layout cannot silently reorder model outputs.
 	#[must_use]
-	pub fn target_source_indices(&self) -> &[usize] {
-		&self.target_source_indices
-	}
+	pub fn target_source_indices(&self) -> &[usize] { &self.target_source_indices }
 
 	#[must_use]
-	pub const fn train(&self) -> &PreparedPartition {
-		&self.train
-	}
+	pub const fn train(&self) -> &PreparedPartition { &self.train }
 
 	#[must_use]
-	pub const fn validation(&self) -> &PreparedPartition {
-		&self.validation
-	}
+	pub const fn validation(&self) -> &PreparedPartition { &self.validation }
 
 	/// Materialize one role and partition as a homogeneous row-major matrix.
 	/// No normalization, imputation, lossy casting, or feature derivation
@@ -772,10 +682,11 @@ impl PreparedDataset {
 		for position in &partition.retained_positions {
 			for vector in vectors {
 				let value = match &vector.values {
-					PreparedValues::F32Bits(values) => values
-						.get(*position)
-						.ok_or_else(|| inconsistent_vector_error(vector, *position))?
-						.ok_or_else(|| missing_dense_error(vector, self.source_row_at(*position)))?,
+					PreparedValues::F32Bits(values) => {
+						values.get(*position)
+							.ok_or_else(|| inconsistent_vector_error(vector, *position))?
+							.ok_or_else(|| missing_dense_error(vector, self.source_row_at(*position)))?
+					}
 					PreparedValues::I32(values) => {
 						let value = values
 							.get(*position)
@@ -1486,10 +1397,12 @@ fn validate_predicate_type(
 			semantic_type == SemanticType::Numeric && encoding == VectorEncoding::I32
 		}
 		PredicateLiteral::F32Bits(_) => semantic_type == SemanticType::Numeric && encoding == VectorEncoding::F32,
-		PredicateLiteral::Text(_) => matches!(
-			semantic_type,
-			SemanticType::Categorical | SemanticType::Ordinal | SemanticType::Text
-		),
+		PredicateLiteral::Text(_) => {
+			matches!(
+				semantic_type,
+				SemanticType::Categorical | SemanticType::Ordinal | SemanticType::Text
+			)
+		}
 	};
 	if !compatible {
 		return Err(PrepareError::new(
@@ -1551,14 +1464,18 @@ fn evaluate_predicate(value: &[u8], source_row: usize, resolved: &ResolvedPredic
 		.for_row(source_row));
 	}
 	let ordering = match &resolved.predicate.literal {
-		PredicateLiteral::Signed(literal) => parse_predicate_text(value, source_row, resolved)?
-			.parse::<i64>()
-			.map(|parsed| parsed.cmp(literal))
-			.map_err(|error| predicate_value_error(source_row, resolved, error))?,
-		PredicateLiteral::Unsigned(literal) => parse_predicate_text(value, source_row, resolved)?
-			.parse::<u64>()
-			.map(|parsed| parsed.cmp(literal))
-			.map_err(|error| predicate_value_error(source_row, resolved, error))?,
+		PredicateLiteral::Signed(literal) => {
+			parse_predicate_text(value, source_row, resolved)?
+				.parse::<i64>()
+				.map(|parsed| parsed.cmp(literal))
+				.map_err(|error| predicate_value_error(source_row, resolved, error))?
+		}
+		PredicateLiteral::Unsigned(literal) => {
+			parse_predicate_text(value, source_row, resolved)?
+				.parse::<u64>()
+				.map(|parsed| parsed.cmp(literal))
+				.map_err(|error| predicate_value_error(source_row, resolved, error))?
+		}
 		PredicateLiteral::F32Bits(bits) => {
 			let parsed = parse_contract_f32(parse_predicate_text(value, source_row, resolved)?)
 				.map_err(|error| predicate_value_error(source_row, resolved, error))?
@@ -1625,12 +1542,16 @@ fn fit_vector_schema(
 	let fit_values = vector_values(table, inferred.index(), inferred.name(), fit_source_rows)?;
 	let metadata = match inferred.encoding() {
 		VectorEncoding::I32 | VectorEncoding::F32 | VectorEncoding::Utf8 => VectorMetadata::None,
-		VectorEncoding::RelativeSecondsI32 => VectorMetadata::Temporal {
-			origin: fit_temporal_origin(inferred, fit_source_rows, &fit_values)?,
-		},
-		VectorEncoding::DictionaryI32 => VectorMetadata::Categorical {
-			dictionary: fit_dictionary(inferred, &fit_values)?,
-		},
+		VectorEncoding::RelativeSecondsI32 => {
+			VectorMetadata::Temporal {
+				origin: fit_temporal_origin(inferred, fit_source_rows, &fit_values)?,
+			}
+		}
+		VectorEncoding::DictionaryI32 => {
+			VectorMetadata::Categorical {
+				dictionary: fit_dictionary(inferred, &fit_values)?,
+			}
+		}
 		VectorEncoding::OrdinalI32 => {
 			let present = fit_values
 				.iter()
@@ -1686,41 +1607,51 @@ fn apply_vector_schema(
 		retained_source_rows,
 	)?;
 	let (prepared_values, categorical_observations) = match (schema.encoding, &schema.metadata) {
-		(VectorEncoding::I32, VectorMetadata::None) => (
-			PreparedValues::I32(encode_i32(schema, retained_source_rows, &values)?),
-			None,
-		),
-		(VectorEncoding::F32, VectorMetadata::None) => (
-			PreparedValues::F32Bits(encode_f32(schema, retained_source_rows, &values)?),
-			None,
-		),
-		(VectorEncoding::RelativeSecondsI32, VectorMetadata::Temporal { origin }) => (
-			PreparedValues::I32(encode_temporal(
-				schema,
-				retained_source_rows,
-				&values,
-				*origin,
-			)?),
-			None,
-		),
+		(VectorEncoding::I32, VectorMetadata::None) => {
+			(
+				PreparedValues::I32(encode_i32(schema, retained_source_rows, &values)?),
+				None,
+			)
+		}
+		(VectorEncoding::F32, VectorMetadata::None) => {
+			(
+				PreparedValues::F32Bits(encode_f32(schema, retained_source_rows, &values)?),
+				None,
+			)
+		}
+		(VectorEncoding::RelativeSecondsI32, VectorMetadata::Temporal { origin }) => {
+			(
+				PreparedValues::I32(encode_temporal(
+					schema,
+					retained_source_rows,
+					&values,
+					*origin,
+				)?),
+				None,
+			)
+		}
 		(VectorEncoding::DictionaryI32, VectorMetadata::Categorical { dictionary }) => {
 			let (codes, observations) = encode_dictionary(schema, retained_source_rows, &values, dictionary)?;
 			validate_categorical_alignment(schema, dictionary.len(), &codes, &observations)?;
 			(PreparedValues::I32(codes), Some(observations))
 		}
-		(VectorEncoding::OrdinalI32, VectorMetadata::Ordinal { ordered_labels }) => (
-			PreparedValues::I32(encode_ordinal(
-				schema,
-				retained_source_rows,
-				&values,
-				ordered_labels,
-			)?),
-			None,
-		),
-		(VectorEncoding::Utf8, VectorMetadata::None) => (
-			PreparedValues::VariableWidth(encode_variable(schema, retained_source_rows, &values)?),
-			None,
-		),
+		(VectorEncoding::OrdinalI32, VectorMetadata::Ordinal { ordered_labels }) => {
+			(
+				PreparedValues::I32(encode_ordinal(
+					schema,
+					retained_source_rows,
+					&values,
+					ordered_labels,
+				)?),
+				None,
+			)
+		}
+		(VectorEncoding::Utf8, VectorMetadata::None) => {
+			(
+				PreparedValues::VariableWidth(encode_variable(schema, retained_source_rows, &values)?),
+				None,
+			)
+		}
 		(VectorEncoding::Bytes, VectorMetadata::Image { .. }) if schema.semantic_type == SemanticType::Image => {
 			// Applying a schema still validates every encoded image header, but
 			// validation-only variants are deliberately not added to fitted metadata.
@@ -1730,10 +1661,12 @@ fn apply_vector_schema(
 				None,
 			)
 		}
-		(VectorEncoding::Bytes, VectorMetadata::None) => (
-			PreparedValues::VariableWidth(encode_variable(schema, retained_source_rows, &values)?),
-			None,
-		),
+		(VectorEncoding::Bytes, VectorMetadata::None) => {
+			(
+				PreparedValues::VariableWidth(encode_variable(schema, retained_source_rows, &values)?),
+				None,
+			)
+		}
 		_ => {
 			return Err(PrepareError::new(
 				PrepareErrorKind::InconsistentPreparedVector,
@@ -2030,12 +1963,9 @@ fn encode_dictionary(
 			} else if let Some(code) = known_codes.get(value).copied() {
 				Ok((Some(code), CategoricalObservation::Known { code }))
 			} else {
-				Ok((
-					Some(reserved_code),
-					CategoricalObservation::Unseen {
-						label: value.to_vec(),
-					},
-				))
+				Ok((Some(reserved_code), CategoricalObservation::Unseen {
+					label: value.to_vec(),
+				}))
 			}
 		})
 		.collect::<PrepareResult<Vec<_>>>()?;
@@ -2259,830 +2189,4 @@ fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
 		pattern_index += 1;
 	}
 	pattern_index == pattern.len()
-}
-
-#[cfg(test)]
-mod tests {
-	use std::cell::RefCell;
-
-	use crate::{CategoricalEncodingModel, Delimiter, HeaderMode, IngestLimits, TableRequest, parse_table};
-
-	use super::*;
-
-	fn table(bytes: &[u8], records: u64) -> RawTable {
-		parse_table(
-			bytes,
-			TableRequest::new(
-				Delimiter::Comma,
-				HeaderMode::Present,
-				IngestLimits::new(1_048_576, records, 32, 1_024).unwrap(),
-			),
-		)
-		.unwrap()
-	}
-
-	fn fraction() -> TrainFraction {
-		TrainFraction::new(3, 4).unwrap()
-	}
-
-	fn jpeg(width: u16, height: u16) -> Vec<u8> {
-		let mut bytes = b"\xff\xd8\xff\xe0\x00\x07JFIF\0\xff\xc0\x00\x11\x08".to_vec();
-		bytes.extend_from_slice(&height.to_be_bytes());
-		bytes.extend_from_slice(&width.to_be_bytes());
-		bytes.extend_from_slice(&[3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0]);
-		bytes
-	}
-
-	fn gif(width: u16, height: u16) -> Vec<u8> {
-		let mut bytes = b"GIF89a".to_vec();
-		bytes.extend_from_slice(&width.to_le_bytes());
-		bytes.extend_from_slice(&height.to_le_bytes());
-		bytes.extend_from_slice(&[0, 0, 0]);
-		bytes
-	}
-
-	fn image_table(images: &[Vec<u8>]) -> RawTable {
-		let mut bytes = b"image,target\n".to_vec();
-		for (index, image) in images.iter().enumerate() {
-			bytes.extend_from_slice(image);
-			bytes.push(b',');
-			bytes.extend_from_slice(index.to_string().as_bytes());
-			bytes.push(b'\n');
-		}
-		table(&bytes, u64::try_from(images.len() + 1).unwrap())
-	}
-
-	#[test]
-	fn target_free_selection_filters_before_removing_helper_columns_and_preserves_order() {
-		let source = table(b"id,feature,helper\n1,10,drop\n2,20,keep\n3,30,drop\n", 4);
-		let selected = select_table(
-			&source,
-			[
-				ColumnPattern::new("id").unwrap(),
-				ColumnPattern::new("helper").unwrap(),
-			],
-			[RowPredicate::new(
-				"helper",
-				ComparisonOperator::Equal,
-				PredicateLiteral::Text("drop".to_owned()),
-			)],
-		)
-		.unwrap();
-
-		assert_eq!(selected.headers(), [b"feature".to_vec()]);
-		assert_eq!(selected.rows(), [vec![b"20".to_vec()]]);
-	}
-
-	#[test]
-	fn target_free_selection_reuses_fail_closed_pattern_and_empty_row_rules() {
-		let source = table(b"feature,helper\n10,drop\n", 2);
-		let unmatched = select_table(&source, [ColumnPattern::new("absent*").unwrap()], []).unwrap_err();
-		assert_eq!(unmatched.kind, PrepareErrorKind::UnmatchedColumnPattern);
-
-		let empty = select_table(
-			&source,
-			[],
-			[RowPredicate::new(
-				"helper",
-				ComparisonOperator::Equal,
-				PredicateLiteral::Text("drop".to_owned()),
-			)],
-		)
-		.unwrap_err();
-		assert_eq!(empty.kind, PrepareErrorKind::NoRetainedRows);
-	}
-
-	#[test]
-	fn no_show_shaped_table_filters_before_split_and_preserves_source_vectors() {
-		let raw = table(
-			b"PatientId,AppointmentID,Gender,ScheduledDay,AppointmentDay,Age,Neighbourhood,Scholarship,\
-			Hipertension,Diabetes,Alcoholism,Handcap,SMS_received,No-show\n\
-			29872499824296,5642903,F,2016-04-29T18:38:08Z,2016-04-29T00:00:00Z,62,JARDIM DA PENHA,0,1,0,0,0,0,No\n\
-			558997776694438,5642503,M,2016-04-29T16:08:27Z,2016-04-29T00:00:00Z,-1,JARDIM DA PENHA,0,0,0,0,0,0,No\n\
-			4262962299951,5642549,F,2016-04-30T16:19:04Z,2016-04-30T00:00:00Z,18,MATA DA PRAIA,0,0,0,0,0,0,Yes\n\
-			867951213174,5642828,F,2016-05-01T08:00:00Z,2016-05-01T00:00:00Z,33,PONTAL,1,0,0,0,0,1,No\n\
-			8841186448183,5642494,M,2016-05-02T09:00:00Z,2016-05-02T00:00:00Z,44,CENTRO,0,1,1,0,0,1,Yes\n",
-			8,
-		);
-		let request = PreparationRequest::new(["No-show"], fraction())
-			.exclude_columns([ColumnPattern::new("*ID*").unwrap()])
-			.exclude_rows([RowPredicate::new(
-				"Age",
-				ComparisonOperator::Less,
-				PredicateLiteral::Signed(0),
-			)]);
-		let prepared = prepare_table(&raw, &request, &CategoricalEncodingModel).unwrap();
-		assert_eq!(raw.width(), 14);
-		assert_eq!(prepared.vectors().len(), 12);
-		assert_eq!(
-			prepared
-				.vectors()
-				.iter()
-				.map(PreparedVector::source_index)
-				.collect::<Vec<_>>(),
-			(2..14).collect::<Vec<_>>()
-		);
-		assert_eq!(prepared.retained_source_rows(), [0, 2, 3, 4]);
-		assert_eq!(prepared.excluded_source_rows(), [1]);
-		assert_eq!(prepared.train().source_rows(), [0, 2, 3]);
-		assert_eq!(prepared.validation().source_rows(), [4]);
-		assert_eq!(
-			prepared
-				.vectors()
-				.iter()
-				.filter(|vector| vector.role() == VectorRole::Target)
-				.map(PreparedVector::name)
-				.collect::<Vec<_>>(),
-			[b"No-show".as_slice()]
-		);
-	}
-
-	#[test]
-	fn semantic_encodings_fit_categorical_state_on_train_rows_and_keep_one_vector_each() {
-		let raw = table(
-			b"integer,float,time,label,rank,prose,target\n\
-			-2,1.25,2024-01-02T00:00:00Z,zeta,low,\"first sentence with spaces\",yes\n\
-			0,-0.5,2024-01-01T00:00:00Z,alpha,medium,\"second sentence with spaces\",no\n\
-			7,2.0,2024-01-03T00:00:00Z,zeta,high,\"third sentence with spaces\",yes\n\
-			9,3.5,2024-01-04T00:00:00Z,beta,medium,\"fourth sentence with spaces\",no\n",
-			8,
-		);
-		let prepared = prepare_table(
-			&raw,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&CategoricalEncodingModel,
-		)
-		.unwrap();
-		assert_eq!(prepared.vectors().len(), raw.width());
-		let integer = &prepared.vectors()[0];
-		assert_eq!(
-			integer.values(),
-			&PreparedValues::I32(vec![Some(-2), Some(0), Some(7), Some(9)])
-		);
-		let float = &prepared.vectors()[1];
-		assert_eq!(
-			float.values(),
-			&PreparedValues::F32Bits(vec![
-				Some(1.25f32.to_bits()),
-				Some((-0.5f32).to_bits()),
-				Some(2.0f32.to_bits()),
-				Some(3.5f32.to_bits()),
-			])
-		);
-		let time = &prepared.vectors()[2];
-		assert_eq!(
-			time.metadata(),
-			&VectorMetadata::Temporal {
-				origin: TemporalOrigin {
-					unix_seconds: 1_704_067_200,
-					nanoseconds: 0,
-				}
-			}
-		);
-		assert_eq!(
-			time.values(),
-			&PreparedValues::I32(vec![Some(86_400), Some(0), Some(172_800), Some(259_200)])
-		);
-		let category = &prepared.vectors()[3];
-		assert_eq!(
-			category.metadata(),
-			&VectorMetadata::Categorical {
-				dictionary: vec![b"alpha".to_vec(), b"zeta".to_vec()]
-			}
-		);
-		assert_eq!(
-			category.values(),
-			&PreparedValues::I32(vec![Some(1), Some(0), Some(1), Some(2)])
-		);
-		assert_eq!(
-			category.categorical_observations(),
-			Some([
-				CategoricalObservation::Known { code: 1 },
-				CategoricalObservation::Known { code: 0 },
-				CategoricalObservation::Known { code: 1 },
-				CategoricalObservation::Unseen {
-					label: b"beta".to_vec(),
-				},
-			]
-			.as_slice())
-		);
-		assert_eq!(
-			prepared.vectors()[4].values(),
-			&PreparedValues::I32(vec![Some(0), Some(1), Some(2), Some(1)])
-		);
-		let PreparedValues::VariableWidth(prose) = prepared.vectors()[5].values() else {
-			panic!("prose must remain variable-width");
-		};
-		assert_eq!(
-			prose.value(1),
-			Some(Some(b"second sentence with spaces".as_slice()))
-		);
-	}
-
-	#[test]
-	fn dense_projection_fails_instead_of_casting_imputing_or_flattening_text() {
-		let raw = table(
-			b"sentence,target\n\"one sentence with words\",1\n\"another sentence with words\",0\n",
-			4,
-		);
-		let prepared = prepare_table(
-			&raw,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&CategoricalEncodingModel,
-		)
-		.unwrap();
-		assert_eq!(
-			prepared
-				.fixed_dense_matrix(VectorRole::Feature, PartitionKind::Train)
-				.unwrap_err()
-				.kind,
-			PrepareErrorKind::VariableWidthDenseMatrix
-		);
-		assert_eq!(
-			prepared
-				.fixed_dense_matrix(VectorRole::Target, PartitionKind::Train)
-				.unwrap(),
-			DenseMatrix::I32 {
-				rows: 1,
-				columns: 1,
-				values: vec![1],
-			}
-		);
-
-		let missing = table(b"x,target\n1,0\n,1\n", 4);
-		let prepared = prepare_table(
-			&missing,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&CategoricalEncodingModel,
-		)
-		.unwrap();
-		assert_eq!(
-			prepared
-				.fixed_dense_matrix(VectorRole::Feature, PartitionKind::Validation)
-				.unwrap_err()
-				.kind,
-			PrepareErrorKind::MissingDenseValue
-		);
-	}
-
-	#[test]
-	fn dense_projection_combines_only_exact_mixed_numeric_values() {
-		let raw = table(b"float,count,target\n1.5,1,0\n2.5,2,1\n", 4);
-		let prepared = prepare_table(
-			&raw,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&CategoricalEncodingModel,
-		)
-		.unwrap();
-		assert_eq!(
-			prepared
-				.fixed_dense_matrix(VectorRole::Feature, PartitionKind::Train)
-				.unwrap(),
-			DenseMatrix::F32Bits {
-				rows: 1,
-				columns: 2,
-				values: vec![1.5f32.to_bits(), 1.0f32.to_bits()],
-			}
-		);
-
-		let lossy = table(b"float,count,target\n1.5,1,0\n2.5,16777217,1\n", 4);
-		let prepared = prepare_table(
-			&lossy,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&CategoricalEncodingModel,
-		)
-		.unwrap();
-		let error = prepared
-			.fixed_dense_matrix(VectorRole::Feature, PartitionKind::Validation)
-			.unwrap_err();
-		assert_eq!(error.kind, PrepareErrorKind::MixedDenseEncoding);
-		assert_eq!(error.column.as_deref(), Some(b"count".as_slice()));
-		assert_eq!(error.source_row, Some(1));
-	}
-
-	#[test]
-	fn predicates_are_typed_and_all_comparison_operators_are_exact() {
-		let raw = table(b"value,label,target\n-2,ant,0\n0,bee,1\n3,cat,0\n", 5);
-		let cases = [
-			(
-				ComparisonOperator::Equal,
-				PredicateLiteral::Signed(0),
-				vec![0, 2],
-			),
-			(
-				ComparisonOperator::NotEqual,
-				PredicateLiteral::Signed(0),
-				vec![1],
-			),
-			(
-				ComparisonOperator::Less,
-				PredicateLiteral::Signed(0),
-				vec![1, 2],
-			),
-			(
-				ComparisonOperator::LessOrEqual,
-				PredicateLiteral::Signed(0),
-				vec![2],
-			),
-			(
-				ComparisonOperator::Greater,
-				PredicateLiteral::Signed(0),
-				vec![0, 1],
-			),
-			(
-				ComparisonOperator::GreaterOrEqual,
-				PredicateLiteral::Signed(0),
-				vec![0],
-			),
-		];
-		for (operator, literal, expected) in cases {
-			let request = PreparationRequest::new(["target"], fraction())
-				.exclude_rows([RowPredicate::new("value", operator, literal)]);
-			assert_eq!(
-				prepare_table(&raw, &request, &CategoricalEncodingModel)
-					.unwrap()
-					.retained_source_rows(),
-				expected
-			);
-		}
-		let text = PreparationRequest::new(["target"], fraction()).exclude_rows([RowPredicate::new(
-			"label",
-			ComparisonOperator::GreaterOrEqual,
-			PredicateLiteral::Text("bee".to_owned()),
-		)]);
-		assert_eq!(
-			prepare_table(&raw, &text, &CategoricalEncodingModel)
-				.unwrap()
-				.retained_source_rows(),
-			[0]
-		);
-
-		let typed = table(b"float,count,target\n-1.25,0,0\n0.5,2,1\n3.0,4,0\n", 5);
-		let unsigned = PreparationRequest::new(["target"], fraction()).exclude_rows([RowPredicate::new(
-			"count",
-			ComparisonOperator::Greater,
-			PredicateLiteral::Unsigned(1),
-		)]);
-		assert_eq!(
-			prepare_table(&typed, &unsigned, &CategoricalEncodingModel)
-				.unwrap()
-				.retained_source_rows(),
-			[0]
-		);
-		let float = PreparationRequest::new(["target"], fraction()).exclude_rows([RowPredicate::new(
-			"float",
-			ComparisonOperator::LessOrEqual,
-			PredicateLiteral::f32(0.5),
-		)]);
-		assert_eq!(
-			prepare_table(&typed, &float, &CategoricalEncodingModel)
-				.unwrap()
-				.retained_source_rows(),
-			[2]
-		);
-	}
-
-	#[test]
-	fn selection_and_predicate_errors_fail_closed() {
-		let raw = table(b"id,name,target\n1,alpha,0\n2,beta,1\n", 4);
-		let unmatched = PreparationRequest::new(["target"], fraction())
-			.exclude_columns([ColumnPattern::new("*missing*").unwrap()]);
-		assert_eq!(
-			prepare_table(&raw, &unmatched, &CategoricalEncodingModel)
-				.unwrap_err()
-				.kind,
-			PrepareErrorKind::UnmatchedColumnPattern
-		);
-		let target = PreparationRequest::new(["target"], fraction())
-			.exclude_columns([ColumnPattern::new("*target*").unwrap()]);
-		assert_eq!(
-			prepare_table(&raw, &target, &CategoricalEncodingModel)
-				.unwrap_err()
-				.kind,
-			PrepareErrorKind::TargetExcluded
-		);
-		let wrong_type = PreparationRequest::new(["target"], fraction()).exclude_rows([RowPredicate::new(
-			"name",
-			ComparisonOperator::Equal,
-			PredicateLiteral::Signed(1),
-		)]);
-		assert_eq!(
-			prepare_table(&raw, &wrong_type, &CategoricalEncodingModel)
-				.unwrap_err()
-				.kind,
-			PrepareErrorKind::PredicateTypeMismatch
-		);
-		let all_rows = PreparationRequest::new(["target"], fraction()).exclude_rows([RowPredicate::new(
-			"id",
-			ComparisonOperator::Greater,
-			PredicateLiteral::Signed(0),
-		)]);
-		assert_eq!(
-			prepare_table(&raw, &all_rows, &CategoricalEncodingModel)
-				.unwrap_err()
-				.kind,
-			PrepareErrorKind::NoRetainedRows
-		);
-	}
-
-	#[test]
-	fn fraction_is_reduced_and_split_uses_exact_integer_arithmetic() {
-		assert_eq!(
-			TrainFraction::new(8, 10).unwrap(),
-			TrainFraction {
-				numerator: 4,
-				denominator: NonZeroU64::new(5).unwrap(),
-			}
-		);
-		assert_eq!(
-			TrainFraction::new(0, 5).unwrap_err().kind,
-			PrepareErrorKind::InvalidTrainFraction
-		);
-		assert_eq!(
-			TrainFraction::new(5, 5).unwrap_err().kind,
-			PrepareErrorKind::InvalidTrainFraction
-		);
-		assert_eq!(
-			TrainFraction::new(1, 0).unwrap_err().kind,
-			PrepareErrorKind::InvalidTrainFraction
-		);
-		assert_eq!(
-			TrainFraction::from_f32(0.8),
-			TrainFraction::new(13_421_773, 16_777_216)
-		);
-		assert_eq!(
-			TrainFraction::from_f32(f32::MIN_POSITIVE).unwrap_err().kind,
-			PrepareErrorKind::InvalidTrainFraction
-		);
-	}
-
-	#[test]
-	fn temporal_offsets_are_lossless_or_rejected_and_images_remain_variable_width() {
-		let first = jpeg(23, 17);
-		let second = jpeg(23, 17);
-		let mut bytes = b"time,image,target\n2024-01-01T00:00:00.125+01:00,".to_vec();
-		bytes.extend_from_slice(&first);
-		bytes.extend_from_slice(b",0\n2024-01-01T00:00:01.125+01:00,");
-		bytes.extend_from_slice(&second);
-		bytes.extend_from_slice(b",1\n");
-		let temporal = table(&bytes, 4);
-		let prepared = prepare_table(
-			&temporal,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&CategoricalEncodingModel,
-		)
-		.unwrap();
-		assert_eq!(
-			prepared.vectors()[0].metadata(),
-			&VectorMetadata::Temporal {
-				origin: TemporalOrigin {
-					unix_seconds: 1_704_063_600,
-					nanoseconds: 125_000_000,
-				}
-			}
-		);
-		assert_eq!(
-			prepared.vectors()[0].values(),
-			&PreparedValues::I32(vec![Some(0), Some(1)])
-		);
-		assert!(matches!(
-			prepared.vectors()[1].values(),
-			PreparedValues::VariableWidth(_)
-		));
-		assert!(matches!(
-			prepared.vectors()[1].metadata(),
-			VectorMetadata::Image { encoded_variants } if encoded_variants.len() == 1
-		));
-
-		let lossy = table(
-			b"time,target\n2024-01-01T00:00:00.1Z,0\n2024-01-01T00:00:01.2Z,1\n",
-			4,
-		);
-		assert_eq!(
-			prepare_table(
-				&lossy,
-				&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-				&CategoricalEncodingModel,
-			)
-			.unwrap_err()
-			.kind,
-			PrepareErrorKind::EncodingFailure
-		);
-	}
-
-	#[test]
-	fn validation_image_shapes_remain_encoded_without_entering_fitted_schema() {
-		let images = [jpeg(23, 17), jpeg(29, 19)];
-		let raw = image_table(&images);
-		let prepared = prepare_table(
-			&raw,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&CategoricalEncodingModel,
-		)
-		.unwrap();
-		let image = &prepared.vectors()[0];
-		let VectorMetadata::Image { encoded_variants } = image.metadata() else {
-			panic!("image vector must retain encoded header metadata");
-		};
-		assert_eq!(encoded_variants.len(), 1);
-		assert_eq!(
-			encoded_variants
-				.iter()
-				.map(|variant| (variant.width(), variant.height()))
-				.collect::<Vec<_>>(),
-			[(23, 17)]
-		);
-		assert!(encoded_variants.iter().all(|variant| {
-			variant.format() == crate::EncodedImageFormat::Jpeg
-				&& variant.channels() == Some(3)
-				&& variant.color_model() == Some(crate::ImageColorModel::YCbCr)
-				&& variant.sample_bits() == Some(8)
-				&& variant.value_layout() == crate::ImageValueLayout::EncodedFile
-				&& variant.value_range() == crate::ImageValueRange::EncodedBytes
-		}));
-		let PreparedValues::VariableWidth(values) = image.values() else {
-			panic!("encoded image bytes must remain variable-width");
-		};
-		assert_eq!(values.value(0), Some(Some(images[0].as_slice())));
-		assert_eq!(values.value(1), Some(Some(images[1].as_slice())));
-
-		let schema = image.schema();
-		let cloned = schema.clone();
-		assert_eq!(cloned, schema);
-		assert_eq!(schema.source_index(), 0);
-		assert_eq!(schema.name(), b"image");
-		assert_eq!(schema.role(), VectorRole::Feature);
-		assert_eq!(schema.semantic_type(), SemanticType::Image);
-		assert_eq!(schema.encoding(), VectorEncoding::Bytes);
-		assert_eq!(schema.metadata(), image.metadata());
-	}
-
-	#[test]
-	fn validation_image_formats_do_not_enter_fitted_schema_variants() {
-		let raw = image_table(&[jpeg(23, 17), gif(31, 19)]);
-		let prepared = prepare_table(
-			&raw,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&CategoricalEncodingModel,
-		)
-		.unwrap();
-		let VectorMetadata::Image { encoded_variants } = prepared.vectors()[0].metadata() else {
-			panic!("image vector must retain encoded header metadata");
-		};
-		assert_eq!(
-			encoded_variants
-				.iter()
-				.map(|variant| (variant.format(), variant.width(), variant.height()))
-				.collect::<Vec<_>>(),
-			[(crate::EncodedImageFormat::Jpeg, 23, 17)]
-		);
-	}
-
-	#[test]
-	fn truncated_image_header_reports_its_source_vector_and_row() {
-		let raw = image_table(&[b"\xff\xd8\xff".to_vec(), jpeg(23, 17)]);
-		let error = prepare_table(
-			&raw,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&CategoricalEncodingModel,
-		)
-		.unwrap_err();
-		assert_eq!(error.kind, PrepareErrorKind::EncodingFailure);
-		assert_eq!(error.column.as_deref(), Some(b"image".as_slice()));
-		assert_eq!(error.source_row, Some(0));
-		assert!(error.detail.contains("invalid encoded image header"));
-	}
-
-	#[test]
-	fn fitted_temporal_ordinal_and_categorical_state_uses_only_train_rows() {
-		let raw = table(
-			b"time,rank,label,target\n\
-			2024-01-10T00:00:00Z,low,alpha,0\n\
-			2024-01-11T00:00:00Z,medium,beta,1\n\
-			2024-01-12T00:00:00Z,low,alpha,0\n\
-			2024-01-01T00:00:00Z,high,gamma,1\n\
-			2024-02-01T00:00:00Z,medium,,0\n\
-			2024-03-01T00:00:00Z,high,beta,1\n",
-			8,
-		);
-		let prepared = prepare_table(
-			&raw,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&CategoricalEncodingModel,
-		)
-		.unwrap();
-		let fit_origin = parse_temporal_instant(b"2024-01-10T00:00:00Z").unwrap();
-		assert_eq!(
-			prepared.vectors()[0].metadata(),
-			&VectorMetadata::Temporal {
-				origin: TemporalOrigin {
-					unix_seconds: fit_origin.unix_seconds,
-					nanoseconds: fit_origin.nanoseconds,
-				},
-			}
-		);
-		assert_eq!(
-			prepared.vectors()[0].values(),
-			&PreparedValues::I32(vec![
-				Some(0),
-				Some(86_400),
-				Some(172_800),
-				Some(-777_600),
-				Some(1_900_800),
-				Some(4_406_400)
-			])
-		);
-		assert_eq!(
-			prepared.vectors()[1].metadata(),
-			&VectorMetadata::Ordinal {
-				ordered_labels: vec![b"low".to_vec(), b"medium".to_vec(), b"high".to_vec()],
-			}
-		);
-		let category = &prepared.vectors()[2];
-		assert_eq!(
-			category.metadata(),
-			&VectorMetadata::Categorical {
-				dictionary: vec![b"alpha".to_vec(), b"beta".to_vec()],
-			}
-		);
-		assert_eq!(
-			category.values(),
-			&PreparedValues::I32(vec![Some(0), Some(1), Some(0), Some(2), None, Some(1)])
-		);
-		assert_eq!(
-			category.categorical_observations(),
-			Some([
-				CategoricalObservation::Known { code: 0 },
-				CategoricalObservation::Known { code: 1 },
-				CategoricalObservation::Known { code: 0 },
-				CategoricalObservation::Unseen {
-					label: b"gamma".to_vec(),
-				},
-				CategoricalObservation::Missing,
-				CategoricalObservation::Known { code: 1 },
-			]
-			.as_slice())
-		);
-		assert_eq!(
-			category.values().len(),
-			category.categorical_observations().unwrap().len()
-		);
-	}
-
-	#[test]
-	fn validation_novelty_is_applied_under_train_semantics_without_refitting() {
-		let temporal = table(
-			b"time,target\n2024-01-01T00:00:00Z,0\n2024-01-02T00:00:00Z,1\nnot-a-time,0\n2024-01-04T00:00:00Z,1\n",
-			6,
-		);
-		let error = prepare_table(
-			&temporal,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&CategoricalEncodingModel,
-		)
-		.unwrap_err();
-		assert_eq!(error.kind, PrepareErrorKind::EncodingFailure);
-		assert_eq!(error.column.as_deref(), Some(b"time".as_slice()));
-		assert_eq!(error.source_row, Some(2));
-
-		let ordinal = table(b"rank,target\nlow,0\nmedium,1\ngold,0\ngold,1\n", 6);
-		let error = prepare_table(
-			&ordinal,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&CategoricalEncodingModel,
-		)
-		.unwrap_err();
-		assert_eq!(error.kind, PrepareErrorKind::EncodingFailure);
-		assert_eq!(error.column.as_deref(), Some(b"rank".as_slice()));
-		assert_eq!(error.source_row, Some(2));
-	}
-
-	#[test]
-	fn zero_fit_rows_and_all_missing_fit_categories_preserve_observation_identity() {
-		let zero_fit = table(b"feature,target\nnovel,1\n", 3);
-		let prepared = prepare_table(
-			&zero_fit,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&CategoricalEncodingModel,
-		)
-		.unwrap();
-		assert!(prepared.train().is_empty());
-		assert_eq!(
-			prepared.vectors()[0].metadata(),
-			&VectorMetadata::Categorical {
-				dictionary: Vec::new()
-			}
-		);
-		assert_eq!(
-			prepared.vectors()[0].values(),
-			&PreparedValues::I32(vec![Some(0)])
-		);
-		assert_eq!(
-			prepared.vectors()[0].categorical_observations(),
-			Some([CategoricalObservation::Unseen {
-				label: b"novel".to_vec(),
-			}]
-			.as_slice())
-		);
-
-		let all_missing_fit = table(b"feature,target\n,0\n,1\nnovel,0\n,1\n", 6);
-		let prepared = prepare_table(
-			&all_missing_fit,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&CategoricalEncodingModel,
-		)
-		.unwrap();
-		let feature = &prepared.vectors()[0];
-		assert_eq!(
-			feature.metadata(),
-			&VectorMetadata::Categorical {
-				dictionary: Vec::new()
-			}
-		);
-		assert_eq!(
-			feature.values(),
-			&PreparedValues::I32(vec![None, None, Some(0), None])
-		);
-		assert_eq!(
-			feature.categorical_observations(),
-			Some([
-				CategoricalObservation::Missing,
-				CategoricalObservation::Missing,
-				CategoricalObservation::Unseen {
-					label: b"novel".to_vec(),
-				},
-				CategoricalObservation::Missing,
-			]
-			.as_slice())
-		);
-	}
-
-	#[test]
-	fn ambiguous_model_receives_only_fit_partition_evidence() {
-		#[derive(Debug, Default)]
-		struct RecordingModel {
-			evidence: RefCell<Vec<crate::VectorEvidence>>,
-		}
-
-		impl AmbiguousVectorModel for RecordingModel {
-			fn classify(&self, evidence: crate::VectorEvidence) -> SemanticType {
-				self.evidence.borrow_mut().push(evidence);
-				SemanticType::Categorical
-			}
-		}
-
-		let raw = table(
-			b"label,target\nalpha,0\nbeta,1\nvalidation-only-one,0\nvalidation-only-two,1\n",
-			6,
-		);
-		let model = RecordingModel::default();
-		let prepared = prepare_table(
-			&raw,
-			&PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()),
-			&model,
-		)
-		.unwrap();
-		assert_eq!(
-			prepared.vectors()[0].metadata(),
-			&VectorMetadata::Categorical {
-				dictionary: vec![b"alpha".to_vec(), b"beta".to_vec()],
-			}
-		);
-		let evidence = model.evidence.borrow();
-		assert_eq!(evidence.len(), 1);
-		assert_eq!(evidence[0].values, 2);
-		assert_eq!(evidence[0].unique, 2);
-		assert_eq!(evidence[0].source_bytes, 9);
-	}
-
-	#[test]
-	fn row_predicates_short_circuit_after_one_or_branch_excludes_a_row() {
-		let raw = table(b"id,later,target\n1,,0\n2,5,1\n", 4);
-		let request = PreparationRequest::new(["target"], TrainFraction::new(1, 2).unwrap()).exclude_rows([
-			RowPredicate::new("id", ComparisonOperator::Equal, PredicateLiteral::Signed(1)),
-			RowPredicate::new(
-				"later",
-				ComparisonOperator::Greater,
-				PredicateLiteral::Signed(10),
-			),
-		]);
-		let prepared = prepare_table(&raw, &request, &CategoricalEncodingModel).unwrap();
-		assert_eq!(prepared.retained_source_rows(), [1]);
-		assert_eq!(prepared.excluded_source_rows(), [0]);
-	}
-
-	#[test]
-	fn glob_matching_is_ascii_case_insensitive_and_wildcards_are_bounded() {
-		assert!(ColumnPattern::new("*ID*").unwrap().matches(b"PatientId"));
-		assert!(
-			ColumnPattern::new("Appointment??")
-				.unwrap()
-				.matches(b"AppointmentID")
-		);
-		assert!(!ColumnPattern::new("*ID").unwrap().matches(b"identity"));
-		assert_eq!(
-			ColumnPattern::new(Vec::new()).unwrap_err().kind,
-			PrepareErrorKind::InvalidColumnPattern
-		);
-	}
 }

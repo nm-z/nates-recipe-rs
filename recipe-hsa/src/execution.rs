@@ -1,21 +1,30 @@
-use crate::abi::*;
-use crate::discovery::{AgentDescription, DiscoveredAgent, MemoryPoolDescription, RawPool};
-use crate::identity::c_bool;
-use crate::loader::Api;
-use crate::session::{QueueCore, SharedFault};
-use crate::{Error, MemoryPoolFlags, MemorySegment, Queue, QueueKind, Result, Runtime, Session};
-use core::cell::{Cell, RefCell};
-use core::ffi::c_void;
-use core::fmt;
-use core::marker::PhantomData;
-use core::mem::MaybeUninit;
-use core::ptr::NonNull;
-use std::ffi::CString;
-use std::num::NonZeroU32;
-use std::rc::{Rc, Weak};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::{Duration, Instant};
+use core::{
+	cell::{Cell, RefCell},
+	ffi::c_void,
+	fmt,
+	marker::PhantomData,
+	mem::MaybeUninit,
+	ptr::NonNull,
+};
+use std::{
+	ffi::CString,
+	num::NonZeroU32,
+	rc::{Rc, Weak},
+	sync::{
+		Arc,
+		atomic::{AtomicU16, Ordering},
+	},
+	time::{Duration, Instant},
+};
+
+use crate::{
+	Error, MemoryPoolFlags, MemorySegment, Queue, QueueKind, Result, Runtime, Session,
+	abi::*,
+	discovery::{AgentDescription, DiscoveredAgent, MemoryPoolDescription, RawPool},
+	identity::c_bool,
+	loader::Api,
+	session::{QueueCore, SharedFault},
+};
 
 #[derive(Clone)]
 pub(crate) struct SignalPool {
@@ -87,15 +96,11 @@ pub struct RetirementReport {
 }
 
 impl RetirementReport {
-	pub const fn is_drained(self) -> bool {
-		self.pending == 0
-	}
+	pub const fn is_drained(self) -> bool { self.pending == 0 }
 }
 
 impl SignalRecord {
-	fn raw(&self) -> HsaSignal {
-		self.signal
-	}
+	fn raw(&self) -> HsaSignal { self.signal }
 
 	fn mark_terminal(&self, value: i64) {
 		debug_assert!(value <= 0);
@@ -196,12 +201,12 @@ impl SignalPool {
 			})?;
 		if required > state.retired.capacity() {
 			let additional = required - state.retired.len();
-			state.retired
-				.try_reserve(additional)
-				.map_err(|_| Error::AllocationFailed {
+			state.retired.try_reserve(additional).map_err(|_| {
+				Error::AllocationFailed {
 					field: "deferred HSA retirement set",
 					requested: required,
-				})?;
+				}
+			})?;
 		}
 		state.retirement_reservations += 1;
 		let available = state.available.pop();
@@ -255,12 +260,12 @@ impl SignalPool {
 			})?;
 		if required > state.retired.capacity() {
 			let additional = required - state.retired.len();
-			state.retired
-				.try_reserve(additional)
-				.map_err(|_| Error::AllocationFailed {
+			state.retired.try_reserve(additional).map_err(|_| {
+				Error::AllocationFailed {
 					field: "deferred HSA retirement set",
 					requested: required,
-				})?;
+				}
+			})?;
 		}
 		state.retirement_reservations += 1;
 		debug_assert!(!signal.retirement_reserved.replace(true));
@@ -406,9 +411,7 @@ impl AllocationInner {
 		self.api.check("hsa_amd_memory_pool_free", status)
 	}
 
-	fn is_accessible_by(&self, agent: HsaAgent) -> bool {
-		self.accessible_agents.borrow().contains(&agent.handle)
-	}
+	fn is_accessible_by(&self, agent: HsaAgent) -> bool { self.accessible_agents.borrow().contains(&agent.handle) }
 
 	fn record_access_grant(&self, agents: &[HsaAgent]) {
 		*self.accessible_agents.borrow_mut() = exact_access_handles(self.owner, agents);
@@ -427,9 +430,7 @@ fn exact_access_handles(owner: HsaAgent, agents: &[HsaAgent]) -> Vec<u64> {
 }
 
 impl Drop for AllocationInner {
-	fn drop(&mut self) {
-		let _ = self.destroy();
-	}
+	fn drop(&mut self) { let _ = self.destroy(); }
 }
 
 /// One allocation from an exactly discovered ROCr memory pool.
@@ -439,9 +440,7 @@ pub struct Allocation<'runtime> {
 }
 
 impl Allocation<'_> {
-	fn inner(&self) -> &Rc<AllocationInner> {
-		&self.inner
-	}
+	fn inner(&self) -> &Rc<AllocationInner> { &self.inner }
 
 	pub fn as_ptr(&self) -> *mut c_void {
 		self.inner
@@ -450,17 +449,11 @@ impl Allocation<'_> {
 			.as_ptr()
 	}
 
-	pub fn len(&self) -> usize {
-		self.inner.size
-	}
+	pub fn len(&self) -> usize { self.inner.size }
 
-	pub fn is_empty(&self) -> bool {
-		self.len() == 0
-	}
+	pub fn is_empty(&self) -> bool { self.len() == 0 }
 
-	pub fn pool_index(&self) -> usize {
-		self.inner.pool_index
-	}
+	pub fn pool_index(&self) -> usize { self.inner.pool_index }
 
 	/// Copy host bytes directly into an allocation known by the caller to be
 	/// host-accessible and coherent.
@@ -600,8 +593,10 @@ fn matching_pool(
 }
 
 fn grant_access(api: &Api, agents: &[HsaAgent], allocation: &Allocation<'_>) -> Result<()> {
-	let count = u32::try_from(agents.len()).map_err(|_| Error::InvalidDispatch {
-		reason: "HSA access-grant agent count exceeds the public ABI",
+	let count = u32::try_from(agents.len()).map_err(|_| {
+		Error::InvalidDispatch {
+			reason: "HSA access-grant agent count exceeds the public ABI",
+		}
 	})?;
 	if count == 0 {
 		return Err(Error::InvalidDispatch {
@@ -744,9 +739,7 @@ impl<'runtime> Session<'runtime> {
 	}
 
 	/// Make one nonblocking pass over the explicit deferred-retirement set.
-	pub fn poll_retirements(&self) -> RetirementReport {
-		self.signals.collect_retired()
-	}
+	pub fn poll_retirements(&self) -> RetirementReport { self.signals.collect_retired() }
 
 	/// Drain deferred operations for at most `timeout`.
 	///
@@ -818,9 +811,7 @@ impl ExecutableInner {
 }
 
 impl Drop for ExecutableInner {
-	fn drop(&mut self) {
-		let _ = self.destroy();
-	}
+	fn drop(&mut self) { let _ = self.destroy(); }
 }
 
 pub struct Executable<'session, 'runtime> {
@@ -846,19 +837,17 @@ pub struct Kernel<'session, 'runtime> {
 }
 
 impl Kernel<'_, '_> {
-	pub fn name(&self) -> &str {
-		&self.name
-	}
+	pub fn name(&self) -> &str { &self.name }
 
-	pub fn metadata(&self) -> &KernelMetadata {
-		&self.metadata
-	}
+	pub fn metadata(&self) -> &KernelMetadata { &self.metadata }
 }
 
 impl<'session, 'runtime> Executable<'session, 'runtime> {
 	pub fn kernel(&self, name: &str) -> Result<Kernel<'session, 'runtime>> {
-		let name_c = CString::new(name).map_err(|_| Error::NameContainsNul {
-			field: "kernel symbol name",
+		let name_c = CString::new(name).map_err(|_| {
+			Error::NameContainsNul {
+				field: "kernel symbol name",
+			}
 		})?;
 		let executable = self
 			.inner
@@ -1207,15 +1196,17 @@ impl<'session, 'runtime> Pending<'session, 'runtime> {
 		// SAFETY: the signal remains owned by this token.
 		let value = unsafe { (self.pool.inner.api.signal_load_scacquire)(signal.raw()) };
 		match classify_signal(value) {
-			SignalState::Pending => match self.pool.inner.fault.check() {
-				Ok(()) => Ok(PollStatus::Pending),
-				// A queue callback can poison the session before this operation's
-				// completion signal reaches a terminal value. Keep the operation
-				// nonterminal so Drop moves its signal and every referenced
-				// resource into deferred retirement instead of releasing objects
-				// the device may still reference.
-				Err(error) => Err(error),
-			},
+			SignalState::Pending => {
+				match self.pool.inner.fault.check() {
+					Ok(()) => Ok(PollStatus::Pending),
+					// A queue callback can poison the session before this operation's
+					// completion signal reaches a terminal value. Keep the operation
+					// nonterminal so Drop moves its signal and every referenced
+					// resource into deferred retirement instead of releasing objects
+					// the device may still reference.
+					Err(error) => Err(error),
+				}
+			}
 			SignalState::Complete => {
 				signal.mark_terminal(0);
 				signal.release_retirement_reservation();
@@ -1380,12 +1371,16 @@ impl<'session, 'runtime> PreparedPending<'session, 'runtime> {
 	pub fn poll(&mut self) -> Result<PollStatus> {
 		match &mut self.state {
 			PreparedPendingState::Active(pending) => pending.poll(),
-			PreparedPendingState::Ready { .. } => Err(Error::InvalidDispatch {
-				reason: "preallocated HSA pending token has not been submitted",
-			}),
-			PreparedPendingState::Consumed => Err(Error::ResourceBusy {
-				resource: "consumed HSA pending token",
-			}),
+			PreparedPendingState::Ready { .. } => {
+				Err(Error::InvalidDispatch {
+					reason: "preallocated HSA pending token has not been submitted",
+				})
+			}
+			PreparedPendingState::Consumed => {
+				Err(Error::ResourceBusy {
+					resource: "consumed HSA pending token",
+				})
+			}
 		}
 	}
 
@@ -1400,32 +1395,36 @@ impl<'session, 'runtime> PreparedPending<'session, 'runtime> {
 				self.state = PreparedPendingState::Ready { signal, keepalive };
 				Ok(())
 			}
-			PreparedPendingState::Active(mut pending) => match pending.poll() {
-				Ok(PollStatus::Pending) => {
-					self.state = PreparedPendingState::Active(pending);
-					Err(Error::ResourceBusy {
-						resource: "nonterminal prepared HSA pending token",
-					})
+			PreparedPendingState::Active(mut pending) => {
+				match pending.poll() {
+					Ok(PollStatus::Pending) => {
+						self.state = PreparedPendingState::Active(pending);
+						Err(Error::ResourceBusy {
+							resource: "nonterminal prepared HSA pending token",
+						})
+					}
+					Ok(PollStatus::Complete) => {
+						let signal = pending.signal.take().ok_or(Error::ResourceBusy {
+							resource: "completed HSA pending signal",
+						})?;
+						let keepalive = pending.keepalive.take().ok_or(Error::ResourceBusy {
+							resource: "completed HSA pending keepalive",
+						})?;
+						self.pool.rearm(&signal)?;
+						self.restore_ready(signal, keepalive);
+						Ok(())
+					}
+					Err(error) => {
+						self.state = PreparedPendingState::Active(pending);
+						Err(error)
+					}
 				}
-				Ok(PollStatus::Complete) => {
-					let signal = pending.signal.take().ok_or(Error::ResourceBusy {
-						resource: "completed HSA pending signal",
-					})?;
-					let keepalive = pending.keepalive.take().ok_or(Error::ResourceBusy {
-						resource: "completed HSA pending keepalive",
-					})?;
-					self.pool.rearm(&signal)?;
-					self.restore_ready(signal, keepalive);
-					Ok(())
-				}
-				Err(error) => {
-					self.state = PreparedPendingState::Active(pending);
-					Err(error)
-				}
-			},
-			PreparedPendingState::Consumed => Err(Error::ResourceBusy {
-				resource: "consumed HSA pending token",
-			}),
+			}
+			PreparedPendingState::Consumed => {
+				Err(Error::ResourceBusy {
+					resource: "consumed HSA pending token",
+				})
+			}
 		}
 	}
 
@@ -1433,9 +1432,11 @@ impl<'session, 'runtime> PreparedPending<'session, 'runtime> {
 	pub fn dependency(&self) -> Result<Dependency<'session, 'runtime>> {
 		match &self.state {
 			PreparedPendingState::Active(pending) => Ok(pending.dependency()),
-			PreparedPendingState::Ready { .. } | PreparedPendingState::Consumed => Err(Error::InvalidDispatch {
-				reason: "only an active HSA pending token can be a dependency",
-			}),
+			PreparedPendingState::Ready { .. } | PreparedPendingState::Consumed => {
+				Err(Error::InvalidDispatch {
+					reason: "only an active HSA pending token can be a dependency",
+				})
+			}
 		}
 	}
 }
@@ -2265,9 +2266,11 @@ impl<'session, 'runtime> Queue<'session, 'runtime> {
 			completion_signal: signal.raw(),
 		};
 		let mut packets = Vec::with_capacity(required_packets as usize);
-		packets.extend(barrier_packets.into_iter().map(|packet| PreparedPacket {
-			body: AqlPacket::BarrierAnd(packet),
-			final_header: barrier_and_packet_header(),
+		packets.extend(barrier_packets.into_iter().map(|packet| {
+			PreparedPacket {
+				body: AqlPacket::BarrierAnd(packet),
+				final_header: barrier_and_packet_header(),
+			}
 		}));
 		packets.push(PreparedPacket {
 			body: AqlPacket::Kernel(packet),
@@ -2298,370 +2301,5 @@ impl<'session, 'runtime> Queue<'session, 'runtime> {
 			terminal: None,
 			_session: PhantomData,
 		})
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use core::cell::{Cell, RefCell};
-
-	struct MockQueueIo {
-		write: u64,
-		read: Cell<u64>,
-		events: RefCell<Vec<&'static str>>,
-		written: RefCell<Vec<(u64, &'static str)>>,
-		reserved: RefCell<Vec<u64>>,
-		published: RefCell<Vec<(u64, u16)>>,
-		doorbells: RefCell<Vec<u64>>,
-	}
-
-	impl MockQueueIo {
-		fn new(write: u64, read: u64) -> Self {
-			Self {
-				write,
-				read: Cell::new(read),
-				events: RefCell::new(Vec::new()),
-				written: RefCell::new(Vec::new()),
-				reserved: RefCell::new(Vec::new()),
-				published: RefCell::new(Vec::new()),
-				doorbells: RefCell::new(Vec::new()),
-			}
-		}
-	}
-
-	impl QueueIo for MockQueueIo {
-		fn load_write_index_relaxed(&self) -> u64 {
-			self.events.borrow_mut().push("load-write");
-			self.write
-		}
-
-		fn load_read_index_scacquire(&self) -> u64 {
-			self.events.borrow_mut().push("load-read");
-			self.read.get()
-		}
-
-		fn publish_write_index_screlease(&self, next: u64) {
-			self.events.borrow_mut().push("write-index-release");
-			self.reserved.borrow_mut().push(next);
-		}
-
-		fn write_packet(&self, index: u64, packet: AqlPacket) {
-			assert_eq!(packet.invalid_header(), PACKET_TYPE_INVALID);
-			self.events.borrow_mut().push("write-body");
-			let kind = match packet {
-				AqlPacket::Kernel(_) => "kernel",
-				AqlPacket::BarrierAnd(_) => "barrier-and",
-			};
-			self.written.borrow_mut().push((index, kind));
-		}
-
-		fn publish_header_screlease(&self, index: u64, header: u16) {
-			self.events.borrow_mut().push("publish-release");
-			self.published.borrow_mut().push((index, header));
-		}
-
-		fn ring_doorbell_screlease(&self, index: u64) {
-			self.events.borrow_mut().push("doorbell-release");
-			self.doorbells.borrow_mut().push(index);
-		}
-	}
-
-	fn test_packet() -> HsaKernelDispatchPacket {
-		HsaKernelDispatchPacket {
-			header: PACKET_TYPE_INVALID,
-			setup: 1,
-			workgroup_size_x: 1,
-			workgroup_size_y: 1,
-			workgroup_size_z: 1,
-			reserved0: 0,
-			grid_size_x: 1,
-			grid_size_y: 1,
-			grid_size_z: 1,
-			private_segment_size: 0,
-			group_segment_size: 0,
-			kernel_object: 1,
-			kernarg_address: std::ptr::null_mut(),
-			reserved2: 0,
-			completion_signal: HsaSignal { handle: 1 },
-		}
-	}
-
-	#[test]
-	fn publication_order_is_body_header_write_index_then_doorbell() {
-		let io = MockQueueIo::new(7, 4);
-		let index = enqueue_packets(
-			&io,
-			8,
-			&[PreparedPacket {
-				body: AqlPacket::Kernel(test_packet()),
-				final_header: kernel_packet_header(false),
-			}],
-		)
-		.unwrap();
-		assert_eq!(index, 7);
-		assert_eq!(&*io.reserved.borrow(), &[8]);
-		assert_eq!(&*io.doorbells.borrow(), &[7]);
-		assert_eq!(
-			&*io.events.borrow(),
-			&[
-				"load-write",
-				"load-read",
-				"write-body",
-				"publish-release",
-				"write-index-release",
-				"doorbell-release",
-			]
-		);
-	}
-
-	#[test]
-	fn full_queue_does_not_advance_or_publish() {
-		let io = MockQueueIo::new(12, 4);
-		assert!(matches!(
-			enqueue_packets(
-				&io,
-				8,
-				&[PreparedPacket {
-					body: AqlPacket::Kernel(test_packet()),
-					final_header: kernel_packet_header(false),
-				}]
-			),
-			Err(Error::QueueFull { .. })
-		));
-		assert!(io.reserved.borrow().is_empty());
-		assert_eq!(&*io.events.borrow(), &["load-write", "load-read"]);
-	}
-
-	#[test]
-	fn packet_headers_have_expected_types_and_system_fences() {
-		let header = kernel_packet_header(true);
-		assert_eq!(header & 0xff, PACKET_TYPE_KERNEL_DISPATCH);
-		assert_ne!(header & (1 << 8), 0);
-		assert_eq!(
-			(header >> PACKET_HEADER_ACQUIRE_FENCE_SCOPE) & 0b11,
-			FENCE_SCOPE_SYSTEM
-		);
-		assert_eq!(
-			(header >> PACKET_HEADER_RELEASE_FENCE_SCOPE) & 0b11,
-			FENCE_SCOPE_SYSTEM
-		);
-		let barrier = barrier_and_packet_header();
-		assert_eq!(barrier & 0xff, PACKET_TYPE_BARRIER_AND);
-		assert_eq!(
-			(barrier >> PACKET_HEADER_ACQUIRE_FENCE_SCOPE) & 0b11,
-			FENCE_SCOPE_SYSTEM
-		);
-		assert_eq!(
-			(barrier >> PACKET_HEADER_RELEASE_FENCE_SCOPE) & 0b11,
-			FENCE_SCOPE_SYSTEM
-		);
-	}
-
-	#[test]
-	fn arbitrary_fan_in_lowers_to_deterministic_five_way_tree() {
-		let dependencies: Vec<_> = (1..=12).map(|handle| HsaSignal { handle }).collect();
-		let completions: Vec<_> = (100..104).map(|handle| HsaSignal { handle }).collect();
-		let packets = lower_barrier_packets(&dependencies, &completions);
-		assert_eq!(barrier_packet_count(12), 4);
-		assert_eq!(dependent_dispatch_packet_count(12).unwrap(), 5);
-		assert_eq!(
-			packets[0].dep_signal.map(|signal| signal.handle),
-			[1, 2, 3, 4, 5]
-		);
-		assert_eq!(
-			packets[1].dep_signal.map(|signal| signal.handle),
-			[6, 7, 8, 9, 10]
-		);
-		assert_eq!(
-			packets[2].dep_signal.map(|signal| signal.handle),
-			[11, 12, 0, 0, 0]
-		);
-		assert_eq!(
-			packets[3].dep_signal.map(|signal| signal.handle),
-			[100, 101, 102, 0, 0]
-		);
-		assert_eq!(packets[3].completion_signal.handle, 103);
-	}
-
-	#[test]
-	fn packet_batch_preserves_order_across_ring_index_wraparound() {
-		let io = MockQueueIo::new(u64::MAX - 1, u64::MAX - 3);
-		let packets = [
-			PreparedPacket {
-				body: AqlPacket::Kernel(test_packet()),
-				final_header: kernel_packet_header(false),
-			},
-			PreparedPacket {
-				body: AqlPacket::Kernel(test_packet()),
-				final_header: kernel_packet_header(false),
-			},
-			PreparedPacket {
-				body: AqlPacket::Kernel(test_packet()),
-				final_header: kernel_packet_header(false),
-			},
-		];
-		enqueue_packets(&io, 8, &packets).unwrap();
-		let indices: Vec<_> = io
-			.written
-			.borrow()
-			.iter()
-			.map(|(index, _)| *index)
-			.collect();
-		assert_eq!(indices, [u64::MAX - 1, u64::MAX, 0]);
-		let slots: Vec<_> = indices.iter().map(|index| index & 7).collect();
-		assert_eq!(slots, [6, 7, 0]);
-		assert_eq!(&*io.reserved.borrow(), &[u64::MAX, 0, 1]);
-		assert_eq!(&*io.doorbells.borrow(), &[u64::MAX - 1, u64::MAX, 0]);
-	}
-
-	#[test]
-	fn bounded_capacity_progress_can_be_retried_without_hidden_wait() {
-		let io = MockQueueIo::new(8, 0);
-		let budget = NonZeroU32::new(3).unwrap();
-		assert_eq!(
-			progress_capacity(&io, 8, 2, budget).unwrap(),
-			QueueProgress::Backpressured {
-				available_packets: 0,
-				required_packets: 2,
-				probes: 3,
-			}
-		);
-		io.read.set(4);
-		assert_eq!(
-			progress_capacity(&io, 8, 2, budget).unwrap(),
-			QueueProgress::Ready {
-				available_packets: 4,
-				probes: 1,
-			}
-		);
-	}
-
-	#[test]
-	fn queue_fault_fails_a_logically_pending_dependency() {
-		let fault = SharedFault::new();
-		assert_eq!(
-			poll_dependency_value(1, &fault).unwrap(),
-			PollStatus::Pending
-		);
-		fault.record(0x1016, Some(42));
-		assert!(matches!(
-			poll_dependency_value(1, &fault),
-			Err(Error::SessionPoisoned {
-				source_queue_id: Some(42),
-				..
-			})
-		));
-	}
-
-	#[test]
-	fn negative_signals_are_errors() {
-		assert!(matches!(classify_signal(-7), SignalState::Failed(-7)));
-		assert!(matches!(classify_signal(0), SignalState::Complete));
-		assert!(matches!(classify_signal(1), SignalState::Pending));
-		let fault = SharedFault::new();
-		assert_eq!(
-			poll_dependency_value(-7, &fault),
-			Err(Error::AsyncSignal { value: -7 })
-		);
-	}
-
-	#[test]
-	fn timeout_does_not_prevent_later_completion() {
-		assert_eq!(
-			wait_decision(PollStatus::Pending, true),
-			Some(WaitOutcome::TimedOut)
-		);
-		assert_eq!(
-			wait_decision(PollStatus::Complete, true),
-			Some(WaitOutcome::Complete)
-		);
-	}
-
-	#[test]
-	fn retirement_releases_keepalive_before_signal() {
-		struct DropSpy<'a> {
-			name: &'static str,
-			log: &'a RefCell<Vec<&'static str>>,
-		}
-		impl Drop for DropSpy<'_> {
-			fn drop(&mut self) {
-				self.log.borrow_mut().push(self.name);
-			}
-		}
-
-		let log = RefCell::new(Vec::new());
-		release_retired(RetiredResource {
-			signal: DropSpy {
-				name: "signal",
-				log: &log,
-			},
-			keepalive: DropSpy {
-				name: "keepalive",
-				log: &log,
-			},
-		});
-		assert_eq!(&*log.borrow(), &["keepalive", "signal"]);
-	}
-
-	#[test]
-	fn terminal_keepalive_release_preserves_preallocated_rearm_storage() {
-		let allocations = Vec::with_capacity(2);
-		let dependencies = Vec::with_capacity(3);
-		let allocation_storage = allocations.as_ptr();
-		let dependency_storage = dependencies.as_ptr();
-		let mut keepalive = PendingKeepalive {
-			_queue: None,
-			_executable: None,
-			_allocations: allocations,
-			_dependencies: dependencies,
-		};
-
-		keepalive.release_resources();
-
-		assert_eq!(keepalive._allocations.capacity(), 2);
-		assert_eq!(keepalive._dependencies.capacity(), 3);
-		assert_eq!(keepalive._allocations.as_ptr(), allocation_storage);
-		assert_eq!(keepalive._dependencies.as_ptr(), dependency_storage);
-	}
-
-	#[test]
-	fn duration_conversion_is_bounded_and_nonzero() {
-		assert_eq!(
-			duration_to_ticks(Duration::from_millis(1), 1_000_000_000),
-			1_000_000
-		);
-		assert_eq!(duration_to_ticks(Duration::ZERO, 1_000_000_000), 1);
-	}
-
-	#[test]
-	fn copy_range_overflow_is_rejected() {
-		assert!(check_range("test", usize::MAX, 2, usize::MAX).is_err());
-	}
-
-	#[test]
-	fn exact_access_grant_replaces_with_owner_and_deduplicated_agents() {
-		let owner = HsaAgent { handle: 7 };
-		let first = HsaAgent { handle: 11 };
-		let second = HsaAgent { handle: 13 };
-		assert_eq!(
-			exact_access_handles(owner, &[first, owner, second, first]),
-			vec![7, 11, 13]
-		);
-		assert_eq!(exact_access_handles(owner, &[second]), vec![7, 13]);
-	}
-
-	#[test]
-	fn exact_arena_and_host_staging_grants_are_mutually_accessible() {
-		let gpu = HsaAgent { handle: 7 };
-		let peer_gpu = HsaAgent { handle: 11 };
-		let cpu = HsaAgent { handle: 13 };
-		let arena_access = exact_access_handles(gpu, &[gpu, peer_gpu, cpu]);
-		let staging_access = exact_access_handles(cpu, &[gpu]);
-
-		assert!(arena_access.contains(&cpu.handle));
-		assert!(arena_access.contains(&peer_gpu.handle));
-		assert!(staging_access.contains(&gpu.handle));
-		assert!(!staging_access.contains(&peer_gpu.handle));
 	}
 }

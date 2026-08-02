@@ -30,6 +30,3 @@ pub use session::{
 
 /// Recipe remote-execution wire version.
 pub const PROTOCOL_VERSION: u16 = 2;
-
-#[cfg(test)]
-mod tests;

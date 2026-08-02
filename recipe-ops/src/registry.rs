@@ -15,36 +15,24 @@ pub struct OperationId {
 
 impl OperationId {
 	#[must_use]
-	pub const fn ordinal(self) -> usize {
-		self.ordinal
-	}
+	pub const fn ordinal(self) -> usize { self.ordinal }
 
 	#[must_use]
-	pub const fn surface_line(self) -> usize {
-		self.surface_line
-	}
+	pub const fn surface_line(self) -> usize { self.surface_line }
 
 	#[must_use]
-	pub const fn occurrence(self) -> u16 {
-		self.occurrence
-	}
+	pub const fn occurrence(self) -> u16 { self.occurrence }
 
 	#[must_use]
-	pub const fn occurrences(self) -> u16 {
-		self.occurrences
-	}
+	pub const fn occurrences(self) -> u16 { self.occurrences }
 
 	#[must_use]
-	pub const fn is_duplicate_symbol(self) -> bool {
-		self.occurrences > 1
-	}
+	pub const fn is_duplicate_symbol(self) -> bool { self.occurrences > 1 }
 
 	/// Whether this identity belongs to the Recipe-owned extension segment
 	/// rather than a numbered `operation-surface.txt` line.
 	#[must_use]
-	pub const fn is_recipe_owned(self) -> bool {
-		self.surface_line == 0
-	}
+	pub const fn is_recipe_owned(self) -> bool { self.surface_line == 0 }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,51 +230,41 @@ const RECIPE_OWNED_OPERATIONS: &[RawSurfaceEntry] = &[
 pub struct OperationRegistry;
 
 #[must_use]
-pub const fn operation_registry() -> OperationRegistry {
-	OperationRegistry
-}
+pub const fn operation_registry() -> OperationRegistry { OperationRegistry }
 
 /// Recipe-owned channelwise max-pool descriptor. This is deliberately
 /// separate from the preserved legacy operation-surface inventory.
 #[must_use]
-pub fn channelwise_max_pool_1d_descriptor() -> OperationDescriptor {
-	describe(&RECIPE_OWNED_OPERATIONS[0])
-}
+pub fn channelwise_max_pool_1d_descriptor() -> OperationDescriptor { describe(&RECIPE_OWNED_OPERATIONS[0]) }
 
 /// Recipe-owned channelwise max-pool backward descriptor. This is deliberately
 /// separate from the preserved legacy operation-surface inventory.
 #[must_use]
-pub fn channelwise_max_pool_1d_backward_descriptor() -> OperationDescriptor {
-	describe(&RECIPE_OWNED_OPERATIONS[1])
-}
+pub fn channelwise_max_pool_1d_backward_descriptor() -> OperationDescriptor { describe(&RECIPE_OWNED_OPERATIONS[1]) }
 
 impl OperationRegistry {
 	/// Total canonical descriptors: the immutable legacy surface prefix followed
 	/// by Recipe-owned extensions.
 	#[must_use]
-	pub const fn len(self) -> usize {
-		RAW_OPERATION_COUNT + RECIPE_OWNED_OPERATIONS.len()
-	}
+	pub const fn len(self) -> usize { RAW_OPERATION_COUNT + RECIPE_OWNED_OPERATIONS.len() }
 
 	#[must_use]
-	pub const fn is_empty(self) -> bool {
-		self.len() == 0
-	}
+	pub const fn is_empty(self) -> bool { self.len() == 0 }
 
 	/// Iterate the complete canonical registry without changing legacy ordinal
 	/// order. Recipe-owned extensions always follow the surface prefix.
 	pub fn iter(self) -> impl ExactSizeIterator<Item = OperationDescriptor> {
-		(0..self.len()).map(|ordinal| match ordinal < RAW_OPERATION_COUNT {
-			true => describe(&RAW_OPERATION_SURFACE[ordinal]),
-			false => describe(&RECIPE_OWNED_OPERATIONS[ordinal - RAW_OPERATION_COUNT]),
+		(0..self.len()).map(|ordinal| {
+			match ordinal < RAW_OPERATION_COUNT {
+				true => describe(&RAW_OPERATION_SURFACE[ordinal]),
+				false => describe(&RECIPE_OWNED_OPERATIONS[ordinal - RAW_OPERATION_COUNT]),
+			}
 		})
 	}
 
 	/// Number of descriptors sourced verbatim from `operation-surface.txt`.
 	#[must_use]
-	pub const fn surface_len(self) -> usize {
-		RAW_OPERATION_COUNT
-	}
+	pub const fn surface_len(self) -> usize { RAW_OPERATION_COUNT }
 
 	/// Iterate only the immutable `operation-surface.txt` prefix.
 	pub fn surface_iter(self) -> impl ExactSizeIterator<Item = OperationDescriptor> {
@@ -295,9 +273,7 @@ impl OperationRegistry {
 
 	/// Number of native Recipe-owned extensions after the legacy surface.
 	#[must_use]
-	pub const fn owned_len(self) -> usize {
-		RECIPE_OWNED_OPERATIONS.len()
-	}
+	pub const fn owned_len(self) -> usize { RECIPE_OWNED_OPERATIONS.len() }
 
 	/// Iterate only native Recipe-owned extensions.
 	pub fn owned_iter(self) -> impl ExactSizeIterator<Item = OperationDescriptor> {

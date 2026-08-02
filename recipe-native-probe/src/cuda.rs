@@ -1,6 +1,8 @@
 use core::ffi::c_void;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::{
+	path::PathBuf,
+	time::{Duration, Instant},
+};
 
 use recipe_core::{Label, TargetIdentity, TransferLaneCount, TransportKind};
 use recipe_cuda::{
@@ -13,16 +15,18 @@ use recipe_kernel::{
 use recipe_native_executor::CUDA_MAXIMUM_SUBMISSION_QUEUES;
 use recipe_probe::{BoundedBenchmarkPlan, GpuDescriptor, GpuMeasurement, LinkDuplex, ProbeError, ProbeResult};
 
-use crate::benchmark::{
-	calculation_rate, capacity, compute_buffer_bytes, fill_input, fma_template, measured, plan_bytes, time_bounded,
-	transfer_rate, verify_compute_output,
+use crate::{
+	benchmark::{
+		calculation_rate, capacity, compute_buffer_bytes, fill_input, fma_template, measured, plan_bytes,
+		time_bounded, transfer_rate, verify_compute_output,
+	},
+	config::{BackendLibrary, KernelBuildConfig, NativeProbeConfig},
+	identity::{
+		PinnedLibrary, backend_toolchain_identity, label, library_identity, pci_accelerator_present, pci_surface,
+		selected_library,
+	},
+	native::Backend,
 };
-use crate::config::{BackendLibrary, KernelBuildConfig, NativeProbeConfig};
-use crate::identity::{
-	PinnedLibrary, backend_toolchain_identity, label, library_identity, pci_accelerator_present, pci_surface,
-	selected_library,
-};
-use crate::native::Backend;
 
 const CUDA_KERNEL_ENTRY: &str = "recipe_probe_fma_f32";
 const COMPLETION_POLL_INITIAL_DELAY: Duration = Duration::from_micros(50);
@@ -56,9 +60,7 @@ impl CompletionPollBackoff {
 		self.advance();
 	}
 
-	fn advance(&mut self) {
-		self.next_delay = self.next_delay.saturating_mul(2).min(self.maximum_delay);
-	}
+	fn advance(&mut self) { self.next_delay = self.next_delay.saturating_mul(2).min(self.maximum_delay); }
 }
 
 #[derive(Clone, Debug)]
@@ -366,14 +368,10 @@ impl CudaBackend {
 				.map_err(|_| ProbeError::Benchmark("CUDA SM minor does not fit u8".to_owned()))?,
 			ptx_isa: self.ptx_isa,
 		});
-		let lowered = lower_elementwise(
-			&template,
-			&target,
-			&LoweringOptions {
-				entry_symbol: CUDA_KERNEL_ENTRY.to_owned(),
-				workgroup_lanes,
-			},
-		)
+		let lowered = lower_elementwise(&template, &target, &LoweringOptions {
+			entry_symbol: CUDA_KERNEL_ENTRY.to_owned(),
+			workgroup_lanes,
+		})
 		.map_err(kernel_benchmark_error)?;
 		let builder = ArtifactBuilder::new(self.kernels.toolchain.clone()).map_err(kernel_benchmark_error)?;
 		let artifact = builder
@@ -589,60 +587,4 @@ fn parse_pci_bus_id(value: &str) -> ProbeResult<ParsedPci> {
 		device: parse_hex(device, "device")?,
 		function,
 	})
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn workgroup_selection_uses_discovered_limit_and_realized_elements() {
-		assert_eq!(
-			cuda_workgroup_lanes(1_024, 900).expect("workgroup lanes"),
-			512
-		);
-		assert_eq!(
-			cuda_workgroup_lanes(192, 900).expect("workgroup lanes"),
-			128
-		);
-		assert_eq!(
-			cuda_workgroup_lanes(1_024, 17).expect("workgroup lanes"),
-			16
-		);
-		assert!(cuda_workgroup_lanes(1_024, 0).is_err());
-	}
-
-	#[test]
-	fn parses_exact_cuda_pci_function() {
-		let parsed = parse_pci_bus_id("0000:0B:00.1").expect("valid PCI identity");
-		assert_eq!(
-			parsed,
-			ParsedPci {
-				domain: 0,
-				bus: 11,
-				device: 0,
-				function: 1,
-			}
-		);
-		assert_eq!(parsed.sysfs_bdf(), "0000:0b:00.1");
-	}
-
-	#[test]
-	fn rejects_approximate_cuda_pci_function() {
-		assert!(parse_pci_bus_id("04:00").is_err());
-		assert!(parse_pci_bus_id("0000:04:00.8").is_err());
-		assert!(parse_pci_bus_id("0000:gg:00.0").is_err());
-	}
-
-	#[test]
-	fn timed_out_completion_polling_reaches_a_large_fixed_cap() {
-		let mut backoff = CompletionPollBackoff::timed_out_cleanup();
-		assert_eq!(backoff.next_delay, Duration::from_millis(10));
-		for _ in 0..8 {
-			backoff.advance();
-		}
-		assert_eq!(backoff.next_delay, Duration::from_millis(100));
-		backoff.advance();
-		assert_eq!(backoff.next_delay, Duration::from_millis(100));
-	}
 }

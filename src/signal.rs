@@ -1,9 +1,13 @@
 #![allow(unsafe_code)]
 
 use core::fmt;
-use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::{
+	io,
+	sync::{
+		Mutex, MutexGuard,
+		atomic::{AtomicBool, Ordering},
+	},
+};
 
 static SIGINT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SIGINT_INSTALLATION: Mutex<()> = Mutex::new(());
@@ -57,13 +61,9 @@ impl SigintGuard {
 		})
 	}
 
-	pub(crate) fn requested(&self) -> bool {
-		SIGINT_REQUESTED.load(Ordering::Acquire)
-	}
+	pub(crate) fn requested(&self) -> bool { SIGINT_REQUESTED.load(Ordering::Acquire) }
 
-	pub(crate) const fn request_flag(&self) -> &'static AtomicBool {
-		&SIGINT_REQUESTED
-	}
+	pub(crate) const fn request_flag(&self) -> &'static AtomicBool { &SIGINT_REQUESTED }
 }
 
 impl Drop for SigintGuard {

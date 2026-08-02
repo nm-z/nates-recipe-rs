@@ -6,9 +6,7 @@ pub type Result<T> = core::result::Result<T, CudaError>;
 pub struct DriverStatus(pub i32);
 
 impl fmt::Display for DriverStatus {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "CUDA status {}", self.0)
-	}
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "CUDA status {}", self.0) }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,10 +106,12 @@ impl fmt::Display for CudaError {
 			Self::DuplicateDeviceUuid {
 				first_ordinal,
 				second_ordinal,
-			} => write!(
-				f,
-				"CUDA devices {first_ordinal} and {second_ordinal} returned the same UUID"
-			),
+			} => {
+				write!(
+					f,
+					"CUDA devices {first_ordinal} and {second_ordinal} returned the same UUID"
+				)
+			}
 			Self::InvalidContextFlags { bits } => {
 				write!(f, "invalid R470-safe CUDA context flag set 0x{bits:08x}")
 			}

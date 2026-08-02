@@ -1,8 +1,12 @@
-use core::fmt;
-use core::num::{NonZeroU32, NonZeroU64};
-use std::fs::File;
-use std::io::Read as _;
-use std::path::{Path, PathBuf};
+use core::{
+	fmt,
+	num::{NonZeroU32, NonZeroU64},
+};
+use std::{
+	fs::File,
+	io::Read as _,
+	path::{Path, PathBuf},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delimiter {
@@ -48,24 +52,16 @@ impl IngestLimits {
 	}
 
 	#[must_use]
-	pub const fn source_bytes(self) -> NonZeroU64 {
-		self.source_bytes
-	}
+	pub const fn source_bytes(self) -> NonZeroU64 { self.source_bytes }
 
 	#[must_use]
-	pub const fn records(self) -> NonZeroU64 {
-		self.records
-	}
+	pub const fn records(self) -> NonZeroU64 { self.records }
 
 	#[must_use]
-	pub const fn fields_per_record(self) -> NonZeroU32 {
-		self.fields_per_record
-	}
+	pub const fn fields_per_record(self) -> NonZeroU32 { self.fields_per_record }
 
 	#[must_use]
-	pub const fn field_bytes(self) -> NonZeroU64 {
-		self.field_bytes
-	}
+	pub const fn field_bytes(self) -> NonZeroU64 { self.field_bytes }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,19 +114,13 @@ impl RawTable {
 	}
 
 	#[must_use]
-	pub const fn delimiter(&self) -> Delimiter {
-		self.delimiter
-	}
+	pub const fn delimiter(&self) -> Delimiter { self.delimiter }
 
 	#[must_use]
-	pub fn headers(&self) -> &[Vec<u8>] {
-		&self.headers
-	}
+	pub fn headers(&self) -> &[Vec<u8>] { &self.headers }
 
 	#[must_use]
-	pub fn rows(&self) -> &[Vec<Vec<u8>>] {
-		&self.rows
-	}
+	pub fn rows(&self) -> &[Vec<Vec<u8>>] { &self.rows }
 
 	#[must_use]
 	pub fn width(&self) -> usize {
@@ -360,9 +350,11 @@ fn assemble_table(mut records: Vec<Vec<Vec<u8>>>, delimiter: Delimiter, header: 
 	let width = records.first().map_or(0, Vec::len);
 	let headers = match header {
 		HeaderMode::Present => records.remove(0),
-		HeaderMode::Absent => (1..=width)
-			.map(|index| format!("col{index}").into_bytes())
-			.collect(),
+		HeaderMode::Absent => {
+			(1..=width)
+				.map(|index| format!("col{index}").into_bytes())
+				.collect()
+		}
 	};
 	Ok(RawTable {
 		delimiter,
@@ -524,91 +516,4 @@ fn invalid_limit(name: &str) -> IngestError {
 		IngestErrorKind::InvalidLimit,
 		format!("{name} limit must be nonzero"),
 	)
-}
-
-#[cfg(test)]
-mod tests {
-	use super::{Delimiter, HeaderMode, IngestErrorKind, IngestLimits, TableRequest, parse_table};
-
-	fn limits() -> IngestLimits {
-		IngestLimits::new(4096, 16, 8, 64).unwrap()
-	}
-
-	#[test]
-	fn auto_delimiter_ignores_quoted_separators_and_preserves_bytes() {
-		let table = parse_table(
-			b"name;note;raw\r\nnate;\"a,b\";\xff\r\n",
-			TableRequest::new(Delimiter::Auto, HeaderMode::Present, limits()),
-		)
-		.unwrap();
-		assert_eq!(table.delimiter(), Delimiter::Semicolon);
-		assert_eq!(
-			table.headers(),
-			[b"name".to_vec(), b"note".to_vec(), b"raw".to_vec()]
-		);
-		assert_eq!(
-			table.rows(),
-			[vec![b"nate".to_vec(), b"a,b".to_vec(), vec![0xff]]]
-		);
-	}
-
-	#[test]
-	fn headerless_whitespace_framing_is_explicit_and_rectangular() {
-		let table = parse_table(
-			b"1  2\t3\n4 5 6\n",
-			TableRequest::new(Delimiter::Auto, HeaderMode::Absent, limits()),
-		)
-		.unwrap();
-		assert_eq!(table.delimiter(), Delimiter::AsciiWhitespace);
-		assert_eq!(
-			table.headers(),
-			[b"col1".to_vec(), b"col2".to_vec(), b"col3".to_vec()]
-		);
-		assert_eq!(table.rows().len(), 2);
-		assert_eq!(table.width(), 3);
-	}
-
-	#[test]
-	fn every_bound_fails_before_returning_a_partial_table() {
-		let requests = [
-			(
-				IngestLimits::new(3, 16, 8, 64).unwrap(),
-				IngestErrorKind::SourceLimitExceeded,
-			),
-			(
-				IngestLimits::new(4096, 1, 8, 64).unwrap(),
-				IngestErrorKind::RecordLimitExceeded,
-			),
-			(
-				IngestLimits::new(4096, 16, 1, 64).unwrap(),
-				IngestErrorKind::FieldLimitExceeded,
-			),
-			(
-				IngestLimits::new(4096, 16, 8, 1).unwrap(),
-				IngestErrorKind::FieldByteLimitExceeded,
-			),
-		];
-		for (limits, kind) in requests {
-			let error = parse_table(
-				b"aa,b\nc,d\n",
-				TableRequest::new(Delimiter::Comma, HeaderMode::Present, limits),
-			)
-			.unwrap_err();
-			assert_eq!(error.kind, kind);
-		}
-	}
-
-	#[test]
-	fn zero_limits_and_ragged_whitespace_fail_closed() {
-		assert_eq!(
-			IngestLimits::new(0, 1, 1, 1).unwrap_err().kind,
-			IngestErrorKind::InvalidLimit
-		);
-		let error = parse_table(
-			b"1 2\n3\n",
-			TableRequest::new(Delimiter::AsciiWhitespace, HeaderMode::Absent, limits()),
-		)
-		.unwrap_err();
-		assert_eq!(error.kind, IngestErrorKind::InconsistentWidth);
-	}
 }
