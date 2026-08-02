@@ -1,0 +1,14 @@
+[package]
+name = "recipe-cluster"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+recipe-core = { path = "../core" }
+recipe-probe = { path = "../probe" }
+recipe-transport = { path = "../transport" }
+sha2 = "0.10.9"
+
+[lints.rust]
+unsafe_code = "forbid"

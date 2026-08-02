@@ -44,6 +44,10 @@ maximum, grouped imports, and formatted documentation examples. Use
 `SCREAMING_SNAKE_CASE` for constants. Keep unsafe code confined to reviewed FFI
 boundaries and document its invariants.
 
+This repository contains no Python. Run repository-wide searches, diffs,
+reviews, and Git inspections normally without Python-specific exclusion globs
+or pathspecs.
+
 ## Acceptance Guidelines
 
 Do not add inline, unit, mock, synthetic-data, compile-pass, or compile-fail

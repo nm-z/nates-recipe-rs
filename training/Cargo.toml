@@ -1,0 +1,24 @@
+[package]
+name = "recipe-training"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Recipe-owned static dense-training graph compiler"
+
+[dependencies]
+recipe-core = { path = "../core" }
+recipe-executor = { path = "../executor" }
+recipe-ingest = { path = "../ingest" }
+recipe-language = { path = "../language" }
+recipe-math = { path = "../math" }
+recipe-native-executor = { path = "../native-executor" }
+recipe-ogdl = { path = "../ogdl" }
+recipe-ops = { path = "../ops" }
+recipe-prepare = { path = "../prepare" }
+recipe-probe = { path = "../probe" }
+recipe-program = { path = "../program" }
+rustix = { version = "0.38.44", features = ["fs"] }
+sha2 = "0.10"
+
+[lints]
+workspace = true

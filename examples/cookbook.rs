@@ -1,6 +1,4 @@
-//! Recipe's public training and inference cookbook.
-//!
-//! Run every recipe in declaration order with `cargo run --example cookbook`.
+//!`cargo run --example cookbook`
 
 use recipe::*;
 
@@ -331,8 +329,14 @@ fn knn() -> CookbookResult {
 		.knn_predictions()
 		.expect("KNN inference returns independently typed outputs");
 	assert_eq!(predictions.len(), 2);
-	assert_eq!(predictions[0].contract().kind(), KnnInferencePredictionKind::DiscreteMode);
-	assert_eq!(predictions[1].contract().kind(), KnnInferencePredictionKind::NumericMean);
+	assert_eq!(
+		predictions[0].contract().kind(),
+		KnnInferencePredictionKind::DiscreteMode
+	);
+	assert_eq!(
+		predictions[1].contract().kind(),
+		KnnInferencePredictionKind::NumericMean
+	);
 	Ok(())
 }
 
@@ -601,8 +605,14 @@ fn bayes_multi() -> CookbookResult {
 	assert_eq!(report.bayes_output_range(0), Some(0..2));
 	assert_eq!(report.bayes_output_range(1), Some(2..5));
 	assert_eq!(report.values().len(), 25);
-	assert_eq!(report.decode_bayes_output_class(0, 0), Some(b"falcon".as_slice()));
-	assert_eq!(report.decode_bayes_output_class(1, 2), Some(b"walk".as_slice()));
+	assert_eq!(
+		report.decode_bayes_output_class(0, 0),
+		Some(b"falcon".as_slice())
+	);
+	assert_eq!(
+		report.decode_bayes_output_class(1, 2),
+		Some(b"walk".as_slice())
+	);
 	Ok(())
 }
 

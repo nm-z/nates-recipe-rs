@@ -60,7 +60,7 @@ cargo run --bin recipe -- probe --help
 ```
 
 Real-data, real-hardware proof gates are documented in
-[`recipe-acceptance/README.md`](recipe-acceptance/README.md). They are explicit
+[`acceptance/README.md`](acceptance/README.md). They are explicit
 commands, not part of `cargo test`, and missing prerequisites fail rather than
 skip.
 

@@ -1,0 +1,13 @@
+[package]
+name = "recipe-language"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Backend-neutral tensor and primitive-kernel language for Recipe"
+
+[dependencies]
+recipe-core = { path = "../core" }
+recipe-ogdl = { path = "../ogdl" }
+
+[lints.rust]
+unsafe_code = "forbid"

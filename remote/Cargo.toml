@@ -1,0 +1,11 @@
+[package]
+name = "recipe-remote"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+recipe-core = { path = "../core" }
+recipe-executor = { path = "../executor" }
+recipe-transport = { path = "../transport" }
+sha2 = "0.10.9"

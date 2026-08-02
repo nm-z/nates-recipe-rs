@@ -1,0 +1,21 @@
+[package]
+name = "recipe-native-executor"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Native CUDA Driver and ROCr/HSA execution resources for Recipe"
+
+[dependencies]
+recipe-core = { path = "../core" }
+recipe-cuda = { path = "../cuda" }
+recipe-executor = { path = "../executor" }
+recipe-hsa = { path = "../hsa" }
+recipe-host = { path = "../host" }
+recipe-kernel = { path = "../kernel" }
+recipe-planner = { path = "../planner" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

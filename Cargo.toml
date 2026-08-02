@@ -23,61 +23,61 @@ test = false
 resolver = "3"
 members = [
 	".",
-	"recipe-audit",
-	"recipe-acceptance",
-	"recipe-cluster",
-	"recipe-core",
-	"recipe-cuda",
-	"recipe-executor",
-	"recipe-host",
-	"recipe-hsa",
-	"recipe-ingest",
-	"recipe-kernel",
-	"recipe-language",
-	"recipe-math",
-	"recipe-native-executor",
-	"recipe-native-probe",
-	"recipe-ogdl",
-	"recipe-ops",
-	"recipe-planner",
-	"recipe-prepare",
-	"recipe-primitives",
-	"recipe-program",
-	"recipe-probe",
-	"recipe-remote",
-	"recipe-scheduler",
-	"recipe-text",
-	"recipe-training",
-	"recipe-transport",
+	"audit",
+	"acceptance",
+	"cluster",
+	"core",
+	"cuda",
+	"executor",
+	"host",
+	"hsa",
+	"ingest",
+	"kernel",
+	"language",
+	"math",
+	"native-executor",
+	"native-probe",
+	"ogdl",
+	"ops",
+	"planner",
+	"prepare",
+	"primitives",
+	"program",
+	"probe",
+	"remote",
+	"scheduler",
+	"text",
+	"training",
+	"transport",
 ]
 
 [dependencies]
 libc = "0.2"
 proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
-recipe-cluster = { path = "recipe-cluster" }
-recipe-core = { path = "recipe-core" }
-recipe-cuda = { path = "recipe-cuda" }
-recipe-executor = { path = "recipe-executor" }
-recipe-host = { path = "recipe-host" }
-recipe-hsa = { path = "recipe-hsa" }
-recipe-ingest = { path = "recipe-ingest" }
-recipe-kernel = { path = "recipe-kernel" }
-recipe-language = { path = "recipe-language" }
-recipe-math = { path = "recipe-math" }
-recipe-native-executor = { path = "recipe-native-executor" }
-recipe-native-probe = { path = "recipe-native-probe" }
-recipe-ogdl = { path = "recipe-ogdl" }
-recipe-ops = { path = "recipe-ops" }
-recipe-planner = { path = "recipe-planner" }
-recipe-prepare = { path = "recipe-prepare" }
-recipe-primitives = { path = "recipe-primitives" }
-recipe-program = { path = "recipe-program" }
-recipe-probe = { path = "recipe-probe" }
-recipe-remote = { path = "recipe-remote" }
-recipe-scheduler = { path = "recipe-scheduler" }
-recipe-text = { path = "recipe-text" }
-recipe-training = { path = "recipe-training" }
-recipe-transport = { path = "recipe-transport" }
+recipe-cluster = { path = "cluster" }
+recipe-core = { path = "core" }
+recipe-cuda = { path = "cuda" }
+recipe-executor = { path = "executor" }
+recipe-host = { path = "host" }
+recipe-hsa = { path = "hsa" }
+recipe-ingest = { path = "ingest" }
+recipe-kernel = { path = "kernel" }
+recipe-language = { path = "language" }
+recipe-math = { path = "math" }
+recipe-native-executor = { path = "native-executor" }
+recipe-native-probe = { path = "native-probe" }
+recipe-ogdl = { path = "ogdl" }
+recipe-ops = { path = "ops" }
+recipe-planner = { path = "planner" }
+recipe-prepare = { path = "prepare" }
+recipe-primitives = { path = "primitives" }
+recipe-program = { path = "program" }
+recipe-probe = { path = "probe" }
+recipe-remote = { path = "remote" }
+recipe-scheduler = { path = "scheduler" }
+recipe-text = { path = "text" }
+recipe-training = { path = "training" }
+recipe-transport = { path = "transport" }
 serde_json = "1.0.150"
 syn = { version = "2.0.117", features = ["full", "visit"] }
 

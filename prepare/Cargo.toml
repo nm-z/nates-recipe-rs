@@ -1,0 +1,21 @@
+[package]
+name = "recipe-prepare"
+version = "0.1.0"
+edition = "2024"
+description = "Fixed-point public preparation pipeline for Recipe"
+license = "MIT"
+
+[dependencies]
+recipe-core = { path = "../core" }
+recipe-cuda = { path = "../cuda" }
+recipe-kernel = { path = "../kernel" }
+recipe-language = { path = "../language" }
+recipe-native-executor = { path = "../native-executor" }
+recipe-planner = { path = "../planner" }
+recipe-probe = { path = "../probe" }
+recipe-program = { path = "../program" }
+recipe-scheduler = { path = "../scheduler" }
+sha2 = "0.10"
+
+[lints.rust]
+unsafe_code = "forbid"

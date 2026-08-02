@@ -1,0 +1,25 @@
+[package]
+name = "recipe-native-probe"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Bare-metal NVIDIA CUDA Driver and AMD ROCr probe adapters for Recipe"
+
+[dependencies]
+recipe-core = { path = "../core" }
+recipe-cuda = { path = "../cuda" }
+recipe-hsa = { path = "../hsa" }
+recipe-host = { path = "../host" }
+recipe-kernel = { path = "../kernel" }
+recipe-native-executor = { path = "../native-executor" }
+recipe-probe = { path = "../probe" }
+sha2 = "0.10"
+
+[build-dependencies]
+sha2 = "0.10"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

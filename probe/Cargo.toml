@@ -1,0 +1,10 @@
+[package]
+name = "recipe-probe"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+recipe-core = { path = "../core" }
+rustix = { version = "0.38.44", features = ["fs", "process"] }
+sha2 = "0.10.9"

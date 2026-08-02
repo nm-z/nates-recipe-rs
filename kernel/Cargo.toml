@@ -1,0 +1,11 @@
+[package]
+name = "recipe-kernel"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+recipe-core = { path = "../core" }
+recipe-language = { path = "../language" }
+recipe-primitives = { path = "../primitives" }
+sha2 = "0.10"

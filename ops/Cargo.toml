@@ -1,0 +1,19 @@
+[package]
+name = "recipe-ops"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Canonical operation registry and honest lowering boundary for Recipe"
+build = "build.rs"
+
+[dependencies]
+recipe-core = { path = "../core" }
+recipe-language = { path = "../language" }
+recipe-math = { path = "../math" }
+recipe-primitives = { path = "../primitives" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"

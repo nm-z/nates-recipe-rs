@@ -1,0 +1,10 @@
+[package]
+name = "recipe-executor"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Backend-neutral, typestate execution lifecycle for finalized Recipe bundles"
+
+[dependencies]
+recipe-core = { path = "../core" }
+sha2 = "0.10.9"
