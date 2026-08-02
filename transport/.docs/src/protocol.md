@@ -295,6 +295,17 @@ or before `ready` is a protocol-state error. Thus the runtime boundary has
 explicit ownership on both sides: a transmitted slot is held until completion
 release, and received bytes are held until receive release.
 
+The configured capacities must therefore be chosen consistently: a remote
+peer may legally declare any payload up to `ProtocolLimits::max_payload`, but
+the runtime receive buffer is only `ChannelCapacities::max_payload`. Outbound
+submission checks the smaller runtime buffer. Inbound `progress_read` checks
+only the protocol limit before taking a slice of the fixed receive buffer; it
+does not separately reject a declared payload between the runtime capacity
+and the protocol limit. With mismatched values, such a peer frame reaches an
+out-of-bounds slice rather than a structured `BufferTooSmall` error. The
+current callers must keep the runtime capacity and protocol maximum aligned;
+the implementation does not negotiate or repair this mismatch.
+
 ## Probe protocol and measured-profile boundary
 
 `TcpPeerSession` is a serialized owner of one blocking probe connection. Its
@@ -659,13 +670,18 @@ count, sends scheduled `UserData`, and waits for `DataAck`. Only after
 `DataAck` does it call `user_data_acked`, clear the buffer, mark the transfer
 complete, and release its half-duplex claim. The master stores one incoming
 worker data frame in a fixed data slot and sends its `DataAck` before reporting
-the task complete. It stores metrics in fixed metric slots; the caller must
-take them.
+the task complete. The caller must call `release_data(slot)` to return that
+data slot; until then a later worker-to-master frame can be backpressured. It
+stores metrics in fixed metric slots, and the caller must call `take_metric`
+to clear a metric slot. A full data inbox or metric inbox is therefore a
+bounded backpressure result, not an overwrite.
 
 Full-duplex transfer claims may progress independently. Half-duplex claims
 for the same finalized resource are serialized by the master and worker token
 stores. The runtime lane itself still remains a single outer stream with the
-control, user-data, and metrics queue priority described above.
+control, user-data, and metrics queue priority described above. The queue has
+no fairness rotation: a continuously occupied higher-priority lane can delay
+lower-priority frames until its slots are released.
 
 ### Normal exit
 
