@@ -6,8 +6,8 @@ use recipe_ingest::{
 use recipe_ogdl::{Graph, NodeId};
 
 use crate::{ CheckpointArtifactMetadata, CheckpointArtifactVector, CheckpointDecodeErrorKind, CheckpointError,
-	CheckpointImageMetadata, CheckpointPath, CheckpointResult, CompiledFeatureSpan, DenseDataNormalization,
-	DenseFeatureLowering, DenseOperation, KnnLabelValue, KnnReferenceOutput, KnnReferenceSet, KnnReferenceValues,
+	CheckpointImageMetadata, CheckpointPath, CheckpointResult, CompiledFeatureSpan, DataNormalization,
+	DenseFeatureLowering, Function, KnnLabelValue, KnnReferenceOutput, KnnReferenceSet, KnnReferenceValues,
 	checkpoint::{atomic_save, decode_error, validate_saved_vector}, };
 
 /// Canonical semantic KNN artifact format version.
@@ -41,9 +41,9 @@ pub struct KnnModelArtifact {
 	/// Immutable KNN reference state.
 	references: KnnReferenceSet,
 	/// Declared feature normalization, when present.
-	data_normalization: Option<DenseDataNormalization>,
+	data_normalization: Option<DataNormalization>,
 	/// Ordered post-reduction operations.
-	operations: Vec<DenseOperation>, }
+	operations: Vec<Function>, }
 
 impl KnnModelArtifact {
 	/// Construct and validate one semantic KNN artifact.
@@ -53,8 +53,8 @@ impl KnnModelArtifact {
 	/// Returns an error when the supplied reference state or declarations are
 	/// inconsistent.
 	#[inline]
-	pub fn new( references: KnnReferenceSet, data_normalization: Option<DenseDataNormalization>,
-		operations: impl IntoIterator<Item = DenseOperation>, ) -> CheckpointResult<Self> { let artifact = Self {
+	pub fn new( references: KnnReferenceSet, data_normalization: Option<DataNormalization>,
+		operations: impl IntoIterator<Item = Function>, ) -> CheckpointResult<Self> { let artifact = Self {
 			format_version: KNN_MODEL_FORMAT_VERSION, references, data_normalization,
 			operations: operations.into_iter().collect(), }; validate_artifact(&artifact)?; return Ok(artifact); }
 
@@ -68,11 +68,11 @@ impl KnnModelArtifact {
 
 	#[must_use]
 	#[inline]
-	pub const fn data_normalization(&self) -> Option<DenseDataNormalization> { return self.data_normalization; }
+	pub const fn data_normalization(&self) -> Option<DataNormalization> { return self.data_normalization; }
 
 	#[must_use]
 	#[inline]
-	pub fn operations(&self) -> &[DenseOperation] { return &self.operations; }
+	pub fn operations(&self) -> &[Function] { return &self.operations; }
 
 	/// Continue one KNN model with another prepared training partition.
 	///
@@ -182,10 +182,10 @@ impl KnnModelArtifact {
 			"data-normalization",
 			&self.data_normalization.map_or("none", |value| {
 				return match value {
-					DenseDataNormalization::Identity => "identity",
-					DenseDataNormalization::ZScore => "z-score",
-					DenseDataNormalization::MinMax => "min-max",
-					DenseDataNormalization::L2Norm => "l2-norm",
+					DataNormalization::Identity => "identity",
+					DataNormalization::ZScore => "z-score",
+					DataNormalization::MinMax => "min-max",
+					DataNormalization::L2Norm => "l2-norm",
 				}; }), )?;
 		let operations = child(&mut graph, root, "operations")?;
 		for operation in &self.operations {
@@ -632,9 +632,9 @@ impl Decoder {
 		let data_normalization_path = path.field("data-normalization");
 		let data_normalization = match self.scalar(fields["data-normalization"], &data_normalization_path)? {
 			"none" => None,
-			"z-score" => Some(DenseDataNormalization::ZScore),
-			"min-max" => Some(DenseDataNormalization::MinMax),
-			"l2-norm" => Some(DenseDataNormalization::L2Norm),
+			"z-score" => Some(DataNormalization::ZScore),
+			"min-max" => Some(DataNormalization::MinMax),
+			"l2-norm" => Some(DataNormalization::L2Norm),
 			_ => { return Err(Self::invalid_value( &data_normalization_path,
 					"unknown data normalization",
 				)); } }; let operations = self.parse_operations(
@@ -700,13 +700,13 @@ impl Decoder {
 					CheckpointPath::root(), other.to_string(), ); } })?; return Ok(artifact); }
 
 	/// Decode the ordered dense-operation list.
-	fn parse_operations(&self, node: NodeId, path: &CheckpointPath) -> CheckpointResult<Vec<DenseOperation>> {
+	fn parse_operations(&self, node: NodeId, path: &CheckpointPath) -> CheckpointResult<Vec<Function>> {
 		let children = self.node(node, path)?.children(); let mut operations = Vec::with_capacity(children.len());
 		for (index, child) in children.iter().copied().enumerate() { let item_path = path.index(index);
 			if self.node(child, &item_path)?.text() != "operation" {
 				return Err(Self::unknown(&item_path, "expected operation entry"));
 			}
-			let value = self.scalar(child, &item_path)?; operations.push(DenseOperation::from_token(value).ok_or_else(|| {
+			let value = self.scalar(child, &item_path)?; operations.push(Function::from_token(value).ok_or_else(|| {
 				return Self::invalid_value(&item_path, format!("unknown dense operation {value:?}"));
 			})?); }
 		return Ok(operations); }

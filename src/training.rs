@@ -12,25 +12,20 @@ use recipe_native_executor::{LocalCandidateFactory, StagedCrossBackend}; use rec
 use recipe_probe::MeasuredProfile; use recipe_training::{
 	AdamWConfig, BayesModelArtifact, BayesModelDecodeLimits, BayesianDependency, BinaryValidationConfig,
 	CheckpointArtifact, CheckpointDecodeLimits, CheckpointError, CheckpointManifest, CompiledTraining,
-	CompletedTrainingCheckpoint, CompletedTrainingExecution, DenseActivation, DenseAttention, DenseBlock,
-	DenseBlockKind, DenseConvolution, DenseDataNormalization, DenseEmbedding, DenseGru, DenseKMeans, DenseLayer,
-	DenseLoss, DenseLstm, DenseNormalization, DenseOperation, DensePool, DenseResidual, DenseResidualOperation,
-	DenseRnn, DenseTrainingConfig, DenseTree, DenseTreeFamily, FinalTrainingMetric, InferencePreparationError,
-	KnnModelArtifact, KnnModelDecodeLimits, LearningRateDecay, MAXIMUM_REDUCTION_TREE_LANES,
+	CompletedTrainingCheckpoint, CompletedTrainingExecution, FinalTrainingMetric,
+	InferencePreparationError,
+	KnnModelArtifact, KnnModelDecodeLimits, MAXIMUM_REDUCTION_TREE_LANES,
 	MulticlassValidationConfig, NativeKernelFormat, RealizedNativeKernelSet, RegressionValidationConfig,
 	TrainingBounds, TrainingCompileError, TrainingExecutionControl, TrainingExecutionEvidence,
 	TrainingExecutionLimits, TrainingHorizon, TrainingMetricKind, TrainingMetricObserver, TrainingMetricSample,
-	ValidationMetricStatus, apply_checkpoint_resume, bounded_training_metric_channel, compile_dense_training,
-	compile_dense_training_with_binary_validation, compile_dense_training_with_blocks,
-	compile_dense_training_with_blocks_and_binary_validation, compile_dense_training_with_blocks_and_multiclass_validation,
-	compile_dense_training_with_blocks_and_regression_validation, compile_dense_training_with_multiclass_validation,
-	compile_dense_training_with_regression_validation, compiled_training_program_digest, load_bayes_model_file,
+	ValidationMetricStatus, apply_checkpoint_resume, bounded_training_metric_channel, compile_training,
+	compiled_training_program_digest, load_bayes_model_file,
 	load_checkpoint_file, load_knn_model_file, prepare_and_execute_local_training_controlled,
 	prepare_categorical_bayesian_reference_sets, prepare_knn_reference_set, };
 
 use crate::{ api::{
-		Activation, Data, DataNormalization, DeclarationError, ForestBooster, LayerNormalization, LayerOperation,
-		LayerSpec, LearningRateSchedule, Loss, Metric, Model, Objective, Optimizer, ResidualOperation, ResidualSkip, Train, },
+		Block, Data, DataNormalization, DeclarationError, LearningRateSchedule, Loss, Metric, Model, Objective, Optimizer,
+		Train, },
 	data_prepare::{DataPreparationError, prepare_data},
 	native_prepare::{NativePreparationError, with_current_native_preparation}, };
 
@@ -226,7 +221,7 @@ struct ResumeNativeBundle { topology: TopologyIdentity, discovery: DiscoveryIden
 /// partition becomes the immutable reference set; prediction calculation is
 /// compiled when target-free query rows are supplied.
 pub fn compile_knn_model(policy: &Train, data: &Data, model: &Model) -> TrainingResult<KnnModelArtifact> {
-	policy.validate()?; data.validate()?; model.validate()?; let [ LayerSpec::Knn { neighbors, operations, },
+	policy.validate()?; data.validate()?; model.validate()?; let [ Block::Knn { neighbors, functions, },
 	] = model.layers()
 	else { return Err(TrainingError::unsupported(
 			"KNN preparation requires exactly one `.knn(neighbors)` model block",
@@ -260,10 +255,11 @@ pub fn compile_knn_model(policy: &Train, data: &Data, model: &Model) -> Training
 		.ok_or_else(|| TrainingError::unsupported("KNN neighbor count must be nonzero"))?;
 	let prepared = prepare_data(data)?; let references = prepare_knn_reference_set(&prepared, neighbors)?;
 	let normalization = data .normalization() .map(|normalization| match normalization {
-			DataNormalization::ZScore => DenseDataNormalization::ZScore,
-			DataNormalization::MinMax => DenseDataNormalization::MinMax,
-			DataNormalization::L2Norm => DenseDataNormalization::L2Norm, });
-	let current = KnnModelArtifact::new(references, normalization, map_dense_operations(operations)?)?; match resume {
+			DataNormalization::Identity => DataNormalization::Identity,
+			DataNormalization::ZScore => DataNormalization::ZScore,
+			DataNormalization::MinMax => DataNormalization::MinMax,
+			DataNormalization::L2Norm => DataNormalization::L2Norm, });
+	let current = KnnModelArtifact::new(references, normalization, functions.clone())?; match resume {
 		Some(saved) => saved.continue_with(current).map_err(Into::into), None => Ok(current), } }
 
 /// Prepare one or more observed categorical Bayesian target conditionals.
@@ -318,9 +314,8 @@ fn compile_training_graph( policy: &Train, data: &Data, model: &Model,
 ) -> TrainingResult<(CompiledTraining, Option<CheckpointArtifact>)> { policy.validate()?; data.validate()?;
 	model.validate()?; let loss = require_supported_model(model)?; require_supported_policy(policy)?;
 
-	let prepared = prepare_data(data)?; let blocks = model .layers() .iter() .map(map_dense_block)
-		.collect::<TrainingResult<Vec<_>>>()?; let layers = blocks .iter() .map(|block| block.layer().cloned())
-		.collect::<Option<Vec<_>>>() .unwrap_or_default(); let epochs = policy .epoch_bound() .map(|epochs| {
+	let prepared = prepare_data(data)?; let blocks = model.layers().to_vec();
+	let epochs = policy .epoch_bound() .map(|epochs| {
 			u64::try_from(epochs)
 				.map_err(|error| TrainingError::unsupported(format!("epoch bound does not fit u64: {error}")))
 				.and_then(|epochs| { NonZeroU64::new(epochs) .map(TrainingHorizon::Finite)
@@ -330,59 +325,42 @@ fn compile_training_graph( policy: &Train, data: &Data, model: &Model,
 		.map_err(|error| TrainingError::unsupported(format!("warmup epoch bound does not fit u64: {error}")))?;
 	let learning_rate = policy .learning_rate() .unwrap_or_else(|| AdamWConfig::default().learning_rate);
 	let learning_rate_decay = match (epochs, policy.learning_rate_schedule()) {
-		(TrainingHorizon::Unbounded, Some(LearningRateSchedule::LinearDecay)) => LearningRateDecay::Constant,
-		(TrainingHorizon::Unbounded, Some(LearningRateSchedule::CosineDecay)) => { return Err(TrainingError::unsupported(
+		(TrainingHorizon::Unbounded, Some(LearningRateSchedule::Linear)) => LearningRateSchedule::Constant,
+		(TrainingHorizon::Unbounded, Some(LearningRateSchedule::Cosine)) => { return Err(TrainingError::unsupported(
 				"cosine learning-rate decay requires `.epochs(...)` to define its endpoint",
 			)); }
-		(TrainingHorizon::Unbounded, Some(LearningRateSchedule::ExponentialDecay)) => { return Err(TrainingError::unsupported(
+		(TrainingHorizon::Unbounded, Some(LearningRateSchedule::Exponential)) => { return Err(TrainingError::unsupported(
 				"exponential learning-rate decay requires `.epochs(...)` to define its endpoint",
 			)); }
-		(TrainingHorizon::Finite(_), Some(LearningRateSchedule::LinearDecay)) => LearningRateDecay::Linear,
-		(TrainingHorizon::Finite(_), Some(LearningRateSchedule::CosineDecay)) => LearningRateDecay::Cosine,
-		(TrainingHorizon::Finite(_), Some(LearningRateSchedule::ExponentialDecay)) => { LearningRateDecay::Exponential }
+		(TrainingHorizon::Finite(_), Some(LearningRateSchedule::Linear)) => LearningRateSchedule::Linear,
+		(TrainingHorizon::Finite(_), Some(LearningRateSchedule::Cosine)) => LearningRateSchedule::Cosine,
+		(TrainingHorizon::Finite(_), Some(LearningRateSchedule::Exponential)) => { LearningRateSchedule::Exponential }
+		(_, Some(LearningRateSchedule::Constant)) => LearningRateSchedule::Constant,
 		(_, None) => { return Err(TrainingError::unsupported(
 				"an explicit learning-rate decay is required",
-			)); } }; let has_embedding = blocks.first().and_then(DenseBlock::embedding).is_some();
+			)); } }; let has_embedding = matches!(blocks.first(), Some(Block::Embedding { .. }));
 	let data_normalization = match (has_embedding, data.normalization()) {
-		(true, None) => DenseDataNormalization::Identity, (true, Some(_)) => { return Err(TrainingError::unsupported(
+		(true, None) => DataNormalization::Identity, (true, Some(_)) => { return Err(TrainingError::unsupported(
 				"embedding consumes exact int32 token IDs; do not declare numeric data normalization",
 			)); }
-		(false, Some(DataNormalization::ZScore)) => DenseDataNormalization::ZScore,
-		(false, Some(DataNormalization::MinMax)) => DenseDataNormalization::MinMax,
-		(false, Some(DataNormalization::L2Norm)) => DenseDataNormalization::L2Norm, (false, None) => {
+		(false, Some(DataNormalization::ZScore)) => DataNormalization::ZScore,
+		(false, Some(DataNormalization::MinMax)) => DataNormalization::MinMax,
+		(false, Some(DataNormalization::L2Norm)) => DataNormalization::L2Norm,
+		(false, Some(DataNormalization::Identity)) => DataNormalization::Identity, (false, None) => {
 			return Err(TrainingError::unsupported(
 				"dense training requires explicit data normalization",
-			)); } }; let config = DenseTrainingConfig { layers, loss, data_normalization, epochs, warmup_epochs,
-		learning_rate_decay, gradient_clip_norm: model.gradient_clip_value(), normalization_epsilon: 1.0e-6,
-		// This is the grammar's semantic ceiling. Primitive lowering selects the
-		// actual tree width from realized reduction shape and measured hardware.
-		reduction_tree_lanes: MAXIMUM_REDUCTION_TREE_LANES, random_seed: 0x7265_6369_7065, adamw: AdamWConfig { learning_rate,
-			..AdamWConfig::default() }, }; let binary_validation = binary_validation_config(policy, loss)?;
+			)); } }; let binary_validation = binary_validation_config(policy, loss)?;
 	let multiclass_validation = multiclass_validation_config(policy, loss)?;
 	let regression_validation = regression_validation_config(policy, loss)?;
-	let contains_structured_blocks = blocks.iter().any(|block| block.layer().is_none()); let mut training = match (
-		contains_structured_blocks, binary_validation, multiclass_validation, regression_validation, ) {
-		(false, Some(validation), None, None) => {
-			compile_dense_training_with_binary_validation(&prepared, &config, &validation) .map_err(TrainingError::from) }
-		(false, None, Some(validation), None) => {
-			compile_dense_training_with_multiclass_validation(&prepared, &config, &validation) .map_err(TrainingError::from) }
-		(false, None, None, Some(validation)) => {
-			compile_dense_training_with_regression_validation(&prepared, &config, &validation) .map_err(TrainingError::from) }
-		(false, None, None, None) => compile_dense_training(&prepared, &config).map_err(TrainingError::from),
-		(true, Some(validation), None, None) => {
-			compile_dense_training_with_blocks_and_binary_validation(&prepared, &config, &blocks, &validation)
-				.map_err(TrainingError::from) }
-		(true, None, Some(validation), None) => {
-			compile_dense_training_with_blocks_and_multiclass_validation(&prepared, &config, &blocks, &validation)
-				.map_err(TrainingError::from) }
-		(true, None, None, Some(validation)) => {
-			compile_dense_training_with_blocks_and_regression_validation(&prepared, &config, &blocks, &validation)
-				.map_err(TrainingError::from) }
-		(true, None, None, None) => {
-			compile_dense_training_with_blocks(&prepared, &config, &blocks).map_err(TrainingError::from) }
-		_ => Err(TrainingError::unsupported(
+	if usize::from(binary_validation.is_some()) + usize::from(multiclass_validation.is_some())
+		+ usize::from(regression_validation.is_some()) > 1 { return Err(TrainingError::unsupported(
 			"one training run cannot request multiple validation metric families simultaneously",
-		)), }?; let mut resume_checkpoint = None; if let Some(source) = policy.resume_source() { let path = Path::new(source);
+		)); }
+	let mut training = compile_training( &prepared, &blocks, loss, data_normalization, epochs, warmup_epochs,
+		learning_rate_decay, model.gradient_clip_value(), 1.0e-6, MAXIMUM_REDUCTION_TREE_LANES, 0x7265_6369_7065,
+		AdamWConfig { learning_rate, ..AdamWConfig::default() }, binary_validation.as_ref(),
+		multiclass_validation.as_ref(), regression_validation.as_ref(), )?;
+	let mut resume_checkpoint = None; if let Some(source) = policy.resume_source() { let path = Path::new(source);
 		let exists = path .try_exists()
 			.map_err(|error| TrainingError::runtime("inspect training resume model", error.to_string()))?;
 		if exists { let checkpoint = load_checkpoint_file(path, CheckpointDecodeLimits::default())?;
@@ -446,7 +424,7 @@ impl Train {
 			let report = TrainingReport::bayes(compile_bayes_model(self, data, model)?);
 			if let Some(destination) = self.save_model_destination() { report.save_model(destination)?; }
 			return Ok(report); }
-		if model .layers() .iter() .any(|layer| matches!(layer, LayerSpec::Knn { .. }))
+		if model .layers() .iter() .any(|layer| matches!(layer, Block::Knn { .. }))
 		{ let report = TrainingReport::knn(compile_knn_model(self, data, model)?);
 			if let Some(destination) = self.save_model_destination() { report.save_model(destination)?; }
 			return Ok(report); }
@@ -849,19 +827,19 @@ pub(crate) fn next_run_id() -> RunId { let sequence = NEXT_RUN_SEQUENCE.fetch_ad
 	let process = u64::from(std::process::id()); let value = epoch ^ process.rotate_left(19) ^ sequence.rotate_left(41);
 	RunId::new(value.max(1)) }
 
-fn require_supported_model(model: &Model) -> TrainingResult<DenseLoss> { if model.weights_source().is_some() {
+fn require_supported_model(model: &Model) -> TrainingResult<Loss> { if model.weights_source().is_some() {
 		return Err(TrainingError::unsupported(
 			"loading an existing weight image is not part of the dense training compiler",
 		)); }
 	if !model.bayes_dependencies().is_empty() { return Err(TrainingError::unsupported(
 			"Bayesian dependencies require a Bayesian model compiler and cannot be ignored by dense training",
 		)); }
-	match model.objective() { Some(Objective::Builtin(Loss::BinaryCrossEntropy)) => Ok(DenseLoss::BinaryCrossEntropy),
-		Some(Objective::Builtin(Loss::MeanSquaredError)) => Ok(DenseLoss::MeanSquaredError),
-		Some(Objective::Builtin(Loss::MeanAbsoluteError)) => Ok(DenseLoss::MeanAbsoluteError),
-		Some(Objective::Builtin(Loss::CrossEntropy)) => Ok(DenseLoss::CrossEntropy),
-		Some(Objective::Builtin(Loss::Huber)) => Ok(DenseLoss::Huber),
-		Some(Objective::Builtin(Loss::Focal)) => Ok(DenseLoss::Focal),
+	match model.objective() { Some(Objective::Builtin(Loss::BinaryCrossEntropy)) => Ok(Loss::BinaryCrossEntropy),
+		Some(Objective::Builtin(Loss::MeanSquaredError)) => Ok(Loss::MeanSquaredError),
+		Some(Objective::Builtin(Loss::MeanAbsoluteError)) => Ok(Loss::MeanAbsoluteError),
+		Some(Objective::Builtin(Loss::CrossEntropy)) => Ok(Loss::CrossEntropy),
+		Some(Objective::Builtin(Loss::Huber)) => Ok(Loss::Huber),
+		Some(Objective::Builtin(Loss::Focal)) => Ok(Loss::Focal),
 		Some(Objective::Reference(_)) => Err(TrainingError::unsupported(
 			"model-referenced objectives have no dense training lowering",
 		)), None => Err(TrainingError::unsupported(
@@ -880,153 +858,37 @@ fn require_supported_policy(policy: &Train) -> TrainingResult<()> {
 		)); }
 	Ok(()) }
 
-fn binary_validation_config(policy: &Train, loss: DenseLoss) -> TrainingResult<Option<BinaryValidationConfig>> {
+fn binary_validation_config(policy: &Train, loss: Loss) -> TrainingResult<Option<BinaryValidationConfig>> {
 	let mut requested = false; for item in policy.log_items().iter().chain(policy.plot_items()) { match item.metric() {
 			Metric::Loss => {}
 			Metric::AuRoc | Metric::AuPrc | Metric::Brier | Metric::CalibrationError => { requested = true; }
 			Metric::Epoch | Metric::LearningRate | Metric::Time | Metric::Device => {}
-			Metric::Accuracy if matches!(loss, DenseLoss::BinaryCrossEntropy | DenseLoss::Focal) => { requested = true; }
-			Metric::Accuracy if loss == DenseLoss::CrossEntropy => {}
-			Metric::R2 if matches!( loss, DenseLoss::MeanSquaredError | DenseLoss::MeanAbsoluteError | DenseLoss::Huber ) => {}
+			Metric::Accuracy if matches!(loss, Loss::BinaryCrossEntropy | Loss::Focal) => { requested = true; }
+			Metric::Accuracy if loss == Loss::CrossEntropy => {}
+			Metric::R2 if matches!( loss, Loss::MeanSquaredError | Loss::MeanAbsoluteError | Loss::Huber ) => {}
 			Metric::Accuracy | Metric::R2 => { return Err(TrainingError::unsupported(format!(
 					"metric {:?} is not defined for the current training objective",
 					item.metric() ))); } } }
 	if !requested { return Ok(None); }
-	if !matches!(loss, DenseLoss::BinaryCrossEntropy | DenseLoss::Focal) { return Err(TrainingError::unsupported(
+	if !matches!(loss, Loss::BinaryCrossEntropy | Loss::Focal) { return Err(TrainingError::unsupported(
 			"binary classification validation metrics and calibration require BCE or focal loss",
 		)); }
 	let bins = NonZeroU32::new(15).expect("the Recipe ECE default is nonzero");
 	Ok(Some(BinaryValidationConfig::new(bins, Vec::new()))) }
 
-fn multiclass_validation_config(policy: &Train, loss: DenseLoss) -> TrainingResult<Option<MulticlassValidationConfig>> {
+fn multiclass_validation_config(policy: &Train, loss: Loss) -> TrainingResult<Option<MulticlassValidationConfig>> {
 	let requested = policy .log_items() .iter() .chain(policy.plot_items()) .any(|item| item.metric() == Metric::Accuracy);
 	if !requested { return Ok(None); }
-	match loss { DenseLoss::CrossEntropy => Ok(Some(MulticlassValidationConfig)),
-		DenseLoss::BinaryCrossEntropy | DenseLoss::Focal => Ok(None), _ => Err(TrainingError::unsupported(
+	match loss { Loss::CrossEntropy => Ok(Some(MulticlassValidationConfig)),
+		Loss::BinaryCrossEntropy | Loss::Focal => Ok(None), _ => Err(TrainingError::unsupported(
 			"accuracy validation requires binary or categorical cross entropy",
 		)), } }
 
-fn regression_validation_config(policy: &Train, loss: DenseLoss) -> TrainingResult<Option<RegressionValidationConfig>> {
+fn regression_validation_config(policy: &Train, loss: Loss) -> TrainingResult<Option<RegressionValidationConfig>> {
 	let requested = policy .log_items() .iter() .chain(policy.plot_items()) .any(|item| item.metric() == Metric::R2);
 	if !requested { return Ok(None); }
-	if !matches!( loss, DenseLoss::MeanSquaredError | DenseLoss::MeanAbsoluteError | DenseLoss::Huber ) {
+	if !matches!( loss, Loss::MeanSquaredError | Loss::MeanAbsoluteError | Loss::Huber ) {
 		return Err(TrainingError::unsupported(
 			"R2 validation requires a scalar regression loss",
 		)); }
 	Ok(Some(RegressionValidationConfig)) }
-
-fn map_dense_block(layer: &LayerSpec) -> TrainingResult<DenseBlock> { match layer { LayerSpec::Embedding { dimensions,
-			vocabulary, } => { let vocabulary = vocabulary.ok_or_else(|| {
-				TrainingError::unsupported("`.embed(dimensions)` requires an immediate `.vocab(vocabulary)`")
-			})?; Ok(DenseEmbedding::new(
-				map_dense_width(*dimensions, "embedding dimension")?,
-				map_dense_width(vocabulary, "embedding vocabulary")?,
-			) .into()) }
-		LayerSpec::Attention { heads } => {
-			Ok(DenseAttention::new(map_dense_width(*heads, "attention head count")?).into())
-		}
-		LayerSpec::Rnn { width, operations } => { if !operations.is_empty() { return Err(TrainingError::unsupported(
-					"the first vanilla RNN case does not yet define chained recurrent-block operations",
-				)); }
-			Ok(DenseRnn::new(map_dense_width(*width, "RNN hidden width")?).into())
-		}
-		LayerSpec::Convolution { filters, kernel, activation, } => Ok(DenseConvolution::new(
-			map_dense_width(*filters, "convolution filter count")?,
-			map_dense_width(*kernel, "convolution kernel width")?,
-			map_dense_activation(*activation)?, ) .into()), LayerSpec::Pool { size, group_to_neuron, } => {
-			let size = map_dense_width(*size, "pool size")?;
-			let group_to_neuron = group_to_neuron
-				.map(|connection| map_dense_width(connection.neurons(), "pool destination neuron count"))
-				.transpose()?; Ok(DensePool::new(size, group_to_neuron).into()) }
-		LayerSpec::KMeans { clusters, group_to_neuron, } => {
-			let clusters = map_dense_width(*clusters, "K-means cluster count")?;
-			let group_to_neuron = group_to_neuron
-				.map(|connection| map_dense_width(connection.neurons(), "K-means destination neuron count"))
-				.transpose()?; Ok(DenseKMeans::new(clusters, group_to_neuron).into()) }
-		LayerSpec::Gru { width, operations } => { if !operations.is_empty() { return Err(TrainingError::unsupported(
-					"the first GRU case does not yet define chained recurrent-block operations",
-				)); }
-			Ok(DenseGru::new(map_dense_width(*width, "GRU hidden width")?).into())
-		}
-		LayerSpec::Lstm { width, operations } => { if !operations.is_empty() { return Err(TrainingError::unsupported(
-					"the first LSTM case does not yet define chained recurrent-block operations",
-				)); }
-			Ok(DenseLstm::new(map_dense_width(*width, "LSTM hidden width")?).into())
-		}
-		LayerSpec::Lgbm { depth } => map_tree_block(DenseTreeFamily::LightGbm, 1, *depth),
-		LayerSpec::Cbst { depth } => map_tree_block(DenseTreeFamily::CatBoost, 1, *depth),
-		LayerSpec::Xgbst { depth } => map_tree_block(DenseTreeFamily::XGBoost, 1, *depth),
-		LayerSpec::Forest { trees, booster } => { let booster = booster.as_ref().ok_or_else(|| { TrainingError::unsupported(
-					"forest requires one nested `.lgbm`, `.cbst`, or `.xgbst` declaration",
-				) })?; let (family, depth) = match booster { ForestBooster::Lgbm { depth } => (DenseTreeFamily::LightGbm, *depth),
-				ForestBooster::Cbst { depth } => (DenseTreeFamily::CatBoost, *depth),
-				ForestBooster::Xgbst { depth } => (DenseTreeFamily::XGBoost, *depth), }; map_tree_block(family, *trees, depth) }
-		LayerSpec::Residual { branch, output_width, skip: ResidualSkip::IdentityOrLinearProjection, operations, } => {
-			let branch = branch .iter() .copied() .map(map_dense_residual_operation) .collect::<TrainingResult<Vec<_>>>()?;
-			let operations = map_dense_operations(operations)?; let residual = DenseResidual::new(branch, operations);
-			let declared_output_width = map_dense_width(*output_width, "residual output width")?;
-			if residual.output_width() != Some(declared_output_width) { return Err(TrainingError::unsupported(format!(
-					"residual branch resolves to output width {:?}, but the facade retained {}",
-					residual.output_width().map(NonZeroU64::get), declared_output_width.get(), ))); }
-			Ok(residual.into()) }
-		_ => map_dense_layer(layer).map(DenseBlock::from), } }
-
-fn map_tree_block(family: DenseTreeFamily, trees: usize, depth: usize) -> TrainingResult<DenseBlock> {
-	let trees = map_dense_width(trees, "tree count")?;
-	let depth = u32::try_from(depth)
-		.map_err(|error| TrainingError::unsupported(format!("tree depth does not fit u32: {error}")))?;
-	let depth = NonZeroU32::new(depth).ok_or_else(|| TrainingError::unsupported("tree depth must be nonzero"))?;
-	Ok(DenseTree::new(family, trees, depth).into()) }
-
-fn map_dense_residual_operation(operation: ResidualOperation) -> TrainingResult<DenseResidualOperation> {
-	match operation { ResidualOperation::Layer { width } => Ok(DenseResidualOperation::Layer(DenseLayer::with_kind(
-			DenseBlockKind::Layer,
-			map_dense_width(width, "residual branch layer width")?,
-			[], ))), ResidualOperation::Activation(activation) => Ok(DenseResidualOperation::Operation(
-			DenseOperation::Activation(map_dense_activation(activation)?), )), } }
-
-fn map_dense_layer(layer: &LayerSpec) -> TrainingResult<DenseLayer> { let (kind, units, operations) = match layer {
-		LayerSpec::Dense { units, operations } => (DenseBlockKind::Layer, units, operations),
-		LayerSpec::Perc { count, operations } => (DenseBlockKind::Perc, count, operations), LayerSpec::Rnn { .. }
-		| LayerSpec::Gru { .. }
-		| LayerSpec::Lstm { .. }
-		| LayerSpec::Convolution { .. }
-		| LayerSpec::Pool { .. }
-		| LayerSpec::Lgbm { .. }
-		| LayerSpec::Cbst { .. }
-		| LayerSpec::Xgbst { .. }
-		| LayerSpec::Forest { .. }
-		| LayerSpec::KMeans { .. }
-		| LayerSpec::Knn { .. }
-		| LayerSpec::Embedding { .. }
-		| LayerSpec::Attention { .. }
-		| LayerSpec::Residual { .. } => { return Err(TrainingError::unsupported(
-				"the current training compiler accepts layer, perc, and residual blocks only",
-			)); } };
-	let width = map_dense_width(*units, "dense layer width")?;
-	let operations = map_dense_operations(operations)?; Ok(DenseLayer::with_kind(kind, width, operations)) }
-
-fn map_dense_width(width: usize, role: &str) -> TrainingResult<NonZeroU64> { let width = u64::try_from(width)
-		.map_err(|error| TrainingError::unsupported(format!("{role} does not fit u64: {error}")))?;
-	NonZeroU64::new(width).ok_or_else(|| TrainingError::unsupported(format!("{role} must be nonzero")))
-}
-
-fn map_dense_operations(operations: &[LayerOperation]) -> TrainingResult<Vec<DenseOperation>> {
-	let operations = operations .iter() .copied() .map(|operation| match operation {
-			LayerOperation::Activation(activation) => { map_dense_activation(activation).map(DenseOperation::Activation) }
-			LayerOperation::Normalization(LayerNormalization::LayerNorm) => {
-				Ok(DenseOperation::Normalization(DenseNormalization::Layer)) }
-			LayerOperation::Normalization(LayerNormalization::BatchNorm) => {
-				Ok(DenseOperation::Normalization(DenseNormalization::Batch)) } }) .collect::<TrainingResult<Vec<_>>>()?;
-	Ok(operations) }
-
-fn map_dense_activation(activation: Activation) -> TrainingResult<DenseActivation> { match activation {
-		Activation::Linear => Ok(DenseActivation::Linear), Activation::Cosine => Ok(DenseActivation::Cosine),
-		Activation::Exponential => Ok(DenseActivation::Exponential), Activation::Logarithm => Ok(DenseActivation::Logarithm),
-		Activation::NaturalLogarithm => Ok(DenseActivation::NaturalLogarithm),
-		Activation::Huber => Ok(DenseActivation::Huber), Activation::Tangent => Ok(DenseActivation::Tangent),
-		Activation::Relu => Ok(DenseActivation::Relu), Activation::LeakyRelu => Ok(DenseActivation::LeakyRelu),
-		Activation::Sigmoid => Ok(DenseActivation::Sigmoid), Activation::Tanh => Ok(DenseActivation::Tanh),
-		Activation::Selu => Ok(DenseActivation::Selu), Activation::Gelu => Ok(DenseActivation::Gelu),
-		Activation::Silu => Ok(DenseActivation::Silu), Activation::Elu => Ok(DenseActivation::Elu),
-		Activation::PRelu => Ok(DenseActivation::PRelu), } }

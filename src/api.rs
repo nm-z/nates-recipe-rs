@@ -1,4 +1,6 @@
 use core::fmt; use std::collections::BTreeSet; use std::num::NonZeroUsize;
+pub use recipe_core::{Activation, Block, DataNormalization, Function, LearningRateSchedule, Loss, Normalization, Optimizer,
+	TreeFamily};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -143,9 +145,6 @@ impl IntoExclusions for Exclusion { fn into_exclusions(self) -> Vec<Exclusion> {
 
 impl IntoExclusions for Vec<Exclusion> { fn into_exclusions(self) -> Vec<Exclusion> { self } }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DataNormalization { ZScore, MinMax, L2Norm, }
-
 #[allow(non_upper_case_globals)]
 pub const z_score: DataNormalization = DataNormalization::ZScore;
 #[allow(non_upper_case_globals)]
@@ -231,139 +230,36 @@ impl Data { pub(crate) const fn empty() -> Self { Self { sources: Vec::new(), ta
 	fn defer(&mut self, kind: DeclarationErrorKind, detail: impl Into<String>) { if self.deferred.is_none() {
 			self.deferred = Some(DeclarationError::new(kind, detail)); } } }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Activation {
-	#[default]
-	Linear, Cosine, Exponential,
-	/// Signed logarithm `sign(x) * ln(abs(x))` on nonzero inputs.
-	Logarithm,
-	/// Natural logarithm `ln(x)` on strictly positive inputs.
-	NaturalLogarithm, Huber, Tangent, Relu, LeakyRelu, Sigmoid, Tanh, Selu, Gelu, Silu, Elu, PRelu, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LayerNormalization { LayerNorm, BatchNorm, }
-
 #[allow(non_upper_case_globals)]
-pub const layer_norm: LayerNormalization = LayerNormalization::LayerNorm;
+pub const layer_norm: Function = Function::Normalization(Normalization::Layer);
 #[allow(non_upper_case_globals)]
-pub const batch_norm: LayerNormalization = LayerNormalization::BatchNorm;
+pub const batch_norm: Function = Function::Normalization(Normalization::Batch);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LayerOperation { Activation(Activation), Normalization(LayerNormalization), }
-
-/// One operation inside a residual branch, retained in declaration order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResidualOperation { Layer { width: usize }, Activation(Activation), }
-
-/// The shortcut rule implied by a residual branch's declared output width.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResidualSkip { IdentityOrLinearProjection, }
-
-/// Declare a dense operation inside a residual branch.
 #[must_use]
-pub const fn layer(width: usize) -> ResidualOperation { ResidualOperation::Layer { width } }
+pub const fn layer(width: usize) -> Block { Block::layer(width) }
 
-/// Declare a ReLU operation inside a residual branch.
 #[must_use]
-pub const fn relu() -> ResidualOperation { ResidualOperation::Activation(Activation::Relu) }
+pub const fn conv(filters: usize, kernel: usize) -> Block { Block::convolution(filters, kernel) }
 
-trait IntoResidualBranch { fn into_residual_branch(self) -> Vec<ResidualOperation>; }
+pub trait IntoLayer { fn into_layer(self) -> Block; }
 
-impl IntoResidualBranch for ResidualOperation { fn into_residual_branch(self) -> Vec<ResidualOperation> { vec![self] } }
+impl IntoLayer for usize { fn into_layer(self) -> Block { Block::layer(self) } }
 
-impl<const N: usize> IntoResidualBranch for [ResidualOperation; N] {
-	fn into_residual_branch(self) -> Vec<ResidualOperation> { self.into_iter().collect() } }
+impl IntoLayer for Block { fn into_layer(self) -> Block { self } }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ForestBooster { Lgbm { depth: usize }, Cbst { depth: usize }, Xgbst { depth: usize }, }
-
-impl ForestBooster { const fn depth(&self) -> usize { match self {
-			Self::Lgbm { depth } | Self::Cbst { depth } | Self::Xgbst { depth } => *depth, } } }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GroupCount { Derived, Exact(usize), }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GroupToNeuronRouting { Identity { width: usize, }, Expand { groups: usize, neurons: usize,
-		neurons_per_group: usize, }, Contract { groups: usize, neurons: usize, groups_per_neuron: usize, }, FullyConnected {
-		groups: usize, neurons: usize, }, }
-
-/// Connection from an immediately preceding grouped block into a dense layer.
-///
-/// Pooling derives the number of output groups from its input shape. K-means
-/// knows the exact group count from its cluster declaration. Once that count is
-/// resolved, [`Self::routing`] yields the shared contiguous or fully connected
-/// routing rule.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GroupToNeuronConnection { groups: GroupCount, neurons: usize, }
-
-impl GroupToNeuronConnection {
-	#[must_use]
-	pub const fn groups(&self) -> GroupCount { self.groups }
-
-	#[must_use]
-	pub const fn neurons(&self) -> usize { self.neurons }
-
-	/// Resolve routing after the grouped block's actual output count is known.
-	///
-	/// Expansion and contraction use contiguous ranges. Non-divisible widths use
-	/// ordinary full connectivity. An exact group declaration returns `None` if
-	/// `groups` disagrees with it.
-	#[must_use]
-	pub fn routing(&self, groups: usize) -> Option<GroupToNeuronRouting> { if groups == 0 || self.neurons == 0 {
-			return None; }
-		if let GroupCount::Exact(expected) = self.groups && groups != expected
-		{ return None; }
-		if groups == self.neurons { Some(GroupToNeuronRouting::Identity { width: groups })
-		} else if self.neurons % groups == 0 { Some(GroupToNeuronRouting::Expand { groups, neurons: self.neurons,
-				neurons_per_group: self.neurons / groups, }) } else if groups % self.neurons == 0 {
-			Some(GroupToNeuronRouting::Contract { groups, neurons: self.neurons, groups_per_neuron: groups / self.neurons, })
-		} else { Some(GroupToNeuronRouting::FullyConnected { groups, neurons: self.neurons, }) } }
-
-	fn valid_for(self, groups: GroupCount) -> bool { self.neurons != 0 && self.groups == groups } }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LayerSpec { Dense { units: usize, operations: Vec<LayerOperation>, }, Perc { count: usize,
-		operations: Vec<LayerOperation>, }, Rnn { width: usize, operations: Vec<LayerOperation>, }, Gru { width: usize,
-		operations: Vec<LayerOperation>, }, Lstm { width: usize, operations: Vec<LayerOperation>, }, Convolution {
-		filters: usize, kernel: usize, activation: Activation, }, Pool { size: usize,
-		group_to_neuron: Option<GroupToNeuronConnection>, }, Lgbm { depth: usize, }, Cbst { depth: usize, }, Xgbst {
-		depth: usize, }, Forest { trees: usize, booster: Option<ForestBooster>, }, KMeans { clusters: usize,
-		group_to_neuron: Option<GroupToNeuronConnection>, }, Knn { neighbors: usize, operations: Vec<LayerOperation>, },
-	Residual { branch: Vec<ResidualOperation>, output_width: usize, skip: ResidualSkip, operations: Vec<LayerOperation>, },
-	Embedding { dimensions: usize, vocabulary: Option<usize>, }, Attention { heads: usize, }, }
-
-impl LayerSpec { fn validate(&self) -> DeclarationResult<()> { let valid = match self {
-			Self::Dense { units, .. } => *units != 0, Self::Perc { count, .. } => *count != 0,
-			Self::Rnn { width, .. } | Self::Gru { width, .. } | Self::Lstm { width, .. } => *width != 0, Self::Convolution {
-				filters, kernel, .. } => *filters != 0 && *kernel != 0, Self::Pool { size, group_to_neuron,
-			} => *size != 0 && group_to_neuron.is_none_or(|connection| connection.valid_for(GroupCount::Derived)),
-			Self::Lgbm { depth } | Self::Cbst { depth } | Self::Xgbst { depth } => *depth != 0,
-			Self::Forest { trees, booster } => { *trees != 0 && booster.as_ref().is_some_and(|booster| booster.depth() != 0) }
-			Self::KMeans { clusters, group_to_neuron, } => { *clusters != 0 && group_to_neuron
-						.is_none_or(|connection| connection.valid_for(GroupCount::Exact(*clusters))) }
-			Self::Knn { neighbors, .. } => *neighbors != 0, Self::Residual { branch, output_width,
-				skip: ResidualSkip::IdentityOrLinearProjection, .. } => residual_output_width(branch) == Some(*output_width),
-			Self::Embedding { dimensions, vocabulary, } => *dimensions != 0 && vocabulary.is_none_or(|value| value != 0),
-			Self::Attention { heads } => *heads != 0, }; if valid { Ok(()) } else { Err(DeclarationError::new(
-				DeclarationErrorKind::InvalidLayer,
-				"model blocks must be complete, nonzero, and preserve every declared grouped routing",
-			)) } } }
-
-pub trait IntoLayer { fn into_layer(self) -> LayerSpec; }
-
-impl IntoLayer for usize { fn into_layer(self) -> LayerSpec { LayerSpec::Dense { units: self, operations: Vec::new(), }
-	} }
-
-impl IntoLayer for LayerSpec { fn into_layer(self) -> LayerSpec { self } }
-
-fn residual_output_width(branch: &[ResidualOperation]) -> Option<usize> { let mut output_width = None;
-	for operation in branch { match operation { ResidualOperation::Layer { width: 0 } => return None,
-			ResidualOperation::Layer { width } => output_width = Some(*width), ResidualOperation::Activation(_) => {} } }
-	output_width }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Loss { MeanSquaredError, MeanAbsoluteError, Huber, BinaryCrossEntropy, CrossEntropy, Focal, }
+fn validate_block(block: &Block) -> DeclarationResult<()> { let valid = match block {
+		Block::Layer { width, .. } | Block::Rnn { width, .. } | Block::Gru { width, .. } | Block::Lstm { width, .. } => {
+			*width != 0 }
+		Block::Convolution { filters, kernel, .. } => *filters != 0 && *kernel != 0,
+		Block::Pool { size, group_to_neuron } => *size != 0 && group_to_neuron.is_none_or(|width| width != 0),
+		Block::KMeans { clusters, group_to_neuron } => *clusters != 0 && group_to_neuron.is_none_or(|width| width != 0),
+		Block::Embedding { dimensions, vocabulary } => *dimensions != 0 && vocabulary.is_none_or(|value| value != 0),
+		Block::Attention { heads } => *heads != 0,
+		Block::Tree { trees, depth, .. } => *trees != 0 && *depth != 0,
+		Block::Knn { neighbors, .. } => *neighbors != 0,
+		Block::Residual { branch, .. } => !branch.is_empty() && branch.iter().all(|block| validate_block(block).is_ok()),
+	}; if valid { Ok(()) } else { Err(DeclarationError::new( DeclarationErrorKind::InvalidLayer,
+			"model blocks must be complete and nonzero", )) } }
 
 #[allow(non_upper_case_globals)]
 /// Mean squared error: `(z - y)²`.
@@ -406,9 +302,6 @@ impl IntoObjective for Loss { fn into_objective(self) -> Objective { Objective::
 
 impl IntoObjective for &Model { fn into_objective(self) -> Objective { Objective::Reference(Box::new(self.clone())) } }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Optimizer { AdamW, }
-
 #[allow(non_upper_case_globals)]
 pub const adamw: Optimizer = Optimizer::AdamW;
 
@@ -449,7 +342,7 @@ const CHECKPOINT_MODEL_DECLARATION_CONFLICT: &str =
 /// Backend-neutral model declaration. It contains no runtime handles, loaded
 /// weights, allocations, or mutable global registry entries.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Model { layers: Vec<LayerSpec>, bayes_dependencies: Vec<BayesDependency>, objective: Option<Objective>,
+pub struct Model { layers: Vec<Block>, bayes_dependencies: Vec<BayesDependency>, objective: Option<Objective>,
 	gradient_clip_bits: Option<u32>, weights_source: Option<String>, deferred: Option<DeclarationError>, }
 
 impl Model {
@@ -472,51 +365,49 @@ impl Model {
 		crate::remember_recipe_model(self.clone()); self }
 
 	pub fn layer(mut self, spec: impl IntoLayer) -> Self { let spec = spec.into_layer();
-		if let Err(error) = spec.validate() { self.defer(error.kind, error.detail); } else {
-			if let LayerSpec::Dense { units, .. } = &spec { match self.layers.last_mut() { Some(LayerSpec::Pool {
-						group_to_neuron, .. }) => { *group_to_neuron = Some(GroupToNeuronConnection { groups: GroupCount::Derived,
-							neurons: *units, }); }
-					Some(LayerSpec::KMeans { clusters, group_to_neuron, }) => { *group_to_neuron = Some(GroupToNeuronConnection {
-							groups: GroupCount::Exact(*clusters), neurons: *units, }); }
+		if let Err(error) = validate_block(&spec) { self.defer(error.kind, error.detail); } else {
+			if let Block::Layer { width, .. } = &spec { match self.layers.last_mut() { Some(Block::Pool {
+						group_to_neuron, .. }) | Some(Block::KMeans { group_to_neuron, .. }) => {
+						*group_to_neuron = Some(*width); }
 					_ => {} } }
 			self.layers.push(spec); }
 		crate::remember_recipe_model(self.clone()); self }
 
-	pub fn embed(mut self, dimensions: usize) -> Self { let spec = LayerSpec::Embedding { dimensions, vocabulary: None, };
-		if let Err(error) = spec.validate() { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
+	pub fn embed(mut self, dimensions: usize) -> Self { let spec = Block::Embedding { dimensions, vocabulary: None, };
+		if let Err(error) = validate_block(&spec) { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
 		crate::remember_recipe_model(self.clone()); self }
 
 	pub fn vocab(mut self, vocabulary: usize) -> Self { if vocabulary == 0 { self.defer(
 				DeclarationErrorKind::InvalidLayer,
 				"embedding vocabulary must be nonzero",
-			); } else { match self.layers.last_mut() { Some(LayerSpec::Embedding { vocabulary: current, ..
+			); } else { match self.layers.last_mut() { Some(Block::Embedding { vocabulary: current, ..
 				}) => *current = Some(vocabulary), _ => self.defer( DeclarationErrorKind::InvalidLayer,
 					"vocab requires a preceding embedding block",
 				), } }
 		crate::remember_recipe_model(self.clone()); self }
 
-	pub fn attn(mut self, heads: usize) -> Self { let spec = LayerSpec::Attention { heads };
-		if let Err(error) = spec.validate() { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
+	pub fn attn(mut self, heads: usize) -> Self { let spec = Block::Attention { heads };
+		if let Err(error) = validate_block(&spec) { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
 		crate::remember_recipe_model(self.clone()); self }
 
 	/// Add one block containing `count` parallel perceptrons.
-	pub fn perc(mut self, count: usize) -> Self { let spec = LayerSpec::Perc { count, operations: Vec::new(), };
-		if let Err(error) = spec.validate() { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
+	pub fn perc(mut self, count: usize) -> Self { let spec = Block::Layer { width: count, functions: Vec::new(), };
+		if let Err(error) = validate_block(&spec) { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
 		crate::remember_recipe_model(self.clone()); self }
 
 	/// Add a recurrent neural-network block with `width` recurrent states.
-	pub fn rnn(mut self, width: usize) -> Self { let spec = LayerSpec::Rnn { width, operations: Vec::new(), };
-		if let Err(error) = spec.validate() { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
+	pub fn rnn(mut self, width: usize) -> Self { let spec = Block::Rnn { width, functions: Vec::new(), };
+		if let Err(error) = validate_block(&spec) { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
 		crate::remember_recipe_model(self.clone()); self }
 
 	/// Add a gated recurrent-unit block with `width` recurrent states.
-	pub fn gru(mut self, width: usize) -> Self { let spec = LayerSpec::Gru { width, operations: Vec::new(), };
-		if let Err(error) = spec.validate() { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
+	pub fn gru(mut self, width: usize) -> Self { let spec = Block::Gru { width, functions: Vec::new(), };
+		if let Err(error) = validate_block(&spec) { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
 		crate::remember_recipe_model(self.clone()); self }
 
 	/// Add a long short-term-memory block with `width` recurrent states.
-	pub fn lstm(mut self, width: usize) -> Self { let spec = LayerSpec::Lstm { width, operations: Vec::new(), };
-		if let Err(error) = spec.validate() { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
+	pub fn lstm(mut self, width: usize) -> Self { let spec = Block::Lstm { width, functions: Vec::new(), };
+		if let Err(error) = validate_block(&spec) { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
 		crate::remember_recipe_model(self.clone()); self }
 
 	/// Declare that `child` is conditionally modeled from `parents`.
@@ -536,38 +427,37 @@ impl Model {
 			self.defer(error.kind, error.detail); }
 		crate::remember_recipe_model(self.clone()); self }
 
-	pub fn conv(mut self, filters: usize, kernel: usize) -> Self { let spec = LayerSpec::Convolution { filters, kernel,
-			activation: Activation::Linear, }; if let Err(error) = spec.validate() { self.defer(error.kind, error.detail);
+	pub fn conv(mut self, filters: usize, kernel: usize) -> Self { let spec = Block::Convolution { filters, kernel,
+			functions: Vec::new(), }; if let Err(error) = validate_block(&spec) { self.defer(error.kind, error.detail);
 		} else { self.layers.push(spec); }
 		crate::remember_recipe_model(self.clone()); self }
 
-	pub fn pool(mut self, size: usize) -> Self { let spec = LayerSpec::Pool { size, group_to_neuron: None, };
-		if let Err(error) = spec.validate() { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
+	pub fn pool(mut self, size: usize) -> Self { let spec = Block::Pool { size, group_to_neuron: None, };
+		if let Err(error) = validate_block(&spec) { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
 		crate::remember_recipe_model(self.clone()); self }
 
-	pub fn lgbm(self, depth: usize) -> Self { self.with_tree_booster(ForestBooster::Lgbm { depth }) }
+	pub fn lgbm(self, depth: usize) -> Self { self.with_tree_family(TreeFamily::LightGbm, depth) }
 
-	pub fn cbst(self, depth: usize) -> Self { self.with_tree_booster(ForestBooster::Cbst { depth }) }
+	pub fn cbst(self, depth: usize) -> Self { self.with_tree_family(TreeFamily::CatBoost, depth) }
 
-	pub fn xgbst(self, depth: usize) -> Self { self.with_tree_booster(ForestBooster::Xgbst { depth }) }
+	pub fn xgbst(self, depth: usize) -> Self { self.with_tree_family(TreeFamily::XGBoost, depth) }
 
 	pub fn forest(mut self, trees: usize) -> Self { if trees == 0 { self.defer( DeclarationErrorKind::InvalidLayer,
 				"forest tree count must be nonzero",
-			); } else { self.layers.push(LayerSpec::Forest { trees, booster: None, }); }
+			); } else { self.layers.push(Block::Tree { family: TreeFamily::LightGbm, trees, depth: 0, }); }
 		crate::remember_recipe_model(self.clone()); self }
 
-	pub fn kmeans(mut self, clusters: usize) -> Self { let spec = LayerSpec::KMeans { clusters, group_to_neuron: None, };
-		if let Err(error) = spec.validate() { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
+	pub fn kmeans(mut self, clusters: usize) -> Self { let spec = Block::KMeans { clusters, group_to_neuron: None, };
+		if let Err(error) = validate_block(&spec) { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
 		crate::remember_recipe_model(self.clone()); self }
 
-	pub fn knn(mut self, neighbors: usize) -> Self { let spec = LayerSpec::Knn { neighbors, operations: Vec::new(), };
-		if let Err(error) = spec.validate() { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
+	pub fn knn(mut self, neighbors: usize) -> Self { let spec = Block::Knn { neighbors, functions: Vec::new(), };
+		if let Err(error) = validate_block(&spec) { self.defer(error.kind, error.detail); } else { self.layers.push(spec); }
 		crate::remember_recipe_model(self.clone()); self }
 
-	#[allow(private_bounds)]
-	pub fn residual(mut self, branch: impl IntoResidualBranch) -> Self { let branch = branch.into_residual_branch();
-		if let Some(output_width) = residual_output_width(&branch) { self.layers.push(LayerSpec::Residual { branch,
-				output_width, skip: ResidualSkip::IdentityOrLinearProjection, operations: Vec::new(), }); } else { self.defer(
+	pub fn residual(mut self, branch: impl IntoIterator<Item = Block>) -> Self { let branch = branch.into_iter().collect();
+		let spec = Block::Residual { branch, functions: Vec::new(), }; if validate_block(&spec).is_ok() { self.layers.push(spec);
+		} else { self.defer(
 				DeclarationErrorKind::InvalidLayer,
 				"a residual branch requires at least one layer and every declared layer width must be nonzero",
 			); }
@@ -622,21 +512,19 @@ impl Model {
 					), ); } }
 		crate::remember_recipe_model(self.clone()); self }
 
-	pub fn norm(mut self, normalization: LayerNormalization) -> Self { match self.layers.last_mut() { Some(
-				LayerSpec::Dense { operations, .. }
-				| LayerSpec::Perc { operations, .. }
-				| LayerSpec::Rnn { operations, .. }
-				| LayerSpec::Gru { operations, .. }
-				| LayerSpec::Lstm { operations, .. }
-				| LayerSpec::Residual { operations, .. }, ) => { operations.push(LayerOperation::Normalization(normalization)); }
-			Some(LayerSpec::Knn { .. }) => self.defer( DeclarationErrorKind::InvalidLayer,
+	pub fn norm(mut self, normalization: Function) -> Self { match self.layers.last_mut() { Some(
+				Block::Layer { functions, .. }
+				| Block::Rnn { functions, .. }
+				| Block::Gru { functions, .. }
+				| Block::Lstm { functions, .. }
+				| Block::Residual { functions, .. }, ) => { functions.push(normalization); }
+			Some(Block::Knn { .. }) => self.defer( DeclarationErrorKind::InvalidLayer,
 				"normalization cannot follow terminal all-output KNN reduction",
-			), Some( LayerSpec::Convolution { .. } | LayerSpec::Pool { .. } | LayerSpec::Lgbm { .. } | LayerSpec::Cbst { .. }
-				| LayerSpec::Xgbst { .. }
-				| LayerSpec::Forest { .. }
-				| LayerSpec::KMeans { .. }
-				| LayerSpec::Embedding { .. }
-				| LayerSpec::Attention { .. }, )
+			), Some( Block::Convolution { .. } | Block::Pool { .. }
+				| Block::Tree { .. }
+				| Block::KMeans { .. }
+				| Block::Embedding { .. }
+				| Block::Attention { .. }, )
 			| None => self.defer( DeclarationErrorKind::InvalidLayer,
 				"layer normalization requires a preceding dense, perceptron, recurrent, or residual block",
 			), }
@@ -650,19 +538,19 @@ impl Model {
 			return Err(DeclarationError::new( DeclarationErrorKind::InvalidLayer,
 				"a model requires at least one layer, Bayesian dependency, or declared weight source",
 			)); }
-		if let Some((index, LayerSpec::Knn { operations, .. })) = self .layers .iter() .enumerate()
-			.find(|(_, layer)| matches!(layer, LayerSpec::Knn { .. }))
+		if let Some((index, Block::Knn { functions, .. })) = self .layers .iter() .enumerate()
+			.find(|(_, layer)| matches!(layer, Block::Knn { .. }))
 		{ if self.layers.len() != 1 || index != 0 { return Err(DeclarationError::new( DeclarationErrorKind::InvalidLayer,
 					"`.knn(neighbors)` is one standalone terminal all-output model and cannot compose with other blocks",
 				)); }
-			if !operations.is_empty() { return Err(DeclarationError::new( DeclarationErrorKind::InvalidLayer,
+			if !functions.is_empty() { return Err(DeclarationError::new( DeclarationErrorKind::InvalidLayer,
 					"terminal all-output KNN reduction cannot contain activation or normalization operations",
 				)); } }
-		for (index, layer) in self.layers.iter().enumerate() { layer.validate()?; let connection = match layer {
-				LayerSpec::Pool { group_to_neuron, .. }
-				| LayerSpec::KMeans { group_to_neuron, .. } => group_to_neuron.as_ref(), _ => None, };
+		for (index, layer) in self.layers.iter().enumerate() { validate_block(layer)?; let connection = match layer {
+				Block::Pool { group_to_neuron, .. }
+				| Block::KMeans { group_to_neuron, .. } => group_to_neuron.as_ref(), _ => None, };
 			if let Some(connection) = connection { let has_exact_following_layer = matches!( self.layers.get(index + 1),
-					Some(LayerSpec::Dense { units, .. }) if *units == connection.neurons() ); if !has_exact_following_layer {
+					Some(Block::Layer { width, .. }) if width == connection ); if !has_exact_following_layer {
 					return Err(DeclarationError::new( DeclarationErrorKind::InvalidLayer,
 						"a grouped-to-dense connection must refer to the immediately following layer",
 					)); } } }
@@ -671,7 +559,7 @@ impl Model {
 		Ok(()) }
 
 	#[must_use]
-	pub fn layers(&self) -> &[LayerSpec] { &self.layers }
+	pub fn layers(&self) -> &[Block] { &self.layers }
 
 	#[must_use]
 	pub fn bayes_dependencies(&self) -> &[BayesDependency] { &self.bayes_dependencies }
@@ -689,33 +577,27 @@ impl Model {
 			|| self.objective.is_some()
 			|| self.gradient_clip_bits.is_some() }
 
-	fn with_tree_booster(mut self, booster: ForestBooster) -> Self { let depth = booster.depth(); if depth == 0 {
+	fn with_tree_family(mut self, family: TreeFamily, depth: usize) -> Self { if depth == 0 {
 			self.defer( DeclarationErrorKind::InvalidLayer,
 				"boosted-tree depth must be nonzero",
-			); } else if let Some(LayerSpec::Forest { booster: pending @ None, .. }) = self.layers.last_mut()
-		{ *pending = Some(booster); } else { self.layers.push(match booster {
-				ForestBooster::Lgbm { depth } => LayerSpec::Lgbm { depth },
-				ForestBooster::Cbst { depth } => LayerSpec::Cbst { depth },
-				ForestBooster::Xgbst { depth } => LayerSpec::Xgbst { depth }, }); }
+			); } else if let Some(Block::Tree { family: pending_family, depth: pending_depth @ 0, .. }) = self.layers.last_mut()
+		{ *pending_family = family; *pending_depth = depth; } else {
+			self.layers.push(Block::Tree { family, trees: 1, depth }); }
 		crate::remember_recipe_model(self.clone()); self }
 
 	fn with_last_activation(mut self, activation: Activation) -> Self { match self.layers.last_mut() { Some(
-				LayerSpec::Dense { operations, .. }
-				| LayerSpec::Perc { operations, .. }
-				| LayerSpec::Rnn { operations, .. }
-				| LayerSpec::Gru { operations, .. }
-				| LayerSpec::Lstm { operations, .. }
-				| LayerSpec::Residual { operations, .. }, ) => { operations.push(LayerOperation::Activation(activation)); }
-			Some(LayerSpec::Knn { .. }) => self.defer( DeclarationErrorKind::InvalidActivation,
+				Block::Layer { functions, .. }
+				| Block::Rnn { functions, .. }
+				| Block::Gru { functions, .. }
+				| Block::Lstm { functions, .. }
+				| Block::Residual { functions, .. }, ) => { functions.push(Function::Activation(activation)); }
+			Some(Block::Knn { .. }) => self.defer( DeclarationErrorKind::InvalidActivation,
 				"activation cannot follow terminal all-output KNN reduction",
-			), Some(LayerSpec::Convolution { activation: current, .. }) => *current = activation, Some( LayerSpec::Pool { .. }
-				| LayerSpec::Lgbm { .. }
-				| LayerSpec::Cbst { .. }
-				| LayerSpec::Xgbst { .. }
-				| LayerSpec::Forest { .. }
-				| LayerSpec::KMeans { .. }
-				| LayerSpec::Embedding { .. }
-				| LayerSpec::Attention { .. }, )
+			), Some(Block::Convolution { functions, .. }) => functions.push(Function::Activation(activation)), Some( Block::Pool { .. }
+				| Block::Tree { .. }
+				| Block::KMeans { .. }
+				| Block::Embedding { .. }
+				| Block::Attention { .. }, )
 			| None => self.defer( DeclarationErrorKind::InvalidActivation, concat!(
 					"activation methods require a preceding dense, perceptron, recurrent, convolution,",
 					" or residual block",
@@ -818,9 +700,6 @@ pub const r2: LogItem = R2;
 #[allow(non_upper_case_globals)]
 pub const device: LogItem = Device;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LearningRateSchedule { LinearDecay, CosineDecay, ExponentialDecay, }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LogDeclaration { items: Vec<LogItem>, every: NonZeroUsize, }
 
@@ -854,7 +733,7 @@ impl Train {
 				DeclarationErrorKind::InvalidLearningRate, format!(
 					"training learning rate must be finite, positive, and representable as f32, got {rate}"
 				), ); } else { self.learning_rate_bits = Some(rate_f32.to_bits());
-			self.learning_rate_schedule = Some(LearningRateSchedule::LinearDecay); }
+			self.learning_rate_schedule = Some(LearningRateSchedule::Linear); }
 		self }
 
 	#[must_use]
@@ -864,10 +743,10 @@ impl Train {
 		self }
 
 	#[must_use]
-	pub const fn cos(mut self) -> Self { self.learning_rate_schedule = Some(LearningRateSchedule::CosineDecay); self }
+	pub const fn cos(mut self) -> Self { self.learning_rate_schedule = Some(LearningRateSchedule::Cosine); self }
 
 	#[must_use]
-	pub const fn exp(mut self) -> Self { self.learning_rate_schedule = Some(LearningRateSchedule::ExponentialDecay); self }
+	pub const fn exp(mut self) -> Self { self.learning_rate_schedule = Some(LearningRateSchedule::Exponential); self }
 
 	#[must_use]
 	pub const fn optimizer(mut self, optimizer: Optimizer) -> Self { self.optimizer = Some(optimizer); self }

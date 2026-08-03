@@ -3,7 +3,7 @@ use recipe_core::{AliasPermission, DType, ScalarOpcode, ScalarProgram, ValueId};
 	OperationError, canonical_elu_program, canonical_leaky_relu_program, canonical_prelu_program, canonical_selu_program,
 };
 
-use crate::DenseActivation;
+use crate::Activation;
 
 /// Lowered implementation selected for one dense activation.
 pub enum ForwardActivation {
@@ -137,7 +137,7 @@ pub trait RecurrentForwardGraph {
 	) -> Result<ValueId, Self::Error>;
 
 	/// Apply one dense activation to an input value.
-	fn activate(&mut self, input: ValueId, activation: DenseActivation, shape: Shape)
+	fn activate(&mut self, input: ValueId, activation: Activation, shape: Shape)
 	-> Result<ValueId, Self::Error>; }
 
 /// Emit a complete simple RNN sequence and retain each step's intermediate values.
@@ -150,7 +150,7 @@ pub fn lower_rnn_sequence<G: RecurrentForwardGraph>( graph: &mut G, input: Value
 	let mut hidden = graph.zero_f32(Shape::new(vec![rows, width])?)?; let mut steps = Vec::new(); for step in 0..sequence {
 		let step_input = graph.gather_matrix_column(input, rows, sequence, step)?; let previous_hidden = hidden;
 		let (preactivation, next_hidden) = lower_recurrent_gate( graph, step_input, previous_hidden, rows, width, parameters,
-			DenseActivation::Tanh, )?; steps.push(RnnStepValues { input: step_input, previous_hidden, preactivation,
+			Activation::Tanh, )?; steps.push(RnnStepValues { input: step_input, previous_hidden, preactivation,
 			hidden: next_hidden, }); hidden = next_hidden; }
 	return Ok((hidden, steps)); }
 
@@ -164,15 +164,15 @@ pub fn lower_gru_sequence<G: RecurrentForwardGraph>( graph: &mut G, input: Value
 	let mut hidden = graph.zero_f32(Shape::new(vec![rows, width])?)?; let mut steps = Vec::new(); for step in 0..sequence {
 		let step_input = graph.gather_matrix_column(input, rows, sequence, step)?; let previous_hidden = hidden;
 		let hidden_shape = Shape::new(vec![rows, width])?; let (reset_preactivation, reset) = lower_recurrent_gate( graph,
-			step_input, previous_hidden, rows, width, parameters.reset, DenseActivation::Sigmoid, )?;
+			step_input, previous_hidden, rows, width, parameters.reset, Activation::Sigmoid, )?;
 		let (update_preactivation, update) = lower_recurrent_gate( graph, step_input, previous_hidden, rows, width,
-			parameters.update, DenseActivation::Sigmoid, )?; let reset_hidden = graph.elementwise_f32( hidden_shape.clone(),
+			parameters.update, Activation::Sigmoid, )?; let reset_hidden = graph.elementwise_f32( hidden_shape.clone(),
 			vec![reset, previous_hidden], multiply_program()?, )?; let candidate_input_projection =
 			graph.bias_free_linear(step_input, parameters.candidate.input_weight, rows, width)?;
 		let candidate_recurrent_projection = graph.bias_free_linear( reset_hidden, parameters.candidate.recurrent_weight,
 			rows, width, )?; let candidate_preactivation = graph.elementwise_f32( hidden_shape.clone(), vec![
 				candidate_input_projection, candidate_recurrent_projection, parameters.candidate.bias, ], sum_program(3)?, )?;
-		let candidate = graph.activate( candidate_preactivation, DenseActivation::Tanh, hidden_shape.clone(), )?;
+		let candidate = graph.activate( candidate_preactivation, Activation::Tanh, hidden_shape.clone(), )?;
 		let hidden_program = { let mut program_builder = ScalarProgramBuilder::new()?;
 			let program_candidate = program_builder.input(DType::F32)?; let program_update = program_builder.input(DType::F32)?;
 			let program_previous = program_builder.input(DType::F32)?; let difference =
@@ -196,12 +196,12 @@ pub fn lower_lstm_sequence<G: RecurrentForwardGraph>( graph: &mut G, input: Valu
 	let mut cell = graph.zero_f32(state_shape)?; let mut steps = Vec::new(); for step in 0..sequence {
 		let step_input = graph.gather_matrix_column(input, rows, sequence, step)?; let previous_hidden = hidden;
 		let previous_cell = cell; let (input_gate_preactivation, input_gate) = lower_recurrent_gate( graph, step_input,
-			previous_hidden, rows, width, parameters.input, DenseActivation::Sigmoid, )?;
+			previous_hidden, rows, width, parameters.input, Activation::Sigmoid, )?;
 		let (forget_gate_preactivation, forget_gate) = lower_recurrent_gate( graph, step_input, previous_hidden, rows, width,
-			parameters.forget, DenseActivation::Sigmoid, )?; let (output_gate_preactivation, output_gate) = lower_recurrent_gate(
-			graph, step_input, previous_hidden, rows, width, parameters.output, DenseActivation::Sigmoid, )?;
+			parameters.forget, Activation::Sigmoid, )?; let (output_gate_preactivation, output_gate) = lower_recurrent_gate(
+			graph, step_input, previous_hidden, rows, width, parameters.output, Activation::Sigmoid, )?;
 		let (candidate_preactivation, candidate) = lower_recurrent_gate( graph, step_input, previous_hidden, rows, width,
-			parameters.candidate, DenseActivation::Tanh, )?; let step_shape = Shape::new(vec![rows, width])?;
+			parameters.candidate, Activation::Tanh, )?; let step_shape = Shape::new(vec![rows, width])?;
 		let cell_program = { let mut program_builder = ScalarProgramBuilder::new()?;
 			let program_forget = program_builder.input(DType::F32)?;
 			let program_previous_cell = program_builder.input(DType::F32)?;
@@ -211,7 +211,7 @@ pub fn lower_lstm_sequence<G: RecurrentForwardGraph>( graph: &mut G, input: Valu
 			let updated_cell = program_builder.binary(ScalarOpcode::Add, retained, admitted)?;
 			program_builder.finish(&[updated_cell])? }; let next_cell = graph.elementwise_f32( step_shape.clone(),
 			vec![forget_gate, previous_cell, input_gate, candidate], cell_program, )?;
-		let cell_activation = graph.activate(next_cell, DenseActivation::Tanh, step_shape.clone())?;
+		let cell_activation = graph.activate(next_cell, Activation::Tanh, step_shape.clone())?;
 		let next_hidden = graph.elementwise_f32( step_shape, vec![output_gate, cell_activation], multiply_program()?, )?;
 		steps.push(LstmStepValues { input: step_input, previous_hidden, previous_cell, input_gate_preactivation, input_gate,
 			forget_gate_preactivation, forget_gate, output_gate_preactivation, output_gate, candidate_preactivation, candidate,
@@ -224,7 +224,7 @@ pub fn lower_lstm_sequence<G: RecurrentForwardGraph>( graph: &mut G, input: Valu
 ///
 /// Returns an error when the graph cannot emit a projection, sum, or activation.
 fn lower_recurrent_gate<G: RecurrentForwardGraph>( graph: &mut G, input: ValueId, previous_hidden: ValueId, rows: u64,
-	width: u64, parameters: RecurrentGateParameters, activation: DenseActivation,
+	width: u64, parameters: RecurrentGateParameters, activation: Activation,
 ) -> Result<(ValueId, ValueId), G::Error> {
 	let input_projection = graph.bias_free_linear(input, parameters.input_weight, rows, width)?;
 	let recurrent_projection = graph.bias_free_linear(previous_hidden, parameters.recurrent_weight, rows, width)?;
@@ -238,15 +238,18 @@ fn lower_recurrent_gate<G: RecurrentForwardGraph>( graph: &mut G, input: ValueId
 ///
 /// Returns an error when a required scalar or canonical operation program cannot
 /// be constructed.
-impl DenseActivation { pub(crate) fn forward_kernel<E>(self) -> Result<ForwardActivation, E> where
+pub(crate) trait ActivationForward { fn forward_kernel<E>(self) -> Result<ForwardActivation, E> where
+	E: From<LanguageError> + From<OperationError>; }
+
+impl ActivationForward for Activation { fn forward_kernel<E>(self) -> Result<ForwardActivation, E> where
 		E: From<LanguageError> + From<OperationError>, { Ok(match self {
-		DenseActivation::Linear => ForwardActivation::Identity,
-		DenseActivation::Cosine => ForwardActivation::Owned("gpu_cos"),
-		DenseActivation::Exponential => ForwardActivation::Owned("gpu_exp"),
-		DenseActivation::Logarithm => ForwardActivation::SignedMagnitude("gpu_log_into"),
-		DenseActivation::NaturalLogarithm => ForwardActivation::Owned("gpu_log_into"),
-		DenseActivation::LegacySignedLogOnePlus => ForwardActivation::SignedMagnitude("gpu_log1p"),
-		DenseActivation::Huber => { let mut builder = ScalarProgramBuilder::new()?; let value = builder.input(DType::F32)?;
+		Activation::Linear => ForwardActivation::Identity,
+		Activation::Cosine => ForwardActivation::Owned("gpu_cos"),
+		Activation::Exponential => ForwardActivation::Owned("gpu_exp"),
+		Activation::Logarithm => ForwardActivation::SignedMagnitude("gpu_log_into"),
+		Activation::NaturalLogarithm => ForwardActivation::Owned("gpu_log_into"),
+		Activation::LegacySignedLogOnePlus => ForwardActivation::SignedMagnitude("gpu_log1p"),
+		Activation::Huber => { let mut builder = ScalarProgramBuilder::new()?; let value = builder.input(DType::F32)?;
 			let absolute = builder.unary(ScalarOpcode::Absolute, value)?; let one = builder.f32(1.0)?;
 			let quadratic_domain = builder.binary(ScalarOpcode::LessThanOrEqual, absolute, one)?;
 			let square = builder.binary(ScalarOpcode::Multiply, value, value)?; let half = builder.f32(0.5)?;
@@ -254,16 +257,16 @@ impl DenseActivation { pub(crate) fn forward_kernel<E>(self) -> Result<ForwardAc
 			let linear = builder.binary(ScalarOpcode::Subtract, absolute, half)?;
 			let result = builder.ternary(ScalarOpcode::Select, quadratic_domain, quadratic, linear)?;
 			ForwardActivation::Program(builder.finish(&[result])?) }
-		DenseActivation::Tangent => ForwardActivation::Owned("gpu_tan"),
-		DenseActivation::Relu => ForwardActivation::Owned("gpu_relu_into"),
-		DenseActivation::LeakyRelu => ForwardActivation::Program(canonical_leaky_relu_program()?),
-		DenseActivation::Sigmoid => ForwardActivation::Owned("gpu_sigmoid_into"),
-		DenseActivation::Tanh => ForwardActivation::Owned("gpu_tanh_into"),
-		DenseActivation::Selu => ForwardActivation::Program(canonical_selu_program()?),
-		DenseActivation::Gelu => ForwardActivation::Owned("gpu_gelu_into"),
-		DenseActivation::Silu => ForwardActivation::Owned("gpu_silu_into"),
-		DenseActivation::Elu => ForwardActivation::Program(canonical_elu_program()?),
-		DenseActivation::PRelu => ForwardActivation::PRelu(canonical_prelu_program()?), }) } }
+		Activation::Tangent => ForwardActivation::Owned("gpu_tan"),
+		Activation::Relu => ForwardActivation::Owned("gpu_relu_into"),
+		Activation::LeakyRelu => ForwardActivation::Program(canonical_leaky_relu_program()?),
+		Activation::Sigmoid => ForwardActivation::Owned("gpu_sigmoid_into"),
+		Activation::Tanh => ForwardActivation::Owned("gpu_tanh_into"),
+		Activation::Selu => ForwardActivation::Program(canonical_selu_program()?),
+		Activation::Gelu => ForwardActivation::Owned("gpu_gelu_into"),
+		Activation::Silu => ForwardActivation::Owned("gpu_silu_into"),
+		Activation::Elu => ForwardActivation::Program(canonical_elu_program()?),
+		Activation::PRelu => ForwardActivation::PRelu(canonical_prelu_program()?), }) } }
 
 /// Build a scalar program that marks causally visible attention positions.
 ///

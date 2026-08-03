@@ -13,6 +13,9 @@
 
 extern crate alloc;
 
+pub use recipe_core::{Activation, Block, DataNormalization, Function, LearningRateSchedule, Loss, Normalization,
+	Optimizer, TreeFamily};
+
 /// Bayesian declaration resolution and observed categorical preparation.
 pub mod bayes;
 /// Bayesian semantic-model encoding and decoding.
@@ -41,19 +44,13 @@ pub use bayes::{ BayesianCategoricalReferenceSet, BayesianCategoricalSchema, Bay
 	CATEGORICAL_BAYES_SMOOTHING, ResolvedBayesianDependency, ResolvedBayesianSchema,
 	prepare_categorical_bayesian_reference_sets, resolve_bayesian_schema, };
 pub use bayes_checkpoint::{BayesModelArtifact, BayesModelDecodeLimits, decode_bayes_model}; pub use checkpoint::{
-	CheckpointArtifact, CheckpointArtifactMetadata, CheckpointArtifactVector, CheckpointAttentionImage,
-	CheckpointBlockImage, CheckpointConvolutionImage, CheckpointDecodeError, CheckpointDecodeErrorKind,
-	CheckpointDecodeLimits, CheckpointEmbeddingImage, CheckpointError, CheckpointGruImage, CheckpointImageMetadata,
-	CheckpointKMeansImage, CheckpointLayerImage, CheckpointLstmImage, CheckpointManifest, CheckpointNativeKernel,
+	CheckpointArtifact, CheckpointArtifactMetadata, CheckpointArtifactVector, CheckpointDecodeError,
+	CheckpointDecodeErrorKind, CheckpointDecodeLimits, CheckpointError, CheckpointImageMetadata, CheckpointManifest,
+	CheckpointNativeKernel,
 	CheckpointNativeRealization, CheckpointParameterImage, CheckpointPath, CheckpointPathSegment,
-	CheckpointPoolImage, CheckpointResidualBranchImage, CheckpointResidualImage, CheckpointResidualSkipImage,
-	CheckpointResult, CheckpointRnnImage, CheckpointTensorImage, CheckpointTreeImage, CheckpointVectorSchema,
+	CheckpointResult, CheckpointTensorImage, CheckpointVectorSchema,
 	CompletedTrainingCheckpoint, apply_checkpoint_resume, compiled_training_program_digest, decode_checkpoint, };
-pub use compile::{
-	compile_dense_training, compile_dense_training_with_binary_validation, compile_dense_training_with_blocks,
-	compile_dense_training_with_blocks_and_binary_validation, compile_dense_training_with_blocks_and_multiclass_validation,
-	compile_dense_training_with_blocks_and_regression_validation, compile_dense_training_with_multiclass_validation,
-	compile_dense_training_with_regression_validation, };
+pub use compile::{RealizedBlock, compile_training};
 pub use error::{TrainingCompileError, TrainingCompileErrorKind, TrainingCompileResult}; pub use execute::{
 	CompletedInferenceExecution, CompletedKnnInferenceExecution, CompletedTrainingExecution, FinalTrainingMetric,
 	InferenceExecutionError, InferenceExecutionLimits, InferenceExecutionResult, InferencePrediction,
@@ -76,14 +73,9 @@ pub use error::{TrainingCompileError, TrainingCompileErrorKind, TrainingCompileR
 pub use knn::{KnnLabelValue, KnnReferenceOutput, KnnReferenceSet, KnnReferenceValues, prepare_knn_reference_set};
 pub use knn_checkpoint::{KnnModelArtifact, KnnModelDecodeLimits, decode_knn_model}; pub use model::{
 	AdamWConfig, BinaryMetricOutputs, BinaryValidationConfig, BinaryValidationOutputs, CompiledDatasetSchema,
-	CompiledFeatureSpan, CompiledTraining, DataNormalizationState, DecodedMulticlassClass, DenseActivation,
-	DenseAttention, DenseAttentionState, DenseBlock, DenseBlockKind, DenseBlockState, DenseConvolution,
-	DenseConvolutionGeometry, DenseConvolutionState, DenseDataNormalization, DenseEmbedding, DenseEmbeddingState,
-	DenseFeatureLowering, DenseGroupToNeuronRouting, DenseGru, DenseGruState, DenseKMeans, DenseKMeansState,
-	DenseLayer, DenseLayerState, DenseLoss, DenseLstm, DenseLstmState, DenseNormalization, DenseOperation,
-	DenseOutputAdapter, DensePool, DensePoolGroupOrder, DensePoolState, DensePoolWinnerContract, DenseResidual,
-	DenseResidualOperation, DenseResidualState, DenseRnn, DenseRnnState, DenseTask, DenseTrainingConfig, DenseTree,
-	DenseTreeFamily, DenseTreeState, ExternalInputRole, LearningRateDecay, MAXIMUM_REDUCTION_TREE_LANES, MinMaxState,
+	CompiledFeatureSpan, CompiledTraining, DataNormalizationState, DecodedMulticlassClass,
+	DenseConvolutionGeometry, DenseFeatureLowering, DenseOutputAdapter, DenseTask,
+	ExternalInputRole, MAXIMUM_REDUCTION_TREE_LANES, MinMaxState,
 	MulticlassMetricOutputs, MulticlassValidationConfig, MulticlassValidationOutputs, OptimizerProgressState,
 	OwnedExternalInput, ParameterState, REMAINING_UNSUPPORTED, RecallMetricOutput, RegressionMetricOutputs,
 	RegressionValidationConfig, RegressionValidationOutputs, TemperatureScalingConfig, TemperatureScalingState,

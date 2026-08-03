@@ -1,6 +1,6 @@
 use core::{fmt, num::NonZeroU64}; use alloc::collections::{BTreeMap, BTreeSet}; use std::{ path::Path, };
 
-use recipe_core::{ByteCount, DType, KernelTemplateId, ScalarOpcode, ValueId}; use recipe_ingest::{
+use recipe_core::{Block, ByteCount, DType, KernelTemplateId, ScalarOpcode, ValueId}; use recipe_ingest::{
 	InferenceFeatureEncoding, InferenceFeatureSchema, InferencePrepareError, PreparedInferenceDataset,
 	PreparedInferenceFeature, PreparedInferenceValues, RawTable, SemanticType, SourceError,
 	SourceLimit, VectorEncoding, read_source_snapshot, }; use recipe_language::{
@@ -14,11 +14,12 @@ use recipe_core::{ByteCount, DType, KernelTemplateId, ScalarOpcode, ValueId}; us
 	operation_registry, prepare_channelwise_convolution_1d, prepare_channelwise_max_pool_1d,
 	tree_ensemble_inference_requirements, };
 use recipe_program::{IterationDomain, KernelIterationDomain, StaticCalculationProgram};
+use crate::forward::ActivationForward as _;
 
 use crate::{ BayesModelArtifact, BayesModelDecodeLimits, CheckpointArtifact, CheckpointArtifactMetadata,
 	CheckpointArtifactVector, CheckpointDecodeErrorKind, CheckpointDecodeLimits, CheckpointError, CheckpointPath,
-	CheckpointTensorImage, CompiledFeatureSpan, DenseActivation, DenseDataNormalization, DenseFeatureLowering,
-	DenseNormalization, DenseOperation, DenseOutputAdapter, DenseTask, KnnModelArtifact, KnnModelDecodeLimits,
+	CheckpointTensorImage, CompiledFeatureSpan, Activation, DataNormalization, DenseFeatureLowering,
+	Normalization, Function, DenseOutputAdapter, DenseTask, KnnModelArtifact, KnnModelDecodeLimits,
 	MAXIMUM_REDUCTION_TREE_LANES, checkpoint::decode_error, decode_bayes_model, decode_checkpoint, decode_knn_model,
 	forward::{ ForwardActivation, GruForwardParameters, LstmForwardParameters, RecurrentForwardGraph,
 		RecurrentGateParameters, add_program, causal_mask_program, divide_constant_program, divide_program,
@@ -147,19 +148,20 @@ pub(crate) trait InferenceBlock { fn token_vocabulary(&self) -> Option<u64> { No
 
 	fn output_width(&self) -> NonZeroU64;
 
-	fn output_operations(&self) -> &[DenseOperation] { &[] }
+	fn output_operations(&self) -> &[Function] { &[] }
 
 	fn compile_inference( &self, compiler: &mut InferenceGraphCompiler,
 		context: BlockInferenceContext<'_>,
 	) -> InferenceCompileResult<BlockInference>; }
 
-pub(crate) fn inference_block(block: &crate::CheckpointBlockImage) -> &dyn InferenceBlock { match block {
-		crate::CheckpointBlockImage::Embedding(block) => block, crate::CheckpointBlockImage::Attention(block) => block,
-		crate::CheckpointBlockImage::Rnn(block) => block, crate::CheckpointBlockImage::Gru(block) => block,
-		crate::CheckpointBlockImage::Lstm(block) => block, crate::CheckpointBlockImage::Layer(block) => block,
-		crate::CheckpointBlockImage::Convolution(block) => block, crate::CheckpointBlockImage::Pool(block) => block,
-		crate::CheckpointBlockImage::KMeans(block) => block, crate::CheckpointBlockImage::Tree(block) => block,
-		crate::CheckpointBlockImage::Residual(block) => block, } }
+impl InferenceBlock for Block {
+	fn output_width(&self) -> NonZeroU64 { todo!("derive output width from Block") }
+
+	fn compile_inference(&self, _compiler: &mut InferenceGraphCompiler,
+		_context: BlockInferenceContext<'_>) -> InferenceCompileResult<BlockInference> {
+		todo!("compile inference directly from Block")
+	}
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InferenceInputRole { Feature { feature: usize, source_vector: usize, }, FeatureNormalizationMask,
@@ -390,7 +392,7 @@ impl PreparedInference {
 
 	#[must_use]
 	#[inline]
-	pub const fn normalization(&self) -> DenseDataNormalization { self.checkpoint.config().data_normalization }
+	pub const fn normalization(&self) -> DataNormalization { self.checkpoint.data_normalization() }
 
 
 	#[must_use]
@@ -399,7 +401,7 @@ impl PreparedInference {
 
 	#[must_use]
 	#[inline]
-	pub fn normalization_epsilon(&self) -> f32 { self.checkpoint.config().normalization_epsilon }
+	pub fn normalization_epsilon(&self) -> f32 { self.checkpoint.normalization_epsilon() }
 
 }
 
@@ -494,17 +496,17 @@ pub fn compile_prepared_inference(prepared: &PreparedInference) -> InferenceComp
 		)); }
 
 	let mut compiler = InferenceGraphCompiler::new(); let leading_vocabulary = checkpoint .blocks() .first()
-		.and_then(|block| inference_block(block).token_vocabulary());
+		.and_then(InferenceBlock::token_vocabulary);
 	let lowered = if let Some(vocabulary) = leading_vocabulary { compiler.compile_token_features( prepared.data(),
 			checkpoint.feature_spans(), rows, feature_width, vocabulary, )? } else { compiler.compile_features( prepared.data(),
 			checkpoint.feature_spans(), rows, feature_width, )? };
 	let mut current = compiler.apply_data_normalization(checkpoint, lowered, rows, feature_width)?;
 	let mut current_width = feature_width; let mut logical_length = feature_width; let mut logical_channels = 1u64;
 	let mut layer_index = 0usize; for (block_index, block) in checkpoint.blocks().iter().enumerate() {
-		let inference = inference_block(block).compile_inference( &mut compiler, BlockInferenceContext { input: current, rows,
+		let inference = block.compile_inference( &mut compiler, BlockInferenceContext { input: current, rows,
 				width: current_width, logical_length, logical_channels, block_index, layer_index: &mut layer_index,
-				normalization_epsilon: checkpoint.config().normalization_epsilon,
-				tree_lanes: checkpoint.config().reduction_tree_lanes, }, )?; current = inference.output;
+				normalization_epsilon: checkpoint.normalization_epsilon(),
+				tree_lanes: checkpoint.reduction_tree_lanes(), }, )?; current = inference.output;
 		current_width = inference.width; logical_length = inference.logical_length;
 		logical_channels = inference.logical_channels; }
 	let expected_width = u64::try_from(checkpoint.task().output_width()).map_err(|error| { InferenceCompileError::new(
@@ -516,7 +518,7 @@ pub fn compile_prepared_inference(prepared: &PreparedInference) -> InferenceComp
 		)); }
 	if let Some(temperature) = checkpoint.temperature() { current = compiler.apply_temperature(current, temperature)?; }
 	let (prediction, kind) = compiler.compile_prediction( current, checkpoint.task(), rows, current_width,
-		checkpoint.config().reduction_tree_lanes, )?; let target_dtypes = checkpoint.target_dtypes().collect::<Vec<_>>();
+		checkpoint.reduction_tree_lanes(), )?; let target_dtypes = checkpoint.target_dtypes().collect::<Vec<_>>();
 	if target_dtypes.len() != checkpoint.task().target_count() { return Err(InferenceCompileError::new(
 			InferenceCompileErrorKind::InconsistentCheckpoint,
 			"saved target vectors do not all have fixed calculation dtypes",
@@ -797,7 +799,7 @@ impl RecurrentForwardGraph for InferenceGraphCompiler { type Error = InferenceCo
 	) -> InferenceCompileResult<ValueId> { let output = self.tensor(DType::F32, shape)?;
 		self.emit_elementwise(inputs, vec![output], program)?; Ok(output) }
 
-	fn activate( &mut self, input: ValueId, activation: DenseActivation, shape: Shape,
+	fn activate( &mut self, input: ValueId, activation: Activation, shape: Shape,
 	) -> InferenceCompileResult<ValueId> { self.apply_activation(input, activation, None, shape) } }
 
 impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new(), nodes: Vec::new(),
@@ -1034,7 +1036,7 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 				conflict: ScatterConflict::UniqueIndices, }), forbidden_aliases(3, 1), )?; Ok(output) }
 
 	fn apply_data_normalization( &mut self, checkpoint: &CheckpointArtifact, input: ValueId, rows: u64, columns: u64,
-	) -> InferenceCompileResult<ValueId> { if checkpoint.config().data_normalization == DenseDataNormalization::Identity {
+	) -> InferenceCompileResult<ValueId> { if checkpoint.data_normalization() == DataNormalization::Identity {
 			if !checkpoint.normalization().is_empty() { return Err(InferenceCompileError::new(
 					InferenceCompileErrorKind::InconsistentCheckpoint,
 					"identity-input checkpoint unexpectedly retains fitted normalization tensors",
@@ -1042,42 +1044,42 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 			return Ok(input); }
 		let mask = self.external( InferenceInputRole::FeatureNormalizationMask, DType::F32, shape(&[columns])?, checkpoint
 				.feature_normalization_mask() .iter() .flat_map(|bits| bits.to_le_bytes()) .collect(), )?;
-		let matrix_shape = shape(&[rows, columns])?; match checkpoint.config().data_normalization {
-			DenseDataNormalization::Identity => unreachable!("handled before the normalization mask"),
-			DenseDataNormalization::ZScore => { let [mean, variance] = checkpoint.normalization() else {
+		let matrix_shape = shape(&[rows, columns])?; match checkpoint.data_normalization() {
+			DataNormalization::Identity => unreachable!("handled before the normalization mask"),
+			DataNormalization::ZScore => { let [mean, variance] = checkpoint.normalization() else {
 					return Err(InferenceCompileError::new( InferenceCompileErrorKind::InconsistentCheckpoint,
 						"z-score checkpoint does not retain exactly mean and variance tensors",
 					)); }; let mean = self.external_checkpoint_tensor(InferenceInputRole::DataNormalizationMean, mean)?; let variance =
 					self.external_checkpoint_tensor(InferenceInputRole::DataNormalizationVariance, variance)?;
 				let output = self.tensor(DType::F32, matrix_shape)?; self.emit_elementwise( vec![input, mean, variance, mask],
-					vec![output], z_score_program(checkpoint.config().normalization_epsilon, true)?, )?; Ok(output) }
-			DenseDataNormalization::MinMax => { let [minimum, maximum] = checkpoint.normalization() else {
+					vec![output], z_score_program(checkpoint.normalization_epsilon(), true)?, )?; Ok(output) }
+			DataNormalization::MinMax => { let [minimum, maximum] = checkpoint.normalization() else {
 					return Err(InferenceCompileError::new( InferenceCompileErrorKind::InconsistentCheckpoint,
 						"min-max checkpoint does not retain exactly minimum and maximum tensors",
 					)); }; let minimum =
 					self.external_checkpoint_tensor(InferenceInputRole::DataNormalizationMinimum, minimum)?; let maximum =
 					self.external_checkpoint_tensor(InferenceInputRole::DataNormalizationMaximum, maximum)?;
 				let output = self.tensor(DType::F32, matrix_shape)?; self.emit_elementwise( vec![input, minimum, maximum, mask],
-					vec![output], min_max_program(checkpoint.config().normalization_epsilon, true)?, )?; Ok(output) }
-			DenseDataNormalization::L2Norm => { if !checkpoint.normalization().is_empty() {
+					vec![output], min_max_program(checkpoint.normalization_epsilon(), true)?, )?; Ok(output) }
+			DataNormalization::L2Norm => { if !checkpoint.normalization().is_empty() {
 					return Err(InferenceCompileError::new( InferenceCompileErrorKind::InconsistentCheckpoint,
 						"L2 checkpoint unexpectedly retains fitted normalization tensors",
 					)); }
 				let squares = self.tensor(DType::F32, matrix_shape.clone())?;
 				self.emit_elementwise(vec![input, mask], vec![squares], l2_square_program(true)?)?;
 				let norms_squared = self.tensor(DType::F32, shape(&[rows, 1])?)?; self.reduce( squares, norms_squared,
-					ReduceOperator::Sum, &[1], true, checkpoint.config().reduction_tree_lanes, )?;
+					ReduceOperator::Sum, &[1], true, checkpoint.reduction_tree_lanes(), )?;
 				let output = self.tensor(DType::F32, matrix_shape)?; self.emit_elementwise( vec![input, norms_squared, mask],
-					vec![output], l2_norm_program(checkpoint.config().normalization_epsilon, true)?, )?; Ok(output) } } }
+					vec![output], l2_norm_program(checkpoint.normalization_epsilon(), true)?, )?; Ok(output) } } }
 
 	fn normalize_knn_features( &mut self, values: [ValueId; 2], dimensions: [u64; 3],
-		normalization: Option<DenseDataNormalization>, mask_bits: Option<&[u32]>, tree_lanes: u32,
+		normalization: Option<DataNormalization>, mask_bits: Option<&[u32]>, tree_lanes: u32,
 	) -> InferenceCompileResult<(ValueId, ValueId)> { let [query, reference] = values;
 		let [query_rows, reference_rows, columns] = dimensions; let Some(normalization) = normalization else {
 			return Ok((query, reference)); }; let mask = mask_bits .map(|bits| { self.external(
 					InferenceInputRole::FeatureNormalizationMask, DType::F32, shape(&[columns])?,
 					bits.iter().flat_map(|bits| bits.to_le_bytes()).collect(), ) }) .transpose()?; const EPSILON: f32 = 1.0e-6;
-		match normalization { DenseDataNormalization::Identity => Ok((query, reference)), DenseDataNormalization::ZScore => {
+		match normalization { DataNormalization::Identity => Ok((query, reference)), DataNormalization::ZScore => {
 				let column_shape = shape(&[columns])?; let sums = self.tensor(DType::F32, column_shape.clone())?; self.reduce(
 					reference, sums, ReduceOperator::Sum, &[0], false, tree_lanes, )?;
 				let means = self.tensor(DType::F32, column_shape.clone())?; self.emit_elementwise( vec![sums], vec![means],
@@ -1091,13 +1093,13 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 				self.emit_elementwise( vec![variance_sums], vec![variances], divide_constant_program(reference_rows as f32)?, )?;
 				Ok(( self.apply_knn_z_score([query, means, variances], [query_rows, columns], mask, EPSILON)?,
 					self.apply_knn_z_score( [reference, means, variances], [reference_rows, columns], mask, EPSILON, )?, )) }
-			DenseDataNormalization::MinMax => { let column_shape = shape(&[columns])?;
+			DataNormalization::MinMax => { let column_shape = shape(&[columns])?;
 				let minimum = self.tensor(DType::F32, column_shape.clone())?; self.reduce( reference, minimum,
 					ReduceOperator::Minimum, &[0], false, tree_lanes, )?; let maximum = self.tensor(DType::F32, column_shape)?;
 				self.reduce( reference, maximum, ReduceOperator::Maximum, &[0], false, tree_lanes, )?; Ok((
 					self.apply_knn_min_max([query, minimum, maximum], [query_rows, columns], mask, EPSILON)?, self.apply_knn_min_max(
 						[reference, minimum, maximum], [reference_rows, columns], mask, EPSILON, )?, )) }
-			DenseDataNormalization::L2Norm => Ok(( self.apply_knn_l2(query, query_rows, columns, mask, EPSILON, tree_lanes)?,
+			DataNormalization::L2Norm => Ok(( self.apply_knn_l2(query, query_rows, columns, mask, EPSILON, tree_lanes)?,
 				self.apply_knn_l2( reference, reference_rows, columns, mask, EPSILON, tree_lanes, )?, )), } }
 
 	fn apply_knn_z_score( &mut self, values: [ValueId; 3], dimensions: [u64; 2], mask: Option<ValueId>, epsilon: f32,
@@ -1122,7 +1124,8 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 		let mut inputs = vec![input, norms_squared]; if let Some(mask) = mask { inputs.push(mask); }
 		self.emit_elementwise( inputs, vec![output], l2_norm_program(epsilon, mask.is_some())?, )?; Ok(output) }
 
-	pub(crate) fn compile_embedding( &mut self, block_index: usize, embedding: &crate::CheckpointEmbeddingImage,
+	#[cfg(any())]
+	pub(crate) fn compile_embedding( &mut self, block_index: usize, embedding: &Block,
 		input: ValueId, rows: u64, input_width: u64, ) -> InferenceCompileResult<ValueId> {
 		if embedding.sequence_length().get() != input_width { return Err(InferenceCompileError::new(
 				InferenceCompileErrorKind::InconsistentCheckpoint, format!(
@@ -1148,7 +1151,8 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 		let output = self.tensor(DType::F32, output_shape)?; self.emit( vec![flat, identity], vec![output],
 			PrimitiveKind::Gather(Gather { axis: 0, bounds: IndexBounds::Reject, }), forbidden_aliases(2, 1), )?; Ok(output) }
 
-	pub(crate) fn compile_attention( &mut self, block_index: usize, attention: &crate::CheckpointAttentionImage,
+	#[cfg(any())]
+	pub(crate) fn compile_attention( &mut self, block_index: usize, attention: &Block,
 		input: ValueId, geometry: [u64; 4], tree_lanes: u32, ) -> InferenceCompileResult<ValueId> {
 		let [rows, input_width, logical_length, logical_channels] = geometry;
 		if attention.sequence_length().get() != logical_length || attention.dimensions().get() != logical_channels
@@ -1204,7 +1208,8 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 		let output = self.attention_projection( context, output_weight, rows, logical_length, logical_channels, )?;
 		self.reinterpret_f32(output, shape(&[rows, expected_width])?) }
 
-	pub(crate) fn compile_rnn( &mut self, block_index: usize, rnn: &crate::CheckpointRnnImage, input: ValueId, rows: u64,
+	#[cfg(any())]
+	pub(crate) fn compile_rnn( &mut self, block_index: usize, rnn: &Block, input: ValueId, rows: u64,
 		input_width: u64, ) -> InferenceCompileResult<ValueId> { if rnn.sequence_length().get() != input_width {
 			return Err(InferenceCompileError::new( InferenceCompileErrorKind::InconsistentCheckpoint, format!(
 					"RNN block {block_index} sequence length {} differs from input width {input_width}",
@@ -1224,7 +1229,8 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 			rnn.bias().parameter(), )?; Ok(lower_rnn_sequence( self, input, rows, input_width, width, RecurrentGateParameters {
 				input_weight, recurrent_weight, bias, }, )? .0) }
 
-	pub(crate) fn compile_gru( &mut self, block_index: usize, gru: &crate::CheckpointGruImage, input: ValueId, rows: u64,
+	#[cfg(any())]
+	pub(crate) fn compile_gru( &mut self, block_index: usize, gru: &Block, input: ValueId, rows: u64,
 		input_width: u64, ) -> InferenceCompileResult<ValueId> { if gru.sequence_length().get() != input_width {
 			return Err(InferenceCompileError::new( InferenceCompileErrorKind::InconsistentCheckpoint, format!(
 					"GRU block {block_index} sequence length {} differs from input width {input_width}",
@@ -1278,7 +1284,8 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 					bias: update_bias, }, candidate: RecurrentGateParameters { input_weight: candidate_input_weight,
 					recurrent_weight: candidate_recurrent_weight, bias: candidate_bias, }, }, )? .0) }
 
-	pub(crate) fn compile_lstm( &mut self, block_index: usize, lstm: &crate::CheckpointLstmImage, input: ValueId,
+	#[cfg(any())]
+	pub(crate) fn compile_lstm( &mut self, block_index: usize, lstm: &Block, input: ValueId,
 		rows: u64, input_width: u64, ) -> InferenceCompileResult<ValueId> { if lstm.sequence_length().get() != input_width {
 			return Err(InferenceCompileError::new( InferenceCompileErrorKind::InconsistentCheckpoint, format!(
 					"LSTM block {block_index} sequence length {} differs from input width {input_width}",
@@ -1366,7 +1373,8 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 		self.emit( vec![input, weight], vec![output], PrimitiveKind::Contraction(Contraction { batch_axes: Vec::new(),
 				contract_axes: vec![(2, 0)], }), forbidden_aliases(2, 1), )?; Ok(output) }
 
-	pub(crate) fn compile_layer( &mut self, layer_index: usize, layer: &crate::CheckpointLayerImage, input: ValueId,
+	#[cfg(any())]
+	pub(crate) fn compile_layer( &mut self, layer_index: usize, layer: &Block, input: ValueId,
 		dimensions: [u64; 2], normalization_epsilon: f32, tree_lanes: u32, ) -> InferenceCompileResult<ValueId> {
 		let [rows, input_width] = dimensions; let output_width = layer.declaration().width().get();
 		validate_checkpoint_parameter_image( layer.weight().parameter(), &[input_width, output_width],
@@ -1384,21 +1392,22 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 			"input",
 			&PreparedParameters::new(), )?; let mut current = preactivation; let mut prelu = layer.prelu().iter().enumerate();
 		for operation in layer.declaration().operations().iter().copied() { current = match operation {
-				DenseOperation::Activation(activation) => { let alpha = if activation.learned_parameters() == 1 {
+				Function::Activation(activation) => { let alpha = if activation.learned_parameters() == 1 {
 						let (occurrence, parameter) = prelu.next().ok_or_else(|| { InferenceCompileError::new(
 								InferenceCompileErrorKind::InconsistentCheckpoint,
 								format!("layer {layer_index} omitted a PReLU scalar"),
 							) })?; Some(self.external_checkpoint_tensor( InferenceInputRole::LayerPRelu { layer: layer_index, occurrence, },
 							parameter.parameter(), )?) } else { None };
 					self.apply_activation(current, activation, alpha, output_shape.clone())? }
-				DenseOperation::Normalization(normalization) => self.apply_model_normalization( current, normalization, rows,
+				Function::Normalization(normalization) => self.apply_model_normalization( current, normalization, rows,
 					output_width, normalization_epsilon, tree_lanes, )?, }; }
 		if prelu.next().is_some() { return Err(InferenceCompileError::new( InferenceCompileErrorKind::InconsistentCheckpoint,
 				format!("layer {layer_index} retains an extra PReLU scalar"),
 			)); }
 		Ok(current) }
 
-	pub(crate) fn compile_convolution( &mut self, block_index: usize, convolution: &crate::CheckpointConvolutionImage,
+	#[cfg(any())]
+	pub(crate) fn compile_convolution( &mut self, block_index: usize, convolution: &Block,
 		input: ValueId, input_geometry: [u64; 4], normalization_epsilon: f32, tree_lanes: u32,
 	) -> InferenceCompileResult<ValueId> { let [rows, input_width, logical_length, logical_channels] = input_geometry;
 		let geometry = convolution.geometry(); if geometry.input_length().get() != logical_length
@@ -1439,7 +1448,7 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 		let mut current = self.unpack_pool_to_matrix( grouped, rows, geometry.output_length().get(), geometry.filters().get(),
 			output_width.get(), )?; let mut prelu = convolution.prelu().iter().enumerate();
 		for operation in convolution.declaration().operations().iter().copied() {
-			let alpha = if matches!(operation, DenseOperation::Activation(activation) if activation.learned_parameters() == 1) {
+			let alpha = if matches!(operation, Function::Activation(activation) if activation.learned_parameters() == 1) {
 				let (occurrence, parameter) = prelu.next().ok_or_else(|| { InferenceCompileError::new(
 						InferenceCompileErrorKind::InconsistentCheckpoint,
 						format!("convolution block {block_index} omitted a PReLU scalar"),
@@ -1453,7 +1462,8 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 			)); }
 		Ok(current) }
 
-	pub(crate) fn compile_pool( &mut self, block_index: usize, pool: &crate::CheckpointPoolImage, input: ValueId,
+	#[cfg(any())]
+	pub(crate) fn compile_pool( &mut self, block_index: usize, pool: &Block, input: ValueId,
 		input_geometry: [u64; 4], tree_lanes: u32, ) -> InferenceCompileResult<ValueId> {
 		let [rows, input_width, logical_length, logical_channels] = input_geometry; if pool.input_width().get() != input_width
 			|| pool.input_length().get() != logical_length
@@ -1496,7 +1506,8 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 			&parameters, )?; self.unpack_pool_to_matrix( pooled, rows, pool.output_length().get(), logical_channels,
 			pool.output_width().get(), ) }
 
-	pub(crate) fn compile_kmeans( &mut self, block_index: usize, kmeans: &crate::CheckpointKMeansImage, input: ValueId,
+	#[cfg(any())]
+	pub(crate) fn compile_kmeans( &mut self, block_index: usize, kmeans: &Block, input: ValueId,
 		rows: u64, input_width: u64, tree_lanes: u32, ) -> InferenceCompileResult<ValueId> {
 		if kmeans.input_width().get() != input_width { return Err(InferenceCompileError::new(
 				InferenceCompileErrorKind::InconsistentCheckpoint, format!(
@@ -1522,7 +1533,8 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 			"query",
 			&parameters, )?; Ok(distances) }
 
-	pub(crate) fn compile_tree( &mut self, block_index: usize, tree: &crate::CheckpointTreeImage, input: ValueId,
+	#[cfg(any())]
+	pub(crate) fn compile_tree( &mut self, block_index: usize, tree: &Block, input: ValueId,
 		rows: u64, input_width: u64, tree_lanes: u32, ) -> InferenceCompileResult<ValueId> {
 		if tree.input_width().get() != input_width { return Err(InferenceCompileError::new(
 				InferenceCompileErrorKind::InconsistentCheckpoint, format!(
@@ -1557,19 +1569,20 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 				kernel: node.kernel.id, domain: IterationDomain::first(), }); }
 		Ok(predictions) }
 
-	pub(crate) fn compile_residual( &mut self, residual: &crate::CheckpointResidualImage,
+	#[cfg(any())]
+	pub(crate) fn compile_residual( &mut self, residual: &Block,
 		context: BlockInferenceContext<'_>,
 	) -> InferenceCompileResult<ValueId> { let BlockInferenceContext { input, rows, width: input_width, block_index,
 			layer_index, normalization_epsilon, tree_lanes, .. } = context;
 		self.require_tensor(input, DType::F32, &[rows, input_width], "residual input")?;
 		let mut branch = input; let mut branch_width = input_width; let mut retained_layer = false;
 		let mut branch_prelu = residual.branch_prelu().iter().enumerate(); for step in residual.branch() { match step {
-				crate::CheckpointResidualBranchImage::Layer(layer) => { retained_layer = true; branch = self.compile_layer(
+				Block::Layer { .. } => { retained_layer = true; branch = self.compile_layer(
 						*layer_index, layer, branch, [rows, branch_width], normalization_epsilon, tree_lanes, )?;
 					*layer_index = layer_index.checked_add(1).ok_or_else(identity_exhausted)?;
 					branch_width = layer.declaration().width().get(); }
-				crate::CheckpointResidualBranchImage::Operation(operation) => {
-					let alpha = if matches!(operation, DenseOperation::Activation(activation) if activation.learned_parameters() == 1) {
+				Block::Residual { .. } => {
+					let alpha = if matches!(operation, Function::Activation(activation) if activation.learned_parameters() == 1) {
 						let (occurrence, parameter) = branch_prelu.next().ok_or_else(|| { InferenceCompileError::new(
 								InferenceCompileErrorKind::InconsistentCheckpoint,
 								format!("residual block {block_index} omitted a branch PReLU scalar"),
@@ -1587,23 +1600,23 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 				format!("residual block {block_index} output width disagrees with its last branch layer"),
 			)); }
 		let skip = match residual.skip() {
-			crate::CheckpointResidualSkipImage::Identity if input_width == output_width => input,
-			crate::CheckpointResidualSkipImage::Projection(projection) if input_width != output_width => {
+			Block::Layer { .. } if input_width == output_width => input,
+			Block::Residual { .. } if input_width != output_width => {
 				validate_checkpoint_parameter_image( projection.parameter(), &[input_width, output_width],
 					"residual projection weight",
 				)?; let weight = self.external_checkpoint_tensor(
 					InferenceInputRole::ResidualProjectionWeight { block: block_index }, projection.parameter(), )?;
 				self.bias_free_linear(input, weight, rows, output_width)? }
-			crate::CheckpointResidualSkipImage::Identity => { return Err(InferenceCompileError::new(
+			Block::Layer { .. } => { return Err(InferenceCompileError::new(
 					InferenceCompileErrorKind::InconsistentCheckpoint,
 					format!("residual block {block_index} width mismatch requires a projection"),
 				)); }
-			crate::CheckpointResidualSkipImage::Projection(_) => { return Err(InferenceCompileError::new(
+			Block::Residual { .. } => { return Err(InferenceCompileError::new(
 					InferenceCompileErrorKind::InconsistentCheckpoint,
 					format!("equal-width residual block {block_index} must use an identity skip"),
 				)); } }; let mut current = self.exact_add(branch, skip)?;
 		let mut output_prelu = residual.prelu().iter().enumerate(); for operation in residual.operations().iter().copied() {
-			let alpha = if matches!(operation, DenseOperation::Activation(activation) if activation.learned_parameters() == 1) {
+			let alpha = if matches!(operation, Function::Activation(activation) if activation.learned_parameters() == 1) {
 				let (occurrence, parameter) = output_prelu.next().ok_or_else(|| { InferenceCompileError::new(
 						InferenceCompileErrorKind::InconsistentCheckpoint,
 						format!("residual block {block_index} omitted an output PReLU scalar"),
@@ -1618,11 +1631,11 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 			)); }
 		Ok(current) }
 
-	fn apply_saved_operation( &mut self, input: ValueId, operation: DenseOperation, prelu: Option<ValueId>,
+	fn apply_saved_operation( &mut self, input: ValueId, operation: Function, prelu: Option<ValueId>,
 		dimensions: [u64; 2], normalization_epsilon: f32, tree_lanes: u32, ) -> InferenceCompileResult<ValueId> {
-		let [rows, width] = dimensions; match operation { DenseOperation::Activation(activation) => {
+		let [rows, width] = dimensions; match operation { Function::Activation(activation) => {
 				self.apply_activation(input, activation, prelu, shape(&[rows, width])?) }
-			DenseOperation::Normalization(normalization) => self.apply_model_normalization( input, normalization, rows, width,
+			Function::Normalization(normalization) => self.apply_model_normalization( input, normalization, rows, width,
 				normalization_epsilon, tree_lanes, ), } }
 
 	fn external_i32( &mut self, role: InferenceInputRole, shape: Shape, values: &[i32],
@@ -1746,7 +1759,7 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 					tensor.dtype, tensor.shape.extents(), ), )); }
 		Ok(()) }
 
-	fn apply_activation( &mut self, input: ValueId, activation: DenseActivation, prelu: Option<ValueId>,
+	fn apply_activation( &mut self, input: ValueId, activation: Activation, prelu: Option<ValueId>,
 		output_shape: Shape, ) -> InferenceCompileResult<ValueId> {
 		let activation = activation.forward_kernel::<InferenceCompileError>()?;
 		if matches!(activation, ForwardActivation::Identity) { return Ok(input); }
@@ -1768,11 +1781,11 @@ impl InferenceGraphCompiler { fn new() -> Self { Self { tensors: BTreeMap::new()
 					) })?; self.emit_elementwise(vec![input, alpha], vec![output], program)?; } }
 		Ok(output) }
 
-	fn apply_model_normalization( &mut self, input: ValueId, normalization: DenseNormalization, rows: u64, columns: u64,
+	fn apply_model_normalization( &mut self, input: ValueId, normalization: Normalization, rows: u64, columns: u64,
 		epsilon: f32, tree_lanes: u32, ) -> InferenceCompileResult<ValueId> {
 		let (axis, statistic_shape, population, keep_dimensions) = match normalization {
-			DenseNormalization::Layer => (1, shape(&[rows, 1])?, columns as f32, true),
-			DenseNormalization::Batch => (0, shape(&[columns])?, rows as f32, false), };
+			Normalization::Layer => (1, shape(&[rows, 1])?, columns as f32, true),
+			Normalization::Batch => (0, shape(&[columns])?, rows as f32, false), };
 		let matrix_shape = shape(&[rows, columns])?; let sums = self.tensor(DType::F32, statistic_shape.clone())?;
 		self.reduce( input, sums, ReduceOperator::Sum, &[axis], keep_dimensions, tree_lanes, )?;
 		let means = self.tensor(DType::F32, statistic_shape.clone())?; self.emit_elementwise( vec![sums], vec![means],

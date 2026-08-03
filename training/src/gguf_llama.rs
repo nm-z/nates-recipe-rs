@@ -8,7 +8,7 @@ use recipe_ops::{PreparedParameter, PreparedParameters};
 
 use super::{ InferenceCompileError, InferenceCompileErrorKind, InferenceCompileResult, InferenceGraphCompiler,
 	InferenceInputRole, InferencePredictionKind, InferencePreparationResult, InferenceTask, checked_i32,
-	checked_product, shape, }; use crate::{ CompiledInference, DenseActivation, MAXIMUM_REDUCTION_TREE_LANES,
+	checked_product, shape, }; use crate::{ CompiledInference, Activation, MAXIMUM_REDUCTION_TREE_LANES,
 	forward::{add_program, forbidden_aliases, multiply_constant_program, multiply_program}, };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -337,7 +337,7 @@ pub fn compile_prepared_gguf_llama_inference( prepared: &PreparedGgufLlamaInfere
 			&values, [sequence, artifact.embedding_length, artifact.feed_forward_length], false, 0.0, )?; let up = linear(
 			&mut compiler, current, block.feed_forward_up, &values,
 			[sequence, artifact.embedding_length, artifact.feed_forward_length], false, 0.0, )?;
-		let gate = compiler.apply_activation( gate, DenseActivation::Silu, None,
+		let gate = compiler.apply_activation( gate, Activation::Silu, None,
 			shape(&[sequence, artifact.feed_forward_length])?, )?; let gated = compiler.tensor( DType::F32,
 			shape(&[sequence, artifact.feed_forward_length])?, )?;
 		compiler.emit_elementwise(vec![gate, up], vec![gated], multiply_program()?)?; current = linear( &mut compiler, gated,

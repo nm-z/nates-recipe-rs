@@ -1,6 +1,7 @@
 use core::{ fmt, num::{NonZeroU32, NonZeroU64}, };
 
-use recipe_core::{DType, IterationDomain, KernelTemplateId, LoopIterations, MetricId, ValueId}; use recipe_ingest::{
+use recipe_core::{Block, DataNormalization, DType, IterationDomain, KernelTemplateId,
+	LearningRateSchedule, LoopIterations, Loss, MetricId, ValueId}; use recipe_ingest::{
 	DenseMatrix, PartitionKind, PreparedDataset, PreparedValues, SemanticType, VectorEncoding, VectorMetadata,
 	VectorRole, VectorSchema, }; use recipe_language::{CalculationGraph, Shape};
 use recipe_program::StaticCalculationProgram;
@@ -8,83 +9,6 @@ use recipe_program::StaticCalculationProgram;
 use crate::{TrainingCompileError, TrainingCompileErrorKind, TrainingCompileResult};
 
 pub const MAXIMUM_REDUCTION_TREE_LANES: u32 = 1_024;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DenseActivation { Linear, Cosine, Exponential, Logarithm, NaturalLogarithm, LegacySignedLogOnePlus, Huber,
-	Tangent, Relu, LeakyRelu, Sigmoid, Tanh, Selu, Gelu, Silu, Elu, PRelu, }
-
-impl DenseActivation {
-	pub(crate) const fn checkpoint_tag(self) -> &'static str {
-		match self {
-			Self::Linear => "linear",
-			Self::Cosine => "cosine",
-			Self::Exponential => "exponential",
-			Self::Logarithm => "signed-logarithm",
-			Self::NaturalLogarithm => "natural-logarithm",
-			Self::LegacySignedLogOnePlus => "logarithm",
-			Self::Huber => "huber",
-			Self::Tangent => "tangent",
-			Self::Relu => "relu",
-			Self::LeakyRelu => "leaky-relu",
-			Self::Sigmoid => "sigmoid",
-			Self::Tanh => "tanh",
-			Self::Selu => "selu",
-			Self::Gelu => "gelu",
-			Self::Silu => "silu",
-			Self::Elu => "elu",
-			Self::PRelu => "prelu",
-		} }
-
-	pub(crate) const fn is_identity(self) -> bool { matches!(self, Self::Linear) }
-
-	pub(crate) const fn learned_parameters(self) -> usize { matches!(self, Self::PRelu) as usize } }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DenseNormalization { Layer, Batch, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DenseOperation { Activation(DenseActivation), Normalization(DenseNormalization), }
-
-impl DenseOperation {
-	pub(crate) const fn token(self) -> &'static str {
-		match self { Self::Activation(activation) => activation.checkpoint_tag(),
-			Self::Normalization(DenseNormalization::Layer) => "layer-normalization",
-			Self::Normalization(DenseNormalization::Batch) => "batch-normalization",
-		} }
-
-	pub(crate) fn from_token(value: &str) -> Option<Self> { Some(match value {
-			"linear" => Self::Activation(DenseActivation::Linear),
-			"cosine" => Self::Activation(DenseActivation::Cosine),
-			"exponential" => Self::Activation(DenseActivation::Exponential),
-			"signed-logarithm" => Self::Activation(DenseActivation::Logarithm),
-			"natural-logarithm" => Self::Activation(DenseActivation::NaturalLogarithm),
-			"logarithm" => Self::Activation(DenseActivation::LegacySignedLogOnePlus),
-			"huber" => Self::Activation(DenseActivation::Huber),
-			"tangent" => Self::Activation(DenseActivation::Tangent),
-			"relu" => Self::Activation(DenseActivation::Relu),
-			"leaky-relu" => Self::Activation(DenseActivation::LeakyRelu),
-			"sigmoid" => Self::Activation(DenseActivation::Sigmoid),
-			"tanh" => Self::Activation(DenseActivation::Tanh),
-			"selu" => Self::Activation(DenseActivation::Selu),
-			"gelu" => Self::Activation(DenseActivation::Gelu),
-			"silu" => Self::Activation(DenseActivation::Silu),
-			"elu" => Self::Activation(DenseActivation::Elu),
-			"prelu" => Self::Activation(DenseActivation::PRelu),
-			"layer-normalization" => Self::Normalization(DenseNormalization::Layer),
-			"batch-normalization" => Self::Normalization(DenseNormalization::Batch),
-			_ => return None, }) } }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DenseBlockKind { Layer, Perc, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DenseDataNormalization { Identity, ZScore, MinMax, L2Norm, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DenseLoss { BinaryCrossEntropy, Focal, MeanSquaredError, MeanAbsoluteError, CrossEntropy, Huber, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LearningRateDecay { Constant, Linear, Cosine, Exponential, }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrainingHorizon { Finite(NonZeroU64), Unbounded, }
@@ -122,62 +46,6 @@ impl fmt::Display for TrainingHorizon {
 		match self { Self::Finite(epochs) => epochs.fmt(formatter),
 			Self::Unbounded => formatter.write_str("unbounded"),
 		} } }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DenseLayer { kind: DenseBlockKind, width: NonZeroU64, operations: Vec<DenseOperation>, }
-
-impl DenseLayer {
-	#[must_use]
-	#[inline]
-	pub fn new(width: NonZeroU64, activation: DenseActivation) -> Self { Self { kind: DenseBlockKind::Layer, width,
-			operations: (!activation.is_identity()).then_some(DenseOperation::Activation(activation)).into_iter().collect(), } }
-
-	#[must_use]
-	#[inline]
-	pub fn with_operations(width: NonZeroU64, operations: impl IntoIterator<Item = DenseOperation>) -> Self { Self::with_kind(DenseBlockKind::Layer, width, operations) }
-
-	#[must_use]
-	#[inline]
-	pub fn with_kind( kind: DenseBlockKind, width: NonZeroU64, operations: impl IntoIterator<Item = DenseOperation>,
-	) -> Self { Self { kind, width, operations: operations.into_iter().collect(), } }
-
-	#[must_use]
-	#[inline]
-	pub const fn kind(&self) -> DenseBlockKind { self.kind }
-
-	#[must_use]
-	#[inline]
-	pub const fn width(&self) -> NonZeroU64 { self.width }
-
-	#[must_use]
-	#[inline]
-	pub fn operations(&self) -> &[DenseOperation] { &self.operations } }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DenseConvolution { filters: NonZeroU64, kernel: NonZeroU64, operations: Vec<DenseOperation>, }
-
-impl DenseConvolution {
-	#[must_use]
-	#[inline]
-	pub fn new(filters: NonZeroU64, kernel: NonZeroU64, activation: DenseActivation) -> Self { Self { filters, kernel,
-			operations: (!activation.is_identity()).then_some(DenseOperation::Activation(activation)).into_iter().collect(), } }
-
-	#[must_use]
-	#[inline]
-	pub fn with_operations( filters: NonZeroU64, kernel: NonZeroU64, operations: impl IntoIterator<Item = DenseOperation>,
-	) -> Self { Self { filters, kernel, operations: operations.into_iter().collect(), } }
-
-	#[must_use]
-	#[inline]
-	pub const fn filters(&self) -> NonZeroU64 { self.filters }
-
-	#[must_use]
-	#[inline]
-	pub const fn kernel(&self) -> NonZeroU64 { self.kernel }
-
-	#[must_use]
-	#[inline]
-	pub fn operations(&self) -> &[DenseOperation] { &self.operations } }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DenseConvolutionGeometry { input_length: NonZeroU64, input_channels: NonZeroU64, output_length: NonZeroU64,
@@ -218,312 +86,6 @@ impl DenseConvolutionGeometry {
 	#[inline]
 	pub fn output_width(self) -> Option<NonZeroU64> { self.output_length .get() .checked_mul(self.filters.get())
 			.and_then(NonZeroU64::new) } }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DenseResidual { branch: Vec<DenseResidualOperation>, operations: Vec<DenseOperation>, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DensePool { size: NonZeroU64, group_to_neuron: Option<NonZeroU64>, }
-
-impl DensePool {
-	#[must_use]
-	#[inline]
-	pub const fn new(size: NonZeroU64, group_to_neuron: Option<NonZeroU64>) -> Self { Self { size, group_to_neuron, } }
-
-	#[must_use]
-	#[inline]
-	pub const fn size(self) -> NonZeroU64 { self.size }
-
-	#[must_use]
-	#[inline]
-	pub const fn group_to_neuron(self) -> Option<NonZeroU64> { self.group_to_neuron }
-
-	#[must_use]
-	#[inline]
-	pub fn routing(self, groups: NonZeroU64) -> Option<DenseGroupToNeuronRouting> { self.group_to_neuron
-			.map(|neurons| DenseGroupToNeuronRouting::resolve(groups, neurons)) } }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseKMeans { clusters: NonZeroU64, group_to_neuron: Option<NonZeroU64>, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseEmbedding { dimensions: NonZeroU64, vocabulary: NonZeroU64, }
-
-impl DenseEmbedding {
-	#[must_use]
-	#[inline]
-	pub const fn new(dimensions: NonZeroU64, vocabulary: NonZeroU64) -> Self { Self { dimensions, vocabulary, } }
-
-	#[must_use]
-	#[inline]
-	pub const fn dimensions(self) -> NonZeroU64 { self.dimensions }
-
-	#[must_use]
-	#[inline]
-	pub const fn vocabulary(self) -> NonZeroU64 { self.vocabulary } }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseAttention { heads: NonZeroU64, }
-
-impl DenseAttention {
-	#[must_use]
-	#[inline]
-	pub const fn new(heads: NonZeroU64) -> Self { Self { heads } }
-
-	#[must_use]
-	#[inline]
-	pub const fn heads(self) -> NonZeroU64 { self.heads } }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseRnn { width: NonZeroU64, }
-
-impl DenseRnn {
-	#[must_use]
-	#[inline]
-	pub const fn new(width: NonZeroU64) -> Self { Self { width } }
-
-	#[must_use]
-	#[inline]
-	pub const fn width(self) -> NonZeroU64 { self.width } }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseGru { width: NonZeroU64, }
-
-impl DenseGru {
-	#[must_use]
-	#[inline]
-	pub const fn new(width: NonZeroU64) -> Self { Self { width } }
-
-	#[must_use]
-	#[inline]
-	pub const fn width(self) -> NonZeroU64 { self.width } }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseLstm { width: NonZeroU64, }
-
-impl DenseLstm {
-	#[must_use]
-	#[inline]
-	pub const fn new(width: NonZeroU64) -> Self { Self { width } }
-
-	#[must_use]
-	#[inline]
-	pub const fn width(self) -> NonZeroU64 { self.width } }
-
-impl DenseKMeans {
-	#[must_use]
-	#[inline]
-	pub const fn new(clusters: NonZeroU64, group_to_neuron: Option<NonZeroU64>) -> Self { Self { clusters, group_to_neuron,
-		} }
-
-	#[must_use]
-	#[inline]
-	pub const fn clusters(self) -> NonZeroU64 { self.clusters }
-
-	#[must_use]
-	#[inline]
-	pub const fn group_to_neuron(self) -> Option<NonZeroU64> { self.group_to_neuron }
-
-	#[must_use]
-	#[inline]
-	pub fn routing(self) -> Option<DenseGroupToNeuronRouting> { self.group_to_neuron
-			.map(|neurons| DenseGroupToNeuronRouting::resolve(self.clusters, neurons)) } }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DenseTreeFamily { LightGbm, CatBoost, XGBoost, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseTree { family: DenseTreeFamily, trees: NonZeroU64, depth: NonZeroU32, }
-
-impl DenseTree {
-	#[must_use]
-	#[inline]
-	pub const fn new(family: DenseTreeFamily, trees: NonZeroU64, depth: NonZeroU32) -> Self { Self { family, trees, depth,
-		} }
-
-	#[must_use]
-	#[inline]
-	pub const fn family(self) -> DenseTreeFamily { self.family }
-
-	#[must_use]
-	#[inline]
-	pub const fn trees(self) -> NonZeroU64 { self.trees }
-
-	#[must_use]
-	#[inline]
-	pub const fn depth(self) -> NonZeroU32 { self.depth } }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DenseGroupToNeuronRouting { Identity { width: NonZeroU64, }, Expand { groups: NonZeroU64, neurons: NonZeroU64,
-		neurons_per_group: NonZeroU64, }, Contract { groups: NonZeroU64, neurons: NonZeroU64, groups_per_neuron: NonZeroU64,
-	}, FullyConnected { groups: NonZeroU64, neurons: NonZeroU64, }, }
-
-impl DenseGroupToNeuronRouting {
-	#[must_use]
-	#[inline]
-	pub fn resolve(groups: NonZeroU64, neurons: NonZeroU64) -> Self { let groups_value = groups.get();
-		let neurons_value = neurons.get(); if groups == neurons { Self::Identity { width: groups }
-		} else if neurons_value % groups_value == 0 { Self::Expand { groups, neurons,
-				neurons_per_group: NonZeroU64::new(neurons_value / groups_value)
-					.expect("nonzero divisible group expansion"),
-			} } else if groups_value % neurons_value == 0 { Self::Contract { groups, neurons,
-				groups_per_neuron: NonZeroU64::new(groups_value / neurons_value)
-					.expect("nonzero divisible group contraction"),
-			} } else { Self::FullyConnected { groups, neurons } } } }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DensePoolGroupOrder { GroupMajorChannelMinor, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DensePoolWinnerContract { LowestLogicalIndex, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DensePoolState { input_length: NonZeroU64, channels: NonZeroU64, output_length: NonZeroU64,
-	group_order: DensePoolGroupOrder, winner_contract: DensePoolWinnerContract, }
-
-impl DensePoolState {
-	#[must_use]
-	#[inline]
-	pub const fn new(input_length: NonZeroU64, channels: NonZeroU64, output_length: NonZeroU64) -> Self { Self {
-			input_length, channels, output_length, group_order: DensePoolGroupOrder::GroupMajorChannelMinor,
-			winner_contract: DensePoolWinnerContract::LowestLogicalIndex, } }
-
-	#[must_use]
-	#[inline]
-	pub const fn input_length(self) -> NonZeroU64 { self.input_length }
-
-	#[must_use]
-	#[inline]
-	pub const fn channels(self) -> NonZeroU64 { self.channels }
-
-	#[must_use]
-	#[inline]
-	pub const fn output_length(self) -> NonZeroU64 { self.output_length }
-
-	#[must_use]
-	#[inline]
-	pub const fn group_order(self) -> DensePoolGroupOrder { self.group_order }
-
-	#[must_use]
-	#[inline]
-	pub const fn winner_contract(self) -> DensePoolWinnerContract { self.winner_contract }
-
-	#[must_use]
-	#[inline]
-	pub fn input_width(self) -> Option<NonZeroU64> { self.input_length .get() .checked_mul(self.channels.get())
-			.and_then(NonZeroU64::new) }
-
-	#[must_use]
-	#[inline]
-	pub fn output_width(self) -> Option<NonZeroU64> { self.output_length .get() .checked_mul(self.channels.get())
-			.and_then(NonZeroU64::new) }
-
-
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DenseResidualOperation { Layer(DenseLayer), Operation(DenseOperation), }
-
-impl From<DenseLayer> for DenseResidualOperation {
-	#[inline]
-	fn from(layer: DenseLayer) -> Self { Self::Layer(layer) } }
-
-impl From<DenseOperation> for DenseResidualOperation {
-	#[inline]
-	fn from(operation: DenseOperation) -> Self { Self::Operation(operation) } }
-
-impl DenseResidual {
-	#[must_use]
-	#[inline]
-	pub fn new<T>(branch: impl IntoIterator<Item = T>, operations: impl IntoIterator<Item = DenseOperation>) -> Self
-	where T: Into<DenseResidualOperation>, { Self { branch: branch.into_iter().map(Into::into).collect(),
-			operations: operations.into_iter().collect(), } }
-
-	#[must_use]
-	#[inline]
-	pub fn branch(&self) -> &[DenseResidualOperation] { &self.branch }
-
-	#[must_use]
-	#[inline]
-	pub fn operations(&self) -> &[DenseOperation] { &self.operations }
-
-	#[must_use]
-	#[inline]
-	pub fn output_width(&self) -> Option<NonZeroU64> { self.branch .iter() .rev() .find_map(|operation| match operation {
-				DenseResidualOperation::Layer(layer) => Some(layer.width()), DenseResidualOperation::Operation(_) => None, }) } }
-
-pub struct DenseBlock(Box<dyn crate::compile::DeclaredBlock>);
-
-impl Clone for DenseBlock {
-	#[inline]
-	fn clone(&self) -> Self { Self(self.0.clone_box()) } }
-
-impl core::fmt::Debug for DenseBlock {
-	#[inline]
-	fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { self.0.fmt(formatter) }
-}
-
-impl DenseBlock { pub(crate) fn declaration(&self) -> &dyn crate::compile::DeclaredBlock { self.0.as_ref() }
-
-	#[must_use]
-	#[inline]
-	pub fn output_width(&self) -> Option<NonZeroU64> { self.0.output_width() }
-
-	#[must_use]
-	#[inline]
-	pub fn output_operations(&self) -> &[DenseOperation] { self.0.output_operations() }
-
-	#[must_use]
-	#[inline]
-	pub fn layer(&self) -> Option<&DenseLayer> { self.0.legacy_layer() }
-
-	#[must_use]
-	#[inline]
-	pub fn embedding(&self) -> Option<DenseEmbedding> { self.0.leading_embedding() } }
-
-impl From<DenseEmbedding> for DenseBlock {
-	#[inline]
-	fn from(embedding: DenseEmbedding) -> Self { Self(Box::new(embedding)) } }
-
-impl From<DenseAttention> for DenseBlock {
-	#[inline]
-	fn from(attention: DenseAttention) -> Self { Self(Box::new(attention)) } }
-
-impl From<DenseRnn> for DenseBlock {
-	#[inline]
-	fn from(rnn: DenseRnn) -> Self { Self(Box::new(rnn)) } }
-
-impl From<DenseGru> for DenseBlock {
-	#[inline]
-	fn from(gru: DenseGru) -> Self { Self(Box::new(gru)) } }
-
-impl From<DenseLstm> for DenseBlock {
-	#[inline]
-	fn from(lstm: DenseLstm) -> Self { Self(Box::new(lstm)) } }
-
-impl From<DenseLayer> for DenseBlock {
-	#[inline]
-	fn from(layer: DenseLayer) -> Self { Self(Box::new(layer)) } }
-
-impl From<DensePool> for DenseBlock {
-	#[inline]
-	fn from(pool: DensePool) -> Self { Self(Box::new(pool)) } }
-
-impl From<DenseKMeans> for DenseBlock {
-	#[inline]
-	fn from(kmeans: DenseKMeans) -> Self { Self(Box::new(kmeans)) } }
-
-impl From<DenseConvolution> for DenseBlock {
-	#[inline]
-	fn from(convolution: DenseConvolution) -> Self { Self(Box::new(convolution)) } }
-
-impl From<DenseTree> for DenseBlock {
-	#[inline]
-	fn from(tree: DenseTree) -> Self { Self(Box::new(tree)) } }
-
-impl From<DenseResidual> for DenseBlock {
-	#[inline]
-	fn from(residual: DenseResidual) -> Self { Self(Box::new(residual)) } }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DenseTask { BinaryClassification { target_vector: usize, positive_code: i32, }, MulticlassClassification {
@@ -1075,12 +637,6 @@ impl Default for AdamWConfig {
 			weight_decay: 0.01, } } }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct DenseTrainingConfig { pub layers: Vec<DenseLayer>, pub loss: DenseLoss,
-	pub data_normalization: DenseDataNormalization, pub epochs: TrainingHorizon, pub warmup_epochs: u64,
-	pub learning_rate_decay: LearningRateDecay, pub gradient_clip_norm: Option<f32>, pub normalization_epsilon: f32,
-	pub reduction_tree_lanes: u32, pub random_seed: u64, pub adamw: AdamWConfig, }
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct BinaryValidationConfig { calibration_bins: NonZeroU32, recall_threshold_bits: Vec<u32>,
 	temperature_scaling: Option<TemperatureScalingConfig>, }
 
@@ -1171,71 +727,6 @@ pub struct ParameterState { pub initial_parameter: ValueId, pub updated_paramete
 	pub initial_first_moment: ValueId, pub updated_first_moment: ValueId, pub initial_second_moment: ValueId,
 	pub updated_second_moment: ValueId, pub update_kernel: KernelTemplateId, }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DenseLayerState { pub weight: ParameterState, pub bias: ParameterState, pub prelu: Vec<ParameterState>, }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DenseConvolutionState { pub geometry: DenseConvolutionGeometry, pub weight: ParameterState,
-	pub bias: ParameterState, pub prelu: Vec<ParameterState>, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseKMeansState { pub input_width: NonZeroU64, pub clusters: NonZeroU64, pub initial_centroids: ValueId,
-	pub updated_centroids: ValueId, pub update_kernel: KernelTemplateId, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseEmbeddingState { pub sequence_length: NonZeroU64, pub dimensions: NonZeroU64,
-	pub vocabulary: NonZeroU64, pub table: ParameterState, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseAttentionState { pub sequence_length: NonZeroU64, pub dimensions: NonZeroU64, pub heads: NonZeroU64,
-	pub head_dimension: NonZeroU64, pub query: ParameterState, pub key: ParameterState, pub value: ParameterState,
-	pub output: ParameterState, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseRnnState { pub sequence_length: NonZeroU64, pub width: NonZeroU64, pub input_weight: ParameterState,
-	pub recurrent_weight: ParameterState, pub bias: ParameterState, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseGruState { pub sequence_length: NonZeroU64, pub width: NonZeroU64,
-	pub reset_input_weight: ParameterState, pub reset_recurrent_weight: ParameterState, pub reset_bias: ParameterState,
-	pub update_input_weight: ParameterState, pub update_recurrent_weight: ParameterState, pub update_bias: ParameterState,
-	pub candidate_input_weight: ParameterState, pub candidate_recurrent_weight: ParameterState,
-	pub candidate_bias: ParameterState, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseLstmState { pub sequence_length: NonZeroU64, pub width: NonZeroU64,
-	pub input_gate_input_weight: ParameterState, pub input_gate_recurrent_weight: ParameterState,
-	pub input_gate_bias: ParameterState, pub forget_gate_input_weight: ParameterState,
-	pub forget_gate_recurrent_weight: ParameterState, pub forget_gate_bias: ParameterState,
-	pub output_gate_input_weight: ParameterState, pub output_gate_recurrent_weight: ParameterState,
-	pub output_gate_bias: ParameterState, pub candidate_input_weight: ParameterState,
-	pub candidate_recurrent_weight: ParameterState, pub candidate_bias: ParameterState, }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DenseTreeState { pub declaration: DenseTree, pub input_width: NonZeroU64, pub output_width: NonZeroU64,
-	pub internal_nodes_per_tree: NonZeroU64, pub leaves_per_tree: NonZeroU64, pub split_features: ValueId,
-	pub split_thresholds: ValueId, pub leaf_values: ParameterState, }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DenseResidualState { pub branch: Vec<DenseLayerState>, pub branch_prelu: Vec<ParameterState>,
-	pub projection: Option<ParameterState>, pub prelu: Vec<ParameterState>, }
-
-pub struct DenseBlockState(Box<dyn crate::compile::RealizedBlock>);
-
-impl Clone for DenseBlockState {
-	#[inline]
-	fn clone(&self) -> Self { Self(self.0.clone_box()) } }
-
-impl core::fmt::Debug for DenseBlockState {
-	#[inline]
-	fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { self.0.fmt(formatter) }
-}
-
-impl DenseBlockState {
-	pub(crate) fn from_realized(realized: Box<dyn crate::compile::RealizedBlock>) -> Self { Self(realized) }
-
-	pub(crate) fn realized(&self) -> &dyn crate::compile::RealizedBlock { self.0.as_ref() } }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZScoreState { pub mean: ValueId, pub variance: ValueId, }
 
@@ -1265,16 +756,13 @@ pub enum ValidationMetricStatus { NotRequested, Available { family: ValidationMe
 #[derive(Clone, Debug)]
 pub struct TrainingOutputs { pub training_loss: ValueId, pub training_loss_domain: IterationDomain,
 	pub normalization: DataNormalizationState, pub optimizer_progress: Option<OptimizerProgressState>,
-	pub blocks: Vec<DenseBlockState>, pub layers: Vec<DenseLayerState>, pub validation: Option<BinaryValidationOutputs>,
+	pub blocks: Vec<Box<dyn crate::compile::RealizedBlock>>, pub validation: Option<BinaryValidationOutputs>,
 	pub multiclass_validation: Option<MulticlassValidationOutputs>,
 	pub regression_validation: Option<RegressionValidationOutputs>, pub validation_status: ValidationMetricStatus,
 	pub metric_bindings: Vec<TrainingMetricBinding>, }
 
 impl TrainingOutputs { pub(crate) fn visit_parameter_states(&self, mut visit: impl FnMut(ParameterState)) {
-		if self.blocks.is_empty() { for layer in &self.layers { visit(layer.weight); visit(layer.bias);
-				layer.prelu.iter().copied().for_each(&mut visit); }
-			return; }
-		for block in &self.blocks { block.0.visit_parameter_states(&mut visit); } } }
+		for block in &self.blocks { block.visit_parameter_states(&mut visit); } } }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrainingMetricKind { TrainingLoss, LearningRate, ValidationMeanBce, ValidationMeanCrossEntropy, Accuracy, R2,
@@ -1321,8 +809,7 @@ pub struct MulticlassValidationOutputs { pub logits: ValueId, pub metrics: Multi
 #[derive(Clone, Debug)]
 pub(crate) struct CompiledTrainingParts { pub program: StaticCalculationProgram,
 	pub external_inputs: Vec<OwnedExternalInput>, pub bounds: TrainingBounds, pub outputs: TrainingOutputs,
-	pub dataset_schema: CompiledDatasetSchema, pub config: DenseTrainingConfig, pub blocks: Vec<DenseBlock>,
-	pub layers: Vec<DenseLayer>, pub output_adapter: Option<DenseOutputAdapter>, }
+	pub dataset_schema: CompiledDatasetSchema, pub blocks: Vec<Block>, pub output_adapter: Option<DenseOutputAdapter>, }
 
 #[derive(Clone, Debug)]
 pub struct CompiledTraining { parts: CompiledTrainingParts, }
@@ -1359,15 +846,7 @@ impl CompiledTraining {
 
 	#[must_use]
 	#[inline]
-	pub const fn config(&self) -> &DenseTrainingConfig { &self.parts.config }
-
-	#[must_use]
-	#[inline]
-	pub fn layers(&self) -> &[DenseLayer] { &self.parts.layers }
-
-	#[must_use]
-	#[inline]
-	pub fn blocks(&self) -> &[DenseBlock] { &self.parts.blocks }
+	pub fn blocks(&self) -> &[Block] { &self.parts.blocks }
 
 	#[must_use]
 	#[inline]
