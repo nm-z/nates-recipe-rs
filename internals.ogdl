@@ -1,0 +1,138 @@
+Block
+	dtype:
+		f32
+		i32
+	type:
+		Layer
+			width
+		Convolution
+			filters
+			kernel
+		KMeans
+			clusters
+		Pool
+			size
+		Embedding
+			dimensions
+			vocabulary
+		Attention
+			heads
+		Rnn
+			width
+		Gru
+			width
+		Lstm
+			width
+		Residual
+			branch
+				Vec<Block>
+		Tree
+			family
+				LightGbm
+				CatBoost
+				XGBoost
+			trees
+			depth
+		Knn
+			neighbors
+Function
+	Activation
+		Linear
+		Relu
+		LeakyRelu
+		PRelu
+		Sigmoid
+		Tanh
+		Selu
+		Gelu
+		Silu
+		Elu
+		Cosine
+		Exponential
+		Logarithm
+		NaturalLogarithm
+		Tangent
+		Huber
+	Normalization
+		ZScore
+		MinMax
+		L2Norm
+		LayerNorm
+		BatchNorm
+	Loss
+		MSE
+		MAE
+		Huber
+		BCE
+		CE
+		Focal
+Optimization
+	Forward
+	Backward
+	Optimizer
+		AdamW
+Hyperparameters
+	Lr
+		Constant
+		Linear
+		Cosine
+		Exponential
+	Objective
+		Loss
+		Grad
+Stage
+	Data
+	Model
+	Train
+	Infer
+Run
+	Init
+	Loop
+	Exit
+Op
+	Calculation
+	Transfer
+Device
+	kind:
+		VRAM	(GPU )
+		RAM	(CPU )
+		DISK	(DISK)
+	Nodes
+		Master
+			Device
+		Worker[s]
+			Device[s]
+	Machine[s]
+		engi
+		archy
+		sentry
+properties:
+	ETH
+		GB/s
+	DISK
+		GB
+		GB/s
+	GPU
+		VRAM GB
+		PCIe GB/s
+		FLOPs GFLOP/s
+		Transfer GB/s
+	CPU
+		RAM GB
+		DDRX GB/s
+		FLOPs GFLOP/s
+		Transfer GB/s
+Transport
+	direction
+		Master	<-eth/wlan->	Worker[s]
+		DISK		<-SATA/SAS->	RAM
+		RAM		  <-PCIe->		VRAM
+	concurrency
+		bidirectional
+			PCIe	(SDMA)
+			NVMe	(PCIe SQ/CQ)
+			SAS	(Full duplex)
+			eth	(Full duplex)
+		unidirectional
+			SATA	(Half duplex)
+			wlan	(Half duplex)
