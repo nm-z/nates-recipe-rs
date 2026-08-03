@@ -1,0 +1,322 @@
+recipe
+	format	recipe-semantic-model
+	version	9
+	semantics
+		objective	huber-unit-delta
+		normalization	min-max
+		optimizer	adamw
+	dataset
+		feature-width	5
+		target
+			source-index	5
+			task	scalar-regression
+		vectors
+			vector
+				source-index	0
+				name-bytes	0x636f6c31
+				role	feature
+				semantic-type	numeric
+				encoding	int32
+				metadata	none
+			vector
+				source-index	1
+				name-bytes	0x636f6c32
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	2
+				name-bytes	0x636f6c33
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	3
+				name-bytes	0x636f6c34
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	4
+				name-bytes	0x636f6c35
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	5
+				name-bytes	0x636f6c36
+				role	target
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+		feature-spans
+			span
+				source-index	0
+				start	0
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	1
+				start	1
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	2
+				start	2
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	3
+				start	3
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	4
+				start	4
+				width	1
+				lowering	numeric-scalar
+		feature-normalization-mask
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+	training
+		epochs	1
+		warmup-epochs	0
+		learning-rate-decay	cosine
+		gradient-clip-norm	none
+		normalization-epsilon	0x358637bd
+		reduction-tree-lanes	1024
+		random-seed	125779785117797
+		adamw
+			learning-rate	0x38d1b717
+			beta-one	0x3f666666
+			beta-two	0x3f7fbe77
+			epsilon	0x322bcc77
+			weight-decay	0x3c23d70a
+		bounds
+			train-rows	1202
+			epochs	1
+			training-iterations	1
+			calibration-iterations	0
+			iterations	1
+			warmup-iterations	0
+	model
+		input-width	5
+		output-width	1
+		normalization	min-max
+			minimum
+				dtype	f32
+				shape	5
+				payload	raw-bytes-hex
+					0x0000484300000000a913d03c9a99fd41a112d239
+			maximum
+				dtype	f32
+				shape	5
+				payload	raw-bytes-hex
+					0x00409c469a999d41bf0e9c3e9a998e42b0406f3d
+		blocks
+			perc	24
+				index	0
+				operations	1
+					operation	silu
+				weight
+					parameter
+						dtype	f32
+						shape	5	24
+						payload	raw-bytes-hex
+							0x8812eabe2152dd3e4765143f0ec2e53d4db7773d4fd3cb3e26510e3f5813c2beeb75b93ed74208bfd6cd36bef8092dbfb25f073fdd62083e4fc52f3f15c9f63d
+							0x9bda61bf31f50a3f207fa13e1198d7bef6d8f03d4c526a3e3b283bbf610a993d04e4d2befebfe63e488c3e3e923a40bff240f8bc06a7c5be6901983f845be7be
+							0x7b922f3e3688ad3f97c6653fa1ecb7be0944743d2429eabec3fe863f46cfc5be337b74be6243d2bc2a2e0f3f258a6d3fb96912be853f993e12ad64be102b953e
+							0x5740babd82dda6be9c081e3f4230663fa3517dbe3055123fea4860bf4752083f93e1d43de8a41cbf6a0d7abfa81bef3ec3a741bf76651e3d019a093f48f0893f
+							0xd034d2be683d143e51b00cbe04e6383fdc30133fd9640dbf3c29503ec49f383f3ee0863eefa6d03df0c89bbeb1ecdc3e0a79a03e709d0c3f523f61bd77562bbf
+							0x11feb03e3f1438bfb15cff3e78c0c2bd5113a73ff5f2dd3e19ea0e3b6da302bfb0f9373f91e00cbf62a6de3ee7f1c1be7a331dbfe69d64bde62326bf66cc61be
+							0x9aa53bbf07c368be03f11ebf73dc54bd5c102fbf390b04bfd6988d3efb2b753ef74994bc34b0513edf90febda1f9333fc04991be5e8386bdff3fc33e3dc63d3e
+							0x1030803fa51c0a3f13f1123f021d7c3e0daf893ef941c83eb1816f3ff618d1be
+					first-moment
+						dtype	f32
+						shape	5	24
+						payload	raw-bytes-hex
+							0x6455af390da549388031a539d3f8d439490c7fb9f0e5823ab8e2653a2ced023918f623ba6cc04939186b63b8de49cb383fa8ea38d0318838275fc03a3b75193a
+							0x2b5e373a86d407b94da26e3ada6ab73ae3b559b94f9b923983e193b98a22e439ebeade39325e41b9e32f9439753b0d3a210ea1ba4956173b2aba673bc32ebc39
+							0x04f2b6babe32fb39b515773ad8d9abb9fd2e8c39ee7992395754a43b3ef94a3a996a073b336309bacc13313b1052c43be8a2d5b8c8a0a53a33c4a3baa299a93a
+							0x77b6173b91018a3af5e4b03a1362353b75d50ebbe41e433be585d43abc0da33af1c1af38ebb98f390d09b839b22a9d3a707b20bab1cafb397c24893bc4a9813b
+							0x92cb773b51bb8aba61a8003b8fbed33b8940a1b925f7903a279474ba5428043b4851af3a0c2bf537d3e0863a692ac23a849bb1ba1c2f883bd4cc733ba438013a
+							0x05950abb6f682c3ac0728139bbd2cf3900c8e5b720abe1393833d03bf846023be83d683bf6f013ba6ab8603b5f0aca3b9ad627bafc02b63ab3db80ba3e59ce3a
+							0x32bb9039c8f81337804928399ef2d13981223bbab6c1983af262eb3a5c2b8c39015a04ba78093339f5e8203a92b422b9e44a8a387f692b392bb42f3b7885103a
+							0x69f3ab3af7e3c1b99928b43a32a4693b7343d3368efb433a3f7742ba9428443a
+					second-moment
+						dtype	f32
+						shape	5	24
+						payload	raw-bytes-hex
+							0x5022403215207e2f938d2a322abd8d32e346cb31272dd6335b25a533d444d630b904283318657e31ba9ea12f8c2481309e12ac30e3dbe72f334a6734702e1333
+							0x4f255233af9ee63056f4b13362425234c91d94312b5506328ead0832e0a3a2324c499b3211b16931943e09321c54f9327c1d223427240f356ccda73596535d32
+							0xb32d5134c22fc53211c8be33c6933832bca3f5310818063219c6283630be80338837e5343bf0eb328af94335fee17036e89f8e30a9732b34859e27341dc63334
+							0x53da0f356511ee33eb914334069f4d35eb03ff3481f26d3559248d34d229263482104130211b0132b3ad5332b4611a34b3f62033981ec6320419eb356327d235
+							0x50e1bf35ed93f0334be8ce34101c8c3606832232825703345ceeba333851da344e1940344cd5bb2e0d66e333ae9f6b3464264534afd2e73529beb93551b9d032
+							0x2f0ff03491c639333175d131eaf78632fafea42e76249f325b7587362a26d434708ca8351eca0833dbce9d35b81f7f36e70e30337a0c4f347c8dcf33580f8534
+							0xf6ea023294d8082d48003131f8bd893257de5a33ded61134da24ad340297f53176f5da321a564831b0d2213348742531a10eef2fbda2373140f24035d5890233
+							0xb4ca3834d4f46a32b2da4a340e96aa3554798b2ce50d7033505a6c333b7c7033
+				bias
+					parameter
+						dtype	f32
+						shape	24
+						payload	raw-bytes-hex
+							0x12b7d1b800b7d1b810b7d1b812b7d1b813b7d13815b7d1b815b7d1b80fb7d1b812b7d1380cb7d1b80bb7d1b806b7d1b89bb4d13806b7d1b816b7d1b814b7d1b8
+							0x15b7d1b80fb7d13815b7d1b815b7d1b803b7d13812b7d1b812b7d13813b7d1b8
+					first-moment
+						dtype	f32
+						shape	24
+						payload	raw-bytes-hex
+							0xe70f373b4221193a7cf4e63a085a573ba85160bb908bd03b479ad43b5ececf3ae58920bb9201943aaced953af68d483a5c80b5b7d024583a5bef313c213a9c3b
+							0xcd3dcd3bae10cdba3e7ebe3bc0405f3c501332ba2ed1303b7e4e28bb8f396d3b
+					second-moment
+						dtype	f32
+						shape	24
+						payload	raw-bytes-hex
+							0x11725135888d12339aafa63495ec9035aa3e9d3567e887366c3f8d363ff28634b3132135d5e80834297d0c348a627b33b8e34d2e04fe9133b2e04537838a1836
+							0xc7a28336ed68833471cb6236f7c09b37b530463332664335c70a3135e5dbaf35
+			layer	12
+				index	1
+				operations	1
+					operation	huber
+				weight
+					parameter
+						dtype	f32
+						shape	24	12
+						payload	raw-bytes-hex
+							0xca8dc5bdecea0dbfc6028ebe171c053d42db85bea701e0be87623cbe15b1d43dcb02273efb1054bd98f74f3e2b84093e639f38bc1e257ebe12e804be83e179be
+							0x44588cbe7602073d520df8bd0a9d6dbd12d0d13ddca7aabe5070c63c8cb1233e18c6f9be5e9a9bbe402d833d52e96dbe8b3d113e3232eebe5cb038be2d7f903e
+							0x02dbb43e5b6c7b3e644780be974bda3cf79ea63dcef54bbeb72e843e06fc0abf2902e1be705cd0bd706aa13cb601c53e8c871dbe51ee49bd3142cd3ce951033d
+							0x791d44bf6471843e19148c3e2700b63d5f56c5bb13d6d1bcdb3887be5a6e9b3cfecffbbefc05db3e5b0512bd199fef3d0941b5be378e93be7c6e72be4fb53cbd
+							0x4e6b2b3e299bb7beb2168a3e190ea43db76df3bc36c0d03d2f2020bf4209843d75069cbe4b0e48be2c2a463cf95cba3ea233203e9e64943e09ab5e3eac2d95be
+							0x2e82a3bc481c893eeac814be7167063ebca8763ea5c93abe976ca9bae42da83c8e78d53d9da54b3ec54654bd3bd3863e974a9a3b3cf0233ee2a86ebc57b98f3d
+							0x0081f73e6492f3bd73db533e522985be50257cbe7e084cbeccf86ebe04c5bd3e62708dbe786fc33e79c3ff3d2821393ec2a181be2104ce3cbce8093ee51d96be
+							0xc42bdcbe48c7d8be6676263e5cfc9e3e18d2a73e0058993ecdaa203f7e8f26be86ac323e33fa99bdd1d1143d8aeaccbd561345bef2cb9a3e3776c23dd402fc3d
+							0x8b7ba8bc6e0d55bdc557f9beac1bd03ea3c3cd3de8f828be44e593bc901b7dbc254fa63eba74f03d28bb7cbe3b6ddfbd9bf4cebee1f119be46788a3e3a80f3bb
+							0xfab58fbeaf08673d345358befa680f3e016601bfdd6876bddde2533eb08d11be8fb98ebe3440c6bea4e8a4be11ec8cbe0a84d23e4e6aef3d433415bd0cb89cbe
+							0xd5646a3ebbe5bf3ec4773b3e13fb80be134de3be41c0e63d444b98bd08c85abeb32049be5daf4dbe671b5b3db661b1bd947b963eee2bf93d2262b03e4455ba3e
+							0x5a9a0e3ed366a9beabd7c1bee6a6523d3a04ecbd88eedbbea7f7df3da750ffbdfca534bcba6c503ebca660be5912c8bc059402beb08416be2a07efbc65f09e3e
+							0xfd99fcbd4fdefdbeb837f53ea485bcbdd8eb8cbe33930dbdf6fc4ebd06070dbf1c9ff23d76f6d0bd451f623e72f7783e88685f3dc172773e398500becb4497be
+							0x899bc2bd0746323e372ac13defa6ac3e9d81803e201b77be8b06443e3c8e78bd5b5cc5bc646c9d3cde4f263dd115c73e52c00fbe5d5fa1beae54963ef1d53dbf
+							0x16a8e7bdcdad33befc70bd3ea9fb8f3e0849ed3e56b7adbe78a9c83ecd359d3eeea9c9bed024fbbe43fc0b3f8590d33d55df9f3dd13281be0025c53d45768a3e
+							0x445b293dfb42afbd567646bee14402bec98c8fbe1e2cad3ef606a63cf65ed5bd0947683d8a400cbfc21d24bfde7ff2bd2ce5ff3e07de26bdf62404be06c2153c
+							0xb8d0083e0ca0e63ddd9a223e4507973e390c16beb9e4ecbe41ecb63e1a49a53eb88e77be4a4c29bef52792be1b93143ec0ede63ebec1cd3d08f1f3be732b223d
+							0x4dfc79be923306be0e93c9bed5f8d83df0ca323e88cce7bd0ea7413e66a5e93dbc2491be6d53d1be93c6383e33810f3e66b87d3e99550c3dbc85783ed7439a3c
+					first-moment
+						dtype	f32
+						shape	24	12
+						payload	raw-bytes-hex
+							0x1fb02638aa4e033bdfaaa1b97ce400b92f1da5b977bdfcb8420223bb881b0b376fdb65b8afe9c9b7570b2cb918eeb3b9ef632fbaad9436b99d5cd538a736a139
+							0x50afe5393ae3913724070d3ba7ff2c39e15b07b89ac74e370d5bbd38741e66395887043955d26abb76ce953935151dba194d033922779e39dbba9a3a5845afb9
+							0xd2f375b73f019e3792ce693aaab4ef38acdd23ba49e013bc524b503ac040b1ba257a893a33215b3a4ba38f3b1477e3b993f8cdb935ea6038ea61223b5f18b239
+							0x41defcb90c42903a03bf2ab9a5ed0836de59b438614626b82cfeeeb9be7cbe38534bdab8923b1bb7123fe938e3fe17b96368a2ba79d0eebb6b19283aac6687ba
+							0x9ed99d3a41ca3d3af80b9c3bbae579b9ffc1e2b984fd4938f1cb173b7744a339d69389ba0b5686ba32f3fb39c875953acdec893a909755b7756dcf3bdc07eb39
+							0x9cc6f538813030386f88d5b90d76613a8b7e883aaf68203aac542fb9ec7c8eb9c96d3bba86d1d0b81fd545bbf1e981b9e3fd1a39116d8db7ab7ea7b9b4b081b9
+							0xcd1a87bac14d8fbb8cde0a3aef8d0fb9071a8a3a48a8cc390f14a23b09127838b85464b9b3d237385d3e973a72dcfc39e86c5e3922af8f3a92c1343960c36b3a
+							0xfda7a63861fe43b944c0073b4bbd50392d59a839548ef8363c9e9cba243ae539bfa6b6baedd9edb9dda6b7394875823a68209b3a612d08b731b3b03bcab90d3a
+							0x201c92b8fad20a38c3c3cdb8dcbd303a4157223a52961fbb8b5f8939ac058bb98b91a1b7dfb12039ba0ee4391fcb28b916e3b63727197a372a126639e5141239
+							0x03dc5bbb939891bb5d8e1d3aa4ea9d398ef41d3b4783ff39c5dc153ca849203a2d162bba25878b384842043b3a78403a587629baebfbc5ba5d70c238cbd3a1b9
+							0x25d1d839e1d94539d1be8f3a74216b36a7b85cb932cb2037af2e453a7a5570b3ea1d9abaca304fbc32f2e03aadb43b388515173b3400773a2831613c5912b4b7
+							0xd2a4f5b8016c093900e4053b0890dc3ad4af703a6c68bebb0e3dfc395ebb7ababdd277b8928edf398e76483af19e13ba76b70d38dde0ee37d544903a33553739
+							0x9c7948ba6a390abb2439e039cf7ae7396a0d803a83211139af09883bf092c639608444b915b61738719d8c39c55e073ad52e073acd22afb7dafa53b6625998b6
+							0x14b2aab952b550b855c405ba108d04b98c2a1b3927bbc434089f84b9948b4437c672cabaa5b5d7bb6bc3853af621fc3927f3f63a3512013a85f31f3c9b0cb439
+							0x2d645bb98e72b1388e2e963a1e19963a4555f839e37b00bc65a58d3afff10bb8624a683acc2b083a503edc3b027954b98134083923c998382d1a3f3afd3e823a
+							0x6ad0633a29c8bbba1587b6388ef0b1b9f69ad2b9ec78823859787eba1e489bb9138c0e3907663b36261a7d38b4f58bb7f7d565b94766ab3a2bbdcbb7bc53043a
+							0xa5ebd03840ce17b954d1603ab8ef5039f48ea238d8edda35646604ba562a1b398403863acdc39d3a634a00b998e8c138dd2426baa62938b9f6460cbb4589cfb8
+							0xf5e45239ab8448b7a53441ba30fbdeb8b8e285392841a6bbff3a053a489819ba10e1b139ad29d4390a011d3bc323aeb9dc7daab7b49406380ac2823ac2769f39
+					second-moment
+						dtype	f32
+						shape	24	12
+						payload	raw-bytes-hex
+							0x36a72d2f6484d734a1592332cca9cf30a0632a325d9dc7306f12263514e2f12ce31aa52f31cd7e2e26fe383106574a3231424033775850311c428e301a6f2232
+							0x87dba432a804052e859bf834020d3b31ba05e52ed19d852d25186030387ba531968bdb305d50ac35b1420c3280371a33407fd73081f11c32a4a1153428ff3f32
+							0x6e09bd2d54081c2ef5d3aa33748eb330afd2273348ab0837b9948733175d4434123fec33bf0d96337ff20036c2afa132c9928432d2149e2f58cc2435f63b4632
+							0x2bd1c732251002342c363631255dea2ab4494b302bcb2c2f757db232dec7623065e99430fe9a162d8402aa30cb6310317bd924343839b236309b30333f2ae533
+							0x18ba1b34a61f61336c3018364b26c331baaea03241ff7e2f10031035709926326697ec330893e1335c5ec632d49c0b34c3c9ed33c3908e2d7f748636f39eac32
+							0xf5c3bc30b403422f917c8e32a3d99e336fe1e83316d12033be2040312ac8fd318f8e5b33a84388307c9b74359ef7d231652316316103fa2d9d562f32de3dd231
+							0xb629e433175900362d0ef13228cc0031cf65ee3342e38232792e2436804ec02f74eba231bc30532febf60e3450cec732ed999a31c2070134c0334c31d5b2ad33
+							0x46962d30d0147031e959e6344129883142213132650fc12c3e4e19347e33a432b6815034fbc9b03210cc52321dbdd4334d661634cdcce72cf1234336f012fb32
+							0x7e6c053006e6f02ed64e8430803b4333b7b624335e2c1f35ade3eb311596f1317626232ef6632131a287a2325b113231910b512ea476c32d8d69a5314b5f0531
+							0x050e9735a87c0436c1251b33b2db1b3245ef1b35bc04cc327e5d0c37e692203364f03633e558f32ffea6da3482866733557b333376fb743494496c305dac2332
+							0x2de792323fa77431ef2301348ec4ac2bca3d9831d896212d95007333b07fb425b2721434e42586370c209e34c5345c2fbea90e35dca6be339d789e379aa84a2e
+							0x1290bc30780eec30ad14e034c70598348007b5337e976236bad2c6328474c4336aecbf2f9f2d9c32de277b339a320833b00afb2eb151b22e2c150234c0105231
+							0x862f7b333ad2ee344c1c9d32b771a73208f7cc3351a403315653e735c1717632855d713198d90f2f6b27f7317f0fe532616de43281b33f2ee66b8c2bee0f112c
+							0x921a3632da1e882fbaaadf32869edb30f779163127e4712817dadb31376f712dd2138034fd679136aaa7df3305a8c632b792be343a3dd0327fe61f37ac9b4a32
+							0x8669963180cb4430ddf60c34a0ce0c34cdb6c0324859ce36b4cafa3328cef42e8c9ea83368c7e732359597363b138d310fe5e7300de51130563f64332f0cd433
+							0xdd2ea23380625c34723950305de34532359b8a32fdc8d42f565bca3356b3163228fefd30657c5b2bde2fc82f20dbf42d0813a531da9b373433b7812eb7e0da32
+							0xc065883071071031daf19d33126b8831d127253071c7952a721edb328d791631357ee033108f1b3467bacd300d006b3089852c33b6f85331c5f7f5348f988630
+							0xabfc8a313e4b7b2dae4c6933f75f9b306410e03151c02c365fe0dd32b4711333ebc04532f6a98c32eb0f1a35c3863d3238ab352ea865e22ebcb7d53370ed1e32
+				bias
+					parameter
+						dtype	f32
+						shape	12
+						payload	raw-bytes-hex
+							0x12b7d13815b7d13812b7d1b801b7d13813b7d1b810b7d1b816b7d1b8d7b6d138fab6d138d5b6d1b814b7d1b812b7d1b8
+					first-moment
+						dtype	f32
+						shape	12
+						payload	raw-bytes-hex
+							0xf71a2cbb4c40b5bc99e0343bcbc428ba8269863bb9fdec3a3d8bb83c00e762b9972ff4b9ba765c39a407973b783f223b
+					second-moment
+						dtype	f32
+						shape	12
+						payload	raw-bytes-hex
+							0xc21f39357a524d38e1794c35010432336cd4e1353a83af3498d9543831e3a031c454ba32e6e29731898f0e3676862435
+			layer	1
+				index	2
+				operations	0
+				weight
+					parameter
+						dtype	f32
+						shape	12	1
+						payload	raw-bytes-hex
+							0x7688cabe4993f5be3748d0bd5df9e5bd4814fb3d4b58693d3658d9be1577483dcd3f60bd545de63b0169193e9a91c4bd
+					first-moment
+						dtype	f32
+						shape	12	1
+						payload	raw-bytes-hex
+							0x8105efba1d956dbc07cea8bba567bfbb91b517bc0f47e5bb1054b3bccf5314bcd03698bba75cc9bb12a818bc18e9b9bb
+					second-moment
+						dtype	f32
+						shape	12	1
+						payload	raw-bytes-hex
+							0x6888b234be63b0377d17323689f864369ed80f370146a4362cfd4838268109371fce1036bc697d36eda511379e035836
+				bias
+					parameter
+						dtype	f32
+						shape	1
+						payload	raw-bytes-hex
+							0x17b7d138
+					first-moment
+						dtype	f32
+						shape	1
+						payload	raw-bytes-hex
+							0xd0ccccbd
+					second-moment
+						dtype	f32
+						shape	1
+						payload	raw-bytes-hex
+							0x0012833a
+	native
+		program	0x574d2467391cb241b52433813631d17477c558ed7f6560b8d2e97a29917d7b1e
+		realization	0x0e787aa67701d323bd9db37bb9feaef0ef5dc9ee251112be4e5ea5b09f6059cd
+		topology	0xf850b9da189abfdd314eaeade70d99050198c52e4bbacaf2969455b489db6ee4
+		discovery	0x80b75d51c8ac6e1d52e64d54c66cbd8fea8db2180cdbd672dc24e1cc74a79e7e
+		kernels
+			kernel
+				format	hsaco
+				target
+					backend	amd-rocr-hsa
+					architecture	amdgcn-amd-amdhsa--gfx1101
+					abi	elf64-amdgpu-code-object-v6
+				toolchain
+					name	recipe-owned-llvm-amd-hsa
+					version	auto-pinned-local-tools-and-benchmark-v3
+					digest	0xe82318b2315c84fa4cf78ee39c0cc961c70e918cb3d7ccae19f8f0b15ecc6de6
+				digest	0xdb95c59d33489415708c7f195252ac8177be4c7c11fdfb412781f4fc9b30287a

@@ -149,10 +149,14 @@ impl AcceptanceRecord {
 		);
 		self.field("git_dirty", dirty);
 		self.command_field("rustc", "rustc", &["-Vv"]);
-		self.command_field("nvidia_gpu", "nvidia-smi", &[
-			"--query-gpu=name,uuid,pci.bus_id,driver_version,memory.total",
-			"--format=csv,noheader,nounits",
-		]);
+		self.command_field(
+			"nvidia_gpu",
+			"nvidia-smi",
+			&[
+				"--query-gpu=name,uuid,pci.bus_id,driver_version,memory.total",
+				"--format=csv,noheader,nounits",
+			],
+		);
 		for (field, program, arguments) in [
 			("ptxas", "ptxas", &["--version"][..]),
 			("llvm_opt", "opt", &["--version"][..]),
@@ -307,7 +311,9 @@ fn usage(detail: &str) -> String {
 	)
 }
 
-fn invalid(detail: impl Into<String>) -> io::Error { io::Error::new(io::ErrorKind::InvalidInput, detail.into()) }
+fn invalid(detail: impl Into<String>) -> io::Error {
+	io::Error::new(io::ErrorKind::InvalidInput, detail.into())
+}
 
 fn verify_inputs(inputs: &Inputs) -> AcceptanceResult<()> {
 	let manifest = fs::read_to_string(&inputs.digest_manifest)?;
@@ -983,7 +989,9 @@ fn verify_artifact_set(directory: &Path, expected: &[&str]) -> AcceptanceResult<
 	Ok(())
 }
 
-fn rust_path_literal(path: &Path) -> AcceptanceResult<String> { Ok(format!("{:?}", path_text(path)?)) }
+fn rust_path_literal(path: &Path) -> AcceptanceResult<String> {
+	Ok(format!("{:?}", path_text(path)?))
+}
 
 fn verify_one_cuda_image(kernels: &RealizedNativeKernelSet) -> AcceptanceResult<()> {
 	let images = kernels.kernels();
@@ -1077,16 +1085,17 @@ fn verify_completed_lifecycle(journal: &RunJournal, iterations: usize) -> Accept
 		"loop-completed",
 		"exited",
 	] {
-		let present = journal.logical_events().iter().any(|event| {
-			match (required, event) {
+		let present = journal
+			.logical_events()
+			.iter()
+			.any(|event| match (required, event) {
 				("prepared", LogicalEvent::Prepared { .. })
 				| ("initialized", LogicalEvent::Initialized { .. })
 				| ("loop-started", LogicalEvent::LoopStarted { .. })
 				| ("loop-completed", LogicalEvent::LoopCompleted { .. })
 				| ("exited", LogicalEvent::Exited { .. }) => true,
 				_ => false,
-			}
-		});
+			});
 		if !present {
 			return Err(invalid(format!("native lifecycle omitted {required}")).into());
 		}

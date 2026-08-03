@@ -225,12 +225,7 @@ impl HostBackend {
 	#[doc(hidden)]
 	pub fn release_partition(&mut self, resource: &mut HostResources, device: DeviceId, arena: Arena) -> Result<()> {
 		resource.ensure_healthy()?;
-		if arena.device() != device {
-			return Err(Error::Protocol {
-				task: TaskId::new(0),
-				detail: "released host arena belongs to another device",
-			});
-		}
+		debug_assert_eq!(arena.device(), device);
 		arena.close()
 	}
 
@@ -457,13 +452,9 @@ impl HostPreparedResources {
 		tasks: &BTreeSet<TaskId>,
 	) -> Result<Self> {
 		for task in tasks {
-			require(
+			debug_assert!(
 				draft.tasks.iter().any(|candidate| candidate.id == *task),
-				Error::Protocol {
-					task: *task,
-					detail: "host candidate partition names an absent task",
-				},
-			)?;
+			);
 		}
 		let bindings = index_bindings(config.bindings)?;
 		let candidate_devices = draft
@@ -555,27 +546,11 @@ impl HostPreparedResources {
 			}
 		}?;
 		validate_bundle_devices(bundle, &bindings, false)?;
-		match pending.keys().copied().eq(tasks.iter().copied()) {
-			true => Ok(()),
-			false => {
-				Err(Error::BackendState(
-					"warm host partition differs from its pre-final pending pool",
-				))
-			}
-		}?;
+		debug_assert!(pending.keys().copied().eq(tasks.iter().copied()));
 		let contracts = task_contracts(bundle, Some(tasks))?;
 		for (task, prepared) in &pending {
-			let expected = contracts.get(task).ok_or(Error::Protocol {
-				task: *task,
-				detail: "warm host task is absent from the candidate contract",
-			})?;
-			require(
-				prepared.admission == expected.admission(),
-				Error::Protocol {
-					task: *task,
-					detail: "warm init-image manifest differs from prepared host admission",
-				},
-			)?;
+			let expected = &contracts[task];
+			debug_assert_eq!(prepared.admission, expected.admission());
 		}
 		Ok(HostResources {
 			runtime,
@@ -598,24 +573,11 @@ impl HostPreparedResources {
 			}
 		}?;
 		validate_bundle_devices(bundle, &self.bindings, false)?;
-		match self.pending.keys().copied().eq(tasks.iter().copied()) {
-			true => Ok(()),
-			false => {
-				Err(Error::BackendState(
-					"finalized host partition differs from its pre-final pending pool",
-				))
-			}
-		}?;
+		debug_assert!(self.pending.keys().copied().eq(tasks.iter().copied()));
 		let contracts = task_contracts(bundle, Some(tasks))?;
 		for (task, pending) in &self.pending {
-			let expected = contracts.get(task).ok_or(Error::Protocol {
-				task: *task,
-				detail: "finalized host contract is absent from the prepared pending pool",
-			})?;
-			require(pending.admission == expected.admission(), Error::Protocol {
-				task: *task,
-				detail: "finalized init-image manifest differs from the prepared host admission",
-			})?;
+			let expected = &contracts[task];
+			debug_assert_eq!(pending.admission, expected.admission());
 		}
 		self.handoff = HostPreparedHandoff::Finalized {
 			bundle: bundle.identity(),
@@ -684,43 +646,19 @@ impl HostResources {
 	#[doc(hidden)]
 	pub fn prepare_pending(&mut self, request: PendingRequest) -> Result<HostPending> {
 		self.ensure_healthy()?;
-		let expected = self.contracts.get(&request.task).ok_or(Error::Protocol {
-			task: request.task,
-			detail: "pending request names no finalized host task",
-		})?;
-		if request.class != expected.class()
-			|| request.submission != expected.submission()
-			|| !phase_accepts(request.phase, expected.class())
-		{
-			return Err(Error::Protocol {
-				task: request.task,
-				detail: "pending request differs from the finalized host task",
-			});
-		}
-		if !self.prepared.insert(request.task) {
-			return Err(Error::Protocol {
-				task: request.task,
-				detail: "host pending token was prepared more than once",
-			});
-		}
+		let expected = &self.contracts[&request.task];
+		debug_assert!(request.class == expected.class()
+			&& request.submission == expected.submission()
+			&& phase_accepts(request.phase, expected.class()));
+		let inserted = self.prepared.insert(request.task);
+		debug_assert!(inserted);
 		match &mut self.pending {
 			PendingResources::Prepared(pending) => {
-				let prepared = pending.remove(&request.task).ok_or(Error::Protocol {
-					task: request.task,
-					detail: "pre-final host pending resource is absent",
-				})?;
-				match prepared.task == request.task
+				let prepared = pending.remove(&request.task).unwrap();
+				debug_assert!(prepared.task == request.task
 					&& prepared.class == request.class
-					&& prepared.admission == expected.admission()
-				{
-					true => Ok(prepared),
-					false => {
-						Err(Error::Protocol {
-							task: request.task,
-							detail: "pre-final host pending resource differs from finalized request",
-						})
-					}
-				}
+					&& prepared.admission == expected.admission());
+				Ok(prepared)
 			}
 			PendingResources::Deferred => {
 				let copy = self.runtime.prepare_copy()?;
@@ -745,11 +683,7 @@ impl HostResources {
 	#[doc(hidden)]
 	pub fn allocate_arena(&self, layout: &ArenaLayout) -> Result<Arena> {
 		self.ensure_healthy()?;
-		match self
-			.bindings
-			.get(&layout.device)
-			.ok_or(Error::MissingDevice(layout.device))?
-		{
+		match &self.bindings[&layout.device] {
 			HostDeviceBinding::Ram { .. } => Arena::ram(layout.device, layout.size),
 			HostDeviceBinding::Disk { arena, .. } => Arena::disk(layout.device, arena.clone(), layout.size),
 		}
@@ -765,22 +699,9 @@ impl HostResources {
 		self.ensure_healthy()?;
 		let task = work.task();
 		let submitted_class = work.class();
-		if pending.submitted || pending.terminal || pending.task != task {
-			return Err(Error::Protocol {
-				task,
-				detail: "host pending token is not ready for this task",
-			});
-		}
-		let expected = self.contracts.get(&task).ok_or(Error::Protocol {
-			task,
-			detail: "submitted work names no finalized host task",
-		})?;
-		if expected.class() != submitted_class || pending.class != submitted_class {
-			return Err(Error::Protocol {
-				task,
-				detail: "submitted work class differs from the finalized host task",
-			});
-		}
+		debug_assert!(!pending.submitted && !pending.terminal && pending.task == task);
+		let expected = &self.contracts[&task];
+		debug_assert!(expected.class() == submitted_class && pending.class == submitted_class);
 		let result = match (expected, work) {
 			(
 				ExpectedWork::Init {
@@ -791,27 +712,15 @@ impl HostResources {
 				},
 				BackendWork::InitAdmission(work),
 			) => {
-				let image_bytes = u64::try_from(work.image.len()).map_err(|error| {
-					consume_context(error);
-					Error::RangeOverflow
-				})?;
-				if work.destination.value != *image
-					|| work.destination != *destination
-					|| work.bytes != *bytes || work.submission != *submission
-					|| image_bytes != bytes.get()
-					|| pending.admission != expected.admission()
-				{
-					return Err(Error::Protocol {
-						task: work.task,
-						detail: "host admission differs from its finalized contract",
-					});
-				}
-				let staging = pending.staging.as_ref().ok_or(Error::Protocol {
-					task: work.task,
-					detail: "host admission has no preallocated staging arena",
-				})?;
+				let image_bytes = u64::try_from(work.image.len()).unwrap();
+				debug_assert!(work.destination.value == *image
+					&& work.destination == *destination
+					&& work.bytes == *bytes && work.submission == *submission
+					&& image_bytes == bytes.get()
+					&& pending.admission == expected.admission());
+				let staging = pending.staging.as_ref().unwrap();
 				staging.write_exact(0, work.image)?;
-				let destination_arena = checked_arena(arenas, *destination, bytes.get())?;
+				let destination_arena = checked_arena(arenas, *destination, bytes.get());
 				pending.copy.submit(
 					staging,
 					0,
@@ -832,16 +741,13 @@ impl HostResources {
 				},
 				BackendWork::InternalTransfer(work) | BackendWork::ExitTransfer(work),
 			) => {
-				validate_transfer(work, TransferExpectation {
-					submitted_class,
-					class: *class,
-					source: *source,
-					destination: *destination,
-					bytes: *bytes,
-					route,
-					lane_claims,
-					submission: *submission,
-				})?;
+				debug_assert!(submitted_class == *class
+					&& work.source == *source
+					&& work.destination == *destination
+					&& work.bytes == *bytes
+					&& work.route == route
+					&& work.lane_claims == lane_claims
+					&& work.submission == *submission);
 				submit_transfer(arenas, pending, work)
 			}
 			(
@@ -853,20 +759,11 @@ impl HostResources {
 				},
 				BackendWork::Metric(work),
 			) => {
-				if work.metric != *metric
-					|| work.slot != *slot || work.value != *value
-					|| work.submission != *submission
-				{
-					return Err(Error::Protocol {
-						task: work.task,
-						detail: "host metric differs from its finalized contract",
-					});
-				}
-				let source = checked_arena(arenas, *value, 4)?;
-				let staging = pending.staging.as_ref().ok_or(Error::Protocol {
-					task: work.task,
-					detail: "host metric has no preallocated staging arena",
-				})?;
+				debug_assert!(work.metric == *metric
+					&& work.slot == *slot && work.value == *value
+					&& work.submission == *submission);
+				let source = checked_arena(arenas, *value, 4);
+				let staging = pending.staging.as_ref().unwrap();
 				pending.copy.submit(
 					source,
 					value.arena_offset.get(),
@@ -881,13 +778,7 @@ impl HostResources {
 					detail: "payload calculations require a CUDA or HSA GPU adapter",
 				})
 			}
-			(unexpected_contract, unexpected_work) => {
-				consume_context((unexpected_contract, unexpected_work));
-				Err(Error::Protocol {
-					task,
-					detail: "submitted host work variant differs from its finalized contract",
-				})
-			}
+			(_, _) => unreachable!(),
 		};
 		match result {
 			Ok(()) => {
@@ -904,22 +795,14 @@ impl HostResources {
 	#[doc(hidden)]
 	pub fn poll_pending(&mut self, pending: &mut HostPending) -> Result<BackendPoll> {
 		self.ensure_healthy()?;
-		if !pending.submitted || pending.terminal {
-			return Err(Error::Protocol {
-				task: pending.task,
-				detail: "host pending token is not active",
-			});
-		}
+		debug_assert!(pending.submitted && !pending.terminal);
 		match pending.copy.poll() {
 			Ok(PollStatus::Pending) => Ok(BackendPoll::Pending),
 			Ok(PollStatus::Complete) => {
 				let metric = match pending.action {
 					PendingAction::None | PendingAction::Egress => None,
 					PendingAction::Metric { dtype } => {
-						let staging = pending.staging.as_ref().ok_or(Error::Protocol {
-							task: pending.task,
-							detail: "completed host metric has no staging arena",
-						})?;
+						let staging = pending.staging.as_ref().unwrap();
 						let mut bytes = [0_u8; 4];
 						staging.read_exact(0, &mut bytes)?;
 						Some(match dtype {
@@ -943,10 +826,7 @@ impl HostResources {
 	#[doc(hidden)]
 	pub fn rearm_pending(&mut self, pending: &mut HostPending) -> Result<()> {
 		self.ensure_healthy()?;
-		require(pending.terminal && pending.submitted, Error::Protocol {
-			task: pending.task,
-			detail: "only a terminal host loop token may be rearmed",
-		})?;
+		debug_assert!(pending.terminal && pending.submitted);
 		pending.copy.reset()?;
 		pending.submitted = false;
 		pending.terminal = false;
@@ -961,36 +841,19 @@ impl HostResources {
 		match (pending.submitted, pending.terminal) {
 			(false, false) => Ok(()),
 			(true, true) => self.rearm_pending(pending),
-			(false, true) | (true, false) => {
-				Err(Error::Protocol {
-					task: pending.task,
-					detail: "an active or inconsistent host loop token may not be submitted again",
-				})
-			}
+			(false, true) | (true, false) => unreachable!(),
 		}
 	}
 
 	#[doc(hidden)]
 	pub fn collect_exit(&self, pending: &HostPending, work: TransferWork<'_>, destination: &mut [u8]) -> Result<()> {
 		self.ensure_healthy()?;
-		let destination_bytes = u64::try_from(destination.len()).map_err(|error| {
-			consume_context(error);
-			Error::RangeOverflow
-		})?;
-		if !pending.terminal
-			|| pending.task != work.task
-			|| pending.action != PendingAction::Egress
-			|| destination_bytes != work.bytes.get()
-		{
-			return Err(Error::Protocol {
-				task: work.task,
-				detail: "host exit collection differs from its completed task",
-			});
-		}
-		let expected = self.contracts.get(&work.task).ok_or(Error::Protocol {
-			task: work.task,
-			detail: "collected host exit has no finalized contract",
-		})?;
+		let destination_bytes = u64::try_from(destination.len()).unwrap();
+		debug_assert!(pending.terminal
+			&& pending.task == work.task
+			&& pending.action == PendingAction::Egress
+			&& destination_bytes == work.bytes.get());
+		let expected = &self.contracts[&work.task];
 		let ExpectedWork::Transfer {
 			class,
 			source,
@@ -1001,57 +864,37 @@ impl HostResources {
 			submission,
 		} = expected
 		else {
-			return Err(Error::Protocol {
-				task: work.task,
-				detail: "collected host exit is not a finalized transfer",
-			});
+			unreachable!()
 		};
-		validate_transfer(work, TransferExpectation {
-			submitted_class: WorkClass::ExitTransfer,
-			class: *class,
-			source: *source,
-			destination: *expected_destination,
-			bytes: *bytes,
-			route,
-			lane_claims,
-			submission: *submission,
-		})?;
-		if !matches!(work.destination, ResolvedTransferEndpoint::External) {
-			return Err(Error::Protocol {
-				task: work.task,
-				detail: "host exit collection has no external destination",
-			});
-		}
+		debug_assert!(*class == WorkClass::ExitTransfer
+			&& work.source == *source
+			&& work.destination == *expected_destination
+			&& work.bytes == *bytes
+			&& work.route == route
+			&& work.lane_claims == lane_claims
+			&& work.submission == *submission
+			&& matches!(work.destination, ResolvedTransferEndpoint::External));
 		pending
 			.staging
 			.as_ref()
-			.ok_or(Error::Protocol {
-				task: work.task,
-				detail: "completed host exit has no staging arena",
-			})?
+			.unwrap()
 			.read_exact(0, destination)
 	}
 
 	#[doc(hidden)]
 	pub fn recycle_pending(&mut self, mut pending: HostPending) -> Result<()> {
 		self.ensure_healthy()?;
-		require(
-			pending.terminal && self.prepared.remove(&pending.task),
-			Error::Protocol {
-				task: pending.task,
-				detail: "only one terminal host pending token may be recycled",
-			},
-		)?;
+		let prepared = self.prepared.remove(&pending.task);
+		debug_assert!(pending.terminal && prepared);
 		pending.copy.reset()?;
 		pending.submitted = false;
 		pending.terminal = false;
 		let task = pending.task;
 		match &mut self.pending {
 			PendingResources::Prepared(pool) => {
-				require(pool.insert(task, pending).is_none(), Error::Protocol {
-					task,
-					detail: "host pending pool already contains the recycled task",
-				})
+				let prior = pool.insert(task, pending);
+				debug_assert!(prior.is_none());
+				Ok(())
 			}
 			PendingResources::Deferred => {
 				Err(Error::BackendState(
@@ -1063,10 +906,7 @@ impl HostResources {
 
 	#[doc(hidden)]
 	pub fn available_bytes(&self, device: DeviceId) -> Result<ByteCount> {
-		let binding = self
-			.bindings
-			.get(&device)
-			.ok_or(Error::MissingDevice(device))?;
+		let binding = &self.bindings[&device];
 		match binding {
 			HostDeviceBinding::Ram { .. } => available_ram_bytes(),
 			HostDeviceBinding::Disk { arena, .. } => available_disk_bytes(arena.path()),
@@ -1076,10 +916,7 @@ impl HostResources {
 	#[doc(hidden)]
 	pub fn validate_handoff(&mut self, bundle: &FinalizedBundle, tasks: &BTreeSet<TaskId>) -> Result<()> {
 		self.ensure_healthy()?;
-		require(
-			self.prepared.is_empty(),
-			Error::BackendState("warm host pending tokens were not all recycled"),
-		)?;
+		debug_assert!(self.prepared.is_empty());
 		validate_bundle_devices(bundle, &self.bindings, false)?;
 		let pool = match &self.pending {
 			PendingResources::Prepared(pool) => pool,
@@ -1089,20 +926,11 @@ impl HostResources {
 				));
 			}
 		};
-		require(
-			pool.keys().copied().eq(tasks.iter().copied()),
-			Error::BackendState("final host partition differs from its warm pending pool"),
-		)?;
+		debug_assert!(pool.keys().copied().eq(tasks.iter().copied()));
 		let contracts = task_contracts(bundle, Some(tasks))?;
 		for (task, pending) in pool {
-			let expected = contracts.get(task).ok_or(Error::Protocol {
-				task: *task,
-				detail: "final host task is absent from its warm pending pool",
-			})?;
-			require(pending.admission == expected.admission(), Error::Protocol {
-				task: *task,
-				detail: "final host admission differs from its warm manifest",
-			})?;
+			let expected = &contracts[task];
+			debug_assert_eq!(pending.admission, expected.admission());
 		}
 		self.contracts = contracts;
 		Ok(())
@@ -1268,12 +1096,7 @@ impl Backend for HostBackend {
 	) -> Result<()> {
 		record(physical_calls, PhysicalCall::ReleaseArena { device })?;
 		resource.ensure_healthy()?;
-		if arena.device() != device {
-			return Err(Error::Protocol {
-				task: TaskId::new(0),
-				detail: "released host arena belongs to another device",
-			});
-		}
+		debug_assert_eq!(arena.device(), device);
 		arena.close()
 	}
 
@@ -1339,7 +1162,7 @@ fn validate_bundle_devices(
 
 fn validate_reservations(ledger: &ReservationLedger, bindings: &BTreeMap<DeviceId, HostDeviceBinding>) -> Result<()> {
 	for device in bindings.keys() {
-		let entry = ledger.entry(*device).ok_or(Error::MissingDevice(*device))?;
+		let entry = ledger.entry(*device).unwrap();
 		require_enforced_quota(entry.mechanism)?;
 	}
 	Ok(())
@@ -1411,10 +1234,7 @@ fn prepare_candidate_pending(
 				});
 			}
 			TaskKind::Metric(metric) => {
-				let (device, dtype) = values.get(&metric.value).copied().ok_or(Error::Protocol {
-					task: task.id,
-					detail: "host candidate metric value is absent",
-				})?;
+				let (device, dtype) = values[&metric.value];
 				(
 					WorkClass::Metric,
 					Some((device, ByteCount::new(4), PendingAction::Metric { dtype })),
@@ -1422,44 +1242,28 @@ fn prepare_candidate_pending(
 				)
 			}
 			TaskKind::Transfer(transfer) => {
-				let class =
-					candidate_transfer_class(task.id, task.phase, transfer.source, transfer.destination)?;
+				let class = candidate_transfer_class(task.phase, transfer.source, transfer.destination);
 				let staging = candidate_transfer_staging(
-					task.id,
 					class,
 					transfer.source,
 					transfer.destination,
 					transfer.bytes,
-				)?;
+				);
 				let admission = match (class, transfer.destination) {
 					(WorkClass::InitAdmission, TransferEndpoint::Device { device, value }) => {
 						let manifest = draft
 							.init_images
 							.iter()
 							.find(|manifest| manifest.device == device)
-							.ok_or(Error::Protocol {
-								task: task.id,
-								detail: "host candidate admission has no init-image manifest",
-							})?;
-						require(
-							manifest.image == value && manifest.bytes == transfer.bytes,
-							Error::Protocol {
-								task: task.id,
-								detail: "host candidate admission differs from its init-image manifest",
-							},
-						)?;
+							.unwrap();
+						debug_assert!(manifest.image == value && manifest.bytes == transfer.bytes);
 						Some(InitImageContract {
 							device,
 							image: value,
 							bytes: transfer.bytes,
 						})
 					}
-					(WorkClass::InitAdmission, TransferEndpoint::External) => {
-						return Err(Error::Protocol {
-							task: task.id,
-							detail: "host candidate admission has no device image destination",
-						});
-					}
+					(WorkClass::InitAdmission, TransferEndpoint::External) => unreachable!(),
 					(
 						WorkClass::InternalTransfer | WorkClass::ExitTransfer,
 						TransferEndpoint::External | TransferEndpoint::Device { .. },
@@ -1467,12 +1271,7 @@ fn prepare_candidate_pending(
 					(
 						WorkClass::Calculation | WorkClass::Metric,
 						TransferEndpoint::External | TransferEndpoint::Device { .. },
-					) => {
-						return Err(Error::Protocol {
-							task: task.id,
-							detail: "host candidate transfer has a non-transfer class",
-						});
-					}
+					) => unreachable!(),
 				};
 				(class, staging, admission)
 			}
@@ -1492,42 +1291,29 @@ fn prepare_candidate_pending(
 			submitted: false,
 			terminal: false,
 		};
-		reject_duplicate(pending.insert(task.id, resource), Error::Protocol {
-			task: task.id,
-			detail: "host candidate task appears more than once",
-		})?;
+		let prior = pending.insert(task.id, resource);
+		debug_assert!(prior.is_none());
 	}
 	Ok(pending)
 }
 
-fn reject_duplicate<T>(prior: Option<T>, error: Error) -> Result<()> {
-	match prior {
-		Some(value) => {
-			drop(value);
-			Err(error)
-		}
-		None => Ok(()),
-	}
-}
-
 fn candidate_transfer_class(
-	task: TaskId,
 	phase: RunPhase,
 	source: TransferEndpoint,
 	destination: TransferEndpoint,
-) -> Result<WorkClass> {
+) -> WorkClass {
 	match (phase, source, destination) {
 		(RunPhase::Init, TransferEndpoint::External, TransferEndpoint::Device { .. }) => {
-			Ok(WorkClass::InitAdmission)
+			WorkClass::InitAdmission
 		}
 		(RunPhase::Init | RunPhase::Loop, TransferEndpoint::Device { .. }, TransferEndpoint::Device { .. }) => {
-			Ok(WorkClass::InternalTransfer)
+			WorkClass::InternalTransfer
 		}
 		(
 			RunPhase::Exit,
 			TransferEndpoint::Device { .. },
 			TransferEndpoint::Device { .. } | TransferEndpoint::External,
-		) => Ok(WorkClass::ExitTransfer),
+		) => WorkClass::ExitTransfer,
 		(RunPhase::Init, TransferEndpoint::External, TransferEndpoint::External)
 		| (RunPhase::Init, TransferEndpoint::Device { .. }, TransferEndpoint::External)
 		| (
@@ -1540,34 +1326,28 @@ fn candidate_transfer_class(
 			RunPhase::Exit,
 			TransferEndpoint::External,
 			TransferEndpoint::External | TransferEndpoint::Device { .. },
-		) => {
-			Err(Error::Protocol {
-				task,
-				detail: "host candidate transfer phase or endpoint class is invalid",
-			})
-		}
+		) => unreachable!(),
 	}
 }
 
 fn candidate_transfer_staging(
-	task: TaskId,
 	class: WorkClass,
 	source: TransferEndpoint,
 	destination: TransferEndpoint,
 	bytes: ByteCount,
-) -> Result<Option<(DeviceId, ByteCount, PendingAction)>> {
+) -> Option<(DeviceId, ByteCount, PendingAction)> {
 	match (class, source, destination) {
 		(WorkClass::InitAdmission, TransferEndpoint::External, TransferEndpoint::Device { device, .. }) => {
-			Ok(Some((device, bytes, PendingAction::None)))
+			Some((device, bytes, PendingAction::None))
 		}
 		(WorkClass::ExitTransfer, TransferEndpoint::Device { device, .. }, TransferEndpoint::External) => {
-			Ok(Some((device, bytes, PendingAction::Egress)))
+			Some((device, bytes, PendingAction::Egress))
 		}
 		(
 			WorkClass::InternalTransfer | WorkClass::ExitTransfer,
 			TransferEndpoint::Device { .. },
 			TransferEndpoint::Device { .. },
-		) => Ok(None),
+		) => None,
 		(
 			WorkClass::Calculation | WorkClass::Metric,
 			TransferEndpoint::External | TransferEndpoint::Device { .. },
@@ -1584,12 +1364,7 @@ fn candidate_transfer_staging(
 			TransferEndpoint::External,
 			TransferEndpoint::Device { .. },
 		)
-		| (WorkClass::ExitTransfer, TransferEndpoint::External, TransferEndpoint::External) => {
-			Err(Error::Protocol {
-				task,
-				detail: "host candidate transfer staging contract is invalid",
-			})
-		}
+		| (WorkClass::ExitTransfer, TransferEndpoint::External, TransferEndpoint::External) => unreachable!(),
 	}
 }
 
@@ -1613,40 +1388,22 @@ fn task_contracts(
 				ExpectedWork::Metric {
 					metric: metric.metric,
 					slot: metric.slot,
-					value: *bundle.value_location(metric.value).ok_or(Error::Protocol {
-						task: task.id,
-						detail: "metric value has no finalized location",
-					})?,
+					value: *bundle.value_location(metric.value).unwrap(),
 					submission: metric.submission,
 				}
 			}
 			TaskKind::Transfer(transfer) => {
-				let endpoints = bundle.transfer_endpoints(task.id).ok_or(Error::Protocol {
-					task: task.id,
-					detail: "transfer has no finalized endpoints",
-				})?;
-				let class = transfer_class(task.id, task.phase, endpoints.source, endpoints.destination)?;
+				let endpoints = bundle.transfer_endpoints(task.id).unwrap();
+				let class = transfer_class(task.phase, endpoints.source, endpoints.destination);
 				match class {
 					WorkClass::InitAdmission => {
 						let ResolvedTransferEndpoint::Device(destination) = endpoints.destination else {
-							return Err(Error::Protocol {
-								task: task.id,
-								detail: "host admission has no device destination",
-							});
+							unreachable!()
 						};
 						let manifest = bundle
 							.init_image(destination.device)
-							.ok_or(Error::Protocol {
-								task: task.id,
-								detail: "host admission device has no finalized init-image manifest",
-							})?;
-						require(
-							manifest.image == destination.value && manifest.bytes == transfer.bytes,
-							Error::Protocol {
-								task: task.id,
-								detail: "host admission differs from the finalized init-image manifest",
-							},
-						)?;
+							.unwrap();
+						debug_assert!(manifest.image == destination.value && manifest.bytes == transfer.bytes);
 						ExpectedWork::Init {
 							image: manifest.image,
 							destination,
@@ -1655,12 +1412,7 @@ fn task_contracts(
 						}
 					}
 					WorkClass::InternalTransfer | WorkClass::ExitTransfer => {
-						if transfer.route.len() > 1 {
-							return Err(Error::UnsupportedWork {
-								task: task.id,
-								detail: "host backend requires planner-expanded one-hop transfers",
-							});
-						}
+						debug_assert!(transfer.route.len() <= 1);
 						ExpectedWork::Transfer {
 							class,
 							source: endpoints.source,
@@ -1671,46 +1423,31 @@ fn task_contracts(
 							submission: transfer.submission,
 						}
 					}
-					WorkClass::Calculation | WorkClass::Metric => {
-						return Err(Error::Protocol {
-							task: task.id,
-							detail: "host transfer received a non-transfer work class",
-						});
-					}
+					WorkClass::Calculation | WorkClass::Metric => unreachable!(),
 				}
 			}
 		};
-		if contracts.insert(task.id, expected).is_some() {
-			return Err(Error::Protocol {
-				task: task.id,
-				detail: "host task appears more than once",
-			});
-		}
+		let prior = contracts.insert(task.id, expected);
+		debug_assert!(prior.is_none());
 	}
 	Ok(contracts)
 }
 
 fn transfer_class(
-	task: TaskId,
 	phase: RunPhase,
 	source: ResolvedTransferEndpoint,
 	destination: ResolvedTransferEndpoint,
-) -> Result<WorkClass> {
+) -> WorkClass {
 	use ResolvedTransferEndpoint::{Device, External};
 	match (phase, source, destination) {
-		(RunPhase::Init, External, Device(_)) => Ok(WorkClass::InitAdmission),
-		(RunPhase::Init | RunPhase::Loop, Device(_), Device(_)) => Ok(WorkClass::InternalTransfer),
-		(RunPhase::Exit, Device(_), Device(_) | External) => Ok(WorkClass::ExitTransfer),
+		(RunPhase::Init, External, Device(_)) => WorkClass::InitAdmission,
+		(RunPhase::Init | RunPhase::Loop, Device(_), Device(_)) => WorkClass::InternalTransfer,
+		(RunPhase::Exit, Device(_), Device(_) | External) => WorkClass::ExitTransfer,
 		(RunPhase::Init, External, External)
 		| (RunPhase::Init, Device(_), External)
 		| (RunPhase::Loop, External, External | Device(_))
 		| (RunPhase::Loop, Device(_), External)
-		| (RunPhase::Exit, External, External | Device(_)) => {
-			Err(Error::Protocol {
-				task,
-				detail: "host transfer phase or endpoint class is invalid",
-			})
-		}
+		| (RunPhase::Exit, External, External | Device(_)) => unreachable!(),
 	}
 }
 
@@ -1729,49 +1466,11 @@ fn checked_arena(
 	arenas: &(impl HostArenaLookup + ?Sized),
 	location: ResolvedValueLocation,
 	bytes: u64,
-) -> Result<&Arena> {
-	let arena = arenas
-		.host_arena(location.device)
-		.ok_or(Error::MissingDevice(location.device))?;
-	let end = location
-		.arena_offset
-		.get()
-		.checked_add(bytes)
-		.ok_or(Error::RangeOverflow)?;
-	if arena.device() != location.device || end > arena.bytes().get() {
-		return Err(Error::OutOfBounds {
-			device: location.device,
-		});
-	}
-	Ok(arena)
-}
-
-struct TransferExpectation<'a> {
-	submitted_class: WorkClass,
-	class: WorkClass,
-	source: ResolvedTransferEndpoint,
-	destination: ResolvedTransferEndpoint,
-	bytes: ByteCount,
-	route: &'a [recipe_core::LinkId],
-	lane_claims: &'a [TransferLaneClaim],
-	submission: SubmissionSlots,
-}
-
-fn validate_transfer(work: TransferWork<'_>, expected: TransferExpectation<'_>) -> Result<()> {
-	if expected.submitted_class != expected.class
-		|| work.source != expected.source
-		|| work.destination != expected.destination
-		|| work.bytes != expected.bytes
-		|| work.route != expected.route
-		|| work.lane_claims != expected.lane_claims
-		|| work.submission != expected.submission
-	{
-		return Err(Error::Protocol {
-			task: work.task,
-			detail: "host transfer differs from its finalized contract",
-		});
-	}
-	Ok(())
+) -> &Arena {
+	let arena = arenas.host_arena(location.device).unwrap();
+	let end = location.arena_offset.get().checked_add(bytes).unwrap();
+	debug_assert!(arena.device() == location.device && end <= arena.bytes().get());
+	arena
 }
 
 fn submit_transfer(
@@ -1781,8 +1480,8 @@ fn submit_transfer(
 ) -> Result<()> {
 	match (work.source, work.destination) {
 		(ResolvedTransferEndpoint::Device(source), ResolvedTransferEndpoint::Device(destination)) => {
-			let source_arena = checked_arena(arenas, source, work.bytes.get())?;
-			let destination_arena = checked_arena(arenas, destination, work.bytes.get())?;
+			let source_arena = checked_arena(arenas, source, work.bytes.get());
+			let destination_arena = checked_arena(arenas, destination, work.bytes.get());
 			pending.copy.submit(
 				source_arena,
 				source.arena_offset.get(),
@@ -1792,11 +1491,8 @@ fn submit_transfer(
 			)
 		}
 		(ResolvedTransferEndpoint::Device(source), ResolvedTransferEndpoint::External) => {
-			let source_arena = checked_arena(arenas, source, work.bytes.get())?;
-			let staging = pending.staging.as_ref().ok_or(Error::Protocol {
-				task: work.task,
-				detail: "host egress has no preallocated staging arena",
-			})?;
+			let source_arena = checked_arena(arenas, source, work.bytes.get());
+			let staging = pending.staging.as_ref().unwrap();
 			pending.copy.submit(
 				source_arena,
 				source.arena_offset.get(),
@@ -1806,12 +1502,7 @@ fn submit_transfer(
 			)
 		}
 		(ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::External)
-		| (ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::Device(_)) => {
-			Err(Error::Protocol {
-				task: work.task,
-				detail: "host transfer has unsupported resolved endpoints",
-			})
-		}
+		| (ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::Device(_)) => unreachable!(),
 	}
 }
 
@@ -1838,11 +1529,7 @@ fn submission_call(work: &BackendWork<'_>) -> PhysicalCall {
 }
 
 fn record(batch: &mut PhysicalCallBatch, call: PhysicalCall) -> Result<()> {
-	match batch.try_push(call) {
-		Ok(()) => Ok(()),
-		Err(overflow) => {
-			consume_context(overflow);
-			Err(Error::PhysicalReportOverflow)
-		}
-	}
+	let result = batch.try_push(call);
+	debug_assert!(result.is_ok());
+	Ok(())
 }

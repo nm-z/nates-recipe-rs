@@ -5,6 +5,9 @@ edition = "2024"
 description = "Dependency-clean CUDA Driver API backend scaffolding for Recipe"
 license = "MIT"
 repository = "https://github.com/nm-z/nates-recipe-rs"
+readme = "README.md"
+keywords = ["gpu", "cuda", "runtime"]
+categories = ["hardware-support"]
 
 [dependencies]
 libc = "0.2"

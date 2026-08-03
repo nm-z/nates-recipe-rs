@@ -321,6 +321,52 @@ pub enum VectorMetadata {
 	},
 }
 
+impl VectorMetadata {
+	/// Return whether this vector has no encoding-specific metadata.
+	#[must_use]
+	#[inline]
+	pub const fn is_none(&self) -> bool {
+		matches!(self, Self::None)
+	}
+
+	/// Borrow the temporal origin when this is temporal metadata.
+	#[must_use]
+	#[inline]
+	pub const fn temporal_origin(&self) -> Option<TemporalOrigin> {
+		match self {
+			Self::Temporal { origin } => Some(*origin),
+			Self::None | Self::Categorical { .. } | Self::Ordinal { .. } | Self::Image { .. } => None,
+		}
+	}
+
+	/// Borrow the fitted dictionary when this is categorical metadata.
+	#[must_use]
+	#[inline]
+	pub fn categorical_dictionary(&self) -> Option<&[Vec<u8>]> {
+		match self {
+			Self::Categorical { dictionary } => Some(dictionary),
+			Self::None | Self::Temporal { .. } | Self::Ordinal { .. } | Self::Image { .. } => None,
+		}
+	}
+
+	/// Borrow the fitted label order when this is ordinal metadata.
+	#[must_use]
+	#[inline]
+	pub fn ordinal_labels(&self) -> Option<&[Vec<u8>]> {
+		match self {
+			Self::Ordinal { ordered_labels } => Some(ordered_labels),
+			Self::None | Self::Temporal { .. } | Self::Categorical { .. } | Self::Image { .. } => None,
+		}
+	}
+
+	/// Return whether this is encoded-image metadata.
+	#[must_use]
+	#[inline]
+	pub const fn is_image(&self) -> bool {
+		matches!(self, Self::Image { .. })
+	}
+}
+
 /// The lossless categorical observation route recorded for one retained row.
 ///
 /// Calculation codes remain available in [`PreparedValues::I32`] for existing
@@ -362,6 +408,36 @@ pub enum PreparedValues {
 }
 
 impl PreparedValues {
+	/// Borrow dictionary or integer values when this vector uses `I32` storage.
+	#[must_use]
+	#[inline]
+	pub fn i32_values(&self) -> Option<&[Option<i32>]> {
+		match self {
+			Self::I32(values) => Some(values),
+			Self::F32Bits(_) | Self::VariableWidth(_) => None,
+		}
+	}
+
+	/// Borrow exact f32 bits when this vector uses `F32Bits` storage.
+	#[must_use]
+	#[inline]
+	pub fn f32_bits(&self) -> Option<&[Option<u32>]> {
+		match self {
+			Self::F32Bits(values) => Some(values),
+			Self::I32(_) | Self::VariableWidth(_) => None,
+		}
+	}
+
+	/// Borrow variable-width values when this vector uses variable-width storage.
+	#[must_use]
+	#[inline]
+	pub const fn variable_width(&self) -> Option<&VariableWidthVector> {
+		match self {
+			Self::VariableWidth(values) => Some(values),
+			Self::I32(_) | Self::F32Bits(_) => None,
+		}
+	}
+
 	#[must_use]
 	pub fn len(&self) -> usize {
 		match self {
@@ -936,11 +1012,13 @@ pub fn select_table(
 	})
 }
 
+type SelectedRowsAndColumns = (ResolvedTargets, BTreeSet<usize>, Vec<usize>, Vec<usize>);
+
 fn select_rows_and_columns(
 	table: &RawTable,
 	inferred: &InferredVectorList,
 	request: &PreparationRequest,
-) -> PrepareResult<(ResolvedTargets, BTreeSet<usize>, Vec<usize>, Vec<usize>)> {
+) -> PrepareResult<SelectedRowsAndColumns> {
 	let names = build_name_index(inferred)?;
 	let targets = resolve_targets(request, &names)?;
 	let excluded_columns = resolve_column_exclusions(request, inferred, &targets.indices)?;
@@ -973,7 +1051,7 @@ fn select_rows_and_columns(
 fn select_rows_and_columns_before_fit(
 	table: &RawTable,
 	request: &PreparationRequest,
-) -> PrepareResult<(ResolvedTargets, BTreeSet<usize>, Vec<usize>, Vec<usize>)> {
+) -> PrepareResult<SelectedRowsAndColumns> {
 	let names = build_header_name_index(table)?;
 	let targets = resolve_targets(request, &names)?;
 	let excluded_columns = resolve_column_exclusions_from_headers(request, table.headers(), &targets.indices)?;

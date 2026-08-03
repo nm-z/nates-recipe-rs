@@ -3,5 +3,10 @@ name = "recipe-core"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Dependency-free execution contracts for Recipe"
+repository = "https://github.com/nm-z/nates-recipe-rs"
+readme = "README.md"
+keywords = ["gpu", "runtime", "scheduling"]
+categories = ["science"]
 
 [dependencies]

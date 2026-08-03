@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Bare-metal NVIDIA CUDA Driver and AMD ROCr probe adapters for Recipe"
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 recipe-core = { path = "../core" }

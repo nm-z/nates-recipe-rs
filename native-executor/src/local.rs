@@ -10,11 +10,11 @@ use recipe_core::{
 	ArenaLayout, ArtifactIdentity, BundleIdentity, ByteCount, CapacityLedger, CapacityLedgerEntry, DeviceId,
 	DiscoveryIdentity, DiscoveryProfile, FinalizedBundle, LoopIteration, Property, PropertyProvenance,
 	RealizationIdentity, RealizationProfile, ReservationEvidence, ReservationLedger, ResolvedTransferEndpoint,
-	RunPhase, SubmissionSlots, Task, TaskId, TaskKind, Topology, TopologyIdentity, TransferEndpoint,
+	RunPhase, SubmissionSlots, TaskId, TaskKind, Topology, TopologyIdentity, TransferEndpoint,
 };
 use recipe_executor::{
 	ArenaSet, Backend, BackendPoll, BackendWork, PendingRequest, PhysicalCall, PhysicalCallBatch,
-	PhysicalCallBatchOverflow, PhysicalPollStatus, TransferWork, WorkClass, sealed,
+	PhysicalPollStatus, TransferWork, WorkClass, sealed,
 };
 use recipe_host::{
 	Arena as HostArena, HostArenaLookup, HostBackend, HostBackendConfig, HostPending, HostPreparedResources,
@@ -340,37 +340,11 @@ impl CandidateCrossBackendTransfer<'_, '_> for RejectCrossBackend {
 
 #[derive(Debug)]
 pub enum LocalError<BridgeError> {
-	DuplicateDevice {
-		device: DeviceId,
-	},
-	MissingDevice {
-		device: DeviceId,
-	},
-	UnexpectedDevice {
-		device: DeviceId,
-	},
-	UnsupportedCalculation {
-		task: TaskId,
-	},
-	UnsupportedRoute {
-		task: TaskId,
-		detail: &'static str,
-	},
-	TaskNotAssigned {
-		task: TaskId,
-	},
-	ArenaOwnerMismatch {
-		device: DeviceId,
-	},
-	PendingOwnerMismatch {
-		task: TaskId,
-	},
 	CapacityMismatch {
 		device: DeviceId,
 		detail: &'static str,
 	},
 	BackendState(&'static str),
-	PhysicalAccountingOverflow,
 	Host(recipe_host::Error),
 	Native(Error),
 	Bridge(BridgeError),
@@ -379,54 +353,6 @@ pub enum LocalError<BridgeError> {
 impl<BridgeError: fmt::Display> fmt::Display for LocalError<BridgeError> {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::DuplicateDevice { device } => {
-				write!(
-					formatter,
-					"local device {device} has more than one backend owner"
-				)
-			}
-			Self::MissingDevice { device } => {
-				write!(
-					formatter,
-					"finalized local device {device} has no backend owner"
-				)
-			}
-			Self::UnexpectedDevice { device } => {
-				write!(
-					formatter,
-					"local backend binding {device} has no finalized arena"
-				)
-			}
-			Self::UnsupportedCalculation { task } => {
-				write!(
-					formatter,
-					"calculation task {task} is not owned by a GPU backend"
-				)
-			}
-			Self::UnsupportedRoute { task, detail } => {
-				write!(
-					formatter,
-					"local transfer task {task} is unsupported: {detail}"
-				)
-			}
-			Self::TaskNotAssigned { task } => {
-				write!(
-					formatter,
-					"local task {task} has no immutable backend assignment"
-				)
-			}
-			Self::ArenaOwnerMismatch { device } => {
-				write!(
-					formatter,
-					"arena {device} differs from its immutable backend owner"
-				)
-			}
-			Self::PendingOwnerMismatch { task } => {
-				write!(
-					formatter,
-					"task {task} differs from its prepared backend token"
-				)
-			}
 			Self::CapacityMismatch { device, detail } => {
 				write!(
 					formatter,
@@ -434,9 +360,6 @@ impl<BridgeError: fmt::Display> fmt::Display for LocalError<BridgeError> {
 				)
 			}
 			Self::BackendState(detail) => write!(formatter, "local backend state is invalid: {detail}"),
-			Self::PhysicalAccountingOverflow => {
-				formatter.write_str("local backend exceeded fixed physical-call accounting")
-			}
 			Self::Host(error) => write!(formatter, "host partition failed: {error}"),
 			Self::Native(error) => write!(formatter, "native partition failed: {error}"),
 			Self::Bridge(error) => write!(formatter, "cross-backend bridge failed: {error}"),
@@ -452,17 +375,7 @@ where BridgeError: StdError + 'static
 			Self::Host(error) => Some(error),
 			Self::Native(error) => Some(error),
 			Self::Bridge(error) => Some(error),
-			Self::DuplicateDevice { .. }
-			| Self::MissingDevice { .. }
-			| Self::UnexpectedDevice { .. }
-			| Self::UnsupportedCalculation { .. }
-			| Self::UnsupportedRoute { .. }
-			| Self::TaskNotAssigned { .. }
-			| Self::ArenaOwnerMismatch { .. }
-			| Self::PendingOwnerMismatch { .. }
-			| Self::CapacityMismatch { .. }
-			| Self::BackendState(_)
-			| Self::PhysicalAccountingOverflow => None,
+			Self::CapacityMismatch { .. } | Self::BackendState(_) => None,
 		}
 	}
 }
@@ -523,14 +436,7 @@ where Bridge: CandidateCrossBackendTransfer<'cuda, 'hsa>
 		tasks: &BTreeSet<TaskId>,
 		devices: &BTreeMap<DeviceId, LocalDeviceClass>,
 	) -> Result<Self::Resource, Self::Error> {
-		match *tasks == self.tasks && *devices == self.devices {
-			true => Ok(()),
-			false => {
-				Err(PreparedBridgeError::State(
-					"finalized bridge partition differs from its candidate",
-				))
-			}
-		}?;
+		debug_assert!(*tasks == self.tasks && *devices == self.devices);
 		match self.handoff_validated {
 			true => Ok(()),
 			false => {
@@ -687,7 +593,7 @@ enum LocalPreparedPhysical<'cuda, 'hsa, BridgeResource> {
 	},
 	Warm {
 		_bundle: FinalizedBundle,
-		resources: LocalResources<'cuda, 'hsa, BridgeResource>,
+		resources: Box<LocalResources<'cuda, 'hsa, BridgeResource>>,
 		arenas: BTreeMap<DeviceId, LocalArena<'cuda, 'hsa>>,
 		tasks: Vec<WarmTask>,
 		images: BTreeMap<DeviceId, Vec<u8>>,
@@ -772,13 +678,13 @@ impl WarmWork {
 		}
 	}
 
-	fn backend_work<'work, BridgeError>(
+	fn backend_work<'work>(
 		&'work self,
 		task: TaskId,
 		run: recipe_core::RunId,
 		iteration: LoopIteration,
 		images: &'work BTreeMap<DeviceId, Vec<u8>>,
-	) -> Result<BackendWork<'work>, LocalError<BridgeError>> {
+	) -> BackendWork<'work> {
 		match self {
 			Self::Init {
 				device,
@@ -786,10 +692,8 @@ impl WarmWork {
 				bytes,
 				submission,
 			} => {
-				let image = images
-					.get(device)
-					.ok_or(LocalError::BackendState("warm admission image is absent"))?;
-				Ok(BackendWork::InitAdmission(
+				let image = &images[device];
+				BackendWork::InitAdmission(
 					recipe_executor::InitAdmissionWork {
 						task,
 						destination: *destination,
@@ -797,7 +701,7 @@ impl WarmWork {
 						submission: *submission,
 						image,
 					},
-				))
+				)
 			}
 			Self::Calculation {
 				device,
@@ -808,7 +712,7 @@ impl WarmWork {
 				outputs,
 				fault_flag,
 			} => {
-				Ok(BackendWork::Calculation(recipe_executor::CalculationWork {
+				BackendWork::Calculation(recipe_executor::CalculationWork {
 					task,
 					run,
 					iteration,
@@ -819,7 +723,7 @@ impl WarmWork {
 					inputs,
 					outputs,
 					fault_flag: *fault_flag,
-				}))
+				})
 			}
 			Self::Transfer {
 				class,
@@ -840,13 +744,9 @@ impl WarmWork {
 					submission: *submission,
 				};
 				match class {
-					WorkClass::InternalTransfer => Ok(BackendWork::InternalTransfer(transfer)),
-					WorkClass::ExitTransfer => Ok(BackendWork::ExitTransfer(transfer)),
-					WorkClass::InitAdmission | WorkClass::Calculation | WorkClass::Metric => {
-						Err(LocalError::BackendState(
-							"warm transfer has a non-transfer work class",
-						))
-					}
+					WorkClass::InternalTransfer => BackendWork::InternalTransfer(transfer),
+					WorkClass::ExitTransfer => BackendWork::ExitTransfer(transfer),
+					WorkClass::InitAdmission | WorkClass::Calculation | WorkClass::Metric => unreachable!(),
 				}
 			}
 			Self::Metric {
@@ -856,7 +756,7 @@ impl WarmWork {
 				value,
 				submission,
 			} => {
-				Ok(BackendWork::Metric(recipe_executor::MetricWork {
+				BackendWork::Metric(recipe_executor::MetricWork {
 					task,
 					iteration,
 					purpose: *purpose,
@@ -864,7 +764,7 @@ impl WarmWork {
 					slot: *slot,
 					value: *value,
 					submission: *submission,
-				}))
+				})
 			}
 		}
 	}
@@ -1107,16 +1007,8 @@ where Bridge: CandidateCrossBackendTransfer<'cuda, 'hsa>
 		if arenas.is_empty() {
 			for layout in &candidate.arena_layouts {
 				let arena = allocate_warm_arena(resources, layout).map_err(CandidateFailure::Fatal)?;
-				match arenas.insert(layout.device, arena) {
-					None => {}
-					Some(duplicate) => {
-						let device = duplicate.device();
-						drop(duplicate);
-						return Err(CandidateFailure::Fatal(LocalError::DuplicateDevice {
-							device,
-						}));
-					}
-				}
+				let prior = arenas.insert(layout.device, arena);
+				debug_assert!(prior.is_none());
 			}
 		}
 		run_warm_trace(
@@ -1206,12 +1098,12 @@ where Bridge: CandidateCrossBackendTransfer<'cuda, 'hsa>
 			hsa,
 			bridge: bridge_resource,
 		};
-		let tasks = prepare_warm_tasks::<Bridge::Error>(&bundle).map_err(CandidateFailure::Fatal)?;
-		let images = prepare_warm_images::<Bridge::Error>(&bundle).map_err(CandidateFailure::Fatal)?;
-		let exits = prepare_warm_exits::<Bridge::Error>(&tasks).map_err(CandidateFailure::Fatal)?;
+		let tasks = prepare_warm_tasks(&bundle);
+		let images = prepare_warm_images(&bundle);
+		let exits = prepare_warm_exits(&tasks);
 		self.physical = LocalPreparedPhysical::Warm {
 			_bundle: bundle,
-			resources,
+			resources: Box::new(resources),
 			arenas: BTreeMap::new(),
 			tasks,
 			images,
@@ -1292,7 +1184,7 @@ where Bridge: CandidateCrossBackendTransfer<'cuda, 'hsa>
 					hsa,
 					bridge: bridge_resource,
 					..
-				} = resources;
+				} = *resources;
 				let declared_devices = partitions
 					.devices
 					.iter()
@@ -1331,7 +1223,7 @@ where Bridge: CandidateCrossBackendTransfer<'cuda, 'hsa>
 				))
 			}
 		}?;
-		validate_prepared_identity(&self.candidate, &self.artifacts, &self.reservations, bundle)?;
+		validate_prepared_identity(&self.candidate, &self.artifacts, &self.reservations, bundle);
 		let LocalPreparedPhysical::Warm {
 			resources, arenas, ..
 		} = &mut self.physical
@@ -1403,7 +1295,7 @@ where Bridge: CandidateCrossBackendTransfer<'cuda, 'hsa>
 				resources, arenas, ..
 			} => {
 				let mut first = release_warm_arenas(arenas).err();
-				first = retain_first(first, destroy_warm_resources(&mut bridge, resources));
+				first = retain_first(first, destroy_warm_resources(&mut bridge, *resources));
 				match first {
 					Some(error) => Err(error),
 					None => Ok(()),
@@ -1428,12 +1320,12 @@ where
 	type Session = LocalPreparedSession<'cuda, 'hsa, Bridge, Bridge::Resource>;
 
 	fn reservation_evidence(&self, device: DeviceId) -> Result<ReservationEvidence, Self::Error> {
-		reservation_evidence_for_device(
+		Ok(reservation_evidence_for_device(
 			device,
 			self.host.as_ref(),
 			&self.cuda_bindings,
 			&self.hsa_bindings,
-		)
+		))
 	}
 
 	fn realize_candidate(
@@ -1446,8 +1338,7 @@ where
 			}
 		})?;
 		let declared_devices = declared_devices(self.host.as_ref(), &self.cuda_bindings, &self.hsa_bindings);
-		let partitions = classify_candidate::<Bridge::Error>(request.candidate, &declared_devices)
-			.map_err(CandidateFailure::Fatal)?;
+		let partitions = classify_candidate(request.candidate, &declared_devices);
 		let initial_capacity = match &self.initial_capacity {
 			Some(snapshot)
 				if snapshot.topology == request.topology.identity
@@ -1659,8 +1550,8 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 		bundle: &FinalizedBundle,
 		physical_calls: &mut PhysicalCallBatch,
 	) -> Result<Self::Resource, Self::Error> {
-		record(physical_calls, PhysicalCall::BindResources)?;
-		let partitions = classify(bundle, &self.declared_devices)?;
+		record(physical_calls, PhysicalCall::BindResources);
+		let partitions = classify(bundle, &self.declared_devices);
 		let host = match &mut self.host {
 			Some(host) => {
 				Some(host
@@ -1668,14 +1559,8 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 					.map_err(LocalError::Host)?)
 			}
 			None => {
-				match partitions.host.iter().next() {
-					None => None,
-					Some(_) => {
-						return Err(LocalError::BackendState(
-							"host tasks exist without a configured host partition",
-						));
-					}
-				}
+				debug_assert!(partitions.host.is_empty());
+				None
 			}
 		};
 		let cuda = self
@@ -1708,34 +1593,32 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 	) -> Result<Self::Pending, Self::Error> {
 		record(physical_calls, PhysicalCall::PreparePending {
 			task: request.task,
-		})?;
-		match resource.tasks.get(&request.task).copied() {
-			Some(TaskOwner::Host) => {
-				let host_resource = resource.host.as_mut().ok_or(LocalError::BackendState(
-					"host task has no bound host resources",
-				))?;
+		});
+		match resource.tasks[&request.task] {
+			TaskOwner::Host => {
+				let host_resource = resource.host.as_mut().unwrap();
 				self.host
 					.as_mut()
-					.ok_or(LocalError::BackendState("host partition is absent"))?
+					.unwrap()
 					.prepare_partition(host_resource, request)
 					.map(LocalPending::Host)
 					.map_err(LocalError::Host)
 			}
-			Some(TaskOwner::Cuda) => {
+			TaskOwner::Cuda => {
 				resource
 					.cuda
 					.prepare_pending(request)
 					.map(LocalPending::Cuda)
 					.map_err(LocalError::Native)
 			}
-			Some(TaskOwner::Hsa) => {
+			TaskOwner::Hsa => {
 				resource
 					.hsa
 					.prepare_pending(request)
 					.map(LocalPending::Hsa)
 					.map_err(LocalError::Native)
 			}
-			Some(TaskOwner::Bridge) => {
+			TaskOwner::Bridge => {
 				self.bridge
 					.prepare_pending(&mut resource.bridge, request)
 					.map(|pending| {
@@ -1746,7 +1629,6 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 					})
 					.map_err(LocalError::Bridge)
 			}
-			None => Err(LocalError::TaskNotAssigned { task: request.task }),
 		}
 	}
 
@@ -1759,37 +1641,30 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 		record(physical_calls, PhysicalCall::AllocateArena {
 			device: layout.device,
 			bytes: layout.size,
-		})?;
-		match resource.devices.get(&layout.device).copied() {
-			Some(LocalDeviceClass::Host) => {
-				let host_resource = resource.host.as_mut().ok_or(LocalError::BackendState(
-					"host device has no bound host resources",
-				))?;
+		});
+		match resource.devices[&layout.device] {
+			LocalDeviceClass::Host => {
+				let host_resource = resource.host.as_mut().unwrap();
 				self.host
 					.as_mut()
-					.ok_or(LocalError::BackendState("host partition is absent"))?
+					.unwrap()
 					.allocate_partition(host_resource, layout)
 					.map(LocalArena::Host)
 					.map_err(LocalError::Host)
 			}
-			Some(LocalDeviceClass::Cuda) => {
+			LocalDeviceClass::Cuda => {
 				resource
 					.cuda
 					.allocate_arena(layout)
 					.map(LocalArena::Cuda)
 					.map_err(LocalError::Native)
 			}
-			Some(LocalDeviceClass::Hsa) => {
+			LocalDeviceClass::Hsa => {
 				resource
 					.hsa
 					.allocate_arena(layout)
 					.map(LocalArena::Hsa)
 					.map_err(LocalError::Native)
-			}
-			None => {
-				Err(LocalError::MissingDevice {
-					device: layout.device,
-				})
 			}
 		}
 	}
@@ -1808,30 +1683,28 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 		work: BackendWork<'_>,
 		physical_calls: &mut PhysicalCallBatch,
 	) -> Result<(), Self::Error> {
-		record(physical_calls, crate::accounting::submission_call(&work))?;
+		record(physical_calls, crate::accounting::submission_call(&work));
 		let task = work.task();
 		let lookup = ProjectedArenas { arenas: &arenas };
 		match pending {
 			LocalPending::Host(pending) => {
-				ensure_owner(resource, task, TaskOwner::Host)?;
-				let host_resource = resource.host.as_mut().ok_or(LocalError::BackendState(
-					"host task has no bound host resources",
-				))?;
+				ensure_owner(resource, task, TaskOwner::Host);
+				let host_resource = resource.host.as_mut().unwrap();
 				self.host
 					.as_mut()
-					.ok_or(LocalError::BackendState("host partition is absent"))?
+					.unwrap()
 					.submit_partition(host_resource, &lookup, pending, work)
 					.map_err(LocalError::Host)
 			}
 			LocalPending::Cuda(pending) => {
-				ensure_owner(resource, task, TaskOwner::Cuda)?;
+				ensure_owner(resource, task, TaskOwner::Cuda);
 				resource
 					.cuda
 					.submit(&lookup, pending, work)
 					.map_err(LocalError::Native)
 			}
 			LocalPending::Hsa(pending) => {
-				ensure_owner(resource, task, TaskOwner::Hsa)?;
+				ensure_owner(resource, task, TaskOwner::Hsa);
 				resource
 					.hsa
 					.submit(&lookup, pending, work)
@@ -1841,17 +1714,12 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 				task: pending_task,
 				pending,
 			} => {
-				ensure_owner(resource, task, TaskOwner::Bridge)?;
-				match *pending_task == task {
-					true => Ok(()),
-					false => Err(LocalError::PendingOwnerMismatch { task }),
-				}?;
+				ensure_owner(resource, task, TaskOwner::Bridge);
+				debug_assert_eq!(*pending_task, task);
 				let (class, transfer) = match work {
 					BackendWork::InternalTransfer(work) => (WorkClass::InternalTransfer, work),
 					BackendWork::ExitTransfer(work) => (WorkClass::ExitTransfer, work),
-					BackendWork::InitAdmission(_) | BackendWork::Calculation(_) | BackendWork::Metric(_) => {
-						return Err(LocalError::PendingOwnerMismatch { task });
-					}
+					BackendWork::InitAdmission(_) | BackendWork::Calculation(_) | BackendWork::Metric(_) => unreachable!(),
 				};
 				self.bridge
 					.submit(
@@ -1878,25 +1746,23 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 		let task = work.task();
 		match pending {
 			LocalPending::Host(pending) => {
-				ensure_owner(resource, task, TaskOwner::Host)?;
+				ensure_owner(resource, task, TaskOwner::Host);
 				resource
 					.host
 					.as_mut()
-					.ok_or(LocalError::BackendState(
-						"host task has no bound host resources",
-					))?
+					.unwrap()
 					.prepare_loop_pending(pending)
 					.map_err(LocalError::Host)?;
 			}
 			LocalPending::Cuda(pending) => {
-				ensure_owner(resource, task, TaskOwner::Cuda)?;
+				ensure_owner(resource, task, TaskOwner::Cuda);
 				resource
 					.cuda
 					.prepare_loop_pending(pending)
 					.map_err(LocalError::Native)?;
 			}
 			LocalPending::Hsa(pending) => {
-				ensure_owner(resource, task, TaskOwner::Hsa)?;
+				ensure_owner(resource, task, TaskOwner::Hsa);
 				resource
 					.hsa
 					.prepare_loop_pending(pending)
@@ -1906,10 +1772,8 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 				task: pending_task,
 				pending,
 			} => {
-				ensure_owner(resource, task, TaskOwner::Bridge)?;
-				if *pending_task != task {
-					return Err(LocalError::PendingOwnerMismatch { task });
-				}
+				ensure_owner(resource, task, TaskOwner::Bridge);
+				debug_assert_eq!(*pending_task, task);
 				self.bridge
 					.rearm_loop_pending(&mut resource.bridge, pending)
 					.map_err(LocalError::Bridge)?;
@@ -1927,12 +1791,10 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 		let task = pending.task();
 		let result = match pending {
 			LocalPending::Host(pending) => {
-				let host_resource = resource.host.as_mut().ok_or(LocalError::BackendState(
-					"host task has no bound host resources",
-				))?;
+				let host_resource = resource.host.as_mut().unwrap();
 				self.host
 					.as_mut()
-					.ok_or(LocalError::BackendState("host partition is absent"))?
+					.unwrap()
 					.poll_partition(host_resource, pending)
 					.map_err(LocalError::Host)
 			}
@@ -1953,18 +1815,9 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 			Ok(BackendPoll::Pending) => PhysicalPollStatus::Pending,
 			Ok(BackendPoll::Complete { .. }) => PhysicalPollStatus::Complete,
 			Err(
-				LocalError::DuplicateDevice { .. }
-				| LocalError::MissingDevice { .. }
-				| LocalError::UnexpectedDevice { .. }
-				| LocalError::UnsupportedCalculation { .. }
-				| LocalError::UnsupportedRoute { .. }
-				| LocalError::TaskNotAssigned { .. }
-				| LocalError::ArenaOwnerMismatch { .. }
-				| LocalError::PendingOwnerMismatch { .. }
-				| LocalError::CapacityMismatch { .. }
-				| LocalError::BackendState(_)
-				| LocalError::PhysicalAccountingOverflow
-				| LocalError::Host(_)
+				LocalError::CapacityMismatch { .. }
+					| LocalError::BackendState(_)
+					| LocalError::Host(_)
 				| LocalError::Native(_)
 				| LocalError::Bridge(_),
 			) => PhysicalPollStatus::Failed,
@@ -1972,7 +1825,7 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 		record(
 			physical_calls,
 			crate::accounting::completion_poll_call(task, status),
-		)?;
+		);
 		result
 	}
 
@@ -1988,16 +1841,14 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 		record(physical_calls, PhysicalCall::CollectExit {
 			task: work.task,
 			bytes: work.bytes,
-		})?;
+		});
 		let lookup = ProjectedArenas { arenas: &arenas };
 		match pending {
 			LocalPending::Host(pending) => {
-				let host_resource = resource.host.as_mut().ok_or(LocalError::BackendState(
-					"host task has no bound host resources",
-				))?;
+				let host_resource = resource.host.as_mut().unwrap();
 				self.host
 					.as_mut()
-					.ok_or(LocalError::BackendState("host partition is absent"))?
+					.unwrap()
 					.collect_partition(host_resource, pending, work, destination)
 					.map_err(LocalError::Host)
 			}
@@ -2013,12 +1864,7 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 					.collect_exit(&lookup, pending, work, destination)
 					.map_err(LocalError::Native)
 			}
-			LocalPending::Bridge { .. } => {
-				Err(LocalError::UnsupportedRoute {
-					task: work.task,
-					detail: "cross-backend transfers cannot have an external endpoint",
-				})
-			}
+			LocalPending::Bridge { .. } => unreachable!("finalized external exit has one backend owner"),
 		}
 	}
 
@@ -2029,24 +1875,15 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 		arena: Self::Arena,
 		physical_calls: &mut PhysicalCallBatch,
 	) -> Result<(), Self::Error> {
-		record(physical_calls, PhysicalCall::ReleaseArena { device })?;
-		let expected = resource
-			.devices
-			.get(&device)
-			.copied()
-			.ok_or(LocalError::MissingDevice { device })?;
-		match arena.device() == device && arena.class() == expected {
-			true => Ok(()),
-			false => Err(LocalError::ArenaOwnerMismatch { device }),
-		}?;
+		record(physical_calls, PhysicalCall::ReleaseArena { device });
+		let expected = resource.devices[&device];
+		debug_assert!(arena.device() == device && arena.class() == expected);
 		match arena {
 			LocalArena::Host(arena) => {
-				let host_resource = resource.host.as_mut().ok_or(LocalError::BackendState(
-					"host device has no bound host resources",
-				))?;
+				let host_resource = resource.host.as_mut().unwrap();
 				self.host
 					.as_mut()
-					.ok_or(LocalError::BackendState("host partition is absent"))?
+					.unwrap()
 					.release_partition(host_resource, device, arena)
 					.map_err(LocalError::Host)
 			}
@@ -2066,7 +1903,7 @@ where Bridge: CrossBackendTransfer<'cuda, 'hsa>
 		resource: Self::Resource,
 		physical_calls: &mut PhysicalCallBatch,
 	) -> Result<(), Self::Error> {
-		record(physical_calls, PhysicalCall::DestroyResources)?;
+		record(physical_calls, PhysicalCall::DestroyResources);
 		let mut device_evidence = resource.cuda.execution_evidence();
 		device_evidence.extend(resource.hsa.execution_evidence());
 		let LocalResources {
@@ -2142,12 +1979,12 @@ impl<'hsa> HsaArenaLookup<'hsa> for ProjectedArenas<'_, '_, '_, 'hsa> {
 	}
 }
 
-fn reservation_evidence_for_device<BridgeError>(
+fn reservation_evidence_for_device(
 	device: DeviceId,
 	host: Option<&HostBackendConfig>,
 	cuda_bindings: &[CudaBinding<'_>],
 	hsa_bindings: &[HsaBinding<'_>],
-) -> Result<ReservationEvidence, LocalError<BridgeError>> {
+) -> ReservationEvidence {
 	let mut evidence = None;
 	for binding in host
 		.into_iter()
@@ -2155,9 +1992,8 @@ fn reservation_evidence_for_device<BridgeError>(
 		.filter(|binding| binding.device() == device)
 	{
 		let _ = binding;
-		if evidence.replace(ReservationEvidence::NonGpu).is_some() {
-			return Err(LocalError::DuplicateDevice { device });
-		}
+		let prior = evidence.replace(ReservationEvidence::NonGpu);
+		debug_assert!(prior.is_none());
 	}
 	for binding in cuda_bindings
 		.iter()
@@ -2166,9 +2002,8 @@ fn reservation_evidence_for_device<BridgeError>(
 		let candidate = ReservationEvidence::GpuDisplay {
 			enabled_connectors: binding.enabled_display_connectors(),
 		};
-		if evidence.replace(candidate).is_some() {
-			return Err(LocalError::DuplicateDevice { device });
-		}
+		let prior = evidence.replace(candidate);
+		debug_assert!(prior.is_none());
 	}
 	for binding in hsa_bindings
 		.iter()
@@ -2177,11 +2012,10 @@ fn reservation_evidence_for_device<BridgeError>(
 		let candidate = ReservationEvidence::GpuDisplay {
 			enabled_connectors: binding.enabled_display_connectors(),
 		};
-		if evidence.replace(candidate).is_some() {
-			return Err(LocalError::DuplicateDevice { device });
-		}
+		let prior = evidence.replace(candidate);
+		debug_assert!(prior.is_none());
 	}
-	evidence.ok_or(LocalError::MissingDevice { device })
+	evidence.unwrap()
 }
 
 fn capture_initial_capacity<BridgeError>(
@@ -2194,47 +2028,31 @@ fn capture_initial_capacity<BridgeError>(
 ) -> Result<InitialCapacitySnapshot, LocalError<BridgeError>> {
 	let mut available = BTreeMap::new();
 	for device in &topology.devices {
-		let bytes = match devices.get(&device.id) {
-			Some(LocalDeviceClass::Host) => {
-				host.ok_or(LocalError::CapacityMismatch {
-					device: device.id,
-					detail: "initial host capacity has no configured host owner",
-				})?
+		let bytes = match devices[&device.id] {
+			LocalDeviceClass::Host => {
+				host.unwrap()
 				.available_bytes(device.id)
 				.map_err(LocalError::Host)?
 			}
-			Some(LocalDeviceClass::Cuda) => {
+			LocalDeviceClass::Cuda => {
 				cuda_bindings
 					.iter()
 					.find(|binding| binding.device() == device.id)
-					.ok_or(LocalError::CapacityMismatch {
-						device: device.id,
-						detail: "initial CUDA capacity has no bound CUDA owner",
-					})?
+					.unwrap()
 					.available_bytes()
 					.map_err(LocalError::Native)?
 			}
-			Some(LocalDeviceClass::Hsa) => {
+			LocalDeviceClass::Hsa => {
 				hsa_bindings
 					.iter()
 					.find(|binding| binding.device() == device.id)
-					.ok_or(LocalError::CapacityMismatch {
-						device: device.id,
-						detail: "initial HSA capacity has no bound HSA owner",
-					})?
+					.unwrap()
 					.available_bytes()
 					.map_err(LocalError::Native)?
 			}
-			None => {
-				return Err(LocalError::CapacityMismatch {
-					device: device.id,
-					detail: "initial capacity has no local device owner",
-				});
-			}
 		};
-		if available.insert(device.id, bytes).is_some() {
-			return Err(LocalError::DuplicateDevice { device: device.id });
-		}
+		let prior = available.insert(device.id, bytes);
+		debug_assert!(prior.is_none());
 	}
 	Ok(InitialCapacitySnapshot {
 		topology: topology.identity,
@@ -2248,12 +2066,7 @@ fn validate_initial_headroom<BridgeError>(
 	initial: &InitialCapacitySnapshot,
 ) -> Result<(), LocalError<BridgeError>> {
 	for (device, available) in &initial.available {
-		let reservation = reservations
-			.entry(*device)
-			.ok_or(LocalError::CapacityMismatch {
-				device: *device,
-				detail: "initial capacity has no reservation policy",
-			})?;
+		let reservation = reservations.entry(*device).unwrap();
 		if *available < reservation.bytes {
 			return Err(LocalError::CapacityMismatch {
 				device: *device,
@@ -2288,10 +2101,10 @@ fn declared_devices(
 	declared
 }
 
-fn classify_candidate<BridgeError>(
+fn classify_candidate(
 	candidate: &PlannedCandidate,
 	declared: &[(DeviceId, LocalDeviceClass)],
-) -> Result<Partitions, LocalError<BridgeError>> {
+) -> Partitions {
 	let devices = validate_device_owners(
 		candidate
 			.arena_layouts
@@ -2299,7 +2112,7 @@ fn classify_candidate<BridgeError>(
 			.map(|layout| layout.device)
 			.collect(),
 		declared,
-	)?;
+	);
 	let values = candidate
 		.draft
 		.values
@@ -2317,42 +2130,22 @@ fn classify_candidate<BridgeError>(
 	for task in &candidate.draft.tasks {
 		let owner = match &task.kind {
 			TaskKind::Calculation(calculation) => {
-				match result.devices.get(&calculation.device) {
-					Some(LocalDeviceClass::Cuda) => TaskOwner::Cuda,
-					Some(LocalDeviceClass::Hsa) => TaskOwner::Hsa,
-					Some(LocalDeviceClass::Host) | None => {
-						return Err(LocalError::UnsupportedCalculation { task: task.id });
-					}
+				match result.devices[&calculation.device] {
+					LocalDeviceClass::Cuda => TaskOwner::Cuda,
+					LocalDeviceClass::Hsa => TaskOwner::Hsa,
+					LocalDeviceClass::Host => unreachable!(),
 				}
 			}
 			TaskKind::Metric(metric) => {
-				let device = values
-					.get(&metric.value)
-					.copied()
-					.ok_or(LocalError::TaskNotAssigned { task: task.id })?;
-				class_owner(
-					result.devices
-						.get(&device)
-						.copied()
-						.ok_or(LocalError::MissingDevice { device })?,
-				)
+				let device = values[&metric.value];
+				class_owner(result.devices[&device])
 			}
 			TaskKind::Transfer(transfer) => {
-				match transfer.route.len() {
-					0 | 1 => Ok(()),
-					2.. => {
-						Err(LocalError::UnsupportedRoute {
-							task: task.id,
-							detail: "executor-visible transfers must be planner-expanded to one hop",
-						})
-					}
-				}?;
-				candidate_transfer_owner::<BridgeError>(
-					task.id,
+				candidate_transfer_owner(
 					transfer.source,
 					transfer.destination,
 					&result.devices,
-				)?
+				)
 			}
 		};
 		result.tasks.insert(task.id, owner);
@@ -2367,30 +2160,12 @@ fn classify_candidate<BridgeError>(
 				result.hsa.insert(task.id);
 			}
 			TaskOwner::Bridge => {
-				let route = match &task.kind {
-					TaskKind::Transfer(transfer) => &transfer.route,
-					TaskKind::Calculation(_) | TaskKind::Metric(_) => {
-						return Err(LocalError::UnsupportedRoute {
-							task: task.id,
-							detail: "only transfers may use the cross-backend bridge",
-						});
-					}
-				};
-				match route.len() {
-					1 => Ok(()),
-					0 | 2.. => {
-						Err(LocalError::UnsupportedRoute {
-							task: task.id,
-							detail: "cross-backend transfers require exactly one candidate link",
-						})
-					}
-				}?;
+				debug_assert!(matches!(&task.kind, TaskKind::Transfer(transfer) if transfer.route.len() == 1));
 				result.bridge.insert(task.id);
 			}
 		}
 	}
-	validate_partition_slots(&candidate.draft.tasks, &result)?;
-	Ok(result)
+	result
 }
 
 fn partition_candidate_artifacts<BridgeError>(
@@ -2403,16 +2178,14 @@ fn partition_candidate_artifacts<BridgeError>(
 		let TaskKind::Calculation(calculation) = &task.kind else {
 			continue;
 		};
-		match partitions.tasks.get(&task.id) {
-			Some(TaskOwner::Cuda) => {
+		match partitions.tasks[&task.id] {
+			TaskOwner::Cuda => {
 				cuda_ids.insert(calculation.artifact);
 			}
-			Some(TaskOwner::Hsa) => {
+			TaskOwner::Hsa => {
 				hsa_ids.insert(calculation.artifact);
 			}
-			Some(TaskOwner::Host | TaskOwner::Bridge) | None => {
-				return Err(LocalError::UnsupportedCalculation { task: task.id });
-			}
+			TaskOwner::Host | TaskOwner::Bridge => unreachable!(),
 		}
 	}
 	match cuda_ids.is_disjoint(&hsa_ids) {
@@ -2452,20 +2225,15 @@ fn partition_candidate_artifacts<BridgeError>(
 	}
 }
 
-fn candidate_transfer_owner<BridgeError>(
-	task: TaskId,
+fn candidate_transfer_owner(
 	source: TransferEndpoint,
 	destination: TransferEndpoint,
 	devices: &BTreeMap<DeviceId, LocalDeviceClass>,
-) -> Result<TaskOwner, LocalError<BridgeError>> {
+) -> TaskOwner {
 	match (source, destination) {
 		(TransferEndpoint::External, TransferEndpoint::Device { device, .. })
 		| (TransferEndpoint::Device { device, .. }, TransferEndpoint::External) => {
-			devices
-				.get(&device)
-				.copied()
-				.map(class_owner)
-				.ok_or(LocalError::MissingDevice { device })
+			class_owner(devices[&device])
 		}
 		(
 			TransferEndpoint::Device { device: source, .. },
@@ -2474,124 +2242,43 @@ fn candidate_transfer_owner<BridgeError>(
 				..
 			},
 		) => device_transfer_owner(source, destination, devices),
-		(TransferEndpoint::External, TransferEndpoint::External) => {
-			Err(LocalError::UnsupportedRoute {
-				task,
-				detail: "external-to-external transfers have no local owner",
-			})
-		}
+		(TransferEndpoint::External, TransferEndpoint::External) => unreachable!(),
 	}
 }
 
-fn validate_device_owners<BridgeError>(
+fn validate_device_owners(
 	required: BTreeSet<DeviceId>,
 	declared: &[(DeviceId, LocalDeviceClass)],
-) -> Result<BTreeMap<DeviceId, LocalDeviceClass>, LocalError<BridgeError>> {
+) -> BTreeMap<DeviceId, LocalDeviceClass> {
 	let mut devices = BTreeMap::new();
 	for (device, class) in declared {
-		match devices.insert(*device, *class) {
-			Some(_) => Err(LocalError::DuplicateDevice { device: *device }),
-			None => Ok(()),
-		}?;
+		let prior = devices.insert(*device, *class);
+		debug_assert!(prior.is_none());
 	}
-	for device in &required {
-		match devices.get(device) {
-			Some(_) => Ok(()),
-			None => Err(LocalError::MissingDevice { device: *device }),
-		}?;
-	}
-	for device in devices.keys() {
-		match required.get(device) {
-			Some(_) => Ok(()),
-			None => Err(LocalError::UnexpectedDevice { device: *device }),
-		}?;
-	}
-	Ok(devices)
+	debug_assert!(required.iter().all(|device| devices.contains_key(device)));
+	debug_assert!(devices.keys().all(|device| required.contains(device)));
+	devices
 }
 
-fn validate_partition_slots<BridgeError>(
-	tasks: &[Task],
-	partitions: &Partitions,
-) -> Result<(), LocalError<BridgeError>> {
-	let mut queues = BTreeMap::new();
-	let mut completions = BTreeMap::new();
-	for task in tasks {
-		let owner = partitions
-			.tasks
-			.get(&task.id)
-			.copied()
-			.ok_or(LocalError::TaskNotAssigned { task: task.id })?;
-		let Some(submission) = local_task_submission(task) else {
-			continue;
-		};
-		validate_slot_owner(
-			&mut queues,
-			submission.queue,
-			owner,
-			"one queue slot is shared by different local backend owners",
-		)?;
-		validate_slot_owner(
-			&mut completions,
-			submission.completion,
-			owner,
-			"one completion slot is shared by different local backend owners",
-		)?;
-	}
-	Ok(())
-}
-
-fn validate_slot_owner<Slot: Ord + Copy, BridgeError>(
-	owners: &mut BTreeMap<Slot, TaskOwner>,
-	slot: Slot,
-	owner: TaskOwner,
-	detail: &'static str,
-) -> Result<(), LocalError<BridgeError>> {
-	match owners.insert(slot, owner) {
-		Some(prior) => {
-			match prior == owner {
-				true => Ok(()),
-				false => Err(LocalError::BackendState(detail)),
-			}
-		}
-		None => Ok(()),
-	}
-}
-
-fn local_task_submission(task: &Task) -> Option<SubmissionSlots> {
-	match &task.kind {
-		TaskKind::Calculation(calculation) => Some(calculation.submission),
-		TaskKind::Transfer(transfer) => Some(transfer.submission),
-		TaskKind::Metric(metric) => Some(metric.submission),
-	}
-}
-
-fn device_transfer_owner<BridgeError>(
+fn device_transfer_owner(
 	source: DeviceId,
 	destination: DeviceId,
 	devices: &BTreeMap<DeviceId, LocalDeviceClass>,
-) -> Result<TaskOwner, LocalError<BridgeError>> {
-	let source_class = devices
-		.get(&source)
-		.copied()
-		.ok_or(LocalError::MissingDevice { device: source })?;
-	let destination_class = devices
-		.get(&destination)
-		.copied()
-		.ok_or(LocalError::MissingDevice {
-			device: destination,
-		})?;
+) -> TaskOwner {
+	let source_class = devices[&source];
+	let destination_class = devices[&destination];
 	match (source_class, destination_class) {
-		(LocalDeviceClass::Host, LocalDeviceClass::Host) => Ok(TaskOwner::Host),
-		(LocalDeviceClass::Hsa, LocalDeviceClass::Hsa) => Ok(TaskOwner::Hsa),
+		(LocalDeviceClass::Host, LocalDeviceClass::Host) => TaskOwner::Host,
+		(LocalDeviceClass::Hsa, LocalDeviceClass::Hsa) => TaskOwner::Hsa,
 		(LocalDeviceClass::Cuda, LocalDeviceClass::Cuda) => {
 			match source == destination {
-				true => Ok(TaskOwner::Cuda),
-				false => Ok(TaskOwner::Bridge),
+				true => TaskOwner::Cuda,
+				false => TaskOwner::Bridge,
 			}
 		}
 		(LocalDeviceClass::Host, LocalDeviceClass::Cuda | LocalDeviceClass::Hsa)
 		| (LocalDeviceClass::Cuda, LocalDeviceClass::Host | LocalDeviceClass::Hsa)
-		| (LocalDeviceClass::Hsa, LocalDeviceClass::Host | LocalDeviceClass::Cuda) => Ok(TaskOwner::Bridge),
+		| (LocalDeviceClass::Hsa, LocalDeviceClass::Host | LocalDeviceClass::Cuda) => TaskOwner::Bridge,
 	}
 }
 
@@ -2604,22 +2291,13 @@ fn provisional_warm_bundle(
 ) -> Result<FinalizedBundle, String> {
 	let mut entries = Vec::with_capacity(topology.devices.len());
 	for device in &topology.devices {
-		let discovered = discovery
-			.device(device.id)
-			.ok_or_else(|| format!("warm device {} has no discovery capacity", device.id))?;
-		let reservation = reservations
-			.entry(device.id)
-			.ok_or_else(|| format!("warm device {} has no held reservation", device.id))?;
+		let discovered = discovery.device(device.id).unwrap();
+		let reservation = reservations.entry(device.id).unwrap();
 		let usable = discovered
 			.total_capacity
 			.value
 			.checked_sub(reservation.bytes)
-			.ok_or_else(|| {
-				format!(
-					"warm device {} is smaller than its exact held reservation",
-					device.id
-				)
-			})?;
+			.unwrap();
 		let provenance = discovered.total_capacity.provenance;
 		entries.push(CapacityLedgerEntry {
 			device: device.id,
@@ -2652,7 +2330,7 @@ fn provisional_warm_bundle(
 	.map_err(|errors| format!("candidate warm address resolution failed: {errors}"))
 }
 
-fn prepare_warm_tasks<BridgeError>(bundle: &FinalizedBundle) -> Result<Vec<WarmTask>, LocalError<BridgeError>> {
+fn prepare_warm_tasks(bundle: &FinalizedBundle) -> Vec<WarmTask> {
 	bundle.tasks()
 		.iter()
 		.map(|task| {
@@ -2663,12 +2341,11 @@ fn prepare_warm_tasks<BridgeError>(bundle: &FinalizedBundle) -> Result<Vec<WarmT
 						kernel_template: calculation.kernel_template,
 						artifact: calculation.artifact,
 						submission: calculation.submission,
-						inputs: resolve_warm_values(bundle, task.id, &calculation.inputs)?,
-						outputs: resolve_warm_values(bundle, task.id, &calculation.outputs)?,
+						inputs: resolve_warm_values(bundle, &calculation.inputs),
+						outputs: resolve_warm_values(bundle, &calculation.outputs),
 						fault_flag: calculation
 							.fault_flag
-							.map(|value| resolve_warm_value(bundle, task.id, value))
-							.transpose()?,
+							.map(|value| resolve_warm_value(bundle, value)),
 					}
 				}
 				(TaskKind::Metric(metric), RunPhase::Loop) => {
@@ -2676,7 +2353,7 @@ fn prepare_warm_tasks<BridgeError>(bundle: &FinalizedBundle) -> Result<Vec<WarmT
 						purpose: metric.purpose,
 						metric: metric.metric,
 						slot: metric.slot,
-						value: resolve_warm_value(bundle, task.id, metric.value)?,
+						value: resolve_warm_value(bundle, metric.value),
 						submission: metric.submission,
 					}
 				}
@@ -2687,17 +2364,11 @@ fn prepare_warm_tasks<BridgeError>(bundle: &FinalizedBundle) -> Result<Vec<WarmT
 					) =>
 				{
 					let TransferEndpoint::Device { device, .. } = transfer.destination else {
-						return Err(LocalError::BackendState(
-							"warm admission has no device destination",
-						));
+						unreachable!();
 					};
-					let endpoints = bundle
-						.transfer_endpoints(task.id)
-						.ok_or(LocalError::TaskNotAssigned { task: task.id })?;
+					let endpoints = bundle.transfer_endpoints(task.id).unwrap();
 					let ResolvedTransferEndpoint::Device(destination) = endpoints.destination else {
-						return Err(LocalError::BackendState(
-							"warm admission has no resolved destination",
-						));
+						unreachable!();
 					};
 					WarmWork::Init {
 						device,
@@ -2707,9 +2378,7 @@ fn prepare_warm_tasks<BridgeError>(bundle: &FinalizedBundle) -> Result<Vec<WarmT
 					}
 				}
 				(TaskKind::Transfer(transfer), RunPhase::Init | RunPhase::Loop) => {
-					let endpoints = bundle
-						.transfer_endpoints(task.id)
-						.ok_or(LocalError::TaskNotAssigned { task: task.id })?;
+					let endpoints = bundle.transfer_endpoints(task.id).unwrap();
 					WarmWork::Transfer {
 						class: WorkClass::InternalTransfer,
 						source: endpoints.source,
@@ -2721,9 +2390,7 @@ fn prepare_warm_tasks<BridgeError>(bundle: &FinalizedBundle) -> Result<Vec<WarmT
 					}
 				}
 				(TaskKind::Transfer(transfer), RunPhase::Exit) => {
-					let endpoints = bundle
-						.transfer_endpoints(task.id)
-						.ok_or(LocalError::TaskNotAssigned { task: task.id })?;
+					let endpoints = bundle.transfer_endpoints(task.id).unwrap();
 					WarmWork::Transfer {
 						class: WorkClass::ExitTransfer,
 						source: endpoints.source,
@@ -2734,61 +2401,48 @@ fn prepare_warm_tasks<BridgeError>(bundle: &FinalizedBundle) -> Result<Vec<WarmT
 						submission: transfer.submission,
 					}
 				}
-				(TaskKind::Calculation(_) | TaskKind::Metric(_), RunPhase::Init | RunPhase::Exit) => {
-					return Err(LocalError::BackendState(
-						"warm task kind is illegal in its phase",
-					));
-				}
+				(TaskKind::Calculation(_) | TaskKind::Metric(_), RunPhase::Init | RunPhase::Exit) => unreachable!(),
 			};
-			Ok(WarmTask {
+			WarmTask {
 				id: task.id,
 				phase: task.phase,
 				window: task.window,
 				dependencies: task.dependencies.clone(),
 				work,
-			})
+			}
 		})
 		.collect()
 }
 
-fn resolve_warm_values<BridgeError>(
+fn resolve_warm_values(
 	bundle: &FinalizedBundle,
-	task: TaskId,
 	values: &[recipe_core::ValueId],
-) -> Result<Vec<recipe_core::ResolvedValueLocation>, LocalError<BridgeError>> {
+) -> Vec<recipe_core::ResolvedValueLocation> {
 	values.iter()
-		.map(|value| resolve_warm_value(bundle, task, *value))
+		.map(|value| resolve_warm_value(bundle, *value))
 		.collect()
 }
 
-fn resolve_warm_value<BridgeError>(
+fn resolve_warm_value(
 	bundle: &FinalizedBundle,
-	task: TaskId,
 	value: recipe_core::ValueId,
-) -> Result<recipe_core::ResolvedValueLocation, LocalError<BridgeError>> {
+) -> recipe_core::ResolvedValueLocation {
 	bundle.value_location(value)
 		.copied()
-		.ok_or(LocalError::TaskNotAssigned { task })
+		.unwrap()
 }
 
-fn prepare_warm_images<BridgeError>(
-	bundle: &FinalizedBundle,
-) -> Result<BTreeMap<DeviceId, Vec<u8>>, LocalError<BridgeError>> {
+fn prepare_warm_images(bundle: &FinalizedBundle) -> BTreeMap<DeviceId, Vec<u8>> {
 	bundle.init_images()
 		.iter()
 		.map(|manifest| {
-			let bytes = usize::try_from(manifest.bytes.get()).map_err(|_| {
-				LocalError::CapacityMismatch {
-					device: manifest.device,
-					detail: "warm init image does not fit the host address space",
-				}
-			})?;
-			Ok((manifest.device, vec![0; bytes]))
+			let bytes = usize::try_from(manifest.bytes.get()).unwrap();
+			(manifest.device, vec![0; bytes])
 		})
 		.collect()
 }
 
-fn prepare_warm_exits<BridgeError>(tasks: &[WarmTask]) -> Result<BTreeMap<TaskId, Vec<u8>>, LocalError<BridgeError>> {
+fn prepare_warm_exits(tasks: &[WarmTask]) -> BTreeMap<TaskId, Vec<u8>> {
 	tasks.iter()
 		.filter_map(|task| {
 			task.work
@@ -2796,9 +2450,8 @@ fn prepare_warm_exits<BridgeError>(tasks: &[WarmTask]) -> Result<BTreeMap<TaskId
 				.map(|bytes| (task.id, bytes))
 		})
 		.map(|(task, bytes)| {
-			let bytes = usize::try_from(bytes.get())
-				.map_err(|_| LocalError::BackendState("warm exit image does not fit the host address space"))?;
-			Ok((task, vec![0; bytes]))
+			let bytes = usize::try_from(bytes.get()).unwrap();
+			(task, vec![0; bytes])
 		})
 		.collect()
 }
@@ -2807,36 +2460,29 @@ fn allocate_warm_arena<'cuda, 'hsa, BridgeResource, BridgeError>(
 	resources: &mut LocalResources<'cuda, 'hsa, BridgeResource>,
 	layout: &ArenaLayout,
 ) -> Result<LocalArena<'cuda, 'hsa>, LocalError<BridgeError>> {
-	match resources.devices.get(&layout.device).copied() {
-		Some(LocalDeviceClass::Host) => {
+	match resources.devices[&layout.device] {
+		LocalDeviceClass::Host => {
 			resources
 				.host
 				.as_ref()
-				.ok_or(LocalError::BackendState(
-					"warm host device has no realized host resources",
-				))?
+				.unwrap()
 				.allocate_arena(layout)
 				.map(LocalArena::Host)
 				.map_err(LocalError::Host)
 		}
-		Some(LocalDeviceClass::Cuda) => {
+		LocalDeviceClass::Cuda => {
 			resources
 				.cuda
 				.allocate_arena(layout)
 				.map(LocalArena::Cuda)
 				.map_err(LocalError::Native)
 		}
-		Some(LocalDeviceClass::Hsa) => {
+		LocalDeviceClass::Hsa => {
 			resources
 				.hsa
 				.allocate_arena(layout)
 				.map(LocalArena::Hsa)
 				.map_err(LocalError::Native)
-		}
-		None => {
-			Err(LocalError::MissingDevice {
-				device: layout.device,
-			})
 		}
 	}
 }
@@ -2857,9 +2503,7 @@ where
 	const MAXIMUM_IDLE_DELAY: std::time::Duration = std::time::Duration::from_millis(2);
 
 	let run = recipe_core::RunId::new(u64::from(pass));
-	let iteration = recipe_core::LoopIterations::ONE
-		.iteration(0)
-		.ok_or(LocalError::BackendState("warm loop iteration is absent"))?;
+	let iteration = recipe_core::LoopIterations::ONE.iteration(0).unwrap();
 	let mut states = vec![WarmTaskState::Remaining; tasks.len()];
 	let mut completed = BTreeSet::new();
 	let mut pending = BTreeMap::new();
@@ -2889,43 +2533,31 @@ where
 							submission: task.work.submission(),
 						};
 						let mut token = prepare_warm_pending(bridge, resources, request)?;
-						let work = task.work.backend_work(task.id, run, iteration, images)?;
+						let work = task.work.backend_work(task.id, run, iteration, images);
 						submit_warm_work(bridge, resources, arenas, &mut token, work)?;
-						match pending.insert(task.id, token) {
-							None => {}
-							Some(duplicate) => {
-								drop(duplicate);
-								return Err(LocalError::PendingOwnerMismatch { task: task.id });
-							}
-						}
+						let prior = pending.insert(task.id, token);
+						debug_assert!(prior.is_none());
 						states[index] = WarmTaskState::Pending;
 						progressed = true;
 					}
 				}
 			}
 			for (index, task) in tasks.iter().enumerate() {
-				match task.phase == phase && states[index] == WarmTaskState::Pending {
-					false => continue,
-					true => {}
+				if task.phase != phase || states[index] != WarmTaskState::Pending {
+					continue;
 				}
 				let poll = {
-					let token = pending
-						.get_mut(&task.id)
-						.ok_or(LocalError::PendingOwnerMismatch { task: task.id })?;
+					let token = pending.get_mut(&task.id).unwrap();
 					poll_warm_pending(bridge, resources, token)?
 				};
 				match poll {
 					BackendPoll::Pending => {}
 					BackendPoll::Complete { .. } => {
-						let mut token = pending
-							.remove(&task.id)
-							.ok_or(LocalError::PendingOwnerMismatch { task: task.id })?;
+						let mut token = pending.remove(&task.id).unwrap();
 						if let Some(destination) = exits.get_mut(&task.id) {
-							let work = task
-								.work
-								.backend_work::<Bridge::Error>(task.id, run, iteration, images)?;
+							let work = task.work.backend_work(task.id, run, iteration, images);
 							let BackendWork::ExitTransfer(transfer) = work else {
-								return Err(LocalError::PendingOwnerMismatch { task: task.id });
+								unreachable!()
 							};
 							collect_warm_exit(resources, arenas, &mut token, transfer, destination)?;
 						}
@@ -2940,9 +2572,8 @@ where
 				.iter()
 				.enumerate()
 				.any(|(index, task)| task.phase == phase && states[index] != WarmTaskState::Complete);
-			match remaining {
-				false => break,
-				true => {}
+			if !remaining {
+				break;
 			}
 			match (progressed, pending.is_empty()) {
 				(false, true) => {
@@ -2987,9 +2618,7 @@ where
 			resources
 				.host
 				.as_mut()
-				.ok_or(LocalError::BackendState(
-					"warm host task has no realized resources",
-				))?
+				.unwrap()
 				.prepare_pending(request)
 				.map(LocalPending::Host)
 				.map_err(LocalError::Host)
@@ -3018,7 +2647,7 @@ where
 				})
 				.map_err(LocalError::Bridge)
 		}
-		None => Err(LocalError::TaskNotAssigned { task: request.task }),
+		None => unreachable!("warm request names a finalized task"),
 	}
 }
 
@@ -3037,25 +2666,23 @@ where
 	let lookup = ProjectedArenas { arenas: &arena_set };
 	match pending {
 		LocalPending::Host(pending) => {
-			ensure_owner(resources, task, TaskOwner::Host)?;
+			ensure_owner(resources, task, TaskOwner::Host);
 			resources
 				.host
 				.as_mut()
-				.ok_or(LocalError::BackendState(
-					"warm host task has no realized resources",
-				))?
+				.unwrap()
 				.submit(&lookup, pending, work)
 				.map_err(LocalError::Host)
 		}
 		LocalPending::Cuda(pending) => {
-			ensure_owner(resources, task, TaskOwner::Cuda)?;
+			ensure_owner(resources, task, TaskOwner::Cuda);
 			resources
 				.cuda
 				.submit(&lookup, pending, work)
 				.map_err(LocalError::Native)
 		}
 		LocalPending::Hsa(pending) => {
-			ensure_owner(resources, task, TaskOwner::Hsa)?;
+			ensure_owner(resources, task, TaskOwner::Hsa);
 			resources
 				.hsa
 				.submit(&lookup, pending, work)
@@ -3065,17 +2692,12 @@ where
 			task: pending_task,
 			pending,
 		} => {
-			ensure_owner(resources, task, TaskOwner::Bridge)?;
-			match *pending_task == task {
-				true => Ok(()),
-				false => Err(LocalError::PendingOwnerMismatch { task }),
-			}?;
+			ensure_owner(resources, task, TaskOwner::Bridge);
+			debug_assert_eq!(*pending_task, task);
 			let (class, transfer) = match work {
 				BackendWork::InternalTransfer(transfer) => (WorkClass::InternalTransfer, transfer),
 				BackendWork::ExitTransfer(transfer) => (WorkClass::ExitTransfer, transfer),
-				BackendWork::InitAdmission(_) | BackendWork::Calculation(_) | BackendWork::Metric(_) => {
-					return Err(LocalError::PendingOwnerMismatch { task });
-				}
+				BackendWork::InitAdmission(_) | BackendWork::Calculation(_) | BackendWork::Metric(_) => unreachable!(),
 			};
 			bridge.submit(
 				&mut resources.bridge,
@@ -3102,9 +2724,7 @@ where
 			resources
 				.host
 				.as_mut()
-				.ok_or(LocalError::BackendState(
-					"warm host task has no realized resources",
-				))?
+				.unwrap()
 				.poll_pending(pending)
 				.map_err(LocalError::Host)
 		}
@@ -3136,9 +2756,7 @@ fn collect_warm_exit<'cuda, 'hsa, BridgeResource, BridgePending, BridgeError>(
 			resources
 				.host
 				.as_ref()
-				.ok_or(LocalError::BackendState(
-					"warm host exit has no realized resources",
-				))?
+				.unwrap()
 				.collect_exit(pending, work, destination)
 				.map_err(LocalError::Host)
 		}
@@ -3154,12 +2772,7 @@ fn collect_warm_exit<'cuda, 'hsa, BridgeResource, BridgePending, BridgeError>(
 				.collect_exit(&lookup, pending, work, destination)
 				.map_err(LocalError::Native)
 		}
-		LocalPending::Bridge { .. } => {
-			Err(LocalError::UnsupportedRoute {
-				task: work.task,
-				detail: "warm cross-backend transfer cannot have an external endpoint",
-			})
-		}
+		LocalPending::Bridge { .. } => unreachable!("finalized warm exit has one backend owner"),
 	}
 }
 
@@ -3176,9 +2789,7 @@ where
 			resources
 				.host
 				.as_mut()
-				.ok_or(LocalError::BackendState(
-					"warm host task has no realized resources",
-				))?
+				.unwrap()
 				.recycle_pending(pending)
 				.map_err(LocalError::Host)
 		}
@@ -3290,55 +2901,33 @@ fn observe_capacity_ledger<BridgeError, BridgeResource>(
 	}
 	let mut entries = Vec::with_capacity(topology.devices.len());
 	for device in &topology.devices {
-		discovery
-			.device(device.id)
-			.ok_or(LocalError::CapacityMismatch {
-				device: device.id,
-				detail: "device has no measured discovery capacity",
-			})?;
+		debug_assert!(discovery.device(device.id).is_some());
 		let initial = initial_capacity
 			.available
 			.get(&device.id)
 			.copied()
-			.ok_or(LocalError::CapacityMismatch {
-				device: device.id,
-				detail: "device has no immutable init capacity",
-			})?;
-		let reservation = reservations
-			.entry(device.id)
-			.ok_or(LocalError::CapacityMismatch {
-				device: device.id,
-				detail: "device has no exact held reservation",
-			})?;
-		let available = match resources.devices.get(&device.id).copied() {
-			Some(LocalDeviceClass::Host) => {
+			.unwrap();
+		let reservation = reservations.entry(device.id).unwrap();
+		let available = match resources.devices[&device.id] {
+			LocalDeviceClass::Host => {
 				resources
 					.host
 					.as_ref()
-					.ok_or(LocalError::CapacityMismatch {
-						device: device.id,
-						detail: "host capacity has no realized host resource",
-					})?
+					.unwrap()
 					.available_bytes(device.id)
 					.map_err(LocalError::Host)?
 			}
-			Some(LocalDeviceClass::Cuda) => {
+			LocalDeviceClass::Cuda => {
 				resources
 					.cuda
 					.available_bytes(device.id)
 					.map_err(LocalError::Native)?
 			}
-			Some(LocalDeviceClass::Hsa) => {
+			LocalDeviceClass::Hsa => {
 				resources
 					.hsa
 					.available_bytes(device.id)
 					.map_err(LocalError::Native)?
-			}
-			None => {
-				return Err(LocalError::CapacityMismatch {
-					device: device.id,
-					detail: "device has no local capacity owner",
-				});
 			}
 		};
 		let (overhead, usable) =
@@ -3427,38 +3016,22 @@ fn cleanup_error<E>(first: E, result: Result<(), E>) -> E {
 	}
 }
 
-fn validate_prepared_identity<BridgeError>(
+fn validate_prepared_identity(
 	candidate: &PlannedCandidate,
 	artifacts: &[ArtifactIdentity],
 	reservations: &ReservationLedger,
 	bundle: &FinalizedBundle,
-) -> Result<(), LocalError<BridgeError>> {
-	match bundle.topology() == candidate.draft.topology
+) {
+	debug_assert!(bundle.topology() == candidate.draft.topology
 		&& bundle.discovery() == candidate.draft.discovery
 		&& bundle.draft() == candidate.draft.identity
-		&& bundle.candidate() == candidate.draft.candidate
-	{
-		true => Ok(()),
-		false => {
-			Err(LocalError::BackendState(
-				"finalized bundle identity differs from its prepared candidate",
-			))
-		}
-	}?;
-	match bundle.tasks() == candidate.draft.tasks
+		&& bundle.candidate() == candidate.draft.candidate);
+	debug_assert!(bundle.tasks() == candidate.draft.tasks
 		&& bundle.kernels() == candidate.draft.kernels
 		&& bundle.artifact_builds() == candidate.draft.artifact_builds
 		&& bundle.resources() == &candidate.draft.resources
 		&& bundle.init_images() == candidate.draft.init_images
-		&& bundle.reservations() == reservations
-	{
-		true => Ok(()),
-		false => {
-			Err(LocalError::BackendState(
-				"finalized plan or resources differ from their prepared candidate",
-			))
-		}
-	}?;
+		&& bundle.reservations() == reservations);
 	let prepared_artifacts = artifacts
 		.iter()
 		.map(|artifact| (artifact.id, artifact))
@@ -3468,26 +3041,16 @@ fn validate_prepared_identity<BridgeError>(
 		.iter()
 		.map(|artifact| (artifact.id, artifact))
 		.collect::<BTreeMap<_, _>>();
-	match prepared_artifacts == finalized_artifacts {
-		true => Ok(()),
-		false => {
-			Err(LocalError::BackendState(
-				"finalized artifacts differ from the loaded candidate images",
-			))
-		}
-	}
+	debug_assert_eq!(prepared_artifacts, finalized_artifacts);
 }
 
-fn classify<BridgeError>(
-	bundle: &FinalizedBundle,
-	declared: &[(DeviceId, LocalDeviceClass)],
-) -> Result<Partitions, LocalError<BridgeError>> {
+fn classify(bundle: &FinalizedBundle, declared: &[(DeviceId, LocalDeviceClass)]) -> Partitions {
 	let finalized_devices = bundle
 		.arena_layouts()
 		.iter()
 		.map(|layout| layout.device)
 		.collect::<BTreeSet<_>>();
-	let devices = validate_device_owners(finalized_devices, declared)?;
+	let devices = validate_device_owners(finalized_devices, declared);
 
 	let mut result = Partitions {
 		devices,
@@ -3501,43 +3064,23 @@ fn classify<BridgeError>(
 		let owner =
 			match &task.kind {
 				TaskKind::Calculation(calculation) => {
-					match result.devices.get(&calculation.device) {
-						Some(LocalDeviceClass::Cuda) => TaskOwner::Cuda,
-						Some(LocalDeviceClass::Hsa) => TaskOwner::Hsa,
-						Some(LocalDeviceClass::Host) | None => {
-							return Err(LocalError::UnsupportedCalculation { task: task.id });
-						}
+					match result.devices[&calculation.device] {
+						LocalDeviceClass::Cuda => TaskOwner::Cuda,
+						LocalDeviceClass::Hsa => TaskOwner::Hsa,
+						LocalDeviceClass::Host => unreachable!(),
 					}
 				}
 				TaskKind::Metric(metric) => {
-					let location = bundle
-						.value_location(metric.value)
-						.ok_or(LocalError::TaskNotAssigned { task: task.id })?;
-					class_owner(result.devices.get(&location.device).copied().ok_or(
-						LocalError::MissingDevice {
-							device: location.device,
-						},
-					)?)
+					let location = bundle.value_location(metric.value).unwrap();
+					class_owner(result.devices[&location.device])
 				}
-				TaskKind::Transfer(transfer) => {
-					match transfer.route.len() {
-						0 | 1 => Ok(()),
-						2.. => {
-							Err(LocalError::UnsupportedRoute {
-								task: task.id,
-								detail: "executor-visible transfers must be planner-expanded to one hop",
-							})
-						}
-					}?;
-					let endpoints = bundle
-						.transfer_endpoints(task.id)
-						.ok_or(LocalError::TaskNotAssigned { task: task.id })?;
-					transfer_owner::<BridgeError>(
-						task.id,
+				TaskKind::Transfer(_) => {
+					let endpoints = bundle.transfer_endpoints(task.id).unwrap();
+					transfer_owner(
 						endpoints.source,
 						endpoints.destination,
 						&result.devices,
-					)?
+					)
 				}
 			};
 		result.tasks.insert(task.id, owner);
@@ -3552,66 +3095,30 @@ fn classify<BridgeError>(
 				result.hsa.insert(task.id);
 			}
 			TaskOwner::Bridge => {
-				let route = match &task.kind {
-					TaskKind::Transfer(transfer) => &transfer.route,
-					TaskKind::Calculation(_) | TaskKind::Metric(_) => {
-						return Err(LocalError::UnsupportedRoute {
-							task: task.id,
-							detail: "only transfers may use the cross-backend bridge",
-						});
-					}
-				};
-				match route.len() {
-					1 => Ok(()),
-					0 | 2.. => {
-						Err(LocalError::UnsupportedRoute {
-							task: task.id,
-							detail: "cross-backend transfers require exactly one finalized link",
-						})
-					}
-				}?;
+				debug_assert!(matches!(&task.kind, TaskKind::Transfer(transfer) if transfer.route.len() == 1));
 				result.bridge.insert(task.id);
 			}
 		}
 	}
-	validate_partition_slots(bundle.tasks(), &result)?;
-	Ok(result)
+	result
 }
 
-fn transfer_owner<BridgeError>(
-	task: TaskId,
+fn transfer_owner(
 	source: ResolvedTransferEndpoint,
 	destination: ResolvedTransferEndpoint,
 	devices: &BTreeMap<DeviceId, LocalDeviceClass>,
-) -> Result<TaskOwner, LocalError<BridgeError>> {
+) -> TaskOwner {
 	match (source, destination) {
 		(ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::Device(destination)) => {
-			devices
-				.get(&destination.device)
-				.copied()
-				.map(class_owner)
-				.ok_or(LocalError::MissingDevice {
-					device: destination.device,
-				})
+			class_owner(devices[&destination.device])
 		}
 		(ResolvedTransferEndpoint::Device(source), ResolvedTransferEndpoint::External) => {
-			devices
-				.get(&source.device)
-				.copied()
-				.map(class_owner)
-				.ok_or(LocalError::MissingDevice {
-					device: source.device,
-				})
+			class_owner(devices[&source.device])
 		}
 		(ResolvedTransferEndpoint::Device(source), ResolvedTransferEndpoint::Device(destination)) => {
 			device_transfer_owner(source.device, destination.device, devices)
 		}
-		(ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::External) => {
-			Err(LocalError::UnsupportedRoute {
-				task,
-				detail: "external-to-external transfers have no local owner",
-			})
-		}
+		(ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::External) => unreachable!(),
 	}
 }
 
@@ -3623,27 +3130,17 @@ const fn class_owner(class: LocalDeviceClass) -> TaskOwner {
 	}
 }
 
-fn ensure_owner<BridgeError, BridgeResource>(
+fn ensure_owner<BridgeResource>(
 	resource: &LocalResources<'_, '_, BridgeResource>,
 	task: TaskId,
 	expected: TaskOwner,
-) -> Result<(), LocalError<BridgeError>> {
-	match resource.tasks.get(&task).copied() {
-		Some(actual) => {
-			match actual == expected {
-				true => Ok(()),
-				false => Err(LocalError::PendingOwnerMismatch { task }),
-			}
-		}
-		None => Err(LocalError::TaskNotAssigned { task }),
-	}
+) {
+	debug_assert_eq!(resource.tasks[&task], expected);
 }
 
-fn record<BridgeError>(batch: &mut PhysicalCallBatch, call: PhysicalCall) -> Result<(), LocalError<BridgeError>> {
-	match batch.try_push(call) {
-		Ok(()) => Ok(()),
-		Err(PhysicalCallBatchOverflow) => Err(LocalError::PhysicalAccountingOverflow),
-	}
+fn record(batch: &mut PhysicalCallBatch, call: PhysicalCall) {
+	let result = batch.try_push(call);
+	debug_assert!(result.is_ok());
 }
 
 fn retain_first<E>(first: Option<E>, result: Result<(), E>) -> Option<E> {

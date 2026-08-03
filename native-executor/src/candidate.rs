@@ -90,7 +90,7 @@ pub enum CandidateRequestError {
 	},
 	RuntimeArtifact {
 		artifact: ArtifactId,
-		source: crate::Error,
+		source: Box<crate::Error>,
 	},
 	MissingRuntimeArtifact {
 		artifact: ArtifactId,
@@ -536,7 +536,7 @@ fn validate_artifacts(request: &CandidateRealizationRequest<'_>) -> Result<(), C
 		validate_runtime_artifact(identity, artifact.runtime()).map_err(|source| {
 			CandidateRequestError::RuntimeArtifact {
 				artifact: identity.id,
-				source,
+				source: Box::new(source),
 			}
 		})?;
 	}

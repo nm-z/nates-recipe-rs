@@ -201,6 +201,11 @@ impl TcpPeerSession {
 		let ProbeConnection {
 			sender, receiver, ..
 		} = &mut *connection;
+		let timing = TransferTiming {
+			phase_deadline: measurement_deadline,
+			operation_timeout,
+			control,
+		};
 		let (outbound_evidence, inbound_evidence) = match self.descriptor.duplex {
 			LinkDuplex::Full => {
 				measure_full_duplex(
@@ -209,9 +214,7 @@ impl TcpPeerSession {
 					round,
 					plan.iterations,
 					&payload,
-					measurement_deadline,
-					operation_timeout,
-					control,
+					timing,
 				)
 			}
 			LinkDuplex::Half => {
@@ -222,9 +225,7 @@ impl TcpPeerSession {
 					round,
 					plan.iterations,
 					&payload,
-					measurement_deadline,
-					operation_timeout,
-					control,
+					timing,
 				)
 			}
 		}
@@ -310,10 +311,7 @@ impl PeerSession for TcpPeerSession {
 	fn descriptor(&self) -> ProbeResult<PeerDescriptor> { Ok(self.descriptor.clone()) }
 
 	fn benchmark(&self, plan: BoundedBenchmarkPlan) -> ProbeResult<PeerMeasurement> {
-		let control = match PeerBenchmarkControl::for_plan(plan) {
-			Ok(control) => control,
-			Err(error) => return Err(error),
-		};
+		let control = PeerBenchmarkControl::for_plan(plan)?;
 		self.benchmark_controlled(plan, &control).into_measurement()
 	}
 
@@ -323,7 +321,7 @@ impl PeerSession for TcpPeerSession {
 		control: &PeerBenchmarkControl,
 	) -> PeerBenchmarkAttempt {
 		match self.run_benchmark(plan, control) {
-			Ok(measurement) => PeerBenchmarkAttempt::Measured(measurement),
+			Ok(measurement) => PeerBenchmarkAttempt::Measured(Box::new(measurement)),
 			Err(failure) => PeerBenchmarkAttempt::Failed(failure),
 		}
 	}
@@ -494,6 +492,13 @@ struct DirectionAccumulator {
 	sum_squared_nanoseconds: u128,
 }
 
+#[derive(Clone, Copy)]
+struct TransferTiming<'a> {
+	phase_deadline: Instant,
+	operation_timeout: Duration,
+	control: &'a PeerBenchmarkControl,
+}
+
 impl DirectionAccumulator {
 	fn new() -> Self {
 		Self {
@@ -561,9 +566,7 @@ fn measure_full_duplex(
 	round: u32,
 	iterations: u32,
 	payload: &[u8],
-	phase_deadline: Instant,
-	operation_timeout: Duration,
-	control: &PeerBenchmarkControl,
+	timing: TransferTiming<'_>,
 ) -> TransportResult<(DirectionAccumulator, DirectionAccumulator)> {
 	let barrier = Arc::new(Barrier::new(2));
 	thread::scope(|scope| {
@@ -575,9 +578,7 @@ fn measure_full_duplex(
 				round,
 				iterations,
 				payload.len(),
-				phase_deadline,
-				operation_timeout,
-				control,
+				timing,
 			)
 		});
 		barrier.wait();
@@ -586,9 +587,7 @@ fn measure_full_duplex(
 			round,
 			iterations,
 			payload,
-			phase_deadline,
-			operation_timeout,
-			control,
+			timing,
 		);
 		let inbound = receiver_task
 			.join()
@@ -607,9 +606,7 @@ fn measure_half_duplex(
 	round: u32,
 	iterations: u32,
 	payload: &[u8],
-	phase_deadline: Instant,
-	operation_timeout: Duration,
-	control: &PeerBenchmarkControl,
+	timing: TransferTiming<'_>,
 ) -> TransportResult<(DirectionAccumulator, DirectionAccumulator)> {
 	let local_is_first = identity.local().machine().bytes() < identity.remote().machine().bytes();
 	if local_is_first {
@@ -618,18 +615,14 @@ fn measure_half_duplex(
 			round,
 			iterations,
 			payload,
-			phase_deadline,
-			operation_timeout,
-			control,
+			timing,
 		)?;
 		let inbound = measure_receive(
 			receiver,
 			round,
 			iterations,
 			payload.len(),
-			phase_deadline,
-			operation_timeout,
-			control,
+			timing,
 		)?;
 		Ok((outbound, inbound))
 	} else {
@@ -638,18 +631,14 @@ fn measure_half_duplex(
 			round,
 			iterations,
 			payload.len(),
-			phase_deadline,
-			operation_timeout,
-			control,
+			timing,
 		)?;
 		let outbound = measure_send(
 			sender,
 			round,
 			iterations,
 			payload,
-			phase_deadline,
-			operation_timeout,
-			control,
+			timing,
 		)?;
 		Ok((outbound, inbound))
 	}
@@ -660,13 +649,15 @@ fn measure_send(
 	round: u32,
 	iterations: u32,
 	payload: &[u8],
-	phase_deadline: Instant,
-	operation_timeout: Duration,
-	control: &PeerBenchmarkControl,
+	timing: TransferTiming<'_>,
 ) -> TransportResult<DirectionAccumulator> {
 	let mut measurements = DirectionAccumulator::new();
 	for iteration in 0..iterations {
-		let deadline = transfer_operation_deadline(control, phase_deadline, operation_timeout)?;
+		let deadline = transfer_operation_deadline(
+			timing.control,
+			timing.phase_deadline,
+			timing.operation_timeout,
+		)?;
 		let sample_started = Instant::now();
 		send_exact(
 			sender,
@@ -677,7 +668,7 @@ fn measure_send(
 		)?;
 		measurements.record(sample_started.elapsed())?;
 	}
-	transfer_control_check(control, phase_deadline)?;
+	transfer_control_check(timing.control, timing.phase_deadline)?;
 	Ok(measurements)
 }
 
@@ -686,14 +677,16 @@ fn measure_receive(
 	round: u32,
 	iterations: u32,
 	payload_len: usize,
-	phase_deadline: Instant,
-	operation_timeout: Duration,
-	control: &PeerBenchmarkControl,
+	timing: TransferTiming<'_>,
 ) -> TransportResult<DirectionAccumulator> {
 	let mut payload = vec![0_u8; payload_len];
 	let mut measurements = DirectionAccumulator::new();
 	for iteration in 0..iterations {
-		let deadline = transfer_operation_deadline(control, phase_deadline, operation_timeout)?;
+		let deadline = transfer_operation_deadline(
+			timing.control,
+			timing.phase_deadline,
+			timing.operation_timeout,
+		)?;
 		let sample_started = Instant::now();
 		let received = receive_exact(
 			receiver,
@@ -707,7 +700,7 @@ fn measure_receive(
 		}
 		measurements.record(sample_started.elapsed())?;
 	}
-	transfer_control_check(control, phase_deadline)?;
+	transfer_control_check(timing.control, timing.phase_deadline)?;
 	Ok(measurements)
 }
 

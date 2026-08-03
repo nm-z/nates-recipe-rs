@@ -239,21 +239,3 @@ impl From<recipe_hsa::Error> for Error {
 impl From<recipe_kernel::LoweringError> for Error {
 	fn from(error: recipe_kernel::LoweringError) -> Self { Self::Kernel(error) }
 }
-
-pub(crate) fn ensure_submission_queue_capacity(
-	backend: &'static str,
-	device: DeviceId,
-	requested: usize,
-	maximum: u32,
-) -> Result<()> {
-	if requested <= maximum as usize {
-		Ok(())
-	} else {
-		Err(Error::SubmissionQueueLimitExceeded {
-			backend,
-			device,
-			requested,
-			maximum,
-		})
-	}
-}

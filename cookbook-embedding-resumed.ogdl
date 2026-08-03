@@ -1,0 +1,275 @@
+recipe
+	format	recipe-semantic-model
+	version	13
+	semantics
+		objective	mean-squared-error
+		normalization	identity
+		optimizer	adamw
+	dataset
+		feature-width	3
+		target
+			source-index	3
+			task	scalar-regression
+		vectors
+			vector
+				source-index	0
+				name-bytes	0x746f6b656e5f7a65726f
+				role	feature
+				semantic-type	numeric
+				encoding	int32
+				metadata	none
+			vector
+				source-index	1
+				name-bytes	0x746f6b656e5f6f6e65
+				role	feature
+				semantic-type	numeric
+				encoding	int32
+				metadata	none
+			vector
+				source-index	2
+				name-bytes	0x746f6b656e5f74776f
+				role	feature
+				semantic-type	numeric
+				encoding	int32
+				metadata	none
+			vector
+				source-index	3
+				name-bytes	0x746172676574
+				role	target
+				semantic-type	numeric
+				encoding	int32
+				metadata	none
+		feature-spans
+			span
+				source-index	0
+				start	0
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	1
+				start	1
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	2
+				start	2
+				width	1
+				lowering	numeric-scalar
+		feature-normalization-mask
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+	training
+		epochs	1
+		warmup-epochs	0
+		learning-rate-decay	cosine
+		gradient-clip-norm	none
+		normalization-epsilon	0x358637bd
+		reduction-tree-lanes	1024
+		random-seed	125779785117797
+		adamw
+			learning-rate	0x3a83126f
+			beta-one	0x3f666666
+			beta-two	0x3f7fbe77
+			epsilon	0x322bcc77
+			weight-decay	0x3c23d70a
+		bounds
+			train-rows	6
+			epochs	1
+			training-iterations	1
+			calibration-iterations	0
+			iterations	1
+			warmup-iterations	0
+	model
+		input-width	3
+		output-width	1
+		normalization	identity
+		blocks
+			embedding
+				index	0
+				dimensions	4
+				vocabulary	8
+				sequence-length	3
+				table
+					parameter
+						dtype	f32
+						shape	8	4
+						payload	raw-bytes-hex
+							0xfecc0c3e6b52ffbe539367be683751bf3fce8cbdb0ce2fbe6ba50b3ed857eebe883638bf7614ad3e8bbf87be10eabb3f6f371e3dea7fa0be5ad4123f0fcd2fbd
+							0x4928a8be5642dabf42161e3e381a8dbfc54246be5d7c553f0ecf1c3e2b60dabf703b3bbfa11fe8befa7c3cbd46fcae3d34168e3e5b154ebd9bf5c63de2f820bf
+					first-moment
+						dtype	f32
+						shape	8	4
+						payload	raw-bytes-hex
+							0xc4fab73cc9c604bc225f423c046f79bb64b634bce27712bc8047693c84ad263ce847083ae8d7913cc22190bd8637003bec11af3c28a805bdfe88843d6818a5bc
+							0xa083ef3d5c9e57bdbef1a63d266162bdcec4ef3c0628d13aa64e763c8731c9bc7ab026bdc9c53bbce49e3d3de6e4b53d2baa363a5405063c210a9fbc208a42bc
+					second-moment
+						dtype	f32
+						shape	8	4
+						payload	raw-bytes-hex
+							0x32f2ea3766f47436c75303372c4958353b75e136c893943688533c376d39c036aed41c33ee3b9337da129039ece8753492d3d437d2447838b1017439dc76bd37
+							0x2c29473a1ea021392ad2c139c004323998b5463880de1834de815337f0830c381cccc03877a9f4365684f938ea9ae53957a2e63282f27836d662af3790210337
+			attention
+				index	1
+				sequence-length	3
+				dimensions	4
+				heads	2
+				head-dimension	2
+				query
+					parameter
+						dtype	f32
+						shape	4	4
+						payload	raw-bytes-hex
+							0xe7dc31bd78290ebf2e099a3e0f15943e388bcb3e90b655be834a8ebecd6899bf62aa833e24ef14bffa25873d9bef013fa1ba02409efaa5bf92c84d3e9a6e703e
+					first-moment
+						dtype	f32
+						shape	4	4
+						payload	raw-bytes-hex
+							0xc791c7bc2a581dbadc57f73af8569ebbb8545b3be4e8fc3c3ee1b6bbbaf332bb180d99ba827de13b80d9f0bb12537a3c8c35acbcd0cd75bd36dad33c8a61e0bc
+					second-moment
+						dtype	f32
+						shape	4	4
+						payload	raw-bytes-hex
+							0xba340a388349ac32366b5534eea5ae3521e12735764c5e380836e935ad7add34a2efa133e5be3036ba8d4936f6bb59373e25ce372ffd513908f21b38fec82e38
+				key
+					parameter
+						dtype	f32
+						shape	4	4
+						payload	raw-bytes-hex
+							0xaddf4abfbfba153f6b078abf7ff949bfbbd057be928256bf4fad18bf0600363f6dae96bec04f02bfee4f4a3faeac4ebfeb33e13e672788be15c3fdbe4c410c3f
+					first-moment
+						dtype	f32
+						shape	4	4
+						payload	raw-bytes-hex
+							0xd4fc333c021d49bc96d1cabaf77500bcc7360e3e14d7c2bdb4f562bcaa20f9bc9a5dfbb797fe38bbdcae8aba9e2acbbbbc7ce5bb5a3bc33c4a3f933b9c3ecb3c
+					second-moment
+						dtype	f32
+						shape	4	4
+						payload	raw-bytes-hex
+							0x8ce9e036b4690c37b5010f34e551653676918c3ad6ed033a8231333790c7573878c0152f8a3aed3403a58533c4640f361e933836c47b043812d096359a7b0f38
+				value
+					parameter
+						dtype	f32
+						shape	4	4
+						payload	raw-bytes-hex
+							0x64cb833d2005753f0ac4a0bff3b8323e343f38bf658b913d49e67c3df7d165bf64be993e003bc5bfe3993bbf11e8e0bd65aece3e927db1bd4540c63ecdb04a3f
+					first-moment
+						dtype	f32
+						shape	4	4
+						payload	raw-bytes-hex
+							0xb611f7bcdefaea3abe34353bc841153c5af73abede88703df0bb873dbc64883dfa8b3a3d4e1137bc9cd903bd8784eabcb4b278be9859dcbbc4d03a3ed68a0e3e
+					second-moment
+						dtype	f32
+						shape	4	4
+						payload	raw-bytes-hex
+							0x980654385b6f4c34eeb4e234df6f9a3648ecf23a70d94839bf2880393859813901a8f138faa4e8369898713897123f3878be563b300f28367f68f23a34278d3a
+				output
+					parameter
+						dtype	f32
+						shape	4	4
+						payload	raw-bytes-hex
+							0x8abdb0bf477f8a3ff86aaf3f14cbdbbec3016c3f37b03abf016d6a3fdc3cca3d941428bf4d11a0bfad7843bfa3bfe13e794e763d42a939bfaced24bf0b03f83e
+					first-moment
+						dtype	f32
+						shape	4	4
+						payload	raw-bytes-hex
+							0x760111bd4e54523c036407bcd0fe533cf6feca3cecf0a6bc9a8a92bc50d7c23cce5cc33beb4552bd7c7b2abd4337e73bfc2d03bd051e6bbc9e5832bd10491f3d
+					second-moment
+						dtype	f32
+						shape	4	4
+						payload	raw-bytes-hex
+							0xa90992388cf61937c4607d36e8971b3714340f38a09bc13710ff9437e8e00338b50405364ea71939f60bca384e4d3a36dda16e38863e4037b8addc38a314b038
+			layer	4
+				index	2
+				operations	1
+					operation	relu
+				weight
+					parameter
+						dtype	f32
+						shape	12	4
+						payload	raw-bytes-hex
+							0x7dbefbbeb3ca37be7d2e983ea92f0d3fd1ee153e9b5edf3e18b9cb3ef3e44ebe8c0ff0bc9ae8dd3e93e7843ecbe9b93e6e34243f37d625bec6760cbf5eb28ebe
+							0x52019c3e1f5812bf2b56ffbe530affbe83b9203e569ade3e5f05363fbcde86bd640902bf545dc03e2d3fc53e2c0ab4be67b37bbff541b0be6e324bbe95f2e73d
+							0xab48293e4359f03e639f4abfa420bb3cba2bb83ef5e41b3eeefdccbd7f529cbe2270913e57dbb4be11561ebfea6897bc36552cbd1936cdbdad9485be8a3f5fbc
+					first-moment
+						dtype	f32
+						shape	12	4
+						payload	raw-bytes-hex
+							0xc4e00c3d229f91bcebf2d83a1f56643d8ada12bdae470c3e9d0651bc28d49cbc04bad4bba0ffc53c7c7d13bb42926fbd362d013c364f56bddcaa9f3b6ac33cbc
+							0x38afae3c303e63bd224ba93be31472bd5c2212bdfcfdd93d176822bc0ea6e6bcb84326bc7aeb113cf04c59baaee3aabd3ee5383cb0931ebd15486c3b106c343c
+							0xda6c953c74390cbdf8e9503ba20193bd1cdabfbc1d3f923d6cead9bbd2440fbd06c3dfb98a606bbcaf64af3a7e6392bdfd550a3c74bef3bcd898353b62f0723c
+					second-moment
+						dtype	f32
+						shape	12	4
+						payload	raw-bytes-hex
+							0x5ac4893872e393370ce12334bfbd34395ac1953815b2883ab093173758beaa3716791d36e8b40838d07c9734a8134739a0d667367a831f395ce1b0352f36f736
+							0x86eed337d69233390a14c735a2c34b39295c94382524253aa019b7366cae3838c882c03642a39636b4a5263315b6ca39e49ced369ccdae38b6ce4135993ce236
+							0x12189b3759078938afdc1735455a96398ab5ff376a949439c0c02436e8b48e383e3e4932b6d53f3774ddd43364db943965fc84365e574e3853cee43460644d37
+				bias
+					parameter
+						dtype	f32
+						shape	4
+						payload	raw-bytes-hex
+							0x5e7e193bee7819bb4485193bd87719bb
+					first-moment
+						dtype	f32
+						shape	4
+						payload	raw-bytes-hex
+							0xac01dcbc252d013e687c40bcba4cf63d
+					second-moment
+						dtype	f32
+						shape	4
+						payload	raw-bytes-hex
+							0x64f02738e6b1673a22790037d499523a
+			layer	1
+				index	3
+				operations	0
+				weight
+					parameter
+						dtype	f32
+						shape	4	1
+						payload	raw-bytes-hex
+							0x262c91beabb0443ffea196bd50d89a3f
+					first-moment
+						dtype	f32
+						shape	4	1
+						payload	raw-bytes-hex
+							0x68aac73db4eb6f3e3bbb9b3ee750973d
+					second-moment
+						dtype	f32
+						shape	4	1
+						payload	raw-bytes-hex
+							0x185b0a3a6a14483bf687a83b90159f39
+				bias
+					parameter
+						dtype	f32
+						shape	1
+						payload	raw-bytes-hex
+							0xfc7919bb
+					first-moment
+						dtype	f32
+						shape	1
+						payload	raw-bytes-hex
+							0x6043473e
+					second-moment
+						dtype	f32
+						shape	1
+						payload	raw-bytes-hex
+							0x40d1093b
+	native
+		program	0x3c03bc1c2a99cd4e156a2f8c7d0312cc38fe2350646530699d4396d5541473dc
+		realization	0x4d3f7a5575d874d8842b9fdc5c0827f2860b0caec2028c6336a7a4f21b7e3444
+		topology	0xf850b9da189abfdd314eaeade70d99050198c52e4bbacaf2969455b489db6ee4
+		discovery	0x80b75d51c8ac6e1d52e64d54c66cbd8fea8db2180cdbd672dc24e1cc74a79e7e
+		kernels
+			kernel
+				format	hsaco
+				target
+					backend	amd-rocr-hsa
+					architecture	amdgcn-amd-amdhsa--gfx1101
+					abi	elf64-amdgpu-code-object-v6
+				toolchain
+					name	recipe-owned-llvm-amd-hsa
+					version	auto-pinned-local-tools-and-benchmark-v3
+					digest	0xe82318b2315c84fa4cf78ee39c0cc961c70e918cb3d7ccae19f8f0b15ecc6de6
+				digest	0x518df4a94adecc7fc1104b63df0d61170269e590c6ff9a37a3b6745bc1d1bdb1

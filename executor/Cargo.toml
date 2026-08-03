@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Backend-neutral, typestate execution lifecycle for finalized Recipe bundles"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 recipe-core = { path = "../core" }

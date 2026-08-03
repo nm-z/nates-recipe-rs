@@ -1,9 +1,6 @@
-use core::num::NonZeroU64;
-use std::{
-	collections::{BTreeMap, BTreeSet},
-	io::Write,
-	path::Path,
-};
+use alloc::collections::{BTreeMap, BTreeSet};
+use core::{fmt, num::NonZeroU64, str};
+use std::{io::Write as _, path::Path};
 
 use recipe_ingest::{
 	EncodedImageFormat, ImageColorModel, ImageValueLayout, ImageValueRange, SemanticType, VectorEncoding, VectorRole,
@@ -17,7 +14,9 @@ use crate::{
 	checkpoint::{atomic_save, decode_error, validate_saved_vector},
 };
 
+/// Canonical semantic KNN artifact format version.
 const KNN_MODEL_FORMAT_VERSION: u32 = 1;
+/// Canonical OGDL root name for a semantic KNN artifact.
 const ROOT: &str = "recipe-knn-model";
 
 /// Finite allocation and structural bounds for one semantic KNN model.
@@ -36,19 +35,20 @@ pub struct KnnModelDecodeLimits {
 }
 
 impl Default for KnnModelDecodeLimits {
+	#[inline]
 	fn default() -> Self {
-		Self {
+		return Self {
 			source_bytes: 1 << 30,
 			nodes: 4_000_000,
-			vectors: 65_536,
-			feature_spans: 65_536,
+			vectors: 0x0001_0000,
+			feature_spans: 0x0001_0000,
 			reference_rows: 100_000_000,
 			feature_width: 1_000_000,
-			outputs: 65_536,
+			outputs: 0x0001_0000,
 			labels: 1_000_000,
 			metadata_entries: 1_000_000,
 			total_payload_bytes: 1 << 30,
-		}
+		};
 	}
 }
 
@@ -61,13 +61,24 @@ impl Default for KnnModelDecodeLimits {
 /// policy is deliberately not guessed here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KnnModelArtifact {
+	/// Semantic artifact format version.
 	format_version: u32,
+	/// Immutable KNN reference state.
 	references: KnnReferenceSet,
+	/// Declared feature normalization, when present.
 	data_normalization: Option<DenseDataNormalization>,
+	/// Ordered post-reduction operations.
 	operations: Vec<DenseOperation>,
 }
 
 impl KnnModelArtifact {
+	/// Construct and validate one semantic KNN artifact.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the supplied reference state or declarations are
+	/// inconsistent.
+	#[inline]
 	pub fn new(
 		references: KnnReferenceSet,
 		data_normalization: Option<DenseDataNormalization>,
@@ -80,20 +91,32 @@ impl KnnModelArtifact {
 			operations: operations.into_iter().collect(),
 		};
 		validate_artifact(&artifact)?;
-		Ok(artifact)
+		return Ok(artifact);
 	}
 
 	#[must_use]
-	pub const fn format_version(&self) -> u32 { self.format_version }
+	#[inline]
+	pub const fn format_version(&self) -> u32 {
+		return self.format_version;
+	}
 
 	#[must_use]
-	pub const fn references(&self) -> &KnnReferenceSet { &self.references }
+	#[inline]
+	pub const fn references(&self) -> &KnnReferenceSet {
+		return &self.references;
+	}
 
 	#[must_use]
-	pub const fn data_normalization(&self) -> Option<DenseDataNormalization> { self.data_normalization }
+	#[inline]
+	pub const fn data_normalization(&self) -> Option<DenseDataNormalization> {
+		return self.data_normalization;
+	}
 
 	#[must_use]
-	pub fn operations(&self) -> &[DenseOperation] { &self.operations }
+	#[inline]
+	pub fn operations(&self) -> &[DenseOperation] {
+		return &self.operations;
+	}
 
 	/// Continue one KNN model with another prepared training partition.
 	///
@@ -104,329 +127,580 @@ impl KnnModelArtifact {
 	/// distance-tie order. The current declaration must retain the saved
 	/// neighbors, row-free vector schema, feature lowering, normalization, and
 	/// post-reduction topology.
+	///
+	/// # Errors
+	///
+	/// Returns an error when either artifact is invalid, their declarations are
+	/// incompatible, or their reference storage cannot be combined.
+	#[inline]
 	pub fn continue_with(mut self, current: Self) -> CheckpointResult<Self> {
 		validate_artifact(&self)?;
 		validate_artifact(&current)?;
-		validate_resume_compatibility(&self, &current)?;
-		append_reference_set(&mut self.references, current.references)?;
+		let saved_references = &self.references;
+		let current_references = &current.references;
+		if self.format_version != current.format_version
+			|| saved_references.neighbors != current_references.neighbors
+			|| self.data_normalization != current.data_normalization
+			|| self.operations != current.operations
+		{
+			return Err(incompatible_resume(
+				"saved and current KNN neighbor count, normalization, or topology differ",
+			));
+		}
+		if saved_references.vectors != current_references.vectors
+			|| saved_references.feature_spans != current_references.feature_spans
+			|| saved_references.normalization_mask != current_references.normalization_mask
+			|| saved_references.feature_width != current_references.feature_width
+		{
+			return Err(incompatible_resume(
+				"saved and current KNN row-free vector schemas or feature lowering differ",
+			));
+		}
+		if saved_references.outputs.len() != current_references.outputs.len()
+			|| saved_references
+				.outputs
+				.iter()
+				.zip(&current_references.outputs)
+				.any(|(saved_output, current_output)| return saved_output.schema != current_output.schema)
+		{
+			return Err(incompatible_resume(
+				"saved and current KNN declared output schemas or order differ",
+			));
+		}
+		let appended_references = current.references;
+		let combined_rows = self
+			.references
+			.reference_rows
+			.checked_add(appended_references.reference_rows)
+			.ok_or_else(|| return incompatible_resume("combined KNN reference row count overflowed usize"))?;
+		let combined_feature_elements = combined_rows
+			.checked_mul(self.references.feature_width)
+			.ok_or_else(|| return incompatible_resume("combined KNN reference feature shape overflowed usize"))?;
+		self.references
+			.reference_source_rows
+			.try_reserve_exact(appended_references.reference_source_rows.len())
+			.map_err(|error| return incompatible_resume(format!("reserve combined KNN source rows: {error}")))?;
+		self.references
+			.reference_feature_bits
+			.try_reserve_exact(appended_references.reference_feature_bits.len())
+			.map_err(|error| {
+				return incompatible_resume(format!("reserve combined KNN feature image: {error}"));
+			})?;
+		self.references
+			.reference_source_rows
+			.extend(appended_references.reference_source_rows);
+		self.references
+			.reference_feature_bits
+			.extend(appended_references.reference_feature_bits);
+		for (saved_output, current_output) in self
+			.references
+			.outputs
+			.iter_mut()
+			.zip(appended_references.outputs)
+		{
+			let combined_known = saved_output
+				.known_references
+				.checked_add(current_output.known_references)
+				.ok_or_else(|| {
+					return incompatible_resume("combined KNN known-reference count overflowed u64");
+				})?;
+			saved_output
+				.known
+				.try_reserve_exact(current_output.known.len())
+				.map_err(|error| {
+					return incompatible_resume(format!("reserve combined KNN known mask: {error}"));
+				})?;
+			saved_output.known.extend(current_output.known);
+			saved_output.known_references = combined_known;
+			let current_values = current_output.values;
+			if saved_output.values.is_numeric() != current_values.is_numeric() {
+				return Err(incompatible_resume(
+					"saved and current KNN output aggregation kinds differ",
+				));
+			}
+			if saved_output.values.is_numeric() {
+					let saved_bits = saved_output.values.numeric_f32_bits_mut();
+					let current_bits = current_values.into_numeric_f32_bits();
+					saved_bits
+						.try_reserve_exact(current_bits.len())
+						.map_err(|error| {
+							return incompatible_resume(format!(
+								"reserve combined KNN numeric output: {error}"
+							));
+						})?;
+					saved_bits.extend(current_bits);
+			} else {
+					let (saved_codes, saved_labels) = saved_output.values.discrete_i32_mut();
+					let (current_codes, current_labels) = current_values.into_discrete_i32();
+					let mut codes_by_label = saved_labels
+						.iter()
+						.cloned()
+						.enumerate()
+						.map(|(index, label)| {
+							let code = i32::try_from(index).map_err(|error| {
+								return incompatible_resume(format!(
+									"saved KNN label index does not fit int32: {error}"
+								));
+							})?;
+							return Ok((label, code));
+						})
+						.collect::<CheckpointResult<BTreeMap<_, _>>>()?;
+					for label in &current_labels {
+						if codes_by_label.contains_key(label) {
+							continue;
+						}
+						let code = i32::try_from(saved_labels.len()).map_err(|error| {
+							return incompatible_resume(format!(
+								"combined KNN label index does not fit int32: {error}"
+							));
+						})?;
+						saved_labels.try_reserve_exact(1).map_err(|error| {
+							return incompatible_resume(format!(
+								"reserve combined KNN label dictionary: {error}"
+							));
+						})?;
+						saved_labels.push(label.clone());
+						codes_by_label.insert(label.clone(), code);
+					}
+					saved_codes
+						.try_reserve_exact(current_codes.len())
+						.map_err(|error| {
+							return incompatible_resume(format!(
+								"reserve combined KNN discrete output: {error}"
+							));
+						})?;
+					for code in current_codes {
+						let index = usize::try_from(code).map_err(|error| {
+							return incompatible_resume(format!(
+								"current KNN class code is negative: {error}"
+							));
+						})?;
+						let label = current_labels.get(index).ok_or_else(|| {
+							return incompatible_resume(format!(
+								"current KNN class code {code} is outside its dictionary"
+							));
+						})?;
+						let mapped = codes_by_label.get(label).copied().ok_or_else(|| {
+							return incompatible_resume("combined KNN label has no class code");
+						})?;
+						saved_codes.push(mapped);
+					}
+			}
+		}
+		self.references.reference_rows = combined_rows;
+		if self.references.reference_feature_bits.len() != combined_feature_elements {
+			return Err(incompatible_resume(
+				"combined KNN reference feature image differs from its checked shape",
+			));
+		}
 		validate_artifact(&self)?;
-		Ok(self)
+		return Ok(self);
 	}
 
 	/// Encode one strict canonical textual OGDL model image.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the artifact is invalid or its OGDL graph cannot be
+	/// constructed.
+	#[inline]
 	pub fn encode(&self) -> CheckpointResult<Vec<u8>> {
 		validate_artifact(self)?;
-		let graph = encode_graph(self)?;
-		Ok(graph.to_canonical_string().into_bytes())
+		let mut graph = Graph::new();
+		let root = graph
+			.append_root(ROOT)
+			.map_err(|error| return CheckpointError::manifest(format!("encode KNN root: {error}")))?;
+		field(&mut graph, root, "format-version", &self.format_version)?;
+		field(
+			&mut graph,
+			root,
+			"neighbors",
+			&self.references.neighbors.get(),
+		)?;
+		field(
+			&mut graph,
+			root,
+			"data-normalization",
+			&self.data_normalization.map_or("none", |value| {
+				return match value {
+					DenseDataNormalization::Identity => "identity",
+					DenseDataNormalization::ZScore => "z-score",
+					DenseDataNormalization::MinMax => "min-max",
+					DenseDataNormalization::L2Norm => "l2-norm",
+				};
+			}),
+		)?;
+		let operations = child(&mut graph, root, "operations")?;
+		for operation in &self.operations {
+			field(&mut graph, operations, "operation", &operation.token())?;
+		}
+		let vectors = child(&mut graph, root, "vectors")?;
+		for vector in &self.references.vectors {
+			vector.encode_node(&mut graph, vectors)?;
+		}
+		let spans = child(&mut graph, root, "feature-spans")?;
+		for span in &self.references.feature_spans {
+			let node = child(&mut graph, spans, "span")?;
+			field(&mut graph, node, "source-index", &span.source_vector())?;
+			field(&mut graph, node, "start", &span.start())?;
+			field(&mut graph, node, "width", &span.width())?;
+			let lowering = child(&mut graph, node, "lowering")?;
+			match span.lowering() {
+				DenseFeatureLowering::NumericScalar => {
+					child(&mut graph, lowering, "numeric-scalar")?;
+				}
+				DenseFeatureLowering::CategoricalOneHot {
+					dictionary_width,
+					reserved_index,
+				} => {
+					let tag = child(&mut graph, lowering, "categorical-one-hot")?;
+					field(&mut graph, tag, "dictionary-width", &dictionary_width)?;
+					field(&mut graph, tag, "reserved-index", &reserved_index)?;
+				}
+			}
+		}
+		let mask = child(&mut graph, root, "normalization-mask")?;
+		match self.references.normalization_mask.as_deref() {
+			Some(bits) => {
+				let tag = child(&mut graph, mask, "f32-bits")?;
+				scalar(&mut graph, tag, &encode_u32_hex(bits))?;
+			}
+			None => {
+				child(&mut graph, mask, "none")?;
+			}
+		}
+		let shape = child(&mut graph, root, "reference-shape")?;
+		field(&mut graph, shape, "rows", &self.references.reference_rows)?;
+		field(
+			&mut graph,
+			shape,
+			"feature-width",
+			&self.references.feature_width,
+		)?;
+		field(&mut graph, root, "reference-source-rows", &{
+			const DIGITS: &[u8; 16] = b"0123456789abcdef";
+			let values = &self.references.reference_source_rows;
+			let mut encoded = String::with_capacity(2 + values.len().saturating_mul(16));
+			encoded.push_str("0x");
+			for value in values {
+				let encoded_value = u64::try_from(*value).map_err(|error| {
+					return CheckpointError::manifest(format!("KNN source row does not fit u64: {error}"));
+				})?;
+				for digit_index in (0..16).rev() {
+					let shift = digit_index * 4;
+					let digit = usize::try_from((encoded_value >> shift) & 0x0f).map_err(|error| {
+						return CheckpointError::manifest(format!(
+							"KNN source-row hexadecimal digit is invalid: {error}"
+						));
+					})?;
+					encoded.push(char::from(DIGITS[digit]));
+				}
+			}
+			encoded
+		})?;
+		field(
+			&mut graph,
+			root,
+			"reference-feature-f32-bits",
+			&encode_u32_hex(&self.references.reference_feature_bits),
+		)?;
+		let outputs = child(&mut graph, root, "outputs")?;
+		for output in &self.references.outputs {
+			let node = child(&mut graph, outputs, "output")?;
+			field(
+				&mut graph,
+				node,
+				"source-index",
+				&output.schema.source_index(),
+			)?;
+			let mut known_mask = String::with_capacity(2 + output.known.len());
+			known_mask.push_str("0b");
+			for value in &output.known {
+				known_mask.push(if *value == 1 { '1' } else { '0' });
+			}
+			field(&mut graph, node, "known-mask", &known_mask)?;
+			let values = child(&mut graph, node, "values")?;
+			if output.values.is_numeric() {
+					let tag = child(&mut graph, values, "numeric-f32-bits")?;
+					scalar(
+						&mut graph,
+						tag,
+						&encode_u32_hex(output.values.numeric_f32_bits_storage()),
+					)?;
+			} else {
+					let tag = child(&mut graph, values, "discrete-int32")?;
+					let (codes, labels) = output.values.discrete_i32_storage();
+					let encoded_codes = encode_u32_hex(
+						&codes.iter()
+							.map(|value| return value.cast_unsigned())
+							.collect::<Vec<_>>(),
+					);
+					field(&mut graph, tag, "codes", &encoded_codes)?;
+					let dictionary = child(&mut graph, tag, "labels")?;
+					for label in labels {
+						if let Some(value) = label.as_i32() {
+							field(&mut graph, dictionary, "int32", &value)?;
+						} else {
+							field(&mut graph, dictionary, "bytes", &encode_bytes(label.as_bytes().unwrap()))?;
+						}
+					}
+			}
+		}
+		return Ok(graph.to_canonical_string().into_bytes());
 	}
 
 	/// Decode and validate one bounded semantic KNN model image.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the source is malformed, inconsistent, or exceeds
+	/// the supplied decode limits.
+	#[inline]
 	pub fn decode(source: &[u8], limits: KnnModelDecodeLimits) -> CheckpointResult<Self> {
-		decode_knn_model(source, limits)
+		return Decoder::new(source, limits)?.decode();
 	}
 
 	/// Atomically persist this semantic model as its canonical textual OGDL
 	/// image. The KNN reference state contains no native kernel bytes.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the path is not an `.ogdl` target, encoding fails,
+	/// or the artifact cannot be written atomically.
+	#[inline]
 	pub fn save(&self, path: impl AsRef<Path>) -> CheckpointResult<()> {
-		let path = path.as_ref();
-		if path.extension().and_then(|extension| extension.to_str()) != Some("ogdl") {
+		let target = path.as_ref();
+		if target
+			.extension()
+			.and_then(|extension| return extension.to_str())
+			!= Some("ogdl")
+		{
 			return Err(CheckpointError::invalid_target(
-				path,
+				target,
 				"KNN semantic model path must end in .ogdl",
 			));
 		}
 		let encoded = self.encode()?;
 		let encoded_bytes = u64::try_from(encoded.len()).map_err(|error| {
-			CheckpointError::invalid_target(path, format!("KNN model size exceeds u64: {error}"))
+			return CheckpointError::invalid_target(target, format!("KNN model size exceeds u64: {error}"));
 		})?;
-		atomic_save(path, encoded_bytes, |file| file.write_all(&encoded))
+		return atomic_save(target, encoded_bytes, |file| {
+			return file.write_all(&encoded);
+		});
 	}
 }
 
+/// Decode one bounded canonical semantic KNN model.
+///
+/// # Errors
+///
+/// Returns an error when the source is malformed, inconsistent, or exceeds the
+/// supplied decode limits.
+#[inline]
 pub fn decode_knn_model(source: &[u8], limits: KnnModelDecodeLimits) -> CheckpointResult<KnnModelArtifact> {
-	Decoder::new(source, limits)?.decode()
+	return Decoder::new(source, limits)?.decode();
 }
 
-fn encode_graph(artifact: &KnnModelArtifact) -> CheckpointResult<Graph> {
-	let mut graph = Graph::new();
-	let root = graph
-		.append_root(ROOT)
-		.map_err(|error| CheckpointError::manifest(format!("encode KNN root: {error}")))?;
-	field(&mut graph, root, "format-version", artifact.format_version)?;
-	field(
-		&mut graph,
-		root,
-		"neighbors",
-		artifact.references.neighbors.get(),
-	)?;
-	field(
-		&mut graph,
-		root,
-		"data-normalization",
-		artifact
-			.data_normalization
-			.map_or("none", data_normalization),
-	)?;
+/// Encode one semantic artifact component beneath an OGDL parent node.
+trait EncodeKnnNode {
+	/// Append the component and all of its canonical descendants.
+	fn encode_node(&self, graph: &mut Graph, parent: NodeId) -> CheckpointResult<()>;
+}
 
-	let operations = child(&mut graph, root, "operations")?;
-	for operation in &artifact.operations {
+impl EncodeKnnNode for CheckpointArtifactVector {
+	fn encode_node(&self, graph: &mut Graph, parent: NodeId) -> CheckpointResult<()> {
+		let node = child(graph, parent, "vector")?;
+		field(graph, node, "source-index", &self.source_index())?;
+		field(graph, node, "name-bytes", &encode_bytes(self.name()))?;
 		field(
-			&mut graph,
-			operations,
-			"operation",
-			dense_operation(*operation),
+			graph,
+			node,
+			"role",
+			&match self.role() {
+				VectorRole::Feature => "feature",
+				VectorRole::Target => "target",
+			},
 		)?;
-	}
-
-	let vectors = child(&mut graph, root, "vectors")?;
-	for vector in &artifact.references.vectors {
-		encode_vector(&mut graph, vectors, vector)?;
-	}
-
-	let spans = child(&mut graph, root, "feature-spans")?;
-	for span in &artifact.references.feature_spans {
-		encode_span(&mut graph, spans, span)?;
-	}
-
-	let mask = child(&mut graph, root, "normalization-mask")?;
-	match &artifact.references.normalization_mask {
-		Some(bits) => {
-			let tag = child(&mut graph, mask, "f32-bits")?;
-			scalar(&mut graph, tag, encode_u32_hex(bits))?;
-		}
-		None => {
-			child(&mut graph, mask, "none")?;
-		}
-	}
-
-	let shape = child(&mut graph, root, "reference-shape")?;
-	field(
-		&mut graph,
-		shape,
-		"rows",
-		artifact.references.reference_rows,
-	)?;
-	field(
-		&mut graph,
-		shape,
-		"feature-width",
-		artifact.references.feature_width,
-	)?;
-	field(
-		&mut graph,
-		root,
-		"reference-source-rows",
-		encode_usize_hex(&artifact.references.reference_source_rows)?,
-	)?;
-	field(
-		&mut graph,
-		root,
-		"reference-feature-f32-bits",
-		encode_u32_hex(&artifact.references.reference_feature_bits),
-	)?;
-
-	let outputs = child(&mut graph, root, "outputs")?;
-	for output in &artifact.references.outputs {
-		encode_output(&mut graph, outputs, output)?;
-	}
-	Ok(graph)
-}
-
-fn encode_vector(graph: &mut Graph, parent: NodeId, vector: &CheckpointArtifactVector) -> CheckpointResult<()> {
-	let node = child(graph, parent, "vector")?;
-	field(graph, node, "source-index", vector.source_index())?;
-	field(graph, node, "name-bytes", encode_bytes(vector.name()))?;
-	field(graph, node, "role", vector_role(vector.role()))?;
-	field(
-		graph,
-		node,
-		"semantic-type",
-		semantic_type(vector.semantic_type()),
-	)?;
-	field(graph, node, "encoding", vector_encoding(vector.encoding()))?;
-	encode_metadata(graph, node, vector.metadata())
-}
-
-fn encode_metadata(graph: &mut Graph, parent: NodeId, metadata: &CheckpointArtifactMetadata) -> CheckpointResult<()> {
-	let node = child(graph, parent, "metadata")?;
-	match metadata {
-		CheckpointArtifactMetadata::None => {
-			child(graph, node, "none")?;
-		}
-		CheckpointArtifactMetadata::Temporal {
-			unix_seconds,
-			nanoseconds,
-		} => {
-			let tag = child(graph, node, "temporal")?;
-			field(graph, tag, "unix-seconds", *unix_seconds)?;
-			field(graph, tag, "nanoseconds", *nanoseconds)?;
-		}
-		CheckpointArtifactMetadata::Categorical { dictionary } => {
-			let tag = child(graph, node, "categorical")?;
-			for value in dictionary {
-				field(graph, tag, "value-bytes", encode_bytes(value))?;
+		field(
+			graph,
+			node,
+			"semantic-type",
+			&match self.semantic_type() {
+				SemanticType::Numeric => "numeric",
+				SemanticType::Temporal => "temporal",
+				SemanticType::Categorical => "categorical",
+				SemanticType::Ordinal => "ordinal",
+				SemanticType::Text => "text",
+				SemanticType::Image => "image",
+				SemanticType::Binary => "binary",
+			},
+		)?;
+		field(
+			graph,
+			node,
+			"encoding",
+			&match self.encoding() {
+				VectorEncoding::F32 => "f32",
+				VectorEncoding::I32 => "int32",
+				VectorEncoding::RelativeSecondsI32 => "relative-seconds-int32",
+				VectorEncoding::DictionaryI32 => "dictionary-int32",
+				VectorEncoding::OrdinalI32 => "ordinal-int32",
+				VectorEncoding::Utf8 => "utf8",
+				VectorEncoding::Bytes => "bytes",
+			},
+		)?;
+		let metadata = child(graph, node, "metadata")?;
+		match self.metadata() {
+			CheckpointArtifactMetadata::None => {
+				child(graph, metadata, "none")?;
 			}
-		}
-		CheckpointArtifactMetadata::Ordinal { ordered_labels } => {
-			let tag = child(graph, node, "ordinal")?;
-			for value in ordered_labels {
-				field(graph, tag, "value-bytes", encode_bytes(value))?;
+			CheckpointArtifactMetadata::Temporal {
+				unix_seconds,
+				nanoseconds,
+			} => {
+				let tag = child(graph, metadata, "temporal")?;
+				field(graph, tag, "unix-seconds", unix_seconds)?;
+				field(graph, tag, "nanoseconds", nanoseconds)?;
 			}
-		}
-		CheckpointArtifactMetadata::Image { encoded_variants } => {
-			let tag = child(graph, node, "image")?;
-			for variant in encoded_variants {
-				let item = child(graph, tag, "variant")?;
-				field(graph, item, "format", image_format(variant.format()))?;
-				field(graph, item, "width", variant.width())?;
-				field(graph, item, "height", variant.height())?;
-				field(
-					graph,
-					item,
-					"channels",
-					variant
-						.channels()
-						.map_or_else(|| "none".to_owned(), |value| value.to_string()),
-				)?;
-				field(
-					graph,
-					item,
-					"color-model",
-					variant.color_model().map_or("none", image_color_model),
-				)?;
-				field(
-					graph,
-					item,
-					"sample-bits",
-					variant
-						.sample_bits()
-						.map_or_else(|| "none".to_owned(), |value| value.to_string()),
-				)?;
-				field(
-					graph,
-					item,
-					"value-layout",
-					image_value_layout(variant.value_layout()),
-				)?;
-				field(
-					graph,
-					item,
-					"value-range",
-					image_value_range(variant.value_range()),
-				)?;
+			CheckpointArtifactMetadata::Categorical { dictionary } => {
+				let tag = child(graph, metadata, "categorical")?;
+				for value in dictionary {
+					field(graph, tag, "value-bytes", &encode_bytes(value))?;
+				}
 			}
-		}
-	}
-	Ok(())
-}
-
-fn encode_span(graph: &mut Graph, parent: NodeId, span: &CompiledFeatureSpan) -> CheckpointResult<()> {
-	let node = child(graph, parent, "span")?;
-	field(graph, node, "source-index", span.source_vector())?;
-	field(graph, node, "start", span.start())?;
-	field(graph, node, "width", span.width())?;
-	let lowering = child(graph, node, "lowering")?;
-	match span.lowering() {
-		DenseFeatureLowering::NumericScalar => {
-			child(graph, lowering, "numeric-scalar")?;
-		}
-		DenseFeatureLowering::CategoricalOneHot {
-			dictionary_width,
-			reserved_index,
-		} => {
-			let tag = child(graph, lowering, "categorical-one-hot")?;
-			field(graph, tag, "dictionary-width", dictionary_width)?;
-			field(graph, tag, "reserved-index", reserved_index)?;
-		}
-	}
-	Ok(())
-}
-
-fn encode_output(graph: &mut Graph, parent: NodeId, output: &KnnReferenceOutput) -> CheckpointResult<()> {
-	let node = child(graph, parent, "output")?;
-	field(graph, node, "source-index", output.schema.source_index())?;
-	field(graph, node, "known-mask", encode_known(&output.known))?;
-	let values = child(graph, node, "values")?;
-	match &output.values {
-		KnnReferenceValues::NumericF32Bits(bits) => {
-			let tag = child(graph, values, "numeric-f32-bits")?;
-			scalar(graph, tag, encode_u32_hex(bits))?;
-		}
-		KnnReferenceValues::DiscreteI32 { codes, labels } => {
-			let tag = child(graph, values, "discrete-int32")?;
-			field(graph, tag, "codes", encode_i32_hex(codes))?;
-			let dictionary = child(graph, tag, "labels")?;
-			for label in labels {
-				match label {
-					KnnLabelValue::I32(value) => field(graph, dictionary, "int32", *value)?,
-					KnnLabelValue::Bytes(value) => field(graph, dictionary, "bytes", encode_bytes(value))?,
+			CheckpointArtifactMetadata::Ordinal { ordered_labels } => {
+				let tag = child(graph, metadata, "ordinal")?;
+				for value in ordered_labels {
+					field(graph, tag, "value-bytes", &encode_bytes(value))?;
+				}
+			}
+			CheckpointArtifactMetadata::Image { encoded_variants } => {
+				let tag = child(graph, metadata, "image")?;
+				for variant in encoded_variants {
+					let item = child(graph, tag, "variant")?;
+					field(
+						graph,
+						item,
+						"format",
+						&match variant.format() {
+							EncodedImageFormat::Png => "png",
+							EncodedImageFormat::Jpeg => "jpeg",
+							EncodedImageFormat::Gif87a => "gif87a",
+							EncodedImageFormat::Gif89a => "gif89a",
+							EncodedImageFormat::Bmp => "bmp",
+							EncodedImageFormat::WebP => "webp",
+						},
+					)?;
+					field(graph, item, "width", &variant.width())?;
+					field(graph, item, "height", &variant.height())?;
+					field(
+						graph,
+						item,
+						"channels",
+						&variant.channels().map_or_else(
+							|| return "none".to_owned(),
+							|value| return value.to_string(),
+						),
+					)?;
+					field(
+						graph,
+						item,
+						"color-model",
+						&variant.color_model().map_or("none", |value| {
+							return match value {
+								ImageColorModel::Grayscale => "grayscale",
+								ImageColorModel::GrayscaleAlpha => "grayscale-alpha",
+								ImageColorModel::Rgb => "rgb",
+								ImageColorModel::Rgba => "rgba",
+								ImageColorModel::Bgr => "bgr",
+								ImageColorModel::IndexedRgb => "indexed-rgb",
+								ImageColorModel::YCbCr => "y-cb-cr",
+								ImageColorModel::Cmyk => "cmyk",
+								ImageColorModel::Ycck => "ycck",
+							};
+						}),
+					)?;
+					field(
+						graph,
+						item,
+						"sample-bits",
+						&variant.sample_bits().map_or_else(
+							|| return "none".to_owned(),
+							|value| return value.to_string(),
+						),
+					)?;
+					field(
+						graph,
+						item,
+						"value-layout",
+						&match variant.value_layout() {
+							ImageValueLayout::EncodedFile => "encoded-file",
+						},
+					)?;
+					field(
+						graph,
+						item,
+						"value-range",
+						&match variant.value_range() {
+							ImageValueRange::EncodedBytes => "encoded-bytes",
+						},
+					)?;
 				}
 			}
 		}
+		return Ok(());
 	}
-	Ok(())
 }
 
+/// Append one child node while mapping OGDL errors into checkpoint errors.
 fn child(graph: &mut Graph, parent: NodeId, text: impl Into<String>) -> CheckpointResult<NodeId> {
-	graph.append_child(parent, text)
-		.map_err(|error| CheckpointError::manifest(format!("encode KNN OGDL node: {error}")))
+	return graph
+		.append_child(parent, text)
+		.map_err(|error| return CheckpointError::manifest(format!("encode KNN OGDL node: {error}")));
 }
 
-fn scalar(graph: &mut Graph, parent: NodeId, value: impl ToString) -> CheckpointResult<NodeId> {
-	child(graph, parent, value.to_string())
+/// Append one scalar child value.
+fn scalar(graph: &mut Graph, parent: NodeId, value: &impl ToString) -> CheckpointResult<NodeId> {
+	return child(graph, parent, value.to_string());
 }
 
-fn field(graph: &mut Graph, parent: NodeId, name: impl Into<String>, value: impl ToString) -> CheckpointResult<()> {
+/// Append one named scalar field.
+fn field(graph: &mut Graph, parent: NodeId, name: impl Into<String>, value: &impl ToString) -> CheckpointResult<()> {
 	let node = child(graph, parent, name)?;
 	scalar(graph, node, value)?;
-	Ok(())
+	return Ok(());
 }
 
+/// Encode arbitrary bytes as canonical lowercase hexadecimal.
 fn encode_bytes(bytes: &[u8]) -> String {
 	let mut output = String::with_capacity(2 + bytes.len().saturating_mul(2));
 	output.push_str("0x");
-	for byte in bytes {
-		use core::fmt::Write as _;
-		write!(output, "{byte:02x}").expect("writing to String cannot fail");
-	}
-	output
+	append_hex_bytes(&mut output, bytes);
+	return output;
 }
 
+/// Encode `u32` values as canonical fixed-width lowercase hexadecimal.
 fn encode_u32_hex(values: &[u32]) -> String {
 	let mut output = String::with_capacity(2 + values.len().saturating_mul(8));
 	output.push_str("0x");
 	for value in values {
-		use core::fmt::Write as _;
-		write!(output, "{value:08x}").expect("writing to String cannot fail");
+		append_hex_bytes(&mut output, &value.to_be_bytes());
 	}
-	output
+	return output;
 }
 
-fn encode_i32_hex(values: &[i32]) -> String {
-	encode_u32_hex(&values.iter().map(|value| *value as u32).collect::<Vec<_>>())
-}
-
-fn encode_usize_hex(values: &[usize]) -> CheckpointResult<String> {
-	let mut output = String::with_capacity(2 + values.len().saturating_mul(16));
-	output.push_str("0x");
-	for value in values {
-		let value = u64::try_from(*value)
-			.map_err(|error| CheckpointError::manifest(format!("KNN source row does not fit u64: {error}")))?;
-		use core::fmt::Write as _;
-		write!(output, "{value:016x}").expect("writing to String cannot fail");
+/// Append bytes as lowercase hexadecimal without fallible formatting.
+#[inline]
+fn append_hex_bytes(output: &mut String, bytes: &[u8]) {
+	const DIGITS: &[u8; 16] = b"0123456789abcdef";
+	for byte in bytes {
+		output.push(char::from(DIGITS[usize::from(*byte >> 4)]));
+		output.push(char::from(DIGITS[usize::from(*byte & 0x0f)]));
 	}
-	Ok(output)
+	return;
 }
 
-fn encode_known(values: &[i32]) -> String {
-	let mut output = String::with_capacity(2 + values.len());
-	output.push_str("0b");
-	for value in values {
-		output.push(if *value == 1 { '1' } else { '0' });
-	}
-	output
-}
-
+/// Validate one complete semantic KNN artifact.
 fn validate_artifact(artifact: &KnnModelArtifact) -> CheckpointResult<()> {
 	if artifact.format_version != KNN_MODEL_FORMAT_VERSION {
 		return Err(CheckpointError::manifest(format!(
@@ -436,14 +710,12 @@ fn validate_artifact(artifact: &KnnModelArtifact) -> CheckpointResult<()> {
 	}
 	let references = &artifact.references;
 	if references.reference_rows == 0 || references.feature_width == 0 {
-		return Err(CheckpointError::manifest(
-			"KNN reference rows and feature width must both be nonzero",
-		));
+		return Err(CheckpointError::manifest("KNN reference rows and feature width must both be nonzero"));
 	}
 	let feature_elements = references
 		.reference_rows
 		.checked_mul(references.feature_width)
-		.ok_or_else(|| CheckpointError::manifest("KNN reference feature shape overflowed usize"))?;
+		.ok_or_else(|| return CheckpointError::manifest("KNN reference feature shape overflowed usize"))?;
 	if references.reference_feature_bits.len() != feature_elements {
 		return Err(CheckpointError::manifest(format!(
 			"KNN reference feature image has {} elements, expected {feature_elements}",
@@ -453,7 +725,7 @@ fn validate_artifact(artifact: &KnnModelArtifact) -> CheckpointResult<()> {
 	if references
 		.reference_feature_bits
 		.iter()
-		.any(|bits| !f32::from_bits(*bits).is_finite())
+		.any(|bits| return !f32::from_bits(*bits).is_finite())
 	{
 		return Err(CheckpointError::manifest(
 			"KNN reference features contain a non-finite f32",
@@ -464,180 +736,8 @@ fn validate_artifact(artifact: &KnnModelArtifact) -> CheckpointResult<()> {
 			"KNN reference-source-row count differs from the reference row count",
 		));
 	}
-	validate_vectors(references)?;
-	validate_spans(references)?;
-	validate_mask(references)?;
-	validate_outputs(references)
-}
-
-fn validate_resume_compatibility(saved: &KnnModelArtifact, current: &KnnModelArtifact) -> CheckpointResult<()> {
-	let saved_references = &saved.references;
-	let current_references = &current.references;
-	if saved.format_version != current.format_version
-		|| saved_references.neighbors != current_references.neighbors
-		|| saved.data_normalization != current.data_normalization
-		|| saved.operations != current.operations
-	{
-		return Err(incompatible_resume(
-			"saved and current KNN neighbor count, normalization, or topology differ",
-		));
-	}
-	if saved_references.vectors != current_references.vectors
-		|| saved_references.feature_spans != current_references.feature_spans
-		|| saved_references.normalization_mask != current_references.normalization_mask
-		|| saved_references.feature_width != current_references.feature_width
-	{
-		return Err(incompatible_resume(
-			"saved and current KNN row-free vector schemas or feature lowering differ",
-		));
-	}
-	if saved_references.outputs.len() != current_references.outputs.len()
-		|| saved_references
-			.outputs
-			.iter()
-			.zip(&current_references.outputs)
-			.any(|(saved, current)| saved.schema != current.schema)
-	{
-		return Err(incompatible_resume(
-			"saved and current KNN declared output schemas or order differ",
-		));
-	}
-	Ok(())
-}
-
-fn append_reference_set(saved: &mut KnnReferenceSet, current: KnnReferenceSet) -> CheckpointResult<()> {
-	let combined_rows = saved
-		.reference_rows
-		.checked_add(current.reference_rows)
-		.ok_or_else(|| incompatible_resume("combined KNN reference row count overflowed usize"))?;
-	let combined_feature_elements = combined_rows
-		.checked_mul(saved.feature_width)
-		.ok_or_else(|| incompatible_resume("combined KNN reference feature shape overflowed usize"))?;
-	saved.reference_source_rows
-		.try_reserve_exact(current.reference_source_rows.len())
-		.map_err(|error| incompatible_resume(format!("reserve combined KNN source rows: {error}")))?;
-	saved.reference_feature_bits
-		.try_reserve_exact(current.reference_feature_bits.len())
-		.map_err(|error| incompatible_resume(format!("reserve combined KNN feature image: {error}")))?;
-
-	saved.reference_source_rows
-		.extend(current.reference_source_rows);
-	saved.reference_feature_bits
-		.extend(current.reference_feature_bits);
-	for (saved_output, current_output) in saved.outputs.iter_mut().zip(current.outputs) {
-		append_output(saved_output, current_output)?;
-	}
-	saved.reference_rows = combined_rows;
-	if saved.reference_feature_bits.len() != combined_feature_elements {
-		return Err(incompatible_resume(
-			"combined KNN reference feature image differs from its checked shape",
-		));
-	}
-	Ok(())
-}
-
-fn append_output(saved: &mut KnnReferenceOutput, current: KnnReferenceOutput) -> CheckpointResult<()> {
-	let combined_known = saved
-		.known_references
-		.checked_add(current.known_references)
-		.ok_or_else(|| incompatible_resume("combined KNN known-reference count overflowed u64"))?;
-	saved.known
-		.try_reserve_exact(current.known.len())
-		.map_err(|error| incompatible_resume(format!("reserve combined KNN known mask: {error}")))?;
-	saved.known.extend(current.known);
-	saved.known_references = combined_known;
-
-	match (&mut saved.values, current.values) {
-		(KnnReferenceValues::NumericF32Bits(saved_bits), KnnReferenceValues::NumericF32Bits(current_bits)) => {
-			saved_bits
-				.try_reserve_exact(current_bits.len())
-				.map_err(|error| {
-					incompatible_resume(format!("reserve combined KNN numeric output: {error}"))
-				})?;
-			saved_bits.extend(current_bits);
-		}
-		(
-			KnnReferenceValues::DiscreteI32 {
-				codes: saved_codes,
-				labels: saved_labels,
-			},
-			KnnReferenceValues::DiscreteI32 {
-				codes: current_codes,
-				labels: current_labels,
-			},
-		) => append_discrete_output(saved_codes, saved_labels, current_codes, current_labels)?,
-		_ => {
-			return Err(incompatible_resume(
-				"saved and current KNN output aggregation kinds differ",
-			));
-		}
-	}
-	Ok(())
-}
-
-fn append_discrete_output(
-	saved_codes: &mut Vec<i32>,
-	saved_labels: &mut Vec<KnnLabelValue>,
-	current_codes: Vec<i32>,
-	current_labels: Vec<KnnLabelValue>,
-) -> CheckpointResult<()> {
-	let mut codes_by_label = saved_labels
-		.iter()
-		.cloned()
-		.enumerate()
-		.map(|(index, label)| {
-			let code = i32::try_from(index).map_err(|error| {
-				incompatible_resume(format!("saved KNN label index does not fit int32: {error}"))
-			})?;
-			Ok((label, code))
-		})
-		.collect::<CheckpointResult<BTreeMap<_, _>>>()?;
-	for label in &current_labels {
-		if codes_by_label.contains_key(label) {
-			continue;
-		}
-		let code = i32::try_from(saved_labels.len()).map_err(|error| {
-			incompatible_resume(format!(
-				"combined KNN label index does not fit int32: {error}"
-			))
-		})?;
-		saved_labels
-			.try_reserve_exact(1)
-			.map_err(|error| incompatible_resume(format!("reserve combined KNN label dictionary: {error}")))?;
-		saved_labels.push(label.clone());
-		codes_by_label.insert(label.clone(), code);
-	}
-	saved_codes
-		.try_reserve_exact(current_codes.len())
-		.map_err(|error| incompatible_resume(format!("reserve combined KNN discrete output: {error}")))?;
-	for code in current_codes {
-		let index = usize::try_from(code)
-			.map_err(|error| incompatible_resume(format!("current KNN class code is negative: {error}")))?;
-		let label = current_labels.get(index).ok_or_else(|| {
-			incompatible_resume(format!(
-				"current KNN class code {code} is outside its dictionary"
-			))
-		})?;
-		let mapped = codes_by_label
-			.get(label)
-			.copied()
-			.ok_or_else(|| incompatible_resume("combined KNN label has no class code"))?;
-		saved_codes.push(mapped);
-	}
-	Ok(())
-}
-
-fn incompatible_resume(detail: impl Into<String>) -> CheckpointError {
-	CheckpointError::IncompatibleResume {
-		detail: detail.into(),
-	}
-}
-
-fn validate_vectors(references: &KnnReferenceSet) -> CheckpointResult<()> {
 	if references.vectors.is_empty() {
-		return Err(CheckpointError::manifest(
-			"KNN saved vector schema is empty",
-		));
+		return Err(CheckpointError::manifest("KNN saved vector schema is empty"));
 	}
 	let mut source_indices = BTreeSet::new();
 	let mut names = BTreeSet::new();
@@ -649,7 +749,7 @@ fn validate_vectors(references: &KnnReferenceSet) -> CheckpointResult<()> {
 				vector.source_index()
 			)));
 		}
-		if previous.is_some_and(|prior| prior >= vector.source_index()) {
+		if previous.is_some_and(|prior| return prior >= vector.source_index()) {
 			return Err(CheckpointError::manifest(
 				"KNN vector schemas must retain strictly increasing source order",
 			));
@@ -665,81 +765,65 @@ fn validate_vectors(references: &KnnReferenceSet) -> CheckpointResult<()> {
 			&CheckpointPath::root().field("vectors").index(index),
 		)?;
 	}
-	Ok(())
-}
-
-fn validate_spans(references: &KnnReferenceSet) -> CheckpointResult<()> {
 	if references.feature_spans.is_empty() {
 		return Err(CheckpointError::manifest("KNN feature span list is empty"));
 	}
 	let feature_sources = references
 		.vectors
 		.iter()
-		.filter(|vector| vector.role() == VectorRole::Feature)
+		.filter(|vector| return vector.role() == VectorRole::Feature)
 		.map(CheckpointArtifactVector::source_index)
 		.collect::<BTreeSet<_>>();
-	let mut seen = BTreeSet::new();
+	let mut seen_spans = BTreeSet::new();
 	let mut cursor = 0usize;
 	for span in &references.feature_spans {
 		if span.start() != cursor || span.width() == 0 {
-			return Err(CheckpointError::manifest(
-				"KNN feature spans must be nonempty and contiguous from zero",
-			));
+			return Err(CheckpointError::manifest("KNN feature spans must be nonempty and contiguous from zero"));
 		}
-		if !feature_sources.contains(&span.source_vector()) || !seen.insert(span.source_vector()) {
-			return Err(CheckpointError::manifest(
-				"KNN feature span source is absent, duplicated, or not a feature",
-			));
+		if !feature_sources.contains(&span.source_vector()) || !seen_spans.insert(span.source_vector()) {
+			return Err(CheckpointError::manifest("KNN feature span source is absent, duplicated, or not a feature"));
 		}
 		match span.lowering() {
 			DenseFeatureLowering::NumericScalar if span.width() == 1 => {}
 			DenseFeatureLowering::CategoricalOneHot {
 				dictionary_width,
 				reserved_index,
-			} if reserved_index == dictionary_width && span.width() == dictionary_width.saturating_add(1) => {}
-			_ => {
-				return Err(CheckpointError::manifest(
-					"KNN feature span lowering is internally inconsistent",
-				));
+			} => {
+				if reserved_index != dictionary_width {
+					return Err(CheckpointError::manifest("KNN categorical span reserved index differs from dictionary width"));
+				}
+				if span.width() != dictionary_width.saturating_add(1) {
+					return Err(CheckpointError::manifest("KNN categorical span width differs from encoded dictionary width"));
+				}
+			}
+			DenseFeatureLowering::NumericScalar => {
+				return Err(CheckpointError::manifest("KNN feature span lowering is internally inconsistent"));
 			}
 		}
 		cursor = cursor
 			.checked_add(span.width())
-			.ok_or_else(|| CheckpointError::manifest("KNN feature span width overflowed usize"))?;
+			.ok_or_else(|| return CheckpointError::manifest("KNN feature span width overflowed usize"))?;
 	}
-	if cursor != references.feature_width || seen != feature_sources {
-		return Err(CheckpointError::manifest(
-			"KNN feature spans do not exactly cover every saved feature and feature column",
-		));
+	if cursor != references.feature_width || seen_spans != feature_sources {
+		return Err(CheckpointError::manifest("KNN feature spans do not exactly cover every saved feature column"));
 	}
-	Ok(())
-}
-
-fn validate_mask(references: &KnnReferenceSet) -> CheckpointResult<()> {
-	if let Some(mask) = &references.normalization_mask {
-		if mask.len() != references.feature_width
+	if references.normalization_mask.as_ref().is_some_and(|mask| {
+		return mask.len() != references.feature_width
 			|| mask
 				.iter()
-				.any(|bits| !matches!(*bits, 0x0000_0000 | 0x3f80_0000))
-		{
-			return Err(CheckpointError::manifest(
-				"KNN normalization mask must contain one exact positive-zero/one f32 bit per feature column",
-			));
-		}
-	}
-	Ok(())
-}
-
-fn validate_outputs(references: &KnnReferenceSet) -> CheckpointResult<()> {
-	if references.outputs.is_empty() {
+				.any(|bits| return !matches!(*bits, 0x0000_0000 | 0x3f80_0000));
+	}) {
 		return Err(CheckpointError::manifest(
-			"KNN model has no declared outputs",
+			"KNN normalization mask must contain one exact positive-zero/one f32 bit per feature column",
 		));
+	}
+	if references.outputs.is_empty() {
+		return Err(CheckpointError::manifest("KNN model has no declared outputs"));
 	}
 	let vectors = references
 		.vectors
 		.iter()
-		.map(|vector| (vector.source_index(), vector))
+		.map(|vector| return (vector.source_index(), vector))
 		.collect::<BTreeMap<_, _>>();
 	let mut seen = BTreeSet::new();
 	for output in &references.outputs {
@@ -753,30 +837,42 @@ fn validate_outputs(references: &KnnReferenceSet) -> CheckpointResult<()> {
 			));
 		}
 		if output.known.len() != references.reference_rows
-			|| output.known.iter().any(|value| !matches!(*value, 0 | 1))
+			|| output
+				.known
+				.iter()
+				.any(|value| return !matches!(*value, 0 | 1))
 		{
 			return Err(CheckpointError::manifest(
 				"KNN output known mask is not one binary value per reference row",
 			));
 		}
-		let count = u64::try_from(output.known.iter().filter(|value| **value == 1).count())
-			.map_err(|error| CheckpointError::manifest(format!("KNN known count does not fit u64: {error}")))?;
+		let count = u64::try_from(
+			output.known
+				.iter()
+				.filter(|value| return **value == 1)
+				.count(),
+		)
+		.map_err(|error| {
+			return CheckpointError::manifest(format!("KNN known count does not fit u64: {error}"));
+		})?;
 		if count == 0 || count != output.known_references {
 			return Err(CheckpointError::manifest(
 				"KNN output known-reference count is zero or differs from its mask",
 			));
 		}
-		match &output.values {
-			KnnReferenceValues::NumericF32Bits(bits) => {
+		if output.values.is_numeric() {
+				let bits = output.values.numeric_f32_bits_storage();
 				if bits.len() != references.reference_rows
-					|| bits.iter().any(|bits| !f32::from_bits(*bits).is_finite())
+					|| bits
+						.iter()
+						.any(|encoded_bits| return !f32::from_bits(*encoded_bits).is_finite())
 				{
 					return Err(CheckpointError::manifest(
 						"KNN numeric output must contain one finite f32 per reference row",
 					));
 				}
-			}
-			KnnReferenceValues::DiscreteI32 { codes, labels } => {
+		} else {
+				let (codes, labels) = output.values.discrete_i32_storage();
 				if codes.len() != references.reference_rows
 					|| labels.is_empty() || labels.len() > i32::MAX as usize
 				{
@@ -785,35 +881,47 @@ fn validate_outputs(references: &KnnReferenceSet) -> CheckpointResult<()> {
 					));
 				}
 				let mut unique = BTreeSet::new();
-				if labels.iter().any(|label| !unique.insert(label)) {
+				if labels.iter().any(|label| return !unique.insert(label)) {
 					return Err(CheckpointError::manifest(
 						"KNN discrete output labels are not unique",
 					));
 				}
-				if codes
-					.iter()
-					.any(|code| usize::try_from(*code).map_or(true, |index| index >= labels.len()))
-				{
+				if codes.iter().any(|code| {
+					return usize::try_from(*code).map_or(true, |index| return index >= labels.len());
+				}) {
 					return Err(CheckpointError::manifest(
 						"KNN discrete output contains an invalid class code",
 					));
 				}
-			}
 		}
 	}
-	Ok(())
+	return Ok(());
+}
+
+/// Construct an incompatible-resume checkpoint error.
+fn incompatible_resume(detail: impl Into<String>) -> CheckpointError {
+	return CheckpointError::IncompatibleResume {
+		detail: detail.into(),
+	};
 }
 
 #[derive(Debug)]
+/// Stateful bounded decoder for one semantic KNN artifact.
 struct Decoder {
+	/// Parsed OGDL graph.
 	graph: Graph,
+	/// Caller-provided allocation and structural bounds.
 	limits: KnnModelDecodeLimits,
+	/// Total decoded payload bytes charged so far.
 	payload_bytes: usize,
+	/// Total decoded metadata entries charged so far.
 	metadata_entries: usize,
+	/// Total decoded discrete labels charged so far.
 	labels: usize,
 }
 
 impl Decoder {
+	/// Parse source bytes and establish bounded decoder accounting.
 	fn new(source: &[u8], limits: KnnModelDecodeLimits) -> CheckpointResult<Self> {
 		let root = CheckpointPath::root();
 		if source.len() > limits.source_bytes {
@@ -832,15 +940,15 @@ impl Decoder {
 		} else {
 			1usize.checked_add(
 				source.iter()
-					.filter(|byte| matches!(**byte, b'\n' | b'\t'))
+					.filter(|byte| return matches!(**byte, b'\n' | b'\t'))
 					.count(),
 			)
 			.ok_or_else(|| {
-				decode_error(
+				return decode_error(
 					CheckpointDecodeErrorKind::LimitExceeded,
 					CheckpointPath::root(),
 					"KNN model node pre-count overflowed usize",
-				)
+				);
 			})?
 		};
 		if node_bound > limits.nodes {
@@ -853,19 +961,19 @@ impl Decoder {
 				),
 			));
 		}
-		let text = core::str::from_utf8(source).map_err(|error| {
-			decode_error(
+		let text = str::from_utf8(source).map_err(|error| {
+			return decode_error(
 				CheckpointDecodeErrorKind::InvalidUtf8,
 				CheckpointPath::root(),
 				format!("KNN model is not UTF-8: {error}"),
-			)
+			);
 		})?;
 		let graph = Graph::parse(text).map_err(|error| {
-			decode_error(
+			return decode_error(
 				CheckpointDecodeErrorKind::InvalidSyntax,
 				CheckpointPath::root(),
 				format!("invalid KNN OGDL: {error}"),
-			)
+			);
 		})?;
 		if graph.len() > limits.nodes {
 			return Err(decode_error(
@@ -878,125 +986,112 @@ impl Decoder {
 				),
 			));
 		}
-		Ok(Self {
+		return Ok(Self {
 			graph,
 			limits,
 			payload_bytes: 0,
 			metadata_entries: 0,
 			labels: 0,
-		})
+		});
 	}
 
+	/// Decode and validate the complete semantic KNN artifact.
 	fn decode(mut self) -> CheckpointResult<KnnModelArtifact> {
 		let path = CheckpointPath::root();
-		let [root] = self.graph.roots() else {
+		let roots = self.graph.roots();
+		if roots.len() != 1 {
 			return Err(decode_error(
 				CheckpointDecodeErrorKind::InvalidSyntax,
 				path,
-				format!(
-					"KNN model requires exactly one root, found {}",
-					self.graph.roots().len()
-				),
+				format!("KNN model requires exactly one root, found {}", roots.len()),
 			));
-		};
-		if self.node(*root, &CheckpointPath::root())?.text() != ROOT {
+		}
+		let root = roots.first().copied().ok_or_else(|| {
+			return decode_error(
+				CheckpointDecodeErrorKind::InvalidSyntax,
+				path.clone(),
+				"KNN model root is absent",
+			);
+		})?;
+		if self.node(root, &path)?.text() != ROOT {
 			return Err(decode_error(
 				CheckpointDecodeErrorKind::InvalidValue,
-				CheckpointPath::root(),
+				path,
 				format!("KNN model root must be {ROOT:?}"),
 			));
 		}
-		let fields = self.fields(*root, &CheckpointPath::root(), &[
-			"format-version",
-			"neighbors",
-			"data-normalization",
-			"operations",
-			"vectors",
-			"feature-spans",
-			"normalization-mask",
-			"reference-shape",
-			"reference-source-rows",
-			"reference-feature-f32-bits",
-			"outputs",
-		])?;
-		let format_version = self.parse_u32(
-			self.scalar(
-				fields["format-version"],
-				&CheckpointPath::root().field("format-version"),
-			)?,
-			&CheckpointPath::root().field("format-version"),
+		let fields = self.fields(
+			root,
+			&path,
+			&[
+				"format-version",
+				"neighbors",
+				"data-normalization",
+				"operations",
+				"vectors",
+				"feature-spans",
+				"normalization-mask",
+				"reference-shape",
+				"reference-source-rows",
+				"reference-feature-f32-bits",
+				"outputs",
+			],
 		)?;
+		let format_version_path = path.field("format-version");
+		let format_version = Self::parse_u32(self.scalar(fields["format-version"], &format_version_path)?, &format_version_path)?;
 		if format_version != KNN_MODEL_FORMAT_VERSION {
-			return Err(self.invalid_value(
-				&CheckpointPath::root().field("format-version"),
+			return Err(Self::invalid_value(
+				&format_version_path,
 				format!("unsupported KNN model version {format_version}"),
 			));
 		}
-		let neighbors = self.parse_u64(
-			self.scalar(
-				fields["neighbors"],
-				&CheckpointPath::root().field("neighbors"),
-			)?,
-			&CheckpointPath::root().field("neighbors"),
-		)?;
-		let neighbors = NonZeroU64::new(neighbors).ok_or_else(|| {
-			self.invalid_value(
-				&CheckpointPath::root().field("neighbors"),
+		let neighbors_path = path.field("neighbors");
+		let neighbor_count = parse_canonical(self.scalar(fields["neighbors"], &neighbors_path)?, &neighbors_path)?;
+		let neighbors = NonZeroU64::new(neighbor_count).ok_or_else(|| {
+			return Self::invalid_value(
+				&neighbors_path,
 				"neighbor count must be nonzero",
-			)
+			);
 		})?;
-		let data_normalization = self.parse_data_normalization(
-			self.scalar(
-				fields["data-normalization"],
-				&CheckpointPath::root().field("data-normalization"),
-			)?,
-			&CheckpointPath::root().field("data-normalization"),
-		)?;
+		let data_normalization_path = path.field("data-normalization");
+		let data_normalization = match self.scalar(fields["data-normalization"], &data_normalization_path)? {
+			"none" => None,
+			"z-score" => Some(DenseDataNormalization::ZScore),
+			"min-max" => Some(DenseDataNormalization::MinMax),
+			"l2-norm" => Some(DenseDataNormalization::L2Norm),
+			_ => {
+				return Err(Self::invalid_value(
+					&data_normalization_path,
+					"unknown data normalization",
+				));
+			}
+		};
 		let operations = self.parse_operations(
 			fields["operations"],
-			&CheckpointPath::root().field("operations"),
+			&path.field("operations"),
 		)?;
-		let vectors = self.parse_vectors(fields["vectors"], &CheckpointPath::root().field("vectors"))?;
+		let vectors = self.parse_vectors(fields["vectors"], &path.field("vectors"))?;
 		let feature_spans = self.parse_spans(
 			fields["feature-spans"],
-			&CheckpointPath::root().field("feature-spans"),
+			&path.field("feature-spans"),
 		)?;
 		let normalization_mask = self.parse_mask(
 			fields["normalization-mask"],
-			&CheckpointPath::root().field("normalization-mask"),
+			&path.field("normalization-mask"),
 		)?;
+		let shape_path = path.field("reference-shape");
 		let shape = self.fields(
 			fields["reference-shape"],
-			&CheckpointPath::root().field("reference-shape"),
+			&shape_path,
 			&["rows", "feature-width"],
 		)?;
-		let reference_rows = self.parse_usize(
-			self.scalar(
-				shape["rows"],
-				&CheckpointPath::root()
-					.field("reference-shape")
-					.field("rows"),
-			)?,
-			&CheckpointPath::root()
-				.field("reference-shape")
-				.field("rows"),
-		)?;
-		let feature_width = self.parse_usize(
-			self.scalar(
-				shape["feature-width"],
-				&CheckpointPath::root()
-					.field("reference-shape")
-					.field("feature-width"),
-			)?,
-			&CheckpointPath::root()
-				.field("reference-shape")
-				.field("feature-width"),
-		)?;
+		let rows_path = shape_path.field("rows");
+		let reference_rows = Self::parse_usize(self.scalar(shape["rows"], &rows_path)?, &rows_path)?;
+		let width_path = shape_path.field("feature-width");
+		let feature_width = Self::parse_usize(self.scalar(shape["feature-width"], &width_path)?, &width_path)?;
 		if reference_rows == 0 || reference_rows > self.limits.reference_rows {
-			return Err(self.limit(
-				&CheckpointPath::root()
-					.field("reference-shape")
-					.field("rows"),
+			return Err(Self::limit(
+				&rows_path,
 				format!(
 					"reference row count is {reference_rows}, limit is {}",
 					self.limits.reference_rows
@@ -1004,10 +1099,8 @@ impl Decoder {
 			));
 		}
 		if feature_width == 0 || feature_width > self.limits.feature_width {
-			return Err(self.limit(
-				&CheckpointPath::root()
-					.field("reference-shape")
-					.field("feature-width"),
+			return Err(Self::limit(
+				&width_path,
 				format!(
 					"feature width is {feature_width}, limit is {}",
 					self.limits.feature_width
@@ -1026,10 +1119,10 @@ impl Decoder {
 			&CheckpointPath::root().field("reference-source-rows"),
 		)?;
 		let feature_elements = reference_rows.checked_mul(feature_width).ok_or_else(|| {
-			self.limit(
-				&CheckpointPath::root().field("reference-shape"),
+			return Self::limit(
+				&shape_path,
 				"reference feature element count overflowed usize",
-			)
+			);
 		})?;
 		let reference_feature_bits_value = self
 			.scalar(
@@ -1064,34 +1157,48 @@ impl Decoder {
 			data_normalization,
 			operations,
 		};
-		validate_artifact(&artifact).map_err(|error| {
-			match error {
-				CheckpointError::Decode(error) => CheckpointError::Decode(error),
-				other => {
-					decode_error(
-						CheckpointDecodeErrorKind::InconsistentValue,
-						CheckpointPath::root(),
-						other.to_string(),
-					)
-				}
+		validate_artifact(&artifact).map_err(|validation_error| match validation_error {
+			CheckpointError::Decode(decode_failure) => return CheckpointError::Decode(decode_failure),
+			other @ (CheckpointError::InvalidManifest { .. }
+			| CheckpointError::IncompatibleResume { .. }
+			| CheckpointError::DuplicateOutput { .. }
+			| CheckpointError::MissingOutput { .. }
+			| CheckpointError::UnexpectedOutput { .. }
+			| CheckpointError::OutputDTypeMismatch { .. }
+			| CheckpointError::OutputSizeMismatch { .. }
+			| CheckpointError::NativeKernelUnavailable { .. }
+			| CheckpointError::NativeKernelAmbiguous { .. }
+			| CheckpointError::InvalidTarget { .. }
+			| CheckpointError::InsufficientCapacity { .. }
+			| CheckpointError::Io { .. }) => {
+				return decode_error(
+					CheckpointDecodeErrorKind::InconsistentValue,
+					CheckpointPath::root(),
+					other.to_string(),
+				);
 			}
 		})?;
-		Ok(artifact)
+		return Ok(artifact);
 	}
 
+	/// Decode the ordered dense-operation list.
 	fn parse_operations(&self, node: NodeId, path: &CheckpointPath) -> CheckpointResult<Vec<DenseOperation>> {
 		let children = self.node(node, path)?.children();
 		let mut operations = Vec::with_capacity(children.len());
 		for (index, child) in children.iter().copied().enumerate() {
 			let item_path = path.index(index);
 			if self.node(child, &item_path)?.text() != "operation" {
-				return Err(self.unknown(&item_path, "expected operation entry"));
+				return Err(Self::unknown(&item_path, "expected operation entry"));
 			}
-			operations.push(self.parse_operation(self.scalar(child, &item_path)?, &item_path)?);
+			let value = self.scalar(child, &item_path)?;
+			operations.push(DenseOperation::from_token(value).ok_or_else(|| {
+				return Self::invalid_value(&item_path, format!("unknown dense operation {value:?}"));
+			})?);
 		}
-		Ok(operations)
+		return Ok(operations);
 	}
 
+	/// Decode saved vector schemas in declaration order.
 	fn parse_vectors(
 		&mut self,
 		node: NodeId,
@@ -1099,7 +1206,7 @@ impl Decoder {
 	) -> CheckpointResult<Vec<CheckpointArtifactVector>> {
 		let children = self.node(node, path)?.children().to_vec();
 		if children.len() > self.limits.vectors {
-			return Err(self.limit(
+			return Err(Self::limit(
 				path,
 				format!(
 					"vector count is {}, limit is {}",
@@ -1112,17 +1219,21 @@ impl Decoder {
 		for (index, child) in children.into_iter().enumerate() {
 			let item_path = path.index(index);
 			if self.node(child, &item_path)?.text() != "vector" {
-				return Err(self.unknown(&item_path, "expected vector entry"));
+				return Err(Self::unknown(&item_path, "expected vector entry"));
 			}
-			let fields = self.fields(child, &item_path, &[
-				"source-index",
-				"name-bytes",
-				"role",
-				"semantic-type",
-				"encoding",
-				"metadata",
-			])?;
-			let source_index = self.parse_usize(
+			let fields = self.fields(
+				child,
+				&item_path,
+				&[
+					"source-index",
+					"name-bytes",
+					"role",
+					"semantic-type",
+					"encoding",
+					"metadata",
+				],
+			)?;
+			let source_index = Self::parse_usize(
 				self.scalar(fields["source-index"], &item_path.field("source-index"))?,
 				&item_path.field("source-index"),
 			)?;
@@ -1130,18 +1241,39 @@ impl Decoder {
 				.scalar(fields["name-bytes"], &item_path.field("name-bytes"))?
 				.to_owned();
 			let name = self.parse_bytes(&name_value, &item_path.field("name-bytes"))?;
-			let role = self.parse_role(
-				self.scalar(fields["role"], &item_path.field("role"))?,
-				&item_path.field("role"),
-			)?;
-			let semantic_type = self.parse_semantic(
-				self.scalar(fields["semantic-type"], &item_path.field("semantic-type"))?,
-				&item_path.field("semantic-type"),
-			)?;
-			let encoding = self.parse_encoding(
-				self.scalar(fields["encoding"], &item_path.field("encoding"))?,
-				&item_path.field("encoding"),
-			)?;
+			let role_path = item_path.field("role");
+			let role = match self.scalar(fields["role"], &role_path)? {
+				"feature" => VectorRole::Feature,
+				"target" => VectorRole::Target,
+				_ => return Err(Self::invalid_value(&role_path, "unknown vector role")),
+			};
+			let semantic_path = item_path.field("semantic-type");
+			let semantic_type = match self.scalar(fields["semantic-type"], &semantic_path)? {
+				"numeric" => SemanticType::Numeric,
+				"temporal" => SemanticType::Temporal,
+				"categorical" => SemanticType::Categorical,
+				"ordinal" => SemanticType::Ordinal,
+				"text" => SemanticType::Text,
+				"image" => SemanticType::Image,
+				"binary" => SemanticType::Binary,
+				_ => return Err(Self::invalid_value(&semantic_path, "unknown semantic type")),
+			};
+			let encoding_path = item_path.field("encoding");
+			let encoding = match self.scalar(fields["encoding"], &encoding_path)? {
+				"f32" => VectorEncoding::F32,
+				"int32" => VectorEncoding::I32,
+				"relative-seconds-int32" => VectorEncoding::RelativeSecondsI32,
+				"dictionary-int32" => VectorEncoding::DictionaryI32,
+				"ordinal-int32" => VectorEncoding::OrdinalI32,
+				"utf8" => VectorEncoding::Utf8,
+				"bytes" => VectorEncoding::Bytes,
+				_ => {
+					return Err(Self::invalid_value(
+						&encoding_path,
+						"unknown vector encoding",
+					));
+				}
+			};
 			let metadata = self.parse_metadata(fields["metadata"], &item_path.field("metadata"))?;
 			vectors.push(CheckpointArtifactVector::new(
 				source_index,
@@ -1152,9 +1284,10 @@ impl Decoder {
 				metadata,
 			));
 		}
-		Ok(vectors)
+		return Ok(vectors);
 	}
 
+	/// Decode the metadata attached to one saved vector.
 	fn parse_metadata(
 		&mut self,
 		node: NodeId,
@@ -1163,18 +1296,18 @@ impl Decoder {
 		let tag = self.tag(node, path)?;
 		let text = self.node(tag, path)?.text().to_owned();
 		let children = self.node(tag, path)?.children().to_vec();
-		match text.as_str() {
+		return match text.as_str() {
 			"none" => {
-				self.require_empty(&children, path)?;
+				Self::require_empty(&children, path)?;
 				Ok(CheckpointArtifactMetadata::None)
 			}
 			"temporal" => {
 				let fields = self.fields_from(&children, path, &["unix-seconds", "nanoseconds"])?;
-				let unix_seconds = self.parse_i64(
+				let unix_seconds = parse_canonical(
 					self.scalar(fields["unix-seconds"], &path.field("unix-seconds"))?,
 					&path.field("unix-seconds"),
 				)?;
-				let nanoseconds = self.parse_u32(
+				let nanoseconds = Self::parse_u32(
 					self.scalar(fields["nanoseconds"], &path.field("nanoseconds"))?,
 					&path.field("nanoseconds"),
 				)?;
@@ -1183,39 +1316,41 @@ impl Decoder {
 					nanoseconds,
 				})
 			}
-			"categorical" => {
-				Ok(CheckpointArtifactMetadata::Categorical {
-					dictionary: self.parse_byte_entries(&children, path)?,
-				})
-			}
-			"ordinal" => {
-				Ok(CheckpointArtifactMetadata::Ordinal {
-					ordered_labels: self.parse_byte_entries(&children, path)?,
-				})
-			}
-			"image" => {
-				Ok(CheckpointArtifactMetadata::Image {
-					encoded_variants: self.parse_image_entries(&children, path)?,
-				})
-			}
-			_ => Err(self.invalid_value(path, format!("unknown vector metadata {text:?}"))),
-		}
+			"categorical" => Ok(CheckpointArtifactMetadata::Categorical {
+				dictionary: self.parse_byte_entries(&children, path)?,
+			}),
+			"ordinal" => Ok(CheckpointArtifactMetadata::Ordinal {
+				ordered_labels: self.parse_byte_entries(&children, path)?,
+			}),
+			"image" => Ok(CheckpointArtifactMetadata::Image {
+				encoded_variants: self.parse_image_entries(&children, path)?,
+			}),
+			_ => Err(Self::invalid_value(
+				path,
+				format!("unknown vector metadata {text:?}"),
+			)),
+		};
 	}
 
+	/// Decode a bounded sequence of byte-valued metadata entries.
 	fn parse_byte_entries(&mut self, children: &[NodeId], path: &CheckpointPath) -> CheckpointResult<Vec<Vec<u8>>> {
 		self.reserve_metadata(children.len(), path)?;
 		let mut values = Vec::with_capacity(children.len());
 		for (index, child) in children.iter().copied().enumerate() {
 			let item_path = path.index(index);
 			if self.node(child, &item_path)?.text() != "value-bytes" {
-				return Err(self.unknown(&item_path, "expected value-bytes metadata entry"));
+				return Err(Self::unknown(
+					&item_path,
+					"expected value-bytes metadata entry",
+				));
 			}
 			let value = self.scalar(child, &item_path)?.to_owned();
 			values.push(self.parse_bytes(&value, &item_path)?);
 		}
-		Ok(values)
+		return Ok(values);
 	}
 
+	/// Decode a bounded sequence of encoded-image metadata entries.
 	fn parse_image_entries(
 		&mut self,
 		children: &[NodeId],
@@ -1226,48 +1361,73 @@ impl Decoder {
 		for (index, child) in children.iter().copied().enumerate() {
 			let item_path = path.index(index);
 			if self.node(child, &item_path)?.text() != "variant" {
-				return Err(self.unknown(&item_path, "expected image variant"));
+				return Err(Self::unknown(&item_path, "expected image variant"));
 			}
-			let fields = self.fields(child, &item_path, &[
-				"format",
-				"width",
-				"height",
-				"channels",
-				"color-model",
-				"sample-bits",
-				"value-layout",
-				"value-range",
-			])?;
-			let format = self.parse_image_format(
-				self.scalar(fields["format"], &item_path.field("format"))?,
-				&item_path.field("format"),
+			let fields = self.fields(
+				child,
+				&item_path,
+				&[
+					"format",
+					"width",
+					"height",
+					"channels",
+					"color-model",
+					"sample-bits",
+					"value-layout",
+					"value-range",
+				],
 			)?;
-			let width = self.parse_u32(
+			let format_path = item_path.field("format");
+			let format = match self.scalar(fields["format"], &format_path)? {
+				"png" => EncodedImageFormat::Png,
+				"jpeg" => EncodedImageFormat::Jpeg,
+				"gif87a" => EncodedImageFormat::Gif87a,
+				"gif89a" => EncodedImageFormat::Gif89a,
+				"bmp" => EncodedImageFormat::Bmp,
+				"webp" => EncodedImageFormat::WebP,
+				_ => return Err(Self::invalid_value(&format_path, "unknown image format")),
+			};
+			let width = Self::parse_u32(
 				self.scalar(fields["width"], &item_path.field("width"))?,
 				&item_path.field("width"),
 			)?;
-			let height = self.parse_u32(
+			let height = Self::parse_u32(
 				self.scalar(fields["height"], &item_path.field("height"))?,
 				&item_path.field("height"),
 			)?;
-			let channels = self.parse_optional_u8(
+			let channels = Self::parse_optional_u8(
 				self.scalar(fields["channels"], &item_path.field("channels"))?,
 				&item_path.field("channels"),
 			)?;
-			let color_model = self.parse_color_model(
-				self.scalar(fields["color-model"], &item_path.field("color-model"))?,
-				&item_path.field("color-model"),
-			)?;
-			let sample_bits = self.parse_optional_u8(
+			let color_model_path = item_path.field("color-model");
+			let color_model = match self.scalar(fields["color-model"], &color_model_path)? {
+				"none" => None,
+				"grayscale" => Some(ImageColorModel::Grayscale),
+				"grayscale-alpha" => Some(ImageColorModel::GrayscaleAlpha),
+				"rgb" => Some(ImageColorModel::Rgb),
+				"rgba" => Some(ImageColorModel::Rgba),
+				"bgr" => Some(ImageColorModel::Bgr),
+				"indexed-rgb" => Some(ImageColorModel::IndexedRgb),
+				"y-cb-cr" => Some(ImageColorModel::YCbCr),
+				"cmyk" => Some(ImageColorModel::Cmyk),
+				"ycck" => Some(ImageColorModel::Ycck),
+				_ => {
+					return Err(Self::invalid_value(
+						&color_model_path,
+						"unknown image color model",
+					));
+				}
+			};
+			let sample_bits = Self::parse_optional_u8(
 				self.scalar(fields["sample-bits"], &item_path.field("sample-bits"))?,
 				&item_path.field("sample-bits"),
 			)?;
-			self.expect(
+			Self::expect(
 				self.scalar(fields["value-layout"], &item_path.field("value-layout"))?,
 				"encoded-file",
 				&item_path.field("value-layout"),
 			)?;
-			self.expect(
+			Self::expect(
 				self.scalar(fields["value-range"], &item_path.field("value-range"))?,
 				"encoded-bytes",
 				&item_path.field("value-range"),
@@ -1279,17 +1439,16 @@ impl Decoder {
 				channels,
 				color_model,
 				sample_bits,
-				ImageValueLayout::EncodedFile,
-				ImageValueRange::EncodedBytes,
 			));
 		}
-		Ok(values)
+		return Ok(values);
 	}
 
+	/// Decode the complete dense feature-span layout.
 	fn parse_spans(&self, node: NodeId, path: &CheckpointPath) -> CheckpointResult<Vec<CompiledFeatureSpan>> {
 		let children = self.node(node, path)?.children();
 		if children.len() > self.limits.feature_spans {
-			return Err(self.limit(
+			return Err(Self::limit(
 				path,
 				format!(
 					"feature-span count is {}, limit is {}",
@@ -1302,23 +1461,22 @@ impl Decoder {
 		for (index, child) in children.iter().copied().enumerate() {
 			let item_path = path.index(index);
 			if self.node(child, &item_path)?.text() != "span" {
-				return Err(self.unknown(&item_path, "expected feature span"));
+				return Err(Self::unknown(&item_path, "expected feature span"));
 			}
-			let fields = self.fields(child, &item_path, &[
-				"source-index",
-				"start",
-				"width",
-				"lowering",
-			])?;
-			let source_index = self.parse_usize(
+			let fields = self.fields(
+				child,
+				&item_path,
+				&["source-index", "start", "width", "lowering"],
+			)?;
+			let source_index = Self::parse_usize(
 				self.scalar(fields["source-index"], &item_path.field("source-index"))?,
 				&item_path.field("source-index"),
 			)?;
-			let start = self.parse_usize(
+			let start = Self::parse_usize(
 				self.scalar(fields["start"], &item_path.field("start"))?,
 				&item_path.field("start"),
 			)?;
-			let width = self.parse_usize(
+			let width = Self::parse_usize(
 				self.scalar(fields["width"], &item_path.field("width"))?,
 				&item_path.field("width"),
 			)?;
@@ -1328,26 +1486,27 @@ impl Decoder {
 				.text();
 			let lowering = match lowering_name {
 				"numeric-scalar" => {
-					self.require_empty(
+					Self::require_empty(
 						self.node(lowering_tag, &item_path)?.children(),
 						&item_path.field("lowering"),
 					)?;
 					DenseFeatureLowering::NumericScalar
 				}
 				"categorical-one-hot" => {
-					let tagged_fields = self.fields(lowering_tag, &item_path.field("lowering"), &[
-						"dictionary-width",
-						"reserved-index",
-					])?;
+					let tagged_fields = self.fields(
+						lowering_tag,
+						&item_path.field("lowering"),
+						&["dictionary-width", "reserved-index"],
+					)?;
 					DenseFeatureLowering::CategoricalOneHot {
-						dictionary_width: self.parse_usize(
+						dictionary_width: Self::parse_usize(
 							self.scalar(
 								tagged_fields["dictionary-width"],
 								&item_path.field("lowering").field("dictionary-width"),
 							)?,
 							&item_path.field("lowering").field("dictionary-width"),
 						)?,
-						reserved_index: self.parse_usize(
+						reserved_index: Self::parse_usize(
 							self.scalar(
 								tagged_fields["reserved-index"],
 								&item_path.field("lowering").field("reserved-index"),
@@ -1356,7 +1515,12 @@ impl Decoder {
 						)?,
 					}
 				}
-				_ => return Err(self.invalid_value(&item_path.field("lowering"), "unknown feature lowering")),
+				_ => {
+					return Err(Self::invalid_value(
+						&item_path.field("lowering"),
+						"unknown feature lowering",
+					));
+				}
 			};
 			spans.push(CompiledFeatureSpan::new(
 				source_index,
@@ -1365,27 +1529,29 @@ impl Decoder {
 				lowering,
 			));
 		}
-		Ok(spans)
+		return Ok(spans);
 	}
 
+	/// Decode the optional normalization-mask payload.
 	fn parse_mask(&mut self, node: NodeId, path: &CheckpointPath) -> CheckpointResult<Option<Vec<u32>>> {
 		let tag = self.tag(node, path)?;
-		match self.node(tag, path)?.text() {
+		return match self.node(tag, path)?.text() {
 			"none" => {
-				self.require_empty(self.node(tag, path)?.children(), path)?;
+				Self::require_empty(self.node(tag, path)?.children(), path)?;
 				Ok(None)
 			}
 			"f32-bits" => {
 				let scalar = self.scalar(tag, path)?.to_owned();
 				let count = scalar
 					.strip_prefix("0x")
-					.map_or(0, |digits| digits.len() / 8);
+					.map_or(0, |digits| return digits.len() / 8);
 				self.parse_u32_hex(&scalar, count, path).map(Some)
 			}
-			_ => Err(self.invalid_value(path, "unknown normalization-mask tag")),
-		}
+			_ => Err(Self::invalid_value(path, "unknown normalization-mask tag")),
+		};
 	}
 
+	/// Decode saved target outputs and their reference-row payloads.
 	fn parse_outputs(
 		&mut self,
 		node: NodeId,
@@ -1395,7 +1561,7 @@ impl Decoder {
 	) -> CheckpointResult<Vec<KnnReferenceOutput>> {
 		let children = self.node(node, path)?.children().to_vec();
 		if children.is_empty() || children.len() > self.limits.outputs {
-			return Err(self.limit(
+			return Err(Self::limit(
 				path,
 				format!(
 					"output count is {}, limit is {}",
@@ -1406,42 +1572,42 @@ impl Decoder {
 		}
 		let schemas = vectors
 			.iter()
-			.filter(|vector| vector.role() == VectorRole::Target)
-			.map(|vector| (vector.source_index(), vector))
+			.filter(|vector| return vector.role() == VectorRole::Target)
+			.map(|vector| return (vector.source_index(), vector))
 			.collect::<BTreeMap<_, _>>();
 		let mut outputs = Vec::with_capacity(children.len());
 		for (index, child) in children.into_iter().enumerate() {
 			let item_path = path.index(index);
 			if self.node(child, &item_path)?.text() != "output" {
-				return Err(self.unknown(&item_path, "expected output entry"));
+				return Err(Self::unknown(&item_path, "expected output entry"));
 			}
 			let fields = self.fields(child, &item_path, &["source-index", "known-mask", "values"])?;
-			let source_index = self.parse_usize(
+			let source_index = Self::parse_usize(
 				self.scalar(fields["source-index"], &item_path.field("source-index"))?,
 				&item_path.field("source-index"),
 			)?;
 			let schema = schemas.get(&source_index).copied().ok_or_else(|| {
-				self.invalid_value(
+				return Self::invalid_value(
 					&item_path.field("source-index"),
 					"output source is not a saved target vector",
-				)
+				);
 			})?;
 			let known_value = self
 				.scalar(fields["known-mask"], &item_path.field("known-mask"))?
 				.to_owned();
 			let known = self.parse_known(&known_value, reference_rows, &item_path.field("known-mask"))?;
-			let known_references =
-				u64::try_from(known.iter().filter(|value| **value == 1).count()).map_err(|error| {
-					self.invalid_value(
+			let known_references = u64::try_from(known.iter().filter(|value| return **value == 1).count())
+				.map_err(|error| {
+					return Self::invalid_value(
 						&item_path.field("known-mask"),
 						format!("known count does not fit u64: {error}"),
-					)
+					);
 				})?;
 			let tag = self.tag(fields["values"], &item_path.field("values"))?;
 			let values = match self.node(tag, &item_path.field("values"))?.text() {
 				"numeric-f32-bits" => {
 					let value = self.scalar(tag, &item_path.field("values"))?.to_owned();
-					KnnReferenceValues::NumericF32Bits(self.parse_u32_hex(
+					KnnReferenceValues::from_numeric_f32_bits(self.parse_u32_hex(
 						&value,
 						reference_rows,
 						&item_path.field("values"),
@@ -1464,12 +1630,13 @@ impl Decoder {
 						value_fields["labels"],
 						&item_path.field("values").field("labels"),
 					)?;
-					KnnReferenceValues::DiscreteI32 { codes, labels }
+					KnnReferenceValues::from_discrete_i32(codes, labels)
 				}
 				_ => {
-					return Err(
-						self.invalid_value(&item_path.field("values"), "unknown KNN output value kind")
-					);
+					return Err(Self::invalid_value(
+						&item_path.field("values"),
+						"unknown KNN output value kind",
+					));
 				}
 			};
 			outputs.push(KnnReferenceOutput {
@@ -1479,17 +1646,18 @@ impl Decoder {
 				values,
 			});
 		}
-		Ok(outputs)
+		return Ok(outputs);
 	}
 
+	/// Decode and account for one discrete-label dictionary.
 	fn parse_labels(&mut self, node: NodeId, path: &CheckpointPath) -> CheckpointResult<Vec<KnnLabelValue>> {
 		let children = self.node(node, path)?.children().to_vec();
 		self.labels = self
 			.labels
 			.checked_add(children.len())
-			.ok_or_else(|| self.limit(path, "label count overflowed"))?;
+			.ok_or_else(|| return Self::limit(path, "label count overflowed"))?;
 		if self.labels > self.limits.labels {
-			return Err(self.limit(
+			return Err(Self::limit(
 				path,
 				format!(
 					"label count is {}, limit is {}",
@@ -1503,23 +1671,25 @@ impl Decoder {
 			let kind = self.node(child, &item_path)?.text().to_owned();
 			let value = self.scalar(child, &item_path)?.to_owned();
 			labels.push(match kind.as_str() {
-				"int32" => KnnLabelValue::I32(self.parse_i32(&value, &item_path)?),
-				"bytes" => KnnLabelValue::Bytes(self.parse_bytes(&value, &item_path)?),
-				_ => return Err(self.unknown(&item_path, "expected int32 or bytes label")),
+				"int32" => KnnLabelValue::i32(parse_canonical(&value, &item_path)?),
+				"bytes" => KnnLabelValue::bytes(self.parse_bytes(&value, &item_path)?),
+				_ => return Err(Self::unknown(&item_path, "expected int32 or bytes label")),
 			});
 		}
-		Ok(labels)
+		return Ok(labels);
 	}
 
+	/// Decode one node's required named fields.
 	fn fields(
 		&self,
 		node: NodeId,
 		path: &CheckpointPath,
 		required: &[&str],
 	) -> CheckpointResult<BTreeMap<String, NodeId>> {
-		self.fields_from(self.node(node, path)?.children(), path, required)
+		return self.fields_from(self.node(node, path)?.children(), path, required);
 	}
 
+	/// Decode required named fields from a child-node sequence.
 	fn fields_from(
 		&self,
 		children: &[NodeId],
@@ -1531,7 +1701,10 @@ impl Decoder {
 		for child in children {
 			let name = self.node(*child, path)?.text();
 			if !allowed.contains(name) {
-				return Err(self.unknown(&path.field(name), format!("unknown field {name:?}")));
+				return Err(Self::unknown(
+					&path.field(name),
+					format!("unknown field {name:?}"),
+				));
 			}
 			if fields.insert(name.to_owned(), *child).is_some() {
 				return Err(decode_error(
@@ -1550,54 +1723,73 @@ impl Decoder {
 				));
 			}
 		}
-		Ok(fields)
+		return Ok(fields);
 	}
 
+	/// Resolve one node identity or report invalid graph structure.
 	fn node(&self, id: NodeId, path: &CheckpointPath) -> CheckpointResult<&recipe_ogdl::Node> {
-		self.graph.node(id).ok_or_else(|| {
-			decode_error(
+		return self.graph.node(id).ok_or_else(|| {
+			return decode_error(
 				CheckpointDecodeErrorKind::InvalidSyntax,
 				path.clone(),
 				"KNN OGDL contains an unknown node identity",
-			)
-		})
+			);
+		});
 	}
 
+	/// Decode one scalar child value.
 	fn scalar<'a>(&'a self, node: NodeId, path: &CheckpointPath) -> CheckpointResult<&'a str> {
 		let children = self.node(node, path)?.children();
-		let [value] = children else {
-			return Err(self.invalid_value(path, format!("scalar field has {} values", children.len())));
-		};
-		let value = self.node(*value, path)?;
-		if !value.children().is_empty() {
-			return Err(self.invalid_value(path, "scalar value has descendants"));
+		if children.len() != 1 {
+			return Err(Self::invalid_value(
+				path,
+				format!("scalar field has {} values", children.len()),
+			));
 		}
-		Ok(value.text())
+		let value_node = children
+			.first()
+			.copied()
+			.ok_or_else(|| return Self::invalid_value(path, "scalar value is absent"))?;
+		let scalar_value = self.node(value_node, path)?;
+		if !scalar_value.children().is_empty() {
+			return Err(Self::invalid_value(path, "scalar value has descendants"));
+		}
+		return Ok(scalar_value.text());
 	}
 
+	/// Decode one tagged child node.
 	fn tag(&self, node: NodeId, path: &CheckpointPath) -> CheckpointResult<NodeId> {
 		let children = self.node(node, path)?.children();
-		let [tag] = children else {
-			return Err(self.invalid_value(path, format!("tagged field has {} tags", children.len())));
-		};
-		Ok(*tag)
+		if children.len() != 1 {
+			return Err(Self::invalid_value(
+				path,
+				format!("tagged field has {} tags", children.len()),
+			));
+		}
+		let tag = children
+			.first()
+			.copied()
+			.ok_or_else(|| return Self::invalid_value(path, "tagged value is absent"))?;
+		return Ok(tag);
 	}
 
-	fn require_empty(&self, children: &[NodeId], path: &CheckpointPath) -> CheckpointResult<()> {
-		if children.is_empty() {
+	/// Require that a tagged value has no descendants.
+	fn require_empty(children: &[NodeId], path: &CheckpointPath) -> CheckpointResult<()> {
+		return if children.is_empty() {
 			Ok(())
 		} else {
-			Err(self.unknown(path, "tag has unexpected descendants"))
-		}
+			Err(Self::unknown(path, "tag has unexpected descendants"))
+		};
 	}
 
+	/// Charge decoded payload bytes against the configured bound.
 	fn reserve_payload(&mut self, bytes: usize, path: &CheckpointPath) -> CheckpointResult<()> {
 		self.payload_bytes = self
 			.payload_bytes
 			.checked_add(bytes)
-			.ok_or_else(|| self.limit(path, "payload byte count overflowed"))?;
+			.ok_or_else(|| return Self::limit(path, "payload byte count overflowed"))?;
 		if self.payload_bytes > self.limits.total_payload_bytes {
-			return Err(self.limit(
+			return Err(Self::limit(
 				path,
 				format!(
 					"decoded payload is {} bytes, limit is {}",
@@ -1605,16 +1797,17 @@ impl Decoder {
 				),
 			));
 		}
-		Ok(())
+		return Ok(());
 	}
 
+	/// Charge decoded metadata entries against the configured bound.
 	fn reserve_metadata(&mut self, entries: usize, path: &CheckpointPath) -> CheckpointResult<()> {
 		self.metadata_entries = self
 			.metadata_entries
 			.checked_add(entries)
-			.ok_or_else(|| self.limit(path, "metadata entry count overflowed"))?;
+			.ok_or_else(|| return Self::limit(path, "metadata entry count overflowed"))?;
 		if self.metadata_entries > self.limits.metadata_entries {
-			return Err(self.limit(
+			return Err(Self::limit(
 				path,
 				format!(
 					"metadata entry count is {}, limit is {}",
@@ -1622,57 +1815,86 @@ impl Decoder {
 				),
 			));
 		}
-		Ok(())
+		return Ok(());
 	}
 
+	/// Decode a canonical hexadecimal byte string.
 	fn parse_bytes(&mut self, value: &str, path: &CheckpointPath) -> CheckpointResult<Vec<u8>> {
 		let digits = canonical_hex(value, path)?;
 		if digits.len() % 2 != 0 {
-			return Err(self.invalid_value(path, "hex byte string has an odd digit count"));
+			return Err(Self::invalid_value(
+				path,
+				"hex byte string has an odd digit count",
+			));
 		}
 		let bytes = digits.len() / 2;
 		self.reserve_payload(bytes, path)?;
-		(0..bytes)
-			.map(|index| parse_hex_byte(&digits[index * 2..index * 2 + 2], path))
-			.collect()
+		return (0..bytes)
+			.map(|index| {
+				let start = index * 2;
+				let chunk = digits.get(start..start + 2).ok_or_else(|| {
+					return Self::invalid_value(path, "hex byte boundary is not canonical ASCII");
+				})?;
+				return u8::from_str_radix(chunk, 16).map_err(|error| {
+					return decode_error(
+						CheckpointDecodeErrorKind::InvalidValue,
+						path.clone(),
+						format!("invalid hex byte: {error}"),
+					);
+				});
+			})
+			.collect();
 	}
 
+	/// Decode an exact-count canonical hexadecimal u32 image.
 	fn parse_u32_hex(&mut self, value: &str, count: usize, path: &CheckpointPath) -> CheckpointResult<Vec<u32>> {
 		let digits = canonical_hex(value, path)?;
 		let expected = count
 			.checked_mul(8)
-			.ok_or_else(|| self.limit(path, "u32 hex digit count overflowed"))?;
+			.ok_or_else(|| return Self::limit(path, "u32 hex digit count overflowed"))?;
 		if digits.len() != expected {
-			return Err(self.invalid_value(
+			return Err(Self::invalid_value(
 				path,
 				format!("u32 image has {} digits, expected {expected}", digits.len()),
 			));
 		}
 		self.reserve_payload(
 			count.checked_mul(4)
-				.ok_or_else(|| self.limit(path, "u32 payload overflowed"))?,
+				.ok_or_else(|| return Self::limit(path, "u32 payload overflowed"))?,
 			path,
 		)?;
-		(0..count)
+		return (0..count)
 			.map(|index| {
-				u32::from_str_radix(&digits[index * 8..index * 8 + 8], 16)
-					.map_err(|error| self.invalid_value(path, error.to_string()))
+				let start = index * 8;
+				let chunk = digits
+					.get(start..start + 8)
+					.ok_or_else(|| return Self::invalid_value(path, "u32 boundary is not canonical ASCII"))?;
+				return u32::from_str_radix(chunk, 16)
+					.map_err(|error| return Self::invalid_value(path, error.to_string()));
 			})
-			.collect()
+			.collect();
 	}
 
+	/// Decode an exact-count canonical hexadecimal i32 image.
 	fn parse_i32_hex(&mut self, value: &str, count: usize, path: &CheckpointPath) -> CheckpointResult<Vec<i32>> {
-		self.parse_u32_hex(value, count, path)
-			.map(|values| values.into_iter().map(|value| value as i32).collect())
+		return self
+			.parse_u32_hex(value, count, path)
+			.map(|encoded_values| {
+				return encoded_values
+					.into_iter()
+					.map(|encoded| return encoded.cast_signed())
+					.collect();
+			});
 	}
 
+	/// Decode an exact-count canonical hexadecimal usize image.
 	fn parse_usize_hex(&mut self, value: &str, count: usize, path: &CheckpointPath) -> CheckpointResult<Vec<usize>> {
 		let digits = canonical_hex(value, path)?;
 		let expected = count
 			.checked_mul(16)
-			.ok_or_else(|| self.limit(path, "usize hex digit count overflowed"))?;
+			.ok_or_else(|| return Self::limit(path, "usize hex digit count overflowed"))?;
 		if digits.len() != expected {
-			return Err(self.invalid_value(
+			return Err(Self::invalid_value(
 				path,
 				format!(
 					"source-row image has {} digits, expected {expected}",
@@ -1682,146 +1904,117 @@ impl Decoder {
 		}
 		self.reserve_payload(
 			count.checked_mul(8)
-				.ok_or_else(|| self.limit(path, "source-row payload overflowed"))?,
+				.ok_or_else(|| return Self::limit(path, "source-row payload overflowed"))?,
 			path,
 		)?;
-		(0..count)
+		return (0..count)
 			.map(|index| {
-				let value = u64::from_str_radix(&digits[index * 16..index * 16 + 16], 16)
-					.map_err(|error| self.invalid_value(path, error.to_string()))?;
-				usize::try_from(value).map_err(|error| {
-					self.invalid_value(path, format!("source row does not fit usize: {error}"))
-				})
+				let start = index * 16;
+				let chunk = digits.get(start..start + 16).ok_or_else(|| {
+					return Self::invalid_value(path, "source-row boundary is not canonical ASCII");
+				})?;
+				let source_row = u64::from_str_radix(chunk, 16)
+					.map_err(|error| return Self::invalid_value(path, error.to_string()))?;
+				return usize::try_from(source_row).map_err(|error| {
+					return Self::invalid_value(path, format!("source row does not fit usize: {error}"));
+				});
 			})
-			.collect()
+			.collect();
 	}
 
+	/// Decode an exact-count canonical binary known-value mask.
 	fn parse_known(&mut self, value: &str, count: usize, path: &CheckpointPath) -> CheckpointResult<Vec<i32>> {
 		let digits = value
 			.strip_prefix("0b")
-			.ok_or_else(|| self.invalid_value(path, "known mask lacks canonical 0b prefix"))?;
-		if digits.len() != count || digits.bytes().any(|byte| !matches!(byte, b'0' | b'1')) {
-			return Err(self.invalid_value(
+			.ok_or_else(|| return Self::invalid_value(path, "known mask lacks canonical 0b prefix"))?;
+		if digits.len() != count
+			|| digits
+				.bytes()
+				.any(|byte| return !matches!(byte, b'0' | b'1'))
+		{
+			return Err(Self::invalid_value(
 				path,
 				format!("known mask must contain exactly {count} binary digits"),
 			));
 		}
 		self.reserve_payload(count, path)?;
-		Ok(digits.bytes().map(|byte| i32::from(byte == b'1')).collect())
+		return Ok(digits
+			.bytes()
+			.map(|byte| return i32::from(byte == b'1'))
+			.collect());
 	}
 
-	fn parse_usize(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<usize> {
-		parse_canonical(value, path)
+	/// Decode one canonical usize scalar.
+	fn parse_usize(value: &str, path: &CheckpointPath) -> CheckpointResult<usize> {
+		return parse_canonical(value, path);
 	}
 
-	fn parse_u64(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<u64> { parse_canonical(value, path) }
+	/// Decode one canonical u32 scalar.
+	fn parse_u32(value: &str, path: &CheckpointPath) -> CheckpointResult<u32> {
+		return parse_canonical(value, path);
+	}
 
-	fn parse_u32(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<u32> { parse_canonical(value, path) }
-
-	fn parse_i32(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<i32> { parse_canonical(value, path) }
-
-	fn parse_i64(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<i64> { parse_canonical(value, path) }
-
-	fn parse_optional_u8(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<Option<u8>> {
-		if value == "none" {
+	/// Decode an optional canonical u8 scalar.
+	fn parse_optional_u8(value: &str, path: &CheckpointPath) -> CheckpointResult<Option<u8>> {
+		return if value == "none" {
 			Ok(None)
 		} else {
 			parse_canonical(value, path).map(Some)
-		}
+		};
 	}
 
-	fn parse_data_normalization(
-		&self,
-		value: &str,
-		path: &CheckpointPath,
-	) -> CheckpointResult<Option<DenseDataNormalization>> {
-		match value {
-			"none" => Ok(None),
-			"z-score" => Ok(Some(DenseDataNormalization::ZScore)),
-			"min-max" => Ok(Some(DenseDataNormalization::MinMax)),
-			"l2-norm" => Ok(Some(DenseDataNormalization::L2Norm)),
-			_ => Err(self.invalid_value(path, "unknown data normalization")),
-		}
-	}
-
-	fn parse_operation(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<DenseOperation> {
-		parse_operation(value).ok_or_else(|| self.invalid_value(path, format!("unknown dense operation {value:?}")))
-	}
-
-	fn parse_role(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<VectorRole> {
-		match value {
-			"feature" => Ok(VectorRole::Feature),
-			"target" => Ok(VectorRole::Target),
-			_ => Err(self.invalid_value(path, "unknown vector role")),
-		}
-	}
-
-	fn parse_semantic(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<SemanticType> {
-		parse_semantic_type(value).ok_or_else(|| self.invalid_value(path, "unknown semantic type"))
-	}
-
-	fn parse_encoding(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<VectorEncoding> {
-		parse_vector_encoding(value).ok_or_else(|| self.invalid_value(path, "unknown vector encoding"))
-	}
-
-	fn parse_image_format(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<EncodedImageFormat> {
-		parse_image_format(value).ok_or_else(|| self.invalid_value(path, "unknown image format"))
-	}
-
-	fn parse_color_model(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<Option<ImageColorModel>> {
-		if value == "none" {
-			Ok(None)
-		} else {
-			parse_image_color_model(value)
-				.map(Some)
-				.ok_or_else(|| self.invalid_value(path, "unknown image color model"))
-		}
-	}
-
-	fn expect(&self, actual: &str, expected: &str, path: &CheckpointPath) -> CheckpointResult<()> {
-		if actual == expected {
+	/// Require an exact scalar value.
+	fn expect(actual: &str, expected: &str, path: &CheckpointPath) -> CheckpointResult<()> {
+		return if actual == expected {
 			Ok(())
 		} else {
-			Err(self.invalid_value(path, format!("expected {expected:?}, found {actual:?}")))
-		}
+			Err(Self::invalid_value(
+				path,
+				format!("expected {expected:?}, found {actual:?}"),
+			))
+		};
 	}
 
-	fn invalid_value(&self, path: &CheckpointPath, detail: impl Into<String>) -> CheckpointError {
-		decode_error(
+	/// Construct an invalid-value decode error.
+	fn invalid_value(path: &CheckpointPath, detail: impl Into<String>) -> CheckpointError {
+		return decode_error(
 			CheckpointDecodeErrorKind::InvalidValue,
 			path.clone(),
 			detail,
-		)
+		);
 	}
 
-	fn unknown(&self, path: &CheckpointPath, detail: impl Into<String>) -> CheckpointError {
-		decode_error(
+	/// Construct an unknown-field decode error.
+	fn unknown(path: &CheckpointPath, detail: impl Into<String>) -> CheckpointError {
+		return decode_error(
 			CheckpointDecodeErrorKind::UnknownField,
 			path.clone(),
 			detail,
-		)
+		);
 	}
 
-	fn limit(&self, path: &CheckpointPath, detail: impl Into<String>) -> CheckpointError {
-		decode_error(
+	/// Construct a decode-limit error.
+	fn limit(path: &CheckpointPath, detail: impl Into<String>) -> CheckpointError {
+		return decode_error(
 			CheckpointDecodeErrorKind::LimitExceeded,
 			path.clone(),
 			detail,
-		)
+		);
 	}
 }
 
+/// Validate and return canonical lowercase hexadecimal digits.
 fn canonical_hex<'a>(value: &'a str, path: &CheckpointPath) -> CheckpointResult<&'a str> {
 	let digits = value.strip_prefix("0x").ok_or_else(|| {
-		decode_error(
+		return decode_error(
 			CheckpointDecodeErrorKind::InvalidValue,
 			path.clone(),
 			"hex value lacks canonical lowercase 0x prefix",
-		)
+		);
 	})?;
 	if digits
 		.bytes()
-		.any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+		.any(|byte| return !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
 	{
 		return Err(decode_error(
 			CheckpointDecodeErrorKind::InvalidValue,
@@ -1829,30 +2022,21 @@ fn canonical_hex<'a>(value: &'a str, path: &CheckpointPath) -> CheckpointResult<
 			"hex value contains a noncanonical digit",
 		));
 	}
-	Ok(digits)
+	return Ok(digits);
 }
 
-fn parse_hex_byte(value: &str, path: &CheckpointPath) -> CheckpointResult<u8> {
-	u8::from_str_radix(value, 16).map_err(|error| {
-		decode_error(
-			CheckpointDecodeErrorKind::InvalidValue,
-			path.clone(),
-			format!("invalid hex byte: {error}"),
-		)
-	})
-}
-
+/// Decode one canonical decimal integer.
 fn parse_canonical<T>(value: &str, path: &CheckpointPath) -> CheckpointResult<T>
 where
-	T: core::str::FromStr + ToString,
-	T::Err: core::fmt::Display,
+	T: str::FromStr + ToString,
+	T::Err: fmt::Display,
 {
 	let parsed = value.parse::<T>().map_err(|error| {
-		decode_error(
+		return decode_error(
 			CheckpointDecodeErrorKind::InvalidValue,
 			path.clone(),
 			format!("invalid integer {value:?}: {error}"),
-		)
+		);
 	})?;
 	if parsed.to_string() != value {
 		return Err(decode_error(
@@ -1861,139 +2045,5 @@ where
 			format!("integer {value:?} is not canonical"),
 		));
 	}
-	Ok(parsed)
-}
-
-const fn vector_role(role: VectorRole) -> &'static str {
-	match role {
-		VectorRole::Feature => "feature",
-		VectorRole::Target => "target",
-	}
-}
-
-const fn semantic_type(value: SemanticType) -> &'static str {
-	match value {
-		SemanticType::Numeric => "numeric",
-		SemanticType::Temporal => "temporal",
-		SemanticType::Categorical => "categorical",
-		SemanticType::Ordinal => "ordinal",
-		SemanticType::Text => "text",
-		SemanticType::Image => "image",
-		SemanticType::Binary => "binary",
-	}
-}
-
-fn parse_semantic_type(value: &str) -> Option<SemanticType> {
-	match value {
-		"numeric" => Some(SemanticType::Numeric),
-		"temporal" => Some(SemanticType::Temporal),
-		"categorical" => Some(SemanticType::Categorical),
-		"ordinal" => Some(SemanticType::Ordinal),
-		"text" => Some(SemanticType::Text),
-		"image" => Some(SemanticType::Image),
-		"binary" => Some(SemanticType::Binary),
-		_ => None,
-	}
-}
-
-const fn vector_encoding(value: VectorEncoding) -> &'static str {
-	match value {
-		VectorEncoding::F32 => "f32",
-		VectorEncoding::I32 => "int32",
-		VectorEncoding::RelativeSecondsI32 => "relative-seconds-int32",
-		VectorEncoding::DictionaryI32 => "dictionary-int32",
-		VectorEncoding::OrdinalI32 => "ordinal-int32",
-		VectorEncoding::Utf8 => "utf8",
-		VectorEncoding::Bytes => "bytes",
-	}
-}
-
-fn parse_vector_encoding(value: &str) -> Option<VectorEncoding> {
-	match value {
-		"f32" => Some(VectorEncoding::F32),
-		"int32" => Some(VectorEncoding::I32),
-		"relative-seconds-int32" => Some(VectorEncoding::RelativeSecondsI32),
-		"dictionary-int32" => Some(VectorEncoding::DictionaryI32),
-		"ordinal-int32" => Some(VectorEncoding::OrdinalI32),
-		"utf8" => Some(VectorEncoding::Utf8),
-		"bytes" => Some(VectorEncoding::Bytes),
-		_ => None,
-	}
-}
-
-const fn data_normalization(value: DenseDataNormalization) -> &'static str {
-	match value {
-		DenseDataNormalization::Identity => "identity",
-		DenseDataNormalization::ZScore => "z-score",
-		DenseDataNormalization::MinMax => "min-max",
-		DenseDataNormalization::L2Norm => "l2-norm",
-	}
-}
-
-const fn dense_operation(value: DenseOperation) -> &'static str { value.token() }
-
-fn parse_operation(value: &str) -> Option<DenseOperation> { DenseOperation::from_token(value) }
-
-const fn image_format(value: EncodedImageFormat) -> &'static str {
-	match value {
-		EncodedImageFormat::Png => "png",
-		EncodedImageFormat::Jpeg => "jpeg",
-		EncodedImageFormat::Gif87a => "gif87a",
-		EncodedImageFormat::Gif89a => "gif89a",
-		EncodedImageFormat::Bmp => "bmp",
-		EncodedImageFormat::WebP => "webp",
-	}
-}
-
-fn parse_image_format(value: &str) -> Option<EncodedImageFormat> {
-	match value {
-		"png" => Some(EncodedImageFormat::Png),
-		"jpeg" => Some(EncodedImageFormat::Jpeg),
-		"gif87a" => Some(EncodedImageFormat::Gif87a),
-		"gif89a" => Some(EncodedImageFormat::Gif89a),
-		"bmp" => Some(EncodedImageFormat::Bmp),
-		"webp" => Some(EncodedImageFormat::WebP),
-		_ => None,
-	}
-}
-
-const fn image_color_model(value: ImageColorModel) -> &'static str {
-	match value {
-		ImageColorModel::Grayscale => "grayscale",
-		ImageColorModel::GrayscaleAlpha => "grayscale-alpha",
-		ImageColorModel::Rgb => "rgb",
-		ImageColorModel::Rgba => "rgba",
-		ImageColorModel::Bgr => "bgr",
-		ImageColorModel::IndexedRgb => "indexed-rgb",
-		ImageColorModel::YCbCr => "y-cb-cr",
-		ImageColorModel::Cmyk => "cmyk",
-		ImageColorModel::Ycck => "ycck",
-	}
-}
-
-fn parse_image_color_model(value: &str) -> Option<ImageColorModel> {
-	match value {
-		"grayscale" => Some(ImageColorModel::Grayscale),
-		"grayscale-alpha" => Some(ImageColorModel::GrayscaleAlpha),
-		"rgb" => Some(ImageColorModel::Rgb),
-		"rgba" => Some(ImageColorModel::Rgba),
-		"bgr" => Some(ImageColorModel::Bgr),
-		"indexed-rgb" => Some(ImageColorModel::IndexedRgb),
-		"y-cb-cr" => Some(ImageColorModel::YCbCr),
-		"cmyk" => Some(ImageColorModel::Cmyk),
-		"ycck" => Some(ImageColorModel::Ycck),
-		_ => None,
-	}
-}
-
-const fn image_value_layout(value: ImageValueLayout) -> &'static str {
-	match value {
-		ImageValueLayout::EncodedFile => "encoded-file",
-	}
-}
-
-const fn image_value_range(value: ImageValueRange) -> &'static str {
-	match value {
-		ImageValueRange::EncodedBytes => "encoded-bytes",
-	}
+	return Ok(parsed);
 }

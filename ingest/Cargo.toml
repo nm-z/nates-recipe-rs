@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Dependency-clean external representation and framing for Recipe"
+repository = "https://github.com/nm-z/nates-recipe-rs"
+readme = "README.md"
+keywords = ["data", "ingestion", "serialization"]
+categories = ["encoding"]
 
 [dependencies]
 calamine = "0.36"

@@ -5,6 +5,10 @@ edition = "2024"
 license = "MIT"
 description = "Canonical operation registry and honest lowering boundary for Recipe"
 build = "build.rs"
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 recipe-core = { path = "../core" }

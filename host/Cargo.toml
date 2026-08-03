@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Preallocated asynchronous RAM and disk transfer resources for Recipe"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 recipe-core = { path = "../core" }

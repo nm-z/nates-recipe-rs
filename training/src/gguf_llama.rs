@@ -1,6 +1,6 @@
 use core::fmt;
+use alloc::collections::{BTreeMap, BTreeSet};
 use std::{
-	collections::{BTreeMap, BTreeSet},
 	path::Path,
 };
 
@@ -46,10 +46,16 @@ pub struct GgufLlamaError {
 
 impl GgufLlamaError {
 	#[must_use]
-	pub const fn kind(&self) -> GgufLlamaErrorKind { self.kind }
+	#[inline]
+	pub const fn kind(&self) -> GgufLlamaErrorKind {
+		self.kind
+	}
 
 	#[must_use]
-	pub fn detail(&self) -> &str { &self.detail }
+	#[inline]
+	pub fn detail(&self) -> &str {
+		&self.detail
+	}
 
 	fn new(kind: GgufLlamaErrorKind, detail: impl Into<String>) -> Self {
 		Self {
@@ -60,12 +66,13 @@ impl GgufLlamaError {
 }
 
 impl fmt::Display for GgufLlamaError {
+	#[inline]
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{:?}: {}", self.kind, self.detail)
 	}
 }
 
-impl std::error::Error for GgufLlamaError {}
+impl core::error::Error for GgufLlamaError {}
 
 pub type GgufLlamaResult<T> = Result<T, GgufLlamaError>;
 
@@ -126,21 +133,38 @@ pub struct GgufLlamaArtifact {
 
 impl GgufLlamaArtifact {
 	#[must_use]
-	pub const fn architecture(&self) -> &'static str { "llama" }
+	#[inline]
+	pub const fn architecture(&self) -> &'static str {
+		"llama"
+	}
 
 	#[must_use]
-	pub const fn vocabulary(&self) -> u64 { self.vocabulary }
+	#[inline]
+	pub const fn vocabulary(&self) -> u64 {
+		self.vocabulary
+	}
 
 	#[must_use]
-	pub const fn context_length(&self) -> u64 { self.context_length }
+	#[inline]
+	pub const fn context_length(&self) -> u64 {
+		self.context_length
+	}
 
 	#[must_use]
-	pub const fn embedding_length(&self) -> u64 { self.embedding_length }
+	#[inline]
+	pub const fn embedding_length(&self) -> u64 {
+		self.embedding_length
+	}
 
 	#[must_use]
-	pub fn block_count(&self) -> usize { self.blocks.len() }
+	#[inline]
+	pub fn block_count(&self) -> usize {
+		self.blocks.len()
+	}
 
-	fn tensor(&self, index: usize) -> &GgufLlamaTensorImage { &self.tensors[index] }
+	fn tensor(&self, index: usize) -> &GgufLlamaTensorImage {
+		&self.tensors[index]
+	}
 
 	fn execution_tensor_indices(&self) -> BTreeSet<usize> {
 		let mut indices = BTreeSet::from([self.token_embedding, self.output_norm, self.output]);
@@ -177,13 +201,20 @@ pub struct PreparedGgufLlamaInference {
 
 impl PreparedGgufLlamaInference {
 	#[must_use]
-	pub const fn artifact(&self) -> &GgufLlamaArtifact { &self.artifact }
+	#[inline]
+	pub const fn artifact(&self) -> &GgufLlamaArtifact {
+		&self.artifact
+	}
 
 	#[must_use]
-	pub fn tokens(&self) -> &[i32] { &self.tokens }
+	#[inline]
+	pub fn tokens(&self) -> &[i32] {
+		&self.tokens
+	}
 }
 
 /// Decode one bounded GGUF image as the supported dense-F32 `llama` case.
+#[inline]
 pub fn decode_gguf_llama(bytes: &[u8], limits: GgufLimits) -> GgufLlamaResult<GgufLlamaArtifact> {
 	let archive = parse_gguf(bytes, limits)
 		.map_err(|error| GgufLlamaError::new(GgufLlamaErrorKind::Container, error.to_string()))?;
@@ -476,6 +507,7 @@ pub fn decode_gguf_llama(bytes: &[u8], limits: GgufLimits) -> GgufLlamaResult<Gg
 }
 
 /// Read and decode one GGUF model through a bounded immutable source snapshot.
+#[inline]
 pub fn load_gguf_llama_model_file(path: &Path, limits: GgufLimits) -> InferencePreparationResult<GgufLlamaArtifact> {
 	let source_limit = SourceLimit::new(limits.file_bytes().get())?;
 	let snapshot = read_source_snapshot(path, source_limit)?;
@@ -483,6 +515,7 @@ pub fn load_gguf_llama_model_file(path: &Path, limits: GgufLimits) -> InferenceP
 }
 
 /// Bind one target-free table to the exact integer-token input contract.
+#[inline]
 pub fn prepare_gguf_llama_inference_table(
 	artifact: GgufLlamaArtifact,
 	table: &RawTable,
@@ -566,6 +599,7 @@ pub fn prepare_gguf_llama_inference_table(
 }
 
 /// Lower the supported llama instrument to one immutable all-position logits program.
+#[inline]
 pub fn compile_prepared_gguf_llama_inference(
 	prepared: &PreparedGgufLlamaInference,
 ) -> InferenceCompileResult<CompiledInference> {
@@ -625,9 +659,7 @@ pub fn compile_prepared_gguf_llama_inference(
 			current,
 			block.query,
 			&values,
-			sequence,
-			artifact.embedding_length,
-			artifact.embedding_length,
+			[sequence, artifact.embedding_length, artifact.embedding_length],
 			true,
 			f32::from_bits(artifact.clamp_kqv_bits),
 		)?;
@@ -636,9 +668,7 @@ pub fn compile_prepared_gguf_llama_inference(
 			current,
 			block.key,
 			&values,
-			sequence,
-			artifact.embedding_length,
-			artifact.embedding_length,
+			[sequence, artifact.embedding_length, artifact.embedding_length],
 			true,
 			f32::from_bits(artifact.clamp_kqv_bits),
 		)?;
@@ -647,9 +677,7 @@ pub fn compile_prepared_gguf_llama_inference(
 			current,
 			block.value,
 			&values,
-			sequence,
-			artifact.embedding_length,
-			artifact.embedding_length,
+			[sequence, artifact.embedding_length, artifact.embedding_length],
 			true,
 			f32::from_bits(artifact.clamp_kqv_bits),
 		)?;
@@ -659,9 +687,7 @@ pub fn compile_prepared_gguf_llama_inference(
 			attention,
 			block.attention_output,
 			&values,
-			sequence,
-			artifact.embedding_length,
-			artifact.embedding_length,
+			[sequence, artifact.embedding_length, artifact.embedding_length],
 			true,
 			0.0,
 		)?;
@@ -680,9 +706,7 @@ pub fn compile_prepared_gguf_llama_inference(
 			current,
 			block.feed_forward_gate,
 			&values,
-			sequence,
-			artifact.embedding_length,
-			artifact.feed_forward_length,
+			[sequence, artifact.embedding_length, artifact.feed_forward_length],
 			false,
 			0.0,
 		)?;
@@ -691,9 +715,7 @@ pub fn compile_prepared_gguf_llama_inference(
 			current,
 			block.feed_forward_up,
 			&values,
-			sequence,
-			artifact.embedding_length,
-			artifact.feed_forward_length,
+			[sequence, artifact.embedding_length, artifact.feed_forward_length],
 			false,
 			0.0,
 		)?;
@@ -713,9 +735,7 @@ pub fn compile_prepared_gguf_llama_inference(
 			gated,
 			block.feed_forward_down,
 			&values,
-			sequence,
-			artifact.feed_forward_length,
-			artifact.embedding_length,
+			[sequence, artifact.feed_forward_length, artifact.embedding_length],
 			false,
 			0.0,
 		)?;
@@ -767,11 +787,9 @@ fn prepare_rope_inputs(
 	let rotary_half = artifact.head_dimension / 2;
 	let factor_bytes = match artifact.rope_factors {
 		Some(index) => artifact.tensor(index).bytes.clone(),
-		None => {
-			(0..rotary_half)
-				.flat_map(|_| 1.0f32.to_le_bytes())
-				.collect()
-		}
+		None => (0..rotary_half)
+			.flat_map(|_| 1.0f32.to_le_bytes())
+			.collect(),
 	};
 	let factor_values = factor_bytes
 		.chunks_exact(4)
@@ -977,18 +995,16 @@ fn apply_rope(
 	)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn linear(
 	compiler: &mut InferenceGraphCompiler,
 	input: ValueId,
 	linear: GgufLlamaLinear,
 	values: &BTreeMap<usize, ValueId>,
-	rows: u64,
-	input_width: u64,
-	output_width: u64,
+	dimensions: [u64; 3],
 	scale_before_bias: bool,
 	clamp: f32,
 ) -> InferenceCompileResult<ValueId> {
+	let [rows, input_width, output_width] = dimensions;
 	compiler.require_tensor(
 		input,
 		DType::F32,

@@ -1,0 +1,52 @@
+recipe-knn-model	format-version	1
+	neighbors	3
+	data-normalization	z-score
+	operations
+	vectors	vector	source-index	0
+			name-bytes	0x78
+			role	feature
+			semantic-type	numeric
+			encoding	f32
+			metadata	none
+		vector	source-index	1
+			name-bytes	0x79
+			role	feature
+			semantic-type	numeric
+			encoding	f32
+			metadata	none
+		vector	source-index	2
+			name-bytes	0x636c6173735f746172676574
+			role	target
+			semantic-type	categorical
+			encoding	dictionary-int32
+			metadata	categorical	value-bytes	0x626c7565
+					value-bytes	0x677265656e
+					value-bytes	0x726564
+		vector	source-index	3
+			name-bytes	0x6e756d657269635f746172676574
+			role	target
+			semantic-type	numeric
+			encoding	f32
+			metadata	none
+	feature-spans	span	source-index	0
+			start	0
+			width	1
+			lowering	numeric-scalar
+		span	source-index	1
+			start	1
+			width	1
+			lowering	numeric-scalar
+	normalization-mask	none
+	reference-shape	rows	9
+		feature-width	2
+	reference-source-rows	0x000000000000000000000000000000010000000000000002000000000000000300000000000000040000000000000005000000000000000600000000000000070000000000000008
+	reference-feature-f32-bits	0x00000000000000003dcccccd3e4ccccd3e4ccccd3dcccccd3f4ccccd3f6666663f6666663f4ccccd3f8000003f8000003ecccccd3f0000003f0000003ecccccd3f0000003f19999a
+	outputs	output	source-index	2
+			known-mask	0b111111111
+			values	discrete-int32	codes	0x000000020000000200000002000000000000000000000000000000010000000100000001
+					labels	bytes	0x626c7565
+						bytes	0x677265656e
+						bytes	0x726564
+		output	source-index	3
+			known-mask	0b111111111
+			values	numeric-f32-bits	0x000000003e4ccccd3e99999a3fd9999a3fe66666400000003f6666663f4ccccd3f8ccccd

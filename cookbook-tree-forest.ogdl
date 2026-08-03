@@ -1,0 +1,163 @@
+recipe
+	format	recipe-semantic-model
+	version	12
+	semantics
+		objective	binary-cross-entropy-with-logits
+		normalization	z-score
+		optimizer	adamw
+	dataset
+		feature-width	4
+		target
+			source-index	4
+			task	binary-classification
+			positive-code	1
+		vectors
+			vector
+				source-index	0
+				name-bytes	0x61
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	1
+				name-bytes	0x62
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	2
+				name-bytes	0x63
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	3
+				name-bytes	0x64
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	4
+				name-bytes	0x746172676574
+				role	target
+				semantic-type	numeric
+				encoding	int32
+				metadata	none
+		feature-spans
+			span
+				source-index	0
+				start	0
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	1
+				start	1
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	2
+				start	2
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	3
+				start	3
+				width	1
+				lowering	numeric-scalar
+		feature-normalization-mask
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+	training
+		epochs	1
+		warmup-epochs	0
+		learning-rate-decay	cosine
+		gradient-clip-norm	none
+		normalization-epsilon	0x358637bd
+		reduction-tree-lanes	1024
+		random-seed	125779785117797
+		adamw
+			learning-rate	0x3a83126f
+			beta-one	0x3f666666
+			beta-two	0x3f7fbe77
+			epsilon	0x322bcc77
+			weight-decay	0x3c23d70a
+		bounds
+			train-rows	9
+			epochs	1
+			training-iterations	1
+			calibration-iterations	0
+			iterations	1
+			warmup-iterations	0
+	model
+		input-width	4
+		output-width	1
+		normalization	z-score
+			mean
+				dtype	f32
+				shape	4
+				payload	raw-bytes-hex
+					0x2dd8023fa54ffa3eeeeeee3e398ee33e
+			variance
+				dtype	f32
+				shape	4
+				payload	raw-bytes-hex
+					0x60c8f73dfe79033d610bb63cea19bb3d
+		blocks
+			tree
+				index	0
+				family	lightgbm
+				trees	2
+				depth	2
+				input-width	4
+				output-width	1
+				internal-nodes-per-tree	3
+				leaves-per-tree	4
+				split-features
+					dtype	int32
+					shape	6
+					payload	raw-bytes-hex
+						0x000000000000000000000000000000000000000000000000
+				split-thresholds
+					dtype	f32
+					shape	6
+					payload	raw-bytes-hex
+						0x688d23bfffff7f7fffff7f7f688da3beffff7f7fffff7f7f
+				leaf-values
+					parameter
+						dtype	f32
+						shape	8
+						payload	raw-bytes-hex
+							0x6e1283ba000000006e12833a000000006e1283ba000000006f12833a00000000
+					first-moment
+						dtype	f32
+						shape	8
+						payload	raw-bytes-hex
+							0x8b88883c00000000640bb6bc00000000640bb63c000000003d8ee3bc00000000
+					second-moment
+						dtype	f32
+						shape	8
+						payload	raw-bytes-hex
+							0x8f03e937000000009b1f4f38000000009b1f4f3800000000b2d0a13800000000
+	native
+		program	0x913cb48a4cadddff1e75c48a552f4dbb5f379c63c8cf8763f07c29191125b332
+		realization	0xf246f3f18b9c177166b9bef0ffe096cf070ff195876ba4e2896708a24eb55913
+		topology	0xf850b9da189abfdd314eaeade70d99050198c52e4bbacaf2969455b489db6ee4
+		discovery	0x80b75d51c8ac6e1d52e64d54c66cbd8fea8db2180cdbd672dc24e1cc74a79e7e
+		kernels
+			kernel
+				format	hsaco
+				target
+					backend	amd-rocr-hsa
+					architecture	amdgcn-amd-amdhsa--gfx1101
+					abi	elf64-amdgpu-code-object-v6
+				toolchain
+					name	recipe-owned-llvm-amd-hsa
+					version	auto-pinned-local-tools-and-benchmark-v3
+					digest	0xe82318b2315c84fa4cf78ee39c0cc961c70e918cb3d7ccae19f8f0b15ecc6de6
+				digest	0xdcb27f9cb053677ba08023be052e0cfc1bfa37cc65bbe9febd91fcb2d08da18b

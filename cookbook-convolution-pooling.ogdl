@@ -1,0 +1,271 @@
+recipe
+	format	recipe-semantic-model
+	version	9
+	semantics
+		objective	binary-focal-with-logits-alpha-0.25-gamma-2
+		normalization	z-score
+		optimizer	adamw
+	dataset
+		feature-width	4
+		target
+			source-index	4
+			task	binary-classification
+			positive-code	1
+		vectors
+			vector
+				source-index	0
+				name-bytes	0x61
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	1
+				name-bytes	0x62
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	2
+				name-bytes	0x63
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	3
+				name-bytes	0x64
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	4
+				name-bytes	0x746172676574
+				role	target
+				semantic-type	numeric
+				encoding	int32
+				metadata	none
+		feature-spans
+			span
+				source-index	0
+				start	0
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	1
+				start	1
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	2
+				start	2
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	3
+				start	3
+				width	1
+				lowering	numeric-scalar
+		feature-normalization-mask
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+	training
+		epochs	1
+		warmup-epochs	0
+		learning-rate-decay	cosine
+		gradient-clip-norm	none
+		normalization-epsilon	0x358637bd
+		reduction-tree-lanes	1024
+		random-seed	125779785117797
+		adamw
+			learning-rate	0x3a83126f
+			beta-one	0x3f666666
+			beta-two	0x3f7fbe77
+			epsilon	0x322bcc77
+			weight-decay	0x3c23d70a
+		bounds
+			train-rows	9
+			epochs	1
+			training-iterations	1
+			calibration-iterations	0
+			iterations	1
+			warmup-iterations	0
+	model
+		input-width	4
+		output-width	1
+		normalization	z-score
+			mean
+				dtype	f32
+				shape	4
+				payload	raw-bytes-hex
+					0x2dd8023fa54ffa3eeeeeee3e398ee33e
+			variance
+				dtype	f32
+				shape	4
+				payload	raw-bytes-hex
+					0x60c8f73dfe79033d610bb63cea19bb3d
+		blocks
+			convolution
+				index	0
+				filters	2
+				kernel	2
+				input-length	4
+				input-channels	1
+				output-length	3
+				operations	1
+					operation	relu
+				weight
+					parameter
+						dtype	f32
+						shape	2	1	2
+						payload	raw-bytes-hex
+							0x37ceb83f0336a9bf1fe8a8bf3401c6be
+					first-moment
+						dtype	f32
+						shape	2	1	2
+						payload	raw-bytes-hex
+							0xb7a2403b1ad017bc1539583a119ccabb
+					second-moment
+						dtype	f32
+						shape	2	1	2
+						payload	raw-bytes-hex
+							0xc5ec6735f60a10376719923317488036
+				bias
+					parameter
+						dtype	f32
+						shape	2
+						payload	raw-bytes-hex
+							0x6c1283ba6e1283ba
+					first-moment
+						dtype	f32
+						shape	2
+						payload	raw-bytes-hex
+							0x8d156a3b639a103c
+					second-moment
+						dtype	f32
+						shape	2
+						payload	raw-bytes-hex
+							0xbd3bab35a2af0237
+			convolution
+				index	1
+				filters	3
+				kernel	2
+				input-length	3
+				input-channels	2
+				output-length	2
+				operations	1
+					operation	prelu
+				prelu	1
+					parameter
+						parameter
+							dtype	f32
+							shape	1
+							payload	raw-bytes-hex
+								0x33f97e3e
+						first-moment
+							dtype	f32
+							shape	1
+							payload	raw-bytes-hex
+								0x2f56073c
+						second-moment
+							dtype	f32
+							shape	1
+							payload	raw-bytes-hex
+								0x73f2e436
+				weight
+					parameter
+						dtype	f32
+						shape	2	2	3
+						payload	raw-bytes-hex
+							0x7ec8a43b5f1f1b3e531783bf4b47bb3f7185e53e41f1ba3efc61333f600b8abff0ccbb3e115f78bfc58f093d815a223f
+					first-moment
+						dtype	f32
+						shape	2	2	3
+						payload	raw-bytes-hex
+							0x15a2af3a0f328abb6a96d5b9598dbcbbdc3a093d7a140b3c12a3423b12b01cbb425368bb620731bae8d1a83c129fb63b
+					second-moment
+						dtype	f32
+						shape	2	2	3
+						payload	raw-bytes-hex
+							0x89ca4034cfb8ee353a8f8e324d325e36c265eb388dc9f136e3c46c352d7119356faba83511de4333ac1f323830705036
+				bias
+					parameter
+						dtype	f32
+						shape	3
+						payload	raw-bytes-hex
+							0x6a12833a6e1283ba6a1283ba
+					first-moment
+						dtype	f32
+						shape	3
+						payload	raw-bytes-hex
+							0xb5fad2ba55b9753c180e033b
+					second-moment
+						dtype	f32
+						shape	3
+						payload	raw-bytes-hex
+							0x58198b3491afbc37a4b0d634
+			pool
+				index	2
+				size	2
+				group-to-neuron	1
+				input-length	2
+				channels	3
+				output-length	1
+				group-order	group-major-channel-minor
+				winner-contract	lowest-logical-index
+			layer	1
+				index	3
+				operations	0
+				weight
+					parameter
+						dtype	f32
+						shape	3	1
+						payload	raw-bytes-hex
+							0x6817c9be55a2f73f470cf93e
+					first-moment
+						dtype	f32
+						shape	3	1
+						payload	raw-bytes-hex
+							0x64ee6c3c99ea153c50e9413c
+					second-moment
+						dtype	f32
+						shape	3	1
+						payload	raw-bytes-hex
+							0x856caf3767770c37ca016b37
+				bias
+					parameter
+						dtype	f32
+						shape	1
+						payload	raw-bytes-hex
+							0x6c1283ba
+					first-moment
+						dtype	f32
+						shape	1
+						payload	raw-bytes-hex
+							0x896f863b
+					second-moment
+						dtype	f32
+						shape	1
+						payload	raw-bytes-hex
+							0xafe8e135
+	native
+		program	0x834e1a391436dd6e8a560e1da807c35a422931092d4ff9144d7da1828565737a
+		realization	0x49e7dbf53d3910fbbd37fc2b9e48d28e7c8039c20ec67c29852afff15cdcc603
+		topology	0xf850b9da189abfdd314eaeade70d99050198c52e4bbacaf2969455b489db6ee4
+		discovery	0x80b75d51c8ac6e1d52e64d54c66cbd8fea8db2180cdbd672dc24e1cc74a79e7e
+		kernels
+			kernel
+				format	hsaco
+				target
+					backend	amd-rocr-hsa
+					architecture	amdgcn-amd-amdhsa--gfx1101
+					abi	elf64-amdgpu-code-object-v6
+				toolchain
+					name	recipe-owned-llvm-amd-hsa
+					version	auto-pinned-local-tools-and-benchmark-v3
+					digest	0xe82318b2315c84fa4cf78ee39c0cc961c70e918cb3d7ccae19f8f0b15ecc6de6
+				digest	0xa130c1d107d085e51b9e0a98d6ba110a59b602712485507a96c4a029540a7057

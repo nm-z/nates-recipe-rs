@@ -3,6 +3,10 @@ name = "recipe-remote"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Bounded remote Recipe execution over the transport protocol"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 recipe-core = { path = "../core" }

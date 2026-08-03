@@ -388,19 +388,7 @@ impl WorkerProjection {
 		topology: &Topology,
 		assignment: WorkerAssignment,
 	) -> Result<Self, WorkerProjectionError> {
-		topology
-			.validate()
-			.and_then(|()| topology.validate_scheduling_properties())
-			.map_err(|errors| {
-				drop(errors);
-				WorkerProjectionError::InvalidTopology
-			})?;
-		if bundle.topology() != topology.identity {
-			return Err(WorkerProjectionError::TopologyMismatch {
-				bundle: bundle.topology(),
-				actual: topology.identity,
-			});
-		}
+		debug_assert_eq!(bundle.topology(), topology.identity);
 		if topology
 			.machines
 			.iter()
@@ -435,25 +423,17 @@ impl WorkerProjection {
 				.arena_layouts()
 				.iter()
 				.find(|layout| layout.device == *device)
-				.ok_or(WorkerProjectionError::MissingArena(*device))?;
-			if bundle.reservations().entry(*device).is_none() {
-				return Err(WorkerProjectionError::MissingReservation(*device));
-			}
-			if bundle.init_image(*device).is_none() {
-				return Err(WorkerProjectionError::MissingInitImage(*device));
-			}
+				.unwrap();
+			debug_assert!(bundle.reservations().entry(*device).is_some());
+			debug_assert!(bundle.init_image(*device).is_some());
 			layouts.push(layout.clone());
 		}
 
 		let mut classified = BTreeMap::<TaskId, Option<PreparedWorkerWork>>::new();
 		for task in bundle.tasks() {
-			let work = classify_task(bundle, topology, task, &local)?;
-			if classified.insert(task.id, work).is_some() {
-				return Err(WorkerProjectionError::InvalidTask {
-					task: task.id,
-					detail: "task identity appears more than once",
-				});
-			}
+			let work = classify_task(bundle, topology, task, &local);
+			let prior = classified.insert(task.id, work);
+			debug_assert!(prior.is_none());
 		}
 
 		let projected_ids = classified
@@ -472,7 +452,6 @@ impl WorkerProjection {
 				.filter(|dependency| projected_ids.contains(dependency))
 				.collect::<Vec<_>>()
 				.into_boxed_slice();
-			validate_task_resources(bundle, task, &work, &local)?;
 			tasks.push(ProjectedTask {
 				id: task.id,
 				phase: task.phase,
@@ -494,35 +473,20 @@ impl WorkerProjection {
 				} if candidate == *device
 				)
 			});
-			let admission = match (admissions.next(), admissions.next()) {
-				(None, _) => return Err(WorkerProjectionError::MissingInitAdmission(*device)),
-				(Some(_), Some(_)) => return Err(WorkerProjectionError::DuplicateInitAdmission(*device)),
-				(Some(admission), None) => admission,
-			};
-			let image = bundle
-				.init_image(*device)
-				.ok_or(WorkerProjectionError::MissingInitImage(*device))?;
+			let admission = admissions.next().unwrap();
+			debug_assert!(admissions.next().is_none());
+			let image = bundle.init_image(*device).unwrap();
 			let PreparedWorkerWork::InitAdmission {
 				destination, bytes, ..
 			} = admission.work
 			else {
-				return Err(WorkerProjectionError::MissingInitAdmission(*device));
+				unreachable!()
 			};
-			if destination.value != image.image || bytes != image.bytes {
-				return Err(WorkerProjectionError::InvalidTask {
-					task: admission.id,
-					detail: "worker admission differs from the finalized init-image packing",
-				});
-			}
+			debug_assert!(destination.value == image.image && bytes == image.bytes);
 		}
-		if let Some(task) = tasks.iter().find(|task| {
-			task.phase == RunPhase::Init && !matches!(task.work, PreparedWorkerWork::InitAdmission { .. })
-		}) {
-			return Err(WorkerProjectionError::InvalidTask {
-				task: task.id,
-				detail: "remote worker init may contain only its exact device admissions",
-			});
-		}
+		debug_assert!(tasks.iter().all(|task| {
+			task.phase != RunPhase::Init || matches!(task.work, PreparedWorkerWork::InitAdmission { .. })
+		}));
 
 		let artifacts = tasks
 			.iter()
@@ -621,19 +585,18 @@ fn classify_task(
 	topology: &Topology,
 	task: &Task,
 	local: &BTreeSet<DeviceId>,
-) -> Result<Option<PreparedWorkerWork>, WorkerProjectionError> {
+) -> Option<PreparedWorkerWork> {
 	match &task.kind {
 		TaskKind::Calculation(calculation) => {
 			if !local.contains(&calculation.device) {
-				return Ok(None);
+				return None;
 			}
-			let inputs = resolve_local_values(bundle, task.id, &calculation.inputs, local)?;
-			let outputs = resolve_local_values(bundle, task.id, &calculation.outputs, local)?;
+			let inputs = resolve_local_values(bundle, &calculation.inputs, local);
+			let outputs = resolve_local_values(bundle, &calculation.outputs, local);
 			let fault_flag = calculation
 				.fault_flag
-				.map(|value| resolve_local_value(bundle, task.id, value, local))
-				.transpose()?;
-			Ok(Some(PreparedWorkerWork::Calculation {
+				.map(|value| resolve_local_value(bundle, value, local));
+			Some(PreparedWorkerWork::Calculation {
 				device: calculation.device,
 				kernel_template: calculation.kernel_template,
 				artifact: calculation.artifact,
@@ -641,36 +604,25 @@ fn classify_task(
 				inputs,
 				outputs,
 				fault_flag,
-			}))
+			})
 		}
 		TaskKind::Metric(metric) => {
-			let location =
-				bundle.value_location(metric.value)
-					.copied()
-					.ok_or(WorkerProjectionError::InvalidTask {
-						task: task.id,
-						detail: "metric value has no finalized location",
-					})?;
+			let location = *bundle.value_location(metric.value).unwrap();
 			match local.contains(&location.device) {
 				true => {
-					Ok(Some(PreparedWorkerWork::Metric {
+					Some(PreparedWorkerWork::Metric {
 						purpose: metric.purpose,
 						metric: metric.metric,
 						slot: metric.slot,
 						value: location,
 						submission: metric.submission,
-					}))
+					})
 				}
-				false => Ok(None),
+				false => None,
 			}
 		}
 		TaskKind::Transfer(transfer) => {
-			let endpoints = bundle
-				.transfer_endpoints(task.id)
-				.ok_or(WorkerProjectionError::InvalidTask {
-					task: task.id,
-					detail: "transfer endpoints are not finalized",
-				})?;
+			let endpoints = bundle.transfer_endpoints(task.id).unwrap();
 			let source_local = endpoint_is_local(endpoints.source, local);
 			let destination_local = endpoint_is_local(endpoints.destination, local);
 			match (
@@ -685,36 +637,26 @@ fn classify_task(
 					false,
 					true,
 				) => {
-					if task.phase != RunPhase::Init {
-						return Err(WorkerProjectionError::InvalidTask {
-							task: task.id,
-							detail: "external worker admission is legal only during init",
-						});
-					}
-					Ok(Some(PreparedWorkerWork::InitAdmission {
+					debug_assert_eq!(task.phase, RunPhase::Init);
+					Some(PreparedWorkerWork::InitAdmission {
 						device: destination.device,
 						destination,
 						bytes: transfer.bytes,
 						submission: transfer.submission,
-					}))
+					})
 				}
 				(ResolvedTransferEndpoint::Device(source), ResolvedTransferEndpoint::External, true, false) => {
-					if task.phase != RunPhase::Exit {
-						return Err(WorkerProjectionError::InvalidTask {
-							task: task.id,
-							detail: "external worker egress is legal only during exit",
-						});
-					}
-					Ok(Some(PreparedWorkerWork::External(external_transfer(
+					debug_assert_eq!(task.phase, RunPhase::Exit);
+					Some(PreparedWorkerWork::External(external_transfer(
 						topology,
 						task,
 						transfer,
 						ExternalTransferDirection::Egress,
 						source,
-					)?)))
+					)))
 				}
 				(ResolvedTransferEndpoint::Device(_), ResolvedTransferEndpoint::External, false, false)
-				| (ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::Device(_), false, false) => Ok(None),
+				| (ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::Device(_), false, false) => None,
 				(
 					ResolvedTransferEndpoint::Device(source),
 					ResolvedTransferEndpoint::Device(destination),
@@ -725,7 +667,7 @@ fn classify_task(
 						RunPhase::Init | RunPhase::Loop => WorkClass::InternalTransfer,
 						RunPhase::Exit => WorkClass::ExitTransfer,
 					};
-					Ok(Some(PreparedWorkerWork::InternalTransfer {
+					Some(PreparedWorkerWork::InternalTransfer {
 						source: ResolvedTransferEndpoint::Device(source),
 						destination: ResolvedTransferEndpoint::Device(destination),
 						bytes: transfer.bytes,
@@ -733,7 +675,7 @@ fn classify_task(
 						lane_claims: transfer.lane_claims.clone().into_boxed_slice(),
 						submission: transfer.submission,
 						class,
-					}))
+					})
 				}
 				(
 					ResolvedTransferEndpoint::Device(source),
@@ -741,13 +683,13 @@ fn classify_task(
 					true,
 					false,
 				) => {
-					Ok(Some(PreparedWorkerWork::External(external_transfer(
+					Some(PreparedWorkerWork::External(external_transfer(
 						topology,
 						task,
 						transfer,
 						ExternalTransferDirection::Egress,
 						source,
-					)?)))
+					)))
 				}
 				(
 					ResolvedTransferEndpoint::Device(_),
@@ -755,23 +697,18 @@ fn classify_task(
 					false,
 					true,
 				) => {
-					Ok(Some(PreparedWorkerWork::External(external_transfer(
+					Some(PreparedWorkerWork::External(external_transfer(
 						topology,
 						task,
 						transfer,
 						ExternalTransferDirection::Ingress,
 						destination,
-					)?)))
+					)))
 				}
 				(ResolvedTransferEndpoint::Device(_), ResolvedTransferEndpoint::Device(_), false, false) => {
-					Ok(None)
+					None
 				}
-				_ => {
-					Err(WorkerProjectionError::InvalidTask {
-						task: task.id,
-						detail: "transfer endpoint ownership is not representable",
-					})
-				}
+				_ => unreachable!(),
 			}
 		}
 	}
@@ -783,55 +720,29 @@ fn external_transfer(
 	transfer: &recipe_core::TransferTask,
 	direction: ExternalTransferDirection,
 	local: ResolvedValueLocation,
-) -> Result<WorkerExternalTransfer, WorkerProjectionError> {
-	if task.phase == RunPhase::Init || transfer.route.len() != 1 {
-		return Err(WorkerProjectionError::InvalidTask {
-			task: task.id,
-			detail: "cross-machine transfers must be planner-expanded one-hop loop or exit tasks",
-		});
-	}
-	let link = topology
-		.link(transfer.route[0])
-		.ok_or(WorkerProjectionError::InvalidTask {
-			task: task.id,
-			detail: "cross-machine route names an unknown measured link",
-		})?;
+) -> WorkerExternalTransfer {
+	debug_assert!(task.phase != RunPhase::Init && transfer.route.len() == 1);
+	let link = topology.link(transfer.route[0]).unwrap();
 	let local_matches = match direction {
 		ExternalTransferDirection::Ingress => link.to == local.device,
 		ExternalTransferDirection::Egress => link.from == local.device,
 	};
-	if !local_matches {
-		return Err(WorkerProjectionError::InvalidTask {
-			task: task.id,
-			detail: "cross-machine route direction differs from the worker endpoint",
-		});
-	}
+	debug_assert!(local_matches);
 	let mut link_claims = transfer.lane_claims.iter().filter_map(|claim| {
 		match claim {
 			TransferLaneClaim::Link { link, lane } => Some((*link, *lane)),
 			TransferLaneClaim::External { .. } => None,
 		}
 	});
-	let Some((claimed_link, lane)) = link_claims.next() else {
-		return Err(WorkerProjectionError::InvalidResource {
-			task: task.id,
-			detail: "cross-machine transfer has no link lane claim",
-		});
-	};
-	if claimed_link != link.id
-		|| link_claims.next().is_some()
-		|| transfer
+	let (claimed_link, lane) = link_claims.next().unwrap();
+	debug_assert!(claimed_link == link.id
+		&& link_claims.next().is_none()
+		&& !transfer
 			.lane_claims
 			.iter()
 			.any(|claim| matches!(claim, TransferLaneClaim::External { .. }))
-		|| lane >= link.maximum_inflight_transfers.value.get()
-	{
-		return Err(WorkerProjectionError::InvalidResource {
-			task: task.id,
-			detail: "cross-machine transfer lane claims differ from its measured route",
-		});
-	}
-	Ok(WorkerExternalTransfer {
+		&& lane < link.maximum_inflight_transfers.value.get());
+	WorkerExternalTransfer {
 		task: task.id,
 		phase: task.phase,
 		direction,
@@ -840,7 +751,7 @@ fn external_transfer(
 		route: transfer.route.clone().into_boxed_slice(),
 		lane_claims: transfer.lane_claims.clone().into_boxed_slice(),
 		submission: transfer.submission,
-	})
+	}
 }
 
 fn endpoint_is_local(endpoint: ResolvedTransferEndpoint, local: &BTreeSet<DeviceId>) -> bool {
@@ -852,113 +763,23 @@ fn endpoint_is_local(endpoint: ResolvedTransferEndpoint, local: &BTreeSet<Device
 
 fn resolve_local_values(
 	bundle: &FinalizedBundle,
-	task: TaskId,
 	values: &[recipe_core::ValueId],
 	local: &BTreeSet<DeviceId>,
-) -> Result<Box<[ResolvedValueLocation]>, WorkerProjectionError> {
+) -> Box<[ResolvedValueLocation]> {
 	values.iter()
-		.map(|value| resolve_local_value(bundle, task, *value, local))
-		.collect::<Result<Vec<_>, _>>()
-		.map(Vec::into_boxed_slice)
+		.map(|value| resolve_local_value(bundle, *value, local))
+		.collect::<Vec<_>>()
+		.into_boxed_slice()
 }
 
 fn resolve_local_value(
 	bundle: &FinalizedBundle,
-	task: TaskId,
 	value: recipe_core::ValueId,
 	local: &BTreeSet<DeviceId>,
-) -> Result<ResolvedValueLocation, WorkerProjectionError> {
-	let location = bundle
-		.value_location(value)
-		.copied()
-		.ok_or(WorkerProjectionError::InvalidTask {
-			task,
-			detail: "task value has no finalized location",
-		})?;
-	if !local.contains(&location.device) {
-		return Err(WorkerProjectionError::InvalidTask {
-			task,
-			detail: "local worker task references a foreign value",
-		});
-	}
-	Ok(location)
-}
-
-fn validate_task_resources(
-	bundle: &FinalizedBundle,
-	task: &Task,
-	work: &PreparedWorkerWork,
-	local: &BTreeSet<DeviceId>,
-) -> Result<(), WorkerProjectionError> {
-	let submission = match work {
-		PreparedWorkerWork::External(transfer) => Some(transfer.submission),
-		_ => work.submission(),
-	};
-	if let Some(submission) = submission {
-		let queue = bundle
-			.resources()
-			.queue(submission.queue)
-			.ok_or(WorkerProjectionError::InvalidResource {
-				task: task.id,
-				detail: "submission queue is absent",
-			})?;
-		let completion = bundle.resources().completion(submission.completion).ok_or(
-			WorkerProjectionError::InvalidResource {
-				task: task.id,
-				detail: "completion slot is absent",
-			},
-		)?;
-		if queue.device != completion.device {
-			return Err(WorkerProjectionError::InvalidResource {
-				task: task.id,
-				detail: "worker submission queue and completion belong to different devices",
-			});
-		}
-		let owner_is_valid = match work {
-			PreparedWorkerWork::External(transfer) => {
-				let TaskKind::Transfer(task_transfer) = &task.kind else {
-					return Err(WorkerProjectionError::InvalidResource {
-						task: task.id,
-						detail: "external worker work is not a transfer task",
-					});
-				};
-				let expected = match transfer.direction {
-					ExternalTransferDirection::Ingress => {
-						match task_transfer.source {
-							recipe_core::TransferEndpoint::Device { device, .. } => device,
-							recipe_core::TransferEndpoint::External => {
-								return Err(WorkerProjectionError::InvalidResource {
-									task: task.id,
-									detail: "cross-machine ingress has no source submission device",
-								});
-							}
-						}
-					}
-					ExternalTransferDirection::Egress => transfer.local.device,
-				};
-				queue.device == expected
-			}
-			_ => local.contains(&queue.device),
-		};
-		if !owner_is_valid {
-			return Err(WorkerProjectionError::InvalidResource {
-				task: task.id,
-				detail: "worker submission resource belongs to the wrong endpoint device",
-			});
-		}
-	}
-	if let PreparedWorkerWork::Metric { metric, slot, .. } = work
-		&& !bundle
-			.resources()
-			.metric(*slot)
-			.is_some_and(|resource| resource.metric == *metric)
-	{
-		return Err(WorkerProjectionError::InvalidResource {
-			task: task.id,
-			detail: "metric slot is absent",
-		});
-	}
-	Ok(())
+) -> ResolvedValueLocation {
+	let location = *bundle.value_location(value).unwrap();
+	debug_assert!(local.contains(&location.device));
+	location
 }
 
 fn projection_digest(
@@ -1427,13 +1248,7 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 				backend,
 			});
 		}
-		if projection.bundle != bundle.identity() || projection.topology != bundle.topology() {
-			return Err(WorkerPrepareFailure {
-				error: Box::new(WorkerExecutionError::BundleMismatch),
-				cleanup_error: None,
-				backend,
-			});
-		}
+		debug_assert!(projection.bundle == bundle.identity() && projection.topology == bundle.topology());
 		let journal_capacity = match worker_journal_capacity::<B>(bundle, &projection) {
 			Ok(capacity) => capacity,
 			Err(error) => {
@@ -1492,22 +1307,7 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 					let request = PendingRequest {
 						task: contract.id,
 						phase: contract.phase,
-						class: match work.class() {
-							Some(class) => class,
-							None => {
-								return Err(preparation_failure(
-									backend,
-									resource,
-									journal,
-									WorkerExecutionError::Projection(
-										WorkerProjectionError::InvalidTask {
-											task: contract.id,
-											detail: "local task has no backend work class",
-										},
-									),
-								));
-							}
-						},
+						class: work.class().unwrap(),
 						submission: work.submission(),
 					};
 					backend
@@ -1553,9 +1353,7 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		}
 		let images = match prepare_images::<B>(&projection) {
 			Ok(images) => images,
-			Err(error) => {
-				return Err(preparation_failure(backend, resource, journal, error));
-			}
+			Err(error) => return Err(preparation_failure(backend, resource, journal, error)),
 		};
 		if let Err(error) = journal.record_logical(LogicalEvent::Prepared {
 			run,
@@ -1605,19 +1403,15 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		bytes: ByteCount,
 		digest: Digest,
 	) -> Result<(), WorkerExecutionError<B::Error>> {
-		self.ensure_run(run)?;
-		if !matches!(
+		self.ensure_run(run);
+		debug_assert!(matches!(
 			self.lifecycle,
 			WorkerLifecycle::Prepared | WorkerLifecycle::Init
-		) {
-			return Err(self.lifecycle_error("init image cannot begin in this state"));
-		}
-		let image_index = self.image_index(device)?;
+		));
+		let image_index = self.image_index(device);
 		let image_task = self.images[image_index].task;
 		let image_bytes = self.images[image_index].bytes;
-		if self.images[image_index].state != ImageState::Needed {
-			return Err(WorkerExecutionError::DuplicateDispatch(image_task));
-		}
+		debug_assert_eq!(self.images[image_index].state, ImageState::Needed);
 		if image_bytes != bytes {
 			return Err(WorkerExecutionError::ByteCountMismatch {
 				task: Some(image_task),
@@ -1630,21 +1424,13 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 			.layouts
 			.iter()
 			.find(|layout| layout.device == device)
-			.ok_or(WorkerExecutionError::UnknownDevice(device))?
+			.unwrap()
 			.clone();
 		let arena_bytes = layout.size;
-		if self.arenas.contains_key(&device) {
-			return Err(WorkerExecutionError::DuplicateDispatch(image_task));
-		}
+		debug_assert!(!self.arenas.contains_key(&device));
 		let mut calls = PhysicalCallBatch::new();
 		let result = {
-			let resource = self
-				.resource
-				.as_mut()
-				.ok_or(WorkerExecutionError::InvalidLifecycle {
-					state: self.lifecycle,
-					detail: "worker resources are unavailable",
-				})?;
+			let resource = self.resource.as_mut().unwrap();
 			self.backend.allocate_arena(resource, &layout, &mut calls)
 		};
 		let arena = self.backend_result(WorkerBackendOperation::AllocateArena(device), calls, result)?;
@@ -1669,12 +1455,10 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		offset: u64,
 		bytes: &[u8],
 	) -> Result<usize, WorkerExecutionError<B::Error>> {
-		self.ensure_run(run)?;
-		let index = self.image_index(device)?;
+		self.ensure_run(run);
+		let index = self.image_index(device);
 		let image = &mut self.images[index];
-		if image.state != ImageState::Receiving {
-			return Err(self.lifecycle_error("init chunk has no receiving image"));
-		}
+		debug_assert_eq!(image.state, ImageState::Receiving);
 		if image.received != offset {
 			return Err(WorkerExecutionError::InitOffsetMismatch {
 				device,
@@ -1703,46 +1487,29 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 	}
 
 	pub fn submit_init_image(&mut self, run: RunId, device: DeviceId) -> Result<(), WorkerExecutionError<B::Error>> {
-		self.ensure_run(run)?;
-		let image_index = self.image_index(device)?;
+		self.ensure_run(run);
+		let image_index = self.image_index(device);
 		let task_id = self.images[image_index].task;
-		if self.images[image_index].state != ImageState::Receiving
-			|| self.images[image_index].received != self.images[image_index].bytes.get()
-		{
-			return Err(self.lifecycle_error("init image is incomplete"));
-		}
+		debug_assert!(self.images[image_index].state == ImageState::Receiving
+			&& self.images[image_index].received == self.images[image_index].bytes.get()
+		);
 		let actual = Digest::new(Sha256::digest(&self.images[image_index].buffer).into());
 		if actual != self.images[image_index].expected_digest {
 			return Err(WorkerExecutionError::InitDigestMismatch(device));
 		}
-		let task_index = self.task_index(task_id)?;
-		self.ensure_dependencies(task_index)?;
+		let task_index = self.task_index(task_id);
+		self.ensure_dependencies(task_index);
 		let mut calls = PhysicalCallBatch::new();
 		let result = {
-			let resource = self
-				.resource
-				.as_mut()
-				.ok_or(WorkerExecutionError::InvalidLifecycle {
-					state: self.lifecycle,
-					detail: "worker resources are unavailable",
-				})?;
+			let resource = self.resource.as_mut().unwrap();
 			let slot = &mut self.tasks[task_index];
-			let role = slot.contract.role();
 			let work = slot
 				.contract
 				.work
 				.backend_work(task_id, run, None, Some(&self.images[image_index].buffer))
-				.ok_or(WorkerExecutionError::WrongRole {
-					task: task_id,
-					expected: WorkerTaskRole::InitAdmission,
-					actual: role,
-				})?;
+				.unwrap();
 			let WorkerPending::Local(pending) = &mut slot.pending else {
-				return Err(WorkerExecutionError::WrongRole {
-					task: task_id,
-					expected: WorkerTaskRole::InitAdmission,
-					actual: role,
-				});
+				unreachable!()
 			};
 			self.backend.submit(
 				resource,
@@ -1767,13 +1534,11 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		run: RunId,
 		device: DeviceId,
 	) -> Result<ExternalTransferPoll, WorkerExecutionError<B::Error>> {
-		self.ensure_run(run)?;
-		let image_index = self.image_index(device)?;
+		self.ensure_run(run);
+		let image_index = self.image_index(device);
 		let task = self.images[image_index].task;
-		if self.images[image_index].state != ImageState::Submitted {
-			return Err(WorkerExecutionError::TaskNotActive(task));
-		}
-		let task_index = self.task_index(task)?;
+		debug_assert_eq!(self.images[image_index].state, ImageState::Submitted);
+		let task_index = self.task_index(task);
 		let poll = self.poll_local_pending(task_index)?;
 		match poll {
 			BackendPoll::Pending => Ok(ExternalTransferPoll::Pending),
@@ -1800,8 +1565,7 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 					)?;
 				}
 				Ok(ExternalTransferPoll::Complete {
-					bytes: usize::try_from(self.images[image_index].bytes.get())
-						.map_err(|_| WorkerExecutionError::CapacityOverflow)?,
+					bytes: usize::try_from(self.images[image_index].bytes.get()).unwrap(),
 				})
 			}
 			BackendPoll::Complete { metric: Some(_) } => {
@@ -1819,42 +1583,23 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		phase: RunPhase,
 		task: TaskId,
 	) -> Result<(), WorkerExecutionError<B::Error>> {
-		let index = self.ensure_dispatch(run, phase, task, WorkerTaskRole::Local)?;
+		let index = self.ensure_dispatch(run, phase, task, WorkerTaskRole::Local);
 		let class = self.tasks[index]
 			.contract
 			.work
 			.class()
-			.ok_or(WorkerExecutionError::WrongRole {
-				task,
-				expected: WorkerTaskRole::Local,
-				actual: self.tasks[index].contract.role(),
-			})?;
+			.unwrap();
 		let mut calls = PhysicalCallBatch::new();
 		let result = {
-			let resource = self
-				.resource
-				.as_mut()
-				.ok_or(WorkerExecutionError::InvalidLifecycle {
-					state: self.lifecycle,
-					detail: "worker resources are unavailable",
-				})?;
+			let resource = self.resource.as_mut().unwrap();
 			let slot = &mut self.tasks[index];
-			let role = slot.contract.role();
 			let work = slot
 				.contract
 				.work
 				.backend_work(task, run, Some(self.loop_iteration), None)
-				.ok_or(WorkerExecutionError::WrongRole {
-					task,
-					expected: WorkerTaskRole::Local,
-					actual: role,
-				})?;
+				.unwrap();
 			let WorkerPending::Local(pending) = &mut slot.pending else {
-				return Err(WorkerExecutionError::WrongRole {
-					task,
-					expected: WorkerTaskRole::Local,
-					actual: role,
-				});
+				unreachable!()
 			};
 			self.backend.submit(
 				resource,
@@ -1873,18 +1618,10 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 	}
 
 	pub fn poll_task(&mut self, run: RunId, task: TaskId) -> Result<WorkerTaskPoll, WorkerExecutionError<B::Error>> {
-		self.ensure_run(run)?;
-		let index = self.task_index(task)?;
-		if self.tasks[index].contract.role() != WorkerTaskRole::Local {
-			return Err(WorkerExecutionError::WrongRole {
-				task,
-				expected: WorkerTaskRole::Local,
-				actual: self.tasks[index].contract.role(),
-			});
-		}
-		if self.tasks[index].state != TaskState::Active {
-			return Err(WorkerExecutionError::TaskNotActive(task));
-		}
+		self.ensure_run(run);
+		let index = self.task_index(task);
+		debug_assert_eq!(self.tasks[index].contract.role(), WorkerTaskRole::Local);
+		debug_assert_eq!(self.tasks[index].state, TaskState::Active);
 		match self.poll_local_pending(index)? {
 			BackendPoll::Pending => Ok(WorkerTaskPoll::Pending),
 			BackendPoll::Complete { metric } => {
@@ -1906,8 +1643,8 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		task: TaskId,
 		bytes: &[u8],
 	) -> Result<(), WorkerExecutionError<B::Error>> {
-		let index = self.ensure_dispatch(run, phase, task, WorkerTaskRole::ExternalIngress)?;
-		let transfer = self.external_contract(index)?;
+		let index = self.ensure_dispatch(run, phase, task, WorkerTaskRole::ExternalIngress);
+		let transfer = self.external_contract(index);
 		let actual = byte_count(bytes.len())?;
 		if actual != transfer.bytes {
 			return Err(WorkerExecutionError::ByteCountMismatch {
@@ -1919,28 +1656,13 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		let transfer_bytes = transfer.bytes;
 		let mut calls = PhysicalCallBatch::new();
 		let result = {
-			let resource = self
-				.resource
-				.as_mut()
-				.ok_or(WorkerExecutionError::InvalidLifecycle {
-					state: self.lifecycle,
-					detail: "worker resources are unavailable",
-				})?;
+			let resource = self.resource.as_mut().unwrap();
 			let slot = &mut self.tasks[index];
-			let role = slot.contract.role();
 			let PreparedWorkerWork::External(transfer) = &slot.contract.work else {
-				return Err(WorkerExecutionError::WrongRole {
-					task,
-					expected: WorkerTaskRole::ExternalIngress,
-					actual: role,
-				});
+				unreachable!()
 			};
 			let WorkerPending::External(pending) = &mut slot.pending else {
-				return Err(WorkerExecutionError::WrongRole {
-					task,
-					expected: WorkerTaskRole::ExternalIngress,
-					actual: role,
-				});
+				unreachable!()
 			};
 			self.backend.begin_external_ingress(
 				resource,
@@ -1979,8 +1701,8 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		task: TaskId,
 		destination: &mut [u8],
 	) -> Result<(), WorkerExecutionError<B::Error>> {
-		let index = self.ensure_dispatch(run, phase, task, WorkerTaskRole::ExternalEgress)?;
-		let transfer = self.external_contract(index)?;
+		let index = self.ensure_dispatch(run, phase, task, WorkerTaskRole::ExternalEgress);
+		let transfer = self.external_contract(index);
 		let actual = byte_count(destination.len())?;
 		if actual != transfer.bytes {
 			return Err(WorkerExecutionError::ByteCountMismatch {
@@ -1992,28 +1714,13 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		let transfer_bytes = transfer.bytes;
 		let mut calls = PhysicalCallBatch::new();
 		let result = {
-			let resource = self
-				.resource
-				.as_mut()
-				.ok_or(WorkerExecutionError::InvalidLifecycle {
-					state: self.lifecycle,
-					detail: "worker resources are unavailable",
-				})?;
+			let resource = self.resource.as_mut().unwrap();
 			let slot = &mut self.tasks[index];
-			let role = slot.contract.role();
 			let PreparedWorkerWork::External(transfer) = &slot.contract.work else {
-				return Err(WorkerExecutionError::WrongRole {
-					task,
-					expected: WorkerTaskRole::ExternalEgress,
-					actual: role,
-				});
+				unreachable!()
 			};
 			let WorkerPending::External(pending) = &mut slot.pending else {
-				return Err(WorkerExecutionError::WrongRole {
-					task,
-					expected: WorkerTaskRole::ExternalEgress,
-					actual: role,
-				});
+				unreachable!()
 			};
 			self.backend.begin_external_egress(
 				resource,
@@ -2050,46 +1757,23 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		run: RunId,
 		task: TaskId,
 	) -> Result<(), WorkerExecutionError<B::Error>> {
-		self.ensure_run(run)?;
-		let index = self.task_index(task)?;
-		let transfer = self.external_contract(index)?;
-		if transfer.direction != ExternalTransferDirection::Egress {
-			return Err(WorkerExecutionError::WrongRole {
-				task,
-				expected: WorkerTaskRole::ExternalEgress,
-				actual: self.tasks[index].contract.role(),
-			});
-		}
-		if self.tasks[index].state != TaskState::AwaitingAck {
-			return Err(WorkerExecutionError::TaskNotActive(task));
-		}
+		self.ensure_run(run);
+		let index = self.task_index(task);
+		let transfer = self.external_contract(index);
+		debug_assert_eq!(transfer.direction, ExternalTransferDirection::Egress);
+		debug_assert_eq!(self.tasks[index].state, TaskState::AwaitingAck);
 		let transfer_phase = transfer.phase;
 		let transfer_direction = transfer.direction;
 		let transfer_bytes = transfer.bytes;
 		let mut calls = PhysicalCallBatch::new();
 		let result = {
-			let resource = self
-				.resource
-				.as_mut()
-				.ok_or(WorkerExecutionError::InvalidLifecycle {
-					state: self.lifecycle,
-					detail: "worker resources are unavailable",
-				})?;
+			let resource = self.resource.as_mut().unwrap();
 			let slot = &mut self.tasks[index];
-			let role = slot.contract.role();
 			let PreparedWorkerWork::External(transfer) = &slot.contract.work else {
-				return Err(WorkerExecutionError::WrongRole {
-					task,
-					expected: WorkerTaskRole::ExternalEgress,
-					actual: role,
-				});
+				unreachable!()
 			};
 			let WorkerPending::External(pending) = &mut slot.pending else {
-				return Err(WorkerExecutionError::WrongRole {
-					task,
-					expected: WorkerTaskRole::ExternalEgress,
-					actual: role,
-				});
+				unreachable!()
 			};
 			self.backend
 				.acknowledge_external_egress(resource, pending, transfer, &mut calls)
@@ -2112,20 +1796,13 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 	}
 
 	pub fn begin_exit(&mut self, run: RunId) -> Result<(), WorkerExecutionError<B::Error>> {
-		self.ensure_run(run)?;
-		if self.lifecycle != WorkerLifecycle::Loop {
-			return Err(self.lifecycle_error("exit may begin only after worker loop entry"));
-		}
-		if let Some(task) = self
-			.tasks
-			.iter()
-			.find(|slot| slot.contract.phase == RunPhase::Loop && slot.state != TaskState::Complete)
-		{
-			return Err(WorkerExecutionError::PhaseIncomplete {
-				phase: RunPhase::Loop,
-				task: task.contract.id,
-			});
-		}
+		self.ensure_run(run);
+		debug_assert_eq!(self.lifecycle, WorkerLifecycle::Loop);
+		debug_assert!(
+			self.tasks
+				.iter()
+				.all(|slot| slot.contract.phase != RunPhase::Loop || slot.state == TaskState::Complete)
+		);
 		self.lifecycle = WorkerLifecycle::Exit;
 		Self::journal_result(
 			self.journal
@@ -2134,56 +1811,38 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 	}
 
 	pub fn cancel(&mut self, run: RunId) -> Result<(), WorkerExecutionError<B::Error>> {
-		self.ensure_run(run)?;
-		if !matches!(
+		self.ensure_run(run);
+		debug_assert!(matches!(
 			self.lifecycle,
 			WorkerLifecycle::Loop | WorkerLifecycle::Exit
-		) {
-			return Err(self.lifecycle_error("cancellation requires an active loop or exit"));
-		}
+		));
 		self.quiesce()?;
 		self.lifecycle = WorkerLifecycle::Cancelling;
 		Ok(())
 	}
 
 	pub fn release_arena(&mut self, run: RunId, device: DeviceId) -> Result<(), WorkerExecutionError<B::Error>> {
-		self.ensure_run(run)?;
-		match self.lifecycle {
-			WorkerLifecycle::Exit => {
-				if self
-					.tasks
-					.iter()
-					.any(|slot| slot.contract.phase == RunPhase::Exit && slot.state != TaskState::Complete)
-				{
-					return Err(self.lifecycle_error("exit arena release precedes projected exit completion"));
-				}
-			}
-			WorkerLifecycle::Cancelling => {}
-			state => {
-				return Err(WorkerExecutionError::InvalidLifecycle {
-					state,
-					detail: "arena release requires completed exit or cancellation",
-				});
-			}
-		}
+		self.ensure_run(run);
+		debug_assert!(matches!(
+			self.lifecycle,
+			WorkerLifecycle::Exit | WorkerLifecycle::Cancelling
+		));
+		debug_assert!(self.lifecycle != WorkerLifecycle::Exit
+			|| self
+				.tasks
+				.iter()
+				.all(|slot| slot.contract.phase != RunPhase::Exit || slot.state == TaskState::Complete));
 		self.release_one_arena(device)
 	}
 
 	pub fn finish(&mut self, run: RunId) -> Result<(), WorkerExecutionError<B::Error>> {
-		self.ensure_run(run)?;
-		if !matches!(
+		self.ensure_run(run);
+		debug_assert!(matches!(
 			self.lifecycle,
 			WorkerLifecycle::Exit | WorkerLifecycle::Cancelling
-		) {
-			return Err(self.lifecycle_error("finish requires exit or cancellation"));
-		}
-		if !self.arenas.is_empty() {
-			return Err(self.lifecycle_error("finish requires exact release of every worker arena"));
-		}
-		let resource = self
-			.resource
-			.take()
-			.ok_or_else(|| self.lifecycle_error("worker resources were already destroyed"))?;
+		));
+		debug_assert!(self.arenas.is_empty());
+		let resource = self.resource.take().unwrap();
 		let mut calls = PhysicalCallBatch::new();
 		let result = self.backend.destroy_resources(resource, &mut calls);
 		self.backend_result(WorkerBackendOperation::DestroyResources, calls, result)?;
@@ -2196,18 +1855,9 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 	/// arena because native work may still reference it.
 	pub fn fatal_cleanup(&mut self) -> Result<(), WorkerExecutionError<B::Error>> {
 		let mut first_error = None;
-		if self.resource.is_some() {
+		if let Some(resource) = self.resource.as_mut() {
 			let mut calls = PhysicalCallBatch::new();
-			let result = {
-				let resource = self
-					.resource
-					.as_mut()
-					.ok_or(WorkerExecutionError::InvalidLifecycle {
-						state: self.lifecycle,
-						detail: "worker resources are unavailable",
-					})?;
-				self.backend.quiesce_worker(resource, &mut calls)
-			};
+			let result = self.backend.quiesce_worker(resource, &mut calls);
 			let record = self.journal.record_physical(calls);
 			match result {
 				Ok(()) => {
@@ -2277,36 +1927,19 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		task: TaskId,
 		direction: ExternalTransferDirection,
 	) -> Result<ExternalTransferPoll, WorkerExecutionError<B::Error>> {
-		self.ensure_run(run)?;
-		let index = self.task_index(task)?;
+		self.ensure_run(run);
+		let index = self.task_index(task);
 		let (contract_direction, transfer_phase, transfer_bytes) = {
-			let transfer = self.external_contract(index)?;
+			let transfer = self.external_contract(index);
 			(transfer.direction, transfer.phase, transfer.bytes)
 		};
-		if contract_direction != direction {
-			return Err(WorkerExecutionError::WrongRole {
-				task,
-				expected: match direction {
-					ExternalTransferDirection::Ingress => WorkerTaskRole::ExternalIngress,
-					ExternalTransferDirection::Egress => WorkerTaskRole::ExternalEgress,
-				},
-				actual: self.tasks[index].contract.role(),
-			});
-		}
-		if self.tasks[index].state != TaskState::Active {
-			return Err(WorkerExecutionError::TaskNotActive(task));
-		}
+		debug_assert_eq!(contract_direction, direction);
+		debug_assert_eq!(self.tasks[index].state, TaskState::Active);
 		let mut calls = PhysicalCallBatch::new();
 		let result = {
-			let resource = self
-				.resource
-				.as_mut()
-				.ok_or(WorkerExecutionError::InvalidLifecycle {
-					state: self.lifecycle,
-					detail: "worker resources are unavailable",
-				})?;
+			let resource = self.resource.as_mut().unwrap();
 			let WorkerPending::External(pending) = &mut self.tasks[index].pending else {
-				return Err(WorkerExecutionError::TaskNotActive(task));
+				unreachable!()
 			};
 			self.backend.poll_external(resource, pending, &mut calls)
 		};
@@ -2351,15 +1984,9 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		let task = self.tasks[index].contract.id;
 		let mut calls = PhysicalCallBatch::new();
 		let result = {
-			let resource = self
-				.resource
-				.as_mut()
-				.ok_or(WorkerExecutionError::InvalidLifecycle {
-					state: self.lifecycle,
-					detail: "worker resources are unavailable",
-				})?;
+			let resource = self.resource.as_mut().unwrap();
 			let WorkerPending::Local(pending) = &mut self.tasks[index].pending else {
-				return Err(WorkerExecutionError::TaskNotActive(task));
+				unreachable!()
 			};
 			self.backend.poll(resource, pending, &mut calls)
 		};
@@ -2428,13 +2055,7 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 			(PreparedWorkerWork::InitAdmission { .. }, None)
 			| (PreparedWorkerWork::Calculation { .. }, None)
 			| (PreparedWorkerWork::InternalTransfer { .. }, None) => Ok(None),
-			(PreparedWorkerWork::External(_), _) => {
-				Err(WorkerExecutionError::WrongRole {
-					task: task.id,
-					expected: WorkerTaskRole::Local,
-					actual: task.role(),
-				})
-			}
+			(PreparedWorkerWork::External(_), _) => unreachable!(),
 			(_, Some(_)) => {
 				Err(WorkerExecutionError::MetricContract {
 					task: task.id,
@@ -2450,72 +2071,35 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		phase: RunPhase,
 		task: TaskId,
 		role: WorkerTaskRole,
-	) -> Result<usize, WorkerExecutionError<B::Error>> {
-		self.ensure_run(run)?;
-		let active_phase = self.active_phase()?;
-		if active_phase != phase {
-			return Err(WorkerExecutionError::WrongPhase {
-				task: Some(task),
-				expected: active_phase,
-				actual: phase,
-			});
-		}
-		let index = self.task_index(task)?;
+	) -> usize {
+		self.ensure_run(run);
+		debug_assert_eq!(self.active_phase(), phase);
+		let index = self.task_index(task);
 		let contract = &self.tasks[index].contract;
-		if contract.phase != phase {
-			return Err(WorkerExecutionError::WrongPhase {
-				task: Some(task),
-				expected: phase,
-				actual: contract.phase,
-			});
-		}
-		if contract.role() != role {
-			return Err(WorkerExecutionError::WrongRole {
-				task,
-				expected: role,
-				actual: contract.role(),
-			});
-		}
-		if self.tasks[index].state != TaskState::Idle {
-			return Err(WorkerExecutionError::DuplicateDispatch(task));
-		}
-		self.ensure_dependencies(index)?;
-		if let Some(active) = self.tasks.iter().find(|slot| {
+		debug_assert_eq!(contract.phase, phase);
+		debug_assert_eq!(contract.role(), role);
+		debug_assert_eq!(self.tasks[index].state, TaskState::Idle);
+		self.ensure_dependencies(index);
+		debug_assert!(self.tasks.iter().all(|slot| {
 			matches!(slot.state, TaskState::Active | TaskState::AwaitingAck)
-				&& !slot.contract.window.overlaps(contract.window)
-		}) {
-			return Err(WorkerExecutionError::ScheduleConflict {
-				task,
-				active: active.contract.id,
-			});
-		}
-		Ok(index)
+				.then(|| slot.contract.window.overlaps(contract.window))
+				.unwrap_or(true)
+		}));
+		index
 	}
 
-	fn ensure_dependencies(&self, index: usize) -> Result<(), WorkerExecutionError<B::Error>> {
+	fn ensure_dependencies(&self, index: usize) {
 		let contract = &self.tasks[index].contract;
 		for dependency in &contract.projected_dependencies {
-			let dependency_index = self.task_index(*dependency)?;
-			if self.tasks[dependency_index].state != TaskState::Complete {
-				return Err(WorkerExecutionError::DependencyIncomplete {
-					task: contract.id,
-					dependency: *dependency,
-				});
-			}
+			let dependency_index = self.task_index(*dependency);
+			debug_assert_eq!(self.tasks[dependency_index].state, TaskState::Complete);
 		}
-		Ok(())
 	}
 
 	fn quiesce(&mut self) -> Result<(), WorkerExecutionError<B::Error>> {
 		let mut calls = PhysicalCallBatch::new();
 		let result = {
-			let resource = self
-				.resource
-				.as_mut()
-				.ok_or(WorkerExecutionError::InvalidLifecycle {
-					state: self.lifecycle,
-					detail: "worker resources are unavailable",
-				})?;
+			let resource = self.resource.as_mut().unwrap();
 			self.backend.quiesce_worker(resource, &mut calls)
 		};
 		self.backend_result(WorkerBackendOperation::Quiesce, calls, result)?;
@@ -2531,23 +2115,12 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 	}
 
 	fn release_one_arena(&mut self, device: DeviceId) -> Result<(), WorkerExecutionError<B::Error>> {
-		let image_index = self.image_index(device)?;
-		if self.images[image_index].state == ImageState::Released {
-			return Err(WorkerExecutionError::ArenaAlreadyReleased(device));
-		}
-		let arena = self
-			.arenas
-			.remove(&device)
-			.ok_or(WorkerExecutionError::ArenaAlreadyReleased(device))?;
+		let image_index = self.image_index(device);
+		debug_assert_ne!(self.images[image_index].state, ImageState::Released);
+		let arena = self.arenas.remove(&device).unwrap();
 		let mut calls = PhysicalCallBatch::new();
 		let result = {
-			let resource = self
-				.resource
-				.as_mut()
-				.ok_or(WorkerExecutionError::InvalidLifecycle {
-					state: self.lifecycle,
-					detail: "worker resources are unavailable",
-				})?;
+			let resource = self.resource.as_mut().unwrap();
 			self.backend
 				.release_arena(resource, device, arena, &mut calls)
 		};
@@ -2572,61 +2145,35 @@ impl<B: WorkerBackend> WorkerExecutionSession<B> {
 		Ok(())
 	}
 
-	fn ensure_run(&self, run: RunId) -> Result<(), WorkerExecutionError<B::Error>> {
-		match run == self.run {
-			true => Ok(()),
-			false => {
-				Err(WorkerExecutionError::RunMismatch {
-					expected: self.run,
-					actual: run,
-				})
-			}
-		}
+	fn ensure_run(&self, run: RunId) {
+		debug_assert_eq!(run, self.run);
 	}
 
-	fn active_phase(&self) -> Result<RunPhase, WorkerExecutionError<B::Error>> {
+	fn active_phase(&self) -> RunPhase {
 		match self.lifecycle {
-			WorkerLifecycle::Loop => Ok(RunPhase::Loop),
-			WorkerLifecycle::Exit => Ok(RunPhase::Exit),
-			state => {
-				Err(WorkerExecutionError::InvalidLifecycle {
-					state,
-					detail: "worker has no dispatchable phase",
-				})
-			}
+			WorkerLifecycle::Loop => RunPhase::Loop,
+			WorkerLifecycle::Exit => RunPhase::Exit,
+			_ => unreachable!(),
 		}
 	}
 
-	fn lifecycle_error(&self, detail: &'static str) -> WorkerExecutionError<B::Error> {
-		WorkerExecutionError::InvalidLifecycle {
-			state: self.lifecycle,
-			detail,
-		}
-	}
-
-	fn task_index(&self, task: TaskId) -> Result<usize, WorkerExecutionError<B::Error>> {
+	fn task_index(&self, task: TaskId) -> usize {
 		self.tasks
 			.binary_search_by_key(&task, |slot| slot.contract.id)
-			.map_err(|_| WorkerExecutionError::UnknownTask(task))
+			.unwrap()
 	}
 
-	fn image_index(&self, device: DeviceId) -> Result<usize, WorkerExecutionError<B::Error>> {
+	fn image_index(&self, device: DeviceId) -> usize {
 		self.images
 			.binary_search_by_key(&device, |image| image.device)
-			.map_err(|_| WorkerExecutionError::UnknownDevice(device))
+			.unwrap()
 	}
 
-	fn external_contract(&self, index: usize) -> Result<&WorkerExternalTransfer, WorkerExecutionError<B::Error>> {
-		match &self.tasks[index].contract.work {
-			PreparedWorkerWork::External(transfer) => Ok(transfer),
-			_ => {
-				Err(WorkerExecutionError::WrongRole {
-					task: self.tasks[index].contract.id,
-					expected: WorkerTaskRole::ExternalIngress,
-					actual: self.tasks[index].contract.role(),
-				})
-			}
-		}
+	fn external_contract(&self, index: usize) -> &WorkerExternalTransfer {
+		let PreparedWorkerWork::External(transfer) = &self.tasks[index].contract.work else {
+			unreachable!()
+		};
+		transfer
 	}
 
 	fn backend_result<T>(
@@ -2662,10 +2209,8 @@ fn prepare_images<B: WorkerBackend>(
 					_ => None,
 				}
 			})
-			.ok_or(WorkerExecutionError::Projection(
-				WorkerProjectionError::MissingInitAdmission(layout.device),
-			))?;
-		let bytes = usize::try_from(image_bytes.get()).map_err(|_| WorkerExecutionError::CapacityOverflow)?;
+			.unwrap();
+		let bytes = usize::try_from(image_bytes.get()).unwrap();
 		let mut buffer = Vec::new();
 		buffer.try_reserve_exact(bytes)
 			.map_err(|_| WorkerExecutionError::CapacityOverflow)?;
@@ -2690,23 +2235,16 @@ fn worker_journal_capacity<B: WorkerBackend>(
 ) -> Result<JournalCapacity, WorkerExecutionError<B::Error>> {
 	let base = JournalCapacity::for_bundle::<B>(bundle).map_err(WorkerExecutionError::Journal)?;
 	let external = projection.external_transfers().count();
-	let extra_logical = external
-		.checked_mul(2)
-		.and_then(|count| count.checked_add(2))
-		.ok_or(WorkerExecutionError::CapacityOverflow)?;
+	let extra_logical = external.checked_mul(2).and_then(|count| count.checked_add(2)).unwrap();
 	let extra_physical = projection
 		.tasks
 		.len()
 		.checked_mul(B::MAX_NON_POLL_PHYSICAL_CALLS)
 		.and_then(|count| count.checked_add(B::MAX_NON_POLL_PHYSICAL_CALLS))
-		.ok_or(WorkerExecutionError::CapacityOverflow)?;
+		.unwrap();
 	Ok(JournalCapacity::new(
-		base.logical_events
-			.checked_add(extra_logical)
-			.ok_or(WorkerExecutionError::CapacityOverflow)?,
-		base.physical_calls
-			.checked_add(extra_physical)
-			.ok_or(WorkerExecutionError::CapacityOverflow)?,
+		base.logical_events.checked_add(extra_logical).unwrap(),
+		base.physical_calls.checked_add(extra_physical).unwrap(),
 	))
 }
 

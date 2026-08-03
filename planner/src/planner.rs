@@ -988,16 +988,7 @@ fn lower_candidate(
 		.zip(&assignment.options)
 		.collect::<BTreeMap<_, _>>();
 	let mut state = LoweringState::new();
-	initialize_data_images(
-		context.order,
-		context.nodes,
-		context.tensors,
-		context.programs,
-		context.topology,
-		&selected,
-		context.source_domains,
-		&mut state,
-	)?;
+	initialize_data_images(context, &selected, &mut state)?;
 
 	let mut placements = Vec::with_capacity(context.order.len());
 	let mut stage_placements = Vec::new();
@@ -2127,12 +2118,12 @@ fn build_transfer_chain(
 	source: RuntimeCopy,
 	destination: DeviceId,
 	route: &[LinkId],
-	dtype: DType,
-	bytes: ByteCount,
+	tensor: &Tensor,
 	topology: &Topology,
 	allocation: TransferAllocationStart,
 	domain: IterationDomain,
 ) -> PlannerResult<TransferChain> {
+	let bytes = tensor.storage_bytes;
 	topology
 		.validate_route(source.device, destination, route)
 		.map_err(|errors| {
@@ -2204,7 +2195,7 @@ fn build_transfer_chain(
 	let mut values = Vec::with_capacity(endpoints.len());
 	values.push(ValueSpec {
 		id: final_value,
-		dtype,
+		dtype: tensor.dtype,
 		bytes,
 		device: destination,
 		producer: Some(final_task),
@@ -2217,7 +2208,7 @@ fn build_transfer_chain(
 	{
 		values.push(ValueSpec {
 			id: hop_values[hop],
-			dtype,
+			dtype: tensor.dtype,
 			bytes,
 			device: hop_destination,
 			producer: Some(task_ids[hop]),
@@ -2274,25 +2265,20 @@ fn build_transfer_chain(
 }
 
 fn initialize_data_images(
-	order: &[KernelTemplateId],
-	nodes: &BTreeMap<KernelTemplateId, &recipe_language::CalculationNode>,
-	tensors: &BTreeMap<ValueId, &Tensor>,
-	programs: &BTreeMap<KernelTemplateId, LoweredKernelPlan>,
-	topology: &Topology,
+	context: &PlanningContext<'_>,
 	selected: &BTreeMap<KernelTemplateId, &PlacementOption>,
-	source_domains: &BTreeMap<KernelTemplateId, IterationDomain>,
 	state: &mut LoweringState,
 ) -> PlannerResult<()> {
 	let mut image_tensors = BTreeMap::<DeviceId, BTreeSet<ValueId>>::new();
 	let mut fault_buffers = BTreeMap::<DeviceId, BTreeMap<IterationDomain, Vec<(KernelTemplateId, u32)>>>::new();
-	for kernel in order {
-		let node = nodes.get(kernel).ok_or_else(|| {
+	for kernel in context.order {
+		let node = context.nodes.get(kernel).ok_or_else(|| {
 			PlannerError::new(
 				PlannerErrorKind::InvalidGraph,
 				format!("kernel {kernel} is absent while building data images"),
 			)
 		})?;
-		let program = programs.get(kernel).ok_or_else(|| {
+		let program = context.programs.get(kernel).ok_or_else(|| {
 			PlannerError::new(
 				PlannerErrorKind::InvalidGraph,
 				format!("kernel {kernel} has no lowered program while building data images"),
@@ -2300,7 +2286,7 @@ fn initialize_data_images(
 		})?;
 		for buffer in &program.program.buffers {
 			if buffer.lifetime == BufferLifetime::ProgramFaultFlag {
-				let domain = source_domains.get(kernel).copied().ok_or_else(|| {
+				let domain = context.source_domains.get(kernel).copied().ok_or_else(|| {
 					PlannerError::new(
 						PlannerErrorKind::InvalidGraph,
 						format!("kernel {kernel} has no iteration domain while building data images"),
@@ -2315,7 +2301,8 @@ fn initialize_data_images(
 			}
 		}
 		for input in &node.kernel.inputs {
-			if tensors
+			if context
+				.tensors
 				.get(input)
 				.is_some_and(|tensor| tensor.external_input)
 			{
@@ -2326,13 +2313,15 @@ fn initialize_data_images(
 			}
 		}
 	}
-	let mut devices = topology
+	let mut devices = context
+		.topology
 		.devices
 		.iter()
 		.map(|device| device.id)
 		.collect::<Vec<_>>();
 	devices.sort();
-	for tensor in tensors
+	for tensor in context
+		.tensors
 		.values()
 		.copied()
 		.filter(|tensor| tensor.external_input && tensor.external_output)
@@ -2359,7 +2348,7 @@ fn initialize_data_images(
 		let mut external_members = Vec::new();
 		let mut data_members = Vec::new();
 		for logical in image_tensors.get(&device).into_iter().flatten() {
-			let tensor = tensors.get(logical).ok_or_else(|| {
+			let tensor = context.tensors.get(logical).ok_or_else(|| {
 				PlannerError::new(
 					PlannerErrorKind::InvalidGraph,
 					format!("data-image tensor {logical} is absent"),
@@ -2528,8 +2517,7 @@ fn ensure_copy(
 				source,
 				destination,
 				&route,
-				tensor.dtype,
-				tensor.storage_bytes,
+				tensor,
 				topology,
 				allocation,
 				consumer_domain,
@@ -2570,8 +2558,7 @@ fn ensure_copy(
 		source,
 		destination,
 		&route,
-		tensor.dtype,
-		tensor.storage_bytes,
+		tensor,
 		topology,
 		allocation,
 		consumer_domain,

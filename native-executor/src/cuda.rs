@@ -24,7 +24,7 @@ use recipe_kernel::{ArtifactDigest, KernelArgument, inspect_cubin};
 
 use crate::{
 	Error, ExecutionPlan, NativeBackendKind, NativeDeviceExecutionEvidence, Result, RuntimeArtifactKind,
-	cuda_ffi::ParameterBlock, error::ensure_submission_queue_capacity, plan::InitImageContract,
+	cuda_ffi::ParameterBlock, plan::InitImageContract,
 };
 
 /// CUDA Driver API exposes no finite device stream-count attribute. Recipe
@@ -355,23 +355,17 @@ impl<'context> CudaResources<'context> {
 		let mut binding_by_device = BTreeMap::new();
 		for binding in bindings {
 			let device = binding.device;
-			ensure(
-				binding_by_device.insert(device, binding).is_none(),
-				Error::DuplicateDevice { device },
-			)?;
+			let prior = binding_by_device.insert(device, binding);
+			debug_assert!(prior.is_none());
 		}
 		for device in plan.devices() {
-			ensure(
-				binding_by_device.contains_key(&device),
-				Error::MissingDevice { device },
-			)?;
+			debug_assert!(binding_by_device.contains_key(&device));
 		}
-		reject_unexpected_device(
+		debug_assert!(
 			binding_by_device
 				.keys()
-				.copied()
-				.find(|device| !plan.devices().any(|planned| planned == *device)),
-		)?;
+				.all(|device| plan.devices().any(|planned| planned == *device))
+		);
 
 		let mut devices = BTreeMap::new();
 		let runtime_by_id = plan
@@ -390,12 +384,10 @@ impl<'context> CudaResources<'context> {
 			.cloned()
 			.collect::<Vec<_>>();
 		for binding in binding_by_device.values() {
-			ensure_submission_queue_capacity(
-				"CUDA Driver",
-				binding.device,
-				requested_submission_queue_count(bundle.resources(), &scoped_tasks, binding.device),
-				binding.maximum_submission_queues,
-			)?;
+			debug_assert!(
+				requested_submission_queue_count(bundle.resources(), &scoped_tasks, binding.device)
+					<= binding.maximum_submission_queues as usize
+			);
 		}
 		for (device, binding) in binding_by_device {
 			validate_binding(&binding)?;
@@ -410,7 +402,7 @@ impl<'context> CudaResources<'context> {
 			)?;
 			devices.insert(device, resources);
 		}
-		let contracts = task_contracts(bundle, tasks)?;
+		let contracts = task_contracts(bundle, tasks);
 		Ok(Self {
 			plan,
 			contracts,
@@ -421,13 +413,8 @@ impl<'context> CudaResources<'context> {
 	}
 
 	pub(crate) fn allocate_arena(&self, layout: &ArenaLayout) -> Result<CudaArena<'context>> {
-		let resources = self
-			.devices
-			.get(&layout.device)
-			.ok_or(Error::MissingDevice {
-				device: layout.device,
-			})?;
-		let bytes = bytes_to_usize(layout.size.get(), "CUDA arena size")?;
+		let resources = &self.devices[&layout.device];
+		let bytes = bytes_to_usize(layout.size.get());
 		let buffer = DeviceBuffer::allocate(resources.context, bytes)?;
 		Ok(CudaArena {
 			device: layout.device,
@@ -437,43 +424,22 @@ impl<'context> CudaResources<'context> {
 
 	pub(crate) fn prepare_pending(&mut self, request: PendingRequest) -> Result<CudaPending<'context>> {
 		self.ensure_healthy()?;
-		let contract = self.contracts.get(&request.task).ok_or(Error::Protocol {
-			task: request.task,
-			detail: "pending request names no finalized task",
-		})?;
-		ensure(
+		let contract = &self.contracts[&request.task];
+		debug_assert!(
 			request.phase == contract.phase
 				&& request.class == contract.class
-				&& request.submission == contract.submission,
-			Error::Protocol {
-				task: request.task,
-				detail: "pending request differs from the finalized task contract",
-			},
-		)?;
-		let planned = self.plan.submission(request.task).ok_or(Error::Protocol {
-			task: request.task,
-			detail: "task has no immutable native submission assignment",
-		})?;
-		let resources = self
-			.devices
-			.get(&planned.device)
-			.ok_or(Error::MissingDevice {
-				device: planned.device,
-			})?;
-		ensure(
+				&& request.submission == contract.submission
+		);
+		let planned = self.plan.submission(request.task).unwrap();
+		let resources = &self.devices[&planned.device];
+		debug_assert!(
 			resources.queues.contains_key(&planned.slots.queue)
 				&& resources
 					.completions
-					.contains_key(&planned.slots.completion),
-			Error::Protocol {
-				task: request.task,
-				detail: "prepared task references an unrealized CUDA submission slot",
-			},
-		)?;
-		ensure(self.prepared_tasks.insert(request.task), Error::Protocol {
-			task: request.task,
-			detail: "CUDA pending token was prepared more than once",
-		})?;
+					.contains_key(&planned.slots.completion)
+		);
+		let inserted = self.prepared_tasks.insert(request.task);
+		debug_assert!(inserted);
 		Ok(CudaPending::ready(request, planned))
 	}
 
@@ -485,12 +451,8 @@ impl<'context> CudaResources<'context> {
 	) -> Result<()> {
 		self.ensure_healthy()?;
 		let task = work.task();
-		let planned = self.plan.submission(task).ok_or(Error::Protocol {
-			task,
-			detail: "task has no immutable native submission assignment",
-		})?;
-		pending.validate_ready(&work, planned)?;
-		self.validate_work_contract(&work)?;
+		let planned = self.plan.submission(task).unwrap();
+		pending.validate_ready(&work, planned);
 		let result = match work {
 			BackendWork::InitAdmission(work) => self.submit_admission(arenas, planned, work),
 			BackendWork::Calculation(work) => self.submit_calculation(arenas, planned, &work),
@@ -510,62 +472,16 @@ impl<'context> CudaResources<'context> {
 		}
 	}
 
-	fn validate_work_contract(&self, work: &BackendWork<'_>) -> Result<()> {
-		let task = work.task();
-		let contract = self.contracts.get(&task).ok_or(Error::Protocol {
-			task,
-			detail: "submitted work names no finalized CUDA task",
-		})?;
-		ensure(
-			work.class() == contract.class && work_submission(work) == contract.submission,
-			Error::Protocol {
-				task,
-				detail: "submitted work class or slots differ from the finalized CUDA task",
-			},
-		)?;
-		match work {
-			BackendWork::InitAdmission(admission) => {
-				ensure(
-					contract.admission
-						== Some(InitImageContract {
-							device: admission.destination.device,
-							image: admission.destination.value,
-							bytes: admission.bytes,
-						}),
-					Error::Protocol {
-						task,
-						detail: "submitted CUDA admission differs from the finalized init-image manifest",
-					},
-				)
-			}
-			BackendWork::InternalTransfer(transfer) | BackendWork::ExitTransfer(transfer) => {
-				ensure(
-					transfer.route == contract.route && transfer.lane_claims == contract.lane_claims,
-					Error::Protocol {
-						task,
-						detail: "submitted CUDA route or lane claims differ from the finalized transfer",
-					},
-				)
-			}
-			BackendWork::Calculation(_) | BackendWork::Metric(_) => Ok(()),
-		}
-	}
-
 	pub(crate) fn poll(&mut self, pending: &mut CudaPending<'context>) -> Result<BackendPoll> {
 		self.ensure_healthy()?;
-		let device = self.device_mut(pending.device)?;
-		validate_active(device, pending)?;
+		let device = self.device_mut(pending.device);
+		validate_active(device, pending);
 		let status = match &mut pending.native {
 			NativePendingState::Active(PendingSubmission::Event(native)) => native.poll(),
 			NativePendingState::Active(PendingSubmission::Stream) => {
-				queue(&device.queues, pending.task, pending.queue)?.poll_idle()
+				queue(&device.queues, pending.queue).poll_idle()
 			}
-			NativePendingState::Ready | NativePendingState::Terminal => {
-				return Err(Error::Protocol {
-					task: pending.task,
-					detail: "CUDA pending token is not active",
-				});
-			}
+			NativePendingState::Ready | NativePendingState::Terminal => unreachable!(),
 		};
 		let status = match status {
 			Ok(status) => status,
@@ -610,33 +526,18 @@ impl<'context> CudaResources<'context> {
 	) -> Result<()> {
 		self.ensure_healthy()?;
 		let ResolvedTransferEndpoint::Device(source_location) = work.source else {
-			return Err(Error::UnsupportedTransfer {
-				task: work.task,
-				detail: "collected CUDA exit has no device source",
-			});
+			unreachable!()
 		};
-		ensure(
-			pending.task == work.task
+		debug_assert!(pending.task == work.task
 				&& pending.class == WorkClass::ExitTransfer
 				&& pending.terminal && pending.device == source_location.device
 				&& pending.queue == work.submission.queue
 				&& pending.completion == work.submission.completion
 				&& matches!(work.destination, ResolvedTransferEndpoint::External)
-				&& destination.len() == bytes_to_usize(work.bytes.get(), "CUDA exit result size")?,
-			Error::Protocol {
-				task: work.task,
-				detail: "exit collection differs from its completed prepared task",
-			},
-		)?;
-		let device = self.device_mut(pending.device)?;
-		let source = device.egress.get(&work.task).ok_or(Error::Protocol {
-			task: work.task,
-			detail: "completed CUDA exit has no preallocated host result",
-		})?;
-		ensure(source.len() == destination.len(), Error::Protocol {
-			task: work.task,
-			detail: "completed CUDA exit size differs from caller storage",
-		})?;
+				&& destination.len() == bytes_to_usize(work.bytes.get()));
+		let device = self.device_mut(pending.device);
+		let source = &device.egress[&work.task];
+		debug_assert_eq!(source.len(), destination.len());
 		destination.copy_from_slice(source);
 		Ok(())
 	}
@@ -652,35 +553,28 @@ impl<'context> CudaResources<'context> {
 		planned: crate::PlannedSubmission,
 		work: InitAdmissionWork<'_>,
 	) -> Result<(PendingSubmission<'context>, PendingAction)> {
-		ensure(planned.device == work.destination.device, Error::Protocol {
-			task: work.task,
-			detail: "admission device differs from immutable submission",
-		})?;
-		let arena = checked_arena(arenas, work.destination, work.bytes.get())?;
-		let device = self.device_mut(planned.device)?;
-		let bytes = bytes_to_usize(work.bytes.get(), "CUDA admission byte count")?;
-		ensure(
+		debug_assert_eq!(planned.device, work.destination.device);
+		let arena = checked_arena(arenas, work.destination, work.bytes.get());
+		let device = self.device_mut(planned.device);
+		let bytes = bytes_to_usize(work.bytes.get());
+		debug_assert!(
 			device.admission
 				== Some(InitImageContract {
 					device: work.destination.device,
 					image: work.destination.value,
 					bytes: work.bytes,
 				}) && work.image.len() == bytes
-				&& device.staging.len() >= bytes,
-			Error::Protocol {
-				task: work.task,
-				detail: "admission image or pinned staging size differs from finalized bytes",
-			},
-		)?;
+				&& device.staging.len() >= bytes
+		);
 		device.staging.as_mut_slice()[..bytes].copy_from_slice(work.image);
-		let event = take_event(&mut device.completions, work.task, planned.slots.completion)?;
-		let stream = queue(&device.queues, work.task, planned.slots.queue)?;
+		let event = take_event(&mut device.completions, work.task, planned.slots.completion);
+		let stream = queue(&device.queues, planned.slots.queue);
 		// SAFETY: the arena and staging ranges were bounds-checked above. The
 		// pending token remains owned until polling reports a terminal state.
 		let native = unsafe {
 			stream.copy_h2d(
 				&arena.buffer,
-				offset_to_usize(work.destination.arena_offset.get())?,
+				offset_to_usize(work.destination.arena_offset.get()),
 				&device.staging,
 				0,
 				bytes,
@@ -699,26 +593,12 @@ impl<'context> CudaResources<'context> {
 		planned: crate::PlannedSubmission,
 		work: &CalculationWork,
 	) -> Result<(PendingSubmission<'context>, PendingAction)> {
-		ensure(planned.device == work.device, Error::Protocol {
-			task: work.task,
-			detail: "calculation device differs from immutable submission",
-		})?;
-		let device = self.device_mut(planned.device)?;
-		let artifact = device
-			.artifacts
-			.get(&work.artifact)
-			.ok_or(Error::MissingArtifact {
-				artifact: work.artifact,
-			})?;
-		let invocation = device
-			.invocations
-			.get_mut(&planned.slots.completion)
-			.ok_or(Error::MissingCompletion {
-				task: work.task,
-				completion: planned.slots.completion,
-			})?;
+		debug_assert_eq!(planned.device, work.device);
+		let device = self.device_mut(planned.device);
+		let artifact = &device.artifacts[&work.artifact];
+		let invocation = device.invocations.get_mut(&planned.slots.completion).unwrap();
 		fill_invocation(invocation, arenas, work, &artifact.abi)?;
-		let stream = queue(&device.queues, work.task, planned.slots.queue)?;
+		let stream = queue(&device.queues, planned.slots.queue);
 		let grid = grid_size(artifact.abi.elements.get(), artifact.abi.workgroup_lanes)?;
 		let config = LaunchConfig::new(
 			recipe_cuda::Dim3::new(grid, 1, 1)?,
@@ -743,27 +623,21 @@ impl<'context> CudaResources<'context> {
 		planned: crate::PlannedSubmission,
 		work: &TransferWork,
 	) -> Result<(PendingSubmission<'context>, PendingAction)> {
-		let (source, destination) = device_endpoints(work)?;
-		ensure(
-			source.device == destination.device && source.device == planned.device,
-			Error::UnsupportedTransfer {
-				task: work.task,
-				detail: "CUDA Driver bridge currently accepts only same-context D2D routes",
-			},
-		)?;
-		let source_arena = checked_arena(arenas, source, work.bytes.get())?;
-		let destination_arena = checked_arena(arenas, destination, work.bytes.get())?;
-		let device = self.device_mut(planned.device)?;
-		let stream = queue(&device.queues, work.task, planned.slots.queue)?;
+		let (source, destination) = device_endpoints(work);
+		debug_assert!(source.device == destination.device && source.device == planned.device);
+		let source_arena = checked_arena(arenas, source, work.bytes.get());
+		let destination_arena = checked_arena(arenas, destination, work.bytes.get());
+		let device = self.device_mut(planned.device);
+		let stream = queue(&device.queues, planned.slots.queue);
 		// SAFETY: both ranges were bounds-checked and belong to the stream's
 		// context. The pending token retains their lifetime through completion.
 		unsafe {
 			stream.enqueue_d2d(
 				&destination_arena.buffer,
-				offset_to_usize(destination.arena_offset.get())?,
+				offset_to_usize(destination.arena_offset.get()),
 				&source_arena.buffer,
-				offset_to_usize(source.arena_offset.get())?,
-				bytes_to_usize(work.bytes.get(), "CUDA D2D byte count")?,
+				offset_to_usize(source.arena_offset.get()),
+				bytes_to_usize(work.bytes.get()),
 			)
 		}?;
 		Ok((PendingSubmission::Stream, PendingAction::None))
@@ -775,23 +649,11 @@ impl<'context> CudaResources<'context> {
 		planned: crate::PlannedSubmission,
 		work: MetricWork,
 	) -> Result<(PendingSubmission<'context>, PendingAction)> {
-		ensure(
-			work.value.bytes.get() == 4 && work.value.device == planned.device,
-			Error::ValueMismatch {
-				value: work.value.value,
-				detail: "metrics require one resolved four-byte value on the submission device",
-			},
-		)?;
-		let arena = checked_arena(arenas, work.value, 4)?;
-		let device = self.device_mut(planned.device)?;
-		let metric_buffer = device
-			.metric_buffers
-			.get_mut(&work.task)
-			.ok_or(Error::Protocol {
-				task: work.task,
-				detail: "metric pinned buffer was not pre-realized",
-			})?;
-		let stream = queue(&device.queues, work.task, planned.slots.queue)?;
+		debug_assert!(work.value.bytes.get() == 4 && work.value.device == planned.device);
+		let arena = checked_arena(arenas, work.value, 4);
+		let device = self.device_mut(planned.device);
+		let metric_buffer = device.metric_buffers.get_mut(&work.task).unwrap();
+		let stream = queue(&device.queues, planned.slots.queue);
 		// SAFETY: the four-byte source range and pinned destination were checked
 		// above. The pending token remains live until the event is terminal.
 		unsafe {
@@ -799,7 +661,7 @@ impl<'context> CudaResources<'context> {
 				metric_buffer,
 				0,
 				&arena.buffer,
-				offset_to_usize(work.value.arena_offset.get())?,
+				offset_to_usize(work.value.arena_offset.get()),
 				4,
 			)
 		}?;
@@ -815,30 +677,15 @@ impl<'context> CudaResources<'context> {
 		work: &TransferWork,
 	) -> Result<(PendingSubmission<'context>, PendingAction)> {
 		let ResolvedTransferEndpoint::Device(source) = work.source else {
-			return Err(Error::UnsupportedTransfer {
-				task: work.task,
-				detail: "exit transfer has no device source",
-			});
+			unreachable!("finalized exit transfer has a device source");
 		};
-		ensure(
-			matches!(work.destination, ResolvedTransferEndpoint::External) && source.device == planned.device,
-			Error::UnsupportedTransfer {
-				task: work.task,
-				detail: "CUDA exit bridge accepts only device-to-external egress",
-			},
-		)?;
-		let source_arena = checked_arena(arenas, source, work.bytes.get())?;
-		let device = self.device_mut(planned.device)?;
-		let bytes = bytes_to_usize(work.bytes.get(), "CUDA egress byte count")?;
-		ensure(
-			device.staging.len() >= bytes && device.egress.contains_key(&work.task),
-			Error::Protocol {
-				task: work.task,
-				detail: "egress staging was not pre-realized at finalized size",
-			},
-		)?;
-		let event = take_event(&mut device.completions, work.task, planned.slots.completion)?;
-		let stream = queue(&device.queues, work.task, planned.slots.queue)?;
+		debug_assert!(matches!(work.destination, ResolvedTransferEndpoint::External) && source.device == planned.device);
+		let source_arena = checked_arena(arenas, source, work.bytes.get());
+		let device = self.device_mut(planned.device);
+		let bytes = bytes_to_usize(work.bytes.get());
+		debug_assert!(device.staging.len() >= bytes && device.egress.contains_key(&work.task));
+		let event = take_event(&mut device.completions, work.task, planned.slots.completion);
+		let stream = queue(&device.queues, planned.slots.queue);
 		// SAFETY: the finalized source range and pre-realized pinned destination
 		// were bounds-checked. Pending ownership lasts through terminal polling.
 		let native = unsafe {
@@ -846,7 +693,7 @@ impl<'context> CudaResources<'context> {
 				&mut device.staging,
 				0,
 				&source_arena.buffer,
-				offset_to_usize(source.arena_offset.get())?,
+				offset_to_usize(source.arena_offset.get()),
 				bytes,
 				event,
 			)
@@ -860,12 +707,7 @@ impl<'context> CudaResources<'context> {
 	fn finish_pending(&mut self, pending: &mut CudaPending<'context>) -> Result<BackendPoll> {
 		let submission = match core::mem::replace(&mut pending.native, NativePendingState::Terminal) {
 			NativePendingState::Active(native) => native,
-			NativePendingState::Ready | NativePendingState::Terminal => {
-				return Err(Error::Protocol {
-					task: pending.task,
-					detail: "CUDA completion token is absent",
-				});
-			}
+			NativePendingState::Ready | NativePendingState::Terminal => unreachable!(),
 		};
 		if let PendingSubmission::Event(native) = submission {
 			let event = match native.wait(Duration::ZERO)? {
@@ -875,21 +717,12 @@ impl<'context> CudaResources<'context> {
 					return Ok(BackendPoll::Pending);
 				}
 			};
-			let device = self.device_mut(pending.device)?;
-			let slot = device
-				.completions
-				.get_mut(&pending.completion)
-				.ok_or(Error::MissingCompletion {
-					task: pending.task,
-					completion: pending.completion,
-				})?;
+			let device = self.device_mut(pending.device);
+			let slot = device.completions.get_mut(&pending.completion).unwrap();
 			let prior = core::mem::replace(slot, CompletionEvent::Available(event));
-			ensure(completion_owned(&prior, pending.task), Error::Protocol {
-				task: pending.task,
-				detail: "CUDA completion slot was not checked out",
-			})?;
+			debug_assert!(completion_owned(&prior, pending.task));
 		}
-		let device = self.device_mut(pending.device)?;
+		let device = self.device_mut(pending.device);
 		let metric = finish_action(device, pending.task, pending.action)?;
 		pending.terminal = true;
 		Ok(BackendPoll::Complete { metric })
@@ -897,14 +730,10 @@ impl<'context> CudaResources<'context> {
 
 	pub(crate) fn rearm_pending(&mut self, pending: &mut CudaPending<'context>) -> Result<()> {
 		self.ensure_healthy()?;
-		ensure(
+		debug_assert!(
 			pending.phase == RunPhase::Loop
 				&& pending.terminal && matches!(pending.native, NativePendingState::Terminal),
-			Error::Protocol {
-				task: pending.task,
-				detail: "only a terminal CUDA loop token may be rearmed",
-			},
-		)?;
+		);
 		pending.native = NativePendingState::Ready;
 		pending.action = PendingAction::None;
 		pending.terminal = false;
@@ -913,40 +742,27 @@ impl<'context> CudaResources<'context> {
 
 	pub(crate) fn prepare_loop_pending(&mut self, pending: &mut CudaPending<'context>) -> Result<()> {
 		self.ensure_healthy()?;
-		ensure(pending.phase == RunPhase::Loop, Error::Protocol {
-			task: pending.task,
-			detail: "only a CUDA loop token may be prepared for loop submission",
-		})?;
+		debug_assert_eq!(pending.phase, RunPhase::Loop);
 		match pending.loop_submission_action() {
 			Some(LoopSubmissionAction::UsePrepared) => Ok(()),
 			Some(LoopSubmissionAction::Rearm) => self.rearm_pending(pending),
-			None => {
-				Err(Error::Protocol {
-					task: pending.task,
-					detail: "an active CUDA loop token may not be submitted again",
-				})
-			}
+			None => unreachable!(),
 		}
 	}
 
 	pub(crate) fn recycle_pending(&mut self, pending: CudaPending<'context>) -> Result<()> {
 		self.ensure_healthy()?;
-		ensure(
+		let prepared = self.prepared_tasks.remove(&pending.task);
+		debug_assert!(
 			pending.terminal
 				&& matches!(pending.native, NativePendingState::Terminal)
-				&& self.prepared_tasks.remove(&pending.task),
-			Error::Protocol {
-				task: pending.task,
-				detail: "only one terminal CUDA pending token may be recycled",
-			},
-		)
+				&& prepared,
+		);
+		Ok(())
 	}
 
 	pub(crate) fn available_bytes(&self, device: DeviceId) -> Result<ByteCount> {
-		let resources = self
-			.devices
-			.get(&device)
-			.ok_or(Error::MissingDevice { device })?;
+		let resources = &self.devices[&device];
 		let info = resources.context.memory_info()?;
 		let bytes = u64::try_from(info.free_bytes).map_err(|_| {
 			Error::ArenaMismatch {
@@ -959,30 +775,22 @@ impl<'context> CudaResources<'context> {
 
 	pub(crate) fn validate_handoff(&mut self, bundle: &FinalizedBundle, tasks: &BTreeSet<TaskId>) -> Result<()> {
 		self.ensure_healthy()?;
-		ensure(self.prepared_tasks.is_empty(), Error::BackendState {
-			backend: "CUDA",
-			detail: "warm CUDA pending tokens were not all recycled",
-		})?;
+		debug_assert!(self.prepared_tasks.is_empty());
 		for (device, resources) in &self.devices {
 			let finalized = bundle.init_image(*device).map(InitImageContract::from);
-			ensure(resources.admission == finalized, Error::ArenaMismatch {
-				device: *device,
-				detail: "finalized CUDA init-image manifest differs from warm admission",
-			})?;
+			debug_assert_eq!(resources.admission, finalized);
 		}
 		let runtime_artifacts = self.plan.runtime_artifacts().cloned().collect();
 		let devices = self.devices.keys().copied().collect();
 		let plan = ExecutionPlan::validate_partition(bundle, runtime_artifacts, devices, tasks)?;
-		let contracts = task_contracts(bundle, Some(tasks))?;
+		let contracts = task_contracts(bundle, Some(tasks));
 		self.plan = plan;
 		self.contracts = contracts;
 		Ok(())
 	}
 
-	fn device_mut(&mut self, device: DeviceId) -> Result<&mut DeviceResources<'context>> {
-		self.devices
-			.get_mut(&device)
-			.ok_or(Error::MissingDevice { device })
+	fn device_mut(&mut self, device: DeviceId) -> &mut DeviceResources<'context> {
+		self.devices.get_mut(&device).unwrap()
 	}
 
 	pub(crate) fn ensure_healthy(&self) -> Result<()> {
@@ -1009,10 +817,8 @@ impl<'context> CudaPreparedResources<'context> {
 		let mut binding_by_device = BTreeMap::new();
 		for binding in bindings {
 			let device = binding.device;
-			ensure(
-				binding_by_device.insert(device, binding).is_none(),
-				Error::DuplicateDevice { device },
-			)?;
+			let prior = binding_by_device.insert(device, binding);
+			debug_assert!(prior.is_none());
 		}
 		let scoped_tasks = draft
 			.tasks
@@ -1024,12 +830,7 @@ impl<'context> CudaPreparedResources<'context> {
 			let TaskKind::Calculation(calculation) = &task.kind else {
 				continue;
 			};
-			ensure(
-				binding_by_device.contains_key(&calculation.device),
-				Error::MissingDevice {
-					device: calculation.device,
-				},
-			)?;
+			debug_assert!(binding_by_device.contains_key(&calculation.device));
 		}
 		let artifact_ids = scoped_tasks
 			.iter()
@@ -1094,15 +895,8 @@ impl<'context> CudaPreparedResources<'context> {
 				plan,
 				contracts,
 			} => {
-				match prepared_bundle == bundle.identity() && prepared_tasks == *tasks {
-					true => Ok((plan, contracts)),
-					false => {
-						Err(Error::BackendState {
-							backend: "CUDA",
-							detail: "finalized partition differs from its prepared handoff",
-						})
-					}
-				}
+				debug_assert!(prepared_bundle == bundle.identity() && prepared_tasks == *tasks);
+				Ok((plan, contracts))
 			}
 			CudaPreparedHandoff::Candidate(_) => {
 				Err(Error::BackendState {
@@ -1137,14 +931,11 @@ impl<'context> CudaPreparedResources<'context> {
 		};
 		for (device, resources) in &devices {
 			let warm = bundle.init_image(*device).map(InitImageContract::from);
-			ensure(resources.admission == warm, Error::ArenaMismatch {
-				device: *device,
-				detail: "warm CUDA init-image manifest differs from prepared admission",
-			})?;
+			debug_assert_eq!(resources.admission, warm);
 		}
 		let planned_devices = devices.keys().copied().collect();
 		let plan = ExecutionPlan::validate_partition(bundle, runtime_artifacts, planned_devices, tasks)?;
-		let contracts = task_contracts(bundle, Some(tasks))?;
+		let contracts = task_contracts(bundle, Some(tasks));
 		Ok(CudaResources {
 			plan,
 			contracts,
@@ -1170,14 +961,11 @@ impl<'context> CudaPreparedResources<'context> {
 		};
 		for (device, resources) in &self.devices {
 			let finalized = bundle.init_image(*device).map(InitImageContract::from);
-			ensure(resources.admission == finalized, Error::ArenaMismatch {
-				device: *device,
-				detail: "finalized CUDA init-image manifest differs from its prepared admission",
-			})?;
+			debug_assert_eq!(resources.admission, finalized);
 		}
 		let devices = self.devices.keys().copied().collect();
 		let plan = ExecutionPlan::validate_partition(bundle, runtime_artifacts.clone(), devices, tasks)?;
-		let contracts = task_contracts(bundle, Some(tasks))?;
+		let contracts = task_contracts(bundle, Some(tasks));
 		self.handoff = CudaPreparedHandoff::Finalized {
 			bundle: bundle.identity(),
 			tasks: tasks.clone(),
@@ -1340,20 +1128,9 @@ impl<'context> Backend for CudaBackend<'context> {
 		physical_calls: &mut PhysicalCallBatch,
 	) -> std::result::Result<(), Self::Error> {
 		crate::accounting::record(physical_calls, PhysicalCall::ReleaseArena { device })?;
-		match resource.ensure_healthy() {
-			Ok(()) => {
-				match arena.device() == device {
-					true => arena.release(),
-					false => {
-						Err(Error::ArenaMismatch {
-							device,
-							detail: "released CUDA arena belongs to another device",
-						})
-					}
-				}
-			}
-			Err(error) => Err(error),
-		}
+		resource.ensure_healthy()?;
+		debug_assert_eq!(arena.device(), device);
+		arena.release()
 	}
 
 	fn destroy_resources(
@@ -1406,7 +1183,7 @@ impl<'context> CudaPending<'context> {
 		}
 	}
 
-	fn validate_ready(&self, work: &BackendWork<'_>, planned: crate::PlannedSubmission) -> Result<()> {
+	fn validate_ready(&self, work: &BackendWork<'_>, planned: crate::PlannedSubmission) {
 		let submission_matches = match work {
 			BackendWork::InitAdmission(work) => work.submission == planned.slots,
 			BackendWork::Calculation(work) => work.submission == planned.slots,
@@ -1415,7 +1192,7 @@ impl<'context> CudaPending<'context> {
 			}
 			BackendWork::Metric(work) => work.submission == planned.slots,
 		};
-		ensure(
+		debug_assert!(
 			self.task == work.task()
 				&& self.class == work.class()
 				&& self.device == planned.device
@@ -1423,12 +1200,8 @@ impl<'context> CudaPending<'context> {
 				&& self.completion == planned.slots.completion
 				&& submission_matches
 				&& matches!(self.native, NativePendingState::Ready)
-				&& !self.terminal,
-			Error::Protocol {
-				task: work.task(),
-				detail: "CUDA work differs from its pre-realized pending token",
-			},
-		)
+				&& !self.terminal
+		);
 	}
 
 	fn activate(&mut self, native: PendingSubmission<'context>, action: PendingAction) {
@@ -1485,7 +1258,7 @@ impl Drop for CudaPending<'_> {
 fn task_contracts(
 	bundle: &FinalizedBundle,
 	selected: Option<&BTreeSet<TaskId>>,
-) -> Result<BTreeMap<TaskId, TaskContract>> {
+) -> BTreeMap<TaskId, TaskContract> {
 	let mut contracts = BTreeMap::new();
 	for task in bundle.tasks().iter().filter(|task| {
 		match selected {
@@ -1513,42 +1286,20 @@ fn task_contracts(
 				)
 			}
 			TaskKind::Transfer(transfer) => {
-				let class = transfer_work_class(task.id, task.phase, transfer.source, transfer.destination)?;
+				let class = transfer_work_class(task.phase, transfer.source, transfer.destination);
 				let admission = match class {
 					WorkClass::InitAdmission => {
-						let endpoints = bundle.transfer_endpoints(task.id).ok_or(Error::Protocol {
-							task: task.id,
-							detail: "CUDA admission has no finalized endpoints",
-						})?;
+						let endpoints = bundle.transfer_endpoints(task.id).unwrap();
 						let ResolvedTransferEndpoint::Device(destination) = endpoints.destination else {
-							return Err(Error::Protocol {
-								task: task.id,
-								detail: "CUDA admission has no finalized device image",
-							});
+							unreachable!("finalized admission has a device image");
 						};
-						let manifest = bundle
-							.init_image(destination.device)
-							.ok_or(Error::Protocol {
-								task: task.id,
-								detail: "CUDA admission device has no finalized init-image manifest",
-							})?;
+						let manifest = bundle.init_image(destination.device).unwrap();
 						let contract = InitImageContract::from(manifest);
-						ensure(
-							contract.image == destination.value && contract.bytes == transfer.bytes,
-							Error::Protocol {
-								task: task.id,
-								detail: "CUDA admission differs from the finalized init-image manifest",
-							},
-						)?;
+						debug_assert!(contract.image == destination.value && contract.bytes == transfer.bytes);
 						Some(contract)
 					}
 					WorkClass::InternalTransfer | WorkClass::ExitTransfer => None,
-					WorkClass::Calculation | WorkClass::Metric => {
-						return Err(Error::Protocol {
-							task: task.id,
-							detail: "CUDA transfer has a non-transfer work class",
-						});
-					}
+					WorkClass::Calculation | WorkClass::Metric => unreachable!(),
 				};
 				(
 					class,
@@ -1567,45 +1318,27 @@ fn task_contracts(
 			route,
 			lane_claims,
 		});
-		ensure(prior.is_none(), Error::Protocol {
-			task: task.id,
-			detail: "finalized bundle repeats a task identity",
-		})?;
+		debug_assert!(prior.is_none());
 	}
-	Ok(contracts)
+	contracts
 }
 
 fn transfer_work_class(
-	task: TaskId,
 	phase: RunPhase,
 	source: recipe_core::TransferEndpoint,
 	destination: recipe_core::TransferEndpoint,
-) -> Result<WorkClass> {
+) -> WorkClass {
 	use recipe_core::TransferEndpoint::{Device, External};
 
 	match (phase, source, destination) {
-		(RunPhase::Init, External, Device { .. }) => Ok(WorkClass::InitAdmission),
-		(RunPhase::Init | RunPhase::Loop, Device { .. }, Device { .. }) => Ok(WorkClass::InternalTransfer),
-		(RunPhase::Exit, Device { .. }, Device { .. } | External) => Ok(WorkClass::ExitTransfer),
+		(RunPhase::Init, External, Device { .. }) => WorkClass::InitAdmission,
+		(RunPhase::Init | RunPhase::Loop, Device { .. }, Device { .. }) => WorkClass::InternalTransfer,
+		(RunPhase::Exit, Device { .. }, Device { .. } | External) => WorkClass::ExitTransfer,
 		(RunPhase::Init, External, External)
 		| (RunPhase::Init, Device { .. }, External)
 		| (RunPhase::Loop, External, External | Device { .. })
 		| (RunPhase::Loop, Device { .. }, External)
-		| (RunPhase::Exit, External, External | Device { .. }) => {
-			Err(Error::Protocol {
-				task,
-				detail: "CUDA transfer phase or endpoint class is invalid",
-			})
-		}
-	}
-}
-
-fn work_submission(work: &BackendWork<'_>) -> Option<SubmissionSlots> {
-	match work {
-		BackendWork::InitAdmission(work) => Some(work.submission),
-		BackendWork::Calculation(work) => Some(work.submission),
-		BackendWork::InternalTransfer(work) | BackendWork::ExitTransfer(work) => Some(work.submission),
-		BackendWork::Metric(work) => Some(work.submission),
+		| (RunPhase::Exit, External, External | Device { .. }) => unreachable!(),
 	}
 }
 
@@ -1646,9 +1379,7 @@ fn validate_binding(binding: &CudaBinding<'_>) -> Result<()> {
 }
 
 fn validate_reservation(reservations: &ReservationLedger, device: DeviceId) -> Result<()> {
-	let reservation = reservations
-		.entry(device)
-		.ok_or(Error::MissingDevice { device })?;
+	let reservation = reservations.entry(device).unwrap();
 	require_enforced_quota(device, reservation.mechanism)
 }
 
@@ -1704,29 +1435,18 @@ fn realize_device<'context>(
 		.pinned_staging
 		.iter()
 		.find(|entry| entry.device == device)
-		.ok_or(Error::MissingDevice { device })?
+		.unwrap()
 		.bytes
 		.get();
 	let staging = PinnedHostBuffer::allocate(
 		binding.context,
-		bytes_to_usize(staging_bytes, "CUDA pinned staging size")?,
+		bytes_to_usize(staging_bytes),
 	)?;
-	let admission = init_images
+	let admission = InitImageContract::from(init_images
 		.iter()
 		.find(|manifest| manifest.device == device)
-		.map(InitImageContract::from);
-	match admission {
-		Some(admission) => {
-			ensure(
-				admission.bytes.get() <= staging_bytes,
-				Error::ArenaMismatch {
-					device,
-					detail: "CUDA init image exceeds its pre-realized pinned staging",
-				},
-			)
-		}
-		None => Err(Error::MissingDevice { device }),
-	}?;
+		.unwrap());
+	debug_assert!(admission.bytes.get() <= staging_bytes);
 	let scratch = match resources
 		.scratch
 		.iter()
@@ -1737,7 +1457,7 @@ fn realize_device<'context>(
 		Some(bytes) => {
 			Some(DeviceBuffer::allocate(
 				binding.context,
-				bytes_to_usize(bytes, "CUDA scratch size")?,
+				bytes_to_usize(bytes),
 			)?)
 		}
 	};
@@ -1754,11 +1474,7 @@ fn realize_device<'context>(
 		.collect::<BTreeSet<_>>();
 	let mut bundles = BTreeMap::<ArtifactDigest, Vec<(ArtifactId, &crate::RuntimeArtifact)>>::new();
 	for artifact_id in artifact_ids {
-		let runtime = runtime_artifacts
-			.get(&artifact_id)
-			.ok_or(Error::MissingArtifact {
-				artifact: artifact_id,
-			})?;
+		let runtime = &runtime_artifacts[&artifact_id];
 		let RuntimeArtifactKind::Cuda { identity } = &runtime.kind else {
 			return Err(Error::ArtifactMismatch {
 				artifact: artifact_id,
@@ -1847,7 +1563,7 @@ fn realize_device<'context>(
 		}
 	}
 
-	let invocations = invocation_sizes(tasks, device, &artifacts)?
+	let invocations = invocation_sizes(tasks, device, &artifacts)
 		.into_iter()
 		.map(|(slot, count)| (slot, ParameterBlock::new(count)))
 		.collect();
@@ -1855,12 +1571,7 @@ fn realize_device<'context>(
 		.iter()
 		.filter_map(|task| {
 			match &task.kind {
-				TaskKind::Metric(metric) => {
-					match value_devices.get(&metric.value) {
-						Some(value_device) => (*value_device == device).then_some(task.id),
-						None => None,
-					}
-				}
+				TaskKind::Metric(metric) => (value_devices[&metric.value] == device).then_some(task.id),
 				TaskKind::Calculation(_) | TaskKind::Transfer(_) => None,
 			}
 		})
@@ -1885,8 +1596,8 @@ fn realize_device<'context>(
 				TaskKind::Calculation(_) | TaskKind::Metric(_) => None,
 			}
 		})
-		.map(|(task, bytes)| Ok((task, vec![0_u8; bytes_to_usize(bytes, "CUDA egress size")?])))
-		.collect::<Result<BTreeMap<_, _>>>()?;
+		.map(|(task, bytes)| (task, vec![0_u8; bytes_to_usize(bytes)]))
+		.collect::<BTreeMap<_, _>>();
 
 	Ok(DeviceResources {
 		context: binding.context,
@@ -1897,7 +1608,7 @@ fn realize_device<'context>(
 		invocations,
 		metric_buffers,
 		staging,
-		admission,
+		admission: Some(admission),
 		egress,
 		scratch,
 	})
@@ -1907,7 +1618,7 @@ fn invocation_sizes(
 	tasks: &[Task],
 	device: DeviceId,
 	artifacts: &BTreeMap<ArtifactId, LoadedArtifact<'_>>,
-) -> Result<BTreeMap<CompletionSlotId, usize>> {
+) -> BTreeMap<CompletionSlotId, usize> {
 	let mut result = BTreeMap::new();
 	for task in tasks {
 		let TaskKind::Calculation(calculation) = &task.kind else {
@@ -1915,14 +1626,7 @@ fn invocation_sizes(
 		};
 		match calculation.device == device {
 			true => {
-				let count = artifacts
-					.get(&calculation.artifact)
-					.ok_or(Error::MissingArtifact {
-						artifact: calculation.artifact,
-					})?
-					.abi
-					.arguments
-					.len();
+				let count = artifacts[&calculation.artifact].abi.arguments.len();
 				result.entry(calculation.submission.completion)
 					.and_modify(|prior: &mut usize| *prior = (*prior).max(count))
 					.or_insert(count);
@@ -1930,7 +1634,7 @@ fn invocation_sizes(
 			false => continue,
 		}
 	}
-	Ok(result)
+	result
 }
 
 fn fill_invocation<'context>(
@@ -1939,30 +1643,17 @@ fn fill_invocation<'context>(
 	work: &CalculationWork,
 	abi: &recipe_kernel::KernelAbi,
 ) -> Result<()> {
-	ensure(
-		invocation.len() >= abi.arguments.len(),
-		Error::ResourceContention {
-			task: work.task,
-			detail: "preallocated CUDA argument slot is too small",
-		},
-	)?;
+	debug_assert!(invocation.len() >= abi.arguments.len());
 	invocation.reset_keepalive();
 	let mut locations = work.inputs.iter().chain(work.outputs.iter()).copied();
 	let mut fault_consumed = false;
 	for (index, argument) in abi.arguments.iter().enumerate() {
 		let value = match argument {
 			KernelArgument::Buffer { .. } => {
-				let location = locations.next().ok_or(Error::Protocol {
-					task: work.task,
-					detail: "CUDA calculation has fewer operands than its artifact ABI",
-				})?;
-				let arena = checked_arena(arenas, location, location.bytes.get())?;
+				let location = locations.next().unwrap();
+				let arena = checked_arena(arenas, location, location.bytes.get());
 				let base = arena.buffer.device_ptr()?;
-				let pointer = base
-					.checked_add(location.arena_offset.get())
-					.ok_or(Error::IntegerOverflow {
-						field: "CUDA argument device pointer",
-					})?;
+				let pointer = base.checked_add(location.arena_offset.get()).unwrap();
 				// The pointer is used only to build a temporary keepalive
 				// reference for the driver call. Arena ownership outlives every
 				// pending token.
@@ -1970,22 +1661,12 @@ fn fill_invocation<'context>(
 				pointer
 			}
 			KernelArgument::FaultFlag => {
-				let location = work.fault_flag.ok_or(Error::Protocol {
-					task: work.task,
-					detail: "CUDA artifact requires a missing fault-flag location",
-				})?;
-				ensure(!fault_consumed, Error::Protocol {
-					task: work.task,
-					detail: "CUDA artifact repeats its fault-flag argument",
-				})?;
+				let location = work.fault_flag.unwrap();
+				debug_assert!(!fault_consumed);
 				fault_consumed = true;
-				let arena = checked_arena(arenas, location, location.bytes.get())?;
+				let arena = checked_arena(arenas, location, location.bytes.get());
 				let base = arena.buffer.device_ptr()?;
-				let pointer = base
-					.checked_add(location.arena_offset.get())
-					.ok_or(Error::IntegerOverflow {
-						field: "CUDA fault-flag device pointer",
-					})?;
+				let pointer = base.checked_add(location.arena_offset.get()).unwrap();
 				invocation.retain(&arena.buffer);
 				pointer
 			}
@@ -1993,15 +1674,9 @@ fn fill_invocation<'context>(
 			KernelArgument::LoopIteration => work.iteration.index(),
 			KernelArgument::ElementCount => abi.elements.get(),
 		};
-		invocation.set_value(index, value)?;
+		invocation.set_value(index, value);
 	}
-	ensure(
-		locations.next().is_none() && fault_consumed == work.fault_flag.is_some(),
-		Error::Protocol {
-			task: work.task,
-			detail: "CUDA calculation operands differ from the validated artifact ABI",
-		},
-	)?;
+	debug_assert!(locations.next().is_none() && fault_consumed == work.fault_flag.is_some());
 	Ok(())
 }
 
@@ -2009,50 +1684,21 @@ fn checked_arena<'arena, 'context>(
 	arenas: &'arena impl CudaArenaLookup<'context>,
 	location: ResolvedValueLocation,
 	bytes: u64,
-) -> Result<&'arena CudaArena<'context>> {
-	let arena = arenas.arena(location.device).ok_or(Error::MissingDevice {
-		device: location.device,
-	})?;
-	ensure(arena.device == location.device, Error::ArenaMismatch {
-		device: location.device,
-		detail: "arena identity differs from resolved value",
-	})?;
-	let end = location
-		.arena_offset
-		.get()
-		.checked_add(bytes)
-		.ok_or(Error::IntegerOverflow {
-			field: "resolved CUDA arena range",
-		})?;
-	let arena_bytes = match u64::try_from(arena.buffer.len()) {
-		Ok(value) => value,
-		Err(error) => {
-			debug_assert!(std::error::Error::source(&error).is_none());
-			return Err(Error::IntegerOverflow {
-				field: "CUDA arena size",
-			});
-		}
-	};
-	ensure(end <= arena_bytes, Error::ValueMismatch {
-		value: location.value,
-		detail: "resolved range exceeds CUDA arena",
-	})?;
-	Ok(arena)
+) -> &'arena CudaArena<'context> {
+	let arena = arenas.arena(location.device).unwrap();
+	debug_assert_eq!(arena.device, location.device);
+	let end = location.arena_offset.get().checked_add(bytes).unwrap();
+	let arena_bytes = u64::try_from(arena.buffer.len()).unwrap();
+	debug_assert!(end <= arena_bytes);
+	arena
 }
 
-fn device_endpoints(work: &TransferWork) -> Result<(ResolvedValueLocation, ResolvedValueLocation)> {
+fn device_endpoints(work: &TransferWork) -> (ResolvedValueLocation, ResolvedValueLocation) {
 	match (work.source, work.destination) {
 		(ResolvedTransferEndpoint::Device(source), ResolvedTransferEndpoint::Device(destination)) => {
-			Ok((source, destination))
+			(source, destination)
 		}
-		(ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::External)
-		| (ResolvedTransferEndpoint::External, ResolvedTransferEndpoint::Device(_))
-		| (ResolvedTransferEndpoint::Device(_), ResolvedTransferEndpoint::External) => {
-			Err(Error::UnsupportedTransfer {
-				task: work.task,
-				detail: "internal transfer does not have two resolved device endpoints",
-			})
-		}
+		_ => unreachable!("finalized internal transfer has two device endpoints"),
 	}
 }
 
@@ -2060,47 +1706,24 @@ fn take_event<'context>(
 	completions: &mut BTreeMap<CompletionSlotId, CompletionEvent<'context>>,
 	task: TaskId,
 	completion: CompletionSlotId,
-) -> Result<Event<'context>> {
-	let slot = completions
-		.get_mut(&completion)
-		.ok_or(Error::MissingCompletion { task, completion })?;
+) -> Event<'context> {
+	let slot = completions.get_mut(&completion).unwrap();
 	match core::mem::replace(slot, CompletionEvent::Active { task }) {
-		CompletionEvent::Available(event) => Ok(event),
-		CompletionEvent::Active { task: owner } => {
-			Err(Error::CompletionBusy {
-				backend: "CUDA",
-				task,
-				completion,
-				owner,
-			})
-		}
+		CompletionEvent::Available(event) => event,
+		CompletionEvent::Active { .. } => unreachable!(),
 	}
 }
 
-fn validate_active(device: &DeviceResources<'_>, pending: &CudaPending<'_>) -> Result<()> {
+fn validate_active(device: &DeviceResources<'_>, pending: &CudaPending<'_>) {
 	if matches!(
 		pending.native,
 		NativePendingState::Active(PendingSubmission::Stream)
 	) {
-		return ensure(
-			device.queues.contains_key(&pending.queue),
-			Error::MissingQueue {
-				task: pending.task,
-				queue: pending.queue,
-			},
-		);
+		debug_assert!(device.queues.contains_key(&pending.queue));
+		return;
 	}
-	let state = device
-		.completions
-		.get(&pending.completion)
-		.ok_or(Error::MissingCompletion {
-			task: pending.task,
-			completion: pending.completion,
-		})?;
-	ensure(completion_owned(state, pending.task), Error::Protocol {
-		task: pending.task,
-		detail: "CUDA pending token is not registered active",
-	})
+	let state = &device.completions[&pending.completion];
+	debug_assert!(completion_owned(state, pending.task));
 }
 
 fn completion_owned(state: &CompletionEvent<'_>, task: TaskId) -> bool {
@@ -2112,47 +1735,25 @@ fn completion_owned(state: &CompletionEvent<'_>, task: TaskId) -> bool {
 
 fn queue<'borrow, 'context>(
 	queues: &'borrow BTreeMap<QueueSlotId, Stream<'context>>,
-	task: TaskId,
 	slot: QueueSlotId,
-) -> Result<&'borrow Stream<'context>> {
-	queues.get(&slot)
-		.ok_or(Error::MissingQueue { task, queue: slot })
+) -> &'borrow Stream<'context> {
+	&queues[&slot]
 }
 
 fn finish_action(device: &mut DeviceResources<'_>, task: TaskId, action: PendingAction) -> Result<Option<MetricValue>> {
 	match action {
 		PendingAction::None => Ok(None),
 		PendingAction::Metric { dtype } => {
-			let buffer = device.metric_buffers.get(&task).ok_or(Error::Protocol {
-				task,
-				detail: "completed metric has no pinned result buffer",
-			})?;
-			let bytes: [u8; 4] = match buffer.as_slice()[..4].try_into() {
-				Ok(bytes) => bytes,
-				Err(..) => {
-					return Err(Error::Protocol {
-						task,
-						detail: "metric buffer is not four bytes",
-					});
-				}
-			};
+			let buffer = &device.metric_buffers[&task];
+			let bytes: [u8; 4] = buffer.as_slice()[..4].try_into().unwrap();
 			match dtype {
 				recipe_core::DType::F32 => Ok(Some(MetricValue::F32(f32::from_le_bytes(bytes)))),
 				recipe_core::DType::I32 => Ok(Some(MetricValue::I32(i32::from_le_bytes(bytes)))),
 			}
 		}
 		PendingAction::Egress { bytes } => {
-			let output = device.egress.get_mut(&task).ok_or(Error::Protocol {
-				task,
-				detail: "completed egress has no preallocated host output",
-			})?;
-			ensure(
-				output.len() == bytes && device.staging.len() >= bytes,
-				Error::Protocol {
-					task,
-					detail: "completed egress size differs from preallocated output",
-				},
-			)?;
+			let output = device.egress.get_mut(&task).unwrap();
+			debug_assert!(output.len() == bytes && device.staging.len() >= bytes);
 			output.copy_from_slice(&device.staging.as_slice()[..bytes]);
 			Ok(None)
 		}
@@ -2176,14 +1777,9 @@ fn grid_size(elements: u64, lanes: u32) -> Result<u32> {
 	}
 }
 
-fn bytes_to_usize(bytes: u64, field: &'static str) -> Result<usize> {
-	match usize::try_from(bytes) {
-		Ok(value) => Ok(value),
-		Err(..) => Err(Error::IntegerOverflow { field }),
-	}
-}
+fn bytes_to_usize(bytes: u64) -> usize { usize::try_from(bytes).unwrap() }
 
-fn offset_to_usize(offset: u64) -> Result<usize> { bytes_to_usize(offset, "CUDA arena offset") }
+fn offset_to_usize(offset: u64) -> usize { bytes_to_usize(offset) }
 
 fn erase_operation_lifetime<'operation, 'context>(
 	pending: Pending<'operation, 'context>,
@@ -2208,15 +1804,16 @@ fn destroy_devices(devices: BTreeMap<DeviceId, DeviceResources<'_>>) -> Result<(
 				Error::CudaContract("CUDA stream remained active during teardown"),
 			)?;
 		}
+		debug_assert!(
+			device
+				.completions
+				.values()
+				.all(|event| matches!(event, CompletionEvent::Available(..)))
+		);
 		for (_, event) in device.completions {
 			match event {
 				CompletionEvent::Available(event) => event.destroy()?,
-				CompletionEvent::Active { task } => {
-					return Err(Error::ResourceContention {
-						task,
-						detail: "CUDA completion event remains checked out during teardown",
-					});
-				}
+				CompletionEvent::Active { .. } => {}
 			}
 		}
 		for (_, stream) in device.queues {
@@ -2255,12 +1852,5 @@ fn ensure(valid: bool, error: Error) -> Result<()> {
 	match valid {
 		true => Ok(()),
 		false => Err(error),
-	}
-}
-
-fn reject_unexpected_device(device: Option<DeviceId>) -> Result<()> {
-	match device {
-		Some(device) => Err(Error::UnexpectedDevice { device }),
-		None => Ok(()),
 	}
 }

@@ -4,30 +4,43 @@
 //! Static Recipe calculation-program compilation for dense training.
 //!
 //! The compiler owns ordered dense activations and normalizations, data
-//! normalization, selectable losses, learning-rate schedules, and AdamW
+//! normalization, selectable losses, learning-rate schedules, and `AdamW`
 //! semantics. It emits only Recipe primitives, derives iteration-dependent
 //! values on the GPU, and represents recurrent parameter storage with exact
 //! alias contracts. Epoch-bound validation metrics and bounded post-training
 //! temperature scaling use the same static lifecycle without loop-phase host
 //! transfers.
 
+extern crate alloc;
+
+/// Bayesian declaration resolution and observed categorical preparation.
 pub mod bayes;
+/// Bayesian semantic-model encoding and decoding.
 mod bayes_checkpoint;
+/// Dense training checkpoint encoding and resume application.
 mod checkpoint;
+/// Dense training graph compilation.
 mod compile;
+/// Training compilation error types.
 mod error;
+/// Prepared training and inference execution.
 mod execute;
+/// Dense forward-pass lowering.
 mod forward;
+/// Semantic-model inference compilation and preparation.
 mod inference;
+/// K-nearest-neighbor reference preparation.
 mod knn;
+/// K-nearest-neighbor semantic-model encoding and decoding.
 mod knn_checkpoint;
+/// Dense model declarations and compiled state.
 mod model;
 
 pub use bayes::{
 	BayesianCategoricalReferenceSet, BayesianCategoricalSchema, BayesianDependency, BayesianNodeId,
 	BayesianNodeSchema, BayesianNodeSource, BayesianSchemaError, BayesianSchemaErrorKind, BayesianSchemaPathSegment,
 	CATEGORICAL_BAYES_SMOOTHING, ResolvedBayesianDependency, ResolvedBayesianSchema,
-	prepare_categorical_bayesian_reference_set, prepare_categorical_bayesian_reference_sets, resolve_bayesian_schema,
+	prepare_categorical_bayesian_reference_sets, resolve_bayesian_schema,
 };
 pub use bayes_checkpoint::{BayesModelArtifact, BayesModelDecodeLimits, decode_bayes_model};
 pub use checkpoint::{

@@ -1,10 +1,11 @@
 use recipe_executor::{BackendWork, PhysicalCall, PhysicalCallBatch, PhysicalPollStatus};
 
-use crate::{Error, Result};
+use crate::Result;
 
 pub(crate) fn record(batch: &mut PhysicalCallBatch, call: PhysicalCall) -> Result<()> {
-	batch.try_push(call)
-		.map_err(|_| Error::PhysicalAccountingOverflow)
+	let result = batch.try_push(call);
+	debug_assert!(result.is_ok());
+	Ok(())
 }
 
 #[must_use]

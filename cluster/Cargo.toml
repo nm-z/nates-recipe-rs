@@ -3,6 +3,11 @@ name = "recipe-cluster"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Measured multi-machine profile assembly for Recipe"
+repository = "https://github.com/nm-z/nates-recipe-rs"
+readme = "README.md"
+keywords = ["gpu", "cluster", "distributed"]
+categories = ["science"]
 
 [dependencies]
 recipe-core = { path = "../core" }

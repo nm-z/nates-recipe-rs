@@ -4,11 +4,11 @@
 //! validates graph structure. It deliberately emits no calculation graph,
 //! parameters, training plan, checkpoint, or inference program.
 
-use core::fmt;
-use std::collections::{BTreeMap, BTreeSet};
+use core::{error::Error, fmt, iter::once};
+use alloc::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use recipe_ingest::{
-	PreparedDataset, PreparedValues, PreparedVector, SemanticType, VectorEncoding, VectorMetadata, VectorRole,
+	PreparedDataset, PreparedVector, SemanticType, VectorEncoding, VectorMetadata, VectorRole,
 	VectorSchema,
 };
 
@@ -19,32 +19,43 @@ pub const CATEGORICAL_BAYES_SMOOTHING: f32 = 1.0;
 /// One Bayesian child declaration in user order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BayesianDependency {
+	/// Declared child vector name bytes.
 	child: Vec<u8>,
+	/// Declared parent vector name bytes in user order.
 	parents: Vec<Vec<u8>>,
 }
 
 impl BayesianDependency {
 	#[must_use]
+	#[inline]
 	pub fn new<C, I, P>(child: C, parents: I) -> Self
 	where
 		C: AsRef<[u8]>,
 		I: IntoIterator<Item = P>,
 		P: AsRef<[u8]>,
 	{
-		Self {
+		return Self {
 			child: child.as_ref().to_vec(),
 			parents: parents
 				.into_iter()
-				.map(|parent| parent.as_ref().to_vec())
+				.map(|parent| {
+					return parent.as_ref().to_vec();
+				})
 				.collect(),
-		}
+		};
 	}
 
 	#[must_use]
-	pub fn child(&self) -> &[u8] { &self.child }
+	#[inline]
+	pub fn child(&self) -> &[u8] {
+		return &self.child;
+	}
 
 	#[must_use]
-	pub fn parents(&self) -> &[Vec<u8>] { &self.parents }
+	#[inline]
+	pub fn parents(&self) -> &[Vec<u8>] {
+		return &self.parents;
+	}
 }
 
 /// Stable node identity within one resolved schema.
@@ -56,11 +67,15 @@ pub struct BayesianNodeId(usize);
 
 impl BayesianNodeId {
 	#[must_use]
-	pub const fn index(self) -> usize { self.0 }
+	#[inline]
+	pub const fn index(self) -> usize {
+		return self.0;
+	}
 }
 
 /// Whether a Bayesian node is backed by prepared observations.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BayesianNodeSource {
 	/// The complete row-free schema retained by ingestion.
 	Observed(VectorSchema),
@@ -73,38 +88,46 @@ pub enum BayesianNodeSource {
 /// One canonical node in a resolved Bayesian schema.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BayesianNodeSchema {
+	/// Stable identity assigned by canonical name order.
 	id: BayesianNodeId,
+	/// Original node name bytes.
 	name: Vec<u8>,
+	/// Prepared observation or latent-node classification.
 	source: BayesianNodeSource,
 }
 
 impl BayesianNodeSchema {
 	#[must_use]
-	pub const fn id(&self) -> BayesianNodeId { self.id }
-
-	#[must_use]
-	pub fn name(&self) -> &[u8] { &self.name }
-
-	#[must_use]
-	pub const fn source(&self) -> &BayesianNodeSource { &self.source }
-
-	#[must_use]
-	pub const fn observed_schema(&self) -> Option<&VectorSchema> {
-		match &self.source {
-			BayesianNodeSource::Observed(schema) => Some(schema),
-			BayesianNodeSource::LatentRoot | BayesianNodeSource::LatentConditional => None,
-		}
+	#[inline]
+	pub const fn id(&self) -> BayesianNodeId {
+		return self.id;
 	}
 
 	#[must_use]
-	pub const fn is_latent_root(&self) -> bool { matches!(self.source, BayesianNodeSource::LatentRoot) }
+	#[inline]
+	pub fn name(&self) -> &[u8] {
+		return &self.name;
+	}
 
 	#[must_use]
+	#[inline]
+	pub const fn source(&self) -> &BayesianNodeSource {
+		return &self.source;
+	}
+
+	#[must_use]
+	#[inline]
+	pub const fn is_latent_root(&self) -> bool {
+		return matches!(self.source, BayesianNodeSource::LatentRoot);
+	}
+
+	#[must_use]
+	#[inline]
 	pub const fn is_latent(&self) -> bool {
-		matches!(
+		return matches!(
 			self.source,
 			BayesianNodeSource::LatentRoot | BayesianNodeSource::LatentConditional
-		)
+		);
 	}
 }
 
@@ -112,20 +135,32 @@ impl BayesianNodeSchema {
 /// `parents` list remains in its original order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedBayesianDependency {
+	/// Position of the originating declaration in user order.
 	declaration_index: usize,
+	/// Canonical identity of the declared child.
 	child: BayesianNodeId,
+	/// Canonical parent identities in declaration order.
 	parents: Vec<BayesianNodeId>,
 }
 
 impl ResolvedBayesianDependency {
 	#[must_use]
-	pub const fn declaration_index(&self) -> usize { self.declaration_index }
+	#[inline]
+	pub const fn declaration_index(&self) -> usize {
+		return self.declaration_index;
+	}
 
 	#[must_use]
-	pub const fn child(&self) -> BayesianNodeId { self.child }
+	#[inline]
+	pub const fn child(&self) -> BayesianNodeId {
+		return self.child;
+	}
 
 	#[must_use]
-	pub fn parents(&self) -> &[BayesianNodeId] { &self.parents }
+	#[inline]
+	pub fn parents(&self) -> &[BayesianNodeId] {
+		return &self.parents;
+	}
 }
 
 /// A validated, row-free Bayesian schema.
@@ -134,54 +169,97 @@ impl ResolvedBayesianDependency {
 /// `execution_order` is a separately derived deterministic topological order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedBayesianSchema {
+	/// Nodes in canonical ascending name order.
 	nodes: Vec<BayesianNodeSchema>,
+	/// Resolved dependencies in user declaration order.
 	declarations: Vec<ResolvedBayesianDependency>,
+	/// Deterministic topological execution order.
 	execution_order: Vec<BayesianNodeId>,
 }
 
 impl ResolvedBayesianSchema {
 	#[must_use]
-	pub fn nodes(&self) -> &[BayesianNodeSchema] { &self.nodes }
+	#[inline]
+	pub fn nodes(&self) -> &[BayesianNodeSchema] {
+		return &self.nodes;
+	}
 
 	#[must_use]
-	pub fn declarations(&self) -> &[ResolvedBayesianDependency] { &self.declarations }
+	#[inline]
+	pub fn declarations(&self) -> &[ResolvedBayesianDependency] {
+		return &self.declarations;
+	}
 
 	#[must_use]
-	pub fn execution_order(&self) -> &[BayesianNodeId] { &self.execution_order }
+	#[inline]
+	pub fn execution_order(&self) -> &[BayesianNodeId] {
+		return &self.execution_order;
+	}
 
 	#[must_use]
-	pub fn node(&self, id: BayesianNodeId) -> Option<&BayesianNodeSchema> { self.nodes.get(id.index()) }
+	#[inline]
+	pub fn node(&self, id: BayesianNodeId) -> Option<&BayesianNodeSchema> {
+		return self.nodes.get(id.index());
+	}
 
 	#[must_use]
+	#[inline]
 	pub fn node_id(&self, name: impl AsRef<[u8]>) -> Option<BayesianNodeId> {
-		let name = name.as_ref();
-		self.nodes
-			.binary_search_by(|node| node.name.as_slice().cmp(name))
+		let sought_name = name.as_ref();
+		return self.nodes
+			.binary_search_by(|node| {
+				return node.name.as_slice().cmp(sought_name);
+			})
 			.ok()
-			.map(BayesianNodeId)
+			.map(BayesianNodeId);
 	}
 }
 
 /// Exact categorical identity retained for one observed Bayesian node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BayesianCategoricalSchema {
-	pub(crate) source_index: usize,
-	pub(crate) name: Vec<u8>,
-	pub(crate) dictionary: Vec<Vec<u8>>,
+	/// Source-vector position in the prepared dataset.
+	source_index: usize,
+	/// Original vector name bytes.
+	name: Vec<u8>,
+	/// Known categorical labels in encoded-code order.
+	dictionary: Vec<Vec<u8>>,
 }
 
 impl BayesianCategoricalSchema {
-	#[must_use]
-	pub const fn source_index(&self) -> usize { self.source_index }
+	/// Reconstruct a categorical schema from its semantic artifact fields.
+	#[inline]
+	pub(crate) const fn from_parts(source_index: usize, name: Vec<u8>, dictionary: Vec<Vec<u8>>) -> Self {
+		return Self {
+			source_index,
+			name,
+			dictionary,
+		};
+	}
 
 	#[must_use]
-	pub fn name(&self) -> &[u8] { &self.name }
+	#[inline]
+	pub const fn source_index(&self) -> usize {
+		return self.source_index;
+	}
 
 	#[must_use]
-	pub fn dictionary(&self) -> &[Vec<u8>] { &self.dictionary }
+	#[inline]
+	pub fn name(&self) -> &[u8] {
+		return &self.name;
+	}
 
 	#[must_use]
-	pub fn inference_cardinality(&self) -> Option<usize> { self.dictionary.len().checked_add(1) }
+	#[inline]
+	pub fn dictionary(&self) -> &[Vec<u8>] {
+		return &self.dictionary;
+	}
+
+	#[must_use]
+	#[inline]
+	pub const fn inference_cardinality(&self) -> Option<usize> {
+		return self.dictionary.len().checked_add(1);
+	}
 }
 
 /// Saved observations for one executable categorical Bayesian conditional.
@@ -193,48 +271,138 @@ impl BayesianCategoricalSchema {
 /// calculations at inference time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BayesianCategoricalReferenceSet {
-	pub(crate) parents: Vec<BayesianCategoricalSchema>,
-	pub(crate) child: BayesianCategoricalSchema,
-	pub(crate) reference_source_rows: Vec<usize>,
-	pub(crate) reference_rows: usize,
-	pub(crate) parent_codes: Vec<i32>,
-	pub(crate) child_codes: Vec<i32>,
-	pub(crate) parent_cardinalities: Vec<i32>,
-	pub(crate) parent_multipliers: Vec<i32>,
-	pub(crate) parent_configurations: u64,
+	/// Parent schemas in declaration order.
+	parents: Vec<BayesianCategoricalSchema>,
+	/// Declared child schema.
+	child: BayesianCategoricalSchema,
+	/// Original source-row identities in retained order.
+	reference_source_rows: Vec<usize>,
+	/// Number of retained reference rows.
+	reference_rows: usize,
+	/// Row-major parent dictionary codes.
+	parent_codes: Vec<i32>,
+	/// Child dictionary code for each retained row.
+	child_codes: Vec<i32>,
+	/// Parent cardinalities including each unseen-value route.
+	parent_cardinalities: Vec<i32>,
+	/// Mixed-radix multiplier for each parent.
+	parent_multipliers: Vec<i32>,
+	/// Total mixed-radix parent configurations.
+	parent_configurations: u64,
 }
 
 impl BayesianCategoricalReferenceSet {
-	#[must_use]
-	pub fn parents(&self) -> &[BayesianCategoricalSchema] { &self.parents }
+	/// Reconstruct observations and derive their mixed-radix contract.
+	///
+	/// # Errors
+	///
+	/// Returns an error when a parent cardinality or derived configuration
+	/// exceeds the supported categorical domain, or when the observations are
+	/// structurally inconsistent.
+	pub(crate) fn from_observations(
+		parents: Vec<BayesianCategoricalSchema>,
+		child: BayesianCategoricalSchema,
+		reference_source_rows: Vec<usize>,
+		parent_codes: Vec<i32>,
+		child_codes: Vec<i32>,
+	) -> TrainingCompileResult<Self> {
+		let mut parent_cardinalities = Vec::with_capacity(parents.len());
+		for parent in &parents {
+			let cardinality = parent.dictionary.len().checked_add(1).ok_or_else(|| {
+				return bayes_compile_error(
+					TrainingCompileErrorKind::ArithmeticOverflow,
+					"Bayesian parent cardinality overflowed usize",
+				);
+			})?;
+			parent_cardinalities.push(i32::try_from(cardinality).map_err(|error| {
+				return bayes_compile_error(
+					TrainingCompileErrorKind::UnsupportedExtent,
+					format!("Bayesian parent cardinality exceeds int32: {error}"),
+				);
+			})?);
+		}
+		let (parent_multipliers, parent_configurations) = mixed_radix_contract(&parent_cardinalities)?;
+		let references = Self {
+			parents,
+			child,
+			reference_rows: reference_source_rows.len(),
+			reference_source_rows,
+			parent_codes,
+			child_codes,
+			parent_cardinalities,
+			parent_multipliers,
+			parent_configurations,
+		};
+		validate_categorical_reference_set(&references)?;
+		return Ok(references);
+	}
 
 	#[must_use]
-	pub const fn child(&self) -> &BayesianCategoricalSchema { &self.child }
+	#[inline]
+	pub fn parents(&self) -> &[BayesianCategoricalSchema] {
+		return &self.parents;
+	}
 
 	#[must_use]
-	pub fn reference_source_rows(&self) -> &[usize] { &self.reference_source_rows }
+	#[inline]
+	pub const fn child(&self) -> &BayesianCategoricalSchema {
+		return &self.child;
+	}
 
 	#[must_use]
-	pub const fn reference_rows(&self) -> usize { self.reference_rows }
+	#[inline]
+	pub fn reference_source_rows(&self) -> &[usize] {
+		return &self.reference_source_rows;
+	}
 
 	#[must_use]
-	pub fn parent_codes(&self) -> &[i32] { &self.parent_codes }
+	#[inline]
+	pub const fn reference_rows(&self) -> usize {
+		return self.reference_rows;
+	}
 
 	#[must_use]
-	pub fn child_codes(&self) -> &[i32] { &self.child_codes }
+	#[inline]
+	pub fn parent_codes(&self) -> &[i32] {
+		return &self.parent_codes;
+	}
 
 	#[must_use]
-	pub fn parent_cardinalities(&self) -> &[i32] { &self.parent_cardinalities }
+	#[inline]
+	pub fn child_codes(&self) -> &[i32] {
+		return &self.child_codes;
+	}
 
 	#[must_use]
-	pub fn parent_multipliers(&self) -> &[i32] { &self.parent_multipliers }
+	#[inline]
+	pub fn parent_cardinalities(&self) -> &[i32] {
+		return &self.parent_cardinalities;
+	}
 
 	#[must_use]
-	pub const fn parent_configurations(&self) -> u64 { self.parent_configurations }
+	#[inline]
+	pub fn parent_multipliers(&self) -> &[i32] {
+		return &self.parent_multipliers;
+	}
 
 	#[must_use]
-	pub fn child_classes(&self) -> usize { self.child.dictionary.len() }
+	#[inline]
+	pub const fn parent_configurations(&self) -> u64 {
+		return self.parent_configurations;
+	}
 
+	#[must_use]
+	#[inline]
+	pub const fn child_classes(&self) -> usize {
+		return self.child.dictionary.len();
+	}
+
+	/// Append a compatible observation partition in source order.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the schemas differ, row accounting overflows, an
+	/// allocation cannot be reserved, or the combined observations are invalid.
 	pub(crate) fn append(&mut self, current: Self) -> TrainingCompileResult<()> {
 		if self.parents != current.parents
 			|| self.child != current.child
@@ -251,41 +419,41 @@ impl BayesianCategoricalReferenceSet {
 			.reference_rows
 			.checked_add(current.reference_rows)
 			.ok_or_else(|| {
-				bayes_compile_error(
+				return bayes_compile_error(
 					TrainingCompileErrorKind::ArithmeticOverflow,
 					"combined categorical Bayesian reference row count overflowed usize",
-				)
+				);
 			})?;
 		self.reference_source_rows
 			.try_reserve_exact(current.reference_source_rows.len())
 			.map_err(|error| {
-				bayes_compile_error(
+				return bayes_compile_error(
 					TrainingCompileErrorKind::ArithmeticOverflow,
 					format!("reserve categorical Bayesian source rows: {error}"),
-				)
+				);
 			})?;
 		self.parent_codes
 			.try_reserve_exact(current.parent_codes.len())
 			.map_err(|error| {
-				bayes_compile_error(
+				return bayes_compile_error(
 					TrainingCompileErrorKind::ArithmeticOverflow,
 					format!("reserve categorical Bayesian parent observations: {error}"),
-				)
+				);
 			})?;
 		self.child_codes
 			.try_reserve_exact(current.child_codes.len())
 			.map_err(|error| {
-				bayes_compile_error(
+				return bayes_compile_error(
 					TrainingCompileErrorKind::ArithmeticOverflow,
 					format!("reserve categorical Bayesian child observations: {error}"),
-				)
+				);
 			})?;
 		self.reference_source_rows
 			.extend(current.reference_source_rows);
 		self.parent_codes.extend(current.parent_codes);
 		self.child_codes.extend(current.child_codes);
 		self.reference_rows = rows;
-		validate_categorical_reference_set(self)
+		return validate_categorical_reference_set(self);
 	}
 }
 
@@ -297,15 +465,22 @@ impl BayesianCategoricalReferenceSet {
 /// dictionary-categorical vectors. A target-as-parent edge is rejected by that
 /// role boundary; inference for dependent unobserved children is a separate
 /// instrument rather than an implied ancestral or marginal calculation.
+///
+/// # Errors
+///
+/// Returns an error when the declarations do not form the supported observed
+/// categorical network, the prepared rows are empty or incompatible, or the
+/// derived categorical extents exceed supported bounds.
+#[inline]
 pub fn prepare_categorical_bayesian_reference_sets(
 	dataset: &PreparedDataset,
 	dependencies: &[BayesianDependency],
 ) -> TrainingCompileResult<Vec<BayesianCategoricalReferenceSet>> {
 	let schema = resolve_bayesian_schema(dataset, dependencies).map_err(|error| {
-		bayes_compile_error(
+		return bayes_compile_error(
 			TrainingCompileErrorKind::InvalidNetwork,
 			format!("resolve Bayesian DAG: {error}"),
-		)
+		);
 	})?;
 	if dependencies.is_empty() {
 		return Err(bayes_compile_error(
@@ -350,29 +525,15 @@ pub fn prepare_categorical_bayesian_reference_sets(
 		));
 	}
 
-	dependencies
+	return dependencies
 		.iter()
-		.map(|dependency| prepare_categorical_bayesian_reference_set_for_dependency(dataset, dependency))
-		.collect()
+		.map(|dependency| {
+			return prepare_categorical_bayesian_reference_set_for_dependency(dataset, dependency);
+		})
+		.collect();
 }
 
-/// Compatibility boundary for exactly one observed categorical conditional.
-pub fn prepare_categorical_bayesian_reference_set(
-	dataset: &PreparedDataset,
-	dependencies: &[BayesianDependency],
-) -> TrainingCompileResult<BayesianCategoricalReferenceSet> {
-	let [_dependency] = dependencies else {
-		return Err(bayes_compile_error(
-			TrainingCompileErrorKind::InvalidNetwork,
-			"the first executable Bayesian slice requires exactly one `.bayes(child, parents)` declaration",
-		));
-	};
-	let mut references = prepare_categorical_bayesian_reference_sets(dataset, dependencies)?;
-	Ok(references
-		.pop()
-		.expect("one dependency produces one reference set"))
-}
-
+/// Prepare the observations and derived contract for one resolved dependency.
 fn prepare_categorical_bayesian_reference_set_for_dependency(
 	dataset: &PreparedDataset,
 	dependency: &BayesianDependency,
@@ -396,35 +557,37 @@ fn prepare_categorical_bayesian_reference_set_for_dependency(
 	let mut parent_cardinalities = Vec::with_capacity(parents.len());
 	for parent in &parents {
 		let cardinality = parent.inference_cardinality().ok_or_else(|| {
-			bayes_compile_error(
+			return bayes_compile_error(
 				TrainingCompileErrorKind::ArithmeticOverflow,
 				format!(
 					"Bayesian parent {:?} cardinality overflowed usize",
 					String::from_utf8_lossy(parent.name())
 				),
-			)
+			);
 		})?;
 		parent_cardinalities.push(i32::try_from(cardinality).map_err(|error| {
-			bayes_compile_error(
+			return bayes_compile_error(
 				TrainingCompileErrorKind::UnsupportedExtent,
 				format!(
 					"Bayesian parent {:?} cardinality exceeds int32: {error}",
 					String::from_utf8_lossy(parent.name())
 				),
-			)
+			);
 		})?);
 	}
 	let (parent_multipliers, parent_configurations) = mixed_radix_contract(&parent_cardinalities)?;
 	let child_classes = u64::try_from(child_schema.dictionary.len()).map_err(|error| {
-		bayes_compile_error(
+		return bayes_compile_error(
 			TrainingCompileErrorKind::UnsupportedExtent,
 			format!("Bayesian child class count exceeds u64: {error}"),
-		)
+		);
 	})?;
 	if child_classes == 0
 		|| parent_configurations
 			.checked_mul(child_classes)
-			.is_none_or(|bins| bins > i32::MAX as u64 || bins > u32::MAX as u64)
+			.is_none_or(|bins| {
+				return bins > i32::MAX as u64 || bins > u64::from(u32::MAX);
+			})
 	{
 		return Err(bayes_compile_error(
 			TrainingCompileErrorKind::UnsupportedExtent,
@@ -442,10 +605,10 @@ fn prepare_categorical_bayesian_reference_set_for_dependency(
 		.len()
 		.checked_mul(parents.len())
 		.ok_or_else(|| {
-			bayes_compile_error(
+			return bayes_compile_error(
 				TrainingCompileErrorKind::ArithmeticOverflow,
 				"categorical Bayesian reference parent shape overflowed usize",
-			)
+			);
 		})?;
 	let mut parent_codes = Vec::with_capacity(parent_elements);
 	let mut child_codes = Vec::with_capacity(dataset.train().len());
@@ -484,9 +647,10 @@ fn prepare_categorical_bayesian_reference_set_for_dependency(
 		parent_configurations,
 	};
 	validate_categorical_reference_set(&references)?;
-	Ok(references)
+	return Ok(references);
 }
 
+/// Validate categorical observation shapes, identities, codes, and radix metadata.
 pub(crate) fn validate_categorical_reference_set(
 	references: &BayesianCategoricalReferenceSet,
 ) -> TrainingCompileResult<()> {
@@ -498,10 +662,7 @@ pub(crate) fn validate_categorical_reference_set(
 		|| references.child_codes.len() != references.reference_rows
 		|| references.reference_source_rows.len() != references.reference_rows
 		|| references.parent_codes.len()
-			!= references
-				.reference_rows
-				.checked_mul(references.parents.len())
-				.unwrap_or(usize::MAX)
+			!= references.reference_rows.saturating_mul(references.parents.len())
 	{
 		return Err(bayes_compile_error(
 			TrainingCompileErrorKind::InvalidNetwork,
@@ -513,7 +674,7 @@ pub(crate) fn validate_categorical_reference_set(
 	for vector in references
 		.parents
 		.iter()
-		.chain(core::iter::once(&references.child))
+		.chain(once(&references.child))
 	{
 		if vector.name.is_empty()
 			|| vector.dictionary.is_empty()
@@ -529,7 +690,9 @@ pub(crate) fn validate_categorical_reference_set(
 		if vector
 			.dictionary
 			.iter()
-			.any(|label| !labels.insert(label.as_slice()))
+			.any(|label| {
+				return !labels.insert(label.as_slice());
+			})
 		{
 			return Err(bayes_compile_error(
 				TrainingCompileErrorKind::InvalidNetwork,
@@ -538,11 +701,11 @@ pub(crate) fn validate_categorical_reference_set(
 		}
 	}
 	for (parent_index, parent) in references.parents.iter().enumerate() {
-		let cardinality = usize::try_from(references.parent_cardinalities[parent_index]).map_err(|_| {
-			bayes_compile_error(
+		let cardinality = usize::try_from(references.parent_cardinalities[parent_index]).map_err(|error| {
+			return bayes_compile_error(
 				TrainingCompileErrorKind::InvalidNetwork,
-				"categorical Bayesian parent cardinality is negative",
-			)
+				format!("categorical Bayesian parent cardinality is negative: {error}"),
+			);
 		})?;
 		if cardinality != parent.dictionary.len() + 1 {
 			return Err(bayes_compile_error(
@@ -560,8 +723,8 @@ pub(crate) fn validate_categorical_reference_set(
 	}
 	for (index, code) in references.parent_codes.iter().copied().enumerate() {
 		let parent = index % references.parents.len();
-		if usize::try_from(code).map_or(true, |code| {
-			code >= references.parents[parent].dictionary.len()
+		if usize::try_from(code).map_or(true, |parsed_code| {
+			return parsed_code >= references.parents[parent].dictionary.len();
 		}) {
 			return Err(bayes_compile_error(
 				TrainingCompileErrorKind::InvalidNetwork,
@@ -573,48 +736,51 @@ pub(crate) fn validate_categorical_reference_set(
 		.child_codes
 		.iter()
 		.copied()
-		.any(|code| usize::try_from(code).map_or(true, |code| code >= references.child.dictionary.len()))
+		.any(|code| {
+			return usize::try_from(code).map_or(true, |parsed_code| {
+				return parsed_code >= references.child.dictionary.len();
+			});
+		})
 	{
 		return Err(bayes_compile_error(
 			TrainingCompileErrorKind::InvalidNetwork,
 			"categorical Bayesian child observations contain an invalid class code",
 		));
 	}
-	Ok(())
+	return Ok(());
 }
 
+/// Resolve one prepared vector by its exact name bytes.
 fn find_vector<'a>(dataset: &'a PreparedDataset, name: &[u8]) -> TrainingCompileResult<&'a PreparedVector> {
-	dataset
+	return dataset
 		.vectors()
 		.iter()
-		.find(|vector| vector.name() == name)
+		.find(|vector| {
+			return vector.name() == name;
+		})
 		.ok_or_else(|| {
-			bayes_compile_error(
+			return bayes_compile_error(
 				TrainingCompileErrorKind::InvalidNetwork,
 				format!(
 					"Bayesian node {:?} is absent from prepared data",
 					String::from_utf8_lossy(name)
 				),
-			)
-		})
+			);
+		});
 }
 
+/// Extract the exact dictionary schema required for a Bayesian vector role.
 fn categorical_schema(vector: &PreparedVector, role: &str) -> TrainingCompileResult<BayesianCategoricalSchema> {
-	let (
-		SemanticType::Categorical,
-		VectorEncoding::DictionaryI32,
-		VectorMetadata::Categorical { dictionary },
-		PreparedValues::I32(_),
-	) = (
-		vector.semantic_type(),
-		vector.encoding(),
-		vector.metadata(),
-		vector.values(),
-	)
-	else {
+	if vector.semantic_type() != SemanticType::Categorical || vector.encoding() != VectorEncoding::DictionaryI32 {
 		return Err(bayes_vector_error(
 			vector,
 			format!("the executable Bayesian {role} must be dictionary-encoded categorical data"),
+		));
+	}
+	let VectorMetadata::Categorical { dictionary } = vector.metadata().clone() else {
+		return Err(bayes_vector_error(
+			vector,
+			format!("the executable Bayesian {role} must retain a categorical dictionary"),
 		));
 	};
 	if dictionary.is_empty() {
@@ -623,23 +789,21 @@ fn categorical_schema(vector: &PreparedVector, role: &str) -> TrainingCompileRes
 			"categorical dictionary is empty",
 		));
 	}
-	Ok(BayesianCategoricalSchema {
+	return Ok(BayesianCategoricalSchema {
 		source_index: vector.source_index(),
 		name: vector.name().to_vec(),
-		dictionary: dictionary.clone(),
-	})
+		dictionary,
+	});
 }
 
+/// Borrow categorical calculation codes from prepared integer storage.
 fn categorical_values(vector: &PreparedVector) -> TrainingCompileResult<&[Option<i32>]> {
-	let PreparedValues::I32(values) = vector.values() else {
-		return Err(bayes_vector_error(
-			vector,
-			"categorical values are not stored as int32 codes",
-		));
-	};
-	Ok(values)
+	return vector.values().i32_values().ok_or_else(|| {
+		return bayes_vector_error(vector, "categorical values are not stored as int32 codes");
+	});
 }
 
+/// Resolve one complete categorical code and verify its dictionary bound.
 fn require_known_code(
 	vector: &PreparedVector,
 	values: &[Option<i32>],
@@ -650,37 +814,40 @@ fn require_known_code(
 	let code = values
 		.get(position)
 		.ok_or_else(|| {
-			bayes_vector_error(
+			return bayes_vector_error(
 				vector,
 				format!("source row {source_row} is absent from prepared storage"),
-			)
+			);
 		})?
 		.ok_or_else(|| {
-			bayes_vector_error(
+			return bayes_vector_error(
 				vector,
 				format!(
 					"source row {source_row} is missing; the observed categorical slice requires complete rows"
 				),
-			)
+			);
 		})?;
-	if usize::try_from(code).map_or(true, |code| code >= classes) {
+	if usize::try_from(code).map_or(true, |parsed_code| {
+		return parsed_code >= classes;
+	}) {
 		return Err(bayes_vector_error(
 			vector,
 			format!("source row {source_row} has out-of-dictionary code {code}"),
 		));
 	}
-	Ok(code)
+	return Ok(code);
 }
 
+/// Derive right-to-left multipliers and the total parent configuration count.
 fn mixed_radix_contract(cardinalities: &[i32]) -> TrainingCompileResult<(Vec<i32>, u64)> {
-	let mut configurations = 1_u64;
-	let mut multipliers = vec![0_i32; cardinalities.len()];
-	for (index, cardinality) in cardinalities.iter().copied().enumerate().rev() {
-		let cardinality = u64::try_from(cardinality).map_err(|_| {
-			bayes_compile_error(
+	let mut configurations = 1u64;
+	let mut multipliers = vec![0i32; cardinalities.len()];
+	for (index, signed_cardinality) in cardinalities.iter().copied().enumerate().rev() {
+		let cardinality = u64::try_from(signed_cardinality).map_err(|error| {
+			return bayes_compile_error(
 				TrainingCompileErrorKind::InvalidNetwork,
-				"categorical Bayesian parent cardinality must be positive",
-			)
+				format!("categorical Bayesian parent cardinality must be positive: {error}"),
+			);
 		})?;
 		if cardinality == 0 {
 			return Err(bayes_compile_error(
@@ -689,29 +856,30 @@ fn mixed_radix_contract(cardinalities: &[i32]) -> TrainingCompileResult<(Vec<i32
 			));
 		}
 		multipliers[index] = i32::try_from(configurations).map_err(|error| {
-			bayes_compile_error(
+			return bayes_compile_error(
 				TrainingCompileErrorKind::UnsupportedExtent,
 				format!("categorical Bayesian parent multiplier exceeds int32: {error}"),
-			)
+			);
 		})?;
 		configurations = configurations.checked_mul(cardinality).ok_or_else(|| {
-			bayes_compile_error(
+			return bayes_compile_error(
 				TrainingCompileErrorKind::ArithmeticOverflow,
 				"categorical Bayesian parent configuration count overflowed u64",
-			)
+			);
 		})?;
 	}
-	if configurations > i32::MAX as u64 {
+	if configurations > 0x7fff_ffff {
 		return Err(bayes_compile_error(
 			TrainingCompileErrorKind::UnsupportedExtent,
 			"categorical Bayesian parent configuration count exceeds int32",
 		));
 	}
-	Ok((multipliers, configurations))
+	return Ok((multipliers, configurations));
 }
 
+/// Construct a target-matrix error anchored to one prepared vector.
 fn bayes_vector_error(vector: &PreparedVector, detail: impl Into<String>) -> TrainingCompileError {
-	bayes_compile_error(
+	return bayes_compile_error(
 		TrainingCompileErrorKind::InvalidTargetMatrix,
 		format!(
 			"Bayesian vector {:?} at source index {}: {}",
@@ -719,11 +887,12 @@ fn bayes_vector_error(vector: &PreparedVector, detail: impl Into<String>) -> Tra
 			vector.source_index(),
 			detail.into()
 		),
-	)
+	);
 }
 
+/// Construct a typed Bayesian training compilation error.
 fn bayes_compile_error(kind: TrainingCompileErrorKind, detail: impl Into<String>) -> TrainingCompileError {
-	TrainingCompileError::new(kind, detail)
+	return TrainingCompileError::new(kind, detail);
 }
 
 /// Typed reason a Bayesian schema could not be resolved.
@@ -738,8 +907,23 @@ pub enum BayesianSchemaErrorKind {
 	Cycle,
 }
 
+impl fmt::Display for BayesianSchemaErrorKind {
+	#[inline]
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		return f.write_str(match *self {
+			Self::EmptyName => "empty name",
+			Self::DuplicateDatasetName => "duplicate dataset name",
+			Self::DuplicateChild => "duplicate child",
+			Self::DuplicateParent => "duplicate parent",
+			Self::SelfDependency => "self dependency",
+			Self::Cycle => "cycle",
+		});
+	}
+}
+
 /// One typed segment in an error's structural path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BayesianSchemaPathSegment {
 	Dataset,
 	Vectors,
@@ -757,68 +941,87 @@ pub enum BayesianSchemaPathSegment {
 /// A structural Bayesian resolution error with a machine-readable hierarchy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BayesianSchemaError {
+	/// Machine-readable failure category.
 	kind: BayesianSchemaErrorKind,
+	/// Structural location of the invalid declaration or dataset element.
 	path: Vec<BayesianSchemaPathSegment>,
+	/// Human-readable failure detail.
 	detail: String,
 }
 
 impl BayesianSchemaError {
+	/// Construct a structural schema error from its typed components.
 	fn new(
 		kind: BayesianSchemaErrorKind,
 		path: impl Into<Vec<BayesianSchemaPathSegment>>,
 		detail: impl Into<String>,
 	) -> Self {
-		Self {
+		return Self {
 			kind,
 			path: path.into(),
 			detail: detail.into(),
-		}
+		};
 	}
 
 	#[must_use]
-	pub const fn kind(&self) -> BayesianSchemaErrorKind { self.kind }
+	#[inline]
+	pub const fn kind(&self) -> BayesianSchemaErrorKind {
+		return self.kind;
+	}
 
 	#[must_use]
-	pub fn path(&self) -> &[BayesianSchemaPathSegment] { &self.path }
+	#[inline]
+	pub fn path(&self) -> &[BayesianSchemaPathSegment] {
+		return &self.path;
+	}
 
 	#[must_use]
-	pub fn detail(&self) -> &str { &self.detail }
+	#[inline]
+	pub fn detail(&self) -> &str {
+		return &self.detail;
+	}
 }
 
 impl fmt::Display for BayesianSchemaError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(
-			formatter,
-			"{:?} at {}: {}",
+	#[inline]
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		return write!(
+			f,
+			"{} at {}: {}",
 			self.kind,
 			DisplayPath(&self.path),
 			self.detail
-		)
+		);
 	}
 }
 
-impl std::error::Error for BayesianSchemaError {}
+impl Error for BayesianSchemaError {}
 
-struct DisplayPath<'a>(&'a [BayesianSchemaPathSegment]);
+/// Dot-and-index rendering of a typed Bayesian schema path.
+struct DisplayPath<'a>(
+	/// Ordered structural path segments.
+	&'a [BayesianSchemaPathSegment],
+);
 
 impl fmt::Display for DisplayPath<'_> {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+	#[inline]
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		for segment in self.0 {
-			match segment {
-				BayesianSchemaPathSegment::Dataset => formatter.write_str("dataset")?,
-				BayesianSchemaPathSegment::Vectors => formatter.write_str(".vectors")?,
-				BayesianSchemaPathSegment::Vector(vector) => write!(formatter, "[{vector}]")?,
-				BayesianSchemaPathSegment::Name => formatter.write_str(".name")?,
-				BayesianSchemaPathSegment::Declarations => formatter.write_str("declarations")?,
-				BayesianSchemaPathSegment::Declaration(declaration) => write!(formatter, "[{declaration}]")?,
-				BayesianSchemaPathSegment::Child => formatter.write_str(".child")?,
-				BayesianSchemaPathSegment::Parents => formatter.write_str(".parents")?,
-				BayesianSchemaPathSegment::Parent(parent) => write!(formatter, "[{parent}]")?,
-				BayesianSchemaPathSegment::Graph => formatter.write_str("graph")?,
-				BayesianSchemaPathSegment::ExecutionOrder => formatter.write_str(".execution-order")?,
+			match *segment {
+				BayesianSchemaPathSegment::Dataset => f.write_str("dataset")?,
+				BayesianSchemaPathSegment::Vectors => f.write_str(".vectors")?,
+				BayesianSchemaPathSegment::Vector(vector) => write!(f, "[{vector}]")?,
+				BayesianSchemaPathSegment::Name => f.write_str(".name")?,
+				BayesianSchemaPathSegment::Declarations => f.write_str("declarations")?,
+				BayesianSchemaPathSegment::Declaration(declaration) => write!(f, "[{declaration}]")?,
+				BayesianSchemaPathSegment::Child => f.write_str(".child")?,
+				BayesianSchemaPathSegment::Parents => f.write_str(".parents")?,
+				BayesianSchemaPathSegment::Parent(parent) => write!(f, "[{parent}]")?,
+				BayesianSchemaPathSegment::Graph => f.write_str("graph")?,
+				BayesianSchemaPathSegment::ExecutionOrder => f.write_str(".execution-order")?,
 			}
 		}
-		Ok(())
+		return Ok(());
 	}
 }
 
@@ -836,79 +1039,11 @@ pub type BayesianSchemaResult<T> = Result<T, BayesianSchemaError>;
 ///
 /// Returns a typed structural error for empty or duplicate names, duplicate
 /// edges, self-dependencies, or dependency cycles.
+#[inline]
 pub fn resolve_bayesian_schema(
 	dataset: &PreparedDataset,
 	dependencies: &[BayesianDependency],
 ) -> BayesianSchemaResult<ResolvedBayesianSchema> {
-	let observed = observed_schemas(dataset)?;
-	validate_dependencies(dependencies)?;
-
-	let mut sources = observed
-		.into_iter()
-		.map(|(name, schema)| (name, BayesianNodeSource::Observed(schema)))
-		.collect::<BTreeMap<_, _>>();
-	for dependency in dependencies {
-		match sources.entry(dependency.child.clone()) {
-			std::collections::btree_map::Entry::Vacant(entry) => {
-				entry.insert(if dependency.parents.is_empty() {
-					BayesianNodeSource::LatentRoot
-				} else {
-					BayesianNodeSource::LatentConditional
-				});
-			}
-			std::collections::btree_map::Entry::Occupied(mut entry) => {
-				if !dependency.parents.is_empty() && matches!(entry.get(), BayesianNodeSource::LatentRoot) {
-					entry.insert(BayesianNodeSource::LatentConditional);
-				}
-			}
-		}
-		for parent in &dependency.parents {
-			sources
-				.entry(parent.clone())
-				.or_insert(BayesianNodeSource::LatentRoot);
-		}
-	}
-
-	let nodes = sources
-		.into_iter()
-		.enumerate()
-		.map(|(index, (name, source))| {
-			BayesianNodeSchema {
-				id: BayesianNodeId(index),
-				name,
-				source,
-			}
-		})
-		.collect::<Vec<_>>();
-	let ids = nodes
-		.iter()
-		.map(|node| (node.name.clone(), node.id))
-		.collect::<BTreeMap<_, _>>();
-	let declarations = dependencies
-		.iter()
-		.enumerate()
-		.map(|(declaration_index, dependency)| {
-			ResolvedBayesianDependency {
-				declaration_index,
-				child: ids[&dependency.child],
-				parents: dependency
-					.parents
-					.iter()
-					.map(|parent| ids[parent])
-					.collect(),
-			}
-		})
-		.collect::<Vec<_>>();
-	let execution_order = deterministic_topological_order(&nodes, &declarations)?;
-
-	Ok(ResolvedBayesianSchema {
-		nodes,
-		declarations,
-		execution_order,
-	})
-}
-
-fn observed_schemas(dataset: &PreparedDataset) -> BayesianSchemaResult<BTreeMap<Vec<u8>, VectorSchema>> {
 	let mut observed = BTreeMap::new();
 	for (index, vector) in dataset.vectors().iter().enumerate() {
 		if observed
@@ -930,17 +1065,88 @@ fn observed_schemas(dataset: &PreparedDataset) -> BayesianSchemaResult<BTreeMap<
 			));
 		}
 	}
-	Ok(observed)
+	validate_dependencies(dependencies)?;
+
+	let mut sources = observed
+		.into_iter()
+		.map(|(name, schema)| {
+			return (name, BayesianNodeSource::Observed(schema));
+		})
+		.collect::<BTreeMap<_, _>>();
+	for dependency in dependencies {
+		match sources.entry(dependency.child.clone()) {
+			Entry::Vacant(entry) => {
+				entry.insert(if dependency.parents.is_empty() {
+					BayesianNodeSource::LatentRoot
+				} else {
+					BayesianNodeSource::LatentConditional
+				});
+			}
+			Entry::Occupied(mut entry) => {
+				if !dependency.parents.is_empty() && matches!(entry.get(), BayesianNodeSource::LatentRoot) {
+					entry.insert(BayesianNodeSource::LatentConditional);
+				}
+			}
+		}
+		for parent in &dependency.parents {
+			sources
+				.entry(parent.clone())
+				.or_insert(BayesianNodeSource::LatentRoot);
+		}
+	}
+
+	let nodes = sources
+		.into_iter()
+		.enumerate()
+		.map(|(index, (name, source))| {
+			return BayesianNodeSchema {
+				id: BayesianNodeId(index),
+				name,
+				source,
+			};
+		})
+		.collect::<Vec<_>>();
+	let ids = nodes
+		.iter()
+		.map(|node| {
+			return (node.name.clone(), node.id);
+		})
+		.collect::<BTreeMap<_, _>>();
+	let declarations = dependencies
+		.iter()
+		.enumerate()
+		.map(|(declaration_index, dependency)| {
+			return ResolvedBayesianDependency {
+				declaration_index,
+				child: ids[&dependency.child],
+				parents: dependency
+					.parents
+					.iter()
+					.map(|parent| {
+						return ids[parent];
+					})
+					.collect(),
+			};
+		})
+		.collect::<Vec<_>>();
+	let execution_order = deterministic_topological_order(&nodes, &declarations)?;
+
+	return Ok(ResolvedBayesianSchema {
+		nodes,
+		declarations,
+		execution_order,
+	});
 }
 
+/// Validate declaration names and repeated edges before graph construction.
 fn validate_dependencies(dependencies: &[BayesianDependency]) -> BayesianSchemaResult<()> {
 	let mut children = BTreeMap::<&[u8], usize>::new();
 	for (declaration_index, dependency) in dependencies.iter().enumerate() {
 		let declaration_path = || {
-			vec![
+			return vec![
 				BayesianSchemaPathSegment::Declarations,
 				BayesianSchemaPathSegment::Declaration(declaration_index),
-			]
+			];
 		};
 		if dependency.child.is_empty() {
 			let mut path = declaration_path();
@@ -972,7 +1178,7 @@ fn validate_dependencies(dependencies: &[BayesianDependency]) -> BayesianSchemaR
 					BayesianSchemaPathSegment::Parents,
 					BayesianSchemaPathSegment::Parent(parent_index),
 				]);
-				path
+				return path;
 			};
 			if parent.is_empty() {
 				return Err(BayesianSchemaError::new(
@@ -1003,9 +1209,10 @@ fn validate_dependencies(dependencies: &[BayesianDependency]) -> BayesianSchemaR
 			}
 		}
 	}
-	Ok(())
+	return Ok(());
 }
 
+/// Produce the stable name-ordered topological traversal or report a cycle.
 fn deterministic_topological_order(
 	nodes: &[BayesianNodeSchema],
 	declarations: &[ResolvedBayesianDependency],
@@ -1021,7 +1228,9 @@ fn deterministic_topological_order(
 	let mut ready = indegree
 		.iter()
 		.enumerate()
-		.filter_map(|(index, degree)| (*degree == 0).then_some(BayesianNodeId(index)))
+		.filter_map(|(index, degree)| {
+			return (*degree == 0).then_some(BayesianNodeId(index));
+		})
 		.collect::<BTreeSet<_>>();
 	let mut order = Vec::with_capacity(nodes.len());
 	while let Some(node) = ready.iter().next().copied() {
@@ -1038,8 +1247,12 @@ fn deterministic_topological_order(
 		let names = indegree
 			.iter()
 			.enumerate()
-			.filter(|(_, degree)| **degree != 0)
-			.map(|(index, _)| String::from_utf8_lossy(nodes[index].name()).into_owned())
+			.filter(|entry| {
+				return *entry.1 != 0;
+			})
+			.map(|entry| {
+				return String::from_utf8_lossy(nodes[entry.0].name()).into_owned();
+			})
 			.collect::<Vec<_>>();
 		return Err(BayesianSchemaError::new(
 			BayesianSchemaErrorKind::Cycle,
@@ -1050,5 +1263,5 @@ fn deterministic_topological_order(
 			format!("Bayesian declarations contain a dependency cycle among {names:?}"),
 		));
 	}
-	Ok(order)
+	return Ok(order);
 }

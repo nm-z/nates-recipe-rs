@@ -180,7 +180,9 @@ struct Random {
 }
 
 impl Random {
-	const fn new(seed: u64) -> Self { Self { state: seed } }
+	const fn new(seed: u64) -> Self {
+		Self { state: seed }
+	}
 
 	fn next(&mut self) -> u64 {
 		self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -202,9 +204,13 @@ impl Random {
 		}
 	}
 
-	fn choose<'a, T>(&mut self, values: &'a [T]) -> &'a T { &values[self.index(values.len())] }
+	fn choose<'a, T>(&mut self, values: &'a [T]) -> &'a T {
+		&values[self.index(values.len())]
+	}
 
-	fn bool(&mut self) -> bool { self.next() & 1 == 1 }
+	fn bool(&mut self) -> bool {
+		self.next() & 1 == 1
+	}
 }
 
 fn main() -> ExitCode {
@@ -397,10 +403,10 @@ fn generate_source(api: &ApiSurface, seed: u64, datasets: &[Dataset]) -> Result<
 
 	let metrics = choose_metrics(&mut random, dataset.task);
 	let metric_list = metrics.join(", ");
-	let log_token = api.choose(&mut random, &[
-		".log([items])",
-		".log([items]).every(interval)",
-	])?;
+	let log_token = api.choose(
+		&mut random,
+		&[".log([items])", ".log([items]).every(interval)"],
+	)?;
 	if log_token == ".log([items]).every(interval)" {
 		train.push(format!(".log([{metric_list}])"));
 		train.push(format!(".every({})", random.choose(LOG_INTERVALS)));

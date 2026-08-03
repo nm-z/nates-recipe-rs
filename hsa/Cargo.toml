@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Reviewed ROCr/HSA discovery and queue ownership for Recipe"
+repository = "https://github.com/nm-z/nates-recipe-rs"
+keywords = ["gpu", "hsa", "runtime"]
+categories = ["hardware-support"]
 
 [dependencies]
 libc = "0.2"

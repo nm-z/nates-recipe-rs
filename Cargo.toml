@@ -19,6 +19,10 @@ name = "recipe"
 path = "src/main.rs"
 test = false
 
+[[example]]
+name = "cookbook"
+test = true
+
 [workspace]
 resolver = "3"
 members = [
@@ -50,6 +54,12 @@ members = [
 	"training",
 	"transport",
 ]
+
+[workspace.package]
+repository = "https://github.com/nm-z/nates-recipe-rs"
+readme = "README.md"
+keywords = ["machine-learning", "gpu", "runtime", "distributed"]
+categories = ["science::ml"]
 
 [dependencies]
 libc = "0.2"

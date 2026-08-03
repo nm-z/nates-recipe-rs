@@ -1,0 +1,228 @@
+recipe
+	format	recipe-semantic-model
+	version	9
+	semantics
+		objective	binary-cross-entropy-with-logits
+		normalization	min-max
+		optimizer	adamw
+	dataset
+		feature-width	4
+		target
+			source-index	4
+			task	binary-classification
+			positive-code	1
+		vectors
+			vector
+				source-index	0
+				name-bytes	0x61
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	1
+				name-bytes	0x62
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	2
+				name-bytes	0x63
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	3
+				name-bytes	0x64
+				role	feature
+				semantic-type	numeric
+				encoding	f32
+				metadata	none
+			vector
+				source-index	4
+				name-bytes	0x746172676574
+				role	target
+				semantic-type	numeric
+				encoding	int32
+				metadata	none
+		feature-spans
+			span
+				source-index	0
+				start	0
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	1
+				start	1
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	2
+				start	2
+				width	1
+				lowering	numeric-scalar
+			span
+				source-index	3
+				start	3
+				width	1
+				lowering	numeric-scalar
+		feature-normalization-mask
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+			value-bits	0x3f800000
+	training
+		epochs	1
+		warmup-epochs	0
+		learning-rate-decay	cosine
+		gradient-clip-norm	none
+		normalization-epsilon	0x358637bd
+		reduction-tree-lanes	1024
+		random-seed	125779785117797
+		adamw
+			learning-rate	0x3a83126f
+			beta-one	0x3f666666
+			beta-two	0x3f7fbe77
+			epsilon	0x322bcc77
+			weight-decay	0x3c23d70a
+		bounds
+			train-rows	9
+			epochs	1
+			training-iterations	1
+			calibration-iterations	0
+			iterations	1
+			warmup-iterations	0
+	model
+		input-width	4
+		output-width	1
+		normalization	min-max
+			minimum
+				dtype	f32
+				shape	4
+				payload	raw-bytes-hex
+					0x00000000cdcc4c3ecdcc4c3e00000000
+			maximum
+				dtype	f32
+				shape	4
+				payload	raw-bytes-hex
+					0x0000803fcdcc4c3f3333333f6666663f
+		blocks
+			residual
+				index	0
+				output-width	8
+				branch	2
+					layer	8
+						index	0
+						operations	0
+						weight
+							parameter
+								dtype	f32
+								shape	4	8
+								payload	raw-bytes-hex
+									0x5bf4813e99c6d6be3a7a87bf38db38bfa0fb783e1332333f985aafbeac43273d4932fabecbbb46bff9d50e3fd511043f82eb243f6d078c3e7f3aaf3e0d25e13d
+									0xa8d0163fb726eebe03073b3f31698bbe0cc2c8be9c3a043f2526463fb7f5c0bf478489bf7ce097bf2c9cf0bed539bfbed47be5bece4b26be5a4b92bd75878b3e
+							first-moment
+								dtype	f32
+								shape	4	8
+								payload	raw-bytes-hex
+									0x000000000000000035cc493a000000008e4f1cbc1d20543bf6da4d3bf8bc813600000000000000002b2aa83a0000000084a303bc4a66123b6a8c093b4d271036
+									0x000000000000000090994a3b000000002747a1bbe5e86cba8d9601bb0000000000000000000000007d8e613b000000009d3233bb0ed11bbbab2c83bb00000000
+							second-moment
+								dtype	f32
+								shape	4	8
+								payload	raw-bytes-hex
+									0x0000000000000000d1827e33000000005cb41837489d8c35ae6c8435a865d22b000000000000000066be303400000000469bd83614f40535df7dec34efdf012b
+									0x0000000000000000ec448035000000005d9022366264af331fe9d13400000000000000000000000014fc9e35000000003ab2483599bd1735d914d73500000000
+						bias
+							parameter
+								dtype	f32
+								shape	8
+								payload	raw-bytes-hex
+									0x00000000000000006c1283ba000000006e12833a5f1283ba6a12833a3b0d83ba
+							first-moment
+								dtype	f32
+								shape	8
+								payload	raw-bytes-hex
+									0x0000000000000000a4407e3b000000009b5141bcf0a4083a0af8efbaf33ad836
+							second-moment
+								dtype	f32
+								shape	8
+								payload	raw-bytes-hex
+									0x0000000000000000c702ca3500000000a39269378464e93272f3b334ed1b922c
+					operation	relu
+				skip	linear-projection
+					weight
+						parameter
+							dtype	f32
+							shape	4	8
+							payload	raw-bytes-hex
+								0xbc5f073f7a53283fcd64e5beb0dcecbc7fa8243feb7f30bf8ae31c3fcecd78bf4ef71f3e2f7c9abf2e68a2bcc642abbe601a863f8112b7be138354bf8bc053bf
+								0xc0b29ebef501d0beb23b20bfe25b38bf4b0535be2952693fef97ca3fead2b73ec9c927bf0843253f1580f83f3d43f9bd00c7733ea5014ebf7e21b33f2be010bf
+						first-moment
+							dtype	f32
+							shape	4	8
+							payload	raw-bytes-hex
+								0x26a33d3bd7296dbba50881ba1b72863b093907bc1d20543bddf7673b59b8bcb659e0133b24bbeeba7dd952b9e8d62e3bfafbc0bb4a66123b3e0e183b036b39b7
+								0xff27313a59ba863bccbc313bfcd9a6ba703d583ae5e86cba8d9601bba24518b81aac33b99227d43b61e67a3b1ff43dbb0486823b0ed11bbbab2c83bbee493bb8
+						second-moment
+							dtype	f32
+							shape	4	8
+							payload	raw-bytes-hex
+								0xecc2603599c4af35601ed03351f1e135e08fe436489d8c35d426a835af975e2c66ab08356419b2348eed8a317e0d3f35e7c3683614f40535fa80103502df562d
+								0x4226443361e4e235507045357dfe2d34491f92336264af331fe9d13453ea102fb6c249312ba78c36f1b7c43505836135b5f3d43599bd1735d914d735993a5b2f
+				operations	1
+					operation	silu
+			layer	1
+				index	1
+				operations	0
+				weight
+					parameter
+						dtype	f32
+						shape	8	1
+						payload	raw-bytes-hex
+							0x0bb28cbe859a4c3f3018743e5be293bf1d24033f7547a7bed63c8bbe03af38bc
+					first-moment
+						dtype	f32
+						shape	8	1
+						payload	raw-bytes-hex
+							0x8cef05bce7eb623b147db93c0b203fba8a59bcbcc1b50fbb5181083d00c5dc3a
+					second-moment
+						dtype	f32
+						shape	8	1
+						payload	raw-bytes-hex
+							0x563be03624eaa035e5085738594d643342b85d38a6130135e6eae838d44e9834
+				bias
+					parameter
+						dtype	f32
+						shape	1
+						payload	raw-bytes-hex
+							0x8910833a
+					first-moment
+						dtype	f32
+						shape	1
+						payload	raw-bytes-hex
+							0x692694b7
+					second-moment
+						dtype	f32
+						shape	1
+						payload	raw-bytes-hex
+							0x062d092e
+	native
+		program	0x704429eb760f6ed73badf5b6afe0e0c84ea76e90e3fc2176a5bd45abbe70591e
+		realization	0x6973ac249a9a8703e137cf1cf9cde5a39bc0d9cd87dcd94063ee610afad92fd4
+		topology	0xf850b9da189abfdd314eaeade70d99050198c52e4bbacaf2969455b489db6ee4
+		discovery	0x80b75d51c8ac6e1d52e64d54c66cbd8fea8db2180cdbd672dc24e1cc74a79e7e
+		kernels
+			kernel
+				format	hsaco
+				target
+					backend	amd-rocr-hsa
+					architecture	amdgcn-amd-amdhsa--gfx1101
+					abi	elf64-amdgpu-code-object-v6
+				toolchain
+					name	recipe-owned-llvm-amd-hsa
+					version	auto-pinned-local-tools-and-benchmark-v3
+					digest	0xe82318b2315c84fa4cf78ee39c0cc961c70e918cb3d7ccae19f8f0b15ecc6de6
+				digest	0xed4e7b3ea001196d98b76e3a3db3d23cf15180afc335ec34fd2742ed95ccbcd1

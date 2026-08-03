@@ -122,7 +122,9 @@ impl fmt::Display for TrainingError {
 }
 
 impl fmt::Debug for TrainingError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(self, formatter) }
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		fmt::Display::fmt(self, formatter)
+	}
 }
 
 impl std::error::Error for TrainingError {
@@ -141,27 +143,39 @@ impl std::error::Error for TrainingError {
 }
 
 impl From<DeclarationError> for TrainingError {
-	fn from(error: DeclarationError) -> Self { Self::Declaration(error) }
+	fn from(error: DeclarationError) -> Self {
+		Self::Declaration(error)
+	}
 }
 
 impl From<DataPreparationError> for TrainingError {
-	fn from(error: DataPreparationError) -> Self { Self::Data(error) }
+	fn from(error: DataPreparationError) -> Self {
+		Self::Data(error)
+	}
 }
 
 impl From<TrainingCompileError> for TrainingError {
-	fn from(error: TrainingCompileError) -> Self { Self::Compile(error) }
+	fn from(error: TrainingCompileError) -> Self {
+		Self::Compile(error)
+	}
 }
 
 impl From<CheckpointError> for TrainingError {
-	fn from(error: CheckpointError) -> Self { Self::Checkpoint(error) }
+	fn from(error: CheckpointError) -> Self {
+		Self::Checkpoint(error)
+	}
 }
 
 impl From<InferencePreparationError> for TrainingError {
-	fn from(error: InferencePreparationError) -> Self { Self::Resume(error) }
+	fn from(error: InferencePreparationError) -> Self {
+		Self::Resume(error)
+	}
 }
 
 impl From<NativePreparationError> for TrainingError {
-	fn from(error: NativePreparationError) -> Self { Self::Native(error) }
+	fn from(error: NativePreparationError) -> Self {
+		Self::Native(error)
+	}
 }
 
 pub type TrainingResult<T> = Result<T, TrainingError>;
@@ -324,11 +338,15 @@ impl TrainingReport {
 
 	/// Whether requested validation reporting had known target rows.
 	#[must_use]
-	pub const fn validation_status(&self) -> ValidationMetricStatus { self.validation_status }
+	pub const fn validation_status(&self) -> ValidationMetricStatus {
+		self.validation_status
+	}
 
 	/// Whether a host stop request was accepted after a complete epoch.
 	#[must_use]
-	pub const fn gracefully_stopped(&self) -> bool { self.gracefully_stopped }
+	pub const fn gracefully_stopped(&self) -> bool {
+		self.gracefully_stopped
+	}
 
 	/// Prepared KNN semantic model, or `None` for a dense training report.
 	#[must_use]
@@ -358,21 +376,15 @@ impl TrainingReport {
 
 	fn save_native_kernel(&self, path: impl AsRef<Path>, format: NativeKernelFormat) -> TrainingResult<()> {
 		match &self.payload {
-			TrainingReportPayload::Dense(checkpoint) => {
-				checkpoint
-					.save_native_kernel(path, format)
-					.map_err(TrainingError::from)
-			}
-			TrainingReportPayload::Knn(_) => {
-				Err(TrainingError::unsupported(
-					"KNN reference preparation has no native training kernel artifact",
-				))
-			}
-			TrainingReportPayload::Bayes(_) => {
-				Err(TrainingError::unsupported(
-					"categorical Bayesian observation preparation has no native training kernel artifact",
-				))
-			}
+			TrainingReportPayload::Dense(checkpoint) => checkpoint
+				.save_native_kernel(path, format)
+				.map_err(TrainingError::from),
+			TrainingReportPayload::Knn(_) => Err(TrainingError::unsupported(
+				"KNN reference preparation has no native training kernel artifact",
+			)),
+			TrainingReportPayload::Bayes(_) => Err(TrainingError::unsupported(
+				"categorical Bayesian observation preparation has no native training kernel artifact",
+			)),
 		}
 	}
 }
@@ -471,13 +483,13 @@ pub fn compile_knn_model(policy: &Train, data: &Data, model: &Model) -> Training
 		.ok_or_else(|| TrainingError::unsupported("KNN neighbor count must be nonzero"))?;
 	let prepared = prepare_data(data)?;
 	let references = prepare_knn_reference_set(&prepared, neighbors)?;
-	let normalization = data.normalization().map(|normalization| {
-		match normalization {
+	let normalization = data
+		.normalization()
+		.map(|normalization| match normalization {
 			DataNormalization::ZScore => DenseDataNormalization::ZScore,
 			DataNormalization::MinMax => DenseDataNormalization::MinMax,
 			DataNormalization::L2Norm => DenseDataNormalization::L2Norm,
-		}
-	});
+		});
 	let current = KnnModelArtifact::new(references, normalization, map_dense_operations(operations)?)?;
 	match resume {
 		Some(saved) => saved.continue_with(current).map_err(Into::into),
@@ -596,21 +608,7 @@ fn compile_training_graph(
 		.collect::<TrainingResult<Vec<_>>>()?;
 	let layers = blocks
 		.iter()
-		.map(|block| {
-			match block {
-				DenseBlock::Layer(layer) => Some(layer.clone()),
-				DenseBlock::Embedding(_)
-				| DenseBlock::Attention(_)
-				| DenseBlock::Rnn(_)
-				| DenseBlock::Gru(_)
-				| DenseBlock::Lstm(_)
-				| DenseBlock::Convolution(_)
-				| DenseBlock::Pool(_)
-				| DenseBlock::KMeans(_)
-				| DenseBlock::Tree(_)
-				| DenseBlock::Residual(_) => None,
-			}
-		})
+		.map(|block| block.layer().cloned())
 		.collect::<Option<Vec<_>>>()
 		.unwrap_or_default();
 	let epochs = policy
@@ -654,7 +652,7 @@ fn compile_training_graph(
 			));
 		}
 	};
-	let has_embedding = matches!(blocks.first(), Some(DenseBlock::Embedding(_)));
+	let has_embedding = blocks.first().and_then(DenseBlock::embedding).is_some();
 	let data_normalization = match (has_embedding, data.normalization()) {
 		(true, None) => DenseDataNormalization::Identity,
 		(true, Some(_)) => {
@@ -692,9 +690,7 @@ fn compile_training_graph(
 	let binary_validation = binary_validation_config(policy, loss)?;
 	let multiclass_validation = multiclass_validation_config(policy, loss)?;
 	let regression_validation = regression_validation_config(policy, loss)?;
-	let contains_structured_blocks = blocks
-		.iter()
-		.any(|block| !matches!(block, DenseBlock::Layer(_)));
+	let contains_structured_blocks = blocks.iter().any(|block| block.layer().is_none());
 	let mut training = match (
 		contains_structured_blocks,
 		binary_validation,
@@ -729,11 +725,9 @@ fn compile_training_graph(
 		(true, None, None, None) => {
 			compile_dense_training_with_blocks(&prepared, &config, &blocks).map_err(TrainingError::from)
 		}
-		_ => {
-			Err(TrainingError::unsupported(
-				"one training run cannot request multiple validation metric families simultaneously",
-			))
-		}
+		_ => Err(TrainingError::unsupported(
+			"one training run cannot request multiple validation metric families simultaneously",
+		)),
 	}?;
 	let mut resume_checkpoint = None;
 	if let Some(source) = policy.resume_source() {
@@ -847,11 +841,15 @@ impl Train {
 	///
 	/// Expected declaration, preparation, execution, and artifact-write failures
 	/// are returned as typed Recipe errors.
-	pub fn run(&self) -> TrainingResult<TrainingReport> { self.try_run() }
-
-	fn try_run(&self) -> TrainingResult<TrainingReport> {
-		let (data, model) = crate::take_recipe_sequence().map_err(TrainingError::unsupported)?;
+	pub fn run(&self) -> TrainingResult<TrainingReport> {
+		let (data, model) = crate::take_recipe_training_sequence().map_err(TrainingError::unsupported)?;
 		self.try_run_with(&data, &model)
+	}
+
+	/// Source-frontend lowering target for `.run(&model, &data)`.
+	#[doc(hidden)]
+	pub fn __recipe_run_with(&self, model: &Model, data: &Data) -> TrainingResult<TrainingReport> {
+		self.try_run_with(data, model)
 	}
 
 	fn try_run_with(&self, data: &Data, model: &Model) -> TrainingResult<TrainingReport> {
@@ -937,12 +935,10 @@ fn execute_current_training(
 			Ok(execution)
 		}
 		(Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-		(Err(execution), Err(presentation)) => {
-			Err(TrainingError::runtime(
-				"execute native training and present live metrics",
-				format!("execution error: {execution}; presentation error: {presentation}"),
-			))
-		}
+		(Err(execution), Err(presentation)) => Err(TrainingError::runtime(
+			"execute native training and present live metrics",
+			format!("execution error: {execution}; presentation error: {presentation}"),
+		)),
 	}
 }
 
@@ -1356,7 +1352,9 @@ struct LiveMetricPlan {
 }
 
 impl LiveMetricPlan {
-	fn is_empty(&self) -> bool { self.metrics.is_empty() }
+	fn is_empty(&self) -> bool {
+		self.metrics.is_empty()
+	}
 }
 
 fn live_metric_presentations(policy: &Train, training: &CompiledTraining) -> LiveMetricPlan {
@@ -1390,12 +1388,15 @@ fn live_metric_presentations(policy: &Train, training: &CompiledTraining) -> Liv
 		if !logged && !plotted {
 			continue;
 		}
-		plan.metrics.insert(binding.metric, LiveMetricPresentation {
-			label: metric_label(binding.kind),
-			width: metric_width(binding.kind),
-			log_cadence: logged.then(|| policy.metric_log_interval(metric)).flatten(),
-			plot: plotted,
-		});
+		plan.metrics.insert(
+			binding.metric,
+			LiveMetricPresentation {
+				label: metric_label(binding.kind),
+				width: metric_width(binding.kind),
+				log_cadence: logged.then(|| policy.metric_log_interval(metric)).flatten(),
+				plot: plotted,
+			},
+		);
 	}
 	if plan.host.requested()
 		&& let Some(trigger) = training
@@ -1404,14 +1405,14 @@ fn live_metric_presentations(policy: &Train, training: &CompiledTraining) -> Liv
 			.iter()
 			.find(|binding| binding.kind == TrainingMetricKind::TrainingLoss)
 	{
-		plan.metrics.entry(trigger.metric).or_insert_with(|| {
-			LiveMetricPresentation {
+		plan.metrics
+			.entry(trigger.metric)
+			.or_insert_with(|| LiveMetricPresentation {
 				label: metric_label(trigger.kind),
 				width: metric_width(trigger.kind),
 				log_cadence: None,
 				plot: false,
-			}
-		});
+			});
 	}
 	plan
 }
@@ -1701,11 +1702,9 @@ impl BoundedPlotSeries {
 		let (minimum, maximum) = finite
 			.iter()
 			.copied()
-			.fold(None, |range, value| {
-				match range {
-					Some((minimum, maximum)) => Some((f64::min(minimum, value), f64::max(maximum, value))),
-					None => Some((value, value)),
-				}
+			.fold(None, |range, value| match range {
+				Some((minimum, maximum)) => Some((f64::min(minimum, value), f64::max(maximum, value))),
+				None => Some((value, value)),
 			})
 			.unwrap_or((f64::NAN, f64::NAN));
 		let levels = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -1782,16 +1781,12 @@ fn require_supported_model(model: &Model) -> TrainingResult<DenseLoss> {
 		Some(Objective::Builtin(Loss::CrossEntropy)) => Ok(DenseLoss::CrossEntropy),
 		Some(Objective::Builtin(Loss::Huber)) => Ok(DenseLoss::Huber),
 		Some(Objective::Builtin(Loss::Focal)) => Ok(DenseLoss::Focal),
-		Some(Objective::Reference(_)) => {
-			Err(TrainingError::unsupported(
-				"model-referenced objectives have no dense training lowering",
-			))
-		}
-		None => {
-			Err(TrainingError::unsupported(
-				"dense training requires an explicit built-in objective",
-			))
-		}
+		Some(Objective::Reference(_)) => Err(TrainingError::unsupported(
+			"model-referenced objectives have no dense training lowering",
+		)),
+		None => Err(TrainingError::unsupported(
+			"dense training requires an explicit built-in objective",
+		)),
 	}
 }
 
@@ -1864,11 +1859,9 @@ fn multiclass_validation_config(policy: &Train, loss: DenseLoss) -> TrainingResu
 	match loss {
 		DenseLoss::CrossEntropy => Ok(Some(MulticlassValidationConfig)),
 		DenseLoss::BinaryCrossEntropy | DenseLoss::Focal => Ok(None),
-		_ => {
-			Err(TrainingError::unsupported(
-				"accuracy validation requires binary or categorical cross entropy",
-			))
-		}
+		_ => Err(TrainingError::unsupported(
+			"accuracy validation requires binary or categorical cross entropy",
+		)),
 	}
 }
 
@@ -1901,16 +1894,14 @@ fn map_dense_block(layer: &LayerSpec) -> TrainingResult<DenseBlock> {
 			let vocabulary = vocabulary.ok_or_else(|| {
 				TrainingError::unsupported("`.embed(dimensions)` requires an immediate `.vocab(vocabulary)`")
 			})?;
-			Ok(DenseBlock::Embedding(DenseEmbedding::new(
+			Ok(DenseEmbedding::new(
 				map_dense_width(*dimensions, "embedding dimension")?,
 				map_dense_width(vocabulary, "embedding vocabulary")?,
-			)))
+			)
+			.into())
 		}
 		LayerSpec::Attention { heads } => {
-			Ok(DenseBlock::Attention(DenseAttention::new(map_dense_width(
-				*heads,
-				"attention head count",
-			)?)))
+			Ok(DenseAttention::new(map_dense_width(*heads, "attention head count")?).into())
 		}
 		LayerSpec::Rnn { width, operations } => {
 			if !operations.is_empty() {
@@ -1918,22 +1909,18 @@ fn map_dense_block(layer: &LayerSpec) -> TrainingResult<DenseBlock> {
 					"the first vanilla RNN case does not yet define chained recurrent-block operations",
 				));
 			}
-			Ok(DenseBlock::Rnn(DenseRnn::new(map_dense_width(
-				*width,
-				"RNN hidden width",
-			)?)))
+			Ok(DenseRnn::new(map_dense_width(*width, "RNN hidden width")?).into())
 		}
 		LayerSpec::Convolution {
 			filters,
 			kernel,
 			activation,
-		} => {
-			Ok(DenseBlock::Convolution(DenseConvolution::new(
-				map_dense_width(*filters, "convolution filter count")?,
-				map_dense_width(*kernel, "convolution kernel width")?,
-				map_dense_activation(*activation)?,
-			)))
-		}
+		} => Ok(DenseConvolution::new(
+			map_dense_width(*filters, "convolution filter count")?,
+			map_dense_width(*kernel, "convolution kernel width")?,
+			map_dense_activation(*activation)?,
+		)
+		.into()),
 		LayerSpec::Pool {
 			size,
 			group_to_neuron,
@@ -1942,7 +1929,7 @@ fn map_dense_block(layer: &LayerSpec) -> TrainingResult<DenseBlock> {
 			let group_to_neuron = group_to_neuron
 				.map(|connection| map_dense_width(connection.neurons(), "pool destination neuron count"))
 				.transpose()?;
-			Ok(DenseBlock::Pool(DensePool::new(size, group_to_neuron)))
+			Ok(DensePool::new(size, group_to_neuron).into())
 		}
 		LayerSpec::KMeans {
 			clusters,
@@ -1952,10 +1939,7 @@ fn map_dense_block(layer: &LayerSpec) -> TrainingResult<DenseBlock> {
 			let group_to_neuron = group_to_neuron
 				.map(|connection| map_dense_width(connection.neurons(), "K-means destination neuron count"))
 				.transpose()?;
-			Ok(DenseBlock::KMeans(DenseKMeans::new(
-				clusters,
-				group_to_neuron,
-			)))
+			Ok(DenseKMeans::new(clusters, group_to_neuron).into())
 		}
 		LayerSpec::Gru { width, operations } => {
 			if !operations.is_empty() {
@@ -1963,10 +1947,7 @@ fn map_dense_block(layer: &LayerSpec) -> TrainingResult<DenseBlock> {
 					"the first GRU case does not yet define chained recurrent-block operations",
 				));
 			}
-			Ok(DenseBlock::Gru(DenseGru::new(map_dense_width(
-				*width,
-				"GRU hidden width",
-			)?)))
+			Ok(DenseGru::new(map_dense_width(*width, "GRU hidden width")?).into())
 		}
 		LayerSpec::Lstm { width, operations } => {
 			if !operations.is_empty() {
@@ -1974,10 +1955,7 @@ fn map_dense_block(layer: &LayerSpec) -> TrainingResult<DenseBlock> {
 					"the first LSTM case does not yet define chained recurrent-block operations",
 				));
 			}
-			Ok(DenseBlock::Lstm(DenseLstm::new(map_dense_width(
-				*width,
-				"LSTM hidden width",
-			)?)))
+			Ok(DenseLstm::new(map_dense_width(*width, "LSTM hidden width")?).into())
 		}
 		LayerSpec::Lgbm { depth } => map_tree_block(DenseTreeFamily::LightGbm, 1, *depth),
 		LayerSpec::Cbst { depth } => map_tree_block(DenseTreeFamily::CatBoost, 1, *depth),
@@ -2016,9 +1994,9 @@ fn map_dense_block(layer: &LayerSpec) -> TrainingResult<DenseBlock> {
 					declared_output_width.get(),
 				)));
 			}
-			Ok(DenseBlock::Residual(residual))
+			Ok(residual.into())
 		}
-		_ => map_dense_layer(layer).map(DenseBlock::Layer),
+		_ => map_dense_layer(layer).map(DenseBlock::from),
 	}
 }
 
@@ -2027,23 +2005,19 @@ fn map_tree_block(family: DenseTreeFamily, trees: usize, depth: usize) -> Traini
 	let depth = u32::try_from(depth)
 		.map_err(|error| TrainingError::unsupported(format!("tree depth does not fit u32: {error}")))?;
 	let depth = NonZeroU32::new(depth).ok_or_else(|| TrainingError::unsupported("tree depth must be nonzero"))?;
-	Ok(DenseBlock::Tree(DenseTree::new(family, trees, depth)))
+	Ok(DenseTree::new(family, trees, depth).into())
 }
 
 fn map_dense_residual_operation(operation: ResidualOperation) -> TrainingResult<DenseResidualOperation> {
 	match operation {
-		ResidualOperation::Layer { width } => {
-			Ok(DenseResidualOperation::Layer(DenseLayer::with_kind(
-				DenseBlockKind::Layer,
-				map_dense_width(width, "residual branch layer width")?,
-				[],
-			)))
-		}
-		ResidualOperation::Activation(activation) => {
-			Ok(DenseResidualOperation::Operation(
-				DenseOperation::Activation(map_dense_activation(activation)?),
-			))
-		}
+		ResidualOperation::Layer { width } => Ok(DenseResidualOperation::Layer(DenseLayer::with_kind(
+			DenseBlockKind::Layer,
+			map_dense_width(width, "residual branch layer width")?,
+			[],
+		))),
+		ResidualOperation::Activation(activation) => Ok(DenseResidualOperation::Operation(
+			DenseOperation::Activation(map_dense_activation(activation)?),
+		)),
 	}
 }
 
@@ -2085,17 +2059,15 @@ fn map_dense_operations(operations: &[LayerOperation]) -> TrainingResult<Vec<Den
 	let operations = operations
 		.iter()
 		.copied()
-		.map(|operation| {
-			match operation {
-				LayerOperation::Activation(activation) => {
-					map_dense_activation(activation).map(DenseOperation::Activation)
-				}
-				LayerOperation::Normalization(LayerNormalization::LayerNorm) => {
-					Ok(DenseOperation::Normalization(DenseNormalization::Layer))
-				}
-				LayerOperation::Normalization(LayerNormalization::BatchNorm) => {
-					Ok(DenseOperation::Normalization(DenseNormalization::Batch))
-				}
+		.map(|operation| match operation {
+			LayerOperation::Activation(activation) => {
+				map_dense_activation(activation).map(DenseOperation::Activation)
+			}
+			LayerOperation::Normalization(LayerNormalization::LayerNorm) => {
+				Ok(DenseOperation::Normalization(DenseNormalization::Layer))
+			}
+			LayerOperation::Normalization(LayerNormalization::BatchNorm) => {
+				Ok(DenseOperation::Normalization(DenseNormalization::Batch))
 			}
 		})
 		.collect::<TrainingResult<Vec<_>>>()?;

@@ -315,7 +315,7 @@ impl PeerBenchmarkFailure {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PeerBenchmarkAttempt {
-	Measured(PeerMeasurement),
+	Measured(Box<PeerMeasurement>),
 	Failed(PeerBenchmarkFailure),
 }
 
@@ -328,7 +328,7 @@ impl PeerBenchmarkAttempt {
 	/// failed attempt to masquerade as a measured property.
 	pub fn into_measurement(self) -> ProbeResult<PeerMeasurement> {
 		match self {
-			Self::Measured(measurement) => Ok(measurement),
+			Self::Measured(measurement) => Ok(*measurement),
 			Self::Failed(failure) => {
 				Err(crate::ProbeError::Benchmark(format!(
 					"peer benchmark failed during {:?} ({:?}): {}",
@@ -404,7 +404,7 @@ pub trait PeerSession: core::fmt::Debug {
 			return PeerBenchmarkAttempt::Failed(failure);
 		}
 		match result {
-			Ok(measurement) => PeerBenchmarkAttempt::Measured(measurement),
+			Ok(measurement) => PeerBenchmarkAttempt::Measured(Box::new(measurement)),
 			Err(error) => {
 				PeerBenchmarkAttempt::Failed(PeerBenchmarkFailure::new(
 					PeerBenchmarkPhase::DirectionalTransfer,

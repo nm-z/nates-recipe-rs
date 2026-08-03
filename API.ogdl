@@ -86,6 +86,7 @@ recipe
 		.save("model.ogdl", "kernel.cubin")
 		.save("model.ogdl", "kernel.hsaco")
 		.run()
+		.run(model, data)
 	.infer()
 		.load("model.ogdl" OR "model.gguf")
 		.log(item)

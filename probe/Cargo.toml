@@ -3,6 +3,11 @@ name = "recipe-probe"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Bare-metal discovery and bounded measurement for Recipe"
+repository = "https://github.com/nm-z/nates-recipe-rs"
+readme = "README.md"
+keywords = ["gpu", "benchmark", "hardware"]
+categories = ["science"]
 
 [dependencies]
 recipe-core = { path = "../core" }

@@ -33,8 +33,8 @@ pub mod engine {
 	pub use recipe_planner as planner;
 	pub use recipe_prepare as prepare;
 	pub use recipe_primitives as primitives;
-	pub use recipe_program as program;
 	pub use recipe_probe as probe;
+	pub use recipe_program as program;
 	pub use recipe_remote as remote;
 	pub use recipe_scheduler as scheduler;
 	pub use recipe_text as text;
@@ -52,11 +52,12 @@ pub mod operations {
 	pub use recipe_core::ScalarProgram;
 	pub use recipe_ops::{
 		CompositionPayload, CompositionRecipe, CompositionStep, IdentityNamespace, IterationBound, LoweredProgram,
-		LoweringAvailability, LoweringHardware, MaterializationRequest, MaterializedComposition, MissingConcreteComponent,
-		NamedTensor, NonCalculationRecipe, OperationDescriptor, OperationError, OperationErrorKind,
-		OperationRegistry, OperationResult, PreparedParameter, PreparedParameters, PrimitiveRequest,
-		RemainingComposition, ResolvedBound, ResolvedComposition, ResolvedIteration, ResolvedStep, StageEmission,
-		UnsupportedReason, WorkspaceAllocation, WorkspaceFormula, WorkspaceObject, WorkspaceUnit, WorkspaceValue,
+		LoweringAvailability, LoweringHardware, MaterializationRequest, MaterializedComposition,
+		MissingConcreteComponent, NamedTensor, NonCalculationRecipe, OperationDescriptor, OperationError,
+		OperationErrorKind, OperationRegistry, OperationResult, PreparedParameter, PreparedParameters,
+		PrimitiveRequest, RemainingComposition, ResolvedBound, ResolvedComposition, ResolvedIteration,
+		ResolvedStep, StageEmission, UnsupportedReason, WorkspaceAllocation, WorkspaceFormula, WorkspaceObject,
+		WorkspaceUnit, WorkspaceValue,
 	};
 
 	/// Return the finite normative operation registry.
@@ -161,17 +162,17 @@ pub(crate) fn remember_recipe_model(model: Model) {
 	RECIPE_SEQUENCE.with(|sequence| sequence.borrow_mut().model = Some(model));
 }
 
-pub(crate) fn take_recipe_sequence() -> Result<(Data, Model), &'static str> {
-	take_recipe_sequence_with_diagnostics(
-		"recipe.train().run() requires a preceding recipe.data(...) declaration",
-		"recipe.train().run() requires a preceding recipe.model() declaration",
-	)
-}
-
 pub(crate) fn take_recipe_inference_sequence() -> Result<(Data, Model), &'static str> {
 	take_recipe_sequence_with_diagnostics(
 		"recipe.infer().evaluate() requires a preceding recipe.data(...) declaration",
 		"recipe.infer().evaluate() requires a preceding recipe.model() declaration",
+	)
+}
+
+pub(crate) fn take_recipe_training_sequence() -> Result<(Data, Model), &'static str> {
+	take_recipe_sequence_with_diagnostics(
+		"recipe.train().run() requires a preceding recipe.data(...) declaration",
+		"recipe.train().run() requires a preceding recipe.model() declaration",
 	)
 }
 

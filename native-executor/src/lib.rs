@@ -34,7 +34,7 @@ pub use candidate::{
 pub use cuda::{CUDA_MAXIMUM_SUBMISSION_QUEUES, CudaBackend, CudaBinding};
 pub use error::{Error, Result};
 pub use evidence::{NativeBackendKind, NativeDeviceExecutionEvidence, NativeExecutionEvidence};
-pub use hsa::{HsaBackend, HsaBinding};
+pub use hsa::{HsaBackend, HsaBinding, HsaBindingProperties};
 pub use local::{
 	CandidateCrossBackendTransfer, CrossBackendTransfer, CrossBackendUnavailable, LocalArena, LocalArenaRef,
 	LocalArenaSet, LocalBackend, LocalCandidateFactory, LocalCandidateStabilizer, LocalDeviceClass, LocalError,

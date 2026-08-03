@@ -1,15 +1,15 @@
 use core::{
 	fmt,
 	num::{NonZeroU32, NonZeroU64},
+	sync::atomic::{AtomicU64, Ordering},
 };
+use alloc::collections::{BTreeMap, BTreeSet};
 use std::{
-	collections::{BTreeMap, BTreeSet},
 	ffi::OsString,
 	fs::{self, File, OpenOptions},
 	io::{self, Write},
-	os::unix::fs::OpenOptionsExt,
+	os::unix::fs::OpenOptionsExt as _,
 	path::{Path, PathBuf},
-	sync::atomic::{AtomicU64, Ordering},
 };
 
 use recipe_core::{
@@ -26,7 +26,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
 	AdamWConfig, CompiledFeatureSpan, CompiledTraining, CompletedTrainingExecution, DataNormalizationState,
-	DecodedMulticlassClass, DenseActivation, DenseAttention, DenseAttentionState, DenseBlock, DenseBlockKind,
+	DecodedMulticlassClass, DenseActivation, DenseAttention, DenseAttentionState, DenseBlockKind,
 	DenseBlockState, DenseConvolution, DenseConvolutionGeometry, DenseConvolutionState, DenseDataNormalization,
 	DenseEmbedding, DenseEmbeddingState, DenseFeatureLowering, DenseGroupToNeuronRouting, DenseGru, DenseGruState,
 	DenseKMeans, DenseKMeansState, DenseLayer, DenseLayerState, DenseLoss, DenseLstm, DenseLstmState, DenseOperation,
@@ -37,25 +37,43 @@ use crate::{
 	TrainingBounds, TrainingHorizon,
 };
 
+/// Checkpoint format version for flat dense-layer artifacts.
 const FLAT_CHECKPOINT_FORMAT_VERSION: u32 = 5;
+/// Checkpoint format version for structured block artifacts.
 const STRUCTURED_CHECKPOINT_FORMAT_VERSION: u32 = 6;
+/// Checkpoint format version that adds pooling blocks.
 const POOL_CHECKPOINT_FORMAT_VERSION: u32 = 7;
+/// Legacy checkpoint format version that first carried native-kernel metadata.
 const LEGACY_NATIVE_CHECKPOINT_FORMAT_VERSION: u32 = 8;
+/// Checkpoint format version for the current native-kernel metadata layout.
 const NATIVE_CHECKPOINT_FORMAT_VERSION: u32 = 9;
+/// Checkpoint format version that adds K-means model state.
 const KMEANS_CHECKPOINT_FORMAT_VERSION: u32 = 10;
+/// Checkpoint format version that adds multiple supervised targets.
 const MULTI_TARGET_CHECKPOINT_FORMAT_VERSION: u32 = 11;
+/// Checkpoint format version that adds tree-ensemble model state.
 const TREE_CHECKPOINT_FORMAT_VERSION: u32 = 12;
+/// Checkpoint format version that adds embedding-block state.
 const EMBEDDING_CHECKPOINT_FORMAT_VERSION: u32 = 13;
+/// Checkpoint format version that adds vanilla recurrent-block state.
 const RNN_CHECKPOINT_FORMAT_VERSION: u32 = 14;
+/// Checkpoint format version that adds gated recurrent-unit state.
 const GRU_CHECKPOINT_FORMAT_VERSION: u32 = 15;
+/// Checkpoint format version that adds long short-term memory state.
 const LSTM_CHECKPOINT_FORMAT_VERSION: u32 = 16;
+/// Format name accepted for legacy dense training checkpoints.
 const LEGACY_CHECKPOINT_FORMAT: &str = "dense-training-checkpoint";
+/// Format name written for semantic model artifacts.
 const SEMANTIC_MODEL_FORMAT: &str = "recipe-semantic-model";
+/// Number of source bytes encoded into each hexadecimal output chunk.
 const HEX_CHUNK_BYTES: usize = 64;
+/// Maximum number of unique temporary artifact names attempted per write.
 const TEMP_CREATE_ATTEMPTS: u64 = 64;
 
+/// Process-local sequence used to disambiguate temporary artifact names.
 static NEXT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+/// Returns whether a format version represents a semantic model artifact.
 const fn is_semantic_model_version(version: u32) -> bool {
 	matches!(
 		version,
@@ -76,21 +94,30 @@ pub type CheckpointResult<T> = Result<T, CheckpointError>;
 /// A stable location inside a Recipe checkpoint.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CheckpointPath {
+	/// Ordered field and index segments from the artifact root.
 	segments: Vec<CheckpointPathSegment>,
 }
 
 impl CheckpointPath {
 	#[must_use]
-	pub fn segments(&self) -> &[CheckpointPathSegment] { &self.segments }
+	#[inline]
+	pub fn segments(&self) -> &[CheckpointPathSegment] {
+		&self.segments
+	}
 
-	pub(crate) fn root() -> Self { Self::default() }
+	/// Creates a path positioned at the artifact root.
+	pub(crate) fn root() -> Self {
+		Self::default()
+	}
 
+	/// Returns a path extended by one named field.
 	pub(crate) fn field(&self, name: impl Into<String>) -> Self {
 		let mut segments = self.segments.clone();
 		segments.push(CheckpointPathSegment::Field(name.into()));
 		Self { segments }
 	}
 
+	/// Returns a path extended by one collection index.
 	pub(crate) fn index(&self, index: usize) -> Self {
 		let mut segments = self.segments.clone();
 		segments.push(CheckpointPathSegment::Index(index));
@@ -99,6 +126,7 @@ impl CheckpointPath {
 }
 
 impl fmt::Display for CheckpointPath {
+	#[inline]
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		if self.segments.is_empty() {
 			return formatter.write_str("<checkpoint>");
@@ -144,12 +172,16 @@ pub enum CheckpointDecodeErrorKind {
 /// A typed, path-addressed checkpoint decoding failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointDecodeError {
+	/// Stable classification of the decoding failure.
 	kind: CheckpointDecodeErrorKind,
+	/// Artifact location at which decoding failed.
 	path: CheckpointPath,
+	/// Human-readable explanation of the invalid encoded value.
 	detail: String,
 }
 
 impl CheckpointDecodeError {
+	/// Creates a decoding error with its stable kind, artifact path, and detail.
 	pub(crate) fn new(kind: CheckpointDecodeErrorKind, path: CheckpointPath, detail: impl Into<String>) -> Self {
 		Self {
 			kind,
@@ -159,22 +191,32 @@ impl CheckpointDecodeError {
 	}
 
 	#[must_use]
-	pub const fn kind(&self) -> CheckpointDecodeErrorKind { self.kind }
+	#[inline]
+	pub const fn kind(&self) -> CheckpointDecodeErrorKind {
+		self.kind
+	}
 
 	#[must_use]
-	pub const fn path(&self) -> &CheckpointPath { &self.path }
+	#[inline]
+	pub const fn path(&self) -> &CheckpointPath {
+		&self.path
+	}
 
 	#[must_use]
-	pub fn detail(&self) -> &str { &self.detail }
+	#[inline]
+	pub fn detail(&self) -> &str {
+		&self.detail
+	}
 }
 
 impl fmt::Display for CheckpointDecodeError {
+	#[inline]
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{}: {}", self.path, self.detail)
 	}
 }
 
-impl std::error::Error for CheckpointDecodeError {}
+impl core::error::Error for CheckpointDecodeError {}
 
 /// Finite allocation and structural bounds for decoding one checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,13 +234,14 @@ pub struct CheckpointDecodeLimits {
 }
 
 impl Default for CheckpointDecodeLimits {
+	#[inline]
 	fn default() -> Self {
 		Self {
 			source_bytes: 1 << 30,
 			nodes: 4_000_000,
-			vectors: 65_536,
-			feature_spans: 65_536,
-			layers: 16_384,
+			vectors: 0x0001_0000,
+			feature_spans: 0x0001_0000,
+			layers: 0x4000,
 			metadata_entries: 1_000_000,
 			tensors: 100_000,
 			tensor_rank: 16,
@@ -263,12 +306,14 @@ pub enum CheckpointError {
 }
 
 impl CheckpointError {
+	/// Creates an invalid-manifest error with a human-readable detail.
 	pub(crate) fn manifest(detail: impl Into<String>) -> Self {
 		Self::InvalidManifest {
 			detail: detail.into(),
 		}
 	}
 
+	/// Creates an invalid-target error for one artifact path.
 	pub(crate) fn invalid_target(path: impl Into<PathBuf>, detail: impl Into<String>) -> Self {
 		Self::InvalidTarget {
 			path: path.into(),
@@ -276,6 +321,7 @@ impl CheckpointError {
 		}
 	}
 
+	/// Creates an artifact I/O error with operation and path context.
 	fn io(operation: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Self {
 		Self::Io {
 			operation,
@@ -286,6 +332,7 @@ impl CheckpointError {
 }
 
 impl fmt::Display for CheckpointError {
+	#[inline]
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Decode(error) => write!(formatter, "decode checkpoint: {error}"),
@@ -367,8 +414,9 @@ impl fmt::Display for CheckpointError {
 	}
 }
 
-impl std::error::Error for CheckpointError {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for CheckpointError {
+	#[inline]
+	fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
 		match self {
 			Self::Decode(error) => Some(error),
 			Self::Io { source, .. } => Some(source),
@@ -380,53 +428,88 @@ impl std::error::Error for CheckpointError {
 /// Dataset semantics retained by a model without retaining source rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointVectorSchema {
+	/// Zero-based column position in the prepared source schema.
 	source_index: usize,
+	/// Original byte-exact source column name.
 	name: Vec<u8>,
+	/// Training role assigned to the source vector.
 	role: VectorRole,
+	/// Semantic interpretation of the vector values.
 	semantic_type: SemanticType,
+	/// Physical encoding used for the vector values.
 	encoding: VectorEncoding,
+	/// Encoding-specific metadata required to interpret the vector.
 	metadata: VectorMetadata,
 }
 
 impl CheckpointVectorSchema {
 	#[must_use]
-	pub const fn source_index(&self) -> usize { self.source_index }
+	#[inline]
+	pub const fn source_index(&self) -> usize {
+		self.source_index
+	}
 
 	#[must_use]
-	pub fn name(&self) -> &[u8] { &self.name }
+	#[inline]
+	pub fn name(&self) -> &[u8] {
+		&self.name
+	}
 
 	#[must_use]
-	pub const fn role(&self) -> VectorRole { self.role }
+	#[inline]
+	pub const fn role(&self) -> VectorRole {
+		self.role
+	}
 
 	#[must_use]
-	pub const fn semantic_type(&self) -> SemanticType { self.semantic_type }
+	#[inline]
+	pub const fn semantic_type(&self) -> SemanticType {
+		self.semantic_type
+	}
 
 	#[must_use]
-	pub const fn encoding(&self) -> VectorEncoding { self.encoding }
+	#[inline]
+	pub const fn encoding(&self) -> VectorEncoding {
+		self.encoding
+	}
 
 	#[must_use]
-	pub const fn dtype(&self) -> Option<DType> { self.encoding.dtype() }
+	#[inline]
+	pub const fn dtype(&self) -> Option<DType> {
+		self.encoding.dtype()
+	}
 
 	#[must_use]
-	pub const fn metadata(&self) -> &VectorMetadata { &self.metadata }
+	#[inline]
+	pub const fn metadata(&self) -> &VectorMetadata {
+		&self.metadata
+	}
 }
 
 /// Image header facts decoded from a checkpoint without widening ingestion's
 /// construction API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CheckpointImageMetadata {
+	/// Encoded source image format.
 	format: EncodedImageFormat,
+	/// Decoded image width in pixels.
 	width: u32,
+	/// Decoded image height in pixels.
 	height: u32,
+	/// Declared channel count when the source format supplies one.
 	channels: Option<u8>,
+	/// Declared color model when the source format supplies one.
 	color_model: Option<ImageColorModel>,
+	/// Bits per channel sample when the source format supplies that value.
 	sample_bits: Option<u8>,
+	/// Ordering of decoded pixel and channel values.
 	value_layout: ImageValueLayout,
+	/// Numeric range represented by decoded image values.
 	value_range: ImageValueRange,
 }
 
 impl CheckpointImageMetadata {
-	#[allow(clippy::too_many_arguments)]
+	/// Creates image metadata decoded from one checkpoint schema entry.
 	pub(crate) const fn new(
 		format: EncodedImageFormat,
 		width: u32,
@@ -434,8 +517,6 @@ impl CheckpointImageMetadata {
 		channels: Option<u8>,
 		color_model: Option<ImageColorModel>,
 		sample_bits: Option<u8>,
-		value_layout: ImageValueLayout,
-		value_range: ImageValueRange,
 	) -> Self {
 		Self {
 			format,
@@ -444,34 +525,58 @@ impl CheckpointImageMetadata {
 			channels,
 			color_model,
 			sample_bits,
-			value_layout,
-			value_range,
+			value_layout: ImageValueLayout::EncodedFile,
+			value_range: ImageValueRange::EncodedBytes,
 		}
 	}
 
 	#[must_use]
-	pub const fn format(self) -> EncodedImageFormat { self.format }
+	#[inline]
+	pub const fn format(self) -> EncodedImageFormat {
+		self.format
+	}
 
 	#[must_use]
-	pub const fn width(self) -> u32 { self.width }
+	#[inline]
+	pub const fn width(self) -> u32 {
+		self.width
+	}
 
 	#[must_use]
-	pub const fn height(self) -> u32 { self.height }
+	#[inline]
+	pub const fn height(self) -> u32 {
+		self.height
+	}
 
 	#[must_use]
-	pub const fn channels(self) -> Option<u8> { self.channels }
+	#[inline]
+	pub const fn channels(self) -> Option<u8> {
+		self.channels
+	}
 
 	#[must_use]
-	pub const fn color_model(self) -> Option<ImageColorModel> { self.color_model }
+	#[inline]
+	pub const fn color_model(self) -> Option<ImageColorModel> {
+		self.color_model
+	}
 
 	#[must_use]
-	pub const fn sample_bits(self) -> Option<u8> { self.sample_bits }
+	#[inline]
+	pub const fn sample_bits(self) -> Option<u8> {
+		self.sample_bits
+	}
 
 	#[must_use]
-	pub const fn value_layout(self) -> ImageValueLayout { self.value_layout }
+	#[inline]
+	pub const fn value_layout(self) -> ImageValueLayout {
+		self.value_layout
+	}
 
 	#[must_use]
-	pub const fn value_range(self) -> ImageValueRange { self.value_range }
+	#[inline]
+	pub const fn value_range(self) -> ImageValueRange {
+		self.value_range
+	}
 }
 
 /// Encoding metadata retained by a decoded checkpoint.
@@ -496,15 +601,22 @@ pub enum CheckpointArtifactMetadata {
 /// Full row-free vector schema decoded from a checkpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointArtifactVector {
+	/// Zero-based column position in the artifact schema.
 	source_index: usize,
+	/// Byte-exact source column name retained by the artifact.
 	name: Vec<u8>,
+	/// Training role retained for the vector.
 	role: VectorRole,
+	/// Semantic interpretation retained for the vector values.
 	semantic_type: SemanticType,
+	/// Physical encoding retained for the vector values.
 	encoding: VectorEncoding,
+	/// Artifact metadata required to reconstruct vector semantics.
 	metadata: CheckpointArtifactMetadata,
 }
 
 impl CheckpointArtifactVector {
+	/// Creates one row-free vector schema retained by a model artifact.
 	pub(crate) fn new(
 		source_index: usize,
 		name: Vec<u8>,
@@ -523,6 +635,7 @@ impl CheckpointArtifactVector {
 		}
 	}
 
+	/// Copies one prepared vector schema into its row-free artifact form.
 	pub(crate) fn from_schema(schema: &VectorSchema) -> Self {
 		Self {
 			source_index: schema.source_index(),
@@ -535,115 +648,196 @@ impl CheckpointArtifactVector {
 	}
 
 	#[must_use]
-	pub const fn source_index(&self) -> usize { self.source_index }
+	#[inline]
+	pub const fn source_index(&self) -> usize {
+		self.source_index
+	}
 
 	#[must_use]
-	pub fn name(&self) -> &[u8] { &self.name }
+	#[inline]
+	pub fn name(&self) -> &[u8] {
+		&self.name
+	}
 
 	#[must_use]
-	pub const fn role(&self) -> VectorRole { self.role }
+	#[inline]
+	pub const fn role(&self) -> VectorRole {
+		self.role
+	}
 
 	#[must_use]
-	pub const fn semantic_type(&self) -> SemanticType { self.semantic_type }
+	#[inline]
+	pub const fn semantic_type(&self) -> SemanticType {
+		self.semantic_type
+	}
 
 	#[must_use]
-	pub const fn encoding(&self) -> VectorEncoding { self.encoding }
+	#[inline]
+	pub const fn encoding(&self) -> VectorEncoding {
+		self.encoding
+	}
 
 	#[must_use]
-	pub const fn dtype(&self) -> Option<DType> { self.encoding.dtype() }
+	#[inline]
+	pub const fn dtype(&self) -> Option<DType> {
+		self.encoding.dtype()
+	}
 
 	#[must_use]
-	pub const fn metadata(&self) -> &CheckpointArtifactMetadata { &self.metadata }
+	#[inline]
+	pub const fn metadata(&self) -> &CheckpointArtifactMetadata {
+		&self.metadata
+	}
 }
 
 /// One exact tensor image decoded from a checkpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointTensorImage {
+	/// Element data type of the tensor payload.
 	dtype: DType,
+	/// Logical tensor dimensions in axis order.
 	shape: Vec<u64>,
+	/// Byte-exact tensor payload in canonical element order.
 	bytes: Vec<u8>,
 }
 
 impl CheckpointTensorImage {
 	#[must_use]
-	pub const fn dtype(&self) -> DType { self.dtype }
+	#[inline]
+	pub const fn dtype(&self) -> DType {
+		self.dtype
+	}
 
 	#[must_use]
-	pub fn shape(&self) -> &[u64] { &self.shape }
+	#[inline]
+	pub fn shape(&self) -> &[u64] {
+		&self.shape
+	}
 
 	#[must_use]
-	pub fn bytes(&self) -> &[u8] { &self.bytes }
+	#[inline]
+	pub fn bytes(&self) -> &[u8] {
+		&self.bytes
+	}
 }
 
 /// Parameter, first moment, and second moment for one weight or bias.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointParameterImage {
+	/// Current parameter tensor.
 	parameter: CheckpointTensorImage,
+	/// Optimizer first-moment tensor for the parameter.
 	first_moment: CheckpointTensorImage,
+	/// Optimizer second-moment tensor for the parameter.
 	second_moment: CheckpointTensorImage,
 }
 
 impl CheckpointParameterImage {
 	#[must_use]
-	pub const fn parameter(&self) -> &CheckpointTensorImage { &self.parameter }
+	#[inline]
+	pub const fn parameter(&self) -> &CheckpointTensorImage {
+		&self.parameter
+	}
 
 	#[must_use]
-	pub const fn first_moment(&self) -> &CheckpointTensorImage { &self.first_moment }
+	#[inline]
+	pub const fn first_moment(&self) -> &CheckpointTensorImage {
+		&self.first_moment
+	}
 
 	#[must_use]
-	pub const fn second_moment(&self) -> &CheckpointTensorImage { &self.second_moment }
+	#[inline]
+	pub const fn second_moment(&self) -> &CheckpointTensorImage {
+		&self.second_moment
+	}
 }
 
 /// One effective dense block with its saved parameter and per-parameter moment tensors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointLayerImage {
+	/// Semantic declaration of the dense layer.
 	declaration: DenseLayer,
+	/// Saved weight parameter and optimizer moments.
 	weight: CheckpointParameterImage,
+	/// Saved bias parameter and optimizer moments.
 	bias: CheckpointParameterImage,
+	/// Saved PReLU parameters and optimizer moments in operation order.
 	prelu: Vec<CheckpointParameterImage>,
 }
 
 impl CheckpointLayerImage {
 	#[must_use]
-	pub const fn declaration(&self) -> &DenseLayer { &self.declaration }
+	#[inline]
+	pub const fn declaration(&self) -> &DenseLayer {
+		&self.declaration
+	}
 
 	#[must_use]
-	pub const fn weight(&self) -> &CheckpointParameterImage { &self.weight }
+	#[inline]
+	pub const fn weight(&self) -> &CheckpointParameterImage {
+		&self.weight
+	}
 
 	#[must_use]
-	pub const fn bias(&self) -> &CheckpointParameterImage { &self.bias }
+	#[inline]
+	pub const fn bias(&self) -> &CheckpointParameterImage {
+		&self.bias
+	}
 
 	/// Learned scalar parameters in ordered PReLU occurrence order.
 	#[must_use]
-	pub fn prelu(&self) -> &[CheckpointParameterImage] { &self.prelu }
+	#[inline]
+	pub fn prelu(&self) -> &[CheckpointParameterImage] {
+		&self.prelu
+	}
 }
 
 /// One saved valid, stride-one one-dimensional convolution with its resolved
 /// logical geometry, parameters, and optimizer moments.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointConvolutionImage {
+	/// Semantic declaration of the convolution block.
 	declaration: DenseConvolution,
+	/// Resolved logical dimensions of the convolution.
 	geometry: DenseConvolutionGeometry,
+	/// Saved convolution weights and optimizer moments.
 	weight: CheckpointParameterImage,
+	/// Saved convolution biases and optimizer moments.
 	bias: CheckpointParameterImage,
+	/// Saved PReLU parameters and optimizer moments in operation order.
 	prelu: Vec<CheckpointParameterImage>,
 }
 
 impl CheckpointConvolutionImage {
 	#[must_use]
-	pub const fn declaration(&self) -> &DenseConvolution { &self.declaration }
+	#[inline]
+	pub const fn declaration(&self) -> &DenseConvolution {
+		&self.declaration
+	}
 
 	#[must_use]
-	pub const fn geometry(&self) -> DenseConvolutionGeometry { self.geometry }
+	#[inline]
+	pub const fn geometry(&self) -> DenseConvolutionGeometry {
+		self.geometry
+	}
 
 	#[must_use]
-	pub const fn weight(&self) -> &CheckpointParameterImage { &self.weight }
+	#[inline]
+	pub const fn weight(&self) -> &CheckpointParameterImage {
+		&self.weight
+	}
 
 	#[must_use]
-	pub const fn bias(&self) -> &CheckpointParameterImage { &self.bias }
+	#[inline]
+	pub const fn bias(&self) -> &CheckpointParameterImage {
+		&self.bias
+	}
 
 	#[must_use]
-	pub fn prelu(&self) -> &[CheckpointParameterImage] { &self.prelu }
+	#[inline]
+	pub fn prelu(&self) -> &[CheckpointParameterImage] {
+		&self.prelu
+	}
 }
 
 /// One exact ordered step in a saved residual branch.
@@ -665,34 +859,58 @@ pub enum CheckpointResidualSkipImage {
 /// One topology-preserving residual block with its saved parameter and per-parameter moment tensors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointResidualImage {
+	/// Ordered declarations and parameter images of the residual branch.
 	branch: Vec<CheckpointResidualBranchImage>,
+	/// PReLU parameters attached to branch operations.
 	branch_prelu: Vec<CheckpointParameterImage>,
+	/// Logical output width shared by the branch and skip paths.
 	output_width: NonZeroU64,
+	/// Identity or learned projection used by the skip path.
 	skip: CheckpointResidualSkipImage,
+	/// Ordered output operations applied after residual addition.
 	operations: Vec<DenseOperation>,
+	/// PReLU parameters attached to residual output operations.
 	prelu: Vec<CheckpointParameterImage>,
 }
 
 impl CheckpointResidualImage {
 	#[must_use]
-	pub fn branch(&self) -> &[CheckpointResidualBranchImage] { &self.branch }
+	#[inline]
+	pub fn branch(&self) -> &[CheckpointResidualBranchImage] {
+		&self.branch
+	}
 
 	/// Learned scalars for free PReLU branch operations in branch order.
 	#[must_use]
-	pub fn branch_prelu(&self) -> &[CheckpointParameterImage] { &self.branch_prelu }
+	#[inline]
+	pub fn branch_prelu(&self) -> &[CheckpointParameterImage] {
+		&self.branch_prelu
+	}
 
 	#[must_use]
-	pub const fn output_width(&self) -> NonZeroU64 { self.output_width }
+	#[inline]
+	pub const fn output_width(&self) -> NonZeroU64 {
+		self.output_width
+	}
 
 	#[must_use]
-	pub const fn skip(&self) -> &CheckpointResidualSkipImage { &self.skip }
+	#[inline]
+	pub const fn skip(&self) -> &CheckpointResidualSkipImage {
+		&self.skip
+	}
 
 	#[must_use]
-	pub fn operations(&self) -> &[DenseOperation] { &self.operations }
+	#[inline]
+	pub fn operations(&self) -> &[DenseOperation] {
+		&self.operations
+	}
 
 	/// Learned scalars for post-merge PReLU operations in declaration order.
 	#[must_use]
-	pub fn prelu(&self) -> &[CheckpointParameterImage] { &self.prelu }
+	#[inline]
+	pub fn prelu(&self) -> &[CheckpointParameterImage] {
+		&self.prelu
+	}
 }
 
 /// One saved channelwise maximum-pool declaration and its resolved logical shape.
@@ -700,315 +918,563 @@ impl CheckpointResidualImage {
 /// Pool blocks own no parameter or optimizer-moment tensors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CheckpointPoolImage {
+	/// Width of each channelwise maximum-pool window.
 	size: NonZeroU64,
+	/// Optional number of neurons represented by each logical feature group.
 	group_to_neuron: Option<NonZeroU64>,
+	/// Number of spatial positions entering each channel.
 	input_length: NonZeroU64,
+	/// Number of independently pooled channels.
 	channels: NonZeroU64,
+	/// Number of spatial positions emitted per channel.
 	output_length: NonZeroU64,
+	/// Flattened logical width entering the pool block.
 	input_width: NonZeroU64,
+	/// Flattened logical width emitted by the pool block.
 	output_width: NonZeroU64,
+	/// Canonical ordering of groups in flattened pool values.
 	group_order: DensePoolGroupOrder,
+	/// Tie-breaking contract used to retain winning source positions.
 	winner_contract: DensePoolWinnerContract,
 }
 
 impl CheckpointPoolImage {
 	#[must_use]
-	pub const fn size(&self) -> NonZeroU64 { self.size }
+	#[inline]
+	pub const fn size(&self) -> NonZeroU64 {
+		self.size
+	}
 
 	#[must_use]
-	pub const fn group_to_neuron(&self) -> Option<NonZeroU64> { self.group_to_neuron }
+	#[inline]
+	pub const fn group_to_neuron(&self) -> Option<NonZeroU64> {
+		self.group_to_neuron
+	}
 
 	#[must_use]
-	pub const fn input_length(&self) -> NonZeroU64 { self.input_length }
+	#[inline]
+	pub const fn input_length(&self) -> NonZeroU64 {
+		self.input_length
+	}
 
 	#[must_use]
-	pub const fn channels(&self) -> NonZeroU64 { self.channels }
+	#[inline]
+	pub const fn channels(&self) -> NonZeroU64 {
+		self.channels
+	}
 
 	#[must_use]
-	pub const fn output_length(&self) -> NonZeroU64 { self.output_length }
+	#[inline]
+	pub const fn output_length(&self) -> NonZeroU64 {
+		self.output_length
+	}
 
 	#[must_use]
-	pub const fn input_width(&self) -> NonZeroU64 { self.input_width }
+	#[inline]
+	pub const fn input_width(&self) -> NonZeroU64 {
+		self.input_width
+	}
 
 	#[must_use]
-	pub const fn output_width(&self) -> NonZeroU64 { self.output_width }
+	#[inline]
+	pub const fn output_width(&self) -> NonZeroU64 {
+		self.output_width
+	}
 
 	#[must_use]
-	pub const fn group_order(&self) -> DensePoolGroupOrder { self.group_order }
+	#[inline]
+	pub const fn group_order(&self) -> DensePoolGroupOrder {
+		self.group_order
+	}
 
 	#[must_use]
-	pub const fn winner_contract(&self) -> DensePoolWinnerContract { self.winner_contract }
+	#[inline]
+	pub const fn winner_contract(&self) -> DensePoolWinnerContract {
+		self.winner_contract
+	}
 }
 
 /// One saved deterministic K-means reduction and its learned centroid state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointKMeansImage {
+	/// Number of learned clusters.
 	clusters: NonZeroU64,
+	/// Optional number of neurons represented by each logical feature group.
 	group_to_neuron: Option<NonZeroU64>,
+	/// Number of input values assigned to each centroid.
 	input_width: NonZeroU64,
+	/// Learned centroid matrix in cluster-major order.
 	centroids: CheckpointTensorImage,
 }
 
 /// One saved fixed-sequence embedding declaration and learned table state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointEmbeddingImage {
+	/// Number of learned values in each vocabulary embedding.
 	dimensions: NonZeroU64,
+	/// Number of encoded vocabulary entries in the embedding table.
 	vocabulary: NonZeroU64,
+	/// Fixed number of encoded positions consumed per row.
 	sequence_length: NonZeroU64,
+	/// Learned embedding table and optimizer moments.
 	table: CheckpointParameterImage,
 }
 
 impl CheckpointEmbeddingImage {
 	#[must_use]
-	pub const fn dimensions(&self) -> NonZeroU64 { self.dimensions }
+	#[inline]
+	pub const fn dimensions(&self) -> NonZeroU64 {
+		self.dimensions
+	}
 
 	#[must_use]
-	pub const fn vocabulary(&self) -> NonZeroU64 { self.vocabulary }
+	#[inline]
+	pub const fn vocabulary(&self) -> NonZeroU64 {
+		self.vocabulary
+	}
 
 	#[must_use]
-	pub const fn sequence_length(&self) -> NonZeroU64 { self.sequence_length }
+	#[inline]
+	pub const fn sequence_length(&self) -> NonZeroU64 {
+		self.sequence_length
+	}
 
 	#[must_use]
-	pub const fn table(&self) -> &CheckpointParameterImage { &self.table }
+	#[inline]
+	pub const fn table(&self) -> &CheckpointParameterImage {
+		&self.table
+	}
 }
 
 /// One saved causal multi-head self-attention declaration and its four learned
 /// projection matrices.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointAttentionImage {
+	/// Fixed number of token positions processed by the attention block.
 	sequence_length: NonZeroU64,
+	/// Model width entering and leaving the attention block.
 	dimensions: NonZeroU64,
+	/// Number of parallel attention heads.
 	heads: NonZeroU64,
+	/// Width of the query, key, and value vector for each head.
 	head_dimension: NonZeroU64,
+	/// Learned query projection and optimizer moments.
 	query: CheckpointParameterImage,
+	/// Learned key projection and optimizer moments.
 	key: CheckpointParameterImage,
+	/// Learned value projection and optimizer moments.
 	value: CheckpointParameterImage,
+	/// Learned output projection and optimizer moments.
 	output: CheckpointParameterImage,
 }
 
 impl CheckpointAttentionImage {
 	#[must_use]
-	pub const fn sequence_length(&self) -> NonZeroU64 { self.sequence_length }
+	#[inline]
+	pub const fn sequence_length(&self) -> NonZeroU64 {
+		self.sequence_length
+	}
 
 	#[must_use]
-	pub const fn dimensions(&self) -> NonZeroU64 { self.dimensions }
+	#[inline]
+	pub const fn dimensions(&self) -> NonZeroU64 {
+		self.dimensions
+	}
 
 	#[must_use]
-	pub const fn heads(&self) -> NonZeroU64 { self.heads }
+	#[inline]
+	pub const fn heads(&self) -> NonZeroU64 {
+		self.heads
+	}
 
 	#[must_use]
-	pub const fn head_dimension(&self) -> NonZeroU64 { self.head_dimension }
+	#[inline]
+	pub const fn head_dimension(&self) -> NonZeroU64 {
+		self.head_dimension
+	}
 
 	#[must_use]
-	pub const fn query(&self) -> &CheckpointParameterImage { &self.query }
+	#[inline]
+	pub const fn query(&self) -> &CheckpointParameterImage {
+		&self.query
+	}
 
 	#[must_use]
-	pub const fn key(&self) -> &CheckpointParameterImage { &self.key }
+	#[inline]
+	pub const fn key(&self) -> &CheckpointParameterImage {
+		&self.key
+	}
 
 	#[must_use]
-	pub const fn value(&self) -> &CheckpointParameterImage { &self.value }
+	#[inline]
+	pub const fn value(&self) -> &CheckpointParameterImage {
+		&self.value
+	}
 
 	#[must_use]
-	pub const fn output(&self) -> &CheckpointParameterImage { &self.output }
+	#[inline]
+	pub const fn output(&self) -> &CheckpointParameterImage {
+		&self.output
+	}
 }
 
 /// One saved vanilla recurrent block and its three learned parameter tensors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointRnnImage {
+	/// Fixed number of recurrent steps processed per row.
 	sequence_length: NonZeroU64,
+	/// Width of both input features and recurrent state.
 	width: NonZeroU64,
+	/// Learned input projection and optimizer moments.
 	input_weight: CheckpointParameterImage,
+	/// Learned recurrent projection and optimizer moments.
 	recurrent_weight: CheckpointParameterImage,
+	/// Learned recurrent bias and optimizer moments.
 	bias: CheckpointParameterImage,
 }
 
 impl CheckpointRnnImage {
 	#[must_use]
-	pub const fn sequence_length(&self) -> NonZeroU64 { self.sequence_length }
+	#[inline]
+	pub const fn sequence_length(&self) -> NonZeroU64 {
+		self.sequence_length
+	}
 
 	#[must_use]
-	pub const fn width(&self) -> NonZeroU64 { self.width }
+	#[inline]
+	pub const fn width(&self) -> NonZeroU64 {
+		self.width
+	}
 
 	#[must_use]
-	pub const fn input_weight(&self) -> &CheckpointParameterImage { &self.input_weight }
+	#[inline]
+	pub const fn input_weight(&self) -> &CheckpointParameterImage {
+		&self.input_weight
+	}
 
 	#[must_use]
-	pub const fn recurrent_weight(&self) -> &CheckpointParameterImage { &self.recurrent_weight }
+	#[inline]
+	pub const fn recurrent_weight(&self) -> &CheckpointParameterImage {
+		&self.recurrent_weight
+	}
 
 	#[must_use]
-	pub const fn bias(&self) -> &CheckpointParameterImage { &self.bias }
+	#[inline]
+	pub const fn bias(&self) -> &CheckpointParameterImage {
+		&self.bias
+	}
 }
 
 /// One saved reset-before GRU block and its nine learned parameter tensors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointGruImage {
+	/// Fixed number of recurrent steps processed per row.
 	sequence_length: NonZeroU64,
+	/// Width of both input features and recurrent state.
 	width: NonZeroU64,
+	/// Learned reset-gate input projection and optimizer moments.
 	reset_input_weight: CheckpointParameterImage,
+	/// Learned reset-gate recurrent projection and optimizer moments.
 	reset_recurrent_weight: CheckpointParameterImage,
+	/// Learned reset-gate bias and optimizer moments.
 	reset_bias: CheckpointParameterImage,
+	/// Learned update-gate input projection and optimizer moments.
 	update_input_weight: CheckpointParameterImage,
+	/// Learned update-gate recurrent projection and optimizer moments.
 	update_recurrent_weight: CheckpointParameterImage,
+	/// Learned update-gate bias and optimizer moments.
 	update_bias: CheckpointParameterImage,
+	/// Learned candidate-state input projection and optimizer moments.
 	candidate_input_weight: CheckpointParameterImage,
+	/// Learned candidate-state recurrent projection and optimizer moments.
 	candidate_recurrent_weight: CheckpointParameterImage,
+	/// Learned candidate-state bias and optimizer moments.
 	candidate_bias: CheckpointParameterImage,
 }
 
 impl CheckpointGruImage {
 	#[must_use]
-	pub const fn sequence_length(&self) -> NonZeroU64 { self.sequence_length }
+	#[inline]
+	pub const fn sequence_length(&self) -> NonZeroU64 {
+		self.sequence_length
+	}
 
 	#[must_use]
-	pub const fn width(&self) -> NonZeroU64 { self.width }
+	#[inline]
+	pub const fn width(&self) -> NonZeroU64 {
+		self.width
+	}
 
 	#[must_use]
-	pub const fn reset_input_weight(&self) -> &CheckpointParameterImage { &self.reset_input_weight }
+	#[inline]
+	pub const fn reset_input_weight(&self) -> &CheckpointParameterImage {
+		&self.reset_input_weight
+	}
 
 	#[must_use]
-	pub const fn reset_recurrent_weight(&self) -> &CheckpointParameterImage { &self.reset_recurrent_weight }
+	#[inline]
+	pub const fn reset_recurrent_weight(&self) -> &CheckpointParameterImage {
+		&self.reset_recurrent_weight
+	}
 
 	#[must_use]
-	pub const fn reset_bias(&self) -> &CheckpointParameterImage { &self.reset_bias }
+	#[inline]
+	pub const fn reset_bias(&self) -> &CheckpointParameterImage {
+		&self.reset_bias
+	}
 
 	#[must_use]
-	pub const fn update_input_weight(&self) -> &CheckpointParameterImage { &self.update_input_weight }
+	#[inline]
+	pub const fn update_input_weight(&self) -> &CheckpointParameterImage {
+		&self.update_input_weight
+	}
 
 	#[must_use]
-	pub const fn update_recurrent_weight(&self) -> &CheckpointParameterImage { &self.update_recurrent_weight }
+	#[inline]
+	pub const fn update_recurrent_weight(&self) -> &CheckpointParameterImage {
+		&self.update_recurrent_weight
+	}
 
 	#[must_use]
-	pub const fn update_bias(&self) -> &CheckpointParameterImage { &self.update_bias }
+	#[inline]
+	pub const fn update_bias(&self) -> &CheckpointParameterImage {
+		&self.update_bias
+	}
 
 	#[must_use]
-	pub const fn candidate_input_weight(&self) -> &CheckpointParameterImage { &self.candidate_input_weight }
+	#[inline]
+	pub const fn candidate_input_weight(&self) -> &CheckpointParameterImage {
+		&self.candidate_input_weight
+	}
 
 	#[must_use]
-	pub const fn candidate_recurrent_weight(&self) -> &CheckpointParameterImage { &self.candidate_recurrent_weight }
+	#[inline]
+	pub const fn candidate_recurrent_weight(&self) -> &CheckpointParameterImage {
+		&self.candidate_recurrent_weight
+	}
 
 	#[must_use]
-	pub const fn candidate_bias(&self) -> &CheckpointParameterImage { &self.candidate_bias }
+	#[inline]
+	pub const fn candidate_bias(&self) -> &CheckpointParameterImage {
+		&self.candidate_bias
+	}
 }
 
 /// One saved zero-cell LSTM block and its twelve learned parameter tensors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointLstmImage {
+	/// Fixed number of recurrent steps processed per row.
 	sequence_length: NonZeroU64,
+	/// Width of input features, hidden state, and cell state.
 	width: NonZeroU64,
+	/// Learned input-gate input projection and optimizer moments.
 	input_gate_input_weight: CheckpointParameterImage,
+	/// Learned input-gate recurrent projection and optimizer moments.
 	input_gate_recurrent_weight: CheckpointParameterImage,
+	/// Learned input-gate bias and optimizer moments.
 	input_gate_bias: CheckpointParameterImage,
+	/// Learned forget-gate input projection and optimizer moments.
 	forget_gate_input_weight: CheckpointParameterImage,
+	/// Learned forget-gate recurrent projection and optimizer moments.
 	forget_gate_recurrent_weight: CheckpointParameterImage,
+	/// Learned forget-gate bias and optimizer moments.
 	forget_gate_bias: CheckpointParameterImage,
+	/// Learned output-gate input projection and optimizer moments.
 	output_gate_input_weight: CheckpointParameterImage,
+	/// Learned output-gate recurrent projection and optimizer moments.
 	output_gate_recurrent_weight: CheckpointParameterImage,
+	/// Learned output-gate bias and optimizer moments.
 	output_gate_bias: CheckpointParameterImage,
+	/// Learned candidate-state input projection and optimizer moments.
 	candidate_input_weight: CheckpointParameterImage,
+	/// Learned candidate-state recurrent projection and optimizer moments.
 	candidate_recurrent_weight: CheckpointParameterImage,
+	/// Learned candidate-state bias and optimizer moments.
 	candidate_bias: CheckpointParameterImage,
 }
 
 impl CheckpointLstmImage {
 	#[must_use]
-	pub const fn sequence_length(&self) -> NonZeroU64 { self.sequence_length }
+	#[inline]
+	pub const fn sequence_length(&self) -> NonZeroU64 {
+		self.sequence_length
+	}
 
 	#[must_use]
-	pub const fn width(&self) -> NonZeroU64 { self.width }
+	#[inline]
+	pub const fn width(&self) -> NonZeroU64 {
+		self.width
+	}
 
 	#[must_use]
-	pub const fn input_gate_input_weight(&self) -> &CheckpointParameterImage { &self.input_gate_input_weight }
+	#[inline]
+	pub const fn input_gate_input_weight(&self) -> &CheckpointParameterImage {
+		&self.input_gate_input_weight
+	}
 
 	#[must_use]
-	pub const fn input_gate_recurrent_weight(&self) -> &CheckpointParameterImage { &self.input_gate_recurrent_weight }
+	#[inline]
+	pub const fn input_gate_recurrent_weight(&self) -> &CheckpointParameterImage {
+		&self.input_gate_recurrent_weight
+	}
 
 	#[must_use]
-	pub const fn input_gate_bias(&self) -> &CheckpointParameterImage { &self.input_gate_bias }
+	#[inline]
+	pub const fn input_gate_bias(&self) -> &CheckpointParameterImage {
+		&self.input_gate_bias
+	}
 
 	#[must_use]
-	pub const fn forget_gate_input_weight(&self) -> &CheckpointParameterImage { &self.forget_gate_input_weight }
+	#[inline]
+	pub const fn forget_gate_input_weight(&self) -> &CheckpointParameterImage {
+		&self.forget_gate_input_weight
+	}
 
 	#[must_use]
+	#[inline]
 	pub const fn forget_gate_recurrent_weight(&self) -> &CheckpointParameterImage {
 		&self.forget_gate_recurrent_weight
 	}
 
 	#[must_use]
-	pub const fn forget_gate_bias(&self) -> &CheckpointParameterImage { &self.forget_gate_bias }
+	#[inline]
+	pub const fn forget_gate_bias(&self) -> &CheckpointParameterImage {
+		&self.forget_gate_bias
+	}
 
 	#[must_use]
-	pub const fn output_gate_input_weight(&self) -> &CheckpointParameterImage { &self.output_gate_input_weight }
+	#[inline]
+	pub const fn output_gate_input_weight(&self) -> &CheckpointParameterImage {
+		&self.output_gate_input_weight
+	}
 
 	#[must_use]
+	#[inline]
 	pub const fn output_gate_recurrent_weight(&self) -> &CheckpointParameterImage {
 		&self.output_gate_recurrent_weight
 	}
 
 	#[must_use]
-	pub const fn output_gate_bias(&self) -> &CheckpointParameterImage { &self.output_gate_bias }
+	#[inline]
+	pub const fn output_gate_bias(&self) -> &CheckpointParameterImage {
+		&self.output_gate_bias
+	}
 
 	#[must_use]
-	pub const fn candidate_input_weight(&self) -> &CheckpointParameterImage { &self.candidate_input_weight }
+	#[inline]
+	pub const fn candidate_input_weight(&self) -> &CheckpointParameterImage {
+		&self.candidate_input_weight
+	}
 
 	#[must_use]
-	pub const fn candidate_recurrent_weight(&self) -> &CheckpointParameterImage { &self.candidate_recurrent_weight }
+	#[inline]
+	pub const fn candidate_recurrent_weight(&self) -> &CheckpointParameterImage {
+		&self.candidate_recurrent_weight
+	}
 
 	#[must_use]
-	pub const fn candidate_bias(&self) -> &CheckpointParameterImage { &self.candidate_bias }
+	#[inline]
+	pub const fn candidate_bias(&self) -> &CheckpointParameterImage {
+		&self.candidate_bias
+	}
 }
 
 /// One saved terminal supervised tree ensemble and all state required for
 /// byte-exact resume and target-free inference.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointTreeImage {
+	/// Semantic declaration of the tree ensemble.
 	declaration: DenseTree,
+	/// Number of input features examined by each tree.
 	input_width: NonZeroU64,
+	/// Number of values emitted by the complete ensemble.
 	output_width: NonZeroU64,
+	/// Number of split nodes retained for each tree.
 	internal_nodes_per_tree: NonZeroU64,
+	/// Number of terminal leaves retained for each tree.
 	leaves_per_tree: NonZeroU64,
+	/// Feature index selected by each internal split node.
 	split_features: CheckpointTensorImage,
+	/// Comparison threshold retained for each internal split node.
 	split_thresholds: CheckpointTensorImage,
+	/// Learned values emitted by terminal leaves, with optimizer moments.
 	leaf_values: CheckpointParameterImage,
 }
 
 impl CheckpointTreeImage {
 	#[must_use]
-	pub const fn declaration(&self) -> DenseTree { self.declaration }
+	#[inline]
+	pub const fn declaration(&self) -> DenseTree {
+		self.declaration
+	}
 
 	#[must_use]
-	pub const fn input_width(&self) -> NonZeroU64 { self.input_width }
+	#[inline]
+	pub const fn input_width(&self) -> NonZeroU64 {
+		self.input_width
+	}
 
 	#[must_use]
-	pub const fn output_width(&self) -> NonZeroU64 { self.output_width }
+	#[inline]
+	pub const fn output_width(&self) -> NonZeroU64 {
+		self.output_width
+	}
 
 	#[must_use]
-	pub const fn internal_nodes_per_tree(&self) -> NonZeroU64 { self.internal_nodes_per_tree }
+	#[inline]
+	pub const fn internal_nodes_per_tree(&self) -> NonZeroU64 {
+		self.internal_nodes_per_tree
+	}
 
 	#[must_use]
-	pub const fn leaves_per_tree(&self) -> NonZeroU64 { self.leaves_per_tree }
+	#[inline]
+	pub const fn leaves_per_tree(&self) -> NonZeroU64 {
+		self.leaves_per_tree
+	}
 
 	#[must_use]
-	pub const fn split_features(&self) -> &CheckpointTensorImage { &self.split_features }
+	#[inline]
+	pub const fn split_features(&self) -> &CheckpointTensorImage {
+		&self.split_features
+	}
 
 	#[must_use]
-	pub const fn split_thresholds(&self) -> &CheckpointTensorImage { &self.split_thresholds }
+	#[inline]
+	pub const fn split_thresholds(&self) -> &CheckpointTensorImage {
+		&self.split_thresholds
+	}
 
 	#[must_use]
-	pub const fn leaf_values(&self) -> &CheckpointParameterImage { &self.leaf_values }
+	#[inline]
+	pub const fn leaf_values(&self) -> &CheckpointParameterImage {
+		&self.leaf_values
+	}
 }
 
 impl CheckpointKMeansImage {
 	#[must_use]
-	pub const fn clusters(&self) -> NonZeroU64 { self.clusters }
+	#[inline]
+	pub const fn clusters(&self) -> NonZeroU64 {
+		self.clusters
+	}
 
 	#[must_use]
-	pub const fn group_to_neuron(&self) -> Option<NonZeroU64> { self.group_to_neuron }
+	#[inline]
+	pub const fn group_to_neuron(&self) -> Option<NonZeroU64> {
+		self.group_to_neuron
+	}
 
 	#[must_use]
-	pub const fn input_width(&self) -> NonZeroU64 { self.input_width }
+	#[inline]
+	pub const fn input_width(&self) -> NonZeroU64 {
+		self.input_width
+	}
 
 	#[must_use]
-	pub const fn centroids(&self) -> &CheckpointTensorImage { &self.centroids }
+	#[inline]
+	pub const fn centroids(&self) -> &CheckpointTensorImage {
+		&self.centroids
+	}
 }
 
 /// One effective saved model block. Checkpoint v5 contains only `Layer`;
@@ -1039,88 +1505,119 @@ pub enum CheckpointBlockImage {
 /// the native image bytes themselves.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointNativeKernel {
+	/// Native binary format required by the recorded target.
 	format: NativeKernelFormat,
+	/// Target identity for which the native image was realized.
 	target: TargetIdentity,
+	/// Toolchain identity that produced the native image.
 	toolchain: ToolchainIdentity,
+	/// Content digest of the native image bytes.
 	digest: Digest,
 }
 
 impl CheckpointNativeKernel {
 	#[must_use]
-	pub const fn format(&self) -> NativeKernelFormat { self.format }
+	#[inline]
+	pub const fn format(&self) -> NativeKernelFormat {
+		self.format
+	}
 
 	#[must_use]
-	pub const fn target(&self) -> &TargetIdentity { &self.target }
+	#[inline]
+	pub const fn target(&self) -> &TargetIdentity {
+		&self.target
+	}
 
 	#[must_use]
-	pub const fn toolchain(&self) -> &ToolchainIdentity { &self.toolchain }
+	#[inline]
+	pub const fn toolchain(&self) -> &ToolchainIdentity {
+		&self.toolchain
+	}
 
 	#[must_use]
-	pub const fn digest(&self) -> Digest { self.digest }
+	#[inline]
+	pub const fn digest(&self) -> Digest {
+		self.digest
+	}
 }
 
 /// Measured-system identities associated with the native images realized for
 /// one completed semantic model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointNativeRealization {
+	/// Digest of the semantic program realized by these native images.
 	program: Digest,
+	/// Identity of the measured native realization.
 	realization: RealizationIdentity,
+	/// Topology identity on which the native images were realized.
 	topology: TopologyIdentity,
+	/// Discovery identity whose measurements selected the realization.
 	discovery: DiscoveryIdentity,
+	/// Native kernel identities retained for this realization.
 	kernels: Vec<CheckpointNativeKernel>,
 }
 
 impl CheckpointNativeRealization {
 	#[must_use]
-	pub const fn program(&self) -> Digest { self.program }
+	#[inline]
+	pub const fn program(&self) -> Digest {
+		self.program
+	}
 
 	#[must_use]
-	pub const fn realization(&self) -> RealizationIdentity { self.realization }
+	#[inline]
+	pub const fn realization(&self) -> RealizationIdentity {
+		self.realization
+	}
 
 	#[must_use]
-	pub const fn topology(&self) -> TopologyIdentity { self.topology }
+	#[inline]
+	pub const fn topology(&self) -> TopologyIdentity {
+		self.topology
+	}
 
 	#[must_use]
-	pub const fn discovery(&self) -> DiscoveryIdentity { self.discovery }
+	#[inline]
+	pub const fn discovery(&self) -> DiscoveryIdentity {
+		self.discovery
+	}
 
 	#[must_use]
-	pub fn kernels(&self) -> &[CheckpointNativeKernel] { &self.kernels }
+	#[inline]
+	pub fn kernels(&self) -> &[CheckpointNativeKernel] {
+		&self.kernels
+	}
 }
 
 impl CheckpointBlockImage {
 	#[must_use]
+	#[inline]
 	pub fn output_width(&self) -> NonZeroU64 {
 		match self {
-			Self::Embedding(embedding) => {
-				NonZeroU64::new(
-					embedding
-						.sequence_length
-						.get()
-						.checked_mul(embedding.dimensions.get())
-						.expect("validated checkpoint embedding width does not overflow"),
-				)
-				.expect("validated checkpoint embedding width is nonzero")
-			}
-			Self::Attention(attention) => {
-				NonZeroU64::new(
-					attention
-						.sequence_length
-						.get()
-						.checked_mul(attention.dimensions.get())
-						.expect("validated checkpoint attention width does not overflow"),
-				)
-				.expect("validated checkpoint attention width is nonzero")
-			}
+			Self::Embedding(embedding) => NonZeroU64::new(
+				embedding
+					.sequence_length
+					.get()
+					.checked_mul(embedding.dimensions.get())
+					.expect("validated checkpoint embedding width does not overflow"),
+			)
+			.expect("validated checkpoint embedding width is nonzero"),
+			Self::Attention(attention) => NonZeroU64::new(
+				attention
+					.sequence_length
+					.get()
+					.checked_mul(attention.dimensions.get())
+					.expect("validated checkpoint attention width does not overflow"),
+			)
+			.expect("validated checkpoint attention width is nonzero"),
 			Self::Rnn(rnn) => rnn.width,
 			Self::Gru(gru) => gru.width,
 			Self::Lstm(lstm) => lstm.width,
 			Self::Layer(layer) => layer.declaration.width(),
-			Self::Convolution(convolution) => {
-				convolution
-					.geometry
-					.output_width()
-					.expect("validated checkpoint convolution width is nonzero")
-			}
+			Self::Convolution(convolution) => convolution
+				.geometry
+				.output_width()
+				.expect("validated checkpoint convolution width is nonzero"),
 			Self::Pool(pool) => pool.output_width,
 			Self::KMeans(kmeans) => kmeans.clusters,
 			Self::Tree(tree) => tree.output_width,
@@ -1129,6 +1626,7 @@ impl CheckpointBlockImage {
 	}
 
 	#[must_use]
+	#[inline]
 	pub fn output_operations(&self) -> &[DenseOperation] {
 		match self {
 			Self::Embedding(_) => &[],
@@ -1147,52 +1645,92 @@ impl CheckpointBlockImage {
 /// Fully decoded, validated, native-handle-free checkpoint artifact.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckpointArtifact {
+	/// Semantic checkpoint format version used to decode this artifact.
 	format_version: u32,
+	/// Ordered vector schemas retained by the artifact.
 	vectors: Vec<CheckpointArtifactVector>,
+	/// Compiled spans mapping declared features into the dense input vector.
 	feature_spans: Vec<CompiledFeatureSpan>,
+	/// Dense feature coordinates subject to input normalization.
 	feature_normalization_mask: Vec<u32>,
+	/// Total width of the compiled dense input feature vector.
 	feature_width: usize,
+	/// Source-column indices selected as prediction targets.
 	target_source_indices: Vec<usize>,
+	/// Dense learning task encoded by the semantic model.
 	task: DenseTask,
+	/// Optional adapter mapping dense outputs back to declared target values.
 	output_adapter: Option<DenseOutputAdapter>,
+	/// Training configuration required to reconstruct the dense model.
 	config: DenseTrainingConfig,
+	/// Validated training bounds retained with the learned state.
 	bounds: TrainingBounds,
+	/// Tensor images containing learned normalization state.
 	normalization: Vec<CheckpointTensorImage>,
+	/// Ordered learned layer images composing the dense model.
 	layers: Vec<CheckpointLayerImage>,
+	/// Ordered specialized block images composing the model.
 	blocks: Vec<CheckpointBlockImage>,
+	/// Optional learned temperature tensor used for output calibration.
 	temperature: Option<CheckpointTensorImage>,
+	/// Optional measured-system realization metadata for native kernels.
 	native: Option<CheckpointNativeRealization>,
 }
 
 impl CheckpointArtifact {
 	#[must_use]
-	pub const fn format_version(&self) -> u32 { self.format_version }
+	#[inline]
+	pub const fn format_version(&self) -> u32 {
+		self.format_version
+	}
 
 	#[must_use]
-	pub fn vectors(&self) -> &[CheckpointArtifactVector] { &self.vectors }
+	#[inline]
+	pub fn vectors(&self) -> &[CheckpointArtifactVector] {
+		&self.vectors
+	}
 
 	#[must_use]
-	pub fn feature_spans(&self) -> &[CompiledFeatureSpan] { &self.feature_spans }
+	#[inline]
+	pub fn feature_spans(&self) -> &[CompiledFeatureSpan] {
+		&self.feature_spans
+	}
 
 	#[must_use]
-	pub fn feature_normalization_mask(&self) -> &[u32] { &self.feature_normalization_mask }
+	#[inline]
+	pub fn feature_normalization_mask(&self) -> &[u32] {
+		&self.feature_normalization_mask
+	}
 
 	#[must_use]
-	pub const fn feature_width(&self) -> usize { self.feature_width }
+	#[inline]
+	pub const fn feature_width(&self) -> usize {
+		self.feature_width
+	}
 
 	/// Saved target identities in the user's declaration order.
 	#[must_use]
-	pub fn target_source_indices(&self) -> &[usize] { &self.target_source_indices }
+	#[inline]
+	pub fn target_source_indices(&self) -> &[usize] {
+		&self.target_source_indices
+	}
 
 	#[must_use]
-	pub const fn task(&self) -> DenseTask { self.task }
+	#[inline]
+	pub const fn task(&self) -> DenseTask {
+		self.task
+	}
 
 	/// Calculation-facing dtype selected for the saved target vector.
 	#[must_use]
-	pub fn target_dtype(&self) -> Option<DType> { self.target_dtypes().next() }
+	#[inline]
+	pub fn target_dtype(&self) -> Option<DType> {
+		self.target_dtypes().next()
+	}
 
 	/// Saved calculation-facing source dtypes in declared-target order.
 	#[must_use]
+	#[inline]
 	pub fn target_dtypes(&self) -> impl Iterator<Item = DType> + '_ {
 		self.target_source_indices
 			.iter()
@@ -1205,34 +1743,59 @@ impl CheckpointArtifact {
 	}
 
 	#[must_use]
-	pub const fn output_adapter(&self) -> Option<DenseOutputAdapter> { self.output_adapter }
+	#[inline]
+	pub const fn output_adapter(&self) -> Option<DenseOutputAdapter> {
+		self.output_adapter
+	}
 
 	#[must_use]
-	pub const fn config(&self) -> &DenseTrainingConfig { &self.config }
+	#[inline]
+	pub const fn config(&self) -> &DenseTrainingConfig {
+		&self.config
+	}
 
 	#[must_use]
-	pub const fn bounds(&self) -> TrainingBounds { self.bounds }
+	#[inline]
+	pub const fn bounds(&self) -> TrainingBounds {
+		self.bounds
+	}
 
 	#[must_use]
-	pub fn normalization(&self) -> &[CheckpointTensorImage] { &self.normalization }
+	#[inline]
+	pub fn normalization(&self) -> &[CheckpointTensorImage] {
+		&self.normalization
+	}
 
 	#[must_use]
-	pub fn layers(&self) -> &[CheckpointLayerImage] { &self.layers }
+	#[inline]
+	pub fn layers(&self) -> &[CheckpointLayerImage] {
+		&self.layers
+	}
 
 	/// Effective topology. For a flat v5 artifact this contains the same layers
 	/// exposed by [`Self::layers`]. Structured v6 and v7 artifacts leave the
 	/// legacy flat layer view empty and retain their saved topology here.
 	#[must_use]
-	pub fn blocks(&self) -> &[CheckpointBlockImage] { &self.blocks }
+	#[inline]
+	pub fn blocks(&self) -> &[CheckpointBlockImage] {
+		&self.blocks
+	}
 
 	#[must_use]
-	pub const fn temperature(&self) -> Option<&CheckpointTensorImage> { self.temperature.as_ref() }
+	#[inline]
+	pub const fn temperature(&self) -> Option<&CheckpointTensorImage> {
+		self.temperature.as_ref()
+	}
 
 	#[must_use]
-	pub const fn native_realization(&self) -> Option<&CheckpointNativeRealization> { self.native.as_ref() }
+	#[inline]
+	pub const fn native_realization(&self) -> Option<&CheckpointNativeRealization> {
+		self.native.as_ref()
+	}
 
 	/// Decode one predicted multiclass index using only the saved target schema.
 	#[must_use]
+	#[inline]
 	pub fn decode_multiclass_class(&self, class: usize) -> Option<DecodedMulticlassClass<'_>> {
 		let DenseTask::MulticlassClassification {
 			target_vector,
@@ -1261,6 +1824,7 @@ impl CheckpointArtifact {
 	}
 
 	/// Encode this validated artifact in its canonical versioned form.
+	#[inline]
 	pub fn encode(&self) -> CheckpointResult<Vec<u8>> {
 		validate_artifact(self)?;
 		let mut output = Vec::new();
@@ -1271,6 +1835,7 @@ impl CheckpointArtifact {
 }
 
 /// Decode and fully validate one bounded, versioned checkpoint document.
+#[inline]
 pub fn decode_checkpoint(bytes: &[u8], limits: CheckpointDecodeLimits) -> CheckpointResult<CheckpointArtifact> {
 	if bytes.len() > limits.source_bytes {
 		return Err(decode_error(
@@ -1319,6 +1884,7 @@ pub fn decode_checkpoint(bytes: &[u8], limits: CheckpointDecodeLimits) -> Checkp
 	.decode()
 }
 
+/// Constructs one path-aware checkpoint decoding error.
 pub(crate) fn decode_error(
 	kind: CheckpointDecodeErrorKind,
 	path: CheckpointPath,
@@ -1327,20 +1893,30 @@ pub(crate) fn decode_error(
 	CheckpointError::Decode(CheckpointDecodeError::new(kind, path, detail))
 }
 
+/// Stateful bounded decoder for one semantic checkpoint graph.
 struct Decoder<'a> {
+	/// Parsed OGDL graph being decoded.
 	graph: &'a OgdlGraph,
+	/// Resource limits enforced while decoding the graph.
 	limits: CheckpointDecodeLimits,
+	/// Number of model blocks decoded so far.
 	block_count: usize,
+	/// Number of tensor images decoded so far.
 	tensor_count: usize,
+	/// Total tensor payload bytes decoded so far.
 	payload_bytes: usize,
+	/// Total metadata entries decoded so far.
 	metadata_entries: usize,
 }
 
+/// Named child-node index for one decoded checkpoint record.
 struct FieldSet {
+	/// Mapping from field names to their OGDL node identities.
 	fields: BTreeMap<String, OgdlNodeId>,
 }
 
 impl FieldSet {
+	/// Resolves a required named child or reports its precise checkpoint path.
 	fn require(&self, name: &str, path: &CheckpointPath) -> CheckpointResult<OgdlNodeId> {
 		self.fields.get(name).copied().ok_or_else(|| {
 			decode_error(
@@ -1351,10 +1927,14 @@ impl FieldSet {
 		})
 	}
 
-	fn optional(&self, name: &str) -> Option<OgdlNodeId> { self.fields.get(name).copied() }
+	/// Resolves an optional named child when present.
+	fn optional(&self, name: &str) -> Option<OgdlNodeId> {
+		self.fields.get(name).copied()
+	}
 }
 
 impl Decoder<'_> {
+	/// Resolves an OGDL node identity at the supplied checkpoint path.
 	fn node(&self, id: OgdlNodeId, path: &CheckpointPath) -> CheckpointResult<&recipe_ogdl::Node> {
 		self.graph.node(id).ok_or_else(|| {
 			decode_error(
@@ -1365,6 +1945,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Indexes and validates the allowed named children of one record node.
 	fn fields(
 		&self,
 		parent: OgdlNodeId,
@@ -1403,6 +1984,7 @@ impl Decoder<'_> {
 		Ok(fields)
 	}
 
+	/// Decodes a field containing exactly one leaf scalar value.
 	fn scalar<'a>(&'a self, field: OgdlNodeId, path: &CheckpointPath) -> CheckpointResult<&'a str> {
 		let children = self.node(field, path)?.children();
 		if children.len() != 1 {
@@ -1423,6 +2005,7 @@ impl Decoder<'_> {
 		Ok(value.text())
 	}
 
+	/// Decodes a tagged field into its tag text and argument nodes.
 	fn tagged<'a>(
 		&'a self,
 		field: OgdlNodeId,
@@ -1447,6 +2030,7 @@ impl Decoder<'_> {
 		Ok((tag.text(), &children[1..]))
 	}
 
+	/// Indexes and validates named fields supplied as an existing child slice.
 	fn fields_from_children(
 		&self,
 		children: &[OgdlNodeId],
@@ -1486,6 +2070,7 @@ impl Decoder<'_> {
 }
 
 impl Decoder<'_> {
+	/// Decodes and validates the complete semantic checkpoint artifact.
 	fn decode(mut self) -> CheckpointResult<CheckpointArtifact> {
 		let root_path = CheckpointPath::root().field("recipe");
 		if self.graph.roots().len() != 1 {
@@ -1596,18 +2181,15 @@ impl Decoder<'_> {
 		)?;
 		if version == FLAT_CHECKPOINT_FORMAT_VERSION {
 			config.layers = match model.output_adapter {
-				Some(_) => {
-					model.layers[..model.layers.len().saturating_sub(1)]
-						.iter()
-						.map(|layer| layer.declaration.clone())
-						.collect()
-				}
-				None => {
-					model.layers
-						.iter()
-						.map(|layer| layer.declaration.clone())
-						.collect()
-				}
+				Some(_) => model.layers[..model.layers.len().saturating_sub(1)]
+					.iter()
+					.map(|layer| layer.declaration.clone())
+					.collect(),
+				None => model
+					.layers
+					.iter()
+					.map(|layer| layer.declaration.clone())
+					.collect(),
 			};
 		}
 		let native = match (
@@ -1652,13 +2234,18 @@ impl Decoder<'_> {
 		Ok(artifact)
 	}
 
+	/// Decodes the objective, normalization, and optimizer semantics.
 	fn parse_semantics(
 		&self,
 		node: OgdlNodeId,
 		path: &CheckpointPath,
 	) -> CheckpointResult<(DenseLoss, DenseDataNormalization)> {
-		let fields = self.fields(node, path, &["objective", "normalization", "optimizer"], &[
-		])?;
+		let fields = self.fields(
+			node,
+			path,
+			&["objective", "normalization", "optimizer"],
+			&[],
+		)?;
 		let loss = self.parse_loss(
 			self.scalar(fields.require("objective", path)?, &path.field("objective"))?,
 			&path.field("objective"),
@@ -1678,6 +2265,7 @@ impl Decoder<'_> {
 		Ok((loss, normalization))
 	}
 
+	/// Decodes the measured-system native realization metadata.
 	fn parse_native(
 		&mut self,
 		node: OgdlNodeId,
@@ -1820,6 +2408,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes one validated identity label field.
 	fn parse_label_field(&self, field: OgdlNodeId, path: &CheckpointPath) -> CheckpointResult<Label> {
 		let value = self.scalar(field, path)?;
 		Label::new(value).map_err(|error| {
@@ -1831,6 +2420,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes one nonzero hexadecimal digest field.
 	fn parse_digest_field(&self, field: OgdlNodeId, path: &CheckpointPath) -> CheckpointResult<Digest> {
 		let bytes = self.parse_hex_bytes(self.scalar(field, path)?, path)?;
 		let bytes: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
@@ -1853,6 +2443,7 @@ impl Decoder<'_> {
 }
 
 impl Decoder<'_> {
+	/// Requires a scalar field to equal one exact literal value.
 	fn expect_scalar(&self, field: OgdlNodeId, path: &CheckpointPath, expected: &str) -> CheckpointResult<()> {
 		let actual = self.scalar(field, path)?;
 		if actual != expected {
@@ -1865,6 +2456,7 @@ impl Decoder<'_> {
 		Ok(())
 	}
 
+	/// Parses one canonical unsigned integer into the requested type.
 	fn parse_unsigned<T>(&self, value: &str, path: &CheckpointPath, type_name: &str) -> CheckpointResult<T>
 	where
 		T: core::str::FromStr,
@@ -1889,6 +2481,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Parses one canonical signed integer into the requested type.
 	fn parse_signed<T>(&self, value: &str, path: &CheckpointPath, type_name: &str) -> CheckpointResult<T>
 	where
 		T: core::str::FromStr,
@@ -1915,30 +2508,37 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Parses one canonical `u8` value.
 	fn parse_u8(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<u8> {
 		self.parse_unsigned(value, path, "u8")
 	}
 
+	/// Parses one canonical `u32` value.
 	fn parse_u32(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<u32> {
 		self.parse_unsigned(value, path, "u32")
 	}
 
+	/// Parses one canonical `u64` value.
 	fn parse_u64(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<u64> {
 		self.parse_unsigned(value, path, "u64")
 	}
 
+	/// Parses one canonical `usize` value.
 	fn parse_usize(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<usize> {
 		self.parse_unsigned(value, path, "usize")
 	}
 
+	/// Parses one canonical `i32` value.
 	fn parse_i32(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<i32> {
 		self.parse_signed(value, path, "i32")
 	}
 
+	/// Parses one canonical `i64` value.
 	fn parse_i64(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<i64> {
 		self.parse_signed(value, path, "i64")
 	}
 
+	/// Parses one canonical nonzero `u64` value.
 	fn parse_nonzero_u64(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<NonZeroU64> {
 		NonZeroU64::new(self.parse_u64(value, path)?).ok_or_else(|| {
 			decode_error(
@@ -1949,6 +2549,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Parses one canonical hexadecimal `f32` bit pattern.
 	fn parse_f32_bits(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<f32> {
 		if value.len() != 10
 			|| !value.starts_with("0x")
@@ -1972,6 +2573,7 @@ impl Decoder<'_> {
 		Ok(f32::from_bits(bits))
 	}
 
+	/// Parses one canonical lowercase hexadecimal byte string.
 	fn parse_hex_bytes(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<Vec<u8>> {
 		let Some(hex) = value.strip_prefix("0x") else {
 			return Err(decode_error(
@@ -1999,6 +2601,7 @@ impl Decoder<'_> {
 		Ok(bytes)
 	}
 
+	/// Decodes one supported dense loss declaration.
 	fn parse_loss(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<DenseLoss> {
 		match value {
 			"binary-cross-entropy-with-logits" => Ok(DenseLoss::BinaryCrossEntropy),
@@ -2011,6 +2614,7 @@ impl Decoder<'_> {
 		}
 	}
 
+	/// Decodes one supported input-data normalization declaration.
 	fn parse_data_normalization(
 		&self,
 		value: &str,
@@ -2025,6 +2629,7 @@ impl Decoder<'_> {
 		}
 	}
 
+	/// Decodes one supported learning-rate decay declaration.
 	fn parse_learning_rate_decay(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<LearningRateDecay> {
 		match value {
 			"constant" => Ok(LearningRateDecay::Constant),
@@ -2035,6 +2640,7 @@ impl Decoder<'_> {
 		}
 	}
 
+	/// Constructs a path-aware error for an unsupported enumerated value.
 	fn invalid_enum(&self, path: &CheckpointPath, description: &str, value: &str) -> CheckpointError {
 		decode_error(
 			CheckpointDecodeErrorKind::InvalidValue,
@@ -2045,6 +2651,7 @@ impl Decoder<'_> {
 }
 
 impl Decoder<'_> {
+	/// Decodes the compiled dataset schema retained by the checkpoint.
 	fn parse_dataset(&mut self, node: OgdlNodeId, path: &CheckpointPath) -> CheckpointResult<ParsedDataset> {
 		let fields = self.fields(
 			node,
@@ -2085,14 +2692,20 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes the target columns and dense task declaration.
 	fn parse_target(&self, node: OgdlNodeId, path: &CheckpointPath) -> CheckpointResult<ParsedTarget> {
-		let fields = self.fields(node, path, &["task"], &[
-			"source-index",
-			"source-indices",
-			"positive-code",
-			"class-count",
-			"reserved-unseen-code",
-		])?;
+		let fields = self.fields(
+			node,
+			path,
+			&["task"],
+			&[
+				"source-index",
+				"source-indices",
+				"positive-code",
+				"class-count",
+				"reserved-unseen-code",
+			],
+		)?;
 		let task = self.scalar(fields.require("task", path)?, &path.field("task"))?;
 		let parse_source_index = || {
 			self.parse_usize(
@@ -2105,11 +2718,11 @@ impl Decoder<'_> {
 		};
 		match task {
 			"binary-classification" => {
-				self.reject_fields(&fields, path, &[
-					"source-indices",
-					"class-count",
-					"reserved-unseen-code",
-				])?;
+				self.reject_fields(
+					&fields,
+					path,
+					&["source-indices", "class-count", "reserved-unseen-code"],
+				)?;
 				let source_index = parse_source_index()?;
 				let positive_code = self.parse_i32(
 					self.scalar(
@@ -2153,12 +2766,16 @@ impl Decoder<'_> {
 				})
 			}
 			"scalar-regression" => {
-				self.reject_fields(&fields, path, &[
-					"source-indices",
-					"positive-code",
-					"class-count",
-					"reserved-unseen-code",
-				])?;
+				self.reject_fields(
+					&fields,
+					path,
+					&[
+						"source-indices",
+						"positive-code",
+						"class-count",
+						"reserved-unseen-code",
+					],
+				)?;
 				let source_index = parse_source_index()?;
 				Ok(ParsedTarget {
 					source_indices: vec![source_index],
@@ -2170,12 +2787,16 @@ impl Decoder<'_> {
 			"multi-target-binary-classification"
 			| "joint-multiclass-classification"
 			| "multi-target-regression" => {
-				self.reject_fields(&fields, path, &[
-					"source-index",
-					"positive-code",
-					"class-count",
-					"reserved-unseen-code",
-				])?;
+				self.reject_fields(
+					&fields,
+					path,
+					&[
+						"source-index",
+						"positive-code",
+						"class-count",
+						"reserved-unseen-code",
+					],
+				)?;
 				let source_indices_node = fields.require("source-indices", path)?;
 				let children = self
 					.node(source_indices_node, &path.field("source-indices"))?
@@ -2214,24 +2835,18 @@ impl Decoder<'_> {
 				let first_target_vector = source_indices[0];
 				let target_count = source_indices.len();
 				let task = match task {
-					"multi-target-binary-classification" => {
-						DenseTask::MultiTargetBinaryClassification {
-							first_target_vector,
-							target_count,
-						}
-					}
-					"joint-multiclass-classification" => {
-						DenseTask::JointMulticlassClassification {
-							first_target_vector,
-							target_count,
-						}
-					}
-					"multi-target-regression" => {
-						DenseTask::MultiTargetRegression {
-							first_target_vector,
-							target_count,
-						}
-					}
+					"multi-target-binary-classification" => DenseTask::MultiTargetBinaryClassification {
+						first_target_vector,
+						target_count,
+					},
+					"joint-multiclass-classification" => DenseTask::JointMulticlassClassification {
+						first_target_vector,
+						target_count,
+					},
+					"multi-target-regression" => DenseTask::MultiTargetRegression {
+						first_target_vector,
+						target_count,
+					},
 					_ => unreachable!(),
 				};
 				Ok(ParsedTarget {
@@ -2243,6 +2858,7 @@ impl Decoder<'_> {
 		}
 	}
 
+	/// Rejects fields that are invalid for the selected tagged variant.
 	fn reject_fields(&self, fields: &FieldSet, path: &CheckpointPath, names: &[&str]) -> CheckpointResult<()> {
 		if let Some(name) = names.iter().find(|name| fields.optional(name).is_some()) {
 			return Err(decode_error(
@@ -2254,6 +2870,7 @@ impl Decoder<'_> {
 		Ok(())
 	}
 
+	/// Decodes the bounded ordered vector-schema list.
 	fn parse_vectors(
 		&mut self,
 		node: OgdlNodeId,
@@ -2289,6 +2906,7 @@ impl Decoder<'_> {
 		Ok(vectors)
 	}
 
+	/// Decodes one compiled vector schema and its metadata.
 	fn parse_vector(
 		&mut self,
 		node: OgdlNodeId,
@@ -2347,6 +2965,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes one vector role declaration.
 	fn parse_vector_role(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<VectorRole> {
 		match value {
 			"feature" => Ok(VectorRole::Feature),
@@ -2355,6 +2974,7 @@ impl Decoder<'_> {
 		}
 	}
 
+	/// Decodes one vector semantic-type declaration.
 	fn parse_semantic_type(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<SemanticType> {
 		match value {
 			"numeric" => Ok(SemanticType::Numeric),
@@ -2368,6 +2988,7 @@ impl Decoder<'_> {
 		}
 	}
 
+	/// Decodes one vector storage-encoding declaration.
 	fn parse_vector_encoding(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<VectorEncoding> {
 		match value {
 			"f32" => Ok(VectorEncoding::F32),
@@ -2381,6 +3002,7 @@ impl Decoder<'_> {
 		}
 	}
 
+	/// Decodes the tagged metadata associated with one vector schema.
 	fn parse_vector_metadata(
 		&mut self,
 		node: OgdlNodeId,
@@ -2416,25 +3038,20 @@ impl Decoder<'_> {
 					nanoseconds,
 				})
 			}
-			"categorical" => {
-				Ok(CheckpointArtifactMetadata::Categorical {
-					dictionary: self.parse_byte_entries(&payload, path, "value-bytes")?,
-				})
-			}
-			"ordinal" => {
-				Ok(CheckpointArtifactMetadata::Ordinal {
-					ordered_labels: self.parse_byte_entries(&payload, path, "value-bytes")?,
-				})
-			}
-			"image" => {
-				Ok(CheckpointArtifactMetadata::Image {
-					encoded_variants: self.parse_image_variants(&payload, path)?,
-				})
-			}
+			"categorical" => Ok(CheckpointArtifactMetadata::Categorical {
+				dictionary: self.parse_byte_entries(&payload, path, "value-bytes")?,
+			}),
+			"ordinal" => Ok(CheckpointArtifactMetadata::Ordinal {
+				ordered_labels: self.parse_byte_entries(&payload, path, "value-bytes")?,
+			}),
+			"image" => Ok(CheckpointArtifactMetadata::Image {
+				encoded_variants: self.parse_image_variants(&payload, path)?,
+			}),
 			_ => Err(self.invalid_enum(path, "vector metadata", &tag)),
 		}
 	}
 
+	/// Requires a tagged variant to contain no payload children.
 	fn require_empty(&self, children: &[OgdlNodeId], path: &CheckpointPath) -> CheckpointResult<()> {
 		if let Some(child) = children.first() {
 			let name = self.node(*child, path)?.text();
@@ -2447,6 +3064,7 @@ impl Decoder<'_> {
 		Ok(())
 	}
 
+	/// Accounts for additional metadata entries against the decode limit.
 	fn reserve_metadata_entries(&mut self, added: usize, path: &CheckpointPath) -> CheckpointResult<()> {
 		self.metadata_entries = self.metadata_entries.checked_add(added).ok_or_else(|| {
 			decode_error(
@@ -2468,6 +3086,7 @@ impl Decoder<'_> {
 		Ok(())
 	}
 
+	/// Decodes a bounded sequence of named hexadecimal byte entries.
 	fn parse_byte_entries(
 		&mut self,
 		children: &[OgdlNodeId],
@@ -2491,6 +3110,7 @@ impl Decoder<'_> {
 		Ok(entries)
 	}
 
+	/// Decodes the bounded image metadata variants for one vector.
 	fn parse_image_variants(
 		&mut self,
 		children: &[OgdlNodeId],
@@ -2589,6 +3209,7 @@ impl Decoder<'_> {
 		Ok(variants)
 	}
 
+	/// Decodes either `none` or one canonical `u8` value.
 	fn parse_optional_u8(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<Option<u8>> {
 		if value == "none" {
 			Ok(None)
@@ -2597,6 +3218,7 @@ impl Decoder<'_> {
 		}
 	}
 
+	/// Decodes one supported encoded image format.
 	fn parse_image_format(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<EncodedImageFormat> {
 		match value {
 			"png" => Ok(EncodedImageFormat::Png),
@@ -2609,6 +3231,7 @@ impl Decoder<'_> {
 		}
 	}
 
+	/// Decodes either `none` or one supported image color model.
 	fn parse_optional_image_color_model(
 		&self,
 		value: &str,
@@ -2630,6 +3253,7 @@ impl Decoder<'_> {
 		Ok(Some(model))
 	}
 
+	/// Decodes the ordered compiled feature-span list.
 	fn parse_feature_spans(
 		&self,
 		node: OgdlNodeId,
@@ -2701,6 +3325,7 @@ impl Decoder<'_> {
 		Ok(spans)
 	}
 
+	/// Decodes one tagged dense feature-lowering declaration.
 	fn parse_feature_lowering(
 		&self,
 		node: OgdlNodeId,
@@ -2738,6 +3363,7 @@ impl Decoder<'_> {
 		}
 	}
 
+	/// Decodes the dense feature-normalization coordinate mask.
 	fn parse_feature_normalization_mask(
 		&self,
 		node: OgdlNodeId,
@@ -2766,6 +3392,7 @@ impl Decoder<'_> {
 }
 
 impl Decoder<'_> {
+	/// Decodes the dense training configuration and validated bounds.
 	fn parse_training(
 		&self,
 		node: OgdlNodeId,
@@ -2867,6 +3494,7 @@ impl Decoder<'_> {
 		))
 	}
 
+	/// Decodes the complete AdamW optimizer configuration.
 	fn parse_adamw(&self, node: OgdlNodeId, path: &CheckpointPath) -> CheckpointResult<AdamWConfig> {
 		let fields = self.fields(
 			node,
@@ -2910,6 +3538,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes the bounded training and calibration iteration contract.
 	fn parse_bounds(
 		&self,
 		node: OgdlNodeId,
@@ -2963,6 +3592,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes a training horizon according to the checkpoint format version.
 	fn parse_training_horizon(
 		&self,
 		value: &str,
@@ -2983,6 +3613,7 @@ impl Decoder<'_> {
 			.map(TrainingHorizon::Finite)
 	}
 
+	/// Decodes loop iterations according to the checkpoint format version.
 	fn parse_loop_iterations(
 		&self,
 		value: &str,
@@ -3005,6 +3636,7 @@ impl Decoder<'_> {
 }
 
 impl Decoder<'_> {
+	/// Decodes the complete model structure and learned tensor images.
 	fn parse_model(
 		&mut self,
 		node: OgdlNodeId,
@@ -3064,26 +3696,22 @@ impl Decoder<'_> {
 		)?;
 		let layers = if format_version == FLAT_CHECKPOINT_FORMAT_VERSION {
 			blocks.iter()
-				.map(|block| {
-					match block {
-						CheckpointBlockImage::Layer(layer) => Ok(layer.clone()),
-						CheckpointBlockImage::Embedding(_)
-						| CheckpointBlockImage::Attention(_)
-						| CheckpointBlockImage::Rnn(_)
-						| CheckpointBlockImage::Gru(_)
-						| CheckpointBlockImage::Lstm(_)
-						| CheckpointBlockImage::Convolution(_)
-						| CheckpointBlockImage::Pool(_)
-						| CheckpointBlockImage::KMeans(_)
-						| CheckpointBlockImage::Tree(_)
-						| CheckpointBlockImage::Residual(_) => {
-							Err(decode_error(
-								CheckpointDecodeErrorKind::InvalidValue,
-								path.field("blocks"),
-								"checkpoint v5 cannot contain a structured block",
-							))
-						}
-					}
+				.map(|block| match block {
+					CheckpointBlockImage::Layer(layer) => Ok(layer.clone()),
+					CheckpointBlockImage::Embedding(_)
+					| CheckpointBlockImage::Attention(_)
+					| CheckpointBlockImage::Rnn(_)
+					| CheckpointBlockImage::Gru(_)
+					| CheckpointBlockImage::Lstm(_)
+					| CheckpointBlockImage::Convolution(_)
+					| CheckpointBlockImage::Pool(_)
+					| CheckpointBlockImage::KMeans(_)
+					| CheckpointBlockImage::Tree(_)
+					| CheckpointBlockImage::Residual(_) => Err(decode_error(
+						CheckpointDecodeErrorKind::InvalidValue,
+						path.field("blocks"),
+						"checkpoint v5 cannot contain a structured block",
+					)),
 				})
 				.collect::<CheckpointResult<Vec<_>>>()?
 		} else {
@@ -3103,6 +3731,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes the optional linear output-projection adapter.
 	fn parse_output_adapter(&self, node: OgdlNodeId, path: &CheckpointPath) -> CheckpointResult<DenseOutputAdapter> {
 		let (tag, payload) = self.tagged(node, path)?;
 		if tag != "linear-projection" {
@@ -3126,6 +3755,7 @@ impl Decoder<'_> {
 		Ok(DenseOutputAdapter::new(source_width, target_width))
 	}
 
+	/// Decodes normalization tensors and verifies the declared normalization mode.
 	fn parse_model_normalization(
 		&mut self,
 		node: OgdlNodeId,
@@ -3160,6 +3790,7 @@ impl Decoder<'_> {
 		Ok(tensors)
 	}
 
+	/// Decodes the bounded ordered model-block list for one format version.
 	fn parse_blocks(
 		&mut self,
 		node: OgdlNodeId,
@@ -3365,6 +3996,7 @@ impl Decoder<'_> {
 		Ok(blocks)
 	}
 
+	/// Accounts for one model block or branch step against the decode limit.
 	fn claim_block(&mut self, path: &CheckpointPath) -> CheckpointResult<()> {
 		self.block_count = self.block_count.checked_add(1).ok_or_else(|| {
 			decode_error(
@@ -3386,6 +4018,7 @@ impl Decoder<'_> {
 		Ok(())
 	}
 
+	/// Decodes one indexed embedding block image.
 	fn parse_embedding(
 		&mut self,
 		node: OgdlNodeId,
@@ -3433,6 +4066,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes one indexed multi-head attention block image.
 	fn parse_attention(
 		&mut self,
 		node: OgdlNodeId,
@@ -3484,6 +4118,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes one indexed simple recurrent neural-network block image.
 	fn parse_rnn(
 		&mut self,
 		node: OgdlNodeId,
@@ -3535,6 +4170,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes one indexed gated recurrent unit block image.
 	fn parse_gru(
 		&mut self,
 		node: OgdlNodeId,
@@ -3595,6 +4231,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes one indexed long short-term memory block image.
 	fn parse_lstm(
 		&mut self,
 		node: OgdlNodeId,
@@ -3661,6 +4298,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes one indexed dense layer or perceptron block image.
 	fn parse_layer(
 		&mut self,
 		node: OgdlNodeId,
@@ -3712,6 +4350,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes one indexed one-dimensional convolution block image.
 	fn parse_convolution(
 		&mut self,
 		node: OgdlNodeId,
@@ -3776,6 +4415,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes one indexed maximum-pooling block image.
 	fn parse_pool(
 		&self,
 		node: OgdlNodeId,
@@ -3842,6 +4482,7 @@ impl Decoder<'_> {
 		)
 	}
 
+	/// Decodes one indexed k-means block image.
 	fn parse_kmeans(
 		&mut self,
 		node: OgdlNodeId,
@@ -3898,6 +4539,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes one indexed tree-ensemble block image.
 	fn parse_tree(
 		&mut self,
 		node: OgdlNodeId,
@@ -3976,6 +4618,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes one indexed residual block image.
 	fn parse_residual(
 		&mut self,
 		node: OgdlNodeId,
@@ -4012,11 +4655,9 @@ impl Decoder<'_> {
 			.map(|node| self.parse_parameter_list(node, &path.field("branch-prelu")))
 			.transpose()?
 			.unwrap_or_default();
-		let declared_output = branch.iter().rev().find_map(|step| {
-			match step {
-				CheckpointResidualBranchImage::Layer(layer) => Some(layer.declaration.width()),
-				CheckpointResidualBranchImage::Operation(_) => None,
-			}
+		let declared_output = branch.iter().rev().find_map(|step| match step {
+			CheckpointResidualBranchImage::Layer(layer) => Some(layer.declaration.width()),
+			CheckpointResidualBranchImage::Operation(_) => None,
 		});
 		if declared_output != Some(output_width) {
 			return Err(decode_error(
@@ -4049,6 +4690,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes an ordered list of learned parameter images.
 	fn parse_parameter_list(
 		&mut self,
 		node: OgdlNodeId,
@@ -4084,6 +4726,7 @@ impl Decoder<'_> {
 			.collect()
 	}
 
+	/// Decodes the ordered steps in one residual branch.
 	fn parse_residual_branch(
 		&mut self,
 		node: OgdlNodeId,
@@ -4107,22 +4750,19 @@ impl Decoder<'_> {
 			let step_path = path.index(index);
 			self.claim_block(&step_path)?;
 			match self.node(step, &step_path)?.text() {
-				"layer" | "perc" => {
-					branch.push(CheckpointResidualBranchImage::Layer(
-						self.parse_layer(step, &step_path, index)?,
-					))
-				}
-				"operation" => {
-					branch.push(CheckpointResidualBranchImage::Operation(
-						self.parse_dense_operation(self.scalar(step, &step_path)?, &step_path)?,
-					))
-				}
+				"layer" | "perc" => branch.push(CheckpointResidualBranchImage::Layer(
+					self.parse_layer(step, &step_path, index)?,
+				)),
+				"operation" => branch.push(CheckpointResidualBranchImage::Operation(
+					self.parse_dense_operation(self.scalar(step, &step_path)?, &step_path)?,
+				)),
 				value => return Err(self.invalid_enum(&step_path, "residual branch step", value)),
 			}
 		}
 		Ok(branch)
 	}
 
+	/// Decodes the identity or projection skip path for one residual block.
 	fn parse_residual_skip(
 		&mut self,
 		node: OgdlNodeId,
@@ -4151,6 +4791,7 @@ impl Decoder<'_> {
 		}
 	}
 
+	/// Decodes an ordered counted list of dense operations.
 	fn parse_operations(&self, node: OgdlNodeId, path: &CheckpointPath) -> CheckpointResult<Vec<DenseOperation>> {
 		let (count, payload) = self.tagged(node, path)?;
 		let count = self.parse_usize(count, &path.field("count"))?;
@@ -4185,10 +4826,12 @@ impl Decoder<'_> {
 		Ok(operations)
 	}
 
+	/// Decodes one dense operation token.
 	fn parse_dense_operation(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<DenseOperation> {
 		DenseOperation::from_token(value).ok_or_else(|| self.invalid_enum(path, "dense operation", value))
 	}
 
+	/// Decodes one learned parameter and its two AdamW moment tensors.
 	fn parse_parameter(
 		&mut self,
 		node: OgdlNodeId,
@@ -4213,6 +4856,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes one bounded tensor image and accounts for its resource use.
 	fn parse_tensor(&mut self, node: OgdlNodeId, path: &CheckpointPath) -> CheckpointResult<CheckpointTensorImage> {
 		self.tensor_count = self.tensor_count.checked_add(1).ok_or_else(|| {
 			decode_error(
@@ -4245,6 +4889,7 @@ impl Decoder<'_> {
 		})
 	}
 
+	/// Decodes one supported tensor element type.
 	fn parse_dtype(&self, value: &str, path: &CheckpointPath) -> CheckpointResult<DType> {
 		match value {
 			"f32" => Ok(DType::F32),
@@ -4253,6 +4898,7 @@ impl Decoder<'_> {
 		}
 	}
 
+	/// Decodes one bounded tensor-shape extent chain.
 	fn parse_shape(&self, node: OgdlNodeId, path: &CheckpointPath) -> CheckpointResult<Vec<u64>> {
 		let mut shape = Vec::new();
 		let mut children = self.node(node, path)?.children();
@@ -4278,6 +4924,7 @@ impl Decoder<'_> {
 		Ok(shape)
 	}
 
+	/// Decodes and accounts for one chunked raw tensor payload.
 	fn parse_payload(&mut self, node: OgdlNodeId, path: &CheckpointPath) -> CheckpointResult<Vec<u8>> {
 		let (tag, chunks) = self.tagged(node, path)?;
 		if tag != "raw-bytes-hex" {
@@ -4376,6 +5023,7 @@ impl Decoder<'_> {
 		Ok(bytes)
 	}
 
+	/// Decodes the optional learned output-calibration temperature tensor.
 	fn parse_calibration(
 		&mut self,
 		node: OgdlNodeId,
@@ -4389,35 +5037,55 @@ impl Decoder<'_> {
 	}
 }
 
+/// Intermediate decoded dataset schema used to assemble the artifact.
 struct ParsedDataset {
+	/// Ordered decoded vector schemas.
 	vectors: Vec<CheckpointArtifactVector>,
+	/// Compiled dense feature spans.
 	feature_spans: Vec<CompiledFeatureSpan>,
+	/// Dense feature coordinates subject to normalization.
 	feature_normalization_mask: Vec<u32>,
+	/// Total compiled dense input width.
 	feature_width: usize,
+	/// Source-column indices selected as targets.
 	target_source_indices: Vec<usize>,
+	/// Decoded dense learning task.
 	task: DenseTask,
 }
 
+/// Intermediate decoded target selection and task declaration.
 struct ParsedTarget {
+	/// Source-column indices selected as targets.
 	source_indices: Vec<usize>,
+	/// Dense learning task derived from the target declaration.
 	task: DenseTask,
 }
 
+/// Intermediate decoded model structure and learned state.
 struct ParsedModel {
+	/// Optional dense output adapter.
 	output_adapter: Option<DenseOutputAdapter>,
+	/// Learned normalization tensor images.
 	normalization: Vec<CheckpointTensorImage>,
+	/// Ordered learned dense layer images.
 	layers: Vec<CheckpointLayerImage>,
+	/// Ordered specialized model block images.
 	blocks: Vec<CheckpointBlockImage>,
+	/// Optional learned calibration temperature tensor.
 	temperature: Option<CheckpointTensorImage>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Selects whether topology validation uses declarations or realized artifacts.
 enum CheckpointTopologyStorage {
+	/// Validate declared manifest topology without requiring payload bytes.
 	Manifest,
+	/// Validate realized artifact topology including payload-backed tensors.
 	Artifact,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Selects declaration-only or payload-complete tensor validation.
 enum CheckpointTensorValidation {
 	Declaration,
 	Payload,
@@ -4894,12 +5562,10 @@ fn validate_native_metadata(
 	if !is_semantic_model_version(artifact.format_version) {
 		return match artifact.native {
 			None => Ok(()),
-			Some(_) => {
-				Err(validation_error(
-					path.clone(),
-					"native realization metadata requires semantic-model version 8 or newer",
-				))
-			}
+			Some(_) => Err(validation_error(
+				path.clone(),
+				"native realization metadata requires semantic-model version 8 or newer",
+			)),
 		};
 	}
 	let Some(native) = &artifact.native else {
@@ -5537,16 +6203,13 @@ fn image_metadata_could_be_ingested(value: CheckpointImageMetadata) -> bool {
 					) | (Some(3), Some(ImageColorModel::Bgr), Some(8 | 16))
 			)
 		}
-		EncodedImageFormat::WebP => {
-			match (value.channels, value.color_model, value.sample_bits) {
-				(Some(3), Some(ImageColorModel::YCbCr), Some(8)) => {
-					value.width <= 0x3fff && value.height <= 0x3fff
-				}
-				(Some(3), Some(ImageColorModel::Rgb), Some(8))
-				| (Some(4), Some(ImageColorModel::Rgba), Some(8)) => value.width <= 1 << 24 && value.height <= 1 << 24,
-				_ => false,
+		EncodedImageFormat::WebP => match (value.channels, value.color_model, value.sample_bits) {
+			(Some(3), Some(ImageColorModel::YCbCr), Some(8)) => value.width <= 0x3fff && value.height <= 0x3fff,
+			(Some(3), Some(ImageColorModel::Rgb), Some(8)) | (Some(4), Some(ImageColorModel::Rgba), Some(8)) => {
+				value.width <= 1 << 24 && value.height <= 1 << 24
 			}
-		}
+			_ => false,
+		},
 	}
 }
 
@@ -5854,12 +6517,10 @@ fn validate_effective_model(
 		| RNN_CHECKPOINT_FORMAT_VERSION
 		| GRU_CHECKPOINT_FORMAT_VERSION
 		| LSTM_CHECKPOINT_FORMAT_VERSION => validate_effective_structured_model(artifact, path, tensor_validation),
-		version => {
-			Err(invalid_value(
-				CheckpointPath::root().field("recipe").field("version"),
-				format!("unsupported checkpoint version {version}"),
-			))
-		}
+		version => Err(invalid_value(
+			CheckpointPath::root().field("recipe").field("version"),
+			format!("unsupported checkpoint version {version}"),
+		)),
 	}
 }
 
@@ -5917,7 +6578,9 @@ fn validate_effective_flat_model(
 				.operations()
 				.iter()
 				.all(|operation| *operation == DenseOperation::Activation(DenseActivation::Linear));
-			if source.width() == adapter.target_width() && (!classification_requires_logits || source_is_logits) {
+			let source_width = source.width();
+			let target_width = adapter.target_width();
+			if source_width == target_width && (!classification_requires_logits || source_is_logits) {
 				return Err(validation_error(
 					path.field("output-adapter"),
 					"serialized adapter is redundant under the checkpoint-v5 effective-layer rule",
@@ -6049,9 +6712,9 @@ fn validate_effective_structured_model(
 				.output_operations()
 				.iter()
 				.all(|operation| *operation == DenseOperation::Activation(DenseActivation::Linear));
-			if source.output_width() == adapter.target_width()
-				&& (!classification_requires_logits || source_is_logits)
-			{
+			let source_width = source.output_width();
+			let target_width = adapter.target_width();
+			if source_width == target_width && (!classification_requires_logits || source_is_logits) {
 				return Err(validation_error(
 					path.field("output-adapter"),
 					format!(
@@ -6669,11 +7332,9 @@ fn validate_effective_structured_model(
 						branch_width = output_width;
 					}
 				}
-				let branch_operations = residual.branch.iter().filter_map(|step| {
-					match step {
-						CheckpointResidualBranchImage::Operation(operation) => Some(*operation),
-						CheckpointResidualBranchImage::Layer(_) => None,
-					}
+				let branch_operations = residual.branch.iter().filter_map(|step| match step {
+					CheckpointResidualBranchImage::Operation(operation) => Some(*operation),
+					CheckpointResidualBranchImage::Layer(_) => None,
 				});
 				validate_prelu_parameters(
 					branch_operations,
@@ -6804,11 +7465,9 @@ fn validate_structured_tree_declarations(artifact: &CheckpointArtifact, path: &C
 		.blocks
 		.iter()
 		.enumerate()
-		.filter_map(|(index, block)| {
-			match block {
-				CheckpointBlockImage::Tree(tree) => Some((index, tree)),
-				_ => None,
-			}
+		.filter_map(|(index, block)| match block {
+			CheckpointBlockImage::Tree(tree) => Some((index, tree)),
+			_ => None,
 		})
 		.collect::<Vec<_>>();
 	if trees.is_empty() {
@@ -6829,7 +7488,7 @@ fn validate_structured_tree_declarations(artifact: &CheckpointArtifact, path: &C
 			"tree depth exceeds Recipe's checked int32 traversal domain",
 		));
 	}
-	let leaves = 1_u64
+	let leaves = 1u64
 		.checked_shl(depth)
 		.ok_or_else(|| validation_error(block_path.field("depth"), "tree leaf count overflowed u64"))?;
 	let internal_nodes = leaves - 1;
@@ -6856,11 +7515,9 @@ fn validate_structured_embedding_declarations(
 		.blocks
 		.iter()
 		.enumerate()
-		.filter_map(|(index, block)| {
-			match block {
-				CheckpointBlockImage::Embedding(embedding) => Some((index, embedding)),
-				_ => None,
-			}
+		.filter_map(|(index, block)| match block {
+			CheckpointBlockImage::Embedding(embedding) => Some((index, embedding)),
+			_ => None,
 		})
 		.collect::<Vec<_>>();
 	if embeddings.is_empty() {
@@ -7274,7 +7931,7 @@ fn validate_i32_tensor(
 	}
 	let bytes = expected_shape
 		.iter()
-		.try_fold(1_u64, |elements, extent| {
+		.try_fold(1u64, |elements, extent| {
 			if *extent == 0 {
 				None
 			} else {
@@ -7312,18 +7969,14 @@ fn validate_temperature(
 		artifact.bounds.calibration_iterations,
 	) {
 		(None, 0) => Ok(()),
-		(Some(_), 0) => {
-			Err(validation_error(
-				path.clone(),
-				"temperature tensor exists while calibration iteration count is zero",
-			))
-		}
-		(None, _) => {
-			Err(validation_error(
-				path.clone(),
-				"calibration iterations exist without a final temperature tensor",
-			))
-		}
+		(Some(_), 0) => Err(validation_error(
+			path.clone(),
+			"temperature tensor exists while calibration iteration count is zero",
+		)),
+		(None, _) => Err(validation_error(
+			path.clone(),
+			"calibration iterations exist without a final temperature tensor",
+		)),
 		(Some(temperature), _) => {
 			if !matches!(
 				artifact.config.loss,
@@ -7375,7 +8028,7 @@ struct CheckpointParameter {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CheckpointLayer {
+pub(crate) struct CheckpointLayer {
 	declaration: DenseLayer,
 	weight: CheckpointParameter,
 	bias: CheckpointParameter,
@@ -7383,7 +8036,7 @@ struct CheckpointLayer {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CheckpointConvolution {
+pub(crate) struct CheckpointConvolution {
 	declaration: DenseConvolution,
 	geometry: DenseConvolutionGeometry,
 	weight: CheckpointParameter,
@@ -7392,21 +8045,21 @@ struct CheckpointConvolution {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CheckpointKMeans {
+pub(crate) struct CheckpointKMeans {
 	declaration: DenseKMeans,
 	input_width: NonZeroU64,
 	centroids: CheckpointTensor,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CheckpointEmbedding {
+pub(crate) struct CheckpointEmbedding {
 	declaration: DenseEmbedding,
 	sequence_length: NonZeroU64,
 	table: CheckpointParameter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CheckpointAttention {
+pub(crate) struct CheckpointAttention {
 	declaration: DenseAttention,
 	sequence_length: NonZeroU64,
 	dimensions: NonZeroU64,
@@ -7418,7 +8071,7 @@ struct CheckpointAttention {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CheckpointRnn {
+pub(crate) struct CheckpointRnn {
 	declaration: DenseRnn,
 	sequence_length: NonZeroU64,
 	input_weight: CheckpointParameter,
@@ -7427,7 +8080,7 @@ struct CheckpointRnn {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CheckpointGru {
+pub(crate) struct CheckpointGru {
 	declaration: DenseGru,
 	sequence_length: NonZeroU64,
 	reset_input_weight: CheckpointParameter,
@@ -7442,7 +8095,7 @@ struct CheckpointGru {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CheckpointLstm {
+pub(crate) struct CheckpointLstm {
 	declaration: DenseLstm,
 	sequence_length: NonZeroU64,
 	input_gate_input_weight: CheckpointParameter,
@@ -7460,7 +8113,7 @@ struct CheckpointLstm {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CheckpointTree {
+pub(crate) struct CheckpointTree {
 	declaration: DenseTree,
 	input_width: NonZeroU64,
 	output_width: NonZeroU64,
@@ -7484,7 +8137,7 @@ enum CheckpointResidualSkip {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CheckpointResidual {
+pub(crate) struct CheckpointResidual {
 	branch: Vec<CheckpointResidualBranch>,
 	branch_prelu: Vec<CheckpointParameter>,
 	output_width: NonZeroU64,
@@ -7494,7 +8147,7 @@ struct CheckpointResidual {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum CheckpointBlock {
+pub(crate) enum CheckpointBlock {
 	Embedding(CheckpointEmbedding),
 	Attention(CheckpointAttention),
 	Rnn(CheckpointRnn),
@@ -7537,6 +8190,7 @@ pub struct CheckpointManifest {
 impl CheckpointManifest {
 	/// Capture only the declaration and no-row schema needed to interpret the
 	/// final model state.
+	#[inline]
 	pub fn from_compiled(training: &CompiledTraining) -> CheckpointResult<Self> {
 		let feature_width = training.dataset_schema().input_width();
 		let feature_spans = training.dataset_schema().features().to_vec();
@@ -7544,15 +8198,13 @@ impl CheckpointManifest {
 			.dataset_schema()
 			.vectors()
 			.iter()
-			.map(|vector| {
-				CheckpointVectorSchema {
-					source_index: vector.source_index(),
-					name: vector.name().to_vec(),
-					role: vector.role(),
-					semantic_type: vector.semantic_type(),
-					encoding: vector.encoding(),
-					metadata: vector.metadata().clone(),
-				}
+			.map(|vector| CheckpointVectorSchema {
+				source_index: vector.source_index(),
+				name: vector.name().to_vec(),
+				role: vector.role(),
+				semantic_type: vector.semantic_type(),
+				encoding: vector.encoding(),
+				metadata: vector.metadata().clone(),
 			})
 			.collect();
 		let output = training.outputs();
@@ -7572,16 +8224,9 @@ impl CheckpointManifest {
 			}
 			DataNormalizationState::L2Norm => Vec::new(),
 		};
-		if training.blocks().len() != output.blocks.len() {
-			return Err(CheckpointError::manifest(format!(
-				"{} effective blocks produced {} block states",
-				training.blocks().len(),
-				output.blocks.len()
-			)));
-		}
 		let mut config = training.config().clone();
 		config.layers.clear();
-		let blocks = checkpoint_blocks(training, training.blocks(), &output.blocks)?;
+		let blocks = checkpoint_blocks(training, &output.blocks)?;
 		let format_version = if blocks
 			.iter()
 			.any(|block| matches!(block, CheckpointBlock::Lstm(_)))
@@ -7646,29 +8291,51 @@ impl CheckpointManifest {
 	}
 
 	#[must_use]
-	pub const fn format_version(&self) -> u32 { self.format_version }
+	#[inline]
+	pub const fn format_version(&self) -> u32 {
+		self.format_version
+	}
 
 	#[must_use]
-	pub fn vectors(&self) -> &[CheckpointVectorSchema] { &self.vectors }
+	#[inline]
+	pub fn vectors(&self) -> &[CheckpointVectorSchema] {
+		&self.vectors
+	}
 
 	#[must_use]
-	pub fn feature_spans(&self) -> &[CompiledFeatureSpan] { &self.feature_spans }
+	#[inline]
+	pub fn feature_spans(&self) -> &[CompiledFeatureSpan] {
+		&self.feature_spans
+	}
 
 	#[must_use]
-	pub const fn feature_width(&self) -> usize { self.feature_width }
+	#[inline]
+	pub const fn feature_width(&self) -> usize {
+		self.feature_width
+	}
 
 	#[must_use]
-	pub fn target_source_indices(&self) -> &[usize] { &self.target_source_indices }
+	#[inline]
+	pub fn target_source_indices(&self) -> &[usize] {
+		&self.target_source_indices
+	}
 
 	#[must_use]
-	pub const fn task(&self) -> DenseTask { self.task }
+	#[inline]
+	pub const fn task(&self) -> DenseTask {
+		self.task
+	}
 
 	/// Calculation-facing dtype selected for the target vector before rows
 	/// were removed from the semantic model.
 	#[must_use]
-	pub fn target_dtype(&self) -> Option<DType> { self.target_dtypes().next() }
+	#[inline]
+	pub fn target_dtype(&self) -> Option<DType> {
+		self.target_dtypes().next()
+	}
 
 	#[must_use]
+	#[inline]
 	pub fn target_dtypes(&self) -> impl Iterator<Item = DType> + '_ {
 		self.target_source_indices
 			.iter()
@@ -7681,7 +8348,10 @@ impl CheckpointManifest {
 	}
 
 	#[must_use]
-	pub const fn output_adapter(&self) -> Option<DenseOutputAdapter> { self.output_adapter }
+	#[inline]
+	pub const fn output_adapter(&self) -> Option<DenseOutputAdapter> {
+		self.output_adapter
+	}
 
 	fn tensors(&self) -> impl Iterator<Item = &CheckpointTensor> {
 		let mut tensors = self.normalization.iter().collect::<Vec<_>>();
@@ -7738,6 +8408,7 @@ impl CheckpointManifest {
 /// Canonical digest of the complete static program whose lowered stages a
 /// realized native bundle must implement. External input images, including
 /// resumed parameter bytes, are intentionally outside this identity.
+#[inline]
 pub fn compiled_training_program_digest(training: &CompiledTraining) -> CheckpointResult<Digest> {
 	let encoded = training
 		.program()
@@ -7751,6 +8422,7 @@ pub fn compiled_training_program_digest(training: &CompiledTraining) -> Checkpoi
 /// native-artifact contract. The new declaration controls the new training
 /// phase; the checkpoint must retain the same typed dataset schema, objective,
 /// normalization semantics, effective topology, and optimizer-state meaning.
+#[inline]
 pub fn apply_checkpoint_resume(
 	training: &mut CompiledTraining,
 	checkpoint: &CheckpointArtifact,
@@ -7764,38 +8436,33 @@ pub fn apply_checkpoint_resume(
 		.blocks
 		.iter()
 		.enumerate()
-		.filter_map(|(block, image)| {
-			match image {
-				CheckpointBlockImage::KMeans(kmeans) => Some((block, &kmeans.centroids)),
-				_ => None,
-			}
+		.filter_map(|(block, image)| match image {
+			CheckpointBlockImage::KMeans(kmeans) => Some((block, &kmeans.centroids)),
+			_ => None,
 		})
 		.collect::<BTreeMap<_, _>>();
 	let tree_splits = checkpoint
 		.blocks
 		.iter()
 		.enumerate()
-		.filter_map(|(block, image)| {
-			match image {
-				CheckpointBlockImage::Tree(tree) => {
-					Some((block, (tree.split_features(), tree.split_thresholds())))
-				}
-				_ => None,
-			}
+		.filter_map(|(block, image)| match image {
+			CheckpointBlockImage::Tree(tree) => Some((block, (tree.split_features(), tree.split_thresholds()))),
+			_ => None,
 		})
 		.collect::<BTreeMap<_, _>>();
 	let mut admitted_kmeans = BTreeSet::new();
 	let mut admitted_tree_features = BTreeSet::new();
 	let mut admitted_tree_thresholds = BTreeSet::new();
 	let mut enabled_inputs = 0usize;
-	for input in &mut training.external_inputs {
+	for input in training.external_inputs_mut() {
 		let (ordinal, component) = match input.role() {
 			ExternalInputRole::ResumeEnabled => {
-				enabled_inputs = enabled_inputs.checked_add(1).ok_or_else(|| {
-					CheckpointError::IncompatibleResume {
-						detail: "resume-enable input count overflowed".to_owned(),
-					}
-				})?;
+				enabled_inputs =
+					enabled_inputs
+						.checked_add(1)
+						.ok_or_else(|| CheckpointError::IncompatibleResume {
+							detail: "resume-enable input count overflowed".to_owned(),
+						})?;
 				if input.dtype() != DType::I32 || input.shape().extents() != [1] {
 					return Err(CheckpointError::IncompatibleResume {
 						detail: "compiled resume-enable input is not an int32 scalar".to_owned(),
@@ -7805,11 +8472,14 @@ pub fn apply_checkpoint_resume(
 				continue;
 			}
 			ExternalInputRole::ResumeKMeansCentroids { block } => {
-				let image = kmeans_centroids.get(&block).ok_or_else(|| {
-					CheckpointError::IncompatibleResume {
-						detail: format!("compiled resume input refers to absent K-means block {block}"),
-					}
-				})?;
+				let image =
+					kmeans_centroids
+						.get(&block)
+						.ok_or_else(|| CheckpointError::IncompatibleResume {
+							detail: format!(
+								"compiled resume input refers to absent K-means block {block}"
+							),
+						})?;
 				if !admitted_kmeans.insert(block) {
 					return Err(CheckpointError::IncompatibleResume {
 						detail: format!(
@@ -7822,11 +8492,12 @@ pub fn apply_checkpoint_resume(
 				continue;
 			}
 			ExternalInputRole::ResumeTreeSplitFeatures { block } => {
-				let (image, _) = tree_splits.get(&block).ok_or_else(|| {
-					CheckpointError::IncompatibleResume {
-						detail: format!("compiled resume input refers to absent tree block {block}"),
-					}
-				})?;
+				let (image, _) =
+					tree_splits
+						.get(&block)
+						.ok_or_else(|| CheckpointError::IncompatibleResume {
+							detail: format!("compiled resume input refers to absent tree block {block}"),
+						})?;
 				if !admitted_tree_features.insert(block) {
 					return Err(CheckpointError::IncompatibleResume {
 						detail: format!(
@@ -7839,11 +8510,12 @@ pub fn apply_checkpoint_resume(
 				continue;
 			}
 			ExternalInputRole::ResumeTreeSplitThresholds { block } => {
-				let (_, image) = tree_splits.get(&block).ok_or_else(|| {
-					CheckpointError::IncompatibleResume {
-						detail: format!("compiled resume input refers to absent tree block {block}"),
-					}
-				})?;
+				let (_, image) =
+					tree_splits
+						.get(&block)
+						.ok_or_else(|| CheckpointError::IncompatibleResume {
+							detail: format!("compiled resume input refers to absent tree block {block}"),
+						})?;
 				if !admitted_tree_thresholds.insert(block) {
 					return Err(CheckpointError::IncompatibleResume {
 						detail: format!(
@@ -7864,11 +8536,11 @@ pub fn apply_checkpoint_resume(
 			ExternalInputRole::ResumeSecondMoment { ordinal } => (ordinal, 2u8),
 			_ => continue,
 		};
-		let parameter = parameters.get(ordinal).ok_or_else(|| {
-			CheckpointError::IncompatibleResume {
+		let parameter = parameters
+			.get(ordinal)
+			.ok_or_else(|| CheckpointError::IncompatibleResume {
 				detail: format!("compiled resume input refers to absent parameter ordinal {ordinal}"),
-			}
-		})?;
+			})?;
 		let image = match component {
 			0 => parameter.parameter(),
 			1 => parameter.first_moment(),
@@ -7930,11 +8602,12 @@ fn validate_resume_tensor(
 	role: &str,
 ) -> CheckpointResult<()> {
 	let actual_bytes = u64::try_from(image.bytes().len()).unwrap_or(u64::MAX);
-	let expected_bytes = input.shape().bytes(input.dtype()).map_err(|error| {
-		CheckpointError::IncompatibleResume {
+	let expected_bytes = input
+		.shape()
+		.bytes(input.dtype())
+		.map_err(|error| CheckpointError::IncompatibleResume {
 			detail: format!("compiled {role} has invalid tensor shape: {error}"),
-		}
-	})?;
+		})?;
 	if input.dtype() != image.dtype()
 		|| input.shape().extents() != image.shape()
 		|| actual_bytes != expected_bytes.get()
@@ -8108,85 +8781,79 @@ fn resume_topology_matches(manifest: &CheckpointManifest, checkpoint: &Checkpoin
 			.blocks
 			.iter()
 			.zip(&checkpoint.blocks)
-			.all(|(expected, actual)| {
-				match (expected, actual) {
-					(CheckpointBlock::Embedding(expected), CheckpointBlockImage::Embedding(actual)) => {
-						expected.declaration.dimensions() == actual.dimensions
-							&& expected.declaration.vocabulary() == actual.vocabulary
-							&& expected.sequence_length == actual.sequence_length
-					}
-					(CheckpointBlock::Attention(expected), CheckpointBlockImage::Attention(actual)) => {
-						expected.declaration.heads() == actual.heads
-							&& expected.sequence_length == actual.sequence_length
-							&& expected.dimensions == actual.dimensions
-							&& expected.head_dimension == actual.head_dimension
-					}
-					(CheckpointBlock::Rnn(expected), CheckpointBlockImage::Rnn(actual)) => {
-						expected.declaration.width() == actual.width
-							&& expected.sequence_length == actual.sequence_length
-					}
-					(CheckpointBlock::Gru(expected), CheckpointBlockImage::Gru(actual)) => {
-						expected.declaration.width() == actual.width
-							&& expected.sequence_length == actual.sequence_length
-					}
-					(CheckpointBlock::Lstm(expected), CheckpointBlockImage::Lstm(actual)) => {
-						expected.declaration.width() == actual.width
-							&& expected.sequence_length == actual.sequence_length
-					}
-					(CheckpointBlock::Layer(expected), CheckpointBlockImage::Layer(actual)) => {
-						expected.declaration == actual.declaration
-					}
-					(CheckpointBlock::Convolution(expected), CheckpointBlockImage::Convolution(actual)) => {
-						expected.declaration == actual.declaration && expected.geometry == actual.geometry
-					}
-					(CheckpointBlock::Pool(expected), CheckpointBlockImage::Pool(actual)) => {
-						expected == actual
-					}
-					(CheckpointBlock::KMeans(expected), CheckpointBlockImage::KMeans(actual)) => {
-						expected.declaration.clusters() == actual.clusters
-							&& expected.declaration.group_to_neuron() == actual.group_to_neuron
-							&& expected.input_width == actual.input_width
-					}
-					(CheckpointBlock::Tree(expected), CheckpointBlockImage::Tree(actual)) => {
-						expected.declaration == actual.declaration
-							&& expected.input_width == actual.input_width
-							&& expected.output_width == actual.output_width
-							&& expected.internal_nodes_per_tree == actual.internal_nodes_per_tree
-							&& expected.leaves_per_tree == actual.leaves_per_tree
-					}
-					(CheckpointBlock::Residual(expected), CheckpointBlockImage::Residual(actual)) => {
-						expected.output_width == actual.output_width
-							&& expected.operations == actual.operations
-							&& expected.branch.len() == actual.branch.len()
-							&& expected
-								.branch
-								.iter()
-								.zip(&actual.branch)
-								.all(|(expected, actual)| {
-									match (expected, actual) {
-										(
-											CheckpointResidualBranch::Layer(expected),
-											CheckpointResidualBranchImage::Layer(actual),
-										) => expected.declaration == actual.declaration,
-										(
-											CheckpointResidualBranch::Operation(expected),
-											CheckpointResidualBranchImage::Operation(actual),
-										) => expected == actual,
-										_ => false,
-									}
-								}) && matches!(
-							(&expected.skip, &actual.skip),
-							(
-								CheckpointResidualSkip::Identity,
-								CheckpointResidualSkipImage::Identity
-							) | (
-								CheckpointResidualSkip::Projection(_),
-								CheckpointResidualSkipImage::Projection(_)
-							)
-						)
-					}
-					_ => false,
+			.all(|(expected, actual)| match (expected, actual) {
+				(CheckpointBlock::Embedding(expected), CheckpointBlockImage::Embedding(actual)) => {
+					expected.declaration.dimensions() == actual.dimensions
+						&& expected.declaration.vocabulary() == actual.vocabulary
+						&& expected.sequence_length == actual.sequence_length
 				}
+				(CheckpointBlock::Attention(expected), CheckpointBlockImage::Attention(actual)) => {
+					expected.declaration.heads() == actual.heads
+						&& expected.sequence_length == actual.sequence_length
+						&& expected.dimensions == actual.dimensions
+						&& expected.head_dimension == actual.head_dimension
+				}
+				(CheckpointBlock::Rnn(expected), CheckpointBlockImage::Rnn(actual)) => {
+					expected.declaration.width() == actual.width
+						&& expected.sequence_length == actual.sequence_length
+				}
+				(CheckpointBlock::Gru(expected), CheckpointBlockImage::Gru(actual)) => {
+					expected.declaration.width() == actual.width
+						&& expected.sequence_length == actual.sequence_length
+				}
+				(CheckpointBlock::Lstm(expected), CheckpointBlockImage::Lstm(actual)) => {
+					expected.declaration.width() == actual.width
+						&& expected.sequence_length == actual.sequence_length
+				}
+				(CheckpointBlock::Layer(expected), CheckpointBlockImage::Layer(actual)) => {
+					expected.declaration == actual.declaration
+				}
+				(CheckpointBlock::Convolution(expected), CheckpointBlockImage::Convolution(actual)) => {
+					expected.declaration == actual.declaration && expected.geometry == actual.geometry
+				}
+				(CheckpointBlock::Pool(expected), CheckpointBlockImage::Pool(actual)) => expected == actual,
+				(CheckpointBlock::KMeans(expected), CheckpointBlockImage::KMeans(actual)) => {
+					expected.declaration.clusters() == actual.clusters
+						&& expected.declaration.group_to_neuron() == actual.group_to_neuron
+						&& expected.input_width == actual.input_width
+				}
+				(CheckpointBlock::Tree(expected), CheckpointBlockImage::Tree(actual)) => {
+					expected.declaration == actual.declaration
+						&& expected.input_width == actual.input_width
+						&& expected.output_width == actual.output_width
+						&& expected.internal_nodes_per_tree == actual.internal_nodes_per_tree
+						&& expected.leaves_per_tree == actual.leaves_per_tree
+				}
+				(CheckpointBlock::Residual(expected), CheckpointBlockImage::Residual(actual)) => {
+					expected.output_width == actual.output_width
+						&& expected.operations == actual.operations
+						&& expected.branch.len() == actual.branch.len()
+						&& expected
+							.branch
+							.iter()
+							.zip(&actual.branch)
+							.all(|(expected, actual)| match (expected, actual) {
+								(
+									CheckpointResidualBranch::Layer(expected),
+									CheckpointResidualBranchImage::Layer(actual),
+								) => expected.declaration == actual.declaration,
+								(
+									CheckpointResidualBranch::Operation(expected),
+									CheckpointResidualBranchImage::Operation(actual),
+								) => expected == actual,
+								_ => false,
+							}) && matches!(
+						(&expected.skip, &actual.skip),
+						(
+							CheckpointResidualSkip::Identity,
+							CheckpointResidualSkipImage::Identity
+						) | (
+							CheckpointResidualSkip::Projection(_),
+							CheckpointResidualSkipImage::Projection(_)
+						)
+					)
+				}
+				_ => false,
 			})
 }
 
@@ -8199,46 +8866,40 @@ macro_rules! extend_block_parameters {
 		for block in $blocks {
 			match block {
 				$block::Embedding(embedding) => $parameters.push(&embedding.table),
-				$block::Attention(attention) => {
-					$parameters.extend([
-						&attention.query,
-						&attention.key,
-						&attention.value,
-						&attention.output,
-					])
-				}
+				$block::Attention(attention) => $parameters.extend([
+					&attention.query,
+					&attention.key,
+					&attention.value,
+					&attention.output,
+				]),
 				$block::Rnn(rnn) => {
 					$parameters.extend([&rnn.input_weight, &rnn.recurrent_weight, &rnn.bias]);
 				}
-				$block::Gru(gru) => {
-					$parameters.extend([
-						&gru.reset_input_weight,
-						&gru.reset_recurrent_weight,
-						&gru.reset_bias,
-						&gru.update_input_weight,
-						&gru.update_recurrent_weight,
-						&gru.update_bias,
-						&gru.candidate_input_weight,
-						&gru.candidate_recurrent_weight,
-						&gru.candidate_bias,
-					])
-				}
-				$block::Lstm(lstm) => {
-					$parameters.extend([
-						&lstm.input_gate_input_weight,
-						&lstm.input_gate_recurrent_weight,
-						&lstm.input_gate_bias,
-						&lstm.forget_gate_input_weight,
-						&lstm.forget_gate_recurrent_weight,
-						&lstm.forget_gate_bias,
-						&lstm.output_gate_input_weight,
-						&lstm.output_gate_recurrent_weight,
-						&lstm.output_gate_bias,
-						&lstm.candidate_input_weight,
-						&lstm.candidate_recurrent_weight,
-						&lstm.candidate_bias,
-					])
-				}
+				$block::Gru(gru) => $parameters.extend([
+					&gru.reset_input_weight,
+					&gru.reset_recurrent_weight,
+					&gru.reset_bias,
+					&gru.update_input_weight,
+					&gru.update_recurrent_weight,
+					&gru.update_bias,
+					&gru.candidate_input_weight,
+					&gru.candidate_recurrent_weight,
+					&gru.candidate_bias,
+				]),
+				$block::Lstm(lstm) => $parameters.extend([
+					&lstm.input_gate_input_weight,
+					&lstm.input_gate_recurrent_weight,
+					&lstm.input_gate_bias,
+					&lstm.forget_gate_input_weight,
+					&lstm.forget_gate_recurrent_weight,
+					&lstm.forget_gate_bias,
+					&lstm.output_gate_input_weight,
+					&lstm.output_gate_recurrent_weight,
+					&lstm.output_gate_bias,
+					&lstm.candidate_input_weight,
+					&lstm.candidate_recurrent_weight,
+					&lstm.candidate_bias,
+				]),
 				$block::Layer(layer) => {
 					$parameters.extend([&layer.weight, &layer.bias]);
 					$parameters.extend(&layer.prelu);
@@ -8327,7 +8988,7 @@ fn manifest_semantic_error(error: CheckpointError) -> CheckpointError {
 	}
 }
 
-fn checkpoint_layer(
+pub(crate) fn checkpoint_layer(
 	training: &CompiledTraining,
 	declaration: DenseLayer,
 	state: DenseLayerState,
@@ -8344,7 +9005,7 @@ fn checkpoint_layer(
 	})
 }
 
-fn checkpoint_convolution(
+pub(crate) fn checkpoint_convolution(
 	training: &CompiledTraining,
 	declaration: DenseConvolution,
 	state: DenseConvolutionState,
@@ -8364,77 +9025,33 @@ fn checkpoint_convolution(
 
 fn checkpoint_blocks(
 	training: &CompiledTraining,
-	declarations: &[DenseBlock],
 	states: &[DenseBlockState],
 ) -> CheckpointResult<Vec<CheckpointBlock>> {
-	if declarations.len() != states.len() {
-		return Err(CheckpointError::manifest(format!(
-			"{} structured declarations produced {} block states",
-			declarations.len(),
-			states.len()
-		)));
-	}
-	declarations
-		.iter()
-		.zip(states)
+	states.iter()
 		.enumerate()
-		.map(|(index, (declaration, state))| {
-			match (declaration, state) {
-				(DenseBlock::Embedding(embedding), DenseBlockState::Embedding(state)) => {
-					checkpoint_embedding(training, *embedding, *state).map(CheckpointBlock::Embedding)
-				}
-				(DenseBlock::Attention(attention), DenseBlockState::Attention(state)) => {
-					checkpoint_attention(training, *attention, *state).map(CheckpointBlock::Attention)
-				}
-				(DenseBlock::Rnn(rnn), DenseBlockState::Rnn(state)) => {
-					checkpoint_rnn(training, *rnn, *state).map(CheckpointBlock::Rnn)
-				}
-				(DenseBlock::Gru(gru), DenseBlockState::Gru(state)) => {
-					checkpoint_gru(training, *gru, *state).map(CheckpointBlock::Gru)
-				}
-				(DenseBlock::Lstm(lstm), DenseBlockState::Lstm(state)) => {
-					checkpoint_lstm(training, *lstm, *state).map(CheckpointBlock::Lstm)
-				}
-				(DenseBlock::Layer(layer), DenseBlockState::Layer(state)) => {
-					checkpoint_layer(training, layer.clone(), state.clone()).map(CheckpointBlock::Layer)
-				}
-				(DenseBlock::Convolution(convolution), DenseBlockState::Convolution(state)) => {
-					checkpoint_convolution(training, convolution.clone(), state.clone())
-						.map(CheckpointBlock::Convolution)
-				}
-				(DenseBlock::Pool(pool), DenseBlockState::Pool(state)) => {
-					checkpoint_pool_image(
-						*pool,
-						*state,
-						&CheckpointPath::root()
-							.field("recipe")
-							.field("model")
-							.field("blocks")
-							.index(index),
-					)
-					.map(CheckpointBlock::Pool)
-					.map_err(manifest_semantic_error)
-				}
-				(DenseBlock::KMeans(kmeans), DenseBlockState::KMeans(state)) => {
-					checkpoint_kmeans(training, *kmeans, *state).map(CheckpointBlock::KMeans)
-				}
-				(DenseBlock::Tree(tree), DenseBlockState::Tree(state)) => {
-					checkpoint_tree(training, *tree, *state).map(CheckpointBlock::Tree)
-				}
-				(DenseBlock::Residual(residual), DenseBlockState::Residual(state)) => {
-					checkpoint_residual(training, residual, state).map(CheckpointBlock::Residual)
-				}
-				_ => {
-					Err(CheckpointError::manifest(format!(
-						"structured block {index} declaration and saved state have different kinds"
-					)))
-				}
-			}
-		})
+		.map(|(index, state)| state.realized().checkpoint(training, index))
 		.collect()
 }
 
-fn checkpoint_embedding(
+pub(crate) fn checkpoint_pool(
+	declaration: DensePool,
+	state: DensePoolState,
+	index: usize,
+) -> CheckpointResult<CheckpointBlock> {
+	checkpoint_pool_image(
+		declaration,
+		state,
+		&CheckpointPath::root()
+			.field("recipe")
+			.field("model")
+			.field("blocks")
+			.index(index),
+	)
+	.map(CheckpointBlock::Pool)
+	.map_err(manifest_semantic_error)
+}
+
+pub(crate) fn checkpoint_embedding(
 	training: &CompiledTraining,
 	declaration: DenseEmbedding,
 	state: DenseEmbeddingState,
@@ -8451,7 +9068,7 @@ fn checkpoint_embedding(
 	})
 }
 
-fn checkpoint_attention(
+pub(crate) fn checkpoint_attention(
 	training: &CompiledTraining,
 	declaration: DenseAttention,
 	state: DenseAttentionState,
@@ -8475,7 +9092,7 @@ fn checkpoint_attention(
 	})
 }
 
-fn checkpoint_rnn(
+pub(crate) fn checkpoint_rnn(
 	training: &CompiledTraining,
 	declaration: DenseRnn,
 	state: DenseRnnState,
@@ -8494,7 +9111,7 @@ fn checkpoint_rnn(
 	})
 }
 
-fn checkpoint_gru(
+pub(crate) fn checkpoint_gru(
 	training: &CompiledTraining,
 	declaration: DenseGru,
 	state: DenseGruState,
@@ -8519,7 +9136,7 @@ fn checkpoint_gru(
 	})
 }
 
-fn checkpoint_lstm(
+pub(crate) fn checkpoint_lstm(
 	training: &CompiledTraining,
 	declaration: DenseLstm,
 	state: DenseLstmState,
@@ -8547,7 +9164,7 @@ fn checkpoint_lstm(
 	})
 }
 
-fn checkpoint_kmeans(
+pub(crate) fn checkpoint_kmeans(
 	training: &CompiledTraining,
 	declaration: DenseKMeans,
 	state: DenseKMeansState,
@@ -8564,7 +9181,7 @@ fn checkpoint_kmeans(
 	})
 }
 
-fn checkpoint_tree(
+pub(crate) fn checkpoint_tree(
 	training: &CompiledTraining,
 	declaration: DenseTree,
 	state: DenseTreeState,
@@ -8586,7 +9203,7 @@ fn checkpoint_tree(
 	})
 }
 
-fn checkpoint_residual(
+pub(crate) fn checkpoint_residual(
 	training: &CompiledTraining,
 	declaration: &DenseResidual,
 	state: &DenseResidualState,
@@ -8667,6 +9284,7 @@ pub struct CompletedTrainingCheckpoint {
 }
 
 impl CompletedTrainingCheckpoint {
+	#[inline]
 	pub fn new(execution: CompletedTrainingExecution, mut manifest: CheckpointManifest) -> CheckpointResult<Self> {
 		manifest.native = Some(checkpoint_native_realization(
 			execution.native_kernels(),
@@ -8686,41 +9304,70 @@ impl CompletedTrainingCheckpoint {
 	}
 
 	#[must_use]
-	pub const fn run(&self) -> RunId { self.execution.run() }
+	#[inline]
+	pub const fn run(&self) -> RunId {
+		self.execution.run()
+	}
 
 	#[must_use]
-	pub const fn bundle(&self) -> BundleIdentity { self.execution.bundle() }
+	#[inline]
+	pub const fn bundle(&self) -> BundleIdentity {
+		self.execution.bundle()
+	}
 
 	#[must_use]
-	pub fn external_outputs(&self) -> &[ExitImage] { self.execution.external_outputs() }
+	#[inline]
+	pub fn external_outputs(&self) -> &[ExitImage] {
+		self.execution.external_outputs()
+	}
 
 	#[must_use]
-	pub fn metrics(&self) -> &[FinalTrainingMetric] { self.execution.metrics() }
+	#[inline]
+	pub fn metrics(&self) -> &[FinalTrainingMetric] {
+		self.execution.metrics()
+	}
 
 	#[must_use]
-	pub const fn native_kernels(&self) -> &RealizedNativeKernelSet { self.execution.native_kernels() }
+	#[inline]
+	pub const fn native_kernels(&self) -> &RealizedNativeKernelSet {
+		self.execution.native_kernels()
+	}
 
 	#[must_use]
+	#[inline]
 	pub const fn native_evidence(&self) -> &recipe_native_executor::NativeExecutionEvidence {
 		self.execution.native_evidence()
 	}
 
 	#[must_use]
-	pub const fn training_evidence(&self) -> &crate::TrainingExecutionEvidence { self.execution.training_evidence() }
+	#[inline]
+	pub const fn training_evidence(&self) -> &crate::TrainingExecutionEvidence {
+		self.execution.training_evidence()
+	}
 
 	#[must_use]
-	pub const fn journal(&self) -> &RunJournal { self.execution.journal() }
+	#[inline]
+	pub const fn journal(&self) -> &RunJournal {
+		self.execution.journal()
+	}
 
 	#[must_use]
-	pub const fn manifest(&self) -> &CheckpointManifest { &self.manifest }
+	#[inline]
+	pub const fn manifest(&self) -> &CheckpointManifest {
+		&self.manifest
+	}
 
 	#[must_use]
-	pub fn into_execution(self) -> CompletedTrainingExecution { self.execution }
+	#[inline]
+	pub fn into_execution(self) -> CompletedTrainingExecution {
+		self.execution
+	}
 
 	/// Persist the semantic model and tensor images represented by this snapshot
 	/// bit-for-bit. Native target, toolchain, program, and measured-system
 	/// identities authenticate an optional companion kernel, but native bytes are
 	/// never embedded in the OGDL model.
+	#[inline]
 	pub fn save(&self, path: impl AsRef<Path>) -> CheckpointResult<()> {
 		let path = path.as_ref();
 		let outputs = self.output_bytes();
@@ -8732,6 +9379,7 @@ impl CompletedTrainingCheckpoint {
 
 	/// Persist the exact native image that was built and loaded for the selected
 	/// backend. The bytes are not regenerated, wrapped, or serialized as OGDL.
+	#[inline]
 	pub fn save_native_kernel(&self, path: impl AsRef<Path>, format: NativeKernelFormat) -> CheckpointResult<()> {
 		let path = path.as_ref();
 		if path.extension().and_then(|extension| extension.to_str()) != Some(format.extension()) {
@@ -8781,13 +9429,11 @@ fn checkpoint_native_realization(
 	let kernels = realized
 		.kernels()
 		.iter()
-		.map(|kernel| {
-			CheckpointNativeKernel {
-				format: kernel.format(),
-				target: kernel.target().clone(),
-				toolchain: kernel.toolchain().clone(),
-				digest: kernel.digest(),
-			}
+		.map(|kernel| CheckpointNativeKernel {
+			format: kernel.format(),
+			target: kernel.target().clone(),
+			toolchain: kernel.toolchain().clone(),
+			digest: kernel.digest(),
 		})
 		.collect::<Vec<_>>();
 	if kernels.is_empty() {
@@ -8913,15 +9559,13 @@ fn declaration_artifact_from_manifest(manifest: &CheckpointManifest) -> Checkpoi
 		vectors: manifest
 			.vectors
 			.iter()
-			.map(|vector| {
-				CheckpointArtifactVector {
-					source_index: vector.source_index,
-					name: vector.name.clone(),
-					role: vector.role,
-					semantic_type: vector.semantic_type,
-					encoding: vector.encoding,
-					metadata: artifact_metadata(&vector.metadata),
-				}
+			.map(|vector| CheckpointArtifactVector {
+				source_index: vector.source_index,
+				name: vector.name.clone(),
+				role: vector.role,
+				semantic_type: vector.semantic_type,
+				encoding: vector.encoding,
+				metadata: artifact_metadata(&vector.metadata),
 			})
 			.collect(),
 		feature_spans: manifest.feature_spans.clone(),
@@ -9102,42 +9746,38 @@ fn declaration_block_image(block: &CheckpointBlock) -> CheckpointBlockImage {
 		CheckpointBlock::Pool(pool) => CheckpointBlockImage::Pool(*pool),
 		CheckpointBlock::KMeans(kmeans) => CheckpointBlockImage::KMeans(declaration_kmeans_image(kmeans)),
 		CheckpointBlock::Tree(tree) => CheckpointBlockImage::Tree(declaration_tree_image(tree)),
-		CheckpointBlock::Residual(residual) => {
-			CheckpointBlockImage::Residual(CheckpointResidualImage {
-				branch: residual
-					.branch
-					.iter()
-					.map(|step| {
-						match step {
-							CheckpointResidualBranch::Layer(layer) => {
-								CheckpointResidualBranchImage::Layer(declaration_layer_image(layer))
-							}
-							CheckpointResidualBranch::Operation(operation) => {
-								CheckpointResidualBranchImage::Operation(*operation)
-							}
-						}
-					})
-					.collect(),
-				branch_prelu: residual
-					.branch_prelu
-					.iter()
-					.map(declaration_parameter_image)
-					.collect(),
-				output_width: residual.output_width,
-				skip: match &residual.skip {
-					CheckpointResidualSkip::Identity => CheckpointResidualSkipImage::Identity,
-					CheckpointResidualSkip::Projection(projection) => {
-						CheckpointResidualSkipImage::Projection(declaration_parameter_image(projection))
+		CheckpointBlock::Residual(residual) => CheckpointBlockImage::Residual(CheckpointResidualImage {
+			branch: residual
+				.branch
+				.iter()
+				.map(|step| match step {
+					CheckpointResidualBranch::Layer(layer) => {
+						CheckpointResidualBranchImage::Layer(declaration_layer_image(layer))
 					}
-				},
-				operations: residual.operations.clone(),
-				prelu: residual
-					.prelu
-					.iter()
-					.map(declaration_parameter_image)
-					.collect(),
-			})
-		}
+					CheckpointResidualBranch::Operation(operation) => {
+						CheckpointResidualBranchImage::Operation(*operation)
+					}
+				})
+				.collect(),
+			branch_prelu: residual
+				.branch_prelu
+				.iter()
+				.map(declaration_parameter_image)
+				.collect(),
+			output_width: residual.output_width,
+			skip: match &residual.skip {
+				CheckpointResidualSkip::Identity => CheckpointResidualSkipImage::Identity,
+				CheckpointResidualSkip::Projection(projection) => {
+					CheckpointResidualSkipImage::Projection(declaration_parameter_image(projection))
+				}
+			},
+			operations: residual.operations.clone(),
+			prelu: residual
+				.prelu
+				.iter()
+				.map(declaration_parameter_image)
+				.collect(),
+		}),
 	}
 }
 
@@ -9167,15 +9807,13 @@ fn artifact_from_manifest(
 		vectors: manifest
 			.vectors
 			.iter()
-			.map(|vector| {
-				CheckpointArtifactVector {
-					source_index: vector.source_index,
-					name: vector.name.clone(),
-					role: vector.role,
-					semantic_type: vector.semantic_type,
-					encoding: vector.encoding,
-					metadata: artifact_metadata(&vector.metadata),
-				}
+			.map(|vector| CheckpointArtifactVector {
+				source_index: vector.source_index,
+				name: vector.name.clone(),
+				role: vector.role,
+				semantic_type: vector.semantic_type,
+				encoding: vector.encoding,
+				metadata: artifact_metadata(&vector.metadata),
 			})
 			.collect(),
 		feature_spans: manifest.feature_spans.clone(),
@@ -9349,14 +9987,12 @@ fn artifact_block(block: &CheckpointBlock, outputs: &BTreeMap<ValueId, &[u8]>) -
 			let branch = residual
 				.branch
 				.iter()
-				.map(|step| {
-					match step {
-						CheckpointResidualBranch::Layer(layer) => {
-							artifact_layer(layer, outputs).map(CheckpointResidualBranchImage::Layer)
-						}
-						CheckpointResidualBranch::Operation(operation) => {
-							Ok(CheckpointResidualBranchImage::Operation(*operation))
-						}
+				.map(|step| match step {
+					CheckpointResidualBranch::Layer(layer) => {
+						artifact_layer(layer, outputs).map(CheckpointResidualBranchImage::Layer)
+					}
+					CheckpointResidualBranch::Operation(operation) => {
+						Ok(CheckpointResidualBranchImage::Operation(*operation))
 					}
 				})
 				.collect::<io::Result<Vec<_>>>()?;
@@ -9389,41 +10025,31 @@ fn artifact_block(block: &CheckpointBlock, outputs: &BTreeMap<ValueId, &[u8]>) -
 fn artifact_metadata(metadata: &VectorMetadata) -> CheckpointArtifactMetadata {
 	match metadata {
 		VectorMetadata::None => CheckpointArtifactMetadata::None,
-		VectorMetadata::Temporal { origin } => {
-			CheckpointArtifactMetadata::Temporal {
-				unix_seconds: origin.unix_seconds,
-				nanoseconds: origin.nanoseconds,
-			}
-		}
-		VectorMetadata::Categorical { dictionary } => {
-			CheckpointArtifactMetadata::Categorical {
-				dictionary: dictionary.clone(),
-			}
-		}
-		VectorMetadata::Ordinal { ordered_labels } => {
-			CheckpointArtifactMetadata::Ordinal {
-				ordered_labels: ordered_labels.clone(),
-			}
-		}
-		VectorMetadata::Image { encoded_variants } => {
-			CheckpointArtifactMetadata::Image {
-				encoded_variants: encoded_variants
-					.iter()
-					.map(|variant| {
-						CheckpointImageMetadata {
-							format: variant.format(),
-							width: variant.width(),
-							height: variant.height(),
-							channels: variant.channels(),
-							color_model: variant.color_model(),
-							sample_bits: variant.sample_bits(),
-							value_layout: variant.value_layout(),
-							value_range: variant.value_range(),
-						}
-					})
-					.collect(),
-			}
-		}
+		VectorMetadata::Temporal { origin } => CheckpointArtifactMetadata::Temporal {
+			unix_seconds: origin.unix_seconds,
+			nanoseconds: origin.nanoseconds,
+		},
+		VectorMetadata::Categorical { dictionary } => CheckpointArtifactMetadata::Categorical {
+			dictionary: dictionary.clone(),
+		},
+		VectorMetadata::Ordinal { ordered_labels } => CheckpointArtifactMetadata::Ordinal {
+			ordered_labels: ordered_labels.clone(),
+		},
+		VectorMetadata::Image { encoded_variants } => CheckpointArtifactMetadata::Image {
+			encoded_variants: encoded_variants
+				.iter()
+				.map(|variant| CheckpointImageMetadata {
+					format: variant.format(),
+					width: variant.width(),
+					height: variant.height(),
+					channels: variant.channels(),
+					color_model: variant.color_model(),
+					sample_bits: variant.sample_bits(),
+					value_layout: variant.value_layout(),
+					value_range: variant.value_range(),
+				})
+				.collect(),
+		},
 	}
 }
 
@@ -10322,7 +10948,9 @@ const fn vector_encoding(encoding: VectorEncoding) -> &'static str {
 	}
 }
 
-const fn dense_activation(activation: DenseActivation) -> &'static str { activation.token() }
+const fn dense_activation(activation: DenseActivation) -> &'static str {
+	activation.token()
+}
 
 const fn dense_block_kind(kind: DenseBlockKind) -> &'static str {
 	match kind {
@@ -10397,7 +11025,9 @@ impl Write for CountingWriter {
 		Ok(bytes.len())
 	}
 
-	fn flush(&mut self) -> io::Result<()> { Ok(()) }
+	fn flush(&mut self) -> io::Result<()> {
+		Ok(())
+	}
 }
 
 pub(crate) fn atomic_save(
@@ -10472,27 +11102,21 @@ fn validate_target(target: &Path, parent: &Path) -> CheckpointResult<()> {
 		));
 	}
 	match fs::symlink_metadata(target) {
-		Ok(metadata) if metadata.file_type().is_symlink() => {
-			Err(CheckpointError::invalid_target(
-				target,
-				"existing target is a symbolic link",
-			))
-		}
-		Ok(metadata) if !metadata.is_file() => {
-			Err(CheckpointError::invalid_target(
-				target,
-				"existing target is not a regular file",
-			))
-		}
+		Ok(metadata) if metadata.file_type().is_symlink() => Err(CheckpointError::invalid_target(
+			target,
+			"existing target is a symbolic link",
+		)),
+		Ok(metadata) if !metadata.is_file() => Err(CheckpointError::invalid_target(
+			target,
+			"existing target is not a regular file",
+		)),
 		Ok(_) => Ok(()),
 		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-		Err(error) => {
-			Err(CheckpointError::io(
-				"inspect checkpoint target",
-				target,
-				error,
-			))
-		}
+		Err(error) => Err(CheckpointError::io(
+			"inspect checkpoint target",
+			target,
+			error,
+		)),
 	}
 }
 
@@ -10555,10 +11179,13 @@ fn create_private_temporary(target: &Path, parent: &Path) -> CheckpointResult<(F
 			.open(&temporary_path)
 		{
 			Ok(file) => {
-				return Ok((file, TemporaryGuard {
-					path: temporary_path,
-					armed: true,
-				}));
+				return Ok((
+					file,
+					TemporaryGuard {
+						path: temporary_path,
+						armed: true,
+					},
+				));
 			}
 			Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
 			Err(error) => {

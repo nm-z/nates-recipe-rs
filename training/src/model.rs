@@ -44,6 +44,7 @@ pub enum DenseActivation {
 }
 
 impl DenseActivation {
+	/// Return the stable declaration token for this activation.
 	pub(crate) const fn token(self) -> &'static str {
 		match self {
 			Self::Linear => "linear",
@@ -66,28 +67,6 @@ impl DenseActivation {
 		}
 	}
 
-	fn from_token(value: &str) -> Option<Self> {
-		Some(match value {
-			"linear" => Self::Linear,
-			"cosine" => Self::Cosine,
-			"exponential" => Self::Exponential,
-			"signed-logarithm" => Self::Logarithm,
-			"natural-logarithm" => Self::NaturalLogarithm,
-			"logarithm" => Self::LegacySignedLogOnePlus,
-			"huber" => Self::Huber,
-			"tangent" => Self::Tangent,
-			"relu" => Self::Relu,
-			"leaky-relu" => Self::LeakyRelu,
-			"sigmoid" => Self::Sigmoid,
-			"tanh" => Self::Tanh,
-			"selu" => Self::Selu,
-			"gelu" => Self::Gelu,
-			"silu" => Self::Silu,
-			"elu" => Self::Elu,
-			"prelu" => Self::PRelu,
-			_ => return None,
-		})
-	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +82,7 @@ pub enum DenseOperation {
 }
 
 impl DenseOperation {
+	/// Return the stable declaration token for this operation.
 	pub(crate) const fn token(self) -> &'static str {
 		match self {
 			Self::Activation(activation) => activation.token(),
@@ -111,11 +91,26 @@ impl DenseOperation {
 		}
 	}
 
+	/// Decode one exact declaration token.
 	pub(crate) fn from_token(value: &str) -> Option<Self> {
-		if let Some(activation) = DenseActivation::from_token(value) {
-			return Some(Self::Activation(activation));
-		}
 		Some(match value {
+			"linear" => Self::Activation(DenseActivation::Linear),
+			"cosine" => Self::Activation(DenseActivation::Cosine),
+			"exponential" => Self::Activation(DenseActivation::Exponential),
+			"signed-logarithm" => Self::Activation(DenseActivation::Logarithm),
+			"natural-logarithm" => Self::Activation(DenseActivation::NaturalLogarithm),
+			"logarithm" => Self::Activation(DenseActivation::LegacySignedLogOnePlus),
+			"huber" => Self::Activation(DenseActivation::Huber),
+			"tangent" => Self::Activation(DenseActivation::Tangent),
+			"relu" => Self::Activation(DenseActivation::Relu),
+			"leaky-relu" => Self::Activation(DenseActivation::LeakyRelu),
+			"sigmoid" => Self::Activation(DenseActivation::Sigmoid),
+			"tanh" => Self::Activation(DenseActivation::Tanh),
+			"selu" => Self::Activation(DenseActivation::Selu),
+			"gelu" => Self::Activation(DenseActivation::Gelu),
+			"silu" => Self::Activation(DenseActivation::Silu),
+			"elu" => Self::Activation(DenseActivation::Elu),
+			"prelu" => Self::Activation(DenseActivation::PRelu),
 			"layer-normalization" => Self::Normalization(DenseNormalization::Layer),
 			"batch-normalization" => Self::Normalization(DenseNormalization::Batch),
 			_ => return None,
@@ -169,12 +164,19 @@ pub enum TrainingHorizon {
 
 impl TrainingHorizon {
 	#[must_use]
-	pub const fn finite(epochs: NonZeroU64) -> Self { Self::Finite(epochs) }
+	#[inline]
+	pub const fn finite(epochs: NonZeroU64) -> Self {
+		Self::Finite(epochs)
+	}
 
 	#[must_use]
-	pub const fn unbounded() -> Self { Self::Unbounded }
+	#[inline]
+	pub const fn unbounded() -> Self {
+		Self::Unbounded
+	}
 
 	#[must_use]
+	#[inline]
 	pub const fn bound(self) -> Option<NonZeroU64> {
 		match self {
 			Self::Finite(epochs) => Some(epochs),
@@ -183,9 +185,13 @@ impl TrainingHorizon {
 	}
 
 	#[must_use]
-	pub const fn is_unbounded(self) -> bool { matches!(self, Self::Unbounded) }
+	#[inline]
+	pub const fn is_unbounded(self) -> bool {
+		matches!(self, Self::Unbounded)
+	}
 
 	#[must_use]
+	#[inline]
 	pub const fn loop_iterations(self) -> LoopIterations {
 		match self {
 			Self::Finite(epochs) => LoopIterations::Finite(epochs),
@@ -195,10 +201,14 @@ impl TrainingHorizon {
 }
 
 impl From<NonZeroU64> for TrainingHorizon {
-	fn from(epochs: NonZeroU64) -> Self { Self::Finite(epochs) }
+	#[inline]
+	fn from(epochs: NonZeroU64) -> Self {
+		Self::Finite(epochs)
+	}
 }
 
 impl fmt::Display for TrainingHorizon {
+	#[inline]
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Finite(epochs) => epochs.fmt(formatter),
@@ -209,13 +219,17 @@ impl fmt::Display for TrainingHorizon {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DenseLayer {
+	/// Concrete block kind retained for declaration compatibility.
 	kind: DenseBlockKind,
+	/// Number of output neurons produced by the layer.
 	width: NonZeroU64,
+	/// Ordered activation and normalization operations applied after projection.
 	operations: Vec<DenseOperation>,
 }
 
 impl DenseLayer {
 	#[must_use]
+	#[inline]
 	pub fn new(width: NonZeroU64, activation: DenseActivation) -> Self {
 		Self {
 			kind: DenseBlockKind::Layer,
@@ -228,11 +242,13 @@ impl DenseLayer {
 	}
 
 	#[must_use]
+	#[inline]
 	pub fn with_operations(width: NonZeroU64, operations: impl IntoIterator<Item = DenseOperation>) -> Self {
 		Self::with_kind(DenseBlockKind::Layer, width, operations)
 	}
 
 	#[must_use]
+	#[inline]
 	pub fn with_kind(
 		kind: DenseBlockKind,
 		width: NonZeroU64,
@@ -246,13 +262,22 @@ impl DenseLayer {
 	}
 
 	#[must_use]
-	pub const fn kind(&self) -> DenseBlockKind { self.kind }
+	#[inline]
+	pub const fn kind(&self) -> DenseBlockKind {
+		self.kind
+	}
 
 	#[must_use]
-	pub const fn width(&self) -> NonZeroU64 { self.width }
+	#[inline]
+	pub const fn width(&self) -> NonZeroU64 {
+		self.width
+	}
 
 	#[must_use]
-	pub fn operations(&self) -> &[DenseOperation] { &self.operations }
+	#[inline]
+	pub fn operations(&self) -> &[DenseOperation] {
+		&self.operations
+	}
 }
 
 /// One valid, stride-one one-dimensional convolution block.
@@ -262,13 +287,17 @@ impl DenseLayer {
 /// logical length while consuming every input channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DenseConvolution {
+	/// Number of output channels produced by the convolution.
 	filters: NonZeroU64,
+	/// Width of the stride-one convolution kernel.
 	kernel: NonZeroU64,
+	/// Ordered activation and normalization operations applied to the result.
 	operations: Vec<DenseOperation>,
 }
 
 impl DenseConvolution {
 	#[must_use]
+	#[inline]
 	pub fn new(filters: NonZeroU64, kernel: NonZeroU64, activation: DenseActivation) -> Self {
 		Self {
 			filters,
@@ -281,6 +310,7 @@ impl DenseConvolution {
 	}
 
 	#[must_use]
+	#[inline]
 	pub fn with_operations(
 		filters: NonZeroU64,
 		kernel: NonZeroU64,
@@ -294,27 +324,42 @@ impl DenseConvolution {
 	}
 
 	#[must_use]
-	pub const fn filters(&self) -> NonZeroU64 { self.filters }
+	#[inline]
+	pub const fn filters(&self) -> NonZeroU64 {
+		self.filters
+	}
 
 	#[must_use]
-	pub const fn kernel(&self) -> NonZeroU64 { self.kernel }
+	#[inline]
+	pub const fn kernel(&self) -> NonZeroU64 {
+		self.kernel
+	}
 
 	#[must_use]
-	pub fn operations(&self) -> &[DenseOperation] { &self.operations }
+	#[inline]
+	pub fn operations(&self) -> &[DenseOperation] {
+		&self.operations
+	}
 }
 
 /// Resolved logical shape of one convolution block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DenseConvolutionGeometry {
+	/// Logical element count along the input's spatial axis.
 	input_length: NonZeroU64,
+	/// Number of channels consumed at each input position.
 	input_channels: NonZeroU64,
+	/// Logical element count along the output's spatial axis.
 	output_length: NonZeroU64,
+	/// Number of output channels produced at each output position.
 	filters: NonZeroU64,
+	/// Number of adjacent input positions covered by each filter.
 	kernel: NonZeroU64,
 }
 
 impl DenseConvolutionGeometry {
 	#[must_use]
+	#[inline]
 	pub const fn new(
 		input_length: NonZeroU64,
 		input_channels: NonZeroU64,
@@ -332,21 +377,37 @@ impl DenseConvolutionGeometry {
 	}
 
 	#[must_use]
-	pub const fn input_length(self) -> NonZeroU64 { self.input_length }
+	#[inline]
+	pub const fn input_length(self) -> NonZeroU64 {
+		self.input_length
+	}
 
 	#[must_use]
-	pub const fn input_channels(self) -> NonZeroU64 { self.input_channels }
+	#[inline]
+	pub const fn input_channels(self) -> NonZeroU64 {
+		self.input_channels
+	}
 
 	#[must_use]
-	pub const fn output_length(self) -> NonZeroU64 { self.output_length }
+	#[inline]
+	pub const fn output_length(self) -> NonZeroU64 {
+		self.output_length
+	}
 
 	#[must_use]
-	pub const fn filters(self) -> NonZeroU64 { self.filters }
+	#[inline]
+	pub const fn filters(self) -> NonZeroU64 {
+		self.filters
+	}
 
 	#[must_use]
-	pub const fn kernel(self) -> NonZeroU64 { self.kernel }
+	#[inline]
+	pub const fn kernel(self) -> NonZeroU64 {
+		self.kernel
+	}
 
 	#[must_use]
+	#[inline]
 	pub fn input_width(self) -> Option<NonZeroU64> {
 		self.input_length
 			.get()
@@ -355,6 +416,7 @@ impl DenseConvolutionGeometry {
 	}
 
 	#[must_use]
+	#[inline]
 	pub fn output_width(self) -> Option<NonZeroU64> {
 		self.output_length
 			.get()
@@ -370,7 +432,9 @@ impl DenseConvolutionGeometry {
 /// weight-only linear projection from the block input to that width.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DenseResidual {
+	/// Ordered layers and free operations evaluated along the residual branch.
 	branch: Vec<DenseResidualOperation>,
+	/// Ordered operations applied after the branch and skip paths are merged.
 	operations: Vec<DenseOperation>,
 }
 
@@ -382,12 +446,15 @@ pub struct DenseResidual {
 /// facade is translated into the training IR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DensePool {
+	/// Number of adjacent positions reduced into each pooled value.
 	size: NonZeroU64,
+	/// Optional following-layer width that fixes grouped connection routing.
 	group_to_neuron: Option<NonZeroU64>,
 }
 
 impl DensePool {
 	#[must_use]
+	#[inline]
 	pub const fn new(size: NonZeroU64, group_to_neuron: Option<NonZeroU64>) -> Self {
 		Self {
 			size,
@@ -396,12 +463,19 @@ impl DensePool {
 	}
 
 	#[must_use]
-	pub const fn size(self) -> NonZeroU64 { self.size }
+	#[inline]
+	pub const fn size(self) -> NonZeroU64 {
+		self.size
+	}
 
 	#[must_use]
-	pub const fn group_to_neuron(self) -> Option<NonZeroU64> { self.group_to_neuron }
+	#[inline]
+	pub const fn group_to_neuron(self) -> Option<NonZeroU64> {
+		self.group_to_neuron
+	}
 
 	#[must_use]
+	#[inline]
 	pub fn routing(self, groups: NonZeroU64) -> Option<DenseGroupToNeuronRouting> {
 		self.group_to_neuron
 			.map(|neurons| DenseGroupToNeuronRouting::resolve(groups, neurons))
@@ -415,7 +489,9 @@ impl DensePool {
 /// divisible-or-fully-connected routing rule remains explicit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DenseKMeans {
+	/// Number of learned centroids and emitted distance channels.
 	clusters: NonZeroU64,
+	/// Optional following-layer width that fixes grouped connection routing.
 	group_to_neuron: Option<NonZeroU64>,
 }
 
@@ -426,12 +502,15 @@ pub struct DenseKMeans {
 /// maps each ID to `dimensions` binary32 channels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DenseEmbedding {
+	/// Number of learned binary32 channels emitted for each token.
 	dimensions: NonZeroU64,
+	/// Number of valid token IDs represented by the embedding table.
 	vocabulary: NonZeroU64,
 }
 
 impl DenseEmbedding {
 	#[must_use]
+	#[inline]
 	pub const fn new(dimensions: NonZeroU64, vocabulary: NonZeroU64) -> Self {
 		Self {
 			dimensions,
@@ -440,10 +519,16 @@ impl DenseEmbedding {
 	}
 
 	#[must_use]
-	pub const fn dimensions(self) -> NonZeroU64 { self.dimensions }
+	#[inline]
+	pub const fn dimensions(self) -> NonZeroU64 {
+		self.dimensions
+	}
 
 	#[must_use]
-	pub const fn vocabulary(self) -> NonZeroU64 { self.vocabulary }
+	#[inline]
+	pub const fn vocabulary(self) -> NonZeroU64 {
+		self.vocabulary
+	}
 }
 
 /// One causal multi-head self-attention block over the immediately preceding
@@ -454,15 +539,22 @@ impl DenseEmbedding {
 /// mask; no tokenizer, padding, or positional vector is implied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DenseAttention {
+	/// Number of independent attention heads sharing the embedding width.
 	heads: NonZeroU64,
 }
 
 impl DenseAttention {
 	#[must_use]
-	pub const fn new(heads: NonZeroU64) -> Self { Self { heads } }
+	#[inline]
+	pub const fn new(heads: NonZeroU64) -> Self {
+		Self { heads }
+	}
 
 	#[must_use]
-	pub const fn heads(self) -> NonZeroU64 { self.heads }
+	#[inline]
+	pub const fn heads(self) -> NonZeroU64 {
+		self.heads
+	}
 }
 
 /// One vanilla recurrent block over the numeric feature-column sequence.
@@ -472,15 +564,22 @@ impl DenseAttention {
 /// block returns only the final hidden state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DenseRnn {
+	/// Number of channels in the recurrent hidden state.
 	width: NonZeroU64,
 }
 
 impl DenseRnn {
 	#[must_use]
-	pub const fn new(width: NonZeroU64) -> Self { Self { width } }
+	#[inline]
+	pub const fn new(width: NonZeroU64) -> Self {
+		Self { width }
+	}
 
 	#[must_use]
-	pub const fn width(self) -> NonZeroU64 { self.width }
+	#[inline]
+	pub const fn width(self) -> NonZeroU64 {
+		self.width
+	}
 }
 
 /// One reset-before gated recurrent-unit block over the numeric
@@ -491,15 +590,22 @@ impl DenseRnn {
 /// hidden state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DenseGru {
+	/// Number of channels in the gated recurrent hidden state.
 	width: NonZeroU64,
 }
 
 impl DenseGru {
 	#[must_use]
-	pub const fn new(width: NonZeroU64) -> Self { Self { width } }
+	#[inline]
+	pub const fn new(width: NonZeroU64) -> Self {
+		Self { width }
+	}
 
 	#[must_use]
-	pub const fn width(self) -> NonZeroU64 { self.width }
+	#[inline]
+	pub const fn width(self) -> NonZeroU64 {
+		self.width
+	}
 }
 
 /// One gated long short-term memory block over the numeric feature-column
@@ -510,19 +616,27 @@ impl DenseGru {
 /// hidden state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DenseLstm {
+	/// Number of channels in both the hidden and cell states.
 	width: NonZeroU64,
 }
 
 impl DenseLstm {
 	#[must_use]
-	pub const fn new(width: NonZeroU64) -> Self { Self { width } }
+	#[inline]
+	pub const fn new(width: NonZeroU64) -> Self {
+		Self { width }
+	}
 
 	#[must_use]
-	pub const fn width(self) -> NonZeroU64 { self.width }
+	#[inline]
+	pub const fn width(self) -> NonZeroU64 {
+		self.width
+	}
 }
 
 impl DenseKMeans {
 	#[must_use]
+	#[inline]
 	pub const fn new(clusters: NonZeroU64, group_to_neuron: Option<NonZeroU64>) -> Self {
 		Self {
 			clusters,
@@ -531,12 +645,19 @@ impl DenseKMeans {
 	}
 
 	#[must_use]
-	pub const fn clusters(self) -> NonZeroU64 { self.clusters }
+	#[inline]
+	pub const fn clusters(self) -> NonZeroU64 {
+		self.clusters
+	}
 
 	#[must_use]
-	pub const fn group_to_neuron(self) -> Option<NonZeroU64> { self.group_to_neuron }
+	#[inline]
+	pub const fn group_to_neuron(self) -> Option<NonZeroU64> {
+		self.group_to_neuron
+	}
 
 	#[must_use]
+	#[inline]
 	pub fn routing(self) -> Option<DenseGroupToNeuronRouting> {
 		self.group_to_neuron
 			.map(|neurons| DenseGroupToNeuronRouting::resolve(self.clusters, neurons))
@@ -562,13 +683,17 @@ pub enum DenseTreeFamily {
 /// hidden estimator or boosting-round count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DenseTree {
+	/// Ensemble growth rule selected by the public booster declaration.
 	family: DenseTreeFamily,
+	/// Exact number of trees in the ensemble.
 	trees: NonZeroU64,
+	/// Exact decision depth of every tree.
 	depth: NonZeroU32,
 }
 
 impl DenseTree {
 	#[must_use]
+	#[inline]
 	pub const fn new(family: DenseTreeFamily, trees: NonZeroU64, depth: NonZeroU32) -> Self {
 		Self {
 			family,
@@ -578,13 +703,22 @@ impl DenseTree {
 	}
 
 	#[must_use]
-	pub const fn family(self) -> DenseTreeFamily { self.family }
+	#[inline]
+	pub const fn family(self) -> DenseTreeFamily {
+		self.family
+	}
 
 	#[must_use]
-	pub const fn trees(self) -> NonZeroU64 { self.trees }
+	#[inline]
+	pub const fn trees(self) -> NonZeroU64 {
+		self.trees
+	}
 
 	#[must_use]
-	pub const fn depth(self) -> NonZeroU32 { self.depth }
+	#[inline]
+	pub const fn depth(self) -> NonZeroU32 {
+		self.depth
+	}
 }
 
 /// Recipe's shared connection rule from reduced groups to a following dense
@@ -613,6 +747,7 @@ pub enum DenseGroupToNeuronRouting {
 
 impl DenseGroupToNeuronRouting {
 	#[must_use]
+	#[inline]
 	pub fn resolve(groups: NonZeroU64, neurons: NonZeroU64) -> Self {
 		let groups_value = groups.get();
 		let neurons_value = neurons.get();
@@ -654,15 +789,21 @@ pub enum DensePoolWinnerContract {
 /// Resolved, per-example logical shape retained for checkpoint validation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DensePoolState {
+	/// Logical element count along the pre-pool spatial axis.
 	input_length: NonZeroU64,
+	/// Number of channels retained independently by pooling.
 	channels: NonZeroU64,
+	/// Logical element count along the post-pool spatial axis.
 	output_length: NonZeroU64,
+	/// Stable mapping from logical groups and channels to flat storage.
 	group_order: DensePoolGroupOrder,
+	/// Stable rule selecting among equal maximum values.
 	winner_contract: DensePoolWinnerContract,
 }
 
 impl DensePoolState {
 	#[must_use]
+	#[inline]
 	pub const fn new(input_length: NonZeroU64, channels: NonZeroU64, output_length: NonZeroU64) -> Self {
 		Self {
 			input_length,
@@ -674,21 +815,37 @@ impl DensePoolState {
 	}
 
 	#[must_use]
-	pub const fn input_length(self) -> NonZeroU64 { self.input_length }
+	#[inline]
+	pub const fn input_length(self) -> NonZeroU64 {
+		self.input_length
+	}
 
 	#[must_use]
-	pub const fn channels(self) -> NonZeroU64 { self.channels }
+	#[inline]
+	pub const fn channels(self) -> NonZeroU64 {
+		self.channels
+	}
 
 	#[must_use]
-	pub const fn output_length(self) -> NonZeroU64 { self.output_length }
+	#[inline]
+	pub const fn output_length(self) -> NonZeroU64 {
+		self.output_length
+	}
 
 	#[must_use]
-	pub const fn group_order(self) -> DensePoolGroupOrder { self.group_order }
+	#[inline]
+	pub const fn group_order(self) -> DensePoolGroupOrder {
+		self.group_order
+	}
 
 	#[must_use]
-	pub const fn winner_contract(self) -> DensePoolWinnerContract { self.winner_contract }
+	#[inline]
+	pub const fn winner_contract(self) -> DensePoolWinnerContract {
+		self.winner_contract
+	}
 
 	#[must_use]
+	#[inline]
 	pub fn input_width(self) -> Option<NonZeroU64> {
 		self.input_length
 			.get()
@@ -697,6 +854,7 @@ impl DensePoolState {
 	}
 
 	#[must_use]
+	#[inline]
 	pub fn output_width(self) -> Option<NonZeroU64> {
 		self.output_length
 			.get()
@@ -705,11 +863,13 @@ impl DensePoolState {
 	}
 
 	#[must_use]
+	#[inline]
 	pub const fn logical_input_shape(self, rows: NonZeroU64) -> [u64; 3] {
 		[rows.get(), self.input_length.get(), self.channels.get()]
 	}
 
 	#[must_use]
+	#[inline]
 	pub const fn logical_output_shape(self, rows: NonZeroU64) -> [u64; 3] {
 		[rows.get(), self.output_length.get(), self.channels.get()]
 	}
@@ -723,17 +883,26 @@ pub enum DenseResidualOperation {
 }
 
 impl From<DenseLayer> for DenseResidualOperation {
-	fn from(layer: DenseLayer) -> Self { Self::Layer(layer) }
+	#[inline]
+	fn from(layer: DenseLayer) -> Self {
+		Self::Layer(layer)
+	}
 }
 
 impl From<DenseOperation> for DenseResidualOperation {
-	fn from(operation: DenseOperation) -> Self { Self::Operation(operation) }
+	#[inline]
+	fn from(operation: DenseOperation) -> Self {
+		Self::Operation(operation)
+	}
 }
 
 impl DenseResidual {
 	#[must_use]
+	#[inline]
 	pub fn new<T>(branch: impl IntoIterator<Item = T>, operations: impl IntoIterator<Item = DenseOperation>) -> Self
-	where T: Into<DenseResidualOperation> {
+	where
+		T: Into<DenseResidualOperation>,
+	{
 		Self {
 			branch: branch.into_iter().map(Into::into).collect(),
 			operations: operations.into_iter().collect(),
@@ -741,110 +910,153 @@ impl DenseResidual {
 	}
 
 	#[must_use]
-	pub fn branch(&self) -> &[DenseResidualOperation] { &self.branch }
+	#[inline]
+	pub fn branch(&self) -> &[DenseResidualOperation] {
+		&self.branch
+	}
 
 	#[must_use]
-	pub fn operations(&self) -> &[DenseOperation] { &self.operations }
+	#[inline]
+	pub fn operations(&self) -> &[DenseOperation] {
+		&self.operations
+	}
 
 	#[must_use]
+	#[inline]
 	pub fn output_width(&self) -> Option<NonZeroU64> {
-		self.branch.iter().rev().find_map(|operation| {
-			match operation {
+		self.branch
+			.iter()
+			.rev()
+			.find_map(|operation| match operation {
 				DenseResidualOperation::Layer(layer) => Some(layer.width()),
 				DenseResidualOperation::Operation(_) => None,
-			}
-		})
+			})
 	}
 }
 
-/// A topology-preserving dense training block.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DenseBlock {
-	Embedding(DenseEmbedding),
-	Attention(DenseAttention),
-	Rnn(DenseRnn),
-	Gru(DenseGru),
-	Lstm(DenseLstm),
-	Layer(DenseLayer),
-	Convolution(DenseConvolution),
-	Pool(DensePool),
-	KMeans(DenseKMeans),
-	Tree(DenseTree),
-	Residual(DenseResidual),
+/// One topology-preserving dense training block with lifecycle behavior owned
+/// by its concrete declaration type.
+pub struct DenseBlock(Box<dyn crate::compile::DeclaredBlock>);
+
+impl Clone for DenseBlock {
+	#[inline]
+	fn clone(&self) -> Self {
+		Self(self.0.clone_box())
+	}
+}
+
+impl core::fmt::Debug for DenseBlock {
+	#[inline]
+	fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		self.0.fmt(formatter)
+	}
 }
 
 impl DenseBlock {
-	#[must_use]
-	pub fn output_width(&self) -> Option<NonZeroU64> {
-		match self {
-			Self::Embedding(_) => None,
-			Self::Attention(_) => None,
-			Self::Rnn(rnn) => Some(rnn.width()),
-			Self::Gru(gru) => Some(gru.width()),
-			Self::Lstm(lstm) => Some(lstm.width()),
-			Self::Layer(layer) => Some(layer.width()),
-			Self::Convolution(_) => None,
-			Self::Pool(_) => None,
-			Self::KMeans(kmeans) => Some(kmeans.clusters()),
-			Self::Tree(_) => None,
-			Self::Residual(residual) => residual.output_width(),
-		}
+	pub(crate) fn declaration(&self) -> &dyn crate::compile::DeclaredBlock {
+		self.0.as_ref()
 	}
 
 	#[must_use]
+	#[inline]
+	pub fn output_width(&self) -> Option<NonZeroU64> {
+		self.0.output_width()
+	}
+
+	#[must_use]
+	#[inline]
 	pub fn output_operations(&self) -> &[DenseOperation] {
-		match self {
-			Self::Embedding(_) => &[],
-			Self::Attention(_) => &[],
-			Self::Rnn(_) => &[],
-			Self::Gru(_) => &[],
-			Self::Lstm(_) => &[],
-			Self::Layer(layer) => layer.operations(),
-			Self::Convolution(convolution) => convolution.operations(),
-			Self::Pool(_) | Self::KMeans(_) | Self::Tree(_) => &[],
-			Self::Residual(residual) => residual.operations(),
-		}
+		self.0.output_operations()
+	}
+
+	#[must_use]
+	#[inline]
+	pub fn layer(&self) -> Option<&DenseLayer> {
+		self.0.legacy_layer()
+	}
+
+	#[must_use]
+	#[inline]
+	pub fn embedding(&self) -> Option<DenseEmbedding> {
+		self.0.leading_embedding()
 	}
 }
 
 impl From<DenseEmbedding> for DenseBlock {
-	fn from(embedding: DenseEmbedding) -> Self { Self::Embedding(embedding) }
+	#[inline]
+	fn from(embedding: DenseEmbedding) -> Self {
+		Self(Box::new(embedding))
+	}
 }
 
 impl From<DenseAttention> for DenseBlock {
-	fn from(attention: DenseAttention) -> Self { Self::Attention(attention) }
+	#[inline]
+	fn from(attention: DenseAttention) -> Self {
+		Self(Box::new(attention))
+	}
 }
 
 impl From<DenseRnn> for DenseBlock {
-	fn from(rnn: DenseRnn) -> Self { Self::Rnn(rnn) }
+	#[inline]
+	fn from(rnn: DenseRnn) -> Self {
+		Self(Box::new(rnn))
+	}
 }
 
 impl From<DenseGru> for DenseBlock {
-	fn from(gru: DenseGru) -> Self { Self::Gru(gru) }
+	#[inline]
+	fn from(gru: DenseGru) -> Self {
+		Self(Box::new(gru))
+	}
 }
 
 impl From<DenseLstm> for DenseBlock {
-	fn from(lstm: DenseLstm) -> Self { Self::Lstm(lstm) }
+	#[inline]
+	fn from(lstm: DenseLstm) -> Self {
+		Self(Box::new(lstm))
+	}
 }
 
 impl From<DenseLayer> for DenseBlock {
-	fn from(layer: DenseLayer) -> Self { Self::Layer(layer) }
+	#[inline]
+	fn from(layer: DenseLayer) -> Self {
+		Self(Box::new(layer))
+	}
 }
 
 impl From<DensePool> for DenseBlock {
-	fn from(pool: DensePool) -> Self { Self::Pool(pool) }
+	#[inline]
+	fn from(pool: DensePool) -> Self {
+		Self(Box::new(pool))
+	}
 }
 
 impl From<DenseKMeans> for DenseBlock {
-	fn from(kmeans: DenseKMeans) -> Self { Self::KMeans(kmeans) }
+	#[inline]
+	fn from(kmeans: DenseKMeans) -> Self {
+		Self(Box::new(kmeans))
+	}
 }
 
 impl From<DenseConvolution> for DenseBlock {
-	fn from(convolution: DenseConvolution) -> Self { Self::Convolution(convolution) }
+	#[inline]
+	fn from(convolution: DenseConvolution) -> Self {
+		Self(Box::new(convolution))
+	}
 }
 
 impl From<DenseTree> for DenseBlock {
-	fn from(tree: DenseTree) -> Self { Self::Tree(tree) }
+	#[inline]
+	fn from(tree: DenseTree) -> Self {
+		Self(Box::new(tree))
+	}
+}
+
+impl From<DenseResidual> for DenseBlock {
+	#[inline]
+	fn from(residual: DenseResidual) -> Self {
+		Self(Box::new(residual))
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -882,6 +1094,7 @@ pub enum DenseTask {
 
 impl DenseTask {
 	#[must_use]
+	#[inline]
 	pub const fn target_vector(self) -> usize {
 		match self {
 			Self::BinaryClassification { target_vector, .. }
@@ -903,6 +1116,7 @@ impl DenseTask {
 	}
 
 	#[must_use]
+	#[inline]
 	pub const fn target_count(self) -> usize {
 		match self {
 			Self::BinaryClassification { .. }
@@ -915,6 +1129,7 @@ impl DenseTask {
 	}
 
 	#[must_use]
+	#[inline]
 	pub const fn uses_target_matrix(self) -> bool {
 		matches!(
 			self,
@@ -925,6 +1140,7 @@ impl DenseTask {
 	}
 
 	#[must_use]
+	#[inline]
 	pub const fn output_width(self) -> usize {
 		match self {
 			Self::BinaryClassification { .. } | Self::ScalarRegression { .. } => 1,
@@ -938,11 +1154,14 @@ impl DenseTask {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DenseOutputAdapter {
+	/// Width produced by the final declared block.
 	source_width: NonZeroU64,
+	/// Width required by the selected training target.
 	target_width: NonZeroU64,
 }
 
 impl DenseOutputAdapter {
+	/// Create an adapter contract between exact source and target widths.
 	pub(crate) const fn new(source_width: NonZeroU64, target_width: NonZeroU64) -> Self {
 		Self {
 			source_width,
@@ -951,10 +1170,16 @@ impl DenseOutputAdapter {
 	}
 
 	#[must_use]
-	pub const fn source_width(self) -> NonZeroU64 { self.source_width }
+	#[inline]
+	pub const fn source_width(self) -> NonZeroU64 {
+		self.source_width
+	}
 
 	#[must_use]
-	pub const fn target_width(self) -> NonZeroU64 { self.target_width }
+	#[inline]
+	pub const fn target_width(self) -> NonZeroU64 {
+		self.target_width
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -968,13 +1193,18 @@ pub enum DenseFeatureLowering {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompiledFeatureSpan {
+	/// Source-vector position in the prepared dataset.
 	source_vector: usize,
+	/// First column occupied in the lowered dense feature matrix.
 	start: usize,
+	/// Number of lowered dense columns occupied by this feature.
 	width: usize,
+	/// Semantic conversion used to populate the span.
 	lowering: DenseFeatureLowering,
 }
 
 impl CompiledFeatureSpan {
+	/// Create one exact mapping from a prepared vector into dense columns.
 	pub(crate) const fn new(
 		source_vector: usize,
 		start: usize,
@@ -990,29 +1220,48 @@ impl CompiledFeatureSpan {
 	}
 
 	#[must_use]
-	pub const fn source_vector(&self) -> usize { self.source_vector }
+	#[inline]
+	pub const fn source_vector(&self) -> usize {
+		self.source_vector
+	}
 
 	#[must_use]
-	pub const fn start(&self) -> usize { self.start }
+	#[inline]
+	pub const fn start(&self) -> usize {
+		self.start
+	}
 
 	#[must_use]
-	pub const fn width(&self) -> usize { self.width }
+	#[inline]
+	pub const fn width(&self) -> usize {
+		self.width
+	}
 
 	#[must_use]
-	pub const fn lowering(&self) -> DenseFeatureLowering { self.lowering }
+	#[inline]
+	pub const fn lowering(&self) -> DenseFeatureLowering {
+		self.lowering
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompiledDatasetSchema {
+	/// Row-free schemas for every prepared vector in source order.
 	vectors: Vec<VectorSchema>,
+	/// Dense column spans for feature vectors in feature order.
 	features: Vec<CompiledFeatureSpan>,
+	/// Source-vector positions of targets in declared target order.
 	targets: Vec<usize>,
+	/// Calculation dtypes of targets in declared target order.
 	target_dtypes: Vec<DType>,
+	/// Total number of columns in the lowered dense feature matrix.
 	input_width: usize,
+	/// Training task whose target shape and semantics were compiled.
 	task: DenseTask,
 }
 
 impl CompiledDatasetSchema {
+	/// Compile an immutable row-free schema from prepared dataset metadata.
 	pub(crate) fn from_prepared(
 		dataset: &PreparedDataset,
 		task: DenseTask,
@@ -1070,36 +1319,63 @@ impl CompiledDatasetSchema {
 	}
 
 	#[must_use]
-	pub fn vectors(&self) -> &[VectorSchema] { &self.vectors }
+	#[inline]
+	pub fn vectors(&self) -> &[VectorSchema] {
+		&self.vectors
+	}
 
 	#[must_use]
-	pub fn features(&self) -> &[CompiledFeatureSpan] { &self.features }
+	#[inline]
+	pub fn features(&self) -> &[CompiledFeatureSpan] {
+		&self.features
+	}
 
 	#[must_use]
-	pub fn target(&self) -> usize { self.targets[0] }
+	#[inline]
+	pub fn target(&self) -> usize {
+		self.targets[0]
+	}
 
 	/// Target source identities in the user's declaration order.
 	#[must_use]
-	pub fn targets(&self) -> &[usize] { &self.targets }
+	#[inline]
+	pub fn targets(&self) -> &[usize] {
+		&self.targets
+	}
 
 	/// Smallest fixed-width dtype selected by semantic distillation for the
 	/// target vector. Loss calculations may consume an explicit conversion,
 	/// but this source contract never changes.
 	#[must_use]
-	pub fn target_dtype(&self) -> DType { self.target_dtypes[0] }
+	#[inline]
+	pub fn target_dtype(&self) -> DType {
+		self.target_dtypes[0]
+	}
 
 	/// Calculation-facing source dtypes in declared-target order.
 	#[must_use]
-	pub fn target_dtypes(&self) -> &[DType] { &self.target_dtypes }
+	#[inline]
+	pub fn target_dtypes(&self) -> &[DType] {
+		&self.target_dtypes
+	}
 
 	#[must_use]
-	pub const fn input_width(&self) -> usize { self.input_width }
+	#[inline]
+	pub const fn input_width(&self) -> usize {
+		self.input_width
+	}
 
 	#[must_use]
-	pub const fn task(&self) -> DenseTask { self.task }
+	#[inline]
+	pub const fn task(&self) -> DenseTask {
+		self.task
+	}
 
 	#[must_use]
-	pub const fn output_width(&self) -> usize { self.task.output_width() }
+	#[inline]
+	pub const fn output_width(&self) -> usize {
+		self.task.output_width()
+	}
 
 	/// Decode one multiclass output index under the fitted target dictionary.
 	///
@@ -1107,6 +1383,7 @@ impl CompiledDatasetSchema {
 	/// absent from the fit partition. An out-of-range index, or a non-multiclass
 	/// schema, has no categorical decoding.
 	#[must_use]
+	#[inline]
 	pub fn decode_multiclass_class(&self, class: usize) -> Option<DecodedMulticlassClass<'_>> {
 		let DenseTask::MulticlassClassification {
 			target_vector,
@@ -1143,13 +1420,18 @@ pub enum DecodedMulticlassClass<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Exact dense-column plan derived from prepared feature schemas.
 pub(crate) struct DenseFeaturePlan {
+	/// Lowered span assigned to each feature vector in feature order.
 	spans: Vec<CompiledFeatureSpan>,
+	/// Total number of columns produced for one prepared row.
 	input_width: usize,
+	/// Per-column binary32 normalization mask when categorical spans are present.
 	normalization_mask: Option<Vec<u32>>,
 }
 
 impl DenseFeaturePlan {
+	/// Derive feature spans and normalization policy from prepared metadata.
 	pub(crate) fn from_prepared(dataset: &PreparedDataset) -> TrainingCompileResult<Self> {
 		let mut spans = Vec::new();
 		let mut normalization_mask = Vec::new();
@@ -1179,7 +1461,19 @@ impl DenseFeaturePlan {
 					VectorMetadata::Categorical { dictionary },
 					PreparedValues::I32(_),
 				) => {
-					validate_categorical_dictionary(feature.name(), dictionary)?;
+					let mut labels = alloc::collections::BTreeSet::new();
+					if dictionary
+						.iter()
+						.any(|label| label.is_empty() || !labels.insert(label))
+					{
+						return Err(TrainingCompileError::new(
+							TrainingCompileErrorKind::InvalidFeatureMatrix,
+							format!(
+								"categorical feature {:?} has an empty or duplicate dictionary label",
+								String::from_utf8_lossy(feature.name())
+							),
+						));
+					}
 					has_categorical = true;
 					let reserved_index = dictionary.len();
 					(
@@ -1239,27 +1533,67 @@ impl DenseFeaturePlan {
 		})
 	}
 
+	/// Return compiled spans in feature-vector order.
 	#[must_use]
-	pub(crate) fn spans(&self) -> &[CompiledFeatureSpan] { &self.spans }
+	pub(crate) fn spans(&self) -> &[CompiledFeatureSpan] {
+		&self.spans
+	}
 
+	/// Return the optional per-column normalization mask.
 	#[must_use]
-	pub(crate) fn normalization_mask(&self) -> Option<&[u32]> { self.normalization_mask.as_deref() }
+	pub(crate) fn normalization_mask(&self) -> Option<&[u32]> {
+		self.normalization_mask.as_deref()
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// One validated dense feature and target partition with row supervision state.
 pub(crate) struct DensePartition {
+	/// Lowered feature matrix for retained partition rows.
 	features: DenseMatrix,
+	/// Lowered target matrix aligned with the feature rows.
 	targets: DenseMatrix,
+	/// Supervision classification for each target row.
 	target_observations: Vec<TargetObservation>,
 }
 
 impl DensePartition {
+	/// Validate and assemble aligned feature, target, and supervision storage.
 	fn new(
 		features: DenseMatrix,
 		targets: DenseMatrix,
 		target_observations: Vec<TargetObservation>,
 	) -> TrainingCompileResult<Self> {
-		validate_partition(&features, &targets)?;
+		if features.rows() == 0 {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::EmptyDataset,
+				"dense training partition has no rows",
+			));
+		}
+		if features.columns() == 0 {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidFeatureMatrix,
+				"dense feature matrix has no columns",
+			));
+		}
+		if features.rows() != targets.rows() {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InconsistentRows,
+				format!(
+					"feature matrix has {} rows, target matrix has {}",
+					features.rows(),
+					targets.rows()
+				),
+			));
+		}
+		if targets.columns() == 0 {
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidTargetMatrix,
+				"dense training partition has no target columns",
+			));
+		}
+		validate_matrix_storage(&features, "feature")?;
+		validate_matrix_storage(&targets, "target")?;
 		if target_observations.len() != targets.rows() {
 			return Err(TrainingCompileError::new(
 				TrainingCompileErrorKind::InconsistentRows,
@@ -1277,18 +1611,31 @@ impl DensePartition {
 		})
 	}
 
+	/// Return the lowered feature matrix.
 	#[must_use]
-	pub const fn features(&self) -> &DenseMatrix { &self.features }
+	pub const fn features(&self) -> &DenseMatrix {
+		&self.features
+	}
 
+	/// Return the lowered target matrix.
 	#[must_use]
-	pub const fn targets(&self) -> &DenseMatrix { &self.targets }
+	pub const fn targets(&self) -> &DenseMatrix {
+		&self.targets
+	}
 
+	/// Return the number of aligned rows.
 	#[must_use]
-	pub const fn rows(&self) -> usize { self.features.rows() }
+	pub const fn rows(&self) -> usize {
+		self.features.rows()
+	}
 
+	/// Return the number of lowered feature columns.
 	#[must_use]
-	pub const fn feature_columns(&self) -> usize { self.features.columns() }
+	pub const fn feature_columns(&self) -> usize {
+		self.features.columns()
+	}
 
+	/// Report whether every target row is supervised.
 	#[must_use]
 	pub fn all_targets_known(&self) -> bool {
 		self.target_observations
@@ -1296,10 +1643,12 @@ impl DensePartition {
 			.all(|observation| *observation == TargetObservation::Known)
 	}
 
+	/// Return the number of optimizer updates accepted for this partition per epoch.
 	pub(crate) fn accepted_updates_per_epoch(&self) -> usize {
 		usize::from(self.target_observations.contains(&TargetObservation::Known))
 	}
 
+	/// Build the binary32 per-row supervision mask consumed by training.
 	pub(crate) fn target_supervision(&self) -> DenseMatrix {
 		DenseMatrix::F32Bits {
 			rows: self.rows(),
@@ -1307,16 +1656,15 @@ impl DensePartition {
 			values: self
 				.target_observations
 				.iter()
-				.map(|observation| {
-					match observation {
-						TargetObservation::Known => 1.0_f32.to_bits(),
-						TargetObservation::Missing | TargetObservation::Unseen => 0.0_f32.to_bits(),
-					}
+				.map(|observation| match observation {
+					TargetObservation::Known => 1.0f32.to_bits(),
+					TargetObservation::Missing | TargetObservation::Unseen => 0.0f32.to_bits(),
 				})
 				.collect(),
 		}
 	}
 
+	/// Retain only supervised rows, or return no partition when none are known.
 	fn known_only(self) -> TrainingCompileResult<Option<Self>> {
 		if self.all_targets_known() {
 			return Ok(Some(self));
@@ -1332,10 +1680,11 @@ impl DensePartition {
 		}
 		let features = compact_dense_rows(&self.features, &retained_rows, "validation feature")?;
 		let targets = compact_dense_rows(&self.targets, &retained_rows, "validation target")?;
-		Self::new(features, targets, vec![
-			TargetObservation::Known;
-			retained_rows.len()
-		])
+		Self::new(
+			features,
+			targets,
+			vec![TargetObservation::Known; retained_rows.len()],
+		)
 		.map(Some)
 	}
 }
@@ -1343,49 +1692,36 @@ impl DensePartition {
 /// Whether one prepared target value is supervised by the declared task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TargetObservation {
+	/// A source value exists and participates in supervision.
 	Known,
+	/// The prepared source row contains no target value.
 	Missing,
+	/// The source value is the reserved unseen-category route.
 	Unseen,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Lowered target storage paired with one supervision state per row.
 struct LoweredDenseTargets {
+	/// Dense target matrix in retained partition order.
 	matrix: DenseMatrix,
+	/// Observation state aligned one-to-one with matrix rows.
 	observations: Vec<TargetObservation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Fully lowered training and optional validation partitions.
 pub(crate) struct LoweredDenseDataset {
+	/// Training partition containing every retained training row.
 	train: DensePartition,
+	/// Validation partition restricted to rows with known targets.
 	validation: Option<DensePartition>,
+	/// Number of prepared validation rows before unknown targets are removed.
 	validation_split_rows: usize,
 }
 
 impl LoweredDenseDataset {
-	fn new(
-		train: DensePartition,
-		validation: Option<DensePartition>,
-		validation_split_rows: usize,
-	) -> TrainingCompileResult<Self> {
-		if let Some(validation) = &validation
-			&& validation.feature_columns() != train.feature_columns()
-		{
-			return Err(TrainingCompileError::new(
-				TrainingCompileErrorKind::InvalidFeatureMatrix,
-				format!(
-					"validation has {} feature columns, training has {}",
-					validation.feature_columns(),
-					train.feature_columns()
-				),
-			));
-		}
-		Ok(Self {
-			train,
-			validation,
-			validation_split_rows,
-		})
-	}
-
+	/// Lower prepared dataset partitions according to one feature plan and task.
 	pub(crate) fn from_prepared(
 		dataset: &PreparedDataset,
 		feature_plan: &DenseFeaturePlan,
@@ -1409,19 +1745,49 @@ impl LoweredDenseDataset {
 			)?
 			.known_only()?
 		};
-		Self::new(train, validation, validation_split_rows)
+		if let Some(validation) = &validation
+			&& validation.feature_columns() != train.feature_columns()
+		{
+			return Err(TrainingCompileError::new(
+				TrainingCompileErrorKind::InvalidFeatureMatrix,
+				format!(
+					"validation has {} feature columns, training has {}",
+					validation.feature_columns(),
+					train.feature_columns()
+				),
+			));
+		}
+		Ok(Self {
+			train,
+			validation,
+			validation_split_rows,
+		})
 	}
 
+	/// Return the lowered training partition.
 	#[must_use]
-	pub const fn train(&self) -> &DensePartition { &self.train }
+	pub const fn train(&self) -> &DensePartition {
+		&self.train
+	}
 
+	/// Return the supervised validation partition when one remains.
 	#[must_use]
-	pub const fn validation(&self) -> Option<&DensePartition> { self.validation.as_ref() }
+	pub const fn validation(&self) -> Option<&DensePartition> {
+		self.validation.as_ref()
+	}
 
+	/// Return the original prepared validation split size.
 	#[must_use]
-	pub const fn validation_split_rows(&self) -> usize { self.validation_split_rows }
+	pub const fn validation_split_rows(&self) -> usize {
+		self.validation_split_rows
+	}
 }
 
+/// Lower the selected task targets for one prepared partition.
+///
+/// # Errors
+///
+/// Returns an error when target metadata, storage, values, or task semantics are inconsistent.
 fn lower_dense_targets(
 	dataset: &PreparedDataset,
 	task: DenseTask,
@@ -1490,7 +1856,27 @@ fn lower_dense_targets(
 				let value = values.get(retained_position).ok_or_else(|| {
 					target_lowering_error(target.name(), source_row, "target value is absent")
 				})?;
-				let (bits, observation) = lower_f32_target(target.name(), task, *value, source_row)?;
+				let (bits, observation) = match value {
+					Some(bits) => {
+						let value = f32::from_bits(*bits);
+						if !value.is_finite() {
+							return Err(target_lowering_error(
+								target.name(),
+								source_row,
+								format!("target contains non-finite f32 bits {bits:#010x}"),
+							));
+						}
+						if matches!(task, DenseTask::BinaryClassification { .. }) && value != 0.0 && value != 1.0 {
+							return Err(target_lowering_error(
+								target.name(),
+								source_row,
+								format!("binary target matrix contains {value}; only exact zero and one are accepted"),
+							));
+						}
+						(*bits, TargetObservation::Known)
+					}
+					None => (0.0f32.to_bits(), TargetObservation::Missing),
+				};
 				lowered.push(bits);
 				observations.push(observation);
 			}
@@ -1503,16 +1889,19 @@ fn lower_dense_targets(
 				observations,
 			})
 		}
-		PreparedValues::VariableWidth(_) => {
-			Err(target_lowering_error(
-				target.name(),
-				0,
-				"dense target cannot use variable-width storage",
-			))
-		}
+		PreparedValues::VariableWidth(_) => Err(target_lowering_error(
+			target.name(),
+			0,
+			"dense target cannot use variable-width storage",
+		)),
 	}
 }
 
+/// Lower an ordered multi-target task into one binary32 matrix.
+///
+/// # Errors
+///
+/// Returns an error when target order, row storage, or target values violate the declared task.
 fn lower_multi_dense_targets(
 	dataset: &PreparedDataset,
 	task: DenseTask,
@@ -1613,13 +2002,13 @@ fn lower_multi_dense_targets(
 				}
 				None => {
 					row_known = false;
-					lowered.push(0.0_f32.to_bits());
+					lowered.push(0.0f32.to_bits());
 				}
 			}
 		}
 		let row = &mut lowered[row_start..];
 		if !row_known {
-			row.fill(0.0_f32.to_bits());
+			row.fill(0.0f32.to_bits());
 			observations.push(TargetObservation::Missing);
 			continue;
 		}
@@ -1642,11 +2031,13 @@ fn lower_multi_dense_targets(
 				}
 			}
 			DenseTask::JointMulticlassClassification { .. } => {
-				let mut ones = 0_usize;
+				let mut ones = 0usize;
 				for (column, value) in row.iter().copied().map(f32::from_bits).enumerate() {
 					if value == 1.0 {
 						ones += 1;
-					} else if value != 0.0 {
+						continue;
+					}
+					if value != 0.0 {
 						return Err(target_lowering_error(
 							targets[column].name(),
 							source_row,
@@ -1688,6 +2079,11 @@ fn lower_multi_dense_targets(
 	})
 }
 
+/// Lower one optional int32 target and classify its supervision state.
+///
+/// # Errors
+///
+/// Returns an error when the encoded value is incompatible with the selected task.
 fn lower_i32_target(
 	target: &recipe_ingest::PreparedVector,
 	task: DenseTask,
@@ -1791,42 +2187,18 @@ fn lower_i32_target(
 		}
 		DenseTask::MultiTargetBinaryClassification { .. }
 		| DenseTask::JointMulticlassClassification { .. }
-		| DenseTask::MultiTargetRegression { .. } => {
-			Err(TrainingCompileError::new(
-				TrainingCompileErrorKind::InvalidTargetMatrix,
-				"multi-target task reached singular int32 target lowering",
-			))
-		}
+		| DenseTask::MultiTargetRegression { .. } => Err(TrainingCompileError::new(
+			TrainingCompileErrorKind::InvalidTargetMatrix,
+			"multi-target task reached singular int32 target lowering",
+		)),
 	}
 }
 
-fn lower_f32_target(
-	name: &[u8],
-	task: DenseTask,
-	bits: Option<u32>,
-	source_row: usize,
-) -> TrainingCompileResult<(u32, TargetObservation)> {
-	let Some(bits) = bits else {
-		return Ok((0.0_f32.to_bits(), TargetObservation::Missing));
-	};
-	let value = f32::from_bits(bits);
-	if !value.is_finite() {
-		return Err(target_lowering_error(
-			name,
-			source_row,
-			format!("target contains non-finite f32 bits {bits:#010x}"),
-		));
-	}
-	if matches!(task, DenseTask::BinaryClassification { .. }) && value != 0.0 && value != 1.0 {
-		return Err(target_lowering_error(
-			name,
-			source_row,
-			format!("binary target matrix contains {value}; only exact zero and one are accepted"),
-		));
-	}
-	Ok((bits, TargetObservation::Known))
-}
-
+/// Copy selected source rows into a compact dense matrix in the requested order.
+///
+/// # Errors
+///
+/// Returns an error when matrix dimensions overflow or a requested row is outside storage.
 fn compact_dense_rows(matrix: &DenseMatrix, rows: &[usize], role: &str) -> TrainingCompileResult<DenseMatrix> {
 	let columns = matrix.columns();
 	let capacity = rows.len().checked_mul(columns).ok_or_else(|| {
@@ -1895,6 +2267,7 @@ fn compact_dense_rows(matrix: &DenseMatrix, rows: &[usize], role: &str) -> Train
 	}
 }
 
+/// Attach target identity and source-row context to a lowering failure.
 fn target_lowering_error(name: &[u8], source_row: usize, detail: impl core::fmt::Display) -> TrainingCompileError {
 	TrainingCompileError::new(
 		TrainingCompileErrorKind::InvalidTargetMatrix,
@@ -1905,6 +2278,11 @@ fn target_lowering_error(name: &[u8], source_row: usize, detail: impl core::fmt:
 	)
 }
 
+/// Lower one prepared partition into the exact dense feature layout.
+///
+/// # Errors
+///
+/// Returns an error when prepared feature storage no longer matches the compiled feature plan.
 pub(crate) fn lower_dense_features(
 	dataset: &PreparedDataset,
 	plan: &DenseFeaturePlan,
@@ -1953,11 +2331,53 @@ pub(crate) fn lower_dense_features(
 			}
 			match span.lowering {
 				DenseFeatureLowering::NumericScalar => {
-					output.push(lower_numeric_feature(
-						feature,
-						retained_position,
-						source_row,
-					)?);
+					let bits = match feature.values() {
+						PreparedValues::I32(values) => {
+							let value = values
+								.get(retained_position)
+								.ok_or_else(|| {
+									feature_lowering_error(
+										feature.name(),
+										source_row,
+										"numeric value is absent from the prepared vector",
+									)
+								})?
+								.ok_or_else(|| {
+									feature_lowering_error(feature.name(), source_row, "numeric value is missing")
+								})?;
+							let converted = value as f32;
+							if f64::from(converted) != f64::from(value) {
+								return Err(feature_lowering_error(
+									feature.name(),
+									source_row,
+									format!(
+										"int32 value {value} cannot be represented exactly by dense f32 calculation"
+									),
+								));
+							}
+							converted.to_bits()
+						}
+						PreparedValues::F32Bits(values) => values
+							.get(retained_position)
+							.ok_or_else(|| {
+								feature_lowering_error(
+									feature.name(),
+									source_row,
+									"numeric value is absent from the prepared vector",
+								)
+							})?
+							.ok_or_else(|| {
+								feature_lowering_error(feature.name(), source_row, "numeric value is missing")
+							})?,
+						PreparedValues::VariableWidth(_) => {
+							return Err(feature_lowering_error(
+								feature.name(),
+								source_row,
+								"numeric feature unexpectedly contains variable-width values",
+							));
+						}
+					};
+					output.push(bits);
 				}
 				DenseFeatureLowering::CategoricalOneHot {
 					dictionary_width,
@@ -1993,7 +2413,23 @@ pub(crate) fn lower_dense_features(
 					}
 					let category = match code {
 						Some(code) => {
-							categorical_code_index(*code, dictionary_width, feature.name(), source_row)?
+							let category = usize::try_from(*code).map_err(|_| {
+								feature_lowering_error(
+									feature.name(),
+									source_row,
+									format!("negative category code {code} violates dictionary encoding"),
+								)
+							})?;
+							if category > dictionary_width {
+								return Err(feature_lowering_error(
+									feature.name(),
+									source_row,
+									format!(
+										"category code {code} exceeds dictionary and reserved index {dictionary_width}"
+									),
+								));
+							}
+							category
 						}
 						None => reserved_index,
 					};
@@ -2011,97 +2447,7 @@ pub(crate) fn lower_dense_features(
 	})
 }
 
-fn lower_numeric_feature(
-	feature: &recipe_ingest::PreparedVector,
-	retained_position: usize,
-	source_row: usize,
-) -> TrainingCompileResult<u32> {
-	match feature.values() {
-		PreparedValues::I32(values) => {
-			let value = values
-				.get(retained_position)
-				.ok_or_else(|| {
-					feature_lowering_error(
-						feature.name(),
-						source_row,
-						"numeric value is absent from the prepared vector",
-					)
-				})?
-				.ok_or_else(|| {
-					feature_lowering_error(feature.name(), source_row, "numeric value is missing")
-				})?;
-			let converted = value as f32;
-			if f64::from(converted) != f64::from(value) {
-				return Err(feature_lowering_error(
-					feature.name(),
-					source_row,
-					format!("int32 value {value} cannot be represented exactly by dense f32 calculation"),
-				));
-			}
-			Ok(converted.to_bits())
-		}
-		PreparedValues::F32Bits(values) => {
-			values.get(retained_position)
-				.ok_or_else(|| {
-					feature_lowering_error(
-						feature.name(),
-						source_row,
-						"numeric value is absent from the prepared vector",
-					)
-				})?
-				.ok_or_else(|| feature_lowering_error(feature.name(), source_row, "numeric value is missing"))
-		}
-		PreparedValues::VariableWidth(_) => {
-			Err(feature_lowering_error(
-				feature.name(),
-				source_row,
-				"numeric feature unexpectedly contains variable-width values",
-			))
-		}
-	}
-}
-
-fn validate_categorical_dictionary(name: &[u8], dictionary: &[Vec<u8>]) -> TrainingCompileResult<()> {
-	let mut labels = std::collections::BTreeSet::new();
-	if dictionary
-		.iter()
-		.any(|label| label.is_empty() || !labels.insert(label))
-	{
-		return Err(TrainingCompileError::new(
-			TrainingCompileErrorKind::InvalidFeatureMatrix,
-			format!(
-				"categorical feature {:?} has an empty or duplicate dictionary label",
-				String::from_utf8_lossy(name)
-			),
-		));
-	}
-	Ok(())
-}
-
-fn categorical_code_index(
-	code: i32,
-	known_width: usize,
-	name: &[u8],
-	source_row: usize,
-) -> TrainingCompileResult<usize> {
-	let index = usize::try_from(code).map_err(|_| {
-		feature_lowering_error(
-			name,
-			source_row,
-			format!("negative category code {code} violates dictionary encoding"),
-		)
-	})?;
-	if index <= known_width {
-		Ok(index)
-	} else {
-		Err(feature_lowering_error(
-			name,
-			source_row,
-			format!("category code {code} exceeds dictionary and reserved index {known_width}"),
-		))
-	}
-}
-
+/// Attach feature identity and source-row context to a lowering failure.
 fn feature_lowering_error(name: &[u8], source_row: usize, detail: impl core::fmt::Display) -> TrainingCompileError {
 	TrainingCompileError::new(
 		TrainingCompileErrorKind::InvalidFeatureMatrix,
@@ -2122,6 +2468,7 @@ pub struct AdamWConfig {
 }
 
 impl Default for AdamWConfig {
+	#[inline]
 	fn default() -> Self {
 		Self {
 			learning_rate: 1.0e-4,
@@ -2150,8 +2497,11 @@ pub struct DenseTrainingConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BinaryValidationConfig {
+	/// Number of equal-width confidence bins used for calibration error.
 	calibration_bins: NonZeroU32,
+	/// Exact binary32 recall thresholds represented as raw bits.
 	recall_threshold_bits: Vec<u32>,
+	/// Optional post-training temperature-scaling declaration.
 	temperature_scaling: Option<TemperatureScalingConfig>,
 }
 
@@ -2166,6 +2516,7 @@ pub struct RegressionValidationConfig;
 
 impl BinaryValidationConfig {
 	#[must_use]
+	#[inline]
 	pub fn new(calibration_bins: NonZeroU32, recall_thresholds: impl IntoIterator<Item = f32>) -> Self {
 		Self {
 			calibration_bins,
@@ -2175,15 +2526,20 @@ impl BinaryValidationConfig {
 	}
 
 	#[must_use]
+	#[inline]
 	pub fn with_temperature_scaling(mut self, config: TemperatureScalingConfig) -> Self {
 		self.temperature_scaling = Some(config);
 		self
 	}
 
 	#[must_use]
-	pub const fn calibration_bins(&self) -> NonZeroU32 { self.calibration_bins }
+	#[inline]
+	pub const fn calibration_bins(&self) -> NonZeroU32 {
+		self.calibration_bins
+	}
 
 	#[must_use]
+	#[inline]
 	pub fn recall_thresholds(&self) -> impl ExactSizeIterator<Item = f32> + '_ {
 		self.recall_threshold_bits
 			.iter()
@@ -2192,7 +2548,10 @@ impl BinaryValidationConfig {
 	}
 
 	#[must_use]
-	pub const fn temperature_scaling(&self) -> Option<TemperatureScalingConfig> { self.temperature_scaling }
+	#[inline]
+	pub const fn temperature_scaling(&self) -> Option<TemperatureScalingConfig> {
+		self.temperature_scaling
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2204,6 +2563,7 @@ pub struct TemperatureScalingConfig {
 }
 
 impl Default for TemperatureScalingConfig {
+	#[inline]
 	fn default() -> Self {
 		Self {
 			iterations: NonZeroU64::new(64).expect("64 is nonzero"),
@@ -2226,29 +2586,50 @@ pub struct TrainingBounds {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnedExternalInput {
+	/// Semantic role at the compiled program boundary.
 	role: ExternalInputRole,
+	/// Graph value populated by this input image.
 	value: ValueId,
+	/// Element dtype required by the graph value.
 	dtype: DType,
+	/// Exact tensor shape required by the graph value.
 	shape: Shape,
+	/// Owned little-endian input payload bytes.
 	bytes: Vec<u8>,
 }
 
 impl OwnedExternalInput {
 	#[must_use]
-	pub const fn role(&self) -> ExternalInputRole { self.role }
+	#[inline]
+	pub const fn role(&self) -> ExternalInputRole {
+		self.role
+	}
 
 	#[must_use]
-	pub const fn value(&self) -> ValueId { self.value }
+	#[inline]
+	pub const fn value(&self) -> ValueId {
+		self.value
+	}
 
 	#[must_use]
-	pub const fn dtype(&self) -> DType { self.dtype }
+	#[inline]
+	pub const fn dtype(&self) -> DType {
+		self.dtype
+	}
 
 	#[must_use]
-	pub const fn shape(&self) -> &Shape { &self.shape }
+	#[inline]
+	pub const fn shape(&self) -> &Shape {
+		&self.shape
+	}
 
 	#[must_use]
-	pub fn bytes(&self) -> &[u8] { &self.bytes }
+	#[inline]
+	pub fn bytes(&self) -> &[u8] {
+		&self.bytes
+	}
 
+	/// Create one owned external input after its boundary contract is compiled.
 	pub(crate) fn new(role: ExternalInputRole, value: ValueId, dtype: DType, shape: Shape, bytes: Vec<u8>) -> Self {
 		Self {
 			role,
@@ -2259,6 +2640,7 @@ impl OwnedExternalInput {
 		}
 	}
 
+	/// Replace the payload while preserving role, value, dtype, and shape identity.
 	pub(crate) fn replace_bytes(&mut self, bytes: &[u8]) {
 		self.bytes.clear();
 		self.bytes.extend_from_slice(bytes);
@@ -2424,19 +2806,30 @@ pub struct DenseResidualState {
 	pub prelu: Vec<ParameterState>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DenseBlockState {
-	Embedding(DenseEmbeddingState),
-	Attention(DenseAttentionState),
-	Rnn(DenseRnnState),
-	Gru(DenseGruState),
-	Lstm(DenseLstmState),
-	Layer(DenseLayerState),
-	Convolution(DenseConvolutionState),
-	Pool(DensePoolState),
-	KMeans(DenseKMeansState),
-	Tree(DenseTreeState),
-	Residual(DenseResidualState),
+pub struct DenseBlockState(Box<dyn crate::compile::RealizedBlock>);
+
+impl Clone for DenseBlockState {
+	#[inline]
+	fn clone(&self) -> Self {
+		Self(self.0.clone_box())
+	}
+}
+
+impl core::fmt::Debug for DenseBlockState {
+	#[inline]
+	fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		self.0.fmt(formatter)
+	}
+}
+
+impl DenseBlockState {
+	pub(crate) fn from_realized(realized: Box<dyn crate::compile::RealizedBlock>) -> Self {
+		Self(realized)
+	}
+
+	pub(crate) fn realized(&self) -> &dyn crate::compile::RealizedBlock {
+		self.0.as_ref()
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2511,7 +2904,7 @@ pub enum ValidationMetricStatus {
 	},
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct TrainingOutputs {
 	pub training_loss: ValueId,
 	pub training_loss_domain: IterationDomain,
@@ -2527,86 +2920,20 @@ pub struct TrainingOutputs {
 }
 
 impl TrainingOutputs {
+	/// Visit each learned parameter state exactly once in deterministic model order.
 	pub(crate) fn visit_parameter_states(&self, mut visit: impl FnMut(ParameterState)) {
 		if self.blocks.is_empty() {
 			for layer in &self.layers {
-				visit_layer_parameter_states(layer, &mut visit);
+				visit(layer.weight);
+				visit(layer.bias);
+				layer.prelu.iter().copied().for_each(&mut visit);
 			}
 			return;
 		}
 		for block in &self.blocks {
-			match block {
-				DenseBlockState::Embedding(state) => visit(state.table),
-				DenseBlockState::Attention(state) => {
-					for parameter in [state.query, state.key, state.value, state.output] {
-						visit(parameter);
-					}
-				}
-				DenseBlockState::Rnn(state) => {
-					for parameter in [state.input_weight, state.recurrent_weight, state.bias] {
-						visit(parameter);
-					}
-				}
-				DenseBlockState::Gru(state) => {
-					for parameter in [
-						state.reset_input_weight,
-						state.reset_recurrent_weight,
-						state.reset_bias,
-						state.update_input_weight,
-						state.update_recurrent_weight,
-						state.update_bias,
-						state.candidate_input_weight,
-						state.candidate_recurrent_weight,
-						state.candidate_bias,
-					] {
-						visit(parameter);
-					}
-				}
-				DenseBlockState::Lstm(state) => {
-					for parameter in [
-						state.input_gate_input_weight,
-						state.input_gate_recurrent_weight,
-						state.input_gate_bias,
-						state.forget_gate_input_weight,
-						state.forget_gate_recurrent_weight,
-						state.forget_gate_bias,
-						state.output_gate_input_weight,
-						state.output_gate_recurrent_weight,
-						state.output_gate_bias,
-						state.candidate_input_weight,
-						state.candidate_recurrent_weight,
-						state.candidate_bias,
-					] {
-						visit(parameter);
-					}
-				}
-				DenseBlockState::Layer(state) => visit_layer_parameter_states(state, &mut visit),
-				DenseBlockState::Convolution(state) => {
-					visit(state.weight);
-					visit(state.bias);
-					state.prelu.iter().copied().for_each(&mut visit);
-				}
-				DenseBlockState::Pool(_) | DenseBlockState::KMeans(_) => {}
-				DenseBlockState::Tree(state) => visit(state.leaf_values),
-				DenseBlockState::Residual(state) => {
-					for layer in &state.branch {
-						visit_layer_parameter_states(layer, &mut visit);
-					}
-					state.branch_prelu.iter().copied().for_each(&mut visit);
-					if let Some(projection) = state.projection {
-						visit(projection);
-					}
-					state.prelu.iter().copied().for_each(&mut visit);
-				}
-			}
+			block.0.visit_parameter_states(&mut visit);
 		}
 	}
-}
-
-fn visit_layer_parameter_states(layer: &DenseLayerState, visit: &mut impl FnMut(ParameterState)) {
-	visit(layer.weight);
-	visit(layer.bias);
-	layer.prelu.iter().copied().for_each(visit);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2640,7 +2967,10 @@ pub struct RecallMetricOutput {
 
 impl RecallMetricOutput {
 	#[must_use]
-	pub const fn threshold(self) -> f32 { f32::from_bits(self.threshold_bits) }
+	#[inline]
+	pub const fn threshold(self) -> f32 {
+		f32::from_bits(self.threshold_bits)
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2696,48 +3026,102 @@ pub struct MulticlassValidationOutputs {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct CompiledTrainingParts {
+	/// Complete static calculation program executed by the training runtime.
+	pub program: StaticCalculationProgram,
+	/// Owned external input images in compiled boundary order.
+	pub external_inputs: Vec<OwnedExternalInput>,
+	/// Exact row and iteration bounds compiled for this workload.
+	pub bounds: TrainingBounds,
+	/// Graph values and parameter states produced by training.
+	pub outputs: TrainingOutputs,
+	/// Row-free dataset schema retained for resume validation.
+	pub dataset_schema: CompiledDatasetSchema,
+	/// Dense training declaration used to produce the program.
+	pub config: DenseTrainingConfig,
+	/// Ordered declared blocks retained for checkpoint identity.
+	pub blocks: Vec<DenseBlock>,
+	/// Flattened dense layers retained for compatibility paths.
+	pub layers: Vec<DenseLayer>,
+	/// Optional final width adapter inserted before the task output.
+	pub output_adapter: Option<DenseOutputAdapter>,
+}
+
+#[derive(Clone, Debug)]
 pub struct CompiledTraining {
-	pub(crate) program: StaticCalculationProgram,
-	pub(crate) external_inputs: Vec<OwnedExternalInput>,
-	pub(crate) bounds: TrainingBounds,
-	pub(crate) outputs: TrainingOutputs,
-	pub(crate) dataset_schema: CompiledDatasetSchema,
-	pub(crate) config: DenseTrainingConfig,
-	pub(crate) blocks: Vec<DenseBlock>,
-	pub(crate) layers: Vec<DenseLayer>,
-	pub(crate) output_adapter: Option<DenseOutputAdapter>,
+	parts: CompiledTrainingParts,
+}
+
+impl From<CompiledTrainingParts> for CompiledTraining {
+	fn from(parts: CompiledTrainingParts) -> Self {
+		Self { parts }
+ 	}
 }
 
 impl CompiledTraining {
 	#[must_use]
-	pub const fn graph(&self) -> &CalculationGraph { self.program.graph() }
+	#[inline]
+	pub const fn graph(&self) -> &CalculationGraph {
+		self.parts.program.graph()
+	}
 
 	#[must_use]
-	pub const fn program(&self) -> &StaticCalculationProgram { &self.program }
+	#[inline]
+	pub const fn program(&self) -> &StaticCalculationProgram {
+		&self.parts.program
+	}
 
 	#[must_use]
-	pub fn external_inputs(&self) -> &[OwnedExternalInput] { &self.external_inputs }
+	#[inline]
+	pub fn external_inputs(&self) -> &[OwnedExternalInput] {
+		&self.parts.external_inputs
+	}
+
+	pub(crate) fn external_inputs_mut(&mut self) -> &mut [OwnedExternalInput] {
+		&mut self.parts.external_inputs
+	}
 
 	#[must_use]
-	pub const fn bounds(&self) -> TrainingBounds { self.bounds }
+	#[inline]
+	pub const fn bounds(&self) -> TrainingBounds {
+		self.parts.bounds
+	}
 
 	#[must_use]
-	pub const fn outputs(&self) -> &TrainingOutputs { &self.outputs }
+	#[inline]
+	pub const fn outputs(&self) -> &TrainingOutputs {
+		&self.parts.outputs
+	}
 
 	#[must_use]
-	pub const fn dataset_schema(&self) -> &CompiledDatasetSchema { &self.dataset_schema }
+	#[inline]
+	pub const fn dataset_schema(&self) -> &CompiledDatasetSchema {
+		&self.parts.dataset_schema
+	}
 
 	#[must_use]
-	pub const fn config(&self) -> &DenseTrainingConfig { &self.config }
+	#[inline]
+	pub const fn config(&self) -> &DenseTrainingConfig {
+		&self.parts.config
+	}
 
 	#[must_use]
-	pub fn layers(&self) -> &[DenseLayer] { &self.layers }
+	#[inline]
+	pub fn layers(&self) -> &[DenseLayer] {
+		&self.parts.layers
+	}
 
 	#[must_use]
-	pub fn blocks(&self) -> &[DenseBlock] { &self.blocks }
+	#[inline]
+	pub fn blocks(&self) -> &[DenseBlock] {
+		&self.parts.blocks
+	}
 
 	#[must_use]
-	pub const fn output_adapter(&self) -> Option<DenseOutputAdapter> { self.output_adapter }
+	#[inline]
+	pub const fn output_adapter(&self) -> Option<DenseOutputAdapter> {
+		self.parts.output_adapter
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2751,39 +3135,11 @@ pub const REMAINING_UNSUPPORTED: &[UnsupportedTrainingFeature] = &[
 	UnsupportedTrainingFeature::ExactOptimizerResume,
 ];
 
-fn validate_partition(features: &DenseMatrix, targets: &DenseMatrix) -> TrainingCompileResult<()> {
-	if features.rows() == 0 {
-		return Err(TrainingCompileError::new(
-			TrainingCompileErrorKind::EmptyDataset,
-			"dense training partition has no rows",
-		));
-	}
-	if features.columns() == 0 {
-		return Err(TrainingCompileError::new(
-			TrainingCompileErrorKind::InvalidFeatureMatrix,
-			"dense feature matrix has no columns",
-		));
-	}
-	if features.rows() != targets.rows() {
-		return Err(TrainingCompileError::new(
-			TrainingCompileErrorKind::InconsistentRows,
-			format!(
-				"feature matrix has {} rows, target matrix has {}",
-				features.rows(),
-				targets.rows()
-			),
-		));
-	}
-	if targets.columns() == 0 {
-		return Err(TrainingCompileError::new(
-			TrainingCompileErrorKind::InvalidTargetMatrix,
-			"dense training partition has no target columns",
-		));
-	}
-	validate_matrix_storage(features, "feature")?;
-	validate_matrix_storage(targets, "target")
-}
-
+/// Validate dense matrix element count and finite binary32 storage.
+///
+/// # Errors
+///
+/// Returns an error when dimensions overflow, storage length differs, or a binary32 value is not finite.
 fn validate_matrix_storage(matrix: &DenseMatrix, role: &str) -> TrainingCompileResult<()> {
 	let expected = matrix.rows().checked_mul(matrix.columns()).ok_or_else(|| {
 		TrainingCompileError::new(
@@ -2816,21 +3172,24 @@ fn validate_matrix_storage(matrix: &DenseMatrix, role: &str) -> TrainingCompileR
 	Ok(())
 }
 
+/// Validate that a target matrix contains only exact binary zero and one values.
+///
+/// # Errors
+///
+/// Returns an error when the matrix is not binary32 or contains a non-binary value.
 pub(crate) fn validate_binary_targets(targets: &DenseMatrix) -> TrainingCompileResult<()> {
 	let invalid = match targets {
-		DenseMatrix::I32 { values, .. } => {
-			values.iter()
-				.copied()
-				.find(|value| !matches!(value, 0 | 1))
-				.map(|value| value.to_string())
-		}
-		DenseMatrix::F32Bits { values, .. } => {
-			values.iter()
-				.copied()
-				.map(f32::from_bits)
-				.find(|value| *value != 0.0 && *value != 1.0)
-				.map(|value| value.to_string())
-		}
+		DenseMatrix::I32 { values, .. } => values
+			.iter()
+			.copied()
+			.find(|value| !matches!(value, 0 | 1))
+			.map(|value| value.to_string()),
+		DenseMatrix::F32Bits { values, .. } => values
+			.iter()
+			.copied()
+			.map(f32::from_bits)
+			.find(|value| *value != 0.0 && *value != 1.0)
+			.map(|value| value.to_string()),
 	};
 	if let Some(value) = invalid {
 		return Err(TrainingCompileError::new(

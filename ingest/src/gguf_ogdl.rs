@@ -797,8 +797,6 @@ where
 			io_line(output, depth, text)
 		})?;
 	}
-	drop(reader);
-
 	io_line(output, 1, "tensors")?;
 	for (index, tensor) in header.tensors.iter().enumerate() {
 		let path = format!("gguf.tensors[{index}]");
@@ -977,7 +975,6 @@ fn inspect_stream_gguf<R: Read + Seek>(
 		});
 	}
 	let header_end = reader.position();
-	drop(reader);
 	let aligned_header_end = align_up(header_end, u64::from(alignment))?;
 	let data_start = if tensors.is_empty() {
 		if file_bytes == header_end || file_bytes == aligned_header_end {
@@ -1553,8 +1550,6 @@ where
 		));
 	}
 	writer.zeros(total - data_start)?;
-	drop(writer);
-
 	lines.reset()?;
 	let (third_endian, third_alignment, third_file_bytes) = parse_structural_preamble(&mut lines)?;
 	if third_endian != header.endian || third_alignment != header.alignment || third_file_bytes != header.file_bytes {
@@ -1776,10 +1771,7 @@ fn inspect_structural_stream<R: BufRead + Seek>(
 	expect_canonical_line(lines, 1, "tensors", "gguf.tensors")?;
 	let mut tensors = Vec::new();
 	let mut names = BTreeSet::new();
-	loop {
-		let Some(next) = lines.peek()? else {
-			break;
-		};
+	while let Some(next) = lines.peek()? {
 		if next.depth != 2 || next.text != "tensor" {
 			return Err(invalid_structure(
 				format!("<ogdl>:{}", next.number),
@@ -3116,7 +3108,7 @@ fn write_tensor_payload(
 	depth: usize,
 ) -> GgufOgdlResult<()> {
 	let block_bytes = host_usize(tensor_type.block_bytes(), "tensor block bytes")?;
-	if data.len() % block_bytes != 0 {
+	if !data.len().is_multiple_of(block_bytes) {
 		return Err(invalid_structure(
 			"tensor.payload",
 			format!(
@@ -4092,7 +4084,7 @@ fn read_tensor_payload(
 	let path = format!("gguf.tensors[{tensor_index}].payload");
 	let nodes = node_children(graph, tensor.payload, &path)?;
 	let block_bytes = host_usize(tensor.tensor_type.block_bytes(), "tensor block bytes")?;
-	if destination.len() % block_bytes != 0 {
+	if !destination.len().is_multiple_of(block_bytes) {
 		return Err(invalid_structure(
 			&path,
 			"destination does not contain a whole number of tensor blocks",
@@ -5216,7 +5208,7 @@ fn pack_lsb(values: &[u64], width: u32) -> GgufOgdlResult<Vec<u8>> {
 	}
 	let per_byte =
 		usize::try_from(8 / width).map_err(|error| invalid_overflow("tensor.payload", error.to_string()))?;
-	if values.len() % per_byte != 0 {
+	if !values.len().is_multiple_of(per_byte) {
 		return Err(invalid_structure(
 			"tensor.payload",
 			format!(
@@ -5248,7 +5240,7 @@ fn pack_lsb(values: &[u64], width: u32) -> GgufOgdlResult<Vec<u8>> {
 }
 
 fn pack_halves(values: &[u64]) -> GgufOgdlResult<Vec<u8>> {
-	if values.len() % 2 != 0 {
+	if !values.len().is_multiple_of(2) {
 		return Err(invalid_structure(
 			"tensor.payload",
 			"nibble halves require an even value count",
@@ -5263,8 +5255,7 @@ fn pack_halves(values: &[u64]) -> GgufOgdlResult<Vec<u8>> {
 			if low > 15 || high > 15 {
 				return Err(invalid_value("tensor.payload", "nibble value exceeds 15"));
 			}
-			Ok(u8::try_from(low | (high << 4))
-				.map_err(|error| invalid_value("tensor.payload", error.to_string()))?)
+			u8::try_from(low | (high << 4)).map_err(|error| invalid_value("tensor.payload", error.to_string()))
 		})
 		.collect()
 }
@@ -5283,8 +5274,7 @@ fn pack_nibble_pairs(low: &[u64], high: &[u64]) -> GgufOgdlResult<Vec<u8>> {
 			if low > 15 || high > 15 {
 				return Err(invalid_value("tensor.payload", "nibble value exceeds 15"));
 			}
-			Ok(u8::try_from(low | (high << 4))
-				.map_err(|error| invalid_value("tensor.payload", error.to_string()))?)
+			u8::try_from(low | (high << 4)).map_err(|error| invalid_value("tensor.payload", error.to_string()))
 		})
 		.collect()
 }
@@ -5627,7 +5617,7 @@ fn parse_float_parts(value: &str, format: FloatFormat, path: &str) -> GgufOgdlRe
 }
 
 fn align_up(value: u64, alignment: u64) -> GgufOgdlResult<u64> {
-	if alignment == 0 || alignment % 8 != 0 {
+	if alignment == 0 || !alignment.is_multiple_of(8) {
 		return Err(invalid_value(
 			"gguf.alignment",
 			"alignment must be a nonzero multiple of eight",

@@ -1,9 +1,8 @@
-use core::num::NonZeroU64;
-use std::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet};
+use core::{fmt, num::NonZeroU64};
 
 use recipe_ingest::{
-	DenseMatrix, PartitionKind, PreparedDataset, PreparedValues, PreparedVector, SemanticType, VectorEncoding,
-	VectorMetadata, VectorRole,
+	DenseMatrix, PartitionKind, PreparedDataset, PreparedVector, SemanticType, VectorEncoding, VectorRole,
 };
 use recipe_ops::KnnOutputSpec;
 
@@ -19,73 +18,242 @@ use crate::{
 /// dictionary. Every nonnumeric target is reduced as a mode over deterministic
 /// int32 codes, then decoded through one of these exact values.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum KnnLabelValue {
-	I32(i32),
-	Bytes(Vec<u8>),
+pub struct KnnLabelValue {
+	/// Representation selected for this exact label.
+	kind: KnnLabelValueKind,
+	/// Int32 payload when `kind` is `I32`.
+	int32: i32,
+	/// Byte-string payload when `kind` is `Bytes`.
+	bytes: Vec<u8>,
+}
+
+/// Stored payload representation for one exact KNN label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum KnnLabelValueKind {
+	/// One exact int32 label.
+	I32,
+	/// One exact byte-string label.
+	Bytes,
+}
+
+impl KnnLabelValue {
+	/// Construct one exact int32 label.
+	#[must_use]
+	#[inline]
+	pub const fn i32(value: i32) -> Self {
+		return Self {
+			kind: KnnLabelValueKind::I32,
+			int32: value,
+			bytes: Vec::new(),
+		};
+	}
+
+	/// Construct one exact byte-string label.
+	#[must_use]
+	#[inline]
+	pub const fn bytes(value: Vec<u8>) -> Self {
+		return Self {
+			kind: KnnLabelValueKind::Bytes,
+			int32: 0,
+			bytes: value,
+		};
+	}
+
+	/// Return the int32 value when this is an int32 label.
+	#[must_use]
+	#[inline]
+	pub const fn as_i32(&self) -> Option<i32> {
+		return match self.kind {
+			KnnLabelValueKind::I32 => Some(self.int32),
+			KnnLabelValueKind::Bytes => None,
+		};
+	}
+
+	/// Return the byte string when this is a byte-string label.
+	#[must_use]
+	#[inline]
+	pub fn as_bytes(&self) -> Option<&[u8]> {
+		return match self.kind {
+			KnnLabelValueKind::I32 => None,
+			KnnLabelValueKind::Bytes => Some(&self.bytes),
+		};
+	}
 }
 
 /// Calculation-facing reference values for one declared target.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum KnnReferenceValues {
-	/// Exact finite f32 bit patterns. Missing rows contain positive zero and are
-	/// excluded by the sibling known-value mask.
-	NumericF32Bits(Vec<u32>),
-	/// Canonical int32 codes into `labels`. Missing rows contain code zero and
-	/// are excluded by the sibling known-value mask.
-	DiscreteI32 {
-		codes: Vec<i32>,
-		labels: Vec<KnnLabelValue>,
-	},
+pub struct KnnReferenceValues {
+	/// Aggregation representation selected for this output.
+	kind: KnnReferenceValueKind,
+	/// Exact numeric reference values when `kind` is numeric.
+	numeric_f32_bits: Vec<u32>,
+	/// Calculation-facing class codes when `kind` is discrete.
+	codes: Vec<i32>,
+	/// Exact class labels when `kind` is discrete.
+	labels: Vec<KnnLabelValue>,
+}
+
+/// Stored aggregation representation for one KNN output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KnnReferenceValueKind {
+	/// Finite numeric values represented by exact f32 bits.
+	NumericF32Bits,
+	/// Discrete int32 codes paired with an exact label dictionary.
+	DiscreteI32,
+}
+
+impl KnnReferenceValues {
+	/// Construct numeric reference values from exact finite f32 bits.
+	#[inline]
+	pub(super) const fn from_numeric_f32_bits(bits: Vec<u32>) -> Self {
+		return Self {
+			kind: KnnReferenceValueKind::NumericF32Bits,
+			numeric_f32_bits: bits,
+			codes: Vec::new(),
+			labels: Vec::new(),
+		};
+	}
+
+	/// Construct discrete reference values and their exact label dictionary.
+	#[inline]
+	pub(super) const fn from_discrete_i32(codes: Vec<i32>, labels: Vec<KnnLabelValue>) -> Self {
+		return Self {
+			kind: KnnReferenceValueKind::DiscreteI32,
+			numeric_f32_bits: Vec::new(),
+			codes,
+			labels,
+		};
+	}
+
+	/// Return whether these reference values use numeric aggregation.
+	#[inline]
+	pub(super) const fn is_numeric(&self) -> bool {
+		return matches!(self.kind, KnnReferenceValueKind::NumericF32Bits);
+	}
+
+	/// Return mutable numeric storage after the caller selects numeric aggregation.
+	#[inline]
+	pub(super) const fn numeric_f32_bits_mut(&mut self) -> &mut Vec<u32> {
+		return &mut self.numeric_f32_bits;
+	}
+
+	/// Consume and return numeric storage after the caller selects numeric aggregation.
+	#[inline]
+	pub(super) fn into_numeric_f32_bits(self) -> Vec<u32> {
+		return self.numeric_f32_bits;
+	}
+
+	/// Return mutable discrete storage after the caller selects discrete aggregation.
+	#[inline]
+	pub(super) const fn discrete_i32_mut(&mut self) -> (&mut Vec<i32>, &mut Vec<KnnLabelValue>) {
+		return (&mut self.codes, &mut self.labels);
+	}
+
+	/// Consume and return discrete storage after the caller selects discrete aggregation.
+	#[inline]
+	pub(super) fn into_discrete_i32(self) -> (Vec<i32>, Vec<KnnLabelValue>) {
+		return (self.codes, self.labels);
+	}
+
+	/// Return exact finite f32 bit patterns for a numeric output.
+	#[must_use]
+	#[inline]
+	pub fn numeric_f32_bits(&self) -> Option<&[u32]> {
+		return match self.kind {
+			KnnReferenceValueKind::NumericF32Bits => Some(&self.numeric_f32_bits),
+			KnnReferenceValueKind::DiscreteI32 => None,
+		};
+	}
+
+	/// Return numeric storage after the caller selects numeric aggregation.
+	#[inline]
+	pub(super) fn numeric_f32_bits_storage(&self) -> &[u32] {
+		return &self.numeric_f32_bits;
+	}
+
+	/// Return calculation codes and their exact labels for a discrete output.
+	#[must_use]
+	#[inline]
+	pub fn discrete_i32(&self) -> Option<(&[i32], &[KnnLabelValue])> {
+		return match self.kind {
+			KnnReferenceValueKind::NumericF32Bits => None,
+			KnnReferenceValueKind::DiscreteI32 => Some((&self.codes, &self.labels)),
+		};
+	}
+
+	/// Return discrete storage after the caller selects discrete aggregation.
+	#[inline]
+	pub(super) fn discrete_i32_storage(&self) -> (&[i32], &[KnnLabelValue]) {
+		return (&self.codes, &self.labels);
+	}
 }
 
 /// One independently reduced KNN output in target declaration order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KnnReferenceOutput {
-	pub(crate) schema: CheckpointArtifactVector,
-	pub(crate) known: Vec<i32>,
-	pub(crate) known_references: u64,
-	pub(crate) values: KnnReferenceValues,
+	pub schema: CheckpointArtifactVector,
+	pub known: Vec<i32>,
+	pub known_references: u64,
+	pub values: KnnReferenceValues,
 }
 
 impl KnnReferenceOutput {
 	#[must_use]
-	pub const fn schema(&self) -> &CheckpointArtifactVector { &self.schema }
+	#[inline]
+	pub const fn schema(&self) -> &CheckpointArtifactVector {
+		return &self.schema;
+	}
 
 	#[must_use]
-	pub fn known(&self) -> &[i32] { &self.known }
+	#[inline]
+	pub fn known(&self) -> &[i32] {
+		return &self.known;
+	}
 
 	#[must_use]
-	pub const fn known_references(&self) -> u64 { self.known_references }
+	#[inline]
+	pub const fn known_references(&self) -> u64 {
+		return self.known_references;
+	}
 
 	#[must_use]
-	pub const fn values(&self) -> &KnnReferenceValues { &self.values }
+	#[inline]
+	pub const fn values(&self) -> &KnnReferenceValues {
+		return &self.values;
+	}
 
 	#[must_use]
+	#[inline]
+	/// # Panics
+	///
+	/// Panics only if an internally constructed categorical label dictionary
+	/// violates the validated `i32` class-count bound.
 	pub fn operation_spec(&self) -> KnnOutputSpec {
-		match &self.values {
-			KnnReferenceValues::NumericF32Bits(_) => {
-				KnnOutputSpec::Numeric {
+		match self.values.kind {
+			KnnReferenceValueKind::NumericF32Bits => return KnnOutputSpec::Numeric {
+				known_references: self.known_references,
+			},
+			KnnReferenceValueKind::DiscreteI32 => {
+				let Ok(classes) = u64::try_from(self.values.labels.len()) else {
+					unreachable!("validated KNN label count fits u64");
+				};
+				return KnnOutputSpec::Categorical {
 					known_references: self.known_references,
-				}
-			}
-			KnnReferenceValues::DiscreteI32 { labels, .. } => {
-				KnnOutputSpec::Categorical {
-					known_references: self.known_references,
-					classes: u64::try_from(labels.len()).expect("validated KNN label count fits u64"),
-				}
+					classes,
+				};
 			}
 		}
 	}
 
 	/// Decode one discrete prediction. Numeric outputs have no class decoder.
 	#[must_use]
+	#[inline]
 	pub fn decode_class(&self, code: i32) -> Option<&KnnLabelValue> {
-		let KnnReferenceValues::DiscreteI32 { labels, .. } = &self.values else {
+		if self.values.kind != KnnReferenceValueKind::DiscreteI32 {
 			return None;
-		};
-		usize::try_from(code)
-			.ok()
-			.and_then(|index| labels.get(index))
+		}
+		let index = usize::try_from(code).ok()?;
+		return self.values.labels.get(index);
 	}
 }
 
@@ -98,51 +266,79 @@ impl KnnReferenceOutput {
 /// prepared order, which is the deterministic distance-tie order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KnnReferenceSet {
-	pub(crate) neighbors: NonZeroU64,
-	pub(crate) vectors: Vec<CheckpointArtifactVector>,
-	pub(crate) feature_spans: Vec<CompiledFeatureSpan>,
-	pub(crate) normalization_mask: Option<Vec<u32>>,
-	pub(crate) reference_source_rows: Vec<usize>,
-	pub(crate) reference_rows: usize,
-	pub(crate) feature_width: usize,
-	pub(crate) reference_feature_bits: Vec<u32>,
-	pub(crate) outputs: Vec<KnnReferenceOutput>,
+	pub neighbors: NonZeroU64,
+	pub vectors: Vec<CheckpointArtifactVector>,
+	pub feature_spans: Vec<CompiledFeatureSpan>,
+	pub normalization_mask: Option<Vec<u32>>,
+	pub reference_source_rows: Vec<usize>,
+	pub reference_rows: usize,
+	pub feature_width: usize,
+	pub reference_feature_bits: Vec<u32>,
+	pub outputs: Vec<KnnReferenceOutput>,
 }
 
 impl KnnReferenceSet {
 	#[must_use]
-	pub const fn neighbors(&self) -> NonZeroU64 { self.neighbors }
+	#[inline]
+	pub const fn neighbors(&self) -> NonZeroU64 {
+		return self.neighbors;
+	}
 
 	#[must_use]
-	pub fn vectors(&self) -> &[CheckpointArtifactVector] { &self.vectors }
+	#[inline]
+	pub fn vectors(&self) -> &[CheckpointArtifactVector] {
+		return &self.vectors;
+	}
 
 	#[must_use]
-	pub fn feature_spans(&self) -> &[CompiledFeatureSpan] { &self.feature_spans }
+	#[inline]
+	pub fn feature_spans(&self) -> &[CompiledFeatureSpan] {
+		return &self.feature_spans;
+	}
 
 	#[must_use]
-	pub fn normalization_mask(&self) -> Option<&[u32]> { self.normalization_mask.as_deref() }
+	#[inline]
+	pub fn normalization_mask(&self) -> Option<&[u32]> {
+		return self.normalization_mask.as_deref();
+	}
 
 	#[must_use]
-	pub fn reference_source_rows(&self) -> &[usize] { &self.reference_source_rows }
+	#[inline]
+	pub fn reference_source_rows(&self) -> &[usize] {
+		return &self.reference_source_rows;
+	}
 
 	#[must_use]
-	pub const fn reference_rows(&self) -> usize { self.reference_rows }
+	#[inline]
+	pub const fn reference_rows(&self) -> usize {
+		return self.reference_rows;
+	}
 
 	#[must_use]
-	pub const fn feature_width(&self) -> usize { self.feature_width }
+	#[inline]
+	pub const fn feature_width(&self) -> usize {
+		return self.feature_width;
+	}
 
 	#[must_use]
-	pub fn reference_feature_bits(&self) -> &[u32] { &self.reference_feature_bits }
+	#[inline]
+	pub fn reference_feature_bits(&self) -> &[u32] {
+		return &self.reference_feature_bits;
+	}
 
 	#[must_use]
-	pub fn outputs(&self) -> &[KnnReferenceOutput] { &self.outputs }
+	#[inline]
+	pub fn outputs(&self) -> &[KnnReferenceOutput] {
+		return &self.outputs;
+	}
 
 	#[must_use]
+	#[inline]
 	pub fn operation_specs(&self) -> Vec<KnnOutputSpec> {
-		self.outputs
+		return self.outputs
 			.iter()
 			.map(KnnReferenceOutput::operation_spec)
-			.collect()
+			.collect();
 	}
 }
 
@@ -154,6 +350,13 @@ impl KnnReferenceSet {
 /// uses a uniform mode over an exact deterministic label dictionary. Missing
 /// references are retained in row alignment but excluded independently for
 /// each output.
+///
+/// # Errors
+///
+/// Returns an error when the training partition or targets are empty, feature
+/// lowering fails, target declarations are inconsistent, or a target cannot be
+/// represented by the KNN reference format.
+#[inline]
 pub fn prepare_knn_reference_set(
 	dataset: &PreparedDataset,
 	neighbors: NonZeroU64,
@@ -173,12 +376,42 @@ pub fn prepare_knn_reference_set(
 
 	let feature_plan = DenseFeaturePlan::from_prepared(dataset)?;
 	let lowered = lower_dense_features(dataset, &feature_plan, PartitionKind::Train)?;
-	let (reference_rows, feature_width, reference_feature_bits) = f32_reference_features(lowered)?;
+	let (reference_rows, feature_width, reference_feature_bits) = match lowered {
+		DenseMatrix::I32 { rows, columns, values } => {
+			let bits = values
+				.into_iter()
+				.enumerate()
+				.map(|(index, value)| {
+					let Some(converted) = exact_i32_as_f32(value) else {
+						return Err(knn_error(
+							TrainingCompileErrorKind::InvalidFeatureMatrix,
+							format!(
+								"KNN feature element {index} int32 value {value} is not exactly representable as f32"
+							),
+						));
+					};
+					return Ok(converted.to_bits());
+				})
+				.collect::<TrainingCompileResult<Vec<_>>>()?;
+			(rows, columns, bits)
+		}
+		DenseMatrix::F32Bits { rows, columns, values } => {
+			for (index, bits) in values.iter().copied().enumerate() {
+				if !f32::from_bits(bits).is_finite() {
+					return Err(knn_error(
+						TrainingCompileErrorKind::InvalidFeatureMatrix,
+						format!("KNN feature element {index} has non-finite f32 bits {bits:#010x}"),
+					));
+				}
+			}
+			(rows, columns, values)
+		}
+	};
 	let targets = dataset
 		.vectors()
 		.iter()
-		.filter(|vector| vector.role() == VectorRole::Target)
-		.map(|vector| (vector.source_index(), vector))
+		.filter(|vector| return vector.role() == VectorRole::Target)
+		.map(|vector| return (vector.source_index(), vector))
 		.collect::<BTreeMap<_, _>>();
 	let mut seen_targets = BTreeSet::new();
 	let mut outputs = Vec::with_capacity(dataset.target_source_indices().len());
@@ -190,20 +423,126 @@ pub fn prepare_knn_reference_set(
 			));
 		}
 		let target = targets.get(&source_index).copied().ok_or_else(|| {
-			knn_error(
+			return knn_error(
 				TrainingCompileErrorKind::InvalidTargetMatrix,
 				format!("KNN declared target source index {source_index} is absent from prepared vectors"),
-			)
+			);
 		})?;
-		outputs.push(prepare_output(dataset, target)?);
+		let incompatible_target = || {
+			return knn_target_error(
+				target,
+				0,
+				format!(
+					"incompatible prepared semantic tuple {:?}/{:?}/{:?}",
+					target.semantic_type(),
+					target.encoding(),
+					target.metadata(),
+				),
+			);
+		};
+		let prepare_variable_output = || {
+			let values = target.values().variable_width().ok_or_else(&incompatible_target)?;
+			return prepare_remapped_labels(
+				dataset,
+				target,
+				|position, source_row| {
+					return values
+						.value(position)
+						.ok_or_else(|| {
+							return knn_target_error(
+								target,
+								source_row,
+								"value is absent from variable-width storage",
+							);
+						})
+						.map(|value| {
+							return value.map(<[u8]>::to_vec);
+						});
+				},
+				KnnLabelValue::bytes,
+			);
+		};
+		let output = match (target.semantic_type(), target.encoding()) {
+			(SemanticType::Numeric, VectorEncoding::I32) if target.metadata().is_none() => {
+				let values = target.values().i32_values().ok_or_else(&incompatible_target)?;
+				prepare_numeric_output(dataset, target, values, |value, source_row| {
+					let Some(converted) = exact_i32_as_f32(value) else {
+						return Err(knn_target_error(
+							target,
+							source_row,
+							format!("int32 value {value} is not exactly representable as f32"),
+						));
+					};
+					return Ok(converted.to_bits());
+				})
+			}
+			(SemanticType::Numeric, VectorEncoding::F32) if target.metadata().is_none() => {
+				let values = target.values().f32_bits().ok_or_else(&incompatible_target)?;
+				prepare_numeric_output(dataset, target, values, |bits, source_row| {
+					if !f32::from_bits(bits).is_finite() {
+						return Err(knn_target_error(
+							target,
+							source_row,
+							format!("value has non-finite f32 bits {bits:#010x}"),
+						));
+					}
+					return Ok(bits);
+				})
+			}
+			(SemanticType::Categorical, VectorEncoding::DictionaryI32) => {
+				let dictionary = target
+					.metadata()
+					.categorical_dictionary()
+					.ok_or_else(&incompatible_target)?;
+				let values = target.values().i32_values().ok_or_else(&incompatible_target)?;
+				prepare_indexed_labels(
+					dataset,
+					target,
+					values,
+					dictionary.iter().cloned().map(KnnLabelValue::bytes).collect(),
+				)
+			}
+			(SemanticType::Ordinal, VectorEncoding::OrdinalI32) => {
+				let ordered_labels = target.metadata().ordinal_labels().ok_or_else(&incompatible_target)?;
+				let values = target.values().i32_values().ok_or_else(&incompatible_target)?;
+				prepare_indexed_labels(
+					dataset,
+					target,
+					values,
+					ordered_labels.iter().cloned().map(KnnLabelValue::bytes).collect(),
+				)
+			}
+			(SemanticType::Temporal, VectorEncoding::RelativeSecondsI32)
+				if target.metadata().temporal_origin().is_some() =>
+			{
+				let values = target.values().i32_values().ok_or_else(&incompatible_target)?;
+				prepare_remapped_labels(
+					dataset,
+					target,
+					|position, source_row| {
+						return values.get(position).copied().ok_or_else(|| {
+							return knn_target_error(target, source_row, "value is absent from prepared storage");
+						});
+					},
+					KnnLabelValue::i32,
+				)
+			}
+			(SemanticType::Text, VectorEncoding::Utf8) if target.metadata().is_none() => prepare_variable_output(),
+			(SemanticType::Binary, VectorEncoding::Bytes) if target.metadata().is_none() => prepare_variable_output(),
+			(SemanticType::Image, VectorEncoding::Bytes) if target.metadata().is_image() => prepare_variable_output(),
+			_ => Err(incompatible_target()),
+		};
+		outputs.push(output?);
 	}
 
-	Ok(KnnReferenceSet {
+	return Ok(KnnReferenceSet {
 		neighbors,
 		vectors: dataset
 			.vectors()
 			.iter()
-			.map(|vector| CheckpointArtifactVector::from_schema(&vector.schema()))
+			.map(|vector| {
+				return CheckpointArtifactVector::from_schema(&vector.schema());
+			})
 			.collect(),
 		feature_spans: feature_plan.spans().to_vec(),
 		normalization_mask: feature_plan.normalization_mask().map(<[u32]>::to_vec),
@@ -212,198 +551,93 @@ pub fn prepare_knn_reference_set(
 		feature_width,
 		reference_feature_bits,
 		outputs,
-	})
+	});
 }
 
-fn f32_reference_features(matrix: DenseMatrix) -> TrainingCompileResult<(usize, usize, Vec<u32>)> {
-	match matrix {
-		DenseMatrix::I32 {
-			rows,
-			columns,
-			values,
-		} => {
-			let bits = values
-				.into_iter()
-				.enumerate()
-				.map(|(index, value)| {
-					let converted = value as f32;
-					if f64::from(converted) != f64::from(value) {
-						return Err(knn_error(
-							TrainingCompileErrorKind::InvalidFeatureMatrix,
-							format!(
-								"KNN feature element {index} int32 value {value} is not exactly representable as f32"
-							),
-						));
-					}
-					Ok(converted.to_bits())
-				})
-				.collect::<TrainingCompileResult<Vec<_>>>()?;
-			Ok((rows, columns, bits))
-		}
-		DenseMatrix::F32Bits {
-			rows,
-			columns,
-			values,
-		} => {
-			for (index, bits) in values.iter().copied().enumerate() {
-				if !f32::from_bits(bits).is_finite() {
-					return Err(knn_error(
-						TrainingCompileErrorKind::InvalidFeatureMatrix,
-						format!("KNN feature element {index} has non-finite f32 bits {bits:#010x}"),
-					));
-				}
-			}
-			Ok((rows, columns, values))
-		}
-	}
-}
-
-fn prepare_output(dataset: &PreparedDataset, target: &PreparedVector) -> TrainingCompileResult<KnnReferenceOutput> {
-	match (
-		target.semantic_type(),
-		target.encoding(),
-		target.metadata(),
-		target.values(),
-	) {
-		(SemanticType::Numeric, VectorEncoding::I32, VectorMetadata::None, PreparedValues::I32(values)) => {
-			prepare_numeric_i32(dataset, target, values)
-		}
-		(SemanticType::Numeric, VectorEncoding::F32, VectorMetadata::None, PreparedValues::F32Bits(values)) => {
-			prepare_numeric_f32(dataset, target, values)
-		}
-		(
-			SemanticType::Categorical,
-			VectorEncoding::DictionaryI32,
-			VectorMetadata::Categorical { dictionary },
-			PreparedValues::I32(values),
-		) => {
-			prepare_indexed_labels(
-				dataset,
-				target,
-				values,
-				dictionary
-					.iter()
-					.cloned()
-					.map(KnnLabelValue::Bytes)
-					.collect(),
-			)
-		}
-		(
-			SemanticType::Ordinal,
-			VectorEncoding::OrdinalI32,
-			VectorMetadata::Ordinal { ordered_labels },
-			PreparedValues::I32(values),
-		) => {
-			prepare_indexed_labels(
-				dataset,
-				target,
-				values,
-				ordered_labels
-					.iter()
-					.cloned()
-					.map(KnnLabelValue::Bytes)
-					.collect(),
-			)
-		}
-		(
-			SemanticType::Temporal,
-			VectorEncoding::RelativeSecondsI32,
-			VectorMetadata::Temporal { .. },
-			PreparedValues::I32(values),
-		) => prepare_temporal_labels(dataset, target, values),
-		(SemanticType::Text, VectorEncoding::Utf8, VectorMetadata::None, PreparedValues::VariableWidth(values))
-		| (
-			SemanticType::Binary,
-			VectorEncoding::Bytes,
-			VectorMetadata::None,
-			PreparedValues::VariableWidth(values),
-		)
-		| (
-			SemanticType::Image,
-			VectorEncoding::Bytes,
-			VectorMetadata::Image { .. },
-			PreparedValues::VariableWidth(values),
-		) => prepare_byte_labels(dataset, target, values),
-		_ => {
-			Err(knn_target_error(
-				target,
-				0,
-				format!(
-					"incompatible prepared semantic tuple {:?}/{:?}/{:?}",
-					target.semantic_type(),
-					target.encoding(),
-					target.metadata()
-				),
-			))
-		}
-	}
-}
-
-fn prepare_numeric_i32(
+/// Prepare one numeric target using a semantic-value to exact `f32`-bits conversion.
+#[inline]
+fn prepare_numeric_output<Value: Copy>(
 	dataset: &PreparedDataset,
 	target: &PreparedVector,
-	values: &[Option<i32>],
+	values: &[Option<Value>],
+	mut encode: impl FnMut(Value, usize) -> TrainingCompileResult<u32>,
 ) -> TrainingCompileResult<KnnReferenceOutput> {
-	let mut lowered = Vec::with_capacity(dataset.train().len());
+	let mut target_bits = Vec::with_capacity(dataset.train().len());
 	let mut known = Vec::with_capacity(dataset.train().len());
 	for (position, source_row) in partition_rows(dataset) {
-		match values
+		if let Some(value) = values
 			.get(position)
-			.ok_or_else(|| knn_target_error(target, source_row, "value is absent from prepared storage"))?
+			.copied()
+			.ok_or_else(|| {
+				return knn_target_error(target, source_row, "value is absent from prepared storage");
+			})?
 		{
-			Some(value) => {
-				let converted = *value as f32;
-				if f64::from(converted) != f64::from(*value) {
-					return Err(knn_target_error(
-						target,
-						source_row,
-						format!("int32 value {value} is not exactly representable as f32"),
-					));
-				}
-				lowered.push(converted.to_bits());
-				known.push(1);
-			}
-			None => {
-				lowered.push(0.0_f32.to_bits());
-				known.push(0);
-			}
+			target_bits.push(encode(value, source_row)?);
+			known.push(1);
+		} else {
+			target_bits.push(0.0f32.to_bits());
+			known.push(0);
 		}
 	}
-	finish_output(target, known, KnnReferenceValues::NumericF32Bits(lowered))
+	return finish_output(target, known, KnnReferenceValues::from_numeric_f32_bits(target_bits));
 }
 
-fn prepare_numeric_f32(
+/// Fit an ordered label dictionary and remap one target through checked class codes.
+#[inline]
+fn prepare_remapped_labels<Value: Clone + Ord>(
 	dataset: &PreparedDataset,
 	target: &PreparedVector,
-	values: &[Option<u32>],
+	mut value_at: impl FnMut(usize, usize) -> TrainingCompileResult<Option<Value>>,
+	mut label_value: impl FnMut(Value) -> KnnLabelValue,
 ) -> TrainingCompileResult<KnnReferenceOutput> {
-	let mut lowered = Vec::with_capacity(dataset.train().len());
-	let mut known = Vec::with_capacity(dataset.train().len());
+	let mut unique = BTreeSet::new();
 	for (position, source_row) in partition_rows(dataset) {
-		match values
-			.get(position)
-			.ok_or_else(|| knn_target_error(target, source_row, "value is absent from prepared storage"))?
-		{
-			Some(bits) if f32::from_bits(*bits).is_finite() => {
-				lowered.push(*bits);
-				known.push(1);
-			}
-			Some(bits) => {
-				return Err(knn_target_error(
+		if let Some(value) = value_at(position, source_row)? {
+			unique.insert(value);
+		}
+	}
+	let ordered_values = unique.into_iter().collect::<Vec<_>>();
+	let labels = ordered_values
+		.iter()
+		.cloned()
+		.map(&mut label_value)
+		.collect::<Vec<_>>();
+	let codes_by_value = ordered_values
+		.into_iter()
+		.enumerate()
+		.map(|(index, value)| {
+			let code = i32::try_from(index).map_err(|error| {
+				return knn_target_error(
 					target,
-					source_row,
-					format!("value has non-finite f32 bits {bits:#010x}"),
-				));
-			}
-			None => {
-				lowered.push(0.0_f32.to_bits());
-				known.push(0);
-			}
+					0,
+					format!("label index {index} does not fit int32: {error}"),
+				);
+			})?;
+			return Ok((value, code));
+		})
+		.collect::<TrainingCompileResult<BTreeMap<_, _>>>()?;
+	let mut codes = Vec::with_capacity(dataset.train().len());
+	let mut known = Vec::with_capacity(dataset.train().len());
+	for (position, source_row) in partition_rows(dataset) {
+		if let Some(value) = value_at(position, source_row)? {
+			let code = codes_by_value.get(&value).copied().ok_or_else(|| {
+				return knn_target_error(target, source_row, "known label has no fitted class code");
+			})?;
+			codes.push(code);
+			known.push(1);
+		} else {
+			codes.push(0);
+			known.push(0);
 		}
 	}
-	finish_output(target, known, KnnReferenceValues::NumericF32Bits(lowered))
+	return finish_output(
+		target,
+		known,
+		KnnReferenceValues::from_discrete_i32(codes, labels),
+	);
 }
 
+/// Validate and retain an already indexed categorical or ordinal target.
 fn prepare_indexed_labels(
 	dataset: &PreparedDataset,
 	target: &PreparedVector,
@@ -414,159 +648,45 @@ fn prepare_indexed_labels(
 	let mut codes = Vec::with_capacity(dataset.train().len());
 	let mut known = Vec::with_capacity(dataset.train().len());
 	for (position, source_row) in partition_rows(dataset) {
-		match values
+		if let Some(code) = values
 			.get(position)
-			.ok_or_else(|| knn_target_error(target, source_row, "value is absent from prepared storage"))?
+			.copied()
+			.ok_or_else(|| {
+				return knn_target_error(target, source_row, "value is absent from prepared storage");
+			})?
 		{
-			Some(code) => {
-				let index = usize::try_from(*code).map_err(|_| {
-					knn_target_error(target, source_row, format!("negative label code {code}"))
-				})?;
-				if index >= labels.len() {
-					return Err(knn_target_error(
-						target,
-						source_row,
-						format!(
-							"label code {code} is outside {} fitted labels",
-							labels.len()
-						),
-					));
-				}
-				codes.push(*code);
-				known.push(1);
+			let index = usize::try_from(code).map_err(|conversion_error| {
+				return knn_target_error(
+					target,
+					source_row,
+					format!("negative label code {code}: {conversion_error}"),
+				);
+			})?;
+			if index >= labels.len() {
+				return Err(knn_target_error(
+					target,
+					source_row,
+					format!(
+						"label code {code} is outside {} fitted labels",
+						labels.len()
+					),
+				));
 			}
-			None => {
-				codes.push(0);
-				known.push(0);
-			}
+			codes.push(code);
+			known.push(1);
+		} else {
+			codes.push(0);
+			known.push(0);
 		}
 	}
-	finish_output(target, known, KnnReferenceValues::DiscreteI32 {
-		codes,
-		labels,
-	})
+	return finish_output(
+		target,
+		known,
+		KnnReferenceValues::from_discrete_i32(codes, labels),
+	);
 }
 
-fn prepare_temporal_labels(
-	dataset: &PreparedDataset,
-	target: &PreparedVector,
-	values: &[Option<i32>],
-) -> TrainingCompileResult<KnnReferenceOutput> {
-	let mut unique = BTreeSet::new();
-	for (position, source_row) in partition_rows(dataset) {
-		if let Some(value) = values
-			.get(position)
-			.ok_or_else(|| knn_target_error(target, source_row, "value is absent from prepared storage"))?
-		{
-			unique.insert(*value);
-		}
-	}
-	let labels = unique
-		.into_iter()
-		.map(KnnLabelValue::I32)
-		.collect::<Vec<_>>();
-	let codes = labels
-		.iter()
-		.enumerate()
-		.map(|(index, label)| Ok((label.clone(), checked_class_code(target, index)?)))
-		.collect::<TrainingCompileResult<BTreeMap<_, _>>>()?;
-	prepare_remapped_i32(dataset, target, values, labels, &codes)
-}
-
-fn prepare_remapped_i32(
-	dataset: &PreparedDataset,
-	target: &PreparedVector,
-	values: &[Option<i32>],
-	labels: Vec<KnnLabelValue>,
-	codes_by_label: &BTreeMap<KnnLabelValue, i32>,
-) -> TrainingCompileResult<KnnReferenceOutput> {
-	let mut codes = Vec::with_capacity(dataset.train().len());
-	let mut known = Vec::with_capacity(dataset.train().len());
-	for (position, source_row) in partition_rows(dataset) {
-		match values
-			.get(position)
-			.ok_or_else(|| knn_target_error(target, source_row, "value is absent from prepared storage"))?
-		{
-			Some(value) => {
-				let code = codes_by_label
-					.get(&KnnLabelValue::I32(*value))
-					.copied()
-					.ok_or_else(|| {
-						knn_target_error(target, source_row, "known temporal label has no class code")
-					})?;
-				codes.push(code);
-				known.push(1);
-			}
-			None => {
-				codes.push(0);
-				known.push(0);
-			}
-		}
-	}
-	finish_output(target, known, KnnReferenceValues::DiscreteI32 {
-		codes,
-		labels,
-	})
-}
-
-fn prepare_byte_labels(
-	dataset: &PreparedDataset,
-	target: &PreparedVector,
-	values: &recipe_ingest::VariableWidthVector,
-) -> TrainingCompileResult<KnnReferenceOutput> {
-	let mut unique = BTreeSet::new();
-	for (position, source_row) in partition_rows(dataset) {
-		if let Some(value) = values.value(position).ok_or_else(|| {
-			knn_target_error(
-				target,
-				source_row,
-				"value is absent from variable-width storage",
-			)
-		})? {
-			unique.insert(value.to_vec());
-		}
-	}
-	let labels = unique
-		.into_iter()
-		.map(KnnLabelValue::Bytes)
-		.collect::<Vec<_>>();
-	let codes_by_label = labels
-		.iter()
-		.enumerate()
-		.map(|(index, label)| Ok((label.clone(), checked_class_code(target, index)?)))
-		.collect::<TrainingCompileResult<BTreeMap<_, _>>>()?;
-	let mut codes = Vec::with_capacity(dataset.train().len());
-	let mut known = Vec::with_capacity(dataset.train().len());
-	for (position, source_row) in partition_rows(dataset) {
-		match values.value(position).ok_or_else(|| {
-			knn_target_error(
-				target,
-				source_row,
-				"value is absent from variable-width storage",
-			)
-		})? {
-			Some(value) => {
-				let code = codes_by_label
-					.get(&KnnLabelValue::Bytes(value.to_vec()))
-					.copied()
-					.ok_or_else(|| {
-						knn_target_error(target, source_row, "known byte label has no class code")
-					})?;
-				codes.push(code);
-				known.push(1);
-			}
-			None => {
-				codes.push(0);
-				known.push(0);
-			}
-		}
-	}
-	finish_output(target, known, KnnReferenceValues::DiscreteI32 {
-		codes,
-		labels,
-	})
-}
-
+/// Validate the calculation-facing bounds and uniqueness of a label dictionary.
 fn validate_label_dictionary(target: &PreparedVector, labels: &[KnnLabelValue]) -> TrainingCompileResult<()> {
 	if labels.is_empty() {
 		return Err(knn_target_error(
@@ -583,37 +703,32 @@ fn validate_label_dictionary(target: &PreparedVector, labels: &[KnnLabelValue]) 
 		));
 	}
 	let mut unique = BTreeSet::new();
-	if labels.iter().any(|label| !unique.insert(label)) {
+	if labels.iter().any(|label| {
+		return !unique.insert(label);
+	}) {
 		return Err(knn_target_error(
 			target,
 			0,
 			"fitted label dictionary contains duplicates",
 		));
 	}
-	Ok(())
+	return Ok(());
 }
 
-fn checked_class_code(target: &PreparedVector, index: usize) -> TrainingCompileResult<i32> {
-	i32::try_from(index).map_err(|error| {
-		knn_target_error(
-			target,
-			0,
-			format!("label index {index} does not fit int32: {error}"),
-		)
-	})
-}
-
+/// Finish one output after validating its known-row count and label dictionary.
 fn finish_output(
 	target: &PreparedVector,
 	known: Vec<i32>,
 	values: KnnReferenceValues,
 ) -> TrainingCompileResult<KnnReferenceOutput> {
-	let known_references = u64::try_from(known.iter().filter(|value| **value == 1).count()).map_err(|error| {
-		knn_target_error(
+	let known_references = u64::try_from(known.iter().filter(|value| {
+		return **value == 1;
+	}).count()).map_err(|error| {
+		return knn_target_error(
 			target,
 			0,
 			format!("known-reference count does not fit u64: {error}"),
-		)
+		);
 	})?;
 	if known_references == 0 {
 		return Err(knn_target_error(
@@ -622,40 +737,70 @@ fn finish_output(
 			"training partition contains no known reference values",
 		));
 	}
-	if let KnnReferenceValues::DiscreteI32 { labels, .. } = &values {
-		validate_label_dictionary(target, labels)?;
+	if values.kind == KnnReferenceValueKind::DiscreteI32 {
+		validate_label_dictionary(target, &values.labels)?;
 	}
-	Ok(KnnReferenceOutput {
+	return Ok(KnnReferenceOutput {
 		schema: CheckpointArtifactVector::from_schema(&target.schema()),
 		known,
 		known_references,
 		values,
-	})
+	});
 }
 
+/// Convert an `i32` to `f32` only when its exact integer value is representable.
+#[inline]
+const fn exact_i32_as_f32(value: i32) -> Option<f32> {
+	const SIGN_MASK: u32 = 1u32 << (u32::BITS - 1);
+	const EXPONENT_BIAS: u32 = 127;
+	const FRACTION_BITS: u32 = f32::MANTISSA_DIGITS - 1;
+
+	if value == 0 {
+		return Some(0.0);
+	}
+	let magnitude = value.unsigned_abs();
+	let exponent = (u32::BITS - 1) - magnitude.leading_zeros();
+	let discarded_bits = exponent.saturating_sub(FRACTION_BITS);
+	if discarded_bits != 0 && magnitude & ((1u32 << discarded_bits) - 1) != 0 {
+		return None;
+	}
+	let significand = if exponent <= FRACTION_BITS {
+		magnitude << (FRACTION_BITS - exponent)
+	} else {
+		magnitude >> discarded_bits
+	};
+	let sign = if value.is_negative() { SIGN_MASK } else { 0 };
+	let exponent_bits = (exponent + EXPONENT_BIAS) << FRACTION_BITS;
+	let fraction_mask = (1u32 << FRACTION_BITS) - 1;
+	return Some(f32::from_bits(sign | exponent_bits | (significand & fraction_mask)));
+}
+
+/// Pair retained training positions with their original source-row indices.
 fn partition_rows(dataset: &PreparedDataset) -> impl Iterator<Item = (usize, usize)> + '_ {
-	dataset
+	return dataset
 		.train()
 		.retained_positions()
 		.iter()
 		.copied()
-		.zip(dataset.train().source_rows().iter().copied())
+		.zip(dataset.train().source_rows().iter().copied());
 }
 
+/// Construct a target-specific KNN compilation error.
 fn knn_target_error(
 	target: &PreparedVector,
 	source_row: usize,
-	detail: impl core::fmt::Display,
+	detail: impl fmt::Display,
 ) -> TrainingCompileError {
-	knn_error(
+	return knn_error(
 		TrainingCompileErrorKind::InvalidTargetMatrix,
 		format!(
 			"KNN target {:?} at source row {source_row}: {detail}",
 			String::from_utf8_lossy(target.name())
 		),
-	)
+	);
 }
 
+/// Construct a KNN compilation error with the supplied classification.
 fn knn_error(kind: TrainingCompileErrorKind, detail: impl Into<String>) -> TrainingCompileError {
-	TrainingCompileError::new(kind, detail)
+	return TrainingCompileError::new(kind, detail);
 }

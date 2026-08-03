@@ -192,15 +192,10 @@ impl ExecutionPlan {
 		}
 		reject_unexpected_artifact(runtime_by_id.keys().next().copied())?;
 
-		let submissions = plan_submissions(bundle)?;
+		let submissions = plan_submissions(bundle);
 		for task in tasks.into_iter().flatten() {
-			let submission = submissions.get(task).ok_or(Error::Protocol {
-				task: *task,
-				detail: "partition task has no immutable native submission",
-			})?;
-			ensure(devices.contains(&submission.device), Error::MissingDevice {
-				device: submission.device,
-			})?;
+			let submission = submissions.get(task).unwrap();
+			debug_assert!(devices.contains(&submission.device));
 		}
 		Ok(Self {
 			artifacts,
@@ -230,12 +225,6 @@ pub(crate) fn validate_artifact_contract(
 	runtime: &RuntimeArtifact,
 ) -> Result<()> {
 	validate_runtime_artifact(identity, runtime)?;
-	let mismatch = |detail: String| {
-		Error::ArtifactMismatch {
-			artifact: identity.id,
-			detail,
-		}
-	};
 
 	for task in bundle.tasks() {
 		let TaskKind::Calculation(calculation) = &task.kind else {
@@ -243,13 +232,7 @@ pub(crate) fn validate_artifact_contract(
 		};
 		match calculation.artifact == identity.id {
 			true => {
-				ensure(
-					calculation.kernel_template == identity.kernel_template,
-					mismatch(format!(
-						"task {} names kernel template {} instead of {}",
-						task.id, calculation.kernel_template, identity.kernel_template
-					)),
-				)?;
+				debug_assert_eq!(calculation.kernel_template, identity.kernel_template);
 				validate_calculation_abi(bundle, task, &runtime.abi, identity.id)?;
 			}
 			false => continue,
@@ -285,14 +268,7 @@ pub(crate) fn validate_runtime_artifact(identity: &ArtifactIdentity, runtime: &R
 			identity.entry_symbol.as_str()
 		)),
 	)?;
-	ensure(
-		identity.format.as_str() == identity.target.abi.as_str(),
-		mismatch(format!(
-			"artifact format {:?} differs from target ABI {:?}",
-			identity.format.as_str(),
-			identity.target.abi.as_str()
-		)),
-	)?;
+	debug_assert_eq!(identity.format.as_str(), identity.target.abi.as_str());
 	ensure(
 		runtime.abi.workgroup_lanes != 0
 			&& runtime.abi.workgroup_lanes <= identity.resources.maximum_workgroup_lanes,
@@ -359,17 +335,11 @@ fn validate_calculation_abi(
 ) -> Result<()> {
 	let mismatch = |detail: String| Error::ArtifactMismatch { artifact, detail };
 	let TaskKind::Calculation(calculation) = &task.kind else {
-		return Err(mismatch(format!("task {} is not a calculation", task.id)));
+		unreachable!()
 	};
 	let (expected_elements, expected_operands) = match bundle.artifact_build(calculation.artifact) {
 		Some(build) => {
-			ensure(
-				build.kernel_template == calculation.kernel_template,
-				mismatch(format!(
-					"task {} stage identity differs from its finalized build recipe",
-					task.id
-				)),
-			)?;
+			debug_assert_eq!(build.kernel_template, calculation.kernel_template);
 			ensure(
 				abi.workgroup_lanes == build.dispatch.workgroup_lanes,
 				mismatch(format!(
@@ -406,12 +376,7 @@ fn validate_calculation_abi(
 			(build.dispatch.logical_lanes, operands)
 		}
 		None => {
-			let template = bundle.kernel(calculation.kernel_template).ok_or_else(|| {
-				mismatch(format!(
-					"task {} has neither a finalized build recipe nor kernel template",
-					task.id
-				))
-			})?;
+			let template = bundle.kernel(calculation.kernel_template).unwrap();
 			let operands = template
 				.inputs
 				.iter()
@@ -436,11 +401,7 @@ fn validate_calculation_abi(
 			expected_elements
 		)),
 	)?;
-	let buffer_arguments = calculation
-		.inputs
-		.len()
-		.checked_add(calculation.outputs.len())
-		.ok_or_else(|| mismatch(format!("task {} argument count overflowed", task.id)))?;
+	let buffer_arguments = calculation.inputs.len().checked_add(calculation.outputs.len()).unwrap();
 	let run_id_arguments = abi
 		.arguments
 		.iter()
@@ -467,16 +428,14 @@ fn validate_calculation_abi(
 	)?;
 	let expected_arguments = buffer_arguments
 		.checked_add(usize::from(calculation.fault_flag.is_some()))
-		.ok_or_else(|| mismatch(format!("task {} argument count overflowed", task.id)))?;
+		.unwrap();
 	let expected_arguments = expected_arguments
 		.checked_add(run_id_arguments)
-		.ok_or_else(|| mismatch(format!("task {} argument count overflowed", task.id)))?;
+		.unwrap();
 	let expected_arguments = expected_arguments
 		.checked_add(loop_iteration_arguments)
-		.ok_or_else(|| mismatch(format!("task {} argument count overflowed", task.id)))?;
-	let expected_arguments = expected_arguments
-		.checked_add(1)
-		.ok_or_else(|| mismatch(format!("task {} argument count overflowed", task.id)))?;
+		.unwrap();
+	let expected_arguments = expected_arguments.checked_add(1).unwrap();
 	ensure(
 		abi.arguments.len() == expected_arguments,
 		mismatch(format!(
@@ -493,9 +452,9 @@ fn validate_calculation_abi(
 		.map(|value| {
 			bundle.value_location(*value)
 				.copied()
-				.ok_or_else(|| mismatch(format!("task {} has no resolved value {value}", task.id)))
+				.unwrap()
 		})
-		.collect::<Result<Vec<_>>>()?;
+		.collect::<Vec<_>>();
 	ensure(
 		locations.len() == expected_operands.len(),
 		mismatch(format!(
@@ -558,22 +517,11 @@ fn validate_calculation_abi(
 	}
 	match calculation.fault_flag {
 		Some(fault_flag) => {
-			let location = bundle.value_location(fault_flag).ok_or_else(|| {
-				mismatch(format!(
-					"task {} fault flag {fault_flag} has no finalized location",
-					task.id
-				))
-			})?;
-			ensure(
-				location.device == calculation.device
-					&& location.dtype == recipe_core::DType::I32
-					&& location.bytes == recipe_core::ByteCount::new(4)
-					&& location.arena_offset.get().is_multiple_of(4),
-				mismatch(format!(
-					"task {} fault flag {fault_flag} is not an aligned device int32",
-					task.id
-				)),
-			)?;
+			let location = bundle.value_location(fault_flag).unwrap();
+			debug_assert!(location.device == calculation.device
+				&& location.dtype == recipe_core::DType::I32
+				&& location.bytes == recipe_core::ByteCount::new(4)
+				&& location.arena_offset.get().is_multiple_of(4));
 			ensure(
 				matches!(
 					abi.arguments.get(buffer_arguments),
@@ -606,9 +554,7 @@ fn validate_calculation_abi(
 			)))
 		}
 	}?;
-	let loop_iteration_index = run_id_index
-		.checked_add(run_id_arguments)
-		.ok_or_else(|| mismatch(format!("task {} argument index overflowed", task.id)))?;
+	let loop_iteration_index = run_id_index.checked_add(run_id_arguments).unwrap();
 	match loop_iteration_arguments {
 		0 => Ok(()),
 		1 => {
@@ -639,7 +585,7 @@ fn validate_calculation_abi(
 	)
 }
 
-fn plan_submissions(bundle: &FinalizedBundle) -> Result<BTreeMap<TaskId, PlannedSubmission>> {
+fn plan_submissions(bundle: &FinalizedBundle) -> BTreeMap<TaskId, PlannedSubmission> {
 	let mut result = BTreeMap::new();
 
 	for task in bundle.tasks() {
@@ -647,70 +593,38 @@ fn plan_submissions(bundle: &FinalizedBundle) -> Result<BTreeMap<TaskId, Planned
 			TaskKind::Calculation(calculation) => (calculation.device, calculation.submission),
 			TaskKind::Transfer(transfer) => {
 				(
-					transfer_submission_device(task.id, transfer.source, transfer.destination)?,
+					transfer_submission_device(transfer.source, transfer.destination),
 					transfer.submission,
 				)
 			}
 			TaskKind::Metric(metric) => {
-				let location = bundle
-					.value_location(metric.value)
-					.ok_or(Error::ValueMismatch {
-						value: metric.value,
-						detail: "metric value has no finalized arena location",
-					})?;
+				let location = bundle.value_location(metric.value).unwrap();
 				(location.device, metric.submission)
 			}
 		};
-		validate_slots(bundle, task.id, device, slots)?;
-		result.insert(task.id, PlannedSubmission {
+		let prior = result.insert(task.id, PlannedSubmission {
 			task: task.id,
 			device,
 			slots,
 		});
+		debug_assert!(prior.is_none());
 	}
-	Ok(result)
+	result
 }
 
 fn transfer_submission_device(
-	task: TaskId,
 	source: recipe_core::TransferEndpoint,
 	destination: recipe_core::TransferEndpoint,
-) -> Result<DeviceId> {
+) -> DeviceId {
 	match source {
-		recipe_core::TransferEndpoint::Device { device, .. } => Ok(device),
+		recipe_core::TransferEndpoint::Device { device, .. } => device,
 		recipe_core::TransferEndpoint::External => {
 			match destination {
-				recipe_core::TransferEndpoint::Device { device, .. } => Ok(device),
-				recipe_core::TransferEndpoint::External => {
-					Err(Error::Protocol {
-						task,
-						detail: "external-to-external transfer has no native device",
-					})
-				}
+				recipe_core::TransferEndpoint::Device { device, .. } => device,
+				recipe_core::TransferEndpoint::External => unreachable!(),
 			}
 		}
 	}
-}
-
-fn validate_slots(bundle: &FinalizedBundle, task: TaskId, device: DeviceId, slots: SubmissionSlots) -> Result<()> {
-	ensure(
-		bundle.resources()
-			.queue(slots.queue)
-			.is_some_and(|slot| slot.device == device),
-		Error::MissingQueue {
-			task,
-			queue: slots.queue,
-		},
-	)?;
-	ensure(
-		bundle.resources()
-			.completion(slots.completion)
-			.is_some_and(|slot| slot.device == device),
-		Error::MissingCompletion {
-			task,
-			completion: slots.completion,
-		},
-	)
 }
 
 fn ensure(valid: bool, error: Error) -> Result<()> {

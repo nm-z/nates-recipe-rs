@@ -17,7 +17,7 @@ use crate::{
 		MAX_PHYSICAL_CALLS_PER_OPERATION, MetricWork, PendingRequest, PhysicalCall, PhysicalCallBatch,
 		TransferWork, WorkClass,
 	},
-	error::{BackendMessage, BackendOperation, ExecutorError, JournalStream, Result},
+	error::{BackendMessage, BackendOperation, ExecutorError, Result},
 	metrics::{MetricMailbox, MetricSample},
 };
 
@@ -259,52 +259,43 @@ impl JournalCapacity {
 		bundle: &FinalizedBundle,
 		retained_loop_iterations: u64,
 	) -> Result<Self> {
-		if B::MAX_NON_POLL_PHYSICAL_CALLS == 0 || B::MAX_NON_POLL_PHYSICAL_CALLS > MAX_PHYSICAL_CALLS_PER_OPERATION
-		{
-			return Err(ExecutorError::PreparationCapacityOverflow);
-		}
+		debug_assert!(
+			B::MAX_NON_POLL_PHYSICAL_CALLS != 0
+				&& B::MAX_NON_POLL_PHYSICAL_CALLS <= MAX_PHYSICAL_CALLS_PER_OPERATION
+		);
 		let task_count = bundle.tasks().len();
-		let retained_loop_iteration_count =
-			usize::try_from(retained_loop_iterations).map_err(|_| ExecutorError::PreparationCapacityOverflow)?;
+		let retained_loop_iteration_count = usize::try_from(retained_loop_iterations).unwrap();
 		let loop_task_count = bundle
 			.tasks()
 			.iter()
 			.filter(|task| task.phase == RunPhase::Loop)
 			.count();
-		let non_loop_task_count = task_count
-			.checked_sub(loop_task_count)
-			.ok_or(ExecutorError::PreparationCapacityOverflow)?;
-		let loop_task_completions = checked_capacity_mul(loop_task_count, retained_loop_iteration_count)?;
+		let non_loop_task_count = task_count.checked_sub(loop_task_count).unwrap();
+		let loop_task_completions = checked_capacity_mul(loop_task_count, retained_loop_iteration_count);
 		let active_loop_tasks = bundle
 			.tasks()
 			.iter()
 			.filter(|task| task.phase == RunPhase::Loop)
-			.try_fold(0_usize, |total, task| {
-				let domain = bundle
-					.iteration_domain(task.id)
-					.ok_or(ExecutorError::PreparationCapacityOverflow)?;
-				total.checked_add(iteration_domain_activations_before(
-					domain,
+			.map(|task| {
+				iteration_domain_activations_before(
+					bundle.iteration_domain(task.id).unwrap(),
 					retained_loop_iterations,
-				)?)
-				.ok_or(ExecutorError::PreparationCapacityOverflow)
-			})?;
-		let task_executions = checked_capacity_sum(&[non_loop_task_count, active_loop_tasks])?;
+				)
+			})
+			.sum();
+		let task_executions = checked_capacity_sum(&[non_loop_task_count, active_loop_tasks]);
 		let arena_count = bundle.arena_layouts().len();
 		let metric_emissions = bundle
 			.tasks()
 			.iter()
 			.filter(|task| task.phase == RunPhase::Loop && matches!(task.kind, TaskKind::Metric(_)))
-			.try_fold(0_usize, |total, task| {
-				let domain = bundle
-					.iteration_domain(task.id)
-					.ok_or(ExecutorError::PreparationCapacityOverflow)?;
-				total.checked_add(iteration_domain_activations_before(
-					domain,
+			.map(|task| {
+				iteration_domain_activations_before(
+					bundle.iteration_domain(task.id).unwrap(),
 					retained_loop_iterations,
-				)?)
-				.ok_or(ExecutorError::PreparationCapacityOverflow)
-			})?;
+				)
+			})
+			.sum();
 		let exit_image_count = bundle
 			.tasks()
 			.iter()
@@ -324,26 +315,26 @@ impl JournalCapacity {
 			// Prepared, Initialized, LoopStarted, optional LoopStopAccepted,
 			// LoopCompleted, and Exited.
 			RUN_LIFECYCLE_LOGICAL_EVENTS,
-			checked_capacity_mul(arena_count, 2)?,
-			checked_capacity_mul(non_loop_task_count, 2)?,
+			checked_capacity_mul(arena_count, 2),
+			checked_capacity_mul(non_loop_task_count, 2),
 			loop_task_completions,
 			active_loop_tasks,
 			metric_emissions,
-			checked_capacity_mul(retained_loop_iteration_count, 2)?,
-		])?;
+			checked_capacity_mul(retained_loop_iteration_count, 2),
+		]);
 
 		// Every non-poll operation may report a full inline batch. A completed
 		// task contributes one terminal poll record, while arbitrarily many
 		// pending polls consume only its fixed counter and first-marker slot.
 		let fixed_backend_operations = checked_capacity_sum(&[
 			2,
-			checked_capacity_mul(arena_count, 2)?,
+			checked_capacity_mul(arena_count, 2),
 			task_count,
 			task_executions,
 			exit_image_count,
-		])?;
-		let fixed_physical = checked_capacity_mul(fixed_backend_operations, B::MAX_NON_POLL_PHYSICAL_CALLS)?;
-		let physical_calls = checked_capacity_sum(&[fixed_physical, task_executions, task_count])?;
+		]);
+		let fixed_physical = checked_capacity_mul(fixed_backend_operations, B::MAX_NON_POLL_PHYSICAL_CALLS);
+		let physical_calls = checked_capacity_sum(&[fixed_physical, task_executions, task_count]);
 		Ok(Self::new(logical_events, physical_calls))
 	}
 }
@@ -426,18 +417,9 @@ impl RunJournal {
 			self.summary.logical_events_compacted = self.summary.logical_events_compacted.saturating_add(1);
 			return Ok(());
 		}
-		match self.logical_events.len() < self.declared.logical_events {
-			true => {
-				self.logical_events.push(event);
-				Ok(())
-			}
-			false => {
-				Err(ExecutorError::JournalCapacityExceeded {
-					stream: JournalStream::Logical,
-					capacity: self.declared.logical_events,
-				})
-			}
-		}
+		debug_assert!(self.logical_events.len() < self.declared.logical_events);
+		self.logical_events.push(event);
+		Ok(())
 	}
 
 	fn retains_repeated_loop_detail(&self) -> bool {
@@ -491,20 +473,13 @@ impl RunJournal {
 				let index = self
 					.pending_polls
 					.binary_search_by_key(&task, |entry| entry.task)
-					.map_err(|_| {
-						ExecutorError::BackendProtocol {
-							task,
-							detail: "pending poll names a task absent from the finalized bundle",
-						}
-					})?;
+					.unwrap();
 				let existing = pending_batch[..pending_batch_len]
 					.iter_mut()
 					.find_map(|entry| entry.as_mut().filter(|(candidate, _)| *candidate == task));
 				match existing {
 					Some((_, count)) => {
-						*count = count
-							.checked_add(1)
-							.ok_or(ExecutorError::PendingPollCountOverflow { task })?;
+						*count = count.checked_add(1).unwrap();
 						retain = false;
 					}
 					None => {
@@ -523,42 +498,27 @@ impl RunJournal {
 			let index = self
 				.pending_polls
 				.binary_search_by_key(task, |entry| entry.task)
-				.map_err(|_| {
-					ExecutorError::BackendProtocol {
-						task: *task,
-						detail: "pending poll names a task absent from the finalized bundle",
-					}
-				})?;
+				.unwrap();
 			self.pending_polls[index]
 				.count
 				.checked_add(u128::from(*increment))
-				.ok_or(ExecutorError::PendingPollCountOverflow { task: *task })?;
+				.unwrap();
 		}
 		let required = self
 			.physical_calls
 			.len()
 			.checked_add(retained_len)
-			.ok_or(ExecutorError::PreparationCapacityOverflow)?;
-		if required > self.declared.physical_calls {
-			return Err(ExecutorError::JournalCapacityExceeded {
-				stream: JournalStream::Physical,
-				capacity: self.declared.physical_calls,
-			});
-		}
+			.unwrap();
+		debug_assert!(required <= self.declared.physical_calls);
 		for (task, increment) in pending_batch[..pending_batch_len].iter().flatten() {
 			let index = self
 				.pending_polls
 				.binary_search_by_key(task, |entry| entry.task)
-				.map_err(|_| {
-					ExecutorError::BackendProtocol {
-						task: *task,
-						detail: "pending poll names a task absent from the finalized bundle",
-					}
-				})?;
+				.unwrap();
 			self.pending_polls[index].count = self.pending_polls[index]
 				.count
 				.checked_add(u128::from(*increment))
-				.ok_or(ExecutorError::PendingPollCountOverflow { task: *task })?;
+				.unwrap();
 		}
 		self.physical_calls
 			.extend(retained_calls[..retained_len].iter().flatten().copied());
@@ -697,53 +657,41 @@ impl<B: Backend> fmt::Debug for RunCore<B> {
 /// Teardown still attempts every remaining arena release and resource
 /// destruction in lifecycle order.
 pub struct RunFailure<B: Backend> {
-	run_id: RunId,
-	bundle: BundleIdentity,
-	error: ExecutorError,
-	cleanup_error: Option<ExecutorError>,
-	backend: B,
-	journal: Option<RunJournal>,
+	parts: Box<RunFailureParts<B>>,
 }
 
 impl<B: Backend> fmt::Debug for RunFailure<B> {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("RunFailure")
-			.field("run_id", &self.run_id)
-			.field("bundle", &self.bundle)
-			.field("error", &self.error)
-			.field("cleanup_error", &self.cleanup_error)
-			.field("journal", &self.journal)
+			.field("run_id", &self.parts.run_id)
+			.field("bundle", &self.parts.bundle)
+			.field("error", &self.parts.error)
+			.field("cleanup_error", &self.parts.cleanup_error)
+			.field("journal", &self.parts.journal)
 			.finish_non_exhaustive()
 	}
 }
 
 impl<B: Backend> RunFailure<B> {
 	#[must_use]
-	pub const fn run_id(&self) -> RunId { self.run_id }
+	pub const fn run_id(&self) -> RunId { self.parts.run_id }
 
 	#[must_use]
-	pub const fn bundle_identity(&self) -> BundleIdentity { self.bundle }
+	pub const fn bundle_identity(&self) -> BundleIdentity { self.parts.bundle }
 
 	#[must_use]
-	pub const fn error(&self) -> ExecutorError { self.error }
+	pub const fn error(&self) -> ExecutorError { self.parts.error }
 
 	#[must_use]
-	pub const fn cleanup_error(&self) -> Option<ExecutorError> { self.cleanup_error }
+	pub const fn cleanup_error(&self) -> Option<ExecutorError> { self.parts.cleanup_error }
 
 	#[must_use]
-	pub const fn journal(&self) -> Option<&RunJournal> { self.journal.as_ref() }
+	pub const fn journal(&self) -> Option<&RunJournal> { self.parts.journal.as_ref() }
 
 	#[must_use]
 	pub fn into_parts(self) -> RunFailureParts<B> {
-		RunFailureParts {
-			run_id: self.run_id,
-			bundle: self.bundle,
-			error: self.error,
-			cleanup_error: self.cleanup_error,
-			backend: self.backend,
-			journal: self.journal,
-		}
+		*self.parts
 	}
 }
 
@@ -803,10 +751,7 @@ impl<B: Backend> PreparedRun<B> {
 		backend: B,
 		watchdog: Watchdog,
 	) -> std::result::Result<Self, RunFailure<B>> {
-		let journal_capacity = match JournalCapacity::for_bundle::<B>(&bundle) {
-			Ok(capacity) => capacity,
-			Err(error) => return Err(unstarted_failure(run_id, bundle.identity(), backend, error)),
-		};
+		let journal_capacity = JournalCapacity::for_bundle::<B>(&bundle).unwrap();
 		Self::prepare_with_journal_capacity_recoverable(run_id, bundle, backend, watchdog, journal_capacity)
 	}
 
@@ -846,19 +791,7 @@ impl<B: Backend> PreparedRun<B> {
 			));
 		}
 		let mut journal = RunJournal::with_loop_detail(journal_capacity, bundle.tasks(), false);
-		let prepared = match PreparedPhases::new(&bundle) {
-			Ok(prepared) => prepared,
-			Err(error) => {
-				return Err(RunFailure {
-					run_id,
-					bundle: bundle_identity,
-					error,
-					cleanup_error: None,
-					backend,
-					journal: Some(journal),
-				});
-			}
-		};
+		let prepared = PreparedPhases::new(&bundle);
 		let completed = CompletionLedger::new(bundle.tasks());
 		let exit_image_capacity = prepared.exit.external_exit_count();
 		let fault_resets = prepared.fault_resets();
@@ -873,12 +806,14 @@ impl<B: Backend> PreparedRun<B> {
 			Ok(resource) => resource,
 			Err(error) => {
 				return Err(RunFailure {
-					run_id,
-					bundle: bundle_identity,
-					error,
-					cleanup_error: None,
-					backend,
-					journal: Some(journal),
+					parts: Box::new(RunFailureParts {
+						run_id,
+						bundle: bundle_identity,
+						error,
+						cleanup_error: None,
+						backend,
+						journal: Some(journal),
+					}),
 				});
 			}
 		};
@@ -942,20 +877,10 @@ impl<B: Backend> PreparedRun<B> {
 			}
 		};
 		let metrics = MetricMailbox::new(&bundle.resources().metrics, bundle.tasks());
-		if let Err(error) = journal.record_logical(LogicalEvent::Prepared {
+		journal.record_logical(LogicalEvent::Prepared {
 			run: run_id,
 			bundle: bundle_identity,
-		}) {
-			drop((init_phase, loop_phase, exit_phase));
-			return Err(prepared_resource_failure(
-				run_id,
-				bundle_identity,
-				backend,
-				resource,
-				journal,
-				error,
-			));
-		}
+		}).unwrap();
 		Ok(Self {
 			core: RunCore {
 				run_id,
@@ -1010,23 +935,18 @@ impl<B: Backend> PreparedRun<B> {
 			};
 			let previous = self.core.arenas.insert(device, arena);
 			debug_assert!(previous.is_none(), "finalized layouts have unique devices");
-			if let Err(error) = self
-				.core
+			self.core
 				.journal
 				.record_logical(LogicalEvent::ArenaAllocated { device, bytes })
-			{
-				return Err(self.into_failure(error));
-			}
+				.unwrap();
 		}
 
 		if let Err(error) = run_phase_blocking(&mut self.core, &mut self.init_phase, Some(&images)) {
 			return Err(self.into_failure(error));
 		}
-		if let Err(error) = self.core.journal.record_logical(LogicalEvent::Initialized {
+		self.core.journal.record_logical(LogicalEvent::Initialized {
 			run: self.core.run_id,
-		}) {
-			return Err(self.into_failure(error));
-		}
+		}).unwrap();
 		Ok(InitializedRun {
 			core: self.core,
 			loop_phase: self.loop_phase,
@@ -1076,29 +996,18 @@ impl<B: Backend> InitializedRun<B> {
 	}
 
 	pub fn start_loop_recoverable(mut self) -> std::result::Result<RunningRun<B>, RunFailure<B>> {
-		let iteration = match self.core.bundle.loop_iterations().iteration(0) {
-			Some(iteration) => iteration,
-			None => {
-				return Err(self.into_failure(ExecutorError::LifecycleInvariant {
-					detail: "finalized loop count did not contain iteration zero",
-				}));
-			}
-		};
+		let iteration = self.core.bundle.loop_iterations().iteration(0).unwrap();
 		self.loop_phase.begin_loop_iteration(iteration);
-		if let Err(error) = self.core.journal.record_logical(LogicalEvent::LoopStarted {
+		self.core.journal.record_logical(LogicalEvent::LoopStarted {
 			run: self.core.run_id,
-		}) {
-			return Err(self.into_failure(error));
-		}
-		if let Err(error) = self
-			.core
+		}).unwrap();
+		self.core
 			.journal
 			.record_logical(LogicalEvent::LoopIterationStarted {
 				run: self.core.run_id,
 				iteration,
-			}) {
-			return Err(self.into_failure(error));
-		}
+			})
+			.unwrap();
 		Ok(RunningRun {
 			core: self.core,
 			phase: self.loop_phase,
@@ -1106,16 +1015,6 @@ impl<B: Backend> InitializedRun<B> {
 			failure: None,
 			completion_recorded: false,
 		})
-	}
-
-	fn into_failure(self, error: ExecutorError) -> RunFailure<B> {
-		let Self {
-			core,
-			loop_phase,
-			exit_phase,
-		} = self;
-		drop((loop_phase, exit_phase));
-		failed_core(core, error)
 	}
 
 	#[must_use]
@@ -1180,28 +1079,20 @@ impl<B: Backend> RunningRun<B> {
 				let false = self.completion_recorded else {
 					return Ok((LoopStatus::Complete, made_progress));
 				};
-				let iteration = self
-					.phase
-					.loop_iteration
-					.ok_or(ExecutorError::LifecycleInvariant {
-						detail: "completed loop phase has no active iteration",
-					})?;
+				let iteration = self.phase.loop_iteration.unwrap();
 				self.core
 					.journal
 					.record_logical(LogicalEvent::LoopIterationCompleted {
 						run: self.core.run_id,
 						iteration,
-					})?;
+					})
+					.unwrap();
 				let stop_requested = stop_requested();
 				let next =
 					if stop_requested {
 						None
 					} else {
-						let next_index = iteration.index().checked_add(1).ok_or(
-							ExecutorError::LifecycleInvariant {
-								detail: "loop iteration index exhausted the u64 coordinate space",
-							},
-						)?;
+						let next_index = iteration.index().checked_add(1).unwrap();
 						iteration.total().iteration(next_index)
 					};
 				if let Some(next) = next {
@@ -1212,7 +1103,8 @@ impl<B: Backend> RunningRun<B> {
 						.record_logical(LogicalEvent::LoopIterationStarted {
 							run: self.core.run_id,
 							iteration: next,
-						})?;
+						})
+						.unwrap();
 					return Ok((LoopStatus::Pending, true));
 				}
 				if stop_requested {
@@ -1221,13 +1113,15 @@ impl<B: Backend> RunningRun<B> {
 						.record_logical(LogicalEvent::LoopStopAccepted {
 							run: self.core.run_id,
 							after_iteration: iteration,
-						})?;
+						})
+						.unwrap();
 				}
 				self.core
 					.journal
 					.record_logical(LogicalEvent::LoopCompleted {
 						run: self.core.run_id,
-					})?;
+					})
+					.unwrap();
 				self.completion_recorded = true;
 				Ok((LoopStatus::Complete, true))
 			}
@@ -1236,14 +1130,11 @@ impl<B: Backend> RunningRun<B> {
 				made_progress,
 			}) => Ok((LoopStatus::Pending, made_progress)),
 			Err(error) => {
-				let reported = match self.core.journal.record_logical(LogicalEvent::LoopFailed {
+				self.core.journal.record_logical(LogicalEvent::LoopFailed {
 					run: self.core.run_id,
-				}) {
-					Ok(()) => error,
-					Err(journal_error) => journal_error,
-				};
-				self.failure = Some(reported);
-				Err(reported)
+				}).unwrap();
+				self.failure = Some(error);
+				Err(error)
 			}
 		}
 	}
@@ -1353,12 +1244,9 @@ impl<B: Backend> ExitedLoop<B> {
 		if let Some(error) = error {
 			return Err(run_failure(core, error, cleanup_error));
 		}
-		if let Err(error) = core
-			.journal
+		core.journal
 			.record_logical(LogicalEvent::Exited { run: core.run_id })
-		{
-			return Err(run_failure(core, error, None));
-		}
+			.unwrap();
 
 		Ok(ExitedRun {
 			run_id: core.run_id,
@@ -1430,12 +1318,14 @@ fn unstarted_failure<B: Backend>(
 	error: ExecutorError,
 ) -> RunFailure<B> {
 	RunFailure {
-		run_id,
-		bundle,
-		error,
-		cleanup_error: None,
-		backend,
-		journal: None,
+		parts: Box::new(RunFailureParts {
+			run_id,
+			bundle,
+			error,
+			cleanup_error: None,
+			backend,
+			journal: None,
+		}),
 	}
 }
 
@@ -1457,12 +1347,14 @@ fn prepared_resource_failure<B: Backend>(
 	)
 	.err();
 	RunFailure {
-		run_id,
-		bundle,
-		error,
-		cleanup_error,
-		backend,
-		journal: Some(journal),
+		parts: Box::new(RunFailureParts {
+			run_id,
+			bundle,
+			error,
+			cleanup_error,
+			backend,
+			journal: Some(journal),
+		}),
 	}
 }
 
@@ -1477,12 +1369,14 @@ fn run_failure<B: Backend>(
 	cleanup_error: Option<ExecutorError>,
 ) -> RunFailure<B> {
 	RunFailure {
-		run_id: core.run_id,
-		bundle: core.bundle.identity(),
-		error,
-		cleanup_error,
-		backend: core.backend,
-		journal: Some(core.journal),
+		parts: Box::new(RunFailureParts {
+			run_id: core.run_id,
+			bundle: core.bundle.identity(),
+			error,
+			cleanup_error,
+			backend: core.backend,
+			journal: Some(core.journal),
+		}),
 	}
 }
 
@@ -1508,14 +1402,10 @@ fn teardown_resources<B: Backend>(core: &mut RunCore<B>) -> (Option<ExecutorErro
 			physical_calls,
 			result,
 		) {
-			Ok(()) => {
-				if let Err(reported) = core
-					.journal
-					.record_logical(LogicalEvent::ArenaReleased { device })
-				{
-					record_teardown_error(&mut error, &mut cleanup_error, reported);
-				}
-			}
+			Ok(()) => core
+				.journal
+				.record_logical(LogicalEvent::ArenaReleased { device })
+				.unwrap(),
 			Err(reported) => record_teardown_error(&mut error, &mut cleanup_error, reported),
 		}
 	}
@@ -1662,25 +1552,18 @@ enum PreparedWork {
 }
 
 impl PreparedTask {
-	fn new(bundle: &FinalizedBundle, task: &Task) -> Result<Self> {
+	fn new(bundle: &FinalizedBundle, task: &Task) -> Self {
 		let iteration_domain = match task.phase {
-			RunPhase::Loop => {
-				Some(bundle
-					.iteration_domain(task.id)
-					.ok_or(ExecutorError::LifecycleInvariant {
-						detail: "finalized loop task has no iteration domain",
-					})?)
-			}
+			RunPhase::Loop => Some(bundle.iteration_domain(task.id).unwrap()),
 			RunPhase::Init | RunPhase::Exit => None,
 		};
 		let work = match (&task.kind, task.phase) {
 			(TaskKind::Calculation(calculation), RunPhase::Loop) => {
-				let inputs = resolve_values(bundle, task.id, &calculation.inputs)?;
-				let outputs = resolve_values(bundle, task.id, &calculation.outputs)?;
+				let inputs = resolve_values(bundle, &calculation.inputs);
+				let outputs = resolve_values(bundle, &calculation.outputs);
 				let fault_flag = calculation
 					.fault_flag
-					.map(|value| resolve_value(bundle, task.id, value))
-					.transpose()?;
+					.map(|value| resolve_value(bundle, value));
 				PreparedWork::Calculation {
 					device: calculation.device,
 					kernel_template: calculation.kernel_template,
@@ -1696,7 +1579,7 @@ impl PreparedTask {
 					purpose: metric.purpose,
 					metric: metric.metric,
 					slot: metric.slot,
-					value: resolve_value(bundle, task.id, metric.value)?,
+					value: resolve_value(bundle, metric.value),
 					submission: metric.submission,
 				}
 			}
@@ -1709,12 +1592,9 @@ impl PreparedTask {
 				let TransferEndpoint::Device { device, .. } = transfer.destination else {
 					unreachable!("guard established device destination");
 				};
-				let endpoints = resolve_transfer_endpoints(bundle, task.id)?;
+				let endpoints = resolve_transfer_endpoints(bundle, task.id);
 				let ResolvedTransferEndpoint::Device(destination) = endpoints.destination else {
-					return Err(ExecutorError::BackendProtocol {
-						task: task.id,
-						detail: "finalized admission has no resolved device destination",
-					});
+					unreachable!()
 				};
 				PreparedWork::InitAdmission {
 					device,
@@ -1732,7 +1612,7 @@ impl PreparedTask {
 					)
 				) =>
 			{
-				let endpoints = resolve_transfer_endpoints(bundle, task.id)?;
+				let endpoints = resolve_transfer_endpoints(bundle, task.id);
 				PreparedWork::Transfer {
 					class: WorkClass::InternalTransfer,
 					source: endpoints.source,
@@ -1752,7 +1632,7 @@ impl PreparedTask {
 					) | (TransferEndpoint::Device { .. }, TransferEndpoint::External)
 				) =>
 			{
-				let endpoints = resolve_transfer_endpoints(bundle, task.id)?;
+				let endpoints = resolve_transfer_endpoints(bundle, task.id);
 				PreparedWork::Transfer {
 					class: WorkClass::ExitTransfer,
 					source: endpoints.source,
@@ -1763,49 +1643,17 @@ impl PreparedTask {
 					submission: transfer.submission,
 				}
 			}
-			(TaskKind::Calculation(_), _) => {
-				return Err(ExecutorError::InvalidPhaseTask {
-					phase: task.phase,
-					task: task.id,
-					detail: "calculations are legal only in the loop",
-				});
-			}
-			(TaskKind::Metric(_), _) => {
-				return Err(ExecutorError::InvalidPhaseTask {
-					phase: task.phase,
-					task: task.id,
-					detail: "metrics are legal only in the loop",
-				});
-			}
-			(TaskKind::Transfer(_), RunPhase::Loop) => {
-				return Err(ExecutorError::InvalidPhaseTask {
-					phase: task.phase,
-					task: task.id,
-					detail: "loop transfers must be internal",
-				});
-			}
-			(TaskKind::Transfer(_), RunPhase::Init) => {
-				return Err(ExecutorError::InvalidPhaseTask {
-					phase: task.phase,
-					task: task.id,
-					detail: "init transfer is neither admission nor internal movement",
-				});
-			}
-			(TaskKind::Transfer(_), RunPhase::Exit) => {
-				return Err(ExecutorError::InvalidPhaseTask {
-					phase: task.phase,
-					task: task.id,
-					detail: "exit cannot admit external data",
-				});
-			}
+			(TaskKind::Calculation(_), _)
+			| (TaskKind::Metric(_), _)
+			| (TaskKind::Transfer(_), RunPhase::Init | RunPhase::Loop | RunPhase::Exit) => unreachable!(),
 		};
-		Ok(Self {
+		Self {
 			id: task.id,
 			window: task.window,
 			dependencies: task.dependencies.clone(),
 			iteration_domain,
 			work,
-		})
+		}
 	}
 
 	fn active_on(&self, iteration: LoopIteration) -> bool {
@@ -1836,7 +1684,7 @@ impl PreparedTask {
 		run: RunId,
 		iteration: Option<LoopIteration>,
 		images: Option<&'a BTreeMap<InitImageKey, Vec<u8>>>,
-	) -> Result<BackendWork<'a>> {
+	) -> BackendWork<'a> {
 		match &self.work {
 			PreparedWork::InitAdmission {
 				device,
@@ -1844,22 +1692,20 @@ impl PreparedTask {
 				bytes,
 				submission,
 			} => {
-				let images = images.ok_or(ExecutorError::MissingAdmission { device: *device })?;
+				let images = images.unwrap();
 				let key = InitImageKey {
 					device: *device,
 					image: destination.value,
 					bytes: *bytes,
 				};
-				let image = images
-					.get(&key)
-					.ok_or(ExecutorError::MissingAdmission { device: *device })?;
-				Ok(BackendWork::InitAdmission(InitAdmissionWork {
+				let image = &images[&key];
+				BackendWork::InitAdmission(InitAdmissionWork {
 					task: self.id,
 					destination: *destination,
 					bytes: *bytes,
 					submission: *submission,
 					image,
-				}))
+				})
 			}
 			PreparedWork::Calculation {
 				device,
@@ -1870,10 +1716,8 @@ impl PreparedTask {
 				outputs,
 				fault_flag,
 			} => {
-				let iteration = iteration.ok_or(ExecutorError::LifecycleInvariant {
-					detail: "calculation work has no active loop iteration",
-				})?;
-				Ok(BackendWork::Calculation(CalculationWork {
+				let iteration = iteration.unwrap();
+				BackendWork::Calculation(CalculationWork {
 					task: self.id,
 					run,
 					iteration,
@@ -1884,7 +1728,7 @@ impl PreparedTask {
 					inputs,
 					outputs,
 					fault_flag: *fault_flag,
-				}))
+				})
 			}
 			PreparedWork::Transfer {
 				class,
@@ -1905,8 +1749,8 @@ impl PreparedTask {
 					submission: *submission,
 				};
 				match class {
-					WorkClass::InternalTransfer => Ok(BackendWork::InternalTransfer(transfer)),
-					WorkClass::ExitTransfer => Ok(BackendWork::ExitTransfer(transfer)),
+					WorkClass::InternalTransfer => BackendWork::InternalTransfer(transfer),
+					WorkClass::ExitTransfer => BackendWork::ExitTransfer(transfer),
 					_ => unreachable!("prepared transfer has a transfer work class"),
 				}
 			}
@@ -1917,10 +1761,8 @@ impl PreparedTask {
 				value,
 				submission,
 			} => {
-				let iteration = iteration.ok_or(ExecutorError::LifecycleInvariant {
-					detail: "metric work has no active loop iteration",
-				})?;
-				Ok(BackendWork::Metric(MetricWork {
+				let iteration = iteration.unwrap();
+				BackendWork::Metric(MetricWork {
 					task: self.id,
 					iteration,
 					purpose: *purpose,
@@ -1928,7 +1770,7 @@ impl PreparedTask {
 					slot: *slot,
 					value: *value,
 					submission: *submission,
-				}))
+				})
 			}
 		}
 	}
@@ -1952,10 +1794,7 @@ impl PreparedTask {
 				fault_flag: Some(location),
 				..
 			} => {
-				Some(FaultReset {
-					task: self.id,
-					location,
-				})
+				Some(FaultReset { location })
 			}
 			_ => None,
 		}
@@ -1968,15 +1807,15 @@ struct PreparedPhase {
 }
 
 impl PreparedPhase {
-	fn new(bundle: &FinalizedBundle, phase: RunPhase) -> Result<Self> {
+	fn new(bundle: &FinalizedBundle, phase: RunPhase) -> Self {
 		let mut tasks = bundle
 			.tasks()
 			.iter()
 			.filter(|task| task.phase == phase)
 			.map(|task| PreparedTask::new(bundle, task))
-			.collect::<Result<Vec<_>>>()?;
+			.collect::<Vec<_>>();
 		tasks.sort_by_key(|task| (task.window.start, task.id));
-		Ok(Self { tasks })
+		Self { tasks }
 	}
 
 	fn external_exit_count(&self) -> usize {
@@ -1995,12 +1834,12 @@ struct PreparedPhases {
 }
 
 impl PreparedPhases {
-	fn new(bundle: &FinalizedBundle) -> Result<Self> {
-		Ok(Self {
-			init: PreparedPhase::new(bundle, RunPhase::Init)?,
-			loop_phase: PreparedPhase::new(bundle, RunPhase::Loop)?,
-			exit: PreparedPhase::new(bundle, RunPhase::Exit)?,
-		})
+	fn new(bundle: &FinalizedBundle) -> Self {
+		Self {
+			init: PreparedPhase::new(bundle, RunPhase::Init),
+			loop_phase: PreparedPhase::new(bundle, RunPhase::Loop),
+			exit: PreparedPhase::new(bundle, RunPhase::Exit),
+		}
 	}
 
 	fn fault_resets(&self) -> Vec<FaultReset> {
@@ -2018,7 +1857,6 @@ impl PreparedPhases {
 
 #[derive(Clone, Copy, Debug)]
 struct FaultReset {
-	task: TaskId,
 	location: ResolvedValueLocation,
 }
 
@@ -2056,19 +1894,12 @@ impl CompletionLedger {
 			.is_ok_and(|index| self.entries[index].complete)
 	}
 
-	fn mark(&mut self, task: TaskId) -> Result<()> {
+	fn mark(&mut self, task: TaskId) {
 		let index = self
 			.entries
 			.binary_search_by_key(&task, |entry| entry.task)
-			.map_err(|search_index| {
-				debug_assert!(search_index <= self.entries.len());
-				ExecutorError::BackendProtocol {
-					task,
-					detail: "completion names a task outside the fixed ledger",
-				}
-			})?;
+			.unwrap();
 		self.entries[index].complete = true;
-		Ok(())
 	}
 
 	fn completed_count(&self) -> usize { self.entries.iter().filter(|entry| entry.complete).count() }
@@ -2141,19 +1972,12 @@ fn validate_images(
 			image: manifest.image,
 			bytes: manifest.bytes,
 		};
-		let None = expected.insert(manifest.device, key) else {
-			return Err(ExecutorError::DuplicateAdmission {
-				device: manifest.device,
-			});
-		};
+		let prior = expected.insert(manifest.device, key);
+		debug_assert!(prior.is_none());
 	}
 
 	for layout in bundle.arena_layouts() {
-		expected
-			.get(&layout.device)
-			.ok_or(ExecutorError::MissingAdmission {
-				device: layout.device,
-			})?;
+		debug_assert!(expected.contains_key(&layout.device));
 	}
 
 	let mut validated = BTreeMap::new();
@@ -2168,15 +1992,7 @@ fn validate_images(
 				actual: supplied.image,
 			});
 		}
-		let actual = ByteCount::new(
-			u64::try_from(supplied.bytes.len()).map_err(|conversion_error| {
-				debug_assert!(
-					false,
-					"host image length did not fit u64: {conversion_error}"
-				);
-				ExecutorError::PreparationCapacityOverflow
-			})?,
-		);
+		let actual = ByteCount::new(u64::try_from(supplied.bytes.len()).unwrap());
 		if actual != key.bytes {
 			return Err(ExecutorError::AdmissionSizeMismatch {
 				device: *device,
@@ -2192,72 +2008,32 @@ fn validate_images(
 	}?;
 
 	for reset in fault_resets {
-		let key = expected
-			.get(&reset.location.device)
-			.ok_or(ExecutorError::MissingAdmission {
-				device: reset.location.device,
-			})?;
-		let image_location = bundle
-			.value_location(key.image)
-			.ok_or(ExecutorError::BackendProtocol {
-				task: reset.task,
-				detail: "finalized init image has no resolved value location",
-			})?;
-		let range = fault_reset_range(reset.task, *image_location, reset.location, key.bytes)?;
-		let bytes = validated
-			.get_mut(key)
-			.ok_or(ExecutorError::MissingAdmission {
-				device: reset.location.device,
-			})?;
-		let target = bytes.get_mut(range).ok_or(ExecutorError::BackendProtocol {
-			task: reset.task,
-			detail: "fault flag lies outside its device init image",
-		})?;
+		let key = &expected[&reset.location.device];
+		let image_location = bundle.value_location(key.image).unwrap();
+		let range = fault_reset_range(*image_location, reset.location, key.bytes);
+		let bytes = validated.get_mut(key).unwrap();
+		let target = bytes.get_mut(range).unwrap();
 		target.fill(0);
 	}
 	Ok(validated)
 }
 
 fn fault_reset_range(
-	task: TaskId,
 	image: ResolvedValueLocation,
 	fault: ResolvedValueLocation,
 	image_bytes: ByteCount,
-) -> Result<core::ops::Range<usize>> {
-	match image.device == fault.device && image.object == fault.object && image.bytes == image_bytes {
-		true => Ok(()),
-		false => {
-			Err(ExecutorError::BackendProtocol {
-				task,
-				detail: "fault flag and finalized init image do not share one exact arena object",
-			})
-		}
-	}?;
+) -> core::ops::Range<usize> {
+	debug_assert!(image.device == fault.device && image.object == fault.object && image.bytes == image_bytes);
 	let relative_offset = fault
 		.arena_offset
 		.get()
 		.checked_sub(image.arena_offset.get())
-		.ok_or(ExecutorError::BackendProtocol {
-			task,
-			detail: "fault flag precedes its finalized init image",
-		})?;
-	let start = usize::try_from(relative_offset).map_err(|conversion_error| {
-		debug_assert!(
-			false,
-			"fault flag offset did not fit usize: {conversion_error}"
-		);
-		ExecutorError::BackendProtocol {
-			task,
-			detail: "fault flag offset does not fit the host address space",
-		}
-	})?;
+		.unwrap();
+	let start = usize::try_from(relative_offset).unwrap();
 	let end = start
 		.checked_add(core::mem::size_of::<i32>())
-		.ok_or(ExecutorError::BackendProtocol {
-			task,
-			detail: "fault flag byte range overflowed",
-		})?;
-	Ok(start..end)
+		.unwrap();
+	start..end
 }
 
 fn run_phase_blocking<B: Backend>(
@@ -2307,11 +2083,11 @@ fn poll_phase_once<B: Backend>(
 				continue;
 			}
 			let task = state.slots[index].task.id;
-			core.completed.mark(task)?;
+			core.completed.mark(task);
 			core.journal.record_logical(LogicalEvent::TaskCompleted {
 				phase: RunPhase::Loop,
 				task,
-			})?;
+			}).unwrap();
 			state.slots[index].status = SlotStatus::Complete;
 			made_progress = true;
 		}
@@ -2403,9 +2179,7 @@ fn poll_phase_once<B: Backend>(
 				made_progress,
 			});
 		}
-		(true, false) if !made_progress => {
-			return Err(ExecutorError::SchedulerStalled { phase: state.phase });
-		}
+		(true, false) if !made_progress => debug_assert!(false),
 		_ => {}
 	}
 
@@ -2434,7 +2208,7 @@ fn submit_slot<B: Backend>(
 	slot: &mut TaskSlot<B::Pending>,
 	images: Option<&BTreeMap<InitImageKey, Vec<u8>>>,
 ) -> Result<()> {
-	let work = slot.task.backend_work(core.run_id, iteration, images)?;
+	let work = slot.task.backend_work(core.run_id, iteration, images);
 	let class = work.class();
 	let mut physical_calls = PhysicalCallBatch::new();
 	let result = {
@@ -2450,11 +2224,7 @@ fn submit_slot<B: Backend>(
 					&mut physical_calls,
 				)
 			}
-			(RunPhase::Loop, None) => {
-				return Err(ExecutorError::LifecycleInvariant {
-					detail: "loop task submission has no active iteration",
-				});
-			}
+			(RunPhase::Loop, None) => unreachable!(),
 			(RunPhase::Init | RunPhase::Exit, _) => {
 				core.backend.submit(
 					resource,
@@ -2479,14 +2249,14 @@ fn submit_slot<B: Backend>(
 				task: slot.task.id,
 				device,
 				bytes,
-			})?;
+			}).unwrap();
 		}
 		_ => {
 			core.journal.record_logical(LogicalEvent::TaskSubmitted {
 				phase,
 				task: slot.task.id,
 				class,
-			})?;
+			}).unwrap();
 		}
 	}
 	slot.status = SlotStatus::Pending;
@@ -2524,9 +2294,7 @@ fn complete_slot<B: Backend>(
 		) => {
 			match purpose {
 				MetricPurpose::User => {
-					let iteration = iteration.ok_or(ExecutorError::LifecycleInvariant {
-						detail: "metric completion has no active loop iteration",
-					})?;
+					let iteration = iteration.unwrap();
 					let replaced = core.metrics.publish(
 						iteration,
 						slot.task.id,
@@ -2538,7 +2306,7 @@ fn complete_slot<B: Backend>(
 						task: slot.task.id,
 						slot: *metric_slot,
 						replaced_unconsumed: replaced,
-					})?;
+					}).unwrap();
 				}
 				MetricPurpose::FaultReadback => {
 					match metric_value {
@@ -2546,7 +2314,7 @@ fn complete_slot<B: Backend>(
 							core.journal.record_logical(LogicalEvent::FaultChecked {
 								readback: slot.task.id,
 								value: location.value,
-							})?;
+							}).unwrap();
 						}
 						crate::MetricValue::I32(code) => {
 							return Err(ExecutorError::DeviceFault {
@@ -2585,11 +2353,11 @@ fn complete_slot<B: Backend>(
 		}
 		(_, _, None) => {}
 	}
-	core.completed.mark(slot.task.id)?;
+	core.completed.mark(slot.task.id);
 	core.journal.record_logical(LogicalEvent::TaskCompleted {
 		phase,
 		task: slot.task.id,
-	})?;
+	}).unwrap();
 	Ok(())
 }
 
@@ -2622,11 +2390,8 @@ fn collect_exit_image<B: Backend>(
 			}
 		})?;
 	image.resize(length, 0);
-	let BackendWork::ExitTransfer(work) = slot.task.backend_work(core.run_id, None, None)? else {
-		return Err(ExecutorError::BackendProtocol {
-			task: slot.task.id,
-			detail: "external exit did not prepare exit-transfer work",
-		});
+	let BackendWork::ExitTransfer(work) = slot.task.backend_work(core.run_id, None, None) else {
+		unreachable!()
 	};
 	let mut physical_calls = PhysicalCallBatch::new();
 	let result = {
@@ -2646,48 +2411,28 @@ fn collect_exit_image<B: Backend>(
 		physical_calls,
 		result,
 	)?;
-	match core.exit_images.len() < core.exit_image_capacity {
-		true => {
-			core.exit_images.push(ExitImage {
-				task: slot.task.id,
-				source,
-				bytes: image,
-			})
-		}
-		false => {
-			return Err(ExecutorError::BackendProtocol {
-				task: slot.task.id,
-				detail: "external exit exceeded its precomputed result slots",
-			});
-		}
-	}
+	debug_assert!(core.exit_images.len() < core.exit_image_capacity);
+	core.exit_images.push(ExitImage {
+		task: slot.task.id,
+		source,
+		bytes: image,
+	});
 	Ok(())
 }
 
-fn resolve_values(bundle: &FinalizedBundle, task: TaskId, values: &[ValueId]) -> Result<Vec<ResolvedValueLocation>> {
-	values.iter()
-		.map(|value| resolve_value(bundle, task, *value))
-		.collect()
+fn resolve_values(bundle: &FinalizedBundle, values: &[ValueId]) -> Vec<ResolvedValueLocation> {
+	values.iter().map(|value| resolve_value(bundle, *value)).collect()
 }
 
 fn resolve_transfer_endpoints(
 	bundle: &FinalizedBundle,
 	task: TaskId,
-) -> Result<recipe_core::ResolvedTransferEndpoints> {
-	bundle.transfer_endpoints(task)
-		.ok_or(ExecutorError::BackendProtocol {
-			task,
-			detail: "finalized transfer references an endpoint without a resolved location",
-		})
+) -> recipe_core::ResolvedTransferEndpoints {
+	bundle.transfer_endpoints(task).unwrap()
 }
 
-fn resolve_value(bundle: &FinalizedBundle, task: TaskId, value: ValueId) -> Result<ResolvedValueLocation> {
-	bundle.value_location(value)
-		.copied()
-		.ok_or(ExecutorError::BackendProtocol {
-			task,
-			detail: "finalized task references a value without a resolved location",
-		})
+fn resolve_value(bundle: &FinalizedBundle, value: ValueId) -> ResolvedValueLocation {
+	*bundle.value_location(value).unwrap()
 }
 
 fn backend_value<T, E: std::error::Error>(
@@ -2715,29 +2460,26 @@ fn backend_value<T, E: std::error::Error>(
 	}
 }
 
-fn checked_capacity_sum(values: &[usize]) -> Result<usize> {
-	values.iter().try_fold(0_usize, |sum, value| {
-		sum.checked_add(*value)
-			.ok_or(ExecutorError::PreparationCapacityOverflow)
-	})
+fn checked_capacity_sum(values: &[usize]) -> usize {
+	values.iter().fold(0_usize, |sum, value| sum.checked_add(*value).unwrap())
 }
 
-fn iteration_domain_activations_before(domain: IterationDomain, retained_end: u64) -> Result<usize> {
+fn iteration_domain_activations_before(domain: IterationDomain, retained_end: u64) -> usize {
 	let end_exclusive = domain
 		.end_exclusive()
 		.map_or(retained_end, |end| end.min(retained_end));
 	if end_exclusive <= domain.first_iteration() {
-		return Ok(0);
+		return 0;
 	}
 	let span = end_exclusive
 		.checked_sub(domain.first_iteration())
-		.ok_or(ExecutorError::PreparationCapacityOverflow)?;
+		.unwrap();
 	let stride = domain.stride().get();
 	let activations = span
 		.checked_add(stride - 1)
 		.and_then(|value| value.checked_div(stride))
-		.ok_or(ExecutorError::PreparationCapacityOverflow)?;
-	usize::try_from(activations).map_err(|_| ExecutorError::PreparationCapacityOverflow)
+		.unwrap();
+	usize::try_from(activations).unwrap()
 }
 
 fn repeated_loop_event(event: &LogicalEvent) -> bool {
@@ -2756,7 +2498,6 @@ fn repeated_loop_event(event: &LogicalEvent) -> bool {
 	)
 }
 
-fn checked_capacity_mul(left: usize, right: usize) -> Result<usize> {
-	left.checked_mul(right)
-		.ok_or(ExecutorError::PreparationCapacityOverflow)
+fn checked_capacity_mul(left: usize, right: usize) -> usize {
+	left.checked_mul(right).unwrap()
 }

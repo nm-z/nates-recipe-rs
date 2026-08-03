@@ -1051,10 +1051,10 @@ fn write_knn_prediction_rows(
 }
 
 fn write_knn_label(writer: &mut impl Write, label: &KnnLabelValue) -> io::Result<()> {
-	match label {
-		KnnLabelValue::I32(value) => write!(writer, "{value}"),
-		KnnLabelValue::Bytes(bytes) => write_quoted_bytes(writer, bytes),
+	if let Some(value) = label.as_i32() {
+		return write!(writer, "{value}");
 	}
+	write_quoted_bytes(writer, label.as_bytes().unwrap())
 }
 
 fn decode_prediction_f32(bytes: &[u8]) -> f32 {

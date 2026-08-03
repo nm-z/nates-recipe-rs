@@ -5,6 +5,9 @@ edition = "2024"
 autotests = false
 description = "Real-data, real-hardware acceptance gates for Recipe"
 license = "MIT"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "recipe-acceptance"

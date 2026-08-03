@@ -1,6 +1,6 @@
 use core::{fmt, num::NonZeroU64};
+use alloc::collections::{BTreeMap, BTreeSet};
 use std::{
-	collections::{BTreeMap, BTreeSet},
 	path::Path,
 };
 
@@ -30,7 +30,7 @@ use crate::{
 	CheckpointArtifactVector, CheckpointDecodeErrorKind, CheckpointDecodeLimits, CheckpointError, CheckpointPath,
 	CheckpointTensorImage, CompiledFeatureSpan, DenseActivation, DenseDataNormalization, DenseFeatureLowering,
 	DenseNormalization, DenseOperation, DenseOutputAdapter, DenseTask, KnnModelArtifact, KnnModelDecodeLimits,
-	KnnReferenceValues, MAXIMUM_REDUCTION_TREE_LANES,
+	MAXIMUM_REDUCTION_TREE_LANES,
 	checkpoint::decode_error,
 	decode_bayes_model, decode_checkpoint, decode_knn_model,
 	forward::{
@@ -73,6 +73,7 @@ pub enum InferencePreparationError {
 }
 
 impl fmt::Display for InferencePreparationError {
+	#[inline]
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::CheckpointSource(error) => write!(formatter, "load checkpoint source: {error}"),
@@ -94,8 +95,9 @@ impl fmt::Display for InferencePreparationError {
 	}
 }
 
-impl std::error::Error for InferencePreparationError {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for InferencePreparationError {
+	#[inline]
+	fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
 		match self {
 			Self::CheckpointSource(error) => Some(error),
 			Self::Checkpoint(error) => Some(error),
@@ -107,19 +109,31 @@ impl std::error::Error for InferencePreparationError {
 }
 
 impl From<SourceError> for InferencePreparationError {
-	fn from(error: SourceError) -> Self { Self::CheckpointSource(error) }
+	#[inline]
+	fn from(error: SourceError) -> Self {
+		Self::CheckpointSource(error)
+	}
 }
 
 impl From<CheckpointError> for InferencePreparationError {
-	fn from(error: CheckpointError) -> Self { Self::Checkpoint(error) }
+	#[inline]
+	fn from(error: CheckpointError) -> Self {
+		Self::Checkpoint(error)
+	}
 }
 
 impl From<InferencePrepareError> for InferencePreparationError {
-	fn from(error: InferencePrepareError) -> Self { Self::Data(error) }
+	#[inline]
+	fn from(error: InferencePrepareError) -> Self {
+		Self::Data(error)
+	}
 }
 
 impl From<GgufLlamaError> for InferencePreparationError {
-	fn from(error: GgufLlamaError) -> Self { Self::GgufLlama(error) }
+	#[inline]
+	fn from(error: GgufLlamaError) -> Self {
+		Self::GgufLlama(error)
+	}
 }
 
 pub type InferencePreparationResult<T> = Result<T, InferencePreparationError>;
@@ -159,12 +173,18 @@ pub struct InferenceCompileError {
 
 impl InferenceCompileError {
 	#[must_use]
-	pub const fn kind(&self) -> InferenceCompileErrorKind { self.kind }
+	#[inline]
+	pub const fn kind(&self) -> InferenceCompileErrorKind {
+		self.kind
+	}
 
 	#[must_use]
-	pub fn detail(&self) -> &str { &self.detail }
+	#[inline]
+	pub fn detail(&self) -> &str {
+		&self.detail
+	}
 
-	fn new(kind: InferenceCompileErrorKind, detail: impl Into<String>) -> Self {
+	pub(crate) fn new(kind: InferenceCompileErrorKind, detail: impl Into<String>) -> Self {
 		Self {
 			kind,
 			detail: detail.into(),
@@ -173,38 +193,90 @@ impl InferenceCompileError {
 }
 
 impl fmt::Display for InferenceCompileError {
+	#[inline]
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(formatter, "{:?}: {}", self.kind, self.detail)
 	}
 }
 
-impl std::error::Error for InferenceCompileError {}
+impl core::error::Error for InferenceCompileError {}
 
 impl From<recipe_language::LanguageError> for InferenceCompileError {
+	#[inline]
 	fn from(error: recipe_language::LanguageError) -> Self {
 		Self::new(InferenceCompileErrorKind::Language, error.to_string())
 	}
 }
 
 impl From<recipe_language::OgdlCodecError> for InferenceCompileError {
+	#[inline]
 	fn from(error: recipe_language::OgdlCodecError) -> Self {
 		Self::new(InferenceCompileErrorKind::Ogdl, error.to_string())
 	}
 }
 
 impl From<recipe_ops::OperationError> for InferenceCompileError {
+	#[inline]
 	fn from(error: recipe_ops::OperationError) -> Self {
 		Self::new(InferenceCompileErrorKind::Operation, error.to_string())
 	}
 }
 
 impl From<recipe_program::ProgramError> for InferenceCompileError {
+	#[inline]
 	fn from(error: recipe_program::ProgramError) -> Self {
 		Self::new(InferenceCompileErrorKind::Program, error.to_string())
 	}
 }
 
 pub type InferenceCompileResult<T> = Result<T, InferenceCompileError>;
+
+pub(crate) struct BlockInferenceContext<'a> {
+	pub input: ValueId,
+	pub rows: u64,
+	pub width: u64,
+	pub logical_length: u64,
+	pub logical_channels: u64,
+	pub block_index: usize,
+	pub layer_index: &'a mut usize,
+	pub normalization_epsilon: f32,
+	pub tree_lanes: u32,
+}
+
+pub(crate) struct BlockInference {
+	pub output: ValueId,
+	pub width: u64,
+	pub logical_length: u64,
+	pub logical_channels: u64,
+}
+
+pub(crate) trait InferenceBlock {
+	fn token_vocabulary(&self) -> Option<u64> {
+		None
+	}
+
+	fn compile_inference(
+		&self,
+		compiler: &mut InferenceGraphCompiler,
+		context: BlockInferenceContext<'_>,
+	) -> InferenceCompileResult<BlockInference>;
+}
+
+fn inference_block(block: &crate::CheckpointBlockImage) -> &dyn InferenceBlock {
+	match block {
+		crate::CheckpointBlockImage::Embedding(block) => block,
+		crate::CheckpointBlockImage::Attention(block) => block,
+		crate::CheckpointBlockImage::Rnn(block) => block,
+		crate::CheckpointBlockImage::Gru(block) => block,
+		crate::CheckpointBlockImage::Lstm(block) => block,
+		crate::CheckpointBlockImage::Layer(block) => block,
+		crate::CheckpointBlockImage::Convolution(block) => block,
+		crate::CheckpointBlockImage::Pool(block) => block,
+		crate::CheckpointBlockImage::KMeans(block) => block,
+		crate::CheckpointBlockImage::Tree(block) => block,
+		crate::CheckpointBlockImage::Residual(block) => block,
+	}
+}
 
 /// Semantic role of one immutable host image admitted to an inference graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -410,19 +482,34 @@ pub struct InferenceExternalInput {
 
 impl InferenceExternalInput {
 	#[must_use]
-	pub const fn role(&self) -> InferenceInputRole { self.role }
+	#[inline]
+	pub const fn role(&self) -> InferenceInputRole {
+		self.role
+	}
 
 	#[must_use]
-	pub const fn value(&self) -> ValueId { self.value }
+	#[inline]
+	pub const fn value(&self) -> ValueId {
+		self.value
+	}
 
 	#[must_use]
-	pub const fn dtype(&self) -> DType { self.dtype }
+	#[inline]
+	pub const fn dtype(&self) -> DType {
+		self.dtype
+	}
 
 	#[must_use]
-	pub const fn shape(&self) -> &Shape { &self.shape }
+	#[inline]
+	pub const fn shape(&self) -> &Shape {
+		&self.shape
+	}
 
 	#[must_use]
-	pub fn bytes(&self) -> &[u8] { &self.bytes }
+	#[inline]
+	pub fn bytes(&self) -> &[u8] {
+		&self.bytes
+	}
 }
 
 /// Interpretation of the single inference egress matrix.
@@ -461,26 +548,44 @@ pub struct InferenceOutputContract {
 
 impl InferenceOutputContract {
 	#[must_use]
-	pub const fn value(&self) -> ValueId { self.value }
+	#[inline]
+	pub const fn value(&self) -> ValueId {
+		self.value
+	}
 
 	#[must_use]
-	pub const fn dtype(&self) -> DType { self.dtype }
+	#[inline]
+	pub const fn dtype(&self) -> DType {
+		self.dtype
+	}
 
 	/// First dtype selected by semantic distillation. This compatibility accessor
 	/// is the complete target dtype only for singular-target tasks.
 	#[must_use]
-	pub fn target_dtype(&self) -> DType { self.target_dtypes[0] }
+	#[inline]
+	pub fn target_dtype(&self) -> DType {
+		self.target_dtypes[0]
+	}
 
 	/// Source target dtypes in the saved declaration order. Prediction tensors
 	/// remain one f32 matrix regardless of these source representations.
 	#[must_use]
-	pub fn target_dtypes(&self) -> &[DType] { &self.target_dtypes }
+	#[inline]
+	pub fn target_dtypes(&self) -> &[DType] {
+		&self.target_dtypes
+	}
 
 	#[must_use]
-	pub const fn shape(&self) -> &Shape { &self.shape }
+	#[inline]
+	pub const fn shape(&self) -> &Shape {
+		&self.shape
+	}
 
 	#[must_use]
-	pub const fn kind(&self) -> InferencePredictionKind { self.kind }
+	#[inline]
+	pub const fn kind(&self) -> InferencePredictionKind {
+		self.kind
+	}
 }
 
 /// One deterministic, target-free, single-iteration inference program.
@@ -496,25 +601,46 @@ pub struct CompiledInference {
 
 impl CompiledInference {
 	#[must_use]
-	pub const fn graph(&self) -> &CalculationGraph { self.program.graph() }
+	#[inline]
+	pub const fn graph(&self) -> &CalculationGraph {
+		self.program.graph()
+	}
 
 	#[must_use]
-	pub const fn program(&self) -> &StaticCalculationProgram { &self.program }
+	#[inline]
+	pub const fn program(&self) -> &StaticCalculationProgram {
+		&self.program
+	}
 
 	#[must_use]
-	pub fn external_inputs(&self) -> &[InferenceExternalInput] { &self.external_inputs }
+	#[inline]
+	pub fn external_inputs(&self) -> &[InferenceExternalInput] {
+		&self.external_inputs
+	}
 
 	#[must_use]
-	pub const fn output(&self) -> &InferenceOutputContract { &self.output }
+	#[inline]
+	pub const fn output(&self) -> &InferenceOutputContract {
+		&self.output
+	}
 
 	#[must_use]
-	pub const fn rows(&self) -> u64 { self.rows }
+	#[inline]
+	pub const fn rows(&self) -> u64 {
+		self.rows
+	}
 
 	#[must_use]
-	pub const fn task(&self) -> InferenceTask { self.task }
+	#[inline]
+	pub const fn task(&self) -> InferenceTask {
+		self.task
+	}
 
 	#[must_use]
-	pub const fn output_adapter(&self) -> Option<DenseOutputAdapter> { self.output_adapter }
+	#[inline]
+	pub const fn output_adapter(&self) -> Option<DenseOutputAdapter> {
+		self.output_adapter
+	}
 }
 
 /// Aggregation represented by one independently typed KNN prediction tensor.
@@ -552,19 +678,34 @@ impl KnnInferenceOutputContract {
 	}
 
 	#[must_use]
-	pub const fn value(&self) -> ValueId { self.value }
+	#[inline]
+	pub const fn value(&self) -> ValueId {
+		self.value
+	}
 
 	#[must_use]
-	pub const fn dtype(&self) -> DType { self.dtype }
+	#[inline]
+	pub const fn dtype(&self) -> DType {
+		self.dtype
+	}
 
 	#[must_use]
-	pub const fn shape(&self) -> &Shape { &self.shape }
+	#[inline]
+	pub const fn shape(&self) -> &Shape {
+		&self.shape
+	}
 
 	#[must_use]
-	pub const fn source_vector(&self) -> usize { self.source_vector }
+	#[inline]
+	pub const fn source_vector(&self) -> usize {
+		self.source_vector
+	}
 
 	#[must_use]
-	pub const fn kind(&self) -> KnnInferencePredictionKind { self.kind }
+	#[inline]
+	pub const fn kind(&self) -> KnnInferencePredictionKind {
+		self.kind
+	}
 }
 
 /// One deterministic, target-free KNN program with one egress tensor per
@@ -579,19 +720,34 @@ pub struct CompiledKnnInference {
 
 impl CompiledKnnInference {
 	#[must_use]
-	pub const fn graph(&self) -> &CalculationGraph { self.program.graph() }
+	#[inline]
+	pub const fn graph(&self) -> &CalculationGraph {
+		self.program.graph()
+	}
 
 	#[must_use]
-	pub const fn program(&self) -> &StaticCalculationProgram { &self.program }
+	#[inline]
+	pub const fn program(&self) -> &StaticCalculationProgram {
+		&self.program
+	}
 
 	#[must_use]
-	pub fn external_inputs(&self) -> &[InferenceExternalInput] { &self.external_inputs }
+	#[inline]
+	pub fn external_inputs(&self) -> &[InferenceExternalInput] {
+		&self.external_inputs
+	}
 
 	#[must_use]
-	pub fn outputs(&self) -> &[KnnInferenceOutputContract] { &self.outputs }
+	#[inline]
+	pub fn outputs(&self) -> &[KnnInferenceOutputContract] {
+		&self.outputs
+	}
 
 	#[must_use]
-	pub const fn rows(&self) -> u64 { self.rows }
+	#[inline]
+	pub const fn rows(&self) -> u64 {
+		self.rows
+	}
 }
 
 /// A decoded KNN model and target-free rows bound to its saved feature schema.
@@ -610,24 +766,42 @@ pub struct PreparedBayesInference {
 
 impl PreparedBayesInference {
 	#[must_use]
-	pub const fn artifact(&self) -> &BayesModelArtifact { &self.artifact }
+	#[inline]
+	pub const fn artifact(&self) -> &BayesModelArtifact {
+		&self.artifact
+	}
 
 	#[must_use]
-	pub const fn data(&self) -> &PreparedInferenceDataset { &self.data }
+	#[inline]
+	pub const fn data(&self) -> &PreparedInferenceDataset {
+		&self.data
+	}
 
 	#[must_use]
-	pub fn into_artifact(self) -> BayesModelArtifact { self.artifact }
+	#[inline]
+	pub fn into_artifact(self) -> BayesModelArtifact {
+		self.artifact
+	}
 }
 
 impl PreparedKnnInference {
 	#[must_use]
-	pub const fn artifact(&self) -> &KnnModelArtifact { &self.artifact }
+	#[inline]
+	pub const fn artifact(&self) -> &KnnModelArtifact {
+		&self.artifact
+	}
 
 	#[must_use]
-	pub const fn data(&self) -> &PreparedInferenceDataset { &self.data }
+	#[inline]
+	pub const fn data(&self) -> &PreparedInferenceDataset {
+		&self.data
+	}
 
 	#[must_use]
-	pub fn into_artifact(self) -> KnnModelArtifact { self.artifact }
+	#[inline]
+	pub fn into_artifact(self) -> KnnModelArtifact {
+		self.artifact
+	}
 }
 
 /// A decoded model and its unnormalized, schema-bound inference rows.
@@ -643,31 +817,58 @@ pub struct PreparedInference {
 
 impl PreparedInference {
 	#[must_use]
-	pub const fn checkpoint(&self) -> &CheckpointArtifact { &self.checkpoint }
+	#[inline]
+	pub const fn checkpoint(&self) -> &CheckpointArtifact {
+		&self.checkpoint
+	}
 
 	#[must_use]
-	pub const fn data(&self) -> &PreparedInferenceDataset { &self.data }
+	#[inline]
+	pub const fn data(&self) -> &PreparedInferenceDataset {
+		&self.data
+	}
 
 	#[must_use]
-	pub fn features(&self) -> &[PreparedInferenceFeature] { self.data.features() }
+	#[inline]
+	pub fn features(&self) -> &[PreparedInferenceFeature] {
+		self.data.features()
+	}
 
 	#[must_use]
-	pub fn feature_spans(&self) -> &[CompiledFeatureSpan] { self.checkpoint.feature_spans() }
+	#[inline]
+	pub fn feature_spans(&self) -> &[CompiledFeatureSpan] {
+		self.checkpoint.feature_spans()
+	}
 
 	#[must_use]
-	pub const fn normalization(&self) -> DenseDataNormalization { self.checkpoint.config().data_normalization }
+	#[inline]
+	pub const fn normalization(&self) -> DenseDataNormalization {
+		self.checkpoint.config().data_normalization
+	}
 
 	#[must_use]
-	pub fn normalization_tensors(&self) -> &[CheckpointTensorImage] { self.checkpoint.normalization() }
+	#[inline]
+	pub fn normalization_tensors(&self) -> &[CheckpointTensorImage] {
+		self.checkpoint.normalization()
+	}
 
 	#[must_use]
-	pub fn feature_normalization_mask(&self) -> &[u32] { self.checkpoint.feature_normalization_mask() }
+	#[inline]
+	pub fn feature_normalization_mask(&self) -> &[u32] {
+		self.checkpoint.feature_normalization_mask()
+	}
 
 	#[must_use]
-	pub fn normalization_epsilon(&self) -> f32 { self.checkpoint.config().normalization_epsilon }
+	#[inline]
+	pub fn normalization_epsilon(&self) -> f32 {
+		self.checkpoint.config().normalization_epsilon
+	}
 
 	#[must_use]
-	pub fn into_checkpoint(self) -> CheckpointArtifact { self.checkpoint }
+	#[inline]
+	pub fn into_checkpoint(self) -> CheckpointArtifact {
+		self.checkpoint
+	}
 }
 
 /// Read and decode one checkpoint from a bounded regular-file snapshot.
@@ -680,44 +881,44 @@ impl PreparedInference {
 /// Returns a typed source error for a zero or unrepresentable bound, an I/O
 /// failure, a non-regular source, or a file exceeding the bound. Strict
 /// versioned decoding errors retain their checkpoint paths.
+#[inline]
 pub fn load_checkpoint_file(
 	path: impl AsRef<Path>,
 	limits: CheckpointDecodeLimits,
 ) -> InferencePreparationResult<CheckpointArtifact> {
-	let source_bytes = u64::try_from(limits.source_bytes).map_err(|error| {
-		InferencePreparationError::ArithmeticOverflow {
+	let source_bytes =
+		u64::try_from(limits.source_bytes).map_err(|error| InferencePreparationError::ArithmeticOverflow {
 			detail: format!("checkpoint source-byte bound cannot be represented as u64: {error}"),
-		}
-	})?;
+		})?;
 	let source = read_source_snapshot(path.as_ref(), SourceLimit::new(source_bytes)?)?;
 	decode_checkpoint(source.bytes(), limits).map_err(Into::into)
 }
 
 /// Read and decode one bounded KNN semantic model from a regular-file
 /// snapshot.
+#[inline]
 pub fn load_knn_model_file(
 	path: impl AsRef<Path>,
 	limits: KnnModelDecodeLimits,
 ) -> InferencePreparationResult<KnnModelArtifact> {
-	let source_bytes = u64::try_from(limits.source_bytes).map_err(|error| {
-		InferencePreparationError::ArithmeticOverflow {
+	let source_bytes =
+		u64::try_from(limits.source_bytes).map_err(|error| InferencePreparationError::ArithmeticOverflow {
 			detail: format!("KNN model source-byte bound cannot be represented as u64: {error}"),
-		}
-	})?;
+		})?;
 	let source = read_source_snapshot(path.as_ref(), SourceLimit::new(source_bytes)?)?;
 	decode_knn_model(source.bytes(), limits).map_err(Into::into)
 }
 
 /// Read and decode one bounded observed categorical Bayesian semantic model.
+#[inline]
 pub fn load_bayes_model_file(
 	path: impl AsRef<Path>,
 	limits: BayesModelDecodeLimits,
 ) -> InferencePreparationResult<BayesModelArtifact> {
-	let source_bytes = u64::try_from(limits.source_bytes).map_err(|error| {
-		InferencePreparationError::ArithmeticOverflow {
+	let source_bytes =
+		u64::try_from(limits.source_bytes).map_err(|error| InferencePreparationError::ArithmeticOverflow {
 			detail: format!("Bayesian model source-byte bound cannot be represented as u64: {error}"),
-		}
-	})?;
+		})?;
 	let source = read_source_snapshot(path.as_ref(), SourceLimit::new(source_bytes)?)?;
 	decode_bayes_model(source.bytes(), limits).map_err(Into::into)
 }
@@ -728,6 +929,7 @@ pub fn load_bayes_model_file(
 /// The root probe only examines the first line. The selected decoder remains
 /// solely responsible for complete syntax, version, canonicality, and
 /// model-family validation.
+#[inline]
 pub fn load_semantic_model_file(
 	path: impl AsRef<Path>,
 	checkpoint_limits: CheckpointDecodeLimits,
@@ -735,11 +937,10 @@ pub fn load_semantic_model_file(
 ) -> InferencePreparationResult<SemanticModelArtifact> {
 	let source_bytes = checkpoint_limits.source_bytes.max(knn_limits.source_bytes);
 	let source_bytes = source_bytes.max(BayesModelDecodeLimits::default().source_bytes);
-	let source_bytes = u64::try_from(source_bytes).map_err(|error| {
-		InferencePreparationError::ArithmeticOverflow {
+	let source_bytes =
+		u64::try_from(source_bytes).map_err(|error| InferencePreparationError::ArithmeticOverflow {
 			detail: format!("semantic-model source-byte bound cannot be represented as u64: {error}"),
-		}
-	})?;
+		})?;
 	let source = read_source_snapshot(path.as_ref(), SourceLimit::new(source_bytes)?)?;
 	let root = source
 		.bytes()
@@ -754,33 +955,26 @@ pub fn load_semantic_model_file(
 		)
 	})?;
 	match root {
-		"recipe" => {
-			decode_checkpoint(source.bytes(), checkpoint_limits)
-				.map(SemanticModelArtifact::Dense)
-				.map_err(Into::into)
-		}
-		"recipe-knn-model" => {
-			decode_knn_model(source.bytes(), knn_limits)
-				.map(SemanticModelArtifact::Knn)
-				.map_err(Into::into)
-		}
-		"recipe-bayes-model" => {
-			decode_bayes_model(source.bytes(), BayesModelDecodeLimits::default())
-				.map(SemanticModelArtifact::Bayes)
-				.map_err(Into::into)
-		}
-		other => {
-			Err(decode_error(
-				CheckpointDecodeErrorKind::InvalidValue,
-				CheckpointPath::root(),
-				format!("unknown semantic-model root {other:?}"),
-			)
-			.into())
-		}
+		"recipe" => decode_checkpoint(source.bytes(), checkpoint_limits)
+			.map(SemanticModelArtifact::Dense)
+			.map_err(Into::into),
+		"recipe-knn-model" => decode_knn_model(source.bytes(), knn_limits)
+			.map(SemanticModelArtifact::Knn)
+			.map_err(Into::into),
+		"recipe-bayes-model" => decode_bayes_model(source.bytes(), BayesModelDecodeLimits::default())
+			.map(SemanticModelArtifact::Bayes)
+			.map_err(Into::into),
+		other => Err(decode_error(
+			CheckpointDecodeErrorKind::InvalidValue,
+			CheckpointPath::root(),
+			format!("unknown semantic-model root {other:?}"),
+		)
+		.into()),
 	}
 }
 
 /// Prepare a target-free table under one saved KNN feature schema.
+#[inline]
 pub fn prepare_knn_inference_table(
 	artifact: KnnModelArtifact,
 	table: &RawTable,
@@ -797,6 +991,7 @@ pub fn prepare_knn_inference_table(
 /// Prepare target-free query rows under the union of all saved categorical
 /// Bayesian parent schemas. First occurrence across conditional/parent order
 /// defines the physical feature order; shared parents are read once.
+#[inline]
 pub fn prepare_bayes_inference_table(
 	artifact: BayesModelArtifact,
 	table: &RawTable,
@@ -822,6 +1017,7 @@ pub fn prepare_bayes_inference_table(
 
 /// Load a categorical Bayesian model and prepare a newly distilled dataset in
 /// one bounded call.
+#[inline]
 pub fn load_and_prepare_bayes_inference(
 	path: impl AsRef<Path>,
 	limits: BayesModelDecodeLimits,
@@ -832,6 +1028,7 @@ pub fn load_and_prepare_bayes_inference(
 }
 
 /// Load a KNN model and prepare a newly distilled dataset in one bounded call.
+#[inline]
 pub fn load_and_prepare_knn_inference(
 	path: impl AsRef<Path>,
 	limits: KnnModelDecodeLimits,
@@ -850,6 +1047,7 @@ pub fn load_and_prepare_knn_inference(
 /// # Errors
 ///
 /// Returns a typed schema/data error or a checked dense-lowering failure.
+#[inline]
 pub fn prepare_checkpoint_inference(
 	checkpoint: CheckpointArtifact,
 	dataset: &DistilledDataset,
@@ -865,6 +1063,7 @@ pub fn prepare_checkpoint_inference(
 /// # Errors
 ///
 /// Returns a typed schema/data error or a checked dense-lowering failure.
+#[inline]
 pub fn prepare_checkpoint_inference_table(
 	checkpoint: CheckpointArtifact,
 	table: &RawTable,
@@ -881,6 +1080,7 @@ pub fn prepare_checkpoint_inference_table(
 ///
 /// Returns any checkpoint source, strict decoding, schema application, or dense
 /// lowering failure.
+#[inline]
 pub fn load_and_prepare_checkpoint_inference(
 	path: impl AsRef<Path>,
 	limits: CheckpointDecodeLimits,
@@ -907,6 +1107,7 @@ pub fn load_and_prepare_checkpoint_inference(
 ///
 /// Returns a typed topology, extent, checkpoint-consistency, graph, operation,
 /// or static-program failure.
+#[inline]
 pub fn compile_prepared_inference(prepared: &PreparedInference) -> InferenceCompileResult<CompiledInference> {
 	let checkpoint = prepared.checkpoint();
 	if checkpoint.blocks().is_empty() {
@@ -941,19 +1142,17 @@ pub fn compile_prepared_inference(prepared: &PreparedInference) -> InferenceComp
 	}
 
 	let mut compiler = InferenceGraphCompiler::new();
-	let leading_embedding = checkpoint.blocks().first().and_then(|block| {
-		match block {
-			crate::CheckpointBlockImage::Embedding(embedding) => Some(embedding),
-			_ => None,
-		}
-	});
-	let lowered = if let Some(embedding) = leading_embedding {
+	let leading_vocabulary = checkpoint
+		.blocks()
+		.first()
+		.and_then(|block| inference_block(block).token_vocabulary());
+	let lowered = if let Some(vocabulary) = leading_vocabulary {
 		compiler.compile_token_features(
 			prepared.data(),
 			checkpoint.feature_spans(),
 			rows,
 			feature_width,
-			embedding.vocabulary().get(),
+			vocabulary,
 		)?
 	} else {
 		compiler.compile_features(
@@ -966,159 +1165,27 @@ pub fn compile_prepared_inference(prepared: &PreparedInference) -> InferenceComp
 	let mut current = compiler.apply_data_normalization(checkpoint, lowered, rows, feature_width)?;
 	let mut current_width = feature_width;
 	let mut logical_length = feature_width;
-	let mut logical_channels = 1_u64;
-	let mut layer_index = 0_usize;
+	let mut logical_channels = 1u64;
+	let mut layer_index = 0usize;
 	for (block_index, block) in checkpoint.blocks().iter().enumerate() {
-		match block {
-			crate::CheckpointBlockImage::Embedding(embedding) => {
-				current = compiler.compile_embedding(block_index, embedding, current, rows, current_width)?;
-				current_width = embedding
-					.sequence_length()
-					.get()
-					.checked_mul(embedding.dimensions().get())
-					.ok_or_else(|| {
-						InferenceCompileError::new(
-							InferenceCompileErrorKind::ArithmeticOverflow,
-							"embedding inference output width overflowed u64",
-						)
-					})?;
-				logical_length = embedding.sequence_length().get();
-				logical_channels = embedding.dimensions().get();
-			}
-			crate::CheckpointBlockImage::Attention(attention) => {
-				current = compiler.compile_attention(
-					block_index,
-					attention,
-					current,
-					rows,
-					current_width,
-					logical_length,
-					logical_channels,
-					checkpoint.config().reduction_tree_lanes,
-				)?;
-				current_width = attention
-					.sequence_length()
-					.get()
-					.checked_mul(attention.dimensions().get())
-					.ok_or_else(|| {
-						InferenceCompileError::new(
-							InferenceCompileErrorKind::ArithmeticOverflow,
-							"attention inference output width overflowed u64",
-						)
-					})?;
-				logical_length = attention.sequence_length().get();
-				logical_channels = attention.dimensions().get();
-			}
-			crate::CheckpointBlockImage::Rnn(rnn) => {
-				current = compiler.compile_rnn(block_index, rnn, current, rows, current_width)?;
-				current_width = rnn.width().get();
-				logical_length = current_width;
-				logical_channels = 1;
-			}
-			crate::CheckpointBlockImage::Gru(gru) => {
-				current = compiler.compile_gru(block_index, gru, current, rows, current_width)?;
-				current_width = gru.width().get();
-				logical_length = current_width;
-				logical_channels = 1;
-			}
-			crate::CheckpointBlockImage::Lstm(lstm) => {
-				current = compiler.compile_lstm(block_index, lstm, current, rows, current_width)?;
-				current_width = lstm.width().get();
-				logical_length = current_width;
-				logical_channels = 1;
-			}
-			crate::CheckpointBlockImage::Layer(layer) => {
-				current = compiler.compile_layer(
-					layer_index,
-					layer,
-					current,
-					rows,
-					current_width,
-					checkpoint.config().normalization_epsilon,
-					checkpoint.config().reduction_tree_lanes,
-				)?;
-				layer_index = layer_index.checked_add(1).ok_or_else(identity_exhausted)?;
-				current_width = layer.declaration().width().get();
-				logical_length = current_width;
-				logical_channels = 1;
-			}
-			crate::CheckpointBlockImage::Convolution(convolution) => {
-				current = compiler.compile_convolution(
-					block_index,
-					convolution,
-					current,
-					rows,
-					current_width,
-					logical_length,
-					logical_channels,
-					checkpoint.config().normalization_epsilon,
-					checkpoint.config().reduction_tree_lanes,
-				)?;
-				current_width = convolution
-					.geometry()
-					.output_width()
-					.expect("validated convolution output width is nonzero")
-					.get();
-				logical_length = convolution.geometry().output_length().get();
-				logical_channels = convolution.geometry().filters().get();
-			}
-			crate::CheckpointBlockImage::Pool(pool) => {
-				current = compiler.compile_pool(
-					block_index,
-					pool,
-					current,
-					rows,
-					current_width,
-					logical_length,
-					logical_channels,
-					checkpoint.config().reduction_tree_lanes,
-				)?;
-				current_width = pool.output_width().get();
-				logical_length = pool.output_length().get();
-				logical_channels = pool.channels().get();
-			}
-			crate::CheckpointBlockImage::KMeans(kmeans) => {
-				current = compiler.compile_kmeans(
-					block_index,
-					kmeans,
-					current,
-					rows,
-					current_width,
-					checkpoint.config().reduction_tree_lanes,
-				)?;
-				current_width = kmeans.clusters().get();
-				logical_length = current_width;
-				logical_channels = 1;
-			}
-			crate::CheckpointBlockImage::Tree(tree) => {
-				current = compiler.compile_tree(
-					block_index,
-					tree,
-					current,
-					rows,
-					current_width,
-					checkpoint.config().reduction_tree_lanes,
-				)?;
-				current_width = tree.output_width().get();
-				logical_length = current_width;
-				logical_channels = 1;
-			}
-			crate::CheckpointBlockImage::Residual(residual) => {
-				current = compiler.compile_residual(
-					block_index,
-					residual,
-					current,
-					rows,
-					current_width,
-					&mut layer_index,
-					checkpoint.config().normalization_epsilon,
-					checkpoint.config().reduction_tree_lanes,
-				)?;
-				current_width = residual.output_width().get();
-				logical_length = current_width;
-				logical_channels = 1;
-			}
-		}
+		let inference = inference_block(block).compile_inference(
+			&mut compiler,
+			BlockInferenceContext {
+				input: current,
+				rows,
+				width: current_width,
+				logical_length,
+				logical_channels,
+				block_index,
+				layer_index: &mut layer_index,
+				normalization_epsilon: checkpoint.config().normalization_epsilon,
+				tree_lanes: checkpoint.config().reduction_tree_lanes,
+			},
+		)?;
+		current = inference.output;
+		current_width = inference.width;
+		logical_length = inference.logical_length;
+		logical_channels = inference.logical_channels;
 	}
 	let expected_width = u64::try_from(checkpoint.task().output_width()).map_err(|error| {
 		InferenceCompileError::new(
@@ -1166,6 +1233,7 @@ pub fn compile_prepared_inference(prepared: &PreparedInference) -> InferenceComp
 /// mixed-radix packing, native histogram, and Laplace posterior. The resulting
 /// f32 matrices are concatenated row-wise into one output whose adjacent class
 /// ranges follow repeated `.bayes(...)` order.
+#[inline]
 pub fn compile_prepared_bayes_inference(
 	prepared: &PreparedBayesInference,
 ) -> InferenceCompileResult<CompiledInference> {
@@ -1190,7 +1258,7 @@ pub fn compile_prepared_bayes_inference(
 
 	let mut compiler = InferenceGraphCompiler::new();
 	let mut probabilities = Vec::with_capacity(prepared.artifact().conditionals().len());
-	let mut total_width = 0_u64;
+	let mut total_width = 0u64;
 	for (conditional, references) in prepared.artifact().conditionals().iter().enumerate() {
 		let width = u64::try_from(references.child_classes()).map_err(|error| {
 			InferenceCompileError::new(
@@ -1407,14 +1475,15 @@ fn compile_bayes_conditional(
 		nodes: core::mem::take(&mut compiler.nodes),
 	};
 	let materialized = append_categorical_bayes_inference(&mut graph, &request)?;
-	compiler
-		.domains
-		.extend(materialized.kernels.iter().map(|kernel| {
-			KernelIterationDomain {
+	compiler.domains.extend(
+		materialized
+			.kernels
+			.iter()
+			.map(|kernel| KernelIterationDomain {
 				kernel: *kernel,
 				domain: IterationDomain::first(),
-			}
-		}));
+			}),
+	);
 	compiler.tensors = graph
 		.tensors
 		.into_iter()
@@ -1570,6 +1639,7 @@ fn bayes_request_output(compiler: &InferenceGraphCompiler, value: ValueId) -> In
 /// scalar or normalization operations remain rejected because applying one
 /// numeric transform to heterogeneous semantic outputs is not defined by the
 /// public declaration.
+#[inline]
 pub fn compile_prepared_knn_inference(prepared: &PreparedKnnInference) -> InferenceCompileResult<CompiledKnnInference> {
 	let artifact = prepared.artifact();
 	if !artifact.operations().is_empty() {
@@ -1628,11 +1698,8 @@ pub fn compile_prepared_knn_inference(prepared: &PreparedKnnInference) -> Infere
 			.collect(),
 	)?;
 	let (query_features, reference_features) = compiler.normalize_knn_features(
-		query_features,
-		reference_features,
-		rows,
-		reference_rows,
-		feature_width,
+		[query_features, reference_features],
+		[rows, reference_rows, feature_width],
 		artifact.data_normalization(),
 		references.normalization_mask(),
 		MAXIMUM_REDUCTION_TREE_LANES,
@@ -1653,8 +1720,8 @@ pub fn compile_prepared_knn_inference(prepared: &PreparedKnnInference) -> Infere
 				.collect(),
 		)?;
 		let prediction_shape = shape(&[rows, 1])?;
-		let (request, contract) = match output.values() {
-			KnnReferenceValues::NumericF32Bits(bits) => {
+		let (request, contract) = if output.values().is_numeric() {
+				let bits = output.values().numeric_f32_bits_storage();
 				let values = compiler.external(
 					InferenceInputRole::KnnReferenceValues {
 						output: output_index,
@@ -1679,8 +1746,8 @@ pub fn compile_prepared_knn_inference(prepared: &PreparedKnnInference) -> Infere
 						KnnInferencePredictionKind::NumericMean,
 					),
 				)
-			}
-			KnnReferenceValues::DiscreteI32 { codes, labels } => {
+		} else {
+				let (codes, labels) = output.values().discrete_i32_storage();
 				let values = compiler.external(
 					InferenceInputRole::KnnReferenceValues {
 						output: output_index,
@@ -1713,7 +1780,6 @@ pub fn compile_prepared_knn_inference(prepared: &PreparedKnnInference) -> Infere
 						KnnInferencePredictionKind::DiscreteMode,
 					),
 				)
-			}
 		};
 		requests.push(request);
 		outputs.push(contract);
@@ -1754,14 +1820,15 @@ pub fn compile_prepared_knn_inference(prepared: &PreparedKnnInference) -> Infere
 		nodes: compiler.nodes,
 	};
 	let materialized = append_knn_all_outputs(&mut graph, &request)?;
-	compiler
-		.domains
-		.extend(materialized.kernels.iter().map(|kernel| {
-			KernelIterationDomain {
+	compiler.domains.extend(
+		materialized
+			.kernels
+			.iter()
+			.map(|kernel| KernelIterationDomain {
 				kernel: *kernel,
 				domain: IterationDomain::first(),
-			}
-		}));
+			}),
+	);
 	graph.validate()?;
 	let graph = CalculationGraph::from_ogdl(&graph.to_ogdl()?)?;
 	let iterations = NonZeroU64::new(1).expect("one KNN inference iteration is nonzero");
@@ -1790,7 +1857,7 @@ fn knn_request_output(compiler: &InferenceGraphCompiler, value: ValueId) -> Infe
 }
 
 #[derive(Debug)]
-struct InferenceGraphCompiler {
+pub(crate) struct InferenceGraphCompiler {
 	tensors: BTreeMap<ValueId, Tensor>,
 	nodes: Vec<CalculationNode>,
 	domains: Vec<KernelIterationDomain>,
@@ -2088,15 +2155,13 @@ impl InferenceGraphCompiler {
 			{
 				Ok(())
 			}
-			Some(_) => {
-				Err(InferenceCompileError::new(
-					InferenceCompileErrorKind::Language,
-					format!(
-						"materialized tensor {} conflicts with an existing inference contract",
-						tensor.id
-					),
-				))
-			}
+			Some(_) => Err(InferenceCompileError::new(
+				InferenceCompileErrorKind::Language,
+				format!(
+					"materialized tensor {} conflicts with an existing inference contract",
+					tensor.id
+				),
+			)),
 			None => {
 				self.tensors.insert(tensor.id, tensor);
 				Ok(())
@@ -2125,7 +2190,7 @@ impl InferenceGraphCompiler {
 		})?;
 		require_i32_indexable(total_elements, "inference dense feature element count")?;
 		let mut combined = self.zero_f32(shape(&[total_elements])?)?;
-		let mut expected_start = 0_u64;
+		let mut expected_start = 0u64;
 		for (feature_index, (feature, span)) in data.features().iter().zip(spans).enumerate() {
 			let start = u64::try_from(span.start()).map_err(|error| {
 				InferenceCompileError::new(
@@ -2584,18 +2649,16 @@ impl InferenceGraphCompiler {
 		}
 	}
 
-	#[allow(clippy::too_many_arguments)]
 	fn normalize_knn_features(
 		&mut self,
-		query: ValueId,
-		reference: ValueId,
-		query_rows: u64,
-		reference_rows: u64,
-		columns: u64,
+		values: [ValueId; 2],
+		dimensions: [u64; 3],
 		normalization: Option<DenseDataNormalization>,
 		mask_bits: Option<&[u32]>,
 		tree_lanes: u32,
 	) -> InferenceCompileResult<(ValueId, ValueId)> {
+		let [query, reference] = values;
+		let [query_rows, reference_rows, columns] = dimensions;
 		let Some(normalization) = normalization else {
 			return Ok((query, reference));
 		};
@@ -2649,13 +2712,10 @@ impl InferenceGraphCompiler {
 					divide_constant_program(reference_rows as f32)?,
 				)?;
 				Ok((
-					self.apply_knn_z_score(query, means, variances, query_rows, columns, mask, EPSILON)?,
+					self.apply_knn_z_score([query, means, variances], [query_rows, columns], mask, EPSILON)?,
 					self.apply_knn_z_score(
-						reference,
-						means,
-						variances,
-						reference_rows,
-						columns,
+						[reference, means, variances],
+						[reference_rows, columns],
 						mask,
 						EPSILON,
 					)?,
@@ -2682,44 +2742,38 @@ impl InferenceGraphCompiler {
 					tree_lanes,
 				)?;
 				Ok((
-					self.apply_knn_min_max(query, minimum, maximum, query_rows, columns, mask, EPSILON)?,
+					self.apply_knn_min_max([query, minimum, maximum], [query_rows, columns], mask, EPSILON)?,
 					self.apply_knn_min_max(
-						reference,
-						minimum,
-						maximum,
-						reference_rows,
-						columns,
+						[reference, minimum, maximum],
+						[reference_rows, columns],
 						mask,
 						EPSILON,
 					)?,
 				))
 			}
-			DenseDataNormalization::L2Norm => {
-				Ok((
-					self.apply_knn_l2(query, query_rows, columns, mask, EPSILON, tree_lanes)?,
-					self.apply_knn_l2(
-						reference,
-						reference_rows,
-						columns,
-						mask,
-						EPSILON,
-						tree_lanes,
-					)?,
-				))
-			}
+			DenseDataNormalization::L2Norm => Ok((
+				self.apply_knn_l2(query, query_rows, columns, mask, EPSILON, tree_lanes)?,
+				self.apply_knn_l2(
+					reference,
+					reference_rows,
+					columns,
+					mask,
+					EPSILON,
+					tree_lanes,
+				)?,
+			)),
 		}
 	}
 
 	fn apply_knn_z_score(
 		&mut self,
-		input: ValueId,
-		mean: ValueId,
-		variance: ValueId,
-		rows: u64,
-		columns: u64,
+		values: [ValueId; 3],
+		dimensions: [u64; 2],
 		mask: Option<ValueId>,
 		epsilon: f32,
 	) -> InferenceCompileResult<ValueId> {
+		let [input, mean, variance] = values;
+		let [rows, columns] = dimensions;
 		let output = self.tensor(DType::F32, shape(&[rows, columns])?)?;
 		let mut inputs = vec![input, mean, variance];
 		if let Some(mask) = mask {
@@ -2735,14 +2789,13 @@ impl InferenceGraphCompiler {
 
 	fn apply_knn_min_max(
 		&mut self,
-		input: ValueId,
-		minimum: ValueId,
-		maximum: ValueId,
-		rows: u64,
-		columns: u64,
+		values: [ValueId; 3],
+		dimensions: [u64; 2],
 		mask: Option<ValueId>,
 		epsilon: f32,
 	) -> InferenceCompileResult<ValueId> {
+		let [input, minimum, maximum] = values;
+		let [rows, columns] = dimensions;
 		let output = self.tensor(DType::F32, shape(&[rows, columns])?)?;
 		let mut inputs = vec![input, minimum, maximum];
 		if let Some(mask) = mask {
@@ -2798,7 +2851,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
-	fn compile_embedding(
+	pub(crate) fn compile_embedding(
 		&mut self,
 		block_index: usize,
 		embedding: &crate::CheckpointEmbeddingImage,
@@ -2874,18 +2927,15 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
-	#[allow(clippy::too_many_arguments)]
-	fn compile_attention(
+	pub(crate) fn compile_attention(
 		&mut self,
 		block_index: usize,
 		attention: &crate::CheckpointAttentionImage,
 		input: ValueId,
-		rows: u64,
-		input_width: u64,
-		logical_length: u64,
-		logical_channels: u64,
+		geometry: [u64; 4],
 		tree_lanes: u32,
 	) -> InferenceCompileResult<ValueId> {
+		let [rows, input_width, logical_length, logical_channels] = geometry;
 		if attention.sequence_length().get() != logical_length
 			|| attention.dimensions().get() != logical_channels
 			|| attention
@@ -3023,7 +3073,7 @@ impl InferenceGraphCompiler {
 		self.reinterpret_f32(output, shape(&[rows, expected_width])?)
 	}
 
-	fn compile_rnn(
+	pub(crate) fn compile_rnn(
 		&mut self,
 		block_index: usize,
 		rnn: &crate::CheckpointRnnImage,
@@ -3085,7 +3135,7 @@ impl InferenceGraphCompiler {
 		.0)
 	}
 
-	fn compile_gru(
+	pub(crate) fn compile_gru(
 		&mut self,
 		block_index: usize,
 		gru: &crate::CheckpointGruImage,
@@ -3202,7 +3252,7 @@ impl InferenceGraphCompiler {
 		.0)
 	}
 
-	fn compile_lstm(
+	pub(crate) fn compile_lstm(
 		&mut self,
 		block_index: usize,
 		lstm: &crate::CheckpointLstmImage,
@@ -3408,16 +3458,16 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
-	fn compile_layer(
+	pub(crate) fn compile_layer(
 		&mut self,
 		layer_index: usize,
 		layer: &crate::CheckpointLayerImage,
 		input: ValueId,
-		rows: u64,
-		input_width: u64,
+		dimensions: [u64; 2],
 		normalization_epsilon: f32,
 		tree_lanes: u32,
 	) -> InferenceCompileResult<ValueId> {
+		let [rows, input_width] = dimensions;
 		let output_width = layer.declaration().width().get();
 		validate_checkpoint_parameter_image(
 			layer.weight().parameter(),
@@ -3466,16 +3516,14 @@ impl InferenceGraphCompiler {
 					};
 					self.apply_activation(current, activation, alpha, output_shape.clone())?
 				}
-				DenseOperation::Normalization(normalization) => {
-					self.apply_model_normalization(
-						current,
-						normalization,
-						rows,
-						output_width,
-						normalization_epsilon,
-						tree_lanes,
-					)?
-				}
+				DenseOperation::Normalization(normalization) => self.apply_model_normalization(
+					current,
+					normalization,
+					rows,
+					output_width,
+					normalization_epsilon,
+					tree_lanes,
+				)?,
 			};
 		}
 		if prelu.next().is_some() {
@@ -3487,19 +3535,16 @@ impl InferenceGraphCompiler {
 		Ok(current)
 	}
 
-	#[allow(clippy::too_many_arguments)]
-	fn compile_convolution(
+	pub(crate) fn compile_convolution(
 		&mut self,
 		block_index: usize,
 		convolution: &crate::CheckpointConvolutionImage,
 		input: ValueId,
-		rows: u64,
-		input_width: u64,
-		logical_length: u64,
-		logical_channels: u64,
+		input_geometry: [u64; 4],
 		normalization_epsilon: f32,
 		tree_lanes: u32,
 	) -> InferenceCompileResult<ValueId> {
+		let [rows, input_width, logical_length, logical_channels] = input_geometry;
 		let geometry = convolution.geometry();
 		if geometry.input_length().get() != logical_length
 			|| geometry.input_channels().get() != logical_channels
@@ -3613,8 +3658,7 @@ impl InferenceGraphCompiler {
 				current,
 				operation,
 				alpha,
-				rows,
-				output_width.get(),
+				[rows, output_width.get()],
 				normalization_epsilon,
 				tree_lanes,
 			)?;
@@ -3628,18 +3672,15 @@ impl InferenceGraphCompiler {
 		Ok(current)
 	}
 
-	#[allow(clippy::too_many_arguments)]
-	fn compile_pool(
+	pub(crate) fn compile_pool(
 		&mut self,
 		block_index: usize,
 		pool: &crate::CheckpointPoolImage,
 		input: ValueId,
-		rows: u64,
-		input_width: u64,
-		logical_length: u64,
-		logical_channels: u64,
+		input_geometry: [u64; 4],
 		tree_lanes: u32,
 	) -> InferenceCompileResult<ValueId> {
+		let [rows, input_width, logical_length, logical_channels] = input_geometry;
 		if pool.input_width().get() != input_width
 			|| pool.input_length().get() != logical_length
 			|| pool.channels().get() != logical_channels
@@ -3726,7 +3767,7 @@ impl InferenceGraphCompiler {
 		)
 	}
 
-	fn compile_kmeans(
+	pub(crate) fn compile_kmeans(
 		&mut self,
 		block_index: usize,
 		kmeans: &crate::CheckpointKMeansImage,
@@ -3779,7 +3820,7 @@ impl InferenceGraphCompiler {
 		Ok(distances)
 	}
 
-	fn compile_tree(
+	pub(crate) fn compile_tree(
 		&mut self,
 		block_index: usize,
 		tree: &crate::CheckpointTreeImage,
@@ -3873,18 +3914,21 @@ impl InferenceGraphCompiler {
 		Ok(predictions)
 	}
 
-	#[allow(clippy::too_many_arguments)]
-	fn compile_residual(
+	pub(crate) fn compile_residual(
 		&mut self,
-		block_index: usize,
 		residual: &crate::CheckpointResidualImage,
-		input: ValueId,
-		rows: u64,
-		input_width: u64,
-		layer_index: &mut usize,
-		normalization_epsilon: f32,
-		tree_lanes: u32,
+		context: BlockInferenceContext<'_>,
 	) -> InferenceCompileResult<ValueId> {
+		let BlockInferenceContext {
+			input,
+			rows,
+			width: input_width,
+			block_index,
+			layer_index,
+			normalization_epsilon,
+			tree_lanes,
+			..
+		} = context;
 		self.require_tensor(input, DType::F32, &[rows, input_width], "residual input")?;
 		let mut branch = input;
 		let mut branch_width = input_width;
@@ -3898,8 +3942,7 @@ impl InferenceGraphCompiler {
 						*layer_index,
 						layer,
 						branch,
-						rows,
-						branch_width,
+						[rows, branch_width],
 						normalization_epsilon,
 						tree_lanes,
 					)?;
@@ -3933,8 +3976,7 @@ impl InferenceGraphCompiler {
 						branch,
 						*operation,
 						alpha,
-						rows,
-						branch_width,
+						[rows, branch_width],
 						normalization_epsilon,
 						tree_lanes,
 					)?;
@@ -4010,8 +4052,7 @@ impl InferenceGraphCompiler {
 				current,
 				operation,
 				alpha,
-				rows,
-				output_width,
+				[rows, output_width],
 				normalization_epsilon,
 				tree_lanes,
 			)?;
@@ -4025,31 +4066,28 @@ impl InferenceGraphCompiler {
 		Ok(current)
 	}
 
-	#[allow(clippy::too_many_arguments)]
 	fn apply_saved_operation(
 		&mut self,
 		input: ValueId,
 		operation: DenseOperation,
 		prelu: Option<ValueId>,
-		rows: u64,
-		width: u64,
+		dimensions: [u64; 2],
 		normalization_epsilon: f32,
 		tree_lanes: u32,
 	) -> InferenceCompileResult<ValueId> {
+		let [rows, width] = dimensions;
 		match operation {
 			DenseOperation::Activation(activation) => {
 				self.apply_activation(input, activation, prelu, shape(&[rows, width])?)
 			}
-			DenseOperation::Normalization(normalization) => {
-				self.apply_model_normalization(
-					input,
-					normalization,
-					rows,
-					width,
-					normalization_epsilon,
-					tree_lanes,
-				)
-			}
+			DenseOperation::Normalization(normalization) => self.apply_model_normalization(
+				input,
+				normalization,
+				rows,
+				width,
+				normalization_epsilon,
+				tree_lanes,
+			),
 		}
 	}
 
@@ -4660,20 +4698,16 @@ impl InferenceGraphCompiler {
 
 fn inference_feature_bytes(values: &PreparedInferenceValues) -> (DType, Vec<u8>) {
 	match values {
-		PreparedInferenceValues::I32(values) => {
-			(
-				DType::I32,
-				values.iter()
-					.flat_map(|value| value.to_le_bytes())
-					.collect(),
-			)
-		}
-		PreparedInferenceValues::F32Bits(values) => {
-			(
-				DType::F32,
-				values.iter().flat_map(|bits| bits.to_le_bytes()).collect(),
-			)
-		}
+		PreparedInferenceValues::I32(values) => (
+			DType::I32,
+			values.iter()
+				.flat_map(|value| value.to_le_bytes())
+				.collect(),
+		),
+		PreparedInferenceValues::F32Bits(values) => (
+			DType::F32,
+			values.iter().flat_map(|bits| bits.to_le_bytes()).collect(),
+		),
 	}
 }
 
@@ -4694,7 +4728,7 @@ fn validate_checkpoint_parameter_image(
 	}
 	let expected_bytes = expected_shape
 		.iter()
-		.try_fold(1_u64, |elements, extent| elements.checked_mul(*extent))
+		.try_fold(1u64, |elements, extent| elements.checked_mul(*extent))
 		.and_then(|elements| elements.checked_mul(u64::from(DType::F32.byte_width())))
 		.ok_or_else(|| {
 			InferenceCompileError::new(
@@ -4714,10 +4748,12 @@ fn validate_checkpoint_parameter_image(
 	Ok(())
 }
 
-fn shape(extents: &[u64]) -> InferenceCompileResult<Shape> { Ok(Shape::new(extents.to_vec())?) }
+fn shape(extents: &[u64]) -> InferenceCompileResult<Shape> {
+	Ok(Shape::new(extents.to_vec())?)
+}
 
 fn checked_product(values: &[u64], name: &str) -> InferenceCompileResult<u64> {
-	values.iter().copied().try_fold(1_u64, |product, value| {
+	values.iter().copied().try_fold(1u64, |product, value| {
 		product.checked_mul(value).ok_or_else(|| {
 			InferenceCompileError::new(
 				InferenceCompileErrorKind::ArithmeticOverflow,
@@ -4746,7 +4782,7 @@ fn require_i32_indexable(value: u64, name: &str) -> InferenceCompileResult<()> {
 	Ok(())
 }
 
-fn identity_exhausted() -> InferenceCompileError {
+pub(crate) fn identity_exhausted() -> InferenceCompileError {
 	InferenceCompileError::new(
 		InferenceCompileErrorKind::IdentityExhausted,
 		"deterministic inference graph identity space exhausted",

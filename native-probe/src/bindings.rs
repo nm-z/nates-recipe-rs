@@ -4,7 +4,7 @@ use recipe_core::{DeviceId, MachineId, RunId};
 use recipe_cuda::{Context, ContextFlags, DeploymentIdentity};
 use recipe_host::{DiskFileSpec, HostBackendConfig, HostDeviceBinding};
 use recipe_hsa::{DeviceType, DiscoveredAgent, MemoryPoolFlags, MemorySegment, Session};
-use recipe_native_executor::{CudaBinding, HsaBinding};
+use recipe_native_executor::{CudaBinding, HsaBinding, HsaBindingProperties};
 use recipe_probe::{
 	GpuDiscovery as _, HostInventory, MeasuredProfile, ProbeError, ProbeResult, ResolvedGpuDevice,
 	ResolvedLocalInventory,
@@ -66,10 +66,7 @@ struct RealizedHsa<'runtime> {
 	device: DeviceId,
 	session: Session<'runtime>,
 	host_allocator: usize,
-	target_id: String,
-	queue_packets: u32,
-	maximum_submission_queues: u32,
-	enabled_display_connectors: u32,
+	properties: HsaBindingProperties,
 }
 
 struct RealizedHsaSet<'runtime> {
@@ -182,7 +179,7 @@ pub fn with_native_execution_bindings<T>(
 			.map_err(|error| binding_error(format!("exhaustive HSA reopening: {error}")))?;
 		let system = discovery.system().clone();
 		let realized_hsa = realize_hsa(
-			&hsa_backend,
+			hsa_backend,
 			library,
 			&system,
 			discovery.into_agents(),
@@ -196,11 +193,7 @@ pub fn with_native_execution_bindings<T>(
 					realized.device,
 					&realized.session,
 					&realized_hsa.host_allocators[realized.host_allocator],
-					realized.target_id.clone(),
-					hsa_backend.code_object_version(),
-					realized.queue_packets,
-					realized.maximum_submission_queues,
-					realized.enabled_display_connectors,
+					realized.properties.clone(),
 				)
 			})
 			.collect::<Vec<_>>();
@@ -399,10 +392,13 @@ fn realize_hsa<'runtime>(
 			device: expected.device,
 			session,
 			host_allocator,
-			target_id,
-			queue_packets,
-			maximum_submission_queues: queue.maximum_queues,
-			enabled_display_connectors: expected.enabled_display_connectors,
+			properties: HsaBindingProperties::new(
+				target_id,
+				backend.code_object_version(),
+				queue_packets,
+				queue.maximum_queues,
+				expected.enabled_display_connectors,
+			),
 		});
 	}
 	require_all_reopened("HSA", expected, &seen)?;
