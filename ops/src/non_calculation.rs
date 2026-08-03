@@ -4,17 +4,10 @@ use crate::OperationFamily;
 /// than payload arithmetic. These entries never authorize a CPU calculation
 /// fallback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NonCalculationRecipe {
-	FacadeDeclaration,
-	TextTokenization,
-	ModelContainerParsing,
-	ChatTemplateRendering,
-	RunShutdown,
-	EliminatedVendorWorkspaceBinding,
-}
+pub enum NonCalculationRecipe { FacadeDeclaration, TextTokenization, ModelContainerParsing, ChatTemplateRendering,
+	RunShutdown, EliminatedVendorWorkspaceBinding, }
 
-impl NonCalculationRecipe {
-	pub(crate) fn for_entry(symbol: &str, source: &str) -> Option<Self> {
+impl NonCalculationRecipe { pub(crate) fn for_entry(symbol: &str, source: &str) -> Option<Self> {
 		let recipe = match symbol {
 			"Data" | "Model" | "Train" | "Infer" => Self::FacadeDeclaration,
 			"encode" => Self::TextTokenization,
@@ -23,15 +16,11 @@ impl NonCalculationRecipe {
 			"gpu_shutdown" => Self::RunShutdown,
 			"gpu_blas_workspace" => Self::EliminatedVendorWorkspaceBinding,
 			_ if source.contains("safetensors") => Self::ModelContainerParsing,
-			_ => return None,
-		};
-		Some(recipe)
-	}
+			_ => return None, }; Some(recipe) }
 
 	#[must_use]
 	pub const fn definition(self) -> &'static str {
-		match self {
-			Self::FacadeDeclaration => {
+		match self { Self::FacadeDeclaration => {
 				"typed facade declaration that records data, model, training, or inference configuration without payload arithmetic"
 			}
 			Self::TextTokenization => {
@@ -48,18 +37,11 @@ impl NonCalculationRecipe {
 			}
 			Self::EliminatedVendorWorkspaceBinding => {
 				"prohibited vendor-library workspace setter eliminated; owned primitive scratch is fixed during prepare"
-			}
-		}
-	}
+			} } }
 
 	#[must_use]
-	pub const fn operation_family(self) -> OperationFamily {
-		match self {
+	pub const fn operation_family(self) -> OperationFamily { match self {
 			Self::FacadeDeclaration => OperationFamily::Facade,
 			Self::TextTokenization | Self::ChatTemplateRendering => OperationFamily::Encoding,
-			Self::ModelContainerParsing => OperationFamily::Parsing,
-			Self::RunShutdown => OperationFamily::Lifecycle,
-			Self::EliminatedVendorWorkspaceBinding => OperationFamily::Workspace,
-		}
-	}
-}
+			Self::ModelContainerParsing => OperationFamily::Parsing, Self::RunShutdown => OperationFamily::Lifecycle,
+			Self::EliminatedVendorWorkspaceBinding => OperationFamily::Workspace, } } }

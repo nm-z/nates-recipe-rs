@@ -4,58 +4,24 @@ use recipe_core::{KernelTemplateId, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum LanguageErrorKind {
-	EmptyShape,
-	InvalidAxis,
-	DuplicateAxis,
-	ShapeOverflow,
-	ByteSizeOverflow,
-	InvalidLayout,
-	DuplicateTensor,
-	DuplicateKernel,
-	UnknownTensor,
-	DuplicateProducer,
-	MissingProducer,
-	Cycle,
-	ArityMismatch,
-	DTypeMismatch,
-	ShapeMismatch,
-	InvalidScalarProgram,
-	InvalidPrimitive,
-	WorkOverflow,
-}
+pub enum LanguageErrorKind { EmptyShape, InvalidAxis, DuplicateAxis, ShapeOverflow, ByteSizeOverflow, InvalidLayout,
+	DuplicateTensor, DuplicateKernel, UnknownTensor, DuplicateProducer, MissingProducer, Cycle, ArityMismatch,
+	DTypeMismatch, ShapeMismatch, InvalidScalarProgram, InvalidPrimitive, WorkOverflow, }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LanguageError {
-	pub kind: LanguageErrorKind,
-	pub detail: String,
-	pub value: Option<ValueId>,
-	pub kernel: Option<KernelTemplateId>,
-}
+pub struct LanguageError { pub kind: LanguageErrorKind, pub detail: String, pub value: Option<ValueId>,
+	pub kernel: Option<KernelTemplateId>, }
 
 impl LanguageError {
 	#[must_use]
-	pub fn new(kind: LanguageErrorKind, detail: impl Into<String>) -> Self {
-		Self {
-			kind,
-			detail: detail.into(),
-			value: None,
-			kernel: None,
-		}
-	}
+	pub fn new(kind: LanguageErrorKind, detail: impl Into<String>) -> Self { Self { kind, detail: detail.into(),
+			value: None, kernel: None, } }
 
 	#[must_use]
-	pub const fn for_value(mut self, value: ValueId) -> Self {
-		self.value = Some(value);
-		self
-	}
+	pub const fn for_value(mut self, value: ValueId) -> Self { self.value = Some(value); self }
 
 	#[must_use]
-	pub const fn for_kernel(mut self, kernel: KernelTemplateId) -> Self {
-		self.kernel = Some(kernel);
-		self
-	}
-}
+	pub const fn for_kernel(mut self, kernel: KernelTemplateId) -> Self { self.kernel = Some(kernel); self } }
 
 impl fmt::Display for LanguageError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -66,9 +32,7 @@ impl fmt::Display for LanguageError {
 		if let Some(value) = self.value {
 			write!(formatter, " [value {value}]")?;
 		}
-		Ok(())
-	}
-}
+		Ok(()) } }
 
 impl std::error::Error for LanguageError {}
 

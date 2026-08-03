@@ -12,10 +12,7 @@
 //! implement OGDL shared references, anchors, links, or cycles, so callers must
 //! not treat it as a general-graph serialization.
 
-mod error;
-mod graph;
-mod parser;
-mod serializer;
+mod error; mod graph; mod parser; mod serializer;
 
 pub use error::{GraphError, NodeTextErrorKind, ParseError, ParseErrorKind, SourceLocation};
 pub use graph::{Graph, Node, NodeId};

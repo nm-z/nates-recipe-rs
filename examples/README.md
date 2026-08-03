@@ -29,9 +29,9 @@ is inferred from compilation or historical runs.
 | 2026-08-02 | GRU full-partition train-save-infer lifecycle gate | observed on RTX 2050 | not run |
 | 2026-08-02 | Literal save/resume/SIGINT artifact matrix | observed on RTX 2050 | not run |
 | 2026-08-02 | Dense-F32 GGUF Llama inference | correctness/lifecycle/speed observed on RTX 2050 | not run |
-| 2026-08-02 | Unified cookbook: all 21 public workflows | observed on RTX 2050; tree/forest Compute Sanitizer clean; GGUF speed proven by acceptance runner | not run |
+| 2026-08-02 | Unified cookbook: all 21 public workflows | observed on RTX 2050; tree/forest Compute Sanitizer clean | not run |
 
-The pre-consolidation NVIDIA cookbook record is
+The historical pre-consolidation NVIDIA cookbook record is
 `target/acceptance/cookbooks-cuda-1785670794-454449/results.tsv`: all 21 workflows exited successfully as separate
 release binaries, and the record retains each source/binary digest, elapsed time, dataset digest, GPU identity, and
 full per-workload log.

@@ -19,17 +19,29 @@ name = "recipe"
 path = "src/main.rs"
 test = false
 
+[[bin]]
+name = "rpc"
+path = "src/bin/rpc.rs"
+test = false
+
+[[bin]]
+name = "tokenize"
+path = "src/bin/tokenize.rs"
+test = false
+required-features = ["tokenize"]
+
 [[example]]
 name = "cookbook"
 test = true
+
+[features]
+default = []
+tokenize = ["dep:hf-chat-template", "dep:tokenizers"]
 
 [workspace]
 resolver = "3"
 members = [
 	".",
-	"audit",
-	"acceptance",
-	"cluster",
 	"core",
 	"cuda",
 	"executor",
@@ -48,11 +60,8 @@ members = [
 	"primitives",
 	"program",
 	"probe",
-	"remote",
 	"scheduler",
-	"text",
 	"training",
-	"transport",
 ]
 
 [workspace.package]
@@ -63,8 +72,8 @@ categories = ["science::ml"]
 
 [dependencies]
 libc = "0.2"
+hf-chat-template = { version = "0.2", features = ["strftime"], optional = true }
 proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
-recipe-cluster = { path = "cluster" }
 recipe-core = { path = "core" }
 recipe-cuda = { path = "cuda" }
 recipe-executor = { path = "executor" }
@@ -83,13 +92,14 @@ recipe-prepare = { path = "prepare" }
 recipe-primitives = { path = "primitives" }
 recipe-program = { path = "program" }
 recipe-probe = { path = "probe" }
-recipe-remote = { path = "remote" }
 recipe-scheduler = { path = "scheduler" }
-recipe-text = { path = "text" }
 recipe-training = { path = "training" }
-recipe-transport = { path = "transport" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.150"
+sha2 = "0.10.9"
 syn = { version = "2.0.117", features = ["full", "visit"] }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
+toml = "0.9"
 
 [lints]
 workspace = true

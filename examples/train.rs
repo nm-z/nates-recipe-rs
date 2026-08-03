@@ -9,9 +9,6 @@ fn main() -> TrainingResult<()> {
 		.bayes("play", ["weather", "wind"])
 		.bayes("travel", ["weather"]);
 
-	recipe.train()
-		.epochs(48)
+	recipe.train() .epochs(48)
 		.save("cookbook-bayes-multi.ogdl")
-		.run()?;
-	Ok(())
-}
+		.run()?; Ok(()) }

@@ -7,14 +7,8 @@
 //! exact key and lends CUDA/HSA bindings whose lifetimes cannot escape that
 //! realized scope.
 
-mod benchmark;
-mod bindings;
-mod config;
-mod cuda;
-mod hsa;
-mod identity;
-mod native;
+mod benchmark; mod bindings; mod config; mod cuda; mod hsa; mod identity; mod native;
 
-pub use bindings::{NativeExecutionBindings, host_backend_config_from_inventory, with_native_execution_bindings};
+pub use bindings::{NativeExecutionBindings, with_native_execution_bindings};
 pub use config::{BackendLibrary, CudaProbeConfig, HsaProbeConfig, KernelBuildConfig, NativeProbeConfig};
 pub use native::NativeGpuProbe;

@@ -7,15 +7,15 @@ CLI. Implementation is divided into focused workspace crates:
 
 - `recipe-core`, `recipe-language`, `recipe-primitives`, and `recipe-ops` define
   typed graphs and Recipe-owned calculations.
-- `recipe-probe`, `recipe-cluster`, `recipe-planner`, `recipe-scheduler`, and
-  `recipe-prepare` discover hardware and produce immutable AOT plans.
+- `recipe-probe`, `recipe-planner`, `recipe-scheduler`, and `recipe-prepare`
+  discover hardware and produce immutable AOT plans.
 - `recipe-cuda`, `recipe-hsa`, `recipe-executor`, and
   `recipe-native-executor` own native asynchronous execution.
-- `recipe-transport` and `recipe-remote` implement bounded master/worker
-  communication.
+- Root binaries `rpc` and `tokenize` own Ethernet worker communication and
+  standalone text preprocessing without library crate boundaries.
 
-Public real-data workloads live under `examples/`; the hardware acceptance
-runner owns measured correctness, performance, and lifecycle gates. Normative
+Public real-data workloads live under `examples/`; the cookbook owns measured
+correctness, performance, and lifecycle gates. Normative
 behavior is defined by `system-contract.md`, `topology/contract.toml`, and
 `operation-surface.txt`. Packaging files are under `pkg/`, while sample inputs
 belong in `examples/datasets/`.
@@ -57,8 +57,8 @@ correctness, performance, or architectural invariant is violated. Hardware is
 required rather than ignored or feature-gated; an unavailable prerequisite is
 an unsuccessful acceptance run, not a passing or skipped result.
 
-Use the Rust compiler, formatter, linter, and production audit for structural
-validity. They do not prove logical correctness. Prefer gates such as Recipe
+Use the Rust compiler, formatter, and linter for structural validity. They do
+not prove logical correctness. Prefer gates such as Recipe
 inference beating its pinned llama.cpp oracle on identical work and a complete
 training run proving one pre-loop native image load with no loop-time
 realization.

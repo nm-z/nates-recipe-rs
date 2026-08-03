@@ -9,12 +9,7 @@
 //! Distinct-device transfers presented to the scheduler are one-link physical
 //! hops; route decomposition and intermediate allocation belong to the planner.
 
-mod arena;
-mod error;
-mod route;
-mod static_schedule;
+mod arena; mod error; mod route; mod static_schedule;
 
-pub use arena::pack_arenas;
-pub use error::{ScheduleError, ScheduleErrorKind};
-pub use route::{Route, shortest_route};
+pub use arena::pack_arenas; pub use error::{ScheduleError, ScheduleErrorKind}; pub use route::{Route, shortest_route};
 pub use static_schedule::{StaticSchedule, UnscheduledTask, schedule};

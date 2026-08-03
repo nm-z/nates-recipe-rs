@@ -773,10 +773,11 @@ Each block executes saved RMSNorm, adjacent-pair RoPE, scaled causal multi-head 
 saved RMSNorm, parallel SwiGLU, and the second residual update. The final saved RMSNorm and output projection produce
 the logits; absent output weight uses the token embedding table. Optional saved biases and multiplicative scales are
 applied in their llama graph positions. RoPE uses the saved base and scaling metadata, and no user-facing model
-geometry or execution controls are introduced. The hardware acceptance runner compiles the checked-in corpus through
-the public load boundary and rejects native logits whose normalized mean-square error against the pinned llama.cpp
-oracle is not below `1e-3`. Dated backend-specific observations belong in the acceptance record; compilation or a
-result from another backend does not establish current hardware proof.
+geometry or execution controls are introduced. The cookbook executes the checked-in corpus through the public load
+boundary. Hardware correctness evidence requires independently comparing its native logits with the pinned llama.cpp
+oracle and rejecting normalized mean-square error that is not below `1e-3`. Dated backend-specific observations
+belong in the cookbook hardware record; compilation or a result from another backend does not establish current
+hardware proof.
 
 ### C42: repeated observed categorical Bayesian targets
 

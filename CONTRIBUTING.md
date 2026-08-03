@@ -13,6 +13,120 @@ Recipe retains its own internal semantic interpetations, cost modeling, scheduli
 
 Do not add inline, unit, mock, or synthetic-data tests: a Recipe test must execute the public workflow end to end on a real dataset and real CUDA or HSA hardware, proving observed correctness, performance, or an architectural invariant. Use Rust compilation and type checking for structural validity; only real training and inference runs count as evidence against logical errors.
 
+## Native Interface and Dependency Boundary
+
+Apply this boundary to production source, build metadata, the complete Cargo
+dependency closure, generated LLVM declarations and calls, linker inputs,
+runtime library loads, and final ELF `DT_NEEDED` entries and undefined symbols.
+Comments and documentation that merely name an interface are not interface use.
+
+Recipe may use ROCr/HSA and the reviewed CUDA Driver API directly. It must not
+use HIP, the CUDA Runtime API, direct KFD ownership, or vendor operation
+libraries. The prohibited families are HIP, hipBLAS, hipCUB, hipFFT, hipRAND,
+hipRTC, hipSOLVER, hipSPARSE, `amdhip64`, `cudart`, `cuda_runtime`,
+`cuda_runtime_api`, `hsakmt`, `hsaKmt`, `kfd`, rocBLAS, rocBLASLt, rocSOLVER,
+rocFFT, MIOpen, RCCL, cuBLAS, cuSOLVER, cuFFT, cuDNN, and NCCL. This prohibition
+includes source calls, headers, packages, link arguments, runtime-loaded
+libraries, transitive dependencies, and native artifact references.
+
+The allowed CUDA Driver calls are exactly:
+
+```text
+cuCtxCreate
+cuCtxCreate_v2
+cuCtxDestroy
+cuCtxDestroy_v2
+cuCtxGetCurrent
+cuCtxGetDevice
+cuCtxPopCurrent
+cuCtxPopCurrent_v2
+cuCtxPushCurrent
+cuCtxPushCurrent_v2
+cuCtxSetCurrent
+cuDeviceCanAccessPeer
+cuDeviceComputeCapability
+cuDeviceGet
+cuDeviceGetAttribute
+cuDeviceGetCount
+cuDeviceGetName
+cuDeviceGetPCIBusId
+cuDeviceGetUuid
+cuDeviceGetUuid_v2
+cuDevicePrimaryCtxRelease
+cuDevicePrimaryCtxRelease_v2
+cuDevicePrimaryCtxRetain
+cuDeviceTotalMem
+cuDeviceTotalMem_v2
+cuDriverGetVersion
+cuEventCreate
+cuEventDestroy
+cuEventDestroy_v2
+cuEventElapsedTime
+cuEventQuery
+cuEventRecord
+cuEventSynchronize
+cuFuncGetAttribute
+cuFuncSetAttribute
+cuGetErrorName
+cuGetErrorString
+cuGraphAddDependencies
+cuGraphAddEmptyNode
+cuGraphAddEventRecordNode
+cuGraphAddEventWaitNode
+cuGraphAddKernelNode
+cuGraphAddMemcpyNode
+cuGraphDestroy
+cuGraphExecDestroy
+cuGraphInstantiate
+cuGraphInstantiate_v2
+cuGraphLaunch
+cuInit
+cuLaunchKernel
+cuMemAlloc
+cuMemAllocHost
+cuMemAllocHost_v2
+cuMemAlloc_v2
+cuMemFree
+cuMemFreeHost
+cuMemFree_v2
+cuMemGetInfo
+cuMemGetInfo_v2
+cuMemHostAlloc
+cuMemHostGetDevicePointer
+cuMemHostGetDevicePointer_v2
+cuMemHostRegister
+cuMemHostRegister_v2
+cuMemHostUnregister
+cuMemcpyDtoDAsync
+cuMemcpyDtoDAsync_v2
+cuMemcpyDtoHAsync
+cuMemcpyDtoHAsync_v2
+cuMemcpyHtoDAsync
+cuMemcpyHtoDAsync_v2
+cuMemcpyPeerAsync
+cuModuleGetFunction
+cuModuleGetGlobal
+cuModuleGetGlobal_v2
+cuModuleGetLoadingMode
+cuModuleLoad
+cuModuleLoadData
+cuModuleLoadDataEx
+cuModuleUnload
+cuPointerGetAttribute
+cuStreamCreate
+cuStreamCreateWithPriority
+cuStreamDestroy
+cuStreamDestroy_v2
+cuStreamGetPriority
+cuStreamQuery
+cuStreamSynchronize
+cuStreamWaitEvent
+```
+
+Any additional Driver-style `cuXxx` call requires an explicit change to this
+list. Do not introduce wildcard exceptions, path-wide grants, or compatibility
+allowances for prohibited interfaces.
+
 ## Data Semantics
 Recipe treats all digitally stored, learnable data as vectors belonging to six
 semantically detected types: 

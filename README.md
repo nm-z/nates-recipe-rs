@@ -15,7 +15,7 @@ NCCL.
 
 The root library exports immutable, validated declarations for data, models,
 training, and inference. It also exposes the lower-level discovery, language,
-primitive, planning, scheduling, preparation, transport, and execution crates.
+primitive, planning, scheduling, preparation, and execution crates.
 Declaration construction has no hidden I/O or execution side effects.
 
 The installed command currently exposes the bare-metal probe:
@@ -35,6 +35,27 @@ Use `recipe probe --help` for exact library and toolchain path overrides. The
 probe requires LLVM `opt` and `llc`. AMD probing additionally needs ROCr/HSA and
 an ELF linker; NVIDIA probing needs the CUDA Driver library and can use a pinned
 `ptxas`.
+
+Distributed runs use the standalone Ethernet worker:
+
+```bash
+cargo run --release --bin rpc -- rpc.toml
+```
+
+The required file names the worker address and byte bound explicitly:
+
+```toml
+[rpc]
+listen_address = "0.0.0.0:7331"
+max_payload_bytes = 67108864
+```
+
+Hugging Face tokenization is a standalone preprocessing step. It reads text
+from a file or stdin and writes raw little-endian int32 token IDs:
+
+```bash
+cargo run --release --features tokenize --bin tokenize -- tokenizer.json input.txt tokens.i32
+```
 
 The public dense-binary training facade loads and semantically prepares the
 dataset, compiles Recipe-owned primitives, schedules and prepares the measured
@@ -59,10 +80,13 @@ cargo build --examples --release
 cargo run --bin recipe -- probe --help
 ```
 
-Real-data, real-hardware proof gates are documented in
-[`acceptance/README.md`](acceptance/README.md). They are explicit
-commands, not part of `cargo test`, and missing prerequisites fail rather than
-skip.
+The real-data, real-hardware public workflow is the cookbook:
+
+```bash
+cargo run --release --example cookbook
+```
+
+Missing prerequisites fail rather than skip.
 
 Compilation is build hygiene, not runtime evidence. Acceptance executes public
 training and inference declarations on real datasets and real CUDA or HSA
@@ -74,8 +98,6 @@ The main pipeline is split into focused crates:
 
 - `recipe-probe` and `recipe-native-probe`: bare-metal discovery and bounded
   measurement
-- `recipe-cluster`: assembly of identity-checked machine profiles and measured
-  peer links
 - `recipe-language`, `recipe-primitives`, and `recipe-ops`: backend-neutral
   f32/int32 calculations and the owned operation inventory
 - `recipe-planner`, `recipe-scheduler`, and `recipe-prepare`: finite candidate
@@ -83,12 +105,11 @@ The main pipeline is split into focused crates:
 - `recipe-cuda` and `recipe-hsa`: reviewed native driver/runtime boundaries
 - `recipe-executor` and `recipe-native-executor`: typestate lifecycle and native
   execution
-- `recipe-transport` and `recipe-remote`: bounded asynchronous machine-to-machine
-  transport and worker execution
-- `recipe-host`, `recipe-ingest`, and `recipe-text`: preallocated host storage
-  plus bounded pre-init data and text preparation
-- `recipe-audit`: deterministic rejection of prohibited source APIs,
-  dependencies, linker inputs, and binary symbols
+- `recipe-host` and `recipe-ingest`: preallocated host storage plus bounded
+  pre-init data preparation
+
+The root `rpc` and `tokenize` binaries own distributed Ethernet transport and
+text preprocessing without adding library crate boundaries.
 
 The normative contracts are in `system-contract.md`,
 `topology/contract.toml`, and `operation-surface.txt`.

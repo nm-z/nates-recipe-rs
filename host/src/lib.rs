@@ -8,15 +8,9 @@
 //! job slot, staging buffer, RAM allocation, and disk file is created before
 //! the corresponding run enters its loop.
 
-mod arena;
-mod backend;
-mod error;
-mod runtime;
+mod arena; mod backend; mod error; mod runtime;
 
-pub use arena::{Arena, ArenaKind, DiskFileSpec};
-pub use backend::{
-	HostArenaLookup, HostBackend, HostBackendConfig, HostDeviceBinding, HostPending, HostPreparedResources,
-	HostResources,
-};
-pub use error::{Error, Result};
+pub use arena::{Arena, ArenaKind, DiskFileSpec}; pub use backend::{
+	HostArenaLookup, HostBackend, HostBackendConfig, HostDeviceBinding, HostPending, HostPreparedResources, HostResources,
+}; pub use error::{Error, Result};
 pub use runtime::{PendingCopy, PollStatus, Runtime, RuntimeConfig, RuntimeState, SlotCapacity};

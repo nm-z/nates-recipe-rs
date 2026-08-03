@@ -1,16 +1,12 @@
-use recipe_core::{DType, ScalarOpcode};
-use recipe_language::{
+use recipe_core::{DType, ScalarOpcode}; use recipe_language::{
 	AtomicOperation, AtomicOrdering, AxisSet, Elementwise, Gather, IndexBounds, PrimitiveKind, Reduce,
-	ReduceOperator, ReduceResult, Scatter, ScatterConflict, Shape,
-};
-use recipe_math::MathFunction;
+	ReduceOperator, ReduceResult, Scatter, ScatterConflict, Shape, }; use recipe_math::MathFunction;
 
 use super::{
 	Emitter, FamilyDispatch, KernelEmission, MAX_I32_INDEX, MaterializationRequest, emit_checked_gather_identity,
 	identity_program, input, language_error, operation_error, output, prepared_f32, prepared_u64, request_error,
 	require_dtype, require_exact_abi, require_same_tensor_contract, require_shape, require_true, scalar_binary,
-	scalar_builder, scalar_f32, scalar_finish, scalar_input, scalar_ternary, scalar_unary,
-};
+	scalar_builder, scalar_f32, scalar_finish, scalar_input, scalar_ternary, scalar_unary, };
 use crate::{OperationDescriptor, OperationErrorKind, OperationResult};
 
 const OPERATIONS: &[(&str, &str)] = &[
@@ -31,14 +27,10 @@ const OPERATIONS: &[(&str, &str)] = &[
 	("gpu_rope_partial_pos", "gpu-core/src/infer_ops.rs:181"),
 ];
 
-pub(super) fn supports(descriptor: OperationDescriptor) -> bool {
-	OPERATIONS.contains(&(descriptor.symbol, descriptor.source))
-}
+pub(super) fn supports(descriptor: OperationDescriptor) -> bool { OPERATIONS.contains(&(descriptor.symbol, descriptor.source)) }
 
 pub(super) fn dispatch(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> FamilyDispatch {
-	if !supports(request.descriptor) {
-		return FamilyDispatch::NotOwned;
-	}
+	if !supports(request.descriptor) { return FamilyDispatch::NotOwned; }
 	let result = match request.descriptor.symbol {
 		"gpu_causal_softmax_rows" => emit_causal_softmax(request, emitter),
 		"gpu_embed_blend" => emit_embedding_blend(request, emitter),
@@ -54,16 +46,9 @@ pub(super) fn dispatch(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 		| "gpu_rope_partial_factors"
 		| "gpu_rope_partial_factors_pos"
 		| "gpu_rope_partial_pos" => emit_single_tensor_rope(request, emitter),
-		symbol => {
-			Err(operation_error(
-				request.descriptor.id,
-				OperationErrorKind::GraphMaterializationFailed,
+		symbol => { Err(operation_error( request.descriptor.id, OperationErrorKind::GraphMaterializationFailed,
 				format!("attention/sequence/embedding dispatch is incomplete for {symbol}"),
-			))
-		}
-	};
-	FamilyDispatch::Owned(result)
-}
+			)) } }; FamilyDispatch::Owned(result) }
 
 fn emit_mha_merge(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
 	require_exact_abi(request, &["heads", "merge_indices"], &["packed"], &[
@@ -87,23 +72,10 @@ fn emit_mha_merge(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_
 	require_shape(request, indices, &[elements], "merge_indices")?;
 	require_shape(request, packed, &[elements], "packed")?;
 
-	let gathered = emitter.intermediate(DType::F32, packed.shape.clone())?;
-	emitter.emit(
-		vec![heads.id, indices.id],
-		vec![gathered],
-		PrimitiveKind::Gather(Gather {
-			axis: 0,
-			bounds: IndexBounds::Reject,
-		}),
-	)?;
-	emitter.emit(
-		vec![gathered],
-		vec![packed.id],
-		PrimitiveKind::Elementwise(Elementwise {
-			program: identity_program(request.descriptor.id, DType::F32)?,
-		}),
-	)
-}
+	let gathered = emitter.intermediate(DType::F32, packed.shape.clone())?; emitter.emit( vec![heads.id, indices.id],
+		vec![gathered], PrimitiveKind::Gather(Gather { axis: 0, bounds: IndexBounds::Reject, }), )?; emitter.emit(
+		vec![gathered], vec![packed.id], PrimitiveKind::Elementwise(Elementwise {
+			program: identity_program(request.descriptor.id, DType::F32)?, }), ) }
 
 fn emit_repeat_rows(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
 	require_exact_abi(request, &["values", "repeat_indices"], &["repeated"], &[
@@ -116,9 +88,7 @@ fn emit_repeat_rows(request: &MaterializationRequest<'_>, emitter: &mut Emitter<
 	let repeated = output(request, "repeated")?;
 	let source_elements = prepared_dimension(request, "source_elements")?;
 	let repeats = prepared_dimension(request, "repeats")?;
-	let total = checked_product(
-		request,
-		&[source_elements, repeats],
+	let total = checked_product( request, &[source_elements, repeats],
 		"repeated element count",
 	)?;
 	require_true(request, "repeat_indices_verified")?;
@@ -129,27 +99,13 @@ fn emit_repeat_rows(request: &MaterializationRequest<'_>, emitter: &mut Emitter<
 	require_shape(request, indices, &[total], "repeat_indices")?;
 	require_shape(request, repeated, &[total], "repeated")?;
 
-	let gathered = emitter.intermediate(DType::F32, repeated.shape.clone())?;
-	emitter.emit(
-		vec![values.id, indices.id],
-		vec![gathered],
-		PrimitiveKind::Gather(Gather {
-			axis: 0,
-			bounds: IndexBounds::Reject,
-		}),
-	)?;
-	emitter.emit(
-		vec![gathered],
-		vec![repeated.id],
-		PrimitiveKind::Elementwise(Elementwise {
-			program: identity_program(request.descriptor.id, DType::F32)?,
-		}),
-	)
-}
+	let gathered = emitter.intermediate(DType::F32, repeated.shape.clone())?; emitter.emit( vec![values.id, indices.id],
+		vec![gathered], PrimitiveKind::Gather(Gather { axis: 0, bounds: IndexBounds::Reject, }), )?; emitter.emit(
+		vec![gathered], vec![repeated.id], PrimitiveKind::Elementwise(Elementwise {
+			program: identity_program(request.descriptor.id, DType::F32)?, }), ) }
 
 fn emit_embedding_blend(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
+	require_exact_abi( request,
 		&["source_rows", "row_indices", "weights"],
 		&["blended"],
 		&[
@@ -159,8 +115,7 @@ fn emit_embedding_blend(request: &MaterializationRequest<'_>, emitter: &mut Emit
 			"embedding_width",
 			"scale",
 			"row_indices_verified",
-		],
-	)?;
+		], )?;
 	let source_rows = input(request, "source_rows")?;
 	let row_indices = input(request, "row_indices")?;
 	let weights = input(request, "weights")?;
@@ -169,13 +124,9 @@ fn emit_embedding_blend(request: &MaterializationRequest<'_>, emitter: &mut Emit
 	let k = prepared_dimension(request, "k")?;
 	let source_row_count = prepared_dimension(request, "source_row_count")?;
 	let embedding_width = prepared_dimension(request, "embedding_width")?;
-	if k != 1 {
-		return Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::UnsupportedConcreteShape,
+	if k != 1 { return Err(operation_error( request.descriptor.id, OperationErrorKind::UnsupportedConcreteShape,
 			"the concrete embedding-forward materializer currently supports the legacy k = 1 path only",
-		));
-	}
+		)); }
 	let scale = prepared_f32(request, "scale")?;
 	if !scale.is_finite() {
 		return Err(request_error(request, "scale must be finite"));
@@ -185,37 +136,20 @@ fn emit_embedding_blend(request: &MaterializationRequest<'_>, emitter: &mut Emit
 	require_dtype(request, row_indices, DType::I32, "row_indices")?;
 	require_dtype(request, weights, DType::F32, "weights")?;
 	require_dtype(request, blended, DType::F32, "blended")?;
-	require_shape(
-		request,
-		source_rows,
-		&[source_row_count, embedding_width],
+	require_shape( request, source_rows, &[source_row_count, embedding_width],
 		"source_rows",
 	)?;
 	require_shape(request, row_indices, &[rows], "row_indices")?;
 	require_shape(request, weights, &[rows, 1], "weights")?;
 	require_shape(request, blended, &[rows, embedding_width], "blended")?;
 
-	let gathered = emitter.intermediate(DType::F32, blended.shape.clone())?;
-	emitter.emit(
-		vec![source_rows.id, row_indices.id],
-		vec![gathered],
-		PrimitiveKind::Gather(Gather {
-			axis: 0,
-			bounds: IndexBounds::Reject,
-		}),
-	)?;
-	emitter.emit(
-		vec![gathered, weights.id],
-		vec![blended.id],
-		PrimitiveKind::Elementwise(Elementwise {
-			program: embedding_blend_program(request, scale)?,
-		}),
-	)
-}
+	let gathered = emitter.intermediate(DType::F32, blended.shape.clone())?; emitter.emit(
+		vec![source_rows.id, row_indices.id], vec![gathered], PrimitiveKind::Gather(Gather { axis: 0,
+			bounds: IndexBounds::Reject, }), )?; emitter.emit( vec![gathered, weights.id], vec![blended.id],
+		PrimitiveKind::Elementwise(Elementwise { program: embedding_blend_program(request, scale)?, }), ) }
 
 fn emit_embedding_backward(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	require_exact_abi(
-		request,
+	require_exact_abi( request,
 		&["gradient", "indices", "gradient_table_base"],
 		&["gradient_table"],
 		&["rows", "columns", "vocabulary"],
@@ -227,14 +161,9 @@ fn emit_embedding_backward(request: &MaterializationRequest<'_>, emitter: &mut E
 	let rows = prepared_dimension(request, "rows")?;
 	let columns = prepared_dimension(request, "columns")?;
 	let vocabulary = prepared_dimension(request, "vocabulary")?;
-	checked_product(
-		request,
-		&[rows, columns],
+	checked_product( request, &[rows, columns],
 		"embedding gradient element count",
-	)?;
-	checked_product(
-		request,
-		&[vocabulary, columns],
+	)?; checked_product( request, &[vocabulary, columns],
 		"embedding table element count",
 	)?;
 	require_dtype(request, gradient, DType::F32, "gradient")?;
@@ -246,27 +175,11 @@ fn emit_embedding_backward(request: &MaterializationRequest<'_>, emitter: &mut E
 	require_shape(request, base, &[vocabulary, columns], "gradient_table_base")?;
 	require_same_tensor_contract(request, base, table, "gradient_table")?;
 
-	let mapped = emitter.intermediate(DType::F32, gradient.shape.clone())?;
-	emitter.emit(
-		vec![gradient.id],
-		vec![mapped],
-		PrimitiveKind::Elementwise(Elementwise {
-			program: identity_program(request.descriptor.id, DType::F32)?,
-		}),
-	)?;
-	emitter.emit(
-		vec![base.id, indices.id, mapped],
-		vec![table.id],
-		PrimitiveKind::Scatter(Scatter {
-			axis: 0,
-			bounds: IndexBounds::Reject,
-			conflict: ScatterConflict::Atomic {
-				operation: AtomicOperation::Add,
-				ordering: AtomicOrdering::Relaxed,
-			},
-		}),
-	)
-}
+	let mapped = emitter.intermediate(DType::F32, gradient.shape.clone())?; emitter.emit( vec![gradient.id], vec![mapped],
+		PrimitiveKind::Elementwise(Elementwise { program: identity_program(request.descriptor.id, DType::F32)?, }), )?;
+	emitter.emit( vec![base.id, indices.id, mapped], vec![table.id], PrimitiveKind::Scatter(Scatter { axis: 0,
+			bounds: IndexBounds::Reject, conflict: ScatterConflict::Atomic { operation: AtomicOperation::Add,
+				ordering: AtomicOrdering::Relaxed, }, }), ) }
 
 fn emit_positional_encoding(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
 	require_exact_abi(request, &["angles", "channel_parity"], &["encoding"], &[
@@ -292,31 +205,12 @@ fn emit_positional_encoding(request: &MaterializationRequest<'_>, emitter: &mut 
 	let sine_program = recipe_core::ScalarProgram::try_from(MathFunction::Sin)
 		.map_err(|error| language_error(request.descriptor.id, error.to_string()))?;
 	let cosine_program = recipe_core::ScalarProgram::try_from(MathFunction::Cos)
-		.map_err(|error| language_error(request.descriptor.id, error.to_string()))?;
-	emitter.emit_stage([
-		KernelEmission {
-			inputs: vec![angles.id],
-			outputs: vec![sine],
-			kind: PrimitiveKind::Elementwise(Elementwise {
-				program: sine_program,
-			}),
-		},
-		KernelEmission {
-			inputs: vec![angles.id],
-			outputs: vec![cosine],
-			kind: PrimitiveKind::Elementwise(Elementwise {
-				program: cosine_program,
-			}),
-		},
-		KernelEmission {
-			inputs: vec![sine, cosine, parity.id],
-			outputs: vec![encoding.id],
-			kind: PrimitiveKind::Elementwise(Elementwise {
-				program: positional_select_program(request)?,
-			}),
-		},
-	])
-}
+		.map_err(|error| language_error(request.descriptor.id, error.to_string()))?; emitter.emit_stage([ KernelEmission {
+			inputs: vec![angles.id], outputs: vec![sine], kind: PrimitiveKind::Elementwise(Elementwise { program: sine_program,
+			}), }, KernelEmission { inputs: vec![angles.id], outputs: vec![cosine],
+			kind: PrimitiveKind::Elementwise(Elementwise { program: cosine_program, }), }, KernelEmission {
+			inputs: vec![sine, cosine, parity.id], outputs: vec![encoding.id], kind: PrimitiveKind::Elementwise(Elementwise {
+				program: positional_select_program(request)?, }), }, ]) }
 
 fn emit_causal_softmax(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
 	require_exact_abi(request, &["values", "causal_mask"], &["softmax"], &[
@@ -339,102 +233,45 @@ fn emit_causal_softmax(request: &MaterializationRequest<'_>, emitter: &mut Emitt
 	require_shape(request, mask, &[rows, columns], "causal_mask")?;
 	require_same_tensor_contract(request, values, softmax, "softmax")?;
 
-	let row_shape =
-		Shape::new(vec![rows, 1]).map_err(|error| language_error(request.descriptor.id, error.to_string()))?;
+	let row_shape = Shape::new(vec![rows, 1]).map_err(|error| language_error(request.descriptor.id, error.to_string()))?;
 	let masked = emitter.intermediate(DType::F32, values.shape.clone())?;
-	let row_maximum = emitter.intermediate(DType::F32, row_shape.clone())?;
-	emitter.emit_stage([
-		KernelEmission {
-			inputs: vec![values.id, mask.id],
-			outputs: vec![masked],
-			kind: PrimitiveKind::Elementwise(Elementwise {
-				program: causal_max_mask_program(request)?,
-			}),
-		},
-		KernelEmission {
-			inputs: vec![masked],
-			outputs: vec![row_maximum],
-			kind: PrimitiveKind::Reduce(Reduce {
-				operator: ReduceOperator::Maximum,
-				axes: AxisSet::new(vec![1])
-					.map_err(|error| language_error(request.descriptor.id, error.to_string()))?,
-				keep_dimensions: true,
-				result: ReduceResult::Value,
-				tree_lanes,
-			}),
-		},
-	])?;
+	let row_maximum = emitter.intermediate(DType::F32, row_shape.clone())?; emitter.emit_stage([ KernelEmission {
+			inputs: vec![values.id, mask.id], outputs: vec![masked], kind: PrimitiveKind::Elementwise(Elementwise {
+				program: causal_max_mask_program(request)?, }), }, KernelEmission { inputs: vec![masked],
+			outputs: vec![row_maximum], kind: PrimitiveKind::Reduce(Reduce { operator: ReduceOperator::Maximum,
+				axes: AxisSet::new(vec![1]) .map_err(|error| language_error(request.descriptor.id, error.to_string()))?,
+				keep_dimensions: true, result: ReduceResult::Value, tree_lanes, }), }, ])?;
 
 	let safe_shift = emitter.intermediate(DType::F32, values.shape.clone())?;
 	let raw_exponentials = emitter.intermediate(DType::F32, values.shape.clone())?;
 	let exponentials = emitter.intermediate(DType::F32, values.shape.clone())?;
 	let exponential_program = recipe_core::ScalarProgram::try_from(MathFunction::Exp)
-		.map_err(|error| language_error(request.descriptor.id, error.to_string()))?;
-	emitter.emit_stage([
-		KernelEmission {
-			inputs: vec![values.id, row_maximum, mask.id],
-			outputs: vec![safe_shift],
-			kind: PrimitiveKind::Elementwise(Elementwise {
-				program: causal_safe_shift_program(request)?,
-			}),
-		},
-		KernelEmission {
-			inputs: vec![safe_shift],
-			outputs: vec![raw_exponentials],
-			kind: PrimitiveKind::Elementwise(Elementwise {
-				program: exponential_program,
-			}),
-		},
-		KernelEmission {
-			inputs: vec![raw_exponentials, mask.id],
-			outputs: vec![exponentials],
-			kind: PrimitiveKind::Elementwise(Elementwise {
-				program: mask_to_zero_program(request)?,
-			}),
-		},
-	])?;
+		.map_err(|error| language_error(request.descriptor.id, error.to_string()))?; emitter.emit_stage([ KernelEmission {
+			inputs: vec![values.id, row_maximum, mask.id], outputs: vec![safe_shift],
+			kind: PrimitiveKind::Elementwise(Elementwise { program: causal_safe_shift_program(request)?, }), }, KernelEmission {
+			inputs: vec![safe_shift], outputs: vec![raw_exponentials], kind: PrimitiveKind::Elementwise(Elementwise {
+				program: exponential_program, }), }, KernelEmission { inputs: vec![raw_exponentials, mask.id],
+			outputs: vec![exponentials], kind: PrimitiveKind::Elementwise(Elementwise { program: mask_to_zero_program(request)?,
+			}), }, ])?;
 
-	let row_sums = emitter.intermediate(DType::F32, row_shape)?;
-	emitter.emit(
-		vec![exponentials],
-		vec![row_sums],
-		PrimitiveKind::Reduce(Reduce {
-			operator: ReduceOperator::Sum,
-			axes: AxisSet::new(vec![1])
-				.map_err(|error| language_error(request.descriptor.id, error.to_string()))?,
-			keep_dimensions: true,
-			result: ReduceResult::Value,
-			tree_lanes,
-		}),
-	)?;
-	emitter.emit(
-		vec![exponentials, row_sums],
-		vec![softmax.id],
-		PrimitiveKind::Elementwise(Elementwise {
-			program: checked_divide_program(request)?,
-		}),
-	)
-}
+	let row_sums = emitter.intermediate(DType::F32, row_shape)?; emitter.emit( vec![exponentials], vec![row_sums],
+		PrimitiveKind::Reduce(Reduce { operator: ReduceOperator::Sum, axes: AxisSet::new(vec![1])
+				.map_err(|error| language_error(request.descriptor.id, error.to_string()))?, keep_dimensions: true,
+			result: ReduceResult::Value, tree_lanes, }), )?; emitter.emit( vec![exponentials, row_sums], vec![softmax.id],
+		PrimitiveKind::Elementwise(Elementwise { program: checked_divide_program(request)?, }), ) }
 
 fn emit_single_tensor_rope(request: &MaterializationRequest<'_>, emitter: &mut Emitter<'_>) -> OperationResult<()> {
-	let symbol = request.descriptor.symbol;
-	let has_factors = matches!(
-		symbol,
+	let symbol = request.descriptor.symbol; let has_factors = matches!( symbol,
 		"gpu_rope_partial_factors" | "gpu_rope_partial_factors_pos"
-	);
-	let has_position_base = matches!(
-		symbol,
+	); let has_position_base = matches!( symbol,
 		"gpu_rope_partial_pos" | "gpu_rope_partial_factors_pos"
-	);
-	let input_names: &[&str] = if has_factors {
-		&[
+	); let input_names: &[&str] = if has_factors { &[
 			"values",
 			"partner_indices",
 			"cosines",
 			"signed_sines",
 			"factors",
-		]
-	} else {
+		] } else {
 		&["values", "partner_indices", "cosines", "signed_sines"]
 	};
 	let full_parameters = ["seq", "dim", "base", "rotation_tables_verified"];
@@ -445,8 +282,7 @@ fn emit_single_tensor_rope(request: &MaterializationRequest<'_>, emitter: &mut E
 		"heads_per_token",
 		"theta",
 		"rotation_tables_verified",
-	];
-	let partial_position_parameters = [
+	]; let partial_position_parameters = [
 		"rows",
 		"head_dim",
 		"rotary_dim",
@@ -456,12 +292,8 @@ fn emit_single_tensor_rope(request: &MaterializationRequest<'_>, emitter: &mut E
 		"rotation_tables_verified",
 	];
 	let parameter_names = if symbol == "gpu_rope" {
-		full_parameters.as_slice()
-	} else if has_position_base {
-		partial_position_parameters.as_slice()
-	} else {
-		partial_parameters.as_slice()
-	};
+		full_parameters.as_slice() } else if has_position_base { partial_position_parameters.as_slice() } else {
+		partial_parameters.as_slice() };
 	require_exact_abi(request, input_names, &["rotated"], parameter_names)?;
 
 	let (elements, rotary_half) = if symbol == "gpu_rope" {
@@ -471,46 +303,29 @@ fn emit_single_tensor_rope(request: &MaterializationRequest<'_>, emitter: &mut E
 		require_finite_positive(request, "base", base)?;
 		(
 			checked_product(request, &[seq, dim], "RoPE element count")?,
-			dim / 2,
-		)
-	} else {
+			dim / 2, ) } else {
 		let rows = prepared_dimension(request, "rows")?;
 		let head_dim = prepared_dimension(request, "head_dim")?;
 		let rotary_dim = prepared_even_dimension(request, "rotary_dim")?;
-		if rotary_dim > head_dim {
-			return Err(operation_error(
-				request.descriptor.id,
+		if rotary_dim > head_dim { return Err(operation_error( request.descriptor.id,
 				OperationErrorKind::UnsupportedConcreteShape,
 				"rotary_dim must not exceed head_dim",
-			));
-		}
+			)); }
 		let heads_per_token = prepared_dimension(request, "heads_per_token")?;
 		let theta = prepared_f32(request, "theta")?;
 		require_finite_positive(request, "theta", theta)?;
 		if has_position_base {
 			let position_base = prepared_u64(request.descriptor.id, request.parameters, "position_base")?;
-			let final_position = position_base
-				.checked_add((rows - 1) / heads_per_token)
-				.ok_or_else(|| {
-					operation_error(
-						request.descriptor.id,
-						OperationErrorKind::UnsupportedConcreteShape,
+			let final_position = position_base .checked_add((rows - 1) / heads_per_token) .ok_or_else(|| { operation_error(
+						request.descriptor.id, OperationErrorKind::UnsupportedConcreteShape,
 						"partial RoPE final position overflowed u64",
-					)
-				})?;
-			if final_position > MAX_I32_INDEX {
-				return Err(operation_error(
-					request.descriptor.id,
+					) })?; if final_position > MAX_I32_INDEX { return Err(operation_error( request.descriptor.id,
 					OperationErrorKind::UnsupportedConcreteShape,
 					"the final partial RoPE position must fit the legacy int32 coordinate domain",
-				));
-			}
-		}
+				)); } }
 		(
 			checked_product(request, &[rows, head_dim], "partial RoPE element count")?,
-			rotary_dim / 2,
-		)
-	};
+			rotary_dim / 2, ) };
 	require_true(request, "rotation_tables_verified")?;
 
 	let values = input(request, "values")?;
@@ -529,288 +344,121 @@ fn emit_single_tensor_rope(request: &MaterializationRequest<'_>, emitter: &mut E
 		("cosines", cosines),
 		("signed_sines", signed_sines),
 		("rotated", rotated),
-	] {
-		require_shape(request, tensor, &[elements], name)?;
-	}
+	] { require_shape(request, tensor, &[elements], name)?; }
 	if has_factors {
 		let factors = input(request, "factors")?;
 		require_dtype(request, factors, DType::F32, "factors")?;
 		require_shape(request, factors, &[rotary_half], "factors")?;
 	}
 
-	let partners = emitter.intermediate(DType::F32, values.shape.clone())?;
-	emitter.emit(
-		vec![values.id, partner_indices.id],
-		vec![partners],
-		PrimitiveKind::Gather(Gather {
-			axis: 0,
-			bounds: IndexBounds::Reject,
-		}),
-	)?;
-	emitter.emit(
-		vec![values.id, partners, cosines.id, signed_sines.id],
-		vec![rotated.id],
-		PrimitiveKind::Elementwise(Elementwise {
-			program: rotation_program(request)?,
-		}),
-	)
-}
+	let partners = emitter.intermediate(DType::F32, values.shape.clone())?; emitter.emit(
+		vec![values.id, partner_indices.id], vec![partners], PrimitiveKind::Gather(Gather { axis: 0,
+			bounds: IndexBounds::Reject, }), )?; emitter.emit( vec![values.id, partners, cosines.id, signed_sines.id],
+		vec![rotated.id], PrimitiveKind::Elementwise(Elementwise { program: rotation_program(request)?, }), ) }
 
 fn prepared_dimension(request: &MaterializationRequest<'_>, name: &str) -> OperationResult<u64> {
-	let value = prepared_u64(request.descriptor.id, request.parameters, name)?;
-	if value == 0 || value > MAX_I32_INDEX {
-		return Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::UnsupportedConcreteShape,
-			format!(
+	let value = prepared_u64(request.descriptor.id, request.parameters, name)?; if value == 0 || value > MAX_I32_INDEX {
+		return Err(operation_error( request.descriptor.id, OperationErrorKind::UnsupportedConcreteShape, format!(
 				"{name} must be in the legacy int32 extent range 1..={}",
-				i32::MAX
-			),
-		));
-	}
-	Ok(value)
-}
+				i32::MAX ), )); }
+	Ok(value) }
 
 fn prepared_even_dimension(request: &MaterializationRequest<'_>, name: &str) -> OperationResult<u64> {
-	let value = prepared_dimension(request, name)?;
-	if !value.is_multiple_of(2) {
-		return Err(operation_error(
-			request.descriptor.id,
-			OperationErrorKind::UnsupportedConcreteShape,
+	let value = prepared_dimension(request, name)?; if !value.is_multiple_of(2) { return Err(operation_error(
+			request.descriptor.id, OperationErrorKind::UnsupportedConcreteShape,
 			format!("{name} must be even"),
-		));
-	}
-	Ok(value)
-}
+		)); }
+	Ok(value) }
 
 fn prepared_tree_lanes(request: &MaterializationRequest<'_>) -> OperationResult<u32> {
 	let value = prepared_u64(request.descriptor.id, request.parameters, "tree_lanes")?;
 	let lanes = u32::try_from(value)
 		.map_err(|error| request_error(request, format!("tree_lanes does not fit u32: {error}")))?;
-	if lanes == 0 || lanes > 1024 || !lanes.is_power_of_two() {
-		return Err(request_error(
-			request,
+	if lanes == 0 || lanes > 1024 || !lanes.is_power_of_two() { return Err(request_error( request,
 			"tree_lanes must be a power of two in 1..=1024",
-		));
-	}
-	Ok(lanes)
-}
+		)); }
+	Ok(lanes) }
 
 fn checked_product(request: &MaterializationRequest<'_>, factors: &[u64], role: &str) -> OperationResult<u64> {
-	let product = factors.iter().try_fold(1_u64, |product, factor| {
-		product.checked_mul(*factor).ok_or_else(|| {
-			operation_error(
-				request.descriptor.id,
-				OperationErrorKind::WorkspaceArithmeticOverflow,
+	let product = factors.iter().try_fold(1_u64, |product, factor| { product.checked_mul(*factor).ok_or_else(|| {
+			operation_error( request.descriptor.id, OperationErrorKind::WorkspaceArithmeticOverflow,
 				format!("{role} overflowed u64"),
-			)
-		})
-	})?;
-	if product > MAX_I32_INDEX {
-		return Err(operation_error(
-			request.descriptor.id,
+			) }) })?; if product > MAX_I32_INDEX { return Err(operation_error( request.descriptor.id,
 			OperationErrorKind::UnsupportedConcreteShape,
 			format!("{role} must fit the legacy int32 linear-index domain"),
-		));
-	}
-	Ok(product)
-}
+		)); }
+	Ok(product) }
 
 fn require_finite_positive(request: &MaterializationRequest<'_>, name: &str, value: f32) -> OperationResult<()> {
-	if value.is_finite() && value > 0.0 {
-		Ok(())
-	} else {
-		Err(request_error(
-			request,
+	if value.is_finite() && value > 0.0 { Ok(()) } else { Err(request_error( request,
 			format!("{name} must be finite and positive"),
-		))
-	}
-}
+		)) } }
 
 fn embedding_blend_program(
 	request: &MaterializationRequest<'_>,
-	scale: f32,
-) -> OperationResult<recipe_core::ScalarProgram> {
+	scale: f32, ) -> OperationResult<recipe_core::ScalarProgram> {
 	let mut builder = scalar_builder(request.descriptor.id)?;
 	let value = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
-	let weight = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
-	let weighted = scalar_binary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Multiply,
-		value,
-		weight,
-	)?;
-	let scale = scalar_f32(request.descriptor.id, &mut builder, scale)?;
-	let blended = scalar_binary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Multiply,
-		weighted,
-		scale,
-	)?;
-	scalar_finish(request.descriptor.id, builder, &[blended])
-}
+	let weight = scalar_input(request.descriptor.id, &mut builder, DType::F32)?; let weighted = scalar_binary(
+		request.descriptor.id, &mut builder, ScalarOpcode::Multiply, value, weight, )?;
+	let scale = scalar_f32(request.descriptor.id, &mut builder, scale)?; let blended = scalar_binary(
+		request.descriptor.id, &mut builder, ScalarOpcode::Multiply, weighted, scale, )?;
+	scalar_finish(request.descriptor.id, builder, &[blended]) }
 
 fn positional_select_program(request: &MaterializationRequest<'_>) -> OperationResult<recipe_core::ScalarProgram> {
 	let mut builder = scalar_builder(request.descriptor.id)?;
 	let sine = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
 	let cosine = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
-	let parity = scalar_input(request.descriptor.id, &mut builder, DType::I32)?;
-	let zero = builder
-		.i32(0)
-		.map_err(|error| language_error(request.descriptor.id, error.to_string()))?;
-	let one = builder
-		.i32(1)
-		.map_err(|error| language_error(request.descriptor.id, error.to_string()))?;
-	let is_zero = scalar_binary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Equal,
-		parity,
-		zero,
-	)?;
-	let is_one = scalar_binary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Equal,
-		parity,
-		one,
-	)?;
-	let valid = scalar_binary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::BitOr,
-		is_zero,
-		is_one,
-	)?;
-	scalar_unary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Require,
-		valid,
-	)?;
-	let selected = scalar_ternary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Select,
-		parity,
-		cosine,
-		sine,
-	)?;
-	scalar_finish(request.descriptor.id, builder, &[selected])
-}
+	let parity = scalar_input(request.descriptor.id, &mut builder, DType::I32)?; let zero = builder .i32(0)
+		.map_err(|error| language_error(request.descriptor.id, error.to_string()))?; let one = builder .i32(1)
+		.map_err(|error| language_error(request.descriptor.id, error.to_string()))?; let is_zero = scalar_binary(
+		request.descriptor.id, &mut builder, ScalarOpcode::Equal, parity, zero, )?; let is_one = scalar_binary(
+		request.descriptor.id, &mut builder, ScalarOpcode::Equal, parity, one, )?; let valid = scalar_binary(
+		request.descriptor.id, &mut builder, ScalarOpcode::BitOr, is_zero, is_one, )?; scalar_unary( request.descriptor.id,
+		&mut builder, ScalarOpcode::Require, valid, )?; let selected = scalar_ternary( request.descriptor.id, &mut builder,
+		ScalarOpcode::Select, parity, cosine, sine, )?; scalar_finish(request.descriptor.id, builder, &[selected]) }
 
 fn causal_max_mask_program(request: &MaterializationRequest<'_>) -> OperationResult<recipe_core::ScalarProgram> {
 	let mut builder = scalar_builder(request.descriptor.id)?;
 	let value = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
 	let mask = scalar_input(request.descriptor.id, &mut builder, DType::I32)?;
-	let floor = scalar_f32(request.descriptor.id, &mut builder, -1.0e30)?;
-	let selected = scalar_ternary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Select,
-		mask,
-		value,
-		floor,
-	)?;
-	scalar_finish(request.descriptor.id, builder, &[selected])
-}
+	let floor = scalar_f32(request.descriptor.id, &mut builder, -1.0e30)?; let selected = scalar_ternary(
+		request.descriptor.id, &mut builder, ScalarOpcode::Select, mask, value, floor, )?;
+	scalar_finish(request.descriptor.id, builder, &[selected]) }
 
 fn causal_safe_shift_program(request: &MaterializationRequest<'_>) -> OperationResult<recipe_core::ScalarProgram> {
 	let mut builder = scalar_builder(request.descriptor.id)?;
 	let value = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
 	let maximum = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
-	let mask = scalar_input(request.descriptor.id, &mut builder, DType::I32)?;
-	let shifted = scalar_binary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Subtract,
-		value,
-		maximum,
-	)?;
-	let zero = scalar_f32(request.descriptor.id, &mut builder, 0.0)?;
-	let safe = scalar_ternary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Select,
-		mask,
-		shifted,
-		zero,
-	)?;
-	scalar_finish(request.descriptor.id, builder, &[safe])
-}
+	let mask = scalar_input(request.descriptor.id, &mut builder, DType::I32)?; let shifted = scalar_binary(
+		request.descriptor.id, &mut builder, ScalarOpcode::Subtract, value, maximum, )?;
+	let zero = scalar_f32(request.descriptor.id, &mut builder, 0.0)?; let safe = scalar_ternary( request.descriptor.id,
+		&mut builder, ScalarOpcode::Select, mask, shifted, zero, )?; scalar_finish(request.descriptor.id, builder, &[safe]) }
 
 fn mask_to_zero_program(request: &MaterializationRequest<'_>) -> OperationResult<recipe_core::ScalarProgram> {
 	let mut builder = scalar_builder(request.descriptor.id)?;
 	let value = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
 	let mask = scalar_input(request.descriptor.id, &mut builder, DType::I32)?;
-	let zero = scalar_f32(request.descriptor.id, &mut builder, 0.0)?;
-	let selected = scalar_ternary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Select,
-		mask,
-		value,
-		zero,
-	)?;
-	scalar_finish(request.descriptor.id, builder, &[selected])
+	let zero = scalar_f32(request.descriptor.id, &mut builder, 0.0)?; let selected = scalar_ternary( request.descriptor.id,
+		&mut builder, ScalarOpcode::Select, mask, value, zero, )?; scalar_finish(request.descriptor.id, builder, &[selected])
 }
 
 fn checked_divide_program(request: &MaterializationRequest<'_>) -> OperationResult<recipe_core::ScalarProgram> {
 	let mut builder = scalar_builder(request.descriptor.id)?;
 	let numerator = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
 	let denominator = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
-	let zero = scalar_f32(request.descriptor.id, &mut builder, 0.0)?;
-	let positive = scalar_binary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::GreaterThan,
-		denominator,
-		zero,
-	)?;
-	scalar_unary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Require,
-		positive,
-	)?;
-	let quotient = scalar_binary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Divide,
-		numerator,
-		denominator,
-	)?;
-	scalar_finish(request.descriptor.id, builder, &[quotient])
-}
+	let zero = scalar_f32(request.descriptor.id, &mut builder, 0.0)?; let positive = scalar_binary( request.descriptor.id,
+		&mut builder, ScalarOpcode::GreaterThan, denominator, zero, )?; scalar_unary( request.descriptor.id, &mut builder,
+		ScalarOpcode::Require, positive, )?; let quotient = scalar_binary( request.descriptor.id, &mut builder,
+		ScalarOpcode::Divide, numerator, denominator, )?; scalar_finish(request.descriptor.id, builder, &[quotient]) }
 
 fn rotation_program(request: &MaterializationRequest<'_>) -> OperationResult<recipe_core::ScalarProgram> {
 	let mut builder = scalar_builder(request.descriptor.id)?;
 	let value = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
 	let partner = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
 	let cosine = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
-	let signed_sine = scalar_input(request.descriptor.id, &mut builder, DType::F32)?;
-	let cosine_term = scalar_binary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Multiply,
-		value,
-		cosine,
-	)?;
-	let sine_term = scalar_binary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Multiply,
-		partner,
-		signed_sine,
-	)?;
-	let rotated = scalar_binary(
-		request.descriptor.id,
-		&mut builder,
-		ScalarOpcode::Add,
-		cosine_term,
-		sine_term,
-	)?;
-	scalar_finish(request.descriptor.id, builder, &[rotated])
-}
+	let signed_sine = scalar_input(request.descriptor.id, &mut builder, DType::F32)?; let cosine_term = scalar_binary(
+		request.descriptor.id, &mut builder, ScalarOpcode::Multiply, value, cosine, )?; let sine_term = scalar_binary(
+		request.descriptor.id, &mut builder, ScalarOpcode::Multiply, partner, signed_sine, )?; let rotated = scalar_binary(
+		request.descriptor.id, &mut builder, ScalarOpcode::Add, cosine_term, sine_term, )?;
+	scalar_finish(request.descriptor.id, builder, &[rotated]) }
