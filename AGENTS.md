@@ -89,6 +89,13 @@ duplicated source regions, estimate replacement code, and state the net
 workspace percentage; reject abstractions that merely rename or relocate the
 same code.
 
+Do not write bureaucratic code. Do not split one operation into layers whose
+purpose is validating handoffs to one another. Such divisions create bridges;
+the bridges create validation; the validation creates error types; the error
+types create match arms. None of those pieces justifies the original split.
+Collapse them into the single operation unless each division has an independent
+architectural reason to exist.
+
 Training runs must never use a batch size smaller than the number of rows being
 trained on. Concretely: if `.split(...)` is set, the effective batch size must be
 at least the training split size; if no split is set, batch size must be at least

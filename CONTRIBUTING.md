@@ -6,6 +6,20 @@ Recipe uses measurements from the user's hardware, and from the script - derives
 All calculation is GPU-only, transfers are scheduled AOT, since primitives are
 implemented by recipe using no vendored ML AMD/NVIDIA libs. Behavior and configuration is semantically evaluated. Recipe ensures invalid states are impossible, rather than enforce a strict runtime convention.
 
+## No Artificial Type Divisions
+
+Bureaucratic code is banned. Do not split one operation into layers that exist
+to validate handoffs to one another. The split creates bridges; the bridges
+create validation; the validation creates error types; the error types create
+match arms. None of those pieces justifies the split that created them. Collapse
+them into one operation unless each division has an independent architectural
+reason to exist.
+
+Do not implement "you cannot do that, though" paths. If an action is invalid in
+the current state, the interface must not offer or represent it. A user would
+not attempt an invalid action unless the system exposed it as an available
+action, so remove that exposure instead of adding a rejection branch.
+
 Kernel generation may lower Recipe-owned operations through either:
 - the LLVM IR directly
 - or through the MLIR 
