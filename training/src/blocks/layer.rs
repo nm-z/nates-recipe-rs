@@ -35,36 +35,56 @@ impl InferenceBlock for CheckpointLayerImage {
 	}
 }
 
+/// Internal representation of `LayerForwardContext`.
 pub(super) struct LayerForwardContext<'a> {
+	/// Input associated with this value.
 	pub input: ValueId,
+	/// Input width associated with this value.
 	pub input_width: u64,
+	/// Partition rows associated with this value.
 	pub partition_rows: u64,
+	/// Validity associated with this value.
 	pub validity: ValueId,
+	/// Number of valid.
 	pub valid_count: ValueId,
+	/// Routing associated with this value.
 	pub routing: Option<(DenseGroupToNeuronRouting, NonZeroU64)>,
+	/// Config associated with this value.
 	pub config: &'a DenseTrainingConfig,
 }
 
+/// Internal representation of `LayerValidationContext`.
 pub(super) struct LayerValidationContext<'a> {
+	/// Input associated with this value.
 	pub input: ValueId,
+	/// Rows associated with this value.
 	pub rows: u64,
+	/// Routing associated with this value.
 	pub routing: Option<(DenseGroupToNeuronRouting, NonZeroU64)>,
+	/// Config associated with this value.
 	pub config: &'a DenseTrainingConfig,
+	/// Domain associated with this value.
 	pub domain: IterationDomain,
 }
 
+/// Internal representation of `LayerBackward`.
 pub(super) struct LayerBackward {
+	/// Gradient associated with this value.
 	pub gradient: GradientPair,
+	/// Input gradient associated with this value.
 	pub input_gradient: Option<ValueId>,
 }
 
+/// Operations required by `LayerDeclarationLifecycle`.
 pub(super) trait LayerDeclarationLifecycle {
+	/// Compiles the layer forward.
 	fn compile_layer_forward(
 		&self,
 		compiler: &mut GraphCompiler,
 		context: LayerForwardContext<'_>,
 	) -> TrainingCompileResult<(ValueId, LayerValues)>;
 
+	/// Compiles the layer validation.
 	fn compile_layer_validation(
 		&self,
 		compiler: &mut GraphCompiler,
@@ -73,13 +93,16 @@ pub(super) trait LayerDeclarationLifecycle {
 	) -> TrainingCompileResult<ValueId>;
 }
 
+/// Operations required by `LayerTapeLifecycle`.
 pub(super) trait LayerTapeLifecycle {
+	/// Compiles the layer backward.
 	fn compile_layer_backward(
 		&self,
 		compiler: &mut GraphCompiler,
 		context: BlockBackwardContext,
 	) -> TrainingCompileResult<LayerBackward>;
 
+	/// Compiles the layer optimizer.
 	fn compile_layer_optimizer(
 		&self,
 		compiler: &mut GraphCompiler,

@@ -43,30 +43,38 @@ use crate::{
 pub type TrainingExecutionResult<T> = Result<T, TrainingExecutionError>;
 pub type InferenceExecutionResult<T> = Result<T, InferenceExecutionError>;
 
+/// BLOCKING POLL INITIAL DELAY.
 const BLOCKING_POLL_INITIAL_DELAY: Duration = Duration::from_micros(50);
+/// BLOCKING POLL MAXIMUM DELAY.
 const BLOCKING_POLL_MAXIMUM_DELAY: Duration = Duration::from_millis(2);
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `BlockingPollBackoff`.
 struct BlockingPollBackoff {
+	/// Next delay associated with this value.
 	next_delay: Duration,
 }
 
 impl BlockingPollBackoff {
+	/// Constructs a new value.
 	const fn new() -> Self {
 		Self {
 			next_delay: BLOCKING_POLL_INITIAL_DELAY,
 		}
 	}
 
+	/// Performs the reset operation.
 	fn reset(&mut self) {
 		self.next_delay = BLOCKING_POLL_INITIAL_DELAY;
 	}
 
+	/// Performs the wait operation.
 	fn wait(&mut self) {
 		std::thread::sleep(self.next_delay);
 		self.advance();
 	}
 
+	/// Performs the advance operation.
 	fn advance(&mut self) {
 		self.next_delay = self
 			.next_delay
@@ -98,6 +106,7 @@ impl TrainingExecutionLimits {
 /// loop is active.
 #[derive(Clone, Copy, Debug)]
 pub struct TrainingExecutionControl<'a> {
+	/// Stop requested associated with this value.
 	stop_requested: Option<&'a AtomicBool>,
 }
 
@@ -118,16 +127,19 @@ impl<'a> TrainingExecutionControl<'a> {
 		}
 	}
 
+	/// Performs the stop requested operation.
 	fn stop_requested(self) -> bool {
 		self.stop_requested
 			.is_some_and(|requested| requested.load(Ordering::Acquire))
 	}
 
+	/// Returns whether the stop source condition holds.
 	const fn has_stop_source(self) -> bool {
 		self.stop_requested.is_some()
 	}
 }
 
+/// Validates the training execution control.
 fn validate_training_execution_control(
 	iterations: LoopIterations,
 	control: TrainingExecutionControl<'_>,
@@ -169,9 +181,13 @@ pub struct TrainingMetricObserverStats {
 /// full or disconnected consumer can never backpressure executor polling.
 #[derive(Debug)]
 pub struct TrainingMetricObserver {
+	/// Sender associated with this value.
 	sender: SyncSender<TrainingMetricSample>,
+	/// Selected associated with this value.
 	selected: BTreeMap<MetricId, u64>,
+	/// Cadence associated with this value.
 	cadence: NonZeroU64,
+	/// Stats associated with this value.
 	stats: TrainingMetricObserverStats,
 }
 
@@ -182,6 +198,7 @@ impl TrainingMetricObserver {
 		self.stats
 	}
 
+	/// Performs the try observe operation.
 	fn try_observe(&mut self, sample: &TrainingMetricSample) {
 		let Some(observed) = self.selected.get_mut(&sample.metric) else {
 			return;
@@ -243,6 +260,7 @@ pub struct TrainingMetricSample {
 }
 
 impl TrainingMetricSample {
+	/// Constructs this value from executor.
 	fn from_executor(sample: MetricSample) -> Self {
 		let epoch = sample.iteration.index() + 1;
 		let epoch = match NonZeroU64::new(epoch) {
@@ -294,11 +312,17 @@ impl NativeKernelFormat {
 /// because Recipe builds all stages for one native target into one bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RealizedNativeKernel {
+	/// Format associated with this value.
 	format: NativeKernelFormat,
+	/// Target associated with this value.
 	target: TargetIdentity,
+	/// Toolchain associated with this value.
 	toolchain: ToolchainIdentity,
+	/// Digest associated with this value.
 	digest: Digest,
+	/// Bytes associated with this value.
 	bytes: Arc<[u8]>,
+	/// Entries associated with this value.
 	entries: Vec<ArtifactIdentity>,
 }
 
@@ -344,9 +368,13 @@ impl RealizedNativeKernel {
 /// successful realization that was handed to the executor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RealizedNativeKernelSet {
+	/// Realization associated with this value.
 	realization: RealizationIdentity,
+	/// Topology associated with this value.
 	topology: TopologyIdentity,
+	/// Discovery associated with this value.
 	discovery: DiscoveryIdentity,
+	/// Kernels associated with this value.
 	kernels: Vec<RealizedNativeKernel>,
 }
 
@@ -376,6 +404,7 @@ impl RealizedNativeKernelSet {
 	}
 }
 
+/// Performs the retain realized native kernels operation.
 fn retain_realized_native_kernels(
 	realization: &recipe_core::RealizationProfile,
 	artifacts: Vec<NativeArtifact>,
@@ -419,14 +448,23 @@ fn retain_realized_native_kernels(
 /// before this value is returned.
 #[derive(Clone, Debug)]
 pub struct CompletedTrainingExecution {
+	/// Run associated with this value.
 	run: RunId,
+	/// Bundle associated with this value.
 	bundle: BundleIdentity,
+	/// External outputs associated with this value.
 	external_outputs: Vec<ExitImage>,
+	/// External output values associated with this value.
 	external_output_values: Vec<ValueId>,
+	/// Metrics associated with this value.
 	metrics: Vec<FinalTrainingMetric>,
+	/// Native kernels associated with this value.
 	native_kernels: RealizedNativeKernelSet,
+	/// Native evidence associated with this value.
 	native_evidence: NativeExecutionEvidence,
+	/// Training evidence associated with this value.
 	training_evidence: TrainingExecutionEvidence,
+	/// Journal associated with this value.
 	journal: RunJournal,
 }
 
@@ -434,17 +472,29 @@ pub struct CompletedTrainingExecution {
 /// and the completed real executor journal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrainingExecutionEvidence {
+	/// Bounds associated with this value.
 	bounds: TrainingBounds,
+	/// Logical updates per epoch associated with this value.
 	logical_updates_per_epoch: u64,
+	/// Optimizer parameter kernels associated with this value.
 	optimizer_parameter_kernels: usize,
+	/// Optimizer parameter tasks associated with this value.
 	optimizer_parameter_tasks: usize,
+	/// Optimizer parameter submissions associated with this value.
 	optimizer_parameter_submissions: usize,
+	/// Loop iterations started associated with this value.
 	loop_iterations_started: usize,
+	/// Loop iterations completed associated with this value.
 	loop_iterations_completed: usize,
+	/// Loop calculation tasks associated with this value.
 	loop_calculation_tasks: usize,
+	/// Non gpu calculation tasks associated with this value.
 	non_gpu_calculation_tasks: usize,
+	/// Non gpu calculation submissions associated with this value.
 	non_gpu_calculation_submissions: usize,
+	/// Logical events compacted associated with this value.
 	logical_events_compacted: u128,
+	/// Physical calls compacted associated with this value.
 	physical_calls_compacted: u128,
 }
 
@@ -619,7 +669,9 @@ impl CompletedTrainingExecution {
 /// reinterpret or calculate them on the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferencePrediction {
+	/// Contract associated with this value.
 	contract: InferenceOutputContract,
+	/// Bytes associated with this value.
 	bytes: Vec<u8>,
 }
 
@@ -647,12 +699,19 @@ impl InferencePrediction {
 /// before this value is returned.
 #[derive(Clone, Debug)]
 pub struct CompletedInferenceExecution {
+	/// Run associated with this value.
 	run: RunId,
+	/// Bundle associated with this value.
 	bundle: BundleIdentity,
+	/// Prediction associated with this value.
 	prediction: InferencePrediction,
+	/// Native kernels associated with this value.
 	native_kernels: RealizedNativeKernelSet,
+	/// Native evidence associated with this value.
 	native_evidence: NativeExecutionEvidence,
+	/// Elapsed associated with this value.
 	elapsed: Duration,
+	/// Journal associated with this value.
 	journal: RunJournal,
 }
 
@@ -730,7 +789,9 @@ impl CompletedInferenceExecution {
 /// One exact independently typed KNN prediction image.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KnnInferencePrediction {
+	/// Contract associated with this value.
 	contract: KnnInferenceOutputContract,
+	/// Bytes associated with this value.
 	bytes: Vec<u8>,
 }
 
@@ -757,11 +818,17 @@ impl KnnInferencePrediction {
 /// Fully exited all-output KNN inference evidence.
 #[derive(Clone, Debug)]
 pub struct CompletedKnnInferenceExecution {
+	/// Run associated with this value.
 	run: RunId,
+	/// Bundle associated with this value.
 	bundle: BundleIdentity,
+	/// Predictions associated with this value.
 	predictions: Vec<KnnInferencePrediction>,
+	/// Native evidence associated with this value.
 	native_evidence: NativeExecutionEvidence,
+	/// Elapsed associated with this value.
 	elapsed: Duration,
+	/// Journal associated with this value.
 	journal: RunJournal,
 }
 
@@ -832,9 +899,13 @@ impl CompletedKnnInferenceExecution {
 /// executor still attempts every remaining arena release and resource destroy.
 #[derive(Clone, Debug)]
 pub struct InferenceRunFailure {
+	/// Run associated with this value.
 	run: RunId,
+	/// Bundle associated with this value.
 	bundle: BundleIdentity,
+	/// Journal associated with this value.
 	journal: Option<RunJournal>,
+	/// Cleanup error associated with this value.
 	cleanup_error: Option<ExecutorError>,
 }
 
@@ -1626,20 +1697,30 @@ where
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Internal representation of `FinalizedInferenceOutput`.
 struct FinalizedInferenceOutput {
+	/// Task associated with this value.
 	task: TaskId,
+	/// Logical associated with this value.
 	logical: ValueId,
+	/// Source associated with this value.
 	source: ResolvedValueLocation,
+	/// Bytes associated with this value.
 	bytes: ByteCount,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Internal representation of `InferenceInputImage`.
 struct InferenceInputImage<'a> {
+	/// Value associated with this value.
 	value: ValueId,
+	/// Dtype associated with this value.
 	dtype: DType,
+	/// Bytes associated with this value.
 	bytes: &'a [u8],
 }
 
+/// Validates the compiled inference boundary.
 fn validate_compiled_inference_boundary(inference: &CompiledInference) -> InferenceExecutionResult<()> {
 	let iterations = inference.program().iterations();
 	if iterations != LoopIterations::ONE {
@@ -1825,6 +1906,7 @@ fn validate_compiled_inference_boundary(inference: &CompiledInference) -> Infere
 	Ok(())
 }
 
+/// Validates the compiled knn inference boundary.
 fn validate_compiled_knn_inference_boundary(inference: &CompiledKnnInference) -> InferenceExecutionResult<()> {
 	let iterations = inference.program().iterations();
 	if iterations != LoopIterations::ONE {
@@ -2007,6 +2089,7 @@ fn validate_compiled_knn_inference_boundary(inference: &CompiledKnnInference) ->
 	Ok(())
 }
 
+/// Performs the inference input role is allowed operation.
 const fn inference_input_role_is_allowed(role: InferenceInputRole) -> bool {
 	match role {
 		InferenceInputRole::Feature { .. }
@@ -2080,6 +2163,7 @@ const fn inference_input_role_is_allowed(role: InferenceInputRole) -> bool {
 	}
 }
 
+/// Validates the canonical boundary tensor.
 fn validate_canonical_boundary_tensor(
 	tensor: &recipe_language::Tensor,
 	boundary: &'static str,
@@ -2119,6 +2203,7 @@ fn validate_canonical_boundary_tensor(
 	Ok(())
 }
 
+/// Performs the pack inference device images operation.
 fn pack_inference_device_images(
 	inputs: &[InferenceExternalInput],
 	manifests: &[InitDataImage],
@@ -2134,6 +2219,7 @@ fn pack_inference_device_images(
 	pack_inference_input_images(&inputs, manifests)
 }
 
+/// Performs the pack inference input images operation.
 fn pack_inference_input_images(
 	inputs: &[InferenceInputImage<'_>],
 	manifests: &[InitDataImage],
@@ -2242,6 +2328,7 @@ fn pack_inference_input_images(
 	Ok(result)
 }
 
+/// Performs the host byte count operation.
 fn host_byte_count(length: usize) -> ByteCount {
 	ByteCount::new(u64::try_from(length).unwrap_or(u64::MAX))
 }
@@ -2465,16 +2552,24 @@ where
 }
 
 #[derive(Debug)]
+/// Internal representation of `PlannedTrainingExecutionEvidence`.
 struct PlannedTrainingExecutionEvidence {
+	/// Bounds associated with this value.
 	bounds: TrainingBounds,
+	/// Logical updates per epoch associated with this value.
 	logical_updates_per_epoch: u64,
+	/// Optimizer parameter kernels associated with this value.
 	optimizer_parameter_kernels: usize,
+	/// Optimizer parameter tasks associated with this value.
 	optimizer_parameter_tasks: BTreeSet<TaskId>,
+	/// Loop calculation tasks associated with this value.
 	loop_calculation_tasks: usize,
+	/// Non gpu calculation tasks associated with this value.
 	non_gpu_calculation_tasks: BTreeSet<TaskId>,
 }
 
 impl PlannedTrainingExecutionEvidence {
+	/// Constructs a new value.
 	fn new(training: &CompiledTraining, profile: &MeasuredProfile, bundle: &FinalizedBundle) -> Self {
 		let optimizer = training.outputs().optimizer_progress;
 		let mut update_kernels = BTreeSet::new();
@@ -2526,6 +2621,7 @@ impl PlannedTrainingExecutionEvidence {
 		}
 	}
 
+	/// Performs the complete operation.
 	fn complete(self, journal: &RunJournal) -> TrainingExecutionEvidence {
 		let optimizer_parameter_submissions = journal
 			.physical_calls()
@@ -2569,6 +2665,7 @@ impl PlannedTrainingExecutionEvidence {
 	}
 }
 
+/// Performs the map external output tasks operation.
 fn map_external_output_tasks(
 	training: &CompiledTraining,
 	bundle: &FinalizedBundle,
@@ -2676,6 +2773,7 @@ fn map_external_output_tasks(
 	Ok(mapped)
 }
 
+/// Performs the map inference output operation.
 fn map_inference_output(
 	inference: &CompiledInference,
 	bundle: &FinalizedBundle,
@@ -2798,6 +2896,7 @@ fn map_inference_output(
 	Ok(*descriptor)
 }
 
+/// Performs the map knn inference outputs operation.
 fn map_knn_inference_outputs(
 	inference: &CompiledKnnInference,
 	bundle: &FinalizedBundle,
@@ -2924,6 +3023,7 @@ fn map_knn_inference_outputs(
 	Ok(ordered)
 }
 
+/// Collects the knn inference predictions.
 fn collect_knn_inference_predictions(
 	contracts: &[KnnInferenceOutputContract],
 	plans: &[FinalizedInferenceOutput],
@@ -2996,6 +3096,7 @@ fn collect_knn_inference_predictions(
 	Ok(predictions)
 }
 
+/// Collects the inference prediction.
 fn collect_inference_prediction(
 	contract: &InferenceOutputContract,
 	plan: FinalizedInferenceOutput,
@@ -3019,6 +3120,7 @@ fn collect_inference_prediction(
 	})
 }
 
+/// Validates the completed prediction images.
 fn validate_completed_prediction_images(
 	expected_value: ValueId,
 	expected_dtype: DType,
@@ -3088,6 +3190,7 @@ fn validate_completed_prediction_images(
 	Ok(image.bytes)
 }
 
+/// Performs the output locations overlap operation.
 fn output_locations_overlap(left: ResolvedValueLocation, right: ResolvedValueLocation) -> bool {
 	if left.device != right.device {
 		return false;
@@ -3103,6 +3206,7 @@ fn output_locations_overlap(left: ResolvedValueLocation, right: ResolvedValueLoc
 	left_start < right_end && right_start < left_end
 }
 
+/// Performs the drain user metrics operation.
 fn drain_user_metrics(
 	metrics: &mut [FinalTrainingMetric],
 	mut take: impl FnMut(MetricSlotId) -> Option<MetricSample>,
@@ -3127,6 +3231,7 @@ fn drain_user_metrics(
 	}
 }
 
+/// Performs the native handoff error operation.
 fn native_handoff_error<E>(error: LocalError<E>) -> TrainingExecutionError
 where
 	E: StdError + Send + Sync + 'static,
@@ -3134,6 +3239,7 @@ where
 	TrainingExecutionError::NativeHandoff(Box::new(error))
 }
 
+/// Performs the native inference handoff error operation.
 fn native_inference_handoff_error<E>(error: LocalError<E>) -> InferenceExecutionError
 where
 	E: StdError + Send + Sync + 'static,
@@ -3141,6 +3247,7 @@ where
 	InferenceExecutionError::NativeHandoff(Box::new(error))
 }
 
+/// Performs the inference executor failure operation.
 fn inference_executor_failure<B: Backend>(failure: RunFailure<B>) -> InferenceExecutionError {
 	let parts = failure.into_parts();
 	let failure = InferenceRunFailure {
@@ -3156,6 +3263,7 @@ fn inference_executor_failure<B: Backend>(failure: RunFailure<B>) -> InferenceEx
 	}
 }
 
+/// Performs the post exit inference failure operation.
 fn post_exit_inference_failure(
 	source: InferenceExecutionError,
 	run: RunId,
@@ -3173,6 +3281,7 @@ fn post_exit_inference_failure(
 	}
 }
 
+/// Performs the reject loop external transfers operation.
 fn reject_loop_external_transfers(bundle: &FinalizedBundle) -> TrainingExecutionResult<()> {
 	for task in bundle
 		.tasks()
@@ -3191,6 +3300,7 @@ fn reject_loop_external_transfers(bundle: &FinalizedBundle) -> TrainingExecution
 	Ok(())
 }
 
+/// Performs the reject inference loop external transfers operation.
 fn reject_inference_loop_external_transfers(bundle: &FinalizedBundle) -> InferenceExecutionResult<()> {
 	if let Some(task) = inference_loop_external_transfer(bundle.tasks()) {
 		return Err(InferenceExecutionError::LoopExternalTransfer { task });
@@ -3198,6 +3308,7 @@ fn reject_inference_loop_external_transfers(bundle: &FinalizedBundle) -> Inferen
 	Ok(())
 }
 
+/// Performs the inference loop external transfer operation.
 fn inference_loop_external_transfer(tasks: &[recipe_core::Task]) -> Option<TaskId> {
 	tasks.iter()
 		.filter(|task| task.phase == RunPhase::Loop)
@@ -3212,6 +3323,7 @@ fn inference_loop_external_transfer(tasks: &[recipe_core::Task]) -> Option<TaskI
 		})
 }
 
+/// Performs the reject inference user metrics operation.
 fn reject_inference_user_metrics(bundle: &FinalizedBundle) -> InferenceExecutionResult<()> {
 	if let Some(task) = bundle.tasks().iter().find(|task| {
 		matches!(
@@ -3226,6 +3338,7 @@ fn reject_inference_user_metrics(bundle: &FinalizedBundle) -> InferenceExecution
 	Ok(())
 }
 
+/// Performs the user metric slots operation.
 fn user_metric_slots(bundle: &FinalizedBundle) -> Vec<(MetricSlotId, MetricId)> {
 	let mut slots = bundle
 		.tasks()
@@ -3242,6 +3355,7 @@ fn user_metric_slots(bundle: &FinalizedBundle) -> Vec<(MetricSlotId, MetricId)> 
 	slots
 }
 
+/// Performs the pack device images operation.
 fn pack_device_images(
 	inputs: &[OwnedExternalInput],
 	manifests: &[InitDataImage],

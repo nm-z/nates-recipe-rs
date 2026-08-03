@@ -953,6 +953,7 @@ impl core::fmt::Debug for DenseBlock {
 }
 
 impl DenseBlock {
+	/// Performs the declaration operation.
 	pub(crate) fn declaration(&self) -> &dyn crate::compile::DeclaredBlock {
 		self.0.as_ref()
 	}
@@ -2823,10 +2824,12 @@ impl core::fmt::Debug for DenseBlockState {
 }
 
 impl DenseBlockState {
+	/// Constructs this value from realized.
 	pub(crate) fn from_realized(realized: Box<dyn crate::compile::RealizedBlock>) -> Self {
 		Self(realized)
 	}
 
+	/// Performs the realized operation.
 	pub(crate) fn realized(&self) -> &dyn crate::compile::RealizedBlock {
 		self.0.as_ref()
 	}
@@ -3026,6 +3029,7 @@ pub struct MulticlassValidationOutputs {
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `CompiledTrainingParts`.
 pub(crate) struct CompiledTrainingParts {
 	/// Complete static calculation program executed by the training runtime.
 	pub program: StaticCalculationProgram,
@@ -3049,6 +3053,7 @@ pub(crate) struct CompiledTrainingParts {
 
 #[derive(Clone, Debug)]
 pub struct CompiledTraining {
+	/// Parts associated with this value.
 	parts: CompiledTrainingParts,
 }
 
@@ -3077,6 +3082,7 @@ impl CompiledTraining {
 		&self.parts.external_inputs
 	}
 
+	/// Performs the external inputs mut operation.
 	pub(crate) fn external_inputs_mut(&mut self) -> &mut [OwnedExternalInput] {
 		&mut self.parts.external_inputs
 	}

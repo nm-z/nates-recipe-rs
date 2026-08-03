@@ -52,266 +52,453 @@ use crate::{
 };
 
 #[path = "blocks/mod.rs"]
+/// The `mod` variant.
 mod blocks;
 
+/// MATERIALIZATION RESERVATION.
 const MATERIALIZATION_RESERVATION: u64 = 64;
+/// WORKSPACE LIMIT.
 const WORKSPACE_LIMIT: ByteCount = ByteCount::new(u64::MAX);
 
 #[derive(Clone, Debug)]
+/// Internal representation of `LayerValues`.
 struct LayerValues {
+	/// Declaration associated with this value.
 	declaration: DenseLayer,
+	/// Input associated with this value.
 	input: ValueId,
+	/// Weight associated with this value.
 	weight: InitialParameter,
+	/// Forward weight associated with this value.
 	forward_weight: ValueId,
+	/// Routing mask associated with this value.
 	routing_mask: Option<ValueId>,
+	/// Bias associated with this value.
 	bias: InitialParameter,
+	/// Operations associated with this value.
 	operations: Vec<OperationValues>,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `EmbeddingValues`.
 struct EmbeddingValues {
+	/// Declaration associated with this value.
 	declaration: DenseEmbedding,
+	/// Indices associated with this value.
 	indices: ValueId,
+	/// Table associated with this value.
 	table: InitialParameter,
+	/// Sequence length associated with this value.
 	sequence_length: NonZeroU64,
+	/// Dimensions associated with this value.
 	dimensions: NonZeroU64,
+	/// Vocabulary associated with this value.
 	vocabulary: NonZeroU64,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `AttentionValues`.
 struct AttentionValues {
+	/// Declaration associated with this value.
 	declaration: DenseAttention,
+	/// Input associated with this value.
 	input: ValueId,
+	/// Queries associated with this value.
 	queries: ValueId,
+	/// Keys associated with this value.
 	keys: ValueId,
+	/// Values associated with this value.
 	values: ValueId,
+	/// Probabilities associated with this value.
 	probabilities: ValueId,
+	/// Context associated with this value.
 	context: ValueId,
+	/// Query associated with this value.
 	query: InitialParameter,
+	/// Key associated with this value.
 	key: InitialParameter,
+	/// Value associated with this value.
 	value: InitialParameter,
+	/// Output associated with this value.
 	output: InitialParameter,
+	/// Sequence length associated with this value.
 	sequence_length: NonZeroU64,
+	/// Dimensions associated with this value.
 	dimensions: NonZeroU64,
+	/// Heads associated with this value.
 	heads: NonZeroU64,
+	/// Head dimension associated with this value.
 	head_dimension: NonZeroU64,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `AttentionForwardParameters`.
 struct AttentionForwardParameters {
+	/// Query associated with this value.
 	query: ValueId,
+	/// Key associated with this value.
 	key: ValueId,
+	/// Value associated with this value.
 	value: ValueId,
+	/// Output associated with this value.
 	output: ValueId,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `AttentionForwardValues`.
 struct AttentionForwardValues {
+	/// Input associated with this value.
 	input: ValueId,
+	/// Queries associated with this value.
 	queries: ValueId,
+	/// Keys associated with this value.
 	keys: ValueId,
+	/// Values associated with this value.
 	values: ValueId,
+	/// Probabilities associated with this value.
 	probabilities: ValueId,
+	/// Context associated with this value.
 	context: ValueId,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `RnnValues`.
 struct RnnValues {
+	/// Declaration associated with this value.
 	declaration: DenseRnn,
+	/// Steps associated with this value.
 	steps: Vec<RnnStepValues>,
+	/// Input weight associated with this value.
 	input_weight: InitialParameter,
+	/// Recurrent weight associated with this value.
 	recurrent_weight: InitialParameter,
+	/// Bias associated with this value.
 	bias: InitialParameter,
+	/// Sequence length associated with this value.
 	sequence_length: NonZeroU64,
+	/// Width associated with this value.
 	width: NonZeroU64,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `GruValues`.
 struct GruValues {
+	/// Declaration associated with this value.
 	declaration: DenseGru,
+	/// Steps associated with this value.
 	steps: Vec<GruStepValues>,
+	/// Reset input weight associated with this value.
 	reset_input_weight: InitialParameter,
+	/// Reset recurrent weight associated with this value.
 	reset_recurrent_weight: InitialParameter,
+	/// Reset bias associated with this value.
 	reset_bias: InitialParameter,
+	/// Update input weight associated with this value.
 	update_input_weight: InitialParameter,
+	/// Update recurrent weight associated with this value.
 	update_recurrent_weight: InitialParameter,
+	/// Update bias associated with this value.
 	update_bias: InitialParameter,
+	/// Candidate input weight associated with this value.
 	candidate_input_weight: InitialParameter,
+	/// Candidate recurrent weight associated with this value.
 	candidate_recurrent_weight: InitialParameter,
+	/// Candidate bias associated with this value.
 	candidate_bias: InitialParameter,
+	/// Sequence length associated with this value.
 	sequence_length: NonZeroU64,
+	/// Width associated with this value.
 	width: NonZeroU64,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `LstmValues`.
 struct LstmValues {
+	/// Declaration associated with this value.
 	declaration: DenseLstm,
+	/// Steps associated with this value.
 	steps: Vec<LstmStepValues>,
+	/// Input gate input weight associated with this value.
 	input_gate_input_weight: InitialParameter,
+	/// Input gate recurrent weight associated with this value.
 	input_gate_recurrent_weight: InitialParameter,
+	/// Input gate bias associated with this value.
 	input_gate_bias: InitialParameter,
+	/// Forget gate input weight associated with this value.
 	forget_gate_input_weight: InitialParameter,
+	/// Forget gate recurrent weight associated with this value.
 	forget_gate_recurrent_weight: InitialParameter,
+	/// Forget gate bias associated with this value.
 	forget_gate_bias: InitialParameter,
+	/// Output gate input weight associated with this value.
 	output_gate_input_weight: InitialParameter,
+	/// Output gate recurrent weight associated with this value.
 	output_gate_recurrent_weight: InitialParameter,
+	/// Output gate bias associated with this value.
 	output_gate_bias: InitialParameter,
+	/// Candidate input weight associated with this value.
 	candidate_input_weight: InitialParameter,
+	/// Candidate recurrent weight associated with this value.
 	candidate_recurrent_weight: InitialParameter,
+	/// Candidate bias associated with this value.
 	candidate_bias: InitialParameter,
+	/// Sequence length associated with this value.
 	sequence_length: NonZeroU64,
+	/// Width associated with this value.
 	width: NonZeroU64,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `RecurrentGateBackwardValues`.
 struct RecurrentGateBackwardValues {
+	/// Input weight associated with this value.
 	input_weight: ValueId,
+	/// Recurrent weight associated with this value.
 	recurrent_weight: ValueId,
+	/// Bias associated with this value.
 	bias: ValueId,
+	/// Previous hidden associated with this value.
 	previous_hidden: ValueId,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `ConvolutionValues`.
 struct ConvolutionValues {
+	/// Declaration associated with this value.
 	declaration: DenseConvolution,
+	/// Geometry associated with this value.
 	geometry: DenseConvolutionGeometry,
+	/// Preparation associated with this value.
 	preparation: ChannelwiseConvolution1dPreparation,
+	/// Columns associated with this value.
 	columns: ValueId,
+	/// Output group indices associated with this value.
 	output_group_indices: ValueId,
+	/// Weight associated with this value.
 	weight: InitialParameter,
+	/// Bias associated with this value.
 	bias: InitialParameter,
+	/// Operations associated with this value.
 	operations: Vec<OperationValues>,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `PoolValues`.
 struct PoolValues {
+	/// Declaration associated with this value.
 	declaration: DensePool,
+	/// State associated with this value.
 	state: DensePoolState,
+	/// Preparation associated with this value.
 	preparation: ChannelwiseMaxPool1dPreparation,
+	/// Winners associated with this value.
 	winners: ValueId,
+	/// Gradient batch indices associated with this value.
 	gradient_batch_indices: ValueId,
+	/// Input matrix indices associated with this value.
 	input_matrix_indices: ValueId,
+	/// Output group indices associated with this value.
 	output_group_indices: ValueId,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `KMeansValues`.
 struct KMeansValues {
+	/// Declaration associated with this value.
 	declaration: DenseKMeans,
+	/// Input associated with this value.
 	input: ValueId,
+	/// Distances associated with this value.
 	distances: ValueId,
+	/// State associated with this value.
 	state: DenseKMeansState,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `TreeValues`.
 struct TreeValues {
+	/// Declaration associated with this value.
 	declaration: DenseTree,
+	/// Input width associated with this value.
 	input_width: NonZeroU64,
+	/// Output width associated with this value.
 	output_width: NonZeroU64,
+	/// Internal nodes per tree associated with this value.
 	internal_nodes_per_tree: NonZeroU64,
+	/// Leaves per tree associated with this value.
 	leaves_per_tree: NonZeroU64,
+	/// Split features associated with this value.
 	split_features: ValueId,
+	/// Split thresholds associated with this value.
 	split_thresholds: ValueId,
+	/// Leaf values associated with this value.
 	leaf_values: InitialParameter,
+	/// Leaf indices associated with this value.
 	leaf_indices: ValueId,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `ResidualValues`.
 struct ResidualValues {
+	/// Declaration associated with this value.
 	declaration: DenseResidual,
+	/// Input associated with this value.
 	input: ValueId,
+	/// Branch associated with this value.
 	branch: Vec<ResidualBranchValues>,
+	/// Projection associated with this value.
 	projection: Option<InitialParameter>,
+	/// Operations associated with this value.
 	operations: Vec<OperationValues>,
 }
 
 #[derive(Clone, Debug)]
+/// Internal variants for `ResidualBranchValues`.
 enum ResidualBranchValues {
+	/// The `Layer` variant.
 	Layer(LayerValues),
+	/// The `Operation` variant.
 	Operation(OperationValues),
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `OperationValues`.
 struct OperationValues {
+	/// Operation associated with this value.
 	operation: DenseOperation,
+	/// Input associated with this value.
 	input: ValueId,
+	/// Output associated with this value.
 	output: ValueId,
+	/// Variance associated with this value.
 	variance: Option<ValueId>,
+	/// Parameter associated with this value.
 	parameter: Option<InitialParameter>,
 }
 
 #[derive(Clone, Copy)]
+/// Internal variants for `InputGradientRequirement`.
 enum InputGradientRequirement {
+	/// The `Omit` variant.
 	Omit,
+	/// The `Required` variant.
 	Required,
 }
 
 #[derive(Clone, Copy)]
+/// Internal representation of `BlockBackwardContext`.
 struct BlockBackwardContext {
+	/// Gradient associated with this value.
 	gradient: ValueId,
+	/// Input gradient associated with this value.
 	input_gradient: InputGradientRequirement,
+	/// Zero-based block index.
 	block_index: usize,
+	/// Partition rows associated with this value.
 	partition_rows: u64,
+	/// Validity associated with this value.
 	validity: ValueId,
+	/// Number of valid.
 	valid_count: ValueId,
+	/// Epsilon associated with this value.
 	epsilon: f32,
+	/// Tree lanes associated with this value.
 	tree_lanes: u32,
 }
 
+/// Internal representation of `BlockBackward`.
 struct BlockBackward {
+	/// Input gradient associated with this value.
 	input_gradient: Option<ValueId>,
+	/// Parameters associated with this value.
 	parameters: Vec<ParameterGradient>,
 }
 
 #[derive(Clone, Copy)]
+/// Internal representation of `BlockForwardContext`.
 pub(crate) struct BlockForwardContext<'a> {
+	/// Input associated with this value.
 	input: ValueId,
+	/// Targets associated with this value.
 	targets: ValueId,
+	/// Logical associated with this value.
 	logical: LogicalFeatureShape,
+	/// Routing associated with this value.
 	routing: Option<(DenseGroupToNeuronRouting, NonZeroU64)>,
+	/// Target width associated with this value.
 	target_width: u64,
+	/// Task associated with this value.
 	task: DenseTask,
+	/// Partition rows associated with this value.
 	partition_rows: u64,
+	/// Validity associated with this value.
 	validity: ValueId,
+	/// Number of valid.
 	valid_count: ValueId,
+	/// Zero-based block index.
 	block_index: usize,
+	/// Config associated with this value.
 	config: &'a DenseTrainingConfig,
 }
 
+/// Internal representation of `BlockForward`.
 pub(crate) struct BlockForward {
+	/// Output associated with this value.
 	output: ValueId,
+	/// Logical associated with this value.
 	logical: LogicalFeatureShape,
+	/// Routing associated with this value.
 	routing: Option<(DenseGroupToNeuronRouting, NonZeroU64)>,
+	/// Tape associated with this value.
 	tape: Box<dyn CompiledBlock>,
 }
 
 #[derive(Clone, Copy)]
+/// Internal representation of `BlockValidationContext`.
 pub(crate) struct BlockValidationContext<'a> {
+	/// Input associated with this value.
 	input: ValueId,
+	/// Logical associated with this value.
 	logical: LogicalFeatureShape,
+	/// Routing associated with this value.
 	routing: Option<(DenseGroupToNeuronRouting, NonZeroU64)>,
+	/// Rows associated with this value.
 	rows: u64,
+	/// Zero-based block index.
 	block_index: usize,
+	/// Config associated with this value.
 	config: &'a DenseTrainingConfig,
+	/// Domain associated with this value.
 	domain: IterationDomain,
 }
 
+/// Internal representation of `BlockValidation`.
 pub(crate) struct BlockValidation {
+	/// Output associated with this value.
 	output: ValueId,
+	/// Logical associated with this value.
 	logical: LogicalFeatureShape,
+	/// Routing associated with this value.
 	routing: Option<(DenseGroupToNeuronRouting, NonZeroU64)>,
 }
 
+/// Operations required by `RealizedBlock`.
 pub(crate) trait RealizedBlock: core::fmt::Debug {
+	/// Performs the clone box operation.
 	fn clone_box(&self) -> Box<dyn RealizedBlock>;
+	/// Performs the visit parameter states operation.
 	fn visit_parameter_states(&self, visit: &mut dyn FnMut(ParameterState));
+	/// Performs the legacy layer state operation.
 	fn legacy_layer_state(&self) -> Option<&DenseLayerState> {
 		None
 	}
+	/// Compiles the validation.
 	fn compile_validation(
 		&self,
 		compiler: &mut GraphCompiler,
 		context: BlockValidationContext<'_>,
 	) -> TrainingCompileResult<BlockValidation>;
+	/// Performs the checkpoint operation.
 	fn checkpoint(
 		&self,
 		training: &CompiledTraining,
@@ -320,88 +507,129 @@ pub(crate) trait RealizedBlock: core::fmt::Debug {
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `RealizedEmbedding`.
 struct RealizedEmbedding {
+	/// Declaration associated with this value.
 	declaration: DenseEmbedding,
+	/// State associated with this value.
 	state: DenseEmbeddingState,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `RealizedAttention`.
 struct RealizedAttention {
+	/// Declaration associated with this value.
 	declaration: DenseAttention,
+	/// State associated with this value.
 	state: DenseAttentionState,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `RealizedRnn`.
 struct RealizedRnn {
+	/// Declaration associated with this value.
 	declaration: DenseRnn,
+	/// State associated with this value.
 	state: DenseRnnState,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `RealizedGru`.
 struct RealizedGru {
+	/// Declaration associated with this value.
 	declaration: DenseGru,
+	/// State associated with this value.
 	state: DenseGruState,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `RealizedLstm`.
 struct RealizedLstm {
+	/// Declaration associated with this value.
 	declaration: DenseLstm,
+	/// State associated with this value.
 	state: DenseLstmState,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `RealizedLayer`.
 struct RealizedLayer {
+	/// Declaration associated with this value.
 	declaration: DenseLayer,
+	/// State associated with this value.
 	state: DenseLayerState,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `RealizedConvolution`.
 struct RealizedConvolution {
+	/// Declaration associated with this value.
 	declaration: DenseConvolution,
+	/// State associated with this value.
 	state: DenseConvolutionState,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `RealizedPool`.
 struct RealizedPool {
+	/// Declaration associated with this value.
 	declaration: DensePool,
+	/// State associated with this value.
 	state: DensePoolState,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `RealizedKMeans`.
 struct RealizedKMeans {
+	/// Declaration associated with this value.
 	declaration: DenseKMeans,
+	/// State associated with this value.
 	state: DenseKMeansState,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `RealizedTree`.
 struct RealizedTree {
+	/// Declaration associated with this value.
 	declaration: DenseTree,
+	/// State associated with this value.
 	state: DenseTreeState,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `RealizedResidual`.
 struct RealizedResidual {
+	/// Declaration associated with this value.
 	declaration: DenseResidual,
+	/// State associated with this value.
 	state: DenseResidualState,
 }
 
+/// Operations required by `DeclaredBlock`.
 pub(crate) trait DeclaredBlock: core::fmt::Debug {
+	/// Performs the clone box operation.
 	fn clone_box(&self) -> Box<dyn DeclaredBlock>;
+	/// Performs the output width operation.
 	fn output_width(&self) -> Option<NonZeroU64> {
 		None
 	}
+	/// Performs the output operations operation.
 	fn output_operations(&self) -> &[DenseOperation] {
 		&[]
 	}
+	/// Performs the legacy layer operation.
 	fn legacy_layer(&self) -> Option<&DenseLayer> {
 		None
 	}
+	/// Performs the leading embedding operation.
 	fn leading_embedding(&self) -> Option<DenseEmbedding> {
 		None
 	}
+	/// Performs the leading recurrent name operation.
 	fn leading_recurrent_name(&self) -> Option<&'static str> {
 		None
 	}
+	/// Compiles the forward.
 	fn compile_forward(
 		&self,
 		compiler: &mut GraphCompiler,
@@ -409,13 +637,16 @@ pub(crate) trait DeclaredBlock: core::fmt::Debug {
 	) -> TrainingCompileResult<BlockForward>;
 }
 
+/// Operations required by `CompiledBlock`.
 trait CompiledBlock {
+	/// Performs the backward operation.
 	fn backward(
 		&self,
 		compiler: &mut GraphCompiler,
 		context: BlockBackwardContext,
 	) -> TrainingCompileResult<BlockBackward>;
 
+	/// Performs the optimize operation.
 	fn optimize(
 		&self,
 		compiler: &mut GraphCompiler,
@@ -424,40 +655,60 @@ trait CompiledBlock {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `NormalizedValues`.
 struct NormalizedValues {
+	/// Normalized associated with this value.
 	normalized: ValueId,
+	/// Variance associated with this value.
 	variance: ValueId,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `SoftmaxValues`.
 struct SoftmaxValues {
+	/// Maximum associated with this value.
 	maximum: ValueId,
+	/// Logarithmic sum associated with this value.
 	logarithmic_sum: ValueId,
+	/// Exponentials associated with this value.
 	exponentials: ValueId,
+	/// Exponential sum associated with this value.
 	exponential_sum: ValueId,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `InitialParameter`.
 struct InitialParameter {
+	/// Value associated with this value.
 	value: ValueId,
+	/// First moment associated with this value.
 	first_moment: ValueId,
+	/// Second moment associated with this value.
 	second_moment: ValueId,
 }
 
 #[derive(Clone, Debug)]
+/// Internal representation of `GradientPair`.
 struct GradientPair {
+	/// Weight associated with this value.
 	weight: ValueId,
+	/// Bias associated with this value.
 	bias: ValueId,
+	/// Prelu associated with this value.
 	prelu: Vec<ValueId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Internal representation of `LogicalFeatureShape`.
 pub(crate) struct LogicalFeatureShape {
+	/// Length associated with this value.
 	length: NonZeroU64,
+	/// Channels associated with this value.
 	channels: NonZeroU64,
 }
 
 impl LogicalFeatureShape {
+	/// Constructs this value from width.
 	fn from_width(width: u64) -> TrainingCompileResult<Self> {
 		let length = NonZeroU64::new(width).expect("validated logical feature width is nonzero");
 		Ok(Self {
@@ -466,6 +717,7 @@ impl LogicalFeatureShape {
 		})
 	}
 
+	/// Performs the width operation.
 	fn width(self) -> TrainingCompileResult<u64> {
 		self.length
 			.get()
@@ -478,6 +730,7 @@ impl LogicalFeatureShape {
 			})
 	}
 
+	/// Performs the embedded operation.
 	fn embedded(self, embedding: DenseEmbedding) -> TrainingCompileResult<Self> {
 		let embedded = Self {
 			length: self.length,
@@ -487,12 +740,14 @@ impl LogicalFeatureShape {
 		Ok(embedded)
 	}
 
+	/// Performs the attended operation.
 	fn attended(self, attention: DenseAttention) -> TrainingCompileResult<(Self, NonZeroU64)> {
 		let head_dimension = NonZeroU64::new(self.channels.get() / attention.heads().get())
 			.expect("nonzero divisible attention head dimension");
 		Ok((self, head_dimension))
 	}
 
+	/// Performs the recurrent operation.
 	fn recurrent(self, width: NonZeroU64) -> TrainingCompileResult<Self> {
 		Ok(Self {
 			length: width,
@@ -500,6 +755,7 @@ impl LogicalFeatureShape {
 		})
 	}
 
+	/// Performs the pooled operation.
 	fn pooled(self, pool: DensePool) -> TrainingCompileResult<(Self, DensePoolState)> {
 		let output_length = NonZeroU64::new(self.length.get().div_ceil(pool.size().get()))
 			.expect("validated pool output is nonzero");
@@ -513,6 +769,7 @@ impl LogicalFeatureShape {
 		))
 	}
 
+	/// Performs the convolved operation.
 	fn convolved(self, convolution: &DenseConvolution) -> TrainingCompileResult<(Self, DenseConvolutionGeometry)> {
 		let output_length = NonZeroU64::new(self.length.get() - convolution.kernel().get() + 1)
 			.expect("validated convolution output length is nonzero");
@@ -534,67 +791,116 @@ impl LogicalFeatureShape {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Internal variants for `ParameterRole`.
 enum ParameterRole {
+	/// The `EmbeddingTable` variant.
 	EmbeddingTable,
+	/// The `AttentionQuery` variant.
 	AttentionQuery,
+	/// The `AttentionKey` variant.
 	AttentionKey,
+	/// The `AttentionValue` variant.
 	AttentionValue,
+	/// The `AttentionOutput` variant.
 	AttentionOutput,
+	/// The `RnnInputWeight` variant.
 	RnnInputWeight,
+	/// The `RnnRecurrentWeight` variant.
 	RnnRecurrentWeight,
+	/// The `RnnBias` variant.
 	RnnBias,
+	/// The `GruResetInputWeight` variant.
 	GruResetInputWeight,
+	/// The `GruResetRecurrentWeight` variant.
 	GruResetRecurrentWeight,
+	/// The `GruResetBias` variant.
 	GruResetBias,
+	/// The `GruUpdateInputWeight` variant.
 	GruUpdateInputWeight,
+	/// The `GruUpdateRecurrentWeight` variant.
 	GruUpdateRecurrentWeight,
+	/// The `GruUpdateBias` variant.
 	GruUpdateBias,
+	/// The `GruCandidateInputWeight` variant.
 	GruCandidateInputWeight,
+	/// The `GruCandidateRecurrentWeight` variant.
 	GruCandidateRecurrentWeight,
+	/// The `GruCandidateBias` variant.
 	GruCandidateBias,
+	/// The `LstmInputGateInputWeight` variant.
 	LstmInputGateInputWeight,
+	/// The `LstmInputGateRecurrentWeight` variant.
 	LstmInputGateRecurrentWeight,
+	/// The `LstmInputGateBias` variant.
 	LstmInputGateBias,
+	/// The `LstmForgetGateInputWeight` variant.
 	LstmForgetGateInputWeight,
+	/// The `LstmForgetGateRecurrentWeight` variant.
 	LstmForgetGateRecurrentWeight,
+	/// The `LstmForgetGateBias` variant.
 	LstmForgetGateBias,
+	/// The `LstmOutputGateInputWeight` variant.
 	LstmOutputGateInputWeight,
+	/// The `LstmOutputGateRecurrentWeight` variant.
 	LstmOutputGateRecurrentWeight,
+	/// The `LstmOutputGateBias` variant.
 	LstmOutputGateBias,
+	/// The `LstmCandidateInputWeight` variant.
 	LstmCandidateInputWeight,
+	/// The `LstmCandidateRecurrentWeight` variant.
 	LstmCandidateRecurrentWeight,
+	/// The `LstmCandidateBias` variant.
 	LstmCandidateBias,
+	/// The `LayerWeight` variant.
 	LayerWeight,
+	/// The `LayerBias` variant.
 	LayerBias,
+	/// The `ConvolutionWeight` variant.
 	ConvolutionWeight,
+	/// The `ConvolutionBias` variant.
 	ConvolutionBias,
+	/// The `PReluSlope` variant.
 	PReluSlope,
+	/// The `ResidualProjectionWeight` variant.
 	ResidualProjectionWeight,
+	/// The `TreeLeafValue` variant.
 	TreeLeafValue,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `ParameterGradient`.
 struct ParameterGradient {
+	/// Value associated with this value.
 	value: ValueId,
 }
 
 impl ParameterGradient {
+	/// Constructs a new value.
 	const fn new(_role: ParameterRole, value: ValueId) -> Self {
 		Self { value }
 	}
 }
 
+/// Internal representation of `ParameterUpdates`.
 struct ParameterUpdates<'a> {
+	/// Clipped associated with this value.
 	clipped: &'a [ValueId],
+	/// Cursor associated with this value.
 	cursor: usize,
+	/// Learning rate associated with this value.
 	learning_rate: ValueId,
+	/// Beta one power associated with this value.
 	beta_one_power: ValueId,
+	/// Beta two power associated with this value.
 	beta_two_power: ValueId,
+	/// Apply update associated with this value.
 	apply_update: Option<ValueId>,
+	/// Config associated with this value.
 	config: &'a DenseTrainingConfig,
 }
 
 impl<'a> ParameterUpdates<'a> {
+	/// Constructs a new value.
 	fn new(
 		clipped: &'a [ValueId],
 		learning_rate: ValueId,
@@ -614,12 +920,14 @@ impl<'a> ParameterUpdates<'a> {
 		}
 	}
 
+	/// Performs the take operation.
 	fn take(&mut self) -> ValueId {
 		let gradient = self.clipped[self.cursor];
 		self.cursor += 1;
 		gradient
 	}
 
+	/// Performs the apply operation.
 	fn apply(
 		&mut self,
 		compiler: &mut GraphCompiler,
@@ -632,31 +940,48 @@ impl<'a> ParameterUpdates<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `ZScoreValues`.
 struct ZScoreValues {
+	/// Normalized associated with this value.
 	normalized: ValueId,
+	/// Mean associated with this value.
 	mean: ValueId,
+	/// Variance associated with this value.
 	variance: ValueId,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `MinMaxValues`.
 struct MinMaxValues {
+	/// Normalized associated with this value.
 	normalized: ValueId,
+	/// Minimum associated with this value.
 	minimum: ValueId,
+	/// Maximum associated with this value.
 	maximum: ValueId,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `ValidationValues`.
 struct ValidationValues {
+	/// Features associated with this value.
 	features: ValueId,
+	/// Targets associated with this value.
 	targets: ValueId,
+	/// Rows associated with this value.
 	rows: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `AcceptedUpdatePlan`.
 struct AcceptedUpdatePlan {
+	/// Per epoch associated with this value.
 	per_epoch: u64,
+	/// Maximum associated with this value.
 	maximum: Option<u64>,
+	/// Warmup associated with this value.
 	warmup: u64,
+	/// Counter limit associated with this value.
 	counter_limit: u64,
 }
 
@@ -759,6 +1084,7 @@ pub fn compile_dense_training_with_regression_validation(
 	compile_dense_training_impl(dataset, config, &blocks, None, None, Some(validation))
 }
 
+/// Performs the flat dense blocks operation.
 fn flat_dense_blocks(config: &DenseTrainingConfig) -> Vec<DenseBlock> {
 	config.layers
 		.iter()
@@ -767,6 +1093,7 @@ fn flat_dense_blocks(config: &DenseTrainingConfig) -> Vec<DenseBlock> {
 		.collect()
 }
 
+/// Compiles the dense training impl.
 fn compile_dense_training_impl(
 	prepared: &PreparedDataset,
 	config: &DenseTrainingConfig,
@@ -1403,6 +1730,7 @@ fn compile_dense_training_impl(
 	}))
 }
 
+/// Validates the recurrent dataset.
 fn validate_recurrent_dataset(dataset: &PreparedDataset, name: &str) -> TrainingCompileResult<()> {
 	for feature in dataset
 		.vectors()
@@ -1429,6 +1757,7 @@ fn validate_recurrent_dataset(dataset: &PreparedDataset, name: &str) -> Training
 	Ok(())
 }
 
+/// Resolves the dense task.
 fn resolve_dense_task(dataset: &PreparedDataset, loss: DenseLoss) -> TrainingCompileResult<DenseTask> {
 	let targets = dataset
 		.target_source_indices()
@@ -1572,6 +1901,7 @@ fn resolve_dense_task(dataset: &PreparedDataset, loss: DenseLoss) -> TrainingCom
 	}
 }
 
+/// Validates the lowered dataset.
 fn validate_lowered_dataset(
 	dataset: &LoweredDenseDataset,
 	task: DenseTask,
@@ -1642,6 +1972,7 @@ fn validate_lowered_dataset(
 	Ok(())
 }
 
+/// Validates the embedding dataset.
 fn validate_embedding_dataset(
 	prepared: &PreparedDataset,
 	dataset: &LoweredDenseDataset,
@@ -1727,6 +2058,7 @@ fn validate_embedding_dataset(
 	Ok(())
 }
 
+/// Validates the exact i32 to f32.
 fn validate_exact_i32_to_f32(matrix: &DenseMatrix, role: &str) -> TrainingCompileResult<()> {
 	let DenseMatrix::I32 { values, .. } = matrix else {
 		return Ok(());
@@ -1748,6 +2080,7 @@ fn validate_exact_i32_to_f32(matrix: &DenseMatrix, role: &str) -> TrainingCompil
 	Ok(())
 }
 
+/// Performs the push layer gradients operation.
 fn push_layer_gradients(flattened: &mut Vec<ParameterGradient>, gradient: &GradientPair) {
 	flattened.extend([
 		ParameterGradient::new(ParameterRole::LayerWeight, gradient.weight),
@@ -1762,6 +2095,7 @@ fn push_layer_gradients(flattened: &mut Vec<ParameterGradient>, gradient: &Gradi
 	);
 }
 
+/// Performs the validation prelu parameter operation.
 fn validation_prelu_parameter<'a>(
 	operation: DenseOperation,
 	states: &mut impl Iterator<Item = &'a ParameterState>,
@@ -1775,6 +2109,7 @@ fn validation_prelu_parameter<'a>(
 	}
 }
 
+/// Validates the validation config.
 fn validate_validation_config(
 	dataset: &LoweredDenseDataset,
 	binary: Option<&BinaryValidationConfig>,
@@ -1863,6 +2198,7 @@ fn validate_validation_config(
 	binary_validation_metric_status(dataset)
 }
 
+/// Performs the binary validation metric status operation.
 fn binary_validation_metric_status(dataset: &LoweredDenseDataset) -> TrainingCompileResult<ValidationMetricStatus> {
 	let status = validation_metric_status(dataset, ValidationMetricFamily::Binary)?;
 	let ValidationMetricStatus::Available { known_rows, .. } = status else {
@@ -1902,6 +2238,7 @@ fn binary_validation_metric_status(dataset: &LoweredDenseDataset) -> TrainingCom
 	})
 }
 
+/// Performs the validation metric status operation.
 fn validation_metric_status(
 	dataset: &LoweredDenseDataset,
 	family: ValidationMetricFamily,
@@ -1931,6 +2268,7 @@ fn validation_metric_status(
 	Ok(ValidationMetricStatus::Available { family, known_rows })
 }
 
+/// Performs the training bounds operation.
 fn training_bounds(
 	rows: usize,
 	epochs: TrainingHorizon,
@@ -1997,6 +2335,7 @@ fn training_bounds(
 	})
 }
 
+/// Performs the accepted update plan operation.
 fn accepted_update_plan(
 	accepted_updates_per_epoch: usize,
 	config: &DenseTrainingConfig,
@@ -2061,24 +2400,41 @@ fn accepted_update_plan(
 }
 
 #[derive(Debug)]
+/// Internal representation of `GraphCompiler`.
 pub(crate) struct GraphCompiler {
+	/// Tensors associated with this value.
 	tensors: BTreeMap<ValueId, Tensor>,
+	/// Nodes associated with this value.
 	nodes: Vec<CalculationNode>,
+	/// Domains associated with this value.
 	domains: Vec<KernelIterationDomain>,
+	/// Next value associated with this value.
 	next_value: u64,
+	/// Next kernel associated with this value.
 	next_kernel: u64,
+	/// Next weight stream associated with this value.
 	next_weight_stream: u64,
+	/// Next parameter input associated with this value.
 	next_parameter_input: usize,
+	/// Iterations associated with this value.
 	iterations: LoopIterations,
+	/// Training domain associated with this value.
 	training_domain: IterationDomain,
+	/// Resume enabled associated with this value.
 	resume_enabled: Option<ValueId>,
+	/// External inputs associated with this value.
 	external_inputs: Vec<OwnedExternalInput>,
+	/// External input ids associated with this value.
 	external_input_ids: BTreeSet<ValueId>,
+	/// External outputs associated with this value.
 	external_outputs: BTreeSet<ValueId>,
 }
 
+/// Internal representation of `TrainingForwardGraph`.
 struct TrainingForwardGraph<'a> {
+	/// Compiler associated with this value.
 	compiler: &'a mut GraphCompiler,
+	/// Domain associated with this value.
 	domain: IterationDomain,
 }
 
@@ -2132,12 +2488,16 @@ impl RecurrentForwardGraph for TrainingForwardGraph<'_> {
 	}
 }
 
+/// Internal variants for `ScalarOperation`.
 enum ScalarOperation {
+	/// Str.
 	Owned(&'static str),
+	/// The `Program` variant.
 	Program(recipe_core::ScalarProgram),
 }
 
 impl GraphCompiler {
+	/// Constructs a new value.
 	fn new(iterations: LoopIterations, training_iterations: LoopIterations) -> TrainingCompileResult<Self> {
 		let training_domain = IterationDomain::every(training_iterations);
 		let mut compiler = Self {
@@ -2160,6 +2520,7 @@ impl GraphCompiler {
 		Ok(compiler)
 	}
 
+	/// Performs the tensor operation.
 	fn tensor(&mut self, dtype: DType, shape: Shape) -> TrainingCompileResult<ValueId> {
 		let value = self.next_value()?;
 		let tensor = Tensor::contiguous(value, dtype, shape, false, false)?;
@@ -2167,6 +2528,7 @@ impl GraphCompiler {
 		Ok(value)
 	}
 
+	/// Performs the external matrix operation.
 	fn external_matrix(&mut self, role: ExternalInputRole, matrix: &DenseMatrix) -> TrainingCompileResult<ValueId> {
 		let rows = u64::try_from(matrix.rows()).map_err(|error| {
 			TrainingCompileError::new(
@@ -2199,6 +2561,7 @@ impl GraphCompiler {
 		Ok(value)
 	}
 
+	/// Performs the external f32 vector operation.
 	fn external_f32_vector(&mut self, role: ExternalInputRole, values: &[u32]) -> TrainingCompileResult<ValueId> {
 		if values.is_empty() {
 			return Err(TrainingCompileError::new(
@@ -2225,6 +2588,7 @@ impl GraphCompiler {
 		self.external_f32_tensor(role, shape(&[columns])?, values)
 	}
 
+	/// Performs the external f32 tensor operation.
 	fn external_f32_tensor(
 		&mut self,
 		role: ExternalInputRole,
@@ -2257,6 +2621,7 @@ impl GraphCompiler {
 		Ok(value)
 	}
 
+	/// Performs the external f32 zeros operation.
 	fn external_f32_zeros(&mut self, role: ExternalInputRole, tensor_shape: Shape) -> TrainingCompileResult<ValueId> {
 		let byte_count = tensor_shape.bytes(DType::F32)?.get();
 		let byte_count = usize::try_from(byte_count).map_err(|error| {
@@ -2277,6 +2642,7 @@ impl GraphCompiler {
 		Ok(value)
 	}
 
+	/// Performs the external i32 tensor operation.
 	fn external_i32_tensor(
 		&mut self,
 		role: ExternalInputRole,
@@ -2299,6 +2665,7 @@ impl GraphCompiler {
 		Ok(value)
 	}
 
+	/// Performs the external i32 zeros operation.
 	fn external_i32_zeros(&mut self, role: ExternalInputRole, tensor_shape: Shape) -> TrainingCompileResult<ValueId> {
 		let elements = usize::try_from(tensor_shape.elements()).map_err(|error| {
 			TrainingCompileError::new(
@@ -2309,6 +2676,7 @@ impl GraphCompiler {
 		self.external_i32_tensor(role, tensor_shape, &vec![0; elements])
 	}
 
+	/// Converts the matrix if i32.
 	fn convert_matrix_if_i32(
 		&mut self,
 		input: ValueId,
@@ -2321,6 +2689,7 @@ impl GraphCompiler {
 		self.elementwise_f32(output_shape, vec![input], convert_i32_program()?, domain)
 	}
 
+	/// Performs the z score operation.
 	fn z_score(
 		&mut self,
 		input: ValueId,
@@ -2384,6 +2753,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Applies the z score.
 	fn apply_z_score(
 		&mut self,
 		values: [ValueId; 3],
@@ -2405,6 +2775,7 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Performs the min max operation.
 	fn min_max(
 		&mut self,
 		input: ValueId,
@@ -2447,6 +2818,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Applies the min max.
 	fn apply_min_max(
 		&mut self,
 		values: [ValueId; 3],
@@ -2468,6 +2840,7 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Performs the l2 norm operation.
 	fn l2_norm(
 		&mut self,
 		input: ValueId,
@@ -2514,6 +2887,7 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Applies the activation.
 	fn apply_activation(
 		&mut self,
 		input: ValueId,
@@ -2558,6 +2932,7 @@ impl GraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the mask f32 with zero operation.
 	fn mask_f32_with_zero(
 		&mut self,
 		input: ValueId,
@@ -2573,6 +2948,7 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Performs the mask i32 with zero operation.
 	fn mask_i32_with_zero(
 		&mut self,
 		input: ValueId,
@@ -2590,6 +2966,7 @@ impl GraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the cross entropy with logits operation.
 	fn cross_entropy_with_logits(
 		&mut self,
 		logits: ValueId,
@@ -2629,6 +3006,7 @@ impl GraphCompiler {
 		Ok(())
 	}
 
+	/// Performs the cross entropy with dense targets operation.
 	fn cross_entropy_with_dense_targets(
 		&mut self,
 		logits: ValueId,
@@ -2656,6 +3034,7 @@ impl GraphCompiler {
 		Ok(())
 	}
 
+	/// Performs the stable softmax values operation.
 	fn stable_softmax_values(
 		&mut self,
 		logits: ValueId,
@@ -2700,6 +3079,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Performs the normalize training operation.
 	fn normalize_training(
 		&mut self,
 		input: ValueId,
@@ -2731,6 +3111,7 @@ impl GraphCompiler {
 		}
 	}
 
+	/// Performs the normalize validation operation.
 	fn normalize_validation(
 		&mut self,
 		input: ValueId,
@@ -2743,6 +3124,7 @@ impl GraphCompiler {
 		self.normalize_unmasked(input, normalization, dimensions, epsilon, tree_lanes, domain)
 	}
 
+	/// Performs the normalize unmasked operation.
 	fn normalize_unmasked(
 		&mut self,
 		input: ValueId,
@@ -2812,6 +3194,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Performs the normalize masked batch operation.
 	fn normalize_masked_batch(
 		&mut self,
 		input: ValueId,
@@ -2884,6 +3267,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Performs the backward activation operation.
 	fn backward_activation(
 		&mut self,
 		gradient: ValueId,
@@ -2972,6 +3356,7 @@ impl GraphCompiler {
 		Ok(activation_gradient)
 	}
 
+	/// Performs the backward normalization operation.
 	fn backward_normalization(
 		&mut self,
 		gradient: ValueId,
@@ -3072,6 +3457,7 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Compiles the training blocks.
 	fn compile_training_blocks(
 		&mut self,
 		blocks: &[DenseBlock],
@@ -3100,6 +3486,7 @@ impl GraphCompiler {
 		Ok((current, logical.width()?, values))
 	}
 
+	/// Performs the tree target matrix operation.
 	fn tree_target_matrix(
 		&mut self,
 		targets: ValueId,
@@ -3142,6 +3529,7 @@ impl GraphCompiler {
 		Ok(one_hot)
 	}
 
+	/// Performs the bootstrap tree rows operation.
 	fn bootstrap_tree_rows(
 		&mut self,
 		values: [ValueId; 3],
@@ -3177,6 +3565,7 @@ impl GraphCompiler {
 		Ok((sampled_input, sampled_targets, sampled_supervision))
 	}
 
+	/// Performs the supervised global feature thresholds operation.
 	fn supervised_global_feature_thresholds(
 		&mut self,
 		values: [ValueId; 3],
@@ -3225,6 +3614,7 @@ impl GraphCompiler {
 		Ok(thresholds)
 	}
 
+	/// Compiles the lightgbm best leaf candidate.
 	fn compile_lightgbm_best_leaf_candidate(
 		&mut self,
 		values: [ValueId; 8],
@@ -3432,6 +3822,7 @@ impl GraphCompiler {
 		Ok((best_gain, best_node, best_feature, best_threshold))
 	}
 
+	/// Compiles the supervised lightgbm tree structure.
 	fn compile_supervised_lightgbm_tree_structure(
 		&mut self,
 		values: [ValueId; 3],
@@ -3610,6 +4001,7 @@ impl GraphCompiler {
 		Ok((split_features, split_thresholds))
 	}
 
+	/// Compiles the supervised tree structure.
 	fn compile_supervised_tree_structure(
 		&mut self,
 		values: [ValueId; 3],
@@ -4042,6 +4434,7 @@ impl GraphCompiler {
 		Ok((split_features, split_thresholds))
 	}
 
+	/// Performs the materialize tree predictions operation.
 	fn materialize_tree_predictions(
 		&mut self,
 		values: [ValueId; 4],
@@ -4097,6 +4490,7 @@ impl GraphCompiler {
 		Ok(predictions)
 	}
 
+	/// Performs the route tree leaf indices operation.
 	fn route_tree_leaf_indices(
 		&mut self,
 		values: [ValueId; 3],
@@ -4200,6 +4594,7 @@ impl GraphCompiler {
 		Ok(leaf_indices)
 	}
 
+	/// Compiles the embedding forward.
 	fn compile_embedding_forward(
 		&mut self,
 		input: ValueId,
@@ -4223,6 +4618,7 @@ impl GraphCompiler {
 		Ok((output, indices))
 	}
 
+	/// Compiles the attention forward.
 	fn compile_attention_forward(
 		&mut self,
 		input: ValueId,
@@ -4315,6 +4711,7 @@ impl GraphCompiler {
 		))
 	}
 
+	/// Performs the gather matrix column operation.
 	fn gather_matrix_column(
 		&mut self,
 		matrix: ValueId,
@@ -4338,6 +4735,7 @@ impl GraphCompiler {
 		Ok(gathered)
 	}
 
+	/// Performs the attention projection operation.
 	fn attention_projection(
 		&mut self,
 		input: ValueId,
@@ -4373,6 +4771,7 @@ impl GraphCompiler {
 		Ok(projected)
 	}
 
+	/// Compiles the convolution forward.
 	fn compile_convolution_forward(
 		&mut self,
 		values: [ValueId; 3],
@@ -4463,6 +4862,7 @@ impl GraphCompiler {
 		Ok((output, preparation, columns, group_indices))
 	}
 
+	/// Compiles the pool forward.
 	fn compile_pool_forward(
 		&mut self,
 		input: ValueId,
@@ -4530,6 +4930,7 @@ impl GraphCompiler {
 		Ok((output, preparation, winners, input_indices, group_indices))
 	}
 
+	/// Compiles the training operation.
 	fn compile_training_operation(
 		&mut self,
 		input: ValueId,
@@ -4582,6 +4983,7 @@ impl GraphCompiler {
 		))
 	}
 
+	/// Performs the bias free linear operation.
 	fn bias_free_linear(
 		&mut self,
 		input: ValueId,
@@ -4604,6 +5006,7 @@ impl GraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the exact add operation.
 	fn exact_add(
 		&mut self,
 		left: ValueId,
@@ -4617,6 +5020,7 @@ impl GraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the require tensor operation.
 	fn require_tensor(
 		&self,
 		value: ValueId,
@@ -4628,6 +5032,7 @@ impl GraphCompiler {
 		Ok(())
 	}
 
+	/// Performs the identity indices operation.
 	fn identity_indices(&mut self, tensor_shape: Shape) -> TrainingCompileResult<ValueId> {
 		checked_i32(tensor_shape.elements(), "identity index element count")?;
 		let indices = self.index_map(
@@ -4643,6 +5048,7 @@ impl GraphCompiler {
 		Ok(indices)
 	}
 
+	/// Performs the reinterpret tensor operation.
 	fn reinterpret_tensor(
 		&mut self,
 		input: ValueId,
@@ -4653,6 +5059,7 @@ impl GraphCompiler {
 		self.gather_flat_as(flat, output_shape, domain)
 	}
 
+	/// Performs the head major to sequence operation.
 	fn head_major_to_sequence(
 		&mut self,
 		input: ValueId,
@@ -4682,6 +5089,7 @@ impl GraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the sequence to head major operation.
 	fn sequence_to_head_major(
 		&mut self,
 		input: ValueId,
@@ -4711,6 +5119,7 @@ impl GraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the causal softmax operation.
 	fn causal_softmax(
 		&mut self,
 		scores: ValueId,
@@ -4769,6 +5178,7 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Performs the zero f32 tensor operation.
 	fn zero_f32_tensor(&mut self, tensor_shape: Shape) -> TrainingCompileResult<ValueId> {
 		let seed = self.index_map(
 			tensor_shape.clone(),
@@ -4789,6 +5199,7 @@ impl GraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the zero i32 tensor operation.
 	fn zero_i32_tensor(&mut self, tensor_shape: Shape) -> TrainingCompileResult<ValueId> {
 		let output = self.index_map(
 			tensor_shape,
@@ -4803,6 +5214,7 @@ impl GraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the gather flat as operation.
 	fn gather_flat_as(
 		&mut self,
 		flat: ValueId,
@@ -4813,6 +5225,7 @@ impl GraphCompiler {
 		self.gather(flat, indices, output_shape, 0, domain)
 	}
 
+	/// Performs the deterministic segment sum operation.
 	fn deterministic_segment_sum(
 		&mut self,
 		indices: ValueId,
@@ -4852,6 +5265,7 @@ impl GraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the pack contiguous tensor to flat operation.
 	fn pack_contiguous_tensor_to_flat(
 		&mut self,
 		input: ValueId,
@@ -4883,6 +5297,7 @@ impl GraphCompiler {
 		Ok(flat)
 	}
 
+	/// Performs the pack matrix to flat operation.
 	fn pack_matrix_to_flat(
 		&mut self,
 		input: ValueId,
@@ -4893,6 +5308,7 @@ impl GraphCompiler {
 		self.pack_matrix(input, rows, width, DType::F32, domain)
 	}
 
+	/// Performs the pack i32 matrix to flat operation.
 	fn pack_i32_matrix_to_flat(
 		&mut self,
 		input: ValueId,
@@ -4903,6 +5319,7 @@ impl GraphCompiler {
 		self.pack_matrix(input, rows, width, DType::I32, domain)
 	}
 
+	/// Performs the pack matrix operation.
 	fn pack_matrix(
 		&mut self,
 		input: ValueId,
@@ -4934,6 +5351,7 @@ impl GraphCompiler {
 		Ok((flat, matrix_indices))
 	}
 
+	/// Performs the unpack pool to matrix operation.
 	fn unpack_pool_to_matrix(
 		&mut self,
 		pooled: ValueId,
@@ -4966,6 +5384,7 @@ impl GraphCompiler {
 		Ok((output, group_indices))
 	}
 
+	/// Performs the group routing mask operation.
 	fn group_routing_mask(
 		&mut self,
 		input_width: u64,
@@ -4986,6 +5405,7 @@ impl GraphCompiler {
 		Ok(mask)
 	}
 
+	/// Performs the initialize weight operation.
 	fn initialize_weight(
 		&mut self,
 		parameter_shape: Shape,
@@ -5031,10 +5451,12 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Performs the initialize zero parameter operation.
 	fn initialize_zero_parameter(&mut self, parameter_shape: Shape) -> TrainingCompileResult<InitialParameter> {
 		self.initialize_parameter(parameter_shape, zero_outputs_program(3)?)
 	}
 
+	/// Performs the initialize constant parameter operation.
 	fn initialize_constant_parameter(
 		&mut self,
 		parameter_shape: Shape,
@@ -5043,6 +5465,7 @@ impl GraphCompiler {
 		self.initialize_parameter(parameter_shape, constant_parameter_program(value)?)
 	}
 
+	/// Performs the initialize parameter operation.
 	fn initialize_parameter(
 		&mut self,
 		parameter_shape: Shape,
@@ -5079,6 +5502,7 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Performs the resume parameter inputs operation.
 	fn resume_parameter_inputs(&mut self, parameter_shape: Shape) -> TrainingCompileResult<InitialParameter> {
 		let ordinal = self.next_parameter_input;
 		self.next_parameter_input = ordinal.checked_add(1).ok_or_else(identity_exhausted)?;
@@ -5098,6 +5522,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Performs the select resume parameter operation.
 	fn select_resume_parameter(
 		&mut self,
 		fresh: InitialParameter,
@@ -5119,6 +5544,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Performs the select resume tensor operation.
 	fn select_resume_tensor(
 		&mut self,
 		fresh: ValueId,
@@ -5134,6 +5560,7 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Performs the select resume i32 tensor operation.
 	fn select_resume_i32_tensor(
 		&mut self,
 		fresh: ValueId,
@@ -5149,6 +5576,7 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Performs the select resume operation.
 	fn select_resume(
 		&mut self,
 		fresh: ValueId,
@@ -5168,6 +5596,7 @@ impl GraphCompiler {
 		Ok(selected)
 	}
 
+	/// Performs the initialize zero pair operation.
 	fn initialize_zero_pair(&mut self, parameter_shape: Shape) -> TrainingCompileResult<(ValueId, ValueId)> {
 		let seed = self.index_map(
 			parameter_shape.clone(),
@@ -5190,6 +5619,7 @@ impl GraphCompiler {
 		Ok((first, second))
 	}
 
+	/// Compiles the validation blocks.
 	fn compile_validation_blocks(
 		&mut self,
 		states: &[DenseBlockState],
@@ -5221,6 +5651,7 @@ impl GraphCompiler {
 		Ok((current, logical.width()?))
 	}
 
+	/// Applies the validation operation.
 	fn apply_validation_operation(
 		&mut self,
 		input: ValueId,
@@ -5248,6 +5679,7 @@ impl GraphCompiler {
 		}
 	}
 
+	/// Compiles the validation.
 	fn compile_validation(
 		&mut self,
 		validation: ValidationValues,
@@ -5350,6 +5782,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Compiles the multiclass validation.
 	fn compile_multiclass_validation(
 		&mut self,
 		validation: ValidationValues,
@@ -5455,6 +5888,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Compiles the regression validation.
 	fn compile_regression_validation(
 		&mut self,
 		validation: ValidationValues,
@@ -5544,6 +5978,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Performs the matrix column vector operation.
 	fn matrix_column_vector(
 		&mut self,
 		matrix: ValueId,
@@ -5587,6 +6022,7 @@ impl GraphCompiler {
 		Ok(vector)
 	}
 
+	/// Performs the materialize multi target binary metrics operation.
 	fn materialize_multi_target_binary_metrics(
 		&mut self,
 		values: [ValueId; 3],
@@ -5686,6 +6122,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Performs the mean scalar values operation.
 	fn mean_scalar_values(
 		&mut self,
 		values: Vec<ValueId>,
@@ -5706,6 +6143,7 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Performs the materialize binary metrics operation.
 	fn materialize_binary_metrics(
 		&mut self,
 		values: [ValueId; 3],
@@ -5797,6 +6235,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Compiles the temperature scaling.
 	fn compile_temperature_scaling(
 		&mut self,
 		logits: ValueId,
@@ -5904,6 +6343,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Performs the backward blocks operation.
 	fn backward_blocks(
 		&mut self,
 		blocks: &[Box<dyn CompiledBlock>],
@@ -5933,6 +6373,7 @@ impl GraphCompiler {
 		Ok(gradients.into_iter().rev().flatten().collect())
 	}
 
+	/// Performs the gru matrix gradient operation.
 	fn gru_matrix_gradient(
 		&mut self,
 		input: ValueId,
@@ -5954,6 +6395,7 @@ impl GraphCompiler {
 		Ok(result)
 	}
 
+	/// Performs the gru bias gradient operation.
 	fn gru_bias_gradient(
 		&mut self,
 		gradient: ValueId,
@@ -5970,6 +6412,7 @@ impl GraphCompiler {
 		Ok(result)
 	}
 
+	/// Performs the gru projection input gradient operation.
 	fn gru_projection_input_gradient(
 		&mut self,
 		gradient: ValueId,
@@ -5991,6 +6434,7 @@ impl GraphCompiler {
 		Ok(result)
 	}
 
+	/// Performs the recurrent gate backward operation.
 	fn recurrent_gate_backward(
 		&mut self,
 		values: [ValueId; 4],
@@ -6012,6 +6456,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Performs the accumulate recurrent gradient operation.
 	fn accumulate_recurrent_gradient(
 		&mut self,
 		accumulated: &mut Option<ValueId>,
@@ -6024,6 +6469,7 @@ impl GraphCompiler {
 		Ok(())
 	}
 
+	/// Performs the attention head gradient to sequence operation.
 	fn attention_head_gradient_to_sequence(
 		&mut self,
 		gradient: ValueId,
@@ -6048,6 +6494,7 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Performs the attention weight gradient operation.
 	fn attention_weight_gradient(
 		&mut self,
 		input: ValueId,
@@ -6069,6 +6516,7 @@ impl GraphCompiler {
 		Ok(weight_gradient)
 	}
 
+	/// Performs the attention input gradient operation.
 	fn attention_input_gradient(
 		&mut self,
 		values: [ValueId; 2],
@@ -6091,6 +6539,7 @@ impl GraphCompiler {
 		Ok(input_gradient)
 	}
 
+	/// Performs the backward operation operation.
 	fn backward_operation(
 		&mut self,
 		gradient: ValueId,
@@ -6146,6 +6595,7 @@ impl GraphCompiler {
 		))
 	}
 
+	/// Updates the blocks.
 	fn update_blocks(
 		&mut self,
 		blocks: &[Box<dyn CompiledBlock>],
@@ -6158,6 +6608,7 @@ impl GraphCompiler {
 		Ok(states)
 	}
 
+	/// Updates the operation parameters.
 	fn update_operation_parameters(
 		&mut self,
 		operations: &[OperationValues],
@@ -6170,6 +6621,7 @@ impl GraphCompiler {
 			.collect()
 	}
 
+	/// Performs the global clip operation.
 	fn global_clip(
 		&mut self,
 		gradients: &[ValueId],
@@ -6218,6 +6670,7 @@ impl GraphCompiler {
 			.collect()
 	}
 
+	/// Performs the dynamic adam scalars operation.
 	fn dynamic_adam_scalars(
 		&mut self,
 		config: &DenseTrainingConfig,
@@ -6457,6 +6910,7 @@ impl GraphCompiler {
 		))
 	}
 
+	/// Performs the adamw update operation.
 	fn adamw_update(
 		&mut self,
 		gradient: ValueId,
@@ -6522,6 +6976,7 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Performs the reduce sum operation.
 	fn reduce_sum(
 		&mut self,
 		input: ValueId,
@@ -6540,6 +6995,7 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Performs the sum tensor operation.
 	fn sum_tensor(
 		&mut self,
 		input: ValueId,
@@ -6554,6 +7010,7 @@ impl GraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the index map operation.
 	fn index_map(&mut self, shape: Shape, map: IndexMap, domain: IterationDomain) -> TrainingCompileResult<ValueId> {
 		let output = self.tensor(DType::I32, shape)?;
 		self.emit(
@@ -6566,6 +7023,7 @@ impl GraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the gather operation.
 	fn gather(
 		&mut self,
 		source: ValueId,
@@ -6589,6 +7047,7 @@ impl GraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the reduce value operation.
 	fn reduce_value(
 		&mut self,
 		values: [ValueId; 2],
@@ -6614,6 +7073,7 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Performs the emit owned scalar operation.
 	fn emit_owned_scalar(
 		&mut self,
 		symbol: &str,
@@ -6626,6 +7086,7 @@ impl GraphCompiler {
 		self.emit_elementwise(inputs, outputs, program, domain)
 	}
 
+	/// Performs the emit scalar operation operation.
 	fn emit_scalar_operation(
 		&mut self,
 		inputs: Vec<ValueId>,
@@ -6639,6 +7100,7 @@ impl GraphCompiler {
 		}
 	}
 
+	/// Performs the emit elementwise operation.
 	fn emit_elementwise(
 		&mut self,
 		inputs: Vec<ValueId>,
@@ -6656,6 +7118,7 @@ impl GraphCompiler {
 		)
 	}
 
+	/// Performs the elementwise f32 operation.
 	fn elementwise_f32(
 		&mut self,
 		shape: Shape,
@@ -6668,6 +7131,7 @@ impl GraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the owned scalar f32 operation.
 	fn owned_scalar_f32(
 		&mut self,
 		shape: Shape,
@@ -6680,6 +7144,7 @@ impl GraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the emit operation.
 	fn emit(
 		&mut self,
 		inputs: Vec<ValueId>,
@@ -6703,6 +7168,7 @@ impl GraphCompiler {
 		Ok(id)
 	}
 
+	/// Performs the materialize operation.
 	fn materialize(
 		&mut self,
 		symbol: &str,
@@ -6766,6 +7232,7 @@ impl GraphCompiler {
 		Ok(())
 	}
 
+	/// Inserts the materialized graph.
 	fn insert_materialized_graph(
 		&mut self,
 		graph: &CalculationGraph,
@@ -6784,6 +7251,7 @@ impl GraphCompiler {
 		Ok(())
 	}
 
+	/// Inserts the tensor contract.
 	fn insert_tensor_contract(&mut self, mut tensor: Tensor) -> TrainingCompileResult<()> {
 		tensor.external_input = false;
 		tensor.external_output = false;
@@ -6810,6 +7278,7 @@ impl GraphCompiler {
 		}
 	}
 
+	/// Performs the tensor ref operation.
 	fn tensor_ref(&self, value: ValueId) -> TrainingCompileResult<&Tensor> {
 		self.tensors.get(&value).ok_or_else(|| {
 			TrainingCompileError::new(
@@ -6819,17 +7288,20 @@ impl GraphCompiler {
 		})
 	}
 
+	/// Performs the matrix width operation.
 	fn matrix_width(&self, value: ValueId, _role: &str) -> TrainingCompileResult<u64> {
 		let extents = self.tensor_ref(value)?.shape.extents();
 		Ok(extents[1])
 	}
 
+	/// Performs the next value operation.
 	fn next_value(&mut self) -> TrainingCompileResult<ValueId> {
 		let value = self.next_value;
 		self.next_value = value.checked_add(1).ok_or_else(identity_exhausted)?;
 		Ok(ValueId::new(value))
 	}
 
+	/// Performs the next kernel operation.
 	fn next_kernel(&mut self) -> TrainingCompileResult<KernelTemplateId> {
 		let kernel = self.next_kernel;
 		self.next_kernel = kernel.checked_add(1).ok_or_else(identity_exhausted)?;
@@ -6838,6 +7310,7 @@ impl GraphCompiler {
 
 }
 
+/// Performs the matrix bytes operation.
 fn matrix_bytes(matrix: &DenseMatrix) -> (DType, Vec<u8>) {
 	match matrix {
 		DenseMatrix::I32 { values, .. } => (
@@ -6855,10 +7328,12 @@ fn matrix_bytes(matrix: &DenseMatrix) -> (DType, Vec<u8>) {
 	}
 }
 
+/// Performs the shape operation.
 fn shape(extents: &[u64]) -> TrainingCompileResult<Shape> {
 	Ok(Shape::new(extents.to_vec())?)
 }
 
+/// Performs the checked product operation.
 fn checked_product(values: &[u64], name: &str) -> TrainingCompileResult<u64> {
 	values.iter().copied().try_fold(1u64, |product, value| {
 		product.checked_mul(value).ok_or_else(|| {
@@ -6870,6 +7345,7 @@ fn checked_product(values: &[u64], name: &str) -> TrainingCompileResult<u64> {
 	})
 }
 
+/// Performs the checked i32 operation.
 fn checked_i32(value: u64, name: &str) -> TrainingCompileResult<i32> {
 	i32::try_from(value).map_err(|error| {
 		TrainingCompileError::new(
@@ -6879,6 +7355,7 @@ fn checked_i32(value: u64, name: &str) -> TrainingCompileResult<i32> {
 	})
 }
 
+/// Performs the training metric bindings operation.
 fn training_metric_bindings(
 	training_loss: ValueId,
 	training_loss_domain: IterationDomain,
@@ -6953,6 +7430,7 @@ fn training_metric_bindings(
 	Ok(bindings)
 }
 
+/// Performs the push metric binding operation.
 fn push_metric_binding(
 	bindings: &mut Vec<TrainingMetricBinding>,
 	kind: TrainingMetricKind,
@@ -6972,6 +7450,7 @@ fn push_metric_binding(
 	Ok(())
 }
 
+/// Performs the resume tensor program operation.
 fn resume_tensor_program(dtype: DType) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let fresh = builder.input(dtype)?;
@@ -6981,6 +7460,7 @@ fn resume_tensor_program(dtype: DType) -> TrainingCompileResult<recipe_core::Sca
 	Ok(builder.finish(&[selected])?)
 }
 
+/// Performs the tree one hot target program operation.
 fn tree_one_hot_target_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let target = builder.input(DType::I32)?;
@@ -6992,6 +7472,7 @@ fn tree_one_hot_target_program() -> TrainingCompileResult<recipe_core::ScalarPro
 	Ok(builder.finish(&[value])?)
 }
 
+/// Performs the tree relative node program operation.
 fn tree_relative_node_program(level_base: u64, level_nodes: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let node = builder.input(DType::I32)?;
@@ -7006,6 +7487,7 @@ fn tree_relative_node_program(level_base: u64, level_nodes: u64) -> TrainingComp
 	Ok(builder.finish(&[relative])?)
 }
 
+/// Performs the tree lightgbm active row program operation.
 fn tree_lightgbm_active_row_program(internal_nodes: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let node = builder.input(DType::I32)?;
@@ -7021,6 +7503,7 @@ fn tree_lightgbm_active_row_program(internal_nodes: u64) -> TrainingCompileResul
 	Ok(builder.finish(&[safe_node, active_supervision])?)
 }
 
+/// Performs the tree lightgbm candidate choice program operation.
 fn tree_lightgbm_candidate_choice_program(features: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let candidate = builder.input(DType::I32)?;
@@ -7030,6 +7513,7 @@ fn tree_lightgbm_candidate_choice_program(features: u64) -> TrainingCompileResul
 	Ok(builder.finish(&[node, feature])?)
 }
 
+/// Performs the tree lightgbm positive gain program operation.
 fn tree_lightgbm_positive_gain_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let gain = builder.input(DType::F32)?;
@@ -7038,6 +7522,7 @@ fn tree_lightgbm_positive_gain_program() -> TrainingCompileResult<recipe_core::S
 	Ok(builder.finish(&[positive])?)
 }
 
+/// Performs the tree lightgbm destination program operation.
 fn tree_lightgbm_destination_program(tree_offset: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let node = builder.input(DType::I32)?;
@@ -7046,6 +7531,7 @@ fn tree_lightgbm_destination_program(tree_offset: u64) -> TrainingCompileResult<
 	Ok(builder.finish(&[destination])?)
 }
 
+/// Performs the tree lightgbm select i32 program operation.
 fn tree_lightgbm_select_i32_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let previous = builder.input(DType::I32)?;
@@ -7055,6 +7541,7 @@ fn tree_lightgbm_select_i32_program() -> TrainingCompileResult<recipe_core::Scal
 	Ok(builder.finish(&[selected])?)
 }
 
+/// Performs the tree lightgbm select f32 program operation.
 fn tree_lightgbm_select_f32_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let previous = builder.input(DType::F32)?;
@@ -7064,6 +7551,7 @@ fn tree_lightgbm_select_f32_program() -> TrainingCompileResult<recipe_core::Scal
 	Ok(builder.finish(&[selected])?)
 }
 
+/// Performs the tree lightgbm next node program operation.
 fn tree_lightgbm_next_node_program(internal_nodes: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let value = builder.input(DType::F32)?;
@@ -7093,6 +7581,7 @@ fn tree_lightgbm_next_node_program(internal_nodes: u64) -> TrainingCompileResult
 	Ok(builder.finish(&[next])?)
 }
 
+/// Performs the tree candidate index program operation.
 fn tree_candidate_index_program(features: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let node = builder.input(DType::I32)?;
@@ -7103,6 +7592,7 @@ fn tree_candidate_index_program(features: u64) -> TrainingCompileResult<recipe_c
 	Ok(builder.finish(&[index])?)
 }
 
+/// Performs the repeat f32 with i32 program operation.
 fn repeat_f32_with_i32_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let value = builder.input(DType::F32)?;
@@ -7110,6 +7600,7 @@ fn repeat_f32_with_i32_program() -> TrainingCompileResult<recipe_core::ScalarPro
 	Ok(builder.finish(&[value])?)
 }
 
+/// Performs the tree safe mean program operation.
 fn tree_safe_mean_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let sum = builder.input(DType::F32)?;
@@ -7122,6 +7613,7 @@ fn tree_safe_mean_program() -> TrainingCompileResult<recipe_core::ScalarProgram>
 	Ok(builder.finish(&[mean])?)
 }
 
+/// Performs the tree left weight program operation.
 fn tree_left_weight_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let feature = builder.input(DType::F32)?;
@@ -7133,6 +7625,7 @@ fn tree_left_weight_program() -> TrainingCompileResult<recipe_core::ScalarProgra
 	Ok(builder.finish(&[weight])?)
 }
 
+/// Performs the tree parent output index program operation.
 fn tree_parent_output_index_program(outputs: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let node = builder.input(DType::I32)?;
@@ -7143,6 +7636,7 @@ fn tree_parent_output_index_program(outputs: u64) -> TrainingCompileResult<recip
 	Ok(builder.finish(&[index])?)
 }
 
+/// Performs the tree variance gain program operation.
 fn tree_variance_gain_program(invalid_gain: f32) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let left_sum = builder.input(DType::F32)?;
@@ -7172,6 +7666,7 @@ fn tree_variance_gain_program(invalid_gain: f32) -> TrainingCompileResult<recipe
 	Ok(builder.finish(&[gain])?)
 }
 
+/// Performs the tree row feature index program operation.
 fn tree_row_feature_index_program(features: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let row = builder.input(DType::I32)?;
@@ -7182,6 +7677,7 @@ fn tree_row_feature_index_program(features: u64) -> TrainingCompileResult<recipe
 	Ok(builder.finish(&[index])?)
 }
 
+/// Performs the tree split index program operation.
 fn tree_split_index_program(trees: u64, internal_nodes: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let pair = builder.input(DType::I32)?;
@@ -7199,6 +7695,7 @@ fn tree_split_index_program(trees: u64, internal_nodes: u64) -> TrainingCompileR
 	Ok(builder.finish(&[index])?)
 }
 
+/// Performs the tree feature index program operation.
 fn tree_feature_index_program(trees: u64, feature_width: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let pair = builder.input(DType::I32)?;
@@ -7216,6 +7713,7 @@ fn tree_feature_index_program(trees: u64, feature_width: u64) -> TrainingCompile
 	Ok(builder.finish(&[index])?)
 }
 
+/// Performs the tree next node program operation.
 fn tree_next_node_program(internal_nodes: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let value = builder.input(DType::F32)?;
@@ -7240,6 +7738,7 @@ fn tree_next_node_program(internal_nodes: u64) -> TrainingCompileResult<recipe_c
 	Ok(builder.finish(&[next])?)
 }
 
+/// Performs the tree leaf base program operation.
 fn tree_leaf_base_program(
 	trees: u64,
 	internal_nodes: u64,
@@ -7266,6 +7765,7 @@ fn tree_leaf_base_program(
 	Ok(builder.finish(&[base])?)
 }
 
+/// Performs the tree leaf index program operation.
 fn tree_leaf_index_program(outputs: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let base = builder.input(DType::I32)?;
@@ -7280,6 +7780,7 @@ fn tree_leaf_index_program(outputs: u64) -> TrainingCompileResult<recipe_core::S
 	Ok(builder.finish(&[index])?)
 }
 
+/// Performs the identity exhausted operation.
 fn identity_exhausted() -> TrainingCompileError {
 	TrainingCompileError::new(
 		TrainingCompileErrorKind::IdentityExhausted,
@@ -7287,6 +7788,7 @@ fn identity_exhausted() -> TrainingCompileError {
 	)
 }
 
+/// Performs the exact adam aliases operation.
 fn exact_adam_aliases(inputs: usize) -> Vec<PrimitiveAliasRule> {
 	(0..inputs)
 		.flat_map(|input| {
@@ -7306,6 +7808,7 @@ fn exact_adam_aliases(inputs: usize) -> Vec<PrimitiveAliasRule> {
 		.collect()
 }
 
+/// Performs the exact single recurrence aliases operation.
 fn exact_single_recurrence_aliases(inputs: usize) -> Vec<PrimitiveAliasRule> {
 	(0..inputs)
 		.map(|input| PrimitiveAliasRule {
@@ -7320,6 +7823,7 @@ fn exact_single_recurrence_aliases(inputs: usize) -> Vec<PrimitiveAliasRule> {
 		.collect()
 }
 
+/// Performs the exact pair recurrence aliases operation.
 fn exact_pair_recurrence_aliases() -> Vec<PrimitiveAliasRule> {
 	(0..2).flat_map(|input| {
 		(0..2).map(move |output| PrimitiveAliasRule {
@@ -7335,6 +7839,7 @@ fn exact_pair_recurrence_aliases() -> Vec<PrimitiveAliasRule> {
 	.collect()
 }
 
+/// Performs the exact gated pair recurrence aliases operation.
 fn exact_gated_pair_recurrence_aliases() -> Vec<PrimitiveAliasRule> {
 	(0..3).flat_map(|input| {
 		(0..2).map(move |output| PrimitiveAliasRule {
@@ -7350,6 +7855,7 @@ fn exact_gated_pair_recurrence_aliases() -> Vec<PrimitiveAliasRule> {
 	.collect()
 }
 
+/// Performs the sequence major source index program operation.
 fn sequence_major_source_index_program(
 	sequence_length: u64,
 	heads: u64,
@@ -7375,6 +7881,7 @@ fn sequence_major_source_index_program(
 	Ok(builder.finish(&[source])?)
 }
 
+/// Converts the i32 program.
 fn convert_i32_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let value = builder.input(DType::I32)?;
@@ -7382,6 +7889,7 @@ fn convert_i32_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	Ok(builder.finish(&[converted])?)
 }
 
+/// Performs the constant f32 from i32 program operation.
 fn constant_f32_from_i32_program(value: f32) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let _seed = builder.input(DType::I32)?;
@@ -7389,6 +7897,7 @@ fn constant_f32_from_i32_program(value: f32) -> TrainingCompileResult<recipe_cor
 	Ok(builder.finish(&[value])?)
 }
 
+/// Performs the validity program operation.
 fn validity_program(rows: i32) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let position = builder.input(DType::I32)?;
@@ -7398,6 +7907,7 @@ fn validity_program(rows: i32) -> TrainingCompileResult<recipe_core::ScalarProgr
 	Ok(builder.finish(&[valid])?)
 }
 
+/// Performs the zero outputs program operation.
 fn zero_outputs_program(outputs: usize) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let _seed = builder.input(DType::I32)?;
@@ -7407,6 +7917,7 @@ fn zero_outputs_program(outputs: usize) -> TrainingCompileResult<recipe_core::Sc
 	Ok(builder.finish(&zeros)?)
 }
 
+/// Performs the constant parameter program operation.
 fn constant_parameter_program(value: f32) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let _seed = builder.input(DType::I32)?;
@@ -7416,6 +7927,7 @@ fn constant_parameter_program(value: f32) -> TrainingCompileResult<recipe_core::
 	Ok(builder.finish(&[value, first_moment, second_moment])?)
 }
 
+/// Performs the routing extents operation.
 fn routing_extents(routing: DenseGroupToNeuronRouting) -> (NonZeroU64, NonZeroU64) {
 	match routing {
 		DenseGroupToNeuronRouting::Identity { width } => (width, width),
@@ -7429,6 +7941,7 @@ fn routing_extents(routing: DenseGroupToNeuronRouting) -> (NonZeroU64, NonZeroU6
 	}
 }
 
+/// Performs the group routing mask program operation.
 fn group_routing_mask_program(
 	channels: NonZeroU64,
 	routing: DenseGroupToNeuronRouting,
@@ -7476,6 +7989,7 @@ fn group_routing_mask_program(
 	Ok(builder.finish(&[allowed])?)
 }
 
+/// Performs the gru hidden backward program operation.
 fn gru_hidden_backward_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let gradient = builder.input(DType::F32)?;
@@ -7491,6 +8005,7 @@ fn gru_hidden_backward_program() -> TrainingCompileResult<recipe_core::ScalarPro
 	Ok(builder.finish(&[candidate_gradient, update_gradient, previous_gradient])?)
 }
 
+/// Performs the gru reset product backward program operation.
 fn gru_reset_product_backward_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let gradient = builder.input(DType::F32)?;
@@ -7501,6 +8016,7 @@ fn gru_reset_product_backward_program() -> TrainingCompileResult<recipe_core::Sc
 	Ok(builder.finish(&[reset_gradient, previous_gradient])?)
 }
 
+/// Performs the lstm hidden backward program operation.
 fn lstm_hidden_backward_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let gradient = builder.input(DType::F32)?;
@@ -7511,6 +8027,7 @@ fn lstm_hidden_backward_program() -> TrainingCompileResult<recipe_core::ScalarPr
 	Ok(builder.finish(&[output_gate_gradient, cell_activation_gradient])?)
 }
 
+/// Performs the lstm cell backward program operation.
 fn lstm_cell_backward_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let gradient = builder.input(DType::F32)?;
@@ -7530,6 +8047,7 @@ fn lstm_cell_backward_program() -> TrainingCompileResult<recipe_core::ScalarProg
 	])?)
 }
 
+/// Performs the masked zero f32 program operation.
 fn masked_zero_f32_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let value = builder.input(DType::F32)?;
@@ -7540,6 +8058,7 @@ fn masked_zero_f32_program() -> TrainingCompileResult<recipe_core::ScalarProgram
 	Ok(builder.finish(&[masked])?)
 }
 
+/// Performs the masked zero i32 program operation.
 fn masked_zero_i32_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let value = builder.input(DType::I32)?;
@@ -7551,6 +8070,7 @@ fn masked_zero_i32_program() -> TrainingCompileResult<recipe_core::ScalarProgram
 	Ok(builder.finish(&[masked])?)
 }
 
+/// Performs the negative multiply program operation.
 fn negative_multiply_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let left = builder.input(DType::F32)?;
@@ -7560,6 +8080,7 @@ fn negative_multiply_program() -> TrainingCompileResult<recipe_core::ScalarProgr
 	Ok(builder.finish(&[result])?)
 }
 
+/// Performs the pointwise loss program operation.
 fn pointwise_loss_program(loss: DenseLoss) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let prediction = builder.input(DType::F32)?;
@@ -7615,6 +8136,7 @@ fn pointwise_loss_program(loss: DenseLoss) -> TrainingCompileResult<recipe_core:
 	Ok(builder.finish(&[loss, gradient])?)
 }
 
+/// Performs the cross entropy with logits program operation.
 fn cross_entropy_with_logits_program(classes: i32) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	if classes <= 0 {
 		return Err(TrainingCompileError::new(
@@ -7664,6 +8186,7 @@ fn cross_entropy_with_logits_program(classes: i32) -> TrainingCompileResult<reci
 	Ok(builder.finish(&[loss, gradient])?)
 }
 
+/// Performs the cross entropy with dense targets program operation.
 fn cross_entropy_with_dense_targets_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let logit = builder.input(DType::F32)?;
@@ -7697,6 +8220,7 @@ fn cross_entropy_with_dense_targets_program() -> TrainingCompileResult<recipe_co
 	Ok(builder.finish(&[loss, gradient])?)
 }
 
+/// Performs the signed logarithm backward program operation.
 fn signed_logarithm_backward_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let upstream = builder.input(DType::F32)?;
@@ -7709,6 +8233,7 @@ fn signed_logarithm_backward_program() -> TrainingCompileResult<recipe_core::Sca
 	Ok(builder.finish(&[result])?)
 }
 
+/// Performs the natural logarithm backward program operation.
 fn natural_logarithm_backward_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let upstream = builder.input(DType::F32)?;
@@ -7720,6 +8245,7 @@ fn natural_logarithm_backward_program() -> TrainingCompileResult<recipe_core::Sc
 	Ok(builder.finish(&[result])?)
 }
 
+/// Performs the signed log one plus backward program operation.
 fn signed_log_one_plus_backward_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let upstream = builder.input(DType::F32)?;
@@ -7731,6 +8257,7 @@ fn signed_log_one_plus_backward_program() -> TrainingCompileResult<recipe_core::
 	Ok(builder.finish(&[result])?)
 }
 
+/// Performs the huber activation backward program operation.
 fn huber_activation_backward_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let upstream = builder.input(DType::F32)?;
@@ -7743,6 +8270,7 @@ fn huber_activation_backward_program() -> TrainingCompileResult<recipe_core::Sca
 	Ok(builder.finish(&[result])?)
 }
 
+/// Performs the tangent activation backward program operation.
 fn tangent_activation_backward_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let upstream = builder.input(DType::F32)?;
@@ -7754,6 +8282,7 @@ fn tangent_activation_backward_program() -> TrainingCompileResult<recipe_core::S
 	Ok(builder.finish(&[result])?)
 }
 
+/// Performs the kmeans distance gradient scale program operation.
 fn kmeans_distance_gradient_scale_program(epsilon: f32) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let gradient = builder.input(DType::F32)?;
@@ -7764,6 +8293,7 @@ fn kmeans_distance_gradient_scale_program(epsilon: f32) -> TrainingCompileResult
 	Ok(builder.finish(&[scaled])?)
 }
 
+/// Performs the r2 program operation.
 fn r2_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let residual_sum_of_squares = builder.input(DType::F32)?;
@@ -7778,6 +8308,7 @@ fn r2_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	Ok(builder.finish(&[r2])?)
 }
 
+/// Performs the safe count program operation.
 fn safe_count_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let count = builder.input(DType::F32)?;
@@ -7786,6 +8317,7 @@ fn safe_count_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	Ok(builder.finish(&[safe])?)
 }
 
+/// Performs the mean scalar values program operation.
 fn mean_scalar_values_program(count: usize) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	if count == 0 {
 		return Err(TrainingCompileError::new(
@@ -7804,6 +8336,7 @@ fn mean_scalar_values_program(count: usize) -> TrainingCompileResult<recipe_core
 	Ok(builder.finish(&[mean])?)
 }
 
+/// Performs the inverse standard deviation program operation.
 fn inverse_standard_deviation_program(epsilon: f32) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let variance = builder.input(DType::F32)?;
@@ -7815,6 +8348,7 @@ fn inverse_standard_deviation_program(epsilon: f32) -> TrainingCompileResult<rec
 	Ok(builder.finish(&[inverse])?)
 }
 
+/// Performs the normalization backward program operation.
 fn normalization_backward_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let gradient = builder.input(DType::F32)?;
@@ -7829,6 +8363,7 @@ fn normalization_backward_program() -> TrainingCompileResult<recipe_core::Scalar
 	Ok(builder.finish(&[result])?)
 }
 
+/// Performs the masked mean program operation.
 fn masked_mean_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let value = builder.input(DType::F32)?;
@@ -7842,6 +8377,7 @@ fn masked_mean_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	Ok(builder.finish(&[masked])?)
 }
 
+/// Performs the clip scale program operation.
 fn clip_scale_program(maximum_norm: f32) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let squared_norm = builder.input(DType::F32)?;
@@ -7855,6 +8391,7 @@ fn clip_scale_program(maximum_norm: f32) -> TrainingCompileResult<recipe_core::S
 	Ok(builder.finish(&[scale])?)
 }
 
+/// Performs the schedule inputs program operation.
 fn schedule_inputs_program(
 	warmup_iterations: u64,
 	total_iterations: u64,
@@ -7896,6 +8433,7 @@ fn schedule_inputs_program(
 	Ok(builder.finish(&[warmup, progress, remaining_fraction])?)
 }
 
+/// Performs the unbounded schedule inputs program operation.
 fn unbounded_schedule_inputs_program(warmup_iterations: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	if warmup_iterations > i32::MAX as u64 {
 		return Err(TrainingCompileError::new(
@@ -7917,6 +8455,7 @@ fn unbounded_schedule_inputs_program(warmup_iterations: u64) -> TrainingCompileR
 	Ok(builder.finish(&[warmup, progress, one])?)
 }
 
+/// Performs the exact nonnegative i32 ratio operation.
 fn exact_nonnegative_i32_ratio(
 	builder: &mut ScalarProgramBuilder,
 	numerator: ScalarExpression,
@@ -7980,6 +8519,7 @@ fn exact_nonnegative_i32_ratio(
 	Ok(builder.ternary(ScalarOpcode::Select, terminal, one, ratio)?)
 }
 
+/// Performs the cosine angle program operation.
 fn cosine_angle_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let remaining_fraction = builder.input(DType::F32)?;
@@ -7988,6 +8528,7 @@ fn cosine_angle_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	Ok(builder.finish(&[angle])?)
 }
 
+/// Performs the cosine decay program operation.
 fn cosine_decay_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let sine = builder.input(DType::F32)?;
@@ -8002,6 +8543,7 @@ fn cosine_decay_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	Ok(builder.finish(&[decay])?)
 }
 
+/// Performs the exponential decay argument program operation.
 fn exponential_decay_argument_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let remaining_fraction = builder.input(DType::F32)?;
@@ -8010,6 +8552,7 @@ fn exponential_decay_argument_program() -> TrainingCompileResult<recipe_core::Sc
 	Ok(builder.finish(&[argument])?)
 }
 
+/// Performs the exponential decay program operation.
 fn exponential_decay_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let curve = builder.input(DType::F32)?;
@@ -8027,6 +8570,7 @@ fn exponential_decay_program() -> TrainingCompileResult<recipe_core::ScalarProgr
 	Ok(builder.finish(&[decay])?)
 }
 
+/// Performs the learning rate program operation.
 fn learning_rate_program(base_learning_rate: f32, gated: bool) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let decay = builder.input(DType::F32)?;
@@ -8044,6 +8588,7 @@ fn learning_rate_program(base_learning_rate: f32, gated: bool) -> TrainingCompil
 	Ok(builder.finish(&[learning_rate])?)
 }
 
+/// Performs the constant one program operation.
 fn constant_one_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let _coordinate = builder.input(DType::F32)?;
@@ -8051,6 +8596,7 @@ fn constant_one_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	Ok(builder.finish(&[one])?)
 }
 
+/// Performs the optimizer update gate program operation.
 fn optimizer_update_gate_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let known_count = builder.input(DType::F32)?;
@@ -8059,6 +8605,7 @@ fn optimizer_update_gate_program() -> TrainingCompileResult<recipe_core::ScalarP
 	Ok(builder.finish(&[enabled])?)
 }
 
+/// Performs the accepted update program operation.
 fn accepted_update_program(counter_limit: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	if counter_limit == 0 || counter_limit > i32::MAX as u64 {
 		return Err(TrainingCompileError::new(
@@ -8077,6 +8624,7 @@ fn accepted_update_program(counter_limit: u64) -> TrainingCompileResult<recipe_c
 	Ok(builder.finish(&[updated])?)
 }
 
+/// Performs the saturating step program operation.
 fn saturating_step_program(counter_limit: u64) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	if counter_limit == 0 || counter_limit > i32::MAX as u64 {
 		return Err(TrainingCompileError::new(
@@ -8093,6 +8641,7 @@ fn saturating_step_program(counter_limit: u64) -> TrainingCompileResult<recipe_c
 	Ok(builder.finish(&[updated])?)
 }
 
+/// Performs the adam beta power initial program operation.
 fn adam_beta_power_initial_program() -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let _seed = builder.input(DType::I32)?;
@@ -8101,6 +8650,7 @@ fn adam_beta_power_initial_program() -> TrainingCompileResult<recipe_core::Scala
 	Ok(builder.finish(&[beta_one_power, beta_two_power])?)
 }
 
+/// Performs the adam beta power update program operation.
 fn adam_beta_power_update_program(
 	beta_one: f32,
 	beta_two: f32,
@@ -8125,6 +8675,7 @@ fn adam_beta_power_update_program(
 	Ok(builder.finish(&[updated_one, updated_two])?)
 }
 
+/// Performs the adamw program operation.
 fn adamw_program(
 	beta_one: f32,
 	beta_two: f32,
@@ -8197,6 +8748,7 @@ fn adamw_program(
 	Ok(builder.finish(&[updated_first, updated_second, updated_weight])?)
 }
 
+/// Performs the temperature gradient program operation.
 fn temperature_gradient_program(population: f32) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let scaled_logit_gradient = builder.input(DType::F32)?;
@@ -8211,6 +8763,7 @@ fn temperature_gradient_program(population: f32) -> TrainingCompileResult<recipe
 	Ok(builder.finish(&[contribution])?)
 }
 
+/// Performs the temperature update program operation.
 fn temperature_update_program(config: TemperatureScalingConfig) -> TrainingCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let temperature = builder.input(DType::F32)?;

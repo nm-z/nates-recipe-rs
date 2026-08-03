@@ -5087,10 +5087,13 @@ enum CheckpointTopologyStorage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Selects declaration-only or payload-complete tensor validation.
 enum CheckpointTensorValidation {
+	/// Validate tensor dtype and shape declarations only.
 	Declaration,
+	/// The `Payload` variant.
 	Payload,
 }
 
+/// Validates the artifact.
 fn validate_artifact(artifact: &CheckpointArtifact) -> CheckpointResult<()> {
 	validate_checkpoint_semantic_invariants(
 		artifact,
@@ -5099,6 +5102,7 @@ fn validate_artifact(artifact: &CheckpointArtifact) -> CheckpointResult<()> {
 	)
 }
 
+/// Validates the checkpoint semantic invariants.
 fn validate_checkpoint_semantic_invariants(
 	artifact: &CheckpointArtifact,
 	topology_storage: CheckpointTopologyStorage,
@@ -5143,6 +5147,7 @@ fn validate_checkpoint_semantic_invariants(
 	Ok(())
 }
 
+/// Validates the checkpoint topology.
 fn validate_checkpoint_topology(
 	artifact: &CheckpointArtifact,
 	path: &CheckpointPath,
@@ -5554,6 +5559,7 @@ fn validate_checkpoint_topology(
 	Ok(())
 }
 
+/// Validates the native metadata.
 fn validate_native_metadata(
 	artifact: &CheckpointArtifact,
 	path: &CheckpointPath,
@@ -5655,14 +5661,17 @@ fn validate_native_metadata(
 	Ok(())
 }
 
+/// Performs the validation error operation.
 fn validation_error(path: CheckpointPath, detail: impl Into<String>) -> CheckpointError {
 	decode_error(CheckpointDecodeErrorKind::InconsistentValue, path, detail)
 }
 
+/// Performs the invalid value operation.
 fn invalid_value(path: CheckpointPath, detail: impl Into<String>) -> CheckpointError {
 	decode_error(CheckpointDecodeErrorKind::InvalidValue, path, detail)
 }
 
+/// Performs the checkpoint pool image operation.
 fn checkpoint_pool_image(
 	declaration: DensePool,
 	state: DensePoolState,
@@ -5711,6 +5720,7 @@ fn checkpoint_pool_image(
 	})
 }
 
+/// Validates the training config.
 fn validate_training_config(
 	config: &DenseTrainingConfig,
 	path: &CheckpointPath,
@@ -5800,6 +5810,7 @@ fn validate_training_config(
 	Ok(())
 }
 
+/// Validates the training bounds.
 fn validate_training_bounds(
 	config: &DenseTrainingConfig,
 	bounds: TrainingBounds,
@@ -5889,6 +5900,7 @@ fn validate_training_bounds(
 	)
 }
 
+/// Performs the expect u64 operation.
 fn expect_u64(actual: u64, expected: u64, path: CheckpointPath, derivation: &str) -> CheckpointResult<()> {
 	if actual != expected {
 		return Err(validation_error(
@@ -5899,6 +5911,7 @@ fn expect_u64(actual: u64, expected: u64, path: CheckpointPath, derivation: &str
 	Ok(())
 }
 
+/// Validates the vector schema.
 fn validate_vector_schema(artifact: &CheckpointArtifact, path: &CheckpointPath) -> CheckpointResult<()> {
 	let vectors_path = path.field("vectors");
 	if artifact.vectors.is_empty() {
@@ -6015,6 +6028,7 @@ fn validate_vector_schema(artifact: &CheckpointArtifact, path: &CheckpointPath) 
 	validate_feature_spans(artifact, path)
 }
 
+/// Validates the vector metadata.
 fn validate_vector_metadata(vector: &CheckpointArtifactVector, path: &CheckpointPath) -> CheckpointResult<()> {
 	let valid = match (&vector.semantic_type, &vector.encoding, &vector.metadata) {
 		(SemanticType::Numeric, VectorEncoding::F32 | VectorEncoding::I32, CheckpointArtifactMetadata::None) => {
@@ -6074,10 +6088,12 @@ fn validate_vector_metadata(vector: &CheckpointArtifactVector, path: &Checkpoint
 	Ok(())
 }
 
+/// Validates the saved vector.
 pub(crate) fn validate_saved_vector(vector: &CheckpointArtifactVector, path: &CheckpointPath) -> CheckpointResult<()> {
 	validate_vector_metadata(vector, path)
 }
 
+/// Validates the byte dictionary.
 fn validate_byte_dictionary(values: &[Vec<u8>], path: &CheckpointPath, require_sorted: bool) -> CheckpointResult<()> {
 	if values.is_empty() {
 		return Err(invalid_value(path.clone(), "dictionary is empty"));
@@ -6106,6 +6122,7 @@ fn validate_byte_dictionary(values: &[Vec<u8>], path: &CheckpointPath, require_s
 	Ok(())
 }
 
+/// Validates the image metadata.
 fn validate_image_metadata(values: &[CheckpointImageMetadata], path: &CheckpointPath) -> CheckpointResult<()> {
 	if values.is_empty() {
 		return Err(invalid_value(path.clone(), "image variant set is empty"));
@@ -6153,6 +6170,7 @@ fn validate_image_metadata(values: &[CheckpointImageMetadata], path: &Checkpoint
 	Ok(())
 }
 
+/// Performs the image metadata could be ingested operation.
 fn image_metadata_could_be_ingested(value: CheckpointImageMetadata) -> bool {
 	match value.format {
 		EncodedImageFormat::Png => {
@@ -6213,6 +6231,7 @@ fn image_metadata_could_be_ingested(value: CheckpointImageMetadata) -> bool {
 	}
 }
 
+/// Validates the task.
 fn validate_task(
 	loss: DenseLoss,
 	task: DenseTask,
@@ -6334,6 +6353,7 @@ fn validate_task(
 	Ok(())
 }
 
+/// Validates the multi target task.
 fn validate_multi_target_task(
 	loss: DenseLoss,
 	task: DenseTask,
@@ -6385,6 +6405,7 @@ fn validate_multi_target_task(
 	Ok(())
 }
 
+/// Validates the feature spans.
 fn validate_feature_spans(artifact: &CheckpointArtifact, path: &CheckpointPath) -> CheckpointResult<()> {
 	let features = artifact
 		.vectors
@@ -6499,6 +6520,7 @@ fn validate_feature_spans(artifact: &CheckpointArtifact, path: &CheckpointPath) 
 	Ok(())
 }
 
+/// Validates the effective model.
 fn validate_effective_model(
 	artifact: &CheckpointArtifact,
 	path: &CheckpointPath,
@@ -6524,6 +6546,7 @@ fn validate_effective_model(
 	}
 }
 
+/// Validates the effective flat model.
 fn validate_effective_flat_model(
 	artifact: &CheckpointArtifact,
 	path: &CheckpointPath,
@@ -6655,6 +6678,7 @@ fn validate_effective_flat_model(
 	validate_temperature(artifact, &path.field("calibration"), tensor_validation)
 }
 
+/// Validates the effective structured model.
 fn validate_effective_structured_model(
 	artifact: &CheckpointArtifact,
 	path: &CheckpointPath,
@@ -7386,6 +7410,7 @@ fn validate_effective_structured_model(
 	validate_temperature(artifact, &path.field("calibration"), tensor_validation)
 }
 
+/// Validates the structured pool declarations.
 fn validate_structured_pool_declarations(artifact: &CheckpointArtifact, path: &CheckpointPath) -> CheckpointResult<()> {
 	for (index, block) in artifact.blocks.iter().enumerate() {
 		let CheckpointBlockImage::Pool(pool) = block else {
@@ -7424,6 +7449,7 @@ fn validate_structured_pool_declarations(artifact: &CheckpointArtifact, path: &C
 	Ok(())
 }
 
+/// Validates the structured kmeans declarations.
 fn validate_structured_kmeans_declarations(
 	artifact: &CheckpointArtifact,
 	path: &CheckpointPath,
@@ -7460,6 +7486,7 @@ fn validate_structured_kmeans_declarations(
 	Ok(())
 }
 
+/// Validates the structured tree declarations.
 fn validate_structured_tree_declarations(artifact: &CheckpointArtifact, path: &CheckpointPath) -> CheckpointResult<()> {
 	let trees = artifact
 		.blocks
@@ -7507,6 +7534,7 @@ fn validate_structured_tree_declarations(artifact: &CheckpointArtifact, path: &C
 	Ok(())
 }
 
+/// Validates the structured embedding declarations.
 fn validate_structured_embedding_declarations(
 	artifact: &CheckpointArtifact,
 	path: &CheckpointPath,
@@ -7571,6 +7599,7 @@ fn validate_structured_embedding_declarations(
 	Ok(())
 }
 
+/// Validates the pool routed weight.
 fn validate_pool_routed_weight(
 	pool: &CheckpointPoolImage,
 	layer: &CheckpointLayerImage,
@@ -7636,6 +7665,7 @@ fn validate_pool_routed_weight(
 	Ok(())
 }
 
+/// Validates the kmeans routed weight.
 fn validate_kmeans_routed_weight(
 	kmeans: &CheckpointKMeansImage,
 	layer: &CheckpointLayerImage,
@@ -7694,6 +7724,7 @@ fn validate_kmeans_routed_weight(
 	Ok(())
 }
 
+/// Validates the normalization state.
 fn validate_normalization_state(
 	artifact: &CheckpointArtifact,
 	path: &CheckpointPath,
@@ -7785,6 +7816,7 @@ fn validate_normalization_state(
 	}
 }
 
+/// Validates the parameter.
 fn validate_parameter(
 	parameter: &CheckpointParameterImage,
 	path: &CheckpointPath,
@@ -7814,6 +7846,7 @@ fn validate_parameter(
 	)
 }
 
+/// Validates the prelu parameters.
 fn validate_prelu_parameters(
 	operations: impl IntoIterator<Item = DenseOperation>,
 	parameters: &[CheckpointParameterImage],
@@ -7839,6 +7872,7 @@ fn validate_prelu_parameters(
 	Ok(())
 }
 
+/// Validates the f32 tensor.
 fn validate_f32_tensor(
 	tensor: &CheckpointTensorImage,
 	path: &CheckpointPath,
@@ -7908,6 +7942,7 @@ fn validate_f32_tensor(
 	Ok(())
 }
 
+/// Validates the i32 tensor.
 fn validate_i32_tensor(
 	tensor: &CheckpointTensorImage,
 	path: &CheckpointPath,
@@ -7953,12 +7988,14 @@ fn validate_i32_tensor(
 	Ok(())
 }
 
+/// Performs the f32 values operation.
 fn f32_values(tensor: &CheckpointTensorImage) -> impl Iterator<Item = f32> + '_ {
 	tensor.bytes
 		.chunks_exact(4)
 		.map(|bytes| f32::from_le_bytes(bytes.try_into().expect("exact four-byte chunk")))
 }
 
+/// Validates the temperature.
 fn validate_temperature(
 	artifact: &CheckpointArtifact,
 	path: &CheckpointPath,
@@ -8013,151 +8050,255 @@ fn validate_temperature(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal representation of `CheckpointTensor`.
 struct CheckpointTensor {
+	/// Value associated with this value.
 	value: ValueId,
+	/// Dtype associated with this value.
 	dtype: DType,
+	/// Shape associated with this value.
 	shape: Vec<u64>,
+	/// Bytes associated with this value.
 	bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal representation of `CheckpointParameter`.
 struct CheckpointParameter {
+	/// Parameter associated with this value.
 	parameter: CheckpointTensor,
+	/// First moment associated with this value.
 	first_moment: CheckpointTensor,
+	/// Second moment associated with this value.
 	second_moment: CheckpointTensor,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal representation of `CheckpointLayer`.
 pub(crate) struct CheckpointLayer {
+	/// Declaration associated with this value.
 	declaration: DenseLayer,
+	/// Weight associated with this value.
 	weight: CheckpointParameter,
+	/// Bias associated with this value.
 	bias: CheckpointParameter,
+	/// Prelu associated with this value.
 	prelu: Vec<CheckpointParameter>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal representation of `CheckpointConvolution`.
 pub(crate) struct CheckpointConvolution {
+	/// Declaration associated with this value.
 	declaration: DenseConvolution,
+	/// Geometry associated with this value.
 	geometry: DenseConvolutionGeometry,
+	/// Weight associated with this value.
 	weight: CheckpointParameter,
+	/// Bias associated with this value.
 	bias: CheckpointParameter,
+	/// Prelu associated with this value.
 	prelu: Vec<CheckpointParameter>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal representation of `CheckpointKMeans`.
 pub(crate) struct CheckpointKMeans {
+	/// Declaration associated with this value.
 	declaration: DenseKMeans,
+	/// Input width associated with this value.
 	input_width: NonZeroU64,
+	/// Centroids associated with this value.
 	centroids: CheckpointTensor,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal representation of `CheckpointEmbedding`.
 pub(crate) struct CheckpointEmbedding {
+	/// Declaration associated with this value.
 	declaration: DenseEmbedding,
+	/// Sequence length associated with this value.
 	sequence_length: NonZeroU64,
+	/// Table associated with this value.
 	table: CheckpointParameter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal representation of `CheckpointAttention`.
 pub(crate) struct CheckpointAttention {
+	/// Declaration associated with this value.
 	declaration: DenseAttention,
+	/// Sequence length associated with this value.
 	sequence_length: NonZeroU64,
+	/// Dimensions associated with this value.
 	dimensions: NonZeroU64,
+	/// Head dimension associated with this value.
 	head_dimension: NonZeroU64,
+	/// Query associated with this value.
 	query: CheckpointParameter,
+	/// Key associated with this value.
 	key: CheckpointParameter,
+	/// Value associated with this value.
 	value: CheckpointParameter,
+	/// Output associated with this value.
 	output: CheckpointParameter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal representation of `CheckpointRnn`.
 pub(crate) struct CheckpointRnn {
+	/// Declaration associated with this value.
 	declaration: DenseRnn,
+	/// Sequence length associated with this value.
 	sequence_length: NonZeroU64,
+	/// Input weight associated with this value.
 	input_weight: CheckpointParameter,
+	/// Recurrent weight associated with this value.
 	recurrent_weight: CheckpointParameter,
+	/// Bias associated with this value.
 	bias: CheckpointParameter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal representation of `CheckpointGru`.
 pub(crate) struct CheckpointGru {
+	/// Declaration associated with this value.
 	declaration: DenseGru,
+	/// Sequence length associated with this value.
 	sequence_length: NonZeroU64,
+	/// Reset input weight associated with this value.
 	reset_input_weight: CheckpointParameter,
+	/// Reset recurrent weight associated with this value.
 	reset_recurrent_weight: CheckpointParameter,
+	/// Reset bias associated with this value.
 	reset_bias: CheckpointParameter,
+	/// Update input weight associated with this value.
 	update_input_weight: CheckpointParameter,
+	/// Update recurrent weight associated with this value.
 	update_recurrent_weight: CheckpointParameter,
+	/// Update bias associated with this value.
 	update_bias: CheckpointParameter,
+	/// Candidate input weight associated with this value.
 	candidate_input_weight: CheckpointParameter,
+	/// Candidate recurrent weight associated with this value.
 	candidate_recurrent_weight: CheckpointParameter,
+	/// Candidate bias associated with this value.
 	candidate_bias: CheckpointParameter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal representation of `CheckpointLstm`.
 pub(crate) struct CheckpointLstm {
+	/// Declaration associated with this value.
 	declaration: DenseLstm,
+	/// Sequence length associated with this value.
 	sequence_length: NonZeroU64,
+	/// Input gate input weight associated with this value.
 	input_gate_input_weight: CheckpointParameter,
+	/// Input gate recurrent weight associated with this value.
 	input_gate_recurrent_weight: CheckpointParameter,
+	/// Input gate bias associated with this value.
 	input_gate_bias: CheckpointParameter,
+	/// Forget gate input weight associated with this value.
 	forget_gate_input_weight: CheckpointParameter,
+	/// Forget gate recurrent weight associated with this value.
 	forget_gate_recurrent_weight: CheckpointParameter,
+	/// Forget gate bias associated with this value.
 	forget_gate_bias: CheckpointParameter,
+	/// Output gate input weight associated with this value.
 	output_gate_input_weight: CheckpointParameter,
+	/// Output gate recurrent weight associated with this value.
 	output_gate_recurrent_weight: CheckpointParameter,
+	/// Output gate bias associated with this value.
 	output_gate_bias: CheckpointParameter,
+	/// Candidate input weight associated with this value.
 	candidate_input_weight: CheckpointParameter,
+	/// Candidate recurrent weight associated with this value.
 	candidate_recurrent_weight: CheckpointParameter,
+	/// Candidate bias associated with this value.
 	candidate_bias: CheckpointParameter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal representation of `CheckpointTree`.
 pub(crate) struct CheckpointTree {
+	/// Declaration associated with this value.
 	declaration: DenseTree,
+	/// Input width associated with this value.
 	input_width: NonZeroU64,
+	/// Output width associated with this value.
 	output_width: NonZeroU64,
+	/// Internal nodes per tree associated with this value.
 	internal_nodes_per_tree: NonZeroU64,
+	/// Leaves per tree associated with this value.
 	leaves_per_tree: NonZeroU64,
+	/// Split features associated with this value.
 	split_features: CheckpointTensor,
+	/// Split thresholds associated with this value.
 	split_thresholds: CheckpointTensor,
+	/// Leaf values associated with this value.
 	leaf_values: CheckpointParameter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal variants for `CheckpointResidualBranch`.
 enum CheckpointResidualBranch {
+	/// The `Layer` variant.
 	Layer(CheckpointLayer),
+	/// The `Operation` variant.
 	Operation(DenseOperation),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal variants for `CheckpointResidualSkip`.
 enum CheckpointResidualSkip {
+	/// The `Identity` variant.
 	Identity,
+	/// The `Projection` variant.
 	Projection(CheckpointParameter),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal representation of `CheckpointResidual`.
 pub(crate) struct CheckpointResidual {
+	/// Branch associated with this value.
 	branch: Vec<CheckpointResidualBranch>,
+	/// Branch prelu associated with this value.
 	branch_prelu: Vec<CheckpointParameter>,
+	/// Output width associated with this value.
 	output_width: NonZeroU64,
+	/// Skip associated with this value.
 	skip: CheckpointResidualSkip,
+	/// Operations associated with this value.
 	operations: Vec<DenseOperation>,
+	/// Prelu associated with this value.
 	prelu: Vec<CheckpointParameter>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal variants for `CheckpointBlock`.
 pub(crate) enum CheckpointBlock {
+	/// The `Embedding` variant.
 	Embedding(CheckpointEmbedding),
+	/// The `Attention` variant.
 	Attention(CheckpointAttention),
+	/// The `Rnn` variant.
 	Rnn(CheckpointRnn),
+	/// The `Gru` variant.
 	Gru(CheckpointGru),
+	/// The `Lstm` variant.
 	Lstm(CheckpointLstm),
+	/// The `Layer` variant.
 	Layer(CheckpointLayer),
+	/// The `Convolution` variant.
 	Convolution(CheckpointConvolution),
+	/// The `Pool` variant.
 	Pool(CheckpointPoolImage),
+	/// The `KMeans` variant.
 	KMeans(CheckpointKMeans),
+	/// The `Tree` variant.
 	Tree(CheckpointTree),
+	/// The `Residual` variant.
 	Residual(CheckpointResidual),
 }
 
@@ -8170,20 +8311,35 @@ pub(crate) enum CheckpointBlock {
 /// carried across training phases.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckpointManifest {
+	/// Format version associated with this value.
 	format_version: u32,
+	/// Vectors associated with this value.
 	vectors: Vec<CheckpointVectorSchema>,
+	/// Feature spans associated with this value.
 	feature_spans: Vec<CompiledFeatureSpan>,
+	/// Feature width associated with this value.
 	feature_width: usize,
+	/// Target source indices associated with this value.
 	target_source_indices: Vec<usize>,
+	/// Task associated with this value.
 	task: DenseTask,
+	/// Output adapter associated with this value.
 	output_adapter: Option<DenseOutputAdapter>,
+	/// Config associated with this value.
 	config: DenseTrainingConfig,
+	/// Bounds associated with this value.
 	bounds: TrainingBounds,
+	/// Normalization associated with this value.
 	normalization: Vec<CheckpointTensor>,
+	/// Layers associated with this value.
 	layers: Vec<CheckpointLayer>,
+	/// Blocks associated with this value.
 	blocks: Vec<CheckpointBlock>,
+	/// Temperature associated with this value.
 	temperature: Option<CheckpointTensor>,
+	/// Program digest associated with this value.
 	program_digest: Digest,
+	/// Native associated with this value.
 	native: Option<CheckpointNativeRealization>,
 }
 
@@ -8353,6 +8509,7 @@ impl CheckpointManifest {
 		self.output_adapter
 	}
 
+	/// Performs the tensors operation.
 	fn tensors(&self) -> impl Iterator<Item = &CheckpointTensor> {
 		let mut tensors = self.normalization.iter().collect::<Vec<_>>();
 		for parameter in manifest_resume_parameters(self) {
@@ -8377,6 +8534,7 @@ impl CheckpointManifest {
 		tensors.into_iter()
 	}
 
+	/// Validates the external boundary.
 	fn validate_external_boundary(&self, training: &CompiledTraining) -> CheckpointResult<()> {
 		let expected = self
 			.tensors()
@@ -8596,6 +8754,7 @@ pub fn apply_checkpoint_resume(
 	Ok(())
 }
 
+/// Validates the resume tensor.
 fn validate_resume_tensor(
 	input: &OwnedExternalInput,
 	image: &CheckpointTensorImage,
@@ -8627,6 +8786,7 @@ fn validate_resume_tensor(
 	Ok(())
 }
 
+/// Validates the resume input.
 fn validate_resume_input(
 	input: &OwnedExternalInput,
 	image: &CheckpointTensorImage,
@@ -8640,6 +8800,7 @@ fn validate_resume_input(
 	)
 }
 
+/// Validates the resume compatibility.
 fn validate_resume_compatibility(
 	manifest: &CheckpointManifest,
 	checkpoint: &CheckpointArtifact,
@@ -8767,6 +8928,7 @@ fn validate_resume_compatibility(
 	Ok(())
 }
 
+/// Performs the resume topology matches operation.
 fn resume_topology_matches(manifest: &CheckpointManifest, checkpoint: &CheckpointArtifact) -> bool {
 	if manifest.format_version == FLAT_CHECKPOINT_FORMAT_VERSION {
 		return manifest.layers.len() == checkpoint.layers.len()
@@ -8934,6 +9096,7 @@ macro_rules! extend_block_parameters {
 	};
 }
 
+/// Performs the manifest resume parameters operation.
 fn manifest_resume_parameters(manifest: &CheckpointManifest) -> Vec<&CheckpointParameter> {
 	let mut parameters = Vec::new();
 	if manifest.format_version == FLAT_CHECKPOINT_FORMAT_VERSION {
@@ -8953,6 +9116,7 @@ fn manifest_resume_parameters(manifest: &CheckpointManifest) -> Vec<&CheckpointP
 	parameters
 }
 
+/// Performs the artifact resume parameters operation.
 fn artifact_resume_parameters(checkpoint: &CheckpointArtifact) -> Vec<&CheckpointParameterImage> {
 	let mut parameters = Vec::new();
 	if checkpoint.format_version == FLAT_CHECKPOINT_FORMAT_VERSION {
@@ -8972,6 +9136,7 @@ fn artifact_resume_parameters(checkpoint: &CheckpointArtifact) -> Vec<&Checkpoin
 	parameters
 }
 
+/// Validates the manifest semantic invariants.
 fn validate_manifest_semantic_invariants(manifest: &CheckpointManifest) -> CheckpointResult<()> {
 	let artifact = declaration_artifact_from_manifest(manifest);
 	validate_checkpoint_semantic_invariants(
@@ -8981,6 +9146,7 @@ fn validate_manifest_semantic_invariants(manifest: &CheckpointManifest) -> Check
 	)
 }
 
+/// Performs the manifest semantic error operation.
 fn manifest_semantic_error(error: CheckpointError) -> CheckpointError {
 	match error {
 		CheckpointError::Decode(error) => CheckpointError::manifest(error.to_string()),
@@ -8988,6 +9154,7 @@ fn manifest_semantic_error(error: CheckpointError) -> CheckpointError {
 	}
 }
 
+/// Performs the checkpoint layer operation.
 pub(crate) fn checkpoint_layer(
 	training: &CompiledTraining,
 	declaration: DenseLayer,
@@ -9005,6 +9172,7 @@ pub(crate) fn checkpoint_layer(
 	})
 }
 
+/// Performs the checkpoint convolution operation.
 pub(crate) fn checkpoint_convolution(
 	training: &CompiledTraining,
 	declaration: DenseConvolution,
@@ -9023,6 +9191,7 @@ pub(crate) fn checkpoint_convolution(
 	})
 }
 
+/// Performs the checkpoint blocks operation.
 fn checkpoint_blocks(
 	training: &CompiledTraining,
 	states: &[DenseBlockState],
@@ -9033,6 +9202,7 @@ fn checkpoint_blocks(
 		.collect()
 }
 
+/// Performs the checkpoint pool operation.
 pub(crate) fn checkpoint_pool(
 	declaration: DensePool,
 	state: DensePoolState,
@@ -9051,6 +9221,7 @@ pub(crate) fn checkpoint_pool(
 	.map_err(manifest_semantic_error)
 }
 
+/// Performs the checkpoint embedding operation.
 pub(crate) fn checkpoint_embedding(
 	training: &CompiledTraining,
 	declaration: DenseEmbedding,
@@ -9068,6 +9239,7 @@ pub(crate) fn checkpoint_embedding(
 	})
 }
 
+/// Performs the checkpoint attention operation.
 pub(crate) fn checkpoint_attention(
 	training: &CompiledTraining,
 	declaration: DenseAttention,
@@ -9092,6 +9264,7 @@ pub(crate) fn checkpoint_attention(
 	})
 }
 
+/// Performs the checkpoint rnn operation.
 pub(crate) fn checkpoint_rnn(
 	training: &CompiledTraining,
 	declaration: DenseRnn,
@@ -9111,6 +9284,7 @@ pub(crate) fn checkpoint_rnn(
 	})
 }
 
+/// Performs the checkpoint gru operation.
 pub(crate) fn checkpoint_gru(
 	training: &CompiledTraining,
 	declaration: DenseGru,
@@ -9136,6 +9310,7 @@ pub(crate) fn checkpoint_gru(
 	})
 }
 
+/// Performs the checkpoint lstm operation.
 pub(crate) fn checkpoint_lstm(
 	training: &CompiledTraining,
 	declaration: DenseLstm,
@@ -9164,6 +9339,7 @@ pub(crate) fn checkpoint_lstm(
 	})
 }
 
+/// Performs the checkpoint kmeans operation.
 pub(crate) fn checkpoint_kmeans(
 	training: &CompiledTraining,
 	declaration: DenseKMeans,
@@ -9181,6 +9357,7 @@ pub(crate) fn checkpoint_kmeans(
 	})
 }
 
+/// Performs the checkpoint tree operation.
 pub(crate) fn checkpoint_tree(
 	training: &CompiledTraining,
 	declaration: DenseTree,
@@ -9203,6 +9380,7 @@ pub(crate) fn checkpoint_tree(
 	})
 }
 
+/// Performs the checkpoint residual operation.
 pub(crate) fn checkpoint_residual(
 	training: &CompiledTraining,
 	declaration: &DenseResidual,
@@ -9266,6 +9444,7 @@ pub(crate) fn checkpoint_residual(
 	})
 }
 
+/// Performs the push checkpoint parameter tensors operation.
 fn push_checkpoint_parameter_tensors<'a>(tensors: &mut Vec<&'a CheckpointTensor>, parameter: &'a CheckpointParameter) {
 	tensors.extend([
 		&parameter.parameter,
@@ -9278,8 +9457,11 @@ fn push_checkpoint_parameter_tensors<'a>(tensors: &mut Vec<&'a CheckpointTensor>
 /// its exit lifecycle and destroyed its native resources.
 #[derive(Clone, Debug)]
 pub struct CompletedTrainingCheckpoint {
+	/// Execution associated with this value.
 	execution: CompletedTrainingExecution,
+	/// Manifest associated with this value.
 	manifest: CheckpointManifest,
+	/// Output indices associated with this value.
 	output_indices: BTreeMap<ValueId, usize>,
 }
 
@@ -9409,6 +9591,7 @@ impl CompletedTrainingCheckpoint {
 		atomic_save(path, encoded_bytes, |file| file.write_all(kernel.bytes()))
 	}
 
+	/// Performs the output bytes operation.
 	fn output_bytes(&self) -> BTreeMap<ValueId, &[u8]> {
 		self.output_indices
 			.iter()
@@ -9422,6 +9605,7 @@ impl CompletedTrainingCheckpoint {
 	}
 }
 
+/// Performs the checkpoint native realization operation.
 fn checkpoint_native_realization(
 	realized: &RealizedNativeKernelSet,
 	program: Digest,
@@ -9450,6 +9634,7 @@ fn checkpoint_native_realization(
 	})
 }
 
+/// Performs the checkpoint parameter operation.
 fn checkpoint_parameter(training: &CompiledTraining, state: ParameterState) -> CheckpointResult<CheckpointParameter> {
 	Ok(CheckpointParameter {
 		parameter: checkpoint_tensor(training, state.updated_parameter)?,
@@ -9458,6 +9643,7 @@ fn checkpoint_parameter(training: &CompiledTraining, state: ParameterState) -> C
 	})
 }
 
+/// Performs the checkpoint tensor operation.
 fn checkpoint_tensor(training: &CompiledTraining, value: ValueId) -> CheckpointResult<CheckpointTensor> {
 	let tensor = training
 		.graph()
@@ -9482,6 +9668,7 @@ fn checkpoint_tensor(training: &CompiledTraining, value: ValueId) -> CheckpointR
 	})
 }
 
+/// Performs the map outputs operation.
 fn map_outputs(
 	manifest: &CheckpointManifest,
 	outputs: &[ExitImage],
@@ -9531,6 +9718,7 @@ fn map_outputs(
 	Ok(mapped)
 }
 
+/// Performs the encoded size operation.
 fn encoded_size(manifest: &CheckpointManifest, outputs: &BTreeMap<ValueId, &[u8]>) -> CheckpointResult<u64> {
 	let mut counter = CountingWriter::default();
 	encode_checkpoint(manifest, outputs, &mut counter)
@@ -9538,6 +9726,7 @@ fn encoded_size(manifest: &CheckpointManifest, outputs: &BTreeMap<ValueId, &[u8]
 	Ok(counter.bytes)
 }
 
+/// Encodes the checkpoint.
 fn encode_checkpoint(
 	manifest: &CheckpointManifest,
 	outputs: &BTreeMap<ValueId, &[u8]>,
@@ -9549,10 +9738,12 @@ fn encode_checkpoint(
 	encode_artifact(&artifact, writer)
 }
 
+/// Performs the checkpoint validation io error operation.
 fn checkpoint_validation_io_error(error: CheckpointError) -> io::Error {
 	io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
+/// Performs the declaration artifact from manifest operation.
 fn declaration_artifact_from_manifest(manifest: &CheckpointManifest) -> CheckpointArtifact {
 	CheckpointArtifact {
 		format_version: manifest.format_version,
@@ -9596,6 +9787,7 @@ fn declaration_artifact_from_manifest(manifest: &CheckpointManifest) -> Checkpoi
 	}
 }
 
+/// Performs the declaration tensor image operation.
 fn declaration_tensor_image(tensor: &CheckpointTensor) -> CheckpointTensorImage {
 	CheckpointTensorImage {
 		dtype: tensor.dtype,
@@ -9604,6 +9796,7 @@ fn declaration_tensor_image(tensor: &CheckpointTensor) -> CheckpointTensorImage 
 	}
 }
 
+/// Performs the declaration parameter image operation.
 fn declaration_parameter_image(parameter: &CheckpointParameter) -> CheckpointParameterImage {
 	CheckpointParameterImage {
 		parameter: declaration_tensor_image(&parameter.parameter),
@@ -9612,6 +9805,7 @@ fn declaration_parameter_image(parameter: &CheckpointParameter) -> CheckpointPar
 	}
 }
 
+/// Performs the declaration layer image operation.
 fn declaration_layer_image(layer: &CheckpointLayer) -> CheckpointLayerImage {
 	CheckpointLayerImage {
 		declaration: layer.declaration.clone(),
@@ -9625,6 +9819,7 @@ fn declaration_layer_image(layer: &CheckpointLayer) -> CheckpointLayerImage {
 	}
 }
 
+/// Performs the declaration convolution image operation.
 fn declaration_convolution_image(convolution: &CheckpointConvolution) -> CheckpointConvolutionImage {
 	CheckpointConvolutionImage {
 		declaration: convolution.declaration.clone(),
@@ -9639,6 +9834,7 @@ fn declaration_convolution_image(convolution: &CheckpointConvolution) -> Checkpo
 	}
 }
 
+/// Performs the declaration kmeans image operation.
 fn declaration_kmeans_image(kmeans: &CheckpointKMeans) -> CheckpointKMeansImage {
 	CheckpointKMeansImage {
 		clusters: kmeans.declaration.clusters(),
@@ -9648,6 +9844,7 @@ fn declaration_kmeans_image(kmeans: &CheckpointKMeans) -> CheckpointKMeansImage 
 	}
 }
 
+/// Performs the declaration embedding image operation.
 fn declaration_embedding_image(embedding: &CheckpointEmbedding) -> CheckpointEmbeddingImage {
 	CheckpointEmbeddingImage {
 		dimensions: embedding.declaration.dimensions(),
@@ -9657,6 +9854,7 @@ fn declaration_embedding_image(embedding: &CheckpointEmbedding) -> CheckpointEmb
 	}
 }
 
+/// Performs the declaration attention image operation.
 fn declaration_attention_image(attention: &CheckpointAttention) -> CheckpointAttentionImage {
 	CheckpointAttentionImage {
 		sequence_length: attention.sequence_length,
@@ -9670,6 +9868,7 @@ fn declaration_attention_image(attention: &CheckpointAttention) -> CheckpointAtt
 	}
 }
 
+/// Performs the declaration rnn image operation.
 fn declaration_rnn_image(rnn: &CheckpointRnn) -> CheckpointRnnImage {
 	CheckpointRnnImage {
 		sequence_length: rnn.sequence_length,
@@ -9680,6 +9879,7 @@ fn declaration_rnn_image(rnn: &CheckpointRnn) -> CheckpointRnnImage {
 	}
 }
 
+/// Performs the declaration gru image operation.
 fn declaration_gru_image(gru: &CheckpointGru) -> CheckpointGruImage {
 	CheckpointGruImage {
 		sequence_length: gru.sequence_length,
@@ -9696,6 +9896,7 @@ fn declaration_gru_image(gru: &CheckpointGru) -> CheckpointGruImage {
 	}
 }
 
+/// Performs the declaration lstm image operation.
 fn declaration_lstm_image(lstm: &CheckpointLstm) -> CheckpointLstmImage {
 	CheckpointLstmImage {
 		sequence_length: lstm.sequence_length,
@@ -9715,6 +9916,7 @@ fn declaration_lstm_image(lstm: &CheckpointLstm) -> CheckpointLstmImage {
 	}
 }
 
+/// Performs the declaration tree image operation.
 fn declaration_tree_image(tree: &CheckpointTree) -> CheckpointTreeImage {
 	CheckpointTreeImage {
 		declaration: tree.declaration,
@@ -9728,6 +9930,7 @@ fn declaration_tree_image(tree: &CheckpointTree) -> CheckpointTreeImage {
 	}
 }
 
+/// Performs the declaration block image operation.
 fn declaration_block_image(block: &CheckpointBlock) -> CheckpointBlockImage {
 	match block {
 		CheckpointBlock::Embedding(embedding) => {
@@ -9781,6 +9984,7 @@ fn declaration_block_image(block: &CheckpointBlock) -> CheckpointBlockImage {
 	}
 }
 
+/// Performs the artifact from manifest operation.
 fn artifact_from_manifest(
 	manifest: &CheckpointManifest,
 	outputs: &BTreeMap<ValueId, &[u8]>,
@@ -9840,6 +10044,7 @@ fn artifact_from_manifest(
 	})
 }
 
+/// Performs the artifact layer operation.
 fn artifact_layer(layer: &CheckpointLayer, outputs: &BTreeMap<ValueId, &[u8]>) -> io::Result<CheckpointLayerImage> {
 	Ok(CheckpointLayerImage {
 		declaration: layer.declaration.clone(),
@@ -9853,6 +10058,7 @@ fn artifact_layer(layer: &CheckpointLayer, outputs: &BTreeMap<ValueId, &[u8]>) -
 	})
 }
 
+/// Performs the artifact convolution operation.
 fn artifact_convolution(
 	convolution: &CheckpointConvolution,
 	outputs: &BTreeMap<ValueId, &[u8]>,
@@ -9870,6 +10076,7 @@ fn artifact_convolution(
 	})
 }
 
+/// Performs the artifact kmeans operation.
 fn artifact_kmeans(kmeans: &CheckpointKMeans, outputs: &BTreeMap<ValueId, &[u8]>) -> io::Result<CheckpointKMeansImage> {
 	Ok(CheckpointKMeansImage {
 		clusters: kmeans.declaration.clusters(),
@@ -9879,6 +10086,7 @@ fn artifact_kmeans(kmeans: &CheckpointKMeans, outputs: &BTreeMap<ValueId, &[u8]>
 	})
 }
 
+/// Performs the artifact embedding operation.
 fn artifact_embedding(
 	embedding: &CheckpointEmbedding,
 	outputs: &BTreeMap<ValueId, &[u8]>,
@@ -9891,6 +10099,7 @@ fn artifact_embedding(
 	})
 }
 
+/// Performs the artifact attention operation.
 fn artifact_attention(
 	attention: &CheckpointAttention,
 	outputs: &BTreeMap<ValueId, &[u8]>,
@@ -9907,6 +10116,7 @@ fn artifact_attention(
 	})
 }
 
+/// Performs the artifact rnn operation.
 fn artifact_rnn(rnn: &CheckpointRnn, outputs: &BTreeMap<ValueId, &[u8]>) -> io::Result<CheckpointRnnImage> {
 	Ok(CheckpointRnnImage {
 		sequence_length: rnn.sequence_length,
@@ -9917,6 +10127,7 @@ fn artifact_rnn(rnn: &CheckpointRnn, outputs: &BTreeMap<ValueId, &[u8]>) -> io::
 	})
 }
 
+/// Performs the artifact gru operation.
 fn artifact_gru(gru: &CheckpointGru, outputs: &BTreeMap<ValueId, &[u8]>) -> io::Result<CheckpointGruImage> {
 	Ok(CheckpointGruImage {
 		sequence_length: gru.sequence_length,
@@ -9933,6 +10144,7 @@ fn artifact_gru(gru: &CheckpointGru, outputs: &BTreeMap<ValueId, &[u8]>) -> io::
 	})
 }
 
+/// Performs the artifact lstm operation.
 fn artifact_lstm(lstm: &CheckpointLstm, outputs: &BTreeMap<ValueId, &[u8]>) -> io::Result<CheckpointLstmImage> {
 	Ok(CheckpointLstmImage {
 		sequence_length: lstm.sequence_length,
@@ -9952,6 +10164,7 @@ fn artifact_lstm(lstm: &CheckpointLstm, outputs: &BTreeMap<ValueId, &[u8]>) -> i
 	})
 }
 
+/// Performs the artifact tree operation.
 fn artifact_tree(tree: &CheckpointTree, outputs: &BTreeMap<ValueId, &[u8]>) -> io::Result<CheckpointTreeImage> {
 	Ok(CheckpointTreeImage {
 		declaration: tree.declaration,
@@ -9965,6 +10178,7 @@ fn artifact_tree(tree: &CheckpointTree, outputs: &BTreeMap<ValueId, &[u8]>) -> i
 	})
 }
 
+/// Performs the artifact block operation.
 fn artifact_block(block: &CheckpointBlock, outputs: &BTreeMap<ValueId, &[u8]>) -> io::Result<CheckpointBlockImage> {
 	match block {
 		CheckpointBlock::Embedding(embedding) => {
@@ -10022,6 +10236,7 @@ fn artifact_block(block: &CheckpointBlock, outputs: &BTreeMap<ValueId, &[u8]>) -
 	}
 }
 
+/// Performs the artifact metadata operation.
 fn artifact_metadata(metadata: &VectorMetadata) -> CheckpointArtifactMetadata {
 	match metadata {
 		VectorMetadata::None => CheckpointArtifactMetadata::None,
@@ -10053,6 +10268,7 @@ fn artifact_metadata(metadata: &VectorMetadata) -> CheckpointArtifactMetadata {
 	}
 }
 
+/// Performs the artifact parameter operation.
 fn artifact_parameter(
 	parameter: &CheckpointParameter,
 	outputs: &BTreeMap<ValueId, &[u8]>,
@@ -10064,6 +10280,7 @@ fn artifact_parameter(
 	})
 }
 
+/// Performs the artifact tensor operation.
 fn artifact_tensor(tensor: &CheckpointTensor, outputs: &BTreeMap<ValueId, &[u8]>) -> io::Result<CheckpointTensorImage> {
 	Ok(CheckpointTensorImage {
 		dtype: tensor.dtype,
@@ -10072,6 +10289,7 @@ fn artifact_tensor(tensor: &CheckpointTensor, outputs: &BTreeMap<ValueId, &[u8]>
 	})
 }
 
+/// Encodes the artifact.
 fn encode_artifact(artifact: &CheckpointArtifact, writer: &mut impl Write) -> io::Result<()> {
 	writeln!(writer, "recipe")?;
 	writeln!(
@@ -10237,6 +10455,7 @@ fn encode_artifact(artifact: &CheckpointArtifact, writer: &mut impl Write) -> io
 	Ok(())
 }
 
+/// Encodes the native metadata.
 fn encode_native_metadata(writer: &mut impl Write, native: &CheckpointNativeRealization) -> io::Result<()> {
 	writeln!(writer, "\tnative")?;
 	write!(writer, "\t\tprogram\t")?;
@@ -10276,6 +10495,7 @@ fn encode_native_metadata(writer: &mut impl Write, native: &CheckpointNativeReal
 	Ok(())
 }
 
+/// Encodes the artifact block.
 fn encode_artifact_block(
 	writer: &mut impl Write,
 	depth: usize,
@@ -10574,6 +10794,7 @@ fn encode_artifact_block(
 	}
 }
 
+/// Encodes the artifact layer.
 fn encode_artifact_layer(
 	writer: &mut impl Write,
 	depth: usize,
@@ -10599,6 +10820,7 @@ fn encode_artifact_layer(
 	encode_artifact_parameter(writer, depth + 2, &layer.bias)
 }
 
+/// Encodes the artifact operations.
 fn encode_artifact_operations(writer: &mut impl Write, depth: usize, operations: &[DenseOperation]) -> io::Result<()> {
 	write_tabs(writer, depth)?;
 	writeln!(writer, "operations\t{}", operations.len())?;
@@ -10609,6 +10831,7 @@ fn encode_artifact_operations(writer: &mut impl Write, depth: usize, operations:
 	Ok(())
 }
 
+/// Encodes the artifact parameter list.
 fn encode_artifact_parameter_list(
 	writer: &mut impl Write,
 	depth: usize,
@@ -10628,6 +10851,7 @@ fn encode_artifact_parameter_list(
 	Ok(())
 }
 
+/// Encodes the artifact vector metadata.
 fn encode_artifact_vector_metadata(writer: &mut impl Write, metadata: &CheckpointArtifactMetadata) -> io::Result<()> {
 	match metadata {
 		CheckpointArtifactMetadata::None => writeln!(writer, "\t\t\t\tmetadata\tnone"),
@@ -10703,6 +10927,7 @@ fn encode_artifact_vector_metadata(writer: &mut impl Write, metadata: &Checkpoin
 	}
 }
 
+/// Encodes the training config.
 fn encode_training_config(
 	writer: &mut impl Write,
 	config: &DenseTrainingConfig,
@@ -10758,6 +10983,7 @@ fn encode_training_config(
 	)
 }
 
+/// Encodes the artifact data normalization.
 fn encode_artifact_data_normalization(writer: &mut impl Write, artifact: &CheckpointArtifact) -> io::Result<()> {
 	writeln!(
 		writer,
@@ -10782,6 +11008,7 @@ fn encode_artifact_data_normalization(writer: &mut impl Write, artifact: &Checkp
 	Ok(())
 }
 
+/// Encodes the adamw.
 fn encode_adamw(writer: &mut impl Write, adamw: AdamWConfig) -> io::Result<()> {
 	writeln!(writer, "\t\tadamw")?;
 	write_f32_bits(writer, 3, "learning-rate", adamw.learning_rate)?;
@@ -10791,11 +11018,13 @@ fn encode_adamw(writer: &mut impl Write, adamw: AdamWConfig) -> io::Result<()> {
 	write_f32_bits(writer, 3, "weight-decay", adamw.weight_decay)
 }
 
+/// Writes the f32 bits.
 fn write_f32_bits(writer: &mut impl Write, depth: usize, name: &str, value: f32) -> io::Result<()> {
 	write_tabs(writer, depth)?;
 	writeln!(writer, "{name}\t0x{:08x}", value.to_bits())
 }
 
+/// Encodes the artifact parameter.
 fn encode_artifact_parameter(
 	writer: &mut impl Write,
 	depth: usize,
@@ -10806,6 +11035,7 @@ fn encode_artifact_parameter(
 	encode_artifact_tensor(writer, depth, "second-moment", &parameter.second_moment)
 }
 
+/// Encodes the artifact tensor.
 fn encode_artifact_tensor(
 	writer: &mut impl Write,
 	depth: usize,
@@ -10837,6 +11067,7 @@ fn encode_artifact_tensor(
 	Ok(())
 }
 
+/// Performs the required output operation.
 fn required_output<'a>(outputs: &'a BTreeMap<ValueId, &[u8]>, value: ValueId) -> io::Result<&'a [u8]> {
 	outputs.get(&value).copied().ok_or_else(|| {
 		io::Error::new(
@@ -10846,6 +11077,7 @@ fn required_output<'a>(outputs: &'a BTreeMap<ValueId, &[u8]>, value: ValueId) ->
 	})
 }
 
+/// Performs the feature normalization mask operation.
 fn feature_normalization_mask(spans: &[CompiledFeatureSpan], width: usize) -> Vec<u32> {
 	let mut mask = vec![0.0f32.to_bits(); width];
 	for span in spans {
@@ -10857,6 +11089,7 @@ fn feature_normalization_mask(spans: &[CompiledFeatureSpan], width: usize) -> Ve
 	mask
 }
 
+/// Writes the tabs.
 fn write_tabs(writer: &mut impl Write, depth: usize) -> io::Result<()> {
 	for _ in 0..depth {
 		writer.write_all(b"\t")?;
@@ -10864,6 +11097,7 @@ fn write_tabs(writer: &mut impl Write, depth: usize) -> io::Result<()> {
 	Ok(())
 }
 
+/// Writes the hex.
 fn write_hex(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 	const HEX: &[u8; 16] = b"0123456789abcdef";
 	writer.write_all(b"0x")?;
@@ -10873,6 +11107,7 @@ fn write_hex(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 	Ok(())
 }
 
+/// Performs the dtype operation.
 const fn dtype(dtype: DType) -> &'static str {
 	match dtype {
 		DType::F32 => "f32",
@@ -10880,6 +11115,7 @@ const fn dtype(dtype: DType) -> &'static str {
 	}
 }
 
+/// Performs the vector role operation.
 const fn vector_role(role: VectorRole) -> &'static str {
 	match role {
 		VectorRole::Feature => "feature",
@@ -10887,6 +11123,7 @@ const fn vector_role(role: VectorRole) -> &'static str {
 	}
 }
 
+/// Performs the semantic type operation.
 const fn semantic_type(semantic_type: SemanticType) -> &'static str {
 	match semantic_type {
 		SemanticType::Numeric => "numeric",
@@ -10899,6 +11136,7 @@ const fn semantic_type(semantic_type: SemanticType) -> &'static str {
 	}
 }
 
+/// Performs the image format operation.
 const fn image_format(format: EncodedImageFormat) -> &'static str {
 	match format {
 		EncodedImageFormat::Png => "png",
@@ -10910,6 +11148,7 @@ const fn image_format(format: EncodedImageFormat) -> &'static str {
 	}
 }
 
+/// Performs the image color model operation.
 const fn image_color_model(model: ImageColorModel) -> &'static str {
 	match model {
 		ImageColorModel::Grayscale => "grayscale",
@@ -10924,18 +11163,21 @@ const fn image_color_model(model: ImageColorModel) -> &'static str {
 	}
 }
 
+/// Performs the image value layout operation.
 const fn image_value_layout(layout: ImageValueLayout) -> &'static str {
 	match layout {
 		ImageValueLayout::EncodedFile => "encoded-file",
 	}
 }
 
+/// Performs the image value range operation.
 const fn image_value_range(range: ImageValueRange) -> &'static str {
 	match range {
 		ImageValueRange::EncodedBytes => "encoded-bytes",
 	}
 }
 
+/// Performs the vector encoding operation.
 const fn vector_encoding(encoding: VectorEncoding) -> &'static str {
 	match encoding {
 		VectorEncoding::F32 => "f32",
@@ -10948,10 +11190,12 @@ const fn vector_encoding(encoding: VectorEncoding) -> &'static str {
 	}
 }
 
+/// Performs the dense activation operation.
 const fn dense_activation(activation: DenseActivation) -> &'static str {
 	activation.token()
 }
 
+/// Performs the dense block kind operation.
 const fn dense_block_kind(kind: DenseBlockKind) -> &'static str {
 	match kind {
 		DenseBlockKind::Layer => "layer",
@@ -10959,6 +11203,7 @@ const fn dense_block_kind(kind: DenseBlockKind) -> &'static str {
 	}
 }
 
+/// Performs the dense tree family operation.
 const fn dense_tree_family(family: DenseTreeFamily) -> &'static str {
 	match family {
 		DenseTreeFamily::LightGbm => "lightgbm",
@@ -10967,6 +11212,7 @@ const fn dense_tree_family(family: DenseTreeFamily) -> &'static str {
 	}
 }
 
+/// Performs the dense operation operation.
 const fn dense_operation(operation: DenseOperation) -> &'static str {
 	match operation {
 		DenseOperation::Activation(activation) => dense_activation(activation),
@@ -10975,6 +11221,7 @@ const fn dense_operation(operation: DenseOperation) -> &'static str {
 	}
 }
 
+/// Performs the data normalization operation.
 const fn data_normalization(normalization: DenseDataNormalization) -> &'static str {
 	match normalization {
 		DenseDataNormalization::Identity => "identity",
@@ -10984,6 +11231,7 @@ const fn data_normalization(normalization: DenseDataNormalization) -> &'static s
 	}
 }
 
+/// Performs the dense loss operation.
 const fn dense_loss(loss: DenseLoss) -> &'static str {
 	match loss {
 		DenseLoss::BinaryCrossEntropy => "binary-cross-entropy-with-logits",
@@ -10995,6 +11243,7 @@ const fn dense_loss(loss: DenseLoss) -> &'static str {
 	}
 }
 
+/// Performs the learning rate decay operation.
 const fn learning_rate_decay(decay: LearningRateDecay) -> &'static str {
 	match decay {
 		LearningRateDecay::Constant => "constant",
@@ -11004,6 +11253,7 @@ const fn learning_rate_decay(decay: LearningRateDecay) -> &'static str {
 	}
 }
 
+/// Performs the loop iterations text operation.
 fn loop_iterations_text(iterations: LoopIterations) -> String {
 	iterations
 		.finite()
@@ -11011,7 +11261,9 @@ fn loop_iterations_text(iterations: LoopIterations) -> String {
 }
 
 #[derive(Debug, Default)]
+/// Internal representation of `CountingWriter`.
 struct CountingWriter {
+	/// Bytes associated with this value.
 	bytes: u64,
 }
 
@@ -11030,6 +11282,7 @@ impl Write for CountingWriter {
 	}
 }
 
+/// Performs the atomic save operation.
 pub(crate) fn atomic_save(
 	target: &Path,
 	encoded_bytes: u64,
@@ -11077,6 +11330,7 @@ pub(crate) fn atomic_save(
 		.map_err(|error| CheckpointError::io("sync checkpoint parent", parent, error))
 }
 
+/// Performs the normalized parent operation.
 fn normalized_parent(target: &Path) -> CheckpointResult<&Path> {
 	if target.as_os_str().is_empty() || target.file_name().is_none() {
 		return Err(CheckpointError::invalid_target(
@@ -11092,6 +11346,7 @@ fn normalized_parent(target: &Path) -> CheckpointResult<&Path> {
 	})
 }
 
+/// Validates the target.
 fn validate_target(target: &Path, parent: &Path) -> CheckpointResult<()> {
 	let parent_metadata =
 		fs::metadata(parent).map_err(|error| CheckpointError::io("inspect checkpoint parent", parent, error))?;
@@ -11120,6 +11375,7 @@ fn validate_target(target: &Path, parent: &Path) -> CheckpointResult<()> {
 	}
 }
 
+/// Performs the allocation bytes operation.
 fn allocation_bytes(encoded_bytes: u64, fragment_bytes: u64) -> CheckpointResult<u64> {
 	if fragment_bytes == 0 {
 		return Err(CheckpointError::manifest(
@@ -11138,6 +11394,7 @@ fn allocation_bytes(encoded_bytes: u64, fragment_bytes: u64) -> CheckpointResult
 		.ok_or_else(|| CheckpointError::manifest("checkpoint allocation size overflowed"))
 }
 
+/// Performs the require capacity operation.
 fn require_capacity(
 	target: &Path,
 	available_fragments: u64,
@@ -11162,6 +11419,7 @@ fn require_capacity(
 	Ok(())
 }
 
+/// Creates the private temporary.
 fn create_private_temporary(target: &Path, parent: &Path) -> CheckpointResult<(File, TemporaryGuard)> {
 	let filename = target
 		.file_name()
@@ -11204,8 +11462,11 @@ fn create_private_temporary(target: &Path, parent: &Path) -> CheckpointResult<(F
 }
 
 #[derive(Debug)]
+/// Internal representation of `TemporaryGuard`.
 struct TemporaryGuard {
+	/// Path associated with this value.
 	path: PathBuf,
+	/// Armed associated with this value.
 	armed: bool,
 }
 

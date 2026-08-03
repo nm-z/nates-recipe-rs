@@ -43,6 +43,7 @@ use crate::{
 };
 
 #[path = "gguf_llama.rs"]
+/// The `mod` variant.
 mod gguf_llama;
 
 pub use gguf_llama::{
@@ -51,7 +52,9 @@ pub use gguf_llama::{
 	prepare_gguf_llama_inference_table,
 };
 
+/// MATERIALIZATION RESERVATION.
 const MATERIALIZATION_RESERVATION: u64 = 64;
+/// WORKSPACE LIMIT.
 const WORKSPACE_LIMIT: ByteCount = ByteCount::new(u64::MAX);
 
 /// Failure to load a checkpoint or prepare schema-bound inference features.
@@ -167,7 +170,9 @@ pub enum InferenceCompileErrorKind {
 /// target-free inference calculation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceCompileError {
+	/// Kind associated with this value.
 	kind: InferenceCompileErrorKind,
+	/// Detail associated with this value.
 	detail: String,
 }
 
@@ -184,6 +189,7 @@ impl InferenceCompileError {
 		&self.detail
 	}
 
+	/// Constructs a new value.
 	pub(crate) fn new(kind: InferenceCompileErrorKind, detail: impl Into<String>) -> Self {
 		Self {
 			kind,
@@ -231,30 +237,48 @@ impl From<recipe_program::ProgramError> for InferenceCompileError {
 
 pub type InferenceCompileResult<T> = Result<T, InferenceCompileError>;
 
+/// Internal representation of `BlockInferenceContext`.
 pub(crate) struct BlockInferenceContext<'a> {
+	/// Input associated with this value.
 	pub input: ValueId,
+	/// Rows associated with this value.
 	pub rows: u64,
+	/// Width associated with this value.
 	pub width: u64,
+	/// Logical length associated with this value.
 	pub logical_length: u64,
+	/// Logical channels associated with this value.
 	pub logical_channels: u64,
+	/// Zero-based block index.
 	pub block_index: usize,
+	/// Zero-based layer index.
 	pub layer_index: &'a mut usize,
+	/// Normalization epsilon associated with this value.
 	pub normalization_epsilon: f32,
+	/// Tree lanes associated with this value.
 	pub tree_lanes: u32,
 }
 
+/// Internal representation of `BlockInference`.
 pub(crate) struct BlockInference {
+	/// Output associated with this value.
 	pub output: ValueId,
+	/// Width associated with this value.
 	pub width: u64,
+	/// Logical length associated with this value.
 	pub logical_length: u64,
+	/// Logical channels associated with this value.
 	pub logical_channels: u64,
 }
 
+/// Operations required by `InferenceBlock`.
 pub(crate) trait InferenceBlock {
+	/// Performs the token vocabulary operation.
 	fn token_vocabulary(&self) -> Option<u64> {
 		None
 	}
 
+	/// Compiles the inference.
 	fn compile_inference(
 		&self,
 		compiler: &mut InferenceGraphCompiler,
@@ -262,6 +286,7 @@ pub(crate) trait InferenceBlock {
 	) -> InferenceCompileResult<BlockInference>;
 }
 
+/// Performs the inference block operation.
 fn inference_block(block: &crate::CheckpointBlockImage) -> &dyn InferenceBlock {
 	match block {
 		crate::CheckpointBlockImage::Embedding(block) => block,
@@ -473,10 +498,15 @@ pub enum InferenceInputRole {
 /// One typed external input and the exact bytes copied to its device value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceExternalInput {
+	/// Role associated with this value.
 	role: InferenceInputRole,
+	/// Value associated with this value.
 	value: ValueId,
+	/// Dtype associated with this value.
 	dtype: DType,
+	/// Shape associated with this value.
 	shape: Shape,
+	/// Bytes associated with this value.
 	bytes: Vec<u8>,
 }
 
@@ -539,10 +569,15 @@ pub enum InferenceTask {
 /// Exact tensor contract for the one public inference prediction output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceOutputContract {
+	/// Value associated with this value.
 	value: ValueId,
+	/// Dtype associated with this value.
 	dtype: DType,
+	/// Target dtypes associated with this value.
 	target_dtypes: Vec<DType>,
+	/// Shape associated with this value.
 	shape: Shape,
+	/// Kind associated with this value.
 	kind: InferencePredictionKind,
 }
 
@@ -591,11 +626,17 @@ impl InferenceOutputContract {
 /// One deterministic, target-free, single-iteration inference program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompiledInference {
+	/// Program associated with this value.
 	program: StaticCalculationProgram,
+	/// External inputs associated with this value.
 	external_inputs: Vec<InferenceExternalInput>,
+	/// Output associated with this value.
 	output: InferenceOutputContract,
+	/// Rows associated with this value.
 	rows: u64,
+	/// Task associated with this value.
 	task: InferenceTask,
+	/// Output adapter associated with this value.
 	output_adapter: Option<DenseOutputAdapter>,
 }
 
@@ -653,14 +694,20 @@ pub enum KnnInferencePredictionKind {
 /// Exact tensor and source-target identity for one KNN prediction output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KnnInferenceOutputContract {
+	/// Value associated with this value.
 	value: ValueId,
+	/// Dtype associated with this value.
 	dtype: DType,
+	/// Shape associated with this value.
 	shape: Shape,
+	/// Source vector associated with this value.
 	source_vector: usize,
+	/// Kind associated with this value.
 	kind: KnnInferencePredictionKind,
 }
 
 impl KnnInferenceOutputContract {
+	/// Constructs a new value.
 	pub(crate) fn new(
 		value: ValueId,
 		dtype: DType,
@@ -712,9 +759,13 @@ impl KnnInferenceOutputContract {
 /// declared target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompiledKnnInference {
+	/// Program associated with this value.
 	program: StaticCalculationProgram,
+	/// External inputs associated with this value.
 	external_inputs: Vec<InferenceExternalInput>,
+	/// Outputs associated with this value.
 	outputs: Vec<KnnInferenceOutputContract>,
+	/// Rows associated with this value.
 	rows: u64,
 }
 
@@ -753,14 +804,18 @@ impl CompiledKnnInference {
 /// A decoded KNN model and target-free rows bound to its saved feature schema.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedKnnInference {
+	/// Artifact associated with this value.
 	artifact: KnnModelArtifact,
+	/// Data associated with this value.
 	data: PreparedInferenceDataset,
 }
 
 /// One observed categorical Bayesian model bound to target-free query rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedBayesInference {
+	/// Artifact associated with this value.
 	artifact: BayesModelArtifact,
+	/// Data associated with this value.
 	data: PreparedInferenceDataset,
 }
 
@@ -811,7 +866,9 @@ impl PreparedKnnInference {
 /// has been performed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedInference {
+	/// Checkpoint associated with this value.
 	checkpoint: CheckpointArtifact,
+	/// Data associated with this value.
 	data: PreparedInferenceDataset,
 }
 
@@ -1293,6 +1350,7 @@ pub fn compile_prepared_bayes_inference(
 	)
 }
 
+/// Compiles the bayes conditional.
 fn compile_bayes_conditional(
 	compiler: &mut InferenceGraphCompiler,
 	data: &PreparedInferenceDataset,
@@ -1493,6 +1551,7 @@ fn compile_bayes_conditional(
 	Ok(probabilities)
 }
 
+/// Performs the concatenate bayes probabilities operation.
 fn concatenate_bayes_probabilities(
 	compiler: &mut InferenceGraphCompiler,
 	probabilities: Vec<(ValueId, u64)>,
@@ -1618,6 +1677,7 @@ fn concatenate_bayes_probabilities(
 	Ok(combined)
 }
 
+/// Performs the bayes request input operation.
 fn bayes_request_input(compiler: &InferenceGraphCompiler, value: ValueId) -> InferenceCompileResult<Tensor> {
 	let mut tensor = compiler.tensor_ref(value)?.clone();
 	tensor.external_input = true;
@@ -1625,6 +1685,7 @@ fn bayes_request_input(compiler: &InferenceGraphCompiler, value: ValueId) -> Inf
 	Ok(tensor)
 }
 
+/// Performs the bayes request output operation.
 fn bayes_request_output(compiler: &InferenceGraphCompiler, value: ValueId) -> InferenceCompileResult<Tensor> {
 	let mut tensor = compiler.tensor_ref(value)?.clone();
 	tensor.external_input = false;
@@ -1842,6 +1903,7 @@ pub fn compile_prepared_knn_inference(prepared: &PreparedKnnInference) -> Infere
 	})
 }
 
+/// Performs the knn request input operation.
 fn knn_request_input(compiler: &InferenceGraphCompiler, value: ValueId) -> InferenceCompileResult<Tensor> {
 	let mut tensor = compiler.tensor_ref(value)?.clone();
 	tensor.external_input = true;
@@ -1849,6 +1911,7 @@ fn knn_request_input(compiler: &InferenceGraphCompiler, value: ValueId) -> Infer
 	Ok(tensor)
 }
 
+/// Performs the knn request output operation.
 fn knn_request_output(compiler: &InferenceGraphCompiler, value: ValueId) -> InferenceCompileResult<Tensor> {
 	let mut tensor = compiler.tensor_ref(value)?.clone();
 	tensor.external_input = false;
@@ -1857,13 +1920,21 @@ fn knn_request_output(compiler: &InferenceGraphCompiler, value: ValueId) -> Infe
 }
 
 #[derive(Debug)]
+/// Internal representation of `InferenceGraphCompiler`.
 pub(crate) struct InferenceGraphCompiler {
+	/// Tensors associated with this value.
 	tensors: BTreeMap<ValueId, Tensor>,
+	/// Nodes associated with this value.
 	nodes: Vec<CalculationNode>,
+	/// Domains associated with this value.
 	domains: Vec<KernelIterationDomain>,
+	/// Next value associated with this value.
 	next_value: u64,
+	/// Next kernel associated with this value.
 	next_kernel: u64,
+	/// External inputs associated with this value.
 	external_inputs: Vec<InferenceExternalInput>,
+	/// External input ids associated with this value.
 	external_input_ids: BTreeSet<ValueId>,
 }
 
@@ -1916,6 +1987,7 @@ impl RecurrentForwardGraph for InferenceGraphCompiler {
 }
 
 impl InferenceGraphCompiler {
+	/// Constructs a new value.
 	fn new() -> Self {
 		Self {
 			tensors: BTreeMap::new(),
@@ -1928,6 +2000,7 @@ impl InferenceGraphCompiler {
 		}
 	}
 
+	/// Performs the tensor operation.
 	fn tensor(&mut self, dtype: DType, shape: Shape) -> InferenceCompileResult<ValueId> {
 		let value = self.next_value()?;
 		let tensor = Tensor::contiguous(value, dtype, shape, false, false)?;
@@ -1935,6 +2008,7 @@ impl InferenceGraphCompiler {
 		Ok(value)
 	}
 
+	/// Performs the external operation.
 	fn external(
 		&mut self,
 		role: InferenceInputRole,
@@ -1964,6 +2038,7 @@ impl InferenceGraphCompiler {
 		Ok(value)
 	}
 
+	/// Performs the external checkpoint tensor operation.
 	fn external_checkpoint_tensor(
 		&mut self,
 		role: InferenceInputRole,
@@ -1977,18 +2052,21 @@ impl InferenceGraphCompiler {
 		)
 	}
 
+	/// Performs the next value operation.
 	fn next_value(&mut self) -> InferenceCompileResult<ValueId> {
 		let value = self.next_value;
 		self.next_value = value.checked_add(1).ok_or_else(identity_exhausted)?;
 		Ok(ValueId::new(value))
 	}
 
+	/// Performs the next kernel operation.
 	fn next_kernel(&mut self) -> InferenceCompileResult<KernelTemplateId> {
 		let kernel = self.next_kernel;
 		self.next_kernel = kernel.checked_add(1).ok_or_else(identity_exhausted)?;
 		Ok(KernelTemplateId::new(kernel))
 	}
 
+	/// Performs the tensor ref operation.
 	fn tensor_ref(&self, value: ValueId) -> InferenceCompileResult<&Tensor> {
 		self.tensors.get(&value).ok_or_else(|| {
 			InferenceCompileError::new(
@@ -1998,6 +2076,7 @@ impl InferenceGraphCompiler {
 		})
 	}
 
+	/// Performs the emit operation.
 	fn emit(
 		&mut self,
 		inputs: Vec<ValueId>,
@@ -2022,6 +2101,7 @@ impl InferenceGraphCompiler {
 		Ok(id)
 	}
 
+	/// Performs the emit elementwise operation.
 	fn emit_elementwise(
 		&mut self,
 		inputs: Vec<ValueId>,
@@ -2037,6 +2117,7 @@ impl InferenceGraphCompiler {
 		)
 	}
 
+	/// Performs the emit owned scalar operation.
 	fn emit_owned_scalar(
 		&mut self,
 		symbol: &str,
@@ -2048,6 +2129,7 @@ impl InferenceGraphCompiler {
 		self.emit_elementwise(inputs, outputs, program)
 	}
 
+	/// Performs the reduce operation.
 	fn reduce(
 		&mut self,
 		input: ValueId,
@@ -2072,6 +2154,7 @@ impl InferenceGraphCompiler {
 		Ok(())
 	}
 
+	/// Performs the materialize operation.
 	fn materialize(
 		&mut self,
 		symbol: &str,
@@ -2143,6 +2226,7 @@ impl InferenceGraphCompiler {
 		Ok(())
 	}
 
+	/// Inserts the tensor contract.
 	fn insert_tensor_contract(&mut self, mut tensor: Tensor) -> InferenceCompileResult<()> {
 		tensor.external_input = false;
 		tensor.external_output = false;
@@ -2169,6 +2253,7 @@ impl InferenceGraphCompiler {
 		}
 	}
 
+	/// Compiles the features.
 	fn compile_features(
 		&mut self,
 		data: &PreparedInferenceDataset,
@@ -2292,6 +2377,7 @@ impl InferenceGraphCompiler {
 		Ok(dense)
 	}
 
+	/// Compiles the token features.
 	fn compile_token_features(
 		&mut self,
 		data: &PreparedInferenceDataset,
@@ -2390,6 +2476,7 @@ impl InferenceGraphCompiler {
 		Ok(dense)
 	}
 
+	/// Performs the zero f32 operation.
 	fn zero_f32(&mut self, output_shape: Shape) -> InferenceCompileResult<ValueId> {
 		let seed = self.tensor(DType::I32, output_shape.clone())?;
 		self.emit(
@@ -2408,6 +2495,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the zero i32 operation.
 	fn zero_i32(&mut self, output_shape: Shape) -> InferenceCompileResult<ValueId> {
 		let output = self.tensor(DType::I32, output_shape)?;
 		self.emit(
@@ -2424,6 +2512,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the one hot operation.
 	fn one_hot(&mut self, labels: ValueId, rows: u64, classes: u64) -> InferenceCompileResult<ValueId> {
 		let classes_i32 = checked_i32(classes, "categorical one-hot width")?;
 		let row_shape = shape(&[rows])?;
@@ -2468,6 +2557,7 @@ impl InferenceGraphCompiler {
 		Ok(encoded)
 	}
 
+	/// Performs the scatter feature block operation.
 	fn scatter_feature_block(
 		&mut self,
 		base: ValueId,
@@ -2521,6 +2611,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the scatter i32 feature block operation.
 	fn scatter_i32_feature_block(
 		&mut self,
 		base: ValueId,
@@ -2554,6 +2645,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Applies the data normalization.
 	fn apply_data_normalization(
 		&mut self,
 		checkpoint: &CheckpointArtifact,
@@ -2649,6 +2741,7 @@ impl InferenceGraphCompiler {
 		}
 	}
 
+	/// Performs the normalize knn features operation.
 	fn normalize_knn_features(
 		&mut self,
 		values: [ValueId; 2],
@@ -2765,6 +2858,7 @@ impl InferenceGraphCompiler {
 		}
 	}
 
+	/// Applies the knn z score.
 	fn apply_knn_z_score(
 		&mut self,
 		values: [ValueId; 3],
@@ -2787,6 +2881,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Applies the knn min max.
 	fn apply_knn_min_max(
 		&mut self,
 		values: [ValueId; 3],
@@ -2809,6 +2904,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Applies the knn l2.
 	fn apply_knn_l2(
 		&mut self,
 		input: ValueId,
@@ -2851,6 +2947,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Compiles the embedding.
 	pub(crate) fn compile_embedding(
 		&mut self,
 		block_index: usize,
@@ -2927,6 +3024,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Compiles the attention.
 	pub(crate) fn compile_attention(
 		&mut self,
 		block_index: usize,
@@ -3073,6 +3171,7 @@ impl InferenceGraphCompiler {
 		self.reinterpret_f32(output, shape(&[rows, expected_width])?)
 	}
 
+	/// Compiles the rnn.
 	pub(crate) fn compile_rnn(
 		&mut self,
 		block_index: usize,
@@ -3135,6 +3234,7 @@ impl InferenceGraphCompiler {
 		.0)
 	}
 
+	/// Compiles the gru.
 	pub(crate) fn compile_gru(
 		&mut self,
 		block_index: usize,
@@ -3252,6 +3352,7 @@ impl InferenceGraphCompiler {
 		.0)
 	}
 
+	/// Compiles the lstm.
 	pub(crate) fn compile_lstm(
 		&mut self,
 		block_index: usize,
@@ -3398,6 +3499,7 @@ impl InferenceGraphCompiler {
 		.0)
 	}
 
+	/// Performs the gather matrix column operation.
 	fn gather_matrix_column(
 		&mut self,
 		matrix: ValueId,
@@ -3437,6 +3539,7 @@ impl InferenceGraphCompiler {
 		Ok(gathered)
 	}
 
+	/// Performs the attention projection operation.
 	fn attention_projection(
 		&mut self,
 		input: ValueId,
@@ -3458,6 +3561,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Compiles the layer.
 	pub(crate) fn compile_layer(
 		&mut self,
 		layer_index: usize,
@@ -3535,6 +3639,7 @@ impl InferenceGraphCompiler {
 		Ok(current)
 	}
 
+	/// Compiles the convolution.
 	pub(crate) fn compile_convolution(
 		&mut self,
 		block_index: usize,
@@ -3672,6 +3777,7 @@ impl InferenceGraphCompiler {
 		Ok(current)
 	}
 
+	/// Compiles the pool.
 	pub(crate) fn compile_pool(
 		&mut self,
 		block_index: usize,
@@ -3767,6 +3873,7 @@ impl InferenceGraphCompiler {
 		)
 	}
 
+	/// Compiles the kmeans.
 	pub(crate) fn compile_kmeans(
 		&mut self,
 		block_index: usize,
@@ -3820,6 +3927,7 @@ impl InferenceGraphCompiler {
 		Ok(distances)
 	}
 
+	/// Compiles the tree.
 	pub(crate) fn compile_tree(
 		&mut self,
 		block_index: usize,
@@ -3914,6 +4022,7 @@ impl InferenceGraphCompiler {
 		Ok(predictions)
 	}
 
+	/// Compiles the residual.
 	pub(crate) fn compile_residual(
 		&mut self,
 		residual: &crate::CheckpointResidualImage,
@@ -4066,6 +4175,7 @@ impl InferenceGraphCompiler {
 		Ok(current)
 	}
 
+	/// Applies the saved operation.
 	fn apply_saved_operation(
 		&mut self,
 		input: ValueId,
@@ -4091,6 +4201,7 @@ impl InferenceGraphCompiler {
 		}
 	}
 
+	/// Performs the external i32 operation.
 	fn external_i32(
 		&mut self,
 		role: InferenceInputRole,
@@ -4107,6 +4218,7 @@ impl InferenceGraphCompiler {
 		)
 	}
 
+	/// Performs the identity indices operation.
 	fn identity_indices(&mut self, output_shape: Shape) -> InferenceCompileResult<ValueId> {
 		let indices = self.tensor(DType::I32, output_shape)?;
 		self.emit(
@@ -4123,6 +4235,7 @@ impl InferenceGraphCompiler {
 		Ok(indices)
 	}
 
+	/// Performs the pack contiguous f32 to flat operation.
 	fn pack_contiguous_f32_to_flat(&mut self, input: ValueId) -> InferenceCompileResult<ValueId> {
 		let contract = self.tensor_ref(input)?.clone();
 		if contract.dtype != DType::F32 {
@@ -4152,6 +4265,7 @@ impl InferenceGraphCompiler {
 		Ok(flat)
 	}
 
+	/// Performs the reinterpret f32 operation.
 	fn reinterpret_f32(&mut self, input: ValueId, output_shape: Shape) -> InferenceCompileResult<ValueId> {
 		let flat = self.pack_contiguous_f32_to_flat(input)?;
 		if self.tensor_ref(flat)?.shape.elements() != output_shape.elements() {
@@ -4174,6 +4288,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the head major to sequence operation.
 	fn head_major_to_sequence(
 		&mut self,
 		input: ValueId,
@@ -4210,6 +4325,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the causal softmax operation.
 	fn causal_softmax(
 		&mut self,
 		scores: ValueId,
@@ -4249,6 +4365,7 @@ impl InferenceGraphCompiler {
 		self.reinterpret_f32(softmax, shape(&[rows, heads, sequence, sequence])?)
 	}
 
+	/// Performs the pack matrix to flat operation.
 	fn pack_matrix_to_flat(&mut self, input: ValueId, rows: u64, width: u64) -> InferenceCompileResult<ValueId> {
 		self.require_tensor(input, DType::F32, &[rows, width], "pool matrix pack input")?;
 		let elements = rows.checked_mul(width).ok_or_else(|| {
@@ -4273,6 +4390,7 @@ impl InferenceGraphCompiler {
 		Ok(flat)
 	}
 
+	/// Performs the pack i32 matrix to flat operation.
 	fn pack_i32_matrix_to_flat(&mut self, input: ValueId, rows: u64, width: u64) -> InferenceCompileResult<ValueId> {
 		self.require_tensor(input, DType::I32, &[rows, width], "int32 matrix pack input")?;
 		let elements = rows.checked_mul(width).ok_or_else(|| {
@@ -4297,6 +4415,7 @@ impl InferenceGraphCompiler {
 		Ok(flat)
 	}
 
+	/// Performs the unpack pool to matrix operation.
 	fn unpack_pool_to_matrix(
 		&mut self,
 		pooled: ValueId,
@@ -4333,6 +4452,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the bias free linear operation.
 	fn bias_free_linear(
 		&mut self,
 		input: ValueId,
@@ -4353,6 +4473,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the exact add operation.
 	fn exact_add(&mut self, left: ValueId, right: ValueId) -> InferenceCompileResult<ValueId> {
 		let left_tensor = self.tensor_ref(left)?;
 		let left_dtype = left_tensor.dtype;
@@ -4369,6 +4490,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Performs the require tensor operation.
 	fn require_tensor(
 		&self,
 		value: ValueId,
@@ -4390,6 +4512,7 @@ impl InferenceGraphCompiler {
 		Ok(())
 	}
 
+	/// Applies the activation.
 	fn apply_activation(
 		&mut self,
 		input: ValueId,
@@ -4432,6 +4555,7 @@ impl InferenceGraphCompiler {
 		Ok(output)
 	}
 
+	/// Applies the model normalization.
 	fn apply_model_normalization(
 		&mut self,
 		input: ValueId,
@@ -4489,6 +4613,7 @@ impl InferenceGraphCompiler {
 		Ok(normalized)
 	}
 
+	/// Applies the temperature.
 	fn apply_temperature(
 		&mut self,
 		logits: ValueId,
@@ -4502,6 +4627,7 @@ impl InferenceGraphCompiler {
 		Ok(scaled)
 	}
 
+	/// Compiles the prediction.
 	fn compile_prediction(
 		&mut self,
 		values: ValueId,
@@ -4581,6 +4707,7 @@ impl InferenceGraphCompiler {
 		}
 	}
 
+	/// Performs the stable sigmoid operation.
 	fn stable_sigmoid(&mut self, logits: ValueId) -> InferenceCompileResult<ValueId> {
 		let output_shape = self.tensor_ref(logits)?.shape.clone();
 		let exponent_argument = self.tensor(DType::F32, output_shape.clone())?;
@@ -4604,6 +4731,7 @@ impl InferenceGraphCompiler {
 		Ok(probabilities)
 	}
 
+	/// Performs the stable softmax operation.
 	fn stable_softmax(
 		&mut self,
 		logits: ValueId,
@@ -4654,6 +4782,7 @@ impl InferenceGraphCompiler {
 		Ok(probabilities)
 	}
 
+	/// Performs the finish operation.
 	fn finish(
 		mut self,
 		prediction: ValueId,
@@ -4696,6 +4825,7 @@ impl InferenceGraphCompiler {
 	}
 }
 
+/// Performs the inference feature bytes operation.
 fn inference_feature_bytes(values: &PreparedInferenceValues) -> (DType, Vec<u8>) {
 	match values {
 		PreparedInferenceValues::I32(values) => (
@@ -4711,6 +4841,7 @@ fn inference_feature_bytes(values: &PreparedInferenceValues) -> (DType, Vec<u8>)
 	}
 }
 
+/// Validates the checkpoint parameter image.
 fn validate_checkpoint_parameter_image(
 	image: &CheckpointTensorImage,
 	expected_shape: &[u64],
@@ -4748,10 +4879,12 @@ fn validate_checkpoint_parameter_image(
 	Ok(())
 }
 
+/// Performs the shape operation.
 fn shape(extents: &[u64]) -> InferenceCompileResult<Shape> {
 	Ok(Shape::new(extents.to_vec())?)
 }
 
+/// Performs the checked product operation.
 fn checked_product(values: &[u64], name: &str) -> InferenceCompileResult<u64> {
 	values.iter().copied().try_fold(1u64, |product, value| {
 		product.checked_mul(value).ok_or_else(|| {
@@ -4763,6 +4896,7 @@ fn checked_product(values: &[u64], name: &str) -> InferenceCompileResult<u64> {
 	})
 }
 
+/// Performs the checked i32 operation.
 fn checked_i32(value: u64, name: &str) -> InferenceCompileResult<i32> {
 	i32::try_from(value).map_err(|error| {
 		InferenceCompileError::new(
@@ -4772,6 +4906,7 @@ fn checked_i32(value: u64, name: &str) -> InferenceCompileResult<i32> {
 	})
 }
 
+/// Performs the require i32 indexable operation.
 fn require_i32_indexable(value: u64, name: &str) -> InferenceCompileResult<()> {
 	if value == 0 || value > i32::MAX as u64 {
 		return Err(InferenceCompileError::new(
@@ -4782,6 +4917,7 @@ fn require_i32_indexable(value: u64, name: &str) -> InferenceCompileResult<()> {
 	Ok(())
 }
 
+/// Performs the identity exhausted operation.
 pub(crate) fn identity_exhausted() -> InferenceCompileError {
 	InferenceCompileError::new(
 		InferenceCompileErrorKind::IdentityExhausted,
@@ -4789,6 +4925,7 @@ pub(crate) fn identity_exhausted() -> InferenceCompileError {
 	)
 }
 
+/// Performs the zero f32 program operation.
 fn zero_f32_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let _seed = builder.input(DType::I32)?;
@@ -4796,6 +4933,7 @@ fn zero_f32_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
 	Ok(builder.finish(&[zero])?)
 }
 
+/// Performs the checked i32 to f32 program operation.
 fn checked_i32_to_f32_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let input = builder.input(DType::I32)?;
@@ -4809,6 +4947,7 @@ fn checked_i32_to_f32_program() -> InferenceCompileResult<recipe_core::ScalarPro
 	Ok(builder.finish(&[converted])?)
 }
 
+/// Performs the stable sigmoid exponent program operation.
 fn stable_sigmoid_exponent_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let logit = builder.input(DType::F32)?;
@@ -4817,6 +4956,7 @@ fn stable_sigmoid_exponent_program() -> InferenceCompileResult<recipe_core::Scal
 	Ok(builder.finish(&[exponent_argument])?)
 }
 
+/// Performs the stable sigmoid result program operation.
 fn stable_sigmoid_result_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let logit = builder.input(DType::F32)?;
@@ -4831,6 +4971,7 @@ fn stable_sigmoid_result_program() -> InferenceCompileResult<recipe_core::Scalar
 	Ok(builder.finish(&[probability])?)
 }
 
+/// Performs the softmax exponent input program operation.
 fn softmax_exponent_input_program() -> InferenceCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let shifted = builder.input(DType::F32)?;
@@ -4843,6 +4984,7 @@ fn softmax_exponent_input_program() -> InferenceCompileResult<recipe_core::Scala
 	Ok(builder.finish(&[exponent_input])?)
 }
 
+/// Performs the checked one hot update program operation.
 fn checked_one_hot_update_program(classes: i32) -> InferenceCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let label = builder.input(DType::I32)?;
@@ -4858,6 +5000,7 @@ fn checked_one_hot_update_program(classes: i32) -> InferenceCompileResult<recipe
 	Ok(builder.finish(&[destination, one])?)
 }
 
+/// Performs the feature destination program operation.
 fn feature_destination_program(
 	total_width: i32,
 	start: i32,
@@ -4876,10 +5019,12 @@ fn feature_destination_program(
 	Ok(builder.finish(&[destination])?)
 }
 
+/// Performs the saved feature schema operation.
 fn saved_feature_schema(checkpoint: &CheckpointArtifact) -> InferencePreparationResult<Vec<InferenceFeatureSchema>> {
 	saved_feature_schema_from_parts(checkpoint.vectors(), checkpoint.feature_spans())
 }
 
+/// Performs the saved feature schema from parts operation.
 fn saved_feature_schema_from_parts(
 	vectors: &[CheckpointArtifactVector],
 	spans: &[CompiledFeatureSpan],
@@ -4942,6 +5087,7 @@ fn saved_feature_schema_from_parts(
 		.collect()
 }
 
+/// Validates the prepared feature spans.
 fn validate_prepared_feature_spans(
 	prepared: &PreparedInferenceDataset,
 	spans: &[CompiledFeatureSpan],
@@ -5000,6 +5146,7 @@ fn validate_prepared_feature_spans(
 	Ok(())
 }
 
+/// Performs the inconsistent feature operation.
 fn inconsistent_feature(
 	feature: usize,
 	span: &CompiledFeatureSpan,

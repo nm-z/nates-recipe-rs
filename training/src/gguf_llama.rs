@@ -40,7 +40,9 @@ pub enum GgufLlamaErrorKind {
 /// Failure to decode or bind the supported dense-F32 `llama` GGUF instrument.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GgufLlamaError {
+	/// Kind associated with this value.
 	kind: GgufLlamaErrorKind,
+	/// Detail associated with this value.
 	detail: String,
 }
 
@@ -57,6 +59,7 @@ impl GgufLlamaError {
 		&self.detail
 	}
 
+	/// Constructs a new value.
 	fn new(kind: GgufLlamaErrorKind, detail: impl Into<String>) -> Self {
 		Self {
 			kind,
@@ -77,29 +80,47 @@ impl core::error::Error for GgufLlamaError {}
 pub type GgufLlamaResult<T> = Result<T, GgufLlamaError>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Internal representation of `GgufLlamaTensorImage`.
 struct GgufLlamaTensorImage {
+	/// Name associated with this value.
 	name: String,
+	/// Shape associated with this value.
 	shape: Vec<u64>,
+	/// Bytes associated with this value.
 	bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Internal representation of `GgufLlamaLinear`.
 struct GgufLlamaLinear {
+	/// Weight associated with this value.
 	weight: usize,
+	/// Bias associated with this value.
 	bias: Option<usize>,
+	/// Scale associated with this value.
 	scale: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Internal representation of `GgufLlamaBlock`.
 struct GgufLlamaBlock {
+	/// Attention norm associated with this value.
 	attention_norm: usize,
+	/// Query associated with this value.
 	query: GgufLlamaLinear,
+	/// Key associated with this value.
 	key: GgufLlamaLinear,
+	/// Value associated with this value.
 	value: GgufLlamaLinear,
+	/// Attention output associated with this value.
 	attention_output: GgufLlamaLinear,
+	/// Feed forward norm associated with this value.
 	feed_forward_norm: usize,
+	/// Feed forward gate associated with this value.
 	feed_forward_gate: GgufLlamaLinear,
+	/// Feed forward up associated with this value.
 	feed_forward_up: GgufLlamaLinear,
+	/// Feed forward down associated with this value.
 	feed_forward_down: GgufLlamaLinear,
 }
 
@@ -111,23 +132,41 @@ struct GgufLlamaBlock {
 /// fail closed instead of being interpreted as this graph.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GgufLlamaArtifact {
+	/// Vocabulary associated with this value.
 	vocabulary: u64,
+	/// Context length associated with this value.
 	context_length: u64,
+	/// Embedding length associated with this value.
 	embedding_length: u64,
+	/// Feed forward length associated with this value.
 	feed_forward_length: u64,
+	/// Heads associated with this value.
 	heads: u64,
+	/// Head dimension associated with this value.
 	head_dimension: u64,
+	/// Rms epsilon bits associated with this value.
 	rms_epsilon_bits: u32,
+	/// Rope base bits associated with this value.
 	rope_base_bits: u32,
+	/// Rope frequency scale bits associated with this value.
 	rope_frequency_scale_bits: u32,
+	/// Rope attention factor bits associated with this value.
 	rope_attention_factor_bits: u32,
+	/// Attention scale bits associated with this value.
 	attention_scale_bits: u32,
+	/// Clamp kqv bits associated with this value.
 	clamp_kqv_bits: u32,
+	/// Tensors associated with this value.
 	tensors: Vec<GgufLlamaTensorImage>,
+	/// Token embedding associated with this value.
 	token_embedding: usize,
+	/// Output norm associated with this value.
 	output_norm: usize,
+	/// Output associated with this value.
 	output: usize,
+	/// Rope factors associated with this value.
 	rope_factors: Option<usize>,
+	/// Blocks associated with this value.
 	blocks: Vec<GgufLlamaBlock>,
 }
 
@@ -162,10 +201,12 @@ impl GgufLlamaArtifact {
 		self.blocks.len()
 	}
 
+	/// Performs the tensor operation.
 	fn tensor(&self, index: usize) -> &GgufLlamaTensorImage {
 		&self.tensors[index]
 	}
 
+	/// Performs the execution tensor indices operation.
 	fn execution_tensor_indices(&self) -> BTreeSet<usize> {
 		let mut indices = BTreeSet::from([self.token_embedding, self.output_norm, self.output]);
 		for block in &self.blocks {
@@ -195,7 +236,9 @@ impl GgufLlamaArtifact {
 /// One exact token stream bound to one validated GGUF llama artifact.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedGgufLlamaInference {
+	/// Artifact associated with this value.
 	artifact: GgufLlamaArtifact,
+	/// Tokens associated with this value.
 	tokens: Vec<i32>,
 }
 
@@ -773,12 +816,17 @@ pub fn compile_prepared_gguf_llama_inference(
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Internal representation of `RopeInputs`.
 struct RopeInputs {
+	/// Partners associated with this value.
 	partners: ValueId,
+	/// Cosines associated with this value.
 	cosines: ValueId,
+	/// Signed sines associated with this value.
 	signed_sines: ValueId,
 }
 
+/// Prepares the rope inputs.
 fn prepare_rope_inputs(
 	compiler: &mut InferenceGraphCompiler,
 	artifact: &GgufLlamaArtifact,
@@ -873,6 +921,7 @@ fn prepare_rope_inputs(
 	})
 }
 
+/// Performs the causal attention operation.
 fn causal_attention(
 	compiler: &mut InferenceGraphCompiler,
 	artifact: &GgufLlamaArtifact,
@@ -933,6 +982,7 @@ fn causal_attention(
 	compiler.reinterpret_f32(context, shape(&[sequence, artifact.embedding_length])?)
 }
 
+/// Applies the rope.
 fn apply_rope(
 	compiler: &mut InferenceGraphCompiler,
 	artifact: &GgufLlamaArtifact,
@@ -995,6 +1045,7 @@ fn apply_rope(
 	)
 }
 
+/// Performs the linear operation.
 fn linear(
 	compiler: &mut InferenceGraphCompiler,
 	input: ValueId,
@@ -1050,6 +1101,7 @@ fn linear(
 	Ok(current)
 }
 
+/// Applies the optional scale.
 fn apply_optional_scale(
 	compiler: &mut InferenceGraphCompiler,
 	input: ValueId,
@@ -1067,6 +1119,7 @@ fn apply_optional_scale(
 	Ok(output)
 }
 
+/// Performs the rms norm operation.
 fn rms_norm(
 	compiler: &mut InferenceGraphCompiler,
 	input: ValueId,
@@ -1105,6 +1158,7 @@ fn rms_norm(
 	Ok(output)
 }
 
+/// Performs the symmetric clamp program operation.
 fn symmetric_clamp_program(limit: f32) -> InferenceCompileResult<recipe_core::ScalarProgram> {
 	let mut builder = ScalarProgramBuilder::new()?;
 	let value = builder.input(DType::F32)?;
@@ -1115,6 +1169,7 @@ fn symmetric_clamp_program(limit: f32) -> InferenceCompileResult<recipe_core::Sc
 	Ok(builder.finish(&[value])?)
 }
 
+/// Performs the tensor value operation.
 fn tensor_value(values: &BTreeMap<usize, ValueId>, index: usize) -> InferenceCompileResult<ValueId> {
 	values.get(&index).copied().ok_or_else(|| {
 		InferenceCompileError::new(
@@ -1124,13 +1179,18 @@ fn tensor_value(values: &BTreeMap<usize, ValueId>, index: usize) -> InferenceCom
 	})
 }
 
+/// Internal representation of `ArtifactTensorBuilder`.
 struct ArtifactTensorBuilder<'archive, 'data> {
+	/// Archive associated with this value.
 	archive: &'archive GgufArchive<'data>,
+	/// Images associated with this value.
 	images: Vec<GgufLlamaTensorImage>,
+	/// Consumed associated with this value.
 	consumed: BTreeSet<String>,
 }
 
 impl<'archive, 'data> ArtifactTensorBuilder<'archive, 'data> {
+	/// Constructs a new value.
 	fn new(archive: &'archive GgufArchive<'data>) -> Self {
 		Self {
 			archive,
@@ -1139,6 +1199,7 @@ impl<'archive, 'data> ArtifactTensorBuilder<'archive, 'data> {
 		}
 	}
 
+	/// Performs the required operation.
 	fn required(&mut self, name: &str, dimensions: &[u64]) -> GgufLlamaResult<usize> {
 		self.capture(name, dimensions)?.ok_or_else(|| {
 			GgufLlamaError::new(
@@ -1148,10 +1209,12 @@ impl<'archive, 'data> ArtifactTensorBuilder<'archive, 'data> {
 		})
 	}
 
+	/// Performs the optional operation.
 	fn optional(&mut self, name: &str, dimensions: &[u64]) -> GgufLlamaResult<Option<usize>> {
 		self.capture(name, dimensions)
 	}
 
+	/// Performs the ignore optional operation.
 	fn ignore_optional(&mut self, name: &str, dimensions: &[u64]) -> GgufLlamaResult<()> {
 		if self.archive.tensor(name).is_some() {
 			self.validate(name, dimensions)?;
@@ -1160,6 +1223,7 @@ impl<'archive, 'data> ArtifactTensorBuilder<'archive, 'data> {
 		Ok(())
 	}
 
+	/// Performs the linear operation.
 	fn linear(
 		&mut self,
 		prefix: &str,
@@ -1174,6 +1238,7 @@ impl<'archive, 'data> ArtifactTensorBuilder<'archive, 'data> {
 		})
 	}
 
+	/// Performs the capture operation.
 	fn capture(&mut self, name: &str, dimensions: &[u64]) -> GgufLlamaResult<Option<usize>> {
 		let Some(tensor) = self.archive.tensor(name) else {
 			return Ok(None);
@@ -1195,6 +1260,7 @@ impl<'archive, 'data> ArtifactTensorBuilder<'archive, 'data> {
 		Ok(Some(index))
 	}
 
+	/// Performs the validate operation.
 	fn validate(&self, name: &str, dimensions: &[u64]) -> GgufLlamaResult<()> {
 		let tensor = self
 			.archive
@@ -1213,6 +1279,7 @@ impl<'archive, 'data> ArtifactTensorBuilder<'archive, 'data> {
 		Ok(())
 	}
 
+	/// Performs the finish operation.
 	fn finish(self) -> GgufLlamaResult<Vec<GgufLlamaTensorImage>> {
 		if let Some(tensor) = self
 			.archive
@@ -1232,6 +1299,7 @@ impl<'archive, 'data> ArtifactTensorBuilder<'archive, 'data> {
 	}
 }
 
+/// Performs the metadata value operation.
 fn metadata_value<'archive, 'data>(
 	archive: &'archive GgufArchive<'data>,
 	key: &str,
@@ -1247,6 +1315,7 @@ fn metadata_value<'archive, 'data>(
 		})
 }
 
+/// Performs the metadata string operation.
 fn metadata_string<'archive, 'data>(archive: &'archive GgufArchive<'data>, key: &str) -> GgufLlamaResult<&'data str> {
 	match metadata_value(archive, key)? {
 		GgufMetadataValue::String(value) => Ok(value),
@@ -1254,6 +1323,7 @@ fn metadata_string<'archive, 'data>(archive: &'archive GgufArchive<'data>, key: 
 	}
 }
 
+/// Performs the metadata optional string operation.
 fn metadata_optional_string<'archive, 'data>(
 	archive: &'archive GgufArchive<'data>,
 	key: &str,
@@ -1265,6 +1335,7 @@ fn metadata_optional_string<'archive, 'data>(
 	}
 }
 
+/// Performs the metadata u32 operation.
 fn metadata_u32(archive: &GgufArchive<'_>, key: &str) -> GgufLlamaResult<u64> {
 	match metadata_value(archive, key)? {
 		GgufMetadataValue::U32(value) => Ok(u64::from(*value)),
@@ -1272,6 +1343,7 @@ fn metadata_u32(archive: &GgufArchive<'_>, key: &str) -> GgufLlamaResult<u64> {
 	}
 }
 
+/// Performs the metadata optional u32 operation.
 fn metadata_optional_u32(archive: &GgufArchive<'_>, key: &str) -> GgufLlamaResult<Option<u64>> {
 	match archive.metadata_entry(key).map(|entry| entry.value()) {
 		None => Ok(None),
@@ -1280,6 +1352,7 @@ fn metadata_optional_u32(archive: &GgufArchive<'_>, key: &str) -> GgufLlamaResul
 	}
 }
 
+/// Performs the metadata f32 operation.
 fn metadata_f32(archive: &GgufArchive<'_>, key: &str) -> GgufLlamaResult<f32> {
 	match metadata_value(archive, key)? {
 		GgufMetadataValue::F32Bits(bits) => Ok(f32::from_bits(*bits)),
@@ -1287,6 +1360,7 @@ fn metadata_f32(archive: &GgufArchive<'_>, key: &str) -> GgufLlamaResult<f32> {
 	}
 }
 
+/// Performs the metadata optional f32 operation.
 fn metadata_optional_f32(archive: &GgufArchive<'_>, key: &str) -> GgufLlamaResult<Option<f32>> {
 	match archive.metadata_entry(key).map(|entry| entry.value()) {
 		None => Ok(None),
@@ -1295,6 +1369,7 @@ fn metadata_optional_f32(archive: &GgufArchive<'_>, key: &str) -> GgufLlamaResul
 	}
 }
 
+/// Performs the metadata optional bool operation.
 fn metadata_optional_bool(archive: &GgufArchive<'_>, key: &str) -> GgufLlamaResult<Option<bool>> {
 	match archive.metadata_entry(key).map(|entry| entry.value()) {
 		None => Ok(None),
@@ -1303,6 +1378,7 @@ fn metadata_optional_bool(archive: &GgufArchive<'_>, key: &str) -> GgufLlamaResu
 	}
 }
 
+/// Performs the metadata type error operation.
 fn metadata_type_error(key: &str, expected: &str, value: &GgufMetadataValue<'_>) -> GgufLlamaError {
 	GgufLlamaError::new(
 		GgufLlamaErrorKind::InvalidMetadata,
@@ -1313,6 +1389,7 @@ fn metadata_type_error(key: &str, expected: &str, value: &GgufMetadataValue<'_>)
 	)
 }
 
+/// Performs the require zero swiglu clamps operation.
 fn require_zero_swiglu_clamps(archive: &GgufArchive<'_>, block_count: u64) -> GgufLlamaResult<()> {
 	let Some(entry) = archive.metadata_entry("llama.swiglu_clamp_shexp") else {
 		return Ok(());
@@ -1349,6 +1426,7 @@ fn require_zero_swiglu_clamps(archive: &GgufArchive<'_>, block_count: u64) -> Gg
 	Ok(())
 }
 
+/// Performs the to usize operation.
 fn to_usize(value: u64, role: &str) -> GgufLlamaResult<usize> {
 	usize::try_from(value).map_err(|error| {
 		GgufLlamaError::new(

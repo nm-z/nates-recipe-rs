@@ -31,6 +31,7 @@ pub struct TrainingCompileError {
 }
 
 impl TrainingCompileError {
+	/// Constructs a new value.
 	pub(crate) fn new(kind: TrainingCompileErrorKind, detail: impl Into<String>) -> Self {
 		Self {
 			kind,
