@@ -179,7 +179,16 @@ struct AdamwConfig {
 }
 
 macro_rules! hsa_kernels {
-	($($kernel:ident)+) => { #[derive(Clone, Copy)] enum Vendor { Amd, Nvidia } struct Hsa { status: i32, vendor: Vendor, api: [usize; 8], $($kernel: usize),+ } impl Hsa { const fn new(status: i32, vendor: Vendor, api: [usize; 8]) -> Self { Self { status, vendor, api, $($kernel: 0),+ } } unsafe fn load_kernels(&mut self, module: *mut c_void) { let get = self.api[6]; let mut status = self.status; $(if status == 0 { let mut value = ptr::null_mut(); status = unsafe { address::<unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> i32>(get)(&mut value, module, concat!(stringify!($kernel), "\0").as_ptr().cast()) }; self.$kernel = value as usize; })+ self.status = status; } } };
+	($($kernel:ident)+) => {
+		#[derive(Clone, Copy)] enum Vendor { Amd, Nvidia } struct Hsa { status: i32, vendor: Vendor, api: [usize; 8], $($kernel: usize),+ }
+		impl Hsa {
+			const fn new(status: i32, vendor: Vendor, api: [usize; 8]) -> Self { Self { status, vendor, api, $($kernel: 0),+ } }
+			unsafe fn load_kernels(&mut self, module: *mut c_void) { let get = self.api[6]; let mut status = self.status; $(if status == 0 { let mut value = ptr::null_mut(); status = unsafe { address::<unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> i32>(get)(&mut value, module, concat!(stringify!($kernel), "\0").as_ptr().cast()) }; self.$kernel = value as usize; })+ self.status = status; }
+			unsafe fn allocate(&self, pointer: *mut *mut c_void, bytes: usize) -> i32 { unsafe { match self.vendor { Vendor::Amd => address::<unsafe extern "C" fn(*mut *mut c_void, usize) -> i32>(self.api[0])(pointer, bytes), Vendor::Nvidia => address::<unsafe extern "C" fn(*mut u64, usize) -> i32>(self.api[0])(pointer.cast(), bytes) } } } unsafe fn free(&self, pointer: *mut c_void) -> i32 { unsafe { match self.vendor { Vendor::Amd => address::<unsafe extern "C" fn(*mut c_void) -> i32>(self.api[1])(pointer), Vendor::Nvidia => address::<unsafe extern "C" fn(u64) -> i32>(self.api[1])(pointer as usize as u64) } } }
+			unsafe fn upload(&self, destination: *mut c_void, source: *const c_void, bytes: usize) -> i32 { unsafe { match self.vendor { Vendor::Amd => address::<unsafe extern "C" fn(*mut c_void, *const c_void, usize, i32) -> i32>(self.api[2])(destination, source, bytes, 1), Vendor::Nvidia => address::<unsafe extern "C" fn(u64, *const c_void, usize) -> i32>(self.api[2])(destination as usize as u64, source, bytes) } } } unsafe fn download(&self, destination: *mut c_void, source: *const c_void, bytes: usize) -> i32 { unsafe { match self.vendor { Vendor::Amd => address::<unsafe extern "C" fn(*mut c_void, *const c_void, usize, i32) -> i32>(self.api[3])(destination, source, bytes, 2), Vendor::Nvidia => address::<unsafe extern "C" fn(*mut c_void, u64, usize) -> i32>(self.api[3])(destination, source as usize as u64, bytes) } } }
+			unsafe fn synchronize(&self) -> i32 { unsafe { address::<unsafe extern "C" fn() -> i32>(self.api[4])() } } unsafe fn module_load(&self, module: *mut *mut c_void, path: *const c_char) -> i32 { unsafe { address::<unsafe extern "C" fn(*mut *mut c_void, *const c_char) -> i32>(self.api[5])(module, path) } } unsafe fn launch(&self, function: *mut c_void, grid: u32, block: u32, arguments: *mut *mut c_void) -> i32 { unsafe { address::<unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void, *mut *mut c_void, *mut *mut c_void) -> i32>(self.api[7])(function, grid, 1, 1, block, 1, 1, 0, ptr::null_mut(), arguments, ptr::null_mut()) } }
+		}
+	};
 }
 hsa_kernels! { forward_graph epoch_graph normalize affine initialize set_value metrics }
 static HSA: OnceLock<Hsa> = OnceLock::new();
@@ -252,54 +261,104 @@ struct DeviceData {
 	target_affine: [f64; 2],
 }
 
-#[rustfmt::skip]
-impl Drop for DeviceBuffer { fn drop(&mut self) { if let Some(runtime) = HSA.get() { unsafe { runtime.free(self.pointer); } } } }
+impl Drop for DeviceBuffer {
+	fn drop(&mut self) {
+		if let Some(runtime) = HSA.get() {
+			unsafe {
+				runtime.free(self.pointer);
+			}
+		}
+	}
+}
 
 #[link(name = "dl")]
-#[rustfmt::skip]
 unsafe extern "C" {
-    fn dlopen(name: *const c_char, flags: i32) -> *mut c_void; fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void; fn dlclose(handle: *mut c_void) -> i32;
+	fn dlopen(name: *const c_char, flags: i32) -> *mut c_void;
+	fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+	fn dlclose(handle: *mut c_void) -> i32;
 }
 
-#[rustfmt::skip]
-unsafe fn dynamic<F>(handle: *mut c_void, name: &[u8]) -> F { unsafe { std::mem::transmute_copy(&dlsym(handle, name.as_ptr().cast())) } }
-#[rustfmt::skip]
-unsafe fn address<F>(value: usize) -> F { unsafe { std::mem::transmute_copy(&value) } }
-#[rustfmt::skip]
-impl Hsa {
-    unsafe fn allocate(&self, pointer: *mut *mut c_void, bytes: usize) -> i32 { unsafe { match self.vendor { Vendor::Amd => address::<unsafe extern "C" fn(*mut *mut c_void, usize) -> i32>(self.api[0])(pointer, bytes), Vendor::Nvidia => address::<unsafe extern "C" fn(*mut u64, usize) -> i32>(self.api[0])(pointer.cast(), bytes) } } }
-    unsafe fn free(&self, pointer: *mut c_void) -> i32 { unsafe { match self.vendor { Vendor::Amd => std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void) -> i32>(self.api[1])(pointer), Vendor::Nvidia => std::mem::transmute::<usize, unsafe extern "C" fn(u64) -> i32>(self.api[1])(pointer as usize as u64) } } }
-    unsafe fn upload(&self, destination: *mut c_void, source: *const c_void, bytes: usize) -> i32 { unsafe { match self.vendor { Vendor::Amd => std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void, *const c_void, usize, i32) -> i32>(self.api[2])(destination, source, bytes, 1), Vendor::Nvidia => std::mem::transmute::<usize, unsafe extern "C" fn(u64, *const c_void, usize) -> i32>(self.api[2])(destination as usize as u64, source, bytes) } } }
-    unsafe fn download(&self, destination: *mut c_void, source: *const c_void, bytes: usize) -> i32 { unsafe { match self.vendor { Vendor::Amd => std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void, *const c_void, usize, i32) -> i32>(self.api[3])(destination, source, bytes, 2), Vendor::Nvidia => std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void, u64, usize) -> i32>(self.api[3])(destination, source as usize as u64, bytes) } } }
-    unsafe fn synchronize(&self) -> i32 { unsafe { std::mem::transmute::<usize, unsafe extern "C" fn() -> i32>(self.api[4])() } }
-    unsafe fn module_load(&self, module: *mut *mut c_void, path: *const c_char) -> i32 { unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*mut *mut c_void, *const c_char) -> i32>(self.api[5])(module, path) } }
-    unsafe fn launch(&self, function: *mut c_void, grid: u32, block: u32, arguments: *mut *mut c_void) -> i32 { unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void, *mut *mut c_void, *mut *mut c_void) -> i32>(self.api[7])(function, grid, 1, 1, block, 1, 1, 0, ptr::null_mut(), arguments, ptr::null_mut()) } }
+unsafe fn dynamic<F>(handle: *mut c_void, name: &[u8]) -> F {
+	unsafe { std::mem::transmute_copy(&dlsym(handle, name.as_ptr().cast())) }
+}
+unsafe fn address<F>(value: usize) -> F {
+	unsafe { std::mem::transmute_copy(&value) }
+}
+macro_rules! hsa_loader {
+	($($vendor:ident => $module:expr; [$($name:literal),+])+) => {
+		fn hsa() -> Result<&'static Hsa, RecipeError> {
+			let runtime = HSA.get_or_init(|| unsafe {
+				let mut handle = dlopen(b"libamdhip64.so\0".as_ptr().cast(), 2); let mut status = -1;
+				if !handle.is_null() { status = dynamic::<unsafe extern "C" fn(u32) -> i32>(handle, b"hipInit\0")(0); if status == 0 { status = dynamic::<unsafe extern "C" fn(i32) -> i32>(handle, b"hipSetDevice\0")(0); } }
+				let vendor = if status == 0 { Vendor::Amd } else { if !handle.is_null() { dlclose(handle); } handle = dlopen(b"libcuda.so.1\0".as_ptr().cast(), 2); if !handle.is_null() { status = dynamic::<unsafe extern "C" fn(u32) -> i32>(handle, b"cuInit\0")(0); let (mut device, mut context) = (0, ptr::null_mut()); if status == 0 { status = dynamic::<unsafe extern "C" fn(*mut i32, i32) -> i32>(handle, b"cuDeviceGet\0")(&mut device, 0); } if status == 0 { status = dynamic::<unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> i32>(handle, b"cuCtxCreate_v2\0")(&mut context, 0, device); } } Vendor::Nvidia };
+				let names: [&[u8]; 8] = match vendor { $(Vendor::$vendor => [$($name),+],)+ }; let api = names.map(|name| dlsym(handle, name.as_ptr().cast()) as usize); let mut runtime = Hsa::new(status, vendor, api); let mut module = ptr::null_mut();
+				if status == 0 { runtime.status = runtime.module_load(&mut module, match vendor { $(Vendor::$vendor => $module,)+ }.as_ptr().cast()); } runtime.load_kernels(module); runtime
+			});
+			if runtime.status == 0 { Ok(runtime) } else { Err(RecipeError::new(format!("GPU initialization failed with status {}", runtime.status))) }
+		}
+	};
+}
+hsa_loader! {
+	Amd => concat!(env!("RECIPE_HSA_CODE_OBJECT"), "\0"); [b"hipMalloc\0", b"hipFree\0", b"hipMemcpy\0", b"hipMemcpy\0", b"hipDeviceSynchronize\0", b"hipModuleLoad\0", b"hipModuleGetFunction\0", b"hipModuleLaunchKernel\0"]
+	Nvidia => concat!(env!("RECIPE_NV_MODULE"), "\0"); [b"cuMemAlloc_v2\0", b"cuMemFree_v2\0", b"cuMemcpyHtoD_v2\0", b"cuMemcpyDtoH_v2\0", b"cuCtxSynchronize\0", b"cuModuleLoad\0", b"cuModuleGetFunction\0", b"cuLaunchKernel\0"]
 }
 
-#[rustfmt::skip]
-fn hsa() -> Result<&'static Hsa, RecipeError> {
-    let runtime = HSA.get_or_init(|| unsafe {
-        let mut handle = dlopen(b"libamdhip64.so\0".as_ptr().cast(), 2); let mut status = -1;
-        if !handle.is_null() { status = dynamic::<unsafe extern "C" fn(u32) -> i32>(handle, b"hipInit\0")(0); if status == 0 { status = dynamic::<unsafe extern "C" fn(i32) -> i32>(handle, b"hipSetDevice\0")(0); } }
-        let vendor = if status == 0 { Vendor::Amd } else { if !handle.is_null() { dlclose(handle); } handle = dlopen(b"libcuda.so.1\0".as_ptr().cast(), 2); if !handle.is_null() { status = dynamic::<unsafe extern "C" fn(u32) -> i32>(handle, b"cuInit\0")(0); let (mut device, mut context) = (0, ptr::null_mut()); if status == 0 { status = dynamic::<unsafe extern "C" fn(*mut i32, i32) -> i32>(handle, b"cuDeviceGet\0")(&mut device, 0); } if status == 0 { status = dynamic::<unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> i32>(handle, b"cuCtxCreate_v2\0")(&mut context, 0, device); } } Vendor::Nvidia };
-        let names: [&[u8]; 8] = match vendor { Vendor::Amd => [b"hipMalloc\0", b"hipFree\0", b"hipMemcpy\0", b"hipMemcpy\0", b"hipDeviceSynchronize\0", b"hipModuleLoad\0", b"hipModuleGetFunction\0", b"hipModuleLaunchKernel\0"], Vendor::Nvidia => [b"cuMemAlloc_v2\0", b"cuMemFree_v2\0", b"cuMemcpyHtoD_v2\0", b"cuMemcpyDtoH_v2\0", b"cuCtxSynchronize\0", b"cuModuleLoad\0", b"cuModuleGetFunction\0", b"cuLaunchKernel\0"] };
-        let api = names.map(|name| dlsym(handle, name.as_ptr().cast()) as usize); let mut runtime = Hsa::new(status, vendor, api); let mut module = ptr::null_mut();
-        if status == 0 { runtime.status = runtime.module_load(&mut module, match vendor { Vendor::Amd => concat!(env!("RECIPE_HSA_CODE_OBJECT"), "\0"), Vendor::Nvidia => concat!(env!("RECIPE_NV_MODULE"), "\0") }.as_ptr().cast()); }
-        runtime.load_kernels(module);
-        runtime
-    }); if runtime.status == 0 { Ok(runtime) } else { Err(RecipeError::new(format!("GPU initialization failed with status {}", runtime.status))) }
+fn hsa_launch(
+	function: usize,
+	count: usize,
+	threads: u32,
+	arguments: &mut [*mut c_void],
+) -> Result<(), RecipeError> {
+	let runtime = hsa()?;
+	let grid = (count as u32).div_ceil(threads);
+	let status = unsafe {
+		runtime.launch(
+			function as *mut c_void,
+			grid,
+			threads,
+			arguments.as_mut_ptr(),
+		)
+	};
+	DeviceBuffer::status(status, "dispatch")
 }
 
-#[rustfmt::skip]
-fn hsa_launch(function: usize, count: usize, threads: u32, arguments: &mut [*mut c_void]) -> Result<(), RecipeError> {
-    let runtime = hsa()?; let grid = (count as u32).div_ceil(threads);
-    let status = unsafe { runtime.launch(function as *mut c_void, grid, threads, arguments.as_mut_ptr()) };
-    DeviceBuffer::status(status, "dispatch")
-}
-
-#[rustfmt::skip]
-fn gpu_normalize(values: &DeviceBuffer, reference: &DeviceBuffer, scales: &DeviceBuffer, rows: usize, width: usize, normalization: BlockNormalization, reverse: bool, threads: u32) -> Result<(), RecipeError> {
-    let runtime = hsa()?; let mode = if matches!(normalization, BlockNormalization::Batch) { 1 } else { 2 }; let groups = if mode == 1 { width } else { rows }; let (mut values, mut reference, mut scales) = (values.pointer, reference.pointer, scales.pointer); let (mut rows, mut width, mut mode, mut reverse, mut threads) = (rows as u32, width as u32, mode, i32::from(reverse), threads); let mut epsilon = configured_f64("RECIPE_NORMALIZATION_EPSILON", env!("RECIPE_NORMALIZATION_EPSILON"))?; let mut arguments = [&mut values as *mut _ as *mut c_void, &mut reference as *mut _ as *mut c_void, &mut scales as *mut _ as *mut c_void, &mut rows as *mut _ as *mut c_void, &mut width as *mut _ as *mut c_void, &mut mode as *mut _ as *mut c_void, &mut reverse as *mut _ as *mut c_void, &mut epsilon as *mut _ as *mut c_void, &mut threads as *mut _ as *mut c_void]; hsa_launch(runtime.normalize, groups, threads, &mut arguments)
+fn gpu_normalize(
+	values: &DeviceBuffer,
+	reference: &DeviceBuffer,
+	scales: &DeviceBuffer,
+	rows: usize,
+	width: usize,
+	normalization: BlockNormalization,
+	reverse: bool,
+	threads: u32,
+) -> Result<(), RecipeError> {
+	let runtime = hsa()?;
+	let mode = if matches!(normalization, BlockNormalization::Batch) {
+		1
+	} else {
+		2
+	};
+	let groups = if mode == 1 { width } else { rows };
+	let (mut values, mut reference, mut scales) =
+		(values.pointer, reference.pointer, scales.pointer);
+	let (mut rows, mut width, mut mode, mut reverse, mut threads) =
+		(rows as u32, width as u32, mode, i32::from(reverse), threads);
+	let mut epsilon = configured_f64(
+		"RECIPE_NORMALIZATION_EPSILON",
+		env!("RECIPE_NORMALIZATION_EPSILON"),
+	)?;
+	let mut arguments = [
+		&mut values as *mut _ as *mut c_void,
+		&mut reference as *mut _ as *mut c_void,
+		&mut scales as *mut _ as *mut c_void,
+		&mut rows as *mut _ as *mut c_void,
+		&mut width as *mut _ as *mut c_void,
+		&mut mode as *mut _ as *mut c_void,
+		&mut reverse as *mut _ as *mut c_void,
+		&mut epsilon as *mut _ as *mut c_void,
+		&mut threads as *mut _ as *mut c_void,
+	];
+	hsa_launch(runtime.normalize, groups, threads, &mut arguments)
 }
 
 #[rustfmt::skip]
