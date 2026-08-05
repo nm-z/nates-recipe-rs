@@ -32,12 +32,9 @@ impl DType {
 		matches!(self, Self::F32 | Self::F64)
 	}
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Value(usize);
-
 pub static recipe: Recipe = Recipe::new();
-
 pub struct Data {
 	sources: Vec<String>,
 	target: String,
@@ -47,25 +44,28 @@ pub struct Data {
 	prepared: OnceLock<Result<Prepared, RecipeError>>,
 	device: OnceLock<Result<DeviceData, RecipeError>>,
 }
+pub trait IntoDataSources {
+	fn into_data_sources(self) -> Vec<String>;
+}
+macro_rules! scalar_sources {
+	($($source:ty),+) => {$(impl IntoDataSources for $source {
+		fn into_data_sources(self) -> Vec<String> { vec![self.into()] }
+	})+};
+}
+scalar_sources!(&str, String);
+macro_rules! collection_sources {
+	($( [$($generic:tt)*] $source:ty),+) => {$(impl<$($generic)*> IntoDataSources for $source {
+		fn into_data_sources(self) -> Vec<String> { self.into_iter().map(Into::into).collect() }
+	})+};
+}
+collection_sources!([T: Into<String>, const N: usize] [T; N], [T: Into<String>] Vec<T>);
 
-#[rustfmt::skip]
-pub trait IntoDataSources { fn into_data_sources(self) -> Vec<String>; }
-#[rustfmt::skip]
-impl IntoDataSources for &str { fn into_data_sources(self) -> Vec<String> { vec![self.to_owned()] } }
-#[rustfmt::skip]
-impl IntoDataSources for String { fn into_data_sources(self) -> Vec<String> { vec![self] } }
-#[rustfmt::skip]
-impl<T: Into<String>, const N: usize> IntoDataSources for [T; N] { fn into_data_sources(self) -> Vec<String> { self.into_iter().map(Into::into).collect() } }
-#[rustfmt::skip]
-impl<T: Into<String>> IntoDataSources for Vec<T> { fn into_data_sources(self) -> Vec<String> { self.into_iter().map(Into::into).collect() } }
-
-#[rustfmt::skip]
 impl Data {
-    pub fn target(mut self, target: impl Into<String>) -> Self { self.target = target.into(); self }
-    pub fn exclude<const N: usize>(mut self, names: [&str; N]) -> Self { self.exclusions = names.into_iter().map(str::to_owned).collect(); self }
-    pub fn set(mut self, source: impl Into<String>) -> Self { self.sources.push(source.into()); self }
-    pub const fn norm(mut self, _: ZScore) -> Self { self.normalize = true; self }
-    pub const fn split(mut self, fraction: f64) -> Self { self.split = fraction; self }
+	pub fn target(mut self, target: impl Into<String>) -> Self { self.target = target.into(); self }
+	pub fn exclude(mut self, names: impl IntoDataSources) -> Self { self.exclusions = names.into_data_sources(); self }
+	pub fn set(mut self, source: impl Into<String>) -> Self { self.sources.push(source.into()); self }
+	pub const fn norm(mut self, _: ZScore) -> Self { self.normalize = true; self }
+	pub const fn split(mut self, fraction: f64) -> Self { self.split = fraction; self }
 }
 
 #[rustfmt::skip]
@@ -129,28 +129,28 @@ impl Model {
     pub const fn loss(mut self, loss: LossFunction) -> Self { self.loss = loss; self }
 
     fn graph(&self, features: usize) -> Result<TrainingGraph<'_>, RecipeError> {
-        let Some(Block { operation: OperationBlock::Layer(output), .. }) = self.blocks.last() else { return Err(RecipeError::new("training model must end with layer(1)")); };
-        if *output != 1 { return Err(RecipeError::new("training output layer must contain one neuron")); }
+        if self.blocks.is_empty() { return Err(RecipeError::new("training model must contain a block")); }
         let mut widths = vec![features];
         let mut offsets = Vec::with_capacity(self.blocks.len());
         let mut parameters = 0_usize;
-        for (stage, block) in self.blocks.iter().enumerate() {
+        for block in &self.blocks {
             let input = widths[widths.len() - 1];
             let output = match &block.operation {
-                OperationBlock::Layer(width) | OperationBlock::KMeans(width) | OperationBlock::Rnn(width) | OperationBlock::Gru(width) | OperationBlock::Lstm(width) | OperationBlock::Knn(width) | OperationBlock::Perceptron(width) => *width,
+                OperationBlock::Layer(width) | OperationBlock::KMeans(width) | OperationBlock::Rnn(width) | OperationBlock::Gru(width) | OperationBlock::Lstm(width) | OperationBlock::Perceptron(width) => *width,
                 OperationBlock::Conv(filters, kernel) => filters.saturating_mul(input.checked_sub(*kernel).map_or(0, |length| length + 1)),
                 OperationBlock::Pool(size) => input.div_ceil(*size),
                 OperationBlock::Embed(dimensions, _) => input.saturating_mul(*dimensions),
                 OperationBlock::Attention(_) => input,
-                OperationBlock::Forest(trees, _, depth) => trees.saturating_mul(*depth),
+                OperationBlock::Forest(..) | OperationBlock::Knn(_) => 1,
                 OperationBlock::Residual(parts) => parts.iter().filter_map(|part| if let Residual::Layer(width) = part { Some(*width) } else { None }).sum(),
             };
             if output == 0 { return Err(RecipeError::new("model block dimensions must be positive")); }
             offsets.push(parameters);
-			let recurrent = |width: usize, gates: usize| input.checked_mul(width).and_then(|a| width.checked_mul(width).and_then(|b| a.checked_add(b))).and_then(|value| value.checked_add(width)).and_then(|value| value.checked_mul(gates)); let block_parameters = match &block.operation { OperationBlock::Conv(filters, kernel) => filters.checked_mul(*kernel), OperationBlock::Pool(_) => Some(0), OperationBlock::KMeans(_) if stage == 0 => Some(0), OperationBlock::KMeans(_) => return Err(RecipeError::new("KMeans must be the first non-differentiable block")), OperationBlock::Embed(dimensions, vocabulary) if *vocabulary != 0 => dimensions.checked_mul(*vocabulary), OperationBlock::Attention(_) => return Err(RecipeError::new("attention requires genuine Q, K, V lowering")), OperationBlock::Rnn(width) => recurrent(*width, 1), OperationBlock::Gru(width) => recurrent(*width, 3), OperationBlock::Lstm(width) => recurrent(*width, 4), OperationBlock::Forest(..) | OperationBlock::Knn(_) => return Err(RecipeError::new("Forest and KNN are standalone estimators outside the gradient graph")), OperationBlock::Embed(..) => return Err(RecipeError::new("embedding vocabulary must be positive")), _ => input.checked_mul(output) }.ok_or_else(|| RecipeError::new("model parameter count overflow"))?;
+			let recurrent = |width: usize, gates: usize| input.checked_mul(width).and_then(|a| width.checked_mul(width).and_then(|b| a.checked_add(b))).and_then(|value| value.checked_add(width)).and_then(|value| value.checked_mul(gates)); let block_parameters = match &block.operation { OperationBlock::Conv(filters, kernel) => filters.checked_mul(*kernel), OperationBlock::Pool(_) => Some(0), OperationBlock::Embed(dimensions, vocabulary) if *vocabulary != 0 => dimensions.checked_mul(*vocabulary), OperationBlock::Attention(_) => return Err(RecipeError::new("attention requires genuine Q, K, V lowering")), OperationBlock::Rnn(width) => recurrent(*width, 1), OperationBlock::Gru(width) => recurrent(*width, 3), OperationBlock::Lstm(width) => recurrent(*width, 4), OperationBlock::Embed(..) => return Err(RecipeError::new("embedding vocabulary must be positive")), _ => input.checked_mul(output) }.ok_or_else(|| RecipeError::new("model parameter count overflow"))?;
             parameters = parameters.checked_add(block_parameters).ok_or_else(|| RecipeError::new("model parameter count overflow"))?;
             widths.push(output);
         }
+        if widths.last() != Some(&1) { return Err(RecipeError::new("training model output must contain one value")); }
         let matrix_parameters = parameters;
         parameters += self.blocks.iter().filter(|block| block.activation == Activation::PRelu).count();
         Ok(TrainingGraph { blocks: &self.blocks, widths, offsets, matrix_parameters, parameters })
@@ -268,12 +268,12 @@ fn gpu_initialize(count: usize, seed: u64, scale: f64, prelu: &[(usize, f64)], t
 #[rustfmt::skip]
 impl TrainingGraph<'_> {
     fn prelu(&self, stage: usize) -> Option<usize> { (self.blocks[stage].activation == Activation::PRelu).then(|| self.matrix_parameters + self.blocks[..stage].iter().filter(|block| block.activation == Activation::PRelu).count()) }
-    fn operation(&self, stage: usize) -> (i32, f64, f64) { match &self.blocks[stage].operation { OperationBlock::Layer(_) => (0, 1.0, 0.0), OperationBlock::Conv(_, kernel) => (1, *kernel as f64, 0.0), OperationBlock::Pool(size) => (2, *size as f64, 0.0), OperationBlock::KMeans(_) => (3, 1.0, 0.0), OperationBlock::Embed(_, vocabulary) => (4, (*vocabulary).max(1) as f64, 0.0), OperationBlock::Attention(heads) => (5, *heads as f64, 0.0), OperationBlock::Rnn(_) => (6, 1.0, 0.0), OperationBlock::Gru(_) => (7, 1.0, 0.0), OperationBlock::Lstm(_) => (8, 1.0, 0.0), OperationBlock::Forest(trees, kind, depth) => (9, (*trees * *depth) as f64, *kind as f64), OperationBlock::Knn(neighbors) => (10, *neighbors as f64 * f64::EPSILON, 0.0), OperationBlock::Residual(_) => (11, 1.0, 0.0), OperationBlock::Perceptron(_) => (12, 1.0, 0.0) } }
+    fn operation(&self, stage: usize) -> (i32, f64, f64) { match &self.blocks[stage].operation { OperationBlock::Layer(_) => (0, 1.0, 0.0), OperationBlock::Conv(_, kernel) => (1, *kernel as f64, 0.0), OperationBlock::Pool(size) => (2, *size as f64, 0.0), OperationBlock::KMeans(_) => (3, 1.0, 0.0), OperationBlock::Embed(_, vocabulary) => (4, (*vocabulary).max(1) as f64, 0.0), OperationBlock::Attention(heads) => (5, *heads as f64, 0.0), OperationBlock::Rnn(_) => (6, 1.0, 0.0), OperationBlock::Gru(_) => (7, 1.0, 0.0), OperationBlock::Lstm(_) => (8, 1.0, 0.0), OperationBlock::Forest(trees, _, depth) => (9, *trees as f64, *depth as f64), OperationBlock::Knn(neighbors) => (10, *neighbors as f64, 0.0), OperationBlock::Residual(_) => (11, 1.0, 0.0), OperationBlock::Perceptron(_) => (12, 1.0, 0.0) } }
     fn prepare_gpu(&self, rows: usize) -> Result<DeviceGraph, RecipeError> {
 		let mut pass = DevicePass { values: Vec::with_capacity(self.blocks.len()), raw: Vec::with_capacity(self.blocks.len()), derivatives: Vec::with_capacity(self.blocks.len()), operations: Vec::with_capacity(self.blocks.len()), scales: Vec::with_capacity(self.blocks.len()), contexts: Vec::with_capacity(self.blocks.len()) };
         let (mut descriptors, mut parameters) = (Vec::with_capacity(self.blocks.len() * 7), Vec::with_capacity(self.blocks.len() * 2));
         for stage in 0..self.blocks.len() {
-			let (from, to) = (self.widths[stage], self.widths[stage + 1]); let count = rows * to; let normalization = match self.blocks[stage].normalization { None => 0, Some(BlockNormalization::Batch) => 1, Some(BlockNormalization::Layer) => 2 }; let (operation, parameter, secondary) = self.operation(stage); let gates = match operation { 6 => 1, 7 => 3, 8 => 4, _ => 0 }; descriptors.extend([from as i32, to as i32, self.offsets[stage] as i32, operation, self.blocks[stage].activation as i32, normalization, self.prelu(stage).map_or(-1, |index| index as i32)]); parameters.extend([parameter, secondary]); pass.values.push(DeviceBuffer::new(count)?); pass.raw.push(DeviceBuffer::new(count)?); pass.derivatives.push(DeviceBuffer::new(count)?); pass.operations.push(DeviceBuffer::new(count)?); pass.scales.push((normalization != 0).then(|| DeviceBuffer::new(2 * if normalization == 1 { to } else { rows })).transpose()?); pass.contexts.push(match operation { 3 => Some(DeviceBuffer::upload(&vec![0.0; 1 + from * to])?), 6..=8 => Some(DeviceBuffer::new((2 * gates + 4) * count)?), _ => None });
+			let (from, to) = (self.widths[stage], self.widths[stage + 1]); let count = rows * to; let normalization = match self.blocks[stage].normalization { None => 0, Some(BlockNormalization::Batch) => 1, Some(BlockNormalization::Layer) => 2 }; let (operation, parameter, secondary) = self.operation(stage); let gates = match operation { 6 => 1, 7 => 3, 8 => 4, _ => 0 }; descriptors.extend([from as i32, to as i32, self.offsets[stage] as i32, operation, self.blocks[stage].activation as i32, normalization, self.prelu(stage).map_or(-1, |index| index as i32)]); parameters.extend([parameter, secondary]); pass.values.push(DeviceBuffer::new(count)?); pass.raw.push(DeviceBuffer::new(count)?); pass.derivatives.push(DeviceBuffer::new(count)?); pass.operations.push(DeviceBuffer::new(count)?); pass.scales.push((normalization != 0).then(|| DeviceBuffer::new(2 * if normalization == 1 { to } else { rows })).transpose()?); pass.contexts.push(match operation { 3 => Some(DeviceBuffer::upload(&vec![0.0; 1 + from * to + count])?), 9 => Some(DeviceBuffer::new((parameter as usize) * 4 + count)?), 10 => Some(DeviceBuffer::new(count)?), 6..=8 => Some(DeviceBuffer::new((2 * gates + 4) * count)?), _ => None });
         }
 		let addresses = |buffers: &[DeviceBuffer]| buffers.iter().map(|buffer| buffer.pointer as usize as u64).collect::<Vec<_>>(); let optional = |buffers: &[Option<DeviceBuffer>]| buffers.iter().map(|buffer| buffer.as_ref().map_or(0, |buffer| buffer.pointer as usize as u64)).collect::<Vec<_>>(); let value_pointers = DeviceBuffer::upload(&addresses(&pass.values))?; let raw_pointers = DeviceBuffer::upload(&addresses(&pass.raw))?; let derivative_pointers = DeviceBuffer::upload(&addresses(&pass.derivatives))?; let operation_pointers = DeviceBuffer::upload(&addresses(&pass.operations))?; let scale_pointers = DeviceBuffer::upload(&optional(&pass.scales))?; let context_pointers = DeviceBuffer::upload(&optional(&pass.contexts))?;
 		Ok(DeviceGraph { pass, value_pointers, raw_pointers, derivative_pointers, operation_pointers, scale_pointers, context_pointers, descriptors: DeviceBuffer::upload(&descriptors)?, parameters: DeviceBuffer::upload(&parameters)? })
@@ -573,11 +573,9 @@ impl Recipe {
     }
 
     fn reachable_operations(&self, output: Value) -> Result<Vec<Operation>, RecipeError> {
-        let mut indices = Vec::new();
-        self.visit(output, &mut indices)?;
-        indices.sort_unstable();
-        indices.dedup();
-        Ok(indices.into_iter().map(|index| self.operations[index].clone()).collect())
+		let mut indices = Vec::new();
+		self.visit(output, &mut indices)?;
+		Ok(indices.into_iter().map(|index| self.operations[index].clone()).collect())
     }
 
     fn visit(&self, value: Value, indices: &mut Vec<usize>) -> Result<(), RecipeError> {
@@ -707,7 +705,8 @@ impl Train {
         let initialized = gpu_initialize(graph.parameters, seed, initial_weight, &prelu, threads)?;
         let weights = match &self.resume { Some(path) => DeviceBuffer::upload(&load_weights(path, &initialized.download()?, model, features, &prepared.schema)?)?, None => initialized };
         let (moments, variances, mut initial_loss) = (gpu_initialize(graph.parameters, 0, 0.0, &[], threads)?, gpu_initialize(graph.parameters, 0, 0.0, &[], threads)?, 0.0);
-        let config = DeviceBuffer::upload(&[activation_config.leak, activation_config.prelu, activation_config.elu, activation_config.selu_alpha, activation_config.selu_scale, activation_config.gelu_scale, activation_config.gelu_cubic])?;
+        let ho_loss_weight = configured_f64("RECIPE_HO_LOSS_WEIGHT", env!("RECIPE_HO_LOSS_WEIGHT"))?;
+        let config = DeviceBuffer::upload(&[activation_config.leak, activation_config.prelu, activation_config.elu, activation_config.selu_alpha, activation_config.selu_scale, activation_config.gelu_scale, activation_config.gelu_cubic, ho_loss_weight])?;
         let device_graph = graph.prepare_gpu(training_rows)?; let delta_elements = training_rows * graph.widths.iter().copied().max().ok_or_else(|| RecipeError::new("model has no graph width"))?; let epoch_buffers = EpochBuffers { metrics: DeviceBuffer::new(4)?, gradient: DeviceBuffer::new(graph.parameters)?, delta_a: DeviceBuffer::new(delta_elements)?, delta_b: DeviceBuffer::new(delta_elements)?, checkpoint: DeviceBuffer::new(graph.parameters)? }; let optimizer = AdamwConfig { rate: self.learning_rate, beta1, beta2, epsilon, decay };
         let tolerance = self.stop_tolerance.map_or(0.0, |value| value);
         if !tolerance.is_finite() || !(0.0..=1.0).contains(&tolerance) {

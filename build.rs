@@ -28,6 +28,7 @@ fn main() {
 		("gelu-scale", "RECIPE_GELU_SCALE"),
 		("gelu-cubic", "RECIPE_GELU_CUBIC"),
 		("normalization-epsilon", "RECIPE_NORMALIZATION_EPSILON"),
+		("ho-loss-weight", "RECIPE_HO_LOSS_WEIGHT"),
 		("gpu-threads", "RECIPE_GPU_THREADS"),
 		("random-seed", "RECIPE_RANDOM_SEED"),
 	] {

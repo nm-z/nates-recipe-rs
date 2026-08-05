@@ -47,5 +47,6 @@ selu-scale = 1.0507009873554805
 gelu-scale = 0.7978845608028654
 gelu-cubic = 0.044715
 normalization-epsilon = 0.00000001
+ho-loss-weight = 1.0
 gpu-threads = 256
 random-seed = 1

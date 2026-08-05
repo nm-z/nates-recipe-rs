@@ -36,9 +36,23 @@ fn main() {
 	recipe.train()
 		.optimizer(adamw)
 		.epochs(2)
-		.lr(0.0)
+		.lr(0.01)
 		.log([Time, Run, Epoch, R2, Loss, blck, atvn, norm])
 		.run(&lloyd, &data);
+	let estimator_data = recipe
+		.data("/home/nate/Desktop/nates-recipe-rs/examples/datasets/sandp500/individual_stocks_5yr/individual_stocks_5yr/APTV_data.csv")
+		.target("close")
+		.norm(z_score)
+		.split(0.6);
+	for estimator in [
+		recipe.model().knn(5).loss(mse),
+		recipe.model().forest(2).lgbm(2).loss(mse),
+		recipe.model().forest(2).xgbst(2).loss(mse),
+	] {
+		recipe.train().optimizer(adamw).epochs(2).lr(0.01)
+			.log([Time, Run, Epoch, R2, Loss, blck, atvn, norm])
+			.run(&estimator, &estimator_data);
+	}
 	let topology = recipe
 		.model()
 		.conv(8, 3)
