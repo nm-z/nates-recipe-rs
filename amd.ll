@@ -388,274 +388,621 @@ done:
   ret void
 }
 
-define internal void @attention_forward_body(ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %weights, ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) nocapture writeonly %context, i32 %p, i32 %width, i32 %heads) #1 {
+define internal double @sigmoid(double %x) #1 {
 entry:
-  %row = udiv i32 %p, %width
-  %query = urem i32 %p, %width
-  %row.base = mul i32 %row, %width
-  %query.index = add i32 %row.base, %query
-  %query.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %query.index
-  %x.query = load double, ptr addrspace(1) %query.ptr, align 8
-  br label %head.loop
-head.loop:
-  %head = phi i32 [ 0, %entry ], [ %head.next, %head.finish ]
-  %result = phi double [ 0.0, %entry ], [ %result.next, %head.finish ]
-  %head.more = icmp ult i32 %head, %heads
-  br i1 %head.more, label %head.load, label %done
-head.load:
-  %weight.base = mul i32 %head, 4
-  %row.head = mul i32 %row, %heads
-  %row.head.index = add i32 %row.head, %head
-  %context.width = mul i32 %row.head.index, %width
-  %context.item = add i32 %context.width, %query
-  %context.stride = add i32 %width, 2
-  %context.base = mul i32 %context.item, %context.stride
-  %q.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.base
-  %k.index = add i32 %weight.base, 1
-  %v.index = add i32 %weight.base, 2
-  %o.index = add i32 %weight.base, 3
-  %k.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %k.index
-  %v.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %v.index
-  %o.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %o.index
-  %wq = load double, ptr addrspace(1) %q.ptr, align 8
-  %wk = load double, ptr addrspace(1) %k.ptr, align 8
-  %wv = load double, ptr addrspace(1) %v.ptr, align 8
-  %wo = load double, ptr addrspace(1) %o.ptr, align 8
-  %qk = fmul double %wq, %wk
-  %beta = fmul double %qk, %x.query
-  br label %max.loop
-max.loop:
-  %j.max = phi i32 [ 0, %head.load ], [ %j.max.next, %max.step ]
-  %maximum = phi double [ 0xFFF0000000000000, %head.load ], [ %maximum.next, %max.step ]
-  %max.more = icmp ult i32 %j.max, %width
-  br i1 %max.more, label %max.step, label %sum.loop
-max.step:
-  %max.index = add i32 %row.base, %j.max
-  %max.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %max.index
-  %x.max = load double, ptr addrspace(1) %max.ptr, align 8
-  %score.max = fmul double %beta, %x.max
-  %greater = fcmp ogt double %score.max, %maximum
-  %maximum.next = select i1 %greater, double %score.max, double %maximum
-  %j.max.next = add nuw i32 %j.max, 1
-  br label %max.loop
-sum.loop:
-  %j.sum = phi i32 [ 0, %max.loop ], [ %j.sum.next, %sum.step ]
-  %denominator = phi double [ 0.0, %max.loop ], [ %denominator.next, %sum.step ]
-  %numerator = phi double [ 0.0, %max.loop ], [ %numerator.next, %sum.step ]
-  %sum.more = icmp ult i32 %j.sum, %width
-  br i1 %sum.more, label %sum.step, label %head.done
-sum.step:
-  %sum.index = add i32 %row.base, %j.sum
-  %sum.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %sum.index
-  %x.sum = load double, ptr addrspace(1) %sum.ptr, align 8
-  %score = fmul double %beta, %x.sum
-  %centered = fsub double %score, %maximum
-  %exponential = call double @__ocml_exp_f64(double %centered)
-  %alpha.index = add i32 %context.base, %j.sum
-  %alpha.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %alpha.index
-  store double %exponential, ptr addrspace(1) %alpha.ptr, align 8
-  %denominator.next = fadd double %denominator, %exponential
-  %weighted = fmul double %exponential, %x.sum
-  %numerator.next = fadd double %numerator, %weighted
-  %j.sum.next = add nuw i32 %j.sum, 1
-  br label %sum.loop
-head.done:
-  %mean = fdiv double %numerator, %denominator
-  br label %normalize.loop
-normalize.loop:
-  %j.normalize = phi i32 [ 0, %head.done ], [ %j.normalize.next, %normalize.step ]
-  %variance = phi double [ 0.0, %head.done ], [ %variance.next, %normalize.step ]
-  %normalize.more = icmp ult i32 %j.normalize, %width
-  br i1 %normalize.more, label %normalize.step, label %head.finish
-normalize.step:
-  %normalize.alpha.index = add i32 %context.base, %j.normalize
-  %normalize.alpha.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %normalize.alpha.index
-  %unnormalized = load double, ptr addrspace(1) %normalize.alpha.ptr, align 8
-  %alpha = fdiv double %unnormalized, %denominator
-  store double %alpha, ptr addrspace(1) %normalize.alpha.ptr, align 8
-  %normalize.input.index = add i32 %row.base, %j.normalize
-  %normalize.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %normalize.input.index
-  %normalize.input = load double, ptr addrspace(1) %normalize.input.ptr, align 8
-  %normalize.difference = fsub double %normalize.input, %mean
-  %normalize.square = fmul double %normalize.difference, %normalize.difference
-  %normalize.weighted = fmul double %alpha, %normalize.square
-  %variance.next = fadd double %variance, %normalize.weighted
-  %j.normalize.next = add nuw i32 %j.normalize, 1
-  br label %normalize.loop
-head.finish:
-  %value.scale = fmul double %wv, %wo
-  %head.value = fmul double %mean, %value.scale
-  %result.next = fadd double %result, %head.value
-  %context.mean.index = add i32 %context.base, %width
-  %context.variance.index = add i32 %context.mean.index, 1
-  %context.mean = getelementptr inbounds double, ptr addrspace(1) %context, i32 %context.mean.index
-  %context.variance = getelementptr inbounds double, ptr addrspace(1) %context, i32 %context.variance.index
-  store double %mean, ptr addrspace(1) %context.mean, align 8
-  store double %variance, ptr addrspace(1) %context.variance, align 8
-  %head.next = add nuw i32 %head, 1
-  br label %head.loop
-done:
-  %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
-  store double %result, ptr addrspace(1) %output.ptr, align 8
-  ret void
+  %negative = fneg double %x
+  %exponential = call double @__ocml_exp_f64(double %negative)
+  %denominator = fadd double 1.0, %exponential
+  %value = fdiv double 1.0, %denominator
+  ret double %value
 }
 
-define internal void @attention_weight_gradient_body(ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %weights, ptr addrspace(1) nocapture readonly %delta, ptr addrspace(1) nocapture readonly %context, ptr addrspace(1) nocapture writeonly %gradient, i32 %p, i32 %rows, i32 %width, i32 %heads) #1 {
+define internal double @recurrent_linear(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %context, i32 %time, i32 %out, i32 %from, i32 %to, i32 %gate, i32 %operation, i32 %count) #1 {
 entry:
-  %head = udiv i32 %p, 4
-  %kind = urem i32 %p, 4
-  %weight.base = mul i32 %head, 4
-  %q.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.base
-  %k.index = add i32 %weight.base, 1
-  %v.index = add i32 %weight.base, 2
-  %o.index = add i32 %weight.base, 3
-  %k.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %k.index
-  %v.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %v.index
-  %o.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %o.index
-  %wq = load double, ptr addrspace(1) %q.ptr, align 8
-  %wk = load double, ptr addrspace(1) %k.ptr, align 8
-  %wv = load double, ptr addrspace(1) %v.ptr, align 8
-  %wo = load double, ptr addrspace(1) %o.ptr, align 8
-  %queries = mul i32 %rows, %width
-  br label %query.loop
-query.loop:
-  %query.p = phi i32 [ 0, %entry ], [ %query.next, %accumulate ]
-  %sum = phi double [ 0.0, %entry ], [ %sum.next, %accumulate ]
-  %query.more = icmp ult i32 %query.p, %queries
-  br i1 %query.more, label %query.load, label %done
-query.load:
-  %row = udiv i32 %query.p, %width
-  %query = urem i32 %query.p, %width
-  %x.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %query.p
-  %delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %query.p
+  %input.count = mul i32 %from, %to
+  %state.count = mul i32 %to, %to
+  %gate.stride.0 = add i32 %input.count, %state.count
+  %gate.stride = add i32 %gate.stride.0, %to
+  %gate.base = mul i32 %gate, %gate.stride
+  %bias.base.0 = add i32 %gate.base, %input.count
+  %bias.base = add i32 %bias.base.0, %state.count
+  %bias.index = add i32 %bias.base, %out
+  %bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %bias.index
+  %bias = load double, ptr addrspace(1) %bias.ptr, align 8
+  %input.row = mul i32 %time, %from
+  br label %input.loop
+input.loop:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %input.step ]
+  %input.sum = phi double [ %bias, %entry ], [ %input.sum.next, %input.step ]
+  %input.more = icmp ult i32 %i, %from
+  br i1 %input.more, label %input.step, label %state.loop
+input.step:
+  %x.index = add i32 %input.row, %i
+  %w.row = mul i32 %i, %to
+  %w.local = add i32 %w.row, %out
+  %w.index = add i32 %gate.base, %w.local
+  %x.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %x.index
+  %w.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %w.index
   %x = load double, ptr addrspace(1) %x.ptr, align 8
-  %d = load double, ptr addrspace(1) %delta.ptr, align 8
-  %context.row = mul i32 %row, %heads
-  %context.head = add i32 %context.row, %head
-  %context.width = mul i32 %context.head, %width
-  %context.item = add i32 %context.width, %query
-  %context.stride = add i32 %width, 2
-  %context.base = mul i32 %context.item, %context.stride
-  %mean.index = add i32 %context.base, %width
-  %variance.index = add i32 %mean.index, 1
-  %mean.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %mean.index
-  %variance.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %variance.index
-  %mean = load double, ptr addrspace(1) %mean.ptr, align 8
-  %variance = load double, ptr addrspace(1) %variance.ptr, align 8
-  %is.q = icmp eq i32 %kind, 0
-  %is.k = icmp eq i32 %kind, 1
-  %needs.variance = or i1 %is.q, %is.k
-  br i1 %needs.variance, label %variance.direct, label %direct
-direct:
-  %is.v = icmp eq i32 %kind, 2
-  %other = select i1 %is.v, double %wo, double %wv
-  %direct.first = fmul double %d, %other
-  %direct.value = fmul double %direct.first, %mean
-  br label %accumulate
-variance.direct:
-  %qk.other = select i1 %is.q, double %wk, double %wq
-  %variance.first = fmul double %d, %wo
-  %variance.second = fmul double %variance.first, %wv
-  %variance.third = fmul double %variance.second, %x
-  %variance.fourth = fmul double %variance.third, %variance
-  %variance.result = fmul double %variance.fourth, %qk.other
-  br label %accumulate
-accumulate:
-  %contribution = phi double [ %direct.value, %direct ], [ %variance.result, %variance.direct ]
-  %sum.next = fadd double %sum, %contribution
-  %query.next = add nuw i32 %query.p, 1
-  br label %query.loop
+  %w = load double, ptr addrspace(1) %w.ptr, align 8
+  %input.product = fmul double %x, %w
+  %input.sum.next = fadd double %input.sum, %input.product
+  %i.next = add i32 %i, 1
+  br label %input.loop
+state.loop:
+  %j = phi i32 [ 0, %input.loop ], [ %j.next, %state.step ]
+  %sum = phi double [ %input.sum, %input.loop ], [ %sum.next, %state.step ]
+  %state.more = icmp ult i32 %j, %to
+  br i1 %state.more, label %state.step, label %done
+state.step:
+  %has.previous = icmp ugt i32 %time, 0
+  %previous.time = sub i32 %time, 1
+  %previous.row = mul i32 %previous.time, %to
+  %previous.index = add i32 %previous.row, %j
+  %safe.previous = select i1 %has.previous, i32 %previous.index, i32 0
+  %previous.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %safe.previous
+  %loaded.previous = load double, ptr addrspace(1) %previous.ptr, align 8
+  %previous = select i1 %has.previous, double %loaded.previous, double 0.0
+  %is.gru = icmp eq i32 %operation, 7
+  %is.candidate = icmp eq i32 %gate, 2
+  %reset.candidate = and i1 %is.gru, %is.candidate
+  %reset.base = mul i32 %count, 3
+  %reset.row = mul i32 %time, %to
+  %reset.local = add i32 %reset.row, %j
+  %reset.index = add i32 %reset.base, %reset.local
+  %reset.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %reset.index
+  %reset = load double, ptr addrspace(1) %reset.ptr, align 8
+  %reset.previous = fmul double %reset, %previous
+  %state = select i1 %reset.candidate, double %reset.previous, double %previous
+  %u.base = add i32 %gate.base, %input.count
+  %u.row = mul i32 %j, %to
+  %u.local = add i32 %u.row, %out
+  %u.index = add i32 %u.base, %u.local
+  %u.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %u.index
+  %u = load double, ptr addrspace(1) %u.ptr, align 8
+  %product = fmul double %state, %u
+  %sum.next = fadd double %sum, %product
+  %j.next = add i32 %j, 1
+  br label %state.loop
 done:
-  %gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %p
-  store double %sum, ptr addrspace(1) %gradient.ptr, align 8
+  ret double %sum
+}
+
+define internal void @recurrent_forward_body(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %context, i32 %rows, i32 %from, i32 %to, i32 %operation, i32 %threads) #1 {
+entry:
+  %tid = call i32 @llvm.amdgcn.workitem.id.x()
+  %count = mul i32 %rows, %to
+  %is.rnn.gates = icmp eq i32 %operation, 6
+  %is.gru.gates = icmp eq i32 %operation, 7
+  %recurrent.gates = select i1 %is.gru.gates, i32 3, i32 4
+  %gates = select i1 %is.rnn.gates, i32 1, i32 %recurrent.gates
+  %is.gru = icmp eq i32 %operation, 7
+  br label %time.loop
+time.loop:
+  %time = phi i32 [ 0, %entry ], [ %time.next, %time.done ]
+  %time.more = icmp ult i32 %time, %rows
+  br i1 %time.more, label %gate.loop, label %exit
+gate.loop:
+  %p = phi i32 [ %tid, %time.loop ], [ %p.next, %gate.done ]
+  %p.more = icmp ult i32 %p, %to
+  br i1 %p.more, label %gate.step, label %gate.barrier
+gate.step:
+  %gate.limit = select i1 %is.gru, i32 2, i32 %gates
+  %gate.context = mul i32 %count, 2
+  %time.row = mul i32 %time, %to
+  %local = add i32 %time.row, %p
+  br label %component.loop
+component.loop:
+  %gate = phi i32 [ 0, %gate.step ], [ %gate.next, %component.step ]
+  %gate.more = icmp ult i32 %gate, %gate.limit
+  br i1 %gate.more, label %component.step, label %gate.finish
+component.step:
+  %linear = call double @recurrent_linear(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %context, i32 %time, i32 %p, i32 %from, i32 %to, i32 %gate, i32 %operation, i32 %count)
+  %tanh = call double @__ocml_tanh_f64(double %linear)
+  %sigmoid = call double @sigmoid(double %linear)
+  %cell.gate = icmp eq i32 %gate, 3
+  %is.rnn = icmp eq i32 %operation, 6
+  %use.tanh = or i1 %is.rnn, %cell.gate
+  %gate.value = select i1 %use.tanh, double %tanh, double %sigmoid
+  %gate.base = mul i32 %gate, %count
+  %gate.index.0 = add i32 %gate.context, %gate.base
+  %gate.index = add i32 %gate.index.0, %local
+  %gate.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate.index
+  store double %gate.value, ptr addrspace(1) %gate.ptr, align 8
+  %gate.next = add i32 %gate, 1
+  br label %component.loop
+gate.finish:
+  br i1 %is.gru, label %gate.done, label %state.finish
+state.finish:
+  %is.lstm = icmp eq i32 %operation, 8
+  br i1 %is.lstm, label %lstm.finish, label %rnn.finish
+rnn.finish:
+  %rnn.index = add i32 %gate.context, %local
+  %rnn.gate.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %rnn.index
+  %rnn.value = load double, ptr addrspace(1) %rnn.gate.ptr, align 8
+  br label %state.store
+lstm.finish:
+  %gate0.index = add i32 %gate.context, %local
+  %gate1.base = mul i32 %count, 3
+  %gate2.base = mul i32 %count, 4
+  %gate3.base = mul i32 %count, 5
+  %gate1.index = add i32 %gate1.base, %local
+  %gate2.index = add i32 %gate2.base, %local
+  %gate3.index = add i32 %gate3.base, %local
+  %gate0.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate0.index
+  %gate1.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate1.index
+  %gate2.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate2.index
+  %gate3.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate3.index
+  %input.gate = load double, ptr addrspace(1) %gate0.ptr, align 8
+  %forget.gate = load double, ptr addrspace(1) %gate1.ptr, align 8
+  %output.gate = load double, ptr addrspace(1) %gate2.ptr, align 8
+  %cell.candidate = load double, ptr addrspace(1) %gate3.ptr, align 8
+  %has.previous = icmp ugt i32 %time, 0
+  %previous.local = sub i32 %local, %to
+  %safe.previous = select i1 %has.previous, i32 %previous.local, i32 0
+  %previous.cell.index = add i32 %count, %safe.previous
+  %previous.cell.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %previous.cell.index
+  %loaded.previous.cell = load double, ptr addrspace(1) %previous.cell.ptr, align 8
+  %previous.cell = select i1 %has.previous, double %loaded.previous.cell, double 0.0
+  %forgotten = fmul double %forget.gate, %previous.cell
+  %entered = fmul double %input.gate, %cell.candidate
+  %cell = fadd double %forgotten, %entered
+  %cell.index = add i32 %count, %local
+  %cell.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %cell.index
+  store double %cell, ptr addrspace(1) %cell.ptr, align 8
+  %cell.state = call double @__ocml_tanh_f64(double %cell)
+  %lstm.value = fmul double %output.gate, %cell.state
+  br label %state.store
+state.store:
+  %state = phi double [ %rnn.value, %rnn.finish ], [ %lstm.value, %lstm.finish ]
+  %state.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %local
+  %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %local
+  store double %state, ptr addrspace(1) %state.ptr, align 8
+  store double %state, ptr addrspace(1) %output.ptr, align 8
+  br label %gate.done
+gate.done:
+  %p.next = add i32 %p, %threads
+  br label %gate.loop
+gate.barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br i1 %is.gru, label %gru.loop, label %time.done
+gru.loop:
+  %gru.p = phi i32 [ %tid, %gate.barrier ], [ %gru.next, %gru.step ]
+  %gru.more = icmp ult i32 %gru.p, %to
+  br i1 %gru.more, label %gru.step, label %time.done
+gru.step:
+  %gru.linear = call double @recurrent_linear(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %context, i32 %time, i32 %gru.p, i32 %from, i32 %to, i32 2, i32 %operation, i32 %count)
+  %candidate = call double @__ocml_tanh_f64(double %gru.linear)
+  %gru.row = mul i32 %time, %to
+  %gru.local = add i32 %gru.row, %gru.p
+  %candidate.base = mul i32 %count, 4
+  %candidate.index = add i32 %candidate.base, %gru.local
+  %candidate.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %candidate.index
+  store double %candidate, ptr addrspace(1) %candidate.ptr, align 8
+  %update.base = mul i32 %count, 2
+  %update.index = add i32 %update.base, %gru.local
+  %update.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %update.index
+  %update = load double, ptr addrspace(1) %update.ptr, align 8
+  %has.gru.previous = icmp ugt i32 %time, 0
+  %gru.previous.index = sub i32 %gru.local, %to
+  %safe.gru.previous = select i1 %has.gru.previous, i32 %gru.previous.index, i32 0
+  %gru.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %safe.gru.previous
+  %loaded.gru.previous = load double, ptr addrspace(1) %gru.previous.ptr, align 8
+  %gru.previous = select i1 %has.gru.previous, double %loaded.gru.previous, double 0.0
+  %one.update = fsub double 1.0, %update
+  %new.part = fmul double %one.update, %candidate
+  %old.part = fmul double %update, %gru.previous
+  %gru.state = fadd double %new.part, %old.part
+  %gru.state.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gru.local
+  %gru.output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %gru.local
+  store double %gru.state, ptr addrspace(1) %gru.state.ptr, align 8
+  store double %gru.state, ptr addrspace(1) %gru.output.ptr, align 8
+  %gru.next = add i32 %gru.p, %threads
+  br label %gru.loop
+time.done:
+  call void @llvm.amdgcn.s.barrier()
+  %time.next = add i32 %time, 1
+  br label %time.loop
+exit:
   ret void
 }
 
-define internal void @attention_previous_gradient_body(ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %weights, ptr addrspace(1) nocapture readonly %delta, ptr addrspace(1) nocapture readonly %context, ptr addrspace(1) nocapture writeonly %previous, i32 %p, i32 %width, i32 %heads) #1 {
+define internal void @recurrent_backward_body(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, ptr addrspace(1) %context, i32 %rows, i32 %from, i32 %to, i32 %operation, i32 %threads) #1 {
 entry:
-  %row = udiv i32 %p, %width
-  %token = urem i32 %p, %width
-  %row.base = mul i32 %row, %width
-  %token.index = add i32 %row.base, %token
-  %token.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %token.index
-  %x.token = load double, ptr addrspace(1) %token.ptr, align 8
-  br label %head.loop
-head.loop:
-  %head = phi i32 [ 0, %entry ], [ %head.next, %key.done ]
-  %total = phi double [ 0.0, %entry ], [ %total.next, %key.done ]
-  %head.more = icmp ult i32 %head, %heads
-  br i1 %head.more, label %head.load, label %done
-head.load:
-  %weight.base = mul i32 %head, 4
-  %q.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.base
-  %k.index = add i32 %weight.base, 1
-  %v.index = add i32 %weight.base, 2
-  %o.index = add i32 %weight.base, 3
-  %k.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %k.index
-  %v.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %v.index
-  %o.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %o.index
-  %wq = load double, ptr addrspace(1) %q.ptr, align 8
-  %wk = load double, ptr addrspace(1) %k.ptr, align 8
-  %wv = load double, ptr addrspace(1) %v.ptr, align 8
-  %wo = load double, ptr addrspace(1) %o.ptr, align 8
-  %a = fmul double %wq, %wk
-  %c = fmul double %wv, %wo
-  %context.row = mul i32 %row, %heads
-  %context.head = add i32 %context.row, %head
-  %context.width = mul i32 %context.head, %width
-  %query.item = add i32 %context.width, %token
-  %context.stride = add i32 %width, 2
-  %query.base = mul i32 %query.item, %context.stride
-  %query.mean.index = add i32 %query.base, %width
-  %query.variance.index = add i32 %query.mean.index, 1
-  %query.mean.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %query.mean.index
-  %query.variance.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %query.variance.index
-  %query.mean = load double, ptr addrspace(1) %query.mean.ptr, align 8
-  %variance = load double, ptr addrspace(1) %query.variance.ptr, align 8
-  br label %variance.done
-variance.done:
-  %query.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %token.index
-  %query.delta = load double, ptr addrspace(1) %query.delta.ptr, align 8
-  %query.first = fmul double %query.delta, %c
-  %query.second = fmul double %query.first, %a
-  %query.contribution = fmul double %query.second, %variance
-  br label %key.loop
-key.loop:
-  %query = phi i32 [ 0, %variance.done ], [ %query.next, %key.step ]
-  %head.total = phi double [ %query.contribution, %variance.done ], [ %head.total.next, %key.step ]
-  %key.more = icmp ult i32 %query, %width
-  br i1 %key.more, label %key.step, label %key.done
-key.step:
-  %query.index = add i32 %row.base, %query
-  %query.x.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %query.index
-  %query.delta.all.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %query.index
-  %x.query = load double, ptr addrspace(1) %query.x.ptr, align 8
-  %delta.query = load double, ptr addrspace(1) %query.delta.all.ptr, align 8
-  %key.context.item = add i32 %context.width, %query
-  %key.context.base = mul i32 %key.context.item, %context.stride
-  %key.mean.index = add i32 %key.context.base, %width
-  %key.alpha.index = add i32 %key.context.base, %token
-  %key.mean.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %key.mean.index
-  %key.alpha.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %key.alpha.index
-  %key.mean = load double, ptr addrspace(1) %key.mean.ptr, align 8
-  %key.alpha = load double, ptr addrspace(1) %key.alpha.ptr, align 8
-  %token.difference = fsub double %x.token, %key.mean
-  %softmax.first = fmul double %a, %x.query
-  %softmax.second = fmul double %softmax.first, %token.difference
-  %bracket = fadd double 1.0, %softmax.second
-  %key.first = fmul double %delta.query, %c
-  %key.second = fmul double %key.first, %key.alpha
-  %key.contribution = fmul double %key.second, %bracket
-  %head.total.next = fadd double %head.total, %key.contribution
-  %query.next = add nuw i32 %query, 1
-  br label %key.loop
-key.done:
-  %total.next = fadd double %total, %head.total
-  %head.next = add nuw i32 %head, 1
-  br label %head.loop
-done:
-  %previous.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %p
-  store double %total, ptr addrspace(1) %previous.ptr, align 8
+  %tid = call i32 @llvm.amdgcn.workitem.id.x()
+  %count = mul i32 %rows, %to
+  %is.rnn.gates = icmp eq i32 %operation, 6
+  %is.gru.gates = icmp eq i32 %operation, 7
+  %recurrent.gates = select i1 %is.gru.gates, i32 3, i32 4
+  %gates = select i1 %is.rnn.gates, i32 1, i32 %recurrent.gates
+  %input.count = mul i32 %from, %to
+  %state.count = mul i32 %to, %to
+  %stride.0 = add i32 %input.count, %state.count
+  %stride = add i32 %stride.0, %to
+  %gate.values.base = mul i32 %count, 2
+  %gate.delta.factor = add i32 %gates, 2
+  %gate.delta.base = mul i32 %count, %gate.delta.factor
+  %hidden.delta.factor = add i32 %gate.delta.factor, %gates
+  %hidden.delta.base = mul i32 %count, %hidden.delta.factor
+  %cell.delta.base = add i32 %hidden.delta.base, %count
+  %is.gru = icmp eq i32 %operation, 7
+  %reset.values.base = mul i32 %count, 3
+  %parameter.count = mul i32 %gates, %stride
+  %previous.count = mul i32 %rows, %from
+  %last = sub i32 %rows, 1
+  br label %time.loop
+time.loop:
+  %time = phi i32 [ %last, %entry ], [ %time.next, %time.done ]
+  %time.more = icmp sge i32 %time, 0
+  br i1 %time.more, label %hidden.loop, label %weight.loop
+hidden.loop:
+  %p = phi i32 [ %tid, %time.loop ], [ %p.next, %hidden.done ]
+  %p.more = icmp ult i32 %p, %to
+  br i1 %p.more, label %hidden.step, label %hidden.barrier
+hidden.step:
+  %row = mul i32 %time, %to
+  %local = add i32 %row, %p
+  %delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %local
+  %direct = load double, ptr addrspace(1) %delta.ptr, align 8
+  %has.future = icmp ult i32 %time, %last
+  %future.time = add i32 %time, 1
+  %future.row = mul i32 %future.time, %to
+  %future.local = add i32 %future.row, %p
+  %safe.future.row = select i1 %has.future, i32 %future.row, i32 0
+  %safe.future.local = select i1 %has.future, i32 %future.local, i32 0
+  %has.previous = icmp ugt i32 %time, 0
+  %previous.local = sub i32 %local, %to
+  %safe.previous = select i1 %has.previous, i32 %previous.local, i32 0
+  br label %future.gate.loop
+future.gate.loop:
+  %future.gate = phi i32 [ 0, %hidden.step ], [ %future.gate.next, %future.gate.done ]
+  %future.sum = phi double [ 0.0, %hidden.step ], [ %future.sum.next, %future.gate.done ]
+  %future.gate.more = icmp ult i32 %future.gate, %gates
+  br i1 %future.gate.more, label %future.out.loop, label %future.done
+future.out.loop:
+  %future.out = phi i32 [ 0, %future.gate.loop ], [ %future.out.next, %future.out.step ]
+  %future.gate.sum = phi double [ %future.sum, %future.gate.loop ], [ %future.gate.sum.next, %future.out.step ]
+  %future.out.more = icmp ult i32 %future.out, %to
+  br i1 %future.out.more, label %future.out.step, label %future.gate.done
+future.out.step:
+  %gd.gate = mul i32 %future.gate, %count
+  %gd.base = add i32 %gate.delta.base, %gd.gate
+  %gd.local = add i32 %safe.future.row, %future.out
+  %gd.index = add i32 %gd.base, %gd.local
+  %gd.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gd.index
+  %gd.loaded = load double, ptr addrspace(1) %gd.ptr, align 8
+  %gd = select i1 %has.future, double %gd.loaded, double 0.0
+  %u.gate = mul i32 %future.gate, %stride
+  %u.base.0 = add i32 %u.gate, %input.count
+  %u.row = mul i32 %p, %to
+  %u.local = add i32 %u.row, %future.out
+  %u.index = add i32 %u.base.0, %u.local
+  %u.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %u.index
+  %u = load double, ptr addrspace(1) %u.ptr, align 8
+  %is.candidate = icmp eq i32 %future.gate, 2
+  %gru.candidate = and i1 %is.gru, %is.candidate
+  %reset.index = add i32 %reset.values.base, %safe.future.local
+  %reset.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %reset.index
+  %reset = load double, ptr addrspace(1) %reset.ptr, align 8
+  %scaled.u = fmul double %u, %reset
+  %effective.u = select i1 %gru.candidate, double %scaled.u, double %u
+  %product = fmul double %gd, %effective.u
+  %future.gate.sum.next = fadd double %future.gate.sum, %product
+  %future.out.next = add i32 %future.out, 1
+  br label %future.out.loop
+future.gate.done:
+  %future.sum.next = fadd double %future.gate.sum, 0.0
+  %future.gate.next = add i32 %future.gate, 1
+  br label %future.gate.loop
+future.done:
+  %future.hidden.index = add i32 %hidden.delta.base, %safe.future.local
+  %future.hidden.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %future.hidden.index
+  %future.hidden.loaded = load double, ptr addrspace(1) %future.hidden.ptr, align 8
+  %future.hidden = select i1 %has.future, double %future.hidden.loaded, double 0.0
+  %future.update.index = add i32 %gate.values.base, %safe.future.local
+  %future.update.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %future.update.index
+  %future.update = load double, ptr addrspace(1) %future.update.ptr, align 8
+  %gru.direct = fmul double %future.hidden, %future.update
+  %gru.extra = select i1 %is.gru, double %gru.direct, double 0.0
+  %with.future = fadd double %direct, %future.sum
+  %dh = fadd double %with.future, %gru.extra
+  %dh.index = add i32 %hidden.delta.base, %local
+  %dh.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %dh.index
+  store double %dh, ptr addrspace(1) %dh.ptr, align 8
+  %is.rnn = icmp eq i32 %operation, 6
+  br i1 %is.rnn, label %rnn.delta, label %gru.test
+rnn.delta:
+  %hidden.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %local
+  %hidden = load double, ptr addrspace(1) %hidden.ptr, align 8
+  %hidden.square = fmul double %hidden, %hidden
+  %hidden.derivative = fsub double 1.0, %hidden.square
+  %rnn.gd = fmul double %dh, %hidden.derivative
+  %rnn.gd.index = add i32 %gate.delta.base, %local
+  %rnn.gd.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %rnn.gd.index
+  store double %rnn.gd, ptr addrspace(1) %rnn.gd.ptr, align 8
+  br label %hidden.done
+gru.test:
+  br i1 %is.gru, label %gru.delta, label %lstm.delta
+gru.delta:
+  %z.index = add i32 %gate.values.base, %local
+  %n.base = mul i32 %count, 4
+  %n.index = add i32 %n.base, %local
+  %z.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %z.index
+  %n.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %n.index
+  %z = load double, ptr addrspace(1) %z.ptr, align 8
+  %n = load double, ptr addrspace(1) %n.ptr, align 8
+  %previous.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %safe.previous
+  %previous.loaded = load double, ptr addrspace(1) %previous.ptr, align 8
+  %previous.hidden = select i1 %has.previous, double %previous.loaded, double 0.0
+  %one.z = fsub double 1.0, %z
+  %n.square = fmul double %n, %n
+  %one.n = fsub double 1.0, %n.square
+  %dn.0 = fmul double %dh, %one.z
+  %dn = fmul double %dn.0, %one.n
+  %z.diff = fsub double %previous.hidden, %n
+  %dz.0 = fmul double %dh, %z.diff
+  %dz.1 = fmul double %dz.0, %z
+  %dz = fmul double %dz.1, %one.z
+  %dz.index = add i32 %gate.delta.base, %local
+  %dn.base = mul i32 %count, 2
+  %dn.index.0 = add i32 %gate.delta.base, %dn.base
+  %dn.index = add i32 %dn.index.0, %local
+  %dz.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %dz.index
+  %dn.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %dn.index
+  store double %dz, ptr addrspace(1) %dz.ptr, align 8
+  store double %dn, ptr addrspace(1) %dn.ptr, align 8
+  br label %hidden.done
+lstm.delta:
+  %i.index = add i32 %gate.values.base, %local
+  %f.base = mul i32 %count, 3
+  %o.base = mul i32 %count, 4
+  %g.base = mul i32 %count, 5
+  %f.index = add i32 %f.base, %local
+  %o.index = add i32 %o.base, %local
+  %g.index = add i32 %g.base, %local
+  %i.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %i.index
+  %f.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %f.index
+  %o.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %o.index
+  %g.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %g.index
+  %iv = load double, ptr addrspace(1) %i.ptr, align 8
+  %fv = load double, ptr addrspace(1) %f.ptr, align 8
+  %ov = load double, ptr addrspace(1) %o.ptr, align 8
+  %gv = load double, ptr addrspace(1) %g.ptr, align 8
+  %cell.index = add i32 %count, %local
+  %cell.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %cell.index
+  %cell = load double, ptr addrspace(1) %cell.ptr, align 8
+  %tanh.cell = call double @__ocml_tanh_f64(double %cell)
+  %tanh.cell.square = fmul double %tanh.cell, %tanh.cell
+  %cell.derivative = fsub double 1.0, %tanh.cell.square
+  %future.dc.index = add i32 %cell.delta.base, %safe.future.local
+  %future.dc.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %future.dc.index
+  %future.dc.loaded = load double, ptr addrspace(1) %future.dc.ptr, align 8
+  %future.f.index = add i32 %f.base, %safe.future.local
+  %future.f.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %future.f.index
+  %future.f = load double, ptr addrspace(1) %future.f.ptr, align 8
+  %future.cell.0 = fmul double %future.dc.loaded, %future.f
+  %future.cell = select i1 %has.future, double %future.cell.0, double 0.0
+  %dc.0 = fmul double %dh, %ov
+  %dc.1 = fmul double %dc.0, %cell.derivative
+  %dc = fadd double %dc.1, %future.cell
+  %dc.index = add i32 %cell.delta.base, %local
+  %dc.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %dc.index
+  store double %dc, ptr addrspace(1) %dc.ptr, align 8
+  %previous.cell.index = add i32 %count, %safe.previous
+  %previous.cell.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %previous.cell.index
+  %previous.cell.loaded = load double, ptr addrspace(1) %previous.cell.ptr, align 8
+  %previous.cell = select i1 %has.previous, double %previous.cell.loaded, double 0.0
+  %one.i = fsub double 1.0, %iv
+  %one.f = fsub double 1.0, %fv
+  %one.o = fsub double 1.0, %ov
+  %g.square = fmul double %gv, %gv
+  %one.g = fsub double 1.0, %g.square
+  %di.0 = fmul double %dc, %gv
+  %di.1 = fmul double %di.0, %iv
+  %di = fmul double %di.1, %one.i
+  %df.0 = fmul double %dc, %previous.cell
+  %df.1 = fmul double %df.0, %fv
+  %df = fmul double %df.1, %one.f
+  %do.0 = fmul double %dh, %tanh.cell
+  %do.1 = fmul double %do.0, %ov
+  %do = fmul double %do.1, %one.o
+  %dg.0 = fmul double %dc, %iv
+  %dg = fmul double %dg.0, %one.g
+  br label %lstm.store.loop
+lstm.store.loop:
+  %store.gate = phi i32 [ 0, %lstm.delta ], [ %store.next, %lstm.store ]
+  %store.more = icmp ult i32 %store.gate, 4
+  br i1 %store.more, label %lstm.store, label %hidden.done
+lstm.store:
+  %store.value.0 = select i1 true, double %di, double %df
+  %store.is.f = icmp eq i32 %store.gate, 1
+  %store.value.1 = select i1 %store.is.f, double %df, double %store.value.0
+  %store.is.o = icmp eq i32 %store.gate, 2
+  %store.value.2 = select i1 %store.is.o, double %do, double %store.value.1
+  %store.is.g = icmp eq i32 %store.gate, 3
+  %store.value = select i1 %store.is.g, double %dg, double %store.value.2
+  %store.gate.base = mul i32 %store.gate, %count
+  %store.index.0 = add i32 %gate.delta.base, %store.gate.base
+  %store.index = add i32 %store.index.0, %local
+  %store.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %store.index
+  store double %store.value, ptr addrspace(1) %store.ptr, align 8
+  %store.next = add i32 %store.gate, 1
+  br label %lstm.store.loop
+hidden.done:
+  %p.next = add i32 %p, %threads
+  br label %hidden.loop
+hidden.barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br i1 %is.gru, label %reset.loop, label %time.done
+reset.loop:
+  %reset.p = phi i32 [ %tid, %hidden.barrier ], [ %reset.next, %reset.done ]
+  %reset.more = icmp ult i32 %reset.p, %to
+  br i1 %reset.more, label %reset.step, label %time.done
+reset.step:
+  %reset.row.current = mul i32 %time, %to
+  %reset.local.current = add i32 %reset.row.current, %reset.p
+  %reset.gate.index = add i32 %reset.values.base, %reset.local.current
+  %reset.gate.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %reset.gate.index
+  %reset.gate = load double, ptr addrspace(1) %reset.gate.ptr, align 8
+  %has.reset.previous = icmp ugt i32 %time, 0
+  %reset.previous.index = sub i32 %reset.local.current, %to
+  %safe.reset.previous = select i1 %has.reset.previous, i32 %reset.previous.index, i32 0
+  %reset.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %safe.reset.previous
+  %reset.previous.loaded = load double, ptr addrspace(1) %reset.previous.ptr, align 8
+  %reset.previous = select i1 %has.reset.previous, double %reset.previous.loaded, double 0.0
+  br label %reset.out.loop
+reset.out.loop:
+  %reset.out = phi i32 [ 0, %reset.step ], [ %reset.out.next, %reset.out.step ]
+  %reset.sum = phi double [ 0.0, %reset.step ], [ %reset.sum.next, %reset.out.step ]
+  %reset.out.more = icmp ult i32 %reset.out, %to
+  br i1 %reset.out.more, label %reset.out.step, label %reset.done
+reset.out.step:
+  %reset.dn.local = add i32 %reset.row.current, %reset.out
+  %reset.dn.offset = mul i32 %count, 2
+  %reset.dn.base = add i32 %gate.delta.base, %reset.dn.offset
+  %reset.dn.index = add i32 %reset.dn.base, %reset.dn.local
+  %reset.dn.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %reset.dn.index
+  %reset.dn = load double, ptr addrspace(1) %reset.dn.ptr, align 8
+  %candidate.gate.base = mul i32 2, %stride
+  %candidate.u.base = add i32 %candidate.gate.base, %input.count
+  %candidate.u.row = mul i32 %reset.p, %to
+  %candidate.u.local = add i32 %candidate.u.row, %reset.out
+  %candidate.u.index = add i32 %candidate.u.base, %candidate.u.local
+  %candidate.u.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %candidate.u.index
+  %candidate.u = load double, ptr addrspace(1) %candidate.u.ptr, align 8
+  %reset.product.0 = fmul double %reset.dn, %candidate.u
+  %reset.sum.next = fadd double %reset.sum, %reset.product.0
+  %reset.out.next = add i32 %reset.out, 1
+  br label %reset.out.loop
+reset.done:
+  %one.reset = fsub double 1.0, %reset.gate
+  %dr.0 = fmul double %reset.sum, %reset.previous
+  %dr.1 = fmul double %dr.0, %reset.gate
+  %dr = fmul double %dr.1, %one.reset
+  %dr.base = add i32 %gate.delta.base, %count
+  %dr.index = add i32 %dr.base, %reset.local.current
+  %dr.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %dr.index
+  store double %dr, ptr addrspace(1) %dr.ptr, align 8
+  %reset.next = add i32 %reset.p, %threads
+  br label %reset.loop
+time.done:
+  call void @llvm.amdgcn.s.barrier()
+  %time.next = sub i32 %time, 1
+  br label %time.loop
+weight.loop:
+  %wp = phi i32 [ %tid, %time.loop ], [ %wp.next, %weight.done ]
+  %wp.more = icmp ult i32 %wp, %parameter.count
+  br i1 %wp.more, label %weight.step, label %previous.loop
+weight.step:
+  %weight.gate = udiv i32 %wp, %stride
+  %weight.local = urem i32 %wp, %stride
+  %is.input.weight = icmp ult i32 %weight.local, %input.count
+  %state.end = add i32 %input.count, %state.count
+  %is.before.bias = icmp ult i32 %weight.local, %state.end
+  %not.input.weight = xor i1 %is.input.weight, true
+  %is.state.weight = and i1 %is.before.bias, %not.input.weight
+  %input.out = urem i32 %weight.local, %to
+  %input.feature = udiv i32 %weight.local, %to
+  %safe.input.feature = select i1 %is.input.weight, i32 %input.feature, i32 0
+  %state.local.0 = sub i32 %weight.local, %input.count
+  %state.local = select i1 %is.state.weight, i32 %state.local.0, i32 0
+  %state.out = urem i32 %state.local, %to
+  %state.feature = udiv i32 %state.local, %to
+  %bias.out = sub i32 %weight.local, %state.end
+  %selected.out.0 = select i1 %is.input.weight, i32 %input.out, i32 %state.out
+  %selected.out = select i1 %is.before.bias, i32 %selected.out.0, i32 %bias.out
+  br label %weight.time.loop
+weight.time.loop:
+  %wt = phi i32 [ 0, %weight.step ], [ %wt.next, %weight.time.step ]
+  %weight.sum = phi double [ 0.0, %weight.step ], [ %weight.sum.next, %weight.time.step ]
+  %wt.more = icmp ult i32 %wt, %rows
+  br i1 %wt.more, label %weight.time.step, label %weight.done
+weight.time.step:
+  %wt.row = mul i32 %wt, %to
+  %wt.gd.local = add i32 %wt.row, %selected.out
+  %wt.gd.gate = mul i32 %weight.gate, %count
+  %wt.gd.base = add i32 %gate.delta.base, %wt.gd.gate
+  %wt.gd.index = add i32 %wt.gd.base, %wt.gd.local
+  %wt.gd.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %wt.gd.index
+  %wt.gd = load double, ptr addrspace(1) %wt.gd.ptr, align 8
+  %wt.input.row = mul i32 %wt, %from
+  %wt.input.index = add i32 %wt.input.row, %safe.input.feature
+  %wt.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %wt.input.index
+  %wt.input = load double, ptr addrspace(1) %wt.input.ptr, align 8
+  %wt.has.previous = icmp ugt i32 %wt, 0
+  %wt.previous.row = sub i32 %wt.row, %to
+  %wt.previous.index = add i32 %wt.previous.row, %state.feature
+  %wt.safe.previous = select i1 %wt.has.previous, i32 %wt.previous.index, i32 0
+  %wt.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %wt.safe.previous
+  %wt.previous.loaded = load double, ptr addrspace(1) %wt.previous.ptr, align 8
+  %wt.previous = select i1 %wt.has.previous, double %wt.previous.loaded, double 0.0
+  %wt.gru = icmp eq i32 %operation, 7
+  %wt.candidate = icmp eq i32 %weight.gate, 2
+  %wt.reset.candidate = and i1 %wt.gru, %wt.candidate
+  %wt.reset.local = add i32 %wt.row, %state.feature
+  %wt.reset.index = add i32 %reset.values.base, %wt.reset.local
+  %wt.reset.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %wt.reset.index
+  %wt.reset = load double, ptr addrspace(1) %wt.reset.ptr, align 8
+  %wt.reset.previous = fmul double %wt.reset, %wt.previous
+  %wt.state = select i1 %wt.reset.candidate, double %wt.reset.previous, double %wt.previous
+  %wt.nonbias = select i1 %is.input.weight, double %wt.input, double %wt.state
+  %wt.factor = select i1 %is.before.bias, double %wt.nonbias, double 1.0
+  %wt.product = fmul double %wt.gd, %wt.factor
+  %weight.sum.next = fadd double %weight.sum, %wt.product
+  %wt.next = add i32 %wt, 1
+  br label %weight.time.loop
+weight.done:
+  %gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %wp
+  store double %weight.sum, ptr addrspace(1) %gradient.ptr, align 8
+  %wp.next = add i32 %wp, %threads
+  br label %weight.loop
+previous.loop:
+  %xp = phi i32 [ %tid, %weight.loop ], [ %xp.next, %previous.done ]
+  %xp.more = icmp ult i32 %xp, %previous.count
+  br i1 %xp.more, label %previous.step, label %exit
+previous.step:
+  %x.time = udiv i32 %xp, %from
+  %x.feature = urem i32 %xp, %from
+  br label %x.gate.loop
+x.gate.loop:
+  %x.gate = phi i32 [ 0, %previous.step ], [ %x.gate.next, %x.gate.done ]
+  %x.sum = phi double [ 0.0, %previous.step ], [ %x.sum.next, %x.gate.done ]
+  %x.gate.more = icmp ult i32 %x.gate, %gates
+  br i1 %x.gate.more, label %x.out.loop, label %previous.done
+x.out.loop:
+  %x.out = phi i32 [ 0, %x.gate.loop ], [ %x.out.next, %x.out.step ]
+  %x.gate.sum = phi double [ %x.sum, %x.gate.loop ], [ %x.gate.sum.next, %x.out.step ]
+  %x.out.more = icmp ult i32 %x.out, %to
+  br i1 %x.out.more, label %x.out.step, label %x.gate.done
+x.out.step:
+  %x.w.gate = mul i32 %x.gate, %stride
+  %x.w.row = mul i32 %x.feature, %to
+  %x.w.local = add i32 %x.w.row, %x.out
+  %x.w.index = add i32 %x.w.gate, %x.w.local
+  %x.w.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %x.w.index
+  %x.w = load double, ptr addrspace(1) %x.w.ptr, align 8
+  %x.time.row = mul i32 %x.time, %to
+  %x.gd.local = add i32 %x.time.row, %x.out
+  %x.gd.gate = mul i32 %x.gate, %count
+  %x.gd.base = add i32 %gate.delta.base, %x.gd.gate
+  %x.gd.index = add i32 %x.gd.base, %x.gd.local
+  %x.gd.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %x.gd.index
+  %x.gd = load double, ptr addrspace(1) %x.gd.ptr, align 8
+  %x.product = fmul double %x.w, %x.gd
+  %x.gate.sum.next = fadd double %x.gate.sum, %x.product
+  %x.out.next = add i32 %x.out, 1
+  br label %x.out.loop
+x.gate.done:
+  %x.sum.next = fadd double %x.sum, %x.gate.sum
+  %x.gate.next = add i32 %x.gate, 1
+  br label %x.gate.loop
+previous.done:
+  %previous.output.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %xp
+  store double %x.sum, ptr addrspace(1) %previous.output.ptr, align 8
+  %xp.next = add i32 %xp, %threads
+  br label %previous.loop
+exit:
+  call void @llvm.amdgcn.s.barrier()
   ret void
 }
 
@@ -731,52 +1078,10 @@ block:
   %value.ptr = getelementptr inbounds double, ptr addrspace(1) %values, i32 %p
   %value = load double, ptr addrspace(1) %value.ptr, align 8
   switch i32 %operation, label %block.linear [
-    i32 6, label %block.rnn
-    i32 7, label %block.gru
-    i32 8, label %block.lstm
     i32 11, label %block.residual
     i32 12, label %block.perceptron
   ]
 block.linear:
-  br label %block.done
-block.rnn:
-  %rnn.result = call double @__ocml_tanh_f64(double %value)
-  %rnn.square = fmul double %rnn.result, %rnn.result
-  %rnn.derivative = fsub double 1.0, %rnn.square
-  br label %block.done
-block.gru:
-  %gru.negative = fneg double %value
-  %gru.exp = call double @__ocml_exp_f64(double %gru.negative)
-  %gru.denominator = fadd double 1.0, %gru.exp
-  %gru.gate = fdiv double 1.0, %gru.denominator
-  %gru.state = call double @__ocml_tanh_f64(double %value)
-  %gru.result = fmul double %gru.gate, %gru.state
-  %gru.one.gate = fsub double 1.0, %gru.gate
-  %gru.gate.derivative = fmul double %gru.gate, %gru.one.gate
-  %gru.term1 = fmul double %gru.gate.derivative, %gru.state
-  %gru.state.square = fmul double %gru.state, %gru.state
-  %gru.one.state = fsub double 1.0, %gru.state.square
-  %gru.term2 = fmul double %gru.gate, %gru.one.state
-  %gru.derivative = fadd double %gru.term1, %gru.term2
-  br label %block.done
-block.lstm:
-  %lstm.negative = fneg double %value
-  %lstm.exp = call double @__ocml_exp_f64(double %lstm.negative)
-  %lstm.denominator = fadd double 1.0, %lstm.exp
-  %lstm.gate = fdiv double 1.0, %lstm.denominator
-  %lstm.cell = call double @__ocml_tanh_f64(double %value)
-  %lstm.state = call double @__ocml_tanh_f64(double %lstm.cell)
-  %lstm.result = fmul double %lstm.gate, %lstm.state
-  %lstm.one.gate = fsub double 1.0, %lstm.gate
-  %lstm.gate.derivative = fmul double %lstm.gate, %lstm.one.gate
-  %lstm.term1 = fmul double %lstm.gate.derivative, %lstm.state
-  %lstm.state.square = fmul double %lstm.state, %lstm.state
-  %lstm.cell.square = fmul double %lstm.cell, %lstm.cell
-  %lstm.one.state = fsub double 1.0, %lstm.state.square
-  %lstm.one.cell = fsub double 1.0, %lstm.cell.square
-  %lstm.inner = fmul double %lstm.one.state, %lstm.one.cell
-  %lstm.term2a = fmul double %lstm.gate, %lstm.inner
-  %lstm.derivative = fadd double %lstm.term1, %lstm.term2a
   br label %block.done
 block.residual:
   %row = udiv i32 %p, %to
@@ -793,8 +1098,8 @@ block.perceptron:
   %perceptron.result = select i1 %perceptron.test, double 1.0, double 0.0
   br label %block.done
 block.done:
-  %block.result = phi double [ %value, %block.linear ], [ %rnn.result, %block.rnn ], [ %gru.result, %block.gru ], [ %lstm.result, %block.lstm ], [ %residual.result, %block.residual ], [ %perceptron.result, %block.perceptron ]
-  %block.derivative = phi double [ 1.0, %block.linear ], [ %rnn.derivative, %block.rnn ], [ %gru.derivative, %block.gru ], [ %lstm.derivative, %block.lstm ], [ 1.0, %block.residual ], [ 1.0, %block.perceptron ]
+  %block.result = phi double [ %value, %block.linear ], [ %residual.result, %block.residual ], [ %perceptron.result, %block.perceptron ]
+  %block.derivative = phi double [ 1.0, %block.linear ], [ 1.0, %block.residual ], [ 1.0, %block.perceptron ]
   %raw.ptr = getelementptr inbounds double, ptr addrspace(1) %raw, i32 %p
   store double %block.result, ptr addrspace(1) %raw.ptr, align 8
   %operation.ptr = getelementptr inbounds double, ptr addrspace(1) %operation_derivatives, i32 %p
@@ -1177,10 +1482,15 @@ stage.load:
   %matrix = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.offset
   %count = mul i32 %rows, %to
   %is.embedding = icmp eq i32 %operation, 4
-  %is.attention = icmp eq i32 %operation, 5
-  br i1 %is.embedding, label %embedding.loop, label %attention.test
-attention.test:
-  br i1 %is.attention, label %attention.loop, label %value.loop
+  %recurrent.low = icmp uge i32 %operation, 6
+  %recurrent.high = icmp ule i32 %operation, 8
+  %is.recurrent = and i1 %recurrent.low, %recurrent.high
+  br i1 %is.embedding, label %embedding.loop, label %recurrent.test
+recurrent.test:
+  br i1 %is.recurrent, label %recurrent.forward, label %value.loop
+recurrent.forward:
+  call void @recurrent_forward_body(ptr addrspace(1) %source, ptr addrspace(1) %matrix, ptr addrspace(1) %values, ptr addrspace(1) %context, i32 %rows, i32 %from, i32 %to, i32 %operation, i32 %threads)
+  br label %value.loop
 embedding.loop:
   %embedding.p = phi i32 [ %tid, %stage.load ], [ %embedding.next, %embedding.step ]
   %embedding.more = icmp ult i32 %embedding.p, %count
@@ -1201,22 +1511,8 @@ embedding.step:
   call void @transform_body(ptr addrspace(1) %embedding.skip, ptr addrspace(1) %embedding.value, ptr addrspace(1) %embedding.raw, ptr addrspace(1) %embedding.operation, ptr addrspace(1) %embedding.activation, ptr addrspace(1) %config, i32 1, i32 %from, i32 %to, i32 0, i32 %activation, double %parameter, double %secondary, i32 1, i32 0)
   %embedding.next = add nuw i32 %embedding.p, %threads
   br label %embedding.loop
-attention.loop:
-  %attention.p = phi i32 [ %tid, %attention.test ], [ %attention.next, %attention.step ]
-  %attention.more = icmp ult i32 %attention.p, %count
-  br i1 %attention.more, label %attention.step, label %normalize.test
-attention.step:
-  %heads = fptoui double %parameter to i32
-  call void @attention_forward_body(ptr addrspace(1) %source, ptr addrspace(1) %matrix, ptr addrspace(1) %values, ptr addrspace(1) %context, i32 %attention.p, i32 %from, i32 %heads)
-  %attention.value = getelementptr inbounds double, ptr addrspace(1) %values, i32 %attention.p
-  %attention.raw = getelementptr inbounds double, ptr addrspace(1) %raw, i32 %attention.p
-  %attention.operation = getelementptr inbounds double, ptr addrspace(1) %operation.derivatives, i32 %attention.p
-  %attention.activation = getelementptr inbounds double, ptr addrspace(1) %activation.derivatives, i32 %attention.p
-  call void @transform_body(ptr addrspace(1) %source, ptr addrspace(1) %attention.value, ptr addrspace(1) %attention.raw, ptr addrspace(1) %attention.operation, ptr addrspace(1) %attention.activation, ptr addrspace(1) %config, i32 1, i32 %from, i32 %to, i32 0, i32 %activation, double %parameter, double %secondary, i32 1, i32 0)
-  %attention.next = add nuw i32 %attention.p, %threads
-  br label %attention.loop
 value.loop:
-  %p = phi i32 [ %tid, %attention.test ], [ %p.next, %transform.step ]
+  %p = phi i32 [ %tid, %recurrent.test ], [ %tid, %recurrent.forward ], [ %p.next, %transform.step ]
   %value.more = icmp ult i32 %p, %count
   br i1 %value.more, label %value.step, label %normalize.test
 value.step:
@@ -1234,6 +1530,8 @@ value.step:
   %activation.element = getelementptr inbounds double, ptr addrspace(1) %activation.derivatives, i32 %p
   %is.conv = icmp eq i32 %operation, 1
   %is.pool = icmp eq i32 %operation, 2
+  br i1 %is.recurrent, label %transform.step, label %conv.test
+conv.test:
   br i1 %is.conv, label %conv.step, label %pool.test
 conv.step:
   %kernel = fptoui double %parameter to i32
@@ -1249,7 +1547,8 @@ dense.step:
   call void @dense_body(ptr addrspace(1) %input.row, ptr addrspace(1) %weight.column, ptr addrspace(1) %value.element, i32 1, i32 %from, i32 %to, i32 1, i32 0)
   br label %transform.step
 transform.step:
-  %special = or i1 %is.conv, %is.pool
+  %convolution.or.pool = or i1 %is.conv, %is.pool
+  %special = or i1 %convolution.or.pool, %is.recurrent
   %transform.operation = select i1 %special, i32 0, i32 %operation
   call void @transform_body(ptr addrspace(1) %skip, ptr addrspace(1) %value.element, ptr addrspace(1) %raw.element, ptr addrspace(1) %operation.element, ptr addrspace(1) %activation.element, ptr addrspace(1) %config, i32 1, i32 %from, i32 %to, i32 %transform.operation, i32 %activation, double %parameter, double %secondary, i32 1, i32 0)
   %p.next = add nuw i32 %p, %threads
@@ -1448,17 +1747,23 @@ chain.step:
   br label %chain.loop
 matrix.dispatch:
   call void @llvm.amdgcn.s.barrier()
+  %previous.count = mul i32 %rows, %backward.from
+  %matrix.recurrent.low = icmp uge i32 %backward.operation, 6
+  %matrix.recurrent.high = icmp ule i32 %backward.operation, 8
+  %matrix.recurrent = and i1 %matrix.recurrent.low, %matrix.recurrent.high
   %matrix.conv = icmp eq i32 %backward.operation, 1
   %matrix.pool = icmp eq i32 %backward.operation, 2
   %matrix.embedding = icmp eq i32 %backward.operation, 4
-  %matrix.attention = icmp eq i32 %backward.operation, 5
+  br i1 %matrix.recurrent, label %recurrent.backward, label %conv.matrix.test
+recurrent.backward:
+  call void @recurrent_backward_body(ptr addrspace(1) %backward.source, ptr addrspace(1) %backward.matrix, ptr addrspace(1) %delta, ptr addrspace(1) %previous, ptr addrspace(1) %backward.matrix.gradient, ptr addrspace(1) %backward.context, i32 %rows, i32 %backward.from, i32 %backward.to, i32 %backward.operation, i32 %threads)
+  br label %residual.test
+conv.matrix.test:
   br i1 %matrix.conv, label %conv.matrix.loop, label %pool.matrix.test
 pool.matrix.test:
   br i1 %matrix.pool, label %previous.dispatch, label %embedding.matrix.test
 embedding.matrix.test:
-  br i1 %matrix.embedding, label %embedding.matrix.loop, label %attention.matrix.test
-attention.matrix.test:
-  br i1 %matrix.attention, label %attention.matrix.loop, label %matrix.loop
+  br i1 %matrix.embedding, label %embedding.matrix.loop, label %matrix.loop
 conv.matrix.loop:
   %conv.positions = sub i32 %backward.from, %backward.parameter.integer
   %conv.positions.one = add i32 %conv.positions, 1
@@ -1486,17 +1791,6 @@ embedding.matrix.step:
   call void @embedding_gradient_body(ptr addrspace(1) %backward.source, ptr addrspace(1) %delta, ptr addrspace(1) %backward.matrix.gradient, i32 %embedding.matrix.p, i32 %rows, i32 %backward.from, i32 %backward.to, i32 %embedding.vocabulary)
   %embedding.matrix.next = add nuw i32 %embedding.matrix.p, %threads
   br label %embedding.matrix.iterate
-attention.matrix.loop:
-  %attention.matrix.count = mul i32 %backward.parameter.integer, 4
-  br label %attention.matrix.iterate
-attention.matrix.iterate:
-  %attention.matrix.p = phi i32 [ %tid, %attention.matrix.loop ], [ %attention.matrix.next, %attention.matrix.step ]
-  %attention.matrix.more = icmp ult i32 %attention.matrix.p, %attention.matrix.count
-  br i1 %attention.matrix.more, label %attention.matrix.step, label %previous.dispatch
-attention.matrix.step:
-  call void @attention_weight_gradient_body(ptr addrspace(1) %backward.source, ptr addrspace(1) %backward.matrix, ptr addrspace(1) %delta, ptr addrspace(1) %backward.context, ptr addrspace(1) %backward.matrix.gradient, i32 %attention.matrix.p, i32 %rows, i32 %backward.from, i32 %backward.parameter.integer)
-  %attention.matrix.next = add nuw i32 %attention.matrix.p, %threads
-  br label %attention.matrix.iterate
 matrix.loop:
   %matrix.count = mul i32 %backward.from, %backward.to
   br label %matrix.iterate
@@ -1510,14 +1804,11 @@ matrix.step:
   br label %matrix.iterate
 previous.dispatch:
   call void @llvm.amdgcn.s.barrier()
-  %previous.count = mul i32 %rows, %backward.from
   br i1 %matrix.conv, label %conv.previous.loop, label %pool.previous.test
 pool.previous.test:
   br i1 %matrix.pool, label %pool.previous.loop, label %embedding.previous.test
 embedding.previous.test:
-  br i1 %matrix.embedding, label %embedding.previous.loop, label %attention.previous.test
-attention.previous.test:
-  br i1 %matrix.attention, label %attention.previous.loop, label %previous.loop
+  br i1 %matrix.embedding, label %embedding.previous.loop, label %previous.loop
 conv.previous.loop:
   br label %conv.previous.iterate
 conv.previous.iterate:
@@ -1549,16 +1840,6 @@ embedding.previous.step:
   store double 0.0, ptr addrspace(1) %embedding.previous.ptr, align 8
   %embedding.previous.next = add nuw i32 %embedding.previous.p, %threads
   br label %embedding.previous.iterate
-attention.previous.loop:
-  br label %attention.previous.iterate
-attention.previous.iterate:
-  %attention.previous.p = phi i32 [ %tid, %attention.previous.loop ], [ %attention.previous.next, %attention.previous.step ]
-  %attention.previous.more = icmp ult i32 %attention.previous.p, %previous.count
-  br i1 %attention.previous.more, label %attention.previous.step, label %residual.test
-attention.previous.step:
-  call void @attention_previous_gradient_body(ptr addrspace(1) %backward.source, ptr addrspace(1) %backward.matrix, ptr addrspace(1) %delta, ptr addrspace(1) %backward.context, ptr addrspace(1) %previous, i32 %attention.previous.p, i32 %backward.from, i32 %backward.parameter.integer)
-  %attention.previous.next = add nuw i32 %attention.previous.p, %threads
-  br label %attention.previous.iterate
 previous.loop:
   br label %previous.iterate
 previous.iterate:

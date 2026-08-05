@@ -49,11 +49,10 @@ fn main() {
 		.log([Time, Run, Epoch, R2, Loss, blck, atvn, norm])
 		.run(&topology, &data);
 
-	let blocks: [fn(Model) -> Model; 10] = [
+	let blocks: [fn(Model) -> Model; 9] = [
 		|model| model.conv(8, 3),
 		|model| model.pool(2),
 		|model| model.embed(4).vocab(8),
-		|model| model.layer(64).attn(2),
 		|model| model.layer(64),
 		|model| model.rnn(8),
 		|model| model.gru(8),
