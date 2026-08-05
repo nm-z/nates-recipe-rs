@@ -1106,7 +1106,7 @@ exit:
   ret void
 }
 
-define protected amdgpu_kernel void @normalize(ptr addrspace(1) %values, ptr addrspace(1) nocapture readonly %reference, ptr addrspace(1) %scales, i32 %rows, i32 %width, i32 %mode, i32 %reverse, double %epsilon, i32 %threads) #0 {
+define ptx_kernel void @normalize(ptr addrspace(1) %values, ptr addrspace(1) nocapture readonly %reference, ptr addrspace(1) %scales, i32 %rows, i32 %width, i32 %mode, i32 %reverse, double %epsilon, i32 %threads) #0 {
 entry:
   call void @normalize_body(ptr addrspace(1) %values, ptr addrspace(1) %reference, ptr addrspace(1) %scales, i32 %rows, i32 %width, i32 %mode, i32 %reverse, double %epsilon, i32 %threads, i32 -1)
   ret void
@@ -1276,13 +1276,13 @@ exit:
   ret void
 }
 
-define protected amdgpu_kernel void @forward_graph(ptr addrspace(1) nocapture readonly %samples, ptr addrspace(1) nocapture readonly %weights, ptr addrspace(1) nocapture readonly %config, ptr addrspace(1) nocapture readonly %value_pointers, ptr addrspace(1) nocapture readonly %raw_pointers, ptr addrspace(1) nocapture readonly %operation_pointers, ptr addrspace(1) nocapture readonly %activation_pointers, ptr addrspace(1) nocapture readonly %scale_pointers, ptr addrspace(1) nocapture readonly %context_pointers, ptr addrspace(1) nocapture readonly %descriptors, ptr addrspace(1) nocapture readonly %parameters, i32 %rows, i32 %stages, double %epsilon, i32 %threads) #0 {
+define ptx_kernel void @forward_graph(ptr addrspace(1) nocapture readonly %samples, ptr addrspace(1) nocapture readonly %weights, ptr addrspace(1) nocapture readonly %config, ptr addrspace(1) nocapture readonly %value_pointers, ptr addrspace(1) nocapture readonly %raw_pointers, ptr addrspace(1) nocapture readonly %operation_pointers, ptr addrspace(1) nocapture readonly %activation_pointers, ptr addrspace(1) nocapture readonly %scale_pointers, ptr addrspace(1) nocapture readonly %context_pointers, ptr addrspace(1) nocapture readonly %descriptors, ptr addrspace(1) nocapture readonly %parameters, i32 %rows, i32 %stages, double %epsilon, i32 %threads) #0 {
 entry:
   call void @forward_body(ptr addrspace(1) %samples, ptr addrspace(1) %weights, ptr addrspace(1) %config, ptr addrspace(1) %value_pointers, ptr addrspace(1) %raw_pointers, ptr addrspace(1) %operation_pointers, ptr addrspace(1) %activation_pointers, ptr addrspace(1) %scale_pointers, ptr addrspace(1) %context_pointers, ptr addrspace(1) %descriptors, ptr addrspace(1) %parameters, i32 %rows, i32 %stages, double %epsilon, i32 %threads)
   ret void
 }
 
-define protected amdgpu_kernel void @epoch_graph(ptr addrspace(1) %samples, ptr addrspace(1) %targets, ptr addrspace(1) %weights, ptr addrspace(1) %config, ptr addrspace(1) %value_pointers, ptr addrspace(1) %raw_pointers, ptr addrspace(1) %operation_pointers, ptr addrspace(1) %activation_pointers, ptr addrspace(1) %scale_pointers, ptr addrspace(1) %context_pointers, ptr addrspace(1) %descriptors, ptr addrspace(1) %parameters, ptr addrspace(1) %metrics, ptr addrspace(1) %gradient, ptr addrspace(1) %delta_a, ptr addrspace(1) %delta_b, ptr addrspace(1) %moments, ptr addrspace(1) %variances, ptr addrspace(1) %checkpoint_weights, i32 %rows, i32 %stages, i32 %parameter_count, i32 %loss, double %previous_loss, double %tolerance, i32 %checkpoint_enabled, double %normalization_epsilon, double %rate, double %beta1, double %beta2, double %optimizer_epsilon, double %decay, i32 %step, i32 %threads) #0 {
+define ptx_kernel void @epoch_graph(ptr addrspace(1) %samples, ptr addrspace(1) %targets, ptr addrspace(1) %weights, ptr addrspace(1) %config, ptr addrspace(1) %value_pointers, ptr addrspace(1) %raw_pointers, ptr addrspace(1) %operation_pointers, ptr addrspace(1) %activation_pointers, ptr addrspace(1) %scale_pointers, ptr addrspace(1) %context_pointers, ptr addrspace(1) %descriptors, ptr addrspace(1) %parameters, ptr addrspace(1) %metrics, ptr addrspace(1) %gradient, ptr addrspace(1) %delta_a, ptr addrspace(1) %delta_b, ptr addrspace(1) %moments, ptr addrspace(1) %variances, ptr addrspace(1) %checkpoint_weights, i32 %rows, i32 %stages, i32 %parameter_count, i32 %loss, double %previous_loss, double %tolerance, i32 %checkpoint_enabled, double %normalization_epsilon, double %rate, double %beta1, double %beta2, double %optimizer_epsilon, double %decay, i32 %step, i32 %threads) #0 {
 entry:
   %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   call void @forward_body(ptr addrspace(1) %samples, ptr addrspace(1) %weights, ptr addrspace(1) %config, ptr addrspace(1) %value_pointers, ptr addrspace(1) %raw_pointers, ptr addrspace(1) %operation_pointers, ptr addrspace(1) %activation_pointers, ptr addrspace(1) %scale_pointers, ptr addrspace(1) %context_pointers, ptr addrspace(1) %descriptors, ptr addrspace(1) %parameters, i32 %rows, i32 %stages, double %normalization_epsilon, i32 %threads)
@@ -1622,7 +1622,7 @@ exit:
   ret void
 }
 
-define protected amdgpu_kernel void @affine(ptr addrspace(1) %values, i32 %count, double %scale, double %offset, i32 %threads) #0 {
+define ptx_kernel void @affine(ptr addrspace(1) %values, i32 %count, double %scale, double %offset, i32 %threads) #0 {
 entry:
   %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   %bid = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
@@ -1641,7 +1641,7 @@ exit:
   ret void
 }
 
-define protected amdgpu_kernel void @initialize(ptr addrspace(1) nocapture writeonly %values, i32 %count, i64 %seed, double %scale, i32 %threads) #0 {
+define ptx_kernel void @initialize(ptr addrspace(1) nocapture writeonly %values, i32 %count, i64 %seed, double %scale, i32 %threads) #0 {
 entry:
   %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   %bid = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
@@ -1674,7 +1674,7 @@ exit:
   ret void
 }
 
-define protected amdgpu_kernel void @set_value(ptr addrspace(1) %values, i32 %index, double %value) #0 {
+define ptx_kernel void @set_value(ptr addrspace(1) %values, i32 %index, double %value) #0 {
 entry:
   %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   %bid = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
@@ -1875,7 +1875,7 @@ exit:
   ret void
 }
 
-define protected amdgpu_kernel void @metrics(ptr addrspace(1) nocapture readonly %predictions, ptr addrspace(1) nocapture readonly %targets, ptr addrspace(1) nocapture writeonly %metrics, i32 %rows, i32 %loss) #0 {
+define ptx_kernel void @metrics(ptr addrspace(1) nocapture readonly %predictions, ptr addrspace(1) nocapture readonly %targets, ptr addrspace(1) nocapture writeonly %metrics, i32 %rows, i32 %loss) #0 {
 entry:
   call void @metrics_body(ptr addrspace(1) %predictions, ptr addrspace(1) %targets, ptr addrspace(1) %metrics, i32 %rows, i32 %loss)
   ret void
