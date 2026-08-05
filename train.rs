@@ -2,19 +2,11 @@ use recipe::*;
 
 fn main() {
 	let data = recipe
-		.data(
-			"/home/nate/Desktop/nates-recipe-rs/examples/datasets/uci-bank-semicolon/bank-full.csv",
-		)
+		.data("/home/nate/Desktop/nates-recipe-rs/examples/datasets/uci-bank-semicolon/bank-full.csv")
 		.target("y")
 		.norm(z_score)
 		.split(0.6);
-	let checkpoint = recipe
-		.model()
-		.layer(8)
-		.relu()
-		.norm(batch)
-		.layer(1)
-		.loss(mse);
+	let checkpoint = recipe.model().layer(8).relu().norm(batch).layer(1).loss(mse);
 	recipe.train()
 		.stop(0.0)
 		.optimizer(adamw)
@@ -40,9 +32,7 @@ fn main() {
 		.log([Time, Run, Epoch, R2, Loss, blck, atvn, norm])
 		.run(&lloyd, &data);
 	let estimator_data = recipe
-		.data(
-			"/home/nate/Desktop/nates-recipe-rs/examples/datasets/uci-bank-semicolon/bank-full.csv",
-		)
+		.data("/home/nate/Desktop/nates-recipe-rs/examples/datasets/uci-bank-semicolon/bank-full.csv")
 		.target("y")
 		.norm(z_score)
 		.split(0.6);
