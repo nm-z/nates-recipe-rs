@@ -179,8 +179,6 @@ fn main() {
 	println!("cargo:rustc-env=RECIPE_NV_MODULE={}", nv_module.display());
 	println!("cargo:rustc-link-search=native={library}");
 	println!("cargo:rustc-link-search=native={nv_library}");
-	println!("cargo:rustc-link-lib=dylib=amdhip64");
-	println!("cargo:rustc-link-lib=dylib=cuda");
 	println!("cargo:rerun-if-changed=Cargo.toml");
 	println!("cargo:rerun-if-changed=amd.ll");
 	println!("cargo:rerun-if-changed=nv.ll");

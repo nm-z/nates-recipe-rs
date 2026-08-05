@@ -31,15 +31,8 @@ pub struct Value(usize);
 
 pub static recipe: Recipe = Recipe::new();
 
-pub struct Data {
-	sources: Vec<String>,
-	target: String,
-	exclusions: Vec<String>,
-	normalize: bool,
-	split: f64,
-	prepared: OnceLock<Result<Prepared, RecipeError>>,
-	device: OnceLock<Result<DeviceData, RecipeError>>,
-}
+#[rustfmt::skip]
+pub struct Data { sources: Vec<String>, target: String, exclusions: Vec<String>, normalize: bool, split: f64, prepared: OnceLock<Result<Prepared, RecipeError>>, device: OnceLock<Result<DeviceData, RecipeError>> }
 
 #[rustfmt::skip]
 pub trait IntoDataSources { fn into_data_sources(self) -> Vec<String>; }
@@ -162,96 +155,79 @@ impl BlockNormalization { const fn name(self) -> &'static str { match self { Sel
 
 #[rustfmt::skip]
 struct TrainingGraph<'a> { blocks: &'a [Block], widths: Vec<usize>, offsets: Vec<usize>, matrix_parameters: usize, parameters: usize }
-struct DevicePass {
-	values: Vec<DeviceBuffer>,
-	raw: Vec<DeviceBuffer>,
-	derivatives: Vec<DeviceBuffer>,
-	operations: Vec<DeviceBuffer>,
-	scales: Vec<Option<DeviceBuffer>>,
-	contexts: Vec<Option<DeviceBuffer>>,
-}
-struct DeviceGraph {
-	pass: DevicePass,
-	value_pointers: DeviceBuffer,
-	raw_pointers: DeviceBuffer,
-	derivative_pointers: DeviceBuffer,
-	operation_pointers: DeviceBuffer,
-	scale_pointers: DeviceBuffer,
-	context_pointers: DeviceBuffer,
-	descriptors: DeviceBuffer,
-	parameters: DeviceBuffer,
-}
-struct EpochBuffers {
-	metrics: DeviceBuffer,
-	gradient: DeviceBuffer,
-	delta_a: DeviceBuffer,
-	delta_b: DeviceBuffer,
-	checkpoint: DeviceBuffer,
-}
+#[rustfmt::skip]
+struct DevicePass { values: Vec<DeviceBuffer>, raw: Vec<DeviceBuffer>, derivatives: Vec<DeviceBuffer>, operations: Vec<DeviceBuffer>, scales: Vec<Option<DeviceBuffer>>, contexts: Vec<Option<DeviceBuffer>> }
+#[rustfmt::skip]
+struct DeviceGraph { pass: DevicePass, value_pointers: DeviceBuffer, raw_pointers: DeviceBuffer, derivative_pointers: DeviceBuffer, operation_pointers: DeviceBuffer, scale_pointers: DeviceBuffer, context_pointers: DeviceBuffer, descriptors: DeviceBuffer, parameters: DeviceBuffer }
+#[rustfmt::skip]
+struct EpochBuffers { metrics: DeviceBuffer, gradient: DeviceBuffer, delta_a: DeviceBuffer, delta_b: DeviceBuffer, checkpoint: DeviceBuffer }
 #[derive(Clone, Copy)]
 #[rustfmt::skip]
 struct AdamwConfig { rate: f64, beta1: f64, beta2: f64, epsilon: f64, decay: f64 }
 
 #[rustfmt::skip]
-struct Hsa { status: i32, vendor: Vendor, forward_graph: usize, epoch_graph: usize, normalize: usize, affine: usize, initialize: usize, set_value: usize, metrics: usize }
+struct Hsa { status: i32, vendor: Vendor, api: [usize; 8], forward_graph: usize, epoch_graph: usize, normalize: usize, affine: usize, initialize: usize, set_value: usize, metrics: usize }
 static HSA: OnceLock<Hsa> = OnceLock::new();
 #[derive(Clone, Copy)]
-enum Vendor {
-	Amd,
-	Nvidia,
-}
+#[rustfmt::skip]
+enum Vendor { Amd, Nvidia }
 
-struct DeviceBuffer {
-	pointer: *mut c_void,
-	elements: usize,
-}
+#[rustfmt::skip]
+struct DeviceBuffer { pointer: *mut c_void, elements: usize }
 #[rustfmt::skip]
 struct DeviceData { samples: DeviceBuffer, targets: DeviceBuffer, target_offset: f64, target_scale: f64 }
 
 #[rustfmt::skip]
 impl DeviceBuffer {
     fn status(status: i32, action: &str) -> Result<(), RecipeError> { if status == 0 { Ok(()) } else { Err(RecipeError::new(format!("GPU {action} failed with status {status}"))) } }
-    fn allocate(elements: usize, bytes: usize) -> Result<Self, RecipeError> { let runtime = hsa()?; let mut pointer = ptr::null_mut(); let status = unsafe { match runtime.vendor { Vendor::Amd => hipMalloc(&mut pointer, bytes), Vendor::Nvidia => { let mut address = 0; let status = cuMemAlloc_v2(&mut address, bytes); pointer = address as usize as *mut c_void; status } } }; Self::status(status, "allocation")?; Ok(Self { pointer, elements }) }
+    fn allocate(elements: usize, bytes: usize) -> Result<Self, RecipeError> { let runtime = hsa()?; let mut pointer = ptr::null_mut(); Self::status(unsafe { runtime.allocate(&mut pointer, bytes) }, "allocation")?; Ok(Self { pointer, elements }) }
     fn new(elements: usize) -> Result<Self, RecipeError> { Self::allocate(elements, elements * size_of::<f64>()) }
-    fn upload<T>(values: &[T]) -> Result<Self, RecipeError> { let buffer = Self::allocate(values.len(), size_of_val(values))?; let runtime = hsa()?; let status = unsafe { match runtime.vendor { Vendor::Amd => hipMemcpy(buffer.pointer, values.as_ptr().cast(), size_of_val(values), 1), Vendor::Nvidia => cuMemcpyHtoD_v2(buffer.pointer as usize as u64, values.as_ptr().cast(), size_of_val(values)) } }; Self::status(status, "transfer")?; Ok(buffer) }
-    fn download(&self) -> Result<Vec<f64>, RecipeError> { let runtime = hsa()?; Self::status(unsafe { match runtime.vendor { Vendor::Amd => hipDeviceSynchronize(), Vendor::Nvidia => cuCtxSynchronize() } }, "synchronization")?; let mut values = vec![0.0; self.elements]; let status = unsafe { match runtime.vendor { Vendor::Amd => hipMemcpy(values.as_mut_ptr().cast(), self.pointer, self.elements * size_of::<f64>(), 2), Vendor::Nvidia => cuMemcpyDtoH_v2(values.as_mut_ptr().cast(), self.pointer as usize as u64, self.elements * size_of::<f64>()) } }; Self::status(status, "transfer")?; Ok(values) }
+    fn upload<T>(values: &[T]) -> Result<Self, RecipeError> { let buffer = Self::allocate(values.len(), size_of_val(values))?; Self::status(unsafe { hsa()?.upload(buffer.pointer, values.as_ptr().cast(), size_of_val(values)) }, "transfer")?; Ok(buffer) }
+    fn download(&self) -> Result<Vec<f64>, RecipeError> { let runtime = hsa()?; Self::status(unsafe { runtime.synchronize() }, "synchronization")?; let mut values = vec![0.0; self.elements]; Self::status(unsafe { runtime.download(values.as_mut_ptr().cast(), self.pointer, self.elements * size_of::<f64>()) }, "transfer")?; Ok(values) }
 }
 
 #[rustfmt::skip]
-impl Drop for DeviceBuffer { fn drop(&mut self) { if let Some(runtime) = HSA.get() { unsafe { match runtime.vendor { Vendor::Amd => { hipFree(self.pointer); }, Vendor::Nvidia => { cuMemFree_v2(self.pointer as usize as u64); } } } } } }
+impl Drop for DeviceBuffer { fn drop(&mut self) { if let Some(runtime) = HSA.get() { unsafe { runtime.free(self.pointer); } } } }
+
+#[link(name = "dl")]
+#[rustfmt::skip]
+unsafe extern "C" {
+    fn dlopen(name: *const c_char, flags: i32) -> *mut c_void; fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void; fn dlclose(handle: *mut c_void) -> i32;
+}
 
 #[rustfmt::skip]
-unsafe extern "C" {
-    fn hipInit(flags: u32) -> i32; fn hipSetDevice(device: i32) -> i32; fn hipDeviceSynchronize() -> i32;
-    fn hipModuleLoad(module: *mut *mut c_void, path: *const c_char) -> i32; fn hipModuleGetFunction(function: *mut *mut c_void, module: *mut c_void, name: *const c_char) -> i32;
-    fn hipMalloc(pointer: *mut *mut c_void, bytes: usize) -> i32; fn hipFree(pointer: *mut c_void) -> i32; fn hipMemcpy(destination: *mut c_void, source: *const c_void, bytes: usize, kind: i32) -> i32;
-    fn hipModuleLaunchKernel(function: *mut c_void, grid_x: u32, grid_y: u32, grid_z: u32, block_x: u32, block_y: u32, block_z: u32, shared: u32, stream: *mut c_void, arguments: *mut *mut c_void, extra: *mut *mut c_void) -> i32;
-}
+unsafe fn dynamic<F>(handle: *mut c_void, name: &[u8]) -> F { unsafe { std::mem::transmute_copy(&dlsym(handle, name.as_ptr().cast())) } }
 #[rustfmt::skip]
-unsafe extern "C" {
-    fn cuInit(flags: u32) -> i32; fn cuDeviceGet(device: *mut i32, ordinal: i32) -> i32; fn cuCtxCreate_v2(context: *mut *mut c_void, flags: u32, device: i32) -> i32; fn cuCtxSynchronize() -> i32;
-    fn cuModuleLoad(module: *mut *mut c_void, path: *const c_char) -> i32; fn cuModuleGetFunction(function: *mut *mut c_void, module: *mut c_void, name: *const c_char) -> i32;
-    fn cuMemAlloc_v2(pointer: *mut u64, bytes: usize) -> i32; fn cuMemFree_v2(pointer: u64) -> i32; fn cuMemcpyHtoD_v2(destination: u64, source: *const c_void, bytes: usize) -> i32; fn cuMemcpyDtoH_v2(destination: *mut c_void, source: u64, bytes: usize) -> i32;
-    fn cuLaunchKernel(function: *mut c_void, grid_x: u32, grid_y: u32, grid_z: u32, block_x: u32, block_y: u32, block_z: u32, shared: u32, stream: *mut c_void, arguments: *mut *mut c_void, extra: *mut *mut c_void) -> i32;
+unsafe fn address<F>(value: usize) -> F { unsafe { std::mem::transmute_copy(&value) } }
+#[rustfmt::skip]
+impl Hsa {
+    unsafe fn allocate(&self, pointer: *mut *mut c_void, bytes: usize) -> i32 { unsafe { match self.vendor { Vendor::Amd => address::<unsafe extern "C" fn(*mut *mut c_void, usize) -> i32>(self.api[0])(pointer, bytes), Vendor::Nvidia => address::<unsafe extern "C" fn(*mut u64, usize) -> i32>(self.api[0])(pointer.cast(), bytes) } } }
+    unsafe fn free(&self, pointer: *mut c_void) -> i32 { unsafe { match self.vendor { Vendor::Amd => std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void) -> i32>(self.api[1])(pointer), Vendor::Nvidia => std::mem::transmute::<usize, unsafe extern "C" fn(u64) -> i32>(self.api[1])(pointer as usize as u64) } } }
+    unsafe fn upload(&self, destination: *mut c_void, source: *const c_void, bytes: usize) -> i32 { unsafe { match self.vendor { Vendor::Amd => std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void, *const c_void, usize, i32) -> i32>(self.api[2])(destination, source, bytes, 1), Vendor::Nvidia => std::mem::transmute::<usize, unsafe extern "C" fn(u64, *const c_void, usize) -> i32>(self.api[2])(destination as usize as u64, source, bytes) } } }
+    unsafe fn download(&self, destination: *mut c_void, source: *const c_void, bytes: usize) -> i32 { unsafe { match self.vendor { Vendor::Amd => std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void, *const c_void, usize, i32) -> i32>(self.api[3])(destination, source, bytes, 2), Vendor::Nvidia => std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void, u64, usize) -> i32>(self.api[3])(destination, source as usize as u64, bytes) } } }
+    unsafe fn synchronize(&self) -> i32 { unsafe { std::mem::transmute::<usize, unsafe extern "C" fn() -> i32>(self.api[4])() } }
+    unsafe fn module_load(&self, module: *mut *mut c_void, path: *const c_char) -> i32 { unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*mut *mut c_void, *const c_char) -> i32>(self.api[5])(module, path) } }
+    unsafe fn launch(&self, function: *mut c_void, grid: u32, block: u32, arguments: *mut *mut c_void) -> i32 { unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut c_void, *mut *mut c_void, *mut *mut c_void) -> i32>(self.api[7])(function, grid, 1, 1, block, 1, 1, 0, ptr::null_mut(), arguments, ptr::null_mut()) } }
 }
 
 #[rustfmt::skip]
 fn hsa() -> Result<&'static Hsa, RecipeError> {
     let runtime = HSA.get_or_init(|| unsafe {
-        let (mut module, mut forward_graph, mut epoch_graph, mut normalize, mut affine, mut initialize, mut set_value, mut metrics) = (ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
-        let mut status = hipInit(0); if status == 0 { status = hipSetDevice(0); }
-        let vendor = if status == 0 { Vendor::Amd } else { let (mut device, mut context) = (0, ptr::null_mut()); status = cuInit(0); if status == 0 { status = cuDeviceGet(&mut device, 0); } if status == 0 { status = cuCtxCreate_v2(&mut context, 0, device); } Vendor::Nvidia };
-        if status == 0 { status = match vendor { Vendor::Amd => hipModuleLoad(&mut module, concat!(env!("RECIPE_HSA_CODE_OBJECT"), "\0").as_ptr().cast()), Vendor::Nvidia => cuModuleLoad(&mut module, concat!(env!("RECIPE_NV_MODULE"), "\0").as_ptr().cast()) }; }
-        for (function, name) in [(&mut forward_graph, b"forward_graph\0".as_ptr()), (&mut epoch_graph, b"epoch_graph\0".as_ptr()), (&mut normalize, b"normalize\0".as_ptr()), (&mut affine, b"affine\0".as_ptr()), (&mut initialize, b"initialize\0".as_ptr()), (&mut set_value, b"set_value\0".as_ptr()), (&mut metrics, b"metrics\0".as_ptr())] { if status == 0 { status = match vendor { Vendor::Amd => hipModuleGetFunction(function, module, name.cast()), Vendor::Nvidia => cuModuleGetFunction(function, module, name.cast()) }; } }
-        Hsa { status, vendor, forward_graph: forward_graph as usize, epoch_graph: epoch_graph as usize, normalize: normalize as usize, affine: affine as usize, initialize: initialize as usize, set_value: set_value as usize, metrics: metrics as usize }
-    });
-    if runtime.status == 0 { Ok(runtime) } else { Err(RecipeError::new(format!("GPU initialization failed with status {}", runtime.status))) }
+        let mut handle = dlopen(b"libamdhip64.so\0".as_ptr().cast(), 2); let mut status = -1;
+        if !handle.is_null() { status = dynamic::<unsafe extern "C" fn(u32) -> i32>(handle, b"hipInit\0")(0); if status == 0 { status = dynamic::<unsafe extern "C" fn(i32) -> i32>(handle, b"hipSetDevice\0")(0); } }
+        let vendor = if status == 0 { Vendor::Amd } else { if !handle.is_null() { dlclose(handle); } handle = dlopen(b"libcuda.so.1\0".as_ptr().cast(), 2); if !handle.is_null() { status = dynamic::<unsafe extern "C" fn(u32) -> i32>(handle, b"cuInit\0")(0); let (mut device, mut context) = (0, ptr::null_mut()); if status == 0 { status = dynamic::<unsafe extern "C" fn(*mut i32, i32) -> i32>(handle, b"cuDeviceGet\0")(&mut device, 0); } if status == 0 { status = dynamic::<unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> i32>(handle, b"cuCtxCreate_v2\0")(&mut context, 0, device); } } Vendor::Nvidia };
+        let names: [&[u8]; 8] = match vendor { Vendor::Amd => [b"hipMalloc\0", b"hipFree\0", b"hipMemcpy\0", b"hipMemcpy\0", b"hipDeviceSynchronize\0", b"hipModuleLoad\0", b"hipModuleGetFunction\0", b"hipModuleLaunchKernel\0"], Vendor::Nvidia => [b"cuMemAlloc_v2\0", b"cuMemFree_v2\0", b"cuMemcpyHtoD_v2\0", b"cuMemcpyDtoH_v2\0", b"cuCtxSynchronize\0", b"cuModuleLoad\0", b"cuModuleGetFunction\0", b"cuLaunchKernel\0"] };
+        let api = names.map(|name| dlsym(handle, name.as_ptr().cast()) as usize); let mut runtime = Hsa { status, vendor, api, forward_graph: 0, epoch_graph: 0, normalize: 0, affine: 0, initialize: 0, set_value: 0, metrics: 0 }; let mut module = ptr::null_mut();
+        if status == 0 { runtime.status = runtime.module_load(&mut module, match vendor { Vendor::Amd => concat!(env!("RECIPE_HSA_CODE_OBJECT"), "\0"), Vendor::Nvidia => concat!(env!("RECIPE_NV_MODULE"), "\0") }.as_ptr().cast()); }
+        let get = runtime.api[6]; let mut status = runtime.status; for (function, name) in [(&mut runtime.forward_graph, b"forward_graph\0".as_ptr()), (&mut runtime.epoch_graph, b"epoch_graph\0".as_ptr()), (&mut runtime.normalize, b"normalize\0".as_ptr()), (&mut runtime.affine, b"affine\0".as_ptr()), (&mut runtime.initialize, b"initialize\0".as_ptr()), (&mut runtime.set_value, b"set_value\0".as_ptr()), (&mut runtime.metrics, b"metrics\0".as_ptr())] { if status == 0 { let mut value = ptr::null_mut(); status = address::<unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> i32>(get)(&mut value, module, name.cast()); *function = value as usize; } } runtime.status = status;
+        runtime
+    }); if runtime.status == 0 { Ok(runtime) } else { Err(RecipeError::new(format!("GPU initialization failed with status {}", runtime.status))) }
 }
 
 #[rustfmt::skip]
 fn hsa_launch(function: usize, count: usize, threads: u32, arguments: &mut [*mut c_void]) -> Result<(), RecipeError> {
     let runtime = hsa()?; let grid = (count as u32).div_ceil(threads);
-    let status = unsafe { match runtime.vendor { Vendor::Amd => hipModuleLaunchKernel(function as *mut c_void, grid, 1, 1, threads, 1, 1, 0, ptr::null_mut(), arguments.as_mut_ptr(), ptr::null_mut()), Vendor::Nvidia => cuLaunchKernel(function as *mut c_void, grid, 1, 1, threads, 1, 1, 0, ptr::null_mut(), arguments.as_mut_ptr(), ptr::null_mut()) } };
+    let status = unsafe { runtime.launch(function as *mut c_void, grid, threads, arguments.as_mut_ptr()) };
     DeviceBuffer::status(status, "dispatch")
 }
 
@@ -342,14 +318,8 @@ impl TrainingReport {
 #[rustfmt::skip]
 pub enum Bound { Transfer, Calculation }
 
-impl fmt::Display for Bound {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(match self {
-			Self::Transfer => "transfer",
-			Self::Calculation => "calculation",
-		})
-	}
-}
+#[rustfmt::skip]
+impl fmt::Display for Bound { fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(match self { Self::Transfer => "transfer", Self::Calculation => "calculation" }) } }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipeError(String);
@@ -357,30 +327,18 @@ pub struct RecipeError(String);
 #[rustfmt::skip]
 impl RecipeError { fn new(message: impl Into<String>) -> Self { Self(message.into()) } }
 
-impl fmt::Display for RecipeError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(&self.0)
-	}
-}
+#[rustfmt::skip]
+impl fmt::Display for RecipeError { fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(&self.0) } }
 
 impl Error for RecipeError {}
 
 #[derive(Clone)]
-struct Tensor {
-	name: String,
-	dtype: DType,
-	shape: Vec<u64>,
-	data: Option<Vec<f64>>,
-	producer: Option<usize>,
-}
+#[rustfmt::skip]
+struct Tensor { name: String, dtype: DType, shape: Vec<u64>, data: Option<Vec<f64>>, producer: Option<usize> }
 
 #[derive(Clone)]
-enum Operation {
-	Conv1d(Value, Value, Option<Value>, Value, u64),
-	Matmul(Value, Value, Value),
-	Add(Value, Value, Value),
-	Relu(Value, Value),
-}
+#[rustfmt::skip]
+enum Operation { Conv1d(Value, Value, Option<Value>, Value, u64), Matmul(Value, Value, Value), Add(Value, Value, Value), Relu(Value, Value) }
 
 impl Operation {
 	fn inputs(&self) -> Vec<Value> {
@@ -406,10 +364,8 @@ impl Operation {
 }
 
 #[derive(Default)]
-pub struct Recipe {
-	tensors: Vec<Tensor>,
-	operations: Vec<Operation>,
-}
+#[rustfmt::skip]
+pub struct Recipe { tensors: Vec<Tensor>, operations: Vec<Operation> }
 
 #[rustfmt::skip]
 impl Recipe {
@@ -794,80 +750,34 @@ impl Train {
 impl LossFunction { const fn name(self) -> &'static str { match self.0 { 0 => "mse", 1 => "rmse", 2 => "huber", 3 => "mae", 4 => "bce", 5 => "ce", 6 => "focal", _ => unreachable!() } } }
 
 #[rustfmt::skip]
-fn load_weights(
-	path: &str,
-	initial: &[f64],
-	model: &Model,
-	features: usize,
-	schema: &str,
-) -> Result<Vec<f64>, RecipeError> {
-	path.ends_with(".ogdl")
-		.then_some(())
-		.ok_or_else(|| RecipeError::new("resume requires a semantic .ogdl model"))?;
-	if !fs::exists(path)
-		.map_err(|error| RecipeError::new(format!("cannot inspect {path}: {error}")))?
-	{
-		save_weights(path, model, features, schema, initial)?;
-	}
-	let text = fs::read_to_string(path)
-		.map_err(|error| RecipeError::new(format!("cannot resume {path}: {error}")))?;
-	let line = text
-		.lines()
-		.find_map(|line| line.trim().strip_prefix("weights "))
-		.ok_or_else(|| RecipeError::new("model has no weights"))?;
-	let mut weights = line
-		.split_whitespace()
-		.map(|value| {
-			value.parse::<f64>()
-				.map_err(|error| RecipeError::new(format!("invalid model weight: {error}")))
-		})
-		.collect::<Result<Vec<_>, _>>()?;
-	let stored_model = text
-		.lines()
-		.find_map(|line| line.trim().strip_prefix("model "));
-	let stored_schema = text.lines().find_map(|line| line.trim().strip_prefix("schema "));
-	if weights.len() != initial.len() || stored_model != Some(model.signature().as_str()) || stored_schema != Some(schema) {
-		eprint!("mismatch: overwrite {path}? Y/n ");
-		std::io::Write::flush(&mut std::io::stderr())
-			.map_err(|error| RecipeError::new(format!("cannot prompt: {error}")))?;
-		let mut answer = String::new();
-		std::io::stdin()
-			.read_line(&mut answer)
-			.map_err(|error| RecipeError::new(format!("cannot read answer: {error}")))?;
-		if !answer.trim().is_empty() && !answer.trim().eq_ignore_ascii_case("y") {
-			return Err(RecipeError::new("model mismatch not overwritten"));
-		}
-		weights = initial.to_vec();
-		save_weights(path, model, features, schema, &weights)?;
-	}
-	eprintln!("resumed: {path}");
-	Ok(weights)
+fn load_weights(path: &str, initial: &[f64], model: &Model, features: usize, schema: &str) -> Result<Vec<f64>, RecipeError> {
+    path.ends_with(".ogdl").then_some(()).ok_or_else(|| RecipeError::new("resume requires a semantic .ogdl model"))?;
+    if !fs::exists(path).map_err(|error| RecipeError::new(format!("cannot inspect {path}: {error}")))? { save_weights(path, model, features, schema, initial)?; }
+    let text = fs::read_to_string(path).map_err(|error| RecipeError::new(format!("cannot resume {path}: {error}")))?;
+    let (mut stored_model, mut stored_schema, mut stored_weights) = (None, None, None);
+    for line in text.lines().map(str::trim) {
+        if let Some(value) = line.strip_prefix("model ") { stored_model = Some(value); }
+        if let Some(value) = line.strip_prefix("schema ") { stored_schema = Some(value); }
+        if let Some(value) = line.strip_prefix("weights ") { stored_weights = Some(value); }
+    }
+    let mut weights = stored_weights.ok_or_else(|| RecipeError::new("model has no weights"))?.split_whitespace().map(|value| value.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid model weight: {error}")))).collect::<Result<Vec<_>, _>>()?;
+    let signature = model.signature();
+    if weights.len() != initial.len() || stored_model != Some(signature.as_str()) || stored_schema != Some(schema) {
+        eprint!("mismatch: overwrite {path}? Y/n ");
+        std::io::Write::flush(&mut std::io::stderr()).map_err(|error| RecipeError::new(format!("cannot prompt: {error}")))?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).map_err(|error| RecipeError::new(format!("cannot read answer: {error}")))?;
+        if !answer.trim().is_empty() && !answer.trim().eq_ignore_ascii_case("y") { return Err(RecipeError::new("model mismatch not overwritten")); }
+        weights = initial.to_vec(); save_weights(path, model, features, schema, &weights)?;
+    }
+    eprintln!("resumed: {path}"); Ok(weights)
 }
 
-fn save_weights(
-	path: &str,
-	model: &Model,
-	features: usize,
-	schema: &str,
-	weights: &[f64],
-) -> Result<(), RecipeError> {
-	path.ends_with(".ogdl")
-		.then_some(())
-		.ok_or_else(|| RecipeError::new("save requires a semantic .ogdl model"))?;
-	let weights = weights
-		.iter()
-		.map(f64::to_string)
-		.collect::<Vec<_>>()
-		.join(" ");
-	let model = model.signature();
-	fs::write(
-		path,
-		format!(
-			"recipe-model\n    features {features}\n    schema {schema}\n    model {model}\n    weights {weights}\n"
-		),
-	)
-	.map_err(|error| RecipeError::new(format!("cannot write {path}: {error}")))
-	.map(|()| eprintln!("saved: {path}"))
+#[rustfmt::skip]
+fn save_weights(path: &str, model: &Model, features: usize, schema: &str, weights: &[f64]) -> Result<(), RecipeError> {
+    path.ends_with(".ogdl").then_some(()).ok_or_else(|| RecipeError::new("save requires a semantic .ogdl model"))?;
+    let weights = weights.iter().map(f64::to_string).collect::<Vec<_>>().join(" ");
+    fs::write(path, format!("recipe-model\n    features {features}\n    schema {schema}\n    model {}\n    weights {weights}\n", model.signature())).map_err(|error| RecipeError::new(format!("cannot write {path}: {error}"))).map(|()| eprintln!("saved: {path}"))
 }
 
 #[rustfmt::skip]
@@ -972,10 +882,8 @@ fn encode(value: &str, kind: &FeatureType, output: &mut Vec<f64>) -> bool { matc
 #[rustfmt::skip]
 fn image_extension(path: &Path) -> Option<&str> { const IMAGE: &[&str] = &["gif","webp","avif","jxl","apng","mp4","mov","avi","mkv","webm","flv","wmv","jpg","jpeg","png","bmp","tiff","tif","ico","heic","heif","pgm","ppm","pbm","pnm","tga","qoi","jp2","raw","cr2","nef","arw","dng","orf","rw2","psd","exr","hdr","svg"]; path.extension().and_then(|extension| extension.to_str()).map(str::to_ascii_lowercase).and_then(|extension| IMAGE.contains(&extension.as_str()).then(|| path.extension().and_then(|value| value.to_str())).flatten()) }
 
-fn configured_f64(name: &str, value: &str) -> Result<f64, RecipeError> {
-	value.parse()
-		.map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))
-}
+#[rustfmt::skip]
+fn configured_f64(name: &str, value: &str) -> Result<f64, RecipeError> { value.parse().map_err(|error| RecipeError::new(format!("invalid {name}: {error}"))) }
 #[rustfmt::skip]
 fn activation_config() -> Result<ActivationConfig, RecipeError> {
     Ok(ActivationConfig { leak: configured_f64("RECIPE_LEAK_SLOPE", env!("RECIPE_LEAK_SLOPE"))?, prelu: configured_f64("RECIPE_PRELU_INITIAL_SLOPE", env!("RECIPE_PRELU_INITIAL_SLOPE"))?, elu: configured_f64("RECIPE_ELU_ALPHA", env!("RECIPE_ELU_ALPHA"))?, selu_alpha: configured_f64("RECIPE_SELU_ALPHA", env!("RECIPE_SELU_ALPHA"))?, selu_scale: configured_f64("RECIPE_SELU_SCALE", env!("RECIPE_SELU_SCALE"))?, gelu_scale: configured_f64("RECIPE_GELU_SCALE", env!("RECIPE_GELU_SCALE"))?, gelu_cubic: configured_f64("RECIPE_GELU_CUBIC", env!("RECIPE_GELU_CUBIC"))? })
@@ -990,16 +898,8 @@ enum Calculation {
 	Relu(u64),
 }
 
-impl Calculation {
-	const fn flops(&self) -> u64 {
-		match self {
-			Self::Conv1d(_, _, _, _, _, _, flops)
-			| Self::BiasAdd(_, _, _, flops)
-			| Self::Matmul(_, _, _, flops) => *flops,
-			Self::Add(elements) | Self::Relu(elements) => *elements,
-		}
-	}
-}
+#[rustfmt::skip]
+impl Calculation { const fn flops(&self) -> u64 { match self { Self::Conv1d(_, _, _, _, _, _, flops) | Self::BiasAdd(_, _, _, flops) | Self::Matmul(_, _, _, flops) => *flops, Self::Add(elements) | Self::Relu(elements) => *elements } } }
 
 pub struct Lowering {
 	tensors: Vec<Tensor>,
