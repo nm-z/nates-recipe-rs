@@ -470,85 +470,175 @@ exit:
   ret void
 }
 
-define internal void @forest_preds_body(ptr addrspace(1) %input, ptr addrspace(1) %targets, ptr addrspace(1) %output, ptr addrspace(1) %trees.buffer, i32 %rows, i32 %from, i32 %trees, i32 %threads) #1 {
+define internal void @forest_preds_body(ptr addrspace(1) %input, ptr addrspace(1) %targets, ptr addrspace(1) %output, ptr addrspace(1) %context, i32 %rows, i32 %from, i32 %trees, i32 %depth, i32 %threads) #1 {
 entry:
   %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
-  br label %fit.loop
-fit.loop:
-  %tree = phi i32 [ %tid, %entry ], [ %tree.next, %fit.store ]
-  %tree.more = icmp ult i32 %tree, %trees
-  br i1 %tree.more, label %fit.start, label %fit.done
-fit.start:
-  %feature = urem i32 %tree, %from
-  br label %mean.loop
-mean.loop:
-  %mean.row = phi i32 [ 0, %fit.start ], [ %mean.next, %mean.step ]
-  %feature.sum = phi double [ 0.0, %fit.start ], [ %feature.sum.next, %mean.step ]
-  %mean.more = icmp ult i32 %mean.row, %rows
-  br i1 %mean.more, label %mean.step, label %mean.done
-mean.step:
-  %mean.base = mul i32 %mean.row, %from
-  %mean.index = add i32 %mean.base, %feature
-  %mean.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %mean.index
-  %mean.value = load double, ptr addrspace(1) %mean.ptr, align 8
-  %feature.sum.next = fadd double %feature.sum, %mean.value
-  %mean.next = add i32 %mean.row, 1
-  br label %mean.loop
-mean.done:
+  %leaves = shl i32 1, %depth
+  %internals = sub i32 %leaves, 1
+  %internal.fields = mul i32 %internals, 2
+  %tree.span = add i32 %internal.fields, %leaves
+  %tree.data.count = mul i32 %trees, %tree.span
+  br label %target.mean.loop
+target.mean.loop:
+  %target.row = phi i32 [ 0, %entry ], [ %target.row.next, %target.mean.step ]
+  %target.sum = phi double [ 0.0, %entry ], [ %target.sum.next, %target.mean.step ]
+  %target.more = icmp ult i32 %target.row, %rows
+  br i1 %target.more, label %target.mean.step, label %target.mean.done
+target.mean.step:
+  %target.ptr = getelementptr inbounds double, ptr addrspace(1) %targets, i32 %target.row
+  %target.value = load double, ptr addrspace(1) %target.ptr, align 8
+  %target.sum.next = fadd double %target.sum, %target.value
+  %target.row.next = add i32 %target.row, 1
+  br label %target.mean.loop
+target.mean.done:
   %rows.double = uitofp i32 %rows to double
-  %threshold = fdiv double %feature.sum, %rows.double
-  br label %leaf.loop
-leaf.loop:
-  %leaf.row = phi i32 [ 0, %mean.done ], [ %leaf.next, %leaf.step ]
-  %left.sum = phi double [ 0.0, %mean.done ], [ %left.sum.next, %leaf.step ]
-  %right.sum = phi double [ 0.0, %mean.done ], [ %right.sum.next, %leaf.step ]
-  %left.count = phi i32 [ 0, %mean.done ], [ %left.count.next, %leaf.step ]
-  %right.count = phi i32 [ 0, %mean.done ], [ %right.count.next, %leaf.step ]
-  %leaf.more = icmp ult i32 %leaf.row, %rows
-  br i1 %leaf.more, label %leaf.step, label %fit.store
-leaf.step:
-  %leaf.base = mul i32 %leaf.row, %from
-  %leaf.index = add i32 %leaf.base, %feature
-  %leaf.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %leaf.index
-  %target.ptr = getelementptr inbounds double, ptr addrspace(1) %targets, i32 %leaf.row
-  %leaf.value = load double, ptr addrspace(1) %leaf.ptr, align 8
-  %target = load double, ptr addrspace(1) %target.ptr, align 8
-  %left = fcmp ole double %leaf.value, %threshold
-  %left.term = select i1 %left, double %target, double 0.0
-  %right.term = select i1 %left, double 0.0, double %target
-  %left.member = zext i1 %left to i32
-  %right = xor i1 %left, true
-  %right.member = zext i1 %right to i32
-  %left.sum.next = fadd double %left.sum, %left.term
-  %right.sum.next = fadd double %right.sum, %right.term
-  %left.count.next = add i32 %left.count, %left.member
-  %right.count.next = add i32 %right.count, %right.member
-  %leaf.next = add i32 %leaf.row, 1
-  br label %leaf.loop
-fit.store:
-  %left.nonempty = icmp ugt i32 %left.count, 0
-  %right.nonempty = icmp ugt i32 %right.count, 0
-  %left.count.double = uitofp i32 %left.count to double
-  %right.count.double = uitofp i32 %right.count to double
-  %left.divided = fdiv double %left.sum, %left.count.double
-  %right.divided = fdiv double %right.sum, %right.count.double
-  %left.mean = select i1 %left.nonempty, double %left.divided, double 0.0
-  %right.mean = select i1 %right.nonempty, double %right.divided, double 0.0
-  %tree.base = mul i32 %tree, 4
-  %threshold.index = add i32 %tree.base, 1
-  %left.index = add i32 %tree.base, 2
-  %right.index = add i32 %tree.base, 3
-  %feature.ptr = getelementptr inbounds double, ptr addrspace(1) %trees.buffer, i32 %tree.base
-  %threshold.ptr = getelementptr inbounds double, ptr addrspace(1) %trees.buffer, i32 %threshold.index
-  %left.ptr = getelementptr inbounds double, ptr addrspace(1) %trees.buffer, i32 %left.index
-  %right.ptr = getelementptr inbounds double, ptr addrspace(1) %trees.buffer, i32 %right.index
+  %target.mean = fdiv double %target.sum, %rows.double
+  br label %tree.loop
+tree.loop:
+  %tree = phi i32 [ %tid, %target.mean.done ], [ %tree.next, %tree.done ]
+  %tree.more = icmp ult i32 %tree, %trees
+  br i1 %tree.more, label %assignment.initialize, label %fit.done
+assignment.initialize:
+  %tree.base = mul i32 %tree, %tree.span
+  %assignment.tree.offset = mul i32 %tree, %rows
+  %assignment.base = add i32 %tree.data.count, %assignment.tree.offset
+  br label %assignment.initialize.loop
+assignment.initialize.loop:
+  %initialize.row = phi i32 [ 0, %assignment.initialize ], [ %initialize.next, %assignment.initialize.step ]
+  %initialize.more = icmp ult i32 %initialize.row, %rows
+  br i1 %initialize.more, label %assignment.initialize.step, label %level.loop
+assignment.initialize.step:
+  %initialize.index = add i32 %assignment.base, %initialize.row
+  %initialize.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %initialize.index
+  store double 0.0, ptr addrspace(1) %initialize.ptr, align 8
+  %initialize.next = add i32 %initialize.row, 1
+  br label %assignment.initialize.loop
+level.loop:
+  %level = phi i32 [ 0, %assignment.initialize.loop ], [ %level.next, %assignment.update.done ]
+  %level.more = icmp ult i32 %level, %depth
+  br i1 %level.more, label %node.level, label %leaf.loop
+node.level:
+  %nodes.at.level = shl i32 1, %level
+  %node.start = sub i32 %nodes.at.level, 1
+  br label %node.loop
+node.loop:
+  %node.local = phi i32 [ 0, %node.level ], [ %node.local.next, %node.store ]
+  %node.more = icmp ult i32 %node.local, %nodes.at.level
+  br i1 %node.more, label %node.mean.start, label %assignment.update.loop
+node.mean.start:
+  %node = add i32 %node.start, %node.local
+  %feature.seed = add i32 %tree, %node
+  %feature = urem i32 %feature.seed, %from
+  br label %node.mean.loop
+node.mean.loop:
+  %node.row = phi i32 [ 0, %node.mean.start ], [ %node.row.next, %node.mean.step ]
+  %feature.sum = phi double [ 0.0, %node.mean.start ], [ %feature.sum.next, %node.mean.step ]
+  %node.members = phi i32 [ 0, %node.mean.start ], [ %node.members.next, %node.mean.step ]
+  %node.row.more = icmp ult i32 %node.row, %rows
+  br i1 %node.row.more, label %node.mean.step, label %node.store
+node.mean.step:
+  %assignment.index = add i32 %assignment.base, %node.row
+  %assignment.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %assignment.index
+  %assignment.double = load double, ptr addrspace(1) %assignment.ptr, align 8
+  %assignment = fptoui double %assignment.double to i32
+  %node.member = icmp eq i32 %assignment, %node
+  %input.row.base = mul i32 %node.row, %from
+  %input.index = add i32 %input.row.base, %feature
+  %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %input.index
+  %input.value = load double, ptr addrspace(1) %input.ptr, align 8
+  %feature.term = select i1 %node.member, double %input.value, double 0.0
+  %feature.sum.next = fadd double %feature.sum, %feature.term
+  %member.integer = zext i1 %node.member to i32
+  %node.members.next = add i32 %node.members, %member.integer
+  %node.row.next = add i32 %node.row, 1
+  br label %node.mean.loop
+node.store:
+  %node.nonempty = icmp ugt i32 %node.members, 0
+  %node.members.double = uitofp i32 %node.members to double
+  %threshold.divided = fdiv double %feature.sum, %node.members.double
+  %threshold = select i1 %node.nonempty, double %threshold.divided, double 0.0
+  %feature.index = add i32 %tree.base, %node
+  %threshold.local = add i32 %internals, %node
+  %threshold.index = add i32 %tree.base, %threshold.local
+  %feature.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %feature.index
+  %threshold.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %threshold.index
   %feature.double = uitofp i32 %feature to double
   store double %feature.double, ptr addrspace(1) %feature.ptr, align 8
   store double %threshold, ptr addrspace(1) %threshold.ptr, align 8
-  store double %left.mean, ptr addrspace(1) %left.ptr, align 8
-  store double %right.mean, ptr addrspace(1) %right.ptr, align 8
+  %node.local.next = add i32 %node.local, 1
+  br label %node.loop
+assignment.update.loop:
+  %update.row = phi i32 [ 0, %node.loop ], [ %update.row.next, %assignment.update.step ]
+  %update.more = icmp ult i32 %update.row, %rows
+  br i1 %update.more, label %assignment.update.step, label %assignment.update.done
+assignment.update.step:
+  %update.assignment.index = add i32 %assignment.base, %update.row
+  %update.assignment.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %update.assignment.index
+  %update.node.double = load double, ptr addrspace(1) %update.assignment.ptr, align 8
+  %update.node = fptoui double %update.node.double to i32
+  %update.feature.index = add i32 %tree.base, %update.node
+  %update.threshold.local = add i32 %internals, %update.node
+  %update.threshold.index = add i32 %tree.base, %update.threshold.local
+  %update.feature.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %update.feature.index
+  %update.threshold.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %update.threshold.index
+  %update.feature.double = load double, ptr addrspace(1) %update.feature.ptr, align 8
+  %update.feature = fptoui double %update.feature.double to i32
+  %update.threshold = load double, ptr addrspace(1) %update.threshold.ptr, align 8
+  %update.input.row = mul i32 %update.row, %from
+  %update.input.index = add i32 %update.input.row, %update.feature
+  %update.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %update.input.index
+  %update.input = load double, ptr addrspace(1) %update.input.ptr, align 8
+  %update.right = fcmp ogt double %update.input, %update.threshold
+  %update.right.integer = zext i1 %update.right to i32
+  %update.left = mul i32 %update.node, 2
+  %update.child.0 = add i32 %update.left, 1
+  %update.child = add i32 %update.child.0, %update.right.integer
+  %update.child.double = uitofp i32 %update.child to double
+  store double %update.child.double, ptr addrspace(1) %update.assignment.ptr, align 8
+  %update.row.next = add i32 %update.row, 1
+  br label %assignment.update.loop
+assignment.update.done:
+  %level.next = add i32 %level, 1
+  br label %level.loop
+leaf.loop:
+  %leaf = phi i32 [ 0, %level.loop ], [ %leaf.next, %leaf.store ]
+  %leaf.more = icmp ult i32 %leaf, %leaves
+  br i1 %leaf.more, label %leaf.mean.loop, label %tree.done
+leaf.mean.loop:
+  %leaf.row = phi i32 [ 0, %leaf.loop ], [ %leaf.row.next, %leaf.mean.step ]
+  %leaf.sum = phi double [ 0.0, %leaf.loop ], [ %leaf.sum.next, %leaf.mean.step ]
+  %leaf.members = phi i32 [ 0, %leaf.loop ], [ %leaf.members.next, %leaf.mean.step ]
+  %leaf.row.more = icmp ult i32 %leaf.row, %rows
+  br i1 %leaf.row.more, label %leaf.mean.step, label %leaf.store
+leaf.mean.step:
+  %leaf.assignment.index = add i32 %assignment.base, %leaf.row
+  %leaf.assignment.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %leaf.assignment.index
+  %leaf.assignment.double = load double, ptr addrspace(1) %leaf.assignment.ptr, align 8
+  %leaf.assignment = fptoui double %leaf.assignment.double to i32
+  %leaf.heap = add i32 %internals, %leaf
+  %leaf.member = icmp eq i32 %leaf.assignment, %leaf.heap
+  %leaf.target.ptr = getelementptr inbounds double, ptr addrspace(1) %targets, i32 %leaf.row
+  %leaf.target = load double, ptr addrspace(1) %leaf.target.ptr, align 8
+  %leaf.term = select i1 %leaf.member, double %leaf.target, double 0.0
+  %leaf.sum.next = fadd double %leaf.sum, %leaf.term
+  %leaf.member.integer = zext i1 %leaf.member to i32
+  %leaf.members.next = add i32 %leaf.members, %leaf.member.integer
+  %leaf.row.next = add i32 %leaf.row, 1
+  br label %leaf.mean.loop
+leaf.store:
+  %leaf.nonempty = icmp ugt i32 %leaf.members, 0
+  %leaf.members.double = uitofp i32 %leaf.members to double
+  %leaf.divided = fdiv double %leaf.sum, %leaf.members.double
+  %leaf.prediction = select i1 %leaf.nonempty, double %leaf.divided, double %target.mean
+  %leaf.local = add i32 %internal.fields, %leaf
+  %leaf.index = add i32 %tree.base, %leaf.local
+  %leaf.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %leaf.index
+  store double %leaf.prediction, ptr addrspace(1) %leaf.ptr, align 8
+  %leaf.next = add i32 %leaf, 1
+  br label %leaf.loop
+tree.done:
   %tree.next = add i32 %tree, %threads
-  br label %fit.loop
+  br label %tree.loop
 fit.done:
   call void @llvm.nvvm.barrier0()
   br label %predict.loop
@@ -557,30 +647,42 @@ predict.loop:
   %row.more = icmp ult i32 %row, %rows
   br i1 %row.more, label %predict.tree.loop, label %exit
 predict.tree.loop:
-  %predict.tree = phi i32 [ 0, %predict.loop ], [ %predict.tree.next, %predict.tree.step ]
-  %prediction.sum = phi double [ 0.0, %predict.loop ], [ %prediction.sum.next, %predict.tree.step ]
-  %predict.more = icmp ult i32 %predict.tree, %trees
-  br i1 %predict.more, label %predict.tree.step, label %predict.store
-predict.tree.step:
-  %predict.tree.base = mul i32 %predict.tree, 4
-  %predict.threshold.index = add i32 %predict.tree.base, 1
-  %predict.left.index = add i32 %predict.tree.base, 2
-  %predict.right.index = add i32 %predict.tree.base, 3
-  %predict.feature.ptr = getelementptr inbounds double, ptr addrspace(1) %trees.buffer, i32 %predict.tree.base
-  %predict.threshold.ptr = getelementptr inbounds double, ptr addrspace(1) %trees.buffer, i32 %predict.threshold.index
-  %predict.left.ptr = getelementptr inbounds double, ptr addrspace(1) %trees.buffer, i32 %predict.left.index
-  %predict.right.ptr = getelementptr inbounds double, ptr addrspace(1) %trees.buffer, i32 %predict.right.index
-  %predict.feature.double = load double, ptr addrspace(1) %predict.feature.ptr, align 8
-  %predict.feature = fptoui double %predict.feature.double to i32
-  %predict.threshold = load double, ptr addrspace(1) %predict.threshold.ptr, align 8
-  %predict.left = load double, ptr addrspace(1) %predict.left.ptr, align 8
-  %predict.right = load double, ptr addrspace(1) %predict.right.ptr, align 8
+  %predict.tree = phi i32 [ 0, %predict.loop ], [ %predict.tree.next, %predict.tree.done ]
+  %prediction.sum = phi double [ 0.0, %predict.loop ], [ %prediction.sum.next, %predict.tree.done ]
+  %predict.tree.more = icmp ult i32 %predict.tree, %trees
+  %predict.tree.base = mul i32 %predict.tree, %tree.span
+  br i1 %predict.tree.more, label %traverse.loop, label %predict.store
+traverse.loop:
+  %traverse.level = phi i32 [ 0, %predict.tree.loop ], [ %traverse.level.next, %traverse.step ]
+  %traverse.node = phi i32 [ 0, %predict.tree.loop ], [ %traverse.child, %traverse.step ]
+  %traverse.more = icmp ult i32 %traverse.level, %depth
+  br i1 %traverse.more, label %traverse.step, label %predict.tree.done
+traverse.step:
+  %traverse.feature.index = add i32 %predict.tree.base, %traverse.node
+  %traverse.threshold.local = add i32 %internals, %traverse.node
+  %traverse.threshold.index = add i32 %predict.tree.base, %traverse.threshold.local
+  %traverse.feature.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %traverse.feature.index
+  %traverse.threshold.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %traverse.threshold.index
+  %traverse.feature.double = load double, ptr addrspace(1) %traverse.feature.ptr, align 8
+  %traverse.feature = fptoui double %traverse.feature.double to i32
+  %traverse.threshold = load double, ptr addrspace(1) %traverse.threshold.ptr, align 8
   %predict.row.base = mul i32 %row, %from
-  %predict.input.index = add i32 %predict.row.base, %predict.feature
-  %predict.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %predict.input.index
-  %predict.input = load double, ptr addrspace(1) %predict.input.ptr, align 8
-  %predict.left.branch = fcmp ole double %predict.input, %predict.threshold
-  %tree.prediction = select i1 %predict.left.branch, double %predict.left, double %predict.right
+  %traverse.input.index = add i32 %predict.row.base, %traverse.feature
+  %traverse.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %traverse.input.index
+  %traverse.input = load double, ptr addrspace(1) %traverse.input.ptr, align 8
+  %traverse.right = fcmp ogt double %traverse.input, %traverse.threshold
+  %traverse.right.integer = zext i1 %traverse.right to i32
+  %traverse.left = mul i32 %traverse.node, 2
+  %traverse.child.0 = add i32 %traverse.left, 1
+  %traverse.child = add i32 %traverse.child.0, %traverse.right.integer
+  %traverse.level.next = add i32 %traverse.level, 1
+  br label %traverse.loop
+predict.tree.done:
+  %predict.leaf = sub i32 %traverse.node, %internals
+  %predict.leaf.local = add i32 %internal.fields, %predict.leaf
+  %predict.leaf.index = add i32 %predict.tree.base, %predict.leaf.local
+  %predict.leaf.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %predict.leaf.index
+  %tree.prediction = load double, ptr addrspace(1) %predict.leaf.ptr, align 8
   %prediction.sum.next = fadd double %prediction.sum, %tree.prediction
   %predict.tree.next = add i32 %predict.tree, 1
   br label %predict.tree.loop
@@ -1932,9 +2034,15 @@ forest.preds.test:
   br i1 %is.forest, label %forest.preds.fit, label %knn.preds.fit
 forest.preds.fit:
   %trees = fptoui double %parameter to i32
-  %forest.preds.offset = mul i32 %trees, 4
+  %forest.depth = fptoui double %secondary to i32
+  %forest.leaves = shl i32 1, %forest.depth
+  %forest.span.0 = mul i32 %forest.leaves, 3
+  %forest.span = sub i32 %forest.span.0, 2
+  %forest.tree.data = mul i32 %trees, %forest.span
+  %forest.assignments = mul i32 %trees, %rows
+  %forest.preds.offset = add i32 %forest.tree.data, %forest.assignments
   %forest.preds = getelementptr inbounds double, ptr addrspace(1) %context, i32 %forest.preds.offset
-  call void @forest_preds_body(ptr addrspace(1) %source, ptr addrspace(1) %targets, ptr addrspace(1) %forest.preds, ptr addrspace(1) %context, i32 %rows, i32 %from, i32 %trees, i32 %threads)
+  call void @forest_preds_body(ptr addrspace(1) %source, ptr addrspace(1) %targets, ptr addrspace(1) %forest.preds, ptr addrspace(1) %context, i32 %rows, i32 %from, i32 %trees, i32 %forest.depth, i32 %threads)
   br label %operation.dispatch
 knn.preds.fit:
   %neighbors = fptoui double %parameter to i32
@@ -2146,8 +2254,11 @@ backward.load:
   %backward.normalization = load i32, ptr addrspace(1) %backward.normalization.ptr, align 4
   %backward.prelu = load i32, ptr addrspace(1) %backward.prelu.ptr, align 4
   %backward.parameter.base = mul i32 %backward.stage, 2
+  %backward.secondary.index = add i32 %backward.parameter.base, 1
   %backward.parameter.ptr = getelementptr inbounds double, ptr addrspace(1) %parameters, i32 %backward.parameter.base
+  %backward.secondary.ptr = getelementptr inbounds double, ptr addrspace(1) %parameters, i32 %backward.secondary.index
   %backward.parameter = load double, ptr addrspace(1) %backward.parameter.ptr, align 8
+  %backward.secondary = load double, ptr addrspace(1) %backward.secondary.ptr, align 8
   %backward.parameter.integer = fptoui double %backward.parameter to i32
   %backward.value.slot = getelementptr inbounds i64, ptr addrspace(1) %value_pointers, i32 %backward.stage
   %backward.raw.slot = getelementptr inbounds i64, ptr addrspace(1) %raw_pointers, i32 %backward.stage
@@ -2242,7 +2353,13 @@ forest.preds.test:
   br i1 %matrix.forest, label %forest.preds.load, label %knn.preds.load
 forest.preds.load:
   %forest.trees.backward = fptoui double %backward.parameter to i32
-  %forest.preds.offset.backward = mul i32 %forest.trees.backward, 4
+  %forest.depth.backward = fptoui double %backward.secondary to i32
+  %forest.leaves.backward = shl i32 1, %forest.depth.backward
+  %forest.span.0.backward = mul i32 %forest.leaves.backward, 3
+  %forest.span.backward = sub i32 %forest.span.0.backward, 2
+  %forest.tree.data.backward = mul i32 %forest.trees.backward, %forest.span.backward
+  %forest.assignments.backward = mul i32 %forest.trees.backward, %rows
+  %forest.preds.offset.backward = add i32 %forest.tree.data.backward, %forest.assignments.backward
   %forest.preds.backward = getelementptr inbounds double, ptr addrspace(1) %backward.context, i32 %forest.preds.offset.backward
   br label %ho.streetwalk
 knn.preds.load:

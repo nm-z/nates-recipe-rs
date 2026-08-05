@@ -74,18 +74,26 @@ pub struct Model {
 }
 
 macro_rules! operation_blocks {
-	($input:ident, $output:ident, $recurrent:ident; $($variant:ident($($field:ident: $field_type:ty),+) => $method:ident($($argument:ident: $type:ty),*) = ($($value:expr),*); width $width:expr; parameters $parameters:expr;)+ $(@ $plain:ident($($plain_field:ident: $plain_type:ty),+); width $plain_width:expr; parameters $plain_parameters:expr;)+) => {
+	($input:ident, $output:ident, $recurrent:ident; $($variant:ident($($field:ident: $field_type:ty),+) => $method:ident($($argument:ident: $type:ty),*) = ($($value:expr),*); width $width:expr; parameters $parameters:expr; name $name:expr;)+ $(@ $plain:ident($($plain_field:ident: $plain_type:ty),+); width $plain_width:expr; parameters $plain_parameters:expr; name $plain_name:expr;)+) => {
 		#[derive(Clone, Debug)] enum OperationBlock { $($variant($($field_type),+),)+ $($plain($($plain_type),+),)+ }
-		impl Model {$(pub fn $method(self, $($argument: $type),*) -> Self { self.push(OperationBlock::$variant($($value),*)) })+}
-		impl OperationBlock { fn output(&self, $input: usize) -> Result<usize, RecipeError> { let $output = match self { $(Self::$variant($($field),+) => $width,)+ $(Self::$plain($($plain_field),+) => $plain_width,)+ }; ($output != 0).then_some($output).ok_or_else(|| RecipeError::new("model block dimensions must be positive")) } fn parameters(&self, $input: usize, $output: usize) -> Result<usize, RecipeError> { let $recurrent = |width: usize, gates: usize| $input.checked_mul(width).and_then(|a| width.checked_mul(width).and_then(|b| a.checked_add(b))).and_then(|value| value.checked_add(width)).and_then(|value| value.checked_mul(gates)); match self { $(Self::$variant($($field),+) => $parameters,)+ $(Self::$plain($($plain_field),+) => $plain_parameters,)+ }.ok_or_else(|| RecipeError::new("model parameter count overflow")) } }
+		impl Model {
+			$(pub fn $method(self, $($argument: $type),*) -> Self { self.push(OperationBlock::$variant($($value),*)) })+
+			fn push(mut self, operation: OperationBlock) -> Self { self.blocks.push(Block { operation, activation: Activation::Linear, normalization: None }); self }
+			pub fn residual<const N: usize>(self, parts: [Residual; N]) -> Self { self.push(OperationBlock::Residual(parts.into())) }
+			pub const fn loss(mut self, loss: LossFunction) -> Self { self.loss = loss; self }
+			fn graph(&self, features: usize) -> Result<TrainingGraph<'_>, RecipeError> { if self.blocks.is_empty() { return Err(RecipeError::new("training model must contain a block")); } let mut widths = vec![features]; let mut offsets = Vec::with_capacity(self.blocks.len()); let mut parameters = 0_usize; for block in &self.blocks { let input = widths[widths.len() - 1]; let output = block.operation.output(input)?; offsets.push(parameters); parameters = parameters.checked_add(block.operation.parameters(input, output)?).ok_or_else(|| RecipeError::new("model parameter count overflow"))?; widths.push(output); } if widths.last() != Some(&1) { return Err(RecipeError::new("training model output must contain one value")); } let matrix_parameters = parameters; parameters += self.blocks.iter().filter(|block| block.activation == Activation::PRelu).count(); Ok(TrainingGraph { blocks: &self.blocks, widths, offsets, matrix_parameters, parameters }) }
+			fn signature(&self) -> String { format!("{:?}", self.blocks) }
+			fn description(&self, operation: bool, activation: bool, normalization: bool) -> String { self.blocks.iter().filter_map(|block| { let mut parts = Vec::new(); if operation { parts.push(block.operation.name()); } if activation && block.activation != Activation::Linear { parts.push(block.activation.name()); } if normalization && let Some(value) = block.normalization { parts.push(value.name()); } (!parts.is_empty()).then(|| parts.join(".")) }).collect::<Vec<_>>().join("/") }
+		}
+		impl OperationBlock { fn name(&self) -> &'static str { match self { $(Self::$variant($($field),+) => $name,)+ $(Self::$plain($($plain_field),+) => $plain_name,)+ } } fn output(&self, $input: usize) -> Result<usize, RecipeError> { let $output = match self { $(Self::$variant($($field),+) => $width,)+ $(Self::$plain($($plain_field),+) => $plain_width,)+ }; ($output != 0).then_some($output).ok_or_else(|| RecipeError::new("model block dimensions must be positive")) } fn parameters(&self, $input: usize, $output: usize) -> Result<usize, RecipeError> { let $recurrent = |width: usize, gates: usize| $input.checked_mul(width).and_then(|a| width.checked_mul(width).and_then(|b| a.checked_add(b))).and_then(|value| value.checked_add(width)).and_then(|value| value.checked_mul(gates)); match self { $(Self::$variant($($field),+) => $parameters,)+ $(Self::$plain($($plain_field),+) => $plain_parameters,)+ }.ok_or_else(|| RecipeError::new("model parameter count overflow")) } }
 	};
 }
 operation_blocks! {
 	input, output, recurrent;
-	Layer(_width: usize) => layer(value: usize) = (value); width *_width; parameters input.checked_mul(output); Conv(_filters: usize, _kernel: usize) => conv(filters: usize, kernel: usize) = (filters, kernel); width _filters.saturating_mul(input.checked_sub(*_kernel).map_or(0, |length| length + 1)); parameters _filters.checked_mul(*_kernel); Pool(_size: usize) => pool(value: usize) = (value); width input.div_ceil(*_size); parameters Some(0); KMeans(_width: usize) => kmeans(value: usize) = (value); width *_width; parameters input.checked_mul(output);
-	Embed(_dimensions: usize, _vocabulary: usize) => embed(value: usize) = (value, 0); width input.saturating_mul(*_dimensions); parameters if *_vocabulary != 0 { _dimensions.checked_mul(*_vocabulary) } else { return Err(RecipeError::new("embedding vocabulary must be positive")); }; Attention(_heads: usize) => attn(value: usize) = (value); width input; parameters return Err(RecipeError::new("attention requires genuine Q, K, V lowering")); Rnn(_width: usize) => rnn(value: usize) = (value); width *_width; parameters recurrent(*_width, 1); Gru(_width: usize) => gru(value: usize) = (value); width *_width; parameters recurrent(*_width, 3);
-	Lstm(_width: usize) => lstm(value: usize) = (value); width *_width; parameters recurrent(*_width, 4); Forest(_trees: usize, _kind: u8, _depth: usize) => forest(value: usize) = (value, 0, 0); width 1; parameters input.checked_mul(output); Knn(_neighbors: usize) => knn(value: usize) = (value); width 1; parameters input.checked_mul(output); Perceptron(_width: usize) => perc(value: usize) = (value); width *_width; parameters input.checked_mul(output);
-	@ Residual(_parts: Vec<Residual>); width _parts.iter().filter_map(|part| if let Residual::Layer(width) = part { Some(*width) } else { None }).sum(); parameters input.checked_mul(output);
+	Layer(_width: usize) => layer(value: usize) = (value); width *_width; parameters input.checked_mul(output); name "layer"; Conv(_filters: usize, _kernel: usize) => conv(filters: usize, kernel: usize) = (filters, kernel); width _filters.saturating_mul(input.checked_sub(*_kernel).map_or(0, |length| length + 1)); parameters _filters.checked_mul(*_kernel); name "conv"; Pool(_size: usize) => pool(value: usize) = (value); width input.div_ceil(*_size); parameters Some(0); name "pool"; KMeans(_width: usize) => kmeans(value: usize) = (value); width *_width; parameters input.checked_mul(output); name "kmeans";
+	Embed(_dimensions: usize, _vocabulary: usize) => embed(value: usize) = (value, 0); width input.saturating_mul(*_dimensions); parameters if *_vocabulary != 0 { _dimensions.checked_mul(*_vocabulary) } else { return Err(RecipeError::new("embedding vocabulary must be positive")); }; name "embed"; Attention(_heads: usize) => attn(value: usize) = (value); width input; parameters return Err(RecipeError::new("attention requires genuine Q, K, V lowering")); name "attn"; Rnn(_width: usize) => rnn(value: usize) = (value); width *_width; parameters recurrent(*_width, 1); name "rnn"; Gru(_width: usize) => gru(value: usize) = (value); width *_width; parameters recurrent(*_width, 3); name "gru";
+	Lstm(_width: usize) => lstm(value: usize) = (value); width *_width; parameters recurrent(*_width, 4); name "lstm"; Forest(_trees: usize, _kind: u8, _depth: usize) => forest(value: usize) = (value, 0, 0); width usize::from(*_trees != 0); parameters input.checked_mul(output); name match *_kind { 1 => "lgbm", 2 => "xgbst", _ => "forest" }; Knn(_neighbors: usize) => knn(value: usize) = (value); width 1; parameters input.checked_mul(output); name "knn"; Perceptron(_width: usize) => perc(value: usize) = (value); width *_width; parameters input.checked_mul(output); name "perc";
+	@ Residual(_parts: Vec<Residual>); width _parts.iter().filter_map(|part| if let Residual::Layer(width) = part { Some(*width) } else { None }).sum(); parameters input.checked_mul(output); name "residual";
 }
 
 #[derive(Clone, Debug)]
@@ -111,18 +119,9 @@ macro_rules! residuals {
 residuals!(layer(width: usize) => Residual::Layer(width), relu() => Residual::Relu);
 
 macro_rules! activations {
-	($($method:ident: $activation:ident = $code:literal),+) => {#[derive(Clone, Copy, Debug, PartialEq, Eq)] #[allow(dead_code)] #[repr(u8)] enum Activation { Linear = 0, LegacySignedLogOnePlus = 5, $($activation = $code),+ } impl Model {$(pub fn $method(mut self) -> Self { let index = self.blocks.len() - 1; if self.blocks[index].normalization.is_some() { panic!("activation must precede normalization"); } self.blocks[index].activation = Activation::$activation; self })+}};
+	($($method:ident: $activation:ident = $code:literal),+) => {#[derive(Clone, Copy, Debug, PartialEq, Eq)] #[allow(dead_code)] #[repr(u8)] enum Activation { Linear = 0, LegacySignedLogOnePlus = 5, $($activation = $code),+ } struct ActivationConfig { leak: f64, prelu: f64, elu: f64, selu_alpha: f64, selu_scale: f64, gelu_scale: f64, gelu_cubic: f64 } impl Activation { const fn name(self) -> &'static str { match self { Self::Linear => "linear", Self::LegacySignedLogOnePlus => "log1p", $(Self::$activation => stringify!($method)),+ } } } impl Model {$(pub fn $method(mut self) -> Self { let index = self.blocks.len() - 1; if self.blocks[index].normalization.is_some() { panic!("activation must precede normalization"); } self.blocks[index].activation = Activation::$activation; self })+}};
 }
 activations!(cos: Cosine = 1, exp: Exponential = 2, log: Logarithm = 3, ln: NaturalLogarithm = 4, huber: Huber = 6, tan: Tangent = 7, relu: Relu = 8, leak: LeakyRelu = 9, sigmoid: Sigmoid = 10, tanh: Tanh = 11, selu: Selu = 12, gelu: Gelu = 13, silu: Silu = 14, elu: Elu = 15, prelu: PRelu = 16);
-struct ActivationConfig {
-	leak: f64,
-	prelu: f64,
-	elu: f64,
-	selu_alpha: f64,
-	selu_scale: f64,
-	gelu_scale: f64,
-	gelu_cubic: f64,
-}
 
 macro_rules! model_mutators {
 	($($method:ident($argument:ident: $type:ty) => $pattern:pat => $update:expr;)+) => {impl Model {$(pub fn $method(mut self, $argument: $type) -> Self { if let Some($pattern) = self.blocks.last_mut() { $update; } self })+}};
@@ -133,114 +132,66 @@ model_mutators! {
 	xgbst(depth: usize) => Block { operation: OperationBlock::Forest(_, kind, value), .. } => (*kind, *value) = (2, depth);
 	norm(normalization: Normalization) => block => block.normalization = Some(if normalization as usize == batch as usize { BlockNormalization::Batch } else { BlockNormalization::Layer });
 }
-impl Model {
-	fn push(mut self, operation: OperationBlock) -> Self {
-		self.blocks.push(Block {
-			operation,
-			activation: Activation::Linear,
-			normalization: None,
-		});
-		self
-	}
-	pub fn residual<const N: usize>(self, parts: [Residual; N]) -> Self {
-		self.push(OperationBlock::Residual(parts.into()))
-	}
-	pub const fn loss(mut self, loss: LossFunction) -> Self {
-		self.loss = loss;
-		self
-	}
-
-	fn graph(&self, features: usize) -> Result<TrainingGraph<'_>, RecipeError> {
-		if self.blocks.is_empty() {
-			return Err(RecipeError::new("training model must contain a block"));
+impl BlockNormalization {
+	const fn name(self) -> &'static str {
+		match self {
+			Self::Batch => "bnorm",
+			Self::Layer => "lnorm",
 		}
-		let mut widths = vec![features];
-		let mut offsets = Vec::with_capacity(self.blocks.len());
-		let mut parameters = 0_usize;
-		for block in &self.blocks {
-			let input = widths[widths.len() - 1];
-			let output = block.operation.output(input)?;
-			offsets.push(parameters);
-			let block_parameters = block.operation.parameters(input, output)?;
-			parameters = parameters
-				.checked_add(block_parameters)
-				.ok_or_else(|| RecipeError::new("model parameter count overflow"))?;
-			widths.push(output);
-		}
-		if widths.last() != Some(&1) {
-			return Err(RecipeError::new(
-				"training model output must contain one value",
-			));
-		}
-		let matrix_parameters = parameters;
-		parameters += self
-			.blocks
-			.iter()
-			.filter(|block| block.activation == Activation::PRelu)
-			.count();
-		Ok(TrainingGraph {
-			blocks: &self.blocks,
-			widths,
-			offsets,
-			matrix_parameters,
-			parameters,
-		})
-	}
-
-	fn signature(&self) -> String {
-		format!("{:?}", self.blocks)
-	}
-	fn description(&self, operation: bool, activation: bool, normalization: bool) -> String {
-		self.blocks
-			.iter()
-			.filter_map(|block| {
-				let mut parts = Vec::new();
-				if operation {
-					parts.push(block.operation.name());
-				}
-				if activation && block.activation != Activation::Linear {
-					parts.push(block.activation.name());
-				}
-				if normalization && let Some(value) = block.normalization {
-					parts.push(value.name());
-				}
-				(!parts.is_empty()).then(|| parts.join("."))
-			})
-			.collect::<Vec<_>>()
-			.join("/")
 	}
 }
 
-#[rustfmt::skip]
-impl OperationBlock { fn name(&self) -> &'static str { match self { Self::Layer(_) => "layer", Self::Conv(..) => "conv", Self::Pool(_) => "pool", Self::KMeans(_) => "kmeans", Self::Embed(..) => "embed", Self::Attention(_) => "attn", Self::Rnn(_) => "rnn", Self::Gru(_) => "gru", Self::Lstm(_) => "lstm", Self::Forest(_, 1, _) => "lgbm", Self::Forest(_, 2, _) => "xgbst", Self::Forest(..) => "forest", Self::Knn(_) => "knn", Self::Residual(_) => "residual", Self::Perceptron(_) => "perc" } } }
-#[rustfmt::skip]
-impl Activation { const fn name(self) -> &'static str { match self { Self::Linear => "linear", Self::Cosine => "cos", Self::Exponential => "exp", Self::Logarithm => "log", Self::NaturalLogarithm => "ln", Self::LegacySignedLogOnePlus => "log1p", Self::Huber => "huber", Self::Tangent => "tan", Self::Relu => "relu", Self::LeakyRelu => "leak", Self::Sigmoid => "sigmoid", Self::Tanh => "tanh", Self::Selu => "selu", Self::Gelu => "gelu", Self::Silu => "silu", Self::Elu => "elu", Self::PRelu => "prelu" } } }
-#[rustfmt::skip]
-impl BlockNormalization { const fn name(self) -> &'static str { match self { Self::Batch => "bnorm", Self::Layer => "lnorm" } } }
-
-#[rustfmt::skip]
-struct TrainingGraph<'a> { blocks: &'a [Block], widths: Vec<usize>, offsets: Vec<usize>, matrix_parameters: usize, parameters: usize }
-#[rustfmt::skip]
-struct DevicePass { values: Vec<DeviceBuffer>, raw: Vec<DeviceBuffer>, derivatives: Vec<DeviceBuffer>, operations: Vec<DeviceBuffer>, scales: Vec<Option<DeviceBuffer>>, contexts: Vec<Option<DeviceBuffer>> }
-#[rustfmt::skip]
-struct DeviceGraph { pass: DevicePass, value_pointers: DeviceBuffer, raw_pointers: DeviceBuffer, derivative_pointers: DeviceBuffer, operation_pointers: DeviceBuffer, scale_pointers: DeviceBuffer, context_pointers: DeviceBuffer, descriptors: DeviceBuffer, parameters: DeviceBuffer }
-#[rustfmt::skip]
-struct EpochBuffers { metrics: DeviceBuffer, gradient: DeviceBuffer, delta_a: DeviceBuffer, delta_b: DeviceBuffer, checkpoint: DeviceBuffer }
+struct TrainingGraph<'a> {
+	blocks: &'a [Block],
+	widths: Vec<usize>,
+	offsets: Vec<usize>,
+	matrix_parameters: usize,
+	parameters: usize,
+}
+struct DevicePass<T, O = T> {
+	values: T,
+	raw: T,
+	derivatives: T,
+	operations: T,
+	scales: O,
+	contexts: O,
+}
+struct DeviceGraph {
+	pass: DevicePass<Vec<DeviceBuffer>, Vec<Option<DeviceBuffer>>>,
+	pointers: DevicePass<DeviceBuffer>,
+	descriptors: DeviceBuffer,
+	parameters: DeviceBuffer,
+}
+struct EpochBuffers {
+	metrics: DeviceBuffer,
+	gradient: DeviceBuffer,
+	delta: [DeviceBuffer; 2],
+	checkpoint: DeviceBuffer,
+}
 #[derive(Clone, Copy)]
-#[rustfmt::skip]
-struct AdamwConfig { rate: f64, beta1: f64, beta2: f64, epsilon: f64, decay: f64 }
+struct AdamwConfig {
+	rate: f64,
+	beta1: f64,
+	beta2: f64,
+	epsilon: f64,
+	decay: f64,
+}
 
-#[rustfmt::skip]
-struct Hsa { status: i32, vendor: Vendor, api: [usize; 8], forward_graph: usize, epoch_graph: usize, normalize: usize, affine: usize, initialize: usize, set_value: usize, metrics: usize }
+macro_rules! hsa_kernels {
+	($($kernel:ident)+) => { #[derive(Clone, Copy)] enum Vendor { Amd, Nvidia } struct Hsa { status: i32, vendor: Vendor, api: [usize; 8], $($kernel: usize),+ } impl Hsa { const fn new(status: i32, vendor: Vendor, api: [usize; 8]) -> Self { Self { status, vendor, api, $($kernel: 0),+ } } unsafe fn load_kernels(&mut self, module: *mut c_void) { let get = self.api[6]; let mut status = self.status; $(if status == 0 { let mut value = ptr::null_mut(); status = unsafe { address::<unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> i32>(get)(&mut value, module, concat!(stringify!($kernel), "\0").as_ptr().cast()) }; self.$kernel = value as usize; })+ self.status = status; } } };
+}
+hsa_kernels! { forward_graph epoch_graph normalize affine initialize set_value metrics }
 static HSA: OnceLock<Hsa> = OnceLock::new();
-#[derive(Clone, Copy)]
-#[rustfmt::skip]
-enum Vendor { Amd, Nvidia }
 
-#[rustfmt::skip]
-struct DeviceBuffer { pointer: *mut c_void, elements: usize }
-#[rustfmt::skip]
-struct DeviceData { samples: DeviceBuffer, targets: DeviceBuffer, target_offset: f64, target_scale: f64 }
+struct DeviceBuffer {
+	pointer: *mut c_void,
+	elements: usize,
+}
+struct DeviceData {
+	samples: DeviceBuffer,
+	targets: DeviceBuffer,
+	target_affine: [f64; 2],
+}
 
 #[rustfmt::skip]
 impl DeviceBuffer {
@@ -282,9 +233,9 @@ fn hsa() -> Result<&'static Hsa, RecipeError> {
         if !handle.is_null() { status = dynamic::<unsafe extern "C" fn(u32) -> i32>(handle, b"hipInit\0")(0); if status == 0 { status = dynamic::<unsafe extern "C" fn(i32) -> i32>(handle, b"hipSetDevice\0")(0); } }
         let vendor = if status == 0 { Vendor::Amd } else { if !handle.is_null() { dlclose(handle); } handle = dlopen(b"libcuda.so.1\0".as_ptr().cast(), 2); if !handle.is_null() { status = dynamic::<unsafe extern "C" fn(u32) -> i32>(handle, b"cuInit\0")(0); let (mut device, mut context) = (0, ptr::null_mut()); if status == 0 { status = dynamic::<unsafe extern "C" fn(*mut i32, i32) -> i32>(handle, b"cuDeviceGet\0")(&mut device, 0); } if status == 0 { status = dynamic::<unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> i32>(handle, b"cuCtxCreate_v2\0")(&mut context, 0, device); } } Vendor::Nvidia };
         let names: [&[u8]; 8] = match vendor { Vendor::Amd => [b"hipMalloc\0", b"hipFree\0", b"hipMemcpy\0", b"hipMemcpy\0", b"hipDeviceSynchronize\0", b"hipModuleLoad\0", b"hipModuleGetFunction\0", b"hipModuleLaunchKernel\0"], Vendor::Nvidia => [b"cuMemAlloc_v2\0", b"cuMemFree_v2\0", b"cuMemcpyHtoD_v2\0", b"cuMemcpyDtoH_v2\0", b"cuCtxSynchronize\0", b"cuModuleLoad\0", b"cuModuleGetFunction\0", b"cuLaunchKernel\0"] };
-        let api = names.map(|name| dlsym(handle, name.as_ptr().cast()) as usize); let mut runtime = Hsa { status, vendor, api, forward_graph: 0, epoch_graph: 0, normalize: 0, affine: 0, initialize: 0, set_value: 0, metrics: 0 }; let mut module = ptr::null_mut();
+        let api = names.map(|name| dlsym(handle, name.as_ptr().cast()) as usize); let mut runtime = Hsa::new(status, vendor, api); let mut module = ptr::null_mut();
         if status == 0 { runtime.status = runtime.module_load(&mut module, match vendor { Vendor::Amd => concat!(env!("RECIPE_HSA_CODE_OBJECT"), "\0"), Vendor::Nvidia => concat!(env!("RECIPE_NV_MODULE"), "\0") }.as_ptr().cast()); }
-        let get = runtime.api[6]; let mut status = runtime.status; for (function, name) in [(&mut runtime.forward_graph, b"forward_graph\0".as_ptr()), (&mut runtime.epoch_graph, b"epoch_graph\0".as_ptr()), (&mut runtime.normalize, b"normalize\0".as_ptr()), (&mut runtime.affine, b"affine\0".as_ptr()), (&mut runtime.initialize, b"initialize\0".as_ptr()), (&mut runtime.set_value, b"set_value\0".as_ptr()), (&mut runtime.metrics, b"metrics\0".as_ptr())] { if status == 0 { let mut value = ptr::null_mut(); status = address::<unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> i32>(get)(&mut value, module, name.cast()); *function = value as usize; } } runtime.status = status;
+        runtime.load_kernels(module);
         runtime
     }); if runtime.status == 0 { Ok(runtime) } else { Err(RecipeError::new(format!("GPU initialization failed with status {}", runtime.status))) }
 }
@@ -319,21 +270,21 @@ fn gpu_initialize(count: usize, seed: u64, scale: f64, prelu: &[(usize, f64)], t
 #[rustfmt::skip]
 impl TrainingGraph<'_> {
     fn prelu(&self, stage: usize) -> Option<usize> { (self.blocks[stage].activation == Activation::PRelu).then(|| self.matrix_parameters + self.blocks[..stage].iter().filter(|block| block.activation == Activation::PRelu).count()) }
-    fn operation(&self, stage: usize) -> (i32, f64, f64) { match &self.blocks[stage].operation { OperationBlock::Layer(_) => (0, 1.0, 0.0), OperationBlock::Conv(_, kernel) => (1, *kernel as f64, 0.0), OperationBlock::Pool(size) => (2, *size as f64, 0.0), OperationBlock::KMeans(_) => (3, 1.0, 0.0), OperationBlock::Embed(_, vocabulary) => (4, (*vocabulary).max(1) as f64, 0.0), OperationBlock::Attention(heads) => (5, *heads as f64, 0.0), OperationBlock::Rnn(_) => (6, 1.0, 0.0), OperationBlock::Gru(_) => (7, 1.0, 0.0), OperationBlock::Lstm(_) => (8, 1.0, 0.0), OperationBlock::Forest(trees, _, depth) => (9, *trees as f64, *depth as f64), OperationBlock::Knn(neighbors) => (10, *neighbors as f64, 0.0), OperationBlock::Residual(_) => (11, 1.0, 0.0), OperationBlock::Perceptron(_) => (12, 1.0, 0.0) } }
+    fn operation(&self, stage: usize) -> (i32, f64, f64) { match &self.blocks[stage].operation { OperationBlock::Layer(_) => (0, 1.0, 0.0), OperationBlock::Conv(_, kernel) => (1, *kernel as f64, 0.0), OperationBlock::Pool(size) => (2, *size as f64, 0.0), OperationBlock::KMeans(_) => (3, 1.0, 0.0), OperationBlock::Embed(_, vocabulary) => (4, (*vocabulary).max(1) as f64, 0.0), OperationBlock::Attention(heads) => (5, *heads as f64, 0.0), OperationBlock::Rnn(_) => (6, 1.0, 0.0), OperationBlock::Gru(_) => (7, 1.0, 0.0), OperationBlock::Lstm(_) => (8, 1.0, 0.0), OperationBlock::Forest(trees, _, depth) => (9, *trees as f64, (*depth).max(1) as f64), OperationBlock::Knn(neighbors) => (10, *neighbors as f64, 0.0), OperationBlock::Residual(_) => (11, 1.0, 0.0), OperationBlock::Perceptron(_) => (12, 1.0, 0.0) } }
     fn prepare_gpu(&self, rows: usize) -> Result<DeviceGraph, RecipeError> {
-		let mut pass = DevicePass { values: Vec::with_capacity(self.blocks.len()), raw: Vec::with_capacity(self.blocks.len()), derivatives: Vec::with_capacity(self.blocks.len()), operations: Vec::with_capacity(self.blocks.len()), scales: Vec::with_capacity(self.blocks.len()), contexts: Vec::with_capacity(self.blocks.len()) };
+		let mut pass = DevicePass { values: Vec::with_capacity(self.blocks.len()), raw: Vec::with_capacity(self.blocks.len()), derivatives: Vec::with_capacity(self.blocks.len()), operations: Vec::with_capacity(self.blocks.len()), scales: Vec::with_capacity(self.blocks.len()), contexts: Vec::with_capacity(self.blocks.len()) }; let forest = |trees: usize, depth: usize| (depth < i32::BITS as usize).then_some(depth).and_then(|depth| 1_usize.checked_shl(depth as u32)).and_then(|leaves| leaves.checked_mul(3).and_then(|nodes| nodes.checked_sub(2)).and_then(|span| trees.checked_mul(span)).and_then(|nodes| trees.checked_mul(rows).and_then(|assignments| nodes.checked_add(assignments))).and_then(|context| context.checked_add(rows))).ok_or_else(|| RecipeError::new("forest dimensions overflow"));
         let (mut descriptors, mut parameters) = (Vec::with_capacity(self.blocks.len() * 7), Vec::with_capacity(self.blocks.len() * 2));
         for stage in 0..self.blocks.len() {
-			let (from, to) = (self.widths[stage], self.widths[stage + 1]); let count = rows * to; let normalization = match self.blocks[stage].normalization { None => 0, Some(BlockNormalization::Batch) => 1, Some(BlockNormalization::Layer) => 2 }; let (operation, parameter, secondary) = self.operation(stage); let gates = match operation { 6 => 1, 7 => 3, 8 => 4, _ => 0 }; descriptors.extend([from as i32, to as i32, self.offsets[stage] as i32, operation, self.blocks[stage].activation as i32, normalization, self.prelu(stage).map_or(-1, |index| index as i32)]); parameters.extend([parameter, secondary]); pass.values.push(DeviceBuffer::new(count)?); pass.raw.push(DeviceBuffer::new(count)?); pass.derivatives.push(DeviceBuffer::new(count)?); pass.operations.push(DeviceBuffer::new(count)?); pass.scales.push((normalization != 0).then(|| DeviceBuffer::new(2 * if normalization == 1 { to } else { rows })).transpose()?); pass.contexts.push(match operation { 3 => Some(DeviceBuffer::upload(&vec![0.0; 1 + from * to + count])?), 9 => Some(DeviceBuffer::new((parameter as usize) * 4 + count)?), 10 => Some(DeviceBuffer::new(rows * (1 + parameter as usize))?), 6..=8 => Some(DeviceBuffer::new((2 * gates + 4) * count)?), _ => None });
+			let (from, to) = (self.widths[stage], self.widths[stage + 1]); let count = rows * to; let normalization = match self.blocks[stage].normalization { None => 0, Some(BlockNormalization::Batch) => 1, Some(BlockNormalization::Layer) => 2 }; let (operation, parameter, secondary) = self.operation(stage); let gates = match operation { 6 => 1, 7 => 3, 8 => 4, _ => 0 }; descriptors.extend([from as i32, to as i32, self.offsets[stage] as i32, operation, self.blocks[stage].activation as i32, normalization, self.prelu(stage).map_or(-1, |index| index as i32)]); parameters.extend([parameter, secondary]); pass.values.push(DeviceBuffer::new(count)?); pass.raw.push(DeviceBuffer::new(count)?); pass.derivatives.push(DeviceBuffer::new(count)?); pass.operations.push(DeviceBuffer::new(count)?); pass.scales.push((normalization != 0).then(|| DeviceBuffer::new(2 * if normalization == 1 { to } else { rows })).transpose()?); pass.contexts.push(match operation { 3 => Some(DeviceBuffer::upload(&vec![0.0; 1 + from * to + count])?), 9 => Some(DeviceBuffer::new(forest(parameter as usize, secondary as usize)?)?), 10 => Some(DeviceBuffer::new(rows * (1 + parameter as usize))?), 6..=8 => Some(DeviceBuffer::new((2 * gates + 4) * count)?), _ => None });
         }
-		let addresses = |buffers: &[DeviceBuffer]| buffers.iter().map(|buffer| buffer.pointer as usize as u64).collect::<Vec<_>>(); let optional = |buffers: &[Option<DeviceBuffer>]| buffers.iter().map(|buffer| buffer.as_ref().map_or(0, |buffer| buffer.pointer as usize as u64)).collect::<Vec<_>>(); let value_pointers = DeviceBuffer::upload(&addresses(&pass.values))?; let raw_pointers = DeviceBuffer::upload(&addresses(&pass.raw))?; let derivative_pointers = DeviceBuffer::upload(&addresses(&pass.derivatives))?; let operation_pointers = DeviceBuffer::upload(&addresses(&pass.operations))?; let scale_pointers = DeviceBuffer::upload(&optional(&pass.scales))?; let context_pointers = DeviceBuffer::upload(&optional(&pass.contexts))?;
-		Ok(DeviceGraph { pass, value_pointers, raw_pointers, derivative_pointers, operation_pointers, scale_pointers, context_pointers, descriptors: DeviceBuffer::upload(&descriptors)?, parameters: DeviceBuffer::upload(&parameters)? })
+		let addresses = |buffers: &[DeviceBuffer]| buffers.iter().map(|buffer| buffer.pointer as usize as u64).collect::<Vec<_>>(); let optional = |buffers: &[Option<DeviceBuffer>]| buffers.iter().map(|buffer| buffer.as_ref().map_or(0, |buffer| buffer.pointer as usize as u64)).collect::<Vec<_>>(); let pointers = DevicePass { values: DeviceBuffer::upload(&addresses(&pass.values))?, raw: DeviceBuffer::upload(&addresses(&pass.raw))?, derivatives: DeviceBuffer::upload(&addresses(&pass.derivatives))?, operations: DeviceBuffer::upload(&addresses(&pass.operations))?, scales: DeviceBuffer::upload(&optional(&pass.scales))?, contexts: DeviceBuffer::upload(&optional(&pass.contexts))? };
+		Ok(DeviceGraph { pass, pointers, descriptors: DeviceBuffer::upload(&descriptors)?, parameters: DeviceBuffer::upload(&parameters)? })
     }
     fn forward_gpu(&self, graph: &DeviceGraph, input: &DeviceBuffer, rows: usize, weights: &DeviceBuffer, config: &DeviceBuffer, threads: u32) -> Result<(), RecipeError> {
-        let runtime = hsa()?; let (mut input, mut weights, mut config, mut values, mut raw, mut operations, mut derivatives, mut scales, mut contexts, mut descriptors, mut parameters) = (input.pointer, weights.pointer, config.pointer, graph.value_pointers.pointer, graph.raw_pointers.pointer, graph.operation_pointers.pointer, graph.derivative_pointers.pointer, graph.scale_pointers.pointer, graph.context_pointers.pointer, graph.descriptors.pointer, graph.parameters.pointer); let (mut rows, mut stages, mut threads) = (rows as u32, self.blocks.len() as u32, threads); let mut epsilon = configured_f64("RECIPE_NORMALIZATION_EPSILON", env!("RECIPE_NORMALIZATION_EPSILON"))?; let mut arguments = [&mut input as *mut _ as *mut c_void, &mut weights as *mut _ as *mut c_void, &mut config as *mut _ as *mut c_void, &mut values as *mut _ as *mut c_void, &mut raw as *mut _ as *mut c_void, &mut operations as *mut _ as *mut c_void, &mut derivatives as *mut _ as *mut c_void, &mut scales as *mut _ as *mut c_void, &mut contexts as *mut _ as *mut c_void, &mut descriptors as *mut _ as *mut c_void, &mut parameters as *mut _ as *mut c_void, &mut rows as *mut _ as *mut c_void, &mut stages as *mut _ as *mut c_void, &mut epsilon as *mut _ as *mut c_void, &mut threads as *mut _ as *mut c_void]; hsa_launch(runtime.forward_graph, threads as usize, threads, &mut arguments)
+        let runtime = hsa()?; let (mut input, mut weights, mut config, mut values, mut raw, mut operations, mut derivatives, mut scales, mut contexts, mut descriptors, mut parameters) = (input.pointer, weights.pointer, config.pointer, graph.pointers.values.pointer, graph.pointers.raw.pointer, graph.pointers.operations.pointer, graph.pointers.derivatives.pointer, graph.pointers.scales.pointer, graph.pointers.contexts.pointer, graph.descriptors.pointer, graph.parameters.pointer); let (mut rows, mut stages, mut threads) = (rows as u32, self.blocks.len() as u32, threads); let mut epsilon = configured_f64("RECIPE_NORMALIZATION_EPSILON", env!("RECIPE_NORMALIZATION_EPSILON"))?; let mut arguments = [&mut input as *mut _ as *mut c_void, &mut weights as *mut _ as *mut c_void, &mut config as *mut _ as *mut c_void, &mut values as *mut _ as *mut c_void, &mut raw as *mut _ as *mut c_void, &mut operations as *mut _ as *mut c_void, &mut derivatives as *mut _ as *mut c_void, &mut scales as *mut _ as *mut c_void, &mut contexts as *mut _ as *mut c_void, &mut descriptors as *mut _ as *mut c_void, &mut parameters as *mut _ as *mut c_void, &mut rows as *mut _ as *mut c_void, &mut stages as *mut _ as *mut c_void, &mut epsilon as *mut _ as *mut c_void, &mut threads as *mut _ as *mut c_void]; hsa_launch(runtime.forward_graph, threads as usize, threads, &mut arguments)
     }
     fn epoch_gpu(&self, graph: &DeviceGraph, epoch: &EpochBuffers, input: &DeviceBuffer, targets: &DeviceBuffer, weights: &DeviceBuffer, config: &DeviceBuffer, moments: &DeviceBuffer, variances: &DeviceBuffer, rows: usize, threads: u32, loss: LossFunction, optimizer: AdamwConfig, step: i32, previous_loss: f64, tolerance: f64, checkpoint_enabled: bool) -> Result<[f64; 4], RecipeError> {
-        let runtime = hsa()?; let (mut input, mut targets, mut weights, mut config, mut values, mut raw, mut operations, mut derivatives, mut scales, mut contexts, mut descriptors, mut parameters, mut metrics, mut gradient, mut delta_a, mut delta_b, mut moments, mut variances, mut checkpoint) = (input.pointer, targets.pointer, weights.pointer, config.pointer, graph.value_pointers.pointer, graph.raw_pointers.pointer, graph.operation_pointers.pointer, graph.derivative_pointers.pointer, graph.scale_pointers.pointer, graph.context_pointers.pointer, graph.descriptors.pointer, graph.parameters.pointer, epoch.metrics.pointer, epoch.gradient.pointer, epoch.delta_a.pointer, epoch.delta_b.pointer, moments.pointer, variances.pointer, epoch.checkpoint.pointer); let (mut rows, mut stages, mut parameter_count, mut loss, mut checkpoint_enabled, mut step, mut threads) = (rows as u32, self.blocks.len() as u32, self.parameters as u32, loss.0 as i32, i32::from(checkpoint_enabled), step, threads); let (mut previous_loss, mut tolerance) = (previous_loss, tolerance); let (mut rate, mut beta1, mut beta2, mut optimizer_epsilon, mut decay) = (optimizer.rate, optimizer.beta1, optimizer.beta2, optimizer.epsilon, optimizer.decay); let mut normalization_epsilon = configured_f64("RECIPE_NORMALIZATION_EPSILON", env!("RECIPE_NORMALIZATION_EPSILON"))?; let mut arguments = [&mut input as *mut _ as *mut c_void, &mut targets as *mut _ as *mut c_void, &mut weights as *mut _ as *mut c_void, &mut config as *mut _ as *mut c_void, &mut values as *mut _ as *mut c_void, &mut raw as *mut _ as *mut c_void, &mut operations as *mut _ as *mut c_void, &mut derivatives as *mut _ as *mut c_void, &mut scales as *mut _ as *mut c_void, &mut contexts as *mut _ as *mut c_void, &mut descriptors as *mut _ as *mut c_void, &mut parameters as *mut _ as *mut c_void, &mut metrics as *mut _ as *mut c_void, &mut gradient as *mut _ as *mut c_void, &mut delta_a as *mut _ as *mut c_void, &mut delta_b as *mut _ as *mut c_void, &mut moments as *mut _ as *mut c_void, &mut variances as *mut _ as *mut c_void, &mut checkpoint as *mut _ as *mut c_void, &mut rows as *mut _ as *mut c_void, &mut stages as *mut _ as *mut c_void, &mut parameter_count as *mut _ as *mut c_void, &mut loss as *mut _ as *mut c_void, &mut previous_loss as *mut _ as *mut c_void, &mut tolerance as *mut _ as *mut c_void, &mut checkpoint_enabled as *mut _ as *mut c_void, &mut normalization_epsilon as *mut _ as *mut c_void, &mut rate as *mut _ as *mut c_void, &mut beta1 as *mut _ as *mut c_void, &mut beta2 as *mut _ as *mut c_void, &mut optimizer_epsilon as *mut _ as *mut c_void, &mut decay as *mut _ as *mut c_void, &mut step as *mut _ as *mut c_void, &mut threads as *mut _ as *mut c_void]; hsa_launch(runtime.epoch_graph, threads as usize, threads, &mut arguments)?; let values = epoch.metrics.download()?; Ok([values[0], values[1], values[2], values[3]])
+        let runtime = hsa()?; let (mut input, mut targets, mut weights, mut config, mut values, mut raw, mut operations, mut derivatives, mut scales, mut contexts, mut descriptors, mut parameters, mut metrics, mut gradient, mut delta_a, mut delta_b, mut moments, mut variances, mut checkpoint) = (input.pointer, targets.pointer, weights.pointer, config.pointer, graph.pointers.values.pointer, graph.pointers.raw.pointer, graph.pointers.operations.pointer, graph.pointers.derivatives.pointer, graph.pointers.scales.pointer, graph.pointers.contexts.pointer, graph.descriptors.pointer, graph.parameters.pointer, epoch.metrics.pointer, epoch.gradient.pointer, epoch.delta[0].pointer, epoch.delta[1].pointer, moments.pointer, variances.pointer, epoch.checkpoint.pointer); let (mut rows, mut stages, mut parameter_count, mut loss, mut checkpoint_enabled, mut step, mut threads) = (rows as u32, self.blocks.len() as u32, self.parameters as u32, loss.0 as i32, i32::from(checkpoint_enabled), step, threads); let (mut previous_loss, mut tolerance) = (previous_loss, tolerance); let (mut rate, mut beta1, mut beta2, mut optimizer_epsilon, mut decay) = (optimizer.rate, optimizer.beta1, optimizer.beta2, optimizer.epsilon, optimizer.decay); let mut normalization_epsilon = configured_f64("RECIPE_NORMALIZATION_EPSILON", env!("RECIPE_NORMALIZATION_EPSILON"))?; let mut arguments = [&mut input as *mut _ as *mut c_void, &mut targets as *mut _ as *mut c_void, &mut weights as *mut _ as *mut c_void, &mut config as *mut _ as *mut c_void, &mut values as *mut _ as *mut c_void, &mut raw as *mut _ as *mut c_void, &mut operations as *mut _ as *mut c_void, &mut derivatives as *mut _ as *mut c_void, &mut scales as *mut _ as *mut c_void, &mut contexts as *mut _ as *mut c_void, &mut descriptors as *mut _ as *mut c_void, &mut parameters as *mut _ as *mut c_void, &mut metrics as *mut _ as *mut c_void, &mut gradient as *mut _ as *mut c_void, &mut delta_a as *mut _ as *mut c_void, &mut delta_b as *mut _ as *mut c_void, &mut moments as *mut _ as *mut c_void, &mut variances as *mut _ as *mut c_void, &mut checkpoint as *mut _ as *mut c_void, &mut rows as *mut _ as *mut c_void, &mut stages as *mut _ as *mut c_void, &mut parameter_count as *mut _ as *mut c_void, &mut loss as *mut _ as *mut c_void, &mut previous_loss as *mut _ as *mut c_void, &mut tolerance as *mut _ as *mut c_void, &mut checkpoint_enabled as *mut _ as *mut c_void, &mut normalization_epsilon as *mut _ as *mut c_void, &mut rate as *mut _ as *mut c_void, &mut beta1 as *mut _ as *mut c_void, &mut beta2 as *mut _ as *mut c_void, &mut optimizer_epsilon as *mut _ as *mut c_void, &mut decay as *mut _ as *mut c_void, &mut step as *mut _ as *mut c_void, &mut threads as *mut _ as *mut c_void]; hsa_launch(runtime.epoch_graph, threads as usize, threads, &mut arguments)?; let values = epoch.metrics.download()?; Ok([values[0], values[1], values[2], values[3]])
     }
 }
 
@@ -748,8 +699,8 @@ impl Train {
         let decay = configured_f64("RECIPE_TRAIN_ADAMW_WEIGHT_DECAY", env!("RECIPE_TRAIN_ADAMW_WEIGHT_DECAY"))?;
         let threads = env!("RECIPE_GPU_THREADS").parse::<u32>().map_err(|error| RecipeError::new(format!("invalid RECIPE_GPU_THREADS: {error}")))?;
         if threads == 0 { return Err(RecipeError::new("GPU thread count must be positive")); }
-        let device = match data.device.get_or_init(|| { let samples = DeviceBuffer::upload(samples)?; let targets = DeviceBuffer::upload(targets)?; let (target_offset, target_scale) = if data.normalize { let sample_stats = DeviceBuffer::new(2 * features)?; gpu_normalize(&samples, &samples, &sample_stats, rows, features, BlockNormalization::Batch, false, threads)?; let target_stats = DeviceBuffer::new(2)?; gpu_normalize(&targets, &targets, &target_stats, rows, 1, BlockNormalization::Batch, false, threads)?; let values = target_stats.download()?; (values[0], values[1]) } else { (0.0, 1.0) }; Ok(DeviceData { samples, targets, target_offset, target_scale }) }) { Ok(device) => device, Err(error) => return Err(error.clone()) };
-        let (samples, targets, target_offset, target_scale) = (&device.samples, &device.targets, device.target_offset, device.target_scale);
+        let device = match data.device.get_or_init(|| { let samples = DeviceBuffer::upload(samples)?; let targets = DeviceBuffer::upload(targets)?; let target_affine = if data.normalize { let sample_stats = DeviceBuffer::new(2 * features)?; gpu_normalize(&samples, &samples, &sample_stats, rows, features, BlockNormalization::Batch, false, threads)?; let target_stats = DeviceBuffer::new(2)?; gpu_normalize(&targets, &targets, &target_stats, rows, 1, BlockNormalization::Batch, false, threads)?; let values = target_stats.download()?; [values[0], values[1]] } else { [0.0, 1.0] }; Ok(DeviceData { samples, targets, target_affine }) }) { Ok(device) => device, Err(error) => return Err(error.clone()) };
+        let (samples, targets, [target_offset, target_scale]) = (&device.samples, &device.targets, device.target_affine);
         let activation_config = activation_config()?;
         let seed = env!("RECIPE_RANDOM_SEED").parse::<u64>().map_err(|error| RecipeError::new(format!("invalid RECIPE_RANDOM_SEED: {error}")))?;
         let prelu = (0..graph.blocks.len()).filter_map(|stage| graph.prelu(stage).map(|index| (index, activation_config.prelu))).collect::<Vec<_>>();
@@ -758,7 +709,7 @@ impl Train {
         let (moments, variances, mut initial_loss) = (gpu_initialize(graph.parameters, 0, 0.0, &[], threads)?, gpu_initialize(graph.parameters, 0, 0.0, &[], threads)?, 0.0);
         let ho_loss_weight = configured_f64("RECIPE_HO_LOSS_WEIGHT", env!("RECIPE_HO_LOSS_WEIGHT"))?;
         let config = DeviceBuffer::upload(&[activation_config.leak, activation_config.prelu, activation_config.elu, activation_config.selu_alpha, activation_config.selu_scale, activation_config.gelu_scale, activation_config.gelu_cubic, ho_loss_weight, f64::from(prepared.target_categorical)])?;
-        let device_graph = graph.prepare_gpu(training_rows)?; let delta_elements = training_rows * graph.widths.iter().copied().max().ok_or_else(|| RecipeError::new("model has no graph width"))?; let epoch_buffers = EpochBuffers { metrics: DeviceBuffer::new(4)?, gradient: DeviceBuffer::new(graph.parameters)?, delta_a: DeviceBuffer::new(delta_elements)?, delta_b: DeviceBuffer::new(delta_elements)?, checkpoint: DeviceBuffer::new(graph.parameters)? }; let optimizer = AdamwConfig { rate: self.learning_rate, beta1, beta2, epsilon, decay };
+        let device_graph = graph.prepare_gpu(training_rows)?; let delta_elements = training_rows * graph.widths.iter().copied().max().ok_or_else(|| RecipeError::new("model has no graph width"))?; let epoch_buffers = EpochBuffers { metrics: DeviceBuffer::new(4)?, gradient: DeviceBuffer::new(graph.parameters)?, delta: [DeviceBuffer::new(delta_elements)?, DeviceBuffer::new(delta_elements)?], checkpoint: DeviceBuffer::new(graph.parameters)? }; let optimizer = AdamwConfig { rate: self.learning_rate, beta1, beta2, epsilon, decay };
         let tolerance = self.stop_tolerance.map_or(0.0, |value| value);
         if !tolerance.is_finite() || !(0.0..=1.0).contains(&tolerance) {
             return Err(RecipeError::new("stop tolerance must be between 0 and 1"));
