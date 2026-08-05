@@ -11,6 +11,10 @@ path = "src/recipe.rs"
 name = "train"
 path = "train.rs"
 
+[[bin]]
+name = "cookbook"
+path = "cookbook.rs"
+
 [package.metadata.recipe]
 balance-bytes-per-flop = 0.5
 hsa-architecture = "gfx1101"
