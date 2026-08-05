@@ -59,15 +59,17 @@ macro_rules! collection_sources {
 	})+};
 }
 collection_sources!([T: Into<String>, const N: usize] [T; N], [T: Into<String>] Vec<T>);
-
-impl Data {
-	pub fn target(mut self, target: impl Into<String>) -> Self { self.target = target.into(); self }
-	pub fn exclude(mut self, names: impl IntoDataSources) -> Self { self.exclusions = names.into_data_sources(); self }
-	pub fn set(mut self, source: impl Into<String>) -> Self { self.sources.push(source.into()); self }
-	pub const fn norm(mut self, _: ZScore) -> Self { self.normalize = true; self }
-	pub const fn split(mut self, fraction: f64) -> Self { self.split = fraction; self }
+macro_rules! data_methods {
+	($receiver:ident; $(fn $method:ident($argument:ident: $type:ty) => $update:expr;)+ $([const] fn $const_method:ident($const_argument:ident: $const_type:ty) => $field:ident = $value:expr;)+) => {impl Data {$(pub fn $method(mut self, $argument: $type) -> Self { let $receiver = &mut self; $update; self })+ $(pub const fn $const_method(mut self, $const_argument: $const_type) -> Self { self.$field = $value; self })+}};
 }
-
+data_methods! {
+	data;
+	fn target(target: impl Into<String>) => data.target = target.into();
+	fn exclude(names: impl IntoDataSources) => data.exclusions = names.into_data_sources();
+	fn set(source: impl Into<String>) => data.sources.push(source.into());
+	[const] fn norm(_value: ZScore) => normalize = true;
+	[const] fn split(fraction: f64) => split = fraction;
+}
 #[rustfmt::skip]
 pub struct Model { blocks: Vec<Block>, loss: LossFunction }
 
