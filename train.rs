@@ -45,7 +45,7 @@ fn main() {
 		)
 		.target("y")
 		.norm(z_score)
-		.split(0.01);
+		.split(0.6);
 	for estimator in [
 		recipe.model().knn(5).loss(mse),
 		recipe.model().forest(2).lgbm(2).loss(mse),
