@@ -81,7 +81,7 @@ macro_rules! operation_blocks {
 			fn push(mut self, operation: OperationBlock) -> Self { self.blocks.push(Block { operation, activation: Activation::Linear, normalization: None }); self }
 			pub fn residual<const N: usize>(self, parts: [Residual; N]) -> Self { self.push(OperationBlock::Residual(parts.into())) }
 			pub const fn loss(mut self, loss: LossFunction) -> Self { self.loss = loss; self }
-			fn graph(&self, features: usize) -> Result<TrainingGraph<'_>, RecipeError> { if self.blocks.is_empty() { return Err(RecipeError::new("training model must contain a block")); } let mut widths = vec![features]; let mut offsets = Vec::with_capacity(self.blocks.len()); let mut parameters = 0_usize; for block in &self.blocks { let input = widths[widths.len() - 1]; let output = block.operation.output(input)?; offsets.push(parameters); parameters = parameters.checked_add(block.operation.parameters(input, output)?).ok_or_else(|| RecipeError::new("model parameter count overflow"))?; widths.push(output); } if widths.last() != Some(&1) { return Err(RecipeError::new("training model output must contain one value")); } let matrix_parameters = parameters; parameters += self.blocks.iter().filter(|block| block.activation == Activation::PRelu).count(); Ok(TrainingGraph { blocks: &self.blocks, widths, offsets, matrix_parameters, parameters }) }
+			fn graph(&self, features: usize) -> Result<TrainingGraph<'_>, RecipeError> { if self.blocks.is_empty() { return Err(RecipeError::new("training model must contain a block")); } let mut widths = vec![features]; let mut shapes = vec![(1_usize, features)]; let mut offsets = Vec::with_capacity(self.blocks.len()); let mut parameters = 0_usize; for block in &self.blocks { let input = widths[widths.len() - 1]; let (channels, length) = shapes[shapes.len() - 1]; let output = match &block.operation { OperationBlock::Conv(filters, kernel) => if *kernel == 0 { 0 } else { filters.saturating_mul(length.checked_sub(*kernel).map_or(0, |positions| positions + 1)) }, OperationBlock::Pool(size) => if *size == 0 { 0 } else { channels.saturating_mul(length.div_ceil(*size)) }, _ => block.operation.output(input)? }; if output == 0 { return Err(RecipeError::new("model block dimensions must be positive")); } offsets.push(parameters); let block_parameters = match &block.operation { OperationBlock::Conv(filters, kernel) => filters.checked_mul(channels).and_then(|value| value.checked_mul(*kernel)), _ => Some(block.operation.parameters(input, output)?) }.ok_or_else(|| RecipeError::new("model parameter count overflow"))?; parameters = parameters.checked_add(block_parameters).ok_or_else(|| RecipeError::new("model parameter count overflow"))?; widths.push(output); shapes.push(match &block.operation { OperationBlock::Conv(filters, kernel) => (*filters, length - kernel + 1), OperationBlock::Pool(size) => (channels, length.div_ceil(*size)), _ => (1, output) }); } if widths.last() != Some(&1) { return Err(RecipeError::new("training model output must contain one value")); } let matrix_parameters = parameters; parameters += self.blocks.iter().filter(|block| block.activation == Activation::PRelu).count(); Ok(TrainingGraph { blocks: &self.blocks, widths, shapes, offsets, matrix_parameters, parameters }) }
 			fn signature(&self) -> String { format!("{:?}", self.blocks) }
 			fn description(&self, operation: bool, activation: bool, normalization: bool) -> String { self.blocks.iter().filter_map(|block| { let mut parts = Vec::new(); if operation { parts.push(block.operation.name()); } if activation && block.activation != Activation::Linear { parts.push(block.activation.name()); } if normalization && let Some(value) = block.normalization { parts.push(value.name()); } (!parts.is_empty()).then(|| parts.join(".")) }).collect::<Vec<_>>().join("/") }
 		}
@@ -144,6 +144,7 @@ impl BlockNormalization {
 struct TrainingGraph<'a> {
 	blocks: &'a [Block],
 	widths: Vec<usize>,
+	shapes: Vec<(usize, usize)>,
 	offsets: Vec<usize>,
 	matrix_parameters: usize,
 	parameters: usize,
@@ -183,23 +184,72 @@ macro_rules! hsa_kernels {
 hsa_kernels! { forward_graph epoch_graph normalize affine initialize set_value metrics }
 static HSA: OnceLock<Hsa> = OnceLock::new();
 
-struct DeviceBuffer {
-	pointer: *mut c_void,
-	elements: usize,
+macro_rules! device_buffer {
+	() => {
+		struct DeviceBuffer {
+			pointer: *mut c_void,
+			elements: usize,
+		}
+		impl DeviceBuffer {
+			fn status(status: i32, action: &str) -> Result<(), RecipeError> {
+				if status == 0 {
+					Ok(())
+				} else {
+					Err(RecipeError::new(format!(
+						"GPU {action} failed with status {status}"
+					)))
+				}
+			}
+			fn allocate(elements: usize, bytes: usize) -> Result<Self, RecipeError> {
+				let runtime = hsa()?;
+				let mut pointer = ptr::null_mut();
+				Self::status(
+					unsafe { runtime.allocate(&mut pointer, bytes) },
+					"allocation",
+				)?;
+				Ok(Self { pointer, elements })
+			}
+			fn new(elements: usize) -> Result<Self, RecipeError> {
+				Self::allocate(elements, elements * size_of::<f64>())
+			}
+			fn upload<T>(values: &[T]) -> Result<Self, RecipeError> {
+				let buffer = Self::allocate(values.len(), size_of_val(values))?;
+				Self::status(
+					unsafe {
+						hsa()?.upload(
+							buffer.pointer,
+							values.as_ptr().cast(),
+							size_of_val(values),
+						)
+					},
+					"transfer",
+				)?;
+				Ok(buffer)
+			}
+			fn download(&self) -> Result<Vec<f64>, RecipeError> {
+				let runtime = hsa()?;
+				Self::status(unsafe { runtime.synchronize() }, "synchronization")?;
+				let mut values = vec![0.0; self.elements];
+				Self::status(
+					unsafe {
+						runtime.download(
+							values.as_mut_ptr().cast(),
+							self.pointer,
+							self.elements * size_of::<f64>(),
+						)
+					},
+					"transfer",
+				)?;
+				Ok(values)
+			}
+		}
+	};
 }
+device_buffer!();
 struct DeviceData {
 	samples: DeviceBuffer,
 	targets: DeviceBuffer,
 	target_affine: [f64; 2],
-}
-
-#[rustfmt::skip]
-impl DeviceBuffer {
-    fn status(status: i32, action: &str) -> Result<(), RecipeError> { if status == 0 { Ok(()) } else { Err(RecipeError::new(format!("GPU {action} failed with status {status}"))) } }
-    fn allocate(elements: usize, bytes: usize) -> Result<Self, RecipeError> { let runtime = hsa()?; let mut pointer = ptr::null_mut(); Self::status(unsafe { runtime.allocate(&mut pointer, bytes) }, "allocation")?; Ok(Self { pointer, elements }) }
-    fn new(elements: usize) -> Result<Self, RecipeError> { Self::allocate(elements, elements * size_of::<f64>()) }
-    fn upload<T>(values: &[T]) -> Result<Self, RecipeError> { let buffer = Self::allocate(values.len(), size_of_val(values))?; Self::status(unsafe { hsa()?.upload(buffer.pointer, values.as_ptr().cast(), size_of_val(values)) }, "transfer")?; Ok(buffer) }
-    fn download(&self) -> Result<Vec<f64>, RecipeError> { let runtime = hsa()?; Self::status(unsafe { runtime.synchronize() }, "synchronization")?; let mut values = vec![0.0; self.elements]; Self::status(unsafe { runtime.download(values.as_mut_ptr().cast(), self.pointer, self.elements * size_of::<f64>()) }, "transfer")?; Ok(values) }
 }
 
 #[rustfmt::skip]
@@ -275,7 +325,7 @@ impl TrainingGraph<'_> {
 		let mut pass = DevicePass { values: Vec::with_capacity(self.blocks.len()), raw: Vec::with_capacity(self.blocks.len()), derivatives: Vec::with_capacity(self.blocks.len()), operations: Vec::with_capacity(self.blocks.len()), scales: Vec::with_capacity(self.blocks.len()), contexts: Vec::with_capacity(self.blocks.len()) }; let forest = |trees: usize, depth: usize| (depth < i32::BITS as usize).then_some(depth).and_then(|depth| 1_usize.checked_shl(depth as u32)).and_then(|leaves| leaves.checked_mul(3).and_then(|nodes| nodes.checked_sub(2)).and_then(|span| trees.checked_mul(span)).and_then(|nodes| trees.checked_mul(rows).and_then(|assignments| nodes.checked_add(assignments))).and_then(|context| context.checked_add(rows))).ok_or_else(|| RecipeError::new("forest dimensions overflow"));
         let (mut descriptors, mut parameters) = (Vec::with_capacity(self.blocks.len() * 7), Vec::with_capacity(self.blocks.len() * 2));
         for stage in 0..self.blocks.len() {
-			let (from, to) = (self.widths[stage], self.widths[stage + 1]); let count = rows * to; let normalization = match self.blocks[stage].normalization { None => 0, Some(BlockNormalization::Batch) => 1, Some(BlockNormalization::Layer) => 2 }; let (operation, parameter, secondary) = self.operation(stage); let gates = match operation { 6 => 1, 7 => 3, 8 => 4, _ => 0 }; descriptors.extend([from as i32, to as i32, self.offsets[stage] as i32, operation, self.blocks[stage].activation as i32, normalization, self.prelu(stage).map_or(-1, |index| index as i32)]); parameters.extend([parameter, secondary]); pass.values.push(DeviceBuffer::new(count)?); pass.raw.push(DeviceBuffer::new(count)?); pass.derivatives.push(DeviceBuffer::new(count)?); pass.operations.push(DeviceBuffer::new(count)?); pass.scales.push((normalization != 0).then(|| DeviceBuffer::new(2 * if normalization == 1 { to } else { rows })).transpose()?); pass.contexts.push(match operation { 3 => Some(DeviceBuffer::upload(&vec![0.0; 1 + from * to + count])?), 9 => Some(DeviceBuffer::new(forest(parameter as usize, secondary as usize)?)?), 10 => Some(DeviceBuffer::new(rows * (1 + parameter as usize))?), 6..=8 => Some(DeviceBuffer::new((2 * gates + 4) * count)?), _ => None });
+			let (from, to) = (self.widths[stage], self.widths[stage + 1]); let count = rows * to; let normalization = match self.blocks[stage].normalization { None => 0, Some(BlockNormalization::Batch) => 1, Some(BlockNormalization::Layer) => 2 }; let (operation, parameter, mut secondary) = self.operation(stage); if operation == 1 || operation == 2 { secondary = self.shapes[stage].0 as f64; } let gates = match operation { 6 => 1, 7 => 3, 8 => 4, _ => 0 }; descriptors.extend([from as i32, to as i32, self.offsets[stage] as i32, operation, self.blocks[stage].activation as i32, normalization, self.prelu(stage).map_or(-1, |index| index as i32)]); parameters.extend([parameter, secondary]); pass.values.push(DeviceBuffer::new(count)?); pass.raw.push(DeviceBuffer::new(count)?); pass.derivatives.push(DeviceBuffer::new(count)?); pass.operations.push(DeviceBuffer::new(count)?); pass.scales.push((normalization != 0).then(|| DeviceBuffer::new(2 * if normalization == 1 { to } else { rows })).transpose()?); pass.contexts.push(match operation { 3 => Some(DeviceBuffer::upload(&vec![0.0; 1 + from * to + count])?), 9 => Some(DeviceBuffer::new(forest(parameter as usize, secondary as usize)?)?), 10 => Some(DeviceBuffer::new(rows * (1 + parameter as usize))?), 6..=8 => Some(DeviceBuffer::new((2 * gates + 4) * count)?), _ => None });
         }
 		let addresses = |buffers: &[DeviceBuffer]| buffers.iter().map(|buffer| buffer.pointer as usize as u64).collect::<Vec<_>>(); let optional = |buffers: &[Option<DeviceBuffer>]| buffers.iter().map(|buffer| buffer.as_ref().map_or(0, |buffer| buffer.pointer as usize as u64)).collect::<Vec<_>>(); let pointers = DevicePass { values: DeviceBuffer::upload(&addresses(&pass.values))?, raw: DeviceBuffer::upload(&addresses(&pass.raw))?, derivatives: DeviceBuffer::upload(&addresses(&pass.derivatives))?, operations: DeviceBuffer::upload(&addresses(&pass.operations))?, scales: DeviceBuffer::upload(&optional(&pass.scales))?, contexts: DeviceBuffer::upload(&optional(&pass.contexts))? };
 		Ok(DeviceGraph { pass, pointers, descriptors: DeviceBuffer::upload(&descriptors)?, parameters: DeviceBuffer::upload(&parameters)? })
@@ -284,7 +334,10 @@ impl TrainingGraph<'_> {
         let runtime = hsa()?; let (mut input, mut weights, mut config, mut values, mut raw, mut operations, mut derivatives, mut scales, mut contexts, mut descriptors, mut parameters) = (input.pointer, weights.pointer, config.pointer, graph.pointers.values.pointer, graph.pointers.raw.pointer, graph.pointers.operations.pointer, graph.pointers.derivatives.pointer, graph.pointers.scales.pointer, graph.pointers.contexts.pointer, graph.descriptors.pointer, graph.parameters.pointer); let (mut rows, mut stages, mut threads) = (rows as u32, self.blocks.len() as u32, threads); let mut epsilon = configured_f64("RECIPE_NORMALIZATION_EPSILON", env!("RECIPE_NORMALIZATION_EPSILON"))?; let mut arguments = [&mut input as *mut _ as *mut c_void, &mut weights as *mut _ as *mut c_void, &mut config as *mut _ as *mut c_void, &mut values as *mut _ as *mut c_void, &mut raw as *mut _ as *mut c_void, &mut operations as *mut _ as *mut c_void, &mut derivatives as *mut _ as *mut c_void, &mut scales as *mut _ as *mut c_void, &mut contexts as *mut _ as *mut c_void, &mut descriptors as *mut _ as *mut c_void, &mut parameters as *mut _ as *mut c_void, &mut rows as *mut _ as *mut c_void, &mut stages as *mut _ as *mut c_void, &mut epsilon as *mut _ as *mut c_void, &mut threads as *mut _ as *mut c_void]; hsa_launch(runtime.forward_graph, threads as usize, threads, &mut arguments)
     }
     fn epoch_gpu(&self, graph: &DeviceGraph, epoch: &EpochBuffers, input: &DeviceBuffer, targets: &DeviceBuffer, weights: &DeviceBuffer, config: &DeviceBuffer, moments: &DeviceBuffer, variances: &DeviceBuffer, rows: usize, threads: u32, loss: LossFunction, optimizer: AdamwConfig, step: i32, previous_loss: f64, tolerance: f64, checkpoint_enabled: bool) -> Result<[f64; 4], RecipeError> {
-        let runtime = hsa()?; let (mut input, mut targets, mut weights, mut config, mut values, mut raw, mut operations, mut derivatives, mut scales, mut contexts, mut descriptors, mut parameters, mut metrics, mut gradient, mut delta_a, mut delta_b, mut moments, mut variances, mut checkpoint) = (input.pointer, targets.pointer, weights.pointer, config.pointer, graph.pointers.values.pointer, graph.pointers.raw.pointer, graph.pointers.operations.pointer, graph.pointers.derivatives.pointer, graph.pointers.scales.pointer, graph.pointers.contexts.pointer, graph.descriptors.pointer, graph.parameters.pointer, epoch.metrics.pointer, epoch.gradient.pointer, epoch.delta[0].pointer, epoch.delta[1].pointer, moments.pointer, variances.pointer, epoch.checkpoint.pointer); let (mut rows, mut stages, mut parameter_count, mut loss, mut checkpoint_enabled, mut step, mut threads) = (rows as u32, self.blocks.len() as u32, self.parameters as u32, loss.0 as i32, i32::from(checkpoint_enabled), step, threads); let (mut previous_loss, mut tolerance) = (previous_loss, tolerance); let (mut rate, mut beta1, mut beta2, mut optimizer_epsilon, mut decay) = (optimizer.rate, optimizer.beta1, optimizer.beta2, optimizer.epsilon, optimizer.decay); let mut normalization_epsilon = configured_f64("RECIPE_NORMALIZATION_EPSILON", env!("RECIPE_NORMALIZATION_EPSILON"))?; let mut arguments = [&mut input as *mut _ as *mut c_void, &mut targets as *mut _ as *mut c_void, &mut weights as *mut _ as *mut c_void, &mut config as *mut _ as *mut c_void, &mut values as *mut _ as *mut c_void, &mut raw as *mut _ as *mut c_void, &mut operations as *mut _ as *mut c_void, &mut derivatives as *mut _ as *mut c_void, &mut scales as *mut _ as *mut c_void, &mut contexts as *mut _ as *mut c_void, &mut descriptors as *mut _ as *mut c_void, &mut parameters as *mut _ as *mut c_void, &mut metrics as *mut _ as *mut c_void, &mut gradient as *mut _ as *mut c_void, &mut delta_a as *mut _ as *mut c_void, &mut delta_b as *mut _ as *mut c_void, &mut moments as *mut _ as *mut c_void, &mut variances as *mut _ as *mut c_void, &mut checkpoint as *mut _ as *mut c_void, &mut rows as *mut _ as *mut c_void, &mut stages as *mut _ as *mut c_void, &mut parameter_count as *mut _ as *mut c_void, &mut loss as *mut _ as *mut c_void, &mut previous_loss as *mut _ as *mut c_void, &mut tolerance as *mut _ as *mut c_void, &mut checkpoint_enabled as *mut _ as *mut c_void, &mut normalization_epsilon as *mut _ as *mut c_void, &mut rate as *mut _ as *mut c_void, &mut beta1 as *mut _ as *mut c_void, &mut beta2 as *mut _ as *mut c_void, &mut optimizer_epsilon as *mut _ as *mut c_void, &mut decay as *mut _ as *mut c_void, &mut step as *mut _ as *mut c_void, &mut threads as *mut _ as *mut c_void]; hsa_launch(runtime.epoch_graph, threads as usize, threads, &mut arguments)?; let values = epoch.metrics.download()?; Ok([values[0], values[1], values[2], values[3]])
+        let runtime = hsa()?; let (mut input, mut targets, mut weights, mut config, mut values, mut raw, mut operations, mut derivatives, mut scales, mut contexts, mut descriptors, mut parameters, mut metrics, mut gradient, mut delta_a, mut delta_b, mut moments, mut variances, mut checkpoint) = (input.pointer, targets.pointer, weights.pointer, config.pointer, graph.pointers.values.pointer, graph.pointers.raw.pointer, graph.pointers.operations.pointer, graph.pointers.derivatives.pointer, graph.pointers.scales.pointer, graph.pointers.contexts.pointer, graph.descriptors.pointer, graph.parameters.pointer, epoch.metrics.pointer, epoch.gradient.pointer, epoch.delta[0].pointer, epoch.delta[1].pointer, moments.pointer, variances.pointer, epoch.checkpoint.pointer);
+        let (mut rows, mut stages, mut parameter_count, mut loss, mut checkpoint_enabled, mut step, mut threads) = (rows as u32, self.blocks.len() as u32, self.parameters as u32, loss.0 as i32, i32::from(checkpoint_enabled), step, threads); let (mut previous_loss, mut tolerance) = (previous_loss, tolerance); let (mut rate, mut beta1, mut beta2, mut optimizer_epsilon, mut decay) = (optimizer.rate, optimizer.beta1, optimizer.beta2, optimizer.epsilon, optimizer.decay); let mut normalization_epsilon = configured_f64("RECIPE_NORMALIZATION_EPSILON", env!("RECIPE_NORMALIZATION_EPSILON"))?;
+        let mut arguments = [&mut input as *mut _ as *mut c_void, &mut targets as *mut _ as *mut c_void, &mut weights as *mut _ as *mut c_void, &mut config as *mut _ as *mut c_void, &mut values as *mut _ as *mut c_void, &mut raw as *mut _ as *mut c_void, &mut operations as *mut _ as *mut c_void, &mut derivatives as *mut _ as *mut c_void, &mut scales as *mut _ as *mut c_void, &mut contexts as *mut _ as *mut c_void, &mut descriptors as *mut _ as *mut c_void, &mut parameters as *mut _ as *mut c_void, &mut metrics as *mut _ as *mut c_void, &mut gradient as *mut _ as *mut c_void, &mut delta_a as *mut _ as *mut c_void, &mut delta_b as *mut _ as *mut c_void, &mut moments as *mut _ as *mut c_void, &mut variances as *mut _ as *mut c_void, &mut checkpoint as *mut _ as *mut c_void, &mut rows as *mut _ as *mut c_void, &mut stages as *mut _ as *mut c_void, &mut parameter_count as *mut _ as *mut c_void, &mut loss as *mut _ as *mut c_void, &mut previous_loss as *mut _ as *mut c_void, &mut tolerance as *mut _ as *mut c_void, &mut checkpoint_enabled as *mut _ as *mut c_void, &mut normalization_epsilon as *mut _ as *mut c_void, &mut rate as *mut _ as *mut c_void, &mut beta1 as *mut _ as *mut c_void, &mut beta2 as *mut _ as *mut c_void, &mut optimizer_epsilon as *mut _ as *mut c_void, &mut decay as *mut _ as *mut c_void, &mut step as *mut _ as *mut c_void, &mut threads as *mut _ as *mut c_void];
+        hsa_launch(runtime.epoch_graph, threads as usize, threads, &mut arguments)?; let values = epoch.metrics.download()?; Ok([values[0], values[1], values[2], values[3]])
     }
 }
 

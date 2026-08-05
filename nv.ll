@@ -133,25 +133,31 @@ exit:
   ret void
 }
 
-define internal void @conv_forward_body(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %p, i32 %from, i32 %to, i32 %kernel) #1 {
+define internal void @conv_forward_body(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %p, i32 %from, i32 %to, i32 %kernel, i32 %channels) #1 {
 entry:
-  %positions.0 = sub i32 %from, %kernel
+  %length = udiv i32 %from, %channels
+  %positions.0 = sub i32 %length, %kernel
   %positions = add i32 %positions.0, 1
   %row = udiv i32 %p, %to
   %out = urem i32 %p, %to
   %filter = udiv i32 %out, %positions
   %position = urem i32 %out, %positions
   %row.base = mul i32 %row, %from
-  %input.base = add i32 %row.base, %position
-  %weight.base = mul i32 %filter, %kernel
+  %weight.stride = mul i32 %channels, %kernel
+  %weight.base = mul i32 %filter, %weight.stride
   br label %loop
 loop:
   %i = phi i32 [ 0, %entry ], [ %next, %step ]
   %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
-  %more = icmp ult i32 %i, %kernel
+  %more = icmp ult i32 %i, %weight.stride
   br i1 %more, label %step, label %done
 step:
-  %input.index = add i32 %input.base, %i
+  %channel = udiv i32 %i, %kernel
+  %offset = urem i32 %i, %kernel
+  %channel.base = mul i32 %channel, %length
+  %input.local.0 = add i32 %channel.base, %position
+  %input.local = add i32 %input.local.0, %offset
+  %input.index = add i32 %row.base, %input.local
   %weight.index = add i32 %weight.base, %i
   %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %input.index
   %weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.index
@@ -167,12 +173,16 @@ done:
   ret void
 }
 
-define internal void @conv_weight_gradient_body(ptr addrspace(1) %input, ptr addrspace(1) %delta, ptr addrspace(1) %gradient, i32 %p, i32 %rows, i32 %from, i32 %to, i32 %kernel) #1 {
+define internal void @conv_weight_gradient_body(ptr addrspace(1) %input, ptr addrspace(1) %delta, ptr addrspace(1) %gradient, i32 %p, i32 %rows, i32 %from, i32 %to, i32 %kernel, i32 %channels) #1 {
 entry:
-  %positions.0 = sub i32 %from, %kernel
+  %length = udiv i32 %from, %channels
+  %positions.0 = sub i32 %length, %kernel
   %positions = add i32 %positions.0, 1
-  %filter = udiv i32 %p, %kernel
-  %offset = urem i32 %p, %kernel
+  %weight.stride = mul i32 %channels, %kernel
+  %filter = udiv i32 %p, %weight.stride
+  %weight.local = urem i32 %p, %weight.stride
+  %channel = udiv i32 %weight.local, %kernel
+  %offset = urem i32 %weight.local, %kernel
   %items = mul i32 %rows, %positions
   br label %loop
 loop:
@@ -184,7 +194,9 @@ step:
   %row = udiv i32 %item, %positions
   %position = urem i32 %item, %positions
   %input.row = mul i32 %row, %from
-  %input.window = add i32 %input.row, %position
+  %input.channel = mul i32 %channel, %length
+  %input.base = add i32 %input.row, %input.channel
+  %input.window = add i32 %input.base, %position
   %input.index = add i32 %input.window, %offset
   %delta.row = mul i32 %row, %to
   %filter.base = mul i32 %filter, %positions
@@ -204,13 +216,16 @@ done:
   ret void
 }
 
-define internal void @conv_previous_gradient_body(ptr addrspace(1) %weights, ptr addrspace(1) %delta, ptr addrspace(1) %previous, i32 %p, i32 %from, i32 %to, i32 %kernel) #1 {
+define internal void @conv_previous_gradient_body(ptr addrspace(1) %weights, ptr addrspace(1) %delta, ptr addrspace(1) %previous, i32 %p, i32 %from, i32 %to, i32 %kernel, i32 %channels) #1 {
 entry:
-  %positions.0 = sub i32 %from, %kernel
+  %length = udiv i32 %from, %channels
+  %positions.0 = sub i32 %length, %kernel
   %positions = add i32 %positions.0, 1
   %filters = udiv i32 %to, %positions
   %row = udiv i32 %p, %from
-  %column = urem i32 %p, %from
+  %local = urem i32 %p, %from
+  %channel = udiv i32 %local, %length
+  %column = urem i32 %local, %length
   %items = mul i32 %filters, %positions
   br label %loop
 loop:
@@ -227,8 +242,11 @@ step:
   %inside = and i1 %after.start, %before.end
   %offset = sub i32 %column, %position
   %safe.offset = select i1 %inside, i32 %offset, i32 0
-  %weight.base = mul i32 %filter, %kernel
-  %weight.index = add i32 %weight.base, %safe.offset
+  %weight.stride = mul i32 %channels, %kernel
+  %weight.base = mul i32 %filter, %weight.stride
+  %weight.channel = mul i32 %channel, %kernel
+  %weight.local = add i32 %weight.channel, %safe.offset
+  %weight.index = add i32 %weight.base, %weight.local
   %delta.row = mul i32 %row, %to
   %delta.index = add i32 %delta.row, %item
   %weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.index
@@ -246,15 +264,21 @@ done:
   ret void
 }
 
-define internal void @pool_forward_body(ptr addrspace(1) %input, ptr addrspace(1) %output, i32 %p, i32 %from, i32 %to, i32 %size) #1 {
+define internal void @pool_forward_body(ptr addrspace(1) %input, ptr addrspace(1) %output, i32 %p, i32 %from, i32 %to, i32 %size, i32 %channels) #1 {
 entry:
+  %length = udiv i32 %from, %channels
+  %pooled.length = udiv i32 %to, %channels
   %row = udiv i32 %p, %to
   %out = urem i32 %p, %to
-  %start = mul i32 %out, %size
+  %channel = udiv i32 %out, %pooled.length
+  %spatial = urem i32 %out, %pooled.length
+  %start = mul i32 %spatial, %size
   %candidate.end = add i32 %start, %size
-  %short = icmp ult i32 %candidate.end, %from
-  %end = select i1 %short, i32 %candidate.end, i32 %from
+  %short = icmp ult i32 %candidate.end, %length
+  %end = select i1 %short, i32 %candidate.end, i32 %length
   %row.base = mul i32 %row, %from
+  %channel.local = mul i32 %channel, %length
+  %input.base = add i32 %row.base, %channel.local
   br label %loop
 loop:
   %i = phi i32 [ %start, %entry ], [ %next, %step ]
@@ -262,7 +286,7 @@ loop:
   %more = icmp ult i32 %i, %end
   br i1 %more, label %step, label %done
 step:
-  %index = add i32 %row.base, %i
+  %index = add i32 %input.base, %i
   %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %index
   %value = load double, ptr addrspace(1) %input.ptr, align 8
   %greater = fcmp ogt double %value, %maximum
@@ -275,16 +299,22 @@ done:
   ret void
 }
 
-define internal void @pool_previous_gradient_body(ptr addrspace(1) %input, ptr addrspace(1) %delta, ptr addrspace(1) %previous, i32 %p, i32 %from, i32 %to, i32 %size) #1 {
+define internal void @pool_previous_gradient_body(ptr addrspace(1) %input, ptr addrspace(1) %delta, ptr addrspace(1) %previous, i32 %p, i32 %from, i32 %to, i32 %size, i32 %channels) #1 {
 entry:
+  %length = udiv i32 %from, %channels
+  %pooled.length = udiv i32 %to, %channels
   %row = udiv i32 %p, %from
-  %column = urem i32 %p, %from
+  %local = urem i32 %p, %from
+  %channel = udiv i32 %local, %length
+  %column = urem i32 %local, %length
   %window = udiv i32 %column, %size
   %start = mul i32 %window, %size
   %candidate.end = add i32 %start, %size
-  %short = icmp ult i32 %candidate.end, %from
-  %end = select i1 %short, i32 %candidate.end, i32 %from
+  %short = icmp ult i32 %candidate.end, %length
+  %end = select i1 %short, i32 %candidate.end, i32 %length
   %row.base = mul i32 %row, %from
+  %channel.local = mul i32 %channel, %length
+  %input.base = add i32 %row.base, %channel.local
   br label %loop
 loop:
   %i = phi i32 [ %start, %entry ], [ %next, %step ]
@@ -293,7 +323,7 @@ loop:
   %more = icmp ult i32 %i, %end
   br i1 %more, label %step, label %done
 step:
-  %index = add i32 %row.base, %i
+  %index = add i32 %input.base, %i
   %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %index
   %value = load double, ptr addrspace(1) %input.ptr, align 8
   %greater = fcmp ogt double %value, %maximum
@@ -303,7 +333,9 @@ step:
   br label %loop
 done:
   %delta.row = mul i32 %row, %to
-  %delta.index = add i32 %delta.row, %window
+  %delta.channel = mul i32 %channel, %pooled.length
+  %delta.local = add i32 %delta.channel, %window
+  %delta.index = add i32 %delta.row, %delta.local
   %delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %delta.index
   %delta.value = load double, ptr addrspace(1) %delta.ptr, align 8
   %selected = icmp eq i32 %column, %winner
@@ -680,7 +712,8 @@ traverse.step:
 predict.tree.done:
   %predict.leaf = sub i32 %traverse.node, %internals
   %predict.leaf.local = add i32 %internal.fields, %predict.leaf
-  %predict.leaf.index = add i32 %predict.tree.base, %predict.leaf.local
+  %predict.leaf.tree.base = mul i32 %predict.tree, %tree.span
+  %predict.leaf.index = add i32 %predict.leaf.tree.base, %predict.leaf.local
   %predict.leaf.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %predict.leaf.index
   %tree.prediction = load double, ptr addrspace(1) %predict.leaf.ptr, align 8
   %prediction.sum.next = fadd double %prediction.sum, %tree.prediction
@@ -2101,19 +2134,20 @@ value.step:
   %activation.element = getelementptr inbounds double, ptr addrspace(1) %activation.derivatives, i32 %p
   %is.conv = icmp eq i32 %operation, 1
   %is.pool = icmp eq i32 %operation, 2
+  %spatial.channels = fptoui double %secondary to i32
   %matrix.bypass = add i1 %is.recurrent, false
   br i1 %matrix.bypass, label %transform.step, label %conv.test
 conv.test:
   br i1 %is.conv, label %conv.step, label %pool.test
 conv.step:
   %kernel = fptoui double %parameter to i32
-  call void @conv_forward_body(ptr addrspace(1) %source, ptr addrspace(1) %matrix, ptr addrspace(1) %values, i32 %p, i32 %from, i32 %to, i32 %kernel)
+  call void @conv_forward_body(ptr addrspace(1) %source, ptr addrspace(1) %matrix, ptr addrspace(1) %values, i32 %p, i32 %from, i32 %to, i32 %kernel, i32 %spatial.channels)
   br label %transform.step
 pool.test:
   br i1 %is.pool, label %pool.step, label %dense.step
 pool.step:
   %pool.size = fptoui double %parameter to i32
-  call void @pool_forward_body(ptr addrspace(1) %source, ptr addrspace(1) %values, i32 %p, i32 %from, i32 %to, i32 %pool.size)
+  call void @pool_forward_body(ptr addrspace(1) %source, ptr addrspace(1) %values, i32 %p, i32 %from, i32 %to, i32 %pool.size, i32 %spatial.channels)
   br label %transform.step
 dense.step:
   call void @dense_body(ptr addrspace(1) %input.row, ptr addrspace(1) %weight.column, ptr addrspace(1) %value.element, i32 1, i32 %from, i32 %to, i32 1, i32 0)
@@ -2379,17 +2413,20 @@ pool.matrix.test:
 embedding.matrix.test:
   br i1 %matrix.embedding, label %embedding.matrix.loop, label %matrix.loop
 conv.matrix.loop:
-  %conv.positions = sub i32 %backward.from, %backward.parameter.integer
+  %backward.channels = fptoui double %backward.secondary to i32
+  %conv.length = udiv i32 %backward.from, %backward.channels
+  %conv.positions = sub i32 %conv.length, %backward.parameter.integer
   %conv.positions.one = add i32 %conv.positions, 1
   %conv.filters = udiv i32 %backward.to, %conv.positions.one
-  %conv.matrix.count = mul i32 %conv.filters, %backward.parameter.integer
+  %conv.filter.parameters = mul i32 %backward.channels, %backward.parameter.integer
+  %conv.matrix.count = mul i32 %conv.filters, %conv.filter.parameters
   br label %conv.matrix.iterate
 conv.matrix.iterate:
   %conv.matrix.p = phi i32 [ %tid, %conv.matrix.loop ], [ %conv.matrix.next, %conv.matrix.step ]
   %conv.matrix.more = icmp ult i32 %conv.matrix.p, %conv.matrix.count
   br i1 %conv.matrix.more, label %conv.matrix.step, label %previous.dispatch
 conv.matrix.step:
-  call void @conv_weight_gradient_body(ptr addrspace(1) %backward.source, ptr addrspace(1) %delta, ptr addrspace(1) %backward.matrix.gradient, i32 %conv.matrix.p, i32 %rows, i32 %backward.from, i32 %backward.to, i32 %backward.parameter.integer)
+  call void @conv_weight_gradient_body(ptr addrspace(1) %backward.source, ptr addrspace(1) %delta, ptr addrspace(1) %backward.matrix.gradient, i32 %conv.matrix.p, i32 %rows, i32 %backward.from, i32 %backward.to, i32 %backward.parameter.integer, i32 %backward.channels)
   %conv.matrix.next = add nuw i32 %conv.matrix.p, %threads
   br label %conv.matrix.iterate
 embedding.matrix.loop:
@@ -2430,7 +2467,8 @@ conv.previous.iterate:
   %conv.previous.more = icmp ult i32 %conv.previous.p, %previous.count
   br i1 %conv.previous.more, label %conv.previous.step, label %residual.test
 conv.previous.step:
-  call void @conv_previous_gradient_body(ptr addrspace(1) %backward.matrix, ptr addrspace(1) %delta, ptr addrspace(1) %previous, i32 %conv.previous.p, i32 %backward.from, i32 %backward.to, i32 %backward.parameter.integer)
+  %conv.previous.channels = fptoui double %backward.secondary to i32
+  call void @conv_previous_gradient_body(ptr addrspace(1) %backward.matrix, ptr addrspace(1) %delta, ptr addrspace(1) %previous, i32 %conv.previous.p, i32 %backward.from, i32 %backward.to, i32 %backward.parameter.integer, i32 %conv.previous.channels)
   %conv.previous.next = add nuw i32 %conv.previous.p, %threads
   br label %conv.previous.iterate
 pool.previous.loop:
@@ -2440,7 +2478,8 @@ pool.previous.iterate:
   %pool.previous.more = icmp ult i32 %pool.previous.p, %previous.count
   br i1 %pool.previous.more, label %pool.previous.step, label %residual.test
 pool.previous.step:
-  call void @pool_previous_gradient_body(ptr addrspace(1) %backward.source, ptr addrspace(1) %delta, ptr addrspace(1) %previous, i32 %pool.previous.p, i32 %backward.from, i32 %backward.to, i32 %backward.parameter.integer)
+  %pool.previous.channels = fptoui double %backward.secondary to i32
+  call void @pool_previous_gradient_body(ptr addrspace(1) %backward.source, ptr addrspace(1) %delta, ptr addrspace(1) %previous, i32 %pool.previous.p, i32 %backward.from, i32 %backward.to, i32 %backward.parameter.integer, i32 %pool.previous.channels)
   %pool.previous.next = add nuw i32 %pool.previous.p, %threads
   br label %pool.previous.iterate
 embedding.previous.loop:
