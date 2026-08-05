@@ -73,93 +73,142 @@ pub struct Model {
 	loss: LossFunction,
 }
 
-#[derive(Clone, Debug)]
-#[rustfmt::skip]
-enum OperationBlock { Layer(usize), Conv(usize, usize), Pool(usize), KMeans(usize), Embed(usize, usize), Attention(usize), Rnn(usize), Gru(usize), Lstm(usize), Forest(usize, u8, usize), Knn(usize), Residual(Vec<Residual>), Perceptron(usize) }
-
-#[derive(Clone, Debug)]
-#[rustfmt::skip]
-struct Block { operation: OperationBlock, activation: Activation, normalization: Option<BlockNormalization> }
-
-#[derive(Clone, Copy, Debug)]
-#[rustfmt::skip]
-enum BlockNormalization { Batch, Layer }
-
-#[derive(Clone, Debug)]
-#[rustfmt::skip]
-pub enum Residual { Layer(usize), Relu }
-
-#[rustfmt::skip]
-pub const fn layer(width: usize) -> Residual { Residual::Layer(width) }
-#[rustfmt::skip]
-pub const fn relu() -> Residual { Residual::Relu }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)] #[allow(dead_code)] #[repr(u8)]
-#[rustfmt::skip]
-enum Activation { Linear, Cosine, Exponential, Logarithm, NaturalLogarithm, LegacySignedLogOnePlus, Huber, Tangent, Relu, LeakyRelu, Sigmoid, Tanh, Selu, Gelu, Silu, Elu, PRelu }
-
-#[rustfmt::skip]
-struct ActivationConfig { leak: f64, prelu: f64, elu: f64, selu_alpha: f64, selu_scale: f64, gelu_scale: f64, gelu_cubic: f64 }
-
-macro_rules! activations {
-    ($($method:ident: $activation:ident),+ $(,)?) => {$(pub fn $method(mut self) -> Self { let index = self.blocks.len() - 1; if self.blocks[index].normalization.is_some() { panic!("activation must precede normalization"); } self.blocks[index].activation = Activation::$activation; self })+};
+macro_rules! operation_blocks {
+	($input:ident, $output:ident, $recurrent:ident; $($variant:ident($($field:ident: $field_type:ty),+) => $method:ident($($argument:ident: $type:ty),*) = ($($value:expr),*); width $width:expr; parameters $parameters:expr;)+ $(@ $plain:ident($($plain_field:ident: $plain_type:ty),+); width $plain_width:expr; parameters $plain_parameters:expr;)+) => {
+		#[derive(Clone, Debug)] enum OperationBlock { $($variant($($field_type),+),)+ $($plain($($plain_type),+),)+ }
+		impl Model {$(pub fn $method(self, $($argument: $type),*) -> Self { self.push(OperationBlock::$variant($($value),*)) })+}
+		impl OperationBlock { fn output(&self, $input: usize) -> Result<usize, RecipeError> { let $output = match self { $(Self::$variant($($field),+) => $width,)+ $(Self::$plain($($plain_field),+) => $plain_width,)+ }; ($output != 0).then_some($output).ok_or_else(|| RecipeError::new("model block dimensions must be positive")) } fn parameters(&self, $input: usize, $output: usize) -> Result<usize, RecipeError> { let $recurrent = |width: usize, gates: usize| $input.checked_mul(width).and_then(|a| width.checked_mul(width).and_then(|b| a.checked_add(b))).and_then(|value| value.checked_add(width)).and_then(|value| value.checked_mul(gates)); match self { $(Self::$variant($($field),+) => $parameters,)+ $(Self::$plain($($plain_field),+) => $plain_parameters,)+ }.ok_or_else(|| RecipeError::new("model parameter count overflow")) } }
+	};
+}
+operation_blocks! {
+	input, output, recurrent;
+	Layer(_width: usize) => layer(value: usize) = (value); width *_width; parameters input.checked_mul(output); Conv(_filters: usize, _kernel: usize) => conv(filters: usize, kernel: usize) = (filters, kernel); width _filters.saturating_mul(input.checked_sub(*_kernel).map_or(0, |length| length + 1)); parameters _filters.checked_mul(*_kernel); Pool(_size: usize) => pool(value: usize) = (value); width input.div_ceil(*_size); parameters Some(0); KMeans(_width: usize) => kmeans(value: usize) = (value); width *_width; parameters input.checked_mul(output);
+	Embed(_dimensions: usize, _vocabulary: usize) => embed(value: usize) = (value, 0); width input.saturating_mul(*_dimensions); parameters if *_vocabulary != 0 { _dimensions.checked_mul(*_vocabulary) } else { return Err(RecipeError::new("embedding vocabulary must be positive")); }; Attention(_heads: usize) => attn(value: usize) = (value); width input; parameters return Err(RecipeError::new("attention requires genuine Q, K, V lowering")); Rnn(_width: usize) => rnn(value: usize) = (value); width *_width; parameters recurrent(*_width, 1); Gru(_width: usize) => gru(value: usize) = (value); width *_width; parameters recurrent(*_width, 3);
+	Lstm(_width: usize) => lstm(value: usize) = (value); width *_width; parameters recurrent(*_width, 4); Forest(_trees: usize, _kind: u8, _depth: usize) => forest(value: usize) = (value, 0, 0); width 1; parameters input.checked_mul(output); Knn(_neighbors: usize) => knn(value: usize) = (value); width 1; parameters input.checked_mul(output); Perceptron(_width: usize) => perc(value: usize) = (value); width *_width; parameters input.checked_mul(output);
+	@ Residual(_parts: Vec<Residual>); width _parts.iter().filter_map(|part| if let Residual::Layer(width) = part { Some(*width) } else { None }).sum(); parameters input.checked_mul(output);
 }
 
-#[rustfmt::skip]
+#[derive(Clone, Debug)]
+struct Block {
+	operation: OperationBlock,
+	activation: Activation,
+	normalization: Option<BlockNormalization>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BlockNormalization {
+	Batch,
+	Layer,
+}
+#[derive(Clone, Debug)]
+pub enum Residual {
+	Layer(usize),
+	Relu,
+}
+macro_rules! residuals {
+	($($function:ident($($argument:ident: $type:ty),*) => $value:expr),+) => {$(pub const fn $function($($argument: $type),*) -> Residual { $value })+};
+}
+residuals!(layer(width: usize) => Residual::Layer(width), relu() => Residual::Relu);
+
+macro_rules! activations {
+	($($method:ident: $activation:ident = $code:literal),+) => {#[derive(Clone, Copy, Debug, PartialEq, Eq)] #[allow(dead_code)] #[repr(u8)] enum Activation { Linear = 0, LegacySignedLogOnePlus = 5, $($activation = $code),+ } impl Model {$(pub fn $method(mut self) -> Self { let index = self.blocks.len() - 1; if self.blocks[index].normalization.is_some() { panic!("activation must precede normalization"); } self.blocks[index].activation = Activation::$activation; self })+}};
+}
+activations!(cos: Cosine = 1, exp: Exponential = 2, log: Logarithm = 3, ln: NaturalLogarithm = 4, huber: Huber = 6, tan: Tangent = 7, relu: Relu = 8, leak: LeakyRelu = 9, sigmoid: Sigmoid = 10, tanh: Tanh = 11, selu: Selu = 12, gelu: Gelu = 13, silu: Silu = 14, elu: Elu = 15, prelu: PRelu = 16);
+struct ActivationConfig {
+	leak: f64,
+	prelu: f64,
+	elu: f64,
+	selu_alpha: f64,
+	selu_scale: f64,
+	gelu_scale: f64,
+	gelu_cubic: f64,
+}
+
+macro_rules! model_mutators {
+	($($method:ident($argument:ident: $type:ty) => $pattern:pat => $update:expr;)+) => {impl Model {$(pub fn $method(mut self, $argument: $type) -> Self { if let Some($pattern) = self.blocks.last_mut() { $update; } self })+}};
+}
+model_mutators! {
+	vocab(vocabulary: usize) => Block { operation: OperationBlock::Embed(_, value), .. } => *value = vocabulary;
+	lgbm(depth: usize) => Block { operation: OperationBlock::Forest(_, kind, value), .. } => (*kind, *value) = (1, depth);
+	xgbst(depth: usize) => Block { operation: OperationBlock::Forest(_, kind, value), .. } => (*kind, *value) = (2, depth);
+	norm(normalization: Normalization) => block => block.normalization = Some(if normalization as usize == batch as usize { BlockNormalization::Batch } else { BlockNormalization::Layer });
+}
 impl Model {
-    fn push(mut self, operation: OperationBlock) -> Self { self.blocks.push(Block { operation, activation: Activation::Linear, normalization: None }); self }
-    pub fn layer(self, value: usize) -> Self { self.push(OperationBlock::Layer(value)) }
-    pub fn conv(self, filters: usize, kernel: usize) -> Self { self.push(OperationBlock::Conv(filters, kernel)) }
-    pub fn pool(self, value: usize) -> Self { self.push(OperationBlock::Pool(value)) }
-    pub fn kmeans(self, value: usize) -> Self { self.push(OperationBlock::KMeans(value)) }
-    pub fn embed(self, value: usize) -> Self { self.push(OperationBlock::Embed(value, 0)) }
-    pub fn vocab(mut self, vocabulary: usize) -> Self { if let Some(Block { operation: OperationBlock::Embed(_, value), .. }) = self.blocks.last_mut() { *value = vocabulary; } self }
-    pub fn attn(self, value: usize) -> Self { self.push(OperationBlock::Attention(value)) }
-    pub fn rnn(self, value: usize) -> Self { self.push(OperationBlock::Rnn(value)) }
-    pub fn gru(self, value: usize) -> Self { self.push(OperationBlock::Gru(value)) }
-    pub fn lstm(self, value: usize) -> Self { self.push(OperationBlock::Lstm(value)) }
-    pub fn forest(self, value: usize) -> Self { self.push(OperationBlock::Forest(value, 0, 0)) }
-    pub fn lgbm(mut self, depth: usize) -> Self { if let Some(Block { operation: OperationBlock::Forest(_, kind, value), .. }) = self.blocks.last_mut() { (*kind, *value) = (1, depth); } self }
-    pub fn xgbst(mut self, depth: usize) -> Self { if let Some(Block { operation: OperationBlock::Forest(_, kind, value), .. }) = self.blocks.last_mut() { (*kind, *value) = (2, depth); } self }
-    pub fn knn(self, value: usize) -> Self { self.push(OperationBlock::Knn(value)) }
-    pub fn residual<const N: usize>(self, parts: [Residual; N]) -> Self { self.push(OperationBlock::Residual(parts.into())) }
-    pub fn perc(self, value: usize) -> Self { self.push(OperationBlock::Perceptron(value)) }
-    pub fn norm(mut self, value: Normalization) -> Self { let index = self.blocks.len() - 1; self.blocks[index].normalization = Some(if value as usize == batch as usize { BlockNormalization::Batch } else { BlockNormalization::Layer }); self }
+	fn push(mut self, operation: OperationBlock) -> Self {
+		self.blocks.push(Block {
+			operation,
+			activation: Activation::Linear,
+			normalization: None,
+		});
+		self
+	}
+	pub fn residual<const N: usize>(self, parts: [Residual; N]) -> Self {
+		self.push(OperationBlock::Residual(parts.into()))
+	}
+	pub const fn loss(mut self, loss: LossFunction) -> Self {
+		self.loss = loss;
+		self
+	}
 
-    activations!(cos: Cosine, exp: Exponential, log: Logarithm, ln: NaturalLogarithm, huber: Huber, tan: Tangent, relu: Relu, leak: LeakyRelu, sigmoid: Sigmoid, tanh: Tanh, selu: Selu, gelu: Gelu, silu: Silu, elu: Elu, prelu: PRelu);
+	fn graph(&self, features: usize) -> Result<TrainingGraph<'_>, RecipeError> {
+		if self.blocks.is_empty() {
+			return Err(RecipeError::new("training model must contain a block"));
+		}
+		let mut widths = vec![features];
+		let mut offsets = Vec::with_capacity(self.blocks.len());
+		let mut parameters = 0_usize;
+		for block in &self.blocks {
+			let input = widths[widths.len() - 1];
+			let output = block.operation.output(input)?;
+			offsets.push(parameters);
+			let block_parameters = block.operation.parameters(input, output)?;
+			parameters = parameters
+				.checked_add(block_parameters)
+				.ok_or_else(|| RecipeError::new("model parameter count overflow"))?;
+			widths.push(output);
+		}
+		if widths.last() != Some(&1) {
+			return Err(RecipeError::new(
+				"training model output must contain one value",
+			));
+		}
+		let matrix_parameters = parameters;
+		parameters += self
+			.blocks
+			.iter()
+			.filter(|block| block.activation == Activation::PRelu)
+			.count();
+		Ok(TrainingGraph {
+			blocks: &self.blocks,
+			widths,
+			offsets,
+			matrix_parameters,
+			parameters,
+		})
+	}
 
-    pub const fn loss(mut self, loss: LossFunction) -> Self { self.loss = loss; self }
-
-    fn graph(&self, features: usize) -> Result<TrainingGraph<'_>, RecipeError> {
-        if self.blocks.is_empty() { return Err(RecipeError::new("training model must contain a block")); }
-        let mut widths = vec![features];
-        let mut offsets = Vec::with_capacity(self.blocks.len());
-        let mut parameters = 0_usize;
-        for block in &self.blocks {
-            let input = widths[widths.len() - 1];
-            let output = match &block.operation {
-                OperationBlock::Layer(width) | OperationBlock::KMeans(width) | OperationBlock::Rnn(width) | OperationBlock::Gru(width) | OperationBlock::Lstm(width) | OperationBlock::Perceptron(width) => *width,
-                OperationBlock::Conv(filters, kernel) => filters.saturating_mul(input.checked_sub(*kernel).map_or(0, |length| length + 1)),
-                OperationBlock::Pool(size) => input.div_ceil(*size),
-                OperationBlock::Embed(dimensions, _) => input.saturating_mul(*dimensions),
-                OperationBlock::Attention(_) => input,
-                OperationBlock::Forest(..) | OperationBlock::Knn(_) => 1,
-                OperationBlock::Residual(parts) => parts.iter().filter_map(|part| if let Residual::Layer(width) = part { Some(*width) } else { None }).sum(),
-            };
-            if output == 0 { return Err(RecipeError::new("model block dimensions must be positive")); }
-            offsets.push(parameters);
-			let recurrent = |width: usize, gates: usize| input.checked_mul(width).and_then(|a| width.checked_mul(width).and_then(|b| a.checked_add(b))).and_then(|value| value.checked_add(width)).and_then(|value| value.checked_mul(gates)); let block_parameters = match &block.operation { OperationBlock::Conv(filters, kernel) => filters.checked_mul(*kernel), OperationBlock::Pool(_) => Some(0), OperationBlock::Embed(dimensions, vocabulary) if *vocabulary != 0 => dimensions.checked_mul(*vocabulary), OperationBlock::Attention(_) => return Err(RecipeError::new("attention requires genuine Q, K, V lowering")), OperationBlock::Rnn(width) => recurrent(*width, 1), OperationBlock::Gru(width) => recurrent(*width, 3), OperationBlock::Lstm(width) => recurrent(*width, 4), OperationBlock::Embed(..) => return Err(RecipeError::new("embedding vocabulary must be positive")), _ => input.checked_mul(output) }.ok_or_else(|| RecipeError::new("model parameter count overflow"))?;
-            parameters = parameters.checked_add(block_parameters).ok_or_else(|| RecipeError::new("model parameter count overflow"))?;
-            widths.push(output);
-        }
-        if widths.last() != Some(&1) { return Err(RecipeError::new("training model output must contain one value")); }
-        let matrix_parameters = parameters;
-        parameters += self.blocks.iter().filter(|block| block.activation == Activation::PRelu).count();
-        Ok(TrainingGraph { blocks: &self.blocks, widths, offsets, matrix_parameters, parameters })
-    }
-
-    fn signature(&self) -> String { format!("{:?}", self.blocks) }
-    fn description(&self, operation: bool, activation: bool, normalization: bool) -> String { self.blocks.iter().filter_map(|block| { let mut parts = Vec::new(); if operation { parts.push(block.operation.name()); } if activation && block.activation != Activation::Linear { parts.push(block.activation.name()); } if normalization && let Some(value) = block.normalization { parts.push(value.name()); } (!parts.is_empty()).then(|| parts.join(".")) }).collect::<Vec<_>>().join("/") }
+	fn signature(&self) -> String {
+		format!("{:?}", self.blocks)
+	}
+	fn description(&self, operation: bool, activation: bool, normalization: bool) -> String {
+		self.blocks
+			.iter()
+			.filter_map(|block| {
+				let mut parts = Vec::new();
+				if operation {
+					parts.push(block.operation.name());
+				}
+				if activation && block.activation != Activation::Linear {
+					parts.push(block.activation.name());
+				}
+				if normalization && let Some(value) = block.normalization {
+					parts.push(value.name());
+				}
+				(!parts.is_empty()).then(|| parts.join("."))
+			})
+			.collect::<Vec<_>>()
+			.join("/")
+	}
 }
 
 #[rustfmt::skip]
@@ -275,7 +324,7 @@ impl TrainingGraph<'_> {
 		let mut pass = DevicePass { values: Vec::with_capacity(self.blocks.len()), raw: Vec::with_capacity(self.blocks.len()), derivatives: Vec::with_capacity(self.blocks.len()), operations: Vec::with_capacity(self.blocks.len()), scales: Vec::with_capacity(self.blocks.len()), contexts: Vec::with_capacity(self.blocks.len()) };
         let (mut descriptors, mut parameters) = (Vec::with_capacity(self.blocks.len() * 7), Vec::with_capacity(self.blocks.len() * 2));
         for stage in 0..self.blocks.len() {
-			let (from, to) = (self.widths[stage], self.widths[stage + 1]); let count = rows * to; let normalization = match self.blocks[stage].normalization { None => 0, Some(BlockNormalization::Batch) => 1, Some(BlockNormalization::Layer) => 2 }; let (operation, parameter, secondary) = self.operation(stage); let gates = match operation { 6 => 1, 7 => 3, 8 => 4, _ => 0 }; descriptors.extend([from as i32, to as i32, self.offsets[stage] as i32, operation, self.blocks[stage].activation as i32, normalization, self.prelu(stage).map_or(-1, |index| index as i32)]); parameters.extend([parameter, secondary]); pass.values.push(DeviceBuffer::new(count)?); pass.raw.push(DeviceBuffer::new(count)?); pass.derivatives.push(DeviceBuffer::new(count)?); pass.operations.push(DeviceBuffer::new(count)?); pass.scales.push((normalization != 0).then(|| DeviceBuffer::new(2 * if normalization == 1 { to } else { rows })).transpose()?); pass.contexts.push(match operation { 3 => Some(DeviceBuffer::upload(&vec![0.0; 1 + from * to + count])?), 9 => Some(DeviceBuffer::new((parameter as usize) * 4 + count)?), 10 => Some(DeviceBuffer::new(count)?), 6..=8 => Some(DeviceBuffer::new((2 * gates + 4) * count)?), _ => None });
+			let (from, to) = (self.widths[stage], self.widths[stage + 1]); let count = rows * to; let normalization = match self.blocks[stage].normalization { None => 0, Some(BlockNormalization::Batch) => 1, Some(BlockNormalization::Layer) => 2 }; let (operation, parameter, secondary) = self.operation(stage); let gates = match operation { 6 => 1, 7 => 3, 8 => 4, _ => 0 }; descriptors.extend([from as i32, to as i32, self.offsets[stage] as i32, operation, self.blocks[stage].activation as i32, normalization, self.prelu(stage).map_or(-1, |index| index as i32)]); parameters.extend([parameter, secondary]); pass.values.push(DeviceBuffer::new(count)?); pass.raw.push(DeviceBuffer::new(count)?); pass.derivatives.push(DeviceBuffer::new(count)?); pass.operations.push(DeviceBuffer::new(count)?); pass.scales.push((normalization != 0).then(|| DeviceBuffer::new(2 * if normalization == 1 { to } else { rows })).transpose()?); pass.contexts.push(match operation { 3 => Some(DeviceBuffer::upload(&vec![0.0; 1 + from * to + count])?), 9 => Some(DeviceBuffer::new((parameter as usize) * 4 + count)?), 10 => Some(DeviceBuffer::new(rows * (1 + parameter as usize))?), 6..=8 => Some(DeviceBuffer::new((2 * gates + 4) * count)?), _ => None });
         }
 		let addresses = |buffers: &[DeviceBuffer]| buffers.iter().map(|buffer| buffer.pointer as usize as u64).collect::<Vec<_>>(); let optional = |buffers: &[Option<DeviceBuffer>]| buffers.iter().map(|buffer| buffer.as_ref().map_or(0, |buffer| buffer.pointer as usize as u64)).collect::<Vec<_>>(); let value_pointers = DeviceBuffer::upload(&addresses(&pass.values))?; let raw_pointers = DeviceBuffer::upload(&addresses(&pass.raw))?; let derivative_pointers = DeviceBuffer::upload(&addresses(&pass.derivatives))?; let operation_pointers = DeviceBuffer::upload(&addresses(&pass.operations))?; let scale_pointers = DeviceBuffer::upload(&optional(&pass.scales))?; let context_pointers = DeviceBuffer::upload(&optional(&pass.contexts))?;
 		Ok(DeviceGraph { pass, value_pointers, raw_pointers, derivative_pointers, operation_pointers, scale_pointers, context_pointers, descriptors: DeviceBuffer::upload(&descriptors)?, parameters: DeviceBuffer::upload(&parameters)? })
@@ -708,7 +757,7 @@ impl Train {
         let weights = match &self.resume { Some(path) => DeviceBuffer::upload(&load_weights(path, &initialized.download()?, model, features, &prepared.schema)?)?, None => initialized };
         let (moments, variances, mut initial_loss) = (gpu_initialize(graph.parameters, 0, 0.0, &[], threads)?, gpu_initialize(graph.parameters, 0, 0.0, &[], threads)?, 0.0);
         let ho_loss_weight = configured_f64("RECIPE_HO_LOSS_WEIGHT", env!("RECIPE_HO_LOSS_WEIGHT"))?;
-        let config = DeviceBuffer::upload(&[activation_config.leak, activation_config.prelu, activation_config.elu, activation_config.selu_alpha, activation_config.selu_scale, activation_config.gelu_scale, activation_config.gelu_cubic, ho_loss_weight])?;
+        let config = DeviceBuffer::upload(&[activation_config.leak, activation_config.prelu, activation_config.elu, activation_config.selu_alpha, activation_config.selu_scale, activation_config.gelu_scale, activation_config.gelu_cubic, ho_loss_weight, f64::from(prepared.target_categorical)])?;
         let device_graph = graph.prepare_gpu(training_rows)?; let delta_elements = training_rows * graph.widths.iter().copied().max().ok_or_else(|| RecipeError::new("model has no graph width"))?; let epoch_buffers = EpochBuffers { metrics: DeviceBuffer::new(4)?, gradient: DeviceBuffer::new(graph.parameters)?, delta_a: DeviceBuffer::new(delta_elements)?, delta_b: DeviceBuffer::new(delta_elements)?, checkpoint: DeviceBuffer::new(graph.parameters)? }; let optimizer = AdamwConfig { rate: self.learning_rate, beta1, beta2, epsilon, decay };
         let tolerance = self.stop_tolerance.map_or(0.0, |value| value);
         if !tolerance.is_finite() || !(0.0..=1.0).contains(&tolerance) {
@@ -781,7 +830,7 @@ fn save_weights(path: &str, model: &Model, features: usize, schema: &str, weight
 }
 
 #[rustfmt::skip]
-struct Prepared { samples: Vec<f64>, targets: Vec<f64>, rows: usize, features: usize, schema: String }
+struct Prepared { samples: Vec<f64>, targets: Vec<f64>, rows: usize, features: usize, schema: String, target_categorical: bool }
 #[rustfmt::skip]
 struct Table { name: String, headers: Vec<String>, rows: Vec<Vec<String>> }
 #[rustfmt::skip]
@@ -830,7 +879,7 @@ fn prepare_data(data: &Data) -> Result<Prepared, RecipeError> {
 	}
 	let rows = targets.len(); if rows == 0 { return Err(RecipeError::new("dataset has no complete training rows")); }
 	let schema = columns.iter().map(|column| format!("{}.{}:{}:{}", selected.name, selected.headers[*column], kind_name(&kinds[*column]), feature_width(&kinds[*column]))).collect::<Vec<_>>().join("|");
-	Ok(Prepared { samples, targets, rows, features, schema })
+	Ok(Prepared { samples, targets, rows, features, schema, target_categorical: matches!(kinds[target], FeatureType::Categoric(_)) })
 }
 
 #[rustfmt::skip]

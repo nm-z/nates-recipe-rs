@@ -595,7 +595,7 @@ exit:
   ret void
 }
 
-define internal void @knn_preds_body(ptr addrspace(1) %input, ptr addrspace(1) %targets, ptr addrspace(1) %output, i32 %rows, i32 %from, i32 %requested, i32 %threads) #1 {
+define internal void @knn_preds_body(ptr addrspace(1) %input, ptr addrspace(1) %targets, ptr addrspace(1) %output, i32 %rows, i32 %from, i32 %requested, i32 %categorical, i32 %threads) #1 {
 entry:
   %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   %available = sub i32 %rows, 1
@@ -603,7 +603,7 @@ entry:
   %neighbors = select i1 %requested.fits, i32 %requested, i32 %available
   br label %row.loop
 row.loop:
-  %row = phi i32 [ %tid, %entry ], [ %row.next, %row.store ]
+  %row = phi i32 [ %tid, %entry ], [ %row.next, %prediction.store ]
   %row.more = icmp ult i32 %row, %rows
   br i1 %row.more, label %neighbor.loop, label %exit
 neighbor.loop:
@@ -660,16 +660,69 @@ candidate.done:
 neighbor.done:
   %best.target.ptr = getelementptr inbounds double, ptr addrspace(1) %targets, i32 %best.index
   %best.target = load double, ptr addrspace(1) %best.target.ptr, align 8
+  %selected.row.base = mul i32 %row, %requested
+  %selected.local = add i32 %selected.row.base, %rank
+  %selected.index = add i32 %rows, %selected.local
+  %selected.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %selected.index
+  %best.index.double = uitofp i32 %best.index to double
+  store double %best.index.double, ptr addrspace(1) %selected.ptr, align 8
   %sum.next = fadd double %sum, %best.target
   %rank.next = add i32 %rank, 1
   br label %neighbor.loop
 row.store:
   %has.neighbors = icmp ugt i32 %neighbors, 0
+  %is.categorical = icmp ne i32 %categorical, 0
+  %vote = and i1 %has.neighbors, %is.categorical
+  br i1 %vote, label %vote.outer, label %mean.select
+vote.outer:
+  %vote.i = phi i32 [ 0, %row.store ], [ %vote.i.next, %vote.update ]
+  %best.votes = phi i32 [ 0, %row.store ], [ %best.votes.next, %vote.update ]
+  %best.vote.value = phi double [ 0.0, %row.store ], [ %best.vote.value.next, %vote.update ]
+  %vote.more = icmp ult i32 %vote.i, %neighbors
+  br i1 %vote.more, label %vote.value.load, label %prediction.store
+vote.value.load:
+  %vote.row.base = mul i32 %row, %requested
+  %vote.local = add i32 %vote.row.base, %vote.i
+  %vote.selected.index = add i32 %rows, %vote.local
+  %vote.selected.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %vote.selected.index
+  %vote.selected.double = load double, ptr addrspace(1) %vote.selected.ptr, align 8
+  %vote.selected = fptoui double %vote.selected.double to i32
+  %vote.target.ptr = getelementptr inbounds double, ptr addrspace(1) %targets, i32 %vote.selected
+  %vote.value = load double, ptr addrspace(1) %vote.target.ptr, align 8
+  br label %vote.inner
+vote.inner:
+  %vote.j = phi i32 [ 0, %vote.value.load ], [ %vote.j.next, %vote.inner.step ]
+  %votes = phi i32 [ 0, %vote.value.load ], [ %votes.next, %vote.inner.step ]
+  %vote.inner.more = icmp ult i32 %vote.j, %neighbors
+  br i1 %vote.inner.more, label %vote.inner.step, label %vote.update
+vote.inner.step:
+  %compare.local = add i32 %vote.row.base, %vote.j
+  %compare.selected.index = add i32 %rows, %compare.local
+  %compare.selected.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %compare.selected.index
+  %compare.selected.double = load double, ptr addrspace(1) %compare.selected.ptr, align 8
+  %compare.selected = fptoui double %compare.selected.double to i32
+  %compare.target.ptr = getelementptr inbounds double, ptr addrspace(1) %targets, i32 %compare.selected
+  %compare.value = load double, ptr addrspace(1) %compare.target.ptr, align 8
+  %same.vote = fcmp oeq double %compare.value, %vote.value
+  %vote.increment = zext i1 %same.vote to i32
+  %votes.next = add i32 %votes, %vote.increment
+  %vote.j.next = add i32 %vote.j, 1
+  br label %vote.inner
+vote.update:
+  %more.votes = icmp ugt i32 %votes, %best.votes
+  %best.votes.next = select i1 %more.votes, i32 %votes, i32 %best.votes
+  %best.vote.value.next = select i1 %more.votes, double %vote.value, double %best.vote.value
+  %vote.i.next = add i32 %vote.i, 1
+  br label %vote.outer
+mean.select:
   %neighbors.double = uitofp i32 %neighbors to double
   %mean = fdiv double %sum, %neighbors.double
   %own.target.ptr = getelementptr inbounds double, ptr addrspace(1) %targets, i32 %row
   %own.target = load double, ptr addrspace(1) %own.target.ptr, align 8
-  %prediction = select i1 %has.neighbors, double %mean, double %own.target
+  %mean.prediction = select i1 %has.neighbors, double %mean, double %own.target
+  br label %prediction.store
+prediction.store:
+  %prediction = phi double [ %best.vote.value, %vote.outer ], [ %mean.prediction, %mean.select ]
   %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %row
   store double %prediction, ptr addrspace(1) %output.ptr, align 8
   %row.next = add i32 %row, %threads
@@ -1885,7 +1938,10 @@ forest.preds.fit:
   br label %operation.dispatch
 knn.preds.fit:
   %neighbors = fptoui double %parameter to i32
-  call void @knn_preds_body(ptr addrspace(1) %source, ptr addrspace(1) %targets, ptr addrspace(1) %context, i32 %rows, i32 %from, i32 %neighbors, i32 %threads)
+  %target.kind.ptr = getelementptr inbounds double, ptr addrspace(1) %config, i32 8
+  %target.kind.double = load double, ptr addrspace(1) %target.kind.ptr, align 8
+  %target.kind = fptoui double %target.kind.double to i32
+  call void @knn_preds_body(ptr addrspace(1) %source, ptr addrspace(1) %targets, ptr addrspace(1) %context, i32 %rows, i32 %from, i32 %neighbors, i32 %target.kind, i32 %threads)
   br label %operation.dispatch
 operation.dispatch:
   br i1 %is.embedding, label %embedding.loop, label %kmeans.test
