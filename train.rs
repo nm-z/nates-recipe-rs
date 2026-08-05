@@ -20,7 +20,7 @@ fn main() {
 		.optimizer(adamw)
 		.epochs(1)
 		.lr(0.01)
-		.log([Time, Run, Epoch, R2, Loss, blck])
+		.log([Time, Run, Epoch, R2, Loss, blck, atvn, norm])
 		.save("train.ogdl")
 		.run(&checkpoint, &data);
 	recipe.train()
@@ -28,7 +28,7 @@ fn main() {
 		.optimizer(adamw)
 		.epochs(2)
 		.lr(0.01)
-		.log([Time, Run, Epoch, R2, Loss, blck, atvn])
+		.log([Time, Run, Epoch, R2, Loss, blck, atvn, norm])
 		.resume("train.ogdl")
 		.save("train.ogdl")
 		.run(&checkpoint, &data);
@@ -42,30 +42,22 @@ fn main() {
 		.norm(layer)
 		.layer(1)
 		.loss(focal);
-	let training = || recipe.train().optimizer(adamw).epochs(1).lr(0.01);
-	for training in [
-		training().log([R2, Loss]),
-		training().log([R2, Loss, atvn]),
-		training().log([R2, Loss, norm]),
-		training().log([R2, Loss, blck, norm]),
-		training().log([R2, Loss, atvn, norm]),
-	] {
-		training.run(&topology, &data);
-	}
+	recipe.train()
+		.optimizer(adamw)
+		.epochs(1)
+		.lr(0.01)
+		.log([Time, Run, Epoch, R2, Loss, blck, atvn, norm])
+		.run(&topology, &data);
 
-	let blocks: [fn(Model) -> Model; 14] = [
-		|model| model.embed(4).vocab(8),
-		|model| model.attn(2),
-		|model| model.layer(64),
+	let blocks: [fn(Model) -> Model; 10] = [
 		|model| model.conv(8, 3),
 		|model| model.pool(2),
-		|model| model.kmeans(4),
+		|model| model.embed(4).vocab(8),
+		|model| model.layer(64).attn(2),
+		|model| model.layer(64),
 		|model| model.rnn(8),
 		|model| model.gru(8),
 		|model| model.lstm(8),
-		|model| model.forest(2).lgbm(2),
-		|model| model.forest(2).xgbst(2),
-		|model| model.knn(5),
 		|model| model.residual([layer(8), relu()]),
 		|model| model.perc(24),
 	];

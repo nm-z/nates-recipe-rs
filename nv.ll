@@ -133,6 +133,186 @@ exit:
   ret void
 }
 
+define internal void @conv_forward_body(ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %p, i32 %from, i32 %to, i32 %kernel) #1 {
+entry:
+  %positions.0 = sub i32 %from, %kernel
+  %positions = add i32 %positions.0, 1
+  %row = udiv i32 %p, %to
+  %out = urem i32 %p, %to
+  %filter = udiv i32 %out, %positions
+  %position = urem i32 %out, %positions
+  %row.base = mul i32 %row, %from
+  %input.base = add i32 %row.base, %position
+  %weight.base = mul i32 %filter, %kernel
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %step ]
+  %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
+  %more = icmp ult i32 %i, %kernel
+  br i1 %more, label %step, label %done
+step:
+  %input.index = add i32 %input.base, %i
+  %weight.index = add i32 %weight.base, %i
+  %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %input.index
+  %weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.index
+  %x = load double, ptr addrspace(1) %input.ptr, align 8
+  %w = load double, ptr addrspace(1) %weight.ptr, align 8
+  %product = fmul double %x, %w
+  %sum.next = fadd double %sum, %product
+  %next = add i32 %i, 1
+  br label %loop
+done:
+  %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
+  store double %sum, ptr addrspace(1) %output.ptr, align 8
+  ret void
+}
+
+define internal void @conv_weight_gradient_body(ptr addrspace(1) %input, ptr addrspace(1) %delta, ptr addrspace(1) %gradient, i32 %p, i32 %rows, i32 %from, i32 %to, i32 %kernel) #1 {
+entry:
+  %positions.0 = sub i32 %from, %kernel
+  %positions = add i32 %positions.0, 1
+  %filter = udiv i32 %p, %kernel
+  %offset = urem i32 %p, %kernel
+  %items = mul i32 %rows, %positions
+  br label %loop
+loop:
+  %item = phi i32 [ 0, %entry ], [ %next, %step ]
+  %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
+  %more = icmp ult i32 %item, %items
+  br i1 %more, label %step, label %done
+step:
+  %row = udiv i32 %item, %positions
+  %position = urem i32 %item, %positions
+  %input.row = mul i32 %row, %from
+  %input.window = add i32 %input.row, %position
+  %input.index = add i32 %input.window, %offset
+  %delta.row = mul i32 %row, %to
+  %filter.base = mul i32 %filter, %positions
+  %delta.local = add i32 %filter.base, %position
+  %delta.index = add i32 %delta.row, %delta.local
+  %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %input.index
+  %delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %delta.index
+  %x = load double, ptr addrspace(1) %input.ptr, align 8
+  %d = load double, ptr addrspace(1) %delta.ptr, align 8
+  %product = fmul double %x, %d
+  %sum.next = fadd double %sum, %product
+  %next = add i32 %item, 1
+  br label %loop
+done:
+  %gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %p
+  store double %sum, ptr addrspace(1) %gradient.ptr, align 8
+  ret void
+}
+
+define internal void @conv_previous_gradient_body(ptr addrspace(1) %weights, ptr addrspace(1) %delta, ptr addrspace(1) %previous, i32 %p, i32 %from, i32 %to, i32 %kernel) #1 {
+entry:
+  %positions.0 = sub i32 %from, %kernel
+  %positions = add i32 %positions.0, 1
+  %filters = udiv i32 %to, %positions
+  %row = udiv i32 %p, %from
+  %column = urem i32 %p, %from
+  %items = mul i32 %filters, %positions
+  br label %loop
+loop:
+  %item = phi i32 [ 0, %entry ], [ %next, %step ]
+  %sum = phi double [ 0.0, %entry ], [ %sum.next, %step ]
+  %more = icmp ult i32 %item, %items
+  br i1 %more, label %step, label %done
+step:
+  %filter = udiv i32 %item, %positions
+  %position = urem i32 %item, %positions
+  %end = add i32 %position, %kernel
+  %after.start = icmp uge i32 %column, %position
+  %before.end = icmp ult i32 %column, %end
+  %inside = and i1 %after.start, %before.end
+  %offset = sub i32 %column, %position
+  %safe.offset = select i1 %inside, i32 %offset, i32 0
+  %weight.base = mul i32 %filter, %kernel
+  %weight.index = add i32 %weight.base, %safe.offset
+  %delta.row = mul i32 %row, %to
+  %delta.index = add i32 %delta.row, %item
+  %weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.index
+  %delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %delta.index
+  %w = load double, ptr addrspace(1) %weight.ptr, align 8
+  %d = load double, ptr addrspace(1) %delta.ptr, align 8
+  %product = fmul double %w, %d
+  %selected = select i1 %inside, double %product, double 0.0
+  %sum.next = fadd double %sum, %selected
+  %next = add i32 %item, 1
+  br label %loop
+done:
+  %previous.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %p
+  store double %sum, ptr addrspace(1) %previous.ptr, align 8
+  ret void
+}
+
+define internal void @pool_forward_body(ptr addrspace(1) %input, ptr addrspace(1) %output, i32 %p, i32 %from, i32 %to, i32 %size) #1 {
+entry:
+  %row = udiv i32 %p, %to
+  %out = urem i32 %p, %to
+  %start = mul i32 %out, %size
+  %candidate.end = add i32 %start, %size
+  %short = icmp ult i32 %candidate.end, %from
+  %end = select i1 %short, i32 %candidate.end, i32 %from
+  %row.base = mul i32 %row, %from
+  br label %loop
+loop:
+  %i = phi i32 [ %start, %entry ], [ %next, %step ]
+  %maximum = phi double [ 0xFFF0000000000000, %entry ], [ %maximum.next, %step ]
+  %more = icmp ult i32 %i, %end
+  br i1 %more, label %step, label %done
+step:
+  %index = add i32 %row.base, %i
+  %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %index
+  %value = load double, ptr addrspace(1) %input.ptr, align 8
+  %greater = fcmp ogt double %value, %maximum
+  %maximum.next = select i1 %greater, double %value, double %maximum
+  %next = add i32 %i, 1
+  br label %loop
+done:
+  %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
+  store double %maximum, ptr addrspace(1) %output.ptr, align 8
+  ret void
+}
+
+define internal void @pool_previous_gradient_body(ptr addrspace(1) %input, ptr addrspace(1) %delta, ptr addrspace(1) %previous, i32 %p, i32 %from, i32 %to, i32 %size) #1 {
+entry:
+  %row = udiv i32 %p, %from
+  %column = urem i32 %p, %from
+  %window = udiv i32 %column, %size
+  %start = mul i32 %window, %size
+  %candidate.end = add i32 %start, %size
+  %short = icmp ult i32 %candidate.end, %from
+  %end = select i1 %short, i32 %candidate.end, i32 %from
+  %row.base = mul i32 %row, %from
+  br label %loop
+loop:
+  %i = phi i32 [ %start, %entry ], [ %next, %step ]
+  %maximum = phi double [ 0xFFF0000000000000, %entry ], [ %maximum.next, %step ]
+  %winner = phi i32 [ %start, %entry ], [ %winner.next, %step ]
+  %more = icmp ult i32 %i, %end
+  br i1 %more, label %step, label %done
+step:
+  %index = add i32 %row.base, %i
+  %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %index
+  %value = load double, ptr addrspace(1) %input.ptr, align 8
+  %greater = fcmp ogt double %value, %maximum
+  %maximum.next = select i1 %greater, double %value, double %maximum
+  %winner.next = select i1 %greater, i32 %i, i32 %winner
+  %next = add i32 %i, 1
+  br label %loop
+done:
+  %delta.row = mul i32 %row, %to
+  %delta.index = add i32 %delta.row, %window
+  %delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %delta.index
+  %delta.value = load double, ptr addrspace(1) %delta.ptr, align 8
+  %selected = icmp eq i32 %column, %winner
+  %result = select i1 %selected, double %delta.value, double 0.0
+  %previous.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %p
+  store double %result, ptr addrspace(1) %previous.ptr, align 8
+  ret void
+}
+
 define internal i32 @embedding_index(double %value, i32 %vocabulary) #1 {
 entry:
   %unordered = fcmp uno double %value, %value
@@ -551,32 +731,13 @@ block:
   %value.ptr = getelementptr inbounds double, ptr addrspace(1) %values, i32 %p
   %value = load double, ptr addrspace(1) %value.ptr, align 8
   switch i32 %operation, label %block.linear [
-    i32 1, label %block.scale.sqrt
-    i32 2, label %block.scale
-    i32 3, label %block.square
     i32 6, label %block.rnn
     i32 7, label %block.gru
     i32 8, label %block.lstm
-    i32 9, label %block.forest
-    i32 10, label %block.knn
     i32 11, label %block.residual
     i32 12, label %block.perceptron
   ]
 block.linear:
-  br label %block.done
-block.scale.sqrt:
-  %sqrt.scale = call double @llvm.sqrt.f64(double %parameter)
-  %sqrt.result = fdiv double %value, %sqrt.scale
-  %sqrt.derivative = fdiv double 1.0, %sqrt.scale
-  br label %block.done
-block.scale:
-  %scale.result = fdiv double %value, %parameter
-  %scale.derivative = fdiv double 1.0, %parameter
-  br label %block.done
-block.square:
-  %square = fmul double %value, %value
-  %square.result = fneg double %square
-  %square.derivative = fmul double %value, -2.0
   br label %block.done
 block.rnn:
   %rnn.result = call double @__nv_tanh(double %value)
@@ -617,32 +778,6 @@ block.lstm:
   %lstm.term2a = fmul double %lstm.gate, %lstm.inner
   %lstm.derivative = fadd double %lstm.term1, %lstm.term2a
   br label %block.done
-block.forest:
-  %forest.lgbm = fcmp oeq double %secondary, 1.0
-  br i1 %forest.lgbm, label %block.forest.lgbm, label %block.forest.xgbst
-block.forest.lgbm:
-  %forest.input = fmul double %value, %parameter
-  %forest.tanh = call double @__nv_tanh(double %forest.input)
-  %forest.square = fmul double %forest.tanh, %forest.tanh
-  %forest.one = fsub double 1.0, %forest.square
-  %forest.lgbm.derivative = fmul double %parameter, %forest.one
-  br label %block.done
-block.forest.xgbst:
-  %forest.abs = call double @llvm.fabs.f64(double %value)
-  %forest.scaled = fmul double %forest.abs, %parameter
-  %forest.denominator = fadd double 1.0, %forest.scaled
-  %forest.xgbst.result = fdiv double %value, %forest.denominator
-  %forest.denominator.square = fmul double %forest.denominator, %forest.denominator
-  %forest.xgbst.derivative = fdiv double 1.0, %forest.denominator.square
-  br label %block.done
-block.knn:
-  %knn.square = fmul double %value, %value
-  %knn.adjusted = fadd double %knn.square, %parameter
-  %knn.distance = call double @llvm.sqrt.f64(double %knn.adjusted)
-  %knn.result = fneg double %knn.distance
-  %knn.ratio = fdiv double %value, %knn.distance
-  %knn.derivative = fneg double %knn.ratio
-  br label %block.done
 block.residual:
   %row = udiv i32 %p, %to
   %column = urem i32 %p, %to
@@ -658,8 +793,8 @@ block.perceptron:
   %perceptron.result = select i1 %perceptron.test, double 1.0, double 0.0
   br label %block.done
 block.done:
-  %block.result = phi double [ %value, %block.linear ], [ %sqrt.result, %block.scale.sqrt ], [ %scale.result, %block.scale ], [ %square.result, %block.square ], [ %rnn.result, %block.rnn ], [ %gru.result, %block.gru ], [ %lstm.result, %block.lstm ], [ %forest.tanh, %block.forest.lgbm ], [ %forest.xgbst.result, %block.forest.xgbst ], [ %knn.result, %block.knn ], [ %residual.result, %block.residual ], [ %perceptron.result, %block.perceptron ]
-  %block.derivative = phi double [ 1.0, %block.linear ], [ %sqrt.derivative, %block.scale.sqrt ], [ %scale.derivative, %block.scale ], [ %square.derivative, %block.square ], [ %rnn.derivative, %block.rnn ], [ %gru.derivative, %block.gru ], [ %lstm.derivative, %block.lstm ], [ %forest.lgbm.derivative, %block.forest.lgbm ], [ %forest.xgbst.derivative, %block.forest.xgbst ], [ %knn.derivative, %block.knn ], [ 1.0, %block.residual ], [ 1.0, %block.perceptron ]
+  %block.result = phi double [ %value, %block.linear ], [ %rnn.result, %block.rnn ], [ %gru.result, %block.gru ], [ %lstm.result, %block.lstm ], [ %residual.result, %block.residual ], [ %perceptron.result, %block.perceptron ]
+  %block.derivative = phi double [ 1.0, %block.linear ], [ %rnn.derivative, %block.rnn ], [ %gru.derivative, %block.gru ], [ %lstm.derivative, %block.lstm ], [ 1.0, %block.residual ], [ 1.0, %block.perceptron ]
   %raw.ptr = getelementptr inbounds double, ptr addrspace(1) %raw, i32 %p
   store double %block.result, ptr addrspace(1) %raw.ptr, align 8
   %operation.ptr = getelementptr inbounds double, ptr addrspace(1) %operation_derivatives, i32 %p
@@ -971,7 +1106,7 @@ exit:
   ret void
 }
 
-define ptx_kernel void @normalize(ptr addrspace(1) %values, ptr addrspace(1) nocapture readonly %reference, ptr addrspace(1) %scales, i32 %rows, i32 %width, i32 %mode, i32 %reverse, double %epsilon, i32 %threads) #0 {
+define protected amdgpu_kernel void @normalize(ptr addrspace(1) %values, ptr addrspace(1) nocapture readonly %reference, ptr addrspace(1) %scales, i32 %rows, i32 %width, i32 %mode, i32 %reverse, double %epsilon, i32 %threads) #0 {
 entry:
   call void @normalize_body(ptr addrspace(1) %values, ptr addrspace(1) %reference, ptr addrspace(1) %scales, i32 %rows, i32 %width, i32 %mode, i32 %reverse, double %epsilon, i32 %threads, i32 -1)
   ret void
@@ -1081,7 +1216,7 @@ attention.step:
   %attention.next = add nuw i32 %attention.p, %threads
   br label %attention.loop
 value.loop:
-  %p = phi i32 [ %tid, %attention.test ], [ %p.next, %value.step ]
+  %p = phi i32 [ %tid, %attention.test ], [ %p.next, %transform.step ]
   %value.more = icmp ult i32 %p, %count
   br i1 %value.more, label %value.step, label %normalize.test
 value.step:
@@ -1091,14 +1226,32 @@ value.step:
   %input.row = getelementptr inbounds double, ptr addrspace(1) %source, i32 %row.base
   %weight.column = getelementptr inbounds double, ptr addrspace(1) %matrix, i32 %column
   %value.element = getelementptr inbounds double, ptr addrspace(1) %values, i32 %p
-  call void @dense_body(ptr addrspace(1) %input.row, ptr addrspace(1) %weight.column, ptr addrspace(1) %value.element, i32 1, i32 %from, i32 %to, i32 1, i32 0)
   %skip.column = urem i32 %column, %from
   %skip.index = add i32 %row.base, %skip.column
   %skip = getelementptr inbounds double, ptr addrspace(1) %source, i32 %skip.index
   %raw.element = getelementptr inbounds double, ptr addrspace(1) %raw, i32 %p
   %operation.element = getelementptr inbounds double, ptr addrspace(1) %operation.derivatives, i32 %p
   %activation.element = getelementptr inbounds double, ptr addrspace(1) %activation.derivatives, i32 %p
-  call void @transform_body(ptr addrspace(1) %skip, ptr addrspace(1) %value.element, ptr addrspace(1) %raw.element, ptr addrspace(1) %operation.element, ptr addrspace(1) %activation.element, ptr addrspace(1) %config, i32 1, i32 %from, i32 %to, i32 %operation, i32 %activation, double %parameter, double %secondary, i32 1, i32 0)
+  %is.conv = icmp eq i32 %operation, 1
+  %is.pool = icmp eq i32 %operation, 2
+  br i1 %is.conv, label %conv.step, label %pool.test
+conv.step:
+  %kernel = fptoui double %parameter to i32
+  call void @conv_forward_body(ptr addrspace(1) %source, ptr addrspace(1) %matrix, ptr addrspace(1) %values, i32 %p, i32 %from, i32 %to, i32 %kernel)
+  br label %transform.step
+pool.test:
+  br i1 %is.pool, label %pool.step, label %dense.step
+pool.step:
+  %pool.size = fptoui double %parameter to i32
+  call void @pool_forward_body(ptr addrspace(1) %source, ptr addrspace(1) %values, i32 %p, i32 %from, i32 %to, i32 %pool.size)
+  br label %transform.step
+dense.step:
+  call void @dense_body(ptr addrspace(1) %input.row, ptr addrspace(1) %weight.column, ptr addrspace(1) %value.element, i32 1, i32 %from, i32 %to, i32 1, i32 0)
+  br label %transform.step
+transform.step:
+  %special = or i1 %is.conv, %is.pool
+  %transform.operation = select i1 %special, i32 0, i32 %operation
+  call void @transform_body(ptr addrspace(1) %skip, ptr addrspace(1) %value.element, ptr addrspace(1) %raw.element, ptr addrspace(1) %operation.element, ptr addrspace(1) %activation.element, ptr addrspace(1) %config, i32 1, i32 %from, i32 %to, i32 %transform.operation, i32 %activation, double %parameter, double %secondary, i32 1, i32 0)
   %p.next = add nuw i32 %p, %threads
   br label %value.loop
 normalize.test:
@@ -1123,13 +1276,13 @@ exit:
   ret void
 }
 
-define ptx_kernel void @forward_graph(ptr addrspace(1) nocapture readonly %samples, ptr addrspace(1) nocapture readonly %weights, ptr addrspace(1) nocapture readonly %config, ptr addrspace(1) nocapture readonly %value_pointers, ptr addrspace(1) nocapture readonly %raw_pointers, ptr addrspace(1) nocapture readonly %operation_pointers, ptr addrspace(1) nocapture readonly %activation_pointers, ptr addrspace(1) nocapture readonly %scale_pointers, ptr addrspace(1) nocapture readonly %context_pointers, ptr addrspace(1) nocapture readonly %descriptors, ptr addrspace(1) nocapture readonly %parameters, i32 %rows, i32 %stages, double %epsilon, i32 %threads) #0 {
+define protected amdgpu_kernel void @forward_graph(ptr addrspace(1) nocapture readonly %samples, ptr addrspace(1) nocapture readonly %weights, ptr addrspace(1) nocapture readonly %config, ptr addrspace(1) nocapture readonly %value_pointers, ptr addrspace(1) nocapture readonly %raw_pointers, ptr addrspace(1) nocapture readonly %operation_pointers, ptr addrspace(1) nocapture readonly %activation_pointers, ptr addrspace(1) nocapture readonly %scale_pointers, ptr addrspace(1) nocapture readonly %context_pointers, ptr addrspace(1) nocapture readonly %descriptors, ptr addrspace(1) nocapture readonly %parameters, i32 %rows, i32 %stages, double %epsilon, i32 %threads) #0 {
 entry:
   call void @forward_body(ptr addrspace(1) %samples, ptr addrspace(1) %weights, ptr addrspace(1) %config, ptr addrspace(1) %value_pointers, ptr addrspace(1) %raw_pointers, ptr addrspace(1) %operation_pointers, ptr addrspace(1) %activation_pointers, ptr addrspace(1) %scale_pointers, ptr addrspace(1) %context_pointers, ptr addrspace(1) %descriptors, ptr addrspace(1) %parameters, i32 %rows, i32 %stages, double %epsilon, i32 %threads)
   ret void
 }
 
-define ptx_kernel void @epoch_graph(ptr addrspace(1) %samples, ptr addrspace(1) %targets, ptr addrspace(1) %weights, ptr addrspace(1) %config, ptr addrspace(1) %value_pointers, ptr addrspace(1) %raw_pointers, ptr addrspace(1) %operation_pointers, ptr addrspace(1) %activation_pointers, ptr addrspace(1) %scale_pointers, ptr addrspace(1) %context_pointers, ptr addrspace(1) %descriptors, ptr addrspace(1) %parameters, ptr addrspace(1) %metrics, ptr addrspace(1) %gradient, ptr addrspace(1) %delta_a, ptr addrspace(1) %delta_b, ptr addrspace(1) %moments, ptr addrspace(1) %variances, ptr addrspace(1) %checkpoint_weights, i32 %rows, i32 %stages, i32 %parameter_count, i32 %loss, double %previous_loss, double %tolerance, i32 %checkpoint_enabled, double %normalization_epsilon, double %rate, double %beta1, double %beta2, double %optimizer_epsilon, double %decay, i32 %step, i32 %threads) #0 {
+define protected amdgpu_kernel void @epoch_graph(ptr addrspace(1) %samples, ptr addrspace(1) %targets, ptr addrspace(1) %weights, ptr addrspace(1) %config, ptr addrspace(1) %value_pointers, ptr addrspace(1) %raw_pointers, ptr addrspace(1) %operation_pointers, ptr addrspace(1) %activation_pointers, ptr addrspace(1) %scale_pointers, ptr addrspace(1) %context_pointers, ptr addrspace(1) %descriptors, ptr addrspace(1) %parameters, ptr addrspace(1) %metrics, ptr addrspace(1) %gradient, ptr addrspace(1) %delta_a, ptr addrspace(1) %delta_b, ptr addrspace(1) %moments, ptr addrspace(1) %variances, ptr addrspace(1) %checkpoint_weights, i32 %rows, i32 %stages, i32 %parameter_count, i32 %loss, double %previous_loss, double %tolerance, i32 %checkpoint_enabled, double %normalization_epsilon, double %rate, double %beta1, double %beta2, double %optimizer_epsilon, double %decay, i32 %step, i32 %threads) #0 {
 entry:
   %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   call void @forward_body(ptr addrspace(1) %samples, ptr addrspace(1) %weights, ptr addrspace(1) %config, ptr addrspace(1) %value_pointers, ptr addrspace(1) %raw_pointers, ptr addrspace(1) %operation_pointers, ptr addrspace(1) %activation_pointers, ptr addrspace(1) %scale_pointers, ptr addrspace(1) %context_pointers, ptr addrspace(1) %descriptors, ptr addrspace(1) %parameters, i32 %rows, i32 %stages, double %normalization_epsilon, i32 %threads)
@@ -1295,11 +1448,31 @@ chain.step:
   br label %chain.loop
 matrix.dispatch:
   call void @llvm.nvvm.barrier0()
+  %matrix.conv = icmp eq i32 %backward.operation, 1
+  %matrix.pool = icmp eq i32 %backward.operation, 2
   %matrix.embedding = icmp eq i32 %backward.operation, 4
   %matrix.attention = icmp eq i32 %backward.operation, 5
+  br i1 %matrix.conv, label %conv.matrix.loop, label %pool.matrix.test
+pool.matrix.test:
+  br i1 %matrix.pool, label %previous.dispatch, label %embedding.matrix.test
+embedding.matrix.test:
   br i1 %matrix.embedding, label %embedding.matrix.loop, label %attention.matrix.test
 attention.matrix.test:
   br i1 %matrix.attention, label %attention.matrix.loop, label %matrix.loop
+conv.matrix.loop:
+  %conv.positions = sub i32 %backward.from, %backward.parameter.integer
+  %conv.positions.one = add i32 %conv.positions, 1
+  %conv.filters = udiv i32 %backward.to, %conv.positions.one
+  %conv.matrix.count = mul i32 %conv.filters, %backward.parameter.integer
+  br label %conv.matrix.iterate
+conv.matrix.iterate:
+  %conv.matrix.p = phi i32 [ %tid, %conv.matrix.loop ], [ %conv.matrix.next, %conv.matrix.step ]
+  %conv.matrix.more = icmp ult i32 %conv.matrix.p, %conv.matrix.count
+  br i1 %conv.matrix.more, label %conv.matrix.step, label %previous.dispatch
+conv.matrix.step:
+  call void @conv_weight_gradient_body(ptr addrspace(1) %backward.source, ptr addrspace(1) %delta, ptr addrspace(1) %backward.matrix.gradient, i32 %conv.matrix.p, i32 %rows, i32 %backward.from, i32 %backward.to, i32 %backward.parameter.integer)
+  %conv.matrix.next = add nuw i32 %conv.matrix.p, %threads
+  br label %conv.matrix.iterate
 embedding.matrix.loop:
   %embedding.dimensions = udiv i32 %backward.to, %backward.from
   %embedding.vocabulary = add i32 %backward.parameter.integer, 0
@@ -1338,9 +1511,33 @@ matrix.step:
 previous.dispatch:
   call void @llvm.nvvm.barrier0()
   %previous.count = mul i32 %rows, %backward.from
+  br i1 %matrix.conv, label %conv.previous.loop, label %pool.previous.test
+pool.previous.test:
+  br i1 %matrix.pool, label %pool.previous.loop, label %embedding.previous.test
+embedding.previous.test:
   br i1 %matrix.embedding, label %embedding.previous.loop, label %attention.previous.test
 attention.previous.test:
   br i1 %matrix.attention, label %attention.previous.loop, label %previous.loop
+conv.previous.loop:
+  br label %conv.previous.iterate
+conv.previous.iterate:
+  %conv.previous.p = phi i32 [ %tid, %conv.previous.loop ], [ %conv.previous.next, %conv.previous.step ]
+  %conv.previous.more = icmp ult i32 %conv.previous.p, %previous.count
+  br i1 %conv.previous.more, label %conv.previous.step, label %residual.test
+conv.previous.step:
+  call void @conv_previous_gradient_body(ptr addrspace(1) %backward.matrix, ptr addrspace(1) %delta, ptr addrspace(1) %previous, i32 %conv.previous.p, i32 %backward.from, i32 %backward.to, i32 %backward.parameter.integer)
+  %conv.previous.next = add nuw i32 %conv.previous.p, %threads
+  br label %conv.previous.iterate
+pool.previous.loop:
+  br label %pool.previous.iterate
+pool.previous.iterate:
+  %pool.previous.p = phi i32 [ %tid, %pool.previous.loop ], [ %pool.previous.next, %pool.previous.step ]
+  %pool.previous.more = icmp ult i32 %pool.previous.p, %previous.count
+  br i1 %pool.previous.more, label %pool.previous.step, label %residual.test
+pool.previous.step:
+  call void @pool_previous_gradient_body(ptr addrspace(1) %backward.source, ptr addrspace(1) %delta, ptr addrspace(1) %previous, i32 %pool.previous.p, i32 %backward.from, i32 %backward.to, i32 %backward.parameter.integer)
+  %pool.previous.next = add nuw i32 %pool.previous.p, %threads
+  br label %pool.previous.iterate
 embedding.previous.loop:
   br label %embedding.previous.iterate
 embedding.previous.iterate:
@@ -1425,7 +1622,7 @@ exit:
   ret void
 }
 
-define ptx_kernel void @affine(ptr addrspace(1) %values, i32 %count, double %scale, double %offset, i32 %threads) #0 {
+define protected amdgpu_kernel void @affine(ptr addrspace(1) %values, i32 %count, double %scale, double %offset, i32 %threads) #0 {
 entry:
   %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   %bid = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
@@ -1444,7 +1641,7 @@ exit:
   ret void
 }
 
-define ptx_kernel void @initialize(ptr addrspace(1) nocapture writeonly %values, i32 %count, i64 %seed, double %scale, i32 %threads) #0 {
+define protected amdgpu_kernel void @initialize(ptr addrspace(1) nocapture writeonly %values, i32 %count, i64 %seed, double %scale, i32 %threads) #0 {
 entry:
   %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   %bid = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
@@ -1477,7 +1674,7 @@ exit:
   ret void
 }
 
-define ptx_kernel void @set_value(ptr addrspace(1) %values, i32 %index, double %value) #0 {
+define protected amdgpu_kernel void @set_value(ptr addrspace(1) %values, i32 %index, double %value) #0 {
 entry:
   %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   %bid = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
@@ -1678,7 +1875,7 @@ exit:
   ret void
 }
 
-define ptx_kernel void @metrics(ptr addrspace(1) nocapture readonly %predictions, ptr addrspace(1) nocapture readonly %targets, ptr addrspace(1) nocapture writeonly %metrics, i32 %rows, i32 %loss) #0 {
+define protected amdgpu_kernel void @metrics(ptr addrspace(1) nocapture readonly %predictions, ptr addrspace(1) nocapture readonly %targets, ptr addrspace(1) nocapture writeonly %metrics, i32 %rows, i32 %loss) #0 {
 entry:
   call void @metrics_body(ptr addrspace(1) %predictions, ptr addrspace(1) %targets, ptr addrspace(1) %metrics, i32 %rows, i32 %loss)
   ret void
