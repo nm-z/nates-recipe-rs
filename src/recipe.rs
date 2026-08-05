@@ -187,7 +187,7 @@ fn hsa_launch(function: usize, count: usize, threads: u32, arguments: &mut [*mut
 }
 macro_rules! gpu_launch {
 	($function:expr, $count:expr, $threads:expr; $($name:ident = $value:expr),+ $(,)?) => {{
-		let launch_count = $count; let launch_threads = $threads; $(let mut $name = $value;)+
+		let launch_count = $count; let launch_threads = $threads; let ($(mut $name,)+) = ($($value,)+);
 		let mut arguments = [$(&mut $name as *mut _ as *mut c_void),+]; hsa_launch($function, launch_count, launch_threads, &mut arguments) }}; }
 fn gpu_normalize(values: &DeviceBuffer, reference: &DeviceBuffer, scales: &DeviceBuffer, rows: usize, width: usize, normalization: BlockNormalization, reverse: bool, threads: u32) -> Result<(), RecipeError> {
 	let runtime = hsa()?; let mode = if matches!(normalization, BlockNormalization::Batch) { 1 } else { 2 }; let groups = if mode == 1 { width } else { rows }; gpu_launch!(runtime.normalize, groups, threads; values = values.pointer,
@@ -210,8 +210,8 @@ fn gpu_metrics(predictions: &DeviceBuffer, targets: &DeviceBuffer, rows: usize, 
 		loss = loss.0 as i32, )?; let values = metrics.download()?; Ok([values[0], values[1], values[2]])
 }
 fn gpu_affine(values: &DeviceBuffer, scale: f64, offset: f64, threads: u32) -> Result<(), RecipeError> {
-	let runtime = hsa()?; gpu_launch!(runtime.affine, values.elements, threads; count = values.elements as u32,
-		values = values.pointer,
+	let runtime = hsa()?; gpu_launch!(runtime.affine, values.elements, threads; values = values.pointer,
+		count = values.elements as u32,
 		scale = scale,
 		offset = offset,
 		threads = threads, )
