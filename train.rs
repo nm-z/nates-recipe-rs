@@ -40,16 +40,19 @@ fn main() {
 		.log([Time, Run, Epoch, R2, Loss, blck, atvn, norm])
 		.run(&lloyd, &data);
 	let estimator_data = recipe
-		.data("/home/nate/Desktop/nates-recipe-rs/examples/datasets/sandp500/individual_stocks_5yr/individual_stocks_5yr/APTV_data.csv")
-		.target("close")
+		.data("/home/nate/Desktop/nates-recipe-rs/examples/datasets/uci-bank-semicolon/bank-full.csv")
+		.target("y")
 		.norm(z_score)
-		.split(0.6);
+		.split(0.001);
 	for estimator in [
 		recipe.model().knn(5).loss(mse),
 		recipe.model().forest(2).lgbm(2).loss(mse),
 		recipe.model().forest(2).xgbst(2).loss(mse),
 	] {
-		recipe.train().optimizer(adamw).epochs(2).lr(0.01)
+		recipe.train()
+			.optimizer(adamw)
+			.epochs(2)
+			.lr(0.01)
 			.log([Time, Run, Epoch, R2, Loss, blck, atvn, norm])
 			.run(&estimator, &estimator_data);
 	}
