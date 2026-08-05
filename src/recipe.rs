@@ -47,18 +47,16 @@ pub struct Data {
 pub trait IntoDataSources {
 	fn into_data_sources(self) -> Vec<String>;
 }
-macro_rules! scalar_sources {
+macro_rules! data_sources {
+	($( [$($generic:tt)*] $source:ty),+) => {$(impl<$($generic)*> IntoDataSources for $source {
+		fn into_data_sources(self) -> Vec<String> { self.into_iter().map(Into::into).collect() }
+	})+};
 	($($source:ty),+) => {$(impl IntoDataSources for $source {
 		fn into_data_sources(self) -> Vec<String> { vec![self.into()] }
 	})+};
 }
-scalar_sources!(&str, String);
-macro_rules! collection_sources {
-	($( [$($generic:tt)*] $source:ty),+) => {$(impl<$($generic)*> IntoDataSources for $source {
-		fn into_data_sources(self) -> Vec<String> { self.into_iter().map(Into::into).collect() }
-	})+};
-}
-collection_sources!([T: Into<String>, const N: usize] [T; N], [T: Into<String>] Vec<T>);
+data_sources!(&str, String);
+data_sources!([T: Into<String>, const N: usize] [T; N], [T: Into<String>] Vec<T>);
 macro_rules! data_methods {
 	($receiver:ident; $(fn $method:ident($argument:ident: $type:ty) => $update:expr;)+ $([const] fn $const_method:ident($const_argument:ident: $const_type:ty) => $field:ident = $value:expr;)+) => {impl Data {$(pub fn $method(mut self, $argument: $type) -> Self { let $receiver = &mut self; $update; self })+ $(pub const fn $const_method(mut self, $const_argument: $const_type) -> Self { self.$field = $value; self })+}};
 }
@@ -70,8 +68,10 @@ data_methods! {
 	[const] fn norm(_value: ZScore) => normalize = true;
 	[const] fn split(fraction: f64) => split = fraction;
 }
-#[rustfmt::skip]
-pub struct Model { blocks: Vec<Block>, loss: LossFunction }
+pub struct Model {
+	blocks: Vec<Block>,
+	loss: LossFunction,
+}
 
 #[derive(Clone, Debug)]
 #[rustfmt::skip]
