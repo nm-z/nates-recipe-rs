@@ -1,8 +1,5 @@
 use std::{env, fs, path::PathBuf, process::Command};
 
-const HSA_IR: &str = include_str!("amd.ll");
-const NV_IR: &str = include_str!("nv.ll");
-
 fn main() {
 	let manifest = fs::read_to_string("Cargo.toml")
 		.unwrap_or_else(|error| panic!("Cargo.toml must be readable: {error}"));
@@ -120,8 +117,8 @@ fn main() {
 		env::var_os("OUT_DIR").unwrap_or_else(|| panic!("OUT_DIR must be configured")),
 	);
 	let source = out.join("recipe_hsa.ll");
-	fs::write(&source, HSA_IR)
-		.unwrap_or_else(|error| panic!("cannot write HSA LLVM IR: {error}"));
+	fs::copy("amd.ll", &source)
+		.unwrap_or_else(|error| panic!("cannot copy HSA LLVM IR: {error}"));
 	let code_object = out.join("recipe.hsaco");
 	let cpu = format!("-mcpu={architecture}");
 	let mut command = Command::new(compiler);
@@ -139,8 +136,8 @@ fn main() {
 		panic!("HSA LLVM IR compilation failed");
 	}
 	let nv_source = out.join("recipe_nv.ll");
-	fs::write(&nv_source, NV_IR)
-		.unwrap_or_else(|error| panic!("cannot write NVIDIA LLVM IR: {error}"));
+	fs::copy("nv.ll", &nv_source)
+		.unwrap_or_else(|error| panic!("cannot copy NVIDIA LLVM IR: {error}"));
 	let nv_module = out.join("recipe.ptx");
 	let nv_cpu = format!("-march={nv_architecture}");
 	let nv_feature = format!("+{nv_ptx}");

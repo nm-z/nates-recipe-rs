@@ -17,13 +17,20 @@ const BALANCE_BYTES_PER_FLOP: &str = env!("RECIPE_BALANCE_BYTES_PER_FLOP");
 static RUN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[rustfmt::skip]
-pub enum DType { F32, F64, I32, I64 }
+pub enum DType {
+	F32 = 0,
+	F64 = 1,
+	I32 = 2,
+	I64 = 3,
+}
 
-#[rustfmt::skip]
 impl DType {
-    const fn bytes(self) -> u64 { match self { Self::F32 | Self::I32 => 4, Self::F64 | Self::I64 => 8 } }
-    const fn is_float(self) -> bool { matches!(self, Self::F32 | Self::F64) }
+	const fn bytes(self) -> u64 {
+		4 << (self as u8 & 1)
+	}
+	const fn is_float(self) -> bool {
+		matches!(self, Self::F32 | Self::F64)
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -31,8 +38,15 @@ pub struct Value(usize);
 
 pub static recipe: Recipe = Recipe::new();
 
-#[rustfmt::skip]
-pub struct Data { sources: Vec<String>, target: String, exclusions: Vec<String>, normalize: bool, split: f64, prepared: OnceLock<Result<Prepared, RecipeError>>, device: OnceLock<Result<DeviceData, RecipeError>> }
+pub struct Data {
+	sources: Vec<String>,
+	target: String,
+	exclusions: Vec<String>,
+	normalize: bool,
+	split: f64,
+	prepared: OnceLock<Result<Prepared, RecipeError>>,
+	device: OnceLock<Result<DeviceData, RecipeError>>,
+}
 
 #[rustfmt::skip]
 pub trait IntoDataSources { fn into_data_sources(self) -> Vec<String>; }
@@ -120,7 +134,7 @@ impl Model {
         let mut widths = vec![features];
         let mut offsets = Vec::with_capacity(self.blocks.len());
         let mut parameters = 0_usize;
-        for block in &self.blocks {
+        for (stage, block) in self.blocks.iter().enumerate() {
             let input = widths[widths.len() - 1];
             let output = match &block.operation {
                 OperationBlock::Layer(width) | OperationBlock::KMeans(width) | OperationBlock::Rnn(width) | OperationBlock::Gru(width) | OperationBlock::Lstm(width) | OperationBlock::Knn(width) | OperationBlock::Perceptron(width) => *width,
@@ -133,7 +147,7 @@ impl Model {
             };
             if output == 0 { return Err(RecipeError::new("model block dimensions must be positive")); }
             offsets.push(parameters);
-			let recurrent = |width: usize, gates: usize| input.checked_mul(width).and_then(|a| width.checked_mul(width).and_then(|b| a.checked_add(b))).and_then(|value| value.checked_add(width)).and_then(|value| value.checked_mul(gates)); let block_parameters = match &block.operation { OperationBlock::Conv(filters, kernel) => filters.checked_mul(*kernel), OperationBlock::Pool(_) => Some(0), OperationBlock::Embed(dimensions, vocabulary) if *vocabulary != 0 => dimensions.checked_mul(*vocabulary), OperationBlock::Attention(_) => return Err(RecipeError::new("attention requires genuine Q, K, V lowering")), OperationBlock::Rnn(width) => recurrent(*width, 1), OperationBlock::Gru(width) => recurrent(*width, 3), OperationBlock::Lstm(width) => recurrent(*width, 4), OperationBlock::KMeans(_) | OperationBlock::Forest(..) | OperationBlock::Knn(_) => return Err(RecipeError::new("KMeans, Forest, and KNN are standalone estimators outside the gradient graph")), OperationBlock::Embed(..) => return Err(RecipeError::new("embedding vocabulary must be positive")), _ => input.checked_mul(output) }.ok_or_else(|| RecipeError::new("model parameter count overflow"))?;
+			let recurrent = |width: usize, gates: usize| input.checked_mul(width).and_then(|a| width.checked_mul(width).and_then(|b| a.checked_add(b))).and_then(|value| value.checked_add(width)).and_then(|value| value.checked_mul(gates)); let block_parameters = match &block.operation { OperationBlock::Conv(filters, kernel) => filters.checked_mul(*kernel), OperationBlock::Pool(_) => Some(0), OperationBlock::KMeans(_) if stage == 0 => Some(0), OperationBlock::KMeans(_) => return Err(RecipeError::new("KMeans must be the first non-differentiable block")), OperationBlock::Embed(dimensions, vocabulary) if *vocabulary != 0 => dimensions.checked_mul(*vocabulary), OperationBlock::Attention(_) => return Err(RecipeError::new("attention requires genuine Q, K, V lowering")), OperationBlock::Rnn(width) => recurrent(*width, 1), OperationBlock::Gru(width) => recurrent(*width, 3), OperationBlock::Lstm(width) => recurrent(*width, 4), OperationBlock::Forest(..) | OperationBlock::Knn(_) => return Err(RecipeError::new("Forest and KNN are standalone estimators outside the gradient graph")), OperationBlock::Embed(..) => return Err(RecipeError::new("embedding vocabulary must be positive")), _ => input.checked_mul(output) }.ok_or_else(|| RecipeError::new("model parameter count overflow"))?;
             parameters = parameters.checked_add(block_parameters).ok_or_else(|| RecipeError::new("model parameter count overflow"))?;
             widths.push(output);
         }
@@ -259,7 +273,7 @@ impl TrainingGraph<'_> {
 		let mut pass = DevicePass { values: Vec::with_capacity(self.blocks.len()), raw: Vec::with_capacity(self.blocks.len()), derivatives: Vec::with_capacity(self.blocks.len()), operations: Vec::with_capacity(self.blocks.len()), scales: Vec::with_capacity(self.blocks.len()), contexts: Vec::with_capacity(self.blocks.len()) };
         let (mut descriptors, mut parameters) = (Vec::with_capacity(self.blocks.len() * 7), Vec::with_capacity(self.blocks.len() * 2));
         for stage in 0..self.blocks.len() {
-			let (from, to) = (self.widths[stage], self.widths[stage + 1]); let count = rows * to; let normalization = match self.blocks[stage].normalization { None => 0, Some(BlockNormalization::Batch) => 1, Some(BlockNormalization::Layer) => 2 }; let (operation, parameter, secondary) = self.operation(stage); let gates = match operation { 6 => 1, 7 => 3, 8 => 4, _ => 0 }; descriptors.extend([from as i32, to as i32, self.offsets[stage] as i32, operation, self.blocks[stage].activation as i32, normalization, self.prelu(stage).map_or(-1, |index| index as i32)]); parameters.extend([parameter, secondary]); pass.values.push(DeviceBuffer::new(count)?); pass.raw.push(DeviceBuffer::new(count)?); pass.derivatives.push(DeviceBuffer::new(count)?); pass.operations.push(DeviceBuffer::new(count)?); pass.scales.push((normalization != 0).then(|| DeviceBuffer::new(2 * if normalization == 1 { to } else { rows })).transpose()?); pass.contexts.push((gates != 0).then(|| DeviceBuffer::new((2 * gates + 4) * count)).transpose()?);
+			let (from, to) = (self.widths[stage], self.widths[stage + 1]); let count = rows * to; let normalization = match self.blocks[stage].normalization { None => 0, Some(BlockNormalization::Batch) => 1, Some(BlockNormalization::Layer) => 2 }; let (operation, parameter, secondary) = self.operation(stage); let gates = match operation { 6 => 1, 7 => 3, 8 => 4, _ => 0 }; descriptors.extend([from as i32, to as i32, self.offsets[stage] as i32, operation, self.blocks[stage].activation as i32, normalization, self.prelu(stage).map_or(-1, |index| index as i32)]); parameters.extend([parameter, secondary]); pass.values.push(DeviceBuffer::new(count)?); pass.raw.push(DeviceBuffer::new(count)?); pass.derivatives.push(DeviceBuffer::new(count)?); pass.operations.push(DeviceBuffer::new(count)?); pass.scales.push((normalization != 0).then(|| DeviceBuffer::new(2 * if normalization == 1 { to } else { rows })).transpose()?); pass.contexts.push(match operation { 3 => Some(DeviceBuffer::upload(&vec![0.0; 1 + from * to])?), 6..=8 => Some(DeviceBuffer::new((2 * gates + 4) * count)?), _ => None });
         }
 		let addresses = |buffers: &[DeviceBuffer]| buffers.iter().map(|buffer| buffer.pointer as usize as u64).collect::<Vec<_>>(); let optional = |buffers: &[Option<DeviceBuffer>]| buffers.iter().map(|buffer| buffer.as_ref().map_or(0, |buffer| buffer.pointer as usize as u64)).collect::<Vec<_>>(); let value_pointers = DeviceBuffer::upload(&addresses(&pass.values))?; let raw_pointers = DeviceBuffer::upload(&addresses(&pass.raw))?; let derivative_pointers = DeviceBuffer::upload(&addresses(&pass.derivatives))?; let operation_pointers = DeviceBuffer::upload(&addresses(&pass.operations))?; let scale_pointers = DeviceBuffer::upload(&optional(&pass.scales))?; let context_pointers = DeviceBuffer::upload(&optional(&pass.contexts))?;
 		Ok(DeviceGraph { pass, value_pointers, raw_pointers, derivative_pointers, operation_pointers, scale_pointers, context_pointers, descriptors: DeviceBuffer::upload(&descriptors)?, parameters: DeviceBuffer::upload(&parameters)? })
@@ -300,11 +314,7 @@ pub const blck: Metric = Metric(5);
 pub const atvn: Metric = Metric(6);
 pub const norm: Metric = Metric(7);
 pub const z_score: ZScore = ZScore;
-pub const batch: Normalization = batch_marker;
-const fn batch_marker(_: usize) -> Residual {
-	Residual::Relu
-}
-
+pub const batch: Normalization = |_| Residual::Relu;
 pub struct TrainingReport(f64, f64, Vec<f64>);
 
 #[rustfmt::skip]
@@ -341,15 +351,12 @@ struct Tensor { name: String, dtype: DType, shape: Vec<u64>, data: Option<Vec<f6
 enum Operation { Conv1d(Value, Value, Option<Value>, Value, u64), Matmul(Value, Value, Value), Add(Value, Value, Value), Relu(Value, Value) }
 
 impl Operation {
-	fn inputs(&self) -> Vec<Value> {
+	fn inputs(&self) -> [Option<Value>; 3] {
 		match self {
-			Self::Conv1d(input, weights, bias, ..) => {
-				let mut values = vec![*input, *weights];
-				values.extend(bias);
-				values
-			}
-			Self::Matmul(left, right, ..) | Self::Add(left, right, ..) => vec![*left, *right],
-			Self::Relu(input, ..) => vec![*input],
+			Self::Conv1d(input, weights, bias, ..) => [Some(*input), Some(*weights), *bias],
+			Self::Matmul(left, right, ..) => [Some(*left), Some(*right), None],
+			Self::Add(left, right, ..) => [Some(*left), Some(*right), None],
+			Self::Relu(input, ..) => [Some(*input), None, None],
 		}
 	}
 
@@ -488,7 +495,7 @@ impl Recipe {
         let operations = self.reachable_operations(output)?;
         let mut reads = Vec::new();
         for operation in &operations {
-            for input in operation.inputs() {
+			for input in operation.inputs().into_iter().flatten() {
                 if self.tensor_ref(input)?.producer.is_none() && !reads.contains(&input) {
                     reads.push(input);
                 }
@@ -537,16 +544,8 @@ impl Recipe {
     }
 
     fn push_output(&mut self, stem: &str, dtype: DType, shape: Vec<u64>) -> Result<Value, RecipeError> {
-        elements(&shape)?;
-        let value = Value(self.tensors.len());
-        self.tensors.push(Tensor {
-            name: unique_name(&self.tensors, stem),
-            dtype,
-            shape,
-            data: None,
-            producer: None,
-        });
-        Ok(value)
+		let name = unique_name(&self.tensors, stem);
+		self.tensor(name, dtype, shape)
     }
 
     fn push_operation(&mut self, operation: Operation) {
@@ -588,7 +587,7 @@ impl Recipe {
         if indices.contains(&index) {
             return Ok(());
         }
-        for input in self.operations[index].inputs() {
+		for input in self.operations[index].inputs().into_iter().flatten() {
             self.visit(input, indices)?;
         }
         indices.push(index);

@@ -32,6 +32,13 @@ fn main() {
 		.resume("train.ogdl")
 		.save("train.ogdl")
 		.run(&checkpoint, &data);
+	let lloyd = recipe.model().kmeans(4).layer(1).loss(mse);
+	recipe.train()
+		.optimizer(adamw)
+		.epochs(2)
+		.lr(0.0)
+		.log([Time, Run, Epoch, R2, Loss, blck, atvn, norm])
+		.run(&lloyd, &data);
 	let topology = recipe
 		.model()
 		.conv(8, 3)
@@ -49,9 +56,10 @@ fn main() {
 		.log([Time, Run, Epoch, R2, Loss, blck, atvn, norm])
 		.run(&topology, &data);
 
-	let blocks: [fn(Model) -> Model; 9] = [
+	let blocks: [fn(Model) -> Model; 10] = [
 		|model| model.conv(8, 3),
 		|model| model.pool(2),
+		|model| model.kmeans(4),
 		|model| model.embed(4).vocab(8),
 		|model| model.layer(64),
 		|model| model.rnn(8),

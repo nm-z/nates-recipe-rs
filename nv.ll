@@ -332,6 +332,144 @@ done:
   ret i32 %result
 }
 
+define internal void @kmeans_forward_body(ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %context, i32 %rows, i32 %from, i32 %clusters, i32 %threads) #1 {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %flag = load double, ptr addrspace(1) %context, align 8
+  %initialized = fcmp oeq double %flag, 1.0
+  br i1 %initialized, label %distance.loop, label %initialize.loop
+initialize.loop:
+  %ip = phi i32 [ %tid, %entry ], [ %ip.next, %initialize.step ]
+  %centroid.count = mul i32 %clusters, %from
+  %initialize.more = icmp ult i32 %ip, %centroid.count
+  br i1 %initialize.more, label %initialize.step, label %initialize.done
+initialize.step:
+  %ic = udiv i32 %ip, %from
+  %if = urem i32 %ip, %from
+  %ir = urem i32 %ic, %rows
+  %ir.base = mul i32 %ir, %from
+  %ix = add i32 %ir.base, %if
+  %ix.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %ix
+  %iv = load double, ptr addrspace(1) %ix.ptr, align 8
+  %icx = add i32 %ip, 1
+  %icx.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %icx
+  store double %iv, ptr addrspace(1) %icx.ptr, align 8
+  %ip.next = add i32 %ip, %threads
+  br label %initialize.loop
+initialize.done:
+  call void @llvm.nvvm.barrier0()
+  %first = icmp eq i32 %tid, 0
+  br i1 %first, label %flag.store, label %flag.done
+flag.store:
+  store double 1.0, ptr addrspace(1) %context, align 8
+  br label %flag.done
+flag.done:
+  call void @llvm.nvvm.barrier0()
+  br label %distance.loop
+distance.loop:
+  %p = phi i32 [ %tid, %entry ], [ %tid, %flag.done ], [ %p.next, %distance.done ]
+  %distance.count = mul i32 %rows, %clusters
+  %distance.more = icmp ult i32 %p, %distance.count
+  br i1 %distance.more, label %distance.start, label %exit
+distance.start:
+  %row = udiv i32 %p, %clusters
+  %cluster = urem i32 %p, %clusters
+  %row.base = mul i32 %row, %from
+  %centroid.base.0 = mul i32 %cluster, %from
+  %centroid.base = add i32 %centroid.base.0, 1
+  br label %feature.loop
+feature.loop:
+  %feature = phi i32 [ 0, %distance.start ], [ %feature.next, %feature.step ]
+  %square.sum = phi double [ 0.0, %distance.start ], [ %square.next, %feature.step ]
+  %feature.more = icmp ult i32 %feature, %from
+  br i1 %feature.more, label %feature.step, label %distance.done
+feature.step:
+  %x.index = add i32 %row.base, %feature
+  %c.index = add i32 %centroid.base, %feature
+  %x.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %x.index
+  %c.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %c.index
+  %x = load double, ptr addrspace(1) %x.ptr, align 8
+  %c = load double, ptr addrspace(1) %c.ptr, align 8
+  %difference = fsub double %x, %c
+  %square = fmul double %difference, %difference
+  %square.next = fadd double %square.sum, %square
+  %feature.next = add i32 %feature, 1
+  br label %feature.loop
+distance.done:
+  %distance = call double @llvm.sqrt.f64(double %square.sum)
+  %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
+  store double %distance, ptr addrspace(1) %output.ptr, align 8
+  %p.next = add i32 %p, %threads
+  br label %distance.loop
+exit:
+  ret void
+}
+
+define internal void @kmeans_update_body(ptr addrspace(1) %input, ptr addrspace(1) %distances, ptr addrspace(1) %context, i32 %rows, i32 %from, i32 %clusters, i32 %threads) #1 {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %centroid.count = mul i32 %clusters, %from
+  br label %centroid.loop
+centroid.loop:
+  %p = phi i32 [ %tid, %entry ], [ %p.next, %centroid.next ]
+  %centroid.more = icmp ult i32 %p, %centroid.count
+  br i1 %centroid.more, label %centroid.start, label %exit
+centroid.start:
+  %cluster = udiv i32 %p, %from
+  %feature = urem i32 %p, %from
+  br label %row.loop
+row.loop:
+  %row = phi i32 [ 0, %centroid.start ], [ %row.next, %row.done ]
+  %sum = phi double [ 0.0, %centroid.start ], [ %sum.next, %row.done ]
+  %members = phi i32 [ 0, %centroid.start ], [ %members.next, %row.done ]
+  %row.more = icmp ult i32 %row, %rows
+  br i1 %row.more, label %nearest.loop, label %centroid.done
+nearest.loop:
+  %candidate = phi i32 [ 0, %row.loop ], [ %candidate.next, %nearest.step ]
+  %best.cluster = phi i32 [ 0, %row.loop ], [ %best.cluster.next, %nearest.step ]
+  %best.distance = phi double [ 0x7FF0000000000000, %row.loop ], [ %best.distance.next, %nearest.step ]
+  %candidate.more = icmp ult i32 %candidate, %clusters
+  br i1 %candidate.more, label %nearest.step, label %row.done
+nearest.step:
+  %distance.row = mul i32 %row, %clusters
+  %distance.index = add i32 %distance.row, %candidate
+  %distance.ptr = getelementptr inbounds double, ptr addrspace(1) %distances, i32 %distance.index
+  %distance = load double, ptr addrspace(1) %distance.ptr, align 8
+  %closer = fcmp olt double %distance, %best.distance
+  %best.cluster.next = select i1 %closer, i32 %candidate, i32 %best.cluster
+  %best.distance.next = select i1 %closer, double %distance, double %best.distance
+  %candidate.next = add i32 %candidate, 1
+  br label %nearest.loop
+row.done:
+  %assigned = icmp eq i32 %best.cluster, %cluster
+  %input.row = mul i32 %row, %from
+  %input.index = add i32 %input.row, %feature
+  %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %input.index
+  %value = load double, ptr addrspace(1) %input.ptr, align 8
+  %term = select i1 %assigned, double %value, double 0.0
+  %sum.next = fadd double %sum, %term
+  %member = zext i1 %assigned to i32
+  %members.next = add i32 %members, %member
+  %row.next = add i32 %row, 1
+  br label %row.loop
+centroid.done:
+  %nonempty = icmp ugt i32 %members, 0
+  %members.double = uitofp i32 %members to double
+  %mean = fdiv double %sum, %members.double
+  %context.index = add i32 %p, 1
+  %context.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %context.index
+  br i1 %nonempty, label %centroid.store, label %centroid.next
+centroid.store:
+  store double %mean, ptr addrspace(1) %context.ptr, align 8
+  br label %centroid.next
+centroid.next:
+  %p.next = add i32 %p, %threads
+  br label %centroid.loop
+exit:
+  call void @llvm.nvvm.barrier0()
+  ret void
+}
+
 define internal void @embedding_forward_body(ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %table, ptr addrspace(1) nocapture writeonly %output, i32 %p, i32 %from, i32 %to, i32 %vocabulary) #1 {
 entry:
   %dimensions = udiv i32 %to, %from
@@ -1482,10 +1620,16 @@ stage.load:
   %matrix = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.offset
   %count = mul i32 %rows, %to
   %is.embedding = icmp eq i32 %operation, 4
+  %is.kmeans = icmp eq i32 %operation, 3
   %recurrent.low = icmp uge i32 %operation, 6
   %recurrent.high = icmp ule i32 %operation, 8
   %is.recurrent = and i1 %recurrent.low, %recurrent.high
-  br i1 %is.embedding, label %embedding.loop, label %recurrent.test
+  br i1 %is.embedding, label %embedding.loop, label %kmeans.test
+kmeans.test:
+  br i1 %is.kmeans, label %kmeans.forward, label %recurrent.test
+kmeans.forward:
+  call void @kmeans_forward_body(ptr addrspace(1) %source, ptr addrspace(1) %values, ptr addrspace(1) %context, i32 %rows, i32 %from, i32 %to, i32 %threads)
+  br label %value.loop
 recurrent.test:
   br i1 %is.recurrent, label %recurrent.forward, label %value.loop
 recurrent.forward:
@@ -1512,7 +1656,7 @@ embedding.step:
   %embedding.next = add nuw i32 %embedding.p, %threads
   br label %embedding.loop
 value.loop:
-  %p = phi i32 [ %tid, %recurrent.test ], [ %tid, %recurrent.forward ], [ %p.next, %transform.step ]
+  %p = phi i32 [ %tid, %recurrent.test ], [ %tid, %recurrent.forward ], [ %tid, %kmeans.forward ], [ %p.next, %transform.step ]
   %value.more = icmp ult i32 %p, %count
   br i1 %value.more, label %value.step, label %normalize.test
 value.step:
@@ -1530,7 +1674,8 @@ value.step:
   %activation.element = getelementptr inbounds double, ptr addrspace(1) %activation.derivatives, i32 %p
   %is.conv = icmp eq i32 %operation, 1
   %is.pool = icmp eq i32 %operation, 2
-  br i1 %is.recurrent, label %transform.step, label %conv.test
+  %matrix.bypass = or i1 %is.recurrent, %is.kmeans
+  br i1 %matrix.bypass, label %transform.step, label %conv.test
 conv.test:
   br i1 %is.conv, label %conv.step, label %pool.test
 conv.step:
@@ -1548,7 +1693,8 @@ dense.step:
   br label %transform.step
 transform.step:
   %convolution.or.pool = or i1 %is.conv, %is.pool
-  %special = or i1 %convolution.or.pool, %is.recurrent
+  %differentiable.special = or i1 %convolution.or.pool, %is.recurrent
+  %special = or i1 %differentiable.special, %is.kmeans
   %transform.operation = select i1 %special, i32 0, i32 %operation
   call void @transform_body(ptr addrspace(1) %skip, ptr addrspace(1) %value.element, ptr addrspace(1) %raw.element, ptr addrspace(1) %operation.element, ptr addrspace(1) %activation.element, ptr addrspace(1) %config, i32 1, i32 %from, i32 %to, i32 %transform.operation, i32 %activation, double %parameter, double %secondary, i32 1, i32 0)
   %p.next = add nuw i32 %p, %threads
@@ -1754,9 +1900,15 @@ matrix.dispatch:
   %matrix.conv = icmp eq i32 %backward.operation, 1
   %matrix.pool = icmp eq i32 %backward.operation, 2
   %matrix.embedding = icmp eq i32 %backward.operation, 4
-  br i1 %matrix.recurrent, label %recurrent.backward, label %conv.matrix.test
+  %matrix.kmeans = icmp eq i32 %backward.operation, 3
+  br i1 %matrix.recurrent, label %recurrent.backward, label %kmeans.matrix.test
 recurrent.backward:
   call void @recurrent_backward_body(ptr addrspace(1) %backward.source, ptr addrspace(1) %backward.matrix, ptr addrspace(1) %delta, ptr addrspace(1) %previous, ptr addrspace(1) %backward.matrix.gradient, ptr addrspace(1) %backward.context, i32 %rows, i32 %backward.from, i32 %backward.to, i32 %backward.operation, i32 %threads)
+  br label %residual.test
+kmeans.matrix.test:
+  br i1 %matrix.kmeans, label %kmeans.update, label %conv.matrix.test
+kmeans.update:
+  call void @kmeans_update_body(ptr addrspace(1) %backward.source, ptr addrspace(1) %backward.raw, ptr addrspace(1) %backward.context, i32 %rows, i32 %backward.from, i32 %backward.to, i32 %threads)
   br label %residual.test
 conv.matrix.test:
   br i1 %matrix.conv, label %conv.matrix.loop, label %pool.matrix.test
