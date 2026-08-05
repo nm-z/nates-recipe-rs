@@ -1,6 +1,7 @@
 use std::{env, fs, path::PathBuf, process::Command};
 
 const HSA_IR: &str = include_str!("amd.ll");
+const NV_IR: &str = include_str!("nv.ll");
 
 fn main() {
 	let manifest = fs::read_to_string("Cargo.toml")
@@ -98,6 +99,23 @@ fn main() {
 				.and_then(|value| value.strip_suffix('"'))
 		})
 		.unwrap_or_else(|| panic!("hsa-math-library must be configured"));
+	let configured = |key: &str| {
+		manifest
+			.lines()
+			.find_map(|line| {
+				line.trim()
+					.strip_prefix(&format!("{key} = \""))
+					.and_then(|value| value.strip_suffix('"'))
+			})
+			.unwrap_or_else(|| panic!("{key} must be configured"))
+	};
+	let (nv_architecture, nv_ptx, nv_compiler, nv_library, nv_device_library) = (
+		configured("nvidia-architecture"),
+		configured("nvidia-ptx"),
+		configured("nvidia-compiler"),
+		configured("nvidia-library"),
+		configured("nvidia-device-library"),
+	);
 	let out = PathBuf::from(
 		env::var_os("OUT_DIR").unwrap_or_else(|| panic!("OUT_DIR must be configured")),
 	);
@@ -120,12 +138,50 @@ fn main() {
 	if !status.success() {
 		panic!("HSA LLVM IR compilation failed");
 	}
+	let nv_source = out.join("recipe_nv.ll");
+	fs::write(&nv_source, NV_IR)
+		.unwrap_or_else(|error| panic!("cannot write NVIDIA LLVM IR: {error}"));
+	let nv_module = out.join("recipe.ptx");
+	let nv_cpu = format!("-march={nv_architecture}");
+	let nv_feature = format!("+{nv_ptx}");
+	let status = Command::new(nv_compiler)
+		.args([
+			"-target",
+			"nvptx64-nvidia-cuda",
+			&nv_cpu,
+			"-Xclang",
+			"-target-feature",
+			"-Xclang",
+			&nv_feature,
+			"-O2",
+			"-S",
+			"-x",
+			"ir",
+		])
+		.arg(&nv_source)
+		.args([
+			"-Xclang",
+			"-mlink-builtin-bitcode",
+			"-Xclang",
+			nv_device_library,
+			"-o",
+		])
+		.arg(&nv_module)
+		.status()
+		.unwrap_or_else(|error| panic!("cannot run NVIDIA clang: {error}"));
+	if !status.success() {
+		panic!("NVIDIA LLVM IR compilation failed");
+	}
 	println!(
 		"cargo:rustc-env=RECIPE_HSA_CODE_OBJECT={}",
 		code_object.display()
 	);
+	println!("cargo:rustc-env=RECIPE_NV_MODULE={}", nv_module.display());
 	println!("cargo:rustc-link-search=native={library}");
+	println!("cargo:rustc-link-search=native={nv_library}");
 	println!("cargo:rustc-link-lib=dylib=amdhip64");
+	println!("cargo:rustc-link-lib=dylib=cuda");
 	println!("cargo:rerun-if-changed=Cargo.toml");
 	println!("cargo:rerun-if-changed=amd.ll");
+	println!("cargo:rerun-if-changed=nv.ll");
 }

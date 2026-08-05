@@ -192,17 +192,14 @@ struct EpochBuffers {
 #[rustfmt::skip]
 struct AdamwConfig { rate: f64, beta1: f64, beta2: f64, epsilon: f64, decay: f64 }
 
-struct Hsa {
-	status: i32,
-	forward_graph: usize,
-	epoch_graph: usize,
-	normalize: usize,
-	affine: usize,
-	initialize: usize,
-	set_value: usize,
-	metrics: usize,
-}
+#[rustfmt::skip]
+struct Hsa { status: i32, vendor: Vendor, forward_graph: usize, epoch_graph: usize, normalize: usize, affine: usize, initialize: usize, set_value: usize, metrics: usize }
 static HSA: OnceLock<Hsa> = OnceLock::new();
+#[derive(Clone, Copy)]
+enum Vendor {
+	Amd,
+	Nvidia,
+}
 
 struct DeviceBuffer {
 	pointer: *mut c_void,
@@ -213,20 +210,15 @@ struct DeviceData { samples: DeviceBuffer, targets: DeviceBuffer, target_offset:
 
 #[rustfmt::skip]
 impl DeviceBuffer {
-    fn status(status: i32, action: &str) -> Result<(), RecipeError> { if status == 0 { Ok(()) } else { Err(RecipeError::new(format!("HSA {action} failed with status {status}"))) } }
-    fn allocate(elements: usize, bytes: usize) -> Result<Self, RecipeError> { let mut pointer = ptr::null_mut(); Self::status(unsafe { hipMalloc(&mut pointer, bytes) }, "allocation")?; Ok(Self { pointer, elements }) }
+    fn status(status: i32, action: &str) -> Result<(), RecipeError> { if status == 0 { Ok(()) } else { Err(RecipeError::new(format!("GPU {action} failed with status {status}"))) } }
+    fn allocate(elements: usize, bytes: usize) -> Result<Self, RecipeError> { let runtime = hsa()?; let mut pointer = ptr::null_mut(); let status = unsafe { match runtime.vendor { Vendor::Amd => hipMalloc(&mut pointer, bytes), Vendor::Nvidia => { let mut address = 0; let status = cuMemAlloc_v2(&mut address, bytes); pointer = address as usize as *mut c_void; status } } }; Self::status(status, "allocation")?; Ok(Self { pointer, elements }) }
     fn new(elements: usize) -> Result<Self, RecipeError> { Self::allocate(elements, elements * size_of::<f64>()) }
-    fn upload<T>(values: &[T]) -> Result<Self, RecipeError> { let buffer = Self::allocate(values.len(), size_of_val(values))?; Self::status(unsafe { hipMemcpy(buffer.pointer, values.as_ptr().cast(), size_of_val(values), 1) }, "transfer")?; Ok(buffer) }
-    fn download(&self) -> Result<Vec<f64>, RecipeError> { Self::status(unsafe { hipDeviceSynchronize() }, "synchronization")?; let mut values = vec![0.0; self.elements]; Self::status(unsafe { hipMemcpy(values.as_mut_ptr().cast(), self.pointer, self.elements * size_of::<f64>(), 2) }, "transfer")?; Ok(values) }
+    fn upload<T>(values: &[T]) -> Result<Self, RecipeError> { let buffer = Self::allocate(values.len(), size_of_val(values))?; let runtime = hsa()?; let status = unsafe { match runtime.vendor { Vendor::Amd => hipMemcpy(buffer.pointer, values.as_ptr().cast(), size_of_val(values), 1), Vendor::Nvidia => cuMemcpyHtoD_v2(buffer.pointer as usize as u64, values.as_ptr().cast(), size_of_val(values)) } }; Self::status(status, "transfer")?; Ok(buffer) }
+    fn download(&self) -> Result<Vec<f64>, RecipeError> { let runtime = hsa()?; Self::status(unsafe { match runtime.vendor { Vendor::Amd => hipDeviceSynchronize(), Vendor::Nvidia => cuCtxSynchronize() } }, "synchronization")?; let mut values = vec![0.0; self.elements]; let status = unsafe { match runtime.vendor { Vendor::Amd => hipMemcpy(values.as_mut_ptr().cast(), self.pointer, self.elements * size_of::<f64>(), 2), Vendor::Nvidia => cuMemcpyDtoH_v2(values.as_mut_ptr().cast(), self.pointer as usize as u64, self.elements * size_of::<f64>()) } }; Self::status(status, "transfer")?; Ok(values) }
 }
 
-impl Drop for DeviceBuffer {
-	fn drop(&mut self) {
-		unsafe {
-			hipFree(self.pointer);
-		}
-	}
-}
+#[rustfmt::skip]
+impl Drop for DeviceBuffer { fn drop(&mut self) { if let Some(runtime) = HSA.get() { unsafe { match runtime.vendor { Vendor::Amd => { hipFree(self.pointer); }, Vendor::Nvidia => { cuMemFree_v2(self.pointer as usize as u64); } } } } } }
 
 #[rustfmt::skip]
 unsafe extern "C" {
@@ -235,102 +227,32 @@ unsafe extern "C" {
     fn hipMalloc(pointer: *mut *mut c_void, bytes: usize) -> i32; fn hipFree(pointer: *mut c_void) -> i32; fn hipMemcpy(destination: *mut c_void, source: *const c_void, bytes: usize, kind: i32) -> i32;
     fn hipModuleLaunchKernel(function: *mut c_void, grid_x: u32, grid_y: u32, grid_z: u32, block_x: u32, block_y: u32, block_z: u32, shared: u32, stream: *mut c_void, arguments: *mut *mut c_void, extra: *mut *mut c_void) -> i32;
 }
-
-fn hsa() -> Result<&'static Hsa, RecipeError> {
-	let runtime = HSA.get_or_init(|| unsafe {
-		let (
-			mut module,
-			mut forward_graph,
-			mut epoch_graph,
-			mut normalize,
-			mut affine,
-			mut initialize,
-			mut set_value,
-			mut metrics,
-		) = (
-			ptr::null_mut(),
-			ptr::null_mut(),
-			ptr::null_mut(),
-			ptr::null_mut(),
-			ptr::null_mut(),
-			ptr::null_mut(),
-			ptr::null_mut(),
-			ptr::null_mut(),
-		);
-		let mut status = hipInit(0);
-		if status == 0 {
-			status = hipSetDevice(0);
-		}
-		if status == 0 {
-			status = hipModuleLoad(
-				&mut module,
-				concat!(env!("RECIPE_HSA_CODE_OBJECT"), "\0")
-					.as_ptr()
-					.cast(),
-			);
-		}
-		for (function, name) in [
-			(&mut forward_graph, b"forward_graph\0".as_ptr()),
-			(&mut epoch_graph, b"epoch_graph\0".as_ptr()),
-			(&mut normalize, b"normalize\0".as_ptr()),
-			(&mut affine, b"affine\0".as_ptr()),
-			(&mut initialize, b"initialize\0".as_ptr()),
-			(&mut set_value, b"set_value\0".as_ptr()),
-			(&mut metrics, b"metrics\0".as_ptr()),
-		] {
-			if status == 0 {
-				status = hipModuleGetFunction(function, module, name.cast());
-			}
-		}
-		Hsa {
-			status,
-			forward_graph: forward_graph as usize,
-			epoch_graph: epoch_graph as usize,
-			normalize: normalize as usize,
-			affine: affine as usize,
-			initialize: initialize as usize,
-			set_value: set_value as usize,
-			metrics: metrics as usize,
-		}
-	});
-	if runtime.status == 0 {
-		Ok(runtime)
-	} else {
-		Err(RecipeError::new(format!(
-			"HSA initialization failed with status {}",
-			runtime.status
-		)))
-	}
+#[rustfmt::skip]
+unsafe extern "C" {
+    fn cuInit(flags: u32) -> i32; fn cuDeviceGet(device: *mut i32, ordinal: i32) -> i32; fn cuCtxCreate_v2(context: *mut *mut c_void, flags: u32, device: i32) -> i32; fn cuCtxSynchronize() -> i32;
+    fn cuModuleLoad(module: *mut *mut c_void, path: *const c_char) -> i32; fn cuModuleGetFunction(function: *mut *mut c_void, module: *mut c_void, name: *const c_char) -> i32;
+    fn cuMemAlloc_v2(pointer: *mut u64, bytes: usize) -> i32; fn cuMemFree_v2(pointer: u64) -> i32; fn cuMemcpyHtoD_v2(destination: u64, source: *const c_void, bytes: usize) -> i32; fn cuMemcpyDtoH_v2(destination: *mut c_void, source: u64, bytes: usize) -> i32;
+    fn cuLaunchKernel(function: *mut c_void, grid_x: u32, grid_y: u32, grid_z: u32, block_x: u32, block_y: u32, block_z: u32, shared: u32, stream: *mut c_void, arguments: *mut *mut c_void, extra: *mut *mut c_void) -> i32;
 }
 
-fn hsa_launch(
-	function: usize,
-	count: usize,
-	threads: u32,
-	arguments: &mut [*mut c_void],
-) -> Result<(), RecipeError> {
-	let status = unsafe {
-		hipModuleLaunchKernel(
-			function as *mut c_void,
-			(count as u32).div_ceil(threads),
-			1,
-			1,
-			threads,
-			1,
-			1,
-			0,
-			ptr::null_mut(),
-			arguments.as_mut_ptr(),
-			ptr::null_mut(),
-		)
-	};
-	if status == 0 {
-		Ok(())
-	} else {
-		Err(RecipeError::new(format!(
-			"HSA dispatch failed with status {status}"
-		)))
-	}
+#[rustfmt::skip]
+fn hsa() -> Result<&'static Hsa, RecipeError> {
+    let runtime = HSA.get_or_init(|| unsafe {
+        let (mut module, mut forward_graph, mut epoch_graph, mut normalize, mut affine, mut initialize, mut set_value, mut metrics) = (ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+        let mut status = hipInit(0); if status == 0 { status = hipSetDevice(0); }
+        let vendor = if status == 0 { Vendor::Amd } else { let (mut device, mut context) = (0, ptr::null_mut()); status = cuInit(0); if status == 0 { status = cuDeviceGet(&mut device, 0); } if status == 0 { status = cuCtxCreate_v2(&mut context, 0, device); } Vendor::Nvidia };
+        if status == 0 { status = match vendor { Vendor::Amd => hipModuleLoad(&mut module, concat!(env!("RECIPE_HSA_CODE_OBJECT"), "\0").as_ptr().cast()), Vendor::Nvidia => cuModuleLoad(&mut module, concat!(env!("RECIPE_NV_MODULE"), "\0").as_ptr().cast()) }; }
+        for (function, name) in [(&mut forward_graph, b"forward_graph\0".as_ptr()), (&mut epoch_graph, b"epoch_graph\0".as_ptr()), (&mut normalize, b"normalize\0".as_ptr()), (&mut affine, b"affine\0".as_ptr()), (&mut initialize, b"initialize\0".as_ptr()), (&mut set_value, b"set_value\0".as_ptr()), (&mut metrics, b"metrics\0".as_ptr())] { if status == 0 { status = match vendor { Vendor::Amd => hipModuleGetFunction(function, module, name.cast()), Vendor::Nvidia => cuModuleGetFunction(function, module, name.cast()) }; } }
+        Hsa { status, vendor, forward_graph: forward_graph as usize, epoch_graph: epoch_graph as usize, normalize: normalize as usize, affine: affine as usize, initialize: initialize as usize, set_value: set_value as usize, metrics: metrics as usize }
+    });
+    if runtime.status == 0 { Ok(runtime) } else { Err(RecipeError::new(format!("GPU initialization failed with status {}", runtime.status))) }
+}
+
+#[rustfmt::skip]
+fn hsa_launch(function: usize, count: usize, threads: u32, arguments: &mut [*mut c_void]) -> Result<(), RecipeError> {
+    let runtime = hsa()?; let grid = (count as u32).div_ceil(threads);
+    let status = unsafe { match runtime.vendor { Vendor::Amd => hipModuleLaunchKernel(function as *mut c_void, grid, 1, 1, threads, 1, 1, 0, ptr::null_mut(), arguments.as_mut_ptr(), ptr::null_mut()), Vendor::Nvidia => cuLaunchKernel(function as *mut c_void, grid, 1, 1, threads, 1, 1, 0, ptr::null_mut(), arguments.as_mut_ptr(), ptr::null_mut()) } };
+    DeviceBuffer::status(status, "dispatch")
 }
 
 #[rustfmt::skip]
