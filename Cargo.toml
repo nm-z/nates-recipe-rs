@@ -13,7 +13,7 @@ path = "train.rs"
 
 [[bin]]
 name = "recipe"
-path = "cli.rs"
+path = "bin/cli.rs"
 
 [features]
 default = ["amd", "nvidia"]

@@ -51,6 +51,8 @@ fn main() {
 		|m| m.gru(8),
 		|m| m.lstm(8),
 		|m| m.perc(24),
+		|m| m.moe(2, [layer(8), layer(8), layer(8), layer(8)]),
+		|m| m.svm([tanh, relu, gelu, sigmoid]),
 		|m| m.kmeans(4),
 		|m| m.knn(5),
 	];
