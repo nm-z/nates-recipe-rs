@@ -12,7 +12,13 @@ fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) {
 		.unwrap_or((0, f64::INFINITY))
 }
 
-fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, backend: Backend) -> Result<Vec<f64>> {
+pub(super) fn graph_inputs(
+	graph: &Graph,
+	samples: &[f64],
+	targets: &[f64],
+	rows: usize,
+	backend: Backend,
+) -> Result<Vec<f64>> {
 	if graph.nodes.is_empty() {
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
@@ -21,7 +27,7 @@ fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, ba
 	tape.predictions()
 }
 
-fn fit_surrogate(
+pub(super) fn fit_surrogate(
 	input: Shape,
 	samples: &[f64],
 	targets: &[f64],
@@ -48,7 +54,7 @@ fn fit_surrogate(
 	tape.weights(false)
 }
 
-fn estimator_predict(
+pub(super) fn estimator_predict(
 	operation: &Operation,
 	data: &Prepared,
 	training_rows: usize,
@@ -130,50 +136,4 @@ fn estimator_predict(
 			}
 		})
 		.collect())
-}
-
-pub(super) fn lower_estimator(
-	graph: &mut Graph,
-	operation: &Operation,
-	data: &Prepared,
-	rows: usize,
-	backend: Backend,
-	config: Config,
-) -> Result<()> {
-	let input = graph.output;
-	let source = graph.source;
-	let inputs = graph_inputs(graph, &data.samples, &data.targets, rows, backend)?;
-	let mut samples = inputs.clone();
-	samples.extend_from_slice(&inputs);
-	let mut targets = data.targets[..rows].to_vec();
-	targets.extend_from_within(..);
-	let paired = Prepared { samples, targets, rows: rows * 2, features: input.elements(), schema: String::new() };
-	let teacher = estimator_predict(operation, &paired, rows, config, true)?;
-	let hidden = match operation {
-		Operation::KMeans(value) | Operation::Knn(value) => *value,
-		_ => unreachable!(),
-	};
-	let surrogate = fit_surrogate(input, &inputs, &teacher, hidden, backend, config)?;
-	let first = checked_mul(hidden, input.elements(), "surrogate input")?;
-	require(surrogate.len() == first + hidden, "surrogate state has the wrong size")?;
-	push_frozen(
-		graph,
-		Primitive::Contraction,
-		input,
-		Shape { channels: hidden, length: 1 },
-		&surrogate[..first],
-		arguments(input.length as f64, 0.0),
-		source,
-	)?;
-	lower_activation(graph, Activation::Tanh, config)?;
-	let source = graph.source;
-	push_frozen(
-		graph,
-		Primitive::Contraction,
-		Shape { channels: hidden, length: 1 },
-		Shape { channels: 1, length: 1 },
-		&surrogate[first..],
-		[0.0; 9],
-		source,
-	)
 }
