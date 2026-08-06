@@ -1,6 +1,6 @@
 //! Recipe executes one model graph after automatically probing a compiled discrete GPU backend.
 //! Attention is three-projection scaled Q/K/V without an output projection.
-#![allow(non_upper_case_globals)] use std::{ collections::{BTreeMap, BTreeSet}, error::Error, ffi::{c_char, c_void},
+#![allow(non_upper_case_globals)] use std::{ collections::{BTreeMap, BTreeSet}, error::Error, ffi::c_void,
 fmt, fs, mem::{size_of, size_of_val}, path::{Path, PathBuf}, ptr, sync::{ Mutex, OnceLock,
 atomic::{AtomicBool, AtomicU64, Ordering}, }, time::Instant, };
 pub static recipe: Recipe = Recipe;
@@ -12,7 +12,8 @@ extern "C" fn interrupt(_: i32) { INTERRUPTED.store(true, Ordering::Relaxed); } 
 pub struct RecipeError(String); impl RecipeError { fn new(message: impl Into<String>) -> Self { Self(message.into()) } }
 impl fmt::Display for RecipeError { fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 formatter.write_str(&self.0) } } impl Error for RecipeError {} pub type Result<T> = std::result::Result<T, RecipeError>;
-type Ptr = *mut c_void; #[derive(Clone, Copy, Debug, PartialEq, Eq)] enum Backend { Amd, Nvidia, } pub struct Data {
+type Ptr = *mut c_void; #[derive(Clone, Copy, Debug, PartialEq, Eq)] enum Backend { Amd, Nvidia, }
+#[derive(Clone, Copy)] pub enum ArtifactSet { Auto, Amd, Nvidia, } pub struct Data {
 sources: Vec<String>, target: Vec<String>, exclusions: Vec<String>, normalize: bool, split: f64,
 prepared: OnceLock<Result<Prepared>>, } #[derive(Clone, Debug, PartialEq, Eq)] pub enum Residual { Layer(usize), Relu, }
 pub const fn layer(width: usize) -> Residual { Residual::Layer(width) } pub const fn relu() -> Residual { Residual::Relu
@@ -266,16 +267,23 @@ sources: sources.into_data_sources(), target: Vec::new(), exclusions: Vec::new()
 prepared: OnceLock::new(), } } pub fn model(&self) -> Model { Model { blocks: Vec::new(), loss: mse } }
 pub const fn train(&self) -> Train {
 Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: None, resume: None, save: None } }
-pub fn export(&self, source: impl AsRef<Path>) -> Result<PathBuf> { let source = source.as_ref(); require(
+pub fn export(&self, source: impl AsRef<Path>, selection: ArtifactSet) -> Result<Vec<PathBuf>> {
+let source = source.as_ref(); require(
 source.extension().and_then(|value| value.to_str()) == Some("rs"), "export requires a Rust source", )?;
 fs::metadata(source) .map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", source.display())))?;
-let backend = device_backend()?; let (compiled, extension) = match backend {
-Backend::Amd => (option_env!("RECIPE_HSA_CODE_OBJECT"), "hsaco"),
-Backend::Nvidia => (option_env!("RECIPE_NV_MODULE"), "cubin"), };
-let compiled = compiled.ok_or_else(|| RecipeError::new("selected GPU backend was not compiled"))?;
-let output = source.with_extension(extension); fs::copy(compiled, &output)
+let backends = match selection { ArtifactSet::Auto => [Backend::Amd, Backend::Nvidia] .into_iter()
+.filter(|backend| gpu(*backend).is_ok()) .collect(), ArtifactSet::Amd => vec![Backend::Amd],
+ArtifactSet::Nvidia => vec![Backend::Nvidia], };
+let mut outputs = Vec::new(); for backend in backends {
+let artifacts = match backend { Backend::Amd => vec![ ("hsaco", option_env!("RECIPE_HSA_CODE_OBJECT")),
+("amd.s", option_env!("RECIPE_HSA_ASSEMBLY")), ], Backend::Nvidia => vec![
+("ptx", option_env!("RECIPE_NV_PTX")), ("cubin", option_env!("RECIPE_NV_MODULE")),
+("nvidia.sass", option_env!("RECIPE_NV_SASS")), ], }; for (extension, compiled) in artifacts {
+let compiled = compiled.ok_or_else(|| RecipeError::new(format!("{backend:?} artifacts were not compiled")))?;
+let output = source.with_file_name(format!("recipe.{extension}")); fs::copy(compiled, &output)
 .map_err(|error| RecipeError::new(format!("cannot export {}: {error}", output.display())))?;
-eprintln!("exported: {}", output.display()); Ok(output) } } #[derive(Clone, Copy, Debug)] struct Shape {
+eprintln!("exported: {}", output.display());
+outputs.push(output); } } Ok(outputs) } } #[derive(Clone, Copy, Debug)] struct Shape {
 channels: usize, length: usize, } impl Shape { fn elements(self) -> usize { self.channels * self.length } }
 #[derive(Clone, Copy)] #[repr(i32)] enum Primitive { Contraction = 0, Pool = 2, Gather = 3, Attention = 4, Scan = 5,
 Elementwise = 6, Normalize = 8, Estimator = 9, } #[derive(Clone, Copy)] #[repr(i32)] enum ScalarOpcode { Add, Constant,
@@ -771,15 +779,23 @@ free: unsafe extern "C" fn(u64) -> i32, upload: unsafe extern "C" fn(u64, *const
 download: unsafe extern "C" fn(Ptr, u64, usize) -> i32, synchronize: unsafe extern "C" fn() -> i32, launch: Launch,
 forward: usize, epoch: usize, estimate: usize, }
 type Launch = unsafe extern "C" fn(usize, u32, u32, u32, u32, u32, u32, u32, Ptr, *mut Ptr, *mut Ptr) -> i32;
+#[cfg(any(feature = "amd", feature = "nvidia"))]
 type Init = unsafe extern "C" fn(u32) -> i32;
+#[cfg(any(feature = "amd", feature = "nvidia"))]
 type Count = unsafe extern "C" fn(*mut i32) -> i32;
+#[cfg(any(feature = "amd", feature = "nvidia"))]
 type Attribute = unsafe extern "C" fn(*mut i32, i32, i32) -> i32; #[cfg(feature = "amd")]
 type Select = unsafe extern "C" fn(i32) -> i32; #[cfg(feature = "nvidia")]
 type Device = unsafe extern "C" fn(*mut i32, i32) -> i32; #[cfg(feature = "nvidia")]
 type Context = unsafe extern "C" fn(*mut Ptr, u32, i32) -> i32;
+#[cfg(any(feature = "amd", feature = "nvidia"))]
 type Module = unsafe extern "C" fn(*mut Ptr, *const u8) -> i32;
+#[cfg(any(feature = "amd", feature = "nvidia"))]
 type Function = unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32;
-struct Library(Ptr); impl Library { fn open(name: &str) -> Result<Self> {
+#[cfg(any(feature = "amd", feature = "nvidia"))]
+struct Library(Ptr);
+#[cfg(any(feature = "amd", feature = "nvidia"))]
+impl Library { fn open(name: &str) -> Result<Self> {
 let name = format!("{name}\0");
 let handle = unsafe { dlopen(name.as_ptr().cast(), 2) };
 require(!handle.is_null(), format!("cannot load {name:?}"))?; Ok(Self(handle)) }
@@ -799,6 +815,7 @@ Ok(_) => return Ok(backend), Err(error) => failures.push(error.to_string()), } }
 Err(RecipeError::new(failures.join("; "))) } fn gpu(backend: Backend) -> Result<&'static Gpu> {
 let loaded = match backend { Backend::Amd => AMD.get_or_init(load_amd),
 Backend::Nvidia => NVIDIA.get_or_init(load_nvidia), }; loaded.as_ref().map_err(Clone::clone) }
+#[cfg(any(feature = "amd", feature = "nvidia"))]
 fn discrete(backend: Backend, count: i32, mut probe: impl FnMut(i32) -> Result<Option<i32>>) -> Result<i32> { (0..count)
 .map(&mut probe) .find_map(|result| result.transpose()) .transpose()?
 .ok_or_else(|| RecipeError::new(format!("{backend:?} has no discrete GPU"))) } fn load_amd() -> Result<Gpu> {
@@ -861,7 +878,11 @@ gpu.status(load(&mut module, concat!(env!("RECIPE_NV_MODULE"), "\0").as_ptr()), 
 gpu.status(function(&mut forward, module, b"forward_graph\0".as_ptr()), "forward load")?;
 gpu.status(function(&mut epoch, module, b"tape_epoch_graph\0".as_ptr()), "epoch load")?;
 gpu.status(function(&mut estimate, module, b"estimate_graph\0".as_ptr()), "estimator load")?;
-Ok(Gpu { forward, epoch, estimate, ..gpu }) } } #[link(name = "dl")] unsafe extern "C" {
-fn dlopen(name: *const c_char, flags: i32) -> Ptr;
-fn dlsym(handle: Ptr, name: *const c_char) -> Ptr;
-fn signal(number: i32, handler: extern "C" fn(i32)) -> usize; }
+Ok(Gpu { forward, epoch, estimate, ..gpu }) } }
+#[cfg(any(feature = "amd", feature = "nvidia"))]
+#[link(name = "dl")]
+unsafe extern "C" {
+fn dlopen(name: *const std::ffi::c_char, flags: i32) -> Ptr;
+fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr;
+}
+unsafe extern "C" { fn signal(number: i32, handler: extern "C" fn(i32)) -> usize; }

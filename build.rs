@@ -1,4 +1,4 @@
-use std::{env, error::Error, fs, io, path::PathBuf, process::Command};
+use std::{env, error::Error, fs, io, path::{Path, PathBuf}, process::Command};
 
 type BuildResult<T> = Result<T, Box<dyn Error>>;
 
@@ -31,6 +31,16 @@ fn run(command: &mut Command, role: &str) -> BuildResult<()> {
 	Ok(())
 }
 
+fn render(command: &mut Command, role: &str, path: &Path) -> BuildResult<()> {
+	let output = command.output()?;
+	if !output.status.success() {
+		let detail = String::from_utf8_lossy(&output.stderr);
+		return Err(io::Error::other(format!("{role} failed: {}", detail.trim())).into());
+	}
+	fs::write(path, output.stdout)?;
+	Ok(())
+}
+
 fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	let architecture = text(manifest, "hsa-architecture")?;
 	let cpu = format!("-mcpu={architecture}");
@@ -42,7 +52,14 @@ fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	}
 	command.arg("amd-nv.ll").arg("-o").arg(&output);
 	run(&mut command, "HSA LLVM IR compiler")?;
+	let assembly = out.join("recipe.amd.s");
+	render(
+		Command::new(text(manifest, "hsa-disassembler")?).arg("--disassemble").arg(&output),
+		"HSA disassembler",
+		&assembly,
+	)?;
 	println!("cargo:rustc-env=RECIPE_HSA_CODE_OBJECT={}", output.display());
+	println!("cargo:rustc-env=RECIPE_HSA_ASSEMBLY={}", assembly.display());
 	println!("cargo:rustc-link-search=native={}", text(manifest, "hsa-library")?);
 	Ok(())
 }
@@ -101,7 +118,15 @@ fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 			.arg(&output),
 		"PTX assembler",
 	)?;
+	let sass_output = out.join("recipe.nvidia.sass");
+	render(
+		Command::new(text(manifest, "nvidia-disassembler")?).arg(&output),
+		"NVIDIA disassembler",
+		&sass_output,
+	)?;
+	println!("cargo:rustc-env=RECIPE_NV_PTX={}", ptx_output.display());
 	println!("cargo:rustc-env=RECIPE_NV_MODULE={}", output.display());
+	println!("cargo:rustc-env=RECIPE_NV_SASS={}", sass_output.display());
 	println!("cargo:rustc-link-search=native={}", text(manifest, "nvidia-library")?);
 	Ok(())
 }
