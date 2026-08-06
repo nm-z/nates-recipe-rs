@@ -73,7 +73,8 @@ fn parallel_ir(ir: String, width: &str) -> String {
 			println!("cargo:rustc-env=RECIPE_HSA_{prefix}_{suffix}={}", value.trim());
 		} 	} 	Ok(())
 } fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
-	let architecture = text(manifest, "hsa-architecture")?;
+		let architecture = text(manifest, "hsa-architecture")?;
+		println!("cargo:rustc-env=RECIPE_HSA_ARCHITECTURE={architecture}");
 	let cpu = format!("-mcpu={architecture}");
 	let output = out.join("recipe.hsaco");
 	let source = out.join("recipe-amd.ll");
