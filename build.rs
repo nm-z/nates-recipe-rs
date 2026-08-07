@@ -32,6 +32,8 @@ fn setting<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> { let prefi
 		.ok_or_else(|| io::Error::other(format!("{key} must be configured")).into()) }
 fn number<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> { let value = setting(manifest, key)?;
 	value.parse::<f64>().map_err(|error| io::Error::other(format!("{key} must be numeric: {error}")))?; Ok(value) }
+fn flag<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> { let value = setting(manifest, key)?;
+	value.parse::<bool>().map_err(|error| io::Error::other(format!("{key} must be true or false: {error}")))?; Ok(value) }
 fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> { setting(manifest, key)?
 		.strip_prefix('"')
 		.and_then(|value| value.strip_suffix('"'))
@@ -126,6 +128,7 @@ fn main() -> BuildResult<()> { let manifest = fs::read_to_string("Cargo.toml")?;
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?); } for (key, environment) in [
 		("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME"), ("ssh-config", "RECIPE_SSH_CONFIG"),
 	] { println!("cargo:rustc-env={environment}={}", text(&manifest, key)?); }
+	println!("cargo:rustc-env=RECIPE_MULTI_DEVICE={}", flag(&manifest, "multi-device")?);
 	let out = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR must be configured"))?);
 	println!("cargo::rustc-check-cfg=cfg(amd)");
 	println!("cargo::rustc-check-cfg=cfg(nvidia)");

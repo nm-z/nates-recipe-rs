@@ -129,7 +129,8 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 const SIGINT: i32 = 2;
 const INTERRUPTED_EXIT: i32 = 128 + SIGINT;
 static SIGNAL: OnceLock<usize> = OnceLock::new(); extern "C" fn interrupt(_: i32) {
-	INTERRUPTED.store(true, Ordering::Release); } #[derive(Clone, Debug, PartialEq, Eq)]
+	if !INTERRUPTED.swap(true, Ordering::AcqRel) { let message = b"interrupt received, finishing checkpoint\n";
+		unsafe { write(2, message.as_ptr().cast(), message.len()); } } } #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipeError(String); impl RecipeError { fn new(message: impl Into<String>) -> Self { Self(message.into()) } }
 impl fmt::Display for RecipeError { fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter.write_str(&self.0) } } impl Error for RecipeError {}
@@ -320,7 +321,7 @@ fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, confi
 	rows: usize, gpu: &'static Gpu, config: Config, expected: Option<usize>, ) -> Result<Graph> {
 	require(!model.blocks.is_empty(), "model must contain a block")?; let sequential =
 		matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..) | Operation::Embed(..));
-	let shape = if sequential { Shape { channels: 1, length: data.features } } else {
+	let shape = if sequential { data.sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else {
 		Shape { channels: data.features, length: 1 } }; let mut graph = Graph { nodes: Vec::new(), parameters: Vec::new(),
 		frozen: Vec::new(), programs: Vec::new(), input: shape, output: shape, source: -1, state: TrainingState::default(), };
 	for block in &model.blocks { lower_block(&mut graph, block, data, rows, gpu, config)?; }
@@ -328,7 +329,9 @@ fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, confi
 		require(graph.output.elements() == expected, "model output width does not match .out()")?;
 	} else if graph.output.elements() != 1 { let length = graph.output.length;
 		lower_conv(&mut graph, 1, length)?; }
-	initialize_graph(&mut graph, config); Ok(graph) } #[derive(Clone, Copy)] struct Field { source: i32, stride: usize,
+	initialize_graph(&mut graph, config); if expected.is_none() { if let Some(node) = graph.nodes.last() {
+		let mean = data.targets[..rows].iter().sum::<f64>() / rows as f64; graph.parameters[node.offset] = mean; } } Ok(graph) }
+#[derive(Clone, Copy)] struct Field { source: i32, stride: usize,
 	index: usize, } fn field(fields: &[(String, Field)], name: &str) -> Result<Field> { fields.iter()
 		.find(|value| value.0 == name) .map(|value| value.1)
 		.ok_or_else(|| RecipeError::new(format!("RAT value {name:?} is not yet available"))) }
@@ -449,13 +452,17 @@ fn lower_project(graph: &mut Graph, channels: usize) -> Result<()> {
 	require(channels != 0, "layer width must be positive")?;
 	let (parameters, output) = (checked_mul(graph.output.channels, channels, "projection parameters")?,
 		Shape { channels, length: graph.output.length });
-	push_node(graph, Primitive::Contraction, output, parameters, [0.0; 9], -2) }
+	push_node(graph, Primitive::Contraction, output, parameters, [0.0; 9], -2)?; lower_bias(graph) }
 fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	require(filters != 0 && kernel != 0, "convolution dimensions must be positive")?;
 	require(kernel <= graph.output.length, "convolution kernel exceeds sequence length")?;
 	let parameters = checked_mul(filters, checked_mul(graph.output.channels, kernel, "convolution window")?, "conv")?;
 	let output = Shape { channels: filters, length: graph.output.length - kernel + 1 };
-	push_node(graph, Primitive::Contraction, output, parameters, arguments(kernel as f64, 0.0), -2) }
+	push_node(graph, Primitive::Contraction, output, parameters, arguments(kernel as f64, 0.0), -2)?;
+	if output.length == 1 { lower_bias(graph) } else { Ok(()) } }
+fn lower_bias(graph: &mut Graph) -> Result<()> { let (mut program, input) = (ScalarProgram(Vec::new()), -1.0);
+	let bias = program.op(ScalarOpcode::Parameter, 0.0, 0.0); program.op(ScalarOpcode::Add, input, bias);
+	push_program(graph, -2, &[0.0], program) }
 fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> { require(size != 0, "pool window must be positive")?;
 	let output = Shape { channels: graph.output.channels, length: graph.output.length.div_ceil(size) };
 	push_node(graph, Primitive::Pool, output, 0, arguments(size as f64, 0.0), -2) }
@@ -570,7 +577,7 @@ fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Conf
 	samples.extend_from_slice(&inputs);
 	let mut targets = data.targets[..rows].to_vec();
 	targets.extend_from_within(..); let paired = Prepared { samples, targets,
-		rows: checked_mul(rows, 2, "paired estimator rows")?, features: input.elements(), schema: String::new(), };
+		rows: checked_mul(rows, 2, "paired estimator rows")?, features: input.elements(), schema: String::new(), sequence: None, };
 	let teacher = { require(paired.rows > rows, "estimator split must retain test rows")?;
 		let predict = estimator.fit(&paired, rows, config, true)?; paired.samples[rows * input.elements()..]
 			.chunks_exact(input.elements()).enumerate().map(|(row, query)| predict(row, query)).collect::<Vec<_>>() };
@@ -584,8 +591,12 @@ fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Conf
 	let source = graph.source; push_frozen( graph, Primitive::Contraction, Shape { channels: hidden, length: 1 },
 		Shape { channels: 1, length: 1 }, &surrogate[first..], [0.0; 9], source, ) }
 fn initialize_graph(graph: &mut Graph, config: Config) {
-	for (weight, frozen) in graph.parameters.iter_mut().zip(&graph.frozen) { if *frozen == 0 { *weight = config.initial; }
-	} } fn push_frozen( graph: &mut Graph, op: Primitive, input: Shape, output: Shape, values: &[f64], argument: [f64; 9],
+	let mut state = config.random_seed as u64; for node in &graph.nodes { if node.op == Primitive::Elementwise { continue; }
+		let fan_in = (node.parameters / node.output.channels.max(1)).max(1) as f64;
+		let scale = config.initial / fan_in.sqrt(); for index in node.offset..node.offset + node.parameters {
+			if graph.frozen[index] == 0 { state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+				graph.parameters[index] = ((state >> 11) as f64 / ((1_u64 << 53) as f64) * 2.0 - 1.0) * scale; } } }
+} fn push_frozen( graph: &mut Graph, op: Primitive, input: Shape, output: Shape, values: &[f64], argument: [f64; 9],
 	source: i32, ) -> Result<()> { let offset = graph.parameters.len();
 	graph.parameters.extend_from_slice(values);
 	graph.frozen.resize(graph.parameters.len(), 1); graph.nodes.push(Node { op, source, second: -2, input, output, offset,
@@ -609,12 +620,13 @@ impl Tile { fn proposed(values: &mut [f64], limit: Self) -> Result<Self> {
 		values[..3].copy_from_slice(&[f64::from(tile.m), f64::from(tile.n), f64::from(tile.k)]); Ok(tile) } }
 #[derive(Clone, Copy)] struct Config { kmeans_iterations: usize, surrogate_epochs: usize, surrogate_width: usize,
 	surrogate_rate: f64, initial: f64, beta1: f64, beta2: f64, epsilon: f64, decay: f64, rat_batch: usize,
-	activation: [f64; 8], } impl Config { fn load() -> Result<Self> { Ok(Self {
+	random_seed: usize, activation: [f64; 8], } impl Config { fn load() -> Result<Self> { Ok(Self {
 			kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?,
 			surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?,
 			surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?,
 			surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?,
 			rat_batch: natural("RAT batch rows", env!("RECIPE_RAT_BATCH_ROWS"))?,
+			random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?,
 			initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?,
 			beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?,
 			epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?,
@@ -630,6 +642,7 @@ impl Tile { fn proposed(values: &mut [f64], limit: Self) -> Result<Self> {
 fn natural(name: &str, text: &str) -> Result<usize> {
 	let value = text.parse::<usize>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))?;
 	require(value != 0, format!("{name} must be positive")).map(|_| value) }
+fn multi_device() -> bool { env!("RECIPE_MULTI_DEVICE") == "true" }
 fn stored_graph(graph: &Graph, data: &Data) -> bundle::StoredGraph {
 	let inputs = (0..graph.input.elements()).map(|index| format!("input{index}")).collect();
 	let output = data.target.first().cloned().unwrap_or_else(|| "target".to_owned());
@@ -747,9 +760,6 @@ fn stored_graph(graph: &Graph, data: &Data) -> bundle::StoredGraph {
 	fn write_gradient(&self, values: &[f64]) -> Result<()> { self.gradient.write(0, values) }
 	fn optimizer_state(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> { Ok(( self.weights()?,
 		self.moments.download(self.parameters as usize)?, self.variances.download(self.parameters as usize)?, )) }
-	fn write_optimizer(&self, weights: &[f64], moments: &[f64], variances: &[f64]) -> Result<()> {
-		self.weights.write(0, weights)?;
-		self.moments.write(0, moments)?; self.variances.write(0, variances) }
 	fn write_tiles(&mut self, values: &[Tile]) -> Result<()> {
 		require(values.len() == self.nodes as usize, "GPU tile count does not match graph nodes")?;
 		self.tile = values.iter().fold(Tile { m: 1, n: 1, k: 1 }, |prior, tile| Tile {
@@ -757,6 +767,28 @@ fn stored_graph(graph: &Graph, data: &Data) -> bundle::StoredGraph {
 	fn fill_tile(&mut self, tile: Tile) -> Result<()> {
 		self.write_tiles(&std::iter::repeat_n(tile, self.nodes as usize).collect::<Vec<_>>()) }
 	fn write_weights(&self, values: &[f64]) -> Result<()> { self.weights.write(0, values) } }
+fn tape_bytes(graph: &Graph, rows: usize, targets: bool) -> Result<usize> {
+	let mut bytes = 0_usize;
+	let mut add = |value| -> Result<()> { bytes = checked_add(bytes, value, "GPU tape bytes")?; Ok(()) };
+	for node in &graph.nodes { let values = graph_rows_buffer(node.output, rows)?;
+		add(checked_mul(2, values, "GPU values and adjoints")?)?;
+		add(node_context(node, rows)?)?; }
+	let pointers = checked_mul(3 * graph.nodes.len(), size_of::<u64>(), "GPU tape pointers")?;
+	add(pointers)?;
+	add(checked_mul(graph.nodes.len() * 11, size_of::<i32>(), "GPU descriptors")?)?;
+	add(checked_mul(graph.nodes.len() * 9 + graph.programs.len(), size_of::<f64>(), "GPU arguments")?)?;
+	let samples = graph_rows_buffer(graph.input, rows)?;
+	add(checked_mul(2, samples, "GPU samples and input adjoints")?)?;
+	add(checked_mul(graph.nodes.len().max(1), size_of::<u64>() + size_of::<Tile>(), "GPU node metadata")?)?;
+	add(if targets { graph_rows_buffer(graph.output, rows)? } else { size_of::<f64>() })?;
+	let parameters = checked_mul(graph.parameters.len().max(1), size_of::<f64>(), "GPU parameter bytes")?;
+	add(checked_mul(5, parameters, "GPU optimizer bytes")?)?;
+	add(graph.frozen.len().max(1))?;
+	add(7 * size_of::<f64>())?; Ok(bytes) }
+fn tape_row_limit(graph: &Graph, memory: u64, rows: usize, targets: bool) -> Result<usize> {
+	let memory = usize::try_from(memory).unwrap_or(usize::MAX);
+	let (mut low, mut high) = (0, rows); while low < high { let middle = low + (high - low).div_ceil(2);
+		if tape_bytes(graph, middle, targets)? <= memory { low = middle; } else { high = middle - 1; } } Ok(low) }
 struct Placement { tape: GpuTape, rows: Vec<usize>, share: f64, }
 struct DeviceTape { shards: Vec<Placement>, targets: Vec<f64>, best: Vec<f64>, best_moments: Vec<f64>,
 	best_variances: Vec<f64>, best_epoch: u32, best_loss: [f64; 4],
@@ -767,11 +799,23 @@ struct DeviceTape { shards: Vec<Placement>, targets: Vec<f64>, best: Vec<f64>, b
 		require(input != 0 && !samples.is_empty() && samples.len() % input == 0, "model input batch is invalid")?;
 		let (capacity, output) = (samples.len() / input, graph.output.elements());
 		require(targets.len() == capacity * output, "target batch is invalid")?;
-		let replicated = capacity < gpus.len();
-		let mut shards = Vec::new(); for (index, &gpu) in gpus.iter().enumerate() {
-			let rows = if replicated { (0..capacity).collect::<Vec<_>>() } else {
-				(index..capacity).step_by(gpus.len()).collect::<Vec<_>>() };
-			let share = if replicated { 1.0 / gpus.len() as f64 } else { rows.len() as f64 / capacity as f64 };
+		let limits = gpus.iter().map(|gpu| tape_row_limit(graph, gpu.memory, capacity, !targets.is_empty()))
+			.collect::<Result<Vec<_>>>()?;
+		let viable = gpus.iter().zip(limits).filter(|(_, rows)| *rows != 0).collect::<Vec<_>>();
+		require(!viable.is_empty(), "no GPU can fit one training row")?;
+		let replicated = capacity < viable.len();
+		let mut rows = vec![Vec::new(); viable.len()]; if replicated { for values in &mut rows {
+			values.extend(0..capacity); } } else { let total = viable.iter().map(|(_, limit)| *limit).sum::<usize>();
+			require(total >= capacity, "the available GPU memory cannot fit the training batch")?;
+			for row in 0..capacity { let index = viable.iter().enumerate().filter(|(index, (_, limit))| {
+				rows[*index].len() < *limit }).max_by_key(|(index, (_, limit))| {
+				limit.saturating_mul(row + 1).saturating_sub(rows[*index].len().saturating_mul(total))
+			}).map(|(index, _)| index).ok_or_else(|| RecipeError::new("GPU row placement is exhausted"))?;
+			rows[index].push(row); } }
+		let viable_count = viable.len();
+		let mut shards = Vec::new(); for ((&gpu, _), rows) in viable.into_iter().zip(rows) {
+			let share = if replicated { 1.0 / viable_count as f64 } else {
+				rows.len() as f64 / capacity as f64 };
 			let tape = GpuTape::new(graph, &Self::pack(samples, input, &rows), &Self::pack(targets, output, &rows), gpu)?;
 			shards.push(Placement { tape, rows, share }); }
 		let best = if graph.state.best.is_empty() { graph.parameters.clone() } else { graph.state.best.clone() };
@@ -811,17 +855,15 @@ struct DeviceTape { shards: Vec<Placement>, targets: Vec<f64>, best: Vec<f64>, b
 		self.best_loss[2] = next_trail; if trigger {
 			self.best_loss[3] = self.best_loss[0]; } Ok(trigger) } fn epoch(
 		&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool, ) -> Result<(f64, bool)> {
-		self.map(|tape| tape.gradient(rate, loss, tolerance, config, direct))?;
-		let gradients = self.shards.iter().map(|shard| shard.tape.gradient_values()).collect::<Result<Vec<_>>>()?;
+		let gradients = self.map(|tape| { tape.gradient(rate, loss, tolerance, config, direct)?;
+			tape.gradient_values() })?;
 		let mut gradient = std::iter::repeat_n(0.0, self.shards[0].tape.parameters as usize).collect::<Vec<_>>();
 		for (shard, values) in self.shards.iter().zip(gradients) { for (total, value) in gradient.iter_mut().zip(values) {
 				*total += value * shard.share; } } let objective = if direct { 0.0 } else {
 			model_loss(&self.predictions()?, &self.targets, loss, config.activation[7]) };
 		let saved = if direct { false } else { self.observe(objective, tolerance)? };
-		self.shards[0].tape.write_gradient(&gradient)?;
-		self.shards[0].tape.update(rate, loss, tolerance, config, direct)?; if self.shards.len() > 1 {
-			let (weights, moments, variances) = self.shards[0].tape.optimizer_state()?;
-			for shard in &self.shards[1..] { shard.tape.write_optimizer(&weights, &moments, &variances)?; } }
+		self.map(|tape| { tape.write_gradient(&gradient)?;
+			tape.update(rate, loss, tolerance, config, direct) })?;
 		Ok((objective, saved)) } fn write_samples(&self, values: &[f64]) -> Result<()> {
 		require(values.len() == self.capacity * self.input, "RAT input batch has the wrong shape")?;
 		for shard in &self.shards { shard.tape.write_samples(&Self::pack(values, self.input, &shard.rows))?; } Ok(()) }
@@ -1032,24 +1074,23 @@ fn worker_serve(name: &str) -> Result<()> { let gpu = device(Some(name))?;
 	let mut input = std::io::stdin().lock();
 	let mut output = std::io::stdout().lock(); loop {
 		let mut command = [0]; if remote_io("read from", input.read(&mut command))? == 0 {
-			return Ok(()); } match command[0] { 1 => {
-				let pointer = gpu.allocate(get_u64(&mut input)? as usize)?;
-				put_u64(&mut output, pointer)?; } 2 => {
+			return Ok(()); } let result = (|| -> Result<Vec<u8>> { match command[0] { 1 => {
+				Ok(gpu.allocate(get_u64(&mut input)? as usize)?.to_le_bytes().to_vec()) } 2 => {
 				gpu.free(get_u64(&mut input)?);
-				remote_io("write to", output.write_all(&[0]))?; } 3 => {
+				Ok(Vec::new()) } 3 => {
 				let pointer = get_u64(&mut input)?;
 				let bytes = get_u64(&mut input)? as usize;
 				let mut payload = std::iter::repeat_n(0_u8, bytes).collect::<Vec<_>>();
 				remote_io("read from", input.read_exact(&mut payload))?;
 				gpu.upload(pointer, payload.as_ptr().cast(), bytes)?;
-				remote_io("write to", output.write_all(&[0]))?; } 4 => {
+				Ok(Vec::new()) } 4 => {
 				let pointer = get_u64(&mut input)?;
 				let bytes = get_u64(&mut input)? as usize;
 				let mut payload = std::iter::repeat_n(0_u8, bytes).collect::<Vec<_>>();
 				gpu.download(payload.as_mut_ptr().cast(), pointer, bytes)?;
-				remote_io("write to", output.write_all(&payload))?; } 5 => {
+				Ok(payload) } 5 => {
 				gpu.synchronize()?;
-				remote_io("write to", output.write_all(&[0]))?; } 6 => {
+				Ok(Vec::new()) } 6 => {
 				let mut kernel = [0];
 				remote_io("read from", input.read_exact(&mut kernel))?;
 				let threads = get_u64(&mut input)? as u32; let tile = Tile { m: get_u64(&mut input)? as u32,
@@ -1060,8 +1101,10 @@ fn worker_serve(name: &str) -> Result<()> { let gpu = device(Some(name))?;
 				let dispatch = match kernel[0] { 0 => gpu.forward, 1 => gpu.epoch,
 					_ => return Err(RecipeError::new("remote Recipe kernel is invalid")), };
 				gpu.launch(dispatch, &mut arguments, threads, tile)?;
-				remote_io("write to", output.write_all(&[0]))?; }
-			_ => return Err(RecipeError::new("remote Recipe command is invalid")), } remote_io("flush", output.flush())?; } }
+				Ok(Vec::new()) }
+			_ => Err(RecipeError::new("remote Recipe command is invalid")), } })();
+		write_response(&mut output, result)?;
+		remote_io("flush", output.flush())?; } }
 extern "C" fn worker_init() { if let Ok(mode) = std::env::var("RECIPE_WORKER") { let result = if mode == "list" {
 			worker_list() } else if let Some(name) = mode.strip_prefix("serve|") { worker_serve(name) } else {
 			Err(RecipeError::new("Recipe worker mode is invalid")) }; let status = result.map_or_else( |error| {
@@ -1092,35 +1135,49 @@ fn remote_io<T>(action: &str, result: io::Result<T>) -> Result<T> {
 fn put_u64(output: &mut impl Write, value: u64) -> Result<()> {
 	remote_io("write to", output.write_all(&value.to_le_bytes())) } fn get_u64(input: &mut impl Read) -> Result<u64> {
 	let mut bytes = u64::default().to_le_bytes();
-	remote_io("read from", input.read_exact(&mut bytes))?; Ok(u64::from_le_bytes(bytes)) } impl Remote {
+	remote_io("read from", input.read_exact(&mut bytes))?; Ok(u64::from_le_bytes(bytes)) }
+fn write_response(output: &mut impl Write, result: Result<Vec<u8>>) -> Result<()> { let (status, payload) = match result {
+		Ok(payload) => (0, payload), Err(error) => (1, error.to_string().into_bytes()), };
+	remote_io("write to", output.write_all(&[status]))?;
+	put_u64(output, payload.len() as u64)?;
+	remote_io("write to", output.write_all(&payload)) }
+fn read_response(worker: &mut Worker) -> Result<Vec<u8>> { let mut status = [0];
+	remote_io("read from", worker.output.read_exact(&mut status))?;
+	let bytes = get_u64(&mut worker.output)? as usize;
+	let mut payload = std::iter::repeat_n(0, bytes).collect::<Vec<_>>();
+	remote_io("read from", worker.output.read_exact(&mut payload))?; if status[0] == 0 { return Ok(payload); }
+	let message = String::from_utf8(payload).map_err(|_| RecipeError::new("remote Recipe error is not UTF-8"))?;
+	Err(RecipeError::new(message)) } impl Remote {
 	fn worker(&self) -> Result<std::sync::MutexGuard<'_, Worker>> {
 		self.io.lock().map_err(|_| RecipeError::new("remote Recipe worker lock is poisoned")) }
 	fn allocate(&self, bytes: usize) -> Result<u64> { let mut worker = self.worker()?;
 		remote_io("write to", worker.input.write_all(&[1]))?;
 		put_u64(&mut worker.input, bytes as u64)?;
-		remote_io("flush", worker.input.flush())?; get_u64(&mut worker.output) } fn free(&self, pointer: u64) {
+		remote_io("flush", worker.input.flush())?; let payload = read_response(&mut worker)?;
+		require(payload.len() == size_of::<u64>(), "remote allocation response is invalid")?;
+		Ok(u64::from_le_bytes(payload.try_into().map_err(|_| RecipeError::new("remote pointer is invalid"))?)) } fn free(&self, pointer: u64) {
 		if let Ok(mut worker) = self.worker() { let _ = remote_io("write to", worker.input.write_all(&[2]));
 			let _ = put_u64(&mut worker.input, pointer);
 			let _ = worker.input.flush();
-			let mut ready = [0];
-			let _ = worker.output.read_exact(&mut ready); } }
+			let _ = read_response(&mut worker); } }
 	fn upload(&self, dst: u64, src: *const c_void, bytes: usize) -> Result<()> { let mut worker = self.worker()?;
 		remote_io("write to", worker.input.write_all(&[3]))?;
 		put_u64(&mut worker.input, dst)?;
 		put_u64(&mut worker.input, bytes as u64)?; remote_io( "write to",
 			worker.input.write_all(unsafe { std::slice::from_raw_parts(src.cast::<u8>(), bytes) }), )?;
 		remote_io("flush", worker.input.flush())?;
-		let mut ready = [0]; remote_io("acknowledge", worker.output.read_exact(&mut ready)) }
+		read_response(&mut worker).map(|_| ()) }
 	fn download(&self, dst: Ptr, src: u64, bytes: usize) -> Result<()> { let mut worker = self.worker()?;
 		remote_io("write to", worker.input.write_all(&[4]))?;
 		put_u64(&mut worker.input, src)?;
 		put_u64(&mut worker.input, bytes as u64)?;
-		remote_io("flush", worker.input.flush())?; remote_io( "read from",
-			worker.output.read_exact(unsafe { std::slice::from_raw_parts_mut(dst.cast::<u8>(), bytes) }), ) }
+		remote_io("flush", worker.input.flush())?; let payload = read_response(&mut worker)?;
+		require(payload.len() == bytes, "remote download response has the wrong size")?;
+		unsafe { ptr::copy_nonoverlapping(payload.as_ptr(), dst.cast::<u8>(), bytes) }; Ok(()) }
 	fn synchronize(&self) -> Result<()> { let mut worker = self.worker()?;
 		remote_io("write to", worker.input.write_all(&[5]))?;
 		remote_io("flush", worker.input.flush())?;
-		let mut ready = [0]; remote_io("acknowledge", worker.output.read_exact(&mut ready)) }
+		read_response(&mut worker).map(|_| ()) }
 	fn launch(&self, dispatch: Dispatch, arguments: &mut [Ptr], threads: u32, tile: Tile) -> Result<()> {
 		let mut worker = self.worker()?;
 		remote_io("write to", worker.input.write_all(&[6, dispatch.kernel.object as u8]))?; for value in
@@ -1130,7 +1187,7 @@ fn put_u64(output: &mut impl Write, value: u64) -> Result<()> {
 			unsafe { ptr::copy_nonoverlapping( (*argument).cast::<u8>(), value.as_mut_ptr(), usize::from(*kind - b'0'), ) };
 			put_u64(&mut worker.input, u64::from_ne_bytes(value))?; }
 		remote_io("flush", worker.input.flush())?;
-		let mut ready = [0]; remote_io("acknowledge", worker.output.read_exact(&mut ready)) } }
+		read_response(&mut worker).map(|_| ()) } }
 fn worker_process(host: &str, mode: &str) -> Result<Worker> { let executable = fs::read( std::env::current_exe()
 			.map_err(|error| RecipeError::new(format!("cannot locate Recipe executable: {error}")))?, )
 	.map_err(|error| RecipeError::new(format!("cannot read Recipe executable: {error}")))?; let command = format!( concat!(
@@ -1188,7 +1245,7 @@ static REMOTE_GPUS: OnceLock<Result<Vec<Gpu>>> = OnceLock::new(); fn remote_gpus
 	REMOTE_GPUS.get_or_init(|| reachable_nodes()?.iter().map(remote_gpu).collect()).as_ref().map(Vec::as_slice)
 		.map_err(Clone::clone) }
 fn all_gpus() -> Result<Vec<&'static Gpu>> { let mut found = devices()?.iter().collect::<Vec<_>>();
-	found.extend(remote_gpus()?.iter()); Ok(found) }
+	if multi_device() { found.extend(remote_gpus()?.iter()); } Ok(found) }
 static TOPOLOGY: OnceLock<Result<Topology>> = OnceLock::new(); fn topology() -> Result<Topology> {
 	TOPOLOGY.get_or_init(discover_topology).as_ref().cloned().map_err(Clone::clone) }
 fn discover_topology() -> Result<Topology> { let found = devices()?;
@@ -1200,7 +1257,7 @@ fn discover_topology() -> Result<Topology> { let found = devices()?;
 		.map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	let host = host.trim().to_owned(); let mut nodes = found .iter()
 		.map(|gpu| DeviceInfo { name: format!("{host}:{}", gpu.name), host: host.clone() }) .collect::<Vec<_>>();
-	let remote = reachable_nodes()?;
+	let remote: &[RemoteNode] = if multi_device() { reachable_nodes()? } else { &[] };
 	nodes.extend(remote.iter().map(|node| node.info.clone()));
 	let name = |gpu: &Gpu| if matches!(&gpu.driver, Driver::Remote(_)) { gpu.name.clone() } else {
 		format!("{host}:{}", gpu.name) };
@@ -1411,7 +1468,8 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 	} } #[cfg(any(amd, nvidia))] #[link(name = "dl")] unsafe extern "C" {
 	fn dlopen(name: *const std::ffi::c_char, flags: i32) -> Ptr;
 	fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr; } unsafe extern "C" {
-	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize; } fn distance(left: &[f64], right: &[f64]) -> f64 {
+	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
+	fn write(file: i32, bytes: *const c_void, length: usize) -> isize; } fn distance(left: &[f64], right: &[f64]) -> f64 {
 	left.iter().zip(right).map(|(a, b)| (a - b).powi(2)).sum() }
 fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) { state.chunks_exact(features) .enumerate()
 		.map(|(index, row)| (index, distance(query, row))) .min_by(|left, right| left.1.total_cmp(&right.1))
@@ -1425,7 +1483,7 @@ fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gp
 	let sample_count = checked_mul(targets.len(), input.elements(), "surrogate samples")?;
 	require(samples.len() == sample_count, "surrogate sample batch is invalid")?;
 	let model = recipe.model().layer(hidden).tanh().layer(1); let prepared = Prepared { samples: samples.to_vec(),
-		targets: targets.to_vec(), rows: targets.len(), features: input.elements(), schema: String::new(), };
+		targets: targets.to_vec(), rows: targets.len(), features: input.elements(), schema: String::new(), sequence: None, };
 	let graph = compile_output(&model, &prepared, prepared.rows, gpu, config, 1)?;
 	let mut tape = GpuTape::new(&graph, samples, targets, gpu)?; for _ in 0..config.surrogate_epochs {
 		tape.advance()?;
@@ -1500,14 +1558,17 @@ impl<T: Clone + Into<String>> IntoDataSources for &[T] { fn into_data_sources(se
 		self.sources.push(source.into()); self } pub const fn norm(mut self, _: ZScore) -> Self {
 		self.normalize = true; self } pub const fn split(mut self, fraction: f64) -> Self {
 		self.split = fraction; self } } struct Prepared { samples: Vec<f64>, targets: Vec<f64>, rows: usize, features: usize,
-	schema: String, } struct ChildTable { name: String, headers: Vec<String>, rows: usize, } struct Table { name: String,
+	schema: String, sequence: Option<Shape>, } struct ChildTable { name: String, headers: Vec<String>, rows: usize, } struct Table { name: String,
 	headers: Vec<String>, rows: Vec<Vec<String>>, children: Vec<ChildTable>, } enum FeatureType { Numeric(&'static str),
 	Categorical(Vec<String>), Text(usize), } fn prepare(data: &Data) -> Result<&Prepared> {
 	match data.prepared.get_or_init(|| prepare_data(data)) { Ok(prepared) => Ok(prepared),
 		Err(error) => Err(error.clone()), } }
 fn column_match(name: &str, table: &Table, header: &str, column: usize) -> bool {
 	name == header || name == format!("{}.{}", table.name, header) || name == format!("col{}", column + 1)
-		|| name == format!("{}.col{}", table.name, column + 1) }
+		|| name == format!("{}.col{}", table.name, column + 1)
+		|| header.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.')) || header.rsplit_once('.').is_some_and(|(base, row)| {
+			row.parse::<usize>().is_ok() && (base == name || base.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.')))
+		}) }
 fn print_table(table: &Table, fit: usize, targets: &[String], exclusions: &[String]) {
 	eprintln!("{:<37} {:<10} {:<9} {} samples", table.name, "", "", table.rows.len());
 	let mut base = 0; for child in &table.children {
@@ -1553,13 +1614,20 @@ fn print_table(table: &Table, fit: usize, targets: &[String], exclusions: &[Stri
 				let excluded = data.exclusions.iter().any(|name| column_match(name, value, header, column));
 				if !selected.contains(&(table, column)) && !excluded {
 					columns.push((table, column, infer_feature(value, column, fit_rows))); } } } }
-	let features = columns.iter().map(|column| column.2.width()).sum();
+	let features = columns.iter().map(|column| column.2.width()).sum(); let mut sequence_widths = BTreeMap::new();
+	let repeated = columns.iter().all(|column| tables[column.0].headers[column.1].rsplit_once('.').and_then(|value| {
+		value.1.parse::<usize>().ok().map(|row| *sequence_widths.entry(row).or_insert(0) += column.2.width()) }).is_some());
+	let sequence = (repeated && sequence_widths.len() > 1 && sequence_widths.keys().copied().eq(1..=sequence_widths.len())
+		&& sequence_widths.values().all(|width| *width == sequence_widths[&1])).then(|| Shape {
+			channels: sequence_widths[&1], length: sequence_widths.len(), });
 	require(features != 0, "dataset has no training features")?; let target_categories =
 		selected.iter().map(|target| categories(&tables[target.0], target.1, fit_rows)).collect::<Vec<_>>();
 	let mut samples = Vec::new();
 	let mut targets = Vec::new(); for row in 0..row_count {
 		let mut encoded = Vec::with_capacity(features); let valid = columns.iter().all(|column| {
 			tables[column.0].rows[row].get(column.1).is_some_and(|value| encode(value, &column.2, &mut encoded)) });
+		if valid { if let Some(shape) = sequence { let mut ordered = Vec::with_capacity(features); for channel in 0..shape.channels {
+			for position in 0..shape.length { ordered.push(encoded[position * shape.channels + channel]); } } encoded = ordered; } }
 		if valid && selected.is_empty() { samples.extend_from_slice(&encoded);
 			targets.push(0.0); } else if valid { for (target, categories) in selected.iter().zip(&target_categories) {
 				let value = tables[target.0].rows[row].get(target.1);
@@ -1574,7 +1642,7 @@ fn print_table(table: &Table, fit: usize, targets: &[String], exclusions: &[Stri
 		.iter() .map(|column| {
 			format!("{}.{}:{}", tables[column.0].name, tables[column.0].headers[column.1], column.2.width()) })
 		.collect::<Vec<_>>() .join("|") + "->" + &data.target.join("|");
-	Ok(Prepared { samples, targets, rows, features, schema }) }
+	Ok(Prepared { samples, targets, rows, features, schema, sequence }) }
 fn normalize_samples(samples: &mut [f64], features: usize, fit: usize) -> Result<()> {
 	require(fit != 0, "split must retain normalization rows")?;
 	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?; for column in 0..features {
@@ -1737,14 +1805,16 @@ fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, features: usize) -> R
 		let initial_loss = model_loss(&initial_predictions, targets, model.loss, config.activation[7]);
 		let tolerance = self.stop.unwrap_or(0.0);
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
-	for _ in 0..self.epochs { let cases = runtime.propose(&stored.graph, &mut tape)?;
+	for _ in 0..self.epochs { let proposed = runtime.propose(&stored.graph, &mut tape);
+		let cases = self.finish_dispatch(proposed, &mut stored, &prepared.schema, &tape, None)?;
 		let started = Instant::now(); let dispatched = tape.advance()
 			.and_then(|_| tape.epoch(self.learning_rate, model.loss, tolerance, config, false));
 		let (loss, saved) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
 		let (predictions, seconds) = (tape.predictions()?, started.elapsed().as_secs_f64());
 			self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, saved.then_some(true))?;
-			runtime.learn(&cases, &tape, config).map(|_|
-				self.print(model, run, tape.step as usize, loss, targets, &predictions, seconds, saved))?;
+		let learned = runtime.learn(&cases, &tape, config);
+			self.finish_dispatch(learned, &mut stored, &prepared.schema, &tape, None)?;
+			self.print(model, run, tape.step as usize, loss, targets, &predictions, seconds, saved);
 			self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, None)?; } if self.stop.is_some() {
 			tape.restore_best()?; }
 	self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
@@ -1843,7 +1913,7 @@ fn rat_schema(data: &Data) -> String { data.routes .iter()
 fn append_model( graph: &mut Graph, model: &Model, features: usize, outputs: usize, rows: usize,
 	gpu: &'static Gpu, config: Config, schema: &str, ) -> Result<(i32, (usize, usize))> { let prepared = Prepared {
 		samples: vec![0.0; rows * features],
-		targets: vec![0.0; rows], rows, features, schema: schema.to_owned(),
+		targets: vec![0.0; rows], rows, features, schema: schema.to_owned(), sequence: None,
 	};
 	let part = compile_output(model, &prepared, rows, gpu, config, outputs)?;
 	let start = graph.parameters.len();

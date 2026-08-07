@@ -37,6 +37,7 @@ nvidia-device-library = "/opt/cuda/nvvm/libdevice/libdevice.10.bc"
 ssh-config = ".ssh/config"
 
 [package.metadata.train]
+multi-device = false
 epochs = 1
 learning-rate = 0.01
 initial-weight = 0.01
