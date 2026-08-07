@@ -19,7 +19,6 @@ path = "cli.rs"
 
 [package.metadata.recipe]
 dependency-allowlist = []
-hsa-architecture-probe = "/usr/bin/amdgpu-arch"
 hsa-compiler = "/opt/rocm/lib/llvm/bin/clang"
 hsa-disassembler = "/opt/rocm/lib/llvm/bin/llvm-objdump"
 hsa-library = "/opt/rocm/lib"
@@ -29,7 +28,6 @@ hsa-clock-library = "/opt/rocm/amdgcn/bitcode/ockl.bc"
 hsa-device-library-directory = "/opt/rocm/amdgcn/bitcode"
 hsa-finite-library = "/opt/rocm/amdgcn/bitcode/oclc_finite_only_off.bc"
 hsa-math-library = "/opt/rocm/amdgcn/bitcode/oclc_unsafe_math_off.bc"
-nvidia-architecture-probe = "/usr/bin/nvidia-smi"
 nvidia-minimum-architecture = "sm_70"
 nvidia-ptx = "ptx71"
 nvidia-compiler = "/usr/bin/clang"

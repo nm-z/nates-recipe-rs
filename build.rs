@@ -36,14 +36,15 @@ fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> { setting(mani
 		.strip_prefix('"')
 		.and_then(|value| value.strip_suffix('"'))
 		.ok_or_else(|| io::Error::other(format!("{key} must be quoted")).into()) }
-fn probe(manifest: &str, key: &str) -> BuildResult<Vec<String>> {
-	let output = Command::new(text(manifest, key)?).output()?; if !output.status.success() {
-		return Err(io::Error::other(format!("{key} failed")).into()); }
-	let text = String::from_utf8(output.stdout)?;
-	let mut values = text.lines().filter(|value| !value.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+fn architectures(manifest: &str) -> BuildResult<Vec<String>> {
+	let directory = text(manifest, "hsa-device-library-directory")?;
+	let mut values = Vec::new(); for entry in fs::read_dir(directory)? {
+		let name = entry?.file_name().into_string().map_err(|_| io::Error::other("ISA library name is not UTF-8"))?;
+		if let Some(version) = name.strip_prefix("oclc_isa_version_").and_then(|value| value.strip_suffix(".bc"))
+			&& !version.contains('-') { values.push(format!("gfx{version}")); } }
 	values.sort();
 	values.dedup(); if values.is_empty() {
-		return Err(io::Error::other(format!("{key} found no device")).into()); } Ok(values) }
+		return Err(io::Error::other("hsa-device-library-directory has no ISA libraries").into()); } Ok(values) }
 fn run(command: &mut Command, role: &str) -> BuildResult<()> { let status = command.status()?; if !status.success() {
 		return Err(io::Error::other(format!("{role} failed")).into()); } Ok(()) }
 fn render(command: &mut Command, role: &str, path: &Path) -> BuildResult<()> { let output = command.output()?;
@@ -55,7 +56,7 @@ fn render(command: &mut Command, role: &str, path: &Path) -> BuildResult<()> { l
 	fs::write(&source, ir)?;
 	let mut objects = Vec::new();
 	let mut embeds = Vec::new();
-	let mut assemblies = Vec::new(); for architecture in probe(manifest, "hsa-architecture-probe")? {
+	let mut assemblies = Vec::new(); for architecture in architectures(manifest)? {
 		let output = out.join(format!("recipe-{architecture}.hsaco"));
 		let mut command = Command::new(text(manifest, "hsa-compiler")?);
 		command.args(["-target", "amdgcn-amd-amdhsa", &format!("-mcpu={architecture}"), "-O2", "-nogpulib"]);
@@ -64,13 +65,18 @@ fn render(command: &mut Command, role: &str, path: &Path) -> BuildResult<()> { l
 		let isa = Path::new(text(manifest, "hsa-device-library-directory")?)
 			.join(format!("oclc_isa_version_{}.bc", architecture.trim_start_matches("gfx")));
 		command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(isa).arg(&source).arg("-o").arg(&output);
-		run(&mut command, "HSA LLVM IR compiler")?;
-		let assembly = out.join(format!("recipe-{architecture}.amd.s")); render(
+		if run(&mut command, "HSA LLVM IR compiler").is_err() {
+			println!("cargo:warning=skipped {architecture}: the HSA kernel does not compile for it");
+			continue; }
+		let assembly = out.join(format!("recipe-{architecture}.amd.s")); if render(
 			Command::new(text(manifest, "hsa-disassembler")?).arg("--disassemble").arg(&output), "HSA disassembler", &assembly,
-		)?;
+		).is_err() {
+			println!("cargo:warning=skipped {architecture}: the HSA object does not disassemble");
+			continue; }
 		objects.push(format!("{architecture}={}", output.display()));
 		embeds.push(format!("(\"{architecture}\", include_bytes!(\"{}\").as_slice()),", output.display()));
 		assemblies.push(format!("{architecture}={}", assembly.display())); }
+	if objects.is_empty() { return Err(io::Error::other("no HSA architecture compiled").into()); }
 	let table = format!("static HSA_CODE_OBJECTS: &[(&str, &[u8])] = &[{}]\x3b", embeds.join(" "));
 	fs::write(out.join("hsa-embed.rs"), table)?;
 	println!("cargo:rustc-env=RECIPE_HSA_CODE_OBJECTS={}", objects.join("\x3b"));
@@ -123,9 +129,11 @@ fn main() -> BuildResult<()> { let manifest = fs::read_to_string("Cargo.toml")?;
 	let out = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR must be configured"))?);
 	println!("cargo::rustc-check-cfg=cfg(amd)");
 	println!("cargo::rustc-check-cfg=cfg(nvidia)");
-	let amd = probe(&manifest, "hsa-architecture-probe").is_ok();
-	let nvidia = probe(&manifest, "nvidia-architecture-probe").is_ok(); if !amd && !nvidia {
-		return Err(io::Error::other("no AMD or NVIDIA GPU was detected on the build machine").into()); } if amd {
+	let toolchain = |compiler: &str, library: &str| -> BuildResult<bool> {
+		Ok(Path::new(text(&manifest, compiler)?).exists() && Path::new(text(&manifest, library)?).exists()) };
+	let amd = toolchain("hsa-compiler", "hsa-device-library")?;
+	let nvidia = toolchain("nvidia-compiler", "nvidia-device-library")?; if !amd && !nvidia {
+		return Err(io::Error::other("no ROCm or CUDA toolchain is installed on the build machine").into()); } if amd {
 		println!("cargo:rustc-cfg=amd");
 		compile_amd(&manifest, &out)?; } if nvidia {
 		println!("cargo:rustc-cfg=nvidia");
