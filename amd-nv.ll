@@ -1564,10 +1564,8 @@ br i1 %route.more, label %route.gradient.step, label %node.done route.gradient.s
 %route.row.base = mul i32 %route.row, %route.stride %route.index = add i32 %route.row.base, %route.field
 %route.target.ptr = getelementptr inbounds double, ptr addrspace(1) %route.target, i32 %route.index
 %route.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %route.p
-%route.old = load double, ptr addrspace(1) %route.target.ptr, align 8
 %route.delta = load double, ptr addrspace(1) %route.delta.ptr, align 8
-%route.value = fadd double %route.old, %route.delta
-store double %route.value, ptr addrspace(1) %route.target.ptr, align 8
+%route.old = atomicrmw fadd ptr addrspace(1) %route.target.ptr, double %route.delta monotonic, align 8
 %route.next = add i32 %route.p, %threads br label %route.gradient.loop normalization.stats.loop:
 %normalization.stats.group = phi i32 [ %tid, %node.load ], [ %normalization.stats.next, %normalization.stats.store ]
 %normalization.mode = fptoui double %argument to i32 %normalization.batch = icmp eq i32 %normalization.mode, 0
