@@ -24,23 +24,22 @@ nvidia = []
 
 [package.metadata.recipe]
 dependency-allowlist = []
-hsa-architecture = "gfx1101"
+hsa-architecture-probe = "/usr/bin/amdgpu-arch"
 hsa-compiler = "/opt/rocm/lib/llvm/bin/clang"
 hsa-disassembler = "/opt/rocm/lib/llvm/bin/llvm-objdump"
 hsa-library = "/opt/rocm/lib"
 hsa-runtime = "libhsa-runtime64.so.1"
 hsa-device-library = "/opt/rocm/amdgcn/bitcode/ocml.bc"
-hsa-isa-library = "/opt/rocm/amdgcn/bitcode/oclc_isa_version_1101.bc"
+hsa-device-library-directory = "/opt/rocm/amdgcn/bitcode"
 hsa-finite-library = "/opt/rocm/amdgcn/bitcode/oclc_finite_only_off.bc"
 hsa-math-library = "/opt/rocm/amdgcn/bitcode/oclc_unsafe_math_off.bc"
-nvidia-architecture = "sm_86"
+nvidia-minimum-architecture = "sm_70"
 nvidia-ptx = "ptx71"
 nvidia-compiler = "/usr/bin/clang"
-nvidia-assembler = "/opt/cuda/bin/ptxas"
-nvidia-disassembler = "/opt/cuda/bin/nvdisasm"
 nvidia-library = "/usr/lib"
 nvidia-runtime = "libcuda.so.1"
 nvidia-device-library = "/opt/cuda/nvvm/libdevice/libdevice.10.bc"
+ssh-config = ".ssh/config"
 
 [package.metadata.train]
 epochs = 1
@@ -53,13 +52,12 @@ adamw-weight-decay = 0.01
 kmeans-iterations = 8
 surrogate-epochs = 8
 surrogate-rate = 0.01
+surrogate-width = 8
 rat-batch-rows = 32
-contraction-tile-m = 4
-contraction-tile-n = 64
-contraction-tile-k = 64
-contraction-tile-m-max = 32
-contraction-tile-n-max = 256
-contraction-tile-k-max = 2048
+topology-latency-bytes = 8
+topology-bandwidth-bytes = 1048576
+topology-probe-repetitions = 4
+ssh-connect-timeout-seconds = 5
 random-seed = 17
 normalization-epsilon = 0.00001
 leak-slope = 0.01

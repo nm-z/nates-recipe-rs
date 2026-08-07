@@ -2,7 +2,7 @@ target triple = "amdgcn-amd-amdhsa" declare i32 @llvm.amdgcn.workitem.id.x()
 declare void @llvm.amdgcn.s.barrier() declare double @llvm.sqrt.f64(double) declare double @llvm.fabs.f64(double)
 declare double @__ocml_exp_f64(double) declare double @__ocml_tanh_f64(double) declare double @__ocml_cos_f64(double)
 declare double @__ocml_sin_f64(double) declare double @__ocml_log_f64(double) declare void @llvm.trap()
-@contraction.tile = internal addrspace(3) global [RECIPE_CONTRACTION_TILE_K_MAX x double] undef, align 8
+@contraction_tile = external addrspace(3) global [0 x double], align 8
 define internal double @contraction_input(
 ptr addrspace(1) %input, i32 %row.base, i32 %position, i32 %term, i32 %span, i32 %length, i1 %conv ) #1 { entry:
 %channel = udiv i32 %term, %span %window = urem i32 %term, %span
@@ -55,8 +55,8 @@ br i1 %load.more, label %load.step, label %load.done load.step:
 %term = add i32 %term.base, %load
 %value = call double @contraction_input( ptr addrspace(1) %input, i32 %row.base, i32 %position,
 i32 %term, i32 %span, i32 %in.length, i1 %is.conv )
-%tile.ptr = getelementptr inbounds [RECIPE_CONTRACTION_TILE_K_MAX x double],
-ptr addrspace(3) @contraction.tile, i32 0, i32 %load
+%tile.ptr = getelementptr [0 x double],
+ptr addrspace(3) @contraction_tile, i32 0, i32 %load
 store double %value, ptr addrspace(3) %tile.ptr, align 8
 %load.next = add i32 %load, %block br label %load.loop load.done:
 call void @recipe.local.barrier() br label %compute.loop compute.loop:
@@ -64,8 +64,8 @@ call void @recipe.local.barrier() br label %compute.loop compute.loop:
 %partial = phi double [ %sum, %load.done ], [ %partial.next, %compute.step ]
 %compute.more = icmp ult i32 %i, %k.count
 br i1 %compute.more, label %compute.step, label %compute.done compute.step:
-%input.ptr = getelementptr inbounds [RECIPE_CONTRACTION_TILE_K_MAX x double],
-ptr addrspace(3) @contraction.tile, i32 0, i32 %i
+%input.ptr = getelementptr [0 x double],
+ptr addrspace(3) @contraction_tile, i32 0, i32 %i
 %x = load double, ptr addrspace(3) %input.ptr, align 8
 %weight.channel.base = mul i32 %channel, %terms %weight.term = add i32 %term.base, %i
 %weight.index = add i32 %weight.channel.base, %weight.term
@@ -691,8 +691,8 @@ br i1 %job.more, label %gradient.job.step, label %previous.loop gradient.job.ste
 gradient.initial.load: %initial.filter.base = mul i32 %filter, %out.length
 %initial.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %initial.filter.base
 %initial.delta = load double, ptr addrspace(1) %initial.delta.ptr, align 8
-%initial.tile.ptr = getelementptr inbounds [RECIPE_CONTRACTION_TILE_K_MAX x double],
-ptr addrspace(3) @contraction.tile, i32 0, i32 0
+%initial.tile.ptr = getelementptr [0 x double],
+ptr addrspace(3) @contraction_tile, i32 0, i32 0
 store double %initial.delta, ptr addrspace(3) %initial.tile.ptr, align 8 br label %gradient.initial.done
 gradient.initial.done: call void @recipe.local.barrier() br label %gradient.item.loop gradient.item.loop:
 %row = phi i32 [ 0, %gradient.initial.done ], [ %next.row, %gradient.tile.done ]
@@ -712,14 +712,14 @@ gradient.next.load: %next.delta.row.base = mul i32 %next.row, %out.elements
 %next.delta.index = add i32 %next.delta.row.base, %next.delta.local
 %next.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %next.delta.index
 %next.delta = load double, ptr addrspace(1) %next.delta.ptr, align 8
-%next.tile.ptr = getelementptr inbounds [RECIPE_CONTRACTION_TILE_K_MAX x double],
-ptr addrspace(3) @contraction.tile, i32 0, i32 %next.buffer
+%next.tile.ptr = getelementptr [0 x double],
+ptr addrspace(3) @contraction_tile, i32 0, i32 %next.buffer
 store double %next.delta, ptr addrspace(3) %next.tile.ptr, align 8 br label %gradient.compute gradient.compute:
 %input.row.base = mul i32 %row, %in.elements
 %input.value = call double @contraction_input( ptr addrspace(1) %input, i32 %input.row.base, i32 %position,
 i32 %gradient.term, i32 %span, i32 %in.length, i1 %is.conv )
-%tile.ptr = getelementptr inbounds [RECIPE_CONTRACTION_TILE_K_MAX x double],
-ptr addrspace(3) @contraction.tile, i32 0, i32 %buffer
+%tile.ptr = getelementptr [0 x double],
+ptr addrspace(3) @contraction_tile, i32 0, i32 %buffer
 %delta.value = load double, ptr addrspace(3) %tile.ptr, align 8 %product = fmul double %input.value, %delta.value
 %candidate = fadd double %sum, %product %sum.next = select i1 %active, double %candidate, double %sum
 br label %gradient.tile.done gradient.tile.done: call void @recipe.local.barrier()
@@ -1311,7 +1311,11 @@ ptr addrspace(1) %metrics, ptr addrspace(1) %gradient, ptr addrspace(1) %moments
 ptr addrspace(1) %variances, ptr addrspace(1) %best.loss, i32 %rows, i32 %nodes, i32 %parameter.count, i32 %loss.code,
 double %huber.threshold, double %rate, double %beta1, double %beta2,
 double %beta1.power, double %beta2.power, double %epsilon, double %decay, double %tolerance, i32 %step,
-i32 %threads, i32 %tile.m, i32 %tile.n, i32 %tile.k ) #0 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
+i32 %threads, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %phase ) #0 { entry:
+%tid = call i32 @llvm.amdgcn.workitem.id.x()
+%optimizer.only = icmp eq i32 %phase, 2
+%gradient.only = icmp eq i32 %phase, 1
+br i1 %optimizer.only, label %optimizer.entry, label %forward.entry forward.entry:
 call void @tape_forward_body( ptr addrspace(1) %samples, ptr addrspace(1) %weights, ptr addrspace(1) %value.pointers,
 ptr addrspace(1) %context.pointers, ptr addrspace(1) %descriptors, ptr addrspace(1) %arguments,
 i32 %rows, i32 %nodes, i32 %threads, i32 %tile.m, i32 %tile.n, i32 %tile.k )
@@ -1437,7 +1441,8 @@ double %huber.threshold, double %seed.loss, i32 %items )
 store double %seed.value, ptr addrspace(1) %seed.ptr, align 8 %seed.next = add i32 %seed.p, %threads br label %seed.loop
 reverse.entry: call void @llvm.amdgcn.s.barrier() %reverse.first = sub i32 %nodes, 1 br label %reverse.loop
 reverse.loop: %node = phi i32 [ %reverse.first, %reverse.entry ], [ %node.next, %node.done ]
-%node.more = icmp sge i32 %node, 0 br i1 %node.more, label %node.load, label %optimizer.entry node.load:
+%node.more = icmp sge i32 %node, 0 br i1 %node.more, label %node.load, label %backward.done backward.done:
+br i1 %gradient.only, label %exit, label %optimizer.entry node.load:
 %base = mul i32 %node, 11 %descriptor.ptr = getelementptr inbounds i32, ptr addrspace(1) %descriptors, i32 %base
 %descriptor.second.ptr = getelementptr inbounds i32, ptr addrspace(1) %descriptor.ptr, i32 4
 %descriptor.first = load <4 x i32>, ptr addrspace(1) %descriptor.ptr, align 4
