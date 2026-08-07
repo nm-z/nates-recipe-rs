@@ -1459,11 +1459,30 @@ impl<T: Clone + Into<String>> IntoDataSources for &[T] { 	fn into_data_sources(s
 	pub const fn norm(mut self, _: ZScore) -> Self { 		self.normalize = true; 		self 	}
 	pub const fn split(mut self, fraction: f64) -> Self { 		self.split = fraction; 		self 	} } struct Prepared {
 	samples: Vec<f64>, 	targets: Vec<f64>, 	rows: usize,
-	features: usize, 	schema: String, } struct Table { 	name: String,
-	headers: Vec<String>, 	rows: Vec<Vec<String>>, } enum FeatureType { 	Numeric(&'static str), 	Categorical(Vec<String>),
+	features: usize, 	schema: String, } struct ChildTable { 	name: String, 	headers: Vec<String>, 	rows: usize, }
+struct Table { 	name: String, 	headers: Vec<String>, 	rows: Vec<Vec<String>>, 	children: Vec<ChildTable>, }
+enum FeatureType { 	Numeric(&'static str), 	Categorical(Vec<String>),
 	Text(usize), }
 fn prepare(data: &Data) -> Result<&Prepared> { 	match data.prepared.get_or_init(|| prepare_data(data)) {
 		Ok(prepared) => Ok(prepared), 		Err(error) => Err(error.clone()), 	} }
+fn print_table(table: &Table, fit: usize) { 	if table.children.is_empty() {
+		for (column, header) in table.headers.iter().enumerate() {
+			let kind = infer_feature(table, column, fit.min(table.rows.len()));
+			let samples = table.rows.iter().filter(|row| row.get(column).is_some_and(|item| !item.is_empty())).count();
+			eprintln!("{:<37} {:<9} {samples}", format!("{}.{}", table.name, header), kind.name()); 		}
+		return 	}
+	eprintln!("{:<37} {:<9} {} samples", table.name, "", table.rows.len());
+	let mut base = 0; 	for child in &table.children {
+		let unit = if child.rows == 1 { "row/sample" } else { "rows/sample" };
+		eprintln!("{:<37} {:<9} {} {unit}", format!("  {}", child.name), "", child.rows);
+		if child.rows != 0 { 			for (column, header) in child.headers.iter().enumerate() {
+				let kind = infer_feature(table, base + column, fit).name();
+				let same = (1..child.rows).all(|row| {
+					infer_feature(table, base + row * child.headers.len() + column, fit).name() == kind
+				});
+				let kind = if same { kind } else { "mixed" };
+				eprintln!("{:<37} {kind:<9}", format!("    {header}")); 			} 		}
+		base += child.rows * child.headers.len(); 	} }
 fn prepare_data(data: &Data) -> Result<Prepared> { 	let mut paths = Vec::new(); 	for source in &data.sources {
 		collect_files(&expand_home(source)?, &mut paths)?; 	}
 	paths.sort();
@@ -1489,11 +1508,8 @@ fn prepare_data(data: &Data) -> Result<Prepared> { 	let mut paths = Vec::new(); 
 	let row_count = tables[table_index].rows.len();
 	require(selected.iter().all(|target| tables[target.0].rows.len() == row_count), "target row counts differ")?;
 	let fit_rows = ((row_count as f64) * data.split).floor().max(1.0) as usize;
-	eprintln!("Feature name:                         Dtype:    Samples:"); 	for value in &tables {
-		for (column, header) in value.headers.iter().enumerate() {
-			let kind = infer_feature(value, column, fit_rows.min(value.rows.len())); 			let samples =
-				value.rows.iter().filter(|row| row.get(column).is_some_and(|item| !item.is_empty())).count();
-			eprintln!("{:<37} {:<9} {samples}", format!("{}.{}", value.name, header), kind.name()); 		} 	}
+	eprintln!("Feature name:                         Dtype:    Samples:");
+	for value in &tables { 		print_table(value, fit_rows); 	}
 	let mut columns = Vec::new(); 	for (table, value) in tables.iter().enumerate() { 		if value.rows.len() == row_count {
 			for (column, header) in value.headers.iter().enumerate() { 				let qualified = format!("{}.{}", value.name, header);
 				let excluded = data.exclusions.iter().any(|name| name == header || name == &qualified);
@@ -1564,6 +1580,9 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 	let names = (0..schemas.len()).map(|index| { 		let name = &captures[0][index].name;
 		if captures.iter().all(|capture| capture[index].name == *name) { name.clone() } else { format!("table{}", index + 1) }
 	}).collect::<Vec<_>>();
+	let children = names.iter().zip(&schemas).map(|(name, schema)| ChildTable {
+		name: name.clone(), 		headers: schema.0.clone(), 		rows: schema.1,
+	}).collect();
 	let mut headers = Vec::new(); 	for (table, name) in captures[0].iter().zip(&names) {
 		for row in 0..table.rows.len() { 			for header in &table.headers {
 				if targets.contains(header) { 					headers.push(header.clone());
@@ -1573,7 +1592,7 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 		let row = capture.into_iter().flat_map(|table| table.rows.into_iter().flatten()).collect::<Vec<_>>();
 		require(row.len() == headers.len(), "capture value width differs")?;
 		rows.push(row); 	}
-	Ok(vec![Table { name: "data".to_owned(), headers, rows }]) }
+	Ok(vec![Table { name: "data".to_owned(), headers, rows, children }]) }
 fn merge_partitions(mut tables: Vec<Table>, targets: &[String]) -> Vec<Table> {
 	if targets.is_empty() || targets.iter().any(|target| target.contains('.')) { 		return tables; 	}
 	let members = tables.iter().enumerate().filter_map(|(index, table)| {
@@ -1586,7 +1605,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String]) -> Vec<Table> {
 		for row in std::mem::take(&mut tables[index].rows) {
 			let mut merged = std::iter::repeat_with(String::new).take(headers.len()).collect::<Vec<_>>();
 			for (column, value) in row.into_iter().enumerate() { 				merged[positions[column]] = value; 			}
-			rows.push(merged); 		} 	} 	vec![Table { name: "data".to_owned(), headers, rows }] }
+			rows.push(merged); 		} 	} 	vec![Table { name: "data".to_owned(), headers, rows, children: Vec::new() }] }
 fn parse_table(path: &Path, bytes: &[u8]) -> Result<Table> {
 	let first = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
 	let delimiter = [b',', b';', b'\t'] 		.into_iter()
@@ -1600,7 +1619,8 @@ fn parse_table(path: &Path, bytes: &[u8]) -> Result<Table> {
 	let width = headers.len();
 	rows.retain(|row| row.len() == width);
 	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
-	Ok(Table { name, headers, rows }) } fn records(bytes: &[u8], delimiter: u8) -> Result<Vec<Vec<String>>> {
+	Ok(Table { name, headers, rows, children: Vec::new() }) }
+fn records(bytes: &[u8], delimiter: u8) -> Result<Vec<Vec<String>>> {
 	let mut rows = Vec::new();
 	let mut row = Vec::new();
 	let mut field = Vec::new();
