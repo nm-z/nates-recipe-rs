@@ -6,8 +6,8 @@
 		inputs: Vec<String>, outputs: Vec<String>, input: Option<Shape>, output: Option<Shape>, nodes: Vec<Node>,
 		arguments: usize, parameters: Vec<f64>, frozen: Vec<u8>, programs: Vec<f64>, state: TrainingState, } impl Builder {
 		fn finish(self) -> Result<StoredGraph> {
-			let input = self.input.ok_or_else(|| RecipeError::new("model graph has no input shape"))?;
-			let output = self.output.ok_or_else(|| RecipeError::new("model graph has no output shape"))?;
+			let (input, output) = (self.input.ok_or_else(|| RecipeError::new("model graph has no input shape"))?,
+				self.output.ok_or_else(|| RecipeError::new("model graph has no output shape"))?);
 			require(!self.nodes.is_empty(), "model graph has no nodes")?;
 			require(self.arguments == self.nodes.len(), "model graph node arguments are incomplete")?;
 			require(self.parameters.len() == self.frozen.len(), "model graph frozen weights are incomplete")?;
@@ -34,8 +34,7 @@
 			program_count: value[10] as usize, }) } pub(super) fn load(path: &str) -> Result<(String, Vec<StoredGraph>)> {
 		require(path.ends_with(".ogdl"), "model path requires .ogdl")?; let document =
 			fs::read_to_string(path).map_err(|error| RecipeError::new(format!("cannot read {path}: {error}")))?;
-		let mut schema = String::new();
-		let mut graphs = Vec::new();
+		let (mut schema, mut graphs) = (String::new(), Vec::new());
 		let mut current: Option<Builder> = None; for line in document.lines().map(str::trim) { if line == "recipe-model" {
 				continue; } if line == "graph" { if let Some(value) = current.take() { graphs.push(value.finish()?) }
 				current = Some(Builder::default());
@@ -144,8 +143,7 @@ pub const fn layer(width: usize) -> Residual { Residual::Layer(width) }
 type FitFn = fn(usize, &Prepared, usize, Config, bool) -> Result<Predictor>;
 #[derive(Clone, Copy, Debug)] struct Estimator { fit: FitFn, param: usize, name: &'static str, }
 impl PartialEq for Estimator { fn eq(&self, other: &Self) -> bool {
-	self.param == other.param && self.name == other.name } }
-impl Eq for Estimator {}
+	self.param == other.param && self.name == other.name } } impl Eq for Estimator {}
 #[derive(Clone, Debug, PartialEq, Eq)] enum Operation { Layer(usize),
 	Conv(usize, usize), Pool(usize), Estimator(Estimator), Embed(usize, usize), Attention(usize), Rnn(usize), Gru(usize),
 	Lstm(usize), Residual(Vec<Residual>), Moe(usize, Vec<Residual>), Svm(Vec<Activation>), Perceptron(usize), }
@@ -195,15 +193,13 @@ $(pub fn $method(self, $($argument: $kind),*) -> Self { self.push($operation) })
 		block.normalization = Some(if normalization as usize == batch as usize { BlockNormalization::Batch } else {
 			BlockNormalization::Layer }); self } pub fn loss(mut self, loss: impl ModelLoss) -> Self {
 		loss.apply(&mut self); self } fn description(&self, metrics: &[Metric]) -> String {
-		let operation = metrics.iter().any(|metric| metric.0 == 5);
-		let activation = metrics.iter().any(|metric| metric.0 == 6);
-		let normalization = metrics.iter().any(|metric| metric.0 == 7); self.blocks .iter() .filter_map(|block| {
-				let mut names = Vec::new(); if operation {
+		let (operation, activation, normalization) = (metrics.iter().any(|metric| metric.0 == 5),
+			metrics.iter().any(|metric| metric.0 == 6), metrics.iter().any(|metric| metric.0 == 7));
+		self.blocks .iter() .filter_map(|block| { let mut names = Vec::new(); if operation {
 					names.push(block.operation.name()); } if activation && block.activation != Activation::Linear {
 					names.push(block.activation.name()); } if normalization { block.normalization .map(BlockNormalization::name)
 						.into_iter() .for_each(|name| names.push(name)); } (!names.is_empty()).then(|| names.join(".")) })
-			.collect::<Vec<_>>() .join("/") } }
-impl Estimator { const fn name(&self) -> &'static str { self.name } }
+			.collect::<Vec<_>>() .join("/") } } impl Estimator { const fn name(&self) -> &'static str { self.name } }
 impl Operation { const fn name(&self) -> &'static str {
 		match self { Self::Layer(_) => "layer", Self::Conv(..) => "conv", Self::Pool(_) => "pool",
 			Self::Estimator(value) => value.name(), Self::Embed(..) => "embed", Self::Attention(_) => "attn",
@@ -305,11 +301,16 @@ enum Primitive { Contraction = 0, Pool = 2, Gather = 3, Attention = 4, Scan = 5,
 		self.op(ScalarOpcode::Constant, value, 0.0) } fn choose(&mut self, condition: f64, yes: f64, no: f64) -> f64 {
 		let one = self.constant(1.0);
 		let inverse = self.op(ScalarOpcode::Subtract, one, condition);
-		let selected = self.op(ScalarOpcode::Multiply, condition, yes);
-		let alternative = self.op(ScalarOpcode::Multiply, inverse, no); self.op(ScalarOpcode::Add, selected, alternative) }
+		let (selected, alternative) = (self.op(ScalarOpcode::Multiply, condition, yes),
+			self.op(ScalarOpcode::Multiply, inverse, no)); self.op(ScalarOpcode::Add, selected, alternative) }
 	fn unary(&mut self, opcode: ScalarOpcode, value: f64) -> f64 { self.op(opcode, value, 0.0) } } #[derive(Clone)]
 struct Node { op: Primitive, source: i32, second: i32, input: Shape, output: Shape, offset: usize, parameters: usize,
-	argument: [f64; 9], program_offset: usize, program_count: usize, } #[derive(Clone, Default)] struct TrainingState {
+	argument: [f64; 9], program_offset: usize, program_count: usize, }
+impl Node { fn tile_dimensions(&self) -> Option<[f64; 3]> {
+	match self.op { Primitive::Contraction => Some([self.output.length as f64, self.output.channels as f64,
+		self.input.channels as f64 * self.argument[0].max(1.0)]), Primitive::Attention => Some([
+		self.output.length as f64, self.output.channels as f64, self.input.channels as f64, ]), _ => None, } } }
+#[derive(Clone, Default)] struct TrainingState {
 	moments: Vec<f64>, variances: Vec<f64>, best: Vec<f64>, best_loss: Vec<f64>, epoch: usize, } #[derive(Clone)]
 struct Graph { nodes: Vec<Node>, parameters: Vec<f64>, frozen: Vec<u8>, programs: Vec<f64>, input: Shape, output: Shape,
 	source: i32, state: TrainingState, }
@@ -336,8 +337,7 @@ fn route_graph(graph: &mut Graph, names: &[String], fields: &[(String, Field)], 
 	let offset = graph.programs.len(); for name in names {
 		let value = field(fields, name)?;
 		graph.programs.extend([f64::from(value.source), value.stride as f64, value.index as f64]); }
-	let output = Shape { channels: names.len(), length: 1 };
-	let argument = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+	let (output, argument) = (Shape { channels: names.len(), length: 1 }, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
 	push_node(graph, Primitive::Route, output, 0, argument, -2)?;
 	let node = graph.nodes.last_mut().ok_or_else(|| RecipeError::new("RAT route node is absent"))?;
 	node.program_offset = offset;
@@ -345,8 +345,7 @@ fn route_graph(graph: &mut Graph, names: &[String], fields: &[(String, Field)], 
 		let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
 		push_node(graph, Primitive::Normalize, output, 0, arguments(0.0, epsilon), -2)?; } Ok(()) }
 fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> { let source = graph.source;
-	let node_base = narrow(graph.nodes.len(), "RAT graph nodes")?;
-	let weight_base = graph.parameters.len();
+	let (node_base, weight_base) = (narrow(graph.nodes.len(), "RAT graph nodes")?, graph.parameters.len());
 	let program_base = graph.programs.len(); for node in &mut part.nodes {
 		node.source = if node.source < 0 { source } else { node.source + node_base }; if node.second >= 0 {
 			node.second += node_base } node.offset = checked_add(node.offset, weight_base, "RAT weight offset")?;
@@ -377,16 +376,14 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> { let source 
 	let elements = checked_mul(rows, graph.output.elements(), "node batch")?;
 	narrow(elements, "GPU node batch")?; Ok(()) } fn push_node( graph: &mut Graph, op: Primitive, output: Shape,
 	parameters: usize, argument: [f64; 9], second: i32, ) -> Result<()> {
-	let source = graph.source;
-	let offset = graph.parameters.len();
+	let (source, offset) = (graph.source, graph.parameters.len());
 	graph.parameters.resize(checked_add(offset, parameters, "model parameters")?, 0.0);
 	graph.frozen.resize(graph.parameters.len(), 0); graph.nodes.push(Node { op, source, second, input: graph.output,
 		output, offset, parameters, argument, program_offset: 0, program_count: 0, });
 	graph.output = output;
 	graph.source = graph.nodes.len() as i32 - 1; Ok(()) }
 fn push_program(graph: &mut Graph, second: i32, initial: &[f64], program: ScalarProgram) -> Result<()> {
-	let program_offset = graph.programs.len();
-	let program_count = program.0.len() / 3;
+	let (program_offset, program_count) = (graph.programs.len(), program.0.len() / 3);
 	graph.programs.extend(program.0);
 	let arguments = arguments(0.0, 0.0);
 	push_node(graph, Primitive::Elementwise, graph.output, initial.len(), arguments, second)?;
@@ -395,10 +392,8 @@ fn push_program(graph: &mut Graph, second: i32, initial: &[f64], program: Scalar
 	node.program_offset = program_offset;
 	node.program_count = program_count; Ok(()) }
 fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -> Result<()> {
-	let mut program = ScalarProgram(Vec::new());
-	let x = -1.0;
-	let zero = program.constant(0.0);
-	let one = program.constant(1.0);
+	let (mut program, x) = (ScalarProgram(Vec::new()), -1.0);
+	let (zero, one) = (program.constant(0.0), program.constant(1.0));
 	let positive = program.op(ScalarOpcode::Greater, x, zero);
 	let constant = |program: &mut ScalarProgram, value| program.constant(value); let result = match activation {
 		Activation::Cos => program.unary(ScalarOpcode::Cos, x), Activation::Exp => program.unary(ScalarOpcode::Exp, x),
@@ -453,8 +448,8 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 	debug_assert_eq!(result as usize + 1, program.0.len() / 3); push_program(graph, -2, initial, program) }
 fn lower_project(graph: &mut Graph, channels: usize) -> Result<()> {
 	require(channels != 0, "layer width must be positive")?;
-	let parameters = checked_mul(graph.output.channels, channels, "projection parameters")?;
-	let output = Shape { channels, length: graph.output.length };
+	let (parameters, output) = (checked_mul(graph.output.channels, channels, "projection parameters")?,
+		Shape { channels, length: graph.output.length });
 	push_node(graph, Primitive::Contraction, output, parameters, [0.0; 9], -2) }
 fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	require(filters != 0 && kernel != 0, "convolution dimensions must be positive")?;
@@ -467,8 +462,8 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> { require(size != 0,
 	push_node(graph, Primitive::Pool, output, 0, arguments(size as f64, 0.0), -2) }
 fn lower_gather(graph: &mut Graph, dimensions: usize, vocabulary: usize) -> Result<()> {
 	require(dimensions != 0 && vocabulary != 0, "embedding dimensions must be positive")?;
-	let parameters = checked_mul(dimensions, vocabulary, "embedding table")?;
-	let output = Shape { channels: dimensions, length: graph.output.elements() };
+	let (parameters, output) = (checked_mul(dimensions, vocabulary, "embedding table")?,
+		Shape { channels: dimensions, length: graph.output.elements() });
 	push_node(graph, Primitive::Gather, output, parameters, arguments(vocabulary as f64, 0.0), -2) }
 fn lower_attention(graph: &mut Graph, heads: usize) -> Result<()> {
 	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
@@ -535,9 +530,7 @@ fn select( graph: &mut Graph, branches: &[i32], scores: &[i32], shape: Shape, to
 fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Residual], config: Config) -> Result<()> {
 	require(!experts.is_empty(), "moe requires an expert")?;
 	require(top_k != 0 && top_k <= experts.len(), "moe top-k is invalid")?;
-	let source = graph.source;
-	let input = graph.output;
-	let mut branches = Vec::with_capacity(experts.len());
+	let (source, input, mut branches) = (graph.source, graph.output, Vec::with_capacity(experts.len()));
 	let mut output = None; for value in experts {
 		let (branch, shape) = expert(graph, source, input, value, config)?; if let Some(expected) = output {
 			require(shape == expected, "moe experts must have one output shape")?; }
@@ -551,16 +544,14 @@ fn lower_moe(graph: &mut Graph, top_k: usize, experts: &[Residual], config: Conf
 		scores.push(graph.source); } select(graph, &branches, &scores, output, top_k, config) }
 fn lower_svm(graph: &mut Graph, choices: &[Activation], config: Config) -> Result<()> {
 	let choices = if choices.is_empty() { &ACTIVATIONS } else { choices };
-	let source = graph.source;
-	let shape = graph.output;
-	let mut branches = Vec::with_capacity(choices.len());
+	let (source, shape, mut branches) = (graph.source, graph.output, Vec::with_capacity(choices.len()));
 	let mut scores = Vec::with_capacity(choices.len()); for &choice in choices {
 		branches.push(activation(graph, source, shape, choice, config)?.0);
 		scores.push(parameter(graph, source, shape)?); } select(graph, &branches, &scores, shape, 1, config) }
 fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
 	require(channels != 0, "recurrent width must be positive")?;
-	let input = checked_mul(graph.output.channels, channels, "scan input matrix")?;
-	let state = checked_mul(channels, channels, "scan state matrix")?;
+	let (input, state) = (checked_mul(graph.output.channels, channels, "scan input matrix")?,
+		checked_mul(channels, channels, "scan state matrix")?);
 	let stride = checked_add(checked_add(input, state, "scan gate")?, channels, "scan bias")?;
 	let output = Shape { channels, length: graph.output.length }; push_node( graph, Primitive::Scan, output,
 		checked_mul(gates, stride, "scan parameters")?, arguments(gates as f64, 0.0), -2, ) }
@@ -609,7 +600,7 @@ fn checked_mul(left: usize, right: usize, role: &str) -> Result<usize> {
 	left.checked_mul(right).ok_or_else(|| RecipeError::new(format!("{role} overflows"))) }
 fn require(condition: bool, message: impl Into<String>) -> Result<()> {
 	condition.then_some(()).ok_or_else(|| RecipeError::new(message)) } fn logistic(value: f64) -> f64 {
-	1.0 / (1.0 + (-value).exp()) } #[derive(Clone, Copy, PartialEq, Eq)] struct Tile { m: u32, n: u32, k: u32, }
+	1.0 / (1.0 + (-value).exp()) } #[derive(Clone, Copy, PartialEq, Eq)] #[repr(C)] struct Tile { m: u32, n: u32, k: u32, }
 impl Tile { fn proposed(values: &mut [f64], limit: Self) -> Result<Self> {
 		require(values.len() >= 3, "RAT requires M, N, and K proposal outputs")?;
 		let dimension = |value: f64, maximum: u32| -> Result<u32> {
@@ -647,10 +638,9 @@ fn stored_graph(graph: &Graph, data: &Data) -> bundle::StoredGraph {
 	values: Vec<Buffer>, _contexts: Vec<Buffer>, _adjoints: Vec<Buffer>, samples: Buffer, input_adjoint: Buffer,
 	targets: Buffer, weights: Buffer, frozen: Buffer, best: Buffer, moments: Buffer, variances: Buffer, gradient: Buffer,
 	metrics: Buffer, best_loss: Buffer, value_pointers: Buffer, context_pointers: Buffer, adjoint_pointers: Buffer,
-	descriptors: Buffer, arguments: Buffer, rows: u32, nodes: u32, parameters: u32, threads: u32, step: u32, input: usize,
-	output: usize, capacity: usize, tile: Tile, }
-#[derive(Clone, Copy)] #[repr(u32)] enum EpochPhase { Full, Gradient, Optimizer, }
-impl GpuTape {
+	descriptors: Buffer, arguments: Buffer, timings: Buffer, tiles: Buffer, rows: u32, nodes: u32, parameters: u32,
+	threads: u32, step: u32, input: usize, output: usize, capacity: usize, tile: Tile, }
+#[derive(Clone, Copy)] #[repr(u32)] enum EpochPhase { Full, Gradient, Optimizer, } impl GpuTape {
 	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu) -> Result<Self> {
 		let inputs = graph.input.elements();
 		require(inputs != 0 && !samples.is_empty() && samples.len() % inputs == 0, "model input batch is invalid")?;
@@ -677,6 +667,8 @@ impl GpuTape {
 			context_pointers: Buffer::upload(gpu, &addresses(&contexts))?,
 			adjoint_pointers: Buffer::upload(gpu, &addresses(&adjoints))?, descriptors: Buffer::upload(gpu, &descriptors)?,
 			arguments: Buffer::upload(gpu, &arguments)?, samples: Buffer::upload(gpu, samples)?,
+			timings: Buffer::upload(gpu, &std::iter::repeat_n(0_u64, graph.nodes.len().max(1)).collect::<Vec<_>>())?,
+			tiles: Buffer::upload(gpu, &std::iter::repeat_n(tile, graph.nodes.len().max(1)).collect::<Vec<_>>())?,
 			input_adjoint: Buffer::upload(gpu, &std::iter::repeat_n(0.0, samples.len()).collect::<Vec<_>>())?,
 			targets: Buffer::upload(gpu, &target_values)?, weights: Buffer::upload(gpu, &graph.parameters)?,
 			frozen: Buffer::upload(gpu, if graph.frozen.is_empty() { &[1] } else { &graph.frozen })?,
@@ -692,27 +684,23 @@ impl GpuTape {
 	fn forward(&mut self) -> Result<()> { let dispatch = self.gpu.forward;
 		self.threads = dispatch.geometry.threads(self.rows)?;
 		let mut arguments = self.forward_arguments(); self.gpu.launch(dispatch, &mut arguments, self.threads, self.tile) }
-	fn forward_arguments(&mut self) -> [*mut c_void; 12] { [ &mut self.samples.pointer as *mut _ as Ptr,
+	fn forward_arguments(&mut self) -> [*mut c_void; 14] { [ &mut self.samples.pointer as *mut _ as Ptr,
 			&mut self.weights.pointer as *mut _ as Ptr, &mut self.value_pointers.pointer as *mut _ as Ptr,
 			&mut self.context_pointers.pointer as *mut _ as Ptr, &mut self.descriptors.pointer as *mut _ as Ptr,
 			&mut self.arguments.pointer as *mut _ as Ptr, &mut self.rows as *mut _ as Ptr, &mut self.nodes as *mut _ as Ptr,
 			&mut self.threads as *mut _ as Ptr, &mut self.tile.m as *mut _ as Ptr, &mut self.tile.n as *mut _ as Ptr,
-			&mut self.tile.k as *mut _ as Ptr, ] } fn predictions(&self) -> Result<Vec<f64>> { self.values .last()
+			&mut self.tile.k as *mut _ as Ptr, &mut self.timings.pointer as *mut _ as Ptr,
+			&mut self.tiles.pointer as *mut _ as Ptr, ] }
+	fn timings(&self) -> Result<Vec<u64>> { self.timings.download(self.nodes as usize) }
+	fn predictions(&self) -> Result<Vec<f64>> { self.values .last()
 			.ok_or_else(|| RecipeError::new("GPU tape is empty"))? .download(self.rows as usize * self.output) }
 	fn launch_epoch( &mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool,
-		phase: EpochPhase, ) -> Result<()> {
-		let mut loss = if direct { 7 } else { loss.0 as u32 };
+		phase: EpochPhase, ) -> Result<()> { let mut loss = if direct { 7 } else { loss.0 as u32 };
 		let mut huber_threshold = config.activation[7];
 		require(self.step != 0, "optimizer epoch is absent")?;
-		let mut step = self.step;
-		let mut rate = rate;
-		let mut beta1 = config.beta1;
-		let mut beta2 = config.beta2;
-		let mut beta1_power = beta1.powi(step as i32);
-		let mut beta2_power = beta2.powi(step as i32);
-		let mut epsilon = config.epsilon;
-		let mut decay = config.decay;
-		let mut tolerance = tolerance;
+		let (mut step, mut rate, mut beta1, mut beta2, mut beta1_power, mut beta2_power, mut epsilon, mut decay,
+			mut tolerance) = (self.step, rate, config.beta1, config.beta2, config.beta1.powi(self.step as i32),
+			config.beta2.powi(self.step as i32), config.epsilon, config.decay, tolerance);
 		let mut phase = phase as u32; let mut call = [ &mut self.samples.pointer as *mut _ as Ptr,
 			&mut self.input_adjoint.pointer as *mut _ as Ptr, &mut self.targets.pointer as *mut _ as Ptr,
 			&mut self.weights.pointer as *mut _ as Ptr, &mut self.frozen.pointer as *mut _ as Ptr,
@@ -727,15 +715,14 @@ impl GpuTape {
 			&mut beta1_power as *mut _ as Ptr, &mut beta2_power as *mut _ as Ptr, &mut epsilon as *mut _ as Ptr,
 			&mut decay as *mut _ as Ptr, &mut tolerance as *mut _ as Ptr, &mut step as *mut _ as Ptr,
 			&mut self.threads as *mut _ as Ptr, &mut self.tile.m as *mut _ as Ptr, &mut self.tile.n as *mut _ as Ptr,
-			&mut self.tile.k as *mut _ as Ptr, &mut phase as *mut _ as Ptr, ];
+			&mut self.tile.k as *mut _ as Ptr, &mut phase as *mut _ as Ptr,
+			&mut self.timings.pointer as *mut _ as Ptr, &mut self.tiles.pointer as *mut _ as Ptr, ];
 		let dispatch = self.gpu.epoch;
-		self.threads = dispatch.geometry.threads(self.rows)?;
-		self.gpu.launch(dispatch, &mut call, self.threads, self.tile) }
+		self.threads = dispatch.geometry.threads(self.rows)?; self.gpu.launch(dispatch, &mut call, self.threads, self.tile) }
 	fn epoch(
 		&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool, ) -> Result<(f64, bool)> {
 		self.launch_epoch(rate, loss, tolerance, config, direct, EpochPhase::Full)?;
-		let metrics = self.metrics.download::<f64>(3)?; Ok((metrics[0], metrics[1] != 0.0)) }
-	fn gradient(
+		let metrics = self.metrics.download::<f64>(3)?; Ok((metrics[0], metrics[1] != 0.0)) } fn gradient(
 		&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool, ) -> Result<()> {
 		self.launch_epoch(rate, loss, tolerance, config, direct, EpochPhase::Gradient) }
 	fn update(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool) -> Result<()> {
@@ -763,25 +750,27 @@ impl GpuTape {
 		self.moments.download(self.parameters as usize)?, self.variances.download(self.parameters as usize)?, )) }
 	fn write_optimizer(&self, weights: &[f64], moments: &[f64], variances: &[f64]) -> Result<()> {
 		self.weights.write(0, weights)?;
-		self.moments.write(0, moments)?;
-		self.variances.write(0, variances) }
+		self.moments.write(0, moments)?; self.variances.write(0, variances) }
+	fn write_tiles(&mut self, values: &[Tile]) -> Result<()> {
+		require(values.len() == self.nodes as usize, "GPU tile count does not match graph nodes")?;
+		self.tile = values.iter().fold(Tile { m: 1, n: 1, k: 1 }, |prior, tile| Tile {
+			m: prior.m.max(tile.m), n: prior.n.max(tile.n), k: prior.k.max(tile.k), }); self.tiles.write(0, values) }
+	fn fill_tile(&mut self, tile: Tile) -> Result<()> {
+		self.write_tiles(&std::iter::repeat_n(tile, self.nodes as usize).collect::<Vec<_>>()) }
 	fn write_weights(&self, values: &[f64]) -> Result<()> { self.weights.write(0, values) } }
 struct Placement { tape: GpuTape, rows: Vec<usize>, share: f64, }
 struct DeviceTape { shards: Vec<Placement>, targets: Vec<f64>, best: Vec<f64>, best_loss: [f64; 4],
-	replicated: bool, input: usize, output: usize, capacity: usize, step: u32, }
-impl DeviceTape {
+	replicated: bool, input: usize, output: usize, capacity: usize, step: u32, } impl DeviceTape {
 	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpus: &[&'static Gpu]) -> Result<Self> {
 		require(!gpus.is_empty(), "training requires a GPU")?;
 		let input = graph.input.elements();
 		require(input != 0 && !samples.is_empty() && samples.len() % input == 0, "model input batch is invalid")?;
-		let capacity = samples.len() / input;
-		let output = graph.output.elements();
+		let (capacity, output) = (samples.len() / input, graph.output.elements());
 		require(targets.len() == capacity * output, "target batch is invalid")?;
 		let replicated = capacity < gpus.len();
 		let mut shards = Vec::new(); for (index, &gpu) in gpus.iter().enumerate() {
 			let rows = if replicated { (0..capacity).collect::<Vec<_>>() } else {
-				(index..capacity).step_by(gpus.len()).collect::<Vec<_>>()
-			};
+				(index..capacity).step_by(gpus.len()).collect::<Vec<_>>() };
 			let share = if replicated { 1.0 / gpus.len() as f64 } else { rows.len() as f64 / capacity as f64 };
 			let tape = GpuTape::new(graph, &Self::pack(samples, input, &rows), &Self::pack(targets, output, &rows), gpu)?;
 			shards.push(Placement { tape, rows, share }); }
@@ -808,11 +797,8 @@ impl DeviceTape {
 					.copy_from_slice(&local[index * width..(index + 1) * width]); } } Ok(result) }
 	fn predictions(&self) -> Result<Vec<f64>> { self.collect(self.output, GpuTape::predictions) }
 	fn advance(&mut self) -> Result<()> { self.map(|tape| tape.advance())?;
-		self.step = self.shards[0].tape.step; Ok(()) }
-	fn observe(&mut self, loss: f64, tolerance: f64) -> Result<bool> {
-		let old_best = self.best_loss[0];
-		let last = self.best_loss[1];
-		let trail = self.best_loss[2];
+		self.step = self.shards[0].tape.step; Ok(()) } fn observe(&mut self, loss: f64, tolerance: f64) -> Result<bool> {
+		let (old_best, last, trail) = (self.best_loss[0], self.best_loss[1], self.best_loss[2]);
 		let better = loss < old_best; if better {
 			self.best = self.shards[0].tape.weights()?; }
 		let next_trail = if last.is_finite() && !trail.is_finite() && loss > last { last } else { trail };
@@ -820,27 +806,22 @@ impl DeviceTape {
 		self.best_loss[0] = if better { loss } else { old_best };
 		self.best_loss[1] = loss;
 		self.best_loss[2] = next_trail; if trigger {
-			self.best_loss[3] = self.best_loss[0]; } Ok(trigger) }
-	fn epoch(
+			self.best_loss[3] = self.best_loss[0]; } Ok(trigger) } fn epoch(
 		&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool, ) -> Result<(f64, bool)> {
 		self.map(|tape| tape.gradient(rate, loss, tolerance, config, direct))?;
 		let gradients = self.shards.iter().map(|shard| shard.tape.gradient_values()).collect::<Result<Vec<_>>>()?;
 		let mut gradient = std::iter::repeat_n(0.0, self.shards[0].tape.parameters as usize).collect::<Vec<_>>();
 		for (shard, values) in self.shards.iter().zip(gradients) { for (total, value) in gradient.iter_mut().zip(values) {
-				*total += value * shard.share; } }
-		let objective = if direct { 0.0 } else {
-			model_loss(&self.predictions()?, &self.targets, loss, config.activation[7])
-		};
+				*total += value * shard.share; } } let objective = if direct { 0.0 } else {
+			model_loss(&self.predictions()?, &self.targets, loss, config.activation[7]) };
 		let saved = if direct { false } else { self.observe(objective, tolerance)? };
 		self.shards[0].tape.write_gradient(&gradient)?;
 		self.shards[0].tape.update(rate, loss, tolerance, config, direct)?; if self.shards.len() > 1 {
 			let (weights, moments, variances) = self.shards[0].tape.optimizer_state()?;
 			for shard in &self.shards[1..] { shard.tape.write_optimizer(&weights, &moments, &variances)?; } }
-		Ok((objective, saved)) }
-	fn write_samples(&self, values: &[f64]) -> Result<()> {
+		Ok((objective, saved)) } fn write_samples(&self, values: &[f64]) -> Result<()> {
 		require(values.len() == self.capacity * self.input, "RAT input batch has the wrong shape")?;
-		for shard in &self.shards {
-			shard.tape.write_samples(&Self::pack(values, self.input, &shard.rows))?; } Ok(()) }
+		for shard in &self.shards { shard.tape.write_samples(&Self::pack(values, self.input, &shard.rows))?; } Ok(()) }
 	fn write_targets(&mut self, values: &[f64]) -> Result<()> {
 		require(values.len() == self.capacity * self.output, "RAT target batch has the wrong shape")?;
 		self.targets.copy_from_slice(values); for shard in &self.shards {
@@ -850,21 +831,18 @@ impl DeviceTape {
 	fn node_values(&self, node: usize, width: usize) -> Result<Vec<f64>> {
 		self.collect(width, |tape| tape.node_values(node, width)) }
 	fn placement(&self, row: usize) -> Result<usize> { require(row < self.capacity, "GPU row is out of range")?;
-		Ok(row % self.shards.len()) }
-	fn proposal_limit(&self, row: usize, values: [f64; 3]) -> Result<Tile> {
+		Ok(row % self.shards.len()) } fn proposal_limit(&self, row: usize, values: [f64; 3]) -> Result<Tile> {
 		self.shards[self.placement(row)?].tape.gpu.proposal_limit(values) }
 	fn set_tile(&mut self, row: usize, tile: Tile) -> Result<()> { let placement = self.placement(row)?;
-		self.shards[placement].tape.tile = tile; Ok(()) }
+		self.shards[placement].tape.fill_tile(tile) }
 	fn weights(&self, best: bool) -> Result<Vec<f64>> { if best { Ok(self.best.clone()) } else {
-			self.shards[0].tape.weights() } }
-	fn restore_best(&mut self) -> Result<()> { for shard in &self.shards {
+			self.shards[0].tape.weights() } } fn restore_best(&mut self) -> Result<()> { for shard in &self.shards {
 			shard.tape.write_weights(&self.best)?; } Ok(()) }
 	fn capture(&self, graph: &mut Graph, best: bool) -> Result<()> { self.shards[0].tape.capture(graph)?;
 		graph.parameters = self.weights(best)?;
 		graph.state.best = self.best.clone();
 		graph.state.best_loss = self.best_loss.to_vec();
-		graph.state.epoch = self.step as usize; Ok(()) }
-	fn tile(&self) -> Tile { self.shards[0].tape.tile } }
+		graph.state.epoch = self.step as usize; Ok(()) } fn tile(&self) -> Tile { self.shards[0].tape.tile } }
 fn checkpoint(path: &str, schema: &str, stored: &mut bundle::StoredGraph, tape: &DeviceTape, best: bool) -> Result<()> {
 	tape.capture(&mut stored.graph, best)?; bundle::save(path, schema, std::slice::from_ref(stored)) }
 fn node_descriptor(node: &Node, program_base: usize) -> Result<[i32; 11]> {
@@ -880,8 +858,7 @@ fn node_context(node: &Node, rows: usize) -> Result<usize> { let elements = matc
 		Primitive::Elementwise => checked_mul( 2 * node.program_count,
 			checked_mul(rows, node.output.elements(), "program batch")?, "program", )?, Primitive::Attention => {
 			checked_mul(6, checked_mul(rows, node.output.elements(), "attention context")?, "attention")? } Primitive::Scan => {
-			let state_count = checked_mul(rows, node.output.elements(), "scan batch")?;
-			let gates = node.argument[0] as usize;
+			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
 			let states = checked_mul(2 * gates + 1, state_count, "scan states")?;
 			let gradients = checked_mul(rows, node.parameters, "scan gradients")?;
 			checked_add(states, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")? }
@@ -912,8 +889,9 @@ impl Drop for Buffer { fn drop(&mut self) { self.runtime.free(self.pointer); } }
 	layout: &'static [u8], } #[derive(Clone, Copy)] struct Dispatch { kernel: Kernel, geometry: Geometry, }
 impl Kernel { const fn remote(object: u64, shared: u32, layout: &'static [u8]) -> Self { Self { object, shared,
 		#[cfg(feature = "amd")] kernarg: 0, #[cfg(feature = "amd")] private: 0, layout, } } }
-const FORWARD_ARGS: &[u8] = b"888888444444";
-const EPOCH_ARGS: &[u8] = b"88888888888888884444888888888444444"; #[cfg(feature = "nvidia")] struct Cuda { context: Ptr,
+const FORWARD_ARGS: &[u8] = b"88888844444488";
+const EPOCH_ARGS: &[u8] = b"8888888888888888444488888888844444488";
+#[cfg(feature = "nvidia")] struct Cuda { context: Ptr,
 	set: unsafe extern "C" fn(Ptr) -> i32, allocate: unsafe extern "C" fn(*mut u64, usize) -> i32,
 	free: unsafe extern "C" fn(u64) -> i32, upload: unsafe extern "C" fn(u64, *const c_void, usize) -> i32,
 	download: unsafe extern "C" fn(Ptr, u64, usize) -> i32, synchronize: unsafe extern "C" fn() -> i32,
@@ -928,7 +906,8 @@ const EPOCH_ARGS: &[u8] = b"88888888888888884444888888888444444"; #[cfg(feature 
 	queue: Ptr, signal: u64, cpu_agent: u64, vram_pool: u64, kernarg_pool: u64, kernarg_size: usize, kernarg: Ptr,
 	_code: fs::File, } struct Remote { io: Mutex<Worker>, } enum Driver { #[cfg(feature = "amd")] Hsa(Hsa),
 	#[cfg(feature = "nvidia")] Cuda(Cuda), Remote(Remote), } #[allow(dead_code)] struct Gpu { name: String,
-	backend: Backend, driver: Driver, forward: Dispatch, epoch: Dispatch, shared_limit: u32, dispatch: Mutex<()>, }
+	backend: Backend, driver: Driver, forward: Dispatch, epoch: Dispatch, memory: u64, clock: u64, shared_limit: u32,
+	dispatch: Mutex<()>, }
 unsafe impl Send for Gpu {} unsafe impl Sync for Gpu {} #[cfg(feature = "amd")] #[repr(C)] struct HsaQueue { kind: u32,
 	features: u32, base: Ptr, doorbell: u64, size: u32, reserved: u32, id: u64, } #[cfg(feature = "amd")] #[repr(C)]
 struct HsaPacket { header: u16, setup: u16, workgroup_x: u16, workgroup_y: u16, workgroup_z: u16, reserved0: u16,
@@ -1039,9 +1018,9 @@ static DEVICES: OnceLock<Result<Vec<Gpu>>> = OnceLock::new(); fn devices() -> Re
 	require(found.len() == 1, "multiple GPUs require named selection")?; Ok(&found[0]) } fn worker_list() -> Result<()> {
 	let host = fs::read_to_string("/etc/hostname")
 		.map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?; for gpu in devices()? {
-		println!("{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}", host.trim(), gpu.name, gpu.backend,
-			gpu.forward.geometry.groups, gpu.forward.geometry.block, gpu.epoch.geometry.groups,
-			gpu.epoch.geometry.block, gpu.shared_limit, gpu.forward.kernel.shared, gpu.epoch.kernel.shared); } Ok(()) }
+		println!("{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}", host.trim(), gpu.name, gpu.backend,
+		gpu.forward.geometry.groups, gpu.forward.geometry.block, gpu.epoch.geometry.groups, gpu.epoch.geometry.block,
+		gpu.shared_limit, gpu.forward.kernel.shared, gpu.epoch.kernel.shared, gpu.memory, gpu.clock); } Ok(()) }
 fn worker_serve(name: &str) -> Result<()> { let gpu = device(Some(name))?;
 	let mut input = std::io::stdin().lock();
 	let mut output = std::io::stdout().lock(); loop {
@@ -1078,8 +1057,7 @@ fn worker_serve(name: &str) -> Result<()> { let gpu = device(Some(name))?;
 			_ => return Err(RecipeError::new("remote Recipe command is invalid")), } remote_io("flush", output.flush())?; } }
 extern "C" fn worker_init() { if let Ok(mode) = std::env::var("RECIPE_WORKER") { let result = if mode == "list" {
 			worker_list() } else if let Some(name) = mode.strip_prefix("serve|") { worker_serve(name) } else {
-			Err(RecipeError::new("Recipe worker mode is invalid"))
-		}; let status = result.map_or_else( |error| {
+			Err(RecipeError::new("Recipe worker mode is invalid")) }; let status = result.map_or_else( |error| {
 				eprintln!("{error}"); 1 }, |_| 0,
 		); std::process::exit(status) } } #[used] #[unsafe(link_section = ".init_array")]
 static WORKER_INIT: extern "C" fn() = worker_init;
@@ -1100,9 +1078,8 @@ fn ssh_config() -> Result<PathBuf> { let path = PathBuf::from(env!("RECIPE_SSH_C
 		.filter(|host| !host.contains(['*', '?', '!'])) .map(str::to_owned) .collect::<Vec<_>>();
 	hosts.sort();
 	hosts.dedup(); Ok(hosts) } #[derive(Clone)] struct RemoteNode { info: DeviceInfo, transport: String, device: String,
-	backend: Backend, forward: Geometry, epoch: Geometry, shared_limit: u32, forward_shared: u32, epoch_shared: u32, }
-struct Worker {
-	child: Child, input: ChildStdin, output: ChildStdout, }
+	backend: Backend, forward: Geometry, epoch: Geometry, memory: u64, clock: u64, shared_limit: u32, forward_shared: u32,
+	epoch_shared: u32, } struct Worker { child: Child, input: ChildStdin, output: ChildStdout, }
 fn remote_io<T>(action: &str, result: io::Result<T>) -> Result<T> {
 	result.map_err(|error| RecipeError::new(format!("cannot {action} remote Recipe worker: {error}"))) }
 fn put_u64(output: &mut impl Write, value: u64) -> Result<()> {
@@ -1154,8 +1131,7 @@ fn worker_process(host: &str, mode: &str) -> Result<Worker> { let executable = f
 			"dd bs={} count=1 iflag=fullblock of=\"$worker\" status=none\x3b chmod 700 \"$worker\"\x3b ",
 			"RECIPE_WORKER='{}' \"$worker\"", ), executable.len(), mode );
 	let stderr = if mode.starts_with("serve|") { Stdio::inherit() } else { Stdio::null() };
-	let mut child = Command::new("ssh")
-		.arg("-F") .arg(ssh_config()?) .args(["-o", "BatchMode=yes", "-o"])
+	let mut child = Command::new("ssh") .arg("-F") .arg(ssh_config()?) .args(["-o", "BatchMode=yes", "-o"])
 		.arg(format!("ConnectTimeout={}", env!("RECIPE_SSH_CONNECT_TIMEOUT"))) .arg(host) .arg(command) .stdin(Stdio::piped())
 		.stdout(Stdio::piped()) .stderr(stderr) .spawn()
 		.map_err(|error| RecipeError::new(format!("cannot start Recipe worker on {host}: {error}")))?;
@@ -1170,18 +1146,19 @@ fn worker_process(host: &str, mode: &str) -> Result<Worker> { let executable = f
 		child.wait().map_err(|error| RecipeError::new(format!("cannot wait for {host}: {error}")))?.success(),
 		format!("Recipe worker on {host} failed"), )?; text.lines().map(|line| {
 		let fields = line.split('|').collect::<Vec<_>>();
-		require(fields.len() == 10, "Recipe worker device is invalid")?;
+		require(fields.len() == 12, "Recipe worker device is invalid")?;
 		let backend = match fields[2] { "Amd" => Backend::Amd, "Nvidia" => Backend::Nvidia,
 			_ => return Err(RecipeError::new("Recipe worker backend is invalid")), };
 		let positive = |index| -> Result<u32> { Ok(narrow(natural("remote device value", fields[index])?,
-			"remote device value")? as u32) };
-		let fixed = |index: usize| fields[index].parse::<u32>()
+			"remote device value")? as u32) }; let fixed = |index: usize| fields[index].parse::<u32>()
 			.map_err(|error| RecipeError::new(format!("invalid remote device value: {error}")));
 		Ok(RemoteNode { info: DeviceInfo { name: format!("{}:{}", fields[0], fields[1]), host: fields[0].to_owned() },
 			transport: host.to_owned(), device: fields[1].to_owned(), backend,
 			forward: Geometry { groups: positive(3)?, block: positive(4)? },
 			epoch: Geometry { groups: positive(5)?, block: positive(6)? }, shared_limit: positive(7)?,
-			forward_shared: fixed(8)?, epoch_shared: fixed(9)?, }) }).collect() }
+			forward_shared: fixed(8)?, epoch_shared: fixed(9)?, memory: fields[10].parse()
+				.map_err(|error| RecipeError::new(format!("invalid remote memory: {error}")))?,
+			clock: natural("remote timestamp frequency", fields[11])? as u64, }) }).collect() }
 fn host_has_gpu(host: &str) -> Result<bool> { Ok(Command::new("ssh") .arg("-F") .arg(ssh_config()?)
 	.args(["-o", "BatchMode=yes", "-o"]) .arg(format!("ConnectTimeout={}", env!("RECIPE_SSH_CONNECT_TIMEOUT")))
 	.arg(host) .arg("test -d /sys/class/kfd/kfd/topology/nodes || command -v nvidia-smi >/dev/null")
@@ -1192,17 +1169,15 @@ fn reachable_nodes() -> Result<&'static [RemoteNode]> {
 	REMOTE_NODES.get_or_init(|| { let hosts = ssh_hosts()?; let capable = std::thread::scope(|scope| {
 		let workers = hosts.iter().map(|host| scope.spawn(|| host_has_gpu(host))).collect::<Vec<_>>();
 		workers.into_iter().map(|worker| worker.join().map_err(|_| RecipeError::new("GPU host probe panicked"))?)
-			.collect::<Result<Vec<_>>>()
-	})?;
+			.collect::<Result<Vec<_>>>() })?;
 	let mut nodes = Vec::new(); for (host, capable) in hosts.iter().zip(capable) { if capable {
-			nodes.extend(remote_nodes(host)?); } } Ok(nodes) })
-	.as_ref().map(Vec::as_slice).map_err(Clone::clone) }
+			nodes.extend(remote_nodes(host)?); } } Ok(nodes) }) .as_ref().map(Vec::as_slice).map_err(Clone::clone) }
 fn remote_gpu(node: &RemoteNode) -> Result<Gpu> { let worker = worker_process(&node.transport,
 	&format!("serve|{}", node.device))?; Ok(Gpu { name: node.info.name.clone(), backend: node.backend,
 		driver: Driver::Remote(Remote { io: Mutex::new(worker) }),
 		forward: Dispatch { kernel: Kernel::remote(0, node.forward_shared, FORWARD_ARGS), geometry: node.forward },
 		epoch: Dispatch { kernel: Kernel::remote(1, node.epoch_shared, EPOCH_ARGS), geometry: node.epoch },
-		shared_limit: node.shared_limit, dispatch: Mutex::new(()), }) }
+		memory: node.memory, clock: node.clock, shared_limit: node.shared_limit, dispatch: Mutex::new(()), }) }
 static REMOTE_GPUS: OnceLock<Result<Vec<Gpu>>> = OnceLock::new(); fn remote_gpus() -> Result<&'static [Gpu]> {
 	REMOTE_GPUS.get_or_init(|| reachable_nodes()?.iter().map(remote_gpu).collect()).as_ref().map(Vec::as_slice)
 		.map_err(Clone::clone) }
@@ -1222,8 +1197,7 @@ fn discover_topology() -> Result<Topology> { let found = devices()?;
 	let remote = reachable_nodes()?;
 	nodes.extend(remote.iter().map(|node| node.info.clone()));
 	let name = |gpu: &Gpu| if matches!(&gpu.driver, Driver::Remote(_)) { gpu.name.clone() } else {
-		format!("{host}:{}", gpu.name)
-	};
+		format!("{host}:{}", gpu.name) };
 	let active = all_gpus()?;
 	let mut links = Vec::new(); for source in &active { for target in &active {
 			let latency = transfer_time(source, target, latency_bytes, repetitions)?;
@@ -1289,6 +1263,10 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 		driver_status( Backend::Amd, pool_iterate(cpu_agent, collect_hsa, (&mut kernarg as *mut HsaQuery).cast()),
 			"KERNARG pools", )?;
 		require(vram.found != 0 && kernarg.found != 0, "AMD VRAM or KERNARG pool is absent")?;
+		let (mut memory, mut clock) = (0_usize, 0_u64);
+		driver_status(Backend::Amd, pool_info(vram.found, 2, (&mut memory as *mut usize).cast()), "VRAM size")?;
+		driver_status(Backend::Amd, info(agent, 0xA016, (&mut clock as *mut u64).cast()), "timestamp frequency")?;
+		require(clock != 0, "AMD timestamp frequency must be positive")?;
 		let (mut wave, mut workgroup, mut available, mut node, mut cus) = (0_u32, 0_u32, 0_u32, 0_u32, 0_u32);
 		for (attribute, output, action) in [ (6, (&mut wave as *mut u32).cast(), "wave query"),
 			(8, (&mut workgroup as *mut u32).cast(), "workgroup query"),
@@ -1346,8 +1324,8 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 				write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?, queue, signal: completion, cpu_agent,
 				vram_pool: vram.found, kernarg_pool: kernarg.found, kernarg_size: ka_size, kernarg: ka, _code: code, }),
 			forward: Dispatch { kernel: forward, geometry: forward_geometry },
-			epoch: Dispatch { kernel: epoch, geometry: epoch_geometry }, shared_limit: lds, dispatch: Mutex::new(()), }) } }
-fn load_nvidia() -> Result<Vec<Gpu>> { #[cfg(not(feature = "nvidia"))]
+			epoch: Dispatch { kernel: epoch, geometry: epoch_geometry }, memory: memory as u64, clock, shared_limit: lds,
+			dispatch: Mutex::new(()), }) } } fn load_nvidia() -> Result<Vec<Gpu>> { #[cfg(not(feature = "nvidia"))]
 	return Err(RecipeError::new("NVIDIA support is not compiled into this build")); #[cfg(feature = "nvidia")] unsafe {
 		const MAX_BLOCK: i32 = 1;
 		const BLOCK_LDS: i32 = 8;
@@ -1358,11 +1336,13 @@ fn load_nvidia() -> Result<Vec<Gpu>> { #[cfg(not(feature = "nvidia"))]
 		const SM_LDS: i32 = 81;
 		const REGISTERS_PER_SM: i32 = 82;
 		const COOPERATIVE: i32 = 95;
+		const NANOSECOND_TIMER_HZ: u64 = 1_000_000_000;
 		let runtime = Library::open(env!("RECIPE_NV_RUNTIME"))?;
 		let init: unsafe extern "C" fn(u32) -> i32 = runtime.function(b"cuInit\0")?;
 		let count_devices: Count = runtime.function(b"cuDeviceGetCount\0")?;
 		let get_device: Device = runtime.function(b"cuDeviceGet\0")?;
 		let attribute: Attribute = runtime.function(b"cuDeviceGetAttribute\0")?;
+		let total: unsafe extern "C" fn(*mut usize, i32) -> i32 = runtime.function(b"cuDeviceTotalMem_v2\0")?;
 		let create: Context = runtime.function(b"cuCtxCreate_v2\0")?;
 		let load: Module = runtime.function(b"cuModuleLoadData\0")?;
 		let function: Function = runtime.function(b"cuModuleGetFunction\0")?;
@@ -1374,6 +1354,8 @@ fn load_nvidia() -> Result<Vec<Gpu>> { #[cfg(not(feature = "nvidia"))]
 		let load_device = |device, index| -> Result<Gpu> { let (mut forward, mut epoch) = (0, 0);
 			let (mut context, mut module) = (ptr::null_mut(), ptr::null_mut()); let ( mut cus, mut wave, mut workgroup,
 				mut block_lds, mut sm_lds, mut registers, mut threads, mut cooperative, ) = (0, 0, 0, 0, 0, 0, 0, 0);
+			let mut memory = 0;
+			driver_status(Backend::Nvidia, total(&mut memory, device), "VRAM size")?;
 			for (kind, output, action) in [ (CUS, &mut cus, "SM query"), (WAVE, &mut wave, "warp query"),
 				(MAX_BLOCK, &mut workgroup, "workgroup query"), (BLOCK_LDS, &mut block_lds, "workgroup LDS query"),
 				(SM_LDS, &mut sm_lds, "SM LDS query"), (REGISTERS_PER_SM, &mut registers, "register query"),
@@ -1413,7 +1395,8 @@ fn load_nvidia() -> Result<Vec<Gpu>> { #[cfg(not(feature = "nvidia"))]
 				name: format!("nv{index}"), backend: Backend::Nvidia, driver: Driver::Cuda(cuda), forward: Dispatch {
 					kernel: Kernel::cuda(forward, forward_resource.shared, FORWARD_ARGS), geometry: forward_geometry, },
 				epoch: Dispatch { kernel: Kernel::cuda(epoch, epoch_resource.shared, EPOCH_ARGS), geometry: epoch_geometry, },
-				shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()), }) };
+				memory: memory as u64, clock: NANOSECOND_TIMER_HZ, shared_limit: (block_lds as u32).min(sm_lds as u32),
+				dispatch: Mutex::new(()), }) };
 		let mut found = Vec::new(); for ordinal in 0..count {
 			let (mut gpu, mut integrated) = (0, 0);
 			driver_status(Backend::Nvidia, get_device(&mut gpu, ordinal), "device enumeration")?;
@@ -1523,14 +1506,11 @@ fn print_table(table: &Table, fit: usize, targets: &[String], exclusions: &[Stri
 	eprintln!("{:<37} {:<10} {:<9} {} samples", table.name, "", "", table.rows.len());
 	let mut base = 0; for child in &table.children {
 		let unit = if child.rows == 1 { "row/sample" } else { "rows/sample" };
-		eprintln!("{:<37} {:<10} {:<9} {} {unit}", format!("  {}", child.name), "", "", child.rows);
-		if child.rows != 0 {
-			for (column, header) in child.headers.iter().enumerate() {
-				let index = base + column;
+		eprintln!("{:<37} {:<10} {:<9} {} {unit}", format!("  {}", child.name), "", "", child.rows); if child.rows != 0 {
+			for (column, header) in child.headers.iter().enumerate() { let index = base + column;
 				let tagged = |names: &[String]| names.iter().any(|name| column_match(name, table, header, index));
 				let tag = if tagged(targets) { "\x1b[32m[target]\x1b[0m  " } else if tagged(exclusions) {
-					"\x1b[31m[excluded]\x1b[0m"
-				} else { "          " };
+					"\x1b[31m[excluded]\x1b[0m" } else { "          " };
 				let kind = infer_feature(table, index, fit).name(); let same = (1..child.rows).all(|row| {
 					infer_feature(table, base + row * child.headers.len() + column, fit).name() == kind });
 				let kind = if same { kind } else { "mixed" }; if child.rows == 1 { let samples = (0..table.rows.len())
@@ -1552,8 +1532,7 @@ fn print_table(table: &Table, fit: usize, targets: &[String], exclusions: &[Stri
 	require(!tables.is_empty(), "data source contains no supported table")?;
 	let mut selected = Vec::new(); for name in &data.target {
 		let mut matches = Vec::new(); for (table, value) in tables.iter().enumerate() {
-			for (column, header) in value.headers.iter().enumerate() {
-				if column_match(name, value, header, column) {
+			for (column, header) in value.headers.iter().enumerate() { if column_match(name, value, header, column) {
 					matches.push((table, column)); } } }
 		require(matches.len() == 1, format!("target {name:?} must identify exactly one feature"))?;
 		selected.push(matches[0]); }
@@ -1673,10 +1652,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String]) -> Vec<Table> {
 	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
 	let children = vec![ChildTable { name: name.clone(), headers: headers.clone(), rows: 1 }];
 	Ok(Table { name, headers, rows, children }) } fn records(bytes: &[u8], delimiter: u8) -> Result<Vec<Vec<String>>> {
-	let mut rows = Vec::new();
-	let mut row = Vec::new();
-	let mut field = Vec::new();
-	let mut quoted = false;
+	let (mut rows, mut row, mut field, mut quoted) = (Vec::new(), Vec::new(), Vec::new(), false);
 	let mut index = 0; while index < bytes.len() {
 		let byte = bytes[index];
 		if byte == b'"' {
@@ -1737,49 +1713,44 @@ fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, features: usize) -> R
 		SIGNAL.get_or_init(|| unsafe { signal(SIGINT, interrupt) }); if INTERRUPTED.load(Ordering::Acquire) {
 			std::process::exit(INTERRUPTED_EXIT); } self.try_run(model, data).unwrap_or_else(|error| panic!("{error}")) }
 	fn try_run(&self, model: &Model, data: &Data) -> Result<TrainingReport> { drop(topology()?);
-		let gpus = all_gpus()?;
-		let config = Config::load()?;
+		let (gpus, config) = (all_gpus()?, Config::load()?);
 		require(model.downstream.is_none(), "model-valued loss requires .rat()")?;
 		let prepared = prepare(data)?;
 		let training_rows = ((prepared.rows as f64) * data.split).floor() as usize;
 		require(training_rows != 0 && training_rows <= prepared.rows, "split must select training rows")?;
-		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
-		let graph = compile(model, prepared, training_rows, gpus[0], config)?;
+		let (run, graph) = (RUN.fetch_add(1, Ordering::Relaxed) + 1,
+			compile(model, prepared, training_rows, gpus[0], config)?);
 		let mut stored = stored_graph(&graph, data);
 		require(stored.graph.output.elements() == 1, "model output width must be one")?; if let Some(path) = &self.resume {
 			bundle::restore(path, &prepared.schema, std::slice::from_mut(&mut stored))?;
 			eprintln!("resumed: {path}"); }
-		let samples = &prepared.samples[..training_rows * prepared.features];
-		let targets = &prepared.targets[..training_rows];
-		let mut tape = DeviceTape::new(&stored.graph, samples, targets, &gpus)?;
-		let dispatched = tape.forward();
-		self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
+	let (samples, targets) = (&prepared.samples[..training_rows * prepared.features], &prepared.targets[..training_rows]);
+	let (mut tape, mut runtime) = (DeviceTape::new(&stored.graph, samples, targets, &gpus)?, tile_runtime(&gpus, config)?);
+	self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
 		let initial_predictions = tape.predictions()?;
 		let initial_loss = model_loss(&initial_predictions, targets, model.loss, config.activation[7]);
 		let tolerance = self.stop.unwrap_or(0.0);
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
-		for _ in 0..self.epochs { let started = Instant::now();
-			tape.advance()?;
-			let dispatched = tape.epoch(self.learning_rate, model.loss, tolerance, config, false);
-			let (loss, saved) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
-			let predictions = tape.predictions()?;
-			let seconds = started.elapsed().as_secs_f64();
+	for _ in 0..self.epochs { let cases = runtime.propose(&stored.graph, &mut tape)?;
+		let started = Instant::now(); let dispatched = tape.advance()
+			.and_then(|_| tape.epoch(self.learning_rate, model.loss, tolerance, config, false));
+		let (loss, saved) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
+		let (predictions, seconds) = (tape.predictions()?, started.elapsed().as_secs_f64());
 			self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, saved.then_some(true))?;
-			self.print(model, run, tape.step as usize, loss, targets, &predictions, seconds, saved);
+			runtime.learn(&cases, &tape, config).map(|_|
+				self.print(model, run, tape.step as usize, loss, targets, &predictions, seconds, saved))?;
 			self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, None)?; } if self.stop.is_some() {
 			tape.restore_best()?; }
-		let dispatched = tape.forward();
-		self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
+	self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
 		let predictions = tape.predictions()?;
 		let final_loss = model_loss(&predictions, targets, model.loss, config.activation[7]);
 		let r2 = if training_rows == prepared.rows { coefficient(targets, &predictions) } else {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights(false)?;
-			let start = training_rows * prepared.features;
-			let validation_targets = &prepared.targets[training_rows..];
+			let (start, validation_targets) = (training_rows * prepared.features, &prepared.targets[training_rows..]);
 			let mut validation = DeviceTape::new(&graph, &prepared.samples[start..], validation_targets, &gpus)?;
-			validation.forward()?; coefficient(validation_targets, &validation.predictions()?)
-		};
+			validation.forward().and_then(|_| validation.predictions())
+				.map(|values| coefficient(validation_targets, &values))? };
 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(self.stop.is_some()))?; Ok(TrainingReport(
 			initial_loss, final_loss, initial_predictions, predictions, r2, tape.tile(), )) }
 	fn finish_dispatch<T>( &self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &str, tape: &DeviceTape,
@@ -1806,8 +1777,7 @@ fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, features: usize) -> R
 pub struct TrainingReport(f64, f64, Vec<f64>, Vec<f64>, f64, Tile);
 impl TrainingReport { pub const fn initial_loss(&self) -> f64 { self.0 } pub const fn final_loss(&self) -> f64 { self.1
 	} pub fn initial_predictions(&self) -> &[f64] { &self.2 } pub fn predictions(&self) -> &[f64] { &self.3 }
-	pub const fn r2(&self) -> f64 { self.4 } pub const fn tile(&self) -> [u32; 3] {
-		[self.5.m, self.5.n, self.5.k] } }
+	pub const fn r2(&self) -> f64 { self.4 } pub const fn tile(&self) -> [u32; 3] { [self.5.m, self.5.n, self.5.k] } }
 fn model_loss(predictions: &[f64], targets: &[f64], loss: LossFunction, threshold: f64) -> f64 {
 	let values = predictions.iter().zip(targets);
 	let mut result = values.map(|(prediction, target)| loss.value(*prediction, *target, threshold)).sum::<f64>()
@@ -1864,8 +1834,8 @@ struct Process { child: Child, input: Option<ChildStdin>, output: BufReader<Chil
 fn rat_schema(data: &Data) -> String { data.routes .iter()
 		.map(|route| format!("{}->{}", route.inputs.join("|"), route.outputs.join("|")))
 		.chain(std::iter::once(format!("target->{}", data.target.join("|")))) .collect::<Vec<_>>() .join("/") }
-fn append_model( graph: &mut Graph, model: &Model, features: usize, outputs: usize, gpu: &'static Gpu, config: Config,
-	schema: &str, ) -> Result<(i32, (usize, usize))> { let rows = config.rat_batch; let prepared = Prepared {
+fn append_model( graph: &mut Graph, model: &Model, features: usize, outputs: usize, rows: usize,
+	gpu: &'static Gpu, config: Config, schema: &str, ) -> Result<(i32, (usize, usize))> { let prepared = Prepared {
 		samples: vec![0.0; rows * features],
 		targets: vec![0.0; rows], rows, features, schema: schema.to_owned(),
 	};
@@ -1876,8 +1846,8 @@ fn append_model( graph: &mut Graph, model: &Model, features: usize, outputs: usi
 	require(N >= 2, "RAT requires an intermediate model and a predictor")?;
 	require(data.routes.len() + 1 == N, "RAT requires one .r#in().out() pair per intermediate model")?;
 	require(!data.target.is_empty(), "RAT requires .target()")?;
-	let input_names = data.routes[0].inputs.clone();
-	require(!input_names.is_empty(), "RAT requires an initial input")?;
+	let (rows, input_names) = (config.rat_batch, require(!data.routes[0].inputs.is_empty(),
+		"RAT requires an initial input").map(|_| data.routes[0].inputs.clone())?);
 	let input = Shape { channels: input_names.len(), length: 1 }; let mut graph = Graph { nodes: Vec::new(),
 		parameters: Vec::new(), frozen: Vec::new(), programs: Vec::new(), input, output: input, source: -1,
 		state: TrainingState::default(), };
@@ -1885,14 +1855,12 @@ fn append_model( graph: &mut Graph, model: &Model, features: usize, outputs: usi
 		require(!fields.iter().any(|value: &(String, Field)| value.0 == name), "RAT input names must be unique")?;
 		fields.push((name, Field { source: -1, stride: input_names.len(), index })); }
 	let schema = rat_schema(data);
-	let mut proposals = Vec::new();
-	let mut ranges = Vec::new();
-	let mut proposal_names = Vec::new(); for (index, route) in data.routes.iter().enumerate() {
-		if let Some(downstream) = &models[index].downstream {
+	let (mut proposals, mut ranges, mut proposal_names) = (Vec::new(), Vec::new(), Vec::new());
+	for (index, route) in data.routes.iter().enumerate() { if let Some(downstream) = &models[index].downstream {
 			require(downstream == &models[index + 1].blocks, "model-valued loss must name the next RAT model")?; }
 		require(!route.inputs.is_empty() && !route.outputs.is_empty(), "RAT route names must not be empty")?;
 		route_graph(&mut graph, &route.inputs, &fields, data.normalize)?; let (mut source, range) = append_model( &mut graph,
-			&models[index], route.inputs.len(), route.outputs.len(), gpus[0], config, &schema, )?; if index == 0 {
+			&models[index], route.inputs.len(), route.outputs.len(), rows, gpus[0], config, &schema, )?; if index == 0 {
 			lower_activation(&mut graph, Activation::Sigmoid, config)?;
 			source = graph.source; }
 		proposals.push((source as usize, route.outputs.len()));
@@ -1906,17 +1874,51 @@ fn append_model( graph: &mut Graph, model: &Model, features: usize, outputs: usi
 	let mut predictor_inputs = route.inputs.clone();
 	predictor_inputs.extend(route.outputs.iter().cloned());
 	route_graph(&mut graph, &predictor_inputs, &fields, data.normalize)?; let (_, range) =
-		append_model(&mut graph, &models[N - 1], predictor_inputs.len(), data.target.len(), gpus[0], config, &schema)?;
+		append_model(&mut graph, &models[N - 1], predictor_inputs.len(), data.target.len(), rows, gpus[0], config, &schema)?;
 	ranges.push(range);
 	let mut stored = bundle::StoredGraph { graph, inputs: input_names, outputs: data.target.clone() };
 	if let Some(path) = &train.resume { bundle::restore(path, &schema, std::slice::from_mut(&mut stored))?;
 		eprintln!("resumed: {path}"); }
-	let sample_count = config.rat_batch * stored.inputs.len();
-	let target_count = config.rat_batch * stored.outputs.len();
-	let samples = std::iter::repeat_n(0.0, sample_count).collect::<Vec<_>>();
-	let targets = std::iter::repeat_n(0.0, target_count).collect::<Vec<_>>();
-	let tape = DeviceTape::new(&stored.graph, &samples, &targets, gpus)?;
-	Ok(State { stored, tape, proposals, models: ranges, proposal_names, targets: vec![0.0; target_count], schema }) }
+	let targets = std::iter::repeat_n(0.0, rows * stored.outputs.len()).collect::<Vec<_>>();
+	let tape = DeviceTape::new( &stored.graph,
+		&std::iter::repeat_n(0.0, rows * stored.inputs.len()).collect::<Vec<_>>(), &targets, gpus, )?;
+	Ok(State { stored, tape, proposals, models: ranges, proposal_names, targets, schema }) } type TileCase = (usize, usize,
+	[f64; 5],
+	Tile); struct TileRuntime { state: State, train: Train, predictor: Model, }
+static TILE_RUNTIME: OnceLock<Result<Mutex<TileRuntime>>> = OnceLock::new(); impl TileRuntime {
+	fn new(gpus: &[&'static Gpu], config: Config) -> Result<Self> { let predictor =
+			recipe.model().layer(config.surrogate_width).tanh().layer(1).loss(mse);
+		let proposer = recipe.model().layer(config.surrogate_width).tanh().layer(3).loss(&predictor);
+		let models = [proposer, predictor]; let data = recipe.data(Vec::<String>::new())
+			.r#in(["dtype", "VRAM", "M", "N", "K"]).out(["m", "n", "k"]).target(["Mtime"]).norm(z_score);
+		let train = recipe.train().epochs(config.surrogate_epochs).lr(config.surrogate_rate);
+		Ok(Self { state: build(&models, &train, &data, gpus, config)?, train,
+			predictor: models.into_iter().last().unwrap() }) } fn forward(&mut self, cases: &[TileCase]) -> Result<()> {
+		let samples = (0..self.state.tape.capacity).flat_map(|index| cases[index % cases.len()].2).collect::<Vec<_>>();
+		self.state.tape.write_samples(&samples).and_then(|_| self.state.tape.forward()) }
+	fn propose(&mut self, graph: &Graph, tape: &mut DeviceTape) -> Result<Vec<TileCase>> {
+		let mut cases = Vec::new(); for (gpu, shard) in tape.shards.iter().enumerate() {
+			for (node, operation) in graph.nodes.iter().enumerate() { if let Some(dimensions) = operation.tile_dimensions() {
+				let limit = shard.tape.gpu.proposal_limit(dimensions)?;
+				let work = dimensions[0] * f64::from(shard.tape.rows); cases.push((gpu, node,
+					[size_of::<f64>() as f64 * f64::from(u8::BITS), shard.tape.gpu.memory as f64, work,
+						dimensions[1], dimensions[2]], limit)); } } }
+		let mut tiles = tape.shards.iter().map(|shard| std::iter::repeat_n(shard.tape.tile, graph.nodes.len())
+			.collect::<Vec<_>>()).collect::<Vec<_>>(); for chunk in cases.chunks(self.state.tape.capacity) {
+			let mut proposal = self.forward(chunk).and_then(|_| self.state.proposal())?;
+			for (case, row) in chunk.iter().zip(proposal.chunks_exact_mut(self.state.proposal_names.len())) {
+				tiles[case.0][case.1] = Tile::proposed(row, case.3)?; } }
+		for (shard, values) in tape.shards.iter_mut().zip(tiles) { shard.tape.write_tiles(&values)?; } Ok(cases) }
+	fn learn(&mut self, cases: &[TileCase], tape: &DeviceTape, config: Config) -> Result<()> {
+		let timings = tape.shards.iter().map(|shard| shard.tape.timings()).collect::<Result<Vec<_>>>()?;
+		for chunk in cases.chunks(self.state.tape.capacity) { self.forward(chunk)?; let elapsed = chunk.iter().map(|case| {
+			let gpu = tape.shards[case.0].tape.gpu;
+			timings[case.0][case.1] as f64 * 1_000.0 / gpu.clock as f64 }).collect::<Vec<_>>();
+			let measurement = (0..self.state.tape.capacity).map(|index| elapsed[index % elapsed.len()]).collect::<Vec<_>>();
+			train_rat(&mut self.state, &self.train, &self.predictor, &measurement, config)?; } Ok(()) } }
+fn tile_runtime(gpus: &[&'static Gpu], config: Config) -> Result<std::sync::MutexGuard<'static, TileRuntime>> {
+	TILE_RUNTIME.get_or_init(|| TileRuntime::new(gpus, config).map(Mutex::new)).as_ref().map_err(Clone::clone)?
+		.lock().map_err(|_| RecipeError::new("tile runtime lock is poisoned")) }
 impl State { fn proposal(&self) -> Result<Vec<f64>> { let blocks = self .proposals .iter()
 			.map(|&(node, width)| Ok((self.tape.node_values(node, width)?, width))) .collect::<Result<Vec<_>>>()?;
 		let mut values = Vec::new(); for row in 0..self.tape.capacity { for (block, width) in &blocks {
@@ -1928,7 +1930,7 @@ impl State { fn proposal(&self) -> Result<Vec<f64>> { let blocks = self .proposa
 	let predictor_range = *state.models.last().ok_or_else(|| RecipeError::new("RAT predictor range is absent"))?;
 	let proposer_range = (state.models[0].0, state.models[state.models.len() - 2].1);
 	let objective = std::iter::repeat_n(0.0, measurement.len()).collect::<Vec<_>>();
-	let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
+	let run = (!train.log_metrics.is_empty()).then(|| RUN.fetch_add(1, Ordering::Relaxed) + 1).unwrap_or(0);
 	let mut current = Vec::new(); for _ in 0..train.epochs {
 		let started = Instant::now();
 		state.tape.advance()?;

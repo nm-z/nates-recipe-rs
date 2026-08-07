@@ -58,7 +58,7 @@ fn render(command: &mut Command, role: &str, path: &Path) -> BuildResult<()> { l
 		let output = out.join(format!("recipe-{architecture}.hsaco"));
 		let mut command = Command::new(text(manifest, "hsa-compiler")?);
 		command.args(["-target", "amdgcn-amd-amdhsa", &format!("-mcpu={architecture}"), "-O2", "-nogpulib"]);
-		for key in ["hsa-device-library", "hsa-finite-library", "hsa-math-library"] {
+		for key in ["hsa-device-library", "hsa-clock-library", "hsa-finite-library", "hsa-math-library"] {
 			command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", text(manifest, key)?]); }
 		let isa = Path::new(text(manifest, "hsa-device-library-directory")?)
 			.join(format!("oclc_isa_version_{}.bc", architecture.trim_start_matches("gfx")));
@@ -80,6 +80,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	let source = out.join("recipe-nvidia.ll");
 	let ir = parallel_ir(fs::read_to_string("amd-nv.ll")?, "declare i32 @recipe.workgroup.size.x()")
 		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
+		.replace("__ockl_steadyctr_u64", "llvm.nvvm.read.ptx.sreg.globaltimer")
 		.replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x")
 		.replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x")
 		.replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x")
