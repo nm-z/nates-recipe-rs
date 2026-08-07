@@ -35,9 +35,11 @@ fn parallel_ir(ir: String, width: &str) -> String {
 		.lines()
 		.find_map(|line| line.trim().strip_prefix(&prefix))
 			.ok_or_else(|| io::Error::other(format!("{key} must be configured")).into())
-} fn number<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
-	let value = setting(manifest, key)?;
+} fn number<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> { 	let value = setting(manifest, key)?;
 	value.parse::<f64>().map_err(|error| io::Error::other(format!("{key} must be numeric: {error}")))?;
+	Ok(value)
+} fn natural<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> { 	let value = setting(manifest, key)?;
+	value.parse::<u32>().map_err(|error| io::Error::other(format!("{key} must be a natural number: {error}")))?;
 	Ok(value)
 } fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	setting(manifest, key)?
@@ -78,7 +80,8 @@ fn parallel_ir(ir: String, width: &str) -> String {
 	let cpu = format!("-mcpu={architecture}");
 	let output = out.join("recipe.hsaco");
 	let source = out.join("recipe-amd.ll");
-	let ir = parallel_ir(fs::read_to_string("amd-nv.ll")?, AMD_WIDTH);
+	let ir = parallel_ir(fs::read_to_string("amd-nv.ll")?, AMD_WIDTH)
+		.replace("RECIPE_CONTRACTION_TILE_K_MAX", natural(manifest, "contraction-tile-k-max")?);
 	fs::write(&source, ir)?;
 	let mut command = Command::new(text(manifest, "hsa-compiler")?);
 	command.args(["-target", "amdgcn-amd-amdhsa", &cpu, "-O2", "-nogpulib"]);
@@ -108,6 +111,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	let output = out.join("recipe.cubin");
 	let source = out.join("recipe-nvidia.ll");
 	let ir = parallel_ir(fs::read_to_string("amd-nv.ll")?, "declare i32 @recipe.workgroup.size.x()")
+		.replace("RECIPE_CONTRACTION_TILE_K_MAX", natural(manifest, "contraction-tile-k-max")?)
 		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
 		.replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x")
 		.replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x")
@@ -170,6 +174,10 @@ fn main() -> BuildResult<()> {
 		("adamw-beta2", "RECIPE_ADAMW_BETA2"), ("adamw-epsilon", "RECIPE_ADAMW_EPSILON"),
 		("adamw-weight-decay", "RECIPE_ADAMW_WEIGHT_DECAY"), ("kmeans-iterations", "RECIPE_KMEANS_ITERATIONS"),
 		("surrogate-epochs", "RECIPE_SURROGATE_EPOCHS"), ("surrogate-rate", "RECIPE_SURROGATE_RATE"),
+		("rat-batch-rows", "RECIPE_RAT_BATCH_ROWS"), ("contraction-tile-m", "RECIPE_TILE_M"),
+		("contraction-tile-n", "RECIPE_TILE_N"), ("contraction-tile-k", "RECIPE_TILE_K"),
+		("contraction-tile-m-max", "RECIPE_TILE_M_MAX"), ("contraction-tile-n-max", "RECIPE_TILE_N_MAX"),
+		("contraction-tile-k-max", "RECIPE_TILE_K_MAX"),
 		("random-seed", "RECIPE_RANDOM_SEED"), ("normalization-epsilon", "RECIPE_NORMALIZATION_EPSILON"),
 		("leak-slope", "RECIPE_LEAK_SLOPE"), ("prelu-slope", "RECIPE_PRELU_SLOPE"),
 		("elu-alpha", "RECIPE_ELU_ALPHA"), ("selu-alpha", "RECIPE_SELU_ALPHA"),
