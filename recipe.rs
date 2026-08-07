@@ -140,8 +140,13 @@ type Ptr = *mut c_void; #[derive(Clone, Copy, Debug, PartialEq, Eq)] enum Backen
 	target: Vec<String>, exclusions: Vec<String>, routes: Vec<Route>, normalize: bool, split: f64,
 	prepared: OnceLock<Result<Prepared>>, } #[derive(Clone)] struct Route { inputs: Vec<String>, outputs: Vec<String>, }
 #[derive(Clone, Debug, PartialEq, Eq)] pub enum Residual { Layer(usize), Activation(Activation), }
-pub const fn layer(width: usize) -> Residual { Residual::Layer(width) } #[derive(Clone, Debug, PartialEq, Eq)]
-enum Estimator { KMeans(usize), Knn(usize), } #[derive(Clone, Debug, PartialEq, Eq)] enum Operation { Layer(usize),
+pub const fn layer(width: usize) -> Residual { Residual::Layer(width) }
+type FitFn = fn(usize, &Prepared, usize, Config, bool) -> Result<Predictor>;
+#[derive(Clone, Copy, Debug)] struct Estimator { fit: FitFn, param: usize, name: &'static str, }
+impl PartialEq for Estimator { fn eq(&self, other: &Self) -> bool {
+	self.param == other.param && self.name == other.name } }
+impl Eq for Estimator {}
+#[derive(Clone, Debug, PartialEq, Eq)] enum Operation { Layer(usize),
 	Conv(usize, usize), Pool(usize), Estimator(Estimator), Embed(usize, usize), Attention(usize), Rnn(usize), Gru(usize),
 	Lstm(usize), Residual(Vec<Residual>), Moe(usize, Vec<Residual>), Svm(Vec<Activation>), Perceptron(usize), }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)] #[repr(u8)] pub enum Activation { Linear, Cos, Exp, Log, Ln, Huber, Tan,
@@ -171,8 +176,8 @@ $(pub fn $method(self, $($argument: $kind),*) -> Self { self.push($operation) })
 	fn layer(width: usize) = Operation::Layer(width);
 	fn conv(filters: usize, kernel: usize) = Operation::Conv(filters, kernel);
 	fn pool(size: usize) = Operation::Pool(size);
-	fn kmeans(clusters: usize) = Operation::Estimator(Estimator::KMeans(clusters));
-	fn knn(neighbors: usize) = Operation::Estimator(Estimator::Knn(neighbors));
+	fn kmeans(clusters: usize) = Operation::Estimator(Estimator { fit: fit_kmeans, param: clusters, name: "kmeans" });
+	fn knn(neighbors: usize) = Operation::Estimator(Estimator { fit: fit_knn, param: neighbors, name: "knn" });
 	fn embed(dimensions: usize, vocabulary: usize) = Operation::Embed(dimensions, vocabulary);
 	fn attn(heads: usize) = Operation::Attention(heads);
 	fn rnn(width: usize) = Operation::Rnn(width);
@@ -197,8 +202,9 @@ $(pub fn $method(self, $($argument: $kind),*) -> Self { self.push($operation) })
 					names.push(block.operation.name()); } if activation && block.activation != Activation::Linear {
 					names.push(block.activation.name()); } if normalization { block.normalization .map(BlockNormalization::name)
 						.into_iter() .for_each(|name| names.push(name)); } (!names.is_empty()).then(|| names.join(".")) })
-			.collect::<Vec<_>>() .join("/") } } impl Estimator { const fn name(&self) -> &'static str { match self {
-			Self::KMeans(_) => "kmeans", Self::Knn(_) => "knn", } } } impl Operation { const fn name(&self) -> &'static str {
+			.collect::<Vec<_>>() .join("/") } }
+impl Estimator { const fn name(&self) -> &'static str { self.name } }
+impl Operation { const fn name(&self) -> &'static str {
 		match self { Self::Layer(_) => "layer", Self::Conv(..) => "conv", Self::Pool(_) => "pool",
 			Self::Estimator(value) => value.name(), Self::Embed(..) => "embed", Self::Attention(_) => "attn",
 			Self::Rnn(_) => "rnn", Self::Gru(_) => "gru", Self::Lstm(_) => "lstm", Self::Residual(_) => "residual",
@@ -575,7 +581,9 @@ fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Conf
 	let mut targets = data.targets[..rows].to_vec();
 	targets.extend_from_within(..); let paired = Prepared { samples, targets,
 		rows: checked_mul(rows, 2, "paired estimator rows")?, features: input.elements(), schema: String::new(), };
-	let teacher = estimator_predict(estimator, &paired, rows, config, true)?;
+	let teacher = { require(paired.rows > rows, "estimator split must retain test rows")?;
+		let predict = estimator.fit(&paired, rows, config, true)?; paired.samples[rows * input.elements()..]
+			.chunks_exact(input.elements()).enumerate().map(|(row, query)| predict(row, query)).collect::<Vec<_>>() };
 	let hidden = config.surrogate_width;
 	let surrogate = fit_surrogate(input, &inputs, &teacher, hidden, gpu, config)?;
 	let first = checked_mul(hidden, input.elements(), "surrogate input")?;
@@ -1433,39 +1441,37 @@ fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gp
 	let mut tape = GpuTape::new(&graph, samples, targets, gpu)?; for _ in 0..config.surrogate_epochs {
 		tape.advance()?;
 		tape.epoch(config.surrogate_rate, mse, 0.0, config, false)?; } tape.weights() }
-type Predictor = Box<dyn Fn(usize, &[f64]) -> f64>; impl Estimator {
-	fn fit(&self, data: &Prepared, rows: usize, config: Config, exclude: bool) -> Result<Predictor> { match self {
-			Self::KMeans(clusters) => { require(*clusters != 0 && *clusters <= rows, "kmeans cluster count is invalid")?;
-				let mut centers = data.samples[..clusters * data.features].to_vec();
-				let mut assignments = std::iter::repeat_n(0_usize, rows).collect::<Vec<_>>();
-				let mut distances = std::iter::repeat_n(0.0, rows).collect::<Vec<_>>();
-				for _ in 0..config.kmeans_iterations { for (row, sample) in
-						data.samples[..rows * data.features].chunks_exact(data.features).enumerate() {
-						let selected = nearest(sample, &centers, data.features);
-						assignments[row] = selected.0;
-						distances[row] = selected.1; } for cluster in 0..*clusters { let members = assignments .iter() .enumerate()
-							.filter(|value| *value.1 == cluster) .map(|value| value.0) .collect::<Vec<_>>(); if members.is_empty() {
-							let worst = distances .iter() .enumerate() .max_by(|a, b| a.1.total_cmp(b.1)) .map(|value| value.0)
-								.ok_or_else(|| RecipeError::new("kmeans has no training row"))?;
-							centers[cluster * data.features..(cluster + 1) * data.features] .copy_from_slice(
-									&data.samples[worst * data.features..(worst + 1) * data.features], );
-							distances[worst] = -1.0; } else { for feature in 0..data.features { centers[cluster * data.features + feature] =
-									members .iter() .map(|row| data.samples[row * data.features + feature]) .sum::<f64>() / members.len() as f64; }
-						} } } let features = data.features; Ok(Box::new(move |_, query| nearest(query, &centers, features).0 as f64)) }
-			Self::Knn(count) => { let maximum = rows - usize::from(exclude);
-				require(*count != 0 && *count <= maximum, "knn neighbor count is invalid")?;
-				let features = data.features;
-				let samples = data.samples[..rows * features].to_vec();
-				let targets = data.targets[..rows].to_vec();
-				let count = *count; Ok(Box::new(move |row, query| { let mut nearest = samples .chunks_exact(features) .enumerate()
-						.filter(|value| !exclude || value.0 != row) .map(|value| (distance(query, value.1), targets[value.0]))
-						.collect::<Vec<_>>();
-					nearest.sort_by(|a, b| a.0.total_cmp(&b.0));
-					nearest.iter().take(count).map(|value| value.1).sum::<f64>() / count as f64 })) } } } } fn estimator_predict(
-	estimator: &Estimator, data: &Prepared, rows: usize, config: Config, exclude: bool, ) -> Result<Vec<f64>> {
-	require(data.rows > rows, "estimator split must retain test rows")?;
-	let predict = estimator.fit(data, rows, config, exclude)?; Ok(data.samples[rows * data.features..]
-		.chunks_exact(data.features) .enumerate() .map(|(row, query)| predict(row, query)) .collect()) }
+type Predictor = Box<dyn Fn(usize, &[f64]) -> f64>;
+fn fit_kmeans(clusters: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+	require(clusters != 0 && clusters <= rows, "kmeans cluster count is invalid")?;
+	let mut centers = data.samples[..clusters * data.features].to_vec();
+	let mut assignments = std::iter::repeat_n(0_usize, rows).collect::<Vec<_>>();
+	let mut distances = std::iter::repeat_n(0.0, rows).collect::<Vec<_>>();
+	for _ in 0..config.kmeans_iterations { for (row, sample) in
+			data.samples[..rows * data.features].chunks_exact(data.features).enumerate() {
+			let selected = nearest(sample, &centers, data.features);
+			assignments[row] = selected.0;
+			distances[row] = selected.1; } for cluster in 0..clusters { let members = assignments .iter() .enumerate()
+				.filter(|value| *value.1 == cluster) .map(|value| value.0) .collect::<Vec<_>>(); if members.is_empty() {
+				let worst = distances .iter() .enumerate() .max_by(|a, b| a.1.total_cmp(b.1)) .map(|value| value.0)
+					.ok_or_else(|| RecipeError::new("kmeans has no training row"))?;
+				centers[cluster * data.features..(cluster + 1) * data.features] .copy_from_slice(
+						&data.samples[worst * data.features..(worst + 1) * data.features], );
+				distances[worst] = -1.0; } else { for feature in 0..data.features { centers[cluster * data.features + feature] =
+						members .iter() .map(|row| data.samples[row * data.features + feature]) .sum::<f64>() / members.len() as f64; }
+			} } } let features = data.features; Ok(Box::new(move |_, query| nearest(query, &centers, features).0 as f64)) }
+fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool) -> Result<Predictor> {
+	let maximum = rows - usize::from(exclude);
+	require(count != 0 && count <= maximum, "knn neighbor count is invalid")?;
+	let features = data.features;
+	let samples = data.samples[..rows * features].to_vec();
+	let targets = data.targets[..rows].to_vec(); Ok(Box::new(move |row, query| {
+		let mut nearest = samples .chunks_exact(features) .enumerate() .filter(|value| !exclude || value.0 != row)
+			.map(|value| (distance(query, value.1), targets[value.0])) .collect::<Vec<_>>();
+		nearest.sort_by(|a, b| a.0.total_cmp(&b.0));
+		nearest.iter().take(count).map(|value| value.1).sum::<f64>() / count as f64 })) }
+impl Estimator { fn fit(&self, data: &Prepared, rows: usize, config: Config, exclude: bool) -> Result<Predictor> {
+	(self.fit)(self.param, data, rows, config, exclude) } }
 const DOUBLE_BUFFER_VALUES: u32 = 2; fn shared_bytes(tile: u32) -> Result<u32> { tile.max(DOUBLE_BUFFER_VALUES)
 		.checked_mul(size_of::<f64>() as u32) .ok_or_else(|| RecipeError::new("GPU shared memory size overflows")) }
 #[derive(Clone, Copy)] struct Resources { pub shared: u32, pub max_block: u32, } #[derive(Clone, Copy)]
@@ -1509,18 +1515,28 @@ impl<T: Clone + Into<String>> IntoDataSources for &[T] { fn into_data_sources(se
 	headers: Vec<String>, rows: Vec<Vec<String>>, children: Vec<ChildTable>, } enum FeatureType { Numeric(&'static str),
 	Categorical(Vec<String>), Text(usize), } fn prepare(data: &Data) -> Result<&Prepared> {
 	match data.prepared.get_or_init(|| prepare_data(data)) { Ok(prepared) => Ok(prepared),
-		Err(error) => Err(error.clone()), } } fn print_table(table: &Table, fit: usize) {
-	eprintln!("{:<37} {:<9} {} samples", table.name, "", table.rows.len());
+		Err(error) => Err(error.clone()), } }
+fn column_match(name: &str, table: &Table, header: &str, column: usize) -> bool {
+	name == header || name == format!("{}.{}", table.name, header) || name == format!("col{}", column + 1)
+		|| name == format!("{}.col{}", table.name, column + 1) }
+fn print_table(table: &Table, fit: usize, targets: &[String], exclusions: &[String]) {
+	eprintln!("{:<37} {:<10} {:<9} {} samples", table.name, "", "", table.rows.len());
 	let mut base = 0; for child in &table.children {
 		let unit = if child.rows == 1 { "row/sample" } else { "rows/sample" };
-		eprintln!("{:<37} {:<9} {} {unit}", format!("  {}", child.name), "", child.rows); if child.rows != 0 {
+		eprintln!("{:<37} {:<10} {:<9} {} {unit}", format!("  {}", child.name), "", "", child.rows);
+		if child.rows != 0 {
 			for (column, header) in child.headers.iter().enumerate() {
-				let kind = infer_feature(table, base + column, fit).name(); let same = (1..child.rows).all(|row| {
+				let index = base + column;
+				let tagged = |names: &[String]| names.iter().any(|name| column_match(name, table, header, index));
+				let tag = if tagged(targets) { "\x1b[32m[target]\x1b[0m  " } else if tagged(exclusions) {
+					"\x1b[31m[excluded]\x1b[0m"
+				} else { "          " };
+				let kind = infer_feature(table, index, fit).name(); let same = (1..child.rows).all(|row| {
 					infer_feature(table, base + row * child.headers.len() + column, fit).name() == kind });
 				let kind = if same { kind } else { "mixed" }; if child.rows == 1 { let samples = (0..table.rows.len())
-						.filter(|&sample| { table.rows[sample].get(base + column).is_some_and(|item| !item.is_empty()) }) .count();
-					eprintln!("{:<37} {kind:<9} {samples}", format!("    {header}")); } else {
-					eprintln!("{:<37} {kind:<9}", format!("    {header}")); } } }
+						.filter(|&sample| { table.rows[sample].get(index).is_some_and(|item| !item.is_empty()) }) .count();
+					eprintln!("{:<37} {tag} {kind:<9} {samples}", format!("    {header}")); } else {
+					eprintln!("{:<37} {tag} {kind:<9}", format!("    {header}")); } } }
 		base += child.rows * child.headers.len(); } } fn prepare_data(data: &Data) -> Result<Prepared> {
 	let mut paths = Vec::new(); for source in &data.sources {
 		collect_files(&expand_home(source)?, &mut paths)?; }
@@ -1536,10 +1552,8 @@ impl<T: Clone + Into<String>> IntoDataSources for &[T] { fn into_data_sources(se
 	require(!tables.is_empty(), "data source contains no supported table")?;
 	let mut selected = Vec::new(); for name in &data.target {
 		let mut matches = Vec::new(); for (table, value) in tables.iter().enumerate() {
-			for (column, header) in value.headers.iter().enumerate() { let qualified = format!("{}.{}", value.name, header);
-				let numbered = format!("col{}", column + 1);
-				let qualified_numbered = format!("{}.{}", value.name, numbered);
-				if name == header || name == &qualified || name == &numbered || name == &qualified_numbered {
+			for (column, header) in value.headers.iter().enumerate() {
+				if column_match(name, value, header, column) {
 					matches.push((table, column)); } } }
 		require(matches.len() == 1, format!("target {name:?} must identify exactly one feature"))?;
 		selected.push(matches[0]); }
@@ -1547,11 +1561,11 @@ impl<T: Clone + Into<String>> IntoDataSources for &[T] { fn into_data_sources(se
 	let row_count = tables[table_index].rows.len();
 	require(selected.iter().all(|target| tables[target.0].rows.len() == row_count), "target row counts differ")?;
 	let fit_rows = ((row_count as f64) * data.split).floor().max(1.0) as usize;
-	eprintln!("Feature name:                         Dtype:    Samples:"); for value in &tables {
-		print_table(value, fit_rows); }
+	eprintln!("Feature name:                                    Dtype:    Samples:"); for value in &tables {
+		print_table(value, fit_rows, &data.target, &data.exclusions); }
 	let mut columns = Vec::new(); for (table, value) in tables.iter().enumerate() { if value.rows.len() == row_count {
-			for (column, header) in value.headers.iter().enumerate() { let qualified = format!("{}.{}", value.name, header);
-				let excluded = data.exclusions.iter().any(|name| name == header || name == &qualified);
+			for (column, header) in value.headers.iter().enumerate() {
+				let excluded = data.exclusions.iter().any(|name| column_match(name, value, header, column));
 				if !selected.contains(&(table, column)) && !excluded {
 					columns.push((table, column, infer_feature(value, column, fit_rows))); } } } }
 	let features = columns.iter().map(|column| column.2.width()).sum();
@@ -1596,7 +1610,7 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> { let meta
 		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
 	children.sort_by_key(fs::DirEntry::path); for child in children {
 		collect_files(&child.path(), files)?; } Ok(()) } fn target_column(table: &Table, name: &str) -> Option<usize> {
-	table.headers .iter() .enumerate() .position(|(column, header)| name == header || name == format!("col{}", column + 1))
+	table.headers .iter() .enumerate() .position(|(column, header)| column_match(name, table, header, column))
 } fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<Vec<Table>> {
 	let mut groups = BTreeMap::<PathBuf, Vec<Table>>::new(); for (directory, table) in tables {
 		groups.entry(directory).or_default().push(table); } let valid = |group: &[Table]| { group.len() > 1
