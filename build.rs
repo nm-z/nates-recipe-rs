@@ -54,6 +54,7 @@ fn render(command: &mut Command, role: &str, path: &Path) -> BuildResult<()> { l
 	let ir = parallel_ir(fs::read_to_string("amd-nv.ll")?, AMD_WIDTH);
 	fs::write(&source, ir)?;
 	let mut objects = Vec::new();
+	let mut embeds = Vec::new();
 	let mut assemblies = Vec::new(); for architecture in probe(manifest, "hsa-architecture-probe")? {
 		let output = out.join(format!("recipe-{architecture}.hsaco"));
 		let mut command = Command::new(text(manifest, "hsa-compiler")?);
@@ -68,7 +69,10 @@ fn render(command: &mut Command, role: &str, path: &Path) -> BuildResult<()> { l
 			Command::new(text(manifest, "hsa-disassembler")?).arg("--disassemble").arg(&output), "HSA disassembler", &assembly,
 		)?;
 		objects.push(format!("{architecture}={}", output.display()));
+		embeds.push(format!("(\"{architecture}\", include_bytes!(\"{}\").as_slice()),", output.display()));
 		assemblies.push(format!("{architecture}={}", assembly.display())); }
+	let table = format!("static HSA_CODE_OBJECTS: &[(&str, &[u8])] = &[{}]\x3b", embeds.join(" "));
+	fs::write(out.join("hsa-embed.rs"), table)?;
 	println!("cargo:rustc-env=RECIPE_HSA_CODE_OBJECTS={}", objects.join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_HSA_ASSEMBLIES={}", assemblies.join("\x3b"));
 	println!("cargo:rustc-link-search=native={}", text(manifest, "hsa-library")?); Ok(()) }
@@ -117,7 +121,14 @@ fn main() -> BuildResult<()> { let manifest = fs::read_to_string("Cargo.toml")?;
 		("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME"), ("ssh-config", "RECIPE_SSH_CONFIG"),
 	] { println!("cargo:rustc-env={environment}={}", text(&manifest, key)?); }
 	let out = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR must be configured"))?);
-	if env::var_os("CARGO_FEATURE_AMD").is_some() { compile_amd(&manifest, &out)?; }
-	if env::var_os("CARGO_FEATURE_NVIDIA").is_some() { compile_nvidia(&manifest, &out)?; }
+	println!("cargo::rustc-check-cfg=cfg(amd)");
+	println!("cargo::rustc-check-cfg=cfg(nvidia)");
+	let amd = probe(&manifest, "hsa-architecture-probe").is_ok();
+	let nvidia = probe(&manifest, "nvidia-architecture-probe").is_ok(); if !amd && !nvidia {
+		return Err(io::Error::other("no AMD or NVIDIA GPU was detected on the build machine").into()); } if amd {
+		println!("cargo:rustc-cfg=amd");
+		compile_amd(&manifest, &out)?; } if nvidia {
+		println!("cargo:rustc-cfg=nvidia");
+		compile_nvidia(&manifest, &out)?; }
 	println!("cargo:rerun-if-changed=Cargo.toml");
 	println!("cargo:rerun-if-changed=amd-nv.ll"); Ok(()) }

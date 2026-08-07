@@ -135,7 +135,7 @@ impl fmt::Display for RecipeError { fn fmt(&self, formatter: &mut fmt::Formatter
 		formatter.write_str(&self.0) } } impl Error for RecipeError {}
 pub type Result<T> = std::result::Result<T, RecipeError>;
 type Ptr = *mut c_void; #[derive(Clone, Copy, Debug, PartialEq, Eq)] enum Backend { Amd, Nvidia, }
-#[derive(Clone, Copy)] pub enum ArtifactSet { Auto, Amd, Nvidia, } pub struct Data { sources: Vec<String>,
+pub struct Data { sources: Vec<String>,
 	target: Vec<String>, exclusions: Vec<String>, routes: Vec<Route>, normalize: bool, split: f64,
 	prepared: OnceLock<Result<Prepared>>, } #[derive(Clone)] struct Route { inputs: Vec<String>, outputs: Vec<String>, }
 #[derive(Clone, Debug, PartialEq, Eq)] pub enum Residual { Layer(usize), Activation(Activation), }
@@ -269,13 +269,12 @@ pub const batch: Normalization = batch_marker; const fn batch_marker(_: usize) -
 		self.topology().devices.into_iter().map(|device| device.name).collect() } pub fn topology(&self) -> Topology {
 		topology().unwrap_or_else(|error| panic!("{error}")) } pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: None, resume: None, save: None } }
-	pub fn export(&self, source: impl AsRef<Path>, selection: ArtifactSet) -> Result<Vec<PathBuf>> {
+	pub fn export(&self, source: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
 		let source = source.as_ref(); require( source.extension().and_then(|value| value.to_str()) == Some("rs"),
 			"export requires a Rust source", )?; fs::metadata(source)
 			.map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", source.display())))?;
-		let backends = match selection { ArtifactSet::Auto => { let found = devices()?; [Backend::Amd, Backend::Nvidia]
-					.into_iter() .filter(|backend| found.iter().any(|gpu| gpu.backend == *backend)) .collect() }
-			ArtifactSet::Amd => vec![Backend::Amd], ArtifactSet::Nvidia => vec![Backend::Nvidia], };
+		let found = devices()?; let backends = [Backend::Amd, Backend::Nvidia] .into_iter()
+			.filter(|backend| found.iter().any(|gpu| gpu.backend == *backend)) .collect::<Vec<_>>();
 		let mut outputs = Vec::new(); for backend in backends { let artifacts = match backend { Backend::Amd => vec![
 					mapped_artifacts(option_env!("RECIPE_HSA_CODE_OBJECTS"), "hsaco")?,
 					mapped_artifacts(option_env!("RECIPE_HSA_ASSEMBLIES"), "amd.s")?, ] .concat(), Backend::Nvidia => vec![(
@@ -759,7 +758,8 @@ fn stored_graph(graph: &Graph, data: &Data) -> bundle::StoredGraph {
 		self.write_tiles(&std::iter::repeat_n(tile, self.nodes as usize).collect::<Vec<_>>()) }
 	fn write_weights(&self, values: &[f64]) -> Result<()> { self.weights.write(0, values) } }
 struct Placement { tape: GpuTape, rows: Vec<usize>, share: f64, }
-struct DeviceTape { shards: Vec<Placement>, targets: Vec<f64>, best: Vec<f64>, best_loss: [f64; 4],
+struct DeviceTape { shards: Vec<Placement>, targets: Vec<f64>, best: Vec<f64>, best_moments: Vec<f64>,
+	best_variances: Vec<f64>, best_epoch: u32, best_loss: [f64; 4],
 	replicated: bool, input: usize, output: usize, capacity: usize, step: u32, } impl DeviceTape {
 	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpus: &[&'static Gpu]) -> Result<Self> {
 		require(!gpus.is_empty(), "training requires a GPU")?;
@@ -776,11 +776,13 @@ struct DeviceTape { shards: Vec<Placement>, targets: Vec<f64>, best: Vec<f64>, b
 			shards.push(Placement { tape, rows, share }); }
 		let best = if graph.state.best.is_empty() { graph.parameters.clone() } else { graph.state.best.clone() };
 		require(best.len() == graph.parameters.len(), "saved best model has the wrong shape")?;
-		let cold_loss = [f64::INFINITY, f64::NAN, f64::NAN, f64::INFINITY];
-		let best_loss = if graph.state.best_loss.is_empty() { cold_loss } else { graph.state.best_loss.as_slice()
-			.try_into().map_err(|_| RecipeError::new("saved loss state has the wrong shape"))? };
-		Ok(Self { shards, targets: targets.to_vec(), best, best_loss, replicated, input, output, capacity,
-			step: narrow(graph.state.epoch, "optimizer epoch")? as u32, }) }
+		let best_loss = if graph.state.best_loss.is_empty() { [f64::INFINITY, f64::NAN, f64::NAN, f64::INFINITY] } else {
+			graph.state.best_loss.as_slice().try_into().map_err(|_| RecipeError::new("saved loss state is invalid"))? };
+		let step = narrow(graph.state.epoch, "optimizer epoch")? as u32;
+		let saved = |values: &Vec<f64>| if values.is_empty() { [0.0].repeat(best.len()) } else { values.clone() };
+		let (moments, variances) = (saved(&graph.state.moments), saved(&graph.state.variances));
+		Ok(Self { shards, targets: targets.to_vec(), best, best_moments: moments, best_variances: variances,
+			best_epoch: step, best_loss, replicated, input, output, capacity, step, }) }
 	fn pack(values: &[f64], width: usize, rows: &[usize]) -> Vec<f64> {
 		let mut packed = Vec::with_capacity(rows.len() * width);
 		for &row in rows { packed.extend_from_slice(&values[row * width..(row + 1) * width]); } packed }
@@ -800,7 +802,8 @@ struct DeviceTape { shards: Vec<Placement>, targets: Vec<f64>, best: Vec<f64>, b
 		self.step = self.shards[0].tape.step; Ok(()) } fn observe(&mut self, loss: f64, tolerance: f64) -> Result<bool> {
 		let (old_best, last, trail) = (self.best_loss[0], self.best_loss[1], self.best_loss[2]);
 		let better = loss < old_best; if better {
-			self.best = self.shards[0].tape.weights()?; }
+			(self.best, self.best_moments, self.best_variances) = self.shards[0].tape.optimizer_state()?;
+			self.best_epoch = self.shards[0].tape.step; }
 		let next_trail = if last.is_finite() && !trail.is_finite() && loss > last { last } else { trail };
 		let trigger = next_trail.is_finite() && loss > last * (1.0 + tolerance) && loss < next_trail && tolerance > 0.0;
 		self.best_loss[0] = if better { loss } else { old_best };
@@ -835,15 +838,19 @@ struct DeviceTape { shards: Vec<Placement>, targets: Vec<f64>, best: Vec<f64>, b
 		self.shards[self.placement(row)?].tape.gpu.proposal_limit(values) }
 	fn set_tile(&mut self, row: usize, tile: Tile) -> Result<()> { let placement = self.placement(row)?;
 		self.shards[placement].tape.fill_tile(tile) }
-	fn weights(&self, best: bool) -> Result<Vec<f64>> { if best { Ok(self.best.clone()) } else {
-			self.shards[0].tape.weights() } } fn restore_best(&mut self) -> Result<()> { for shard in &self.shards {
+	fn weights(&self) -> Result<Vec<f64>> { self.shards[0].tape.weights() }
+	fn restore_best(&mut self) -> Result<()> { for shard in &self.shards {
 			shard.tape.write_weights(&self.best)?; } Ok(()) }
-	fn capture(&self, graph: &mut Graph, best: bool) -> Result<()> { self.shards[0].tape.capture(graph)?;
-		graph.parameters = self.weights(best)?;
+	fn capture(&self, graph: &mut Graph, best: bool) -> Result<()> { self.shards[0].tape.capture(graph)?; if best {
+			graph.parameters = self.best.clone();
+			(graph.state.moments, graph.state.variances) = (self.best_moments.clone(), self.best_variances.clone());
+			graph.state.epoch = self.best_epoch as usize; }
 		graph.state.best = self.best.clone();
-		graph.state.best_loss = self.best_loss.to_vec();
-		graph.state.epoch = self.step as usize; Ok(()) } fn tile(&self) -> Tile { self.shards[0].tape.tile } }
-fn checkpoint(path: &str, schema: &str, stored: &mut bundle::StoredGraph, tape: &DeviceTape, best: bool) -> Result<()> {
+		graph.state.best_loss = self.best_loss.to_vec(); Ok(()) } fn tile(&self) -> Tile { self.shards[0].tape.tile } }
+fn checkpoint( path: &str, schema: &str, stored: &mut bundle::StoredGraph, tape: &DeviceTape, best: bool, guard: bool,
+) -> Result<()> { let disk = guard.then(|| bundle::load(path).ok()).flatten().and_then(|(_, saved)| saved.first()
+		.and_then(|graph| graph.graph.state.best_loss.first().copied()));
+	if disk.is_some_and(|value| value <= tape.best_loss[0]) { return Ok(eprintln!("kept: {path}")); }
 	tape.capture(&mut stored.graph, best)?; bundle::save(path, schema, std::slice::from_ref(stored)) }
 fn node_descriptor(node: &Node, program_base: usize) -> Result<[i32; 11]> {
 	let program_offset = if node.program_count == 0 { 0 } else {
@@ -885,42 +892,42 @@ fn node_context(node: &Node, rows: usize) -> Result<usize> { let elements = matc
 		self.runtime.synchronize()?;
 		self.runtime.download(values.as_mut_ptr().cast(), self.pointer + start as u64, size_of_val(&*values))?; Ok(values) } }
 impl Drop for Buffer { fn drop(&mut self) { self.runtime.free(self.pointer); } } #[derive(Clone, Copy)] struct Kernel {
-	object: u64, shared: u32, #[cfg(feature = "amd")] kernarg: usize, #[cfg(feature = "amd")] private: u32,
+	object: u64, shared: u32, #[cfg(amd)] kernarg: usize, #[cfg(amd)] private: u32,
 	layout: &'static [u8], } #[derive(Clone, Copy)] struct Dispatch { kernel: Kernel, geometry: Geometry, }
 impl Kernel { const fn remote(object: u64, shared: u32, layout: &'static [u8]) -> Self { Self { object, shared,
-		#[cfg(feature = "amd")] kernarg: 0, #[cfg(feature = "amd")] private: 0, layout, } } }
+		#[cfg(amd)] kernarg: 0, #[cfg(amd)] private: 0, layout, } } }
 const FORWARD_ARGS: &[u8] = b"88888844444488";
 const EPOCH_ARGS: &[u8] = b"8888888888888888444488888888844444488";
-#[cfg(feature = "nvidia")] struct Cuda { context: Ptr,
+#[cfg(nvidia)] struct Cuda { context: Ptr,
 	set: unsafe extern "C" fn(Ptr) -> i32, allocate: unsafe extern "C" fn(*mut u64, usize) -> i32,
 	free: unsafe extern "C" fn(u64) -> i32, upload: unsafe extern "C" fn(u64, *const c_void, usize) -> i32,
 	download: unsafe extern "C" fn(Ptr, u64, usize) -> i32, synchronize: unsafe extern "C" fn() -> i32,
 	launch: unsafe extern "C" fn(usize, u32, u32, u32, u32, u32, u32, u32, Ptr, *mut Ptr) -> i32, }
-#[cfg(feature = "nvidia")] impl Kernel { const fn cuda(object: usize, shared: u32, _layout: &'static [u8]) -> Self {
-		Self { object: object as u64, shared, #[cfg(feature = "amd")] kernarg: 0, #[cfg(feature = "amd")] private: 0,
-			layout: _layout, } } } #[cfg(feature = "amd")] #[allow(dead_code)] struct Hsa {
+#[cfg(nvidia)] impl Kernel { const fn cuda(object: usize, shared: u32, _layout: &'static [u8]) -> Self {
+		Self { object: object as u64, shared, #[cfg(amd)] kernarg: 0, #[cfg(amd)] private: 0,
+			layout: _layout, } } } #[cfg(amd)] #[allow(dead_code)] struct Hsa {
 	allocate: unsafe extern "C" fn(u64, usize, u32, *mut Ptr) -> i32, free: unsafe extern "C" fn(Ptr) -> i32,
 	allow: unsafe extern "C" fn(u32, *const u64, *const u32, *const c_void) -> i32,
 	copy: unsafe extern "C" fn(Ptr, *const c_void, usize) -> i32, store: unsafe extern "C" fn(u64, i64),
 	wait: unsafe extern "C" fn(u64, i32, i64, u64, i32) -> i64, write: unsafe extern "C" fn(*const HsaQueue, u64) -> u64,
-	queue: Ptr, signal: u64, cpu_agent: u64, vram_pool: u64, kernarg_pool: u64, kernarg_size: usize, kernarg: Ptr,
-	_code: fs::File, } struct Remote { io: Mutex<Worker>, } enum Driver { #[cfg(feature = "amd")] Hsa(Hsa),
-	#[cfg(feature = "nvidia")] Cuda(Cuda), Remote(Remote), } #[allow(dead_code)] struct Gpu { name: String,
+	queue: Ptr, signal: u64, cpu_agent: u64, vram_pool: u64, kernarg_pool: u64, kernarg_size: usize,
+	kernarg: Ptr, } struct Remote { io: Mutex<Worker>, } enum Driver { #[cfg(amd)] Hsa(Hsa),
+	#[cfg(nvidia)] Cuda(Cuda), Remote(Remote), } #[allow(dead_code)] struct Gpu { name: String,
 	backend: Backend, driver: Driver, forward: Dispatch, epoch: Dispatch, memory: u64, clock: u64, shared_limit: u32,
 	dispatch: Mutex<()>, }
-unsafe impl Send for Gpu {} unsafe impl Sync for Gpu {} #[cfg(feature = "amd")] #[repr(C)] struct HsaQueue { kind: u32,
-	features: u32, base: Ptr, doorbell: u64, size: u32, reserved: u32, id: u64, } #[cfg(feature = "amd")] #[repr(C)]
+unsafe impl Send for Gpu {} unsafe impl Sync for Gpu {} #[cfg(amd)] #[repr(C)] struct HsaQueue { kind: u32,
+	features: u32, base: Ptr, doorbell: u64, size: u32, reserved: u32, id: u64, } #[cfg(amd)] #[repr(C)]
 struct HsaPacket { header: u16, setup: u16, workgroup_x: u16, workgroup_y: u16, workgroup_z: u16, reserved0: u16,
 	grid_x: u32, grid_y: u32, grid_z: u32, private: u32, group: u32, object: u64, kernarg: Ptr, reserved1: u64,
-	completion: u64, } #[cfg(feature = "nvidia")] type Count = unsafe extern "C" fn(*mut i32) -> i32;
-#[cfg(feature = "nvidia")] type Attribute = unsafe extern "C" fn(*mut i32, i32, i32) -> i32; #[cfg(feature = "nvidia")]
-type Device = unsafe extern "C" fn(*mut i32, i32) -> i32; #[cfg(feature = "nvidia")]
-type Context = unsafe extern "C" fn(*mut Ptr, u32, i32) -> i32; #[cfg(feature = "nvidia")]
-type Module = unsafe extern "C" fn(*mut Ptr, *const c_void) -> i32; #[cfg(feature = "nvidia")]
-type Function = unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32; #[cfg(feature = "nvidia")]
-type FunctionAttribute = unsafe extern "C" fn(*mut i32, i32, usize) -> i32; #[cfg(feature = "nvidia")]
+	completion: u64, } #[cfg(nvidia)] type Count = unsafe extern "C" fn(*mut i32) -> i32;
+#[cfg(nvidia)] type Attribute = unsafe extern "C" fn(*mut i32, i32, i32) -> i32; #[cfg(nvidia)]
+type Device = unsafe extern "C" fn(*mut i32, i32) -> i32; #[cfg(nvidia)]
+type Context = unsafe extern "C" fn(*mut Ptr, u32, i32) -> i32; #[cfg(nvidia)]
+type Module = unsafe extern "C" fn(*mut Ptr, *const c_void) -> i32; #[cfg(nvidia)]
+type Function = unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32; #[cfg(nvidia)]
+type FunctionAttribute = unsafe extern "C" fn(*mut i32, i32, usize) -> i32; #[cfg(nvidia)]
 type Occupancy = unsafe extern "C" fn(*mut i32, usize, i32, usize) -> i32;
-#[cfg(any(feature = "amd", feature = "nvidia"))] struct Library(Ptr); #[cfg(any(feature = "amd", feature = "nvidia"))]
+#[cfg(any(amd, nvidia))] struct Library(Ptr); #[cfg(any(amd, nvidia))]
 impl Library { fn open(name: &str) -> Result<Self> { let name = format!("{name}\0");
 		let handle = unsafe { dlopen(name.as_ptr().cast(), 2) };
 		require(!handle.is_null(), format!("cannot load {name:?}"))?; Ok(Self(handle)) }
@@ -930,8 +937,8 @@ impl Library { fn open(name: &str) -> Result<Self> { let name = format!("{name}\
 fn driver_status(backend: Backend, status: i32, action: &str) -> Result<()> {
 	(status == 0).then_some(()).ok_or_else(|| RecipeError::new(format!("{backend:?} {action} failed: {status}"))) }
 impl Gpu { fn status(&self, status: i32, action: &str) -> Result<()> { driver_status(self.backend, status, action) }
-	fn activate(&self) -> Result<()> { match &self.driver { #[cfg(feature = "nvidia")]
-			Driver::Cuda(driver) => self.status(unsafe { (driver.set)(driver.context) }, "context"), #[cfg(feature = "amd")]
+	fn activate(&self) -> Result<()> { match &self.driver { #[cfg(nvidia)]
+			Driver::Cuda(driver) => self.status(unsafe { (driver.set)(driver.context) }, "context"), #[cfg(amd)]
 			Driver::Hsa(_) => Ok(()), Driver::Remote(_) => Ok(()), } } fn shared_values(&self) -> Result<u32> {
 		let fixed = self.forward.kernel.shared.max(self.epoch.kernel.shared); let shared = self .shared_limit
 			.checked_sub(fixed) .ok_or_else(|| RecipeError::new("GPU kernel exceeds shared memory"))?;
@@ -952,27 +959,27 @@ impl Gpu { fn status(&self, status: i32, action: &str) -> Result<()> { driver_st
 		let block = self.forward.geometry.block.min(self.epoch.geometry.block);
 		Ok(Tile { m: limit.m.min(block), n: limit.n.min(block), k: limit.k.min(block) }) }
 	fn allocate(&self, bytes: usize) -> Result<u64> { self.activate()?; unsafe { match &self.driver {
-				#[cfg(feature = "nvidia")] Driver::Cuda(driver) => { let mut pointer = 0;
-					self.status((driver.allocate)(&mut pointer, bytes), "allocation")?; Ok(pointer) } #[cfg(feature = "amd")]
+				#[cfg(nvidia)] Driver::Cuda(driver) => { let mut pointer = 0;
+					self.status((driver.allocate)(&mut pointer, bytes), "allocation")?; Ok(pointer) } #[cfg(amd)]
 				Driver::Hsa(driver) => { let mut pointer = ptr::null_mut();
 					self.status((driver.allocate)(driver.vram_pool, bytes, 0, &mut pointer), "allocation")?; self.status(
 						(driver.allow)(1, &driver.cpu_agent, ptr::null(), pointer), "CPU allocation access", )?; Ok(pointer as u64) }
 				Driver::Remote(driver) => driver.allocate(bytes), } } } fn free(&self, pointer: u64) { unsafe { match &self.driver {
-				#[cfg(feature = "nvidia")] Driver::Cuda(driver) => { (driver.set)(driver.context);
-					(driver.free)(pointer); } #[cfg(feature = "amd")] Driver::Hsa(driver) => {
+				#[cfg(nvidia)] Driver::Cuda(driver) => { (driver.set)(driver.context);
+					(driver.free)(pointer); } #[cfg(amd)] Driver::Hsa(driver) => {
 					(driver.free)(pointer as Ptr); } Driver::Remote(driver) => driver.free(pointer), } } }
 	fn upload(&self, dst: u64, src: *const c_void, bytes: usize) -> Result<()> { self.activate()?; unsafe {
-			match &self.driver { #[cfg(feature = "nvidia")]
-				Driver::Cuda(driver) => self.status((driver.upload)(dst, src, bytes), "upload"), #[cfg(feature = "amd")]
+			match &self.driver { #[cfg(nvidia)]
+				Driver::Cuda(driver) => self.status((driver.upload)(dst, src, bytes), "upload"), #[cfg(amd)]
 				Driver::Hsa(driver) => self.status((driver.copy)(dst as Ptr, src, bytes), "upload"),
 				Driver::Remote(driver) => driver.upload(dst, src, bytes), } } }
 	fn download(&self, dst: Ptr, src: u64, bytes: usize) -> Result<()> { self.activate()?; unsafe { match &self.driver {
-				#[cfg(feature = "nvidia")] Driver::Cuda(cuda) => self.status((cuda.download)(dst, src, bytes), "download"),
-				#[cfg(feature = "amd")]
+				#[cfg(nvidia)] Driver::Cuda(cuda) => self.status((cuda.download)(dst, src, bytes), "download"),
+				#[cfg(amd)]
 				Driver::Hsa(driver) => self.status((driver.copy)(dst, src as *const c_void, bytes), "download"),
 				Driver::Remote(driver) => driver.download(dst, src, bytes), } } } fn synchronize(&self) -> Result<()> {
-		self.activate()?; unsafe { match &self.driver { #[cfg(feature = "nvidia")]
-				Driver::Cuda(driver) => self.status((driver.synchronize)(), "synchronization"), #[cfg(feature = "amd")]
+		self.activate()?; unsafe { match &self.driver { #[cfg(nvidia)]
+				Driver::Cuda(driver) => self.status((driver.synchronize)(), "synchronization"), #[cfg(amd)]
 				Driver::Hsa(driver) => require((driver.wait)(driver.signal, 0, 0, u64::MAX, 1) == 0, "AMD synchronization failed"),
 				Driver::Remote(driver) => driver.synchronize(), } } }
 	fn launch(&self, dispatch: Dispatch, arguments: &mut [Ptr], threads: u32, tile: Tile) -> Result<()> {
@@ -984,9 +991,9 @@ impl Gpu { fn status(&self, status: i32, action: &str) -> Result<()> { driver_st
 			.ok_or_else(|| RecipeError::new("GPU shared memory size overflows"))?;
 		require(shared <= self.shared_limit, "GPU shared memory exceeds its device limit")?;
 		let _guard = self.dispatch.lock().map_err(|_| RecipeError::new("GPU dispatch lock is poisoned"))?; unsafe {
-			match &self.driver { #[cfg(feature = "nvidia")] Driver::Cuda(driver) => { let stream = ptr::null_mut(); self.status(
+			match &self.driver { #[cfg(nvidia)] Driver::Cuda(driver) => { let stream = ptr::null_mut(); self.status(
 						(driver.launch)( kernel.object as usize, threads / block, 1, 1, block, 1, 1, dynamic, stream,
-							arguments.as_mut_ptr(), ), "dispatch", ) } #[cfg(feature = "amd")] Driver::Hsa(driver) => {
+							arguments.as_mut_ptr(), ), "dispatch", ) } #[cfg(amd)] Driver::Hsa(driver) => {
 					require(arguments.len() == kernel.layout.len(), "kernel argument count is invalid")?;
 					ptr::write_bytes(driver.kernarg.cast::<u8>(), 0, driver.kernarg_size);
 					let mut offset = 0; for (argument, kind) in arguments.iter().zip(kernel.layout) {
@@ -1130,10 +1137,9 @@ fn worker_process(host: &str, mode: &str) -> Result<Worker> { let executable = f
 			"worker=$(mktemp /tmp/recipe-worker.XXXXXX)\x3b trap 'rm -f \"$worker\"' EXIT\x3b ",
 			"dd bs={} count=1 iflag=fullblock of=\"$worker\" status=none\x3b chmod 700 \"$worker\"\x3b ",
 			"RECIPE_WORKER='{}' \"$worker\"", ), executable.len(), mode );
-	let stderr = if mode.starts_with("serve|") { Stdio::inherit() } else { Stdio::null() };
 	let mut child = Command::new("ssh") .arg("-F") .arg(ssh_config()?) .args(["-o", "BatchMode=yes", "-o"])
 		.arg(format!("ConnectTimeout={}", env!("RECIPE_SSH_CONNECT_TIMEOUT"))) .arg(host) .arg(command) .stdin(Stdio::piped())
-		.stdout(Stdio::piped()) .stderr(stderr) .spawn()
+		.stdout(Stdio::piped()) .stderr(Stdio::inherit()) .spawn()
 		.map_err(|error| RecipeError::new(format!("cannot start Recipe worker on {host}: {error}")))?;
 	let mut input = child.stdin.take().ok_or_else(|| RecipeError::new("Recipe worker stdin is absent"))?;
 	let output = child.stdout.take().ok_or_else(|| RecipeError::new("Recipe worker stdout is absent"))?;
@@ -1204,17 +1210,17 @@ fn discover_topology() -> Result<Topology> { let found = devices()?;
 			let duration = transfer_time(source, target, bandwidth_bytes, repetitions)?; links.push(DeviceLink {
 				from: name(source), to: name(target), latency_ms: latency * 1000.0,
 				bytes_per_second: bandwidth_bytes as f64 / duration, }); } } Ok(Topology { devices: nodes, links }) }
-#[cfg(feature = "amd")] type HsaInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32; #[cfg(feature = "amd")]
+#[cfg(amd)] type HsaInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32; #[cfg(amd)]
 struct HsaQuery { info: HsaInfo, attribute: i32, expected: u32, secondary: i32, mask: u32, found: u64, }
-#[cfg(feature = "amd")] extern "C" fn collect_hsa(handle: u64, pointer: Ptr) -> i32 { unsafe {
+#[cfg(amd)] extern "C" fn collect_hsa(handle: u64, pointer: Ptr) -> i32 { unsafe {
 		let query = &mut *pointer.cast::<HsaQuery>();
 		let mut value = 0;
 		let mut status = (query.info)(handle, query.attribute, (&mut value as *mut u32).cast());
 		if status != 0 || value != query.expected { return status; } if query.secondary >= 0 {
 			status = (query.info)(handle, query.secondary, (&mut value as *mut u32).cast());
 			if status != 0 || value & query.mask == 0 { return status; } } if query.found == 0 {
-			query.found = handle; } 0 } } #[cfg(feature = "amd")] struct HsaGpuQuery { info: HsaInfo, found: Vec<u64>, }
-#[cfg(feature = "amd")] extern "C" fn collect_discrete_hsa(handle: u64, pointer: Ptr) -> i32 { unsafe {
+			query.found = handle; } 0 } } #[cfg(amd)] struct HsaGpuQuery { info: HsaInfo, found: Vec<u64>, }
+#[cfg(amd)] extern "C" fn collect_discrete_hsa(handle: u64, pointer: Ptr) -> i32 { unsafe {
 		let query = &mut *pointer.cast::<HsaGpuQuery>();
 		let mut device = 0_u32;
 		let mut status = (query.info)(handle, 17, (&mut device as *mut u32).cast()); if status != 0 || device != 1 {
@@ -1222,9 +1228,9 @@ struct HsaQuery { info: HsaInfo, attribute: i32, expected: u32, secondary: i32, 
 		let mut properties = 0_u64;
 		status = (query.info)(handle, 0xA114, (&mut properties as *mut u64).cast()); if status != 0 || properties & 1 != 0 {
 			return status; }
-		query.found.push(handle); 0 } } #[cfg(feature = "amd")]
-type HsaSymbol = unsafe extern "C" fn(u64, *const u8, *const u64, *mut u64) -> i32; #[cfg(feature = "amd")]
-type HsaSymbolInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32; #[cfg(feature = "amd")] unsafe fn hsa_kernel(
+		query.found.push(handle); 0 } } #[cfg(amd)]
+type HsaSymbol = unsafe extern "C" fn(u64, *const u8, *const u64, *mut u64) -> i32; #[cfg(amd)]
+type HsaSymbolInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32; #[cfg(amd)] unsafe fn hsa_kernel(
 	symbol: HsaSymbol, info: HsaSymbolInfo, executable: u64, agent: u64, name: &'static [u8], layout: &'static [u8],
 ) -> Result<Kernel> { let mut handle = 0;
 	driver_status(Backend::Amd, unsafe { symbol(executable, name.as_ptr(), &agent, &mut handle) }, "kernel lookup")?;
@@ -1232,15 +1238,16 @@ type HsaSymbolInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32; #[cfg(feature =
 		(22, (&mut kernel.object as *mut u64).cast()), (11, (&mut kernel.kernarg as *mut usize).cast()),
 		(13, (&mut kernel.shared as *mut u32).cast()), (14, (&mut kernel.private as *mut u32).cast()), ] {
 		driver_status(Backend::Amd, unsafe { info(handle, attribute, output) }, "kernel metadata")?; } Ok(kernel) }
-#[cfg(feature = "amd")] fn kfd_property(text: &str, name: &str) -> Result<u32> { text.lines()
+#[cfg(amd)] fn kfd_property(text: &str, name: &str) -> Result<u32> { text.lines()
 		.find_map(|line| line.split_once(' ').filter(|value| value.0 == name))
 		.ok_or_else(|| RecipeError::new(format!("KFD property {name:?} is absent")))? .1 .parse::<u32>()
-		.map_err(|error| RecipeError::new(format!("KFD property {name:?} is invalid: {error}"))) } #[cfg(feature = "amd")]
-fn hsa_artifact<'a>(mapping: &'a str, target: &str) -> Result<&'a str> { mapping .split(';')
-		.find_map(|value| value.split_once('=').filter(|value| value.0 == target).map(|value| value.1))
+		.map_err(|error| RecipeError::new(format!("KFD property {name:?} is invalid: {error}"))) } #[cfg(amd)]
+include!(concat!(env!("OUT_DIR"), "/hsa-embed.rs"));
+#[cfg(amd)] fn hsa_artifact(target: &str) -> Result<&'static [u8]> { HSA_CODE_OBJECTS .iter()
+		.find_map(|entry| (entry.0 == target).then_some(entry.1))
 		.ok_or_else(|| RecipeError::new(format!("HSA artifact for {target} is absent"))) } fn load_amd() -> Result<Vec<Gpu>> {
-	#[cfg(not(feature = "amd"))] return Err(RecipeError::new("AMD support is not compiled into this build"));
-	#[cfg(feature = "amd")] unsafe { let runtime = Library::open(env!("RECIPE_HSA_RUNTIME"))?;
+	#[cfg(not(amd))] return Err(RecipeError::new("AMD support is not compiled into this build"));
+	#[cfg(amd)] unsafe { let runtime = Library::open(env!("RECIPE_HSA_RUNTIME"))?;
 		let init: unsafe extern "C" fn() -> i32 = runtime.function(b"hsa_init\0")?;
 		let iterate: unsafe extern "C" fn(extern "C" fn(u64, Ptr) -> i32, Ptr) -> i32 =
 			runtime.function(b"hsa_iterate_agents\0")?;
@@ -1252,7 +1259,7 @@ fn hsa_artifact<'a>(mapping: &'a str, target: &str) -> Result<&'a str> { mapping
 			Backend::Amd, iterate(collect_discrete_hsa, (&mut gpu as *mut HsaGpuQuery).cast()), "GPU agent", )?;
 		require(cpu.found != 0 && !gpu.found.is_empty(), "AMD CPU or discrete GPU agent is absent")?; gpu.found .into_iter()
 			.enumerate() .map(|(index, agent)| load_amd_gpu(&runtime, info, cpu.found, agent, index)) .collect() } }
-#[cfg(feature = "amd")]
+#[cfg(amd)]
 fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, index: usize) -> Result<Gpu> { unsafe {
 		let pool_info: HsaInfo = runtime.function(b"hsa_amd_memory_pool_get_info\0")?;
 		let pool_iterate: unsafe extern "C" fn(u64, extern "C" fn(u64, Ptr) -> i32, Ptr) -> i32 =
@@ -1279,10 +1286,9 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 			.map_err(|error| RecipeError::new(format!("cannot read {path}: {error}")))?;
 		let gfx = kfd_property(&properties, "gfx_target_version")?;
 		let target = format!("gfx{}{}{}", gfx / 10000, gfx / 100 % 100, gfx % 100);
-		let code = fs::File::open(hsa_artifact(env!("RECIPE_HSA_CODE_OBJECTS"), &target)?)
-			.map_err(|error| RecipeError::new(format!("cannot open HSA code object: {error}")))?;
-		let reader_create: unsafe extern "C" fn(i32, *mut u64) -> i32 =
-			runtime.function(b"hsa_code_object_reader_create_from_file\0")?;
+		let code = hsa_artifact(&target)?;
+		let reader_create: unsafe extern "C" fn(*const c_void, usize, *mut u64) -> i32 =
+			runtime.function(b"hsa_code_object_reader_create_from_memory\0")?;
 		let executable_create: unsafe extern "C" fn(i32, i32, Ptr, *mut u64) -> i32 =
 			runtime.function(b"hsa_executable_create_alt\0")?;
 		let executable_load: unsafe extern "C" fn(u64, u64, u64, Ptr, Ptr) -> i32 =
@@ -1291,8 +1297,8 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 		let symbol: HsaSymbol = runtime.function(b"hsa_executable_get_symbol_by_name\0")?;
 		let symbol_info: HsaSymbolInfo = runtime.function(b"hsa_executable_symbol_get_info\0")?;
 		let (mut reader, mut executable) = (0, 0);
-		let descriptor = std::os::fd::AsRawFd::as_raw_fd(&code);
-		driver_status(Backend::Amd, reader_create(descriptor, &mut reader), "code-object reader")?; driver_status(
+		driver_status(Backend::Amd, reader_create(code.as_ptr().cast(), code.len(), &mut reader), "code-object reader")?;
+		driver_status(
 			Backend::Amd, executable_create(1, 0, ptr::null_mut(), &mut executable), "executable creation", )?; driver_status(
 			Backend::Amd, executable_load(executable, agent, reader, ptr::null_mut(), ptr::null_mut()), "code-object load", )?;
 		driver_status(Backend::Amd, executable_freeze(executable, ptr::null_mut()), "executable freeze")?;
@@ -1322,11 +1328,11 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 				free: runtime.function(b"hsa_amd_memory_pool_free\0")?, allow, copy: runtime.function(b"hsa_memory_copy\0")?,
 				store: runtime.function(b"hsa_signal_store_screlease\0")?, wait: runtime.function(b"hsa_signal_wait_scacquire\0")?,
 				write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?, queue, signal: completion, cpu_agent,
-				vram_pool: vram.found, kernarg_pool: kernarg.found, kernarg_size: ka_size, kernarg: ka, _code: code, }),
+				vram_pool: vram.found, kernarg_pool: kernarg.found, kernarg_size: ka_size, kernarg: ka, }),
 			forward: Dispatch { kernel: forward, geometry: forward_geometry },
 			epoch: Dispatch { kernel: epoch, geometry: epoch_geometry }, memory: memory as u64, clock, shared_limit: lds,
-			dispatch: Mutex::new(()), }) } } fn load_nvidia() -> Result<Vec<Gpu>> { #[cfg(not(feature = "nvidia"))]
-	return Err(RecipeError::new("NVIDIA support is not compiled into this build")); #[cfg(feature = "nvidia")] unsafe {
+			dispatch: Mutex::new(()), }) } } fn load_nvidia() -> Result<Vec<Gpu>> { #[cfg(not(nvidia))]
+	return Err(RecipeError::new("NVIDIA support is not compiled into this build")); #[cfg(nvidia)] unsafe {
 		const MAX_BLOCK: i32 = 1;
 		const BLOCK_LDS: i32 = 8;
 		const WAVE: i32 = 10;
@@ -1402,7 +1408,7 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 			driver_status(Backend::Nvidia, get_device(&mut gpu, ordinal), "device enumeration")?;
 			driver_status(Backend::Nvidia, attribute(&mut integrated, INTEGRATED, gpu), "device probe")?; if integrated == 0 {
 				found.push(load_device(gpu, found.len())?) } } require(!found.is_empty(), "Nvidia has no discrete GPU")?; Ok(found)
-	} } #[cfg(any(feature = "amd", feature = "nvidia"))] #[link(name = "dl")] unsafe extern "C" {
+	} } #[cfg(any(amd, nvidia))] #[link(name = "dl")] unsafe extern "C" {
 	fn dlopen(name: *const std::ffi::c_char, flags: i32) -> Ptr;
 	fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr; } unsafe extern "C" {
 	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize; } fn distance(left: &[f64], right: &[f64]) -> f64 {
@@ -1468,9 +1474,9 @@ struct Geometry { pub groups: u32, pub block: u32, } impl Geometry { pub fn thre
 	let block = waves.checked_mul(wave).ok_or_else(|| RecipeError::new("GPU workgroup size overflows"))?;
 	let shared = resources .shared .checked_add(shared_bytes(0)?)
 		.ok_or_else(|| RecipeError::new("GPU shared memory size overflows"))?;
-	require(shared <= lds, "GPU tile exceeds local memory")?; Ok(Geometry { groups: cus, block }) } #[cfg(feature = "amd")]
+	require(shared <= lds, "GPU tile exceeds local memory")?; Ok(Geometry { groups: cus, block }) } #[cfg(amd)]
 fn amd(cus: u32, wave: u32, workgroup: u32, lds: u32, resources: Resources) -> Result<Geometry> {
-	geometry(cus, wave, workgroup, lds, u32::from(wave != 0), resources) } #[cfg(feature = "nvidia")] fn nvidia( cus: u32,
+	geometry(cus, wave, workgroup, lds, u32::from(wave != 0), resources) } #[cfg(nvidia)] fn nvidia( cus: u32,
 	wave: u32, workgroup: u32, block_lds: u32, sm_lds: u32, waves_per_cu: u32, resources: Resources,
 ) -> Result<Geometry> { let shared = resources .shared .checked_add(shared_bytes(0)?)
 		.ok_or_else(|| RecipeError::new("Nvidia shared memory size overflows"))?;
@@ -1746,7 +1752,7 @@ fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, features: usize) -> R
 		let final_loss = model_loss(&predictions, targets, model.loss, config.activation[7]);
 		let r2 = if training_rows == prepared.rows { coefficient(targets, &predictions) } else {
 			let mut graph = stored.graph.clone();
-			graph.parameters = tape.weights(false)?;
+			graph.parameters = tape.weights()?;
 			let (start, validation_targets) = (training_rows * prepared.features, &prepared.targets[training_rows..]);
 			let mut validation = DeviceTape::new(&graph, &prepared.samples[start..], validation_targets, &gpus)?;
 			validation.forward().and_then(|_| validation.predictions())
@@ -1756,7 +1762,7 @@ fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, features: usize) -> R
 	fn finish_dispatch<T>( &self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &str, tape: &DeviceTape,
 		save: Option<bool>, ) -> Result<T> { let interrupted = INTERRUPTED.load(Ordering::Acquire);
 		let save = if interrupted { Some(self.stop.is_some()) } else { save }; if let Some(best) = save
-			&& let Some(path) = &self.save { checkpoint(path, schema, stored, tape, best)?; } if interrupted {
+			&& let Some(path) = &self.save { checkpoint(path, schema, stored, tape, best, interrupted)?; } if interrupted {
 			std::process::exit(INTERRUPTED_EXIT) } result } fn print( &self, model: &Model, run: u64, epoch: usize, loss: f64,
 		targets: &[f64], predictions: &[f64], seconds: f64, checkpoint: bool, ) { if self.log_metrics.is_empty() { return; }
 		let topology = model.description(&self.log_metrics);
@@ -1954,7 +1960,7 @@ impl State { fn proposal(&self) -> Result<Vec<f64>> { let blocks = self .proposa
 		self.process.as_mut().ok_or_else(|| RecipeError::new("RAT command is absent")) }
 	fn check_interrupt(&mut self, state: Option<&mut State>) -> Result<()> { if !INTERRUPTED.load(Ordering::Acquire) {
 			return Ok(()); } if let Some(state) = state && let Some(path) = &self.train.save {
-			checkpoint(path, &state.schema, &mut state.stored, &state.tape, false)?; }
+			checkpoint(path, &state.schema, &mut state.stored, &state.tape, false, true)?; }
 		drop(self.process.take()); std::process::exit(INTERRUPTED_EXIT) } pub fn run(&mut self, data: &Data) -> RatReport {
 		SIGNAL.get_or_init(|| unsafe { signal(SIGINT, interrupt) });
 		self.try_run(data).unwrap_or_else(|error| panic!("{error}")) }
@@ -1990,5 +1996,5 @@ impl State { fn proposal(&self) -> Result<Vec<f64>> { let blocks = self .proposa
 		let prediction = train_rat(&mut state, &self.train, &self.models[N - 1], &measurement, config)?;
 		self.check_interrupt(Some(&mut state))?;
 		self.context = Some(result); if let Some(path) = &self.train.save {
-			checkpoint(path, &state.schema, &mut state.stored, &state.tape, false)?; }
+			checkpoint(path, &state.schema, &mut state.stored, &state.tape, false, false)?; }
 		self.state = Some(state); Ok(RatReport { proposal, prediction, measurement }) } }
