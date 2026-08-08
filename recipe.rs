@@ -1730,6 +1730,7 @@ enum EpochPhase {
 	Gradient,
 	Optimizer,
 }
+macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&mut $e as *mut _ as Ptr),*] } }
 impl GpuTape {
 	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu) -> Result<Self> {
 		let inputs = graph.input.elements();
@@ -1801,22 +1802,10 @@ impl GpuTape {
 		self.gpu.launch(d, &mut a, self.threads, self.tile)
 	}
 	fn forward_arguments(&mut self) -> [*mut c_void; 14] {
-		[
-			&mut self.samples.pointer as *mut _ as Ptr,
-			&mut self.weights.pointer as *mut _ as Ptr,
-			&mut self.value_pointers.pointer as *mut _ as Ptr,
-			&mut self.context_pointers.pointer as *mut _ as Ptr,
-			&mut self.descriptors.pointer as *mut _ as Ptr,
-			&mut self.arguments.pointer as *mut _ as Ptr,
-			&mut self.rows as *mut _ as Ptr,
-			&mut self.nodes as *mut _ as Ptr,
-			&mut self.threads as *mut _ as Ptr,
-			&mut self.tile.m as *mut _ as Ptr,
-			&mut self.tile.n as *mut _ as Ptr,
-			&mut self.tile.k as *mut _ as Ptr,
-			&mut self.timings.pointer as *mut _ as Ptr,
-			&mut self.tiles.pointer as *mut _ as Ptr,
-		]
+		ptrs![self.samples.pointer, self.weights.pointer, self.value_pointers.pointer,
+			self.context_pointers.pointer, self.descriptors.pointer, self.arguments.pointer,
+			self.rows, self.nodes, self.threads, self.tile.m, self.tile.n, self.tile.k,
+			self.timings.pointer, self.tiles.pointer]
 	}
 	fn timings(&self) -> Result<Vec<u64>> { self.timings.download(self.nodes as usize) }
 	fn predictions(&self) -> Result<Vec<f64>> {
@@ -1840,44 +1829,16 @@ impl GpuTape {
 			config.beta1.powi(self.step as i32), config.beta2.powi(self.step as i32),
 		);
 		let mut phase = phase as u32;
-		let mut call = [
-			&mut self.samples.pointer as *mut _ as Ptr,
-			&mut self.input_adjoint.pointer as *mut _ as Ptr,
-			&mut self.targets.pointer as *mut _ as Ptr,
-			&mut self.weights.pointer as *mut _ as Ptr,
-			&mut self.frozen.pointer as *mut _ as Ptr,
-			&mut self.best.pointer as *mut _ as Ptr,
-			&mut self.value_pointers.pointer as *mut _ as Ptr,
-			&mut self.context_pointers.pointer as *mut _ as Ptr,
-			&mut self.adjoint_pointers.pointer as *mut _ as Ptr,
-			&mut self.descriptors.pointer as *mut _ as Ptr,
-			&mut self.arguments.pointer as *mut _ as Ptr,
-			&mut self.metrics.pointer as *mut _ as Ptr,
-			&mut self.gradient.pointer as *mut _ as Ptr,
-			&mut self.moments.pointer as *mut _ as Ptr,
-			&mut self.variances.pointer as *mut _ as Ptr,
-			&mut self.best_loss.pointer as *mut _ as Ptr,
-			&mut self.rows as *mut _ as Ptr,
-			&mut self.nodes as *mut _ as Ptr,
-			&mut self.parameters as *mut _ as Ptr,
-			&mut loss as *mut _ as Ptr,
-			&mut huber_threshold as *mut _ as Ptr,
-			&mut rate as *mut _ as Ptr,
-			&mut beta1 as *mut _ as Ptr,
-			&mut beta2 as *mut _ as Ptr,
-			&mut beta1_power as *mut _ as Ptr,
-			&mut beta2_power as *mut _ as Ptr,
-			&mut epsilon as *mut _ as Ptr,
-			&mut decay as *mut _ as Ptr,
-			&mut tolerance as *mut _ as Ptr,
-			&mut step as *mut _ as Ptr,
-			&mut self.threads as *mut _ as Ptr,
-			&mut self.tile.m as *mut _ as Ptr,
-			&mut self.tile.n as *mut _ as Ptr,
-			&mut self.tile.k as *mut _ as Ptr,
-			&mut phase as *mut _ as Ptr,
-			&mut self.timings.pointer as *mut _ as Ptr,
-			&mut self.tiles.pointer as *mut _ as Ptr,
+		let mut call = ptrs![
+			self.samples.pointer, self.input_adjoint.pointer, self.targets.pointer,
+			self.weights.pointer, self.frozen.pointer, self.best.pointer,
+			self.value_pointers.pointer, self.context_pointers.pointer, self.adjoint_pointers.pointer,
+			self.descriptors.pointer, self.arguments.pointer, self.metrics.pointer,
+			self.gradient.pointer, self.moments.pointer, self.variances.pointer, self.best_loss.pointer,
+			self.rows, self.nodes, self.parameters, loss, huber_threshold,
+			rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay, tolerance, step,
+			self.threads, self.tile.m, self.tile.n, self.tile.k, phase,
+			self.timings.pointer, self.tiles.pointer
 		];
 		let dispatch = self.gpu.epoch;
 		self.threads = dispatch.geometry.threads(self.rows)?;
@@ -2446,14 +2407,7 @@ struct HsaPacket {
 	reserved1: u64,
 	completion: u64,
 }
-#[cfg(nvidia)] type Count = unsafe extern "C" fn(*mut i32) -> i32;
-#[cfg(nvidia)] type Attribute = unsafe extern "C" fn(*mut i32, i32, i32) -> i32;
-#[cfg(nvidia)] type Device = unsafe extern "C" fn(*mut i32, i32) -> i32;
-#[cfg(nvidia)] type Context = unsafe extern "C" fn(*mut Ptr, u32, i32) -> i32;
-#[cfg(nvidia)] type Module = unsafe extern "C" fn(*mut Ptr, *const c_void) -> i32;
-#[cfg(nvidia)] type Function = unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32;
-#[cfg(nvidia)] type FunctionAttribute = unsafe extern "C" fn(*mut i32, i32, usize) -> i32;
-#[cfg(nvidia)] type Occupancy = unsafe extern "C" fn(*mut i32, usize, i32, usize) -> i32;
+#[cfg(nvidia)] type NvQuery = unsafe extern "C" fn(*mut i32, i32, i32) -> i32;
 #[cfg(any(amd, nvidia))]
 struct Library(Ptr);
 #[cfg(any(amd, nvidia))]
@@ -3275,15 +3229,12 @@ fn load_amd() -> Result<Vec<Gpu>> {
 		let iterate: unsafe extern "C" fn(extern "C" fn(u64, Ptr) -> i32, Ptr) -> i32 =
 			runtime.function(b"hsa_iterate_agents\0")?;
 		let info: HsaInfo = runtime.function(b"hsa_agent_get_info\0")?;
-		driver_status(Backend::Amd, init(), "initialization")?;
+		let check = |s, a| driver_status(Backend::Amd, s, a);
+		check(init(), "initialization")?;
 		let mut cpu = HsaQuery { info, attribute: 17, expected: 0, secondary: -1, mask: 0, found: 0 };
 		let mut gpu = HsaGpuQuery { info, found: Vec::new() };
-		driver_status(Backend::Amd, iterate(collect_hsa, (&mut cpu as *mut HsaQuery).cast()), "CPU agent")?;
-		driver_status(
-			Backend::Amd,
-			iterate(collect_discrete_hsa, (&mut gpu as *mut HsaGpuQuery).cast()),
-			"GPU agent",
-		)?;
+		check(iterate(collect_hsa, (&mut cpu as *mut HsaQuery).cast()), "CPU agent")?;
+		check(iterate(collect_discrete_hsa, (&mut gpu as *mut HsaGpuQuery).cast()), "GPU agent")?;
 		require(cpu.found != 0 && !gpu.found.is_empty(), "AMD CPU or discrete GPU agent is absent")?;
 		gpu.found
 			.into_iter()
@@ -3298,22 +3249,15 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 		let pool_info: HsaInfo = runtime.function(b"hsa_amd_memory_pool_get_info\0")?;
 		let pool_iterate: unsafe extern "C" fn(u64, extern "C" fn(u64, Ptr) -> i32, Ptr) -> i32 =
 			runtime.function(b"hsa_amd_agent_iterate_memory_pools\0")?;
+		let check = |s, a| driver_status(Backend::Amd, s, a);
 		let mut vram = HsaQuery { info: pool_info, attribute: 0, expected: 0, secondary: 1, mask: 4, found: 0 };
 		let mut kernarg = HsaQuery { info: pool_info, attribute: 0, expected: 0, secondary: 1, mask: 1, found: 0 };
-		driver_status(
-			Backend::Amd,
-			pool_iterate(agent, collect_hsa, (&mut vram as *mut HsaQuery).cast()),
-			"VRAM pools",
-		)?;
-		driver_status(
-			Backend::Amd,
-			pool_iterate(cpu_agent, collect_hsa, (&mut kernarg as *mut HsaQuery).cast()),
-			"KERNARG pools",
-		)?;
+		check(pool_iterate(agent, collect_hsa, (&mut vram as *mut HsaQuery).cast()), "VRAM pools")?;
+		check(pool_iterate(cpu_agent, collect_hsa, (&mut kernarg as *mut HsaQuery).cast()), "KERNARG pools")?;
 		require(vram.found != 0 && kernarg.found != 0, "AMD VRAM or KERNARG pool is absent")?;
 		let (mut memory, mut clock) = (0_usize, 0_u64);
-		driver_status(Backend::Amd, pool_info(vram.found, 2, (&mut memory as *mut usize).cast()), "VRAM size")?;
-		driver_status(Backend::Amd, info(agent, 0xA016, (&mut clock as *mut u64).cast()), "timestamp frequency")?;
+		check(pool_info(vram.found, 2, (&mut memory as *mut usize).cast()), "VRAM size")?;
+		check(info(agent, 0xA016, (&mut clock as *mut u64).cast()), "timestamp frequency")?;
 		require(clock != 0, "AMD timestamp frequency must be positive")?;
 		let (mut wave, mut workgroup, mut available, mut node, mut cus) = (0_u32, 0_u32, 0_u32, 0_u32, 0_u32);
 		for (attribute, output, action) in [
@@ -3323,7 +3267,7 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 			(0xA004, (&mut node as *mut u32).cast(), "KFD node query"),
 			(0xA014, (&mut cus as *mut u32).cast(), "cooperative CU query"),
 		] {
-			driver_status(Backend::Amd, info(agent, attribute, output), action)?;
+			check(info(agent, attribute, output), action)?;
 		}
 		require(cus <= available, "AMD cooperative CU count exceeds available CUs")?;
 		let path = format!("/sys/class/kfd/kfd/topology/nodes/{node}/properties");
@@ -3343,22 +3287,10 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 		let symbol: HsaSymbol = runtime.function(b"hsa_executable_get_symbol_by_name\0")?;
 		let symbol_info: HsaSymbolInfo = runtime.function(b"hsa_executable_symbol_get_info\0")?;
 		let (mut reader, mut executable) = (0, 0);
-		driver_status(
-			Backend::Amd,
-			reader_create(code.as_ptr().cast(), code.len(), &mut reader),
-			"code-object reader",
-		)?;
-		driver_status(
-			Backend::Amd,
-			executable_create(1, 0, ptr::null_mut(), &mut executable),
-			"executable creation",
-		)?;
-		driver_status(
-			Backend::Amd,
-			executable_load(executable, agent, reader, ptr::null_mut(), ptr::null_mut()),
-			"code-object load",
-		)?;
-		driver_status(Backend::Amd, executable_freeze(executable, ptr::null_mut()), "executable freeze")?;
+		check(reader_create(code.as_ptr().cast(), code.len(), &mut reader), "code-object reader")?;
+		check(executable_create(1, 0, ptr::null_mut(), &mut executable), "executable creation")?;
+		check(executable_load(executable, agent, reader, ptr::null_mut(), ptr::null_mut()), "code-object load")?;
+		check(executable_freeze(executable, ptr::null_mut()), "executable freeze")?;
 		let forward = hsa_kernel(symbol, symbol_info, executable, agent, b"forward_graph.kd\0", FORWARD_ARGS)?;
 		let epoch = hsa_kernel(symbol, symbol_info, executable, agent, b"tape_epoch_graph.kd\0", EPOCH_ARGS)?;
 		let forward_resources = Resources { shared: forward.shared, max_block: workgroup };
@@ -3383,9 +3315,9 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 			queue_create(agent, 256, 2, ptr::null_mut(), ptr::null_mut(), u32::MAX, u32::MAX, &mut queue),
 			"queue creation",
 		)?;
-		driver_status(Backend::Amd, signal_create(0, 0, ptr::null(), &mut completion), "signal creation")?;
-		driver_status(Backend::Amd, allocate(kernarg.found, ka_size, 0, &mut ka), "KERNARG allocation")?;
-		driver_status(Backend::Amd, allow(1, &agent, ptr::null(), ka), "GPU KERNARG access")?;
+		check(signal_create(0, 0, ptr::null(), &mut completion), "signal creation")?;
+		check(allocate(kernarg.found, ka_size, 0, &mut ka), "KERNARG allocation")?;
+		check(allow(1, &agent, ptr::null(), ka), "GPU KERNARG access")?;
 		eprintln!("AMD forward block {} epoch block {}", forward_geometry.block, epoch_geometry.block);
 		Ok(Gpu {
 			name: format!("amd{index}"), backend: Backend::Amd,
@@ -3421,33 +3353,27 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		const NANOSECOND_TIMER_HZ: u64 = 1_000_000_000;
 		let runtime = Library::open(env!("RECIPE_NV_RUNTIME"))?;
 		let init: unsafe extern "C" fn(u32) -> i32 = runtime.function(b"cuInit\0")?;
-		let count_devices: Count = runtime.function(b"cuDeviceGetCount\0")?;
-		let get_device: Device = runtime.function(b"cuDeviceGet\0")?;
-		let attribute: Attribute = runtime.function(b"cuDeviceGetAttribute\0")?;
+		let count_devices: unsafe extern "C" fn(*mut i32) -> i32 = runtime.function(b"cuDeviceGetCount\0")?;
+		let get_device: unsafe extern "C" fn(*mut i32, i32) -> i32 = runtime.function(b"cuDeviceGet\0")?;
+		let attribute: NvQuery = runtime.function(b"cuDeviceGetAttribute\0")?;
 		let total: unsafe extern "C" fn(*mut usize, i32) -> i32 = runtime.function(b"cuDeviceTotalMem_v2\0")?;
-		let create: Context = runtime.function(b"cuCtxCreate_v2\0")?;
-		let load: Module = runtime.function(b"cuModuleLoadData\0")?;
-		let function: Function = runtime.function(b"cuModuleGetFunction\0")?;
-		let function_attribute: FunctionAttribute = runtime.function(b"cuFuncGetAttribute\0")?;
-		let occupancy: Occupancy = runtime.function(b"cuOccupancyMaxActiveBlocksPerMultiprocessor\0")?;
+		let create: unsafe extern "C" fn(*mut Ptr, u32, i32) -> i32 = runtime.function(b"cuCtxCreate_v2\0")?;
+		let load: unsafe extern "C" fn(*mut Ptr, *const c_void) -> i32 = runtime.function(b"cuModuleLoadData\0")?;
+		let function: unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32 = runtime.function(b"cuModuleGetFunction\0")?;
+		let function_attribute: unsafe extern "C" fn(*mut i32, i32, usize) -> i32 = runtime.function(b"cuFuncGetAttribute\0")?;
+		let occupancy: unsafe extern "C" fn(*mut i32, usize, i32, usize) -> i32 = runtime.function(b"cuOccupancyMaxActiveBlocksPerMultiprocessor\0")?;
+		let check = |s, a| driver_status(Backend::Nvidia, s, a);
 		let mut count = 0;
-		driver_status(Backend::Nvidia, init(0), "initialization")?;
-		driver_status(Backend::Nvidia, count_devices(&mut count), "device enumeration")?;
+		check(init(0), "initialization")?;
+		check(count_devices(&mut count), "device enumeration")?;
 		let load_device = |device, index| -> Result<Gpu> {
+			let check = |s, a| driver_status(Backend::Nvidia, s, a);
 			let (mut forward, mut epoch) = (0, 0);
 			let (mut context, mut module) = (ptr::null_mut(), ptr::null_mut());
-			let (
-				mut cus,
-				mut wave,
-				mut workgroup,
-				mut block_lds,
-				mut sm_lds,
-				mut registers,
-				mut threads,
-				mut cooperative,
-			) = (0, 0, 0, 0, 0, 0, 0, 0);
+			let (mut cus, mut wave, mut workgroup, mut block_lds, mut sm_lds, mut registers, mut threads, mut cooperative)
+				= (0, 0, 0, 0, 0, 0, 0, 0);
 			let mut memory = 0;
-			driver_status(Backend::Nvidia, total(&mut memory, device), "VRAM size")?;
+			check(total(&mut memory, device), "VRAM size")?;
 			for (kind, output, action) in [
 				(CUS, &mut cus, "SM query"),
 				(WAVE, &mut wave, "warp query"),
@@ -3458,15 +3384,15 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 				(THREADS_PER_SM, &mut threads, "resident thread query"),
 				(COOPERATIVE, &mut cooperative, "cooperative launch query"),
 			] {
-				driver_status(Backend::Nvidia, attribute(output, kind, device), action)?;
+				check(attribute(output, kind, device), action)?;
 			}
 			require(cooperative != 0, "Nvidia device does not support cooperative launch")?;
-			driver_status(Backend::Nvidia, create(&mut context, 0, device), "context creation")?;
+			check(create(&mut context, 0, device), "context creation")?;
 			let image = std::ffi::CString::new(include_bytes!(env!("RECIPE_NV_PTX")).as_slice())
 				.map_err(|error| RecipeError::new(format!("Nvidia PTX contains a zero byte: {error}")))?;
-			driver_status(Backend::Nvidia, load(&mut module, image.as_ptr().cast()), "module load")?;
-			driver_status(Backend::Nvidia, function(&mut forward, module, b"forward_graph\0".as_ptr()), "forward")?;
-			driver_status(Backend::Nvidia, function(&mut epoch, module, b"tape_epoch_graph\0".as_ptr()), "epoch")?;
+			check(load(&mut module, image.as_ptr().cast()), "module load")?;
+			check(function(&mut forward, module, b"forward_graph\0".as_ptr()), "forward")?;
+			check(function(&mut epoch, module, b"tape_epoch_graph\0".as_ptr()), "epoch")?;
 			let resource = |kernel| -> Result<(Resources, u32)> {
 				let (mut max_block, mut shared, mut used_registers) = (0, 0, 0);
 				for (kind, output, action) in [
@@ -3474,7 +3400,7 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 					(1, &mut shared, "kernel LDS query"),
 					(4, &mut used_registers, "kernel register query"),
 				] {
-					driver_status(Backend::Nvidia, function_attribute(output, kind, kernel), action)?;
+					check(function_attribute(output, kind, kernel), action)?;
 				}
 				require(
 					max_block > 0 && shared >= 0 && used_registers > 0,
@@ -3525,8 +3451,8 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		let mut found = Vec::new();
 		for ordinal in 0..count {
 			let (mut gpu, mut integrated) = (0, 0);
-			driver_status(Backend::Nvidia, get_device(&mut gpu, ordinal), "device enumeration")?;
-			driver_status(Backend::Nvidia, attribute(&mut integrated, INTEGRATED, gpu), "device probe")?;
+			check(get_device(&mut gpu, ordinal), "device enumeration")?;
+			check(attribute(&mut integrated, INTEGRATED, gpu), "device probe")?;
 			if integrated == 0 {
 				found.push(load_device(gpu, found.len())?)
 			}
