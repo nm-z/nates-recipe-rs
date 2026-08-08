@@ -183,9 +183,12 @@ mod bundle {
 				"best" => builder.state.best = values(value, "best weight")?,
 				"best_loss" => builder.state.best_loss = values(value, "best loss")?,
 				"epoch" => {
-					builder.state.epoch = value
-						.parse()
+					builder.state.epoch = value.parse()
 						.map_err(|error| RecipeError::new(format!("invalid epoch: {error}")))?
+				}
+				"training_rows" => {
+					builder.state.training_rows = value.parse()
+						.map_err(|error| RecipeError::new(format!("invalid training_rows: {error}")))?
 				}
 				"" => {}
 				_ => return Err(RecipeError::new(format!("invalid model value: {line}"))),
@@ -226,6 +229,7 @@ mod bundle {
 				("frozen", join(&graph.frozen)), ("moments", join(&graph.state.moments)),
 				("variances", join(&graph.state.variances)), ("best", join(&graph.state.best)),
 				("best_loss", join(&graph.state.best_loss)), ("epoch", graph.state.epoch.to_string()),
+				("training_rows", graph.state.training_rows.to_string()),
 			] { field(&mut document, key, &value) }
 			if stored.target_span != 0.0 {
 				field(&mut document, "target_min", &stored.target_min.to_string());
@@ -269,6 +273,15 @@ mod bundle {
 			&& stored.len() == graphs.len()
 			&& stored.iter().zip(graphs.iter()).all(|(a, b)| same_graph(a, b));
 		if matches {
+			for (current, saved) in graphs.iter_mut().zip(&stored) {
+				let saved_boundary = saved.graph.state.training_rows;
+				let current_boundary = current.graph.state.training_rows;
+				if saved_boundary > 0 && current_boundary > 0 && current_boundary < saved_boundary {
+					return Err(RecipeError::new(format!(
+						"resume rejected: saved model trained on {saved_boundary} rows but current split uses {current_boundary} rows, evaluation set would contain trained samples"
+					)));
+				}
+			}
 			for (current, saved) in graphs.iter_mut().zip(stored) {
 				current.graph.parameters = saved.graph.parameters;
 				current.graph.state = saved.graph.state;
@@ -909,6 +922,7 @@ struct TrainingState {
 	best: Vec<f64>,
 	best_loss: Vec<f64>,
 	epoch: usize,
+	training_rows: usize,
 }
 #[derive(Clone)]
 struct Graph {
@@ -3877,6 +3891,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	let (norm_mean, norm_scale) = if data.normalize {
 		normalize_samples(&mut samples, features, ((rows as f64) * data.split).floor() as usize)?
 	} else {
+		impute_missing(&mut samples);
 		(Vec::new(), Vec::new())
 	};
 	let schema = columns
@@ -3894,17 +3909,22 @@ fn normalize_samples(samples: &mut [f64], features: usize, fit: usize) -> Result
 	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
 	let (mut means, mut scales) = (Vec::with_capacity(features), Vec::with_capacity(features));
 	for column in 0..features {
-		let mean = (0..fit).map(|row| samples[row * features + column]).sum::<f64>() / fit as f64;
-		let variance =
-			(0..fit).map(|row| (samples[row * features + column] - mean).powi(2)).sum::<f64>() / fit as f64;
+		let valid = (0..fit).filter(|&row| samples[row * features + column].is_finite()).collect::<Vec<_>>();
+		let count = valid.len().max(1) as f64;
+		let mean = valid.iter().map(|&row| samples[row * features + column]).sum::<f64>() / count;
+		let variance = valid.iter().map(|&row| (samples[row * features + column] - mean).powi(2)).sum::<f64>() / count;
 		let scale = (variance + epsilon).sqrt();
 		for row in 0..samples.len() / features {
-			samples[row * features + column] = (samples[row * features + column] - mean) / scale;
+			let value = &mut samples[row * features + column];
+			*value = (if value.is_finite() { *value } else { mean } - mean) / scale;
 		}
 		means.push(mean);
 		scales.push(scale);
 	}
 	Ok((means, scales))
+}
+fn impute_missing(samples: &mut [f64]) {
+	for value in samples.iter_mut() { if !value.is_finite() { *value = 0.0 } }
 }
 fn is_table(extension: &str) -> bool {
 	matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt")
@@ -4164,7 +4184,7 @@ impl FeatureType {
 }
 fn encode(value: &str, kind: &FeatureType, output: &mut Vec<f64>) -> bool {
 	if value.is_empty() {
-		output.resize(output.len() + kind.width(), 0.0);
+		output.resize(output.len() + kind.width(), f64::NAN);
 		return true;
 	}
 	match kind {
@@ -4245,6 +4265,7 @@ impl Train {
 			.collect::<Vec<_>>();
 		let (run, mut graph) =
 			(RUN.fetch_add(1, Ordering::Relaxed) + 1, compile(model, prepared, training_rows, gpus[0], config)?);
+		graph.state.training_rows = training_rows;
 		if let Some(scale) = scale
 			&& let Some(offset) = output_bias_offset(&graph)
 		{
