@@ -2,16 +2,13 @@ use recipe::*;
 
 fn main() {
 	let datasets: &[(&str, Data)] = &[
-		("D7", recipe
-			.data("/home/nate/Desktop/D7-data")
-			.target("temper1")
+		("D7", recipe.data("/home/nate/Desktop/D7-data").target("temper1")
 			.exclude(["Frequency(Hz)", "sample", "time", "scan", "temperx", "am1", "am2", "max6675", "minivna", "am1rh", "am2rh"])
 			.norm(z_score).split(0.2)),
-		("VNA", recipe
-			.data("/home/nate/Desktop/odroid-vna-data")
-			.exclude(["Frequency(Hz)"])
-			.norm(z_score).split(0.2)
-			.target("temperature")),
+		("VNA", recipe.data("/home/nate/Desktop/odroid-vna-data").target("temperature")
+			.exclude(["Frequency(Hz)"]).norm(z_score).split(0.2)),
+		("MAX", recipe.data("/home/nate/Desktop/MAX6675-live-20").target("max6675")
+			.exclude(["Frequency(Hz)", "sample", "time", "scan"]).norm(z_score).split(0.2)),
 	];
 	let blocks: &[(&str, fn(Model) -> Model)] = &[
 		("layer", |m| m.layer(64)),
