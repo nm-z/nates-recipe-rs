@@ -274,8 +274,10 @@ mod bundle {
 				}
 			}
 			for (current, saved) in graphs.iter_mut().zip(stored) {
+				let current_training_rows = current.graph.state.training_rows;
 				current.graph.parameters = saved.graph.parameters;
 				current.graph.state = saved.graph.state;
+				current.graph.state.training_rows = current_training_rows;
 			}
 			return Ok(());
 		}
