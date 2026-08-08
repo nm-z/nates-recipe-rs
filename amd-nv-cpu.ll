@@ -292,10 +292,15 @@ br i1 %more, label %step, label %done step: %index = add i32 %input.base, %i
 %context.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %p
 %maximum.index.double = uitofp i32 %maximum.index to double store double %maximum, ptr addrspace(1) %output.ptr, align 8
 store double %maximum.index.double, ptr addrspace(1) %context.ptr, align 8 ret void }
+declare double @llvm.floor.f64(double)
 define internal i32 @embedding_index(double %value, i32 %vocabulary) #1 { entry:
 %ordered = fcmp ord double %value, %value br i1 %ordered, label %convert, label %invalid convert:
-%limit = uitofp i32 %vocabulary to double %remainder = frem double %value, %limit
-%absolute = call double @llvm.fabs.f64(double %remainder) %index = fptoui double %absolute to i32 ret i32 %index
+%floored = call double @llvm.floor.f64(double %value)
+%max.index = sub i32 %vocabulary, 1 %max.double = uitofp i32 %max.index to double
+%low = fcmp olt double %floored, 0.0 %clamped.low = select i1 %low, double 0.0, double %floored
+%high = fcmp ogt double %clamped.low, %max.double
+%clamped = select i1 %high, double %max.double, double %clamped.low
+%index = fptoui double %clamped to i32 ret i32 %index
 invalid: ret i32 0 } define internal void @embedding_forward_body(
 ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %table,
 ptr addrspace(1) nocapture writeonly %output, i32 %p, i32 %from, i32 %to, i32 %vocabulary ) #1 { entry:
@@ -377,7 +382,37 @@ i32 0, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )
 call void @contraction_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %value.weights,
 ptr addrspace(1) %value.context, i32 %rows, i32 %channels, i32 %length, i32 %channels, i32 %length,
 i32 0, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )
-br label %projection.done projection.done: call void @llvm.amdgcn.s.barrier() br label %output.loop output.loop:
+%bias.base = mul i32 %matrix, 3
+br label %attn.bias.loop attn.bias.loop:
+%bp = phi i32 [ %tid, %entry ], [ %bp.next, %attn.bias.step ]
+%bp.more = icmp ult i32 %bp, %plane
+br i1 %bp.more, label %attn.bias.step, label %projection.done attn.bias.step:
+%bp.local = urem i32 %bp, %from %bp.channel = udiv i32 %bp.local, %length
+%qb.offset = add i32 %bias.base, %bp.channel
+%qb.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %qb.offset
+%qb.val = load double, ptr addrspace(1) %qb.ptr, align 8
+%q.bias.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %bp
+%q.bias.old = load double, ptr addrspace(1) %q.bias.ptr, align 8
+%q.biased = fadd double %q.bias.old, %qb.val
+store double %q.biased, ptr addrspace(1) %q.bias.ptr, align 8
+%kb.base = add i32 %bias.base, %channels %kb.offset = add i32 %kb.base, %bp.channel
+%kb.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %kb.offset
+%kb.val = load double, ptr addrspace(1) %kb.ptr, align 8
+%k.bias.idx = add i32 %plane, %bp
+%k.bias.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %k.bias.idx
+%k.bias.old = load double, ptr addrspace(1) %k.bias.ptr, align 8
+%k.biased = fadd double %k.bias.old, %kb.val
+store double %k.biased, ptr addrspace(1) %k.bias.ptr, align 8
+%vb.base = add i32 %kb.base, %channels %vb.offset = add i32 %vb.base, %bp.channel
+%vb.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %vb.offset
+%vb.val = load double, ptr addrspace(1) %vb.ptr, align 8
+%v.bias.idx = add i32 %value.context.offset, %bp
+%v.bias.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %v.bias.idx
+%v.bias.old = load double, ptr addrspace(1) %v.bias.ptr, align 8
+%v.biased = fadd double %v.bias.old, %vb.val
+store double %v.biased, ptr addrspace(1) %v.bias.ptr, align 8
+%bp.next = add i32 %bp, %threads br label %attn.bias.loop
+projection.done: call void @llvm.amdgcn.s.barrier() br label %output.loop output.loop:
 %p = phi i32 [ %tid, %projection.done ], [ %p.next, %output.store ] %output.more = icmp ult i32 %p, %plane
 br i1 %output.more, label %output.step, label %exit output.step: %output.row = udiv i32 %p, %from
 %output.local = urem i32 %p, %from %output.channel.index = udiv i32 %output.local, %length
@@ -536,7 +571,32 @@ i32 %rows, i32 %channels, i32 %length, i32 %channels, i32 %length, i32 0, i32 %k
 call void @contraction_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %value.weights,
 ptr addrspace(1) %value.adjoint, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.previous,
 i32 %rows, i32 %channels, i32 %length, i32 %channels, i32 %length, i32 0, i32 %value.gradient.offset, i32 %threads )
-ret void }
+%bg.matrix3 = mul i32 %matrix, 3
+br label %attn.bg.loop attn.bg.loop:
+%bg.p = phi i32 [ %tid, %rows.done ], [ %bg.next, %attn.bg.step ]
+%bg.more = icmp ult i32 %bg.p, %plane
+br i1 %bg.more, label %attn.bg.step, label %attn.bg.done attn.bg.step:
+%bg.local = urem i32 %bg.p, %from %bg.channel = udiv i32 %bg.local, %length
+%bg.q.adj.idx = add i32 %query.adjoint.offset, %bg.p
+%bg.q.adj.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %bg.q.adj.idx
+%bg.q.adj = load double, ptr addrspace(1) %bg.q.adj.ptr, align 8
+%bg.q.grad.off = add i32 %bg.matrix3, %bg.channel %bg.q.grad.idx = add i32 %offset, %bg.q.grad.off
+%bg.q.grad.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %bg.q.grad.idx
+%bg.q.old = atomicrmw fadd ptr addrspace(1) %bg.q.grad.ptr, double %bg.q.adj monotonic, align 8
+%bg.kb = add i32 %bg.matrix3, %channels %bg.k.adj.idx = add i32 %key.adjoint.offset, %bg.p
+%bg.k.adj.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %bg.k.adj.idx
+%bg.k.adj = load double, ptr addrspace(1) %bg.k.adj.ptr, align 8
+%bg.k.grad.off = add i32 %bg.kb, %bg.channel %bg.k.grad.idx = add i32 %offset, %bg.k.grad.off
+%bg.k.grad.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %bg.k.grad.idx
+%bg.k.old = atomicrmw fadd ptr addrspace(1) %bg.k.grad.ptr, double %bg.k.adj monotonic, align 8
+%bg.vb = add i32 %bg.kb, %channels %bg.v.adj.idx = add i32 %value.adjoint.offset, %bg.p
+%bg.v.adj.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %bg.v.adj.idx
+%bg.v.adj = load double, ptr addrspace(1) %bg.v.adj.ptr, align 8
+%bg.v.grad.off = add i32 %bg.vb, %bg.channel %bg.v.grad.idx = add i32 %offset, %bg.v.grad.off
+%bg.v.grad.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %bg.v.grad.idx
+%bg.v.old = atomicrmw fadd ptr addrspace(1) %bg.v.grad.ptr, double %bg.v.adj monotonic, align 8
+%bg.next = add i32 %bg.p, %threads br label %attn.bg.loop
+attn.bg.done: ret void }
 define internal void @scan_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
 ptr addrspace(1) %context, i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %gates,
 i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #1 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
