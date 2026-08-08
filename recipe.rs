@@ -66,14 +66,9 @@ mod bundle {
 			let source = self.nodes.len() as i32 - 1;
 			Ok(StoredGraph {
 				graph: Graph {
-					nodes: self.nodes,
-					parameters: self.parameters,
-					frozen: self.frozen,
-					programs: self.programs,
-					input,
-					output,
-					source,
-					state: self.state,
+					nodes: self.nodes, parameters: self.parameters, frozen: self.frozen,
+					programs: self.programs, input, output, source, state: self.state,
+					block_index: 0, block_kind: "",
 				},
 				inputs: self.inputs,
 				outputs: self.outputs,
@@ -108,16 +103,12 @@ mod bundle {
 		let value = values::<i32>(value, "node descriptor")?;
 		require(value.len() == 11, "model graph node descriptor has the wrong width")?;
 		Ok(Node {
-			op: primitive(value[0])?,
-			source: value[1],
-			second: value[2],
+			op: primitive(value[0])?, source: value[1], second: value[2],
 			input: Shape { channels: value[3] as usize, length: value[4] as usize },
 			output: Shape { channels: value[5] as usize, length: value[6] as usize },
-			offset: value[7] as usize,
-			parameters: value[8] as usize,
-			argument: [0.0; 9],
-			program_offset: value[9] as usize,
-			program_count: value[10] as usize,
+			offset: value[7] as usize, parameters: value[8] as usize, argument: [0.0; 9],
+			program_offset: value[9] as usize, program_count: value[10] as usize,
+			block_index: 0, block_kind: "",
 		})
 	}
 	pub(super) fn load(path: &str) -> Result<(String, Vec<StoredGraph>)> {
@@ -887,6 +878,19 @@ impl ScalarProgram {
 	}
 	fn unary(&mut self, opcode: ScalarOpcode, value: f64) -> f64 { self.op(opcode, value, 0.0) }
 }
+impl Node {
+	fn identity(&self, index: usize) -> String {
+		let prim = match self.op {
+			Primitive::Contraction => "Contraction", Primitive::Pool => "Pool", Primitive::Gather => "Gather",
+			Primitive::Attention => "Attention", Primitive::Scan => "Scan", Primitive::Elementwise => "Elementwise",
+			Primitive::Route => "Route", Primitive::Normalize => "Normalize",
+		};
+		format!("block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}",
+			self.block_index, self.block_kind, index, prim,
+			self.input.channels, self.input.length, self.output.channels, self.output.length,
+			self.offset, self.parameters)
+	}
+}
 #[derive(Clone)]
 struct Node {
 	op: Primitive,
@@ -899,6 +903,8 @@ struct Node {
 	argument: [f64; 9],
 	program_offset: usize,
 	program_count: usize,
+	block_index: usize,
+	block_kind: &'static str,
 }
 impl Node {
 	fn tile_dimensions(&self) -> Option<[f64; 3]> {
@@ -934,6 +940,8 @@ struct Graph {
 	output: Shape,
 	source: i32,
 	state: TrainingState,
+	block_index: usize,
+	block_kind: &'static str,
 }
 fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<Graph> {
 	compile_graph(model, data, rows, gpu, config, None)
@@ -965,16 +973,13 @@ fn compile_graph(
 		Shape { channels: data.features, length: 1 }
 	};
 	let mut graph = Graph {
-		nodes: Vec::new(),
-		parameters: Vec::new(),
-		frozen: Vec::new(),
-		programs: Vec::new(),
-		input: shape,
-		output: shape,
-		source: -1,
-		state: TrainingState::default(),
+		nodes: Vec::new(), parameters: Vec::new(), frozen: Vec::new(), programs: Vec::new(),
+		input: shape, output: shape, source: -1, state: TrainingState::default(),
+		block_index: 0, block_kind: "",
 	};
-	for block in &model.blocks {
+	for (index, block) in model.blocks.iter().enumerate() {
+		graph.block_index = index;
+		graph.block_kind = block.operation.name();
 		lower_block(&mut graph, block, data, rows, gpu, config)?;
 	}
 	if let Some(expected) = expected {
@@ -1100,16 +1105,8 @@ fn push_node(
 	graph.parameters.resize(checked_add(offset, parameters, "model parameters")?, 0.0);
 	graph.frozen.resize(graph.parameters.len(), 0);
 	graph.nodes.push(Node {
-		op,
-		source,
-		second,
-		input: graph.output,
-		output,
-		offset,
-		parameters,
-		argument,
-		program_offset: 0,
-		program_count: 0,
+		op, source, second, input: graph.output, output, offset, parameters, argument,
+		program_offset: 0, program_count: 0, block_index: graph.block_index, block_kind: graph.block_kind,
 	});
 	graph.output = output;
 	graph.source = graph.nodes.len() as i32 - 1;
@@ -1584,16 +1581,8 @@ fn push_frozen(
 	graph.parameters.extend_from_slice(values);
 	graph.frozen.resize(graph.parameters.len(), 1);
 	graph.nodes.push(Node {
-		op,
-		source,
-		second: -2,
-		input,
-		output,
-		offset,
-		parameters: 0,
-		argument,
-		program_offset: 0,
-		program_count: 0,
+		op, source, second: -2, input, output, offset, parameters: 0, argument,
+		program_offset: 0, program_count: 0, block_index: graph.block_index, block_kind: graph.block_kind,
 	});
 	graph.output = output;
 	graph.source = graph.nodes.len() as i32 - 1;
@@ -1758,14 +1747,14 @@ impl GpuTape {
 		let (mut descriptors, mut arguments, mut values, mut contexts, mut adjoints) =
 			(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
 		let program_base = checked_mul(graph.nodes.len(), 9, "node arguments")?;
-		for node in &graph.nodes {
+		for (index, node) in graph.nodes.iter().enumerate() {
 			descriptors.extend(node_descriptor(node, program_base)?);
 			arguments.extend(node.argument);
 			let elements = graph_rows_buffer(node.output, rows)?;
-			values.push(Buffer::new(gpu, elements)?);
-			let empty = vec![0_u8; elements];
-			adjoints.push(Buffer::upload(gpu, &empty)?);
-			contexts.push(Buffer::new(gpu, node_context(node, rows)?)?);
+			let id = || node.identity(index);
+			values.push(Buffer::new(gpu, elements).map_err(|e| RecipeError::new(format!("{e}, {}", id())))?);
+			adjoints.push(Buffer::upload(gpu, &vec![0_u8; elements]).map_err(|e| RecipeError::new(format!("{e}, {}", id())))?);
+			contexts.push(Buffer::new(gpu, node_context(node, rows)?).map_err(|e| RecipeError::new(format!("{e}, {}", id())))?);
 		}
 		arguments.extend(&graph.programs);
 		let addresses = |buffers: &[Buffer]| buffers.iter().map(|buffer| buffer.pointer).collect::<Vec<_>>();
@@ -4622,10 +4611,8 @@ fn build<const N: usize>(
 		parameters: Vec::new(),
 		frozen: Vec::new(),
 		programs: Vec::new(),
-		input,
-		output: input,
-		source: -1,
-		state: TrainingState::default(),
+		input, output: input, source: -1, state: TrainingState::default(),
+		block_index: 0, block_kind: "",
 	};
 	let mut fields = Vec::new();
 	for (index, name) in input_names.iter().cloned().enumerate() {
