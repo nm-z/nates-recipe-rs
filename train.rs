@@ -1,12 +1,18 @@
 use recipe::*;
 
 fn main() {
-	let data = recipe
-		.data("/home/nate/Desktop/D7-data")
-		.target("temper1")
-		.exclude(["Frequency(Hz)", "sample", "time", "scan", "temperx", "am1", "am2", "max6675", "minivna", "am1rh", "am2rh"])
-		.norm(z_score)
-		.split(0.2);
+	let datasets: &[(&str, Data)] = &[
+		("D7", recipe
+			.data("/home/nate/Desktop/D7-data")
+			.target("temper1")
+			.exclude(["Frequency(Hz)", "sample", "time", "scan", "temperx", "am1", "am2", "max6675", "minivna", "am1rh", "am2rh"])
+			.norm(z_score).split(0.2)),
+		("VNA", recipe
+			.data("/home/nate/Desktop/odroid-vna-data")
+			.exclude(["Frequency(Hz)"])
+			.norm(z_score).split(0.2)
+			.target("temperature")),
+	];
 	let blocks: &[(&str, fn(Model) -> Model)] = &[
 		("layer", |m| m.layer(64)),
 		("residual", |m| m.layer(8).residual([layer(8), relu()])),
@@ -33,20 +39,22 @@ fn main() {
 		("mse", mse), ("rmse", rmse), ("huber", huber), ("mae", mae), ("bce", bce), ("ce", ce), ("focal", focal),
 	];
 	let (mut pass, mut fail) = (0_usize, 0_usize);
-	for (bn, blk) in blocks {
-		for (an, act) in activations {
-			for (nn, nrm) in normalizations {
-				for (ln, los) in losses {
-					let model = act(blk(recipe.model()));
-					let model = match nrm { Some(n) => model.norm(*n), None => model };
-					let model = model.layer(1).loss(*los);
-					let label = format!("{bn}/{an}/{nn}/{ln}");
-					let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-						recipe.train().seed(1).epochs(5).lr(0.01).log([Epoch, R2, blck, atvn, norm]).run(&model, &data)
-					}));
-					match result {
-						Ok(report) => { pass += 1; eprintln!("{label}: R2 {:.4}", report.r2()) }
-						Err(_) => { fail += 1; eprintln!("{label}: FAILED") }
+	for (dn, data) in datasets {
+		for (bn, blk) in blocks {
+			for (an, act) in activations {
+				for (nn, nrm) in normalizations {
+					for (ln, los) in losses {
+						let model = act(blk(recipe.model()));
+						let model = match nrm { Some(n) => model.norm(*n), None => model };
+						let model = model.layer(1).loss(*los);
+						let label = format!("{dn}/{bn}/{an}/{nn}/{ln}");
+						let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+							recipe.train().seed(1).epochs(5).lr(0.01).run(&model, data)
+						}));
+						match result {
+							Ok(report) => { pass += 1; eprintln!("{label}: R2 {:.4}", report.r2()) }
+							Err(_) => { fail += 1; eprintln!("{label}: FAILED") }
+						}
 					}
 				}
 			}
