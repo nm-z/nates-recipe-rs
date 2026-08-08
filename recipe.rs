@@ -311,7 +311,7 @@ mod bundle {
 	pub(super) fn run_infer(
 		path: &str,
 		input: &[f64],
-		forward: impl Fn(&Graph, &[f64]) -> Result<Vec<f64>>,
+		forward: impl Fn(&StoredGraph, &[f64]) -> Result<Vec<f64>>,
 	) -> Result<Vec<f64>> {
 		let (_, graphs) = load(path)?;
 		let first = graphs.first().ok_or_else(|| RecipeError::new("model has no graph"))?;
@@ -327,7 +327,7 @@ mod bundle {
 				})
 				.collect::<Result<Vec<_>>>()?;
 			normalize_input(&mut samples, &stored)?;
-			result = forward(&stored.graph, &samples)?;
+			result = forward(&stored, &samples)?;
 			decode_output(&mut result, &stored);
 			require(result.len() == stored.outputs.len(), "model output has the wrong width")?;
 			for (name, value) in stored.outputs.iter().cloned().zip(result.iter().copied()) {
@@ -785,6 +785,31 @@ fn mapped_artifacts<'a>(mapping: Option<&'a str>, suffix: &str) -> Result<Vec<(S
 		.map(|(target, path)| (format!("{target}.{suffix}"), path))
 		.collect())
 }
+fn inject_bn_stats(graph: &Graph, bn_stats: &[f64], contexts: &[Buffer]) -> Result<()> {
+	if bn_stats.is_empty() { return Ok(()) }
+	let mut offset = 0;
+	for (index, node) in graph.nodes.iter().enumerate() {
+		if node.op == Primitive::Normalize && node.argument[0] == 0.0 {
+			let channels = node.output.channels;
+			let needed = 2 * channels;
+			if offset + needed <= bn_stats.len() {
+				contexts[index].write(0, &bn_stats[offset..offset + needed])?;
+				offset += needed;
+			}
+		}
+	}
+	Ok(())
+}
+fn extract_bn_stats(graph: &Graph, contexts: &[Buffer]) -> Result<Vec<f64>> {
+	let mut stats = Vec::new();
+	for (index, node) in graph.nodes.iter().enumerate() {
+		if node.op == Primitive::Normalize && node.argument[0] == 0.0 {
+			let channels = node.output.channels;
+			stats.extend(contexts[index].download_range::<f64>(0, 2 * channels)?);
+		}
+	}
+	Ok(stats)
+}
 fn cpu_forward(graph: &Graph, samples: &[f64]) -> Result<Vec<f64>> {
 	let inputs = graph.input.elements();
 	require(inputs != 0 && !samples.is_empty() && samples.len() % inputs == 0, "model input batch is invalid")?;
@@ -835,13 +860,14 @@ impl Recipe {
 			&& let Ok(gpus) = devices()
 			&& let Some(gpu) = gpus.first()
 		{
-			bundle::run_infer(&path, input, |graph, samples| {
-				let mut tape = GpuTape::new(graph, samples, &[], gpu)?;
+			bundle::run_infer(&path, input, |stored, samples| {
+				let mut tape = GpuTape::new(&stored.graph, samples, &[], gpu)?;
+				inject_bn_stats(&stored.graph, &stored.bn_stats, &tape.contexts)?;
 				tape.forward()?;
 				tape.predictions()
 			})
 		} else {
-			bundle::run_infer(&path, input, cpu_forward)
+			bundle::run_infer(&path, input, |stored, samples| cpu_forward(&stored.graph, samples))
 		};
 		result.unwrap_or_else(|error| panic!("{error}"))
 	}
@@ -1696,7 +1722,7 @@ fn stored_graph(graph: &Graph, data: &Data, scale: Option<TargetScale>) -> bundl
 struct GpuTape {
 	gpu: &'static Gpu,
 	values: Vec<Buffer>,
-	_contexts: Vec<Buffer>,
+	contexts: Vec<Buffer>,
 	_adjoints: Vec<Buffer>,
 	samples: Buffer,
 	input_adjoint: Buffer,
@@ -1792,7 +1818,7 @@ impl GpuTape {
 			input: graph.input.elements(),
 			output: graph.output.elements(),
 			values,
-			_contexts: contexts,
+			contexts: contexts,
 			_adjoints: adjoints,
 			capacity: rows,
 			tile,
@@ -3807,6 +3833,9 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	}
 	let mut columns = Vec::new();
 	for (table, value) in tables.iter().enumerate() {
+		if value.rows.len() != row_count {
+			eprintln!("excluded: {} ({} rows, target table has {row_count})", value.name, value.rows.len());
+		}
 		if value.rows.len() == row_count {
 			for (column, header) in value.headers.iter().enumerate() {
 				let excluded = data.exclusions.iter().any(|name| column_match(name, value, header, column));
@@ -3969,6 +3998,7 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 				let count = table.rows.len();
 				require(count != 0 && rows % count == 0, "table rows do not broadcast")?;
 				if count != rows {
+					eprintln!("aligned: {} ({count} rows cycled to {rows})", table.name);
 					table.rows = table.rows.iter().cloned().cycle().take(rows).collect();
 				}
 			}
@@ -4298,6 +4328,7 @@ impl Train {
 			tape.restore_best()?;
 		}
 		self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
+		stored.bn_stats = extract_bn_stats(&stored.graph, &tape.shards[0].tape.contexts)?;
 		let raw_predictions = tape.predictions()?;
 		let final_loss = model_loss(&raw_predictions, targets, model.loss, config.activation[7]);
 		let predictions = raw_predictions
