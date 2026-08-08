@@ -1,19 +1,21 @@
 use recipe::*;
 
-const DS: &str = "/home/nate/Desktop/nates-recipe-rs/examples/datasets";
 fn main() {
-	let datasets: &[(&str, Data)] = &[
-		("D7", recipe.data("/home/nate/Desktop/D7-data").target("temper1")
+	let ds = "/home/nate/Desktop/nates-recipe-rs/examples/datasets";
+	let mut datasets: Vec<(String, Data)> = vec![
+		("D7".into(), recipe.data("/home/nate/Desktop/D7-data").target("temper1")
 			.exclude(["Frequency(Hz)", "sample", "time", "scan", "temperx", "am1", "am2", "max6675", "minivna", "am1rh", "am2rh"])
 			.norm(z_score).split(0.2)),
-		("VNA", recipe.data("/home/nate/Desktop/odroid-vna-data").target("temperature")
+		("VNA".into(), recipe.data("/home/nate/Desktop/odroid-vna-data").target("temperature")
 			.exclude(["Frequency(Hz)"]).norm(z_score).split(0.2)),
-		("MAX", recipe.data("/home/nate/Desktop/MAX6675-live-20").target("max6675")
+		("MAX".into(), recipe.data("/home/nate/Desktop/MAX6675-live-20").target("max6675")
 			.exclude(["Frequency(Hz)", "sample", "time", "scan"]).norm(z_score).split(0.2)),
-		("house", recipe.data(format!("{DS}/house-prices")).target("SalePrice").exclude(["Id"]).norm(z_score).split(0.2)),
-		("wine", recipe.data(format!("{DS}/wine-quality")).target("quality").norm(z_score).split(0.2)),
-		("abalone", recipe.data(format!("{DS}/uci-abalone")).target("col9").norm(z_score).split(0.2)),
 	];
+	let mut dirs: Vec<_> = std::fs::read_dir(ds).expect("cannot read datasets dir")
+		.filter_map(|e| e.ok()).filter(|e| e.path().is_dir())
+		.map(|e| e.file_name().to_string_lossy().to_string()).collect();
+	dirs.sort();
+	for name in dirs { datasets.push((name.clone(), recipe.data(format!("{ds}/{name}")).norm(z_score).split(0.2))) }
 	let blocks: &[(&str, fn(Model) -> Model)] = &[
 		("layer", |m| m.layer(8)), ("residual", |m| m.layer(8).residual([layer(8), relu()])),
 		("conv", |m| m.conv(4, 3).pool(8)), ("attn", |m| m.attn(1)),
@@ -29,31 +31,24 @@ fn main() {
 		("prelu", |m| m.prelu()), ("leak", |m| m.leak()), ("exp", |m| m.exp()), ("ln", |m| m.ln()),
 		("log", |m| m.log()), ("cos", |m| m.cos()), ("tan", |m| m.tan()), ("huber", |m| m.huber()),
 	];
-	let normalizations: &[(&str, Option<Norm>)] = &[("none", None), ("batch", Some(batch)), ("layer", Some(layer))];
+	let norms: &[(&str, Option<Norm>)] = &[("none", None), ("batch", Some(batch)), ("layer", Some(layer))];
 	let losses: &[(&str, Loss)] = &[
 		("mse", mse), ("rmse", rmse), ("huber", huber), ("mae", mae), ("bce", bce), ("ce", ce), ("focal", focal),
 	];
 	let (mut pass, mut fail) = (0_usize, 0_usize);
-	for (dn, data) in datasets {
-		for (bn, blk) in blocks {
-			for (an, act) in activations {
-				for (nn, nrm) in normalizations {
-					for (ln, los) in losses {
-						let model = act(blk(recipe.model()));
-						let model = match nrm { Some(n) => model.norm(*n), None => model };
-						let model = model.layer(1).loss(*los);
-						let label = format!("{dn}/{bn}/{an}/{nn}/{ln}");
-						let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-							recipe.train().seed(1).epochs(5).lr(0.01).run(&model, data)
-						}));
-						match result {
-							Ok(report) => { pass += 1; eprintln!("{label}: R2 {:.4}", report.r2()) }
-							Err(_) => { fail += 1; eprintln!("{label}: FAILED") }
-						}
-					}
-				}
+	for (dn, data) in &datasets { for (bn, blk) in blocks { for (an, act) in activations {
+		for (nn, nrm) in norms { for (ln, los) in losses {
+			let model = act(blk(recipe.model()));
+			let model = match nrm { Some(n) => model.norm(*n), None => model };
+			let model = model.layer(1).loss(*los);
+			let label = format!("{dn}/{bn}/{an}/{nn}/{ln}");
+			match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+				recipe.train().seed(1).epochs(5).lr(0.01).run(&model, data)
+			})) {
+				Ok(r) => { pass += 1; eprintln!("{label}: R2 {:.4}", r.r2()) }
+				Err(_) => { fail += 1; eprintln!("{label}: FAILED") }
 			}
-		}
-	}
+		} } }
+	} }
 	eprintln!("{pass} passed, {fail} failed out of {}", pass + fail);
 }
