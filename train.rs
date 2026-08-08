@@ -1,5 +1,6 @@
 use recipe::*;
 
+const DS: &str = "/home/nate/Desktop/nates-recipe-rs/examples/datasets";
 fn main() {
 	let datasets: &[(&str, Data)] = &[
 		("D7", recipe.data("/home/nate/Desktop/D7-data").target("temper1")
@@ -9,21 +10,18 @@ fn main() {
 			.exclude(["Frequency(Hz)"]).norm(z_score).split(0.2)),
 		("MAX", recipe.data("/home/nate/Desktop/MAX6675-live-20").target("max6675")
 			.exclude(["Frequency(Hz)", "sample", "time", "scan"]).norm(z_score).split(0.2)),
+		("house", recipe.data(format!("{DS}/house-prices")).target("SalePrice").exclude(["Id"]).norm(z_score).split(0.2)),
+		("wine", recipe.data(format!("{DS}/wine-quality")).target("quality").norm(z_score).split(0.2)),
+		("abalone", recipe.data(format!("{DS}/uci-abalone")).target("col9").norm(z_score).split(0.2)),
 	];
 	let blocks: &[(&str, fn(Model) -> Model)] = &[
-		("layer", |m| m.layer(64)),
-		("residual", |m| m.layer(8).residual([layer(8), relu()])),
-		("conv", |m| m.conv(8, 3).pool(64)),
-		("attn", |m| m.attn(1)),
-		("embed", |m| m.embed(4, 8).pool(64)),
-		("rnn", |m| m.rnn(8)),
-		("gru", |m| m.gru(8)),
-		("lstm", |m| m.lstm(8)),
-		("perc", |m| m.perc(24)),
-		("moe", |m| m.moe(2, [layer(8), layer(8), layer(8), layer(8)])),
+		("layer", |m| m.layer(8)), ("residual", |m| m.layer(8).residual([layer(8), relu()])),
+		("conv", |m| m.conv(4, 3).pool(8)), ("attn", |m| m.attn(1)),
+		("embed", |m| m.embed(4, 8).pool(8)), ("rnn", |m| m.rnn(4)),
+		("gru", |m| m.gru(4)), ("lstm", |m| m.lstm(4)), ("perc", |m| m.perc(8)),
+		("moe", |m| m.moe(2, [layer(4), layer(4), layer(4), layer(4)])),
 		("svm", |m| m.svm([tanh, relu, gelu, sigmoid])),
-		("kmeans", |m| m.kmeans(4)),
-		("knn", |m| m.knn(5)),
+		("kmeans", |m| m.kmeans(4)), ("knn", |m| m.knn(5)),
 	];
 	let activations: &[(&str, fn(Model) -> Model)] = &[
 		("linear", |m| m), ("relu", |m| m.relu()), ("gelu", |m| m.gelu()), ("silu", |m| m.silu()),
