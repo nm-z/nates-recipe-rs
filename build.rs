@@ -96,7 +96,7 @@ fn render(command: &mut Command, role: &str, path: &Path) -> BuildResult<()> {
 }
 fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	let source = out.join("recipe-amd.ll");
-	let ir = parallel_ir(fs::read_to_string("amd-nv.ll")?, AMD_WIDTH);
+	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, AMD_WIDTH);
 	fs::write(&source, ir)?;
 	let mut objects = Vec::new();
 	let mut embeds = Vec::new();
@@ -112,7 +112,6 @@ fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 			.join(format!("oclc_isa_version_{}.bc", architecture.trim_start_matches("gfx")));
 		command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(isa).arg(&source).arg("-o").arg(&output);
 		if run(&mut command, "HSA LLVM IR compiler").is_err() {
-			println!("cargo:warning=skipped {architecture}: the HSA kernel does not compile for it");
 			continue;
 		}
 		let assembly = out.join(format!("recipe-{architecture}.amd.s"));
@@ -123,7 +122,6 @@ fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 		)
 		.is_err()
 		{
-			println!("cargo:warning=skipped {architecture}: the HSA object does not disassemble");
 			continue;
 		}
 		objects.push(format!("{architecture}={}", output.display()));
@@ -146,7 +144,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	let ptx = format!("+{}", text(manifest, "nvidia-ptx")?);
 	let ptx_output = out.join("recipe.ptx");
 	let source = out.join("recipe-nvidia.ll");
-	let ir = parallel_ir(fs::read_to_string("amd-nv.ll")?, "declare i32 @recipe.workgroup.size.x()")
+	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, "declare i32 @recipe.workgroup.size.x()")
 		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
 		.replace("__ockl_steadyctr_u64", "llvm.nvvm.read.ptx.sreg.globaltimer")
 		.replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x")
@@ -188,6 +186,66 @@ fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	run(&mut command, "NVIDIA LLVM IR compiler")?;
 	println!("cargo:rustc-env=RECIPE_NV_PTX={}", ptx_output.display());
 	println!("cargo:rustc-link-search=native={}", text(manifest, "nvidia-library")?);
+	Ok(())
+}
+const CPU_REPLACEMENTS: &[(&str, &str)] = &[
+	(
+		"@contraction_tile = external addrspace(3) global [0 x double], align 8",
+		"@contraction_tile = internal global [65536 x double] zeroinitializer, align 8",
+	),
+	(" addrspace(3)", ""),
+	("call i32 @llvm.amdgcn.workitem.id.x()", "add i32 0, 0"),
+	("call i32 @recipe.local.id.x()", "add i32 0, 0"),
+	("call i32 @recipe.group.id.x()", "add i32 0, 0"),
+	("call i32 @recipe.workgroup.size.x()", "add i32 1, 0"),
+	("call void @llvm.amdgcn.s.barrier()", ""),
+	("call void @recipe.local.barrier()", ""),
+	("call i64 @__ockl_steadyctr_u64()", "add i64 0, 0"),
+	("declare i32 @llvm.amdgcn.workitem.id.x()", ""),
+	("declare void @llvm.amdgcn.s.barrier()", ""),
+	("declare i64 @__ockl_steadyctr_u64()", ""),
+	("__ocml_exp_f64", "exp"),
+	("__ocml_tanh_f64", "tanh"),
+	("__ocml_cos_f64", "cos"),
+	("__ocml_sin_f64", "sin"),
+	("__ocml_log_f64", "log"),
+	("define protected amdgpu_kernel void @forward_graph(", "define void @recipe_forward_cpu("),
+	("define protected amdgpu_kernel void @tape_epoch_graph(", "define internal void @tape_epoch_graph("),
+	("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"1,1024\" }", "attributes #0 = { nounwind }"),
+];
+fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+	let target = env::var("TARGET")?;
+	let mut ir = fs::read_to_string("amd-nv-cpu.ll")?.replace("amdgcn-amd-amdhsa", &target);
+	for (pattern, replacement) in CPU_REPLACEMENTS {
+		ir = ir.replace(pattern, replacement);
+	}
+	let source = out.join("recipe-cpu.ll");
+	fs::write(&source, ir)?;
+	let object = out.join("recipe-cpu.o");
+	let clang = ["nvidia-compiler", "hsa-compiler"]
+		.iter()
+		.filter_map(|key| text(manifest, key).ok())
+		.find(|path| Path::new(path).exists())
+		.unwrap_or("clang");
+	let mut compile = Command::new(clang);
+	compile
+		.args(["-target", &target, "-Xclang", "-opaque-pointers", "-x", "ir", "-O2", "-fPIC", "-c", "-o"])
+		.arg(&object)
+		.arg(&source);
+	if run(&mut compile, "CPU LLVM IR compiler").is_err() {
+		let mut backend = Command::new("llc");
+		backend
+			.args(["--mtriple", &target, "-O2", "--relocation-model=pic", "-filetype=obj", "-o"])
+			.arg(&object)
+			.arg(&source);
+		run(&mut backend, "CPU LLVM IR backend")?;
+	}
+	run(Command::new("ar").arg("rcs").arg(out.join("librecipe_cpu.a")).arg(&object), "CPU archive")?;
+	println!("cargo:rustc-link-search=native={}", out.display());
+	println!("cargo:rustc-link-lib=static=recipe_cpu");
+	if env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("musl") {
+		println!("cargo:rustc-link-lib=m");
+	}
 	Ok(())
 }
 fn main() -> BuildResult<()> {
@@ -241,11 +299,11 @@ fn main() -> BuildResult<()> {
 	let toolchain = |compiler: &str, library: &str| -> BuildResult<bool> {
 		Ok(Path::new(text(&manifest, compiler)?).exists() && Path::new(text(&manifest, library)?).exists())
 	};
-	let amd = toolchain("hsa-compiler", "hsa-device-library")?;
-	let nvidia = toolchain("nvidia-compiler", "nvidia-device-library")?;
-	if !amd && !nvidia {
-		return Err(io::Error::other("no ROCm or CUDA toolchain is installed on the build machine").into());
-	}
+	compile_cpu(&manifest, &out)?;
+	// GPU driver stubs and library search paths are host-arch: cross-compiled builds are CPU-only.
+	let native = env::var("TARGET")? == env::var("HOST")?;
+	let amd = native && toolchain("hsa-compiler", "hsa-device-library")?;
+	let nvidia = native && toolchain("nvidia-compiler", "nvidia-device-library")?;
 	if amd {
 		println!("cargo:rustc-cfg=amd");
 		compile_amd(&manifest, &out)?;
@@ -255,6 +313,6 @@ fn main() -> BuildResult<()> {
 		compile_nvidia(&manifest, &out)?;
 	}
 	println!("cargo:rerun-if-changed=Cargo.toml");
-	println!("cargo:rerun-if-changed=amd-nv.ll");
+	println!("cargo:rerun-if-changed=amd-nv-cpu.ll");
 	Ok(())
 }

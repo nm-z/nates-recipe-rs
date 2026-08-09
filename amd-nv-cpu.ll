@@ -12,7 +12,7 @@ ptr addrspace(1) %input, i32 %row.base, i32 %position, i32 %term, i32 %span, i32
 %value = load double, ptr addrspace(1) %ptr, align 8 ret double %value } define internal void @contraction_forward_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
 i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %kernel,
-i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #1 { entry:
+i1 %has.bias, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #1 { entry:
 %lid = call i32 @recipe.local.id.x() %group = call i32 @recipe.group.id.x()
 %block = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %block
 %in.elements = mul i32 %in.channels, %in.length %out.elements = mul i32 %out.channels, %out.length
@@ -70,11 +70,258 @@ br i1 %active, label %store, label %position.done store:
 %output.row.base = mul i32 %row, %out.elements %output.channel.base = mul i32 %channel.raw, %out.length
 %output.local = add i32 %output.channel.base, %position %output.index = add i32 %output.row.base, %output.local
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %output.index
-store double %tile.sum, ptr addrspace(1) %output.ptr, align 8 br label %position.done position.done:
+%bias.base = mul i32 %out.channels, %terms %bias.index = add i32 %bias.base, %channel.raw
+%bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %bias.index
+%bias = load double, ptr addrspace(1) %bias.ptr, align 8 %biased = fadd double %tile.sum, %bias
+%result = select i1 %has.bias, double %biased, double %tile.sum
+store double %result, ptr addrspace(1) %output.ptr, align 8 br label %position.done position.done:
 %m.next = add i32 %m, 1 br label %position.loop channel.done:
 %n.next = add i32 %n.offset, %block %n.more = icmp ult i32 %n.next, %n.count
 br i1 %n.more, label %channel.loop, label %job.done job.done:
 %job.next = add i32 %job, %groups br label %job.loop exit: ret void }
+define internal double @quantized_value(
+ptr addrspace(1) %matrix, i32 %kind, i32 %row, i32 %column, i32 %columns ) #1 { entry:
+switch i32 %kind, label %invalid [ i32 0, label %f32 i32 12, label %q4 i32 14, label %q6 ]
+f32:
+%f32.row = mul i32 %row, %columns
+%f32.index = add i32 %f32.row, %column
+%f32.ptr = getelementptr inbounds float, ptr addrspace(1) %matrix, i32 %f32.index
+%f32.value = load float, ptr addrspace(1) %f32.ptr, align 4
+%f32.result = fpext float %f32.value to double
+ret double %f32.result
+q4:
+%q4.blocks = udiv i32 %columns, 256
+%q4.row.base = mul i32 %row, %q4.blocks
+%q4.block.local = udiv i32 %column, 256
+%q4.block.index = add i32 %q4.row.base, %q4.block.local
+%q4.block.offset = mul i32 %q4.block.index, 144
+%q4.block = getelementptr inbounds i8, ptr addrspace(1) %matrix, i32 %q4.block.offset
+%q4.d.ptr = getelementptr inbounds i8, ptr addrspace(1) %q4.block, i32 0
+%q4.min.ptr = getelementptr inbounds i8, ptr addrspace(1) %q4.block, i32 2
+%q4.d.half = load half, ptr addrspace(1) %q4.d.ptr, align 2
+%q4.min.half = load half, ptr addrspace(1) %q4.min.ptr, align 2
+%q4.d = fpext half %q4.d.half to double
+%q4.min = fpext half %q4.min.half to double
+%q4.local = urem i32 %column, 256
+%q4.sub = udiv i32 %q4.local, 32
+%q4.within = urem i32 %q4.local, 32
+%q4.pair = udiv i32 %q4.sub, 2
+%q4.q.base = mul i32 %q4.pair, 32
+%q4.q.local = add i32 %q4.q.base, %q4.within
+%q4.q.offset = add i32 %q4.q.local, 16
+%q4.q.ptr = getelementptr inbounds i8, ptr addrspace(1) %q4.block, i32 %q4.q.offset
+%q4.q.byte = load i8, ptr addrspace(1) %q4.q.ptr, align 1
+%q4.q.raw = zext i8 %q4.q.byte to i32
+%q4.odd = urem i32 %q4.sub, 2
+%q4.q.shift = mul i32 %q4.odd, 4
+%q4.q.shifted = lshr i32 %q4.q.raw, %q4.q.shift
+%q4.q = and i32 %q4.q.shifted, 15
+%q4.low = icmp ult i32 %q4.sub, 4
+br i1 %q4.low, label %q4.scale.low, label %q4.scale.high
+q4.scale.low:
+%q4.low.scale.offset = add i32 %q4.sub, 4
+%q4.low.scale.ptr = getelementptr inbounds i8, ptr addrspace(1) %q4.block, i32 %q4.low.scale.offset
+%q4.low.min.offset = add i32 %q4.sub, 8
+%q4.low.min.ptr = getelementptr inbounds i8, ptr addrspace(1) %q4.block, i32 %q4.low.min.offset
+%q4.low.scale.byte = load i8, ptr addrspace(1) %q4.low.scale.ptr, align 1
+%q4.low.min.byte = load i8, ptr addrspace(1) %q4.low.min.ptr, align 1
+%q4.low.scale.raw = zext i8 %q4.low.scale.byte to i32
+%q4.low.min.raw = zext i8 %q4.low.min.byte to i32
+%q4.low.scale = and i32 %q4.low.scale.raw, 63
+%q4.low.min = and i32 %q4.low.min.raw, 63
+br label %q4.calculate
+q4.scale.high:
+%q4.high.packed.offset = add i32 %q4.sub, 8
+%q4.high.packed.ptr = getelementptr inbounds i8, ptr addrspace(1) %q4.block, i32 %q4.high.packed.offset
+%q4.high.scale.ptr = getelementptr inbounds i8, ptr addrspace(1) %q4.block, i32 %q4.sub
+%q4.high.min.offset = add i32 %q4.sub, 4
+%q4.high.min.ptr = getelementptr inbounds i8, ptr addrspace(1) %q4.block, i32 %q4.high.min.offset
+%q4.high.packed.byte = load i8, ptr addrspace(1) %q4.high.packed.ptr, align 1
+%q4.high.scale.byte = load i8, ptr addrspace(1) %q4.high.scale.ptr, align 1
+%q4.high.min.byte = load i8, ptr addrspace(1) %q4.high.min.ptr, align 1
+%q4.high.packed = zext i8 %q4.high.packed.byte to i32
+%q4.high.scale.bits = zext i8 %q4.high.scale.byte to i32
+%q4.high.min.bits = zext i8 %q4.high.min.byte to i32
+%q4.high.scale.low = and i32 %q4.high.packed, 15
+%q4.high.scale.top = lshr i32 %q4.high.scale.bits, 6
+%q4.high.scale.top.shifted = shl i32 %q4.high.scale.top, 4
+%q4.high.scale = or i32 %q4.high.scale.low, %q4.high.scale.top.shifted
+%q4.high.min.low = lshr i32 %q4.high.packed, 4
+%q4.high.min.top = lshr i32 %q4.high.min.bits, 6
+%q4.high.min.top.shifted = shl i32 %q4.high.min.top, 4
+%q4.high.min = or i32 %q4.high.min.low, %q4.high.min.top.shifted
+br label %q4.calculate
+q4.calculate:
+%q4.scale = phi i32 [ %q4.low.scale, %q4.scale.low ], [ %q4.high.scale, %q4.scale.high ]
+%q4.minimum = phi i32 [ %q4.low.min, %q4.scale.low ], [ %q4.high.min, %q4.scale.high ]
+%q4.scale.double = uitofp i32 %q4.scale to double
+%q4.minimum.double = uitofp i32 %q4.minimum to double
+%q4.q.double = uitofp i32 %q4.q to double
+%q4.step = fmul double %q4.d, %q4.scale.double
+%q4.base = fmul double %q4.min, %q4.minimum.double
+%q4.product = fmul double %q4.step, %q4.q.double
+%q4.result = fsub double %q4.product, %q4.base
+ret double %q4.result
+q6:
+%q6.blocks = udiv i32 %columns, 256
+%q6.row.base = mul i32 %row, %q6.blocks
+%q6.block.local = udiv i32 %column, 256
+%q6.block.index = add i32 %q6.row.base, %q6.block.local
+%q6.block.offset = mul i32 %q6.block.index, 210
+%q6.block = getelementptr inbounds i8, ptr addrspace(1) %matrix, i32 %q6.block.offset
+%q6.local = urem i32 %column, 256
+%q6.chunk = udiv i32 %q6.local, 128
+%q6.chunk.local = urem i32 %q6.local, 128
+%q6.group = udiv i32 %q6.chunk.local, 32
+%q6.within = urem i32 %q6.chunk.local, 32
+%q6.low.group = and i32 %q6.group, 1
+%q6.low.extra = mul i32 %q6.low.group, 32
+%q6.low.local = add i32 %q6.within, %q6.low.extra
+%q6.low.chunk = mul i32 %q6.chunk, 64
+%q6.low.offset = add i32 %q6.low.chunk, %q6.low.local
+%q6.low.ptr = getelementptr inbounds i8, ptr addrspace(1) %q6.block, i32 %q6.low.offset
+%q6.high.chunk = mul i32 %q6.chunk, 32
+%q6.high.local = add i32 %q6.high.chunk, %q6.within
+%q6.high.offset = add i32 %q6.high.local, 128
+%q6.high.ptr = getelementptr inbounds i8, ptr addrspace(1) %q6.block, i32 %q6.high.offset
+%q6.low.byte = load i8, ptr addrspace(1) %q6.low.ptr, align 1
+%q6.high.byte = load i8, ptr addrspace(1) %q6.high.ptr, align 1
+%q6.low.raw = zext i8 %q6.low.byte to i32
+%q6.high.raw = zext i8 %q6.high.byte to i32
+%q6.low.half = udiv i32 %q6.group, 2
+%q6.low.shift = mul i32 %q6.low.half, 4
+%q6.high.shift = mul i32 %q6.group, 2
+%q6.low.shifted = lshr i32 %q6.low.raw, %q6.low.shift
+%q6.high.shifted = lshr i32 %q6.high.raw, %q6.high.shift
+%q6.low.bits = and i32 %q6.low.shifted, 15
+%q6.high.bits = and i32 %q6.high.shifted, 3
+%q6.high.top = shl i32 %q6.high.bits, 4
+%q6.quant.unsigned = or i32 %q6.low.bits, %q6.high.top
+%q6.quant = sub i32 %q6.quant.unsigned, 32
+%q6.scale.half = udiv i32 %q6.within, 16
+%q6.scale.group = mul i32 %q6.group, 2
+%q6.scale.local = add i32 %q6.scale.group, %q6.scale.half
+%q6.scale.chunk = mul i32 %q6.chunk, 8
+%q6.scale.index = add i32 %q6.scale.chunk, %q6.scale.local
+%q6.scale.offset = add i32 %q6.scale.index, 192
+%q6.scale.ptr = getelementptr inbounds i8, ptr addrspace(1) %q6.block, i32 %q6.scale.offset
+%q6.scale.byte = load i8, ptr addrspace(1) %q6.scale.ptr, align 1
+%q6.scale = sext i8 %q6.scale.byte to i32
+%q6.d.ptr = getelementptr inbounds i8, ptr addrspace(1) %q6.block, i32 208
+%q6.d.half = load half, ptr addrspace(1) %q6.d.ptr, align 2
+%q6.d = fpext half %q6.d.half to double
+%q6.scale.double = sitofp i32 %q6.scale to double
+%q6.quant.double = sitofp i32 %q6.quant to double
+%q6.scaled = fmul double %q6.d, %q6.scale.double
+%q6.result = fmul double %q6.scaled, %q6.quant.double
+ret double %q6.result
+invalid: call void @llvm.trap() ret double 0.0 }
+define internal void @quantized_forward_body(
+ptr addrspace(1) %input, ptr addrspace(1) %matrix, ptr addrspace(1) %output,
+i32 %rows, i32 %columns, i32 %outputs, i32 %kind, i32 %mode, i32 %vector.width,
+i32 %tile.n, i32 %tile.k, i32 %threads ) #1 { entry:
+%tid = call i32 @llvm.amdgcn.workitem.id.x()
+%lid = call i32 @recipe.local.id.x()
+%group = call i32 @recipe.group.id.x()
+%block = call i32 @recipe.workgroup.size.x()
+%groups = udiv i32 %threads, %block
+%count = mul i32 %rows, %outputs
+%gather = icmp eq i32 %mode, 1
+%scale = icmp eq i32 %mode, 2
+br i1 %gather, label %gather.loop, label %scale.test
+scale.test:
+br i1 %scale, label %scale.loop, label %output.loop
+scale.loop:
+%scale.p = phi i32 [ %tid, %scale.test ], [ %scale.next, %scale.step ]
+%scale.more = icmp ult i32 %scale.p, %count
+br i1 %scale.more, label %scale.step, label %exit
+scale.step:
+%scale.column = urem i32 %scale.p, %vector.width
+%scale.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %scale.p
+%scale.input = load double, ptr addrspace(1) %scale.input.ptr, align 8
+%scale.weight = call double @quantized_value(
+ptr addrspace(1) %matrix, i32 %kind, i32 0, i32 %scale.column, i32 %vector.width )
+%scale.value = fmul double %scale.input, %scale.weight
+%scale.output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %scale.p
+store double %scale.value, ptr addrspace(1) %scale.output.ptr, align 8
+%scale.next = add i32 %scale.p, %threads
+br label %scale.loop
+gather.loop:
+%gather.p = phi i32 [ %tid, %entry ], [ %gather.next, %gather.step ]
+%gather.more = icmp ult i32 %gather.p, %count
+br i1 %gather.more, label %gather.step, label %exit
+gather.step:
+%gather.row = udiv i32 %gather.p, %outputs
+%gather.channel = urem i32 %gather.p, %outputs
+%gather.token.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %gather.row
+%gather.token.double = load double, ptr addrspace(1) %gather.token.ptr, align 8
+%gather.token = fptoui double %gather.token.double to i32
+%gather.value = call double @quantized_value(
+ptr addrspace(1) %matrix, i32 %kind, i32 %gather.token, i32 %gather.channel, i32 %outputs )
+%gather.output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %gather.p
+store double %gather.value, ptr addrspace(1) %gather.output.ptr, align 8
+%gather.next = add i32 %gather.p, %threads
+br label %gather.loop
+output.loop:
+%n.short = icmp ult i32 %tile.n, %outputs
+%n.tile = select i1 %n.short, i32 %tile.n, i32 %outputs
+%n.adjusted = add i32 %outputs, %n.tile
+%n.numerator = sub i32 %n.adjusted, 1
+%n.tiles = udiv i32 %n.numerator, %n.tile
+%jobs = mul i32 %rows, %n.tiles
+br label %job.loop
+job.loop:
+%job = phi i32 [ %group, %output.loop ], [ %job.next, %output.done ]
+%job.more = icmp ult i32 %job, %jobs
+br i1 %job.more, label %output.step, label %exit
+output.step:
+%row = udiv i32 %job, %n.tiles
+%n.index = urem i32 %job, %n.tiles
+%channel.base = mul i32 %n.index, %n.tile
+%channel = add i32 %channel.base, %lid
+%channel.more = icmp ult i32 %lid, %n.tile
+%channel.valid = icmp ult i32 %channel, %outputs
+%active = and i1 %channel.more, %channel.valid
+%input.base = mul i32 %row, %columns
+br i1 %active, label %tile.loop, label %output.done
+tile.loop:
+%term.base = phi i32 [ 0, %output.step ], [ %term.next, %tile.done ]
+%tile.sum = phi double [ 0.0, %output.step ], [ %sum, %tile.done ]
+%k.remaining = sub i32 %columns, %term.base
+%k.short = icmp ult i32 %k.remaining, %tile.k
+%k.count = select i1 %k.short, i32 %k.remaining, i32 %tile.k
+br label %term.loop
+term.loop:
+%i = phi i32 [ 0, %tile.loop ], [ %i.next, %term.step ]
+%partial = phi double [ %tile.sum, %tile.loop ], [ %sum.next, %term.step ]
+%term.more = icmp ult i32 %i, %k.count
+br i1 %term.more, label %term.step, label %tile.done
+term.step:
+%term = add i32 %term.base, %i
+%input.index = add i32 %input.base, %term
+%input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %input.index
+%x = load double, ptr addrspace(1) %input.ptr, align 8
+%w = call double @quantized_value(
+ptr addrspace(1) %matrix, i32 %kind, i32 %channel, i32 %term, i32 %columns )
+%product = fmul double %x, %w
+%sum.next = fadd double %partial, %product
+%i.next = add nuw i32 %i, 1
+br label %term.loop
+tile.done:
+%sum = phi double [ %partial, %term.loop ]
+%term.next = add i32 %term.base, %k.count
+%terms.more = icmp ult i32 %term.next, %columns
+br i1 %terms.more, label %tile.loop, label %output.store
+output.store:
+%output.base = mul i32 %row, %outputs
+%output.index = add i32 %output.base, %channel
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %output.index
+store double %sum, ptr addrspace(1) %output.ptr, align 8
+br label %output.done
+output.done:
+%job.next = add i32 %job, %groups
+br label %job.loop
+exit: ret void }
 define internal double @scalar_operand( double %first, double %second, ptr addrspace(1) %context,
 i32 %operand, i32 %p, i32 %elements ) #1 { entry: %register = icmp sge i32 %operand, 0
 %safe = select i1 %register, i32 %operand, i32 0 %base = mul i32 %safe, %elements %index = add i32 %base, %p
@@ -98,8 +345,12 @@ br i1 %more, label %step, label %done step: %instruction = mul i32 %i, 3 %left.i
 %left.double = load double, ptr addrspace(1) %left.ptr, align 8
 %right.double = load double, ptr addrspace(1) %right.ptr, align 8 %opcode = fptosi double %opcode.double to i32
 %left = fptosi double %left.double to i32 %right = fptosi double %right.double to i32
+%left.literal.constant = icmp eq i32 %opcode, 1
+%left.literal.parameter = icmp eq i32 %opcode, 2
+%left.literal = or i1 %left.literal.constant, %left.literal.parameter
+%left.operand = select i1 %left.literal, i32 -1, i32 %left
 %left.value = call double @scalar_operand( double %first.value, double %second.value, ptr addrspace(1) %context,
-i32 %left, i32 %p, i32 %elements )
+i32 %left.operand, i32 %p, i32 %elements )
 %right.value = call double @scalar_operand( double %first.value, double %second.value, ptr addrspace(1) %context,
 i32 %right, i32 %p, i32 %elements ) switch i32 %opcode, label %invalid [ i32 0, label %add i32 1, label %constant
 i32 2, label %parameter i32 3, label %subtract i32 4, label %multiply i32 5, label %divide i32 6, label %absolute
@@ -347,13 +598,14 @@ ret void } define internal double @sigmoid(double %x) #1 { entry: %negative = fn
 %value = fdiv double 1.0, %denominator ret double %value }
 define internal double @attention_score( ptr addrspace(1) nocapture readonly %context, i32 %plane, i32 %row, i32 %head,
 i32 %query, i32 %key, i32 %from, i32 %length, i32 %head_width, double %scale ) #1 { entry:
-%row.base = mul i32 %row, %from %head.start = mul i32 %head, %head_width br label %channel.loop channel.loop:
+%batch.stride = mul i32 %from, 3 %row.base = mul i32 %row, %batch.stride
+%head.start = mul i32 %head, %head_width br label %channel.loop channel.loop:
 %offset = phi i32 [ 0, %entry ], [ %offset.next, %channel.step ]
 %sum = phi double [ 0.0, %entry ], [ %sum.next, %channel.step ] %more = icmp ult i32 %offset, %head_width
 br i1 %more, label %channel.step, label %done channel.step: %channel = add i32 %head.start, %offset
 %channel.base = mul i32 %channel, %length %query.local = add i32 %channel.base, %query
 %key.local = add i32 %channel.base, %key %query.index = add i32 %row.base, %query.local
-%key.row.index = add i32 %row.base, %key.local %key.index = add i32 %plane, %key.row.index
+%key.plane = add i32 %row.base, %from %key.index = add i32 %key.plane, %key.local
 %query.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %query.index
 %key.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %key.index
 %query.value = load double, ptr addrspace(1) %query.ptr, align 8
@@ -366,54 +618,8 @@ i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %tile.m, i32 %tile.n, i32 %
 %tid = call i32 @llvm.amdgcn.workitem.id.x()
 %length = udiv i32 %from, %channels %head_width = udiv i32 %channels, %heads
 %head_width.double = uitofp i32 %head_width to double %scale = call double @llvm.sqrt.f64(double %head_width.double)
-%plane = mul i32 %rows, %from %matrix = mul i32 %channels, %channels
-%key.weights = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %matrix
-%value.weight.offset = mul i32 %matrix, 2
-%value.weights = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %value.weight.offset
-%key.context = getelementptr inbounds double, ptr addrspace(1) %context, i32 %plane
-%value.context.offset = mul i32 %plane, 2
-%value.context = getelementptr inbounds double, ptr addrspace(1) %context, i32 %value.context.offset
-call void @contraction_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %weights,
-ptr addrspace(1) %context, i32 %rows, i32 %channels, i32 %length, i32 %channels, i32 %length, i32 0,
-i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )
-call void @contraction_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %key.weights,
-ptr addrspace(1) %key.context, i32 %rows, i32 %channels, i32 %length, i32 %channels, i32 %length,
-i32 0, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )
-call void @contraction_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %value.weights,
-ptr addrspace(1) %value.context, i32 %rows, i32 %channels, i32 %length, i32 %channels, i32 %length,
-i32 0, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )
-%bias.base = mul i32 %matrix, 3
-br label %attn.bias.loop attn.bias.loop:
-%bp = phi i32 [ %tid, %entry ], [ %bp.next, %attn.bias.step ]
-%bp.more = icmp ult i32 %bp, %plane
-br i1 %bp.more, label %attn.bias.step, label %projection.done attn.bias.step:
-%bp.local = urem i32 %bp, %from %bp.channel = udiv i32 %bp.local, %length
-%qb.offset = add i32 %bias.base, %bp.channel
-%qb.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %qb.offset
-%qb.val = load double, ptr addrspace(1) %qb.ptr, align 8
-%q.bias.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %bp
-%q.bias.old = load double, ptr addrspace(1) %q.bias.ptr, align 8
-%q.biased = fadd double %q.bias.old, %qb.val
-store double %q.biased, ptr addrspace(1) %q.bias.ptr, align 8
-%kb.base = add i32 %bias.base, %channels %kb.offset = add i32 %kb.base, %bp.channel
-%kb.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %kb.offset
-%kb.val = load double, ptr addrspace(1) %kb.ptr, align 8
-%k.bias.idx = add i32 %plane, %bp
-%k.bias.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %k.bias.idx
-%k.bias.old = load double, ptr addrspace(1) %k.bias.ptr, align 8
-%k.biased = fadd double %k.bias.old, %kb.val
-store double %k.biased, ptr addrspace(1) %k.bias.ptr, align 8
-%vb.base = add i32 %kb.base, %channels %vb.offset = add i32 %vb.base, %bp.channel
-%vb.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %vb.offset
-%vb.val = load double, ptr addrspace(1) %vb.ptr, align 8
-%v.bias.idx = add i32 %value.context.offset, %bp
-%v.bias.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %v.bias.idx
-%v.bias.old = load double, ptr addrspace(1) %v.bias.ptr, align 8
-%v.biased = fadd double %v.bias.old, %vb.val
-store double %v.biased, ptr addrspace(1) %v.bias.ptr, align 8
-%bp.next = add i32 %bp, %threads br label %attn.bias.loop
-projection.done: call void @llvm.amdgcn.s.barrier() br label %output.loop output.loop:
-%p = phi i32 [ %tid, %projection.done ], [ %p.next, %output.store ] %output.more = icmp ult i32 %p, %plane
+%plane = mul i32 %rows, %from br label %output.loop output.loop:
+%p = phi i32 [ %tid, %entry ], [ %p.next, %output.store ] %output.more = icmp ult i32 %p, %plane
 br i1 %output.more, label %output.step, label %exit output.step: %output.row = udiv i32 %p, %from
 %output.local = urem i32 %p, %from %output.channel.index = udiv i32 %output.local, %length
 %query = urem i32 %output.local, %length %head = udiv i32 %output.channel.index, %head_width br label %online.loop
@@ -422,37 +628,210 @@ online.loop: %key = phi i32 [ 0, %output.step ], [ %key.next, %online.step ]
 %denominator = phi double [ 0.0, %output.step ], [ %denominator.next, %online.step ]
 %numerator = phi double [ 0.0, %output.step ], [ %numerator.next, %online.step ]
 %key.more = icmp ult i32 %key, %length br i1 %key.more, label %online.step, label %output.store online.step:
-%score = call double @attention_score( ptr addrspace(1) %context, i32 %plane, i32 %output.row, i32 %head, i32 %query,
+%score = call double @attention_score( ptr addrspace(1) %input, i32 %plane, i32 %output.row, i32 %head, i32 %query,
 i32 %key, i32 %from, i32 %length, i32 %head_width, double %scale )
 %larger = fcmp ogt double %score, %maximum %maximum.next = select i1 %larger, double %score, double %maximum
 %old.centered = fsub double %maximum, %maximum.next %old.scale = call double @__ocml_exp_f64(double %old.centered)
 %new.centered = fsub double %score, %maximum.next %new.scale = call double @__ocml_exp_f64(double %new.centered)
 %old.denominator = fmul double %denominator, %old.scale
-%denominator.next = fadd double %old.denominator, %new.scale %value.plane = mul i32 %plane, 2
-%value.row = mul i32 %output.row, %from %value.channel.base = mul i32 %output.channel.index, %length
-%value.local = add i32 %value.channel.base, %key %value.row.index = add i32 %value.row, %value.local
-%value.index = add i32 %value.plane, %value.row.index
-%value.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %value.index
+%denominator.next = fadd double %old.denominator, %new.scale %value.batch.stride = mul i32 %from, 3
+%value.row = mul i32 %output.row, %value.batch.stride %value.plane = mul i32 %from, 2
+%value.row.plane = add i32 %value.row, %value.plane %value.channel.base = mul i32 %output.channel.index, %length
+%value.local = add i32 %value.channel.base, %key %value.index = add i32 %value.row.plane, %value.local
+%value.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %value.index
 %value = load double, ptr addrspace(1) %value.ptr, align 8 %weighted = fmul double %new.scale, %value
 %old.numerator = fmul double %numerator, %old.scale %numerator.next = fadd double %old.numerator, %weighted
 %key.next = add i32 %key, 1 br label %online.loop output.store: %attention = fdiv double %numerator, %denominator
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
 store double %attention, ptr addrspace(1) %output.ptr, align 8 %p.next = add i32 %p, %threads br label %output.loop
-exit: ret void } define internal void @attention_reverse_body(
+exit: ret void }
+define internal double @rope_value(
+ptr addrspace(1) %vector, i32 %index, i32 %width, i32 %position,
+double %base, double %factor, i32 %range ) #1 { entry:
+%offset = urem i32 %index, %width
+%half = udiv i32 %width, 2
+%second = icmp uge i32 %offset, %half
+%pair.first = add i32 %offset, %half
+%pair.second = sub i32 %offset, %half
+%pair.offset = select i1 %second, i32 %pair.second, i32 %pair.first
+%pair.index = sub i32 %index, %offset
+%pair = add i32 %pair.index, %pair.offset
+%value.ptr = getelementptr inbounds double, ptr addrspace(1) %vector, i32 %index
+%pair.ptr = getelementptr inbounds double, ptr addrspace(1) %vector, i32 %pair
+%value = load double, ptr addrspace(1) %value.ptr, align 8
+%paired = load double, ptr addrspace(1) %pair.ptr, align 8
+%pair.number = urem i32 %offset, %half
+%pair.double = uitofp i32 %pair.number to double
+%width.double = uitofp i32 %width to double
+%exponent.top = fmul double %pair.double, -2.0
+%exponent = fdiv double %exponent.top, %width.double
+%base.log = call double @__ocml_log_f64(double %base)
+%power = fmul double %base.log, %exponent
+%frequency = call double @__ocml_exp_f64(double %power)
+%position.double = uitofp i32 %position to double
+%theta.extrap = fmul double %position.double, %frequency
+%theta.interp = fmul double %theta.extrap, %factor
+%range.low = and i32 %range, 65535
+%range.high = lshr i32 %range, 16
+%ramp.top.integer = sub i32 %pair.number, %range.low
+%ramp.bottom.integer = sub i32 %range.high, %range.low
+%ramp.top = sitofp i32 %ramp.top.integer to double
+%ramp.bottom = uitofp i32 %ramp.bottom.integer to double
+%ramp.raw = fdiv double %ramp.top, %ramp.bottom
+%ramp.low = fcmp olt double %ramp.raw, 0.0
+%ramp.nonnegative = select i1 %ramp.low, double 0.0, double %ramp.raw
+%ramp.high = fcmp ogt double %ramp.nonnegative, 1.0
+%ramp = select i1 %ramp.high, double 1.0, double %ramp.nonnegative
+%one.minus.ramp = fsub double 1.0, %ramp
+%interp.part = fmul double %theta.interp, %ramp
+%extrap.part = fmul double %theta.extrap, %one.minus.ramp
+%theta = fadd double %interp.part, %extrap.part
+%inverse.factor = fdiv double 1.0, %factor
+%factor.log = call double @__ocml_log_f64(double %inverse.factor)
+%magnitude.extra = fmul double %factor.log, 0.1
+%magnitude = fadd double 1.0, %magnitude.extra
+%cosine.raw = call double @__ocml_cos_f64(double %theta)
+%sine.raw = call double @__ocml_sin_f64(double %theta)
+%cosine = fmul double %cosine.raw, %magnitude
+%sine = fmul double %sine.raw, %magnitude
+%primary = fmul double %value, %cosine
+%secondary = fmul double %paired, %sine
+%first.value = fsub double %primary, %secondary
+%second.value = fadd double %primary, %secondary
+%result = select i1 %second, double %second.value, double %first.value
+ret double %result }
+define internal void @cached_attention_body(
+ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %context,
+i32 %heads, i32 %kv.heads, i32 %width, i32 %maximum,
+double %scale, double %rope.base, double %rope.factor, i32 %rope.range, i32 %threads ) #1 { entry:
+%tid = call i32 @llvm.amdgcn.workitem.id.x()
+%q.width = mul i32 %heads, %width
+%kv.width = mul i32 %kv.heads, %width
+%position.double = load double, ptr addrspace(1) %context, align 8
+%position = fptoui double %position.double to i32
+%valid = icmp ult i32 %position, %maximum
+br i1 %valid, label %cache.loop, label %invalid
+cache.loop:
+%cache.p = phi i32 [ %tid, %entry ], [ %cache.next, %cache.step ]
+%cache.more = icmp ult i32 %cache.p, %kv.width
+br i1 %cache.more, label %cache.step, label %cache.done
+cache.step:
+%key.input.index = add i32 %q.width, %cache.p
+%key.input = getelementptr inbounds double, ptr addrspace(1) %input, i32 %q.width
+%key = call double @rope_value(
+ptr addrspace(1) %key.input, i32 %cache.p, i32 %width, i32 %position,
+double %rope.base, double %rope.factor, i32 %rope.range )
+%cache.row = mul i32 %position, %kv.width
+%key.cache.index.raw = add i32 %cache.row, %cache.p
+%key.cache.index = add i32 %key.cache.index.raw, 4
+%key.cache.ptr = getelementptr inbounds half, ptr addrspace(1) %context, i32 %key.cache.index
+%key.half = fptrunc double %key to half
+store half %key.half, ptr addrspace(1) %key.cache.ptr, align 2
+%value.input.base = add i32 %q.width, %kv.width
+%value.input.index = add i32 %value.input.base, %cache.p
+%value.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %value.input.index
+%value = load double, ptr addrspace(1) %value.input.ptr, align 8
+%value.cache.base = mul i32 %maximum, %kv.width
+%value.cache.row = add i32 %value.cache.base, %cache.row
+%value.cache.local = add i32 %value.cache.row, %cache.p
+%value.cache.index = add i32 %value.cache.local, 4
+%value.cache.ptr = getelementptr inbounds half, ptr addrspace(1) %context, i32 %value.cache.index
+%value.half = fptrunc double %value to half
+store half %value.half, ptr addrspace(1) %value.cache.ptr, align 2
+%cache.next = add i32 %cache.p, %threads
+br label %cache.loop
+cache.done:
+call void @llvm.amdgcn.s.barrier()
+br label %output.loop
+output.loop:
+%p = phi i32 [ %tid, %cache.done ], [ %p.next, %output.store ]
+%p.more = icmp ult i32 %p, %q.width
+br i1 %p.more, label %output.step, label %increment
+output.step:
+%head = udiv i32 %p, %width
+%head.offset = urem i32 %p, %width
+%heads.per.kv = udiv i32 %heads, %kv.heads
+%kv.head = udiv i32 %head, %heads.per.kv
+%kv.head.base = mul i32 %kv.head, %width
+%value.channel = add i32 %kv.head.base, %head.offset
+br label %online.loop
+online.loop:
+%key.position = phi i32 [ 0, %output.step ], [ %key.next, %online.step ]
+%maximum.score = phi double [ 0xFFF0000000000000, %output.step ], [ %maximum.next, %online.step ]
+%denominator = phi double [ 0.0, %output.step ], [ %denominator.next, %online.step ]
+%numerator = phi double [ 0.0, %output.step ], [ %numerator.next, %online.step ]
+%key.more = icmp ule i32 %key.position, %position
+br i1 %key.more, label %score.loop, label %output.store
+score.loop:
+%d = phi i32 [ 0, %online.loop ], [ %d.next, %score.step ]
+%score = phi double [ 0.0, %online.loop ], [ %score.next, %score.step ]
+%d.more = icmp ult i32 %d, %width
+br i1 %d.more, label %score.step, label %online.step
+score.step:
+%query.channel = mul i32 %head, %width
+%query.index = add i32 %query.channel, %d
+%query = call double @rope_value(
+ptr addrspace(1) %input, i32 %query.index, i32 %width, i32 %position,
+double %rope.base, double %rope.factor, i32 %rope.range )
+%key.channel = add i32 %kv.head.base, %d
+%key.row = mul i32 %key.position, %kv.width
+%key.local = add i32 %key.row, %key.channel
+%key.index = add i32 %key.local, 4
+%key.ptr = getelementptr inbounds half, ptr addrspace(1) %context, i32 %key.index
+%key.half.value = load half, ptr addrspace(1) %key.ptr, align 2
+%key.value = fpext half %key.half.value to double
+%product = fmul double %query, %key.value
+%score.next = fadd double %score, %product
+%d.next = add nuw i32 %d, 1
+br label %score.loop
+online.step:
+%scaled.score = fmul double %score, %scale
+%larger = fcmp ogt double %scaled.score, %maximum.score
+%maximum.next = select i1 %larger, double %scaled.score, double %maximum.score
+%old.centered = fsub double %maximum.score, %maximum.next
+%old.scale = call double @__ocml_exp_f64(double %old.centered)
+%new.centered = fsub double %scaled.score, %maximum.next
+%new.scale = call double @__ocml_exp_f64(double %new.centered)
+%old.denominator = fmul double %denominator, %old.scale
+%denominator.next = fadd double %old.denominator, %new.scale
+%lookup.cache.base = mul i32 %maximum, %kv.width
+%lookup.row = mul i32 %key.position, %kv.width
+%lookup.local = add i32 %lookup.row, %value.channel
+%lookup.raw = add i32 %lookup.cache.base, %lookup.local
+%lookup.index = add i32 %lookup.raw, 4
+%lookup.ptr = getelementptr inbounds half, ptr addrspace(1) %context, i32 %lookup.index
+%lookup.half = load half, ptr addrspace(1) %lookup.ptr, align 2
+%lookup.value = fpext half %lookup.half to double
+%weighted = fmul double %new.scale, %lookup.value
+%old.numerator = fmul double %numerator, %old.scale
+%numerator.next = fadd double %old.numerator, %weighted
+%key.next = add nuw i32 %key.position, 1
+br label %online.loop
+output.store:
+%attention = fdiv double %numerator, %denominator
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
+store double %attention, ptr addrspace(1) %output.ptr, align 8
+%p.next = add i32 %p, %threads
+br label %output.loop
+increment:
+call void @llvm.amdgcn.s.barrier()
+%leader = icmp eq i32 %tid, 0
+br i1 %leader, label %position.store, label %exit
+position.store:
+%position.next = add i32 %position, 1
+%position.next.double = uitofp i32 %position.next to double
+store double %position.next.double, ptr addrspace(1) %context, align 8
+br label %exit
+invalid: call void @llvm.trap() br label %exit
+exit: ret void }
+define internal void @attention_reverse_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %context,
 ptr addrspace(1) %delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient,
 i1 %write.previous, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %offset, i32 %threads ) #1 { entry:
 %tid = call i32 @llvm.amdgcn.workitem.id.x() %length = udiv i32 %from, %channels
 %head.width = udiv i32 %channels, %heads %head.width.double = uitofp i32 %head.width to double
-%scale = call double @llvm.sqrt.f64(double %head.width.double) %plane = mul i32 %rows, %from
-%value.plane = mul i32 %plane, 2
-%adjoint.base = mul i32 %plane, 3 %adjoint.count = mul i32 %plane, 3 br label %clear.loop clear.loop:
-%clear.p = phi i32 [ %tid, %entry ], [ %clear.next, %clear.step ] %clear.more = icmp ult i32 %clear.p, %adjoint.count
-br i1 %clear.more, label %clear.step, label %row.entry clear.step: %clear.index = add i32 %adjoint.base, %clear.p
-%clear.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %clear.index
-store double 0.0, ptr addrspace(1) %clear.ptr, align 8 %clear.next = add i32 %clear.p, %threads br label %clear.loop
-row.entry: call void @llvm.amdgcn.s.barrier() br label %row.loop row.loop:
-%row = phi i32 [ %tid, %row.entry ], [ %row.next, %row.done ] %row.more = icmp ult i32 %row, %rows
+%scale = call double @llvm.sqrt.f64(double %head.width.double) %plane = mul i32 %rows, %from br label %row.loop row.loop:
+%row = phi i32 [ %tid, %entry ], [ %row.next, %row.done ] %row.more = icmp ult i32 %row, %rows
 br i1 %row.more, label %head.loop, label %rows.done head.loop:
 %head = phi i32 [ 0, %row.loop ], [ %head.next, %head.done ] %head.more = icmp ult i32 %head, %heads
 br i1 %head.more, label %query.loop, label %row.done query.loop:
@@ -473,16 +852,17 @@ br i1 %online.channel.more, label %online.channel.step, label %online.statistics
 %online.delta.local = add i32 %online.channel.base, %query
 %online.value.local = add i32 %online.channel.base, %online.key
 %online.delta.index = add i32 %online.row.base, %online.delta.local
-%online.value.row.index = add i32 %online.row.base, %online.value.local
-%online.value.index = add i32 %value.plane, %online.value.row.index
+%online.input.stride = mul i32 %from, 3 %online.input.row = mul i32 %row, %online.input.stride
+%online.value.plane = mul i32 %from, 2 %online.value.row = add i32 %online.input.row, %online.value.plane
+%online.value.index = add i32 %online.value.row, %online.value.local
 %online.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %online.delta.index
-%online.value.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %online.value.index
+%online.value.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %online.value.index
 %online.delta = load double, ptr addrspace(1) %online.delta.ptr, align 8
 %online.value = load double, ptr addrspace(1) %online.value.ptr, align 8
 %online.dp.product = fmul double %online.delta, %online.value
 %online.dp.next = fadd double %online.dp, %online.dp.product
 %online.channel.next = add nuw i32 %online.channel.offset, 1 br label %online.channel.loop online.statistics.update:
-%online.score = call double @attention_score( ptr addrspace(1) %context, i32 %plane, i32 %row, i32 %head, i32 %query,
+%online.score = call double @attention_score( ptr addrspace(1) %input, i32 %plane, i32 %row, i32 %head, i32 %query,
 i32 %online.key, i32 %from, i32 %length, i32 %head.width, double %scale )
 %online.larger = fcmp ogt double %online.score, %online.maximum
 %online.maximum.next = select i1 %online.larger, double %online.score, double %online.maximum
@@ -500,7 +880,7 @@ i32 %online.key, i32 %from, i32 %length, i32 %head.width, double %scale )
 %key = phi i32 [ 0, %online.statistics.done ], [ %key.next, %key.channel.done ] %key.more = icmp ult i32 %key, %length
 %key.head.start = mul i32 %head, %head.width %key.row.base = mul i32 %row, %from
 br i1 %key.more, label %key.prepare, label %query.done key.prepare:
-%key.score = call double @attention_score( ptr addrspace(1) %context, i32 %plane, i32 %row, i32 %head, i32 %query,
+%key.score = call double @attention_score( ptr addrspace(1) %input, i32 %plane, i32 %row, i32 %head, i32 %query,
 i32 %key, i32 %from, i32 %length, i32 %head.width, double %scale )
 %key.centered = fsub double %key.score, %online.maximum
 %key.exponential = call double @__ocml_exp_f64(double %key.centered)
@@ -512,10 +892,11 @@ br i1 %key.dp.more, label %key.dp.step, label %key.channel.entry
 key.dp.step: %key.channel = add i32 %key.head.start, %key.dp.channel %key.channel.base = mul i32 %key.channel, %length
 %key.dp.delta.local = add i32 %key.channel.base, %query %key.value.local = add i32 %key.channel.base, %key
 %key.dp.delta.index = add i32 %key.row.base, %key.dp.delta.local
-%key.value.row.index = add i32 %key.row.base, %key.value.local
-%key.value.index = add i32 %value.plane, %key.value.row.index
+%key.input.stride = mul i32 %from, 3 %key.input.row = mul i32 %row, %key.input.stride
+%key.value.plane = mul i32 %from, 2 %key.value.row = add i32 %key.input.row, %key.value.plane
+%key.value.index = add i32 %key.value.row, %key.value.local
 %key.dp.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %key.dp.delta.index
-%key.value.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %key.value.index
+%key.value.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %key.value.index
 %key.dp.delta = load double, ptr addrspace(1) %key.dp.delta.ptr, align 8
 %key.value = load double, ptr addrspace(1) %key.value.ptr, align 8
 %key.dp.product = fmul double %key.dp.delta, %key.value
@@ -527,76 +908,29 @@ key.channel.entry: %key.dp.centered = fsub double %key.dp, %online.mean
 br i1 %key.channel.more, label %key.channel.step, label %key.channel.done key.channel.step:
 %update.channel = add i32 %key.head.start, %key.channel.offset %update.channel.base = mul i32 %update.channel, %length
 %query.local = add i32 %update.channel.base, %query %key.local = add i32 %update.channel.base, %key
-%query.row.index = add i32 %key.row.base, %query.local %key.row.index = add i32 %key.row.base, %key.local
-%key.plane = add i32 %plane, %key.row.index %value.index = add i32 %value.plane, %key.row.index
-%query.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %query.row.index
-%key.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %key.plane
-%value.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %value.index
-%update.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %query.row.index
+%update.input.stride = mul i32 %from, 3 %update.input.row = mul i32 %row, %update.input.stride
+%query.index = add i32 %update.input.row, %query.local %key.plane = add i32 %update.input.row, %from
+%key.index = add i32 %key.plane, %key.local %value.plane = mul i32 %from, 2
+%value.row = add i32 %update.input.row, %value.plane %value.index = add i32 %value.row, %key.local
+%query.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %query.index
+%key.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %key.index
+%update.delta.index = add i32 %key.row.base, %query.local
+%update.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %update.delta.index
 %query.value = load double, ptr addrspace(1) %query.ptr, align 8
 %key.value.current = load double, ptr addrspace(1) %key.ptr, align 8
 %update.delta = load double, ptr addrspace(1) %update.delta.ptr, align 8 %dq.raw = fmul double %ds, %key.value.current
 %dq = fdiv double %dq.raw, %scale %dk.raw = fmul double %ds, %query.value %dk = fdiv double %dk.raw, %scale
-%dv = fmul double %key.probability, %update.delta %dq.base = mul i32 %plane, 3 %dk.base = mul i32 %plane, 4
-%dv.base = mul i32 %plane, 5 %dq.index = add i32 %dq.base, %query.row.index %dk.index = add i32 %dk.base, %key.row.index
-%dv.index = add i32 %dv.base, %key.row.index
-%dq.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %dq.index
-%dk.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %dk.index
-%dv.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %dv.index
-%dq.old = load double, ptr addrspace(1) %dq.ptr, align 8 %dk.old = load double, ptr addrspace(1) %dk.ptr, align 8
-%dv.old = load double, ptr addrspace(1) %dv.ptr, align 8 %dq.next = fadd double %dq.old, %dq
-%dk.next = fadd double %dk.old, %dk %dv.next = fadd double %dv.old, %dv
-store double %dq.next, ptr addrspace(1) %dq.ptr, align 8 store double %dk.next, ptr addrspace(1) %dk.ptr, align 8
-store double %dv.next, ptr addrspace(1) %dv.ptr, align 8 %key.channel.next = add nuw i32 %key.channel.offset, 1
+%dv = fmul double %key.probability, %update.delta
+%dq.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %query.index
+%dk.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %key.index
+%dv.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %value.index
+%dq.old = atomicrmw fadd ptr addrspace(1) %dq.ptr, double %dq monotonic, align 8
+%dk.old = atomicrmw fadd ptr addrspace(1) %dk.ptr, double %dk monotonic, align 8
+%dv.old = atomicrmw fadd ptr addrspace(1) %dv.ptr, double %dv monotonic, align 8
+%key.channel.next = add nuw i32 %key.channel.offset, 1
 br label %key.channel.loop key.channel.done: %key.next = add nuw i32 %key, 1 br label %key.loop query.done:
 %query.next = add nuw i32 %query, 1 br label %query.loop head.done: %head.next = add nuw i32 %head, 1
-br label %head.loop row.done: %row.next = add i32 %row, %threads br label %row.loop rows.done:
-call void @llvm.amdgcn.s.barrier() %matrix = mul i32 %channels, %channels
-%key.weights = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %matrix
-%value.weight.offset = mul i32 %matrix, 2
-%value.weights = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %value.weight.offset
-%query.adjoint.offset = mul i32 %plane, 3
-%query.adjoint = getelementptr inbounds double, ptr addrspace(1) %context, i32 %query.adjoint.offset
-%key.adjoint.offset = mul i32 %plane, 4
-%key.adjoint = getelementptr inbounds double, ptr addrspace(1) %context, i32 %key.adjoint.offset
-%value.adjoint.offset = mul i32 %plane, 5
-%value.adjoint = getelementptr inbounds double, ptr addrspace(1) %context, i32 %value.adjoint.offset
-%key.gradient.offset = add i32 %offset, %matrix %value.gradient.offset = add i32 %offset, %value.weight.offset
-call void @contraction_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %weights,
-ptr addrspace(1) %query.adjoint, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.previous,
-i32 %rows, i32 %channels, i32 %length, i32 %channels, i32 %length, i32 0, i32 %offset, i32 %threads )
-call void @contraction_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %key.weights,
-ptr addrspace(1) %key.adjoint, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.previous,
-i32 %rows, i32 %channels, i32 %length, i32 %channels, i32 %length, i32 0, i32 %key.gradient.offset, i32 %threads )
-call void @contraction_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %value.weights,
-ptr addrspace(1) %value.adjoint, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.previous,
-i32 %rows, i32 %channels, i32 %length, i32 %channels, i32 %length, i32 0, i32 %value.gradient.offset, i32 %threads )
-%bg.matrix3 = mul i32 %matrix, 3
-br label %attn.bg.loop attn.bg.loop:
-%bg.p = phi i32 [ %tid, %rows.done ], [ %bg.next, %attn.bg.step ]
-%bg.more = icmp ult i32 %bg.p, %plane
-br i1 %bg.more, label %attn.bg.step, label %attn.bg.done attn.bg.step:
-%bg.local = urem i32 %bg.p, %from %bg.channel = udiv i32 %bg.local, %length
-%bg.q.adj.idx = add i32 %query.adjoint.offset, %bg.p
-%bg.q.adj.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %bg.q.adj.idx
-%bg.q.adj = load double, ptr addrspace(1) %bg.q.adj.ptr, align 8
-%bg.q.grad.off = add i32 %bg.matrix3, %bg.channel %bg.q.grad.idx = add i32 %offset, %bg.q.grad.off
-%bg.q.grad.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %bg.q.grad.idx
-%bg.q.old = atomicrmw fadd ptr addrspace(1) %bg.q.grad.ptr, double %bg.q.adj monotonic, align 8
-%bg.kb = add i32 %bg.matrix3, %channels %bg.k.adj.idx = add i32 %key.adjoint.offset, %bg.p
-%bg.k.adj.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %bg.k.adj.idx
-%bg.k.adj = load double, ptr addrspace(1) %bg.k.adj.ptr, align 8
-%bg.k.grad.off = add i32 %bg.kb, %bg.channel %bg.k.grad.idx = add i32 %offset, %bg.k.grad.off
-%bg.k.grad.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %bg.k.grad.idx
-%bg.k.old = atomicrmw fadd ptr addrspace(1) %bg.k.grad.ptr, double %bg.k.adj monotonic, align 8
-%bg.vb = add i32 %bg.kb, %channels %bg.v.adj.idx = add i32 %value.adjoint.offset, %bg.p
-%bg.v.adj.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %bg.v.adj.idx
-%bg.v.adj = load double, ptr addrspace(1) %bg.v.adj.ptr, align 8
-%bg.v.grad.off = add i32 %bg.vb, %bg.channel %bg.v.grad.idx = add i32 %offset, %bg.v.grad.off
-%bg.v.grad.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %bg.v.grad.idx
-%bg.v.old = atomicrmw fadd ptr addrspace(1) %bg.v.grad.ptr, double %bg.v.adj monotonic, align 8
-%bg.next = add i32 %bg.p, %threads br label %attn.bg.loop
-attn.bg.done: ret void }
+br label %head.loop row.done: %row.next = add i32 %row, %threads br label %row.loop rows.done: ret void }
 define internal void @scan_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
 ptr addrspace(1) %context, i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %gates,
 i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #1 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
@@ -614,7 +948,7 @@ br i1 %precompute.more, label %precompute.step, label %precompute.done precomput
 %precompute.context = getelementptr inbounds double, ptr addrspace(1) %context, i32 %precompute.context.offset
 call void @contraction_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %precompute.weights,
 ptr addrspace(1) %precompute.context, i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels,
-i32 %length, i32 0, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )
+i32 %length, i32 0, i1 false, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )
 %precompute.next = add i32 %precompute.gate, 1 br label %precompute.loop precompute.done:
 call void @llvm.amdgcn.s.barrier() br label %row.loop row.loop:
 %row = phi i32 [ %tid, %precompute.done ], [ %row.next, %time.done ] %row.more = icmp ult i32 %row, %rows
@@ -670,13 +1004,16 @@ br label %hidden.loop hidden.done: %gate.next = add nuw i32 %gate, 1 br label %g
 output.step: %output.hidden.base = mul i32 %output.hidden, %length %output.local = add i32 %output.hidden.base, %time
 %output.index = add i32 %output.row.base, %output.local
 %gate0.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %output.index
-%gate0 = load double, ptr addrspace(1) %gate0.ptr, align 8 %gate1.index = add i32 %gate.batch, %output.index
+%gate0 = load double, ptr addrspace(1) %gate0.ptr, align 8
+%is.gru = icmp eq i32 %gates, 3 %is.lstm = icmp eq i32 %gates, 4
+%gate1.raw = add i32 %gate.batch, %output.index %gate1.index = select i1 %is.lstm, i32 %gate1.raw, i32 %output.index
 %gate1.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate1.index
 %gate1 = load double, ptr addrspace(1) %gate1.ptr, align 8 %gate2.base = mul i32 %gate.batch, 2
-%gate2.index = add i32 %gate2.base, %output.index
+%gate2.raw = add i32 %gate2.base, %output.index %gate2.valid = or i1 %is.gru, %is.lstm
+%gate2.index = select i1 %gate2.valid, i32 %gate2.raw, i32 %output.index
 %gate2.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate2.index
 %gate2 = load double, ptr addrspace(1) %gate2.ptr, align 8 %gate3.base = mul i32 %gate.batch, 3
-%gate3.index = add i32 %gate3.base, %output.index
+%gate3.raw = add i32 %gate3.base, %output.index %gate3.index = select i1 %is.lstm, i32 %gate3.raw, i32 %output.index
 %gate3.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate3.index
 %gate3 = load double, ptr addrspace(1) %gate3.ptr, align 8 %output.previous.time = sub i32 %time, 1
 %output.previous.safe = select i1 %previous.exists, i32 %output.previous.time, i32 0
@@ -696,7 +1033,7 @@ output.step: %output.hidden.base = mul i32 %output.hidden, %length %output.local
 %cell = fadd double %cell.old, %cell.new
 %cell.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %cell.index
 store double %cell, ptr addrspace(1) %cell.ptr, align 8 %cell.tanh = call double @__ocml_tanh_f64(double %cell)
-%lstm.value = fmul double %gate2, %cell.tanh %is.gru = icmp eq i32 %gates, 3 %is.lstm = icmp eq i32 %gates, 4
+%lstm.value = fmul double %gate2, %cell.tanh
 %rnn.or.gru = select i1 %is.gru, double %gru.value, double %gate0
 %output.value = select i1 %is.lstm, double %lstm.value, double %rnn.or.gru br label %output.store output.store:
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %output.index
@@ -705,6 +1042,7 @@ br label %output.loop output.done: %time.next = add nuw i32 %time, 1 br label %t
 %row.next = add i32 %row, %threads br label %row.loop exit: ret void } define internal void @contraction_reverse_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %delta,
 ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.input,
+i1 %has.bias,
 i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %kernel, i32 %offset,
 i32 %threads ) #1 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
 %lid = call i32 @recipe.local.id.x() %group = call i32 @recipe.group.id.x()
@@ -716,7 +1054,7 @@ i32 %threads ) #1 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
 %term.tiles = udiv i32 %terms.numerator, %block %jobs = mul i32 %out.channels, %term.tiles
 br label %gradient.job.loop gradient.job.loop:
 %job = phi i32 [ %group, %entry ], [ %job.next, %gradient.job.done ] %job.more = icmp ult i32 %job, %jobs
-br i1 %job.more, label %gradient.job.step, label %previous.loop gradient.job.step:
+br i1 %job.more, label %gradient.job.step, label %bias.test gradient.job.step:
 %filter = udiv i32 %job, %term.tiles %term.tile = urem i32 %job, %term.tiles
 %term.base = mul i32 %term.tile, %block %term.raw = add i32 %term.base, %lid
 %active = icmp ult i32 %term.raw, %window %gradient.term = select i1 %active, i32 %term.raw, i32 0
@@ -758,7 +1096,26 @@ gradient.write: %p.0 = mul i32 %filter, %window %p = add i32 %p.0, %gradient.ter
 %gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %gradient.index
 store double %sum, ptr addrspace(1) %gradient.ptr, align 8 br label %gradient.job.done gradient.job.done:
 %job.next = add i32 %job, %groups br label %gradient.job.loop
-previous.loop: %previous.p = phi i32 [ %tid, %gradient.job.loop ], [ %previous.next, %previous.done ]
+bias.test: br i1 %has.bias, label %bias.loop, label %previous.loop bias.loop:
+%bias.filter = phi i32 [ %tid, %bias.test ], [ %bias.next, %bias.store ]
+%bias.more = icmp ult i32 %bias.filter, %out.channels
+br i1 %bias.more, label %bias.sum.loop, label %previous.loop bias.sum.loop:
+%bias.p = phi i32 [ 0, %bias.loop ], [ %bias.p.next, %bias.sum.step ]
+%bias.sum = phi double [ 0.0, %bias.loop ], [ %bias.sum.next, %bias.sum.step ]
+%bias.count = mul i32 %rows, %out.length %bias.p.more = icmp ult i32 %bias.p, %bias.count
+br i1 %bias.p.more, label %bias.sum.step, label %bias.store bias.sum.step:
+%bias.row = udiv i32 %bias.p, %out.length %bias.position = urem i32 %bias.p, %out.length
+%bias.row.base = mul i32 %bias.row, %out.elements %bias.filter.base = mul i32 %bias.filter, %out.length
+%bias.local = add i32 %bias.filter.base, %bias.position %bias.delta.index = add i32 %bias.row.base, %bias.local
+%bias.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %bias.delta.index
+%bias.delta = load double, ptr addrspace(1) %bias.delta.ptr, align 8
+%bias.sum.next = fadd double %bias.sum, %bias.delta %bias.p.next = add nuw i32 %bias.p, 1 br label %bias.sum.loop
+bias.store: %bias.weight.base = mul i32 %out.channels, %window %bias.weight = add i32 %bias.weight.base, %bias.filter
+%bias.gradient.index = add i32 %offset, %bias.weight
+%bias.gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %bias.gradient.index
+store double %bias.sum, ptr addrspace(1) %bias.gradient.ptr, align 8
+%bias.next = add i32 %bias.filter, %threads br label %bias.loop
+previous.loop: %previous.p = phi i32 [ %tid, %bias.test ], [ %tid, %bias.loop ], [ %previous.next, %previous.done ]
 %previous.count = mul i32 %rows, %in.elements %previous.more = icmp ult i32 %previous.p, %previous.count
 br i1 %previous.more, label %previous.entry, label %exit previous.entry:
 %previous.row = udiv i32 %previous.p, %in.elements %previous.local = urem i32 %previous.p, %in.elements
@@ -1058,7 +1415,7 @@ br i1 %projection.more, label %projection.step, label %exit projection.step:
 %projection.delta = getelementptr inbounds double, ptr addrspace(1) %context, i32 %projection.delta.offset
 %projection.gradient.offset = add i32 %offset, %projection.weight.offset
 call void @contraction_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %projection.weights,
-ptr addrspace(1) %projection.delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.input,
+ptr addrspace(1) %projection.delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.input, i1 false,
 i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %length, i32 0,
 i32 %projection.gradient.offset, i32 %threads ) %projection.next = add i32 %projection.gate, 1 br label %projection.loop
 invalid: call void @llvm.trap() br label %exit exit: ret void } define internal void @tape_forward_body(
@@ -1122,25 +1479,67 @@ br i1 %node.more, label %node.load, label %exit node.load: %base = mul i32 %node
 %matrix = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %offset
 %in.elements = mul i32 %in.channels, %in.length %out.elements = mul i32 %out.channels, %out.length
 %count = mul i32 %rows, %out.elements %is.attention = icmp eq i32 %op, 4 %is.scan = icmp eq i32 %op, 5
-%is.contraction = icmp eq i32 %op, 0 %is.normalize = icmp eq i32 %op, 8
-br i1 %is.attention, label %attention.node, label %scan.test attention.node: %heads = fptoui double %argument to i32
+%is.contraction = icmp eq i32 %op, 0 %is.normalize = icmp eq i32 %op, 8 %is.quantized = icmp eq i32 %op, 9
+br i1 %is.attention, label %attention.node, label %scan.test attention.node:
+%heads = fptoui double %argument to i32
+%kv.heads = fptoui double %argument.second to i32
+%head.width = fptoui double %argument.third to i32
+%attention.maximum.index = add i32 %argument.base, 3
+%attention.mode.index = add i32 %argument.base, 4
+%attention.scale.index = add i32 %argument.base, 5
+%attention.rope.base.index = add i32 %argument.base, 6
+%attention.rope.factor.index = add i32 %argument.base, 7
+%attention.rope.range.index = add i32 %argument.base, 8
+%attention.maximum.ptr = getelementptr inbounds double, ptr addrspace(1) %arguments, i32 %attention.maximum.index
+%attention.mode.ptr = getelementptr inbounds double, ptr addrspace(1) %arguments, i32 %attention.mode.index
+%attention.scale.ptr = getelementptr inbounds double, ptr addrspace(1) %arguments, i32 %attention.scale.index
+%attention.rope.base.ptr = getelementptr inbounds double, ptr addrspace(1) %arguments, i32 %attention.rope.base.index
+%attention.rope.factor.ptr = getelementptr inbounds double, ptr addrspace(1) %arguments, i32 %attention.rope.factor.index
+%attention.rope.range.ptr = getelementptr inbounds double, ptr addrspace(1) %arguments, i32 %attention.rope.range.index
+%attention.maximum.double = load double, ptr addrspace(1) %attention.maximum.ptr, align 8
+%attention.mode.double = load double, ptr addrspace(1) %attention.mode.ptr, align 8
+%attention.scale = load double, ptr addrspace(1) %attention.scale.ptr, align 8
+%attention.rope.base = load double, ptr addrspace(1) %attention.rope.base.ptr, align 8
+%attention.rope.factor = load double, ptr addrspace(1) %attention.rope.factor.ptr, align 8
+%attention.rope.range.double = load double, ptr addrspace(1) %attention.rope.range.ptr, align 8
+%attention.maximum = fptoui double %attention.maximum.double to i32
+%attention.mode = fptoui double %attention.mode.double to i32
+%attention.rope.range = fptoui double %attention.rope.range.double to i32
+%attention.cached = icmp eq i32 %attention.mode, 1
+br i1 %attention.cached, label %attention.cached.node, label %attention.full.node
+attention.full.node:
 call void @attention_forward_body( ptr addrspace(1) %source, ptr addrspace(1) %matrix, ptr addrspace(1) %values,
-ptr addrspace(1) %context, i32 %rows, i32 %in.elements, i32 %heads, i32 %in.channels,
+ptr addrspace(1) %context, i32 %rows, i32 %out.elements, i32 %heads, i32 %out.channels,
 i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) br label %node.done
-scan.test: br i1 %is.scan, label %scan.node, label %contraction.test scan.node:
+attention.cached.node:
+call void @cached_attention_body( ptr addrspace(1) %source, ptr addrspace(1) %values, ptr addrspace(1) %context,
+i32 %heads, i32 %kv.heads, i32 %head.width, i32 %attention.maximum,
+double %attention.scale, double %attention.rope.base, double %attention.rope.factor,
+i32 %attention.rope.range, i32 %threads ) br label %node.done
+scan.test: br i1 %is.scan, label %scan.node, label %quantized.test scan.node:
 %scan.gates = fptoui double %argument to i32
 call void @scan_forward_body( ptr addrspace(1) %source, ptr addrspace(1) %matrix, ptr addrspace(1) %values,
 ptr addrspace(1) %context, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels,
-i32 %scan.gates, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) br label %node.done contraction.test:
+i32 %scan.gates, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) br label %node.done quantized.test:
+br i1 %is.quantized, label %quantized.node, label %contraction.test quantized.node:
+%quantized.kind = fptoui double %argument to i32
+%quantized.mode = fptoui double %argument.second to i32
+%quantized.vector.width = fptoui double %argument.third to i32
+call void @quantized_forward_body( ptr addrspace(1) %source, ptr addrspace(1) %matrix,
+ptr addrspace(1) %values, i32 %rows, i32 %in.elements, i32 %out.elements,
+i32 %quantized.kind, i32 %quantized.mode, i32 %quantized.vector.width,
+i32 %tile.n, i32 %tile.k, i32 %threads )
+br label %node.done contraction.test:
 br i1 %is.contraction, label %contraction.node, label %normalize.stats.entry contraction.node:
 %contraction.kernel = fptoui double %argument to i32
 call void @contraction_forward_body( ptr addrspace(1) %source, ptr addrspace(1) %matrix,
 ptr addrspace(1) %values, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels,
-i32 %out.length, i32 %contraction.kernel, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )
+i32 %out.length, i32 %contraction.kernel, i1 true, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )
 br label %node.done normalize.stats.entry: br label %normalize.test normalize.test:
 br i1 %is.normalize, label %normalize.stats.loop, label %element.loop
 normalize.stats.loop: %stats.group = phi i32 [ %tid, %normalize.test ], [ %stats.next, %stats.store ]
 %stats.mode = fptoui double %argument to i32 %stats.batch = icmp eq i32 %stats.mode, 0
+%stats.rms = icmp eq i32 %stats.mode, 2
 %stats.layer.groups = mul i32 %rows, %out.length
 %stats.groups = select i1 %stats.batch, i32 %out.channels, i32 %stats.layer.groups
 %stats.more = icmp ult i32 %stats.group, %stats.groups br i1 %stats.more, label %stats.mean.loop, label %stats.done
@@ -1184,7 +1583,8 @@ br i1 %stats.variance.more, label %stats.variance.step, label %stats.store stats
 %stats.variance.index = select i1 %stats.batch, i32 %stats.variance.batch.index, i32 %stats.variance.layer.index
 %stats.variance.input.ptr = getelementptr inbounds double, ptr addrspace(1) %source, i32 %stats.variance.index
 %stats.variance.input = load double, ptr addrspace(1) %stats.variance.input.ptr, align 8
-%stats.difference = fsub double %stats.variance.input, %stats.mean
+%stats.centered = fsub double %stats.variance.input, %stats.mean
+%stats.difference = select i1 %stats.rms, double %stats.variance.input, double %stats.centered
 %stats.square = fmul double %stats.difference, %stats.difference
 %stats.variance.sum.next = fadd double %stats.variance.sum, %stats.square
 %stats.variance.next = add nuw i32 %stats.variance.p, 1 br label %stats.variance.loop stats.store:
@@ -1194,7 +1594,8 @@ br i1 %stats.variance.more, label %stats.variance.step, label %stats.store stats
 %stats.scale.index = add i32 %stats.groups, %stats.group
 %stats.mean.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %stats.group
 %stats.scale.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %stats.scale.index
-store double %stats.mean, ptr addrspace(1) %stats.mean.ptr, align 8
+%stats.stored.mean = select i1 %stats.rms, double 0.0, double %stats.mean
+store double %stats.stored.mean, ptr addrspace(1) %stats.mean.ptr, align 8
 store double %stats.inverse, ptr addrspace(1) %stats.scale.ptr, align 8 %stats.next = add i32 %stats.group, %threads
 br label %normalize.stats.loop stats.done: call void @llvm.amdgcn.s.barrier() br label %element.loop element.loop:
 %p = phi i32 [ %tid, %normalize.test ], [ %tid, %stats.done ], [ %p.next, %element.done ]
@@ -1515,7 +1916,7 @@ i32 7, label %route.gradient.loop i32 8, label %normalization.stats.loop ] contr
 %contraction.matrix = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %offset
 %contraction.kernel = fptoui double %argument to i32 call void @contraction_reverse_body(
 ptr addrspace(1) %source.values, ptr addrspace(1) %contraction.matrix, ptr addrspace(1) %delta,
-ptr addrspace(1) %source.adjoint, ptr addrspace(1) %gradient, i1 true,
+ptr addrspace(1) %source.adjoint, ptr addrspace(1) %gradient, i1 true, i1 true,
 i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels,
 i32 %out.length, i32 %contraction.kernel, i32 %offset, i32 %threads ) br label %node.done gather.gradient:
 %gather.vocabulary = fptoui double %argument to i32
@@ -1529,7 +1930,7 @@ attention.gradient: %attention.context.slot = getelementptr inbounds i64, ptr ad
 call void @attention_reverse_body( ptr addrspace(1) %source.values, ptr addrspace(1) %attention.matrix,
 ptr addrspace(1) %attention.context, ptr addrspace(1) %delta,
 ptr addrspace(1) %source.adjoint, ptr addrspace(1) %gradient, i1 true,
-i32 %rows, i32 %in.elements, i32 %attention.heads, i32 %in.channels, i32 %offset, i32 %threads ) br label %node.done
+i32 %rows, i32 %out.elements, i32 %attention.heads, i32 %out.channels, i32 %offset, i32 %threads ) br label %node.done
 scan.gradient: %scan.context.slot = getelementptr inbounds i64, ptr addrspace(1) %context.pointers, i32 %node
 %scan.context.address = load i64, ptr addrspace(1) %scan.context.slot, align 8
 %scan.context = inttoptr i64 %scan.context.address to ptr addrspace(1)
