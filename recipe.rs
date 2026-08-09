@@ -688,6 +688,49 @@ fn k_scale(metadata: &[u8], block: usize) -> (u8, u8) {
 	if block < 4 { (metadata[block] & 63, metadata[block + 4] & 63) } else { ((metadata[block + 4] & 15) | (metadata[block - 4] >> 6) << 4, (metadata[block + 4] >> 4) | (metadata[block] >> 6) << 4) }
 }
 const IQ4: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+const IQ3_XXS: [u16; 256] = [
+	0,2,4,9,11,15,16,18,25,34,59,61,65,67,72,74,81,85,88,90,97,108,120,128,130,132,137,144,146,153,155,159,
+	169,175,189,193,199,200,202,213,248,267,287,292,303,315,317,321,327,346,362,413,436,456,460,462,483,497,513,515,520,522,529,531,
+	536,538,540,551,552,576,578,585,592,594,641,643,648,650,657,664,698,704,706,720,729,742,758,769,773,808,848,852,870,889,901,978,
+	992,1024,1026,1033,1035,1040,1042,1046,1049,1058,1089,1091,1093,1096,1098,1105,1112,1139,1143,1144,1152,1154,1161,1167,1168,1170,1183,1184,1197,1217,1224,1228,
+	1272,1276,1309,1323,1347,1367,1377,1404,1473,1475,1486,1509,1537,1544,1546,1553,1555,1576,1589,1594,1600,1602,1616,1625,1636,1638,1665,1667,1672,1685,1706,1722,
+	1737,1755,1816,1831,1850,1856,1862,1874,1901,1932,1950,1971,2011,2032,2052,2063,2077,2079,2091,2095,2172,2192,2207,2208,2224,2230,2247,2277,2308,2345,2356,2389,
+	2403,2424,2501,2504,2506,2520,2570,2593,2616,2624,2630,2646,2669,2700,2714,2746,2754,2795,2824,2835,2839,2874,2882,2905,2984,3028,3042,3092,3108,3110,3124,3153,
+	3185,3215,3252,3288,3294,3364,3397,3434,3483,3523,3537,3587,3589,3591,3592,3610,3626,3670,3680,3722,3749,3754,3776,3789,3803,3824,3857,3873,3904,3906,3924,3992,
+];
+fn iq3_grid(index: usize, lane: usize) -> i8 { (2 * (IQ3_XXS[index] >> (3 * lane) & 7) + 1) as i8 }
+fn iq3_nearest(levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32) -> usize {
+	let key = levels.iter().enumerate().fold(0_u16, |key, (lane, level)| key | (*level as u16) << (3 * lane));
+	if let Some(index) = IQ3_XXS.iter().position(|value| *value == key) { return index }
+	let mut candidates = IQ3_XXS.iter().enumerate().map(|(index, grid)| ((0..4).map(|lane| { let difference = i32::from((*grid >> (3 * lane) & 7) as i8 - levels[lane]); difference * difference }).sum::<i32>(), index)).collect::<Vec<_>>();
+	candidates.sort_unstable();
+	let first = candidates[0].0; let second = candidates.iter().find(|item| item.0 != first).map(|item| item.0).unwrap_or(first);
+	let index = candidates.into_iter().take_while(|item| item.0 <= second).map(|item| item.1).min_by(|left, right| {
+		let error = |index| (0..4).map(|lane| { let difference = scale * f32::from(iq3_grid(index, lane)) - values[lane]; weights[lane] * difference * difference }).sum::<f32>(); error(*left).total_cmp(&error(*right))
+	}).unwrap();
+	for lane in 0..4 { levels[lane] = (iq3_grid(index, lane) - 1) / 2 }
+	index
+}
+#[rustfmt::skip]
+fn iq3_xxs(values: &[f32]) -> Vec<u8> {
+	let mut output = Vec::new();
+	for values in values.chunks(256) {
+		let value = |index| values.get(index).copied().unwrap_or(0.0); let mut packed = [0_u8; 96]; let mut scales = [0.0_f32; 8]; let mut maximum = 0.0_f32;
+		for block in 0..8 {
+			let x = (0..32).map(|offset| value(block * 32 + offset)).collect::<Vec<_>>(); let weights = x.iter().map(|value| value * value).collect::<Vec<_>>(); let mut magnitudes = x.iter().map(|value| value.abs()).collect::<Vec<_>>(); let mut signs = [0_u8; 4];
+			for group in 0..4 { let mut flips = 0; for lane in 0..8 { if x[group * 8 + lane] < 0.0 { flips += 1; signs[group] |= 1 << lane } } if flips % 2 != 0 { let lane = (0..8).min_by(|a,b| (weights[group*8+*a]*x[group*8+*a]*x[group*8+*a]).total_cmp(&(weights[group*8+*b]*x[group*8+*b]*x[group*8+*b]))).unwrap(); magnitudes[group*8+lane] = -magnitudes[group*8+lane]; signs[group] ^= 1 << lane } signs[group] &= 127 }
+			let max = magnitudes.iter().copied().fold(0.0_f32, f32::max); if max < 1.0e-6 { continue }
+			let mut best = 0.0_f32; let mut scale = max / 15.0; let mut levels = [0_i8; 32];
+			for step in -15..=15 { let inverse = (15.0 + 0.2 * step as f32) / max; let trial_scale = inverse.recip(); let mut trial = [0_i8; 32]; for group in 0..8 { for lane in 0..4 { trial[group*4+lane] = qround(0.5*(inverse*magnitudes[group*4+lane]-1.0)).max(0.0).min(7.0) as i8 } iq3_nearest(&mut trial[group*4..group*4+4], &magnitudes[group*4..group*4+4], &weights[group*4..group*4+4].iter().map(|value| value.sqrt()).collect::<Vec<_>>(), trial_scale); } let (mut qx, mut q2) = (0.0,0.0); for lane in 0..32 { let quant = f32::from(2*trial[lane]+1); qx += weights[lane]*magnitudes[lane]*quant; q2 += weights[lane]*quant*quant } if q2 > 0.0 && qx*qx > best*q2 { scale=qx/q2; best=scale*qx; levels=trial } }
+			for group in 0..8 { packed[block*8+group] = iq3_nearest(&mut levels[group*4..group*4+4], &magnitudes[group*4..group*4+4], &weights[group*4..group*4+4].iter().map(|value| value.sqrt()).collect::<Vec<_>>(), scale) as u8 }
+			let word = u32::from(signs[0]) | u32::from(signs[1])<<7 | u32::from(signs[2])<<14 | u32::from(signs[3])<<21; packed[64+block*4..68+block*4].copy_from_slice(&word.to_le_bytes()); scales[block]=scale; maximum=maximum.max(scale)
+		}
+		if maximum == 0.0 { put_half(&mut output, 0.0); output.extend(packed); continue }
+		let scale = maximum / 31.0; for block in 0..8 { let code=qround(0.5*(scales[block]/scale-1.0)).max(0.0).min(15.0) as u32; let mut word=u32::from_le_bytes(packed[64+block*4..68+block*4].try_into().unwrap()); word|=code<<28; packed[64+block*4..68+block*4].copy_from_slice(&word.to_le_bytes()) }
+		put_half(&mut output, scale * 1.0125); output.extend(packed)
+	}
+	output
+}
 fn iq4_code(value: f32) -> u8 {
 	IQ4.iter().enumerate().min_by(|left, right| (value - f32::from(*left.1)).abs().total_cmp(&(value - f32::from(*right.1)).abs())).unwrap().0 as u8
 }
@@ -1047,7 +1090,8 @@ impl Integer for IntegerFormat {
 			}
 			return Ok((data, Vec::new()));
 		}
-		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ4_NL, and IQ4_XS", self.0)))
+		if family == 1 && variant == 1 && bits == 3 { return Ok((iq3_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new())) }
+		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ3_XXS, IQ4_NL, and IQ4_XS", self.0)))
 	}
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>> {
 		let (family, variant, bits) = (self.0 >> 12, self.0 >> 8 & 15, self.bits());
@@ -1223,7 +1267,12 @@ impl Integer for IntegerFormat {
 			}
 			return Ok(weights);
 		}
-		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ4_NL, and IQ4_XS", self.0)))
+		if family == 1 && variant == 1 && bits == 3 {
+			const STRIDE: usize = 98; require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ3_XXS weights are invalid")?; let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE) { let scale=half(bytes); for block in 0..8 { let word=u32::from_le_bytes(bytes[66+block*4..70+block*4].try_into().unwrap()); let d=scale*(0.5+(word>>28) as f32)*0.5; for group in 0..4 { let signs=(word>>(7*group)&127) as u8; let signs=signs | ((signs.count_ones() as u8 & 1)<<7); for lane in 0..8 { if weights.len()==count { return Ok(weights) } let grid=usize::from(bytes[2+block*8+group*2+lane/4]); let magnitude=f32::from(iq3_grid(grid,lane%4)); weights.push(f64::from(d*magnitude*if signs>>lane&1!=0 {-1.0} else {1.0})) } } } }
+			return Ok(weights);
+		}
+		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ3_XXS, IQ4_NL, and IQ4_XS", self.0)))
 	}
 }
 pub struct Qi {
