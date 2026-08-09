@@ -4448,9 +4448,9 @@ impl Train {
 		drop(topology()?);
 		let (gpus, mut config) = (all_gpus()?, Config::load()?);
 		let precision = model.blocks.first().map(|block| block.format).unwrap_or(model.format);
-		require(model.blocks.iter().all(|block| block.format == precision), "mixed execution formats are unavailable on the active hardware")?;
 		let fp32 = gpus.iter().all(|gpu| gpu.forward_f32.is_some() && gpu.epoch_f32.is_some());
 		let available = if fp32 { "fp(32) [float], fp(64) [double]" } else { "fp(64) [double]" };
+		require(model.blocks.iter().all(|block| block.format == precision), format!("mixed execution formats are unavailable on {}; available precision: {available}", gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
 		require(precision == FP64 || precision == FP32 && fp32, format!("{}({}) [{}] training is unavailable on {}; available precision: {available}", precision.family, precision.bits, precision.llvm, gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
 		config.precision = precision;
 		if let Some(seed) = self.seed {
