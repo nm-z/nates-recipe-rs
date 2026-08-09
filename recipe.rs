@@ -468,12 +468,8 @@ impl Model {
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
 	fn perc(width: usize) = Operation::Perceptron(width); }
-	pub fn residual<const N: usize>(&self, parts: [Residual; N]) -> Self {
-		self.push(Operation::Residual(parts.into()))
-	}
-	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Residual; N]) -> Self {
-		self.push(Operation::Moe(top_k, experts.into()))
-	}
+	pub fn residual<const N: usize>(&self, parts: [Residual; N]) -> Self { self.push(Operation::Residual(parts.into())) }
+	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Residual; N]) -> Self { self.push(Operation::Moe(top_k, experts.into())) }
 	pub fn svm<const N: usize>(&self, choices: [fn() -> Residual; N]) -> Self {
 		let choices = choices
 			.into_iter()
@@ -490,11 +486,7 @@ impl Model {
 		block.normalization = Some(if normalization as usize == batch as usize { BlockNormalization::Batch } else { BlockNormalization::Layer });
 		model
 	}
-	pub fn loss(&self, loss: impl ModelLoss) -> Self {
-		let mut model = self.clone();
-		loss.apply(&mut model);
-		model
-	}
+	pub fn loss(&self, loss: impl ModelLoss) -> Self { let mut model = self.clone(); loss.apply(&mut model); model }
 	fn arithmetic(&self, format: FloatFormat) -> Self {
 		let mut model = self.clone();
 		if let Some(block) = model.blocks.last_mut() {
@@ -504,11 +496,7 @@ impl Model {
 		}
 		model
 	}
-	pub fn f(&self, exponent: u8, mantissa: u8) -> Self {
-		assert!(exponent != 0 && mantissa != 0, "f requires exponent and mantissa fields");
-		let llvm = match (exponent, mantissa) { (8, 23) => "float", (11, 52) => "double", _ => "unsupported" };
-		self.arithmetic(FloatFormat { family: "f", bits: exponent + mantissa + 1, exponent, mantissa, llvm })
-	}
+	pub fn f(&self, exponent: u8, mantissa: u8) -> Self { assert!(exponent != 0 && mantissa != 0, "f requires exponent and mantissa fields"); let llvm = match (exponent, mantissa) { (8, 23) => "float", (11, 52) => "double", _ => "unsupported" }; self.arithmetic(FloatFormat { family: "f", bits: exponent + mantissa + 1, exponent, mantissa, llvm }) }
 	pub fn fp(&self, bits: u8) -> Self {
 		let (exponent, mantissa, llvm) = match bits {
 			8 => (4, 3, "unsupported"),
@@ -519,18 +507,9 @@ impl Model {
 		};
 		self.arithmetic(FloatFormat { family: "fp", bits, exponent, mantissa, llvm })
 	}
-	pub fn int(&self, bits: u8) -> Self {
-		assert!([1, 4, 8].contains(&bits), "int bits must be 1, 4, or 8");
-		self.arithmetic(FloatFormat { family: "int", bits, exponent: 0, mantissa: 0, llvm: "unsupported" })
-	}
-	pub fn bf(&self, bits: u8) -> Self {
-		assert_eq!(bits, 16, "bf bits must be 16");
-		self.arithmetic(FloatFormat { family: "bf", bits, exponent: 8, mantissa: 7, llvm: "bfloat" })
-	}
-	pub fn tf(&self, bits: u8) -> Self {
-		assert_eq!(bits, 32, "tf bits must be 32");
-		self.arithmetic(FloatFormat { family: "tf", bits, exponent: 8, mantissa: 10, llvm: "unsupported" })
-	}
+	pub fn int(&self, bits: u8) -> Self { assert!([1, 4, 8].contains(&bits), "int bits must be 1, 4, or 8"); self.arithmetic(FloatFormat { family: "int", bits, exponent: 0, mantissa: 0, llvm: "unsupported" }) }
+	pub fn bf(&self, bits: u8) -> Self { assert_eq!(bits, 16, "bf bits must be 16"); self.arithmetic(FloatFormat { family: "bf", bits, exponent: 8, mantissa: 7, llvm: "bfloat" }) }
+	pub fn tf(&self, bits: u8) -> Self { assert_eq!(bits, 32, "tf bits must be 32"); self.arithmetic(FloatFormat { family: "tf", bits, exponent: 8, mantissa: 10, llvm: "unsupported" }) }
 	fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self {
 		let mut model = self.clone();
 		let format = family << 12 | variant << 8 | u16::from(bits);
@@ -700,6 +679,11 @@ const IQ3_S: [u16; 512] = [
 	577,579,582,584,588,593,600,603,609,616,618,632,638,640,650,653,655,656,660,666,672,675,685,688,698,705,708,711,712,715,721,727,728,732,737,754,760,771,773,778,780,793,795,802,806,808,812,833,840,843,849,856,858,873,912,916,919,932,934,961,963,968,970,977,989,993,1010,1016,1024,1025,1027,1029,1031,1032,1034,1036,1038,1041,1043,1047,1048,1050,1057,1059,1061,1064,1066,1079,1080,1083,1085,1088,1090,1096,1099,1103,1106,1109,1113,1116,1122,1129,1153,1156,1159,1169,1171,1176,1183,1185,1195,1199,1209,1212,1216,1218,1221,1225,1234,1236,1241,1243,1250,1256,1270,1281,1287,1296,
 	1299,1306,1309,1313,1338,1341,1348,1353,1362,1375,1376,1387,1400,1408,1410,1415,1425,1453,1457,1477,1481,1494,1496,1507,1512,1538,1545,1547,1549,1551,1554,1561,1563,1565,1570,1572,1575,1577,1587,1593,1601,1603,1605,1612,1617,1619,1632,1648,1658,1662,1664,1674,1680,1690,1692,1704,1729,1736,1740,1745,1747,1751,1752,1761,1763,1767,1773,1787,1795,1801,1806,1810,1817,1834,1840,1844,1857,1864,1866,1877,1882,1892,1902,1915,1934,1953,1985,1987,2000,2002,2013,2048,2052,2058,2064,2068,2071,2074,2081,2088,2104,2114,2119,2121,2123,2130,2136,2141,2147,2153,2157,2177,2179,2184,2189,2193,2203,2208,2223,2226,2232,2244,2249,2251,2256,2258,2265,2269,
 	2304,2306,2324,2335,2336,2361,2373,2375,2385,2418,2443,2460,2480,2504,2509,2520,2531,2537,2562,2568,2572,2578,2592,2596,2599,2602,2614,2620,2625,2627,2629,2634,2641,2650,2682,2688,2697,2707,2712,2718,2731,2754,2759,2760,2775,2788,2793,2805,2811,2817,2820,2832,2842,2854,2890,2902,2921,2923,2978,3010,3012,3026,3081,3083,3085,3097,3099,3120,3136,3152,3159,3188,3210,3228,3234,3245,3250,3256,3264,3276,3281,3296,3349,3363,3378,3392,3395,3420,3440,3461,3488,3529,3531,3584,3588,3591,3600,3602,3614,3616,3628,3634,3650,3657,3668,3683,3685,3713,3716,3720,3726,3729,3736,3753,3778,3802,3805,3819,3841,3845,3851,3856,3880,3922,3938,3970,3993,4032];
+const IQ2_S: [u16; 1024] = [
+	0,2,5,8,10,17,20,22,25,32,34,37,40,65,68,70,73,80,82,85,88,97,100,102,105,128,130,133,136,145,148,160,165,170,257,260,262,265,272,274,277,280,289,292,320,322,325,328,337,340,342,345,352,357,360,385,388,400,402,405,417,420,512,514,517,520,529,532,544,554,577,580,582,585,592,597,640,645,650,660,674,1025,1028,1030,1033,1040,1042,1045,1048,1057,1060,1062,1065,1088,1090,1093,1096,1098,1105,1108,1110,1113,1120,1122,1125,1153,1156,1158,1161,1168,1173,1176,1185,1188,1280,1282,1285,1288,1290,1297,1300,1302,1305,1312,1317,1320,1345,1348,1350,1353,1360,1362,1365,1368,1377,1380,1408,1410,1413,1416,1425,1428,1440,1537,1540,1542,1545,1552,1557,1600,1605,1608,1617,1620,1632,1665,1668,1680,2048,2050,2053,2056,2065,2068,2070,2073,2080,2085,2090,2113,2116,2118,2121,2128,2130,2133,2136,2145,2148,2176,2181,2196,2218,2305,2308,2320,2322,2325,2328,2337,2368,2373,2376,2385,2388,2400,2433,2448,2560,2577,2580,2594,2600,2602,2640,2713,4097,4100,4102,4105,4112,4114,4117,4120,4129,4132,4134,4160,4162,4165,4168,4177,4180,4182,4185,4192,4194,4197,4200,4225,4228,4230,4240,4245,4248,4257,4260,4352,4354,4357,4360,4362,4369,4372,4374,4377,4384,4386,4389,4392,4417,4420,4422,4425,4432,4434,
+	4437,4440,4449,4452,4480,4482,4485,4488,4497,4500,4609,4612,4617,4624,4629,4641,4644,4672,4677,4689,4692,4737,4740,4752,5120,5122,5125,5128,5137,5140,5142,5145,5152,5157,5160,5185,5188,5190,5193,5200,5202,5205,5208,5217,5220,5248,5250,5253,5256,5265,5268,5280,5377,5380,5382,5385,5392,5394,5397,5400,5409,5412,5440,5442,5445,5448,5457,5460,5472,5505,5508,5520,5632,5637,5640,5649,5652,5664,5697,5700,5712,5760,5802,6145,6148,6150,6153,6160,6165,6168,6177,6208,6210,6213,6216,6225,6228,6240,6273,6276,6400,6402,6405,6408,6417,6420,6432,6465,6468,6480,6505,6562,6660,6672,6720,6742,8192,8194,8197,8200,8209,8212,8214,8217,8224,8229,8234,8257,8260,8272,8274,8277,8292,8320,8330,8340,8362,8449,8452,8464,8466,8469,8481,8512,8514,8517,8529,8532,8544,8577,8580,8592,8704,8714,8738,8744,8746,8772,8784,8840,8842,8872,9217,9220,9222,9225,9232,9237,9240,9249,9252,9280,9282,9285,9288,9297,9300,9312,9345,9348,9360,9472,9477,9480,9489,9492,9504,9537,9540,9552,9574,9600,9729,9732,9744,9792,9817,10240,10245,10257,10260,10305,10308,10320,10378,10410,10497,10500,10512,10645,10762,10786,10852,10888,10890,16385,16388,16390,16393,16400,16402,16405,16408,16410,16417,16420,16422,16448,16450,16453,16456,16458,16465,16468,16470,16473,16480,16482,16485,16513,16516,16528,16533,16536,16545,16548,16640,16642,16645,16648,16657,16660,16662,16665,16672,16674,
+	16677,16705,16708,16710,16713,16720,16722,16725,16728,16737,16740,16768,16770,16773,16776,16785,16788,16800,16897,16900,16912,16914,16917,16920,16932,16960,16965,16968,16977,16980,16992,17025,17028,17408,17410,17413,17416,17418,17425,17428,17430,17433,17440,17442,17445,17448,17473,17476,17478,17481,17488,17490,17493,17496,17505,17508,17536,17538,17541,17544,17553,17556,17568,17665,17668,17670,17673,17680,17682,17685,17688,17697,17700,17728,17730,17733,17736,17745,17748,17760,17770,17793,17796,17808,17920,17922,17925,17928,17937,17940,17952,17985,17988,18000,18048,18085,18433,18436,18441,18448,18450,18453,18456,18465,18468,18496,18498,18501,18504,18513,18516,18528,18564,18576,18688,18690,18693,18696,18705,18708,18720,18753,18756,18768,18816,18838,18945,18948,18960,19008,20480,20482,20485,20488,20497,20500,20502,20505,20512,20514,20517,20520,20545,20548,20550,20553,20560,20562,20565,20568,20577,20580,20608,20610,20613,20616,20625,20628,20737,20740,20742,20745,20752,20754,20757,20760,20769,20772,20800,20802,20805,20808,20817,20820,20832,20865,20868,20880,20992,20997,21000,21009,21012,21024,21057,21060,21072,21097,21120,21505,21508,21510,21513,21520,21522,21525,21528,21537,21540,21568,21570,21573,21576,21585,21588,21600,21633,21636,21648,21760,21762,21765,21768,21777,21780,21792,21825,21828,21840,21888,22017,22020,22032,22054,22080,22528,22530,22533,22536,22545,22548,22560,22593,22596,22608,22618,22656,22785,22788,22800,22848,23040,23065,23173,23208,24577,24580,24582,24592,24594,24597,24600,24609,24612,24640,24645,
+	24648,24657,24660,24672,24708,24720,24832,24834,24837,24840,24849,24852,24864,24897,24900,24912,24960,24985,25092,25104,25152,25174,25249,25600,25605,25608,25617,25620,25632,25665,25668,25680,25728,25857,25860,25872,25920,25930,25960,26002,26112,26260,26625,26628,26640,26725,26776,26880,26922,27202,27297,32768,32770,32773,32776,32785,32788,32793,32800,32805,32833,32836,32848,32850,32853,32856,32865,32896,32901,32913,32916,33025,33028,33033,33040,33042,33045,33048,33057,33060,33088,33090,33093,33096,33105,33108,33153,33156,33168,33193,33280,33285,33290,33297,33300,33345,33348,33360,33793,33796,33798,33801,33808,33810,33813,33816,33825,33856,33858,33861,33864,33873,33876,33888,33921,33924,33936,34048,34050,34053,34056,34065,34068,34080,34113,34116,34128,34176,34186,34305,34308,34320,34345,34368,34816,34821,34833,34836,34881,34884,34896,34978,35073,35076,35136,35173,35362,35416,35418,35458,35490,36865,36868,36873,36880,36882,36885,36888,36900,36928,36930,36933,36936,36945,36948,36960,36993,36996,37008,37120,37125,37137,37140,37185,37188,37200,37210,37377,37380,37392,37440,37542,37888,37890,37893,37896,37905,37908,37920,37953,37956,37968,38016,38038,38145,38148,38160,38208,38296,38305,38400,38470,38500,38913,38916,38928,38950,38976,39081,39168,39241,39250,39568,40960,40965,40970,40980,40994,41002,41025,41028,41040,41122,41130,41280,41317,41474,41482,41506,41512,41514,41602,41608,41610,41640,41985,41988,42000,42048,42121,42148,42240,42265,42577,43018,43048,43170,43348,43398,43528,43530,43552,43554,43560,43656,43690];
 fn iq3_grid(grid: &[u16], index: usize, lane: usize) -> i8 { (2 * (grid[index] >> (3 * lane) & 7) + 1) as i8 }
 fn iq3_nearest(grid: &[u16], levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32) -> usize {
 	let key = levels.iter().enumerate().fold(0_u16, |key, (lane, level)| key | (*level as u16) << (3 * lane));
@@ -710,7 +694,18 @@ fn iq3_nearest(grid: &[u16], levels: &mut [i8], values: &[f32], weights: &[f32],
 	for lane in 0..4 { levels[lane] = (iq3_grid(grid, index, lane) - 1) / 2 }
 	index
 }
-#[rustfmt::skip] fn iq3_xxs(values: &[f32]) -> Vec<u8> {
+fn iq2_grid(index:usize,lane:usize)->i8{(2*(IQ2_S[index]>>(2*lane)&3)+1)as i8}
+fn iq2_nearest(levels:&mut[i8],values:&[f32],weights:&[f32],scale:f32)->usize{
+	let key=levels.iter().enumerate().fold(0_u16,|key,(lane,level)|key|(*level as u16)<<(2*lane));if let Some(index)=IQ2_S.iter().position(|value|*value==key){return index}let mut candidates=IQ2_S.iter().enumerate().map(|(index,point)|((0..8).map(|lane|{let difference=i32::from((*point>>(2*lane)&3)as i8-levels[lane]);difference*difference}).sum::<i32>(),index)).collect::<Vec<_>>();candidates.sort_unstable();let first=candidates[0].0;let index=candidates.into_iter().take_while(|item|item.0==first).map(|item|item.1).min_by(|left,right|{let error=|index|(0..8).map(|lane|{let difference=scale*f32::from(iq2_grid(index,lane))-values[lane];weights[lane]*difference*difference}).sum::<f32>();error(*left).total_cmp(&error(*right))}).unwrap();for lane in 0..8{levels[lane]=(iq2_grid(index,lane)-1)/2}index
+}
+#[rustfmt::skip] fn iq2_s(values:&[f32])->Vec<u8>{
+	let mut output=Vec::new();for values in values.chunks(256){let value=|index|values.get(index).copied().unwrap_or(0.0);let sigma2=2.0*(0..256).map(|index|value(index)*value(index)).sum::<f32>()/256.0;let mut packed=[0_u8;80];let mut scales=[0.0_f32;16];let mut maximum=0.0_f32;
+		for block in 0..16{let x=(0..16).map(|offset|value(block*16+offset)).collect::<Vec<_>>();let weights=x.iter().map(|value|0.25*sigma2+value*value).collect::<Vec<_>>();let magnitudes=x.iter().map(|value|value.abs()).collect::<Vec<_>>();let max=magnitudes.iter().copied().fold(0.0_f32,f32::max);if max<1.0e-8{continue}let mut best=0.0_f32;let mut scale=max/5.0;let mut levels=[0_i8;16];let mut on_grid=[true;2];
+			for step in -9..=9{let inverse=(5.0+0.1*step as f32)/max;let trial_scale=inverse.recip();let mut trial=[0_i8;16];let mut trial_on=[true;2];for group in 0..2{for lane in 0..8{trial[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}let key=(0..8).fold(0_u16,|key,lane|key|(trial[group*8+lane]as u16)<<(2*lane));trial_on[group]=IQ2_S.contains(&key);iq2_nearest(&mut trial[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),trial_scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..16{let quant=f32::from(2*trial[lane]+1);qx+=weights[lane]*magnitudes[lane]*quant;q2+=weights[lane]*quant*quant}if q2>0.0&&qx*qx>best*q2{scale=qx/q2;best=scale*qx;levels=trial;on_grid=trial_on}}
+			if on_grid.iter().any(|value|!*value)&&scale>0.0{let inverse=scale.recip();for group in 0..2{if on_grid[group]{continue}for lane in 0..8{levels[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}iq2_nearest(&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..16{let quant=f32::from(2*levels[lane]+1);qx+=weights[lane]*magnitudes[lane]*quant;q2+=weights[lane]*quant*quant}if q2>0.0{scale=qx/q2}}
+			for group in 0..2{let index=iq2_nearest(&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);let slot=2*block+group;packed[slot]=index as u8;packed[64+slot/4]|=((index>>8)as u8)<<(2*(slot%4));packed[32+slot]=(0..8).fold(0,|signs,lane|signs|u8::from(x[group*8+lane]<0.0)<<lane)}scales[block]=scale;maximum=maximum.max(scale)}
+		if maximum==0.0{put_half(&mut output,0.0);output.extend(packed);continue}let scale=maximum/31.0;for block in 0..16{let code=qround(0.5*(scales[block]/scale-1.0)).max(0.0).min(15.0)as u8;packed[72+block/2]|=code<<(block%2*4)}put_half(&mut output,scale*0.9875);output.extend(packed)}output
+} #[rustfmt::skip] fn iq3_xxs(values: &[f32]) -> Vec<u8> {
 	let mut output = Vec::new(); for values in values.chunks(256) {
 		let value = |index| values.get(index).copied().unwrap_or(0.0); let mut packed = [0_u8; 96]; let mut scales = [0.0_f32; 8]; let mut maximum = 0.0_f32;
 		for block in 0..8 { let x = (0..32).map(|offset| value(block * 32 + offset)).collect::<Vec<_>>(); let weights = x.iter().map(|value| value * value).collect::<Vec<_>>(); let mut magnitudes = x.iter().map(|value| value.abs()).collect::<Vec<_>>(); let mut signs = [0_u8; 4];
@@ -1093,8 +1088,9 @@ impl Integer for IntegerFormat {
 			return Ok((data, Vec::new()));
 		}
 		if family == 1 && variant == 1 && bits == 3 { return Ok((iq3_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new())) }
+		if family == 1 && variant == 3 && bits == 2 { return Ok((iq2_s(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new())) }
 		if family == 1 && variant == 3 && bits == 3 { return Ok((iq3_s(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new())) }
-		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS", self.0)))
+		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS", self.0)))
 	}
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>> {
 		let (family, variant, bits) = (self.0 >> 12, self.0 >> 8 & 15, self.bits());
@@ -1275,12 +1271,16 @@ impl Integer for IntegerFormat {
 			for bytes in data.chunks_exact(STRIDE) { let scale=half(bytes); for block in 0..8 { let word=u32::from_le_bytes(bytes[66+block*4..70+block*4].try_into().unwrap()); let d=scale*(0.5+(word>>28) as f32)*0.5; for group in 0..4 { let signs=(word>>(7*group)&127) as u8; let signs=signs | ((signs.count_ones() as u8 & 1)<<7); for lane in 0..8 { if weights.len()==count { return Ok(weights) } let grid=usize::from(bytes[2+block*8+group*2+lane/4]); let magnitude=f32::from(iq3_grid(&IQ3_XXS,grid,lane%4)); weights.push(f64::from(d*magnitude*if signs>>lane&1!=0 {-1.0} else {1.0})) } } } }
 			return Ok(weights);
 		}
+		if family == 1 && variant == 3 && bits == 2 {
+			const STRIDE:usize=82;require(data.len()>=count.div_ceil(256)*STRIDE,"GGML IQ2_S weights are invalid")?;let mut weights=Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE){let scale=half(bytes);for index in 0..256{if weights.len()==count{return Ok(weights)}let block=index/16;let slot=index/8;let grid=usize::from(bytes[2+slot])|usize::from(bytes[66+slot/4]>>(2*(slot%4))&3)<<8;let code=bytes[74+block/2]>>(4*(block%2))&15;let d=scale*(0.5+f32::from(code))*0.25;let sign=if bytes[34+slot]>>(index%8)&1!=0{-1.0}else{1.0};weights.push(f64::from(d*f32::from(iq2_grid(grid,index%8))*sign))}}return Ok(weights)
+		}
 		if family == 1 && variant == 3 && bits == 3 {
 			const STRIDE:usize=110;require(data.len()>=count.div_ceil(256)*STRIDE,"GGML IQ3_S weights are invalid")?;let mut weights=Vec::with_capacity(count);
 			for bytes in data.chunks_exact(STRIDE) {let scale=half(bytes);for index in 0..256 {if weights.len()==count{return Ok(weights)}let block=index/32;let group=index/4;let grid=usize::from(bytes[2+group])|usize::from(bytes[66+group/8]>>(group%8)&1)<<8;let code=bytes[106+block/2]>>(block%2*4)&15;let d=scale*f32::from(1+2*code);let sign=if bytes[74+index/8]>>(index%8)&1!=0{-1.0}else{1.0};weights.push(f64::from(d*f32::from(iq3_grid(&IQ3_S,grid,index%4))*sign))}}
 			return Ok(weights)
 		}
-		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS", self.0)))
+		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS", self.0)))
 	}
 }
 pub struct Qi { model: Model, pub zero: Model, pub one: Model, pub nf: Model, pub k: Qk }
