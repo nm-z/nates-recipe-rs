@@ -326,6 +326,7 @@ pub type Result<T> = std::result::Result<T, RecipeError>;
 type Ptr = *mut c_void;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
+	Cpu,
 	Amd,
 	Nvidia,
 }
@@ -417,19 +418,11 @@ pub mod atv {
 pub use atv::{cos, elu, exp, gelu, leak, linear, ln, log, prelu, relu, selu, sigmoid, silu, tan, tanh};
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Block {
-	operation: Operation,
-	activation: Activation,
-	normalization: Option<BlockNormalization>,
-	format: FloatFormat,
-	quantization: u16,
+	operation: Operation, activation: Activation, normalization: Option<BlockNormalization>, format: FloatFormat, quantization: u16,
 }
 #[derive(Clone)]
 pub struct Model {
-	blocks: Vec<Block>,
-	loss: LossFunction,
-	downstream: Option<Vec<Block>>,
-	format: FloatFormat,
-	quantization: u16,
+	blocks: Vec<Block>, loss: LossFunction, downstream: Option<Vec<Block>>, format: FloatFormat, quantization: u16,
 }
 pub trait ModelLoss {
 	fn apply(self, model: &mut Model);
@@ -1251,43 +1244,22 @@ impl Integer for IntegerFormat {
 	}
 }
 pub struct Qi {
-	model: Model,
-	pub zero: Model,
-	pub one: Model,
-	pub nf: Model,
-	pub k: Qk,
+	model: Model, pub zero: Model, pub one: Model, pub nf: Model, pub k: Qk,
 }
 pub struct Qk {
-	model: Model,
-	pub s: Model,
-	pub m: Model,
-	pub l: Model,
+	model: Model, pub s: Model, pub m: Model, pub l: Model,
 }
 pub struct Iq {
-	model: Model,
-	pub xxs: Model,
-	pub xs: Model,
-	pub s: Model,
-	pub m: Model,
-	pub nl: Model,
+	model: Model, pub xxs: Model, pub xs: Model, pub s: Model, pub m: Model, pub nl: Model,
 }
 impl std::ops::Deref for Qi {
-	type Target = Model;
-	fn deref(&self) -> &Model {
-		&self.model
-	}
+	type Target = Model; fn deref(&self) -> &Model { &self.model }
 }
 impl std::ops::Deref for Qk {
-	type Target = Model;
-	fn deref(&self) -> &Model {
-		&self.model
-	}
+	type Target = Model; fn deref(&self) -> &Model { &self.model }
 }
 impl std::ops::Deref for Iq {
-	type Target = Model;
-	fn deref(&self) -> &Model {
-		&self.model
-	}
+	type Target = Model; fn deref(&self) -> &Model { &self.model }
 }
 impl Estimator {
 	const fn name(&self) -> &'static str {
@@ -1466,6 +1438,7 @@ impl Recipe {
 		let mut outputs = Vec::new();
 		for backend in backends {
 			let artifacts = match backend {
+				Backend::Cpu => Vec::new(),
 				Backend::Amd => vec![mapped_artifacts(option_env!("RECIPE_HSA_CODE_OBJECTS"), "hsaco")?, mapped_artifacts(option_env!("RECIPE_HSA_ASSEMBLIES"), "amd.s")?].concat(),
 				Backend::Nvidia => vec![("ptx".to_owned(), option_env!("RECIPE_NV_PTX").ok_or_else(|| RecipeError::new("Nvidia artifacts were not compiled"))?)],
 			};
@@ -1511,56 +1484,26 @@ fn extract_bn_stats(graph: &Graph, contexts: &[Buffer]) -> Result<Vec<f64>> {
 	Ok(stats)
 }
 trait CpuFloat: Copy + Default {
-	fn convert(value: f64) -> Self; fn expand(self) -> f64;
-	unsafe fn forward(samples: *const Self, weights: *const Self, values: *const *mut Self, contexts: *const *mut Self, descriptors: *const i32, arguments: *const Self, rows: i32, nodes: i32, timings: *mut u64, tiles: *const Tile); }
+	unsafe fn forward(samples: *const Self, weights: *const Self, values: *const *mut Self, contexts: *const *mut Self, descriptors: *const i32, arguments: *const Self, rows: i32, nodes: i32, timings: *mut u64, tiles: *const Tile);
+	unsafe fn epoch(samples: *const Self, input_adjoint: *mut Self, targets: *const Self, weights: *mut Self, frozen: *const u8, best: *mut Self, values: *const *mut Self, contexts: *const *mut Self, adjoints: *const *mut Self, descriptors: *const i32, arguments: *const Self, metrics: *mut Self, gradient: *mut Self, moments: *mut Self, variances: *mut Self, best_loss: *mut Self, rows: i32, nodes: i32, parameters: i32, loss: i32, threshold: Self, rate: Self, beta1: Self, beta2: Self, beta1_power: Self, beta2_power: Self, epsilon: Self, decay: Self, tolerance: Self, step: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, phase: i32, timings: *mut u64, tiles: *const Tile); }
 impl CpuFloat for f64 {
-	fn convert(value: f64) -> Self { value } fn expand(self) -> f64 { self }
-	unsafe fn forward(samples: *const Self, weights: *const Self, values: *const *mut Self, contexts: *const *mut Self, descriptors: *const i32, arguments: *const Self, rows: i32, nodes: i32, timings: *mut u64, tiles: *const Tile) { unsafe { recipe_forward_cpu(samples, weights, values, contexts, descriptors, arguments, rows, nodes, 1, 1, 1, 1, timings, tiles) } } }
+	unsafe fn forward(samples: *const Self, weights: *const Self, values: *const *mut Self, contexts: *const *mut Self, descriptors: *const i32, arguments: *const Self, rows: i32, nodes: i32, timings: *mut u64, tiles: *const Tile) { unsafe { recipe_forward_cpu(samples, weights, values, contexts, descriptors, arguments, rows, nodes, 1, 1, 1, 1, timings, tiles) } }
+	unsafe fn epoch(samples: *const Self, input_adjoint: *mut Self, targets: *const Self, weights: *mut Self, frozen: *const u8, best: *mut Self, values: *const *mut Self, contexts: *const *mut Self, adjoints: *const *mut Self, descriptors: *const i32, arguments: *const Self, metrics: *mut Self, gradient: *mut Self, moments: *mut Self, variances: *mut Self, best_loss: *mut Self, rows: i32, nodes: i32, parameters: i32, loss: i32, threshold: Self, rate: Self, beta1: Self, beta2: Self, beta1_power: Self, beta2_power: Self, epsilon: Self, decay: Self, tolerance: Self, step: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, phase: i32, timings: *mut u64, tiles: *const Tile) { unsafe { recipe_epoch_cpu(samples, input_adjoint, targets, weights, frozen, best, values, contexts, adjoints, descriptors, arguments, metrics, gradient, moments, variances, best_loss, rows, nodes, parameters, loss, threshold, rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay, tolerance, step, threads, tile_m, tile_n, tile_k, phase, timings, tiles) } } }
 impl CpuFloat for f32 {
-	fn convert(value: f64) -> Self { value as f32 } fn expand(self) -> f64 { self as f64 }
 	unsafe fn forward(samples: *const Self, weights: *const Self, values: *const *mut Self, contexts: *const *mut Self, descriptors: *const i32, arguments: *const Self, rows: i32, nodes: i32, timings: *mut u64, tiles: *const Tile) { unsafe { recipe_forward_cpu_f32(samples, weights, values, contexts, descriptors, arguments, rows, nodes, 1, 1, 1, 1, timings, tiles) } }
-}
-fn cpu_forward<T: CpuFloat>(graph: &Graph, samples: &[f64]) -> Result<Vec<f64>> {
-	let inputs = graph.input.elements();
-	require(inputs != 0 && !samples.is_empty() && samples.len() % inputs == 0, "model input batch is invalid")?;
-	let rows = samples.len() / inputs;
-	let program_base = checked_mul(graph.nodes.len(), 9, "node arguments")?;
-	let (mut descriptors, mut arguments, mut buffers, mut contexts, mut tiles) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-	for node in &graph.nodes {
-		descriptors.extend(node_descriptor(node, program_base)?);
-		arguments.extend(node.argument.map(T::convert));
-		buffers.push(vec![T::default(); graph_rows_buffer(node.output, rows, size_of::<T>())? / size_of::<T>()]);
-		contexts.push(vec![T::default(); node_context(node, rows, size_of::<T>())? / size_of::<T>()]);
-		tiles.push(Tile { m: narrow(node.output.length.max(1), "CPU tile M")? as u32, n: narrow(node.output.channels.max(1), "CPU tile N")? as u32, k: narrow(node.input.elements().clamp(1, TILE_CAPACITY), "CPU tile K")? as u32 });
-	}
-	arguments.extend(graph.programs.iter().copied().map(T::convert));
-	let samples = samples.iter().copied().map(T::convert).collect::<Vec<_>>();
-	let mut value_pointers = buffers.iter_mut().map(Vec::as_mut_ptr).collect::<Vec<_>>();
-	let mut context_pointers = contexts.iter_mut().map(Vec::as_mut_ptr).collect::<Vec<_>>();
-	let mut timings = vec![0_u64; graph.nodes.len()];
-	let mut weights = graph.parameters.iter().copied().map(T::convert).collect::<Vec<_>>();
-	if weights.is_empty() { weights.push(T::default()) }
-	unsafe {
-		T::forward(samples.as_ptr(), weights.as_ptr(), value_pointers.as_mut_ptr(), context_pointers.as_mut_ptr(), descriptors.as_ptr(), arguments.as_ptr(), narrow(rows, "CPU rows")?, narrow(graph.nodes.len(), "CPU nodes")?, timings.as_mut_ptr(), tiles.as_ptr());
-	}
-	buffers.pop().map(|values| values.into_iter().map(T::expand).collect()).ok_or_else(|| RecipeError::new("model graph has no nodes"))
+	unsafe fn epoch(samples: *const Self, input_adjoint: *mut Self, targets: *const Self, weights: *mut Self, frozen: *const u8, best: *mut Self, values: *const *mut Self, contexts: *const *mut Self, adjoints: *const *mut Self, descriptors: *const i32, arguments: *const Self, metrics: *mut Self, gradient: *mut Self, moments: *mut Self, variances: *mut Self, best_loss: *mut Self, rows: i32, nodes: i32, parameters: i32, loss: i32, threshold: Self, rate: Self, beta1: Self, beta2: Self, beta1_power: Self, beta2_power: Self, epsilon: Self, decay: Self, tolerance: Self, step: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, phase: i32, timings: *mut u64, tiles: *const Tile) { unsafe { recipe_epoch_cpu_f32(samples, input_adjoint, targets, weights, frozen, best, values, contexts, adjoints, descriptors, arguments, metrics, gradient, moments, variances, best_loss, rows, nodes, parameters, loss, threshold, rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay, tolerance, step, threads, tile_m, tile_n, tile_k, phase, timings, tiles) } }
 }
 impl Recipe {
 	pub fn infer(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
 		let path = path.as_ref().to_string_lossy();
-		let result = if std::env::var_os("RECIPE_FORCE_CPU").is_none()
-			&& let Ok(gpus) = devices()
-			&& let Some(gpu) = gpus.first()
-		{
+		let result = devices().and_then(|devices| devices.first().ok_or_else(|| RecipeError::new("execution device is absent"))).and_then(|device| {
 			bundle::run_infer(&path, input, |stored, samples| {
-				let mut tape = GpuTape::new(&stored.graph, samples, &[], gpu, stored.precision)?;
+				let mut tape = GpuTape::new(&stored.graph, samples, &[], device, stored.precision)?;
 				inject_bn_stats(&stored.graph, &stored.bn_stats, &tape.contexts)?;
 				tape.forward()?;
 				tape.predictions()
 			})
-		} else {
-			bundle::run_infer(&path, input, |stored, samples| if stored.precision == FP32 { cpu_forward::<f32>(&stored.graph, samples) } else { cpu_forward::<f64>(&stored.graph, samples) })
-		};
+		});
 		result.unwrap_or_else(|error| panic!("{error}"))
 	}
 }
@@ -2848,6 +2791,7 @@ struct Remote {
 	io: Mutex<Worker>,
 }
 enum Driver {
+	Cpu,
 	#[cfg(amd)]
 	Hsa(Hsa),
 	#[cfg(nvidia)]
@@ -2922,6 +2866,13 @@ impl Library {
 fn driver_status(backend: Backend, status: i32, action: &str) -> Result<()> {
 	(status == 0).then_some(()).ok_or_else(|| RecipeError::new(format!("{backend:?} {action} failed: {status}")))
 }
+unsafe fn cpu_argument<T: Copy>(arguments: &[Ptr], index: usize) -> T { unsafe { *arguments[index].cast::<T>() } }
+unsafe fn cpu_forward_dispatch<T: CpuFloat>(arguments: &[Ptr]) {
+	unsafe { T::forward(cpu_argument::<u64>(arguments, 0) as *const T, cpu_argument::<u64>(arguments, 1) as *const T, cpu_argument::<u64>(arguments, 2) as *const *mut T, cpu_argument::<u64>(arguments, 3) as *const *mut T, cpu_argument::<u64>(arguments, 4) as *const i32, cpu_argument::<u64>(arguments, 5) as *const T, cpu_argument(arguments, 6), cpu_argument(arguments, 7), cpu_argument::<u64>(arguments, 12) as *mut u64, cpu_argument::<u64>(arguments, 13) as *const Tile) }
+}
+unsafe fn cpu_epoch_dispatch<T: CpuFloat>(a: &[Ptr]) {
+	unsafe { T::epoch(cpu_argument::<u64>(a, 0) as *const T, cpu_argument::<u64>(a, 1) as *mut T, cpu_argument::<u64>(a, 2) as *const T, cpu_argument::<u64>(a, 3) as *mut T, cpu_argument::<u64>(a, 4) as *const u8, cpu_argument::<u64>(a, 5) as *mut T, cpu_argument::<u64>(a, 6) as *const *mut T, cpu_argument::<u64>(a, 7) as *const *mut T, cpu_argument::<u64>(a, 8) as *const *mut T, cpu_argument::<u64>(a, 9) as *const i32, cpu_argument::<u64>(a, 10) as *const T, cpu_argument::<u64>(a, 11) as *mut T, cpu_argument::<u64>(a, 12) as *mut T, cpu_argument::<u64>(a, 13) as *mut T, cpu_argument::<u64>(a, 14) as *mut T, cpu_argument::<u64>(a, 15) as *mut T, cpu_argument(a, 16), cpu_argument(a, 17), cpu_argument(a, 18), cpu_argument(a, 19), cpu_argument(a, 20), cpu_argument(a, 21), cpu_argument(a, 22), cpu_argument(a, 23), cpu_argument(a, 24), cpu_argument(a, 25), cpu_argument(a, 26), cpu_argument(a, 27), cpu_argument(a, 28), cpu_argument(a, 29), cpu_argument(a, 30), cpu_argument(a, 31), cpu_argument(a, 32), cpu_argument(a, 33), cpu_argument(a, 34), cpu_argument::<u64>(a, 35) as *mut u64, cpu_argument::<u64>(a, 36) as *const Tile) }
+}
 impl Gpu {
 	#[cfg(any(amd, nvidia))]
 	fn status(&self, status: i32, action: &str) -> Result<()> {
@@ -2929,6 +2880,7 @@ impl Gpu {
 	}
 	fn activate(&self) -> Result<()> {
 		match &self.driver {
+			Driver::Cpu => Ok(()),
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => self.status(unsafe { (driver.set)(driver.context) }, "context"),
 			#[cfg(amd)]
@@ -2975,6 +2927,7 @@ impl Gpu {
 		self.activate()?;
 		unsafe {
 			match &self.driver {
+				Driver::Cpu => { let size = checked_add(bytes.max(1), size_of::<usize>(), "CPU allocation")?; let layout = std::alloc::Layout::from_size_align(size, 8).map_err(|error| RecipeError::new(format!("CPU allocation layout is invalid: {error}")))?; let base = std::alloc::alloc_zeroed(layout); require(!base.is_null(), "CPU allocation failed")?; base.cast::<usize>().write(size); Ok(base.add(size_of::<usize>()) as u64) }
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => {
 					let mut pointer = 0;
@@ -2996,6 +2949,7 @@ impl Gpu {
 	fn free(&self, pointer: u64) {
 		unsafe {
 			match &self.driver {
+				Driver::Cpu => { let base = (pointer as *mut u8).sub(size_of::<usize>()); let size = base.cast::<usize>().read(); std::alloc::dealloc(base, std::alloc::Layout::from_size_align_unchecked(size, 8)) },
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => {
 					(driver.set)(driver.context);
@@ -3014,6 +2968,7 @@ impl Gpu {
 		self.activate()?;
 		unsafe {
 			match &self.driver {
+				Driver::Cpu => { ptr::copy_nonoverlapping(src.cast::<u8>(), dst as *mut u8, bytes); Ok(()) }
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => self.status((driver.upload)(dst, src, bytes), "upload"),
 				#[cfg(amd)]
@@ -3027,6 +2982,7 @@ impl Gpu {
 		self.activate()?;
 		unsafe {
 			match &self.driver {
+				Driver::Cpu => { ptr::copy_nonoverlapping(src as *const u8, dst.cast::<u8>(), bytes); Ok(()) }
 				#[cfg(nvidia)]
 				Driver::Cuda(cuda) => self.status((cuda.download)(dst, src, bytes), "download"),
 				#[cfg(amd)]
@@ -3040,6 +2996,7 @@ impl Gpu {
 		self.activate()?;
 		unsafe {
 			match &self.driver {
+				Driver::Cpu => Ok(()),
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => self.status((driver.synchronize)(), "synchronization"),
 				#[cfg(amd)]
@@ -3060,6 +3017,7 @@ impl Gpu {
 		let _guard = self.dispatch.lock().map_err(|_| RecipeError::new("GPU dispatch lock is poisoned"))?;
 		unsafe {
 			match &self.driver {
+				Driver::Cpu => { if kernel.object & 1 == 0 { if kernel.element == 4 { cpu_forward_dispatch::<f32>(arguments) } else { cpu_forward_dispatch::<f64>(arguments) } } else if kernel.element == 4 { cpu_epoch_dispatch::<f32>(arguments) } else { cpu_epoch_dispatch::<f64>(arguments) } Ok(()) },
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => {
 					let stream = ptr::null_mut();
@@ -3094,9 +3052,14 @@ impl Gpu {
 	}
 }
 static DEVICES: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
+fn cpu_device() -> Gpu {
+	let dispatch = |object, element, layout| Dispatch { kernel: Kernel::remote(object, 0, element, layout), geometry: Geometry { groups: 1, block: 1 } };
+	Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, driver: Driver::Cpu, forward: dispatch(0, 8, FORWARD_ARGS), epoch: dispatch(1, 8, EPOCH_ARGS), forward_f32: Some(dispatch(2, 4, FORWARD_ARGS)), epoch_f32: Some(dispatch(3, 4, EPOCH_F32_ARGS)), memory: u64::MAX, clock: 1, shared_limit: u32::MAX, dispatch: Mutex::new(()) }
+}
 fn devices() -> Result<&'static [Gpu]> {
 	DEVICES
 		.get_or_init(|| {
+			if std::env::var_os("RECIPE_FORCE_CPU").is_some() { return Ok(vec![cpu_device()]) }
 			let mut found = Vec::new();
 			let mut errors = Vec::new();
 			for load in [load_amd as fn() -> Result<Vec<Gpu>>, load_nvidia] {
@@ -3105,7 +3068,8 @@ fn devices() -> Result<&'static [Gpu]> {
 					Err(error) => errors.push(error.to_string()),
 				}
 			}
-			if found.is_empty() { Err(RecipeError::new(errors.join("; "))) } else { Ok(found) }
+			if found.is_empty() { if cfg!(any(amd, nvidia)) { return Err(RecipeError::new(errors.join("; "))) } found.push(cpu_device()) }
+			Ok(found)
 		})
 		.as_ref()
 		.map(Vec::as_slice)
@@ -3743,10 +3707,11 @@ unsafe extern "C" {
 	#[cfg_attr(windows, link_name = "_write")]
 	fn write(file: i32, bytes: *const c_void, length: usize) -> isize;
 }
-const TILE_CAPACITY: usize = 65536;
 unsafe extern "C" {
 	fn recipe_forward_cpu(samples: *const f64, weights: *const f64, value_pointers: *const *mut f64, context_pointers: *const *mut f64, descriptors: *const i32, arguments: *const f64, rows: i32, nodes: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, timings: *mut u64, tiles: *const Tile);
 	fn recipe_forward_cpu_f32(samples: *const f32, weights: *const f32, value_pointers: *const *mut f32, context_pointers: *const *mut f32, descriptors: *const i32, arguments: *const f32, rows: i32, nodes: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, timings: *mut u64, tiles: *const Tile);
+	fn recipe_epoch_cpu(samples: *const f64, input_adjoint: *mut f64, targets: *const f64, weights: *mut f64, frozen: *const u8, best: *mut f64, values: *const *mut f64, contexts: *const *mut f64, adjoints: *const *mut f64, descriptors: *const i32, arguments: *const f64, metrics: *mut f64, gradient: *mut f64, moments: *mut f64, variances: *mut f64, best_loss: *mut f64, rows: i32, nodes: i32, parameters: i32, loss: i32, huber: f64, rate: f64, beta1: f64, beta2: f64, beta1_power: f64, beta2_power: f64, epsilon: f64, decay: f64, tolerance: f64, step: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, phase: i32, timings: *mut u64, tiles: *const Tile);
+	fn recipe_epoch_cpu_f32(samples: *const f32, input_adjoint: *mut f32, targets: *const f32, weights: *mut f32, frozen: *const u8, best: *mut f32, values: *const *mut f32, contexts: *const *mut f32, adjoints: *const *mut f32, descriptors: *const i32, arguments: *const f32, metrics: *mut f32, gradient: *mut f32, moments: *mut f32, variances: *mut f32, best_loss: *mut f32, rows: i32, nodes: i32, parameters: i32, loss: i32, huber: f32, rate: f32, beta1: f32, beta2: f32, beta1_power: f32, beta2_power: f32, epsilon: f32, decay: f32, tolerance: f32, step: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, phase: i32, timings: *mut u64, tiles: *const Tile);
 }
 fn distance(left: &[f64], right: &[f64]) -> f64 {
 	left.iter().zip(right).map(|(a, b)| (a - b).powi(2)).sum()
