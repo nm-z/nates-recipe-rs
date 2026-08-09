@@ -749,8 +749,8 @@ fn iq4_fit(values: &[f32], tries: i32) -> (f32, Vec<u8>) {
 struct IntegerFormat(u16);
 impl IntegerFormat {
 	fn valid(self)->bool{matches!((self.0>>12,self.bits(),self.0>>8&15),(0,4|5|8,0|1)|(0,4,2)|(0,2|3|4|5|6|8,3)|(0,3|4|5,4|5)|(0,3,6)|(1,1,3|4)|(1,2|3,1|2|3|4)|(1,4,2|5))}
-	fn unavailable(self)->RecipeError{RecipeError::new(format!("{} is unavailable; available GGML formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS",quantization(self.0)))}
-	fn selection(self)->Option<u16>{let(family,bits,variant)=(self.0>>12,self.bits(),self.0>>8&15);match(family,bits,variant){(0,2|6|8,3)=>Some(3),(0,3|4|5,3|5)=>Some(5),(0,3|4|5,4)=>Some(4),(0,3,6)=>Some(6),(1,2,4)|(1,3,2|4)=>Some(variant),_=>None}}
+	fn unavailable(self)->RecipeError{RecipeError::new(format!("{} is unavailable; available GGML formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q3_K_S, Q3_K_M, Q3_K_L, Q4_K, Q4_K_S, Q4_K_M, Q5_K, Q5_K_S, Q5_K_M, Q6_K, Q8_K, Q4_NF, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ2_M, IQ3_XXS, IQ3_XS, IQ3_S, IQ3_M, IQ4_XS, and IQ4_NL",quantization(self.0)))}
+	fn selection(self)->Option<u16>{let(family,bits,variant)=(self.0>>12,self.bits(),self.0>>8&15);match(family,bits,variant){(0,3|4|5,5)=>Some(5),(0,3|4|5,4)=>Some(4),(0,3,6)=>Some(6),(1,2,4)|(1,3,2|4)=>Some(variant),_=>None}}
 	fn tensor(self,role:u8,more:bool,output:bool)->u16{let(family,bits,style)=(self.0>>12,self.bits(),self.selection().unwrap());if output{return 3<<8|6}if family==1{return match(bits,style,role,more){(2,4,2|3,_)|(2,4,_,true)=>1<<12|3<<8|3,(3,2,0|1,_)|(3,2,_,false)=>1<<12|1<<8|3,(3,4,2|3,_)|(3,4,_,true)=>3<<8|4,_=>1<<12|3<<8|u16::from(bits)}}let bits=match(bits,style,role){(2,_,2|3)=>3,(3,5,2)=>5,(3,5,3)=>4,(3,6,2|3)=>5,(4,4,2)=>5,(4,5,2)if more=>6,(5,5,2)if more=>6,_=>bits};3<<8|u16::from(bits)}
 }
 trait Integer {
