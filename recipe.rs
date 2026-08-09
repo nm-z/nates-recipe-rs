@@ -130,7 +130,8 @@ mod bundle {
 					let mut fields = value.split_whitespace();
 					let code = self::value(fields.next().unwrap_or(""), "quantization code")?;
 					let count = self::value(fields.next().unwrap_or(""), "quantized weight count")?;
-					let codebook = fields.next().unwrap_or("").split(',').map(|value| self::value(value, "quantization codebook")).collect::<Result<Vec<_>>>()?;
+					let codebook = fields.next().unwrap_or("");
+					let codebook = if codebook == "-" { Vec::new() } else { codebook.split(',').map(|value| self::value(value, "quantization codebook")).collect::<Result<Vec<_>>>()? };
 					let hex = fields.next().unwrap_or("");
 					require(hex.len() % 2 == 0, "quantized bytes are invalid")?;
 					let bytes = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|error| RecipeError::new(format!("invalid quantized byte: {error}")))).collect::<Result<Vec<_>>>()?;
@@ -193,7 +194,8 @@ mod bundle {
 						let format = IntegerFormat(node.argument[8] as u16);
 						let (bytes, codebook) = format.compress(weights, config)?;
 						let hex = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-						field(&mut document, "quantized", &format!("{} {} {} {hex}", format.0, weights.len(), codebook.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")))
+						let metadata = if codebook.is_empty() { "-".to_owned() } else { codebook.iter().map(ToString::to_string).collect::<Vec<_>>().join(",") };
+						field(&mut document, "quantized", &format!("{} {} {metadata} {hex}", format.0, weights.len()))
 					}
 				}
 			}
@@ -593,6 +595,51 @@ fn quantization(code: u16) -> String {
 	let suffix = if family == 0 { ["_0", "_1", "_NF", "_K", "_K_S", "_K_M", "_K_L"][variant] } else { ["", "_XXS", "_XS", "_S", "_M", "_NL"][variant] };
 	format!("{}{bits}{suffix}", if family == 0 { "Q" } else { "IQ" })
 }
+fn fp16(value: f32) -> u16 {
+	let bits = value.to_bits();
+	let sign = (bits >> 16 & 0x8000) as u16;
+	let exponent = ((bits >> 23 & 0xff) as i32) - 112;
+	let mantissa = bits & 0x7fffff;
+	if exponent <= 0 {
+		if exponent < -10 {
+			return sign;
+		}
+		let value = (mantissa | 0x800000) >> (1 - exponent);
+		return sign | ((value + 0xfff + (value >> 13 & 1)) >> 13) as u16;
+	}
+	if exponent >= 31 {
+		return sign | 0x7c00 | u16::from(mantissa != 0);
+	}
+	let rounded = mantissa + 0xfff + (mantissa >> 13 & 1);
+	if rounded & 0x800000 != 0 {
+		return sign | ((exponent + 1).min(31) as u16) << 10;
+	}
+	sign | (exponent as u16) << 10 | (rounded >> 13) as u16
+}
+fn unfp16(value: u16) -> f32 {
+	let sign = (u32::from(value) & 0x8000) << 16;
+	let exponent = u32::from(value >> 10 & 31);
+	let mantissa = u32::from(value & 1023);
+	let bits = if exponent == 0 {
+		if mantissa == 0 {
+			sign
+		} else {
+			let shift = mantissa.leading_zeros() - 22;
+			sign | (113 - shift) << 23 | (mantissa << (shift + 1) & 0x7fffff)
+		}
+	} else if exponent == 31 {
+		sign | 0x7f800000 | mantissa << 13
+	} else {
+		sign | (exponent + 112) << 23 | mantissa << 13
+	};
+	f32::from_bits(bits)
+}
+fn put_half(output: &mut Vec<u8>, value: f32) {
+	output.extend(fp16(value).to_le_bytes())
+}
+fn half(input: &[u8]) -> f32 {
+	unfp16(u16::from_le_bytes([input[0], input[1]]))
+}
 #[derive(Clone, Copy)]
 struct IntegerFormat(u16);
 trait Integer {
@@ -606,8 +653,68 @@ impl Integer for IntegerFormat {
 	}
 	fn compress(self, weights: &[f64], config: Config) -> Result<(Vec<u8>, Vec<f64>)> {
 		let bits = self.bits();
-		let (family, variant, levels) = (self.0 >> 12, self.0 >> 8 & 15, 1_usize << bits);
-		if family == 0 && variant == 2 {
+		let (family, variant) = (self.0 >> 12, self.0 >> 8 & 15);
+		if family == 0 && ((variant == 0 && bits == 2) || (variant < 2 && matches!(bits, 4 | 5 | 8))) {
+			let block = if bits == 2 { 64 } else { 32 };
+			let mut data = Vec::new();
+			for values in weights.chunks(block) {
+				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
+				let (minimum, maximum) = (0..block).map(value).fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), value| (low.min(value), high.max(value)));
+				let extreme = (0..block).map(value).max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
+				let scale = match (bits, variant) {
+					(2, 0) => extreme.abs(),
+					(8, _) => extreme.abs() / 127.0,
+					(_, 0) => extreme / -(1_i32 << (bits - 1)) as f32,
+					(_, 1) => (maximum - minimum) / ((1_u16 << bits) - 1) as f32,
+					_ => unreachable!(),
+				};
+				let inverse = if scale == 0.0 { 0.0 } else { scale.recip() };
+				put_half(&mut data, scale);
+				if variant == 1 && bits != 8 {
+					put_half(&mut data, minimum)
+				}
+				let (mut low, mut high) = ([0_u8; 32], [0_u8; 4]);
+				let mut sum = 0_i32;
+				for index in 0..block {
+					let shifted = match (bits, variant) {
+						(2, 0) => (value(index) * inverse).round() + 1.0,
+						(8, _) => (value(index) * inverse).round() + 128.0,
+						(_, 0) => value(index) * inverse + (1_i32 << (bits - 1)) as f32 + 0.5,
+						(_, 1) => (value(index) - minimum) * inverse + 0.5,
+						_ => unreachable!(),
+					};
+					let code = shifted.max(0.0).min(f32::from((1_u16 << bits) - 1)) as u8;
+					if bits == 2 {
+						low[index / 4] |= code << (index % 4 * 2)
+					}
+					if bits == 4 || bits == 5 {
+						low[index % 16] |= (code & 15) << (index / 16 * 4)
+					}
+					if bits == 5 {
+						high[index / 8] |= (code >> 4) << (index % 8)
+					}
+					if bits == 8 {
+						low[index] = code.wrapping_sub(128);
+						sum += i32::from(i8::from_ne_bytes([low[index]]))
+					}
+				}
+				if bits == 5 {
+					data.extend(high)
+				}
+				if bits == 8 && variant == 1 {
+					put_half(&mut data, scale * sum as f32)
+				}
+				data.extend_from_slice(
+					&low[..match bits {
+						2 | 4 | 5 => 16,
+						8 => 32,
+						_ => unreachable!(),
+					}],
+				);
+			}
+			return Ok((data, Vec::new()));
+		}
+		if family == 0 && variant == 2 && bits == 4 {
 			const NF4: [f64; 16] = [-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0, 0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0];
 			let mut metadata = vec![config.quantization_block as f64];
 			metadata.extend(NF4);
@@ -623,51 +730,52 @@ impl Integer for IntegerFormat {
 			}
 			return Ok((data, metadata));
 		}
-		let codebook = if family == 0 && variant < 2 {
-			let (minimum, maximum) = if variant == 0 {
-				let bound = weights.iter().map(|value| value.abs()).max_by(f64::total_cmp).unwrap_or(0.0);
-				(-bound, bound)
-			} else {
-				(weights.iter().copied().min_by(f64::total_cmp).unwrap_or(0.0), weights.iter().copied().max_by(f64::total_cmp).unwrap_or(0.0))
-			};
-			(0..levels).map(|index| minimum + (maximum - minimum) * index as f64 / (levels - 1) as f64).collect()
-		} else {
-			let iterations = if (family == 0 && variant == 4) || (family == 1 && variant == 2) {
-				config.kmeans_iterations.div_ceil(2)
-			} else if (family == 0 && variant == 6) || (family == 1 && variant >= 4) {
-				config.kmeans_iterations.saturating_mul(2)
-			} else {
-				config.kmeans_iterations
-			};
-			let importance = (family == 1).then(|| weights.iter().map(|value| value.abs().max(f64::EPSILON).powi(if variant == 5 { 2 } else { 1 })).collect::<Vec<_>>());
-			cluster(weights, 1, levels.min(weights.len()), iterations, importance.as_deref())?.0
-		};
-		let mut data = vec![0_u8; (weights.len() * bits as usize).div_ceil(8)];
-		for (index, weight) in weights.iter().enumerate() {
-			let code = nearest(std::slice::from_ref(weight), &codebook, 1).0;
-			for bit in 0..bits as usize {
-				data[(index * bits as usize + bit) / 8] |= (((code >> bit) & 1) as u8) << ((index * bits as usize + bit) % 8);
-			}
-		}
-		Ok((data, codebook))
+		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, and Q4_NF", self.0)))
 	}
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>> {
+		let (family, variant, bits) = (self.0 >> 12, self.0 >> 8 & 15, self.bits());
+		if family == 0 && ((variant == 0 && bits == 2) || (variant < 2 && matches!(bits, 4 | 5 | 8))) {
+			let block = if bits == 2 { 64 } else { 32 };
+			let header = if variant == 1 { 4 } else { 2 };
+			let payload = match bits {
+				2 | 4 => 16,
+				5 => 20,
+				8 => 32,
+				_ => unreachable!(),
+			};
+			let stride = header + payload;
+			require(data.len() >= count.div_ceil(block) * stride, "GGML quantized weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(stride) {
+				let scale = half(bytes);
+				let minimum = if variant == 1 && bits != 8 { half(&bytes[2..]) } else { 0.0 };
+				let codes = &bytes[header..header + payload];
+				for index in 0..block.min(count - weights.len()) {
+					let code = match bits {
+						2 => codes[index / 4] >> (index % 4 * 2) & 3,
+						4 => codes[index % 16] >> (index / 16 * 4) & 15,
+						5 => (codes[4 + index % 16] >> (index / 16 * 4) & 15) | ((codes[index / 8] >> (index % 8) & 1) << 4),
+						8 => codes[index],
+						_ => unreachable!(),
+					};
+					let value = match (bits, variant) {
+						(2, 0) => (i32::from(code) - 1) as f32 * scale,
+						(8, _) => i8::from_ne_bytes([code]) as f32 * scale,
+						(_, 0) => (i32::from(code) - (1_i32 << (bits - 1))) as f32 * scale,
+						(_, 1) => f32::from(code) * scale + minimum,
+						_ => unreachable!(),
+					};
+					weights.push(f64::from(value));
+				}
+			}
+			return Ok(weights);
+		}
 		if self.0 >> 12 == 0 && self.0 >> 8 & 15 == 2 {
 			let block = codebook.first().copied().unwrap_or(0.0) as usize;
 			require(block != 0 && codebook.len() >= 17 + count.div_ceil(block) && data.len() * 2 >= count, "NF4 weights are invalid")?;
 			return (0..count).map(|index| codebook.get(1 + usize::from(data[index / 2] >> (index % 2 * 4) & 15)).zip(codebook.get(17 + index / block)).map(|(value, scale)| value * scale).ok_or_else(|| RecipeError::new("NF4 weight index is invalid"))).collect();
 		}
-		let bits = self.bits() as usize;
-		require((1..=8).contains(&bits) && !codebook.is_empty() && data.len() * 8 >= count * bits, "quantized weights are invalid")?;
-		(0..count)
-			.map(|index| {
-				let mut code = 0;
-				for bit in 0..bits {
-					code |= usize::from(data[(index * bits + bit) / 8] >> ((index * bits + bit) % 8) & 1) << bit;
-				}
-				codebook.get(code).copied().ok_or_else(|| RecipeError::new("quantized weight index is invalid"))
-			})
-			.collect()
+		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, and Q4_NF", self.0)))
 	}
 }
 pub struct Qi {
