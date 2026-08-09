@@ -398,7 +398,7 @@ pub use atv::{cos, elu, exp, gelu, leak, linear, ln, log, prelu, relu, selu, sig
 const IQ_DEFAULT: [u16; 5] = [0, 3, 1, 1, 5];
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Block {
-	operation: Operation, activation: Activation, normalization: Option<BlockNormalization>, format: FloatFormat, quantization: u16,
+	operation: Operation, activation: Activation, normalization: Option<BlockNormalization>, format: FloatFormat, quantization: u16, profile: bool,
 }
 #[derive(Clone)]
 pub struct Model {
@@ -423,7 +423,7 @@ $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) }
 impl Model {
 	fn push(&self, operation: Operation) -> Self {
 		let mut model = self.clone();
-		model.blocks.push(Block { operation, activation: Activation::Linear, normalization: None, format: model.format, quantization: model.quantization });
+		model.blocks.push(Block { operation, activation: Activation::Linear, normalization: None, format: model.format, quantization: model.quantization, profile: IntegerFormat(model.quantization).selection().is_some() });
 		model
 	}
 	fn activate(&self, activation: Activation) -> Self {
@@ -493,7 +493,7 @@ impl Model {
 		let mut model = self.clone();
 		let format = family << 12 | variant << 8 | u16::from(bits);
 		if let Some(block) = model.blocks.last_mut() {
-			block.quantization = format
+			block.quantization = format; block.profile = variant >= 4 && IntegerFormat(format).selection().is_some()
 		} else {
 			model.quantization = format
 		}
@@ -771,6 +771,10 @@ fn iq4_fit(values: &[f32], tries: i32) -> (f32, Vec<u8>) {
 }
 #[derive(Clone, Copy)]
 struct IntegerFormat(u16);
+impl IntegerFormat {
+	fn selection(self)->Option<u16>{let(bits,variant)=(self.bits(),self.0>>8&15);if self.0>>12!=0{return None}match(bits,variant){(2|6|8,3)=>Some(3),(3|4|5,3|5)=>Some(5),(3|4|5,4)=>Some(4),(3,6)=>Some(6),_=>None}}
+	fn tensor(self,role:u8,more:bool,output:bool)->u16{let bits=self.bits();let style=self.selection().unwrap();let bits=if output&&bits<6{6}else{match(bits,style,role){(2,_,2|3)=>3,(3,5,2)=>5,(3,5,3)=>4,(3,6,2|3)=>5,(4,4,2)=>5,(4,5,2)if more=>6,(5,5,2)if more=>6,_=>bits}};3<<8|u16::from(bits)}
+}
 trait Integer {
 	fn compress(self, weights: &[f64], importance: &[f64], config: Config) -> Result<(Vec<u8>, Vec<f64>)>;
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>>;
@@ -1675,14 +1679,17 @@ fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu,
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
 		graph.block_kind = block.operation.name();
-		lower_block(&mut graph, block, data, rows, gpu, config)?;
+		lower_block(&mut graph, block, model.blocks.len(), data, rows, gpu, config)?;
 	}
+	let mut output_profile=model.blocks.last().is_some_and(|block|block.profile);
 	if let Some(expected) = expected {
 		require(graph.output.elements() == expected, "model output width does not match .out()")?;
 	} else if graph.output.elements() != 1 {
 		let length = graph.output.length;
 		lower_conv(&mut graph, 1, length)?;
+		if model.quantization!=0{graph.nodes.last_mut().unwrap().argument[8]=f64::from(model.quantization)}output_profile=IntegerFormat(model.quantization).selection().is_some();
 	}
+	if output_profile&&let Some(node)=graph.nodes.iter_mut().rev().find(|node|node.parameters!=0&&node.block_index+1==model.blocks.len()){node.argument[8]=f64::from(IntegerFormat(node.argument[8]as u16).tensor(0,false,true))}
 	initialize_graph(&mut graph, config);
 	if expected.is_none() {
 		if let Some(offset) = output_bias_offset(&graph) {
@@ -1741,7 +1748,7 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	graph.source = narrow(graph.nodes.len(), "RAT graph nodes")? - 1;
 	Ok(graph.source)
 }
-fn lower_block(graph: &mut Graph, block: &Block, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+fn lower_block(graph: &mut Graph, block: &Block, total:usize, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let skip = graph.source;
 	let first = graph.nodes.len();
 	match &block.operation {
@@ -1769,9 +1776,10 @@ fn lower_block(graph: &mut Graph, block: &Block, data: &Prepared, rows: usize, g
 		push_node(graph, Primitive::Normalize, graph.output, 0, arguments(normalization as u8 as f64, epsilon), -2)?;
 	}
 	if block.quantization != 0 {
+		let more=graph.block_index<total/8||graph.block_index>=7*total/8||(graph.block_index-total/8)%3==2;let mut parameter=0;
 		for node in &mut graph.nodes[first..] {
 			if node.parameters != 0 {
-				node.argument[8] = f64::from(block.quantization)
+				let role=if block.operation.name()=="attn"{parameter}else{0};node.argument[8]=f64::from(if block.profile{IntegerFormat(block.quantization).tensor(role,more,false)}else{block.quantization});parameter+=1
 			}
 		}
 	}
@@ -3912,17 +3920,8 @@ struct Prepared {
 	norm_scale: Vec<f64>,
 	identities: Vec<u64>,
 }
-struct ChildTable {
-	name: String,
-	headers: Vec<String>,
-	rows: usize,
-}
-struct Table {
-	name: String,
-	headers: Vec<String>,
-	rows: Vec<Vec<String>>,
-	children: Vec<ChildTable>,
-}
+struct ChildTable { name: String, headers: Vec<String>, rows: usize }
+struct Table { name: String, headers: Vec<String>, rows: Vec<Vec<String>>, children: Vec<ChildTable> }
 enum FeatureType {
 	Numeric(&'static str),
 	Categorical(Vec<String>),
