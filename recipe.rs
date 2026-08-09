@@ -4415,7 +4415,7 @@ impl Train {
 		let support = |format: FloatFormat| format.kernel().is_some_and(|index| gpus.iter().all(|gpu| gpu.kernels[index].is_some()));
 		let available = [FP16, FP32, FP64].into_iter().filter(|format| support(*format)).flat_map(|format| [format!("f({},{}) [{}]", format.exponent, format.mantissa, format.llvm), format!("fp({}) [{}]", format.bits, format.llvm)]).collect::<Vec<_>>().join(", ");
 		require(model.blocks.iter().all(|block| block.format.native() == precision.native()), format!("mixed execution formats are unavailable on {}; available precision: {available}", gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
-		require(support(precision), format!("{} [{}] training is unavailable on {}; available precision: {available}", precision.label(), precision.llvm, gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
+		require(support(precision), format!("{} training is unavailable on {}; available precision: {available}", precision.label(), gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
 		config.precision = precision;
 		if let Some(seed) = self.seed {
 			config.random_seed = seed;
