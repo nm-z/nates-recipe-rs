@@ -100,10 +100,14 @@ fn render(command: &mut Command, role: &str, path: &Path) -> BuildResult<()> {
 }
 fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	let source = out.join("recipe-amd.ll");
+	let float_source = out.join("recipe-amd-f32.ll");
 	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, AMD_WIDTH);
-	fs::write(&source, ir)?;
+	fs::write(&source, &ir)?;
+	fs::write(&float_source, float_ir(ir))?;
 	let mut objects = Vec::new();
+	let mut float_objects = Vec::new();
 	let mut embeds = Vec::new();
+	let mut float_embeds = Vec::new();
 	let mut assemblies = Vec::new();
 	for architecture in architectures(manifest)? {
 		let output = out.join(format!("recipe-{architecture}.hsaco"));
@@ -117,20 +121,34 @@ fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 		if run(&mut command, "HSA LLVM IR compiler").is_err() {
 			continue;
 		}
+		let float_output = out.join(format!("recipe-{architecture}-f32.hsaco"));
+		let mut command = Command::new(text(manifest, "hsa-compiler")?);
+		command.args(["-target", "amdgcn-amd-amdhsa", &format!("-mcpu={architecture}"), "-O2", "-nogpulib"]);
+		for key in ["hsa-device-library", "hsa-clock-library", "hsa-finite-library", "hsa-math-library"] {
+			command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", text(manifest, key)?]);
+		}
+		let isa = Path::new(text(manifest, "hsa-device-library-directory")?).join(format!("oclc_isa_version_{}.bc", architecture.trim_start_matches("gfx")));
+		command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(isa).arg(&float_source).arg("-o").arg(&float_output);
+		if run(&mut command, "HSA FP32 LLVM IR compiler").is_err() {
+			continue;
+		}
 		let assembly = out.join(format!("recipe-{architecture}.amd.s"));
 		if render(Command::new(text(manifest, "hsa-disassembler")?).arg("--disassemble").arg(&output), "HSA disassembler", &assembly).is_err() {
 			continue;
 		}
 		objects.push(format!("{architecture}={}", output.display()));
+		float_objects.push(format!("{architecture}={}", float_output.display()));
 		embeds.push(format!("(\"{architecture}\", include_bytes!(\"{}\").as_slice()),", output.display()));
+		float_embeds.push(format!("(\"{architecture}\", include_bytes!(\"{}\").as_slice()),", float_output.display()));
 		assemblies.push(format!("{architecture}={}", assembly.display()));
 	}
 	if objects.is_empty() {
 		return Err(io::Error::other("no HSA architecture compiled").into());
 	}
-	let table = format!("static HSA_CODE_OBJECTS: &[(&str, &[u8])] = &[{}]\x3b", embeds.join(" "));
+	let table = format!("static HSA_CODE_OBJECTS: &[(&str, &[u8])] = &[{}]\x3b static HSA_F32_CODE_OBJECTS: &[(&str, &[u8])] = &[{}]\x3b", embeds.join(" "), float_embeds.join(" "));
 	fs::write(out.join("hsa-embed.rs"), table)?;
 	println!("cargo:rustc-env=RECIPE_HSA_CODE_OBJECTS={}", objects.join("\x3b"));
+	println!("cargo:rustc-env=RECIPE_HSA_F32_CODE_OBJECTS={}", float_objects.join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_HSA_ASSEMBLIES={}", assemblies.join("\x3b"));
 	println!("cargo:rustc-link-search=native={}", text(manifest, "hsa-library")?);
 	Ok(())
@@ -187,7 +205,7 @@ fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 }
 fn main() -> BuildResult<()> {
 	let manifest = fs::read_to_string("Cargo.toml")?;
-	for (key, environment) in [("epochs", "RECIPE_TRAIN_EPOCHS"), ("learning-rate", "RECIPE_TRAIN_LEARNING_RATE"), ("initial-weight", "RECIPE_TRAIN_INITIAL_WEIGHT"), ("adamw-beta1", "RECIPE_ADAMW_BETA1"), ("adamw-beta2", "RECIPE_ADAMW_BETA2"), ("adamw-epsilon", "RECIPE_ADAMW_EPSILON"), ("adamw-weight-decay", "RECIPE_ADAMW_WEIGHT_DECAY"), ("kmeans-iterations", "RECIPE_KMEANS_ITERATIONS"), ("surrogate-epochs", "RECIPE_SURROGATE_EPOCHS"), ("surrogate-rate", "RECIPE_SURROGATE_RATE"), ("surrogate-width", "RECIPE_SURROGATE_WIDTH"), ("rat-batch-rows", "RECIPE_RAT_BATCH_ROWS"), ("topology-latency-bytes", "RECIPE_TOPOLOGY_LATENCY_BYTES"), ("topology-bandwidth-bytes", "RECIPE_TOPOLOGY_BANDWIDTH_BYTES"), ("topology-probe-repetitions", "RECIPE_TOPOLOGY_REPETITIONS"), ("ssh-connect-timeout-seconds", "RECIPE_SSH_CONNECT_TIMEOUT"), ("random-seed", "RECIPE_RANDOM_SEED"), ("training-trials", "RECIPE_TRAINING_TRIALS"), ("training-start-run", "RECIPE_TRAINING_START_RUN"), ("normalization-epsilon", "RECIPE_NORMALIZATION_EPSILON"), ("leak-slope", "RECIPE_LEAK_SLOPE"), ("prelu-slope", "RECIPE_PRELU_SLOPE"), ("elu-alpha", "RECIPE_ELU_ALPHA"), ("selu-alpha", "RECIPE_SELU_ALPHA"), ("selu-scale", "RECIPE_SELU_SCALE"), ("gelu-scale", "RECIPE_GELU_SCALE"), ("gelu-cubic", "RECIPE_GELU_CUBIC"), ("huber-threshold", "RECIPE_HUBER_THRESHOLD"), ("output-tolerance", "RECIPE_OUTPUT_TOLERANCE"), ("gradient-tolerance", "RECIPE_GRADIENT_TOLERANCE"), ("backend-tolerance", "RECIPE_BACKEND_TOLERANCE")] {
+	for (key, environment) in [("epochs", "RECIPE_TRAIN_EPOCHS"), ("learning-rate", "RECIPE_TRAIN_LEARNING_RATE"), ("initial-weight", "RECIPE_TRAIN_INITIAL_WEIGHT"), ("adamw-beta1", "RECIPE_ADAMW_BETA1"), ("adamw-beta2", "RECIPE_ADAMW_BETA2"), ("adamw-epsilon", "RECIPE_ADAMW_EPSILON"), ("adamw-weight-decay", "RECIPE_ADAMW_WEIGHT_DECAY"), ("kmeans-iterations", "RECIPE_KMEANS_ITERATIONS"), ("quantization-block-weights", "RECIPE_QUANTIZATION_BLOCK_WEIGHTS"), ("surrogate-epochs", "RECIPE_SURROGATE_EPOCHS"), ("surrogate-rate", "RECIPE_SURROGATE_RATE"), ("surrogate-width", "RECIPE_SURROGATE_WIDTH"), ("rat-batch-rows", "RECIPE_RAT_BATCH_ROWS"), ("topology-latency-bytes", "RECIPE_TOPOLOGY_LATENCY_BYTES"), ("topology-bandwidth-bytes", "RECIPE_TOPOLOGY_BANDWIDTH_BYTES"), ("topology-probe-repetitions", "RECIPE_TOPOLOGY_REPETITIONS"), ("ssh-connect-timeout-seconds", "RECIPE_SSH_CONNECT_TIMEOUT"), ("random-seed", "RECIPE_RANDOM_SEED"), ("training-trials", "RECIPE_TRAINING_TRIALS"), ("training-start-run", "RECIPE_TRAINING_START_RUN"), ("normalization-epsilon", "RECIPE_NORMALIZATION_EPSILON"), ("leak-slope", "RECIPE_LEAK_SLOPE"), ("prelu-slope", "RECIPE_PRELU_SLOPE"), ("elu-alpha", "RECIPE_ELU_ALPHA"), ("selu-alpha", "RECIPE_SELU_ALPHA"), ("selu-scale", "RECIPE_SELU_SCALE"), ("gelu-scale", "RECIPE_GELU_SCALE"), ("gelu-cubic", "RECIPE_GELU_CUBIC"), ("huber-threshold", "RECIPE_HUBER_THRESHOLD"), ("output-tolerance", "RECIPE_OUTPUT_TOLERANCE"), ("gradient-tolerance", "RECIPE_GRADIENT_TOLERANCE"), ("backend-tolerance", "RECIPE_BACKEND_TOLERANCE")] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
 	for (key, environment) in [("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME"), ("ssh-config", "RECIPE_SSH_CONFIG")] {

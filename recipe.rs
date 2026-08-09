@@ -428,6 +428,7 @@ struct Block {
 	operation: Operation,
 	activation: Activation,
 	normalization: Option<BlockNormalization>,
+	format: FloatFormat,
 	quantization: u16,
 }
 #[derive(Clone)]
@@ -435,6 +436,7 @@ pub struct Model {
 	blocks: Vec<Block>,
 	loss: LossFunction,
 	downstream: Option<Vec<Block>>,
+	format: FloatFormat,
 	quantization: u16,
 }
 pub trait ModelLoss {
@@ -456,7 +458,7 @@ $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) }
 impl Model {
 	fn push(&self, operation: Operation) -> Self {
 		let mut model = self.clone();
-		model.blocks.push(Block { operation, activation: Activation::Linear, normalization: None, quantization: model.quantization });
+		model.blocks.push(Block { operation, activation: Activation::Linear, normalization: None, format: model.format, quantization: model.quantization });
 		model
 	}
 	fn activate(&self, activation: Activation) -> Self {
@@ -507,6 +509,41 @@ impl Model {
 		loss.apply(&mut model);
 		model
 	}
+	fn arithmetic(&self, format: FloatFormat) -> Self {
+		let mut model = self.clone();
+		if let Some(block) = model.blocks.last_mut() {
+			block.format = format
+		} else {
+			model.format = format
+		}
+		model
+	}
+	pub fn f(&self, exponent: u8, mantissa: u8) -> Self {
+		assert!(exponent != 0 && mantissa != 0, "f requires exponent and mantissa fields");
+		self.arithmetic(FloatFormat { family: "f", bits: exponent + mantissa + 1, exponent, mantissa, llvm: "unsupported" })
+	}
+	pub fn fp(&self, bits: u8) -> Self {
+		let (exponent, mantissa, llvm) = match bits {
+			8 => (4, 3, "unsupported"),
+			16 => (5, 10, "half"),
+			32 => (8, 23, "float"),
+			64 => (11, 52, "double"),
+			_ => panic!("fp bits must be 8, 16, 32, or 64"),
+		};
+		self.arithmetic(FloatFormat { family: "fp", bits, exponent, mantissa, llvm })
+	}
+	pub fn int(&self, bits: u8) -> Self {
+		assert!([1, 4, 8].contains(&bits), "int bits must be 1, 4, or 8");
+		self.arithmetic(FloatFormat { family: "int", bits, exponent: 0, mantissa: 0, llvm: "unsupported" })
+	}
+	pub fn bf(&self, bits: u8) -> Self {
+		assert_eq!(bits, 16, "bf bits must be 16");
+		self.arithmetic(FloatFormat { family: "bf", bits, exponent: 8, mantissa: 7, llvm: "bfloat" })
+	}
+	pub fn tf(&self, bits: u8) -> Self {
+		assert_eq!(bits, 32, "tf bits must be 32");
+		self.arithmetic(FloatFormat { family: "tf", bits, exponent: 8, mantissa: 10, llvm: "unsupported" })
+	}
 	fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self {
 		let mut model = self.clone();
 		let format = family << 12 | variant << 8 | u16::from(bits);
@@ -520,7 +557,7 @@ impl Model {
 	pub fn qi(&self, bits: u8) -> Qi {
 		assert!((2..=8).contains(&bits), "qi bits must be 2 through 8");
 		let q = |v| self.quantize(0, bits, v);
-		Qi { model: q(0), zero: q(0), one: q(1), k: Qk { model: q(2), s: q(3), m: q(4), l: q(5) } }
+		Qi { model: q(0), zero: q(0), one: q(1), nf: q(2), k: Qk { model: q(3), s: q(4), m: q(5), l: q(6) } }
 	}
 	pub fn iq(&self, bits: u8) -> Iq {
 		assert!((1..=4).contains(&bits), "iq bits must be 1 through 4");
@@ -553,7 +590,7 @@ impl Model {
 }
 fn quantization(code: u16) -> String {
 	let (family, bits, variant) = (code >> 12, code as u8, usize::from(code >> 8 & 15));
-	let suffix = if family == 0 { ["_0", "_1", "_K", "_K_S", "_K_M", "_K_L"][variant] } else { ["", "_XXS", "_XS", "_S", "_M", "_NL"][variant] };
+	let suffix = if family == 0 { ["_0", "_1", "_NF", "_K", "_K_S", "_K_M", "_K_L"][variant] } else { ["", "_XXS", "_XS", "_S", "_M", "_NL"][variant] };
 	format!("{}{bits}{suffix}", if family == 0 { "Q" } else { "IQ" })
 }
 #[derive(Clone, Copy)]
@@ -570,6 +607,22 @@ impl Integer for IntegerFormat {
 	fn compress(self, weights: &[f64], config: Config) -> Result<(Vec<u8>, Vec<f64>)> {
 		let bits = self.bits();
 		let (family, variant, levels) = (self.0 >> 12, self.0 >> 8 & 15, 1_usize << bits);
+		if family == 0 && variant == 2 {
+			const NF4: [f64; 16] = [-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0, 0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0];
+			let mut metadata = vec![config.quantization_block as f64];
+			metadata.extend(NF4);
+			let mut data = vec![0_u8; weights.len().div_ceil(2)];
+			for (block, values) in weights.chunks(config.quantization_block).enumerate() {
+				let scale = values.iter().map(|value| value.abs()).max_by(f64::total_cmp).unwrap_or(0.0);
+				metadata.push(scale);
+				for (offset, weight) in values.iter().enumerate() {
+					let index = block * config.quantization_block + offset;
+					let code = nearest(std::slice::from_ref(&(if scale == 0.0 { 0.0 } else { weight / scale })), &NF4, 1).0 as u8;
+					data[index / 2] |= code << (index % 2 * 4);
+				}
+			}
+			return Ok((data, metadata));
+		}
 		let codebook = if family == 0 && variant < 2 {
 			let (minimum, maximum) = if variant == 0 {
 				let bound = weights.iter().map(|value| value.abs()).max_by(f64::total_cmp).unwrap_or(0.0);
@@ -579,9 +632,9 @@ impl Integer for IntegerFormat {
 			};
 			(0..levels).map(|index| minimum + (maximum - minimum) * index as f64 / (levels - 1) as f64).collect()
 		} else {
-			let iterations = if (family == 0 && variant == 3) || (family == 1 && variant == 2) {
+			let iterations = if (family == 0 && variant == 4) || (family == 1 && variant == 2) {
 				config.kmeans_iterations.div_ceil(2)
-			} else if (family == 0 && variant == 5) || (family == 1 && variant >= 4) {
+			} else if (family == 0 && variant == 6) || (family == 1 && variant >= 4) {
 				config.kmeans_iterations.saturating_mul(2)
 			} else {
 				config.kmeans_iterations
@@ -599,6 +652,11 @@ impl Integer for IntegerFormat {
 		Ok((data, codebook))
 	}
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>> {
+		if self.0 >> 12 == 0 && self.0 >> 8 & 15 == 2 {
+			let block = codebook.first().copied().unwrap_or(0.0) as usize;
+			require(block != 0 && codebook.len() >= 17 + count.div_ceil(block) && data.len() * 2 >= count, "NF4 weights are invalid")?;
+			return (0..count).map(|index| codebook.get(1 + usize::from(data[index / 2] >> (index % 2 * 4) & 15)).zip(codebook.get(17 + index / block)).map(|(value, scale)| value * scale).ok_or_else(|| RecipeError::new("NF4 weight index is invalid"))).collect();
+		}
 		let bits = self.bits() as usize;
 		require((1..=8).contains(&bits) && !codebook.is_empty() && data.len() * 8 >= count * bits, "quantized weights are invalid")?;
 		(0..count)
@@ -616,6 +674,7 @@ pub struct Qi {
 	model: Model,
 	pub zero: Model,
 	pub one: Model,
+	pub nf: Model,
 	pub k: Qk,
 }
 pub struct Qk {
@@ -807,7 +866,7 @@ impl Recipe {
 		Data { sources: sources.into_data_sources(), target: Vec::new(), exclusions: Vec::new(), routes: Vec::new(), normalize: false, split: 1.0, prepared: OnceLock::new() }
 	}
 	pub fn model(&self) -> Model {
-		Model { blocks: Vec::new(), loss: mse, downstream: None, quantization: 0 }
+		Model { blocks: Vec::new(), loss: mse, downstream: None, format: FP64, quantization: 0 }
 	}
 	pub fn devices(&self) -> Vec<String> {
 		self.topology().devices.into_iter().map(|device| device.name).collect()
@@ -816,7 +875,7 @@ impl Recipe {
 		topology().unwrap_or_else(|error| panic!("{error}"))
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: None, resume: None, save: None, seed: None, precision: FloatFormat("fp", 64, "double") }
+		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: None, resume: None, save: None, seed: None }
 	}
 	pub fn export(&self, source: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
 		let source = source.as_ref();
@@ -1565,6 +1624,7 @@ impl Tile {
 #[derive(Clone, Copy)]
 struct Config {
 	kmeans_iterations: usize,
+	quantization_block: usize,
 	surrogate_epochs: usize,
 	surrogate_width: usize,
 	surrogate_rate: f64,
@@ -1580,7 +1640,7 @@ struct Config {
 }
 impl Config {
 	fn load() -> Result<Self> {
-		Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, rat_batch: natural("RAT batch rows", env!("RECIPE_RAT_BATCH_ROWS"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: FP64 })
+		Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, rat_batch: natural("RAT batch rows", env!("RECIPE_RAT_BATCH_ROWS"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: FP64 })
 	}
 }
 fn number(name: &str, text: &str) -> Result<f64> {
@@ -2417,9 +2477,10 @@ impl Gpu {
 				Driver::Hsa(driver) => {
 					require(arguments.len() == kernel.layout.len(), "kernel argument count is invalid")?;
 					ptr::write_bytes(driver.kernarg.cast::<u8>(), 0, driver.kernarg_size);
-					let mut offset = 0;
+					let mut offset = 0_usize;
 					for (argument, kind) in arguments.iter().zip(kernel.layout) {
 						let bytes = usize::from(*kind - b'0');
+						offset = offset.next_multiple_of(bytes);
 						ptr::copy_nonoverlapping((*argument).cast::<u8>(), driver.kernarg.cast::<u8>().add(offset), bytes);
 						offset += bytes;
 					}
@@ -2881,8 +2942,8 @@ fn kfd_property(text: &str, name: &str) -> Result<u32> {
 #[cfg(amd)]
 include!(concat!(env!("OUT_DIR"), "/hsa-embed.rs"));
 #[cfg(amd)]
-fn hsa_artifact(target: &str) -> Result<&'static [u8]> {
-	HSA_CODE_OBJECTS.iter().find_map(|entry| (entry.0 == target).then_some(entry.1)).ok_or_else(|| RecipeError::new(format!("HSA artifact for {target} is absent")))
+fn hsa_artifact(artifacts: &'static [(&str, &[u8])], target: &str) -> Result<&'static [u8]> {
+	artifacts.iter().find_map(|entry| (entry.0 == target).then_some(entry.1)).ok_or_else(|| RecipeError::new(format!("HSA artifact for {target} is absent")))
 }
 fn load_amd() -> Result<Vec<Gpu>> {
 	#[cfg(not(amd))]
@@ -2927,37 +2988,46 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 		let properties = fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read {path}: {error}")))?;
 		let gfx = kfd_property(&properties, "gfx_target_version")?;
 		let target = format!("gfx{}{}{}", gfx / 10000, gfx / 100 % 100, gfx % 100);
-		let code = hsa_artifact(&target)?;
+		let code = hsa_artifact(HSA_CODE_OBJECTS, &target)?;
+		let float_code = hsa_artifact(HSA_F32_CODE_OBJECTS, &target)?;
 		let reader_create: unsafe extern "C" fn(*const c_void, usize, *mut u64) -> i32 = runtime.function(b"hsa_code_object_reader_create_from_memory\0")?;
 		let executable_create: unsafe extern "C" fn(i32, i32, Ptr, *mut u64) -> i32 = runtime.function(b"hsa_executable_create_alt\0")?;
 		let executable_load: unsafe extern "C" fn(u64, u64, u64, Ptr, Ptr) -> i32 = runtime.function(b"hsa_executable_load_agent_code_object\0")?;
 		let executable_freeze: unsafe extern "C" fn(u64, Ptr) -> i32 = runtime.function(b"hsa_executable_freeze\0")?;
 		let symbol: HsaSymbol = runtime.function(b"hsa_executable_get_symbol_by_name\0")?;
 		let symbol_info: HsaSymbolInfo = runtime.function(b"hsa_executable_symbol_get_info\0")?;
-		let (mut reader, mut executable) = (0, 0);
+		let (mut reader, mut float_reader, mut executable) = (0, 0, 0);
 		check(reader_create(code.as_ptr().cast(), code.len(), &mut reader), "code-object reader")?;
+		check(reader_create(float_code.as_ptr().cast(), float_code.len(), &mut float_reader), "FP32 code-object reader")?;
 		check(executable_create(1, 0, ptr::null_mut(), &mut executable), "executable creation")?;
 		check(executable_load(executable, agent, reader, ptr::null_mut(), ptr::null_mut()), "code-object load")?;
+		check(executable_load(executable, agent, float_reader, ptr::null_mut(), ptr::null_mut()), "FP32 code-object load")?;
 		check(executable_freeze(executable, ptr::null_mut()), "executable freeze")?;
 		let forward = hsa_kernel(symbol, symbol_info, executable, agent, b"forward_graph.kd\0", 8, FORWARD_ARGS)?;
 		let epoch = hsa_kernel(symbol, symbol_info, executable, agent, b"tape_epoch_graph.kd\0", 8, EPOCH_ARGS)?;
+		let forward_f32 = hsa_kernel(symbol, symbol_info, executable, agent, b"forward_graph_f32.kd\0", 4, FORWARD_ARGS)?;
+		let epoch_f32 = hsa_kernel(symbol, symbol_info, executable, agent, b"tape_epoch_graph_f32.kd\0", 4, EPOCH_F32_ARGS)?;
 		let forward_resources = Resources { shared: forward.shared, max_block: workgroup, element: 8 };
 		let epoch_resources = Resources { shared: epoch.shared, max_block: workgroup, element: 8 };
+		let forward_f32_resources = Resources { shared: forward_f32.shared, max_block: workgroup, element: 4 };
+		let epoch_f32_resources = Resources { shared: epoch_f32.shared, max_block: workgroup, element: 4 };
 		let lds = kfd_property(&properties, "lds_size_in_kb")?.checked_mul(1024).ok_or_else(|| RecipeError::new("AMD LDS size overflows"))?;
 		let forward_geometry = amd(cus, wave, workgroup, lds, forward_resources)?;
 		let epoch_geometry = amd(cus, wave, workgroup, lds, epoch_resources)?;
+		let forward_f32_geometry = amd(cus, wave, workgroup, lds, forward_f32_resources)?;
+		let epoch_f32_geometry = amd(cus, wave, workgroup, lds, epoch_f32_resources)?;
 		let queue_create: unsafe extern "C" fn(u64, u32, u32, Ptr, Ptr, u32, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_queue_create\0")?;
 		let signal_create: unsafe extern "C" fn(i64, u32, *const u64, *mut u64) -> i32 = runtime.function(b"hsa_signal_create\0")?;
 		let allocate: unsafe extern "C" fn(u64, usize, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_amd_memory_pool_allocate\0")?;
 		let allow: unsafe extern "C" fn(u32, *const u64, *const u32, *const c_void) -> i32 = runtime.function(b"hsa_amd_agents_allow_access\0")?;
-		let (ka_size, mut ka) = (forward.kernarg.max(epoch.kernarg), ptr::null_mut());
+		let (ka_size, mut ka) = ([forward.kernarg, epoch.kernarg, forward_f32.kernarg, epoch_f32.kernarg].into_iter().max().unwrap(), ptr::null_mut());
 		let (mut queue, mut completion) = (ptr::null_mut(), 0);
 		driver_status(Backend::Amd, queue_create(agent, 256, 2, ptr::null_mut(), ptr::null_mut(), u32::MAX, u32::MAX, &mut queue), "queue creation")?;
 		check(signal_create(0, 0, ptr::null(), &mut completion), "signal creation")?;
 		check(allocate(kernarg.found, ka_size, 0, &mut ka), "KERNARG allocation")?;
 		check(allow(1, &agent, ptr::null(), ka), "GPU KERNARG access")?;
 		eprintln!("AMD forward block {} epoch block {}", forward_geometry.block, epoch_geometry.block);
-		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, driver: Driver::Hsa(Hsa { allocate, allow, queue, cpu_agent, kernarg_size: ka_size, kernarg: ka, free: runtime.function(b"hsa_amd_memory_pool_free\0")?, copy: runtime.function(b"hsa_memory_copy\0")?, store: runtime.function(b"hsa_signal_store_screlease\0")?, wait: runtime.function(b"hsa_signal_wait_scacquire\0")?, write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?, signal: completion, vram_pool: vram.found, kernarg_pool: kernarg.found }), forward: Dispatch { kernel: forward, geometry: forward_geometry }, epoch: Dispatch { kernel: epoch, geometry: epoch_geometry }, forward_f32: None, epoch_f32: None, memory: memory as u64, clock, shared_limit: lds, dispatch: Mutex::new(()) })
+		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, driver: Driver::Hsa(Hsa { allocate, allow, queue, cpu_agent, kernarg_size: ka_size, kernarg: ka, free: runtime.function(b"hsa_amd_memory_pool_free\0")?, copy: runtime.function(b"hsa_memory_copy\0")?, store: runtime.function(b"hsa_signal_store_screlease\0")?, wait: runtime.function(b"hsa_signal_wait_scacquire\0")?, write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?, signal: completion, vram_pool: vram.found, kernarg_pool: kernarg.found }), forward: Dispatch { kernel: forward, geometry: forward_geometry }, epoch: Dispatch { kernel: epoch, geometry: epoch_geometry }, forward_f32: Some(Dispatch { kernel: forward_f32, geometry: forward_f32_geometry }), epoch_f32: Some(Dispatch { kernel: epoch_f32, geometry: epoch_f32_geometry }), memory: memory as u64, clock, shared_limit: lds, dispatch: Mutex::new(()) })
 	}
 }
 fn load_nvidia() -> Result<Vec<Gpu>> {
@@ -3726,61 +3796,23 @@ pub struct Train {
 	resume: Option<String>,
 	save: Option<String>,
 	seed: Option<usize>,
-	precision: FloatFormat,
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct FloatFormat(&'static str, u8, &'static str);
-const FP64: FloatFormat = FloatFormat("fp", 64, "double");
-const FP32: FloatFormat = FloatFormat("fp", 32, "float");
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FloatFormat {
+	family: &'static str,
+	bits: u8,
+	exponent: u8,
+	mantissa: u8,
+	llvm: &'static str,
+}
+const FP64: FloatFormat = FloatFormat { family: "fp", bits: 64, exponent: 11, mantissa: 52, llvm: "double" };
+const FP32: FloatFormat = FloatFormat { family: "fp", bits: 32, exponent: 8, mantissa: 23, llvm: "float" };
 impl FloatFormat {
 	fn bytes(self) -> usize {
-		usize::from(self.1 / 8)
+		usize::from(self.bits.div_ceil(8))
 	}
 }
-trait Float {
-	fn format(self) -> FloatFormat;
-}
-struct Fp(u8);
-struct Bf(u8);
-struct Nf(u8);
-struct Tf(u8);
-impl Float for Fp {
-	fn format(self) -> FloatFormat {
-		FloatFormat(
-			"fp",
-			self.0,
-			if self.0 == 64 {
-				"double"
-			} else if self.0 == 32 {
-				"float"
-			} else {
-				"unsupported"
-			},
-		)
-	}
-}
-impl Float for Bf {
-	fn format(self) -> FloatFormat {
-		FloatFormat("bf", self.0, "bfloat")
-	}
-}
-impl Float for Nf {
-	fn format(self) -> FloatFormat {
-		FloatFormat("nf", self.0, "normal")
-	}
-}
-impl Float for Tf {
-	fn format(self) -> FloatFormat {
-		FloatFormat("tf", self.0, "tensor")
-	}
-}
-macro_rules! float_methods { ($($name:ident $kind:ident)+) => { $(pub fn $name(self, bits: u8) -> Self { self.float($kind(bits)) })+ }; }
 impl Train {
-	fn float(mut self, value: impl Float) -> Self {
-		self.precision = value.format();
-		self
-	}
-	float_methods!(fp Fp bf Bf nf Nf tf Tf);
 	pub const fn seed(mut self, value: usize) -> Self {
 		self.seed = Some(value);
 		self
@@ -3822,10 +3854,12 @@ impl Train {
 	fn try_run(&self, model: &Model, data: &Data) -> Result<TrainingReport> {
 		drop(topology()?);
 		let (gpus, mut config) = (all_gpus()?, Config::load()?);
+		let precision = model.blocks.first().map(|block| block.format).unwrap_or(model.format);
+		require(model.blocks.iter().all(|block| block.format == precision), "mixed execution formats are unavailable on the active hardware")?;
 		let fp32 = gpus.iter().all(|gpu| gpu.forward_f32.is_some() && gpu.epoch_f32.is_some());
 		let available = if fp32 { "fp(32) [float], fp(64) [double]" } else { "fp(64) [double]" };
-		require(self.precision == FP64 || self.precision == FP32 && fp32, format!("{}({}) [{}] training is unavailable on {}; available precision: {available}", self.precision.0, self.precision.1, self.precision.2, gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
-		config.precision = self.precision;
+		require(precision == FP64 || precision == FP32 && fp32, format!("{}({}) [{}] training is unavailable on {}; available precision: {available}", precision.family, precision.bits, precision.llvm, gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
+		config.precision = precision;
 		if let Some(seed) = self.seed {
 			config.random_seed = seed;
 		}

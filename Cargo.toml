@@ -46,6 +46,7 @@ adamw-beta2 = 0.999
 adamw-epsilon = 0.00000001
 adamw-weight-decay = 0.01
 kmeans-iterations = 8
+quantization-block-weights = 64
 surrogate-epochs = 8
 surrogate-rate = 0.01
 surrogate-width = 8
