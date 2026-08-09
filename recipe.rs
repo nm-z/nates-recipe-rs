@@ -493,7 +493,7 @@ impl Model {
 		let mut model = self.clone();
 		let format = family << 12 | variant << 8 | u16::from(bits);
 		if let Some(block) = model.blocks.last_mut() {
-			block.quantization = format; block.profile = variant >= 4 && IntegerFormat(format).selection().is_some()
+			block.quantization = format; block.profile = IntegerFormat(format).selection().is_some()
 		} else {
 			model.quantization = format
 		}
@@ -772,8 +772,8 @@ fn iq4_fit(values: &[f32], tries: i32) -> (f32, Vec<u8>) {
 #[derive(Clone, Copy)]
 struct IntegerFormat(u16);
 impl IntegerFormat {
-	fn selection(self)->Option<u16>{let(bits,variant)=(self.bits(),self.0>>8&15);if self.0>>12!=0{return None}match(bits,variant){(2|6|8,3)=>Some(3),(3|4|5,3|5)=>Some(5),(3|4|5,4)=>Some(4),(3,6)=>Some(6),_=>None}}
-	fn tensor(self,role:u8,more:bool,output:bool)->u16{let bits=self.bits();let style=self.selection().unwrap();let bits=if output&&bits<6{6}else{match(bits,style,role){(2,_,2|3)=>3,(3,5,2)=>5,(3,5,3)=>4,(3,6,2|3)=>5,(4,4,2)=>5,(4,5,2)if more=>6,(5,5,2)if more=>6,_=>bits}};3<<8|u16::from(bits)}
+	fn selection(self)->Option<u16>{let(family,bits,variant)=(self.0>>12,self.bits(),self.0>>8&15);match(family,bits,variant){(0,2|6|8,3)=>Some(3),(0,3|4|5,3|5)=>Some(5),(0,3|4|5,4)=>Some(4),(0,3,6)=>Some(6),(1,2,4)|(1,3,2|4)=>Some(variant),_=>None}}
+	fn tensor(self,role:u8,more:bool,output:bool)->u16{let(family,bits,style)=(self.0>>12,self.bits(),self.selection().unwrap());if output{return 3<<8|6}if family==1{return match(bits,style,role,more){(2,4,2|3,_)|(2,4,_,true)=>1<<12|3<<8|3,(3,2,0|1,_)|(3,2,_,false)=>1<<12|1<<8|3,(3,4,2|3,_)|(3,4,_,true)=>3<<8|4,_=>1<<12|3<<8|u16::from(bits)}}let bits=match(bits,style,role){(2,_,2|3)=>3,(3,5,2)=>5,(3,5,3)=>4,(3,6,2|3)=>5,(4,4,2)=>5,(4,5,2)if more=>6,(5,5,2)if more=>6,_=>bits};3<<8|u16::from(bits)}
 }
 trait Integer {
 	fn compress(self, weights: &[f64], importance: &[f64], config: Config) -> Result<(Vec<u8>, Vec<f64>)>;
@@ -1681,15 +1681,15 @@ fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu,
 		graph.block_kind = block.operation.name();
 		lower_block(&mut graph, block, model.blocks.len(), data, rows, gpu, config)?;
 	}
-	let mut output_profile=model.blocks.last().is_some_and(|block|block.profile);
+	let mut output_profile=model.blocks.last().filter(|block|block.profile).map(|block|IntegerFormat(block.quantization));
 	if let Some(expected) = expected {
 		require(graph.output.elements() == expected, "model output width does not match .out()")?;
 	} else if graph.output.elements() != 1 {
 		let length = graph.output.length;
 		lower_conv(&mut graph, 1, length)?;
-		if model.quantization!=0{graph.nodes.last_mut().unwrap().argument[8]=f64::from(model.quantization)}output_profile=IntegerFormat(model.quantization).selection().is_some();
+		if model.quantization!=0{graph.nodes.last_mut().unwrap().argument[8]=f64::from(model.quantization)}output_profile=IntegerFormat(model.quantization).selection().map(|_|IntegerFormat(model.quantization));
 	}
-	if output_profile&&let Some(node)=graph.nodes.iter_mut().rev().find(|node|node.parameters!=0&&node.block_index+1==model.blocks.len()){node.argument[8]=f64::from(IntegerFormat(node.argument[8]as u16).tensor(0,false,true))}
+	if let Some(format)=output_profile&&let Some(node)=graph.nodes.iter_mut().rev().find(|node|node.parameters!=0&&node.block_index+1==model.blocks.len()){node.argument[8]=f64::from(format.tensor(0,false,true))}
 	initialize_graph(&mut graph, config);
 	if expected.is_none() {
 		if let Some(offset) = output_bias_offset(&graph) {
