@@ -184,18 +184,25 @@ fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
-	let source = out.join("recipe-cpu.ll");
-	fs::write(&source, ir)?;
-	let object = out.join("recipe-cpu.o");
 	let clang = ["nvidia-compiler", "hsa-compiler"].iter().filter_map(|key| text(manifest, key).ok()).find(|path| Path::new(path).exists()).unwrap_or("clang");
-	let mut compile = Command::new(clang);
-	compile.args(["-target", &target, "-Xclang", "-opaque-pointers", "-x", "ir", "-O2", "-fPIC", "-c", "-o"]).arg(&object).arg(&source);
-	if run(&mut compile, "CPU LLVM IR compiler").is_err() {
-		let mut backend = Command::new("llc");
-		backend.args(["--mtriple", &target, "-O2", "--relocation-model=pic", "-filetype=obj", "-o"]).arg(&object).arg(&source);
-		run(&mut backend, "CPU LLVM IR backend")?;
+	let float = float_ir(ir.clone()).replace("@recipe_forward_cpu(", "@recipe_forward_cpu_f32(").replace("@exp(", "@expf(").replace("@tanh(", "@tanhf(").replace("@cos(", "@cosf(").replace("@sin(", "@sinf(").replace("@log(", "@logf(");
+	let mut objects = Vec::new();
+	for (name, contents) in [("recipe-cpu", ir), ("recipe-cpu-f32", float)] {
+		let source = out.join(format!("{name}.ll"));
+		let object = out.join(format!("{name}.o"));
+		fs::write(&source, contents)?;
+		let mut compile = Command::new(clang);
+		compile.args(["-target", &target, "-Xclang", "-opaque-pointers", "-x", "ir", "-O2", "-fPIC", "-c", "-o"]).arg(&object).arg(&source);
+		if run(&mut compile, "CPU LLVM IR compiler").is_err() {
+			let mut backend = Command::new("llc");
+			backend.args(["--mtriple", &target, "-O2", "--relocation-model=pic", "-filetype=obj", "-o"]).arg(&object).arg(&source);
+			run(&mut backend, "CPU LLVM IR backend")?;
+		}
+		objects.push(object);
 	}
-	run(Command::new("llvm-ar").arg("rcs").arg(out.join("librecipe_cpu.a")).arg(&object), "CPU archive")?;
+	let mut archive = Command::new("llvm-ar");
+	archive.arg("rcs").arg(out.join("librecipe_cpu.a")).args(objects);
+	run(&mut archive, "CPU archive")?;
 	println!("cargo:rustc-link-search=native={}", out.display());
 	println!("cargo:rustc-link-lib=static=recipe_cpu");
 	if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("musl") {

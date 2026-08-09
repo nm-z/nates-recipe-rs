@@ -6,32 +6,14 @@ mod bundle {
 	use std::{collections::BTreeMap, io::Write as _, str::FromStr};
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
-		pub graph: Graph,
-		pub inputs: Vec<String>,
-		pub outputs: Vec<String>,
-		pub norm_mean: Vec<f64>,
-		pub norm_scale: Vec<f64>,
-		pub target_min: f64,
-		pub target_span: f64,
-		pub bn_stats: Vec<f64>,
+		pub graph: Graph, pub precision: FloatFormat, pub inputs: Vec<String>, pub outputs: Vec<String>,
+		pub norm_mean: Vec<f64>, pub norm_scale: Vec<f64>, pub target_min: f64, pub target_span: f64, pub bn_stats: Vec<f64>,
 	}
 	#[derive(Default)]
 	struct Builder {
-		inputs: Vec<String>,
-		outputs: Vec<String>,
-		input: Option<Shape>,
-		output: Option<Shape>,
-		nodes: Vec<Node>,
-		arguments: usize,
-		parameters: Vec<f64>,
-		frozen: Vec<u8>,
-		programs: Vec<f64>,
-		state: TrainingState,
-		norm_mean: Vec<f64>,
-		norm_scale: Vec<f64>,
-		target_min: f64,
-		target_span: f64,
-		bn_stats: Vec<f64>,
+		inputs: Vec<String>, outputs: Vec<String>, input: Option<Shape>, output: Option<Shape>, nodes: Vec<Node>, arguments: usize,
+		parameters: Vec<f64>, frozen: Vec<u8>, programs: Vec<f64>, state: TrainingState, precision: Option<FloatFormat>,
+		norm_mean: Vec<f64>, norm_scale: Vec<f64>, target_min: f64, target_span: f64, bn_stats: Vec<f64>,
 	}
 	impl Builder {
 		fn finish(self) -> Result<StoredGraph> {
@@ -47,7 +29,7 @@ mod bundle {
 			require(self.outputs.len() == output.elements(), "model graph output schema has the wrong width")?;
 			require(self.norm_mean.len() == self.norm_scale.len() && (self.norm_mean.is_empty() || self.norm_mean.len() == self.inputs.len()), "model graph normalization stats have the wrong width")?;
 			let source = self.nodes.len() as i32 - 1;
-			Ok(StoredGraph { graph: Graph { nodes: self.nodes, parameters: self.parameters, frozen: self.frozen, programs: self.programs, input, output, source, state: self.state, block_index: 0, block_kind: "" }, inputs: self.inputs, outputs: self.outputs, norm_mean: self.norm_mean, norm_scale: self.norm_scale, target_min: self.target_min, target_span: self.target_span, bn_stats: self.bn_stats })
+			Ok(StoredGraph { graph: Graph { nodes: self.nodes, parameters: self.parameters, frozen: self.frozen, programs: self.programs, input, output, source, state: self.state, block_index: 0, block_kind: "" }, precision: self.precision.ok_or_else(|| RecipeError::new("model graph has no arithmetic format"))?, inputs: self.inputs, outputs: self.outputs, norm_mean: self.norm_mean, norm_scale: self.norm_scale, target_min: self.target_min, target_span: self.target_span, bn_stats: self.bn_stats })
 		}
 	}
 	fn values<T: FromStr>(text: &str, role: &str) -> Result<Vec<T>>
@@ -80,6 +62,12 @@ mod bundle {
 		require(value.len() == 11, "model graph node descriptor has the wrong width")?;
 		Ok(Node { op: primitive(value[0])?, source: value[1], second: value[2], input: Shape { channels: value[3] as usize, length: value[4] as usize }, output: Shape { channels: value[5] as usize, length: value[6] as usize }, offset: value[7] as usize, parameters: value[8] as usize, argument: [0.0; 9], program_offset: value[9] as usize, program_count: value[10] as usize, block_index: 0, block_kind: "" })
 	}
+	fn precision(value: &str) -> Result<FloatFormat> {
+		let fields = value.split_whitespace().collect::<Vec<_>>();
+		require(fields.len() == 5, "arithmetic format has the wrong width")?;
+		let shape = (fields[0], self::value::<u8>(fields[1], "arithmetic bits")?, self::value::<u8>(fields[2], "arithmetic exponent")?, self::value::<u8>(fields[3], "arithmetic mantissa")?, fields[4]);
+		match shape { ("fp", 64, 11, 52, "double") => Ok(FP64), ("fp", 32, 8, 23, "float") => Ok(FP32), _ => Err(RecipeError::new(format!("saved arithmetic format {}({}) [{}] is unavailable; available precision: fp(32) [float], fp(64) [double]", fields[0], fields[1], fields[4]))) }
+	}
 	pub(super) fn load(path: &str) -> Result<(String, Vec<StoredGraph>)> {
 		require(path.ends_with(".ogdl"), "model path requires .ogdl")?;
 		let document = fs::read_to_string(path).map_err(|error| RecipeError::new(format!("cannot read {path}: {error}")))?;
@@ -103,6 +91,7 @@ mod bundle {
 			}
 			let builder = current.as_mut().ok_or_else(|| RecipeError::new("model value precedes graph"))?;
 			match kind {
+				"arithmetic" => builder.precision = Some(precision(value)?),
 				"in" => builder.inputs.push(value.to_owned()),
 				"out" => builder.outputs.push(value.to_owned()),
 				"shape" => {
@@ -175,6 +164,7 @@ mod bundle {
 				document.push_str(&format!("        out {name}\n"))
 			}
 			let graph = &stored.graph;
+			field(&mut document, "arithmetic", &format!("{} {} {} {} {}", stored.precision.family, stored.precision.bits, stored.precision.exponent, stored.precision.mantissa, stored.precision.llvm));
 			let quantized = graph.nodes.iter().any(|node| node.argument[8] != 0.0);
 			field(&mut document, "shape", &format!("{} {} {} {}", graph.input.channels, graph.input.length, graph.output.channels, graph.output.length));
 			for node in &graph.nodes {
@@ -218,7 +208,7 @@ mod bundle {
 		a.op == b.op && a.source == b.source && a.second == b.second && a.input == b.input && a.output == b.output && a.offset == b.offset && a.parameters == b.parameters && a.argument.map(f64::to_bits) == b.argument.map(f64::to_bits) && a.program_offset == b.program_offset && a.program_count == b.program_count
 	}
 	fn same_graph(a: &StoredGraph, b: &StoredGraph) -> bool {
-		a.inputs == b.inputs && a.outputs == b.outputs && a.graph.input == b.graph.input && a.graph.output == b.graph.output && a.graph.frozen == b.graph.frozen && a.graph.programs == b.graph.programs && a.graph.parameters.len() == b.graph.parameters.len() && a.graph.nodes.len() == b.graph.nodes.len() && a.graph.nodes.iter().zip(&b.graph.nodes).all(|(a, b)| same_node(a, b))
+		a.precision == b.precision && a.inputs == b.inputs && a.outputs == b.outputs && a.graph.input == b.graph.input && a.graph.output == b.graph.output && a.graph.frozen == b.graph.frozen && a.graph.programs == b.graph.programs && a.graph.parameters.len() == b.graph.parameters.len() && a.graph.nodes.len() == b.graph.nodes.len() && a.graph.nodes.iter().zip(&b.graph.nodes).all(|(a, b)| same_node(a, b))
 	}
 	pub(super) fn restore(path: &str, schema: &str, graphs: &mut [StoredGraph], identities: &[u64]) -> Result<()> {
 		if !fs::exists(path).map_err(|error| RecipeError::new(format!("cannot inspect {path}: {error}")))? {
@@ -1520,7 +1510,17 @@ fn extract_bn_stats(graph: &Graph, contexts: &[Buffer]) -> Result<Vec<f64>> {
 	}
 	Ok(stats)
 }
-fn cpu_forward(graph: &Graph, samples: &[f64]) -> Result<Vec<f64>> {
+trait CpuFloat: Copy + Default {
+	fn convert(value: f64) -> Self; fn expand(self) -> f64;
+	unsafe fn forward(samples: *const Self, weights: *const Self, values: *const *mut Self, contexts: *const *mut Self, descriptors: *const i32, arguments: *const Self, rows: i32, nodes: i32, timings: *mut u64, tiles: *const Tile); }
+impl CpuFloat for f64 {
+	fn convert(value: f64) -> Self { value } fn expand(self) -> f64 { self }
+	unsafe fn forward(samples: *const Self, weights: *const Self, values: *const *mut Self, contexts: *const *mut Self, descriptors: *const i32, arguments: *const Self, rows: i32, nodes: i32, timings: *mut u64, tiles: *const Tile) { unsafe { recipe_forward_cpu(samples, weights, values, contexts, descriptors, arguments, rows, nodes, 1, 1, 1, 1, timings, tiles) } } }
+impl CpuFloat for f32 {
+	fn convert(value: f64) -> Self { value as f32 } fn expand(self) -> f64 { self as f64 }
+	unsafe fn forward(samples: *const Self, weights: *const Self, values: *const *mut Self, contexts: *const *mut Self, descriptors: *const i32, arguments: *const Self, rows: i32, nodes: i32, timings: *mut u64, tiles: *const Tile) { unsafe { recipe_forward_cpu_f32(samples, weights, values, contexts, descriptors, arguments, rows, nodes, 1, 1, 1, 1, timings, tiles) } }
+}
+fn cpu_forward<T: CpuFloat>(graph: &Graph, samples: &[f64]) -> Result<Vec<f64>> {
 	let inputs = graph.input.elements();
 	require(inputs != 0 && !samples.is_empty() && samples.len() % inputs == 0, "model input batch is invalid")?;
 	let rows = samples.len() / inputs;
@@ -1528,20 +1528,22 @@ fn cpu_forward(graph: &Graph, samples: &[f64]) -> Result<Vec<f64>> {
 	let (mut descriptors, mut arguments, mut buffers, mut contexts, mut tiles) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
 	for node in &graph.nodes {
 		descriptors.extend(node_descriptor(node, program_base)?);
-		arguments.extend(node.argument);
-		buffers.push(vec![0.0_f64; graph_rows_buffer(node.output, rows, size_of::<f64>())? / size_of::<f64>()]);
-		contexts.push(vec![0.0_f64; node_context(node, rows, size_of::<f64>())? / size_of::<f64>()]);
+		arguments.extend(node.argument.map(T::convert));
+		buffers.push(vec![T::default(); graph_rows_buffer(node.output, rows, size_of::<T>())? / size_of::<T>()]);
+		contexts.push(vec![T::default(); node_context(node, rows, size_of::<T>())? / size_of::<T>()]);
 		tiles.push(Tile { m: narrow(node.output.length.max(1), "CPU tile M")? as u32, n: narrow(node.output.channels.max(1), "CPU tile N")? as u32, k: narrow(node.input.elements().clamp(1, TILE_CAPACITY), "CPU tile K")? as u32 });
 	}
-	arguments.extend(&graph.programs);
+	arguments.extend(graph.programs.iter().copied().map(T::convert));
+	let samples = samples.iter().copied().map(T::convert).collect::<Vec<_>>();
 	let mut value_pointers = buffers.iter_mut().map(Vec::as_mut_ptr).collect::<Vec<_>>();
 	let mut context_pointers = contexts.iter_mut().map(Vec::as_mut_ptr).collect::<Vec<_>>();
 	let mut timings = vec![0_u64; graph.nodes.len()];
-	let weights: &[f64] = if graph.parameters.is_empty() { &[0.0] } else { &graph.parameters };
+	let mut weights = graph.parameters.iter().copied().map(T::convert).collect::<Vec<_>>();
+	if weights.is_empty() { weights.push(T::default()) }
 	unsafe {
-		recipe_forward_cpu(samples.as_ptr(), weights.as_ptr(), value_pointers.as_mut_ptr(), context_pointers.as_mut_ptr(), descriptors.as_ptr(), arguments.as_ptr(), narrow(rows, "CPU rows")?, narrow(graph.nodes.len(), "CPU nodes")?, 1, 1, 1, 1, timings.as_mut_ptr(), tiles.as_ptr());
+		T::forward(samples.as_ptr(), weights.as_ptr(), value_pointers.as_mut_ptr(), context_pointers.as_mut_ptr(), descriptors.as_ptr(), arguments.as_ptr(), narrow(rows, "CPU rows")?, narrow(graph.nodes.len(), "CPU nodes")?, timings.as_mut_ptr(), tiles.as_ptr());
 	}
-	buffers.pop().ok_or_else(|| RecipeError::new("model graph has no nodes"))
+	buffers.pop().map(|values| values.into_iter().map(T::expand).collect()).ok_or_else(|| RecipeError::new("model graph has no nodes"))
 }
 impl Recipe {
 	pub fn infer(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
@@ -1551,13 +1553,13 @@ impl Recipe {
 			&& let Some(gpu) = gpus.first()
 		{
 			bundle::run_infer(&path, input, |stored, samples| {
-				let mut tape = GpuTape::new(&stored.graph, samples, &[], gpu, FP64)?;
+				let mut tape = GpuTape::new(&stored.graph, samples, &[], gpu, stored.precision)?;
 				inject_bn_stats(&stored.graph, &stored.bn_stats, &tape.contexts)?;
 				tape.forward()?;
 				tape.predictions()
 			})
 		} else {
-			bundle::run_infer(&path, input, |stored, samples| cpu_forward(&stored.graph, samples))
+			bundle::run_infer(&path, input, |stored, samples| if stored.precision == FP32 { cpu_forward::<f32>(&stored.graph, samples) } else { cpu_forward::<f64>(&stored.graph, samples) })
 		};
 		result.unwrap_or_else(|error| panic!("{error}"))
 	}
@@ -2244,7 +2246,7 @@ fn natural(name: &str, text: &str) -> Result<usize> {
 fn multi_device() -> bool {
 	env!("RECIPE_MULTI_DEVICE") == "true"
 }
-fn stored_graph(graph: &Graph, data: &Data, scale: Option<TargetScale>) -> bundle::StoredGraph {
+fn stored_graph(graph: &Graph, data: &Data, scale: Option<TargetScale>, precision: FloatFormat) -> bundle::StoredGraph {
 	let inputs = (0..graph.input.elements()).map(|index| format!("input{index}")).collect();
 	let output = data.target.first().cloned().unwrap_or_else(|| "target".to_owned());
 	let (norm_mean, norm_scale) = match data.prepared.get() {
@@ -2252,7 +2254,7 @@ fn stored_graph(graph: &Graph, data: &Data, scale: Option<TargetScale>) -> bundl
 		_ => (Vec::new(), Vec::new()),
 	};
 	let (target_min, target_span) = scale.map_or((0.0, 0.0), |s| (s.minimum, s.span));
-	bundle::StoredGraph { graph: graph.clone(), inputs, outputs: vec![output], norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new() }
+	bundle::StoredGraph { graph: graph.clone(), precision, inputs, outputs: vec![output], norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new() }
 }
 struct GpuTape {
 	gpu: &'static Gpu,
@@ -3744,6 +3746,7 @@ unsafe extern "C" {
 const TILE_CAPACITY: usize = 65536;
 unsafe extern "C" {
 	fn recipe_forward_cpu(samples: *const f64, weights: *const f64, value_pointers: *const *mut f64, context_pointers: *const *mut f64, descriptors: *const i32, arguments: *const f64, rows: i32, nodes: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, timings: *mut u64, tiles: *const Tile);
+	fn recipe_forward_cpu_f32(samples: *const f32, weights: *const f32, value_pointers: *const *mut f32, context_pointers: *const *mut f32, descriptors: *const i32, arguments: *const f32, rows: i32, nodes: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, timings: *mut u64, tiles: *const Tile);
 }
 fn distance(left: &[f64], right: &[f64]) -> f64 {
 	left.iter().zip(right).map(|(a, b)| (a - b).powi(2)).sum()
@@ -4468,7 +4471,7 @@ impl Train {
 			let mean = target_values[..training_rows].iter().sum::<f64>() / training_rows as f64;
 			graph.parameters[offset] = scale.logit(mean);
 		}
-		let mut stored = stored_graph(&graph, data, scale);
+		let mut stored = stored_graph(&graph, data, scale, precision);
 		require(stored.graph.output.elements() == 1, "model output width must be one")?;
 		if let Some(path) = &self.resume {
 			bundle::restore(path, &prepared.schema, std::slice::from_mut(&mut stored), &prepared.identities)?;
@@ -4790,7 +4793,7 @@ fn build<const N: usize>(models: &[Model; N], train: &Train, data: &Data, gpus: 
 	route_graph(&mut graph, &predictor_inputs, &fields, data.normalize)?;
 	let (_, range) = append_model(&mut graph, &models[N - 1], predictor_inputs.len(), data.target.len(), rows, gpus[0], config, &schema)?;
 	ranges.push(range);
-	let mut stored = bundle::StoredGraph { graph, inputs: input_names, outputs: data.target.clone(), norm_mean: Vec::new(), norm_scale: Vec::new(), target_min: 0.0, target_span: 0.0, bn_stats: Vec::new() };
+	let mut stored = bundle::StoredGraph { graph, precision: config.precision, inputs: input_names, outputs: data.target.clone(), norm_mean: Vec::new(), norm_scale: Vec::new(), target_min: 0.0, target_span: 0.0, bn_stats: Vec::new() };
 	if let Some(path) = &train.resume {
 		bundle::restore(path, &schema, std::slice::from_mut(&mut stored), &[])?;
 		eprintln!("resumed: {path}");
