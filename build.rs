@@ -47,6 +47,10 @@ fn word(text: String, from: &str, to: &str) -> String {
 fn float_ir(ir: String) -> String {
 	word(ir.replace("%f32.result = fpext float %f32.value to double", "%f32.result = fadd float %f32.value, 0.0"), "double", "float").replace("@contraction_tile", "@contraction_tile_f32").replace("@forward_graph", "@forward_graph_f32").replace("@tape_epoch_graph", "@tape_epoch_graph_f32").replace("to double", "to float").replace(".f64", ".f32").replace("_f64", "_f32").replace("@__nv_exp(", "@__nv_expf(").replace("@__nv_tanh(", "@__nv_tanhf(").replace("@__nv_cos(", "@__nv_cosf(").replace("@__nv_sin(", "@__nv_sinf(").replace("@__nv_log(", "@__nv_logf(").replace("0.1", "0x3FB99999A0000000").replace("0x3CB0000000000000", "0x3E80000000000000").replace("0x3FEFFFFFFFFFFFFE", "0x3FEFFFFFE0000000").replace("align 8", "align 4")
 }
+fn half_ir(ir: String) -> String {
+	let ir = ir.replace("%f32.result = fpext float %f32.value to double", "%f32.result = fptrunc float %f32.value to half").replace("fpext half %q4.d.half to double", "fadd half %q4.d.half, 0.0").replace("fpext half %q4.min.half to double", "fadd half %q4.min.half, 0.0").replace("fpext half %q6.d.half to double", "fadd half %q6.d.half, 0.0").replace("fpext half %key.half.value to double", "fadd half %key.half.value, 0.0").replace("fpext half %lookup.half to double", "fadd half %lookup.half, 0.0").replace("fptrunc double %key to half", "fadd half %key, 0.0").replace("fptrunc double %value to half", "fadd half %value, 0.0");
+	word(ir, "double", "half").replace("@contraction_tile", "@contraction_tile_f16").replace("@forward_graph", "@forward_graph_f16").replace("@tape_epoch_graph", "@tape_epoch_graph_f16").replace(".f64", ".f16").replace("_f64", "_f16").replace("@exp(", "@llvm.exp.f16(").replace("@tanh(", "@llvm.tanh.f16(").replace("@cos(", "@llvm.cos.f16(").replace("@sin(", "@llvm.sin.f16(").replace("@log(", "@llvm.log.f16(").replace("@__nv_exp(", "@llvm.exp.f16(").replace("@__nv_tanh(", "@llvm.tanh.f16(").replace("@__nv_cos(", "@llvm.cos.f16(").replace("@__nv_sin(", "@llvm.sin.f16(").replace("@__nv_log(", "@llvm.log.f16(").replace("0.1", "0xH2E66").replace("0x3CB0000000000000", "0xH1400").replace("0x3FEFFFFFFFFFFFFE", "0xH3BFF").replace("align 8", "align 2")
+}
 fn setting<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	let prefix = format!("{key} = ");
 	manifest.lines().find_map(|line| line.trim().strip_prefix(&prefix)).ok_or_else(|| io::Error::other(format!("{key} must be configured")).into())
@@ -99,56 +103,28 @@ fn render(command: &mut Command, role: &str, path: &Path) -> BuildResult<()> {
 	Ok(())
 }
 fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
-	let source = out.join("recipe-amd.ll");
-	let float_source = out.join("recipe-amd-f32.ll");
 	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, AMD_WIDTH);
-	fs::write(&source, &ir)?;
-	fs::write(&float_source, float_ir(ir))?;
-	let mut objects = Vec::new();
-	let mut float_objects = Vec::new();
-	let mut embeds = Vec::new();
-	let mut float_embeds = Vec::new();
+	let sources = [("", ir.clone()), ("-f32", float_ir(ir.clone())), ("-f16", half_ir(ir))].map(|(suffix, contents)| { let path = out.join(format!("recipe-amd{suffix}.ll")); fs::write(&path, contents).map(|_| (suffix, path)) }).into_iter().collect::<io::Result<Vec<_>>>()?;
+	let (mut objects, mut embeds): ([Vec<String>; 3], [Vec<String>; 3]) = (std::array::from_fn(|_| Vec::new()), std::array::from_fn(|_| Vec::new()));
 	let mut assemblies = Vec::new();
 	for architecture in architectures(manifest)? {
-		let output = out.join(format!("recipe-{architecture}.hsaco"));
-		let mut command = Command::new(text(manifest, "hsa-compiler")?);
-		command.args(["-target", "amdgcn-amd-amdhsa", &format!("-mcpu={architecture}"), "-O2", "-nogpulib"]);
-		for key in ["hsa-device-library", "hsa-clock-library", "hsa-finite-library", "hsa-math-library"] {
-			command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", text(manifest, key)?]);
-		}
-		let isa = Path::new(text(manifest, "hsa-device-library-directory")?).join(format!("oclc_isa_version_{}.bc", architecture.trim_start_matches("gfx")));
-		command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(isa).arg(&source).arg("-o").arg(&output);
-		if run(&mut command, "HSA LLVM IR compiler").is_err() {
-			continue;
-		}
-		let float_output = out.join(format!("recipe-{architecture}-f32.hsaco"));
-		let mut command = Command::new(text(manifest, "hsa-compiler")?);
-		command.args(["-target", "amdgcn-amd-amdhsa", &format!("-mcpu={architecture}"), "-O2", "-nogpulib"]);
-		for key in ["hsa-device-library", "hsa-clock-library", "hsa-finite-library", "hsa-math-library"] {
-			command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", text(manifest, key)?]);
-		}
-		let isa = Path::new(text(manifest, "hsa-device-library-directory")?).join(format!("oclc_isa_version_{}.bc", architecture.trim_start_matches("gfx")));
-		command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(isa).arg(&float_source).arg("-o").arg(&float_output);
-		if run(&mut command, "HSA FP32 LLVM IR compiler").is_err() {
-			continue;
-		}
+		let mut compiled = Vec::new();
+		for (suffix, source) in &sources { let output = out.join(format!("recipe-{architecture}{suffix}.hsaco")); let mut command = Command::new(text(manifest, "hsa-compiler")?); command.args(["-target", "amdgcn-amd-amdhsa", &format!("-mcpu={architecture}"), "-O2", "-nogpulib"]); for key in ["hsa-device-library", "hsa-clock-library", "hsa-finite-library", "hsa-math-library"] { command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", text(manifest, key)?]); } let isa = Path::new(text(manifest, "hsa-device-library-directory")?).join(format!("oclc_isa_version_{}.bc", architecture.trim_start_matches("gfx"))); command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(isa).arg(source).arg("-o").arg(&output); if run(&mut command, "HSA LLVM IR compiler").is_err() { compiled.clear(); break } compiled.push(output) }
+		if compiled.len() != sources.len() { continue }
 		let assembly = out.join(format!("recipe-{architecture}.amd.s"));
-		if render(Command::new(text(manifest, "hsa-disassembler")?).arg("--disassemble").arg(&output), "HSA disassembler", &assembly).is_err() {
+		if render(Command::new(text(manifest, "hsa-disassembler")?).arg("--disassemble").arg(&compiled[0]), "HSA disassembler", &assembly).is_err() {
 			continue;
 		}
-		objects.push(format!("{architecture}={}", output.display()));
-		float_objects.push(format!("{architecture}={}", float_output.display()));
-		embeds.push(format!("(\"{architecture}\", include_bytes!(\"{}\").as_slice()),", output.display()));
-		float_embeds.push(format!("(\"{architecture}\", include_bytes!(\"{}\").as_slice()),", float_output.display()));
+		for (index, output) in compiled.iter().enumerate() { objects[index].push(format!("{architecture}={}", output.display())); embeds[index].push(format!("(\"{architecture}\", include_bytes!(\"{}\").as_slice()),", output.display())) }
 		assemblies.push(format!("{architecture}={}", assembly.display()));
 	}
-	if objects.is_empty() {
+	if objects[0].is_empty() {
 		return Err(io::Error::other("no HSA architecture compiled").into());
 	}
-	let table = format!("static HSA_CODE_OBJECTS: &[(&str, &[u8])] = &[{}]\x3b static HSA_F32_CODE_OBJECTS: &[(&str, &[u8])] = &[{}]\x3b", embeds.join(" "), float_embeds.join(" "));
+	let names = [("HSA_CODE_OBJECTS", "RECIPE_HSA_CODE_OBJECTS"), ("HSA_F32_CODE_OBJECTS", "RECIPE_HSA_F32_CODE_OBJECTS"), ("HSA_F16_CODE_OBJECTS", "RECIPE_HSA_F16_CODE_OBJECTS")];
+	let table = names.iter().zip(&embeds).map(|(name, values)| format!("static {}: &[(&str, &[u8])] = &[{}]\x3b", name.0, values.join(" "))).collect::<String>();
 	fs::write(out.join("hsa-embed.rs"), table)?;
-	println!("cargo:rustc-env=RECIPE_HSA_CODE_OBJECTS={}", objects.join("\x3b"));
-	println!("cargo:rustc-env=RECIPE_HSA_F32_CODE_OBJECTS={}", float_objects.join("\x3b"));
+	for ((_, environment), values) in names.iter().zip(&objects) { println!("cargo:rustc-env={environment}={}", values.join("\x3b")) }
 	println!("cargo:rustc-env=RECIPE_HSA_ASSEMBLIES={}", assemblies.join("\x3b"));
 	println!("cargo:rustc-link-search=native={}", text(manifest, "hsa-library")?);
 	Ok(())
@@ -162,7 +138,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	let float_source = out.join("recipe-nvidia-f32.ll");
 	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, "declare i32 @recipe.workgroup.size.x()").replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda").replace("__ockl_steadyctr_u64", "llvm.nvvm.read.ptx.sreg.globaltimer").replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x").replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x").replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x").replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0").replace("__ocml_exp_f64", "__nv_exp").replace("__ocml_tanh_f64", "__nv_tanh").replace("__ocml_cos_f64", "__nv_cos").replace("__ocml_sin_f64", "__nv_sin").replace("__ocml_log_f64", "__nv_log").replace("define protected amdgpu_kernel", "define ptx_kernel").replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"1,1024\" }", "attributes #0 = { nounwind }");
 	fs::write(&source, &ir)?;
-	fs::write(&float_source, float_ir(ir))?;
+	fs::write(&float_source, float_ir(ir.clone()))?;
 	let compiler = text(manifest, "nvidia-compiler")?;
 	let compiler = if Path::new(compiler).exists() { compiler } else { "clang" };
 	let device = text(manifest, "nvidia-device-library")?;
@@ -212,7 +188,7 @@ fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 }
 fn main() -> BuildResult<()> {
 	let manifest = fs::read_to_string("Cargo.toml")?;
-	for (key, environment) in [("epochs", "RECIPE_TRAIN_EPOCHS"), ("learning-rate", "RECIPE_TRAIN_LEARNING_RATE"), ("initial-weight", "RECIPE_TRAIN_INITIAL_WEIGHT"), ("adamw-beta1", "RECIPE_ADAMW_BETA1"), ("adamw-beta2", "RECIPE_ADAMW_BETA2"), ("adamw-epsilon", "RECIPE_ADAMW_EPSILON"), ("adamw-weight-decay", "RECIPE_ADAMW_WEIGHT_DECAY"), ("kmeans-iterations", "RECIPE_KMEANS_ITERATIONS"), ("quantization-block-weights", "RECIPE_QUANTIZATION_BLOCK_WEIGHTS"), ("surrogate-epochs", "RECIPE_SURROGATE_EPOCHS"), ("surrogate-rate", "RECIPE_SURROGATE_RATE"), ("surrogate-width", "RECIPE_SURROGATE_WIDTH"), ("rat-batch-rows", "RECIPE_RAT_BATCH_ROWS"), ("topology-latency-bytes", "RECIPE_TOPOLOGY_LATENCY_BYTES"), ("topology-bandwidth-bytes", "RECIPE_TOPOLOGY_BANDWIDTH_BYTES"), ("topology-probe-repetitions", "RECIPE_TOPOLOGY_REPETITIONS"), ("ssh-connect-timeout-seconds", "RECIPE_SSH_CONNECT_TIMEOUT"), ("random-seed", "RECIPE_RANDOM_SEED"), ("training-trials", "RECIPE_TRAINING_TRIALS"), ("training-start-run", "RECIPE_TRAINING_START_RUN"), ("normalization-epsilon", "RECIPE_NORMALIZATION_EPSILON"), ("leak-slope", "RECIPE_LEAK_SLOPE"), ("prelu-slope", "RECIPE_PRELU_SLOPE"), ("elu-alpha", "RECIPE_ELU_ALPHA"), ("selu-alpha", "RECIPE_SELU_ALPHA"), ("selu-scale", "RECIPE_SELU_SCALE"), ("gelu-scale", "RECIPE_GELU_SCALE"), ("gelu-cubic", "RECIPE_GELU_CUBIC"), ("huber-threshold", "RECIPE_HUBER_THRESHOLD"), ("output-tolerance", "RECIPE_OUTPUT_TOLERANCE"), ("gradient-tolerance", "RECIPE_GRADIENT_TOLERANCE"), ("backend-tolerance", "RECIPE_BACKEND_TOLERANCE")] {
+	for (key, environment) in [("epochs", "RECIPE_TRAIN_EPOCHS"), ("learning-rate", "RECIPE_TRAIN_LEARNING_RATE"), ("initial-weight", "RECIPE_TRAIN_INITIAL_WEIGHT"), ("adamw-beta1", "RECIPE_ADAMW_BETA1"), ("adamw-beta2", "RECIPE_ADAMW_BETA2"), ("adamw-epsilon", "RECIPE_ADAMW_EPSILON"), ("adamw-weight-decay", "RECIPE_ADAMW_WEIGHT_DECAY"), ("kmeans-iterations", "RECIPE_KMEANS_ITERATIONS"), ("quantization-block-weights", "RECIPE_QUANTIZATION_BLOCK_WEIGHTS"), ("surrogate-epochs", "RECIPE_SURROGATE_EPOCHS"), ("surrogate-rate", "RECIPE_SURROGATE_RATE"), ("surrogate-width", "RECIPE_SURROGATE_WIDTH"), ("rat-batch-rows", "RECIPE_RAT_BATCH_ROWS"), ("topology-latency-bytes", "RECIPE_TOPOLOGY_LATENCY_BYTES"), ("topology-bandwidth-bytes", "RECIPE_TOPOLOGY_BANDWIDTH_BYTES"), ("topology-probe-repetitions", "RECIPE_TOPOLOGY_REPETITIONS"), ("tile-vram-unit-bytes", "RECIPE_TILE_VRAM_UNIT_BYTES"), ("ssh-connect-timeout-seconds", "RECIPE_SSH_CONNECT_TIMEOUT"), ("random-seed", "RECIPE_RANDOM_SEED"), ("training-trials", "RECIPE_TRAINING_TRIALS"), ("training-start-run", "RECIPE_TRAINING_START_RUN"), ("normalization-epsilon", "RECIPE_NORMALIZATION_EPSILON"), ("leak-slope", "RECIPE_LEAK_SLOPE"), ("prelu-slope", "RECIPE_PRELU_SLOPE"), ("elu-alpha", "RECIPE_ELU_ALPHA"), ("selu-alpha", "RECIPE_SELU_ALPHA"), ("selu-scale", "RECIPE_SELU_SCALE"), ("gelu-scale", "RECIPE_GELU_SCALE"), ("gelu-cubic", "RECIPE_GELU_CUBIC"), ("huber-threshold", "RECIPE_HUBER_THRESHOLD"), ("output-tolerance", "RECIPE_OUTPUT_TOLERANCE"), ("gradient-tolerance", "RECIPE_GRADIENT_TOLERANCE"), ("backend-tolerance", "RECIPE_BACKEND_TOLERANCE")] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
 	for (key, environment) in [("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME"), ("ssh-config", "RECIPE_SSH_CONFIG")] {

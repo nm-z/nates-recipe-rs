@@ -66,7 +66,7 @@ mod bundle {
 		let fields = value.split_whitespace().collect::<Vec<_>>();
 		require(fields.len() == 5, "arithmetic format has the wrong width")?;
 		let shape = (fields[0], self::value::<u8>(fields[1], "arithmetic bits")?, self::value::<u8>(fields[2], "arithmetic exponent")?, self::value::<u8>(fields[3], "arithmetic mantissa")?, fields[4]);
-		match shape { ("fp", 64, 11, 52, "double") => Ok(FP64), ("fp", 32, 8, 23, "float") => Ok(FP32), ("f", 64, 11, 52, "double") => Ok(FloatFormat { family: "f", ..FP64 }), ("f", 32, 8, 23, "float") => Ok(FloatFormat { family: "f", ..FP32 }), _ => Err(RecipeError::new(format!("saved arithmetic format {}({}) [{}] is unavailable; available precision: f(8,23) [float], f(11,52) [double], fp(32) [float], fp(64) [double]", fields[0], fields[1], fields[4]))) }
+		match shape { ("fp", 64, 11, 52, "double") => Ok(FP64), ("fp", 32, 8, 23, "float") => Ok(FP32), ("fp", 16, 5, 10, "half") => Ok(FP16), ("f", 64, 11, 52, "double") => Ok(FloatFormat { family: "f", ..FP64 }), ("f", 32, 8, 23, "float") => Ok(FloatFormat { family: "f", ..FP32 }), ("f", 16, 5, 10, "half") => Ok(FloatFormat { family: "f", ..FP16 }), _ => Err(RecipeError::new(format!("saved arithmetic format {}({}) [{}] is unavailable; available precision: f(5,10) [half], f(8,23) [float], f(11,52) [double], fp(16) [half], fp(32) [float], fp(64) [double]", fields[0], fields[1], fields[4]))) }
 	}
 	pub(super) fn load(path: &str) -> Result<(String, Vec<StoredGraph>)> {
 		require(path.ends_with(".ogdl"), "model path requires .ogdl")?;
@@ -2197,13 +2197,14 @@ struct Config {
 	epsilon: f64,
 	decay: f64,
 	rat_batch: usize,
+	vram_unit: usize,
 	random_seed: usize,
 	activation: [f64; 8],
 	precision: FloatFormat,
 }
 impl Config {
 	fn load() -> Result<Self> {
-		Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, rat_batch: natural("RAT batch rows", env!("RECIPE_RAT_BATCH_ROWS"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: FP64 })
+		Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, rat_batch: natural("RAT batch rows", env!("RECIPE_RAT_BATCH_ROWS"))?, vram_unit: natural("tile VRAM unit bytes", env!("RECIPE_TILE_VRAM_UNIT_BYTES"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: FP64 })
 	}
 }
 fn number(name: &str, text: &str) -> Result<f64> {
@@ -2328,6 +2329,8 @@ impl GpuTape {
 		let mut phase = phase as u32;
 		let mut call = ptrs![self.samples.pointer, self.input_adjoint.pointer, self.targets.pointer, self.weights.pointer, self.frozen.pointer, self.best.pointer, self.value_pointers.pointer, self.context_pointers.pointer, self.adjoint_pointers.pointer, self.descriptors.pointer, self.arguments.pointer, self.metrics.pointer, self.gradient.pointer, self.moments.pointer, self.variances.pointer, self.best_loss.pointer, self.rows, self.nodes, self.parameters, loss, huber_threshold, rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay, tolerance, step, self.threads, self.tile.m, self.tile.n, self.tile.k, phase, self.timings.pointer, self.tiles.pointer];
 		let mut narrow = [huber_threshold as f32, rate as f32, beta1 as f32, beta2 as f32, beta1_power as f32, beta2_power as f32, epsilon as f32, decay as f32, tolerance as f32];
+		let mut half = narrow.map(fp16);
+		if self.precision.native() == Some(FP16) { for (slot, value) in call[20..29].iter_mut().zip(&mut half) { *slot = value as *mut u16 as Ptr } }
 		if self.precision.native() == Some(FP32) {
 			for (slot, value) in call[20..29].iter_mut().zip(&mut narrow) {
 				*slot = value as *mut f32 as Ptr;
@@ -2691,6 +2694,7 @@ impl Buffer {
 		Ok(buffer)
 	}
 	fn upload_float(runtime: &'static Gpu, values: &[f64], precision: FloatFormat) -> Result<Self> {
+		if precision.native() == Some(FP16) { return Self::upload(runtime, &values.iter().map(|value| fp16(*value as f32)).collect::<Vec<_>>()) }
 		if precision.native() == Some(FP32) {
 			return Self::upload(runtime, &values.iter().map(|value| *value as f32).collect::<Vec<_>>());
 		}
@@ -2702,6 +2706,7 @@ impl Buffer {
 		self.runtime.upload(self.pointer + start as u64, values.as_ptr().cast(), size_of_val(values))
 	}
 	fn write_float(&self, offset: usize, values: &[f64], precision: FloatFormat) -> Result<()> {
+		if precision.native() == Some(FP16) { return self.write(offset, &values.iter().map(|value| fp16(*value as f32)).collect::<Vec<_>>()) }
 		if precision.native() == Some(FP32) {
 			return self.write(offset, &values.iter().map(|value| *value as f32).collect::<Vec<_>>());
 		}
@@ -2719,6 +2724,7 @@ impl Buffer {
 		Ok(values)
 	}
 	fn download_float(&self, count: usize, precision: FloatFormat) -> Result<Vec<f64>> {
+		if precision.native() == Some(FP16) { return Ok(self.download::<u16>(count)?.into_iter().map(|value| f64::from(unfp16(value))).collect()) }
 		if precision.native() == Some(FP32) {
 			return Ok(self.download::<f32>(count)?.into_iter().map(f64::from).collect());
 		}
@@ -2763,6 +2769,7 @@ impl Kernel {
 const FORWARD_ARGS: &[u8] = b"88888844444488";
 const EPOCH_ARGS: &[u8] = b"8888888888888888444488888888844444488";
 const EPOCH_F32_ARGS: &[u8] = b"8888888888888888444444444444444444488";
+const EPOCH_F16_ARGS: &[u8] = b"8888888888888888444422222222244444488";
 #[cfg(nvidia)]
 struct Cuda {
 	context: Ptr,
@@ -2823,10 +2830,7 @@ struct Gpu {
 	name: String,
 	backend: Backend,
 	driver: Driver,
-	forward: Dispatch,
-	epoch: Dispatch,
-	forward_f32: Option<Dispatch>,
-	epoch_f32: Option<Dispatch>,
+	kernels: [Option<(Dispatch, Dispatch)>; 3],
 	memory: u64,
 	clock: u64,
 	shared_limit: u32,
@@ -2909,10 +2913,7 @@ impl Gpu {
 		}
 	}
 	fn kernels(&self, precision: FloatFormat) -> Result<(Dispatch, Dispatch)> {
-		if precision.native() == Some(FP32) {
-			return self.forward_f32.zip(self.epoch_f32).ok_or_else(|| RecipeError::new(format!("fp(32) training is unavailable on {}", self.name)));
-		}
-		Ok((self.forward, self.epoch))
+		precision.kernel().and_then(|index| self.kernels[index]).ok_or_else(|| RecipeError::new(format!("{}({}) training is unavailable on {}", precision.family, precision.bits, self.name)))
 	}
 	fn shared_values(&self, precision: FloatFormat) -> Result<u32> {
 		let (forward, epoch) = self.kernels(precision)?;
@@ -3037,7 +3038,7 @@ impl Gpu {
 		let _guard = self.dispatch.lock().map_err(|_| RecipeError::new("GPU dispatch lock is poisoned"))?;
 		unsafe {
 			match &self.driver {
-				Driver::Cpu => { if kernel.object & 1 == 0 { if kernel.element == 4 { cpu_forward_dispatch::<f32>(arguments) } else { cpu_forward_dispatch::<f64>(arguments) } } else if kernel.element == 4 { cpu_epoch_dispatch::<f32>(arguments) } else { cpu_epoch_dispatch::<f64>(arguments) } Ok(()) },
+				Driver::Cpu => { match kernel.object { 0 => cpu_forward_dispatch::<f64>(arguments), 1 => cpu_epoch_dispatch::<f64>(arguments), 2 => cpu_forward_dispatch::<f32>(arguments), 3 => cpu_epoch_dispatch::<f32>(arguments), _ => unreachable!() } Ok(()) },
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => {
 					let stream = ptr::null_mut();
@@ -3074,7 +3075,7 @@ impl Gpu {
 static DEVICES: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
 fn cpu_device() -> Gpu {
 	let dispatch = |object, element, layout| Dispatch { kernel: Kernel::remote(object, 0, element, layout), geometry: Geometry { groups: 1, block: 1 } };
-	Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, driver: Driver::Cpu, forward: dispatch(0, 8, FORWARD_ARGS), epoch: dispatch(1, 8, EPOCH_ARGS), forward_f32: Some(dispatch(2, 4, FORWARD_ARGS)), epoch_f32: Some(dispatch(3, 4, EPOCH_F32_ARGS)), memory: u64::MAX, clock: 1, shared_limit: u32::MAX, dispatch: Mutex::new(()) }
+	Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, driver: Driver::Cpu, kernels: [Some((dispatch(0, 8, FORWARD_ARGS), dispatch(1, 8, EPOCH_ARGS))), Some((dispatch(2, 4, FORWARD_ARGS), dispatch(3, 4, EPOCH_F32_ARGS))), None], memory: u64::MAX, clock: 1, shared_limit: u32::MAX, dispatch: Mutex::new(()) }
 }
 fn devices() -> Result<&'static [Gpu]> {
 	DEVICES
@@ -3106,8 +3107,8 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 fn worker_list() -> Result<()> {
 	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	for gpu in devices()? {
-		let f32 = gpu.forward_f32.zip(gpu.epoch_f32);
-		println!("{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}", host.trim(), gpu.name, gpu.backend, gpu.forward.geometry.groups, gpu.forward.geometry.block, gpu.epoch.geometry.groups, gpu.epoch.geometry.block, gpu.shared_limit, gpu.forward.kernel.shared, gpu.epoch.kernel.shared, gpu.memory, gpu.clock, u8::from(f32.is_some()), f32.map_or(0, |value| value.0.geometry.groups), f32.map_or(0, |value| value.0.geometry.block), f32.map_or(0, |value| value.1.geometry.groups), f32.map_or(0, |value| value.1.geometry.block), f32.map_or(0, |value| value.0.kernel.shared), f32.map_or(0, |value| value.1.kernel.shared),);
+		let (wide, f32) = (gpu.kernels[0].unwrap(), gpu.kernels[1]);
+		println!("{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}", host.trim(), gpu.name, gpu.backend, wide.0.geometry.groups, wide.0.geometry.block, wide.1.geometry.groups, wide.1.geometry.block, gpu.shared_limit, wide.0.kernel.shared, wide.1.kernel.shared, gpu.memory, gpu.clock, u8::from(f32.is_some()), f32.map_or(0, |value| value.0.geometry.groups), f32.map_or(0, |value| value.0.geometry.block), f32.map_or(0, |value| value.1.geometry.groups), f32.map_or(0, |value| value.1.geometry.block), f32.map_or(0, |value| value.0.kernel.shared), f32.map_or(0, |value| value.1.kernel.shared));
 	}
 	Ok(())
 }
@@ -3154,13 +3155,7 @@ fn worker_serve(name: &str) -> Result<()> {
 					let count = get_u64(&mut input)? as usize;
 					let mut values = (0..count).map(|_| get_u64(&mut input)).collect::<Result<Vec<_>>>()?;
 					let mut arguments = values.iter_mut().map(|value| value as *mut u64 as Ptr).collect::<Vec<_>>();
-					let dispatch = match kernel[0] {
-						0 => gpu.forward,
-						1 => gpu.epoch,
-						2 => gpu.forward_f32.ok_or_else(|| RecipeError::new("remote fp32 forward is unavailable"))?,
-						3 => gpu.epoch_f32.ok_or_else(|| RecipeError::new("remote fp32 epoch is unavailable"))?,
-						_ => return Err(RecipeError::new("remote Recipe kernel is invalid")),
-					};
+					let dispatch = gpu.kernels.get(usize::from(kernel[0]) / 2).and_then(|pair| *pair).map(|pair| if kernel[0] & 1 == 0 { pair.0 } else { pair.1 }).ok_or_else(|| RecipeError::new("remote Recipe kernel is unavailable"))?;
 					gpu.launch(dispatch, &mut arguments, threads, tile)?;
 					Ok(Vec::new())
 				}
@@ -3400,7 +3395,9 @@ fn reachable_nodes() -> Result<&'static [RemoteNode]> {
 }
 fn remote_gpu(node: &RemoteNode) -> Result<Gpu> {
 	let worker = worker_process(&node.transport, &format!("serve|{}", node.device))?;
-	Ok(Gpu { name: node.info.name.clone(), backend: node.backend, driver: Driver::Remote(Remote { io: Mutex::new(worker) }), forward: Dispatch { kernel: Kernel::remote(0, node.forward_shared, 8, FORWARD_ARGS), geometry: node.forward }, epoch: Dispatch { kernel: Kernel::remote(1, node.epoch_shared, 8, EPOCH_ARGS), geometry: node.epoch }, forward_f32: node.forward_f32.map(|geometry| Dispatch { kernel: Kernel::remote(2, node.forward_f32_shared, 4, FORWARD_ARGS), geometry }), epoch_f32: node.epoch_f32.map(|geometry| Dispatch { kernel: Kernel::remote(3, node.epoch_f32_shared, 4, EPOCH_F32_ARGS), geometry }), memory: node.memory, clock: node.clock, shared_limit: node.shared_limit, dispatch: Mutex::new(()) })
+	let wide = (Dispatch { kernel: Kernel::remote(0, node.forward_shared, 8, FORWARD_ARGS), geometry: node.forward }, Dispatch { kernel: Kernel::remote(1, node.epoch_shared, 8, EPOCH_ARGS), geometry: node.epoch });
+	let f32 = node.forward_f32.zip(node.epoch_f32).map(|geometry| (Dispatch { kernel: Kernel::remote(2, node.forward_f32_shared, 4, FORWARD_ARGS), geometry: geometry.0 }, Dispatch { kernel: Kernel::remote(3, node.epoch_f32_shared, 4, EPOCH_F32_ARGS), geometry: geometry.1 }));
+	Ok(Gpu { name: node.info.name.clone(), backend: node.backend, driver: Driver::Remote(Remote { io: Mutex::new(worker) }), kernels: [Some(wide), f32, None], memory: node.memory, clock: node.clock, shared_limit: node.shared_limit, dispatch: Mutex::new(()) })
 }
 static REMOTE_GPUS: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
 fn remote_gpus() -> Result<&'static [Gpu]> {
@@ -3564,46 +3561,36 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 		let properties = fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read {path}: {error}")))?;
 		let gfx = kfd_property(&properties, "gfx_target_version")?;
 		let target = format!("gfx{}{}{}", gfx / 10000, gfx / 100 % 100, gfx % 100);
-		let code = hsa_artifact(HSA_CODE_OBJECTS, &target)?;
-		let float_code = hsa_artifact(HSA_F32_CODE_OBJECTS, &target)?;
+		let codes = [hsa_artifact(HSA_CODE_OBJECTS, &target)?, hsa_artifact(HSA_F32_CODE_OBJECTS, &target)?, hsa_artifact(HSA_F16_CODE_OBJECTS, &target)?];
 		let reader_create: unsafe extern "C" fn(*const c_void, usize, *mut u64) -> i32 = runtime.function(b"hsa_code_object_reader_create_from_memory\0")?;
 		let executable_create: unsafe extern "C" fn(i32, i32, Ptr, *mut u64) -> i32 = runtime.function(b"hsa_executable_create_alt\0")?;
 		let executable_load: unsafe extern "C" fn(u64, u64, u64, Ptr, Ptr) -> i32 = runtime.function(b"hsa_executable_load_agent_code_object\0")?;
 		let executable_freeze: unsafe extern "C" fn(u64, Ptr) -> i32 = runtime.function(b"hsa_executable_freeze\0")?;
 		let symbol: HsaSymbol = runtime.function(b"hsa_executable_get_symbol_by_name\0")?;
 		let symbol_info: HsaSymbolInfo = runtime.function(b"hsa_executable_symbol_get_info\0")?;
-		let (mut reader, mut float_reader, mut executable) = (0, 0, 0);
-		check(reader_create(code.as_ptr().cast(), code.len(), &mut reader), "code-object reader")?;
-		check(reader_create(float_code.as_ptr().cast(), float_code.len(), &mut float_reader), "FP32 code-object reader")?;
+		let (mut readers, mut executable) = ([0; 3], 0);
+		for (index, code) in codes.into_iter().enumerate() { check(reader_create(code.as_ptr().cast(), code.len(), &mut readers[index]), "code-object reader")? }
 		check(executable_create(1, 0, ptr::null_mut(), &mut executable), "executable creation")?;
-		check(executable_load(executable, agent, reader, ptr::null_mut(), ptr::null_mut()), "code-object load")?;
-		check(executable_load(executable, agent, float_reader, ptr::null_mut(), ptr::null_mut()), "FP32 code-object load")?;
+		for reader in readers { check(executable_load(executable, agent, reader, ptr::null_mut(), ptr::null_mut()), "code-object load")? }
 		check(executable_freeze(executable, ptr::null_mut()), "executable freeze")?;
-		let forward = hsa_kernel(symbol, symbol_info, executable, agent, b"forward_graph.kd\0", 8, FORWARD_ARGS)?;
-		let epoch = hsa_kernel(symbol, symbol_info, executable, agent, b"tape_epoch_graph.kd\0", 8, EPOCH_ARGS)?;
-		let forward_f32 = hsa_kernel(symbol, symbol_info, executable, agent, b"forward_graph_f32.kd\0", 4, FORWARD_ARGS)?;
-		let epoch_f32 = hsa_kernel(symbol, symbol_info, executable, agent, b"tape_epoch_graph_f32.kd\0", 4, EPOCH_F32_ARGS)?;
-		let forward_resources = Resources { shared: forward.shared, max_block: workgroup, element: 8 };
-		let epoch_resources = Resources { shared: epoch.shared, max_block: workgroup, element: 8 };
-		let forward_f32_resources = Resources { shared: forward_f32.shared, max_block: workgroup, element: 4 };
-		let epoch_f32_resources = Resources { shared: epoch_f32.shared, max_block: workgroup, element: 4 };
 		let lds = kfd_property(&properties, "lds_size_in_kb")?.checked_mul(1024).ok_or_else(|| RecipeError::new("AMD LDS size overflows"))?;
-		let forward_geometry = amd(cus, wave, workgroup, lds, forward_resources)?;
-		let epoch_geometry = amd(cus, wave, workgroup, lds, epoch_resources)?;
-		let forward_f32_geometry = amd(cus, wave, workgroup, lds, forward_f32_resources)?;
-		let epoch_f32_geometry = amd(cus, wave, workgroup, lds, epoch_f32_resources)?;
+		let specifications: [(&[u8], u8, &[u8]); 6] = [(b"forward_graph.kd\0", 8, FORWARD_ARGS), (b"tape_epoch_graph.kd\0", 8, EPOCH_ARGS), (b"forward_graph_f32.kd\0", 4, FORWARD_ARGS), (b"tape_epoch_graph_f32.kd\0", 4, EPOCH_F32_ARGS), (b"forward_graph_f16.kd\0", 2, FORWARD_ARGS), (b"tape_epoch_graph_f16.kd\0", 2, EPOCH_F16_ARGS)];
+		let mut dispatches = Vec::new();
+		for (name, element, layout) in specifications { let kernel = hsa_kernel(symbol, symbol_info, executable, agent, name, element, layout)?; let geometry = amd(cus, wave, workgroup, lds, Resources { shared: kernel.shared, max_block: workgroup, element })?; dispatches.push(Dispatch { kernel, geometry }) }
 		let queue_create: unsafe extern "C" fn(u64, u32, u32, Ptr, Ptr, u32, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_queue_create\0")?;
 		let signal_create: unsafe extern "C" fn(i64, u32, *const u64, *mut u64) -> i32 = runtime.function(b"hsa_signal_create\0")?;
 		let allocate: unsafe extern "C" fn(u64, usize, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_amd_memory_pool_allocate\0")?;
 		let allow: unsafe extern "C" fn(u32, *const u64, *const u32, *const c_void) -> i32 = runtime.function(b"hsa_amd_agents_allow_access\0")?;
-		let (ka_size, mut ka) = ([forward.kernarg, epoch.kernarg, forward_f32.kernarg, epoch_f32.kernarg].into_iter().max().unwrap(), ptr::null_mut());
+		let (ka_size, mut ka) = (dispatches.iter().map(|dispatch| dispatch.kernel.kernarg).max().unwrap(), ptr::null_mut());
 		let (mut queue, mut completion) = (ptr::null_mut(), 0);
 		driver_status(Backend::Amd, queue_create(agent, 256, 2, ptr::null_mut(), ptr::null_mut(), u32::MAX, u32::MAX, &mut queue), "queue creation")?;
 		check(signal_create(0, 0, ptr::null(), &mut completion), "signal creation")?;
 		check(allocate(kernarg.found, ka_size, 0, &mut ka), "KERNARG allocation")?;
 		check(allow(1, &agent, ptr::null(), ka), "GPU KERNARG access")?;
-		eprintln!("AMD forward block {} epoch block {}", forward_geometry.block, epoch_geometry.block);
-		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, driver: Driver::Hsa(Hsa { allocate, allow, queue, cpu_agent, kernarg_size: ka_size, kernarg: ka, free: runtime.function(b"hsa_amd_memory_pool_free\0")?, copy: runtime.function(b"hsa_memory_copy\0")?, store: runtime.function(b"hsa_signal_store_screlease\0")?, wait: runtime.function(b"hsa_signal_wait_scacquire\0")?, write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?, signal: completion, vram_pool: vram.found, kernarg_pool: kernarg.found }), forward: Dispatch { kernel: forward, geometry: forward_geometry }, epoch: Dispatch { kernel: epoch, geometry: epoch_geometry }, forward_f32: Some(Dispatch { kernel: forward_f32, geometry: forward_f32_geometry }), epoch_f32: Some(Dispatch { kernel: epoch_f32, geometry: epoch_f32_geometry }), memory: memory as u64, clock, shared_limit: lds, dispatch: Mutex::new(()) })
+		let mut dispatches = dispatches.into_iter();
+		let kernels = std::array::from_fn(|_| Some((dispatches.next().unwrap(), dispatches.next().unwrap())));
+		eprintln!("AMD forward block {} epoch block {}", kernels[0].unwrap().0.geometry.block, kernels[0].unwrap().1.geometry.block);
+		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, driver: Driver::Hsa(Hsa { allocate, allow, queue, cpu_agent, kernarg_size: ka_size, kernarg: ka, free: runtime.function(b"hsa_amd_memory_pool_free\0")?, copy: runtime.function(b"hsa_memory_copy\0")?, store: runtime.function(b"hsa_signal_store_screlease\0")?, wait: runtime.function(b"hsa_signal_wait_scacquire\0")?, write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?, signal: completion, vram_pool: vram.found, kernarg_pool: kernarg.found }), kernels, memory: memory as u64, clock, shared_limit: lds, dispatch: Mutex::new(()) })
 	}
 }
 fn load_nvidia() -> Result<Vec<Gpu>> {
@@ -3687,7 +3674,7 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 			}
 			let cuda = Cuda { context, set: runtime.function(b"cuCtxSetCurrent\0")?, allocate: runtime.function(b"cuMemAlloc_v2\0")?, free: runtime.function(b"cuMemFree_v2\0")?, upload: runtime.function(b"cuMemcpyHtoD_v2\0")?, download: runtime.function(b"cuMemcpyDtoH_v2\0")?, synchronize: runtime.function(b"cuCtxSynchronize\0")?, launch: runtime.function(b"cuLaunchCooperativeKernel\0")? };
 			eprintln!("Nvidia forward block {} epoch block {}", forward_geometry.block, epoch_geometry.block);
-			Ok(Gpu { name: format!("nv{index}"), backend: Backend::Nvidia, driver: Driver::Cuda(cuda), forward: Dispatch { kernel: Kernel::cuda(forward, forward_resource.shared, 8, FORWARD_ARGS), geometry: forward_geometry }, epoch: Dispatch { kernel: Kernel::cuda(epoch, epoch_resource.shared, 8, EPOCH_ARGS), geometry: epoch_geometry }, forward_f32: Some(Dispatch { kernel: Kernel::cuda(forward_f32, forward_f32_resource.shared, 4, FORWARD_ARGS), geometry: forward_f32_geometry }), epoch_f32: Some(Dispatch { kernel: Kernel::cuda(epoch_f32, epoch_f32_resource.shared, 4, EPOCH_F32_ARGS), geometry: epoch_f32_geometry }), memory: memory as u64, clock: NANOSECOND_TIMER_HZ, shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()) })
+			Ok(Gpu { name: format!("nv{index}"), backend: Backend::Nvidia, driver: Driver::Cuda(cuda), kernels: [Some((Dispatch { kernel: Kernel::cuda(forward, forward_resource.shared, 8, FORWARD_ARGS), geometry: forward_geometry }, Dispatch { kernel: Kernel::cuda(epoch, epoch_resource.shared, 8, EPOCH_ARGS), geometry: epoch_geometry })), Some((Dispatch { kernel: Kernel::cuda(forward_f32, forward_f32_resource.shared, 4, FORWARD_ARGS), geometry: forward_f32_geometry }, Dispatch { kernel: Kernel::cuda(epoch_f32, epoch_f32_resource.shared, 4, EPOCH_F32_ARGS), geometry: epoch_f32_geometry })), None], memory: memory as u64, clock: NANOSECOND_TIMER_HZ, shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()) })
 		};
 		let mut found = Vec::new();
 		for ordinal in 0..count {
@@ -4373,11 +4360,13 @@ struct FloatFormat {
 }
 const FP64: FloatFormat = FloatFormat { family: "fp", bits: 64, exponent: 11, mantissa: 52, llvm: "double" };
 const FP32: FloatFormat = FloatFormat { family: "fp", bits: 32, exponent: 8, mantissa: 23, llvm: "float" };
+const FP16: FloatFormat = FloatFormat { family: "fp", bits: 16, exponent: 5, mantissa: 10, llvm: "half" };
 impl FloatFormat {
 	fn bytes(self) -> usize {
 		usize::from(self.bits.div_ceil(8))
 	}
-	fn native(self) -> Option<Self> { match (self.bits, self.exponent, self.mantissa) { (32, 8, 23) => Some(FP32), (64, 11, 52) => Some(FP64), _ => None } }
+	fn native(self) -> Option<Self> { match (self.bits, self.exponent, self.mantissa) { (16, 5, 10) => Some(FP16), (32, 8, 23) => Some(FP32), (64, 11, 52) => Some(FP64), _ => None } }
+	fn kernel(self) -> Option<usize> { [FP64, FP32, FP16].iter().position(|format| Some(*format) == self.native()) }
 }
 impl Train {
 	pub const fn seed(mut self, value: usize) -> Self {
@@ -4422,10 +4411,10 @@ impl Train {
 		drop(topology()?);
 		let (gpus, mut config) = (all_gpus()?, Config::load()?);
 		let precision = model.blocks.first().map(|block| block.format).unwrap_or(model.format);
-		let fp32 = gpus.iter().all(|gpu| gpu.forward_f32.is_some() && gpu.epoch_f32.is_some());
-		let available = if fp32 { "f(8,23) [float], f(11,52) [double], fp(32) [float], fp(64) [double]" } else { "f(11,52) [double], fp(64) [double]" };
+		let support = |format: FloatFormat| format.kernel().is_some_and(|index| gpus.iter().all(|gpu| gpu.kernels[index].is_some()));
+		let available = [FP16, FP32, FP64].into_iter().filter(|format| support(*format)).flat_map(|format| [format!("f({},{}) [{}]", format.exponent, format.mantissa, format.llvm), format!("fp({}) [{}]", format.bits, format.llvm)]).collect::<Vec<_>>().join(", ");
 		require(model.blocks.iter().all(|block| block.format.native() == precision.native()), format!("mixed execution formats are unavailable on {}; available precision: {available}", gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
-		require(precision.native() == Some(FP64) || precision.native() == Some(FP32) && fp32, format!("{}({}) [{}] training is unavailable on {}; available precision: {available}", precision.family, precision.bits, precision.llvm, gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
+		require(support(precision), format!("{}({}) [{}] training is unavailable on {}; available precision: {available}", precision.family, precision.bits, precision.llvm, gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
 		config.precision = precision;
 		if let Some(seed) = self.seed {
 			config.random_seed = seed;
@@ -4781,6 +4770,7 @@ struct TileRuntime {
 	state: State,
 	train: Train,
 	predictor: Model,
+	vram_unit: usize,
 }
 static TILE_RUNTIME: OnceLock<Result<Mutex<TileRuntime>>> = OnceLock::new();
 impl TileRuntime {
@@ -4790,7 +4780,7 @@ impl TileRuntime {
 		let models = [proposer, predictor];
 		let data = recipe.data(Vec::<String>::new()).r#in(["dtype", "VRAM", "M", "N", "K"]).out(["m", "n", "k"]).target(["Mtime"]).norm(z_score);
 		let train = recipe.train().epochs(config.surrogate_epochs).lr(config.surrogate_rate);
-		Ok(Self { state: build(&models, &train, &data, gpus, config)?, train, predictor: models.into_iter().last().unwrap() })
+		Ok(Self { state: build(&models, &train, &data, gpus, config)?, train, predictor: models.into_iter().last().unwrap(), vram_unit: config.vram_unit })
 	}
 	fn forward(&mut self, cases: &[TileCase]) -> Result<()> {
 		let samples = (0..self.state.tape.capacity).flat_map(|index| cases[index % cases.len()].2).collect::<Vec<_>>();
@@ -4811,7 +4801,8 @@ impl TileRuntime {
 					let limit = shard.tape.gpu.proposal_limit(dimensions, shard.tape.precision)?;
 					let minimum = Tile { m: shard.tape.tile.m.min(limit.m), n: shard.tape.tile.n.min(limit.n), k: shard.tape.tile.k.min(limit.k) };
 					let work = dimensions[0] * f64::from(shard.tape.rows);
-					cases.push((gpu, node, [size_of::<f64>() as f64 * f64::from(u8::BITS), shard.tape.gpu.memory as f64, work, dimensions[1], dimensions[2]], minimum, limit));
+					let vram = if shard.tape.gpu.backend == Backend::Cpu { 0.0 } else { shard.tape.gpu.memory as f64 / self.vram_unit as f64 };
+					cases.push((gpu, node, [f64::from(shard.tape.precision.bits), vram, work, dimensions[1], dimensions[2]], minimum, limit));
 				}
 			}
 		}

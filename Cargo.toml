@@ -54,6 +54,7 @@ rat-batch-rows = 32
 topology-latency-bytes = 8
 topology-bandwidth-bytes = 1048576
 topology-probe-repetitions = 4
+tile-vram-unit-bytes = 1073741824
 ssh-connect-timeout-seconds = 5
 random-seed = 17
 training-trials = 35
