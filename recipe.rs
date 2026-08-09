@@ -182,7 +182,7 @@ mod bundle {
 						field(&mut document, "weights", &join(weights))
 					} else {
 						let format = IntegerFormat(node.argument[8] as u16);
-						let (bytes, codebook) = format.compress(weights, config)?;
+						let importance = graph.state.variances.get(node.offset..node.offset + node.parameters).unwrap_or(&[]); let (bytes, codebook) = format.compress(weights, importance, config)?;
 						let hex = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
 						let metadata = if codebook.is_empty() { "-".to_owned() } else { codebook.iter().map(ToString::to_string).collect::<Vec<_>>().join(",") };
 						field(&mut document, "quantized", &format!("{} {} {metadata} {hex}", format.0, weights.len()))
@@ -205,7 +205,7 @@ mod bundle {
 		Ok(())
 	}
 	fn same_node(a: &Node, b: &Node) -> bool {
-		a.op == b.op && a.source == b.source && a.second == b.second && a.input == b.input && a.output == b.output && a.offset == b.offset && a.parameters == b.parameters && a.argument.map(f64::to_bits) == b.argument.map(f64::to_bits) && a.program_offset == b.program_offset && a.program_count == b.program_count
+		a.op == b.op && a.source == b.source && a.second == b.second && a.input == b.input && a.output == b.output && a.offset == b.offset && a.parameters == b.parameters && a.argument[..8].iter().zip(&b.argument).all(|(a,b)|a.to_bits()==b.to_bits()) && a.program_offset == b.program_offset && a.program_count == b.program_count
 	}
 	fn same_graph(a: &StoredGraph, b: &StoredGraph) -> bool {
 		a.precision == b.precision && a.inputs == b.inputs && a.outputs == b.outputs && a.graph.input == b.graph.input && a.graph.output == b.graph.output && a.graph.frozen == b.graph.frozen && a.graph.programs == b.graph.programs && a.graph.parameters.len() == b.graph.parameters.len() && a.graph.nodes.len() == b.graph.nodes.len() && a.graph.nodes.iter().zip(&b.graph.nodes).all(|(a, b)| same_node(a, b))
@@ -311,25 +311,13 @@ extern "C" fn interrupt(_: i32) {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipeError(String);
-impl RecipeError {
-	fn new(message: impl Into<String>) -> Self {
-		Self(message.into())
-	}
-}
-impl fmt::Display for RecipeError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(&self.0)
-	}
-}
+impl RecipeError { fn new(message: impl Into<String>) -> Self { Self(message.into()) } }
+impl fmt::Display for RecipeError { fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(&self.0) } }
 impl Error for RecipeError {}
 pub type Result<T> = std::result::Result<T, RecipeError>;
 type Ptr = *mut c_void;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Backend {
-	Cpu,
-	Amd,
-	Nvidia,
-}
+enum Backend { Cpu, Amd, Nvidia }
 pub struct Data {
 	sources: Vec<String>,
 	target: Vec<String>,
@@ -340,15 +328,9 @@ pub struct Data {
 	prepared: OnceLock<Result<Prepared>>,
 }
 #[derive(Clone)]
-struct Route {
-	inputs: Vec<String>,
-	outputs: Vec<String>,
-}
+struct Route { inputs: Vec<String>, outputs: Vec<String> }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Residual {
-	Layer(usize),
-	Activation(Activation),
-}
+pub enum Residual { Layer(usize), Activation(Activation) }
 pub const fn layer(width: usize) -> Residual {
 	Residual::Layer(width)
 }
@@ -402,10 +384,7 @@ pub enum Activation {
 	Prelu,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BlockNormalization {
-	Batch,
-	Layer,
-}
+enum BlockNormalization { Batch, Layer }
 macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Residual {
 	Residual::Activation(Activation::$value) })+}; }
 pub mod atv {
@@ -679,6 +658,7 @@ const IQ3_S: [u16; 512] = [
 	577,579,582,584,588,593,600,603,609,616,618,632,638,640,650,653,655,656,660,666,672,675,685,688,698,705,708,711,712,715,721,727,728,732,737,754,760,771,773,778,780,793,795,802,806,808,812,833,840,843,849,856,858,873,912,916,919,932,934,961,963,968,970,977,989,993,1010,1016,1024,1025,1027,1029,1031,1032,1034,1036,1038,1041,1043,1047,1048,1050,1057,1059,1061,1064,1066,1079,1080,1083,1085,1088,1090,1096,1099,1103,1106,1109,1113,1116,1122,1129,1153,1156,1159,1169,1171,1176,1183,1185,1195,1199,1209,1212,1216,1218,1221,1225,1234,1236,1241,1243,1250,1256,1270,1281,1287,1296,
 	1299,1306,1309,1313,1338,1341,1348,1353,1362,1375,1376,1387,1400,1408,1410,1415,1425,1453,1457,1477,1481,1494,1496,1507,1512,1538,1545,1547,1549,1551,1554,1561,1563,1565,1570,1572,1575,1577,1587,1593,1601,1603,1605,1612,1617,1619,1632,1648,1658,1662,1664,1674,1680,1690,1692,1704,1729,1736,1740,1745,1747,1751,1752,1761,1763,1767,1773,1787,1795,1801,1806,1810,1817,1834,1840,1844,1857,1864,1866,1877,1882,1892,1902,1915,1934,1953,1985,1987,2000,2002,2013,2048,2052,2058,2064,2068,2071,2074,2081,2088,2104,2114,2119,2121,2123,2130,2136,2141,2147,2153,2157,2177,2179,2184,2189,2193,2203,2208,2223,2226,2232,2244,2249,2251,2256,2258,2265,2269,
 	2304,2306,2324,2335,2336,2361,2373,2375,2385,2418,2443,2460,2480,2504,2509,2520,2531,2537,2562,2568,2572,2578,2592,2596,2599,2602,2614,2620,2625,2627,2629,2634,2641,2650,2682,2688,2697,2707,2712,2718,2731,2754,2759,2760,2775,2788,2793,2805,2811,2817,2820,2832,2842,2854,2890,2902,2921,2923,2978,3010,3012,3026,3081,3083,3085,3097,3099,3120,3136,3152,3159,3188,3210,3228,3234,3245,3250,3256,3264,3276,3281,3296,3349,3363,3378,3392,3395,3420,3440,3461,3488,3529,3531,3584,3588,3591,3600,3602,3614,3616,3628,3634,3650,3657,3668,3683,3685,3713,3716,3720,3726,3729,3736,3753,3778,3802,3805,3819,3841,3845,3851,3856,3880,3922,3938,3970,3993,4032];
+const IQ2_XXS:[u16;256]=[0,2,5,8,10,17,20,32,34,40,42,65,68,80,88,97,100,128,130,138,162,257,260,272,277,320,388,408,512,514,546,642,1025,1028,1040,1057,1060,1088,1090,1096,1120,1153,1156,1168,1188,1280,1282,1288,1312,1350,1385,1408,1425,1545,1552,1600,1668,1700,2048,2053,2056,2068,2088,2113,2116,2128,2130,2184,2308,2368,2562,2580,4097,4100,4112,4129,4160,4192,4228,4240,4245,4352,4360,4384,4432,4442,4480,4644,4677,5120,5128,5152,5157,5193,5248,5400,5474,5632,5654,6145,6148,6160,6208,6273,6400,6405,6560,6737,8192,8194,8202,8260,8289,8320,8322,8489,8520,8704,8706,9217,9220,9232,9280,9302,9472,9537,9572,9872,10248,10272,10388,10820,16385,16388,16400,16408,16417,16420,16448,16456,16470,16480,16513,16516,16528,16640,16672,16737,16768,16773,16897,16912,16968,16982,17000,17408,17416,17440,17536,17561,17682,17700,17920,18433,18436,18448,18496,18501,18688,18776,18785,18818,19013,19088,20480,20488,20497,20505,20512,20608,20616,20740,20802,20900,21137,21648,21650,21770,22017,22100,22528,22545,22553,22628,22848,23048,24580,24592,24640,24680,24832,24917,25112,25184,25600,25605,25872,25874,25988,26690,32768,32770,32778,32833,32898,33028,33048,33088,33297,33793,33796,33808,33813,33856,33888,34048,34118,34196,34313,34368,34400,34818,35076,35345,36868,36880,36900,36928,37025,37142,37248,37445,37888,37922,37956,38225,39041,39200,40962,41040,41093,41225,41472,42008,43088,43268];
 const IQ2_S: [u16; 1024] = [
 	0,2,5,8,10,17,20,22,25,32,34,37,40,65,68,70,73,80,82,85,88,97,100,102,105,128,130,133,136,145,148,160,165,170,257,260,262,265,272,274,277,280,289,292,320,322,325,328,337,340,342,345,352,357,360,385,388,400,402,405,417,420,512,514,517,520,529,532,544,554,577,580,582,585,592,597,640,645,650,660,674,1025,1028,1030,1033,1040,1042,1045,1048,1057,1060,1062,1065,1088,1090,1093,1096,1098,1105,1108,1110,1113,1120,1122,1125,1153,1156,1158,1161,1168,1173,1176,1185,1188,1280,1282,1285,1288,1290,1297,1300,1302,1305,1312,1317,1320,1345,1348,1350,1353,1360,1362,1365,1368,1377,1380,1408,1410,1413,1416,1425,1428,1440,1537,1540,1542,1545,1552,1557,1600,1605,1608,1617,1620,1632,1665,1668,1680,2048,2050,2053,2056,2065,2068,2070,2073,2080,2085,2090,2113,2116,2118,2121,2128,2130,2133,2136,2145,2148,2176,2181,2196,2218,2305,2308,2320,2322,2325,2328,2337,2368,2373,2376,2385,2388,2400,2433,2448,2560,2577,2580,2594,2600,2602,2640,2713,4097,4100,4102,4105,4112,4114,4117,4120,4129,4132,4134,4160,4162,4165,4168,4177,4180,4182,4185,4192,4194,4197,4200,4225,4228,4230,4240,4245,4248,4257,4260,4352,4354,4357,4360,4362,4369,4372,4374,4377,4384,4386,4389,4392,4417,4420,4422,4425,4432,4434,
 	4437,4440,4449,4452,4480,4482,4485,4488,4497,4500,4609,4612,4617,4624,4629,4641,4644,4672,4677,4689,4692,4737,4740,4752,5120,5122,5125,5128,5137,5140,5142,5145,5152,5157,5160,5185,5188,5190,5193,5200,5202,5205,5208,5217,5220,5248,5250,5253,5256,5265,5268,5280,5377,5380,5382,5385,5392,5394,5397,5400,5409,5412,5440,5442,5445,5448,5457,5460,5472,5505,5508,5520,5632,5637,5640,5649,5652,5664,5697,5700,5712,5760,5802,6145,6148,6150,6153,6160,6165,6168,6177,6208,6210,6213,6216,6225,6228,6240,6273,6276,6400,6402,6405,6408,6417,6420,6432,6465,6468,6480,6505,6562,6660,6672,6720,6742,8192,8194,8197,8200,8209,8212,8214,8217,8224,8229,8234,8257,8260,8272,8274,8277,8292,8320,8330,8340,8362,8449,8452,8464,8466,8469,8481,8512,8514,8517,8529,8532,8544,8577,8580,8592,8704,8714,8738,8744,8746,8772,8784,8840,8842,8872,9217,9220,9222,9225,9232,9237,9240,9249,9252,9280,9282,9285,9288,9297,9300,9312,9345,9348,9360,9472,9477,9480,9489,9492,9504,9537,9540,9552,9574,9600,9729,9732,9744,9792,9817,10240,10245,10257,10260,10305,10308,10320,10378,10410,10497,10500,10512,10645,10762,10786,10852,10888,10890,16385,16388,16390,16393,16400,16402,16405,16408,16410,16417,16420,16422,16448,16450,16453,16456,16458,16465,16468,16470,16473,16480,16482,16485,16513,16516,16528,16533,16536,16545,16548,16640,16642,16645,16648,16657,16660,16662,16665,16672,16674,
@@ -694,16 +674,29 @@ fn iq3_nearest(grid: &[u16], levels: &mut [i8], values: &[f32], weights: &[f32],
 	for lane in 0..4 { levels[lane] = (iq3_grid(grid, index, lane) - 1) / 2 }
 	index
 }
-fn iq2_grid(index:usize,lane:usize)->i8{(2*(IQ2_S[index]>>(2*lane)&3)+1)as i8}
-fn iq2_nearest(levels:&mut[i8],values:&[f32],weights:&[f32],scale:f32)->usize{
-	let key=levels.iter().enumerate().fold(0_u16,|key,(lane,level)|key|(*level as u16)<<(2*lane));if let Some(index)=IQ2_S.iter().position(|value|*value==key){return index}let mut candidates=IQ2_S.iter().enumerate().map(|(index,point)|((0..8).map(|lane|{let difference=i32::from((*point>>(2*lane)&3)as i8-levels[lane]);difference*difference}).sum::<i32>(),index)).collect::<Vec<_>>();candidates.sort_unstable();let first=candidates[0].0;let index=candidates.into_iter().take_while(|item|item.0==first).map(|item|item.1).min_by(|left,right|{let error=|index|(0..8).map(|lane|{let difference=scale*f32::from(iq2_grid(index,lane))-values[lane];weights[lane]*difference*difference}).sum::<f32>();error(*left).total_cmp(&error(*right))}).unwrap();for lane in 0..8{levels[lane]=(iq2_grid(index,lane)-1)/2}index
+fn iq2_grid(grid:&[u16],index:usize,lane:usize)->i8{(2*(grid[index]>>(2*lane)&3)+1)as i8}
+fn iq2_nearest(grid:&[u16],shells:usize,levels:&mut[i8],values:&[f32],weights:&[f32],scale:f32)->usize{
+	let key=levels.iter().enumerate().fold(0_u16,|key,(lane,level)|key|(*level as u16)<<(2*lane));if let Some(index)=grid.iter().position(|value|*value==key){return index}let mut candidates=grid.iter().enumerate().map(|(index,point)|((0..8).map(|lane|{let difference=i32::from((*point>>(2*lane)&3)as i8-levels[lane]);difference*difference}).sum::<i32>(),index)).collect::<Vec<_>>();candidates.sort_unstable();let mut distances=candidates.iter().map(|item|item.0).collect::<Vec<_>>();distances.dedup();let limit=distances.get(shells.saturating_sub(1)).copied().unwrap_or(candidates[0].0);let index=candidates.into_iter().take_while(|item|item.0<=limit).map(|item|item.1).min_by(|left,right|{let error=|index|(0..8).map(|lane|{let difference=scale*f32::from(iq2_grid(grid,index,lane))-values[lane];weights[lane]*difference*difference}).sum::<f32>();error(*left).total_cmp(&error(*right))}).unwrap();for lane in 0..8{levels[lane]=(iq2_grid(grid,index,lane)-1)/2}index
+}
+fn qp_scale(values:&[f32],weights:&[f32],nmax:i8)->f32{
+	let max=values.iter().copied().fold(0.0_f32,f32::max);if max<1.0e-15{return 0.0}let mut inverse=f32::from(nmax)/max;let mut levels=values.iter().map(|value|qround(inverse*value).min(f32::from(nmax))as i8).collect::<Vec<_>>();let error=|inverse:f32|values.iter().zip(weights).map(|(value,weight)|{let level=qround(inverse*value).min(f32::from(nmax));let difference=value-level/inverse;weight*difference*difference}).sum::<f32>();let mut best=error(inverse);
+	for step in -4..=4{if step==0{continue}let trial=(f32::from(nmax)+0.1*step as f32)/max;let trial_error=error(trial);if trial_error<best{best=trial_error;inverse=trial}}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..values.len(){levels[lane]=qround(inverse*values[lane]).min(f32::from(nmax))as i8;qx+=weights[lane]*values[lane]*f32::from(levels[lane]);q2+=weights[lane]*f32::from(levels[lane]*levels[lane])}
+	for _ in 0..5{let mut changed=false;for lane in 0..values.len(){let level=f32::from(levels[lane]);let x=qx-weights[lane]*values[lane]*level;let q=q2-weights[lane]*level*level;if x>0.0&&q>0.0{let next=qround(values[lane]*q/x).min(f32::from(nmax))as i8;if next!=levels[lane]{let nx=x+weights[lane]*values[lane]*f32::from(next);let nq=q+weights[lane]*f32::from(next*next);if nx*nx*q2>qx*qx*nq{levels[lane]=next;qx=nx;q2=nq;changed=true}}}}if !changed{break}}if q2>0.0{qx/q2}else{0.0}
+}
+#[rustfmt::skip] fn iq2_xxs(values:&[f32],importance:&[f32])->Vec<u8>{
+	let mut output=Vec::new();for (chunk,values)in values.chunks(256).enumerate(){let value=|index|values.get(index).copied().unwrap_or(0.0);let importance=|index|importance.get(chunk*256+index).copied().unwrap_or(0.0);let sigma2=(0..256).map(|index|value(index)*value(index)).sum::<f32>()/256.0;let mut packed=[0_u8;64];let mut scales=[0.0_f32;8];let mut maximum=0.0_f32;
+		for block in 0..8{let x=(0..32).map(|offset|value(block*32+offset)).collect::<Vec<_>>();let weights=(0..32).map(|offset|importance(block*32+offset)*(sigma2+x[offset]*x[offset]).sqrt()).collect::<Vec<_>>();let mut magnitudes=x.iter().map(|value|value.abs()).collect::<Vec<_>>();let mut signs=[0_u8;4];for group in 0..4{let mut flips=0;for lane in 0..8{if x[group*8+lane]<0.0{flips+=1;signs[group]|=1<<lane}}if flips%2!=0{let lane=(0..8).min_by(|a,b|(weights[group*8+*a]*x[group*8+*a]*x[group*8+*a]).total_cmp(&(weights[group*8+*b]*x[group*8+*b]*x[group*8+*b]))).unwrap();magnitudes[group*8+lane]=-magnitudes[group*8+lane];signs[group]^=1<<lane}signs[group]&=127}let max=magnitudes.iter().copied().fold(0.0_f32,f32::max);if max<1.0e-15{continue}
+			let seed=qp_scale(&magnitudes,&weights,4);let effective=seed*3.0;if effective<=0.0{continue}let mut best=0.0_f32;let mut scale=seed;let mut levels=[0_i8;32];for step in -6..=6{let inverse=(5.0+0.1*step as f32)/effective;let trial_scale=inverse.recip();let mut trial=[0_i8;32];for group in 0..4{for lane in 0..8{trial[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}iq2_nearest(&IQ2_XXS,2,&mut trial[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),trial_scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..32{let quant=f32::from(2*trial[lane]+1);qx+=weights[lane]*magnitudes[lane]*quant;q2+=weights[lane]*quant*quant}if q2>0.0&&qx*qx>best*q2{scale=qx/q2;best=scale*qx;levels=trial}}
+			if scale>0.0{let inverse=scale.recip();for group in 0..4{for lane in 0..8{levels[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}iq2_nearest(&IQ2_XXS,2,&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..32{let quant=f32::from(2*levels[lane]+1);qx+=weights[lane]*magnitudes[lane]*quant;q2+=weights[lane]*quant*quant}if q2>0.0{scale=qx/q2}}if scale<0.0{scale=-scale;for sign in &mut signs{*sign=(!*sign)&127}}
+			for group in 0..4{packed[block*8+group]=iq2_nearest(&IQ2_XXS,2,&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale)as u8}let word=u32::from(signs[0])|u32::from(signs[1])<<7|u32::from(signs[2])<<14|u32::from(signs[3])<<21;packed[block*8+4..block*8+8].copy_from_slice(&word.to_le_bytes());scales[block]=scale;maximum=maximum.max(scale)}
+		if maximum==0.0{put_half(&mut output,0.0);output.extend(packed);continue}let scale=maximum/31.0;for block in 0..8{let code=qround(0.5*(scales[block]/scale-1.0)).max(0.0).min(15.0)as u32;let mut word=u32::from_le_bytes(packed[block*8+4..block*8+8].try_into().unwrap());word|=code<<28;packed[block*8+4..block*8+8].copy_from_slice(&word.to_le_bytes())}put_half(&mut output,scale);output.extend(packed)}output
 }
 #[rustfmt::skip] fn iq2_s(values:&[f32])->Vec<u8>{
 	let mut output=Vec::new();for values in values.chunks(256){let value=|index|values.get(index).copied().unwrap_or(0.0);let sigma2=2.0*(0..256).map(|index|value(index)*value(index)).sum::<f32>()/256.0;let mut packed=[0_u8;80];let mut scales=[0.0_f32;16];let mut maximum=0.0_f32;
 		for block in 0..16{let x=(0..16).map(|offset|value(block*16+offset)).collect::<Vec<_>>();let weights=x.iter().map(|value|0.25*sigma2+value*value).collect::<Vec<_>>();let magnitudes=x.iter().map(|value|value.abs()).collect::<Vec<_>>();let max=magnitudes.iter().copied().fold(0.0_f32,f32::max);if max<1.0e-8{continue}let mut best=0.0_f32;let mut scale=max/5.0;let mut levels=[0_i8;16];let mut on_grid=[true;2];
-			for step in -9..=9{let inverse=(5.0+0.1*step as f32)/max;let trial_scale=inverse.recip();let mut trial=[0_i8;16];let mut trial_on=[true;2];for group in 0..2{for lane in 0..8{trial[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}let key=(0..8).fold(0_u16,|key,lane|key|(trial[group*8+lane]as u16)<<(2*lane));trial_on[group]=IQ2_S.contains(&key);iq2_nearest(&mut trial[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),trial_scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..16{let quant=f32::from(2*trial[lane]+1);qx+=weights[lane]*magnitudes[lane]*quant;q2+=weights[lane]*quant*quant}if q2>0.0&&qx*qx>best*q2{scale=qx/q2;best=scale*qx;levels=trial;on_grid=trial_on}}
-			if on_grid.iter().any(|value|!*value)&&scale>0.0{let inverse=scale.recip();for group in 0..2{if on_grid[group]{continue}for lane in 0..8{levels[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}iq2_nearest(&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..16{let quant=f32::from(2*levels[lane]+1);qx+=weights[lane]*magnitudes[lane]*quant;q2+=weights[lane]*quant*quant}if q2>0.0{scale=qx/q2}}
-			for group in 0..2{let index=iq2_nearest(&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);let slot=2*block+group;packed[slot]=index as u8;packed[64+slot/4]|=((index>>8)as u8)<<(2*(slot%4));packed[32+slot]=(0..8).fold(0,|signs,lane|signs|u8::from(x[group*8+lane]<0.0)<<lane)}scales[block]=scale;maximum=maximum.max(scale)}
+			for step in -9..=9{let inverse=(5.0+0.1*step as f32)/max;let trial_scale=inverse.recip();let mut trial=[0_i8;16];let mut trial_on=[true;2];for group in 0..2{for lane in 0..8{trial[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}let key=(0..8).fold(0_u16,|key,lane|key|(trial[group*8+lane]as u16)<<(2*lane));trial_on[group]=IQ2_S.contains(&key);iq2_nearest(&IQ2_S,1,&mut trial[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),trial_scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..16{let quant=f32::from(2*trial[lane]+1);qx+=weights[lane]*magnitudes[lane]*quant;q2+=weights[lane]*quant*quant}if q2>0.0&&qx*qx>best*q2{scale=qx/q2;best=scale*qx;levels=trial;on_grid=trial_on}}
+			if on_grid.iter().any(|value|!*value)&&scale>0.0{let inverse=scale.recip();for group in 0..2{if on_grid[group]{continue}for lane in 0..8{levels[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}iq2_nearest(&IQ2_S,1,&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..16{let quant=f32::from(2*levels[lane]+1);qx+=weights[lane]*magnitudes[lane]*quant;q2+=weights[lane]*quant*quant}if q2>0.0{scale=qx/q2}}
+			for group in 0..2{let index=iq2_nearest(&IQ2_S,1,&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);let slot=2*block+group;packed[slot]=index as u8;packed[64+slot/4]|=((index>>8)as u8)<<(2*(slot%4));packed[32+slot]=(0..8).fold(0,|signs,lane|signs|u8::from(x[group*8+lane]<0.0)<<lane)}scales[block]=scale;maximum=maximum.max(scale)}
 		if maximum==0.0{put_half(&mut output,0.0);output.extend(packed);continue}let scale=maximum/31.0;for block in 0..16{let code=qround(0.5*(scales[block]/scale-1.0)).max(0.0).min(15.0)as u8;packed[72+block/2]|=code<<(block%2*4)}put_half(&mut output,scale*0.9875);output.extend(packed)}output
 } #[rustfmt::skip] fn iq3_xxs(values: &[f32]) -> Vec<u8> {
 	let mut output = Vec::new(); for values in values.chunks(256) {
@@ -754,7 +747,7 @@ fn iq4_fit(values: &[f32], tries: i32) -> (f32, Vec<u8>) {
 #[derive(Clone, Copy)]
 struct IntegerFormat(u16);
 trait Integer {
-	fn compress(self, weights: &[f64], config: Config) -> Result<(Vec<u8>, Vec<f64>)>;
+	fn compress(self, weights: &[f64], importance: &[f64], config: Config) -> Result<(Vec<u8>, Vec<f64>)>;
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>>;
 	fn bits(self) -> u8;
 }
@@ -762,7 +755,7 @@ impl Integer for IntegerFormat {
 	fn bits(self) -> u8 {
 		self.0 as u8
 	}
-	fn compress(self, weights: &[f64], config: Config) -> Result<(Vec<u8>, Vec<f64>)> {
+	fn compress(self, weights: &[f64], importance: &[f64], config: Config) -> Result<(Vec<u8>, Vec<f64>)> {
 		let bits = self.bits();
 		let (family, variant) = (self.0 >> 12, self.0 >> 8 & 15);
 		if family == 0 && ((variant == 0 && bits == 2) || (variant < 2 && matches!(bits, 4 | 5 | 8))) {
@@ -1087,10 +1080,11 @@ impl Integer for IntegerFormat {
 			}
 			return Ok((data, Vec::new()));
 		}
+		if family == 1 && variant == 1 && bits == 2 { require(importance.len()==weights.len()&&importance.iter().all(|value|value.is_finite()&&*value>=0.0)&&importance.iter().any(|value|*value>0.0),"GGML IQ2_XXS requires trained importance weights")?;return Ok((iq2_xxs(&weights.iter().map(|value|*value as f32).collect::<Vec<_>>(),&importance.iter().map(|value|*value as f32).collect::<Vec<_>>()),Vec::new())) }
 		if family == 1 && variant == 1 && bits == 3 { return Ok((iq3_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new())) }
 		if family == 1 && variant == 3 && bits == 2 { return Ok((iq2_s(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new())) }
 		if family == 1 && variant == 3 && bits == 3 { return Ok((iq3_s(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new())) }
-		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS", self.0)))
+		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS", self.0)))
 	}
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>> {
 		let (family, variant, bits) = (self.0 >> 12, self.0 >> 8 & 15, self.bits());
@@ -1271,16 +1265,20 @@ impl Integer for IntegerFormat {
 			for bytes in data.chunks_exact(STRIDE) { let scale=half(bytes); for block in 0..8 { let word=u32::from_le_bytes(bytes[66+block*4..70+block*4].try_into().unwrap()); let d=scale*(0.5+(word>>28) as f32)*0.5; for group in 0..4 { let signs=(word>>(7*group)&127) as u8; let signs=signs | ((signs.count_ones() as u8 & 1)<<7); for lane in 0..8 { if weights.len()==count { return Ok(weights) } let grid=usize::from(bytes[2+block*8+group*2+lane/4]); let magnitude=f32::from(iq3_grid(&IQ3_XXS,grid,lane%4)); weights.push(f64::from(d*magnitude*if signs>>lane&1!=0 {-1.0} else {1.0})) } } } }
 			return Ok(weights);
 		}
+		if family==1&&variant==1&&bits==2{
+			const STRIDE:usize=66;require(data.len()>=count.div_ceil(256)*STRIDE,"GGML IQ2_XXS weights are invalid")?;let mut weights=Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE){let scale=half(bytes);for block in 0..8{let word=u32::from_le_bytes(bytes[6+block*8..10+block*8].try_into().unwrap());let d=scale*(0.5+(word>>28)as f32)*0.25;for group in 0..4{let signs=(word>>(7*group)&127)as u8;let signs=signs|((signs.count_ones()as u8&1)<<7);let grid=usize::from(bytes[2+block*8+group]);for lane in 0..8{if weights.len()==count{return Ok(weights)}let sign=if signs>>lane&1!=0{-1.0}else{1.0};weights.push(f64::from(d*f32::from(iq2_grid(&IQ2_XXS,grid,lane))*sign))}}}}return Ok(weights)
+		}
 		if family == 1 && variant == 3 && bits == 2 {
 			const STRIDE:usize=82;require(data.len()>=count.div_ceil(256)*STRIDE,"GGML IQ2_S weights are invalid")?;let mut weights=Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE){let scale=half(bytes);for index in 0..256{if weights.len()==count{return Ok(weights)}let block=index/16;let slot=index/8;let grid=usize::from(bytes[2+slot])|usize::from(bytes[66+slot/4]>>(2*(slot%4))&3)<<8;let code=bytes[74+block/2]>>(4*(block%2))&15;let d=scale*(0.5+f32::from(code))*0.25;let sign=if bytes[34+slot]>>(index%8)&1!=0{-1.0}else{1.0};weights.push(f64::from(d*f32::from(iq2_grid(grid,index%8))*sign))}}return Ok(weights)
+			for bytes in data.chunks_exact(STRIDE){let scale=half(bytes);for index in 0..256{if weights.len()==count{return Ok(weights)}let block=index/16;let slot=index/8;let grid=usize::from(bytes[2+slot])|usize::from(bytes[66+slot/4]>>(2*(slot%4))&3)<<8;let code=bytes[74+block/2]>>(4*(block%2))&15;let d=scale*(0.5+f32::from(code))*0.25;let sign=if bytes[34+slot]>>(index%8)&1!=0{-1.0}else{1.0};weights.push(f64::from(d*f32::from(iq2_grid(&IQ2_S,grid,index%8))*sign))}}return Ok(weights)
 		}
 		if family == 1 && variant == 3 && bits == 3 {
 			const STRIDE:usize=110;require(data.len()>=count.div_ceil(256)*STRIDE,"GGML IQ3_S weights are invalid")?;let mut weights=Vec::with_capacity(count);
 			for bytes in data.chunks_exact(STRIDE) {let scale=half(bytes);for index in 0..256 {if weights.len()==count{return Ok(weights)}let block=index/32;let group=index/4;let grid=usize::from(bytes[2+group])|usize::from(bytes[66+group/8]>>(group%8)&1)<<8;let code=bytes[106+block/2]>>(block%2*4)&15;let d=scale*f32::from(1+2*code);let sign=if bytes[74+index/8]>>(index%8)&1!=0{-1.0}else{1.0};weights.push(f64::from(d*f32::from(iq3_grid(&IQ3_S,grid,index%4))*sign))}}
 			return Ok(weights)
 		}
-		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS", self.0)))
+		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS", self.0)))
 	}
 }
 pub struct Qi { model: Model, pub zero: Model, pub one: Model, pub nf: Model, pub k: Qk }
