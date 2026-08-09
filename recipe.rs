@@ -603,8 +603,8 @@ fn unfp16(value: u16) -> f32 {
 	let mantissa = u32::from(value & 1023);
 	let bits = if exponent == 0 {
 		if mantissa == 0 { sign } else {
-			let shift = mantissa.leading_zeros() - 22;
-			sign | (113 - shift) << 23 | (mantissa << (shift + 1) & 0x7fffff)
+			let shift = mantissa.leading_zeros() - 21;
+			sign | (113 - shift) << 23 | (mantissa << (shift + 13) & 0x7fffff)
 		}
 	} else if exponent == 31 { sign | 0x7f800000 | mantissa << 13 }
 	else { sign | (exponent + 112) << 23 | mantissa << 13 };
@@ -617,105 +617,68 @@ fn half(input: &[u8]) -> f32 {
 	unfp16(u16::from_le_bytes([input[0], input[1]]))
 }
 fn float(input: &[u8]) -> f32 { f32::from_le_bytes([input[0], input[1], input[2], input[3]]) }
+fn qround(value: f32) -> f32 { (((value + 12582912.0).to_bits() as i32 & 0x007fffff) - 0x00400000) as f32 }
+fn positive_max(values: &[f32]) -> f32 { values.iter().fold(0.0, |maximum, value| if *value > maximum { *value } else { maximum }) }
 #[rustfmt::skip]
 fn qkx2(values: &[f32], weights: &[f32], levels: i32, range: (f32, f32, usize), mad: bool, codes: &mut [u8]) -> (f32, f32) {
-	let (minimum, maximum) = values.iter().copied().fold((values[0], values[0]), |(low, high), value| (low.min(value), high.max(value)));
-	let minimum = minimum.min(0.0);
+	let (mut minimum, mut maximum, mut sum_w, mut sum_x) = (values[0], values[0], weights[0], weights[0] * values[0]);
+	for index in 1..values.len() { if values[index] < minimum { minimum = values[index] } if values[index] > maximum { maximum = values[index] } sum_w += weights[index]; sum_x += weights[index] * values[index] }
+	if minimum > 0.0 { minimum = 0.0 }
 	if maximum == minimum { codes.fill(0); return (0.0, -minimum) }
-	let (sum_w, sum_x) = weights.iter().zip(values).fold((0.0, 0.0), |(sum_w, sum_x), (weight, value)| (sum_w + weight, sum_x + weight * value));
-	let mut scale = (maximum - minimum) / levels as f32;
-	let mut error = 0.0;
-	for ((value, weight), code) in values.iter().zip(weights).zip(codes.iter_mut()) {
-		*code = ((value - minimum) / scale).round().max(0.0).min(levels as f32) as u8;
-		let difference = scale * f32::from(*code) + minimum - value;
-		error += weight * if mad { difference.abs() } else { difference * difference };
-	}
-	let mut best = (scale, minimum, error);
+	let mut inverse = levels as f32 / (maximum - minimum); let mut scale = 1.0 / inverse; let mut best_error = 0.0;
+	for index in 0..values.len() { codes[index] = qround(inverse * (values[index] - minimum)).max(0.0).min(levels as f32) as u8; let difference = scale * f32::from(codes[index]) + minimum - values[index]; best_error += weights[index] * if mad { difference.abs() } else { difference * difference } }
+	let mut trial = vec![0_u8; values.len()];
 	for step in 0..=range.2 {
-		let inverse = (range.0 + range.1 * step as f32 + levels as f32) / (maximum - minimum);
+		inverse = (range.0 + range.1 * step as f32 + levels as f32) / (maximum - minimum);
 		let (mut sum_l, mut sum_l2, mut sum_xl) = (0.0, 0.0, 0.0);
-		let mut trial = vec![0_u8; values.len()];
-		for ((value, weight), code) in values.iter().zip(weights).zip(&mut trial) {
-			*code = ((value - minimum) * inverse).round().max(0.0).min(levels as f32) as u8;
-			let code = f32::from(*code);
-			sum_l += weight * code;
-			sum_l2 += weight * code * code;
-			sum_xl += weight * code * value;
-		}
+		for index in 0..values.len() { trial[index] = qround(inverse * (values[index] - minimum)).max(0.0).min(levels as f32) as u8; let code = f32::from(trial[index]); sum_l += weights[index] * code; sum_l2 += weights[index] * code * code; sum_xl += weights[index] * code * values[index] }
 		let denominator = sum_w * sum_l2 - sum_l * sum_l;
 		if denominator > 0.0 {
 			let mut candidate_scale = (sum_w * sum_xl - sum_x * sum_l) / denominator;
 			let mut candidate_minimum = (sum_l2 * sum_x - sum_l * sum_xl) / denominator;
 			if candidate_minimum > 0.0 { candidate_minimum = 0.0; candidate_scale = sum_xl / sum_l2 }
-			let candidate_error = values.iter().zip(weights).zip(&trial).map(|((value, weight), code)| {
-					let difference = candidate_scale * f32::from(*code) + candidate_minimum - value;
-					weight * if mad { difference.abs() } else { difference * difference }
-				}).sum();
-			if candidate_error < best.2 {
-				codes.copy_from_slice(&trial);
-				best = (candidate_scale, candidate_minimum, candidate_error)
-			}
+			let mut error = 0.0; for index in 0..values.len() { let difference = candidate_scale * f32::from(trial[index]) + candidate_minimum - values[index]; error += weights[index] * if mad { difference.abs() } else { difference * difference } }
+			if error < best_error { codes.copy_from_slice(&trial); best_error = error; scale = candidate_scale; minimum = candidate_minimum }
 		}
 	}
-	scale = best.0;
-	(scale, -best.1)
+	(scale, -minimum)
 }
 #[rustfmt::skip]
 fn q3(values: &[f32], codes: &mut [i8]) -> f32 {
-	let mut extreme = 0.0_f32;
-	for value in values { if value.abs() > extreme.abs() { extreme = *value } }
-	if extreme.abs() < 1.0e-15 { codes.fill(0); return 0.0 }
-	let inverse = -4.0 / extreme;
+	let (mut maximum, mut absolute) = (0.0_f32, 0.0_f32);
+	for value in values { let candidate = value.abs(); if candidate > absolute { absolute = candidate; maximum = *value } }
+	if absolute < 1.0e-15 { codes.fill(0); return 0.0 }
+	let inverse = -4.0 / maximum;
 	let (mut sum_lx, mut sum_l2) = (0.0, 0.0);
-	for (value, code) in values.iter().zip(codes.iter_mut()) {
-		*code = (value * inverse).round().max(-4.0).min(3.0) as i8;
-		let weight = value * value;
-		sum_lx += weight * value * f32::from(*code); sum_l2 += weight * f32::from(*code) * f32::from(*code);
-	}
+	for index in 0..values.len() { let code = qround(inverse * values[index]).max(-4.0).min(3.0); codes[index] = code as i8; let weight = values[index] * values[index]; sum_lx += weight * values[index] * code; sum_l2 += weight * code * code }
 	for _ in 0..5 {
-		let mut changed = false;
-		for (value, code) in values.iter().zip(codes.iter_mut()) {
-			let weight = value * value;
-			let reduced_lx = sum_lx - weight * value * f32::from(*code);
-			if reduced_lx <= 0.0 { continue }
-			let reduced_l2 = sum_l2 - weight * f32::from(*code) * f32::from(*code);
-			let candidate = (value * reduced_l2 / reduced_lx).round().max(-4.0).min(3.0) as i8;
-			let (candidate_lx, candidate_l2) = (reduced_lx + weight * value * f32::from(candidate), reduced_l2 + weight * f32::from(candidate) * f32::from(candidate));
-			if candidate != *code && candidate_l2 > 0.0 && candidate_lx * candidate_lx * sum_l2 > sum_lx * sum_lx * candidate_l2 {
-				*code = candidate; sum_lx = candidate_lx; sum_l2 = candidate_l2; changed = true
-			}
+		let mut changed = 0;
+		for index in 0..values.len() {
+			let value = values[index]; let code = f32::from(codes[index]); let weight = value * value; let mut reduced_lx = sum_lx - weight * value * code;
+			if reduced_lx > 0.0 { let mut reduced_l2 = sum_l2 - weight * code * code; let candidate = qround(value * reduced_l2 / reduced_lx).max(-4.0).min(3.0); if candidate != code { reduced_lx += weight * value * candidate; reduced_l2 += weight * candidate * candidate; if reduced_l2 > 0.0 && reduced_lx * reduced_lx * sum_l2 > sum_lx * sum_lx * reduced_l2 { codes[index] = candidate as i8; sum_lx = reduced_lx; sum_l2 = reduced_l2; changed += 1 } } }
 		}
-		if !changed { break }
+		if changed == 0 { break }
 	}
 	for code in codes { *code += 4 }
 	if sum_l2 > 0.0 { sum_lx / sum_l2 } else { 0.0 }
 }
 #[rustfmt::skip]
 fn qx(values: &[f32], levels: i32, codes: &mut [i8]) -> f32 {
-	let mut extreme = 0.0_f32;
-	for value in values { if value.abs() > extreme.abs() { extreme = *value } }
-	if extreme.abs() < 1.0e-15 { codes.fill(0); return 0.0 }
-	let mut inverse = -(levels as f32) / extreme;
+	let (mut maximum, mut absolute) = (0.0_f32, 0.0_f32);
+	for value in values { let candidate = value.abs(); if candidate > absolute { absolute = candidate; maximum = *value } }
+	if absolute < 1.0e-15 { codes.fill(0); return 0.0 }
+	let mut inverse = -(levels as f32) / maximum;
 	let (mut sum_lx, mut sum_l2) = (0.0, 0.0);
-	for (value, code) in values.iter().zip(codes.iter_mut()) {
-		*code = (value * inverse).round().max(-(levels as f32)).min((levels - 1) as f32) as i8 + levels as i8;
-		let signed = f32::from(*code) - levels as f32;
-		let weight = value * value;
-		sum_lx += weight * value * signed; sum_l2 += weight * signed * signed;
-	}
+	for index in 0..values.len() { let signed = qround(inverse * values[index]).max(-(levels as f32)).min((levels - 1) as f32); codes[index] = signed as i8 + levels as i8; let weight = values[index] * values[index]; sum_lx += weight * values[index] * signed; sum_l2 += weight * signed * signed }
 	let mut scale = if sum_l2 == 0.0 { 0.0 } else { sum_lx / sum_l2 };
 	let mut best = scale * sum_lx;
 	for step in -9..=9 {
 		if step == 0 { continue }
-		inverse = -(levels as f32 + 0.1 * step as f32) / extreme;
+		inverse = -(levels as f32 + 0.1 * step as f32) / maximum;
 		(sum_lx, sum_l2) = (0.0, 0.0);
-		for value in values {
-			let code = (value * inverse).round().max(-(levels as f32)).min((levels - 1) as f32);
-			let weight = value * value;
-			sum_lx += weight * value * code; sum_l2 += weight * code * code;
-		}
+		for value in values { let code = qround(inverse * value).max(-(levels as f32)).min((levels - 1) as f32); let weight = value * value; sum_lx += weight * value * code; sum_l2 += weight * code * code }
 		if sum_l2 > 0.0 && sum_lx * sum_lx > best * sum_l2 {
-			for (value, code) in values.iter().zip(codes.iter_mut()) { *code = (value * inverse).round().max(-(levels as f32)).min((levels - 1) as f32) as i8 + levels as i8 }
+			for (value, code) in values.iter().zip(codes.iter_mut()) { *code = qround(inverse * value).max(-(levels as f32)).min((levels - 1) as f32) as i8 + levels as i8 }
 			scale = sum_lx / sum_l2; best = scale * sum_lx
 		}
 	}
@@ -831,18 +794,18 @@ impl Integer for IntegerFormat {
 					let weights = values[block * 16..block * 16 + 16].iter().map(|value| value.abs()).collect::<Vec<_>>();
 					(scales[block], minima[block]) = qkx2(&values[block * 16..block * 16 + 16], &weights, 3, (-0.5, 0.1, 15), true, &mut codes[block * 16..block * 16 + 16]);
 				}
-				let (max_scale, max_minimum) = (scales.iter().copied().fold(0.0_f32, f32::max), minima.iter().copied().fold(0.0_f32, f32::max));
+				let (max_scale, max_minimum) = (positive_max(&scales), positive_max(&minima));
 				let (scale, minimum) = (max_scale / 15.0, max_minimum / 15.0);
 				let (stored_scale, stored_minimum) = (unfp16(fp16(scale)), unfp16(fp16(minimum)));
 				let mut packed_scales = [0_u8; 16];
 				for block in 0..16 {
-					let scale_code = if max_scale > 0.0 { (15.0 * scales[block] / max_scale).round() as u8 } else { 0 };
-					let minimum_code = if max_minimum > 0.0 { (15.0 * minima[block] / max_minimum).round() as u8 } else { 0 };
+					let scale_code = if max_scale > 0.0 { qround(15.0 * scales[block] / max_scale) as u8 } else { 0 };
+					let minimum_code = if max_minimum > 0.0 { qround(15.0 * minima[block] / max_minimum) as u8 } else { 0 };
 					packed_scales[block] = scale_code | minimum_code << 4;
 					let (d, m) = (stored_scale * f32::from(scale_code), stored_minimum * f32::from(minimum_code));
 					if d != 0.0 {
 						for offset in 0..16 {
-							codes[block * 16 + offset] = ((values[block * 16 + offset] + m) / d).round().max(0.0).min(3.0) as u8;
+							codes[block * 16 + offset] = qround((values[block * 16 + offset] + m) / d).max(0.0).min(3.0) as u8;
 						}
 					}
 				}
@@ -877,7 +840,7 @@ impl Integer for IntegerFormat {
 				let stored_scale = unfp16(fp16(scale));
 				let mut scales = [0_u8; 12];
 				for block in 0..16 {
-					let mut code = (inverse * block_scales[block]).round().max(-32.0).min(31.0) as i8 + 32;
+					let mut code = qround(inverse * block_scales[block]).max(-32.0).min(31.0) as i8 + 32;
 					if block < 8 {
 						scales[block] = code as u8 & 15
 					} else {
@@ -889,7 +852,7 @@ impl Integer for IntegerFormat {
 					let d = stored_scale * f32::from(signed);
 					if d != 0.0 {
 						for offset in 0..16 {
-							codes[block * 16 + offset] = (values[block * 16 + offset] / d).round().max(-4.0).min(3.0) as i8 + 4;
+							codes[block * 16 + offset] = qround(values[block * 16 + offset] / d).max(-4.0).min(3.0) as i8 + 4;
 						}
 					}
 				}
@@ -921,13 +884,13 @@ impl Integer for IntegerFormat {
 					let (levels, range) = if bits == 4 { (15, (-1.0, 0.1, 20)) } else { (31, (-0.5, 0.1, 15)) };
 					(block_scales[block], minima[block]) = qkx2(slice, &weights, levels, range, false, &mut codes[block * 32..block * 32 + 32]);
 				}
-				let (maximum, max_minimum) = (block_scales.iter().copied().fold(0.0_f32, f32::max), minima.iter().copied().fold(0.0_f32, f32::max));
+				let (maximum, max_minimum) = (positive_max(&block_scales), positive_max(&minima));
 				let (scale, minimum) = (maximum / 63.0, max_minimum / 63.0);
 				let (stored_scale, stored_minimum) = (unfp16(fp16(scale)), unfp16(fp16(minimum)));
 				let mut metadata = [0_u8; 12];
 				for block in 0..8 {
-					let scale_code = if maximum > 0.0 { (63.0 * block_scales[block] / maximum).round().min(63.0) as u8 } else { 0 };
-					let minimum_code = if max_minimum > 0.0 { (63.0 * minima[block] / max_minimum).round().min(63.0) as u8 } else { 0 };
+					let scale_code = if maximum > 0.0 { qround(63.0 * block_scales[block] / maximum).min(63.0) as u8 } else { 0 };
+					let minimum_code = if max_minimum > 0.0 { qround(63.0 * minima[block] / max_minimum).min(63.0) as u8 } else { 0 };
 					if block < 4 {
 						metadata[block] = scale_code;
 						metadata[block + 4] = minimum_code
@@ -942,7 +905,7 @@ impl Integer for IntegerFormat {
 					let (d, m) = (stored_scale * f32::from(scale_code), stored_minimum * f32::from(minimum_code));
 					if d != 0.0 {
 						for offset in 0..32 {
-							codes[block * 32 + offset] = ((values[block * 32 + offset] + m) / d).round().max(0.0).min(if bits == 4 { 15.0 } else { 31.0 }) as u8;
+							codes[block * 32 + offset] = qround((values[block * 32 + offset] + m) / d).max(0.0).min(if bits == 4 { 15.0 } else { 31.0 }) as u8;
 						}
 					}
 				}
@@ -981,11 +944,11 @@ impl Integer for IntegerFormat {
 				let stored_scale = unfp16(fp16(scale));
 				let mut scales = [0_i8; 16];
 				for block in 0..16 {
-					scales[block] = (inverse * block_scales[block]).round().min(127.0) as i8;
+					scales[block] = qround(inverse * block_scales[block]).min(127.0) as i8;
 					let d = stored_scale * f32::from(scales[block]);
 					if d != 0.0 {
 						for offset in 0..16 {
-							codes[block * 16 + offset] = (values[block * 16 + offset] / d).round().max(-32.0).min(31.0) as i8 + 32;
+							codes[block * 16 + offset] = qround(values[block * 16 + offset] / d).max(-32.0).min(31.0) as i8 + 32;
 						}
 					}
 				}
@@ -1011,7 +974,7 @@ impl Integer for IntegerFormat {
 				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
 				let maximum = (0..256).map(value).max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
 				let inverse = if maximum == 0.0 { 0.0 } else { -127.0 / maximum }; let scale = if inverse == 0.0 { 0.0 } else { inverse.recip() };
-				data.extend(scale.to_le_bytes()); let codes = (0..256).map(|index| (inverse * value(index)).round().max(-128.0).min(127.0) as i8).collect::<Vec<_>>();
+				data.extend(scale.to_le_bytes()); let codes = (0..256).map(|index| qround(inverse * value(index)).max(-128.0).min(127.0) as i8).collect::<Vec<_>>();
 				data.extend(codes.iter().map(|code| *code as u8)); for block in codes.chunks(16) { data.extend(block.iter().map(|code| i16::from(*code)).sum::<i16>().to_le_bytes()) }
 			}
 			return Ok((data, Vec::new()));
@@ -1063,7 +1026,7 @@ impl Integer for IntegerFormat {
 				let stored_scale = unfp16(fp16(scale));
 				let (mut high, mut low) = (0_u16, [0_u8; 4]);
 				for block in 0..8 {
-					let signed = if scale == 0.0 { 0 } else { (scales[block] / scale).round().max(-32.0).min(31.0) as i8 };
+					let signed = if scale == 0.0 { 0 } else { qround(scales[block] / scale).max(-32.0).min(31.0) as i8 };
 					let code = (signed + 32) as u8;
 					low[block / 2] |= (code & 15) << (block % 2 * 4);
 					high |= u16::from(code >> 4) << (block * 2);
