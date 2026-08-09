@@ -616,6 +616,7 @@ fn put_half(output: &mut Vec<u8>, value: f32) {
 fn half(input: &[u8]) -> f32 {
 	unfp16(u16::from_le_bytes([input[0], input[1]]))
 }
+fn float(input: &[u8]) -> f32 { f32::from_le_bytes([input[0], input[1], input[2], input[3]]) }
 #[rustfmt::skip]
 fn qkx2(values: &[f32], weights: &[f32], levels: i32, range: (f32, f32, usize), mad: bool, codes: &mut [u8]) -> (f32, f32) {
 	let (minimum, maximum) = values.iter().copied().fold((values[0], values[0]), |(low, high), value| (low.min(value), high.max(value)));
@@ -1004,6 +1005,17 @@ impl Integer for IntegerFormat {
 			}
 			return Ok((data, Vec::new()));
 		}
+		if family == 0 && variant == 3 && bits == 8 {
+			let mut data = Vec::new();
+			for values in weights.chunks(256) {
+				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
+				let maximum = (0..256).map(value).max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
+				let inverse = if maximum == 0.0 { 0.0 } else { -128.0 / maximum }; let scale = if inverse == 0.0 { 0.0 } else { inverse.recip() };
+				data.extend(scale.to_le_bytes()); let codes = (0..256).map(|index| (inverse * value(index)).round().max(-128.0).min(127.0) as i8).collect::<Vec<_>>();
+				data.extend(codes.iter().map(|code| *code as u8)); for block in codes.chunks(16) { data.extend(block.iter().map(|code| i16::from(*code)).sum::<i16>().to_le_bytes()) }
+			}
+			return Ok((data, Vec::new()));
+		}
 		if family == 0 && variant == 2 && bits == 4 {
 			const NF4: [f64; 16] = [-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0, 0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0];
 			let mut metadata = vec![config.quantization_block as f64];
@@ -1072,7 +1084,7 @@ impl Integer for IntegerFormat {
 			}
 			return Ok((data, Vec::new()));
 		}
-		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_NF, IQ4_NL, and IQ4_XS", self.0)))
+		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ4_NL, and IQ4_XS", self.0)))
 	}
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>> {
 		let (family, variant, bits) = (self.0 >> 12, self.0 >> 8 & 15, self.bits());
@@ -1202,6 +1214,12 @@ impl Integer for IntegerFormat {
 			}
 			return Ok(weights);
 		}
+		if family == 0 && variant == 3 && bits == 8 {
+			const STRIDE: usize = 292; require(data.len() >= count.div_ceil(256) * STRIDE, "GGML Q8_K weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE) { let scale = float(bytes); for code in &bytes[4..260] { if weights.len() == count { return Ok(weights) } weights.push(f64::from(scale * f32::from(i8::from_ne_bytes([*code])))) } }
+			return Ok(weights);
+		}
 		if self.0 >> 12 == 0 && self.0 >> 8 & 15 == 2 {
 			let block = codebook.first().copied().unwrap_or(0.0) as usize;
 			require(block != 0 && codebook.len() >= 17 + count.div_ceil(block) && data.len() * 2 >= count, "NF4 weights are invalid")?;
@@ -1242,7 +1260,7 @@ impl Integer for IntegerFormat {
 			}
 			return Ok(weights);
 		}
-		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_NF, IQ4_NL, and IQ4_XS", self.0)))
+		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ4_NL, and IQ4_XS", self.0)))
 	}
 }
 pub struct Qi {
