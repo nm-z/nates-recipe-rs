@@ -416,6 +416,7 @@ pub mod atv {
 	fn selu = Selu, fn gelu = Gelu, fn silu = Silu, fn elu = Elu, fn prelu = Prelu, }
 }
 pub use atv::{cos, elu, exp, gelu, leak, linear, ln, log, prelu, relu, selu, sigmoid, silu, tan, tanh};
+const IQ_DEFAULT: [u16; 5] = [0, 3, 1, 1, 5];
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Block {
 	operation: Operation, activation: Activation, normalization: Option<BlockNormalization>, format: FloatFormat, quantization: u16,
@@ -548,7 +549,7 @@ impl Model {
 	pub fn iq(&self, bits: u8) -> Iq {
 		assert!((1..=4).contains(&bits), "iq bits must be 1 through 4");
 		let q = |v| self.quantize(1, bits, v);
-		Iq { model: q(0), xxs: q(1), xs: q(2), s: q(3), m: q(4), nl: q(5) }
+		Iq { model: q(IQ_DEFAULT[usize::from(bits)]), xxs: q(1), xs: q(2), s: q(3), m: q(4), nl: q(5) }
 	}
 	fn description(&self, metrics: &[Metric]) -> String {
 		let has = |value| metrics.iter().any(|metric| metric.0 == value);
