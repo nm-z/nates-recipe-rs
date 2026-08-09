@@ -66,7 +66,7 @@ mod bundle {
 		let fields = value.split_whitespace().collect::<Vec<_>>();
 		require(fields.len() == 5, "arithmetic format has the wrong width")?;
 		let shape = (fields[0], self::value::<u8>(fields[1], "arithmetic bits")?, self::value::<u8>(fields[2], "arithmetic exponent")?, self::value::<u8>(fields[3], "arithmetic mantissa")?, fields[4]);
-		match shape { ("fp", 64, 11, 52, "double") => Ok(FP64), ("fp", 32, 8, 23, "float") => Ok(FP32), _ => Err(RecipeError::new(format!("saved arithmetic format {}({}) [{}] is unavailable; available precision: fp(32) [float], fp(64) [double]", fields[0], fields[1], fields[4]))) }
+		match shape { ("fp", 64, 11, 52, "double") => Ok(FP64), ("fp", 32, 8, 23, "float") => Ok(FP32), ("f", 64, 11, 52, "double") => Ok(FloatFormat { family: "f", ..FP64 }), ("f", 32, 8, 23, "float") => Ok(FloatFormat { family: "f", ..FP32 }), _ => Err(RecipeError::new(format!("saved arithmetic format {}({}) [{}] is unavailable; available precision: f(8,23) [float], f(11,52) [double], fp(32) [float], fp(64) [double]", fields[0], fields[1], fields[4]))) }
 	}
 	pub(super) fn load(path: &str) -> Result<(String, Vec<StoredGraph>)> {
 		require(path.ends_with(".ogdl"), "model path requires .ogdl")?;
@@ -505,7 +505,8 @@ impl Model {
 	}
 	pub fn f(&self, exponent: u8, mantissa: u8) -> Self {
 		assert!(exponent != 0 && mantissa != 0, "f requires exponent and mantissa fields");
-		self.arithmetic(FloatFormat { family: "f", bits: exponent + mantissa + 1, exponent, mantissa, llvm: "unsupported" })
+		let llvm = match (exponent, mantissa) { (8, 23) => "float", (11, 52) => "double", _ => "unsupported" };
+		self.arithmetic(FloatFormat { family: "f", bits: exponent + mantissa + 1, exponent, mantissa, llvm })
 	}
 	pub fn fp(&self, bits: u8) -> Self {
 		let (exponent, mantissa, llvm) = match bits {
@@ -2300,7 +2301,7 @@ impl GpuTape {
 		let mut phase = phase as u32;
 		let mut call = ptrs![self.samples.pointer, self.input_adjoint.pointer, self.targets.pointer, self.weights.pointer, self.frozen.pointer, self.best.pointer, self.value_pointers.pointer, self.context_pointers.pointer, self.adjoint_pointers.pointer, self.descriptors.pointer, self.arguments.pointer, self.metrics.pointer, self.gradient.pointer, self.moments.pointer, self.variances.pointer, self.best_loss.pointer, self.rows, self.nodes, self.parameters, loss, huber_threshold, rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay, tolerance, step, self.threads, self.tile.m, self.tile.n, self.tile.k, phase, self.timings.pointer, self.tiles.pointer];
 		let mut narrow = [huber_threshold as f32, rate as f32, beta1 as f32, beta2 as f32, beta1_power as f32, beta2_power as f32, epsilon as f32, decay as f32, tolerance as f32];
-		if self.precision == FP32 {
+		if self.precision.native() == Some(FP32) {
 			for (slot, value) in call[20..29].iter_mut().zip(&mut narrow) {
 				*slot = value as *mut f32 as Ptr;
 			}
@@ -2671,7 +2672,7 @@ impl Buffer {
 		Ok(buffer)
 	}
 	fn upload_float(runtime: &'static Gpu, values: &[f64], precision: FloatFormat) -> Result<Self> {
-		if precision == FP32 {
+		if precision.native() == Some(FP32) {
 			return Self::upload(runtime, &values.iter().map(|value| *value as f32).collect::<Vec<_>>());
 		}
 		Self::upload(runtime, values)
@@ -2682,7 +2683,7 @@ impl Buffer {
 		self.runtime.upload(self.pointer + start as u64, values.as_ptr().cast(), size_of_val(values))
 	}
 	fn write_float(&self, offset: usize, values: &[f64], precision: FloatFormat) -> Result<()> {
-		if precision == FP32 {
+		if precision.native() == Some(FP32) {
 			return self.write(offset, &values.iter().map(|value| *value as f32).collect::<Vec<_>>());
 		}
 		self.write(offset, values)
@@ -2699,7 +2700,7 @@ impl Buffer {
 		Ok(values)
 	}
 	fn download_float(&self, count: usize, precision: FloatFormat) -> Result<Vec<f64>> {
-		if precision == FP32 {
+		if precision.native() == Some(FP32) {
 			return Ok(self.download::<f32>(count)?.into_iter().map(f64::from).collect());
 		}
 		self.download(count)
@@ -2889,7 +2890,7 @@ impl Gpu {
 		}
 	}
 	fn kernels(&self, precision: FloatFormat) -> Result<(Dispatch, Dispatch)> {
-		if precision == FP32 {
+		if precision.native() == Some(FP32) {
 			return self.forward_f32.zip(self.epoch_f32).ok_or_else(|| RecipeError::new(format!("fp(32) training is unavailable on {}", self.name)));
 		}
 		Ok((self.forward, self.epoch))
@@ -4369,6 +4370,7 @@ impl FloatFormat {
 	fn bytes(self) -> usize {
 		usize::from(self.bits.div_ceil(8))
 	}
+	fn native(self) -> Option<Self> { match (self.bits, self.exponent, self.mantissa) { (32, 8, 23) => Some(FP32), (64, 11, 52) => Some(FP64), _ => None } }
 }
 impl Train {
 	pub const fn seed(mut self, value: usize) -> Self {
@@ -4414,9 +4416,9 @@ impl Train {
 		let (gpus, mut config) = (all_gpus()?, Config::load()?);
 		let precision = model.blocks.first().map(|block| block.format).unwrap_or(model.format);
 		let fp32 = gpus.iter().all(|gpu| gpu.forward_f32.is_some() && gpu.epoch_f32.is_some());
-		let available = if fp32 { "fp(32) [float], fp(64) [double]" } else { "fp(64) [double]" };
-		require(model.blocks.iter().all(|block| block.format == precision), format!("mixed execution formats are unavailable on {}; available precision: {available}", gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
-		require(precision == FP64 || precision == FP32 && fp32, format!("{}({}) [{}] training is unavailable on {}; available precision: {available}", precision.family, precision.bits, precision.llvm, gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
+		let available = if fp32 { "f(8,23) [float], f(11,52) [double], fp(32) [float], fp(64) [double]" } else { "f(11,52) [double], fp(64) [double]" };
+		require(model.blocks.iter().all(|block| block.format.native() == precision.native()), format!("mixed execution formats are unavailable on {}; available precision: {available}", gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
+		require(precision.native() == Some(FP64) || precision.native() == Some(FP32) && fp32, format!("{}({}) [{}] training is unavailable on {}; available precision: {available}", precision.family, precision.bits, precision.llvm, gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
 		config.precision = precision;
 		if let Some(seed) = self.seed {
 			config.random_seed = seed;
