@@ -1010,7 +1010,7 @@ impl Integer for IntegerFormat {
 			for values in weights.chunks(256) {
 				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
 				let maximum = (0..256).map(value).max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
-				let inverse = if maximum == 0.0 { 0.0 } else { -128.0 / maximum }; let scale = if inverse == 0.0 { 0.0 } else { inverse.recip() };
+				let inverse = if maximum == 0.0 { 0.0 } else { -127.0 / maximum }; let scale = if inverse == 0.0 { 0.0 } else { inverse.recip() };
 				data.extend(scale.to_le_bytes()); let codes = (0..256).map(|index| (inverse * value(index)).round().max(-128.0).min(127.0) as i8).collect::<Vec<_>>();
 				data.extend(codes.iter().map(|code| *code as u8)); for block in codes.chunks(16) { data.extend(block.iter().map(|code| i16::from(*code)).sum::<i16>().to_le_bytes()) }
 			}
