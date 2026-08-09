@@ -398,11 +398,11 @@ pub use atv::{cos, elu, exp, gelu, leak, linear, ln, log, prelu, relu, selu, sig
 const IQ_DEFAULT: [u16; 5] = [0, 3, 1, 1, 5];
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Block {
-	operation: Operation, activation: Activation, normalization: Option<BlockNormalization>, format: FloatFormat, quantization: u16, profile: bool,
+	operation: Operation, activation: Activation, normalization: Option<BlockNormalization>, quantization: u16, profile: bool,
 }
 #[derive(Clone)]
 pub struct Model {
-	blocks: Vec<Block>, loss: LossFunction, downstream: Option<Vec<Block>>, format: FloatFormat, quantization: u16,
+	blocks: Vec<Block>, loss: LossFunction, downstream: Option<Vec<Block>>, quantization: u16,
 }
 pub trait ModelLoss {
 	fn apply(self, model: &mut Model);
@@ -423,7 +423,7 @@ $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) }
 impl Model {
 	fn push(&self, operation: Operation) -> Self {
 		let mut model = self.clone();
-		model.blocks.push(Block { operation, activation: Activation::Linear, normalization: None, format: model.format, quantization: model.quantization, profile: IntegerFormat(model.quantization).selection().is_some() });
+		model.blocks.push(Block { operation, activation: Activation::Linear, normalization: None, quantization: model.quantization, profile: IntegerFormat(model.quantization).selection().is_some() });
 		model
 	}
 	fn activate(&self, activation: Activation) -> Self {
@@ -466,29 +466,6 @@ impl Model {
 		model
 	}
 	pub fn loss(&self, loss: impl ModelLoss) -> Self { let mut model = self.clone(); loss.apply(&mut model); model }
-	fn arithmetic(&self, format: FloatFormat) -> Self {
-		let mut model = self.clone();
-		if let Some(block) = model.blocks.last_mut() {
-			block.format = format
-		} else {
-			model.format = format
-		}
-		model
-	}
-	pub fn f(&self, exponent: u8, mantissa: u8) -> Self { assert!(exponent != 0 && mantissa != 0, "f requires exponent and mantissa fields"); let llvm = match (exponent, mantissa) { (5, 10) => "half", (8, 23) => "float", (11, 52) => "double", _ => "unsupported" }; self.arithmetic(FloatFormat { family: "f", bits: exponent + mantissa + 1, exponent, mantissa, llvm }) }
-	pub fn fp(&self, bits: u8) -> Self {
-		let (exponent, mantissa, llvm) = match bits {
-			8 => (4, 3, "unsupported"),
-			16 => (5, 10, "half"),
-			32 => (8, 23, "float"),
-			64 => (11, 52, "double"),
-			_ => panic!("fp bits must be 8, 16, 32, or 64"),
-		};
-		self.arithmetic(FloatFormat { family: "fp", bits, exponent, mantissa, llvm })
-	}
-	pub fn int(&self, bits: u8) -> Self { assert!([1, 4, 8].contains(&bits), "int bits must be 1, 4, or 8"); self.arithmetic(FloatFormat { family: "int", bits, exponent: 0, mantissa: 0, llvm: "unsupported" }) }
-	pub fn bf(&self, bits: u8) -> Self { assert_eq!(bits, 16, "bf bits must be 16"); self.arithmetic(FloatFormat { family: "bf", bits, exponent: 8, mantissa: 7, llvm: "bfloat" }) }
-	pub fn tf(&self, bits: u8) -> Self { assert_eq!(bits, 32, "tf bits must be 32"); self.arithmetic(FloatFormat { family: "tf", bits, exponent: 8, mantissa: 10, llvm: "unsupported" }) }
 	fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self {
 		let mut model = self.clone();
 		let format = family << 12 | variant << 8 | u16::from(bits);
@@ -1474,7 +1451,7 @@ impl Recipe {
 		Data { sources: sources.into_data_sources(), target: Vec::new(), exclusions: Vec::new(), routes: Vec::new(), normalize: false, split: 1.0, prepared: OnceLock::new() }
 	}
 	pub fn model(&self) -> Model {
-		Model { blocks: Vec::new(), loss: mse, downstream: None, format: FP64, quantization: 0 }
+		Model { blocks: Vec::new(), loss: mse, downstream: None, quantization: 0 }
 	}
 	pub fn devices(&self) -> Vec<String> {
 		self.topology().devices.into_iter().map(|device| device.name).collect()
@@ -1483,7 +1460,7 @@ impl Recipe {
 		topology().unwrap_or_else(|error| panic!("{error}"))
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: None, resume: None, save: None, seed: None }
+		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: None, resume: None, save: None, seed: None, precision: FP64 }
 	}
 	pub fn export(&self, source: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
 		let source = source.as_ref();
@@ -4349,6 +4326,7 @@ pub struct Train {
 	resume: Option<String>,
 	save: Option<String>,
 	seed: Option<usize>,
+	precision: FloatFormat,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FloatFormat {
@@ -4370,6 +4348,21 @@ impl FloatFormat {
 	fn label(self)->String{if self.family=="f"{format!("f({},{})",self.exponent,self.mantissa)}else{format!("{}({})",self.family,self.bits)}}
 }
 impl Train {
+	fn arithmetic(mut self, format: FloatFormat) -> Self { self.precision = format; self }
+	pub fn f(self, exponent: u8, mantissa: u8) -> Self { assert!(exponent != 0 && mantissa != 0, "f requires exponent and mantissa fields"); let llvm = match (exponent, mantissa) { (5, 10) => "half", (8, 23) => "float", (11, 52) => "double", _ => "unsupported" }; self.arithmetic(FloatFormat { family: "f", bits: exponent + mantissa + 1, exponent, mantissa, llvm }) }
+	pub fn fp(self, bits: u8) -> Self {
+		let (exponent, mantissa, llvm) = match bits {
+			8 => (4, 3, "unsupported"),
+			16 => (5, 10, "half"),
+			32 => (8, 23, "float"),
+			64 => (11, 52, "double"),
+			_ => panic!("fp bits must be 8, 16, 32, or 64"),
+		};
+		self.arithmetic(FloatFormat { family: "fp", bits, exponent, mantissa, llvm })
+	}
+	pub fn int(self, bits: u8) -> Self { assert!([1, 4, 8].contains(&bits), "int bits must be 1, 4, or 8"); self.arithmetic(FloatFormat { family: "int", bits, exponent: 0, mantissa: 0, llvm: "unsupported" }) }
+	pub fn bf(self, bits: u8) -> Self { assert_eq!(bits, 16, "bf bits must be 16"); self.arithmetic(FloatFormat { family: "bf", bits, exponent: 8, mantissa: 7, llvm: "bfloat" }) }
+	pub fn tf(self, bits: u8) -> Self { assert_eq!(bits, 32, "tf bits must be 32"); self.arithmetic(FloatFormat { family: "tf", bits, exponent: 8, mantissa: 10, llvm: "unsupported" }) }
 	pub const fn seed(mut self, value: usize) -> Self {
 		self.seed = Some(value);
 		self
@@ -4411,10 +4404,9 @@ impl Train {
 	fn try_run(&self, model: &Model, data: &Data) -> Result<TrainingReport> {
 		drop(topology()?);
 		let (gpus, mut config) = (all_gpus()?, Config::load()?);
-		let precision = model.blocks.first().map(|block| block.format).unwrap_or(model.format);
+		let precision = self.precision;
 		let support = |format: FloatFormat| format.kernel().is_some_and(|index| gpus.iter().all(|gpu| gpu.kernels[index].is_some()));
 		let available = [FP16, FP32, FP64].into_iter().filter(|format| support(*format)).flat_map(|format| [format!("f({},{}) [{}]", format.exponent, format.mantissa, format.llvm), format!("fp({}) [{}]", format.bits, format.llvm)]).collect::<Vec<_>>().join(", ");
-		require(model.blocks.iter().all(|block| block.format.native() == precision.native()), format!("mixed execution formats are unavailable on {}; available precision: {available}", gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
 		require(support(precision), format!("{} training is unavailable on {}; available precision: {available}", precision.label(), gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
 		config.precision = precision;
 		if let Some(seed) = self.seed {
@@ -4775,7 +4767,8 @@ struct TileRuntime {
 }
 static TILE_RUNTIME: OnceLock<Result<Mutex<TileRuntime>>> = OnceLock::new();
 impl TileRuntime {
-	fn new(gpus: &[&'static Gpu], config: Config) -> Result<Self> {
+	fn new(gpus: &[&'static Gpu], mut config: Config) -> Result<Self> {
+		config.precision = FP64;
 		let predictor = recipe.model().layer(config.surrogate_width).tanh().layer(1).loss(mse);
 		let proposer = recipe.model().layer(config.surrogate_width).tanh().layer(3).loss(&predictor);
 		let models = [proposer, predictor];
