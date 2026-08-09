@@ -500,7 +500,7 @@ impl Model {
 		model
 	}
 	pub fn qi(&self, bits: u8) -> Qi {
-		assert!((2..=8).contains(&bits), "qi bits must be 2 through 8");
+		assert!([2,3,4,5,6,8].contains(&bits), "qi bits must be 2, 3, 4, 5, 6, or 8");
 		let q = |v| self.quantize(0, bits, v);
 		Qi { model: q(0), zero: q(0), one: q(1), nf: q(2), k: Qk { model: q(3), s: q(4), m: q(5), l: q(6) } }
 	}
@@ -783,15 +783,14 @@ impl Integer for IntegerFormat {
 	fn compress(self, weights: &[f64], importance: &[f64], config: Config) -> Result<(Vec<u8>, Vec<f64>)> {
 		let bits = self.bits();
 		let (family, variant) = (self.0 >> 12, self.0 >> 8 & 15);
-		if family == 0 && ((variant == 0 && bits == 2) || (variant < 2 && matches!(bits, 4 | 5 | 8))) {
-			let block = if bits == 2 { 64 } else { 32 };
+		if family == 0 && variant < 2 && matches!(bits, 4 | 5 | 8) {
+			let block = 32;
 			let mut data = Vec::new();
 			for values in weights.chunks(block) {
 				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
 				let (minimum, maximum) = (0..block).map(value).fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), value| (low.min(value), high.max(value)));
 				let extreme = (0..block).map(value).max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
 				let scale = match (bits, variant) {
-					(2, 0) => extreme.abs(),
 					(8, _) => extreme.abs() / 127.0,
 					(_, 0) => extreme / -(1_i32 << (bits - 1)) as f32,
 					(_, 1) => (maximum - minimum) / ((1_u16 << bits) - 1) as f32,
@@ -806,16 +805,12 @@ impl Integer for IntegerFormat {
 				let mut sum = 0_i32;
 				for index in 0..block {
 					let shifted = match (bits, variant) {
-						(2, 0) => (value(index) * inverse).round() + 1.0,
 						(8, _) => (value(index) * inverse).round() + 128.0,
 						(_, 0) => value(index) * inverse + (1_i32 << (bits - 1)) as f32 + 0.5,
 						(_, 1) => (value(index) - minimum) * inverse + 0.5,
 						_ => unreachable!(),
 					};
 					let code = shifted.max(0.0).min(f32::from((1_u16 << bits) - 1)) as u8;
-					if bits == 2 {
-						low[index / 4] |= code << (index % 4 * 2)
-					}
 					if bits == 4 || bits == 5 {
 						low[index % 16] |= (code & 15) << (index / 16 * 4)
 					}
@@ -835,7 +830,7 @@ impl Integer for IntegerFormat {
 				}
 				data.extend_from_slice(
 					&low[..match bits {
-						2 | 4 | 5 => 16,
+						4 | 5 => 16,
 						8 => 32,
 						_ => unreachable!(),
 					}],
@@ -1111,15 +1106,15 @@ impl Integer for IntegerFormat {
 		if family == 1 && variant == 1 && bits == 3 { return Ok((iq3_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new())) }
 		if family == 1 && variant == 3 && bits == 2 { return Ok((iq2_16(&weights.iter().map(|value|*value as f32).collect::<Vec<_>>(),None,false),Vec::new())) }
 		if family == 1 && variant == 3 && bits == 3 { return Ok((iq3_s(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new())) }
-		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS", self.0)))
+		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS", self.0)))
 	}
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>> {
 		let (family, variant, bits) = (self.0 >> 12, self.0 >> 8 & 15, self.bits());
-		if family == 0 && ((variant == 0 && bits == 2) || (variant < 2 && matches!(bits, 4 | 5 | 8))) {
-			let block = if bits == 2 { 64 } else { 32 };
+		if family == 0 && variant < 2 && matches!(bits, 4 | 5 | 8) {
+			let block = 32;
 			let header = if variant == 1 { 4 } else { 2 };
 			let payload = match bits {
-				2 | 4 => 16,
+				4 => 16,
 				5 => 20,
 				8 => 32,
 				_ => unreachable!(),
@@ -1133,14 +1128,12 @@ impl Integer for IntegerFormat {
 				let codes = &bytes[header..header + payload];
 				for index in 0..block.min(count - weights.len()) {
 					let code = match bits {
-						2 => codes[index / 4] >> (index % 4 * 2) & 3,
 						4 => codes[index % 16] >> (index / 16 * 4) & 15,
 						5 => (codes[4 + index % 16] >> (index / 16 * 4) & 15) | ((codes[index / 8] >> (index % 8) & 1) << 4),
 						8 => codes[index],
 						_ => unreachable!(),
 					};
 					let value = match (bits, variant) {
-						(2, 0) => (i32::from(code) - 1) as f32 * scale,
 						(8, _) => i8::from_ne_bytes([code]) as f32 * scale,
 						(_, 0) => (i32::from(code) - (1_i32 << (bits - 1))) as f32 * scale,
 						(_, 1) => f32::from(code) * scale + minimum,
@@ -1316,7 +1309,7 @@ impl Integer for IntegerFormat {
 			for bytes in data.chunks_exact(STRIDE) {let scale=half(bytes);for index in 0..256 {if weights.len()==count{return Ok(weights)}let block=index/32;let group=index/4;let grid=usize::from(bytes[2+group])|usize::from(bytes[66+group/8]>>(group%8)&1)<<8;let code=bytes[106+block/2]>>(block%2*4)&15;let d=scale*f32::from(1+2*code);let sign=if bytes[74+index/8]>>(index%8)&1!=0{-1.0}else{1.0};weights.push(f64::from(d*f32::from(iq3_grid(&IQ3_S,grid,index%4))*sign))}}
 			return Ok(weights)
 		}
-		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS", self.0)))
+		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS", self.0)))
 	}
 }
 pub struct Qi { model: Model, pub zero: Model, pub one: Model, pub nf: Model, pub k: Qk }
