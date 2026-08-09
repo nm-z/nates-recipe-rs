@@ -2812,7 +2812,9 @@ extern "C" fn worker_init() {
 	}
 }
 #[used]
-#[unsafe(link_section = ".init_array")]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
+#[cfg_attr(target_os = "windows", unsafe(link_section = ".CRT$XCU"))]
 static WORKER_INIT: extern "C" fn() = worker_init;
 fn transfer_time(source: &'static Gpu, target: &'static Gpu, bytes: usize, repetitions: usize) -> Result<f64> {
 	let payload = vec![0_u8; bytes];
@@ -2830,7 +2832,7 @@ fn ssh_config() -> Result<PathBuf> {
 	if path.is_absolute() {
 		return Ok(path);
 	}
-	let home = std::env::var_os("HOME").ok_or_else(|| RecipeError::new("HOME is absent"))?;
+	let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| RecipeError::new("home directory is absent"))?;
 	Ok(PathBuf::from(home).join(path))
 }
 fn ssh_hosts() -> Result<Vec<String>> {
@@ -3381,7 +3383,7 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		const REGISTERS_PER_SM: i32 = 82;
 		const COOPERATIVE: i32 = 95;
 		const NANOSECOND_TIMER_HZ: u64 = 1_000_000_000;
-		let runtime = Library::open(env!("RECIPE_NV_RUNTIME"))?;
+		let runtime = Library::open(if cfg!(windows) { "nvcuda.dll" } else { env!("RECIPE_NV_RUNTIME") })?;
 		let init: unsafe extern "C" fn(u32) -> i32 = runtime.function(b"cuInit\0")?;
 		let count_devices: unsafe extern "C" fn(*mut i32) -> i32 = runtime.function(b"cuDeviceGetCount\0")?;
 		let get_device: unsafe extern "C" fn(*mut i32, i32) -> i32 = runtime.function(b"cuDeviceGet\0")?;
@@ -3491,14 +3493,22 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		Ok(found)
 	}
 }
-#[cfg(any(amd, nvidia))]
+#[cfg(all(any(amd, nvidia), not(windows)))]
 #[link(name = "dl")]
 unsafe extern "C" {
 	fn dlopen(name: *const std::ffi::c_char, flags: i32) -> Ptr;
 	fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr;
 }
+#[cfg(all(nvidia, windows))]
+unsafe fn dlopen(name: *const std::ffi::c_char, _: i32) -> Ptr { unsafe { LoadLibraryA(name) } }
+#[cfg(all(nvidia, windows))]
+unsafe fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr { unsafe { GetProcAddress(handle, name) } }
+#[cfg(all(nvidia, windows))]
+#[link(name = "kernel32")]
+unsafe extern "system" { fn LoadLibraryA(name: *const std::ffi::c_char) -> Ptr; fn GetProcAddress(handle: Ptr, name: *const std::ffi::c_char) -> Ptr; }
 unsafe extern "C" {
 	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
+	#[cfg_attr(windows, link_name = "_write")]
 	fn write(file: i32, bytes: *const c_void, length: usize) -> isize;
 }
 const TILE_CAPACITY: usize = 65536;

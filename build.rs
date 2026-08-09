@@ -139,6 +139,7 @@ fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	Ok(())
 }
 fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+	let cuda = env::var_os("CUDA_PATH").map(PathBuf::from);
 	let gpu_architecture = text(manifest, "nvidia-minimum-architecture")?;
 	let architecture = format!("-march={gpu_architecture}");
 	let ptx = format!("+{}", text(manifest, "nvidia-ptx")?);
@@ -162,7 +163,11 @@ fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 			"attributes #0 = { nounwind }",
 		);
 	fs::write(&source, ir)?;
-	let mut command = Command::new(text(manifest, "nvidia-compiler")?);
+	let compiler = text(manifest, "nvidia-compiler")?;
+	let compiler = if Path::new(compiler).exists() { compiler } else { "clang" };
+	let device = text(manifest, "nvidia-device-library")?;
+	let device = cuda.map(|path| path.join("nvvm/libdevice/libdevice.10.bc")).filter(|path| path.exists()).unwrap_or_else(|| device.into());
+	let mut command = Command::new(compiler);
 	command.args([
 		"-target",
 		"nvptx64-nvidia-cuda",
@@ -179,7 +184,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 		"-Xclang",
 		"-mlink-builtin-bitcode",
 		"-Xclang",
-		text(manifest, "nvidia-device-library")?,
+		device.to_str().ok_or_else(|| io::Error::other("NVIDIA device library path is not UTF-8"))?,
 		"-o",
 	]);
 	command.arg(&ptx_output);
@@ -240,10 +245,10 @@ fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 			.arg(&source);
 		run(&mut backend, "CPU LLVM IR backend")?;
 	}
-	run(Command::new("ar").arg("rcs").arg(out.join("librecipe_cpu.a")).arg(&object), "CPU archive")?;
+	run(Command::new("llvm-ar").arg("rcs").arg(out.join("librecipe_cpu.a")).arg(&object), "CPU archive")?;
 	println!("cargo:rustc-link-search=native={}", out.display());
 	println!("cargo:rustc-link-lib=static=recipe_cpu");
-	if env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("musl") {
+	if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("musl") {
 		println!("cargo:rustc-link-lib=m");
 	}
 	Ok(())
@@ -303,7 +308,7 @@ fn main() -> BuildResult<()> {
 	// GPU driver stubs and library search paths are host-arch: cross-compiled builds are CPU-only.
 	let native = env::var("TARGET")? == env::var("HOST")?;
 	let amd = native && toolchain("hsa-compiler", "hsa-device-library")?;
-	let nvidia = native && toolchain("nvidia-compiler", "nvidia-device-library")?;
+	let nvidia = native && (toolchain("nvidia-compiler", "nvidia-device-library")? || env::var_os("CUDA_PATH").is_some());
 	if amd {
 		println!("cargo:rustc-cfg=amd");
 		compile_amd(&manifest, &out)?;
