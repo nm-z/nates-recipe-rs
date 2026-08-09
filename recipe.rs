@@ -595,43 +595,34 @@ fn quantization(code: u16) -> String {
 	let suffix = if family == 0 { ["_0", "_1", "_NF", "_K", "_K_S", "_K_M", "_K_L"][variant] } else { ["", "_XXS", "_XS", "_S", "_M", "_NL"][variant] };
 	format!("{}{bits}{suffix}", if family == 0 { "Q" } else { "IQ" })
 }
+#[rustfmt::skip]
 fn fp16(value: f32) -> u16 {
 	let bits = value.to_bits();
 	let sign = (bits >> 16 & 0x8000) as u16;
 	let exponent = ((bits >> 23 & 0xff) as i32) - 112;
 	let mantissa = bits & 0x7fffff;
 	if exponent <= 0 {
-		if exponent < -10 {
-			return sign;
-		}
+		if exponent < -10 { return sign }
 		let value = (mantissa | 0x800000) >> (1 - exponent);
-		return sign | ((value + 0xfff + (value >> 13 & 1)) >> 13) as u16;
+		return sign | ((value + 0xfff + (value >> 13 & 1)) >> 13) as u16
 	}
-	if exponent >= 31 {
-		return sign | 0x7c00 | u16::from(mantissa != 0);
-	}
+	if exponent >= 31 { return sign | 0x7c00 | u16::from(mantissa != 0) }
 	let rounded = mantissa + 0xfff + (mantissa >> 13 & 1);
-	if rounded & 0x800000 != 0 {
-		return sign | ((exponent + 1).min(31) as u16) << 10;
-	}
+	if rounded & 0x800000 != 0 { return sign | ((exponent + 1).min(31) as u16) << 10 }
 	sign | (exponent as u16) << 10 | (rounded >> 13) as u16
 }
+#[rustfmt::skip]
 fn unfp16(value: u16) -> f32 {
 	let sign = (u32::from(value) & 0x8000) << 16;
 	let exponent = u32::from(value >> 10 & 31);
 	let mantissa = u32::from(value & 1023);
 	let bits = if exponent == 0 {
-		if mantissa == 0 {
-			sign
-		} else {
+		if mantissa == 0 { sign } else {
 			let shift = mantissa.leading_zeros() - 22;
 			sign | (113 - shift) << 23 | (mantissa << (shift + 1) & 0x7fffff)
 		}
-	} else if exponent == 31 {
-		sign | 0x7f800000 | mantissa << 13
-	} else {
-		sign | (exponent + 112) << 23 | mantissa << 13
-	};
+	} else if exponent == 31 { sign | 0x7f800000 | mantissa << 13 }
+	else { sign | (exponent + 112) << 23 | mantissa << 13 };
 	f32::from_bits(bits)
 }
 fn put_half(output: &mut Vec<u8>, value: f32) {
@@ -639,6 +630,137 @@ fn put_half(output: &mut Vec<u8>, value: f32) {
 }
 fn half(input: &[u8]) -> f32 {
 	unfp16(u16::from_le_bytes([input[0], input[1]]))
+}
+#[rustfmt::skip]
+fn qkx2(values: &[f32], weights: &[f32], levels: i32, range: (f32, f32, usize), mad: bool, codes: &mut [u8]) -> (f32, f32) {
+	let (minimum, maximum) = values.iter().copied().fold((values[0], values[0]), |(low, high), value| (low.min(value), high.max(value)));
+	let minimum = minimum.min(0.0);
+	if maximum == minimum { codes.fill(0); return (0.0, -minimum) }
+	let (sum_w, sum_x) = weights.iter().zip(values).fold((0.0, 0.0), |(sum_w, sum_x), (weight, value)| (sum_w + weight, sum_x + weight * value));
+	let mut scale = (maximum - minimum) / levels as f32;
+	let mut error = 0.0;
+	for ((value, weight), code) in values.iter().zip(weights).zip(codes.iter_mut()) {
+		*code = ((value - minimum) / scale).round().max(0.0).min(levels as f32) as u8;
+		let difference = scale * f32::from(*code) + minimum - value;
+		error += weight * if mad { difference.abs() } else { difference * difference };
+	}
+	let mut best = (scale, minimum, error);
+	for step in 0..=range.2 {
+		let inverse = (range.0 + range.1 * step as f32 + levels as f32) / (maximum - minimum);
+		let (mut sum_l, mut sum_l2, mut sum_xl) = (0.0, 0.0, 0.0);
+		let mut trial = vec![0_u8; values.len()];
+		for ((value, weight), code) in values.iter().zip(weights).zip(&mut trial) {
+			*code = ((value - minimum) * inverse).round().max(0.0).min(levels as f32) as u8;
+			let code = f32::from(*code);
+			sum_l += weight * code;
+			sum_l2 += weight * code * code;
+			sum_xl += weight * code * value;
+		}
+		let denominator = sum_w * sum_l2 - sum_l * sum_l;
+		if denominator > 0.0 {
+			let mut candidate_scale = (sum_w * sum_xl - sum_x * sum_l) / denominator;
+			let mut candidate_minimum = (sum_l2 * sum_x - sum_l * sum_xl) / denominator;
+			if candidate_minimum > 0.0 { candidate_minimum = 0.0; candidate_scale = sum_xl / sum_l2 }
+			let candidate_error = values.iter().zip(weights).zip(&trial).map(|((value, weight), code)| {
+					let difference = candidate_scale * f32::from(*code) + candidate_minimum - value;
+					weight * if mad { difference.abs() } else { difference * difference }
+				}).sum();
+			if candidate_error < best.2 {
+				codes.copy_from_slice(&trial);
+				best = (candidate_scale, candidate_minimum, candidate_error)
+			}
+		}
+	}
+	scale = best.0;
+	(scale, -best.1)
+}
+#[rustfmt::skip]
+fn q3(values: &[f32], codes: &mut [i8]) -> f32 {
+	let mut extreme = 0.0_f32;
+	for value in values { if value.abs() > extreme.abs() { extreme = *value } }
+	if extreme.abs() < 1.0e-15 { codes.fill(0); return 0.0 }
+	let inverse = -4.0 / extreme;
+	let (mut sum_lx, mut sum_l2) = (0.0, 0.0);
+	for (value, code) in values.iter().zip(codes.iter_mut()) {
+		*code = (value * inverse).round().max(-4.0).min(3.0) as i8;
+		let weight = value * value;
+		sum_lx += weight * value * f32::from(*code); sum_l2 += weight * f32::from(*code) * f32::from(*code);
+	}
+	for _ in 0..5 {
+		let mut changed = false;
+		for (value, code) in values.iter().zip(codes.iter_mut()) {
+			let weight = value * value;
+			let reduced_lx = sum_lx - weight * value * f32::from(*code);
+			if reduced_lx <= 0.0 { continue }
+			let reduced_l2 = sum_l2 - weight * f32::from(*code) * f32::from(*code);
+			let candidate = (value * reduced_l2 / reduced_lx).round().max(-4.0).min(3.0) as i8;
+			let (candidate_lx, candidate_l2) = (reduced_lx + weight * value * f32::from(candidate), reduced_l2 + weight * f32::from(candidate) * f32::from(candidate));
+			if candidate != *code && candidate_l2 > 0.0 && candidate_lx * candidate_lx * sum_l2 > sum_lx * sum_lx * candidate_l2 {
+				*code = candidate; sum_lx = candidate_lx; sum_l2 = candidate_l2; changed = true
+			}
+		}
+		if !changed { break }
+	}
+	for code in codes { *code += 4 }
+	if sum_l2 > 0.0 { sum_lx / sum_l2 } else { 0.0 }
+}
+#[rustfmt::skip]
+fn qx(values: &[f32], levels: i32, codes: &mut [i8]) -> f32 {
+	let mut extreme = 0.0_f32;
+	for value in values { if value.abs() > extreme.abs() { extreme = *value } }
+	if extreme.abs() < 1.0e-15 { codes.fill(0); return 0.0 }
+	let mut inverse = -(levels as f32) / extreme;
+	let (mut sum_lx, mut sum_l2) = (0.0, 0.0);
+	for (value, code) in values.iter().zip(codes.iter_mut()) {
+		*code = (value * inverse).round().max(-(levels as f32)).min((levels - 1) as f32) as i8 + levels as i8;
+		let signed = f32::from(*code) - levels as f32;
+		let weight = value * value;
+		sum_lx += weight * value * signed; sum_l2 += weight * signed * signed;
+	}
+	let mut scale = if sum_l2 == 0.0 { 0.0 } else { sum_lx / sum_l2 };
+	let mut best = scale * sum_lx;
+	for step in -9..=9 {
+		if step == 0 { continue }
+		inverse = -(levels as f32 + 0.1 * step as f32) / extreme;
+		(sum_lx, sum_l2) = (0.0, 0.0);
+		for value in values {
+			let code = (value * inverse).round().max(-(levels as f32)).min((levels - 1) as f32);
+			let weight = value * value;
+			sum_lx += weight * value * code; sum_l2 += weight * code * code;
+		}
+		if sum_l2 > 0.0 && sum_lx * sum_lx > best * sum_l2 {
+			for (value, code) in values.iter().zip(codes.iter_mut()) { *code = (value * inverse).round().max(-(levels as f32)).min((levels - 1) as f32) as i8 + levels as i8 }
+			scale = sum_lx / sum_l2; best = scale * sum_lx
+		}
+	}
+	scale
+}
+fn k_scale(metadata: &[u8], block: usize) -> (u8, u8) {
+	if block < 4 { (metadata[block] & 63, metadata[block + 4] & 63) } else { ((metadata[block + 4] & 15) | (metadata[block - 4] >> 6) << 4, (metadata[block + 4] >> 4) | (metadata[block] >> 6) << 4) }
+}
+const IQ4: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+fn iq4_code(value: f32) -> u8 {
+	IQ4.iter().enumerate().min_by(|left, right| (value - f32::from(*left.1)).abs().total_cmp(&(value - f32::from(*right.1)).abs())).unwrap().0 as u8
+}
+#[rustfmt::skip]
+fn iq4_fit(values: &[f32], tries: i32) -> (f32, Vec<u8>) {
+	let mut extreme = 0.0_f32;
+	for value in values { if value.abs() > extreme.abs() { extreme = *value } }
+	if extreme.abs() < 1.0e-15 { return (0.0, vec![0; values.len()]) }
+	let initial = if tries > 0 { -extreme / f32::from(IQ4[0]) } else { extreme / f32::from(IQ4[0]) };
+	let score = |inverse: f32| {
+		values.iter().map(|value| { let quant = f32::from(IQ4[usize::from(iq4_code(value * inverse))]);
+			(value * value * quant * value, value * value * quant * quant) }).fold((0.0, 0.0), |left, right| (left.0 + right.0, left.1 + right.1))
+	};
+	let (numerator, denominator) = score(initial.recip());
+	let mut scale = if denominator > 0.0 { numerator / denominator } else { 0.0 };
+	let mut best = scale * numerator;
+	for attempt in -tries..=tries {
+		let (numerator, denominator) = score((attempt as f32 + f32::from(IQ4[0])) / extreme);
+		if denominator > 0.0 && numerator * numerator > best * denominator { scale = numerator / denominator; best = scale * numerator }
+	}
+	let inverse = if tries > 0 && scale != 0.0 { scale.recip() } else { initial.recip() };
+	(scale, values.iter().map(|value| iq4_code(value * inverse)).collect())
 }
 #[derive(Clone, Copy)]
 struct IntegerFormat(u16);
@@ -714,6 +836,189 @@ impl Integer for IntegerFormat {
 			}
 			return Ok((data, Vec::new()));
 		}
+		if family == 0 && variant == 3 && bits == 2 {
+			let mut data = Vec::new();
+			for values in weights.chunks(256) {
+				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+				let (mut codes, mut scales, mut minima) = ([0_u8; 256], [0.0_f32; 16], [0.0_f32; 16]);
+				for block in 0..16 {
+					let weights = values[block * 16..block * 16 + 16].iter().map(|value| value.abs()).collect::<Vec<_>>();
+					(scales[block], minima[block]) = qkx2(&values[block * 16..block * 16 + 16], &weights, 3, (-0.5, 0.1, 15), true, &mut codes[block * 16..block * 16 + 16]);
+				}
+				let (max_scale, max_minimum) = (scales.iter().copied().fold(0.0_f32, f32::max), minima.iter().copied().fold(0.0_f32, f32::max));
+				let (scale, minimum) = (max_scale / 15.0, max_minimum / 15.0);
+				let (stored_scale, stored_minimum) = (unfp16(fp16(scale)), unfp16(fp16(minimum)));
+				let mut packed_scales = [0_u8; 16];
+				for block in 0..16 {
+					let scale_code = if max_scale > 0.0 { (15.0 * scales[block] / max_scale).round() as u8 } else { 0 };
+					let minimum_code = if max_minimum > 0.0 { (15.0 * minima[block] / max_minimum).round() as u8 } else { 0 };
+					packed_scales[block] = scale_code | minimum_code << 4;
+					let (d, m) = (stored_scale * f32::from(scale_code), stored_minimum * f32::from(minimum_code));
+					if d != 0.0 {
+						for offset in 0..16 {
+							codes[block * 16 + offset] = ((values[block * 16 + offset] + m) / d).round().max(0.0).min(3.0) as u8;
+						}
+					}
+				}
+				let mut packed = [0_u8; 64];
+				for group in (0..256).step_by(128) {
+					for offset in 0..32 {
+						packed[group / 4 + offset] = codes[group + offset] | codes[group + offset + 32] << 2 | codes[group + offset + 64] << 4 | codes[group + offset + 96] << 6;
+					}
+				}
+				data.extend(packed_scales);
+				data.extend(packed);
+				put_half(&mut data, scale);
+				put_half(&mut data, minimum);
+			}
+			return Ok((data, Vec::new()));
+		}
+		if family == 0 && variant == 3 && bits == 3 {
+			let mut data = Vec::new();
+			for values in weights.chunks(256) {
+				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+				let (mut codes, mut block_scales) = ([0_i8; 256], [0.0_f32; 16]);
+				let (mut maximum, mut extreme) = (0.0, 0.0);
+				for block in 0..16 {
+					block_scales[block] = q3(&values[block * 16..block * 16 + 16], &mut codes[block * 16..block * 16 + 16]);
+					if block_scales[block].abs() > extreme {
+						extreme = block_scales[block].abs();
+						maximum = block_scales[block]
+					}
+				}
+				let inverse = if maximum == 0.0 { 0.0 } else { -32.0 / maximum };
+				let scale = if inverse == 0.0 { 0.0 } else { inverse.recip() };
+				let stored_scale = unfp16(fp16(scale));
+				let mut scales = [0_u8; 12];
+				for block in 0..16 {
+					let mut code = (inverse * block_scales[block]).round().max(-32.0).min(31.0) as i8 + 32;
+					if block < 8 {
+						scales[block] = code as u8 & 15
+					} else {
+						scales[block - 8] |= (code as u8 & 15) << 4
+					}
+					code >>= 4;
+					scales[block % 4 + 8] |= (code as u8) << (2 * (block / 4));
+					let signed = ((scales[if block < 8 { block } else { block - 8 }] >> if block < 8 { 0 } else { 4 } & 15) | ((scales[8 + block % 4] >> (2 * (block / 4)) & 3) << 4)) as i8 - 32;
+					let d = stored_scale * f32::from(signed);
+					if d != 0.0 {
+						for offset in 0..16 {
+							codes[block * 16 + offset] = (values[block * 16 + offset] / d).round().max(-4.0).min(3.0) as i8 + 4;
+						}
+					}
+				}
+				let (mut high, mut low) = ([0_u8; 32], [0_u8; 64]);
+				for index in 0..256 {
+					let mut code = codes[index] as u8;
+					if code > 3 {
+						high[index % 32] |= 1 << (index / 32);
+						code -= 4
+					}
+					low[index / 128 * 32 + index % 32] |= code << (index % 128 / 32 * 2);
+				}
+				data.extend(high);
+				data.extend(low);
+				data.extend(scales);
+				put_half(&mut data, scale);
+			}
+			return Ok((data, Vec::new()));
+		}
+		if family == 0 && variant == 3 && matches!(bits, 4 | 5) {
+			let mut data = Vec::new();
+			for values in weights.chunks(256) {
+				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+				let (mut codes, mut block_scales, mut minima) = ([0_u8; 256], [0.0_f32; 8], [0.0_f32; 8]);
+				for block in 0..8 {
+					let slice = &values[block * 32..block * 32 + 32];
+					let rms = (slice.iter().map(|value| value * value).sum::<f32>() / 32.0).sqrt();
+					let weights = slice.iter().map(|value| rms + value.abs()).collect::<Vec<_>>();
+					let (levels, range) = if bits == 4 { (15, (-1.0, 0.1, 20)) } else { (31, (-0.5, 0.1, 15)) };
+					(block_scales[block], minima[block]) = qkx2(slice, &weights, levels, range, false, &mut codes[block * 32..block * 32 + 32]);
+				}
+				let (maximum, max_minimum) = (block_scales.iter().copied().fold(0.0_f32, f32::max), minima.iter().copied().fold(0.0_f32, f32::max));
+				let (scale, minimum) = (maximum / 63.0, max_minimum / 63.0);
+				let (stored_scale, stored_minimum) = (unfp16(fp16(scale)), unfp16(fp16(minimum)));
+				let mut metadata = [0_u8; 12];
+				for block in 0..8 {
+					let scale_code = if maximum > 0.0 { (63.0 * block_scales[block] / maximum).round().min(63.0) as u8 } else { 0 };
+					let minimum_code = if max_minimum > 0.0 { (63.0 * minima[block] / max_minimum).round().min(63.0) as u8 } else { 0 };
+					if block < 4 {
+						metadata[block] = scale_code;
+						metadata[block + 4] = minimum_code
+					} else {
+						metadata[block + 4] = scale_code & 15 | (minimum_code & 15) << 4;
+						metadata[block - 4] |= scale_code >> 4 << 6;
+						metadata[block] |= minimum_code >> 4 << 6
+					}
+				}
+				for block in 0..8 {
+					let (scale_code, minimum_code) = k_scale(&metadata, block);
+					let (d, m) = (stored_scale * f32::from(scale_code), stored_minimum * f32::from(minimum_code));
+					if d != 0.0 {
+						for offset in 0..32 {
+							codes[block * 32 + offset] = ((values[block * 32 + offset] + m) / d).round().max(0.0).min(if bits == 4 { 15.0 } else { 31.0 }) as u8;
+						}
+					}
+				}
+				let (mut high, mut packed) = ([0_u8; 32], [0_u8; 128]);
+				for group in (0..256).step_by(64) {
+					for offset in 0..32 {
+						packed[group / 2 + offset] = codes[group + offset] & 15 | (codes[group + offset + 32] & 15) << 4;
+						high[offset] |= (codes[group + offset] >> 4) << (group / 32) | (codes[group + offset + 32] >> 4) << (group / 32 + 1)
+					}
+				}
+				put_half(&mut data, scale);
+				put_half(&mut data, minimum);
+				data.extend(metadata);
+				if bits == 5 {
+					data.extend(high)
+				}
+				data.extend(packed);
+			}
+			return Ok((data, Vec::new()));
+		}
+		if family == 0 && variant == 3 && bits == 6 {
+			let mut data = Vec::new();
+			for values in weights.chunks(256) {
+				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+				let (mut codes, mut block_scales) = ([0_i8; 256], [0.0_f32; 16]);
+				let (mut maximum, mut extreme) = (0.0, 0.0);
+				for block in 0..16 {
+					block_scales[block] = qx(&values[block * 16..block * 16 + 16], 32, &mut codes[block * 16..block * 16 + 16]);
+					if block_scales[block].abs() > extreme {
+						extreme = block_scales[block].abs();
+						maximum = block_scales[block]
+					}
+				}
+				let inverse = if extreme < 1.0e-15 { 0.0 } else { -128.0 / maximum };
+				let scale = if inverse == 0.0 { 0.0 } else { inverse.recip() };
+				let stored_scale = unfp16(fp16(scale));
+				let mut scales = [0_i8; 16];
+				for block in 0..16 {
+					scales[block] = (inverse * block_scales[block]).round().min(127.0) as i8;
+					let d = stored_scale * f32::from(scales[block]);
+					if d != 0.0 {
+						for offset in 0..16 {
+							codes[block * 16 + offset] = (values[block * 16 + offset] / d).round().max(-32.0).min(31.0) as i8 + 32;
+						}
+					}
+				}
+				let (mut low, mut high) = ([0_u8; 128], [0_u8; 64]);
+				for group in (0..256).step_by(128) {
+					for offset in 0..32 {
+						let code = [codes[group + offset], codes[group + offset + 32], codes[group + offset + 64], codes[group + offset + 96]].map(|value| value as u8);
+						low[group / 2 + offset] = code[0] & 15 | (code[2] & 15) << 4;
+						low[group / 2 + offset + 32] = code[1] & 15 | (code[3] & 15) << 4;
+						high[group / 4 + offset] = code[0] >> 4 | code[1] >> 4 << 2 | code[2] >> 4 << 4 | code[3] >> 4 << 6;
+					}
+				}
+				data.extend(low);
+				data.extend(high);
+				data.extend(scales.map(|value| value as u8));
+				put_half(&mut data, scale);
+			}
+			return Ok((data, Vec::new()));
+		}
 		if family == 0 && variant == 2 && bits == 4 {
 			const NF4: [f64; 16] = [-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0, 0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0];
 			let mut metadata = vec![config.quantization_block as f64];
@@ -730,7 +1035,59 @@ impl Integer for IntegerFormat {
 			}
 			return Ok((data, metadata));
 		}
-		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, and Q4_NF", self.0)))
+		if family == 1 && variant == 5 && bits == 4 {
+			let mut data = Vec::new();
+			for values in weights.chunks(32) {
+				let values = (0..32).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+				let (scale, codes) = iq4_fit(&values, -1);
+				put_half(&mut data, scale);
+				for index in 0..16 {
+					data.push(codes[index] | codes[index + 16] << 4)
+				}
+			}
+			return Ok((data, Vec::new()));
+		}
+		if family == 1 && variant == 2 && bits == 4 {
+			let mut data = Vec::new();
+			for values in weights.chunks(256) {
+				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+				let (mut scales, mut codes) = ([0.0_f32; 8], [0_u8; 256]);
+				let (mut maximum, mut extreme) = (0.0, 0.0);
+				for block in 0..8 {
+					let (scale, fitted) = iq4_fit(&values[block * 32..block * 32 + 32], 7);
+					scales[block] = scale;
+					codes[block * 32..block * 32 + 32].copy_from_slice(&fitted);
+					if scale.abs() > extreme {
+						extreme = scale.abs();
+						maximum = scale
+					}
+				}
+				let scale = -maximum / 32.0;
+				let stored_scale = unfp16(fp16(scale));
+				let (mut high, mut low) = (0_u16, [0_u8; 4]);
+				for block in 0..8 {
+					let signed = if scale == 0.0 { 0 } else { (scales[block] / scale).round().max(-32.0).min(31.0) as i8 };
+					let code = (signed + 32) as u8;
+					low[block / 2] |= (code & 15) << (block % 2 * 4);
+					high |= u16::from(code >> 4) << (block * 2);
+					let d = stored_scale * f32::from(signed);
+					let inverse = if d == 0.0 { 0.0 } else { d.recip() };
+					for offset in 0..32 {
+						codes[block * 32 + offset] = iq4_code(values[block * 32 + offset] * inverse)
+					}
+				}
+				put_half(&mut data, scale);
+				data.extend(high.to_le_bytes());
+				data.extend(low);
+				for block in 0..8 {
+					for offset in 0..16 {
+						data.push(codes[block * 32 + offset] | codes[block * 32 + offset + 16] << 4)
+					}
+				}
+			}
+			return Ok((data, Vec::new()));
+		}
+		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_NF, IQ4_NL, and IQ4_XS", self.0)))
 	}
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>> {
 		let (family, variant, bits) = (self.0 >> 12, self.0 >> 8 & 15, self.bits());
@@ -770,12 +1127,137 @@ impl Integer for IntegerFormat {
 			}
 			return Ok(weights);
 		}
+		if family == 0 && variant == 3 && bits == 2 {
+			const STRIDE: usize = 84;
+			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML Q2_K weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE) {
+				let (scale, minimum) = (half(&bytes[80..]), half(&bytes[82..]));
+				let packed = &bytes[16..80];
+				for group in (0..256).step_by(128) {
+					for shift in (0..8).step_by(2) {
+						for half in 0..2 {
+							let block = group / 16 + shift + half;
+							let metadata = bytes[block];
+							let (d, m) = (scale * f32::from(metadata & 15), minimum * f32::from(metadata >> 4));
+							for offset in 0..16 {
+								if weights.len() == count {
+									return Ok(weights);
+								}
+								weights.push(f64::from(d * f32::from(packed[group / 4 + half * 16 + offset] >> shift & 3) - m));
+							}
+						}
+					}
+				}
+			}
+			return Ok(weights);
+		}
+		if family == 0 && variant == 3 && bits == 3 {
+			const STRIDE: usize = 110;
+			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML Q3_K weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE) {
+				let scale = half(&bytes[108..]);
+				for index in 0..256 {
+					if weights.len() == count {
+						return Ok(weights);
+					}
+					let block = index / 16;
+					let low_scale = bytes[96 + if block < 8 { block } else { block - 8 }] >> if block < 8 { 0 } else { 4 } & 15;
+					let high_scale = bytes[104 + block % 4] >> (2 * (block / 4)) & 3;
+					let block_scale = (low_scale | high_scale << 4) as i8 - 32;
+					let low = bytes[32 + index / 128 * 32 + index % 32] >> (index % 128 / 32 * 2) & 3;
+					let quant = i8::try_from(low).unwrap() - if bytes[index % 32] >> (index / 32) & 1 == 0 { 4 } else { 0 };
+					weights.push(f64::from(scale * f32::from(block_scale) * f32::from(quant)));
+				}
+			}
+			return Ok(weights);
+		}
+		if family == 0 && variant == 3 && matches!(bits, 4 | 5) {
+			let stride = if bits == 4 { 144 } else { 176 };
+			require(data.len() >= count.div_ceil(256) * stride, "GGML Q4_K or Q5_K weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(stride) {
+				let (scale, minimum) = (half(bytes), half(&bytes[2..]));
+				for index in 0..256 {
+					if weights.len() == count {
+						return Ok(weights);
+					}
+					let block = index / 32;
+					let (scale_code, minimum_code) = k_scale(&bytes[4..16], block);
+					let packed = bytes[(if bits == 4 { 16 } else { 48 }) + index / 64 * 32 + index % 32];
+					let mut code = if index % 64 < 32 { packed & 15 } else { packed >> 4 };
+					if bits == 5 {
+						code |= (bytes[16 + index % 32] >> (index / 32) & 1) << 4
+					}
+					weights.push(f64::from(scale * f32::from(scale_code) * f32::from(code) - minimum * f32::from(minimum_code)));
+				}
+			}
+			return Ok(weights);
+		}
+		if family == 0 && variant == 3 && bits == 6 {
+			const STRIDE: usize = 210;
+			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML Q6_K weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE) {
+				let scale = half(&bytes[208..]);
+				for index in 0..256 {
+					if weights.len() == count {
+						return Ok(weights);
+					}
+					let group = index / 128 * 128;
+					let quarter = index % 128 / 32;
+					let packed = bytes[group / 2 + index % 32 + if quarter % 2 == 0 { 0 } else { 32 }];
+					let low = if quarter < 2 { packed & 15 } else { packed >> 4 };
+					let high = bytes[128 + group / 4 + index % 32] >> (quarter * 2) & 3;
+					let quant = (low | high << 4) as i8 - 32;
+					let block_scale = i8::from_ne_bytes([bytes[192 + index / 16]]);
+					weights.push(f64::from(scale * f32::from(block_scale) * f32::from(quant)));
+				}
+			}
+			return Ok(weights);
+		}
 		if self.0 >> 12 == 0 && self.0 >> 8 & 15 == 2 {
 			let block = codebook.first().copied().unwrap_or(0.0) as usize;
 			require(block != 0 && codebook.len() >= 17 + count.div_ceil(block) && data.len() * 2 >= count, "NF4 weights are invalid")?;
 			return (0..count).map(|index| codebook.get(1 + usize::from(data[index / 2] >> (index % 2 * 4) & 15)).zip(codebook.get(17 + index / block)).map(|(value, scale)| value * scale).ok_or_else(|| RecipeError::new("NF4 weight index is invalid"))).collect();
 		}
-		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, and Q4_NF", self.0)))
+		if family == 1 && variant == 5 && bits == 4 {
+			const STRIDE: usize = 18;
+			require(data.len() >= count.div_ceil(32) * STRIDE, "GGML IQ4_NL weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE) {
+				let scale = half(bytes);
+				for index in 0..32 {
+					if weights.len() == count {
+						return Ok(weights);
+					}
+					let code = if index < 16 { bytes[2 + index] & 15 } else { bytes[2 + index - 16] >> 4 };
+					weights.push(f64::from(scale * f32::from(IQ4[usize::from(code)])));
+				}
+			}
+			return Ok(weights);
+		}
+		if family == 1 && variant == 2 && bits == 4 {
+			const STRIDE: usize = 136;
+			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ4_XS weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE) {
+				let (scale, high) = (half(bytes), u16::from_le_bytes([bytes[2], bytes[3]]));
+				for index in 0..256 {
+					if weights.len() == count {
+						return Ok(weights);
+					}
+					let block = index / 32;
+					let scale_code = (bytes[4 + block / 2] >> (block % 2 * 4) & 15) | ((high >> (block * 2) & 3) as u8) << 4;
+					let packed = bytes[8 + block * 16 + index % 16];
+					let code = if index % 32 < 16 { packed & 15 } else { packed >> 4 };
+					weights.push(f64::from(scale * f32::from(scale_code as i8 - 32) * f32::from(IQ4[usize::from(code)])));
+				}
+			}
+			return Ok(weights);
+		}
+		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_NF, IQ4_NL, and IQ4_XS", self.0)))
 	}
 }
 pub struct Qi {
