@@ -395,7 +395,6 @@ pub mod atv {
 	fn selu = Selu, fn gelu = Gelu, fn silu = Silu, fn elu = Elu, fn prelu = Prelu, }
 }
 pub use atv::{cos, elu, exp, gelu, leak, linear, ln, log, prelu, relu, selu, sigmoid, silu, tan, tanh};
-const IQ_DEFAULT: [u16; 5] = [0, 3, 1, 1, 5];
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Block {
 	operation: Operation, activation: Activation, normalization: Option<BlockNormalization>, quantization: u16, profile: bool,
@@ -479,12 +478,12 @@ impl Model {
 	pub fn qi(&self, bits: u8) -> Qi {
 		assert!([2,3,4,5,6,8].contains(&bits), "qi bits must be 2, 3, 4, 5, 6, or 8");
 		let q = |v| self.quantize(0, bits, v);
-		Qi { model: q(0), zero: q(0), one: q(1), nf: q(2), k: Qk { model: q(3), s: q(4), m: q(5), l: q(6) } }
+		Qi { zero: q(0), one: q(1), nf: q(2), k: Qk { model: q(3), s: q(4), m: q(5), l: q(6) } }
 	}
 	pub fn iq(&self, bits: u8) -> Iq {
 		assert!((1..=4).contains(&bits), "iq bits must be 1 through 4");
 		let q = |v| self.quantize(1, bits, v);
-		Iq { model: q(IQ_DEFAULT[usize::from(bits)]), xxs: q(1), xs: q(2), s: q(3), m: q(4), nl: q(5) }
+		Iq { xxs: q(1), xs: q(2), s: q(3), m: q(4), nl: q(5) }
 	}
 	fn description(&self, metrics: &[Metric]) -> String {
 		let has = |value| metrics.iter().any(|metric| metric.0 == value);
@@ -512,8 +511,8 @@ impl Model {
 }
 fn quantization(code: u16) -> String {
 	let (family, bits, variant) = (code >> 12, code as u8, usize::from(code >> 8 & 15));
-	let suffix = if family == 0 { ["_0", "_1", "_NF", "_K", "_K_S", "_K_M", "_K_L"][variant] } else { ["", "_XXS", "_XS", "_S", "_M", "_NL"][variant] };
-	format!("{}{bits}{suffix}", if family == 0 { "Q" } else { "IQ" })
+	let variants:&[&str]=if family==0{&["_0","_1","_NF","_K","_K_S","_K_M","_K_L"]}else if family==1{&["","_XXS","_XS","_S","_M","_NL"]}else{return format!("quantization code {code}")};
+	variants.get(variant).map(|suffix|format!("{}{bits}{suffix}",if family==0{"Q"}else{"IQ"})).unwrap_or_else(||format!("quantization code {code}"))
 }
 #[rustfmt::skip]
 fn fp16(value: f32) -> u16 {
@@ -749,6 +748,8 @@ fn iq4_fit(values: &[f32], tries: i32) -> (f32, Vec<u8>) {
 #[derive(Clone, Copy)]
 struct IntegerFormat(u16);
 impl IntegerFormat {
+	fn valid(self)->bool{matches!((self.0>>12,self.bits(),self.0>>8&15),(0,4|5|8,0|1)|(0,4,2)|(0,2|3|4|5|6|8,3)|(0,3|4|5,4|5)|(0,3,6)|(1,1,3|4)|(1,2|3,1|2|3|4)|(1,4,2|5))}
+	fn unavailable(self)->RecipeError{RecipeError::new(format!("{} is unavailable; available GGML formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS",quantization(self.0)))}
 	fn selection(self)->Option<u16>{let(family,bits,variant)=(self.0>>12,self.bits(),self.0>>8&15);match(family,bits,variant){(0,2|6|8,3)=>Some(3),(0,3|4|5,3|5)=>Some(5),(0,3|4|5,4)=>Some(4),(0,3,6)=>Some(6),(1,2,4)|(1,3,2|4)=>Some(variant),_=>None}}
 	fn tensor(self,role:u8,more:bool,output:bool)->u16{let(family,bits,style)=(self.0>>12,self.bits(),self.selection().unwrap());if output{return 3<<8|6}if family==1{return match(bits,style,role,more){(2,4,2|3,_)|(2,4,_,true)=>1<<12|3<<8|3,(3,2,0|1,_)|(3,2,_,false)=>1<<12|1<<8|3,(3,4,2|3,_)|(3,4,_,true)=>3<<8|4,_=>1<<12|3<<8|u16::from(bits)}}let bits=match(bits,style,role){(2,_,2|3)=>3,(3,5,2)=>5,(3,5,3)=>4,(3,6,2|3)=>5,(4,4,2)=>5,(4,5,2)if more=>6,(5,5,2)if more=>6,_=>bits};3<<8|u16::from(bits)}
 }
@@ -1087,7 +1088,7 @@ impl Integer for IntegerFormat {
 		if family == 1 && variant == 1 && bits == 3 { return Ok((iq3_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new())) }
 		if family == 1 && variant == 3 && bits == 2 { return Ok((iq2_16(&weights.iter().map(|value|*value as f32).collect::<Vec<_>>(),None,false),Vec::new())) }
 		if family == 1 && variant == 3 && bits == 3 { return Ok((iq3_s(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new())) }
-		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS", self.0)))
+		Err(self.unavailable())
 	}
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>> {
 		let (family, variant, bits) = (self.0 >> 12, self.0 >> 8 & 15, self.bits());
@@ -1290,19 +1291,13 @@ impl Integer for IntegerFormat {
 			for bytes in data.chunks_exact(STRIDE) {let scale=half(bytes);for index in 0..256 {if weights.len()==count{return Ok(weights)}let block=index/32;let group=index/4;let grid=usize::from(bytes[2+group])|usize::from(bytes[66+group/8]>>(group%8)&1)<<8;let code=bytes[106+block/2]>>(block%2*4)&15;let d=scale*f32::from(1+2*code);let sign=if bytes[74+index/8]>>(index%8)&1!=0{-1.0}else{1.0};weights.push(f64::from(d*f32::from(iq3_grid(&IQ3_S,grid,index%4))*sign))}}
 			return Ok(weights)
 		}
-		Err(RecipeError::new(format!("quantization code {} is unavailable; available GGML formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_NF, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, and IQ4_XS", self.0)))
+		Err(self.unavailable())
 	}
 }
-pub struct Qi { model: Model, pub zero: Model, pub one: Model, pub nf: Model, pub k: Qk }
+pub struct Qi { pub zero: Model, pub one: Model, pub nf: Model, pub k: Qk }
 pub struct Qk { model: Model, pub s: Model, pub m: Model, pub l: Model }
-pub struct Iq { model: Model, pub xxs: Model, pub xs: Model, pub s: Model, pub m: Model, pub nl: Model }
-impl std::ops::Deref for Qi {
-	type Target = Model; fn deref(&self) -> &Model { &self.model }
-}
+pub struct Iq { pub xxs: Model, pub xs: Model, pub s: Model, pub m: Model, pub nl: Model }
 impl std::ops::Deref for Qk {
-	type Target = Model; fn deref(&self) -> &Model { &self.model }
-}
-impl std::ops::Deref for Iq {
 	type Target = Model; fn deref(&self) -> &Model { &self.model }
 }
 impl Estimator {
@@ -1650,6 +1645,7 @@ fn compile_output(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu
 }
 fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config, expected: Option<usize>) -> Result<Graph> {
 	require(!model.blocks.is_empty(), "model must contain a block")?;
+	if let Some(format)=model.blocks.iter().map(|block|IntegerFormat(block.quantization)).find(|format|format.0!=0&&!format.valid()){return Err(format.unavailable())}
 	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..) | Operation::Embed(..));
 	let shape = if sequential { data.sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
