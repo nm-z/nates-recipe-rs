@@ -475,7 +475,7 @@ impl Model {
 		}
 		model
 	}
-	pub fn f(&self, exponent: u8, mantissa: u8) -> Self { assert!(exponent != 0 && mantissa != 0, "f requires exponent and mantissa fields"); let llvm = match (exponent, mantissa) { (8, 23) => "float", (11, 52) => "double", _ => "unsupported" }; self.arithmetic(FloatFormat { family: "f", bits: exponent + mantissa + 1, exponent, mantissa, llvm }) }
+	pub fn f(&self, exponent: u8, mantissa: u8) -> Self { assert!(exponent != 0 && mantissa != 0, "f requires exponent and mantissa fields"); let llvm = match (exponent, mantissa) { (5, 10) => "half", (8, 23) => "float", (11, 52) => "double", _ => "unsupported" }; self.arithmetic(FloatFormat { family: "f", bits: exponent + mantissa + 1, exponent, mantissa, llvm }) }
 	pub fn fp(&self, bits: u8) -> Self {
 		let (exponent, mantissa, llvm) = match bits {
 			8 => (4, 3, "unsupported"),
@@ -4367,6 +4367,7 @@ impl FloatFormat {
 	}
 	fn native(self) -> Option<Self> { match (self.bits, self.exponent, self.mantissa) { (16, 5, 10) => Some(FP16), (32, 8, 23) => Some(FP32), (64, 11, 52) => Some(FP64), _ => None } }
 	fn kernel(self) -> Option<usize> { [FP64, FP32, FP16].iter().position(|format| Some(*format) == self.native()) }
+	fn label(self)->String{if self.family=="f"{format!("f({},{})",self.exponent,self.mantissa)}else{format!("{}({})",self.family,self.bits)}}
 }
 impl Train {
 	pub const fn seed(mut self, value: usize) -> Self {
@@ -4414,7 +4415,7 @@ impl Train {
 		let support = |format: FloatFormat| format.kernel().is_some_and(|index| gpus.iter().all(|gpu| gpu.kernels[index].is_some()));
 		let available = [FP16, FP32, FP64].into_iter().filter(|format| support(*format)).flat_map(|format| [format!("f({},{}) [{}]", format.exponent, format.mantissa, format.llvm), format!("fp({}) [{}]", format.bits, format.llvm)]).collect::<Vec<_>>().join(", ");
 		require(model.blocks.iter().all(|block| block.format.native() == precision.native()), format!("mixed execution formats are unavailable on {}; available precision: {available}", gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
-		require(support(precision), format!("{}({}) [{}] training is unavailable on {}; available precision: {available}", precision.family, precision.bits, precision.llvm, gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
+		require(support(precision), format!("{} [{}] training is unavailable on {}; available precision: {available}", precision.label(), precision.llvm, gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
 		config.precision = precision;
 		if let Some(seed) = self.seed {
 			config.random_seed = seed;
