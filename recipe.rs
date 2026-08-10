@@ -1,19 +1,141 @@
 //! Recipe executes one model graph after automatically probing a compiled discrete GPU backend.
 //! Attention is three-projection scaled Q/K/V without an output projection.
 #![allow(non_upper_case_globals)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FloatLayout {
+	sign: u8,
+	exp: u8,
+	man: u8,
+}
+impl FloatLayout {
+	const fn new(sign: u8, exp: u8, man: u8) -> Self { Self { sign, exp, man } }
+	const fn bias(self) -> u64 { (1u64 << (self.exp - 1)) - 1 }
+	const fn bits(self) -> u8 { self.sign + self.exp + self.man }
+	fn pack(self, value: f64) -> u64 {
+		let sign = value.to_bits() >> (u64::BITS - 1) << (self.exp + self.man);
+		let exponent_limit = (1u64 << self.exp) - 1;
+		let mantissa_limit = 1u64 << self.man;
+		match value.classify() {
+			std::num::FpCategory::Nan => sign | exponent_limit << self.man | 1u64 << (self.man - 1),
+			std::num::FpCategory::Infinite => sign | exponent_limit << self.man,
+			std::num::FpCategory::Zero => sign,
+			std::num::FpCategory::Normal | std::num::FpCategory::Subnormal => {
+				let magnitude = value.abs();
+				let minimum_exponent = 1 - self.bias() as i64;
+				match magnitude.log2().floor() as i64 {
+					exponent if exponent < minimum_exponent => {
+						let scale = power(minimum_exponent);
+						let mantissa = (magnitude / scale * mantissa_limit as f64).round_ties_even() as u64;
+						if mantissa == mantissa_limit { sign | 1u64 << self.man } else { sign | mantissa }
+					}
+					mut exponent => {
+						let mut mantissa = ((magnitude / power(exponent) - 1.0) * mantissa_limit as f64).round_ties_even() as u64;
+						if mantissa == mantissa_limit {
+							mantissa = 0;
+							exponent += 1
+						}
+						let stored_exponent = exponent + self.bias() as i64;
+						if stored_exponent >= exponent_limit as i64 { sign | exponent_limit << self.man } else { sign | (stored_exponent as u64) << self.man | mantissa }
+					}
+				}
+			}
+		}
+	}
+	fn unpack(self, bits: u64) -> f64 {
+		let negative = bits >> (self.exp + self.man) != 0;
+		let exponent_limit = (1u64 << self.exp) - 1;
+		let mantissa_limit = 1u64 << self.man;
+		let exponent = bits >> self.man & exponent_limit;
+		let mantissa = bits & (mantissa_limit - 1);
+		let magnitude = match (exponent, mantissa) {
+			(value, 0) if value == exponent_limit => f64::INFINITY,
+			(value, _) if value == exponent_limit => f64::NAN,
+			(0, 0) => 0.0,
+			(0, value) => power(1 - self.bias() as i64) * value as f64 / mantissa_limit as f64,
+			(value, man) => power(value as i64 - self.bias() as i64) * (1.0 + man as f64 / mantissa_limit as f64),
+		};
+		if negative { -magnitude } else { magnitude }
+	}
+}
+fn power(exponent: i64) -> f64 {
+	if exponent > f64::MAX_EXP as i64 {
+		f64::INFINITY
+	} else if exponent < f64::MIN_EXP as i64 - f64::MANTISSA_DIGITS as i64 {
+		0.0
+	} else {
+		2.0f64.powi(exponent as i32)
+	}
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FloatFormat {
+	arithmetic: FloatLayout,
+	storage: FloatLayout,
+}
+impl FloatFormat {
+	const FP8: Self = Self::native(1, 5, 2);
+	const FP16: Self = Self::native(1, 5, 10);
+	const FP32: Self = Self::native(1, 8, 23);
+	const FP64: Self = Self::native(1, 11, 52);
+	const BF16: Self = Self::native(1, 8, 7);
+	const TF32: Self = Self { arithmetic: FloatLayout::new(1, 8, 10), storage: FloatLayout::new(1, 8, 23) };
+	const fn computed(exp: u8, man: u8) -> Self { Self { arithmetic: FloatLayout::new(1, exp, man), storage: Self::FP64.storage } }
+	const fn native(sign: u8, exp: u8, man: u8) -> Self {
+		let layout = FloatLayout::new(sign, exp, man);
+		Self { arithmetic: layout, storage: layout }
+	}
+	const fn bytes(self) -> usize { self.storage.bits().div_ceil(8) as usize }
+	fn pack(self, value: f64) -> u64 { self.storage.pack(self.arithmetic.unpack(self.arithmetic.pack(value))) }
+	fn unpack(self, bits: u64) -> f64 { self.arithmetic.unpack(self.arithmetic.pack(self.storage.unpack(bits))) }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IntFormat {
+	bits: u8,
+}
+impl IntFormat {
+	const INT1: Self = Self { bits: 1 };
+	const INT4: Self = Self { bits: 4 };
+	const INT8: Self = Self { bits: 8 };
+	const fn bytes(self) -> usize { self.bits.div_ceil(8) as usize }
+	fn pack(self, value: f64) -> u64 {
+		let minimum = -(1i64 << (self.bits - 1));
+		let maximum = (1i64 << (self.bits - 1)) - 1;
+		(value.round_ties_even() as i64).clamp(minimum, maximum) as u64 & ((1u64 << self.bits) - 1)
+	}
+	fn unpack(self, bits: u64) -> f64 { ((bits << (u64::BITS as u8 - self.bits)) as i64 >> (u64::BITS as u8 - self.bits)) as f64 }
+}
 mod bundle {
 	use super::*;
 	use std::{collections::BTreeMap, io::Write as _, str::FromStr};
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
-		pub graph: Graph, pub precision: FloatFormat, pub inputs: Vec<String>, pub outputs: Vec<String>,
-		pub norm_mean: Vec<f64>, pub norm_scale: Vec<f64>, pub target_min: f64, pub target_span: f64, pub bn_stats: Vec<f64>,
+		pub graph: Graph,
+		pub precision: Compute,
+		pub inputs: Vec<String>,
+		pub outputs: Vec<String>,
+		pub norm_mean: Vec<f64>,
+		pub norm_scale: Vec<f64>,
+		pub target_min: f64,
+		pub target_span: f64,
+		pub bn_stats: Vec<f64>,
 	}
 	#[derive(Default)]
 	struct Builder {
-		inputs: Vec<String>, outputs: Vec<String>, input: Option<Shape>, output: Option<Shape>, nodes: Vec<Node>, arguments: usize,
-		parameters: Vec<f64>, frozen: Vec<u8>, programs: Vec<f64>, state: TrainingState, precision: Option<FloatFormat>,
-		norm_mean: Vec<f64>, norm_scale: Vec<f64>, target_min: f64, target_span: f64, bn_stats: Vec<f64>,
+		inputs: Vec<String>,
+		outputs: Vec<String>,
+		input: Option<Shape>,
+		output: Option<Shape>,
+		nodes: Vec<Node>,
+		arguments: usize,
+		parameters: Vec<f64>,
+		frozen: Vec<u8>,
+		programs: Vec<f64>,
+		state: TrainingState,
+		precision: Option<Compute>,
+		norm_mean: Vec<f64>,
+		norm_scale: Vec<f64>,
+		target_min: f64,
+		target_span: f64,
+		bn_stats: Vec<f64>,
 	}
 	impl Builder {
 		fn finish(self) -> Result<StoredGraph> {
@@ -33,15 +155,11 @@ mod bundle {
 		}
 	}
 	fn values<T: FromStr>(text: &str, role: &str) -> Result<Vec<T>>
-	where
-		T::Err: fmt::Display,
-	{
+	where T::Err: fmt::Display {
 		text.split_whitespace().map(|value| value.parse().map_err(|error| RecipeError::new(format!("invalid {role}: {error}")))).collect()
 	}
 	fn value<T: FromStr>(text: &str, role: &str) -> Result<T>
-	where
-		T::Err: fmt::Display,
-	{
+	where T::Err: fmt::Display {
 		text.parse().map_err(|error| RecipeError::new(format!("invalid {role}: {error}")))
 	}
 	fn primitive(value: i32) -> Result<Primitive> {
@@ -62,11 +180,11 @@ mod bundle {
 		require(value.len() == 11, "model graph node descriptor has the wrong width")?;
 		Ok(Node { op: primitive(value[0])?, source: value[1], second: value[2], input: Shape { channels: value[3] as usize, length: value[4] as usize }, output: Shape { channels: value[5] as usize, length: value[6] as usize }, offset: value[7] as usize, parameters: value[8] as usize, argument: [0.0; 9], program_offset: value[9] as usize, program_count: value[10] as usize, block_index: 0, block_kind: "" })
 	}
-	fn precision(value: &str) -> Result<FloatFormat> {
+	fn precision(value: &str) -> Result<Compute> {
 		let fields = value.split_whitespace().collect::<Vec<_>>();
 		require(fields.len() == 5, "arithmetic format has the wrong width")?;
-		let shape = (fields[0], self::value::<u8>(fields[1], "arithmetic bits")?, self::value::<u8>(fields[2], "arithmetic exponent")?, self::value::<u8>(fields[3], "arithmetic mantissa")?, fields[4]);
-		match shape { ("fp", 64, 11, 52, "double") => Ok(FP64), ("fp", 32, 8, 23, "float") => Ok(FP32), ("fp", 16, 5, 10, "half") => Ok(FP16), ("f", 64, 11, 52, "double") => Ok(FloatFormat { family: "f", ..FP64 }), ("f", 32, 8, 23, "float") => Ok(FloatFormat { family: "f", ..FP32 }), ("f", 16, 5, 10, "half") => Ok(FloatFormat { family: "f", ..FP16 }), _ => Err(RecipeError::new(format!("saved arithmetic format {}({}) [{}] is unavailable; available precision: f(5,10) [half], f(8,23) [float], f(11,52) [double], fp(16) [half], fp(32) [float], fp(64) [double]", fields[0], fields[1], fields[4]))) }
+		let values = [self::value::<u8>(fields[1], "arithmetic bits")?, self::value::<u8>(fields[2], "arithmetic exponent")?, self::value::<u8>(fields[3], "arithmetic mantissa")?, self::value::<u8>(fields[4], "storage mantissa")?];
+		Compute::saved(fields[0], values).ok_or_else(|| RecipeError::new(format!("saved arithmetic format {} {} {} {} {} is unavailable", fields[0], values[0], values[1], values[2], values[3])))
 	}
 	pub(super) fn load(path: &str) -> Result<(String, Vec<StoredGraph>)> {
 		require(path.ends_with(".ogdl"), "model path requires .ogdl")?;
@@ -144,15 +262,11 @@ mod bundle {
 		require(!graphs.is_empty(), "model has no graphs")?;
 		Ok((schema, graphs))
 	}
-	fn join<T: ToString>(values: &[T]) -> String {
-		values.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")
-	}
+	fn join<T: ToString>(values: &[T]) -> String { values.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ") }
 	pub(super) fn save(path: &str, schema: &str, graphs: &[StoredGraph]) -> Result<()> {
 		require(path.ends_with(".ogdl"), "save requires an .ogdl model")?;
 		require(!graphs.is_empty(), "model bundle has no graphs")?;
-		fn field(document: &mut String, key: &str, value: &str) {
-			document.push_str(&format!("        {key} {value}\n"));
-		}
+		fn field(document: &mut String, key: &str, value: &str) { document.push_str(&format!("        {key} {value}\n")); }
 		let mut document = format!("recipe-model\n    schema {schema}\n");
 		let config = Config::load()?;
 		for stored in graphs {
@@ -164,7 +278,8 @@ mod bundle {
 				document.push_str(&format!("        out {name}\n"))
 			}
 			let graph = &stored.graph;
-			field(&mut document, "arithmetic", &format!("{} {} {} {} {}", stored.precision.family, stored.precision.bits, stored.precision.exponent, stored.precision.mantissa, stored.precision.llvm));
+			let (family, values) = stored.precision.saved_fields();
+			field(&mut document, "arithmetic", &format!("{family} {} {} {} {}", values[0], values[1], values[2], values[3]));
 			let quantized = graph.nodes.iter().any(|node| node.argument[8] != 0.0);
 			field(&mut document, "shape", &format!("{} {} {} {}", graph.input.channels, graph.input.length, graph.output.channels, graph.output.length));
 			for node in &graph.nodes {
@@ -182,7 +297,8 @@ mod bundle {
 						field(&mut document, "weights", &join(weights))
 					} else {
 						let format = IntegerFormat(node.argument[8] as u16);
-						let importance = graph.state.variances.get(node.offset..node.offset + node.parameters).unwrap_or(&[]); let (bytes, codebook) = format.compress(weights, importance, config)?;
+						let importance = graph.state.variances.get(node.offset..node.offset + node.parameters).unwrap_or(&[]);
+						let (bytes, codebook) = format.compress(weights, importance, config)?;
 						let hex = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
 						let metadata = if codebook.is_empty() { "-".to_owned() } else { codebook.iter().map(ToString::to_string).collect::<Vec<_>>().join(",") };
 						field(&mut document, "quantized", &format!("{} {} {metadata} {hex}", format.0, weights.len()))
@@ -204,12 +320,8 @@ mod bundle {
 		eprintln!("saved: {path}");
 		Ok(())
 	}
-	fn same_node(a: &Node, b: &Node) -> bool {
-		a.op == b.op && a.source == b.source && a.second == b.second && a.input == b.input && a.output == b.output && a.offset == b.offset && a.parameters == b.parameters && a.argument[..8].iter().zip(&b.argument).all(|(a,b)|a.to_bits()==b.to_bits()) && a.program_offset == b.program_offset && a.program_count == b.program_count
-	}
-	fn same_graph(a: &StoredGraph, b: &StoredGraph) -> bool {
-		a.precision == b.precision && a.inputs == b.inputs && a.outputs == b.outputs && a.graph.input == b.graph.input && a.graph.output == b.graph.output && a.graph.frozen == b.graph.frozen && a.graph.programs == b.graph.programs && a.graph.parameters.len() == b.graph.parameters.len() && a.graph.nodes.len() == b.graph.nodes.len() && a.graph.nodes.iter().zip(&b.graph.nodes).all(|(a, b)| same_node(a, b))
-	}
+	fn same_node(a: &Node, b: &Node) -> bool { a.op == b.op && a.source == b.source && a.second == b.second && a.input == b.input && a.output == b.output && a.offset == b.offset && a.parameters == b.parameters && a.argument[..8].iter().zip(&b.argument).all(|(a, b)| a.to_bits() == b.to_bits()) && a.program_offset == b.program_offset && a.program_count == b.program_count }
+	fn same_graph(a: &StoredGraph, b: &StoredGraph) -> bool { a.precision == b.precision && a.inputs == b.inputs && a.outputs == b.outputs && a.graph.input == b.graph.input && a.graph.output == b.graph.output && a.graph.frozen == b.graph.frozen && a.graph.programs == b.graph.programs && a.graph.parameters.len() == b.graph.parameters.len() && a.graph.nodes.len() == b.graph.nodes.len() && a.graph.nodes.iter().zip(&b.graph.nodes).all(|(a, b)| same_node(a, b)) }
 	pub(super) fn restore(path: &str, schema: &str, graphs: &mut [StoredGraph], identities: &[u64]) -> Result<()> {
 		if !fs::exists(path).map_err(|error| RecipeError::new(format!("cannot inspect {path}: {error}")))? {
 			return save(path, schema, graphs);
@@ -311,13 +423,21 @@ extern "C" fn interrupt(_: i32) {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipeError(String);
-impl RecipeError { fn new(message: impl Into<String>) -> Self { Self(message.into()) } }
-impl fmt::Display for RecipeError { fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(&self.0) } }
+impl RecipeError {
+	fn new(message: impl Into<String>) -> Self { Self(message.into()) }
+}
+impl fmt::Display for RecipeError {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(&self.0) }
+}
 impl Error for RecipeError {}
 pub type Result<T> = std::result::Result<T, RecipeError>;
 type Ptr = *mut c_void;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Backend { Cpu, Amd, Nvidia }
+enum Backend {
+	Cpu,
+	Amd,
+	Nvidia,
+}
 pub struct Data {
 	sources: Vec<String>,
 	target: Vec<String>,
@@ -328,12 +448,16 @@ pub struct Data {
 	prepared: OnceLock<Result<Prepared>>,
 }
 #[derive(Clone)]
-struct Route { inputs: Vec<String>, outputs: Vec<String> }
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Residual { Layer(usize), Activation(Activation) }
-pub const fn layer(width: usize) -> Residual {
-	Residual::Layer(width)
+struct Route {
+	inputs: Vec<String>,
+	outputs: Vec<String>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Residual {
+	Layer(usize),
+	Activation(Activation),
+}
+pub const fn layer(width: usize) -> Residual { Residual::Layer(width) }
 type FitFn = fn(usize, &Prepared, usize, Config, bool) -> Result<Predictor>;
 #[derive(Clone, Copy, Debug)]
 struct Estimator {
@@ -342,9 +466,7 @@ struct Estimator {
 	name: &'static str,
 }
 impl PartialEq for Estimator {
-	fn eq(&self, other: &Self) -> bool {
-		self.param == other.param && self.name == other.name
-	}
+	fn eq(&self, other: &Self) -> bool { self.param == other.param && self.name == other.name }
 }
 impl Eq for Estimator {}
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -384,7 +506,10 @@ pub enum Activation {
 	Prelu,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BlockNormalization { Batch, Layer }
+enum BlockNormalization {
+	Batch,
+	Layer,
+}
 macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Residual {
 	Residual::Activation(Activation::$value) })+}; }
 pub mod atv {
@@ -397,11 +522,18 @@ pub mod atv {
 pub use atv::{cos, elu, exp, gelu, leak, linear, ln, log, prelu, relu, selu, sigmoid, silu, tan, tanh};
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Block {
-	operation: Operation, activation: Activation, normalization: Option<BlockNormalization>, quantization: u16, profile: bool,
+	operation: Operation,
+	activation: Activation,
+	normalization: Option<BlockNormalization>,
+	quantization: u16,
+	profile: bool,
 }
 #[derive(Clone)]
 pub struct Model {
-	blocks: Vec<Block>, loss: LossFunction, downstream: Option<Vec<Block>>, quantization: u16,
+	blocks: Vec<Block>,
+	loss: LossFunction,
+	downstream: Option<Vec<Block>>,
+	quantization: u16,
 }
 pub trait ModelLoss {
 	fn apply(self, model: &mut Model);
@@ -413,9 +545,7 @@ impl ModelLoss for LossFunction {
 	}
 }
 impl ModelLoss for &Model {
-	fn apply(self, model: &mut Model) {
-		model.downstream = Some(self.blocks.clone());
-	}
+	fn apply(self, model: &mut Model) { model.downstream = Some(self.blocks.clone()); }
 }
 macro_rules! operation_methods { ($(fn $method:ident($($argument:ident: $kind:ty),*) = $operation:expr;)+) => {
 $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) })+ }; }
@@ -464,19 +594,24 @@ impl Model {
 		block.normalization = Some(if normalization as usize == batch as usize { BlockNormalization::Batch } else { BlockNormalization::Layer });
 		model
 	}
-	pub fn loss(&self, loss: impl ModelLoss) -> Self { let mut model = self.clone(); loss.apply(&mut model); model }
+	pub fn loss(&self, loss: impl ModelLoss) -> Self {
+		let mut model = self.clone();
+		loss.apply(&mut model);
+		model
+	}
 	fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self {
 		let mut model = self.clone();
 		let format = family << 12 | variant << 8 | u16::from(bits);
 		if let Some(block) = model.blocks.last_mut() {
-			block.quantization = format; block.profile = IntegerFormat(format).selection().is_some()
+			block.quantization = format;
+			block.profile = IntegerFormat(format).selection().is_some()
 		} else {
 			model.quantization = format
 		}
 		model
 	}
 	pub fn qi(&self, bits: u8) -> Qi {
-		assert!([2,3,4,5,6,8].contains(&bits), "qi bits must be 2, 3, 4, 5, 6, or 8");
+		assert!([2, 3, 4, 5, 6, 8].contains(&bits), "qi bits must be 2, 3, 4, 5, 6, or 8");
 		let q = |v| self.quantize(0, bits, v);
 		Qi { zero: q(0), one: q(1), nf: q(2), k: Qk { model: q(3), s: q(4), m: q(5), l: q(6) } }
 	}
@@ -511,8 +646,14 @@ impl Model {
 }
 fn quantization(code: u16) -> String {
 	let (family, bits, variant) = (code >> 12, code as u8, usize::from(code >> 8 & 15));
-	let variants:&[&str]=if family==0{&["_0","_1","_NF","_K","_K_S","_K_M","_K_L"]}else if family==1{&["","_XXS","_XS","_S","_M","_NL"]}else{return format!("quantization code {code}")};
-	variants.get(variant).map(|suffix|format!("{}{bits}{suffix}",if family==0{"Q"}else{"IQ"})).unwrap_or_else(||format!("quantization code {code}"))
+	let variants: &[&str] = if family == 0 {
+		&["_0", "_1", "_NF", "_K", "_K_S", "_K_M", "_K_L"]
+	} else if family == 1 {
+		&["", "_XXS", "_XS", "_S", "_M", "_NL"]
+	} else {
+		return format!("quantization code {code}");
+	};
+	variants.get(variant).map(|suffix| format!("{}{bits}{suffix}", if family == 0 { "Q" } else { "IQ" })).unwrap_or_else(|| format!("quantization code {code}"))
 }
 #[rustfmt::skip]
 fn fp16(value: f32) -> u16 {
@@ -544,12 +685,8 @@ fn unfp16(value: u16) -> f32 {
 	else { sign | (exponent + 112) << 23 | mantissa << 13 };
 	f32::from_bits(bits)
 }
-fn put_half(output: &mut Vec<u8>, value: f32) {
-	output.extend(fp16(value).to_le_bytes())
-}
-fn half(input: &[u8]) -> f32 {
-	unfp16(u16::from_le_bytes([input[0], input[1]]))
-}
+fn put_half(output: &mut Vec<u8>, value: f32) { output.extend(fp16(value).to_le_bytes()) }
+fn half(input: &[u8]) -> f32 { unfp16(u16::from_le_bytes([input[0], input[1]])) }
 fn float(input: &[u8]) -> f32 { f32::from_le_bytes([input[0], input[1], input[2], input[3]]) }
 fn qround(value: f32) -> f32 { (((value + 12582912.0).to_bits() as i32 & 0x007fffff) - 0x00400000) as f32 }
 fn positive_max(values: &[f32]) -> f32 { values.iter().fold(0.0, |maximum, value| if *value > maximum { *value } else { maximum }) }
@@ -620,57 +757,165 @@ fn qx(values: &[f32], levels: i32, codes: &mut [i8]) -> f32 {
 }
 fn k_scale(metadata: &[u8], block: usize) -> (u8, u8) { if block < 4 { (metadata[block] & 63, metadata[block + 4] & 63) } else { ((metadata[block + 4] & 15) | (metadata[block - 4] >> 6) << 4, (metadata[block + 4] >> 4) | (metadata[block] >> 6) << 4) } }
 const IQ4: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
-const IQ3_XXS: [u16; 256] = [
-	0,2,4,9,11,15,16,18,25,34,59,61,65,67,72,74,81,85,88,90,97,108,120,128,130,132,137,144,146,153,155,159,
-	169,175,189,193,199,200,202,213,248,267,287,292,303,315,317,321,327,346,362,413,436,456,460,462,483,497,513,515,520,522,529,531,
-	536,538,540,551,552,576,578,585,592,594,641,643,648,650,657,664,698,704,706,720,729,742,758,769,773,808,848,852,870,889,901,978,
-	992,1024,1026,1033,1035,1040,1042,1046,1049,1058,1089,1091,1093,1096,1098,1105,1112,1139,1143,1144,1152,1154,1161,1167,1168,1170,1183,1184,1197,1217,1224,1228,
-	1272,1276,1309,1323,1347,1367,1377,1404,1473,1475,1486,1509,1537,1544,1546,1553,1555,1576,1589,1594,1600,1602,1616,1625,1636,1638,1665,1667,1672,1685,1706,1722,
-	1737,1755,1816,1831,1850,1856,1862,1874,1901,1932,1950,1971,2011,2032,2052,2063,2077,2079,2091,2095,2172,2192,2207,2208,2224,2230,2247,2277,2308,2345,2356,2389,
-	2403,2424,2501,2504,2506,2520,2570,2593,2616,2624,2630,2646,2669,2700,2714,2746,2754,2795,2824,2835,2839,2874,2882,2905,2984,3028,3042,3092,3108,3110,3124,3153,
-	3185,3215,3252,3288,3294,3364,3397,3434,3483,3523,3537,3587,3589,3591,3592,3610,3626,3670,3680,3722,3749,3754,3776,3789,3803,3824,3857,3873,3904,3906,3924,3992];
+const IQ3_XXS: [u16; 256] = [0, 2, 4, 9, 11, 15, 16, 18, 25, 34, 59, 61, 65, 67, 72, 74, 81, 85, 88, 90, 97, 108, 120, 128, 130, 132, 137, 144, 146, 153, 155, 159, 169, 175, 189, 193, 199, 200, 202, 213, 248, 267, 287, 292, 303, 315, 317, 321, 327, 346, 362, 413, 436, 456, 460, 462, 483, 497, 513, 515, 520, 522, 529, 531, 536, 538, 540, 551, 552, 576, 578, 585, 592, 594, 641, 643, 648, 650, 657, 664, 698, 704, 706, 720, 729, 742, 758, 769, 773, 808, 848, 852, 870, 889, 901, 978, 992, 1024, 1026, 1033, 1035, 1040, 1042, 1046, 1049, 1058, 1089, 1091, 1093, 1096, 1098, 1105, 1112, 1139, 1143, 1144, 1152, 1154, 1161, 1167, 1168, 1170, 1183, 1184, 1197, 1217, 1224, 1228, 1272, 1276, 1309, 1323, 1347, 1367, 1377, 1404, 1473, 1475, 1486, 1509, 1537, 1544, 1546, 1553, 1555, 1576, 1589, 1594, 1600, 1602, 1616, 1625, 1636, 1638, 1665, 1667, 1672, 1685, 1706, 1722, 1737, 1755, 1816, 1831, 1850, 1856, 1862, 1874, 1901, 1932, 1950, 1971, 2011, 2032, 2052, 2063, 2077, 2079, 2091, 2095, 2172, 2192, 2207, 2208, 2224, 2230, 2247, 2277, 2308, 2345, 2356, 2389, 2403, 2424, 2501, 2504, 2506, 2520, 2570, 2593, 2616, 2624, 2630, 2646, 2669, 2700, 2714, 2746, 2754, 2795, 2824, 2835, 2839, 2874, 2882, 2905, 2984, 3028, 3042, 3092, 3108, 3110, 3124, 3153, 3185, 3215, 3252, 3288, 3294, 3364, 3397, 3434, 3483, 3523, 3537, 3587, 3589, 3591, 3592, 3610, 3626, 3670, 3680, 3722, 3749, 3754, 3776, 3789, 3803, 3824, 3857, 3873, 3904, 3906, 3924, 3992];
 const IQ3_S: [u16; 512] = [
-	0,1,2,5,7,8,9,10,12,14,16,17,21,27,32,34,37,39,41,43,48,50,57,60,63,64,65,66,68,72,73,77,80,83,87,89,93,100,113,117,122,128,129,133,135,136,139,142,145,149,152,156,162,165,167,169,171,184,187,195,201,205,208,210,217,219,222,228,232,234,247,249,253,256,267,271,273,276,282,288,291,297,312,322,324,336,338,342,347,353,357,359,374,379,390,393,395,409,426,441,448,450,452,464,466,470,475,488,492,512,513,514,516,520,521,523,525,527,528,530,537,540,542,556,558,561,570,576,
-	577,579,582,584,588,593,600,603,609,616,618,632,638,640,650,653,655,656,660,666,672,675,685,688,698,705,708,711,712,715,721,727,728,732,737,754,760,771,773,778,780,793,795,802,806,808,812,833,840,843,849,856,858,873,912,916,919,932,934,961,963,968,970,977,989,993,1010,1016,1024,1025,1027,1029,1031,1032,1034,1036,1038,1041,1043,1047,1048,1050,1057,1059,1061,1064,1066,1079,1080,1083,1085,1088,1090,1096,1099,1103,1106,1109,1113,1116,1122,1129,1153,1156,1159,1169,1171,1176,1183,1185,1195,1199,1209,1212,1216,1218,1221,1225,1234,1236,1241,1243,1250,1256,1270,1281,1287,1296,
-	1299,1306,1309,1313,1338,1341,1348,1353,1362,1375,1376,1387,1400,1408,1410,1415,1425,1453,1457,1477,1481,1494,1496,1507,1512,1538,1545,1547,1549,1551,1554,1561,1563,1565,1570,1572,1575,1577,1587,1593,1601,1603,1605,1612,1617,1619,1632,1648,1658,1662,1664,1674,1680,1690,1692,1704,1729,1736,1740,1745,1747,1751,1752,1761,1763,1767,1773,1787,1795,1801,1806,1810,1817,1834,1840,1844,1857,1864,1866,1877,1882,1892,1902,1915,1934,1953,1985,1987,2000,2002,2013,2048,2052,2058,2064,2068,2071,2074,2081,2088,2104,2114,2119,2121,2123,2130,2136,2141,2147,2153,2157,2177,2179,2184,2189,2193,2203,2208,2223,2226,2232,2244,2249,2251,2256,2258,2265,2269,
-	2304,2306,2324,2335,2336,2361,2373,2375,2385,2418,2443,2460,2480,2504,2509,2520,2531,2537,2562,2568,2572,2578,2592,2596,2599,2602,2614,2620,2625,2627,2629,2634,2641,2650,2682,2688,2697,2707,2712,2718,2731,2754,2759,2760,2775,2788,2793,2805,2811,2817,2820,2832,2842,2854,2890,2902,2921,2923,2978,3010,3012,3026,3081,3083,3085,3097,3099,3120,3136,3152,3159,3188,3210,3228,3234,3245,3250,3256,3264,3276,3281,3296,3349,3363,3378,3392,3395,3420,3440,3461,3488,3529,3531,3584,3588,3591,3600,3602,3614,3616,3628,3634,3650,3657,3668,3683,3685,3713,3716,3720,3726,3729,3736,3753,3778,3802,3805,3819,3841,3845,3851,3856,3880,3922,3938,3970,3993,4032];
-const IQ2_XXS:[u16;256]=[0,2,5,8,10,17,20,32,34,40,42,65,68,80,88,97,100,128,130,138,162,257,260,272,277,320,388,408,512,514,546,642,1025,1028,1040,1057,1060,1088,1090,1096,1120,1153,1156,1168,1188,1280,1282,1288,1312,1350,1385,1408,1425,1545,1552,1600,1668,1700,2048,2053,2056,2068,2088,2113,2116,2128,2130,2184,2308,2368,2562,2580,4097,4100,4112,4129,4160,4192,4228,4240,4245,4352,4360,4384,4432,4442,4480,4644,4677,5120,5128,5152,5157,5193,5248,5400,5474,5632,5654,6145,6148,6160,6208,6273,6400,6405,6560,6737,8192,8194,8202,8260,8289,8320,8322,8489,8520,8704,8706,9217,9220,9232,9280,9302,9472,9537,9572,9872,10248,10272,10388,10820,16385,16388,16400,16408,16417,16420,16448,16456,16470,16480,16513,16516,16528,16640,16672,16737,16768,16773,16897,16912,16968,16982,17000,17408,17416,17440,17536,17561,17682,17700,17920,18433,18436,18448,18496,18501,18688,18776,18785,18818,19013,19088,20480,20488,20497,20505,20512,20608,20616,20740,20802,20900,21137,21648,21650,21770,22017,22100,22528,22545,22553,22628,22848,23048,24580,24592,24640,24680,24832,24917,25112,25184,25600,25605,25872,25874,25988,26690,32768,32770,32778,32833,32898,33028,33048,33088,33297,33793,33796,33808,33813,33856,33888,34048,34118,34196,34313,34368,34400,34818,35076,35345,36868,36880,36900,36928,37025,37142,37248,37445,37888,37922,37956,38225,39041,39200,40962,41040,41093,41225,41472,42008,43088,43268];
-const IQ2_XS:[u16;512]=[
-	0,2,5,8,10,17,20,22,25,32,34,37,40,65,68,70,73,80,82,85,88,97,100,128,130,133,136,145,148,153,160,257,260,262,265,272,274,277,280,282,289,292,320,322,325,328,337,340,352,360,385,388,400,512,514,517,520,529,532,544,577,580,592,597,640,650,1025,1028,1030,1033,1040,1042,1045,1048,1057,1060,1088,1090,1093,1096,1105,1108,1110,1120,1153,1156,1168,1280,1282,1285,1288,1297,1300,1312,1345,1348,1360,1377,1408,1537,1540,1552,1574,1600,1602,1668,2048,2050,2053,2056,2058,2065,2068,2080,2085,2113,2116,2128,2136,2176,2208,2218,2305,2308,2320,2368,2433,2441,2560,2592,2600,2710,2720,4097,4100,4102,4105,4112,4114,4117,4120,4129,4132,4160,4162,4165,4168,4177,4180,4192,4202,4225,4228,4240,4352,4354,4357,4360,4369,4372,4384,4417,4420,4432,4480,4500,4502,4609,4612,4614,4624,4672,4704,5120,5122,5125,5128,5137,5140,5152,5185,5188,5193,5200,5220,5248,5377,5380,5392,5440,5632,5652,5705,6145,6148,6160,6162,6208,6228,6278,6400,6405,6502,6737,6825,8192,8194,8197,8200,8202,8209,8212,8224,8257,8260,8272,8320,8352,8449,8452,8464,8512,8520,8549,8704,8738,8832,8872,9217,9220,9232,9257,9280,9472,9537,9554,9625,9729,9754,9894,10240,10248,10250,10272,10325,10376,10402,10600,10640,10760,10784,10882,10888,10890,16385,16388,
-	16390,16393,16400,16402,16405,16408,16417,16420,16448,16450,16453,16456,16458,16465,16468,16480,16485,16513,16516,16528,16640,16642,16645,16648,16657,16660,16672,16705,16708,16720,16768,16773,16802,16897,16900,16912,16914,16937,16960,17408,17410,17413,17416,17425,17428,17433,17440,17473,17476,17488,17536,17556,17665,17668,17680,17700,17728,17818,17920,17930,17988,18000,18433,18436,18448,18496,18501,18516,18530,18688,18705,18756,18768,18793,18948,20480,20482,20485,20488,20497,20500,20512,20520,20545,20548,20560,20608,20737,20740,20752,20757,20800,20802,20992,21060,21162,21505,21508,21520,21537,21568,21600,21633,21665,21760,21768,21888,21896,22049,22120,22177,22528,22548,22593,22608,22681,22810,22848,22850,23173,24577,24580,24592,24640,24660,24674,24710,24745,24832,25124,25162,25234,25600,25622,25872,25920,25925,26020,26625,26730,26917,27142,27220,27234,32768,32770,32773,32776,32785,32788,32800,32810,32833,32836,32848,32896,32898,32936,32938,33025,33028,33030,33040,33088,33105,33113,33280,33312,33408,33410,33440,33448,33793,33796,33808,33810,33813,33856,33888,33929,34048,34116,34213,34328,34410,34816,34824,34853,34906,34944,34946,34984,35078,35362,35456,35464,35478,35496,36865,36868,36880,36928,36950,36996,37120,37154,37220,37462,37513,37888,37893,37956,37968,37976,38185,38288,38290,38465,38993,39078,39241,39445,39520,40960,40962,40968,40970,40992,41002,41120,41297,41305,41382,41472,41474,41480,41514,41600,41632,42048,42133,42597,42648,43018,43040,43042,43048,43168,43176,43268,43396,43398,43560,43562,43665,43690];
-const IQ1:[u16;2048]=[
-	0,2,5,8,10,17,21,32,34,40,42,69,81,84,86,101,128,130,136,138,149,160,162,168,170,260,261,273,276,278,281,282,293,321,326,329,338,341,346,353,356,358,360,389,401,404,406,421,512,514,520,522,533,544,546,552,554,581,593,601,612,617,640,642,648,650,657,661,665,672,674,680,682,1041,1044,1046,1061,1089,1097,1109,1114,1124,1125,1169,1177,1189,1281,1284,1285,1286,1301,1304,1306,1321,1344,1349,1354,1360,1361,1364,1365,1366,1369,1376,1378,1381,1384,1386,1409,1425,1429,1432,1434,1441,1444,1445,1446,1449,1556,1561,1601,1604,1616,1618,1621,1624,1632,1633,1638,1641,1669,1681,1684,1689,2048,2050,2056,2058,2069,2080,2082,2088,2090,2117,2129,2134,2149,2176,2178,2184,2186,2197,2208,2210,2216,2218,2309,2321,2324,2329,2340,2341,2369,2384,2385,2389,2401,2404,2409,2449,2452,2454,2457,2469,2560,2562,2568,2570,2581,2592,2594,2600,2602,2629,2641,2649,2657,2661,2688,2690,2693,2696,2698,2709,2720,2722,2728,2730,4112,4113,4116,4121,4132,4133,4161,4164,4176,4181,4184,4193,4196,4197,4201,4241,4244,4246,4257,4261,4353,4356,4358,4361,4368,4370,4373,4376,4385,4388,4393,4421,4426,4432,4433,4434,4436,4437,4438,4441,4448,4453,4484,4498,4501,4513,4516,4625,4628,4630,4645,4672,4678,4681,4690,4693,4696,4698,
-	4708,4710,4741,4753,4756,4758,4773,5121,5126,5129,5140,5141,5144,5145,5153,5158,5185,5189,5190,5192,5194,5201,5204,5205,5206,5209,5218,5221,5224,5252,5257,5264,5268,5269,5272,5273,5274,5281,5284,5285,5289,5378,5381,5386,5393,5396,5397,5398,5401,5408,5410,5413,5416,5418,5441,5444,5445,5446,5457,5458,5460,5461,5462,5465,5466,5473,5476,5477,5478,5481,5504,5506,5508,5509,5512,5514,5520,5521,5524,5525,5526,5529,5530,5536,5538,5541,5633,5636,5637,5638,5653,5654,5656,5658,5665,5670,5696,5698,5700,5701,5704,5706,5713,5717,5718,5720,5721,5729,5732,5733,5736,5737,5738,5766,5770,5778,5781,5796,5801,6161,6166,6181,6209,6212,6214,6217,6224,6229,6232,6234,6240,6241,6244,6246,6249,6277,6289,6292,6309,6416,6418,6421,6426,6433,6437,6466,6468,6469,6472,6481,6484,6485,6486,6489,6490,6496,6501,6506,6537,6545,6546,6549,6552,6561,6566,6569,6665,6678,6692,6694,6724,6726,6729,6736,6738,6741,6744,6753,6758,6761,6789,6801,6806,6810,8192,8194,8200,8202,8213,8224,8226,8229,8232,8234,8261,8273,8281,8289,8293,8320,8322,8328,8330,8341,8352,8354,8357,8360,8362,8453,8465,8468,8473,8485,8514,8516,8521,8533,8536,8538,8545,8548,8549,8550,8581,8592,8598,8601,8613,8705,8712,8714,8721,8725,8736,8738,8744,8746,8773,8785,8790,8793,8805,8833,8840,8842,8849,8853,8864,8866,8872,8874,9221,9236,9238,9241,
-	9253,9284,9285,9286,9289,9298,9301,9304,9306,9318,9349,9361,9364,9369,9377,9381,9481,9493,9505,9513,9536,9541,9544,9553,9556,9557,9561,9570,9573,9576,9609,9616,9620,9621,9624,9626,9633,9636,9638,9641,9733,9744,9746,9753,9765,9793,9801,9813,9824,9825,9833,9860,9862,9872,9882,10240,10242,10248,10250,10261,10272,10274,10280,10282,10309,10321,10324,10341,10368,10370,10376,10378,10400,10402,10408,10410,10505,10513,10516,10521,10533,10566,10569,10578,10581,10593,10596,10598,10601,10629,10640,10646,10649,10660,10661,10752,10754,10760,10762,10784,10786,10792,10794,10821,10833,10838,10841,10853,10880,10882,10888,10890,10901,10912,10914,10920,10922,16389,16401,16406,16421,16457,16466,16469,16472,16474,16481,16484,16486,16532,16537,16545,16550,16640,16641,16644,16646,16649,16658,16661,16662,16664,16666,16673,16678,16681,16709,16712,16714,16721,16724,16725,16726,16729,16730,16741,16744,16746,16769,16772,16774,16784,16786,16789,16800,16801,16802,16901,16913,16916,16918,16933,16961,16978,16981,16986,16996,17001,17033,17044,17061,17409,17429,17433,17449,17477,17480,17482,17489,17492,17493,17494,17505,17506,17509,17512,17514,17537,17542,17545,17552,17554,17557,17568,17569,17577,17665,17666,17669,17674,17681,17684,17685,17686,17689,17696,17701,17706,17729,17732,17733,17734,17737,17744,17745,17748,17749,17750,17752,17753,17761,17764,17765,17766,17769,17794,17796,17797,17800,17809,17812,17813,17814,17817,17818,17829,17832,17834,17921,17925,17929,17940,17941,17944,17946,17953,
-	17956,17961,17984,17986,17989,17992,18000,18001,18002,18005,18006,18009,18018,18021,18024,18049,18053,18058,18068,18069,18081,18084,18086,18437,18449,18453,18458,18469,18498,18505,18512,18517,18520,18529,18532,18534,18537,18565,18577,18580,18582,18585,18597,18689,18693,18694,18698,18704,18708,18709,18712,18721,18724,18726,18752,18757,18762,18769,18770,18772,18773,18774,18777,18784,18786,18789,18790,18794,18822,18825,18834,18837,18838,18840,18849,18852,18854,18857,18966,19012,19014,19017,19029,19032,19034,19044,19049,19092,19109,20481,20484,20485,20486,20489,20498,20501,20506,20513,20516,20521,20544,20549,20552,20561,20564,20565,20566,20569,20581,20584,20614,20617,20629,20632,20640,20641,20646,20649,20741,20744,20745,20746,20753,20756,20757,20758,20760,20761,20768,20773,20774,20776,20778,20801,20804,20805,20806,20809,20816,20817,20818,20820,20821,20822,20824,20825,20826,20833,20836,20837,20838,20841,20866,20869,20881,20884,20885,20886,20889,20896,20901,20906,20993,20998,21010,21013,21018,21025,21028,21058,21061,21066,21073,21076,21077,21078,21081,21090,21093,21125,21136,21138,21141,21145,21146,21156,21508,21509,21521,21524,21525,21526,21528,21529,21537,21541,21544,21546,21569,21572,21573,21574,21577,21578,21584,21585,21588,21589,21590,21592,21593,21594,21601,21602,21604,21605,21606,21609,21632,21640,21642,21649,21652,21653,21654,21657,21665,21668,21669,21674,21761,21762,21764,21765,21766,21769,21776,21777,21778,21780,21781,21782,21785,21786,21793,21796,21797,21798,21801,21824,21825,21826,21828,21829,21830,21832,
-	21833,21840,21841,21842,21844,21845,21846,21848,21849,21850,21856,21857,21860,21861,21862,21864,21865,21866,21889,21892,21893,21897,21898,21904,21905,21908,21909,21910,21912,21913,21921,21924,21925,21926,21929,22016,22017,22018,22020,22022,22024,22025,22033,22036,22037,22040,22041,22048,22049,22050,22052,22053,22054,22056,22057,22081,22085,22086,22088,22089,22090,22096,22097,22098,22100,22101,22102,22104,22105,22106,22113,22116,22117,22121,22146,22149,22150,22152,22153,22154,22161,22165,22170,22178,22181,22182,22184,22185,22532,22533,22534,22537,22544,22549,22552,22561,22570,22597,22600,22602,22609,22612,22613,22614,22616,22617,22624,22626,22628,22629,22658,22665,22672,22674,22677,22680,22689,22697,22785,22786,22789,22794,22801,22804,22805,22806,22809,22821,22849,22852,22853,22854,22857,22864,22865,22866,22868,22869,22870,22872,22873,22874,22881,22884,22885,22886,22889,22913,22917,22921,22929,22932,22933,22934,22936,22937,22949,23044,23048,23061,23066,23072,23077,23078,23081,23109,23112,23113,23121,23125,23126,23128,23129,23138,23141,23144,23146,23169,23178,23186,23189,23190,23192,23194,23201,24581,24596,24598,24601,24613,24644,24656,24661,24662,24664,24666,24673,24676,24678,24681,24705,24726,24741,24833,24836,24838,24841,24850,24853,24865,24866,24870,24873,24901,24905,24913,24917,24918,24921,24933,24934,24938,24964,24970,24978,24981,24993,24998,25001,25105,25110,25113,25152,25153,25158,25173,25174,25176,25184,25221,25233,25238,25253,25617,25618,25621,25622,25626,25633,25638,25641,25664,25666,25669,25672,25674,
-	25681,25684,25685,25686,25689,25690,25696,25698,25701,25732,25733,25737,25744,25746,25748,25749,25750,25752,25754,25761,25764,25769,25861,25864,25866,25873,25877,25878,25881,25924,25925,25926,25929,25936,25937,25940,25941,25942,25945,25953,25956,25957,25958,25961,25990,25993,25994,26001,26005,26006,26009,26010,26018,26021,26022,26024,26114,26121,26133,26144,26150,26152,26153,26176,26181,26184,26186,26193,26196,26197,26198,26200,26202,26208,26213,26216,26240,26242,26245,26250,26260,26262,26264,26265,26272,26276,26278,26282,26646,26649,26661,26689,26706,26709,26714,26721,26729,26757,26769,26776,26790,26881,26884,26896,26901,26913,26916,26918,26921,26944,26945,26949,26950,26952,26961,26964,26965,26966,26969,26976,26981,26986,27010,27012,27018,27029,27041,27044,27045,27049,27153,27158,27160,27201,27204,27209,27216,27221,27224,27226,27236,27237,27241,27270,27284,27288,27290,27302,32768,32770,32776,32778,32800,32802,32808,32810,32837,32848,32849,32852,32854,32857,32869,32896,32898,32904,32906,32917,32928,32930,32936,32938,33029,33041,33044,33046,33049,33061,33089,33092,33097,33104,33106,33109,33110,33112,33113,33124,33126,33129,33157,33161,33172,33174,33177,33189,33280,33282,33288,33290,33301,33312,33314,33320,33322,33361,33364,33369,33381,33408,33410,33416,33418,33429,33440,33442,33448,33450,33812,33817,33857,33860,33873,33877,33882,33889,33892,33897,33940,33945,34049,34057,34066,34069,34074,34086,34089,34112,34113,34117,34120,34129,34132,34133,34134,34137,34138,34149,34150,34152,34154,34177,34180,34182,34185,34192,
-	34194,34197,34200,34214,34321,34326,34329,34341,34369,34372,34377,34378,34384,34389,34393,34394,34401,34406,34410,34437,34449,34458,34468,34816,34818,34824,34826,34837,34848,34850,34856,34858,34881,34885,34897,34900,34905,34917,34921,34944,34946,34952,34954,34965,34976,34978,34984,34986,35077,35078,35089,35092,35094,35109,35137,35140,35142,35145,35152,35154,35157,35162,35169,35172,35205,35222,35225,35237,35328,35330,35336,35338,35349,35360,35362,35368,35370,35397,35409,35412,35414,35456,35458,35464,35466,35477,35488,35490,35496,35498,36869,36881,36886,36888,36889,36901,36929,36934,36937,36949,36952,36954,36969,36970,36997,37009,37012,37014,37017,37029,37121,37124,37126,37129,37136,37141,37144,37146,37153,37156,37158,37161,37184,37189,37200,37201,37204,37205,37206,37209,37218,37221,37252,37254,37266,37269,37272,37281,37284,37286,37289,37381,37393,37396,37401,37413,37444,37446,37449,37456,37458,37461,37464,37478,37481,37509,37524,37526,37545,37889,37892,37894,37904,37909,37912,37926,37952,37962,37969,37972,37973,37974,37976,37977,37984,37985,37986,37989,38020,38022,38034,38036,38037,38040,38049,38057,38144,38149,38152,38154,38160,38161,38164,38165,38166,38169,38177,38181,38185,38186,38209,38212,38213,38214,38217,38224,38225,38226,38228,38229,38230,38232,38233,38234,38241,38244,38245,38246,38249,38273,38277,38280,38289,38290,38292,38293,38294,38297,38298,38304,38306,38309,38312,38314,38401,38404,38416,38421,38425,38432,38438,38441,38469,38472,38473,38481,38482,38485,38486,38489,38501,38504,38530,38532,38537,38538,
-	38546,38548,38549,38564,38566,38569,38917,38934,38937,38949,38977,38982,38992,38994,38997,38998,39002,39012,39013,39045,39057,39062,39065,39077,39172,39174,39177,39184,39186,39189,39192,39194,39200,39201,39204,39206,39232,39234,39237,39240,39242,39249,39252,39253,39254,39257,39266,39269,39270,39274,39297,39300,39312,39314,39317,39322,39329,39334,39429,39445,39461,39492,39494,39497,39504,39509,39512,39521,39557,39569,39572,39573,39574,40960,40962,40968,40970,40981,40992,40994,41000,41002,41029,41041,41044,41046,41049,41088,41090,41096,41098,41109,41120,41122,41128,41130,41221,41225,41233,41236,41238,41241,41242,41286,41289,41297,41301,41304,41306,41313,41316,41349,41360,41362,41366,41369,41474,41480,41482,41488,41497,41506,41512,41514,41541,41553,41558,41561,41573,41600,41602,41608,41610,41621,41632,41634,41640,41642,42009,42021,42049,42052,42064,42068,42069,42072,42074,42081,42085,42086,42088,42089,42117,42246,42249,42256,42258,42261,42264,42278,42281,42306,42309,42321,42324,42325,42326,42329,42341,42346,42369,42372,42373,42374,42377,42386,42389,42392,42501,42513,42518,42522,42529,42533,42564,42566,42570,42578,42581,42582,42584,42592,42594,42630,42640,42645,42646,42649,42657,42660,42662,43008,43010,43016,43018,43040,43042,43048,43050,43089,43092,43094,43097,43136,43138,43144,43146,43157,43168,43170,43176,43178,43269,43284,43289,43297,43301,43329,43344,43349,43354,43361,43366,43369,43408,43414,43520,43522,43528,43530,43552,43554,43560,43562,43601,43604,43606,43648,43650,43656,43658,43669,43680,43682,43688,43690];
+	0, 1, 2, 5, 7, 8, 9, 10, 12, 14, 16, 17, 21, 27, 32, 34, 37, 39, 41, 43, 48, 50, 57, 60, 63, 64, 65, 66, 68, 72, 73, 77, 80, 83, 87, 89, 93, 100, 113, 117, 122, 128, 129, 133, 135, 136, 139, 142, 145, 149, 152, 156, 162, 165, 167, 169, 171, 184, 187, 195, 201, 205, 208, 210, 217, 219, 222, 228, 232, 234, 247, 249, 253, 256, 267, 271, 273, 276, 282, 288, 291, 297, 312, 322, 324, 336, 338, 342, 347, 353, 357, 359, 374, 379, 390, 393, 395, 409, 426, 441, 448, 450, 452, 464, 466, 470, 475, 488, 492, 512, 513, 514, 516, 520, 521, 523, 525, 527, 528, 530, 537, 540, 542, 556, 558, 561, 570, 576, 577, 579, 582, 584, 588, 593, 600, 603, 609, 616, 618, 632, 638, 640, 650, 653, 655, 656, 660, 666, 672, 675, 685, 688, 698, 705, 708, 711, 712, 715, 721, 727, 728, 732, 737, 754, 760, 771, 773, 778, 780, 793, 795, 802, 806, 808, 812, 833, 840, 843, 849, 856, 858, 873, 912, 916, 919, 932, 934, 961, 963, 968, 970, 977, 989, 993, 1010, 1016, 1024, 1025, 1027, 1029, 1031, 1032, 1034, 1036, 1038, 1041, 1043, 1047, 1048, 1050, 1057, 1059, 1061, 1064, 1066, 1079, 1080, 1083, 1085, 1088, 1090, 1096, 1099, 1103, 1106, 1109, 1113, 1116, 1122, 1129, 1153, 1156, 1159, 1169, 1171, 1176, 1183, 1185, 1195, 1199, 1209, 1212, 1216, 1218, 1221, 1225, 1234, 1236, 1241, 1243, 1250, 1256, 1270, 1281, 1287, 1296, 1299, 1306, 1309, 1313, 1338, 1341, 1348, 1353, 1362, 1375, 1376, 1387, 1400, 1408, 1410, 1415, 1425, 1453, 1457, 1477, 1481, 1494, 1496, 1507, 1512, 1538, 1545, 1547, 1549, 1551, 1554, 1561, 1563, 1565, 1570, 1572, 1575, 1577, 1587, 1593, 1601, 1603, 1605, 1612, 1617, 1619, 1632, 1648, 1658, 1662, 1664, 1674, 1680, 1690, 1692, 1704, 1729, 1736, 1740, 1745, 1747, 1751, 1752, 1761, 1763, 1767, 1773, 1787, 1795, 1801, 1806, 1810, 1817, 1834, 1840, 1844, 1857, 1864, 1866, 1877, 1882, 1892, 1902, 1915, 1934, 1953, 1985, 1987, 2000, 2002, 2013, 2048, 2052, 2058, 2064, 2068, 2071, 2074, 2081,
+	2088, 2104, 2114, 2119, 2121, 2123, 2130, 2136, 2141, 2147, 2153, 2157, 2177, 2179, 2184, 2189, 2193, 2203, 2208, 2223, 2226, 2232, 2244, 2249, 2251, 2256, 2258, 2265, 2269, 2304, 2306, 2324, 2335, 2336, 2361, 2373, 2375, 2385, 2418, 2443, 2460, 2480, 2504, 2509, 2520, 2531, 2537, 2562, 2568, 2572, 2578, 2592, 2596, 2599, 2602, 2614, 2620, 2625, 2627, 2629, 2634, 2641, 2650, 2682, 2688, 2697, 2707, 2712, 2718, 2731, 2754, 2759, 2760, 2775, 2788, 2793, 2805, 2811, 2817, 2820, 2832, 2842, 2854, 2890, 2902, 2921, 2923, 2978, 3010, 3012, 3026, 3081, 3083, 3085, 3097, 3099, 3120, 3136, 3152, 3159, 3188, 3210, 3228, 3234, 3245, 3250, 3256, 3264, 3276, 3281, 3296, 3349, 3363, 3378, 3392, 3395, 3420, 3440, 3461, 3488, 3529, 3531, 3584, 3588, 3591, 3600, 3602, 3614, 3616, 3628, 3634, 3650, 3657, 3668, 3683, 3685, 3713, 3716, 3720, 3726, 3729, 3736, 3753, 3778, 3802, 3805, 3819, 3841, 3845, 3851, 3856, 3880, 3922, 3938, 3970, 3993, 4032,
+];
+const IQ2_XXS: [u16; 256] = [0, 2, 5, 8, 10, 17, 20, 32, 34, 40, 42, 65, 68, 80, 88, 97, 100, 128, 130, 138, 162, 257, 260, 272, 277, 320, 388, 408, 512, 514, 546, 642, 1025, 1028, 1040, 1057, 1060, 1088, 1090, 1096, 1120, 1153, 1156, 1168, 1188, 1280, 1282, 1288, 1312, 1350, 1385, 1408, 1425, 1545, 1552, 1600, 1668, 1700, 2048, 2053, 2056, 2068, 2088, 2113, 2116, 2128, 2130, 2184, 2308, 2368, 2562, 2580, 4097, 4100, 4112, 4129, 4160, 4192, 4228, 4240, 4245, 4352, 4360, 4384, 4432, 4442, 4480, 4644, 4677, 5120, 5128, 5152, 5157, 5193, 5248, 5400, 5474, 5632, 5654, 6145, 6148, 6160, 6208, 6273, 6400, 6405, 6560, 6737, 8192, 8194, 8202, 8260, 8289, 8320, 8322, 8489, 8520, 8704, 8706, 9217, 9220, 9232, 9280, 9302, 9472, 9537, 9572, 9872, 10248, 10272, 10388, 10820, 16385, 16388, 16400, 16408, 16417, 16420, 16448, 16456, 16470, 16480, 16513, 16516, 16528, 16640, 16672, 16737, 16768, 16773, 16897, 16912, 16968, 16982, 17000, 17408, 17416, 17440, 17536, 17561, 17682, 17700, 17920, 18433, 18436, 18448, 18496, 18501, 18688, 18776, 18785, 18818, 19013, 19088, 20480, 20488, 20497, 20505, 20512, 20608, 20616, 20740, 20802, 20900, 21137, 21648, 21650, 21770, 22017, 22100, 22528, 22545, 22553, 22628, 22848, 23048, 24580, 24592, 24640, 24680, 24832, 24917, 25112, 25184, 25600, 25605, 25872, 25874, 25988, 26690, 32768, 32770, 32778, 32833, 32898, 33028, 33048, 33088, 33297, 33793, 33796, 33808, 33813, 33856, 33888, 34048, 34118, 34196, 34313, 34368, 34400, 34818, 35076, 35345, 36868, 36880, 36900, 36928, 37025, 37142, 37248, 37445, 37888, 37922, 37956, 38225, 39041, 39200, 40962, 41040, 41093, 41225, 41472, 42008, 43088, 43268];
+const IQ2_XS: [u16; 512] = [
+	0, 2, 5, 8, 10, 17, 20, 22, 25, 32, 34, 37, 40, 65, 68, 70, 73, 80, 82, 85, 88, 97, 100, 128, 130, 133, 136, 145, 148, 153, 160, 257, 260, 262, 265, 272, 274, 277, 280, 282, 289, 292, 320, 322, 325, 328, 337, 340, 352, 360, 385, 388, 400, 512, 514, 517, 520, 529, 532, 544, 577, 580, 592, 597, 640, 650, 1025, 1028, 1030, 1033, 1040, 1042, 1045, 1048, 1057, 1060, 1088, 1090, 1093, 1096, 1105, 1108, 1110, 1120, 1153, 1156, 1168, 1280, 1282, 1285, 1288, 1297, 1300, 1312, 1345, 1348, 1360, 1377, 1408, 1537, 1540, 1552, 1574, 1600, 1602, 1668, 2048, 2050, 2053, 2056, 2058, 2065, 2068, 2080, 2085, 2113, 2116, 2128, 2136, 2176, 2208, 2218, 2305, 2308, 2320, 2368, 2433, 2441, 2560, 2592, 2600, 2710, 2720, 4097, 4100, 4102, 4105, 4112, 4114, 4117, 4120, 4129, 4132, 4160, 4162, 4165, 4168, 4177, 4180, 4192, 4202, 4225, 4228, 4240, 4352, 4354, 4357, 4360, 4369, 4372, 4384, 4417, 4420, 4432, 4480, 4500, 4502, 4609, 4612, 4614, 4624, 4672, 4704, 5120, 5122, 5125, 5128, 5137, 5140, 5152, 5185, 5188, 5193, 5200, 5220, 5248, 5377, 5380, 5392, 5440, 5632, 5652, 5705, 6145, 6148, 6160, 6162, 6208, 6228, 6278, 6400, 6405, 6502, 6737, 6825, 8192, 8194, 8197, 8200, 8202, 8209, 8212, 8224, 8257, 8260, 8272, 8320, 8352, 8449, 8452, 8464, 8512, 8520, 8549, 8704, 8738, 8832, 8872, 9217, 9220, 9232, 9257, 9280, 9472, 9537, 9554, 9625, 9729, 9754, 9894, 10240, 10248, 10250, 10272, 10325, 10376, 10402, 10600, 10640, 10760, 10784, 10882, 10888, 10890, 16385, 16388, 16390, 16393, 16400, 16402, 16405, 16408, 16417, 16420, 16448, 16450, 16453, 16456, 16458, 16465, 16468, 16480, 16485, 16513, 16516, 16528, 16640, 16642, 16645, 16648, 16657, 16660, 16672, 16705, 16708, 16720, 16768, 16773, 16802, 16897, 16900, 16912, 16914, 16937, 16960, 17408, 17410, 17413, 17416, 17425, 17428, 17433, 17440, 17473, 17476, 17488, 17536, 17556, 17665, 17668, 17680, 17700, 17728, 17818, 17920, 17930, 17988, 18000,
+	18433, 18436, 18448, 18496, 18501, 18516, 18530, 18688, 18705, 18756, 18768, 18793, 18948, 20480, 20482, 20485, 20488, 20497, 20500, 20512, 20520, 20545, 20548, 20560, 20608, 20737, 20740, 20752, 20757, 20800, 20802, 20992, 21060, 21162, 21505, 21508, 21520, 21537, 21568, 21600, 21633, 21665, 21760, 21768, 21888, 21896, 22049, 22120, 22177, 22528, 22548, 22593, 22608, 22681, 22810, 22848, 22850, 23173, 24577, 24580, 24592, 24640, 24660, 24674, 24710, 24745, 24832, 25124, 25162, 25234, 25600, 25622, 25872, 25920, 25925, 26020, 26625, 26730, 26917, 27142, 27220, 27234, 32768, 32770, 32773, 32776, 32785, 32788, 32800, 32810, 32833, 32836, 32848, 32896, 32898, 32936, 32938, 33025, 33028, 33030, 33040, 33088, 33105, 33113, 33280, 33312, 33408, 33410, 33440, 33448, 33793, 33796, 33808, 33810, 33813, 33856, 33888, 33929, 34048, 34116, 34213, 34328, 34410, 34816, 34824, 34853, 34906, 34944, 34946, 34984, 35078, 35362, 35456, 35464, 35478, 35496, 36865, 36868, 36880, 36928, 36950, 36996, 37120, 37154, 37220, 37462, 37513, 37888, 37893, 37956, 37968, 37976, 38185, 38288, 38290, 38465, 38993, 39078, 39241, 39445, 39520, 40960, 40962, 40968, 40970, 40992, 41002, 41120, 41297, 41305, 41382, 41472, 41474, 41480, 41514, 41600, 41632, 42048, 42133, 42597, 42648, 43018, 43040, 43042, 43048, 43168, 43176, 43268, 43396, 43398, 43560, 43562, 43665, 43690,
+];
+const IQ1: [u16; 2048] = [
+	0, 2, 5, 8, 10, 17, 21, 32, 34, 40, 42, 69, 81, 84, 86, 101, 128, 130, 136, 138, 149, 160, 162, 168, 170, 260, 261, 273, 276, 278, 281, 282, 293, 321, 326, 329, 338, 341, 346, 353, 356, 358, 360, 389, 401, 404, 406, 421, 512, 514, 520, 522, 533, 544, 546, 552, 554, 581, 593, 601, 612, 617, 640, 642, 648, 650, 657, 661, 665, 672, 674, 680, 682, 1041, 1044, 1046, 1061, 1089, 1097, 1109, 1114, 1124, 1125, 1169, 1177, 1189, 1281, 1284, 1285, 1286, 1301, 1304, 1306, 1321, 1344, 1349, 1354, 1360, 1361, 1364, 1365, 1366, 1369, 1376, 1378, 1381, 1384, 1386, 1409, 1425, 1429, 1432, 1434, 1441, 1444, 1445, 1446, 1449, 1556, 1561, 1601, 1604, 1616, 1618, 1621, 1624, 1632, 1633, 1638, 1641, 1669, 1681, 1684, 1689, 2048, 2050, 2056, 2058, 2069, 2080, 2082, 2088, 2090, 2117, 2129, 2134, 2149, 2176, 2178, 2184, 2186, 2197, 2208, 2210, 2216, 2218, 2309, 2321, 2324, 2329, 2340, 2341, 2369, 2384, 2385, 2389, 2401, 2404, 2409, 2449, 2452, 2454, 2457, 2469, 2560, 2562, 2568, 2570, 2581, 2592, 2594, 2600, 2602, 2629, 2641, 2649, 2657, 2661, 2688, 2690, 2693, 2696, 2698, 2709, 2720, 2722, 2728, 2730, 4112, 4113, 4116, 4121, 4132, 4133, 4161, 4164, 4176, 4181, 4184, 4193, 4196, 4197, 4201, 4241, 4244, 4246, 4257, 4261, 4353, 4356, 4358, 4361, 4368, 4370, 4373, 4376, 4385, 4388, 4393, 4421, 4426, 4432, 4433, 4434, 4436, 4437, 4438, 4441, 4448, 4453, 4484, 4498, 4501, 4513, 4516, 4625, 4628, 4630, 4645, 4672, 4678, 4681, 4690, 4693, 4696, 4698, 4708, 4710, 4741, 4753, 4756, 4758, 4773, 5121, 5126, 5129, 5140, 5141, 5144, 5145, 5153, 5158, 5185, 5189, 5190, 5192, 5194, 5201, 5204, 5205, 5206, 5209, 5218, 5221, 5224, 5252, 5257, 5264, 5268, 5269, 5272, 5273, 5274, 5281, 5284, 5285, 5289, 5378, 5381, 5386, 5393, 5396, 5397, 5398, 5401, 5408, 5410, 5413, 5416, 5418, 5441, 5444, 5445, 5446, 5457, 5458, 5460, 5461, 5462, 5465, 5466, 5473, 5476, 5477, 5478, 5481, 5504, 5506, 5508, 5509, 5512,
+	5514, 5520, 5521, 5524, 5525, 5526, 5529, 5530, 5536, 5538, 5541, 5633, 5636, 5637, 5638, 5653, 5654, 5656, 5658, 5665, 5670, 5696, 5698, 5700, 5701, 5704, 5706, 5713, 5717, 5718, 5720, 5721, 5729, 5732, 5733, 5736, 5737, 5738, 5766, 5770, 5778, 5781, 5796, 5801, 6161, 6166, 6181, 6209, 6212, 6214, 6217, 6224, 6229, 6232, 6234, 6240, 6241, 6244, 6246, 6249, 6277, 6289, 6292, 6309, 6416, 6418, 6421, 6426, 6433, 6437, 6466, 6468, 6469, 6472, 6481, 6484, 6485, 6486, 6489, 6490, 6496, 6501, 6506, 6537, 6545, 6546, 6549, 6552, 6561, 6566, 6569, 6665, 6678, 6692, 6694, 6724, 6726, 6729, 6736, 6738, 6741, 6744, 6753, 6758, 6761, 6789, 6801, 6806, 6810, 8192, 8194, 8200, 8202, 8213, 8224, 8226, 8229, 8232, 8234, 8261, 8273, 8281, 8289, 8293, 8320, 8322, 8328, 8330, 8341, 8352, 8354, 8357, 8360, 8362, 8453, 8465, 8468, 8473, 8485, 8514, 8516, 8521, 8533, 8536, 8538, 8545, 8548, 8549, 8550, 8581, 8592, 8598, 8601, 8613, 8705, 8712, 8714, 8721, 8725, 8736, 8738, 8744, 8746, 8773, 8785, 8790, 8793, 8805, 8833, 8840, 8842, 8849, 8853, 8864, 8866, 8872, 8874, 9221, 9236, 9238, 9241, 9253, 9284, 9285, 9286, 9289, 9298, 9301, 9304, 9306, 9318, 9349, 9361, 9364, 9369, 9377, 9381, 9481, 9493, 9505, 9513, 9536, 9541, 9544, 9553, 9556, 9557, 9561, 9570, 9573, 9576, 9609, 9616, 9620, 9621, 9624, 9626, 9633, 9636, 9638, 9641, 9733, 9744, 9746, 9753, 9765, 9793, 9801, 9813, 9824, 9825, 9833, 9860, 9862, 9872, 9882, 10240, 10242, 10248, 10250, 10261, 10272, 10274, 10280, 10282, 10309, 10321, 10324, 10341, 10368, 10370, 10376, 10378, 10400, 10402, 10408, 10410, 10505, 10513, 10516, 10521, 10533, 10566, 10569, 10578, 10581, 10593, 10596, 10598, 10601, 10629, 10640, 10646, 10649, 10660, 10661, 10752, 10754, 10760, 10762, 10784, 10786, 10792, 10794, 10821, 10833, 10838, 10841, 10853, 10880, 10882, 10888, 10890, 10901, 10912, 10914, 10920, 10922, 16389, 16401, 16406, 16421, 16457, 16466,
+	16469, 16472, 16474, 16481, 16484, 16486, 16532, 16537, 16545, 16550, 16640, 16641, 16644, 16646, 16649, 16658, 16661, 16662, 16664, 16666, 16673, 16678, 16681, 16709, 16712, 16714, 16721, 16724, 16725, 16726, 16729, 16730, 16741, 16744, 16746, 16769, 16772, 16774, 16784, 16786, 16789, 16800, 16801, 16802, 16901, 16913, 16916, 16918, 16933, 16961, 16978, 16981, 16986, 16996, 17001, 17033, 17044, 17061, 17409, 17429, 17433, 17449, 17477, 17480, 17482, 17489, 17492, 17493, 17494, 17505, 17506, 17509, 17512, 17514, 17537, 17542, 17545, 17552, 17554, 17557, 17568, 17569, 17577, 17665, 17666, 17669, 17674, 17681, 17684, 17685, 17686, 17689, 17696, 17701, 17706, 17729, 17732, 17733, 17734, 17737, 17744, 17745, 17748, 17749, 17750, 17752, 17753, 17761, 17764, 17765, 17766, 17769, 17794, 17796, 17797, 17800, 17809, 17812, 17813, 17814, 17817, 17818, 17829, 17832, 17834, 17921, 17925, 17929, 17940, 17941, 17944, 17946, 17953, 17956, 17961, 17984, 17986, 17989, 17992, 18000, 18001, 18002, 18005, 18006, 18009, 18018, 18021, 18024, 18049, 18053, 18058, 18068, 18069, 18081, 18084, 18086, 18437, 18449, 18453, 18458, 18469, 18498, 18505, 18512, 18517, 18520, 18529, 18532, 18534, 18537, 18565, 18577, 18580, 18582, 18585, 18597, 18689, 18693, 18694, 18698, 18704, 18708, 18709, 18712, 18721, 18724, 18726, 18752, 18757, 18762, 18769, 18770, 18772, 18773, 18774, 18777, 18784, 18786, 18789, 18790, 18794, 18822, 18825, 18834, 18837, 18838, 18840, 18849, 18852, 18854, 18857, 18966, 19012, 19014, 19017, 19029, 19032, 19034, 19044, 19049, 19092, 19109, 20481, 20484, 20485, 20486, 20489, 20498, 20501, 20506, 20513, 20516, 20521, 20544, 20549, 20552, 20561, 20564, 20565, 20566, 20569, 20581, 20584, 20614, 20617, 20629, 20632, 20640, 20641, 20646, 20649, 20741, 20744, 20745, 20746, 20753, 20756, 20757, 20758, 20760, 20761, 20768, 20773, 20774, 20776, 20778, 20801, 20804, 20805, 20806,
+	20809, 20816, 20817, 20818, 20820, 20821, 20822, 20824, 20825, 20826, 20833, 20836, 20837, 20838, 20841, 20866, 20869, 20881, 20884, 20885, 20886, 20889, 20896, 20901, 20906, 20993, 20998, 21010, 21013, 21018, 21025, 21028, 21058, 21061, 21066, 21073, 21076, 21077, 21078, 21081, 21090, 21093, 21125, 21136, 21138, 21141, 21145, 21146, 21156, 21508, 21509, 21521, 21524, 21525, 21526, 21528, 21529, 21537, 21541, 21544, 21546, 21569, 21572, 21573, 21574, 21577, 21578, 21584, 21585, 21588, 21589, 21590, 21592, 21593, 21594, 21601, 21602, 21604, 21605, 21606, 21609, 21632, 21640, 21642, 21649, 21652, 21653, 21654, 21657, 21665, 21668, 21669, 21674, 21761, 21762, 21764, 21765, 21766, 21769, 21776, 21777, 21778, 21780, 21781, 21782, 21785, 21786, 21793, 21796, 21797, 21798, 21801, 21824, 21825, 21826, 21828, 21829, 21830, 21832, 21833, 21840, 21841, 21842, 21844, 21845, 21846, 21848, 21849, 21850, 21856, 21857, 21860, 21861, 21862, 21864, 21865, 21866, 21889, 21892, 21893, 21897, 21898, 21904, 21905, 21908, 21909, 21910, 21912, 21913, 21921, 21924, 21925, 21926, 21929, 22016, 22017, 22018, 22020, 22022, 22024, 22025, 22033, 22036, 22037, 22040, 22041, 22048, 22049, 22050, 22052, 22053, 22054, 22056, 22057, 22081, 22085, 22086, 22088, 22089, 22090, 22096, 22097, 22098, 22100, 22101, 22102, 22104, 22105, 22106, 22113, 22116, 22117, 22121, 22146, 22149, 22150, 22152, 22153, 22154, 22161, 22165, 22170, 22178, 22181, 22182, 22184, 22185, 22532, 22533, 22534, 22537, 22544, 22549, 22552, 22561, 22570, 22597, 22600, 22602, 22609, 22612, 22613, 22614, 22616, 22617, 22624, 22626, 22628, 22629, 22658, 22665, 22672, 22674, 22677, 22680, 22689, 22697, 22785, 22786, 22789, 22794, 22801, 22804, 22805, 22806, 22809, 22821, 22849, 22852, 22853, 22854, 22857, 22864, 22865, 22866, 22868, 22869, 22870, 22872, 22873, 22874, 22881, 22884, 22885, 22886, 22889, 22913, 22917, 22921, 22929,
+	22932, 22933, 22934, 22936, 22937, 22949, 23044, 23048, 23061, 23066, 23072, 23077, 23078, 23081, 23109, 23112, 23113, 23121, 23125, 23126, 23128, 23129, 23138, 23141, 23144, 23146, 23169, 23178, 23186, 23189, 23190, 23192, 23194, 23201, 24581, 24596, 24598, 24601, 24613, 24644, 24656, 24661, 24662, 24664, 24666, 24673, 24676, 24678, 24681, 24705, 24726, 24741, 24833, 24836, 24838, 24841, 24850, 24853, 24865, 24866, 24870, 24873, 24901, 24905, 24913, 24917, 24918, 24921, 24933, 24934, 24938, 24964, 24970, 24978, 24981, 24993, 24998, 25001, 25105, 25110, 25113, 25152, 25153, 25158, 25173, 25174, 25176, 25184, 25221, 25233, 25238, 25253, 25617, 25618, 25621, 25622, 25626, 25633, 25638, 25641, 25664, 25666, 25669, 25672, 25674, 25681, 25684, 25685, 25686, 25689, 25690, 25696, 25698, 25701, 25732, 25733, 25737, 25744, 25746, 25748, 25749, 25750, 25752, 25754, 25761, 25764, 25769, 25861, 25864, 25866, 25873, 25877, 25878, 25881, 25924, 25925, 25926, 25929, 25936, 25937, 25940, 25941, 25942, 25945, 25953, 25956, 25957, 25958, 25961, 25990, 25993, 25994, 26001, 26005, 26006, 26009, 26010, 26018, 26021, 26022, 26024, 26114, 26121, 26133, 26144, 26150, 26152, 26153, 26176, 26181, 26184, 26186, 26193, 26196, 26197, 26198, 26200, 26202, 26208, 26213, 26216, 26240, 26242, 26245, 26250, 26260, 26262, 26264, 26265, 26272, 26276, 26278, 26282, 26646, 26649, 26661, 26689, 26706, 26709, 26714, 26721, 26729, 26757, 26769, 26776, 26790, 26881, 26884, 26896, 26901, 26913, 26916, 26918, 26921, 26944, 26945, 26949, 26950, 26952, 26961, 26964, 26965, 26966, 26969, 26976, 26981, 26986, 27010, 27012, 27018, 27029, 27041, 27044, 27045, 27049, 27153, 27158, 27160, 27201, 27204, 27209, 27216, 27221, 27224, 27226, 27236, 27237, 27241, 27270, 27284, 27288, 27290, 27302, 32768, 32770, 32776, 32778, 32800, 32802, 32808, 32810, 32837, 32848, 32849, 32852, 32854, 32857, 32869, 32896, 32898,
+	32904, 32906, 32917, 32928, 32930, 32936, 32938, 33029, 33041, 33044, 33046, 33049, 33061, 33089, 33092, 33097, 33104, 33106, 33109, 33110, 33112, 33113, 33124, 33126, 33129, 33157, 33161, 33172, 33174, 33177, 33189, 33280, 33282, 33288, 33290, 33301, 33312, 33314, 33320, 33322, 33361, 33364, 33369, 33381, 33408, 33410, 33416, 33418, 33429, 33440, 33442, 33448, 33450, 33812, 33817, 33857, 33860, 33873, 33877, 33882, 33889, 33892, 33897, 33940, 33945, 34049, 34057, 34066, 34069, 34074, 34086, 34089, 34112, 34113, 34117, 34120, 34129, 34132, 34133, 34134, 34137, 34138, 34149, 34150, 34152, 34154, 34177, 34180, 34182, 34185, 34192, 34194, 34197, 34200, 34214, 34321, 34326, 34329, 34341, 34369, 34372, 34377, 34378, 34384, 34389, 34393, 34394, 34401, 34406, 34410, 34437, 34449, 34458, 34468, 34816, 34818, 34824, 34826, 34837, 34848, 34850, 34856, 34858, 34881, 34885, 34897, 34900, 34905, 34917, 34921, 34944, 34946, 34952, 34954, 34965, 34976, 34978, 34984, 34986, 35077, 35078, 35089, 35092, 35094, 35109, 35137, 35140, 35142, 35145, 35152, 35154, 35157, 35162, 35169, 35172, 35205, 35222, 35225, 35237, 35328, 35330, 35336, 35338, 35349, 35360, 35362, 35368, 35370, 35397, 35409, 35412, 35414, 35456, 35458, 35464, 35466, 35477, 35488, 35490, 35496, 35498, 36869, 36881, 36886, 36888, 36889, 36901, 36929, 36934, 36937, 36949, 36952, 36954, 36969, 36970, 36997, 37009, 37012, 37014, 37017, 37029, 37121, 37124, 37126, 37129, 37136, 37141, 37144, 37146, 37153, 37156, 37158, 37161, 37184, 37189, 37200, 37201, 37204, 37205, 37206, 37209, 37218, 37221, 37252, 37254, 37266, 37269, 37272, 37281, 37284, 37286, 37289, 37381, 37393, 37396, 37401, 37413, 37444, 37446, 37449, 37456, 37458, 37461, 37464, 37478, 37481, 37509, 37524, 37526, 37545, 37889, 37892, 37894, 37904, 37909, 37912, 37926, 37952, 37962, 37969, 37972, 37973, 37974, 37976, 37977, 37984, 37985, 37986, 37989, 38020,
+	38022, 38034, 38036, 38037, 38040, 38049, 38057, 38144, 38149, 38152, 38154, 38160, 38161, 38164, 38165, 38166, 38169, 38177, 38181, 38185, 38186, 38209, 38212, 38213, 38214, 38217, 38224, 38225, 38226, 38228, 38229, 38230, 38232, 38233, 38234, 38241, 38244, 38245, 38246, 38249, 38273, 38277, 38280, 38289, 38290, 38292, 38293, 38294, 38297, 38298, 38304, 38306, 38309, 38312, 38314, 38401, 38404, 38416, 38421, 38425, 38432, 38438, 38441, 38469, 38472, 38473, 38481, 38482, 38485, 38486, 38489, 38501, 38504, 38530, 38532, 38537, 38538, 38546, 38548, 38549, 38564, 38566, 38569, 38917, 38934, 38937, 38949, 38977, 38982, 38992, 38994, 38997, 38998, 39002, 39012, 39013, 39045, 39057, 39062, 39065, 39077, 39172, 39174, 39177, 39184, 39186, 39189, 39192, 39194, 39200, 39201, 39204, 39206, 39232, 39234, 39237, 39240, 39242, 39249, 39252, 39253, 39254, 39257, 39266, 39269, 39270, 39274, 39297, 39300, 39312, 39314, 39317, 39322, 39329, 39334, 39429, 39445, 39461, 39492, 39494, 39497, 39504, 39509, 39512, 39521, 39557, 39569, 39572, 39573, 39574, 40960, 40962, 40968, 40970, 40981, 40992, 40994, 41000, 41002, 41029, 41041, 41044, 41046, 41049, 41088, 41090, 41096, 41098, 41109, 41120, 41122, 41128, 41130, 41221, 41225, 41233, 41236, 41238, 41241, 41242, 41286, 41289, 41297, 41301, 41304, 41306, 41313, 41316, 41349, 41360, 41362, 41366, 41369, 41474, 41480, 41482, 41488, 41497, 41506, 41512, 41514, 41541, 41553, 41558, 41561, 41573, 41600, 41602, 41608, 41610, 41621, 41632, 41634, 41640, 41642, 42009, 42021, 42049, 42052, 42064, 42068, 42069, 42072, 42074, 42081, 42085, 42086, 42088, 42089, 42117, 42246, 42249, 42256, 42258, 42261, 42264, 42278, 42281, 42306, 42309, 42321, 42324, 42325, 42326, 42329, 42341, 42346, 42369, 42372, 42373, 42374, 42377, 42386, 42389, 42392, 42501, 42513, 42518, 42522, 42529, 42533, 42564, 42566, 42570, 42578, 42581, 42582, 42584, 42592, 42594,
+	42630, 42640, 42645, 42646, 42649, 42657, 42660, 42662, 43008, 43010, 43016, 43018, 43040, 43042, 43048, 43050, 43089, 43092, 43094, 43097, 43136, 43138, 43144, 43146, 43157, 43168, 43170, 43176, 43178, 43269, 43284, 43289, 43297, 43301, 43329, 43344, 43349, 43354, 43361, 43366, 43369, 43408, 43414, 43520, 43522, 43528, 43530, 43552, 43554, 43560, 43562, 43601, 43604, 43606, 43648, 43650, 43656, 43658, 43669, 43680, 43682, 43688, 43690,
+];
 const IQ2_S: [u16; 1024] = [
-	0,2,5,8,10,17,20,22,25,32,34,37,40,65,68,70,73,80,82,85,88,97,100,102,105,128,130,133,136,145,148,160,165,170,257,260,262,265,272,274,277,280,289,292,320,322,325,328,337,340,342,345,352,357,360,385,388,400,402,405,417,420,512,514,517,520,529,532,544,554,577,580,582,585,592,597,640,645,650,660,674,1025,1028,1030,1033,1040,1042,1045,1048,1057,1060,1062,1065,1088,1090,1093,1096,1098,1105,1108,1110,1113,1120,1122,1125,1153,1156,1158,1161,1168,1173,1176,1185,1188,1280,1282,1285,1288,1290,1297,1300,1302,1305,1312,1317,1320,1345,1348,1350,1353,1360,1362,1365,1368,1377,1380,1408,1410,1413,1416,1425,1428,1440,1537,1540,1542,1545,1552,1557,1600,1605,1608,1617,1620,1632,1665,1668,1680,2048,2050,2053,2056,2065,2068,2070,2073,2080,2085,2090,2113,2116,2118,2121,2128,2130,2133,2136,2145,2148,2176,2181,2196,2218,2305,2308,2320,2322,2325,2328,2337,2368,2373,2376,2385,2388,2400,2433,2448,2560,2577,2580,2594,2600,2602,2640,2713,4097,4100,4102,4105,4112,4114,4117,4120,4129,4132,4134,4160,4162,4165,4168,4177,4180,4182,4185,4192,4194,4197,4200,4225,4228,4230,4240,4245,4248,4257,4260,4352,4354,4357,4360,4362,4369,4372,4374,4377,4384,4386,4389,4392,4417,4420,4422,4425,4432,4434,
-	4437,4440,4449,4452,4480,4482,4485,4488,4497,4500,4609,4612,4617,4624,4629,4641,4644,4672,4677,4689,4692,4737,4740,4752,5120,5122,5125,5128,5137,5140,5142,5145,5152,5157,5160,5185,5188,5190,5193,5200,5202,5205,5208,5217,5220,5248,5250,5253,5256,5265,5268,5280,5377,5380,5382,5385,5392,5394,5397,5400,5409,5412,5440,5442,5445,5448,5457,5460,5472,5505,5508,5520,5632,5637,5640,5649,5652,5664,5697,5700,5712,5760,5802,6145,6148,6150,6153,6160,6165,6168,6177,6208,6210,6213,6216,6225,6228,6240,6273,6276,6400,6402,6405,6408,6417,6420,6432,6465,6468,6480,6505,6562,6660,6672,6720,6742,8192,8194,8197,8200,8209,8212,8214,8217,8224,8229,8234,8257,8260,8272,8274,8277,8292,8320,8330,8340,8362,8449,8452,8464,8466,8469,8481,8512,8514,8517,8529,8532,8544,8577,8580,8592,8704,8714,8738,8744,8746,8772,8784,8840,8842,8872,9217,9220,9222,9225,9232,9237,9240,9249,9252,9280,9282,9285,9288,9297,9300,9312,9345,9348,9360,9472,9477,9480,9489,9492,9504,9537,9540,9552,9574,9600,9729,9732,9744,9792,9817,10240,10245,10257,10260,10305,10308,10320,10378,10410,10497,10500,10512,10645,10762,10786,10852,10888,10890,16385,16388,16390,16393,16400,16402,16405,16408,16410,16417,16420,16422,16448,16450,16453,16456,16458,16465,16468,16470,16473,16480,16482,16485,16513,16516,16528,16533,16536,16545,16548,16640,16642,16645,16648,16657,16660,16662,16665,16672,16674,
-	16677,16705,16708,16710,16713,16720,16722,16725,16728,16737,16740,16768,16770,16773,16776,16785,16788,16800,16897,16900,16912,16914,16917,16920,16932,16960,16965,16968,16977,16980,16992,17025,17028,17408,17410,17413,17416,17418,17425,17428,17430,17433,17440,17442,17445,17448,17473,17476,17478,17481,17488,17490,17493,17496,17505,17508,17536,17538,17541,17544,17553,17556,17568,17665,17668,17670,17673,17680,17682,17685,17688,17697,17700,17728,17730,17733,17736,17745,17748,17760,17770,17793,17796,17808,17920,17922,17925,17928,17937,17940,17952,17985,17988,18000,18048,18085,18433,18436,18441,18448,18450,18453,18456,18465,18468,18496,18498,18501,18504,18513,18516,18528,18564,18576,18688,18690,18693,18696,18705,18708,18720,18753,18756,18768,18816,18838,18945,18948,18960,19008,20480,20482,20485,20488,20497,20500,20502,20505,20512,20514,20517,20520,20545,20548,20550,20553,20560,20562,20565,20568,20577,20580,20608,20610,20613,20616,20625,20628,20737,20740,20742,20745,20752,20754,20757,20760,20769,20772,20800,20802,20805,20808,20817,20820,20832,20865,20868,20880,20992,20997,21000,21009,21012,21024,21057,21060,21072,21097,21120,21505,21508,21510,21513,21520,21522,21525,21528,21537,21540,21568,21570,21573,21576,21585,21588,21600,21633,21636,21648,21760,21762,21765,21768,21777,21780,21792,21825,21828,21840,21888,22017,22020,22032,22054,22080,22528,22530,22533,22536,22545,22548,22560,22593,22596,22608,22618,22656,22785,22788,22800,22848,23040,23065,23173,23208,24577,24580,24582,24592,24594,24597,24600,24609,24612,24640,24645,
-	24648,24657,24660,24672,24708,24720,24832,24834,24837,24840,24849,24852,24864,24897,24900,24912,24960,24985,25092,25104,25152,25174,25249,25600,25605,25608,25617,25620,25632,25665,25668,25680,25728,25857,25860,25872,25920,25930,25960,26002,26112,26260,26625,26628,26640,26725,26776,26880,26922,27202,27297,32768,32770,32773,32776,32785,32788,32793,32800,32805,32833,32836,32848,32850,32853,32856,32865,32896,32901,32913,32916,33025,33028,33033,33040,33042,33045,33048,33057,33060,33088,33090,33093,33096,33105,33108,33153,33156,33168,33193,33280,33285,33290,33297,33300,33345,33348,33360,33793,33796,33798,33801,33808,33810,33813,33816,33825,33856,33858,33861,33864,33873,33876,33888,33921,33924,33936,34048,34050,34053,34056,34065,34068,34080,34113,34116,34128,34176,34186,34305,34308,34320,34345,34368,34816,34821,34833,34836,34881,34884,34896,34978,35073,35076,35136,35173,35362,35416,35418,35458,35490,36865,36868,36873,36880,36882,36885,36888,36900,36928,36930,36933,36936,36945,36948,36960,36993,36996,37008,37120,37125,37137,37140,37185,37188,37200,37210,37377,37380,37392,37440,37542,37888,37890,37893,37896,37905,37908,37920,37953,37956,37968,38016,38038,38145,38148,38160,38208,38296,38305,38400,38470,38500,38913,38916,38928,38950,38976,39081,39168,39241,39250,39568,40960,40965,40970,40980,40994,41002,41025,41028,41040,41122,41130,41280,41317,41474,41482,41506,41512,41514,41602,41608,41610,41640,41985,41988,42000,42048,42121,42148,42240,42265,42577,43018,43048,43170,43348,43398,43528,43530,43552,43554,43560,43656,43690];
+	0, 2, 5, 8, 10, 17, 20, 22, 25, 32, 34, 37, 40, 65, 68, 70, 73, 80, 82, 85, 88, 97, 100, 102, 105, 128, 130, 133, 136, 145, 148, 160, 165, 170, 257, 260, 262, 265, 272, 274, 277, 280, 289, 292, 320, 322, 325, 328, 337, 340, 342, 345, 352, 357, 360, 385, 388, 400, 402, 405, 417, 420, 512, 514, 517, 520, 529, 532, 544, 554, 577, 580, 582, 585, 592, 597, 640, 645, 650, 660, 674, 1025, 1028, 1030, 1033, 1040, 1042, 1045, 1048, 1057, 1060, 1062, 1065, 1088, 1090, 1093, 1096, 1098, 1105, 1108, 1110, 1113, 1120, 1122, 1125, 1153, 1156, 1158, 1161, 1168, 1173, 1176, 1185, 1188, 1280, 1282, 1285, 1288, 1290, 1297, 1300, 1302, 1305, 1312, 1317, 1320, 1345, 1348, 1350, 1353, 1360, 1362, 1365, 1368, 1377, 1380, 1408, 1410, 1413, 1416, 1425, 1428, 1440, 1537, 1540, 1542, 1545, 1552, 1557, 1600, 1605, 1608, 1617, 1620, 1632, 1665, 1668, 1680, 2048, 2050, 2053, 2056, 2065, 2068, 2070, 2073, 2080, 2085, 2090, 2113, 2116, 2118, 2121, 2128, 2130, 2133, 2136, 2145, 2148, 2176, 2181, 2196, 2218, 2305, 2308, 2320, 2322, 2325, 2328, 2337, 2368, 2373, 2376, 2385, 2388, 2400, 2433, 2448, 2560, 2577, 2580, 2594, 2600, 2602, 2640, 2713, 4097, 4100, 4102, 4105, 4112, 4114, 4117, 4120, 4129, 4132, 4134, 4160, 4162, 4165, 4168, 4177, 4180, 4182, 4185, 4192, 4194, 4197, 4200, 4225, 4228, 4230, 4240, 4245, 4248, 4257, 4260, 4352, 4354, 4357, 4360, 4362, 4369, 4372, 4374, 4377, 4384, 4386, 4389, 4392, 4417, 4420, 4422, 4425, 4432, 4434, 4437, 4440, 4449, 4452, 4480, 4482, 4485, 4488, 4497, 4500, 4609, 4612, 4617, 4624, 4629, 4641, 4644, 4672, 4677, 4689, 4692, 4737, 4740, 4752, 5120, 5122, 5125, 5128, 5137, 5140, 5142, 5145, 5152, 5157, 5160, 5185, 5188, 5190, 5193, 5200, 5202, 5205, 5208, 5217, 5220, 5248, 5250, 5253, 5256, 5265, 5268, 5280, 5377, 5380, 5382, 5385, 5392, 5394, 5397, 5400, 5409, 5412, 5440, 5442, 5445, 5448, 5457, 5460, 5472, 5505, 5508, 5520, 5632, 5637, 5640, 5649, 5652,
+	5664, 5697, 5700, 5712, 5760, 5802, 6145, 6148, 6150, 6153, 6160, 6165, 6168, 6177, 6208, 6210, 6213, 6216, 6225, 6228, 6240, 6273, 6276, 6400, 6402, 6405, 6408, 6417, 6420, 6432, 6465, 6468, 6480, 6505, 6562, 6660, 6672, 6720, 6742, 8192, 8194, 8197, 8200, 8209, 8212, 8214, 8217, 8224, 8229, 8234, 8257, 8260, 8272, 8274, 8277, 8292, 8320, 8330, 8340, 8362, 8449, 8452, 8464, 8466, 8469, 8481, 8512, 8514, 8517, 8529, 8532, 8544, 8577, 8580, 8592, 8704, 8714, 8738, 8744, 8746, 8772, 8784, 8840, 8842, 8872, 9217, 9220, 9222, 9225, 9232, 9237, 9240, 9249, 9252, 9280, 9282, 9285, 9288, 9297, 9300, 9312, 9345, 9348, 9360, 9472, 9477, 9480, 9489, 9492, 9504, 9537, 9540, 9552, 9574, 9600, 9729, 9732, 9744, 9792, 9817, 10240, 10245, 10257, 10260, 10305, 10308, 10320, 10378, 10410, 10497, 10500, 10512, 10645, 10762, 10786, 10852, 10888, 10890, 16385, 16388, 16390, 16393, 16400, 16402, 16405, 16408, 16410, 16417, 16420, 16422, 16448, 16450, 16453, 16456, 16458, 16465, 16468, 16470, 16473, 16480, 16482, 16485, 16513, 16516, 16528, 16533, 16536, 16545, 16548, 16640, 16642, 16645, 16648, 16657, 16660, 16662, 16665, 16672, 16674, 16677, 16705, 16708, 16710, 16713, 16720, 16722, 16725, 16728, 16737, 16740, 16768, 16770, 16773, 16776, 16785, 16788, 16800, 16897, 16900, 16912, 16914, 16917, 16920, 16932, 16960, 16965, 16968, 16977, 16980, 16992, 17025, 17028, 17408, 17410, 17413, 17416, 17418, 17425, 17428, 17430, 17433, 17440, 17442, 17445, 17448, 17473, 17476, 17478, 17481, 17488, 17490, 17493, 17496, 17505, 17508, 17536, 17538, 17541, 17544, 17553, 17556, 17568, 17665, 17668, 17670, 17673, 17680, 17682, 17685, 17688, 17697, 17700, 17728, 17730, 17733, 17736, 17745, 17748, 17760, 17770, 17793, 17796, 17808, 17920, 17922, 17925, 17928, 17937, 17940, 17952, 17985, 17988, 18000, 18048, 18085, 18433, 18436, 18441, 18448, 18450, 18453, 18456, 18465, 18468, 18496, 18498, 18501,
+	18504, 18513, 18516, 18528, 18564, 18576, 18688, 18690, 18693, 18696, 18705, 18708, 18720, 18753, 18756, 18768, 18816, 18838, 18945, 18948, 18960, 19008, 20480, 20482, 20485, 20488, 20497, 20500, 20502, 20505, 20512, 20514, 20517, 20520, 20545, 20548, 20550, 20553, 20560, 20562, 20565, 20568, 20577, 20580, 20608, 20610, 20613, 20616, 20625, 20628, 20737, 20740, 20742, 20745, 20752, 20754, 20757, 20760, 20769, 20772, 20800, 20802, 20805, 20808, 20817, 20820, 20832, 20865, 20868, 20880, 20992, 20997, 21000, 21009, 21012, 21024, 21057, 21060, 21072, 21097, 21120, 21505, 21508, 21510, 21513, 21520, 21522, 21525, 21528, 21537, 21540, 21568, 21570, 21573, 21576, 21585, 21588, 21600, 21633, 21636, 21648, 21760, 21762, 21765, 21768, 21777, 21780, 21792, 21825, 21828, 21840, 21888, 22017, 22020, 22032, 22054, 22080, 22528, 22530, 22533, 22536, 22545, 22548, 22560, 22593, 22596, 22608, 22618, 22656, 22785, 22788, 22800, 22848, 23040, 23065, 23173, 23208, 24577, 24580, 24582, 24592, 24594, 24597, 24600, 24609, 24612, 24640, 24645, 24648, 24657, 24660, 24672, 24708, 24720, 24832, 24834, 24837, 24840, 24849, 24852, 24864, 24897, 24900, 24912, 24960, 24985, 25092, 25104, 25152, 25174, 25249, 25600, 25605, 25608, 25617, 25620, 25632, 25665, 25668, 25680, 25728, 25857, 25860, 25872, 25920, 25930, 25960, 26002, 26112, 26260, 26625, 26628, 26640, 26725, 26776, 26880, 26922, 27202, 27297, 32768, 32770, 32773, 32776, 32785, 32788, 32793, 32800, 32805, 32833, 32836, 32848, 32850, 32853, 32856, 32865, 32896, 32901, 32913, 32916, 33025, 33028, 33033, 33040, 33042, 33045, 33048, 33057, 33060, 33088, 33090, 33093, 33096, 33105, 33108, 33153, 33156, 33168, 33193, 33280, 33285, 33290, 33297, 33300, 33345, 33348, 33360, 33793, 33796, 33798, 33801, 33808, 33810, 33813, 33816, 33825, 33856, 33858, 33861, 33864, 33873, 33876, 33888, 33921, 33924, 33936, 34048, 34050, 34053, 34056, 34065,
+	34068, 34080, 34113, 34116, 34128, 34176, 34186, 34305, 34308, 34320, 34345, 34368, 34816, 34821, 34833, 34836, 34881, 34884, 34896, 34978, 35073, 35076, 35136, 35173, 35362, 35416, 35418, 35458, 35490, 36865, 36868, 36873, 36880, 36882, 36885, 36888, 36900, 36928, 36930, 36933, 36936, 36945, 36948, 36960, 36993, 36996, 37008, 37120, 37125, 37137, 37140, 37185, 37188, 37200, 37210, 37377, 37380, 37392, 37440, 37542, 37888, 37890, 37893, 37896, 37905, 37908, 37920, 37953, 37956, 37968, 38016, 38038, 38145, 38148, 38160, 38208, 38296, 38305, 38400, 38470, 38500, 38913, 38916, 38928, 38950, 38976, 39081, 39168, 39241, 39250, 39568, 40960, 40965, 40970, 40980, 40994, 41002, 41025, 41028, 41040, 41122, 41130, 41280, 41317, 41474, 41482, 41506, 41512, 41514, 41602, 41608, 41610, 41640, 41985, 41988, 42000, 42048, 42121, 42148, 42240, 42265, 42577, 43018, 43048, 43170, 43348, 43398, 43528, 43530, 43552, 43554, 43560, 43656, 43690,
+];
 fn iq3_grid(grid: &[u16], index: usize, lane: usize) -> i8 { (2 * (grid[index] >> (3 * lane) & 7) + 1) as i8 }
 fn iq3_nearest(grid: &[u16], levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32) -> usize {
 	let key = levels.iter().enumerate().fold(0_u16, |key, (lane, level)| key | (*level as u16) << (3 * lane));
-	if let Some(index) = grid.iter().position(|value| *value == key) { return index }
-	let mut candidates = grid.iter().enumerate().map(|(index, point)| ((0..4).map(|lane| { let difference = i32::from((*point >> (3 * lane) & 7) as i8 - levels[lane]); difference * difference }).sum::<i32>(), index)).collect::<Vec<_>>(); candidates.sort_unstable();
-	let first = candidates[0].0; let second = candidates.iter().find(|item| item.0 != first).map(|item| item.0).unwrap_or(first);
-	let index = candidates.into_iter().take_while(|item| item.0 <= second).map(|item| item.1).min_by(|left, right| { let error = |index| (0..4).map(|lane| { let difference = scale * f32::from(iq3_grid(grid, index, lane)) - values[lane]; weights[lane] * difference * difference }).sum::<f32>(); error(*left).total_cmp(&error(*right)) }).unwrap();
-	for lane in 0..4 { levels[lane] = (iq3_grid(grid, index, lane) - 1) / 2 }
+	if let Some(index) = grid.iter().position(|value| *value == key) {
+		return index;
+	}
+	let mut candidates = grid
+		.iter()
+		.enumerate()
+		.map(|(index, point)| {
+			(
+				(0..4).map(|lane| {
+					let difference = i32::from((*point >> (3 * lane) & 7) as i8 - levels[lane]);
+					difference * difference
+				})
+				.sum::<i32>(),
+				index,
+			)
+		})
+		.collect::<Vec<_>>();
+	candidates.sort_unstable();
+	let first = candidates[0].0;
+	let second = candidates.iter().find(|item| item.0 != first).map(|item| item.0).unwrap_or(first);
+	let index = candidates
+		.into_iter()
+		.take_while(|item| item.0 <= second)
+		.map(|item| item.1)
+		.min_by(|left, right| {
+			let error = |index| {
+				(0..4).map(|lane| {
+					let difference = scale * f32::from(iq3_grid(grid, index, lane)) - values[lane];
+					weights[lane] * difference * difference
+				})
+				.sum::<f32>()
+			};
+			error(*left).total_cmp(&error(*right))
+		})
+		.unwrap();
+	for lane in 0..4 {
+		levels[lane] = (iq3_grid(grid, index, lane) - 1) / 2
+	}
 	index
 }
-fn iq2_grid(grid:&[u16],index:usize,lane:usize)->i8{(2*(grid[index]>>(2*lane)&3)+1)as i8}
-fn iq2_nearest(grid:&[u16],shells:usize,levels:&mut[i8],values:&[f32],weights:&[f32],scale:f32)->usize{
-	let key=levels.iter().enumerate().fold(0_u16,|key,(lane,level)|key|(*level as u16)<<(2*lane));if let Some(index)=grid.iter().position(|value|*value==key){return index}let mut candidates=grid.iter().enumerate().map(|(index,point)|((0..8).map(|lane|{let difference=i32::from((*point>>(2*lane)&3)as i8-levels[lane]);difference*difference}).sum::<i32>(),index)).collect::<Vec<_>>();candidates.sort_unstable();let mut distances=candidates.iter().map(|item|item.0).collect::<Vec<_>>();distances.dedup();let limit=distances.get(shells.saturating_sub(1)).copied().unwrap_or(candidates[0].0);let index=candidates.into_iter().take_while(|item|item.0<=limit).map(|item|item.1).min_by(|left,right|{let error=|index|(0..8).map(|lane|{let difference=scale*f32::from(iq2_grid(grid,index,lane))-values[lane];weights[lane]*difference*difference}).sum::<f32>();error(*left).total_cmp(&error(*right))}).unwrap();for lane in 0..8{levels[lane]=(iq2_grid(grid,index,lane)-1)/2}index
+fn iq2_grid(grid: &[u16], index: usize, lane: usize) -> i8 { (2 * (grid[index] >> (2 * lane) & 3) + 1) as i8 }
+fn iq2_nearest(grid: &[u16], shells: usize, levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32) -> usize {
+	let key = levels.iter().enumerate().fold(0_u16, |key, (lane, level)| key | (*level as u16) << (2 * lane));
+	if let Some(index) = grid.iter().position(|value| *value == key) {
+		return index;
+	}
+	let mut candidates = grid
+		.iter()
+		.enumerate()
+		.map(|(index, point)| {
+			(
+				(0..8).map(|lane| {
+					let difference = i32::from((*point >> (2 * lane) & 3) as i8 - levels[lane]);
+					difference * difference
+				})
+				.sum::<i32>(),
+				index,
+			)
+		})
+		.collect::<Vec<_>>();
+	candidates.sort_unstable();
+	let mut distances = candidates.iter().map(|item| item.0).collect::<Vec<_>>();
+	distances.dedup();
+	let limit = distances.get(shells.saturating_sub(1)).copied().unwrap_or(candidates[0].0);
+	let index = candidates
+		.into_iter()
+		.take_while(|item| item.0 <= limit)
+		.map(|item| item.1)
+		.min_by(|left, right| {
+			let error = |index| {
+				(0..8).map(|lane| {
+					let difference = scale * f32::from(iq2_grid(grid, index, lane)) - values[lane];
+					weights[lane] * difference * difference
+				})
+				.sum::<f32>()
+			};
+			error(*left).total_cmp(&error(*right))
+		})
+		.unwrap();
+	for lane in 0..8 {
+		levels[lane] = (iq2_grid(grid, index, lane) - 1) / 2
+	}
+	index
 }
-fn iq1_level(index:usize,lane:usize)->i8{(IQ1[index]>>(2*lane)&3)as i8}
-fn iq1_nearest(levels:&mut[i8],values:&[f32],weights:&[f32],scale:f32,shift:i8)->usize{
-	let key=levels.iter().enumerate().fold(0_u16,|key,(lane,level)|key|(*level as u16)<<(2*lane));if let Some(index)=IQ1.iter().position(|value|*value==key){return index}let mut candidates=IQ1.iter().enumerate().map(|(index,point)|((0..8).map(|lane|{let difference=i32::from((*point>>(2*lane)&3)as i8-levels[lane]);difference*difference}).sum::<i32>(),index)).collect::<Vec<_>>();candidates.sort_unstable();let mut distances=candidates.iter().map(|item|item.0).collect::<Vec<_>>();distances.dedup();let limit=distances.get(2).copied().unwrap_or(candidates[0].0);let index=candidates.into_iter().take_while(|item|item.0<=limit).map(|item|item.1).min_by(|left,right|{let error=|index|(0..8).map(|lane|{let quant=f32::from(iq1_level(index,lane))-1.0+0.125*f32::from(shift);let difference=scale*quant-values[lane];weights[lane]*difference*difference}).sum::<f32>();error(*left).total_cmp(&error(*right))}).unwrap();for lane in 0..8{levels[lane]=iq1_level(index,lane)}index
+fn iq1_level(index: usize, lane: usize) -> i8 { (IQ1[index] >> (2 * lane) & 3) as i8 }
+fn iq1_nearest(levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32, shift: i8) -> usize {
+	let key = levels.iter().enumerate().fold(0_u16, |key, (lane, level)| key | (*level as u16) << (2 * lane));
+	if let Some(index) = IQ1.iter().position(|value| *value == key) {
+		return index;
+	}
+	let mut candidates = IQ1
+		.iter()
+		.enumerate()
+		.map(|(index, point)| {
+			(
+				(0..8).map(|lane| {
+					let difference = i32::from((*point >> (2 * lane) & 3) as i8 - levels[lane]);
+					difference * difference
+				})
+				.sum::<i32>(),
+				index,
+			)
+		})
+		.collect::<Vec<_>>();
+	candidates.sort_unstable();
+	let mut distances = candidates.iter().map(|item| item.0).collect::<Vec<_>>();
+	distances.dedup();
+	let limit = distances.get(2).copied().unwrap_or(candidates[0].0);
+	let index = candidates
+		.into_iter()
+		.take_while(|item| item.0 <= limit)
+		.map(|item| item.1)
+		.min_by(|left, right| {
+			let error = |index| {
+				(0..8).map(|lane| {
+					let quant = f32::from(iq1_level(index, lane)) - 1.0 + 0.125 * f32::from(shift);
+					let difference = scale * quant - values[lane];
+					weights[lane] * difference * difference
+				})
+				.sum::<f32>()
+			};
+			error(*left).total_cmp(&error(*right))
+		})
+		.unwrap();
+	for lane in 0..8 {
+		levels[lane] = iq1_level(index, lane)
+	}
+	index
 }
-fn iq1_shift(medium:bool,pattern:i8,group:usize)->i8{if (!medium&&pattern==0)||(medium&&if group==0{pattern<2}else{pattern%2==0}){1}else{-1}}
+fn iq1_shift(medium: bool, pattern: i8, group: usize) -> i8 { if (!medium && pattern == 0) || (medium && if group == 0 { pattern < 2 } else { pattern % 2 == 0 }) { 1 } else { -1 } }
 #[rustfmt::skip] fn iq1(values:&[f32],importance:&[f32],medium:bool)->Vec<u8>{
 	let mut output=Vec::new();for(chunk,values)in values.chunks(256).enumerate(){let value=|index|values.get(index).copied().unwrap_or(0.0);let importance=|index|importance.get(chunk*256+index).copied().unwrap_or(0.0);let sigma2=2.0*(0..256).map(|index|value(index)*value(index)).sum::<f32>()/256.0;let size=if medium{16}else{32};let blocks=256/size;let mut packed=vec![0_u8;if medium{56}else{48}];let mut scales=vec![0.0_f32;blocks];let mut patterns=vec![0_i8;blocks];let mut maximum=0.0_f32;
 		for block in 0..blocks{let x=(0..size).map(|offset|value(block*size+offset)).collect::<Vec<_>>();let weights=(0..size).map(|offset|importance(block*size+offset)*(sigma2+x[offset]*x[offset]).sqrt()).collect::<Vec<_>>();let max=x.iter().map(|value|value.abs()).fold(0.0_f32,f32::max);let mut levels=vec![1_i8;size];if max<if medium{1.0e-7}else{1.0e-12}{continue}let mut pairs=x.iter().copied().enumerate().map(|(index,value)|(value,index)).collect::<Vec<_>>();pairs.sort_by(|left,right|left.0.total_cmp(&right.0));let(mut sumx,mut sumw)=(vec![0.0_f32;size+1],vec![0.0_f32;size+1]);for j in 0..size{let index=pairs[j].1;sumx[j+1]=sumx[j]+weights[index]*x[index];sumw[j+1]=sumw[j]+weights[index]}let(mut best,mut scale,mut split,mut pattern)=(f32::NEG_INFINITY,max,(0,0),-1_i8);
@@ -679,10 +924,66 @@ fn iq1_shift(medium:bool,pattern:i8,group:usize)->i8{if (!medium&&pattern==0)||(
 		if maximum==0.0{if !medium{put_half(&mut output,0.0)}output.extend(packed);continue}let mut scale=maximum/15.0;if medium{let(mut qx,mut q2)=(0.0,0.0);for block in 0..16{let code=qround(0.5*(scales[block]/scale-1.0)).max(0.0).min(7.0)as u16;let word=block/4;let mut stored=u16::from_le_bytes(packed[48+2*word..50+2*word].try_into().unwrap());stored|=code<<(3*(block%4));packed[48+2*word..50+2*word].copy_from_slice(&stored.to_le_bytes());for lane in 0..16{let group=lane/8;let grid=usize::from(packed[2*block+group])|usize::from(packed[32+block]>>(4*group)&7)<<8;let quant=(f32::from(iq1_level(grid,lane%8))-1.0+0.125*f32::from(iq1_shift(true,patterns[block],group)))*f32::from(2*code+1);let x=value(block*16+lane);let weight=importance(block*16+lane)*(sigma2+x*x).sqrt();qx+=weight*quant*x;q2+=weight*quant*quant}}if q2>0.0{scale=qx/q2}
 			let bits=fp16(scale*1.1125);for word in 0..4{let mut stored=u16::from_le_bytes(packed[48+2*word..50+2*word].try_into().unwrap());stored|=(bits>>(4*word)&15)<<12;packed[48+2*word..50+2*word].copy_from_slice(&stored.to_le_bytes())}output.extend(packed)}else{for block in 0..8{let code=qround(0.5*(scales[block]/scale-1.0)).max(0.0).min(7.0)as u16|u16::from(patterns[block]!=0)<<3;let mut high=u16::from_le_bytes(packed[32+2*block..34+2*block].try_into().unwrap());high|=code<<12;packed[32+2*block..34+2*block].copy_from_slice(&high.to_le_bytes())}put_half(&mut output,scale*1.125);output.extend(packed)}}output
 }
-fn qp_scale(values:&[f32],weights:&[f32],nmax:i8)->f32{
-	let max=values.iter().copied().fold(0.0_f32,f32::max);if max<1.0e-15{return 0.0}let mut inverse=f32::from(nmax)/max;let mut levels=values.iter().map(|value|qround(inverse*value).min(f32::from(nmax))as i8).collect::<Vec<_>>();let error=|inverse:f32|values.iter().zip(weights).map(|(value,weight)|{let level=qround(inverse*value).min(f32::from(nmax));let difference=value-level/inverse;weight*difference*difference}).sum::<f32>();let mut best=error(inverse);
-	for step in -4..=4{if step==0{continue}let trial=(f32::from(nmax)+0.1*step as f32)/max;let trial_error=error(trial);if trial_error<best{best=trial_error;inverse=trial}}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..values.len(){levels[lane]=qround(inverse*values[lane]).min(f32::from(nmax))as i8;qx+=weights[lane]*values[lane]*f32::from(levels[lane]);q2+=weights[lane]*f32::from(levels[lane])*f32::from(levels[lane])}
-	for _ in 0..5{let mut changed=false;for lane in 0..values.len(){let level=f32::from(levels[lane]);let x=qx-weights[lane]*values[lane]*level;let q=q2-weights[lane]*level*level;if x>0.0&&q>0.0{let next=qround(values[lane]*q/x).min(f32::from(nmax))as i8;if next!=levels[lane]{let nx=x+weights[lane]*values[lane]*f32::from(next);let nq=q+weights[lane]*f32::from(next)*f32::from(next);if nx*nx*q2>qx*qx*nq{levels[lane]=next;qx=nx;q2=nq;changed=true}}}}if !changed{break}}if q2>0.0{qx/q2}else{0.0}
+fn qp_scale(values: &[f32], weights: &[f32], nmax: i8) -> f32 {
+	let max = values.iter().copied().fold(0.0_f32, f32::max);
+	if max < 1.0e-15 {
+		return 0.0;
+	}
+	let mut inverse = f32::from(nmax) / max;
+	let mut levels = values.iter().map(|value| qround(inverse * value).min(f32::from(nmax)) as i8).collect::<Vec<_>>();
+	let error = |inverse: f32| {
+		values.iter()
+			.zip(weights)
+			.map(|(value, weight)| {
+				let level = qround(inverse * value).min(f32::from(nmax));
+				let difference = value - level / inverse;
+				weight * difference * difference
+			})
+			.sum::<f32>()
+	};
+	let mut best = error(inverse);
+	for step in -4..=4 {
+		if step == 0 {
+			continue;
+		}
+		let trial = (f32::from(nmax) + 0.1 * step as f32) / max;
+		let trial_error = error(trial);
+		if trial_error < best {
+			best = trial_error;
+			inverse = trial
+		}
+	}
+	let (mut qx, mut q2) = (0.0, 0.0);
+	for lane in 0..values.len() {
+		levels[lane] = qround(inverse * values[lane]).min(f32::from(nmax)) as i8;
+		qx += weights[lane] * values[lane] * f32::from(levels[lane]);
+		q2 += weights[lane] * f32::from(levels[lane]) * f32::from(levels[lane])
+	}
+	for _ in 0..5 {
+		let mut changed = false;
+		for lane in 0..values.len() {
+			let level = f32::from(levels[lane]);
+			let x = qx - weights[lane] * values[lane] * level;
+			let q = q2 - weights[lane] * level * level;
+			if x > 0.0 && q > 0.0 {
+				let next = qround(values[lane] * q / x).min(f32::from(nmax)) as i8;
+				if next != levels[lane] {
+					let nx = x + weights[lane] * values[lane] * f32::from(next);
+					let nq = q + weights[lane] * f32::from(next) * f32::from(next);
+					if nx * nx * q2 > qx * qx * nq {
+						levels[lane] = next;
+						qx = nx;
+						q2 = nq;
+						changed = true
+					}
+				}
+			}
+		}
+		if !changed {
+			break;
+		}
+	}
+	if q2 > 0.0 { qx / q2 } else { 0.0 }
 }
 #[rustfmt::skip] fn iq2_xxs(values:&[f32],importance:&[f32])->Vec<u8>{
 	let mut output=Vec::new();for (chunk,values)in values.chunks(256).enumerate(){let value=|index|values.get(index).copied().unwrap_or(0.0);let importance=|index|importance.get(chunk*256+index).copied().unwrap_or(0.0);let sigma2=(0..256).map(|index|value(index)*value(index)).sum::<f32>()/256.0;let mut packed=[0_u8;64];let mut scales=[0.0_f32;8];let mut maximum=0.0_f32;
@@ -699,7 +1000,8 @@ fn qp_scale(values:&[f32],weights:&[f32],nmax:i8)->f32{
 			if on_grid.iter().any(|value|!*value)&&scale>0.0{let inverse=scale.recip();for group in 0..2{if on_grid[group]{continue}for lane in 0..8{levels[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}iq2_nearest(grid,shells,&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..16{let quant=f32::from(2*levels[lane]+1);qx+=weights[lane]*magnitudes[lane]*quant;q2+=weights[lane]*quant*quant}if q2>0.0{scale=qx/q2}}if scale<0.0{scale=-scale;for sign in &mut signs{*sign=if xs{(!*sign)&127}else{!*sign}}}
 			for group in 0..2{let index=iq2_nearest(grid,shells,&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);let slot=2*block+group;if xs{let word=index as u16|u16::from(signs[group])<<9;packed[2*slot..2*slot+2].copy_from_slice(&word.to_le_bytes())}else{packed[slot]=index as u8;packed[64+slot/4]|=((index>>8)as u8)<<(2*(slot%4));packed[32+slot]=signs[group]}}scales[block]=scale;maximum=maximum.max(scale)}
 		if maximum==0.0{put_half(&mut output,0.0);output.extend(packed);continue}let scale=maximum/31.0;let offset=if xs{64}else{72};for block in 0..16{let code=qround(0.5*(scales[block]/scale-1.0)).max(0.0).min(15.0)as u8;packed[offset+block/2]|=code<<(block%2*4)}put_half(&mut output,scale*if xs{1.0}else{0.9875});output.extend(packed)}output
-} #[rustfmt::skip] fn iq3_xxs(values: &[f32]) -> Vec<u8> {
+}
+#[rustfmt::skip] fn iq3_xxs(values: &[f32]) -> Vec<u8> {
 	let mut output = Vec::new(); for values in values.chunks(256) {
 		let value = |index| values.get(index).copied().unwrap_or(0.0); let mut packed = [0_u8; 96]; let mut scales = [0.0_f32; 8]; let mut maximum = 0.0_f32;
 		for block in 0..8 { let x = (0..32).map(|offset| value(block * 32 + offset)).collect::<Vec<_>>(); let weights = x.iter().map(|value| value * value).collect::<Vec<_>>(); let mut magnitudes = x.iter().map(|value| value.abs()).collect::<Vec<_>>(); let mut signs = [0_u8; 4];
@@ -748,10 +1050,43 @@ fn iq4_fit(values: &[f32], tries: i32) -> (f32, Vec<u8>) {
 #[derive(Clone, Copy)]
 struct IntegerFormat(u16);
 impl IntegerFormat {
-	fn valid(self)->bool{matches!((self.0>>12,self.bits(),self.0>>8&15),(0,4|5|8,0|1)|(0,4,2)|(0,2|3|4|5|6|8,3)|(0,3|4|5,4|5)|(0,3,6)|(1,1,3|4)|(1,2|3,1|2|3|4)|(1,4,2|5))}
-	fn unavailable(self)->RecipeError{RecipeError::new(format!("{} is unavailable; available GGML formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q3_K_S, Q3_K_M, Q3_K_L, Q4_K, Q4_K_S, Q4_K_M, Q5_K, Q5_K_S, Q5_K_M, Q6_K, Q8_K, Q4_NF, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ2_M, IQ3_XXS, IQ3_XS, IQ3_S, IQ3_M, IQ4_XS, and IQ4_NL",quantization(self.0)))}
-	fn selection(self)->Option<u16>{let(family,bits,variant)=(self.0>>12,self.bits(),self.0>>8&15);match(family,bits,variant){(0,3|4|5,5)=>Some(5),(0,3|4|5,4)=>Some(4),(0,3,6)=>Some(6),(1,2,4)|(1,3,2|4)=>Some(variant),_=>None}}
-	fn tensor(self,role:u8,more:bool,output:bool)->u16{let(family,bits,style)=(self.0>>12,self.bits(),self.selection().unwrap());if output{return 3<<8|6}if family==1{return match(bits,style,role,more){(2,4,2|3,_)|(2,4,_,true)=>1<<12|3<<8|3,(3,2,0|1,_)|(3,2,_,false)=>1<<12|1<<8|3,(3,4,2|3,_)|(3,4,_,true)=>3<<8|4,_=>1<<12|3<<8|u16::from(bits)}}let bits=match(bits,style,role){(2,_,2|3)=>3,(3,5,2)=>5,(3,5,3)=>4,(3,6,2|3)=>5,(4,4,2)=>5,(4,5,2)if more=>6,(5,5,2)if more=>6,_=>bits};3<<8|u16::from(bits)}
+	fn valid(self) -> bool { matches!((self.0 >> 12, self.bits(), self.0 >> 8 & 15), (0, 4 | 5 | 8, 0 | 1) | (0, 4, 2) | (0, 2 | 3 | 4 | 5 | 6 | 8, 3) | (0, 3 | 4 | 5, 4 | 5) | (0, 3, 6) | (1, 1, 3 | 4) | (1, 2 | 3, 1 | 2 | 3 | 4) | (1, 4, 2 | 5)) }
+	fn unavailable(self) -> RecipeError { RecipeError::new(format!("{} is unavailable; available GGML formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q3_K_S, Q3_K_M, Q3_K_L, Q4_K, Q4_K_S, Q4_K_M, Q5_K, Q5_K_S, Q5_K_M, Q6_K, Q8_K, Q4_NF, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ2_M, IQ3_XXS, IQ3_XS, IQ3_S, IQ3_M, IQ4_XS, and IQ4_NL", quantization(self.0))) }
+	fn selection(self) -> Option<u16> {
+		let (family, bits, variant) = (self.0 >> 12, self.bits(), self.0 >> 8 & 15);
+		match (family, bits, variant) {
+			(0, 3 | 4 | 5, 5) => Some(5),
+			(0, 3 | 4 | 5, 4) => Some(4),
+			(0, 3, 6) => Some(6),
+			(1, 2, 4) | (1, 3, 2 | 4) => Some(variant),
+			_ => None,
+		}
+	}
+	fn tensor(self, role: u8, more: bool, output: bool) -> u16 {
+		let (family, bits, style) = (self.0 >> 12, self.bits(), self.selection().unwrap());
+		if output {
+			return 3 << 8 | 6;
+		}
+		if family == 1 {
+			return match (bits, style, role, more) {
+				(2, 4, 2 | 3, _) | (2, 4, _, true) => 1 << 12 | 3 << 8 | 3,
+				(3, 2, 0 | 1, _) | (3, 2, _, false) => 1 << 12 | 1 << 8 | 3,
+				(3, 4, 2 | 3, _) | (3, 4, _, true) => 3 << 8 | 4,
+				_ => 1 << 12 | 3 << 8 | u16::from(bits),
+			};
+		}
+		let bits = match (bits, style, role) {
+			(2, _, 2 | 3) => 3,
+			(3, 5, 2) => 5,
+			(3, 5, 3) => 4,
+			(3, 6, 2 | 3) => 5,
+			(4, 4, 2) => 5,
+			(4, 5, 2) if more => 6,
+			(5, 5, 2) if more => 6,
+			_ => bits,
+		};
+		3 << 8 | u16::from(bits)
+	}
 }
 trait Integer {
 	fn compress(self, weights: &[f64], importance: &[f64], config: Config) -> Result<(Vec<u8>, Vec<f64>)>;
@@ -759,9 +1094,7 @@ trait Integer {
 	fn bits(self) -> u8;
 }
 impl Integer for IntegerFormat {
-	fn bits(self) -> u8 {
-		self.0 as u8
-	}
+	fn bits(self) -> u8 { self.0 as u8 }
 	fn compress(self, weights: &[f64], importance: &[f64], config: Config) -> Result<(Vec<u8>, Vec<f64>)> {
 		let bits = self.bits();
 		let (family, variant) = (self.0 >> 12, self.0 >> 8 & 15);
@@ -1008,9 +1341,14 @@ impl Integer for IntegerFormat {
 			for values in weights.chunks(256) {
 				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
 				let maximum = (0..256).map(value).max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
-				let inverse = if maximum == 0.0 { 0.0 } else { -127.0 / maximum }; let scale = if inverse == 0.0 { 0.0 } else { inverse.recip() };
-				data.extend(scale.to_le_bytes()); let codes = (0..256).map(|index| qround(inverse * value(index)).max(-128.0).min(127.0) as i8).collect::<Vec<_>>();
-				data.extend(codes.iter().map(|code| *code as u8)); for block in codes.chunks(16) { data.extend(block.iter().map(|code| i16::from(*code)).sum::<i16>().to_le_bytes()) }
+				let inverse = if maximum == 0.0 { 0.0 } else { -127.0 / maximum };
+				let scale = if inverse == 0.0 { 0.0 } else { inverse.recip() };
+				data.extend(scale.to_le_bytes());
+				let codes = (0..256).map(|index| qround(inverse * value(index)).max(-128.0).min(127.0) as i8).collect::<Vec<_>>();
+				data.extend(codes.iter().map(|code| *code as u8));
+				for block in codes.chunks(16) {
+					data.extend(block.iter().map(|code| i16::from(*code)).sum::<i16>().to_le_bytes())
+				}
 			}
 			return Ok((data, Vec::new()));
 		}
@@ -1082,12 +1420,27 @@ impl Integer for IntegerFormat {
 			}
 			return Ok((data, Vec::new()));
 		}
-		if family == 1 && variant == 1 && bits == 2 { require(importance.len()==weights.len()&&importance.iter().all(|value|value.is_finite()&&*value>=0.0)&&importance.iter().any(|value|*value>0.0),"GGML IQ2_XXS requires trained importance weights")?;return Ok((iq2_xxs(&weights.iter().map(|value|*value as f32).collect::<Vec<_>>(),&importance.iter().map(|value|*value as f32).collect::<Vec<_>>()),Vec::new())) }
-		if family == 1 && variant == 2 && bits == 2 { require(importance.len()==weights.len()&&importance.iter().all(|value|value.is_finite()&&*value>=0.0)&&importance.iter().any(|value|*value>0.0),"GGML IQ2_XS requires trained importance weights")?;return Ok((iq2_16(&weights.iter().map(|value|*value as f32).collect::<Vec<_>>(),Some(&importance.iter().map(|value|*value as f32).collect::<Vec<_>>()),true),Vec::new())) }
-		if family == 1 && matches!(variant,3|4) && bits == 1 { require(importance.len()==weights.len()&&importance.iter().all(|value|value.is_finite()&&*value>=0.0)&&importance.iter().any(|value|*value>0.0),format!("GGML IQ1_{} requires trained importance weights",if variant==3{"S"}else{"M"}))?;return Ok((iq1(&weights.iter().map(|value|*value as f32).collect::<Vec<_>>(),&importance.iter().map(|value|*value as f32).collect::<Vec<_>>(),variant==4),Vec::new())) }
-		if family == 1 && variant == 1 && bits == 3 { return Ok((iq3_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new())) }
-		if family == 1 && variant == 3 && bits == 2 { return Ok((iq2_16(&weights.iter().map(|value|*value as f32).collect::<Vec<_>>(),None,false),Vec::new())) }
-		if family == 1 && variant == 3 && bits == 3 { return Ok((iq3_s(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new())) }
+		if family == 1 && variant == 1 && bits == 2 {
+			require(importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0), "GGML IQ2_XXS requires trained importance weights")?;
+			return Ok((iq2_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), &importance.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
+		}
+		if family == 1 && variant == 2 && bits == 2 {
+			require(importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0), "GGML IQ2_XS requires trained importance weights")?;
+			return Ok((iq2_16(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), Some(&importance.iter().map(|value| *value as f32).collect::<Vec<_>>()), true), Vec::new()));
+		}
+		if family == 1 && matches!(variant, 3 | 4) && bits == 1 {
+			require(importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0), format!("GGML IQ1_{} requires trained importance weights", if variant == 3 { "S" } else { "M" }))?;
+			return Ok((iq1(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), &importance.iter().map(|value| *value as f32).collect::<Vec<_>>(), variant == 4), Vec::new()));
+		}
+		if family == 1 && variant == 1 && bits == 3 {
+			return Ok((iq3_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
+		}
+		if family == 1 && variant == 3 && bits == 2 {
+			return Ok((iq2_16(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), None, false), Vec::new()));
+		}
+		if family == 1 && variant == 3 && bits == 3 {
+			return Ok((iq3_s(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
+		}
 		Err(self.unavailable())
 	}
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>> {
@@ -1217,9 +1570,18 @@ impl Integer for IntegerFormat {
 			return Ok(weights);
 		}
 		if family == 0 && variant == 3 && bits == 8 {
-			const STRIDE: usize = 292; require(data.len() >= count.div_ceil(256) * STRIDE, "GGML Q8_K weights are invalid")?;
+			const STRIDE: usize = 292;
+			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML Q8_K weights are invalid")?;
 			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) { let scale = float(bytes); for code in &bytes[4..260] { if weights.len() == count { return Ok(weights) } weights.push(f64::from(scale * f32::from(i8::from_ne_bytes([*code])))) } }
+			for bytes in data.chunks_exact(STRIDE) {
+				let scale = float(bytes);
+				for code in &bytes[4..260] {
+					if weights.len() == count {
+						return Ok(weights);
+					}
+					weights.push(f64::from(scale * f32::from(i8::from_ne_bytes([*code]))))
+				}
+			}
 			return Ok(weights);
 		}
 		if self.0 >> 12 == 0 && self.0 >> 8 & 15 == 2 {
@@ -1263,47 +1625,197 @@ impl Integer for IntegerFormat {
 			return Ok(weights);
 		}
 		if family == 1 && variant == 1 && bits == 3 {
-			const STRIDE: usize = 98; require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ3_XXS weights are invalid")?; let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) { let scale=half(bytes); for block in 0..8 { let word=u32::from_le_bytes(bytes[66+block*4..70+block*4].try_into().unwrap()); let d=scale*(0.5+(word>>28) as f32)*0.5; for group in 0..4 { let signs=(word>>(7*group)&127) as u8; let signs=signs | ((signs.count_ones() as u8 & 1)<<7); for lane in 0..8 { if weights.len()==count { return Ok(weights) } let grid=usize::from(bytes[2+block*8+group*2+lane/4]); let magnitude=f32::from(iq3_grid(&IQ3_XXS,grid,lane%4)); weights.push(f64::from(d*magnitude*if signs>>lane&1!=0 {-1.0} else {1.0})) } } } }
+			const STRIDE: usize = 98;
+			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ3_XXS weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE) {
+				let scale = half(bytes);
+				for block in 0..8 {
+					let word = u32::from_le_bytes(bytes[66 + block * 4..70 + block * 4].try_into().unwrap());
+					let d = scale * (0.5 + (word >> 28) as f32) * 0.5;
+					for group in 0..4 {
+						let signs = (word >> (7 * group) & 127) as u8;
+						let signs = signs | ((signs.count_ones() as u8 & 1) << 7);
+						for lane in 0..8 {
+							if weights.len() == count {
+								return Ok(weights);
+							}
+							let grid = usize::from(bytes[2 + block * 8 + group * 2 + lane / 4]);
+							let magnitude = f32::from(iq3_grid(&IQ3_XXS, grid, lane % 4));
+							weights.push(f64::from(d * magnitude * if signs >> lane & 1 != 0 { -1.0 } else { 1.0 }))
+						}
+					}
+				}
+			}
 			return Ok(weights);
 		}
-		if family==1&&variant==1&&bits==2{
-			const STRIDE:usize=66;require(data.len()>=count.div_ceil(256)*STRIDE,"GGML IQ2_XXS weights are invalid")?;let mut weights=Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE){let scale=half(bytes);for block in 0..8{let word=u32::from_le_bytes(bytes[6+block*8..10+block*8].try_into().unwrap());let d=scale*(0.5+(word>>28)as f32)*0.25;for group in 0..4{let signs=(word>>(7*group)&127)as u8;let signs=signs|((signs.count_ones()as u8&1)<<7);let grid=usize::from(bytes[2+block*8+group]);for lane in 0..8{if weights.len()==count{return Ok(weights)}let sign=if signs>>lane&1!=0{-1.0}else{1.0};weights.push(f64::from(d*f32::from(iq2_grid(&IQ2_XXS,grid,lane))*sign))}}}}return Ok(weights)
+		if family == 1 && variant == 1 && bits == 2 {
+			const STRIDE: usize = 66;
+			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ2_XXS weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE) {
+				let scale = half(bytes);
+				for block in 0..8 {
+					let word = u32::from_le_bytes(bytes[6 + block * 8..10 + block * 8].try_into().unwrap());
+					let d = scale * (0.5 + (word >> 28) as f32) * 0.25;
+					for group in 0..4 {
+						let signs = (word >> (7 * group) & 127) as u8;
+						let signs = signs | ((signs.count_ones() as u8 & 1) << 7);
+						let grid = usize::from(bytes[2 + block * 8 + group]);
+						for lane in 0..8 {
+							if weights.len() == count {
+								return Ok(weights);
+							}
+							let sign = if signs >> lane & 1 != 0 { -1.0 } else { 1.0 };
+							weights.push(f64::from(d * f32::from(iq2_grid(&IQ2_XXS, grid, lane)) * sign))
+						}
+					}
+				}
+			}
+			return Ok(weights);
 		}
 		if family == 1 && variant == 3 && bits == 2 {
-			const STRIDE:usize=82;require(data.len()>=count.div_ceil(256)*STRIDE,"GGML IQ2_S weights are invalid")?;let mut weights=Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE){let scale=half(bytes);for index in 0..256{if weights.len()==count{return Ok(weights)}let block=index/16;let slot=index/8;let grid=usize::from(bytes[2+slot])|usize::from(bytes[66+slot/4]>>(2*(slot%4))&3)<<8;let code=bytes[74+block/2]>>(4*(block%2))&15;let d=scale*(0.5+f32::from(code))*0.25;let sign=if bytes[34+slot]>>(index%8)&1!=0{-1.0}else{1.0};weights.push(f64::from(d*f32::from(iq2_grid(&IQ2_S,grid,index%8))*sign))}}return Ok(weights)
+			const STRIDE: usize = 82;
+			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ2_S weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE) {
+				let scale = half(bytes);
+				for index in 0..256 {
+					if weights.len() == count {
+						return Ok(weights);
+					}
+					let block = index / 16;
+					let slot = index / 8;
+					let grid = usize::from(bytes[2 + slot]) | usize::from(bytes[66 + slot / 4] >> (2 * (slot % 4)) & 3) << 8;
+					let code = bytes[74 + block / 2] >> (4 * (block % 2)) & 15;
+					let d = scale * (0.5 + f32::from(code)) * 0.25;
+					let sign = if bytes[34 + slot] >> (index % 8) & 1 != 0 { -1.0 } else { 1.0 };
+					weights.push(f64::from(d * f32::from(iq2_grid(&IQ2_S, grid, index % 8)) * sign))
+				}
+			}
+			return Ok(weights);
 		}
-		if family==1&&variant==2&&bits==2{
-			const STRIDE:usize=74;require(data.len()>=count.div_ceil(256)*STRIDE,"GGML IQ2_XS weights are invalid")?;let mut weights=Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE){let scale=half(bytes);for index in 0..256{if weights.len()==count{return Ok(weights)}let block=index/16;let slot=index/8;let word=u16::from_le_bytes(bytes[2+2*slot..4+2*slot].try_into().unwrap());let grid=usize::from(word&511);let signs=(word>>9)as u8;let signs=signs|((signs.count_ones()as u8&1)<<7);let code=bytes[66+block/2]>>(4*(block%2))&15;let d=scale*(0.5+f32::from(code))*0.25;let sign=if signs>>(index%8)&1!=0{-1.0}else{1.0};weights.push(f64::from(d*f32::from(iq2_grid(&IQ2_XS,grid,index%8))*sign))}}return Ok(weights)
+		if family == 1 && variant == 2 && bits == 2 {
+			const STRIDE: usize = 74;
+			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ2_XS weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE) {
+				let scale = half(bytes);
+				for index in 0..256 {
+					if weights.len() == count {
+						return Ok(weights);
+					}
+					let block = index / 16;
+					let slot = index / 8;
+					let word = u16::from_le_bytes(bytes[2 + 2 * slot..4 + 2 * slot].try_into().unwrap());
+					let grid = usize::from(word & 511);
+					let signs = (word >> 9) as u8;
+					let signs = signs | ((signs.count_ones() as u8 & 1) << 7);
+					let code = bytes[66 + block / 2] >> (4 * (block % 2)) & 15;
+					let d = scale * (0.5 + f32::from(code)) * 0.25;
+					let sign = if signs >> (index % 8) & 1 != 0 { -1.0 } else { 1.0 };
+					weights.push(f64::from(d * f32::from(iq2_grid(&IQ2_XS, grid, index % 8)) * sign))
+				}
+			}
+			return Ok(weights);
 		}
-		if family==1&&variant==3&&bits==1{
-			const STRIDE:usize=50;require(data.len()>=count.div_ceil(256)*STRIDE,"GGML IQ1_S weights are invalid")?;let mut weights=Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE){let scale=half(bytes);for index in 0..256{if weights.len()==count{return Ok(weights)}let block=index/32;let group=index/8;let high=u16::from_le_bytes(bytes[34+2*block..36+2*block].try_into().unwrap());let grid=usize::from(bytes[2+4*block+group])|usize::from(high>>(3*group)&7)<<8;let d=scale*f32::from(2*((high>>12)&7)+1);let delta=if high&0x8000!=0{-0.125}else{0.125};weights.push(f64::from(d*(f32::from(iq1_level(grid,index%8))-1.0+delta)))}}return Ok(weights)
+		if family == 1 && variant == 3 && bits == 1 {
+			const STRIDE: usize = 50;
+			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ1_S weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE) {
+				let scale = half(bytes);
+				for index in 0..256 {
+					if weights.len() == count {
+						return Ok(weights);
+					}
+					let block = index / 32;
+					let group = index / 8;
+					let high = u16::from_le_bytes(bytes[34 + 2 * block..36 + 2 * block].try_into().unwrap());
+					let grid = usize::from(bytes[2 + 4 * block + group]) | usize::from(high >> (3 * group) & 7) << 8;
+					let d = scale * f32::from(2 * ((high >> 12) & 7) + 1);
+					let delta = if high & 0x8000 != 0 { -0.125 } else { 0.125 };
+					weights.push(f64::from(d * (f32::from(iq1_level(grid, index % 8)) - 1.0 + delta)))
+				}
+			}
+			return Ok(weights);
 		}
-		if family==1&&variant==4&&bits==1{
-			const STRIDE:usize=56;require(data.len()>=count.div_ceil(256)*STRIDE,"GGML IQ1_M weights are invalid")?;let mut weights=Vec::with_capacity(count);for bytes in data.chunks_exact(STRIDE){let mut scale=0_u16;for word in 0..4{let stored=u16::from_le_bytes(bytes[48+2*word..50+2*word].try_into().unwrap());scale|=(stored>>12&15)<<(4*word)}let scale=unfp16(scale);for index in 0..256{if weights.len()==count{return Ok(weights)}let block=index/16;let group=index%16/8;let high=bytes[32+block];let grid=usize::from(bytes[2*block+group])|usize::from(high>>(4*group)&7)<<8;let stored=u16::from_le_bytes(bytes[48+2*(block/4)..50+2*(block/4)].try_into().unwrap());let d=scale*f32::from(2*((stored>>(3*(block%4)))&7)+1);let delta=if high>>(3+4*group)&1!=0{-0.125}else{0.125};weights.push(f64::from(d*(f32::from(iq1_level(grid,index%8))-1.0+delta)))}}return Ok(weights)
+		if family == 1 && variant == 4 && bits == 1 {
+			const STRIDE: usize = 56;
+			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ1_M weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE) {
+				let mut scale = 0_u16;
+				for word in 0..4 {
+					let stored = u16::from_le_bytes(bytes[48 + 2 * word..50 + 2 * word].try_into().unwrap());
+					scale |= (stored >> 12 & 15) << (4 * word)
+				}
+				let scale = unfp16(scale);
+				for index in 0..256 {
+					if weights.len() == count {
+						return Ok(weights);
+					}
+					let block = index / 16;
+					let group = index % 16 / 8;
+					let high = bytes[32 + block];
+					let grid = usize::from(bytes[2 * block + group]) | usize::from(high >> (4 * group) & 7) << 8;
+					let stored = u16::from_le_bytes(bytes[48 + 2 * (block / 4)..50 + 2 * (block / 4)].try_into().unwrap());
+					let d = scale * f32::from(2 * ((stored >> (3 * (block % 4))) & 7) + 1);
+					let delta = if high >> (3 + 4 * group) & 1 != 0 { -0.125 } else { 0.125 };
+					weights.push(f64::from(d * (f32::from(iq1_level(grid, index % 8)) - 1.0 + delta)))
+				}
+			}
+			return Ok(weights);
 		}
 		if family == 1 && variant == 3 && bits == 3 {
-			const STRIDE:usize=110;require(data.len()>=count.div_ceil(256)*STRIDE,"GGML IQ3_S weights are invalid")?;let mut weights=Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) {let scale=half(bytes);for index in 0..256 {if weights.len()==count{return Ok(weights)}let block=index/32;let group=index/4;let grid=usize::from(bytes[2+group])|usize::from(bytes[66+group/8]>>(group%8)&1)<<8;let code=bytes[106+block/2]>>(block%2*4)&15;let d=scale*f32::from(1+2*code);let sign=if bytes[74+index/8]>>(index%8)&1!=0{-1.0}else{1.0};weights.push(f64::from(d*f32::from(iq3_grid(&IQ3_S,grid,index%4))*sign))}}
-			return Ok(weights)
+			const STRIDE: usize = 110;
+			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ3_S weights are invalid")?;
+			let mut weights = Vec::with_capacity(count);
+			for bytes in data.chunks_exact(STRIDE) {
+				let scale = half(bytes);
+				for index in 0..256 {
+					if weights.len() == count {
+						return Ok(weights);
+					}
+					let block = index / 32;
+					let group = index / 4;
+					let grid = usize::from(bytes[2 + group]) | usize::from(bytes[66 + group / 8] >> (group % 8) & 1) << 8;
+					let code = bytes[106 + block / 2] >> (block % 2 * 4) & 15;
+					let d = scale * f32::from(1 + 2 * code);
+					let sign = if bytes[74 + index / 8] >> (index % 8) & 1 != 0 { -1.0 } else { 1.0 };
+					weights.push(f64::from(d * f32::from(iq3_grid(&IQ3_S, grid, index % 4)) * sign))
+				}
+			}
+			return Ok(weights);
 		}
 		Err(self.unavailable())
 	}
 }
-pub struct Qi { pub zero: Model, pub one: Model, pub nf: Model, pub k: Qk }
-pub struct Qk { model: Model, pub s: Model, pub m: Model, pub l: Model }
-pub struct Iq { pub xxs: Model, pub xs: Model, pub s: Model, pub m: Model, pub nl: Model }
+pub struct Qi {
+	pub zero: Model,
+	pub one: Model,
+	pub nf: Model,
+	pub k: Qk,
+}
+pub struct Qk {
+	model: Model,
+	pub s: Model,
+	pub m: Model,
+	pub l: Model,
+}
+pub struct Iq {
+	pub xxs: Model,
+	pub xs: Model,
+	pub s: Model,
+	pub m: Model,
+	pub nl: Model,
+}
 impl std::ops::Deref for Qk {
-	type Target = Model; fn deref(&self) -> &Model { &self.model }
+	type Target = Model;
+	fn deref(&self) -> &Model { &self.model }
 }
 impl Estimator {
-	const fn name(&self) -> &'static str {
-		self.name
-	}
+	const fn name(&self) -> &'static str { self.name }
 }
 impl Operation {
 	const fn name(&self) -> &'static str {
@@ -1374,11 +1886,22 @@ fn elu = Elu;
 fn prelu = Prelu; }
 pub struct Recipe;
 #[derive(Clone)]
-pub struct DeviceInfo { pub name: String, pub host: String }
+pub struct DeviceInfo {
+	pub name: String,
+	pub host: String,
+}
 #[derive(Clone)]
-pub struct DeviceLink { pub from: String, pub to: String, pub latency_ms: f64, pub bytes_per_second: f64 }
+pub struct DeviceLink {
+	pub from: String,
+	pub to: String,
+	pub latency_ms: f64,
+	pub bytes_per_second: f64,
+}
 #[derive(Clone)]
-pub struct Topology { pub devices: Vec<DeviceInfo>, pub links: Vec<DeviceLink> }
+pub struct Topology {
+	pub devices: Vec<DeviceInfo>,
+	pub links: Vec<DeviceLink>,
+}
 pub struct Adamw;
 #[derive(Clone, Copy)]
 pub struct LossFunction(u8);
@@ -1406,9 +1929,7 @@ pub const atvn: Metric = Metric(6);
 pub const norm: Metric = Metric(7);
 pub const z_score: ZScore = ZScore;
 pub const batch: Normalization = batch_marker;
-const fn batch_marker(_: usize) -> Residual {
-	Residual::Activation(Activation::Relu)
-}
+const fn batch_marker(_: usize) -> Residual { Residual::Activation(Activation::Relu) }
 impl LossFunction {
 	const fn name(self) -> &'static str {
 		match self.0 {
@@ -1442,21 +1963,11 @@ impl LossFunction {
 	}
 }
 impl Recipe {
-	pub fn data(&self, sources: impl IntoDataSources) -> Data {
-		Data { sources: sources.into_data_sources(), target: Vec::new(), exclusions: Vec::new(), routes: Vec::new(), normalize: false, split: 1.0, prepared: OnceLock::new() }
-	}
-	pub fn model(&self) -> Model {
-		Model { blocks: Vec::new(), loss: mse, downstream: None, quantization: 0 }
-	}
-	pub fn devices(&self) -> Vec<String> {
-		self.topology().devices.into_iter().map(|device| device.name).collect()
-	}
-	pub fn topology(&self) -> Topology {
-		topology().unwrap_or_else(|error| panic!("{error}"))
-	}
-	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: None, resume: None, save: None, seed: None, precision: FP64 }
-	}
+	pub fn data(&self, sources: impl IntoDataSources) -> Data { Data { sources: sources.into_data_sources(), target: Vec::new(), exclusions: Vec::new(), routes: Vec::new(), normalize: false, split: 1.0, prepared: OnceLock::new() } }
+	pub fn model(&self) -> Model { Model { blocks: Vec::new(), loss: mse, downstream: None, quantization: 0 } }
+	pub fn devices(&self) -> Vec<String> { self.topology().devices.into_iter().map(|device| device.name).collect() }
+	pub fn topology(&self) -> Topology { topology().unwrap_or_else(|error| panic!("{error}")) }
+	pub const fn train(&self) -> Train { Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: None, resume: None, save: None, seed: None, precision: Compute::FP64 } }
 	pub fn export(&self, source: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
 		let source = source.as_ref();
 		require(source.extension().and_then(|value| value.to_str()) == Some("rs"), "export requires a Rust source")?;
@@ -1484,7 +1995,7 @@ fn mapped_artifacts<'a>(mapping: Option<&'a str>, suffix: &str) -> Result<Vec<(S
 	let mapping = mapping.ok_or_else(|| RecipeError::new("AMD artifacts were not compiled"))?;
 	Ok(mapping.split(';').filter_map(|value| value.split_once('=')).map(|(target, path)| (format!("{target}.{suffix}"), path)).collect())
 }
-fn inject_bn_stats(graph: &Graph, bn_stats: &[f64], contexts: &[Buffer]) -> Result<()> {
+fn inject_bn_stats(graph: &Graph, bn_stats: &[f64], contexts: &[Buffer], precision: Compute) -> Result<()> {
 	if bn_stats.is_empty() {
 		return Ok(());
 	}
@@ -1494,40 +2005,80 @@ fn inject_bn_stats(graph: &Graph, bn_stats: &[f64], contexts: &[Buffer]) -> Resu
 			let channels = node.output.channels;
 			let needed = 2 * channels;
 			if offset + needed <= bn_stats.len() {
-				contexts[index].write(0, &bn_stats[offset..offset + needed])?;
+				contexts[index].write_float(0, &bn_stats[offset..offset + needed], precision)?;
 				offset += needed;
 			}
 		}
 	}
 	Ok(())
 }
-fn extract_bn_stats(graph: &Graph, contexts: &[Buffer]) -> Result<Vec<f64>> {
+fn extract_bn_stats(graph: &Graph, contexts: &[Buffer], precision: Compute) -> Result<Vec<f64>> {
 	let mut stats = Vec::new();
 	for (index, node) in graph.nodes.iter().enumerate() {
 		if node.op == Primitive::Normalize && node.argument[0] == 0.0 {
 			let channels = node.output.channels;
-			stats.extend(contexts[index].download_range::<f64>(0, 2 * channels)?);
+			stats.extend(contexts[index].download_float(2 * channels, precision)?);
 		}
 	}
 	Ok(stats)
 }
 trait CpuFloat: Copy + Default {
-	unsafe fn forward(samples: *const Self, weights: *const Self, values: *const *mut Self, contexts: *const *mut Self, descriptors: *const i32, arguments: *const Self, rows: i32, nodes: i32, timings: *mut u64, tiles: *const Tile);
-	unsafe fn epoch(samples: *const Self, input_adjoint: *mut Self, targets: *const Self, weights: *mut Self, frozen: *const u8, best: *mut Self, values: *const *mut Self, contexts: *const *mut Self, adjoints: *const *mut Self, descriptors: *const i32, arguments: *const Self, metrics: *mut Self, gradient: *mut Self, moments: *mut Self, variances: *mut Self, best_loss: *mut Self, rows: i32, nodes: i32, parameters: i32, loss: i32, threshold: Self, rate: Self, beta1: Self, beta2: Self, beta1_power: Self, beta2_power: Self, epsilon: Self, decay: Self, tolerance: Self, step: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, phase: i32, timings: *mut u64, tiles: *const Tile); }
-impl CpuFloat for f64 {
-	unsafe fn forward(samples: *const Self, weights: *const Self, values: *const *mut Self, contexts: *const *mut Self, descriptors: *const i32, arguments: *const Self, rows: i32, nodes: i32, timings: *mut u64, tiles: *const Tile) { unsafe { recipe_forward_cpu(samples, weights, values, contexts, descriptors, arguments, rows, nodes, 1, 1, 1, 1, timings, tiles) } }
-	unsafe fn epoch(samples: *const Self, input_adjoint: *mut Self, targets: *const Self, weights: *mut Self, frozen: *const u8, best: *mut Self, values: *const *mut Self, contexts: *const *mut Self, adjoints: *const *mut Self, descriptors: *const i32, arguments: *const Self, metrics: *mut Self, gradient: *mut Self, moments: *mut Self, variances: *mut Self, best_loss: *mut Self, rows: i32, nodes: i32, parameters: i32, loss: i32, threshold: Self, rate: Self, beta1: Self, beta2: Self, beta1_power: Self, beta2_power: Self, epsilon: Self, decay: Self, tolerance: Self, step: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, phase: i32, timings: *mut u64, tiles: *const Tile) { unsafe { recipe_epoch_cpu(samples, input_adjoint, targets, weights, frozen, best, values, contexts, adjoints, descriptors, arguments, metrics, gradient, moments, variances, best_loss, rows, nodes, parameters, loss, threshold, rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay, tolerance, step, threads, tile_m, tile_n, tile_k, phase, timings, tiles) } } }
-impl CpuFloat for f32 {
-	unsafe fn forward(samples: *const Self, weights: *const Self, values: *const *mut Self, contexts: *const *mut Self, descriptors: *const i32, arguments: *const Self, rows: i32, nodes: i32, timings: *mut u64, tiles: *const Tile) { unsafe { recipe_forward_cpu_f32(samples, weights, values, contexts, descriptors, arguments, rows, nodes, 1, 1, 1, 1, timings, tiles) } }
-	unsafe fn epoch(samples: *const Self, input_adjoint: *mut Self, targets: *const Self, weights: *mut Self, frozen: *const u8, best: *mut Self, values: *const *mut Self, contexts: *const *mut Self, adjoints: *const *mut Self, descriptors: *const i32, arguments: *const Self, metrics: *mut Self, gradient: *mut Self, moments: *mut Self, variances: *mut Self, best_loss: *mut Self, rows: i32, nodes: i32, parameters: i32, loss: i32, threshold: Self, rate: Self, beta1: Self, beta2: Self, beta1_power: Self, beta2_power: Self, epsilon: Self, decay: Self, tolerance: Self, step: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, phase: i32, timings: *mut u64, tiles: *const Tile) { unsafe { recipe_epoch_cpu_f32(samples, input_adjoint, targets, weights, frozen, best, values, contexts, adjoints, descriptors, arguments, metrics, gradient, moments, variances, best_loss, rows, nodes, parameters, loss, threshold, rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay, tolerance, step, threads, tile_m, tile_n, tile_k, phase, timings, tiles) } }
+	unsafe fn forward(samples: *const Self, weights: *const Self, values: *const *mut Self, contexts: *const *mut Self, descriptors: *const i32, arguments: *const Self, rows: i32, nodes: i32, timings: *mut u64, tiles: *const Tile, format_exp: i32, format_man: i32);
+	unsafe fn epoch(samples: *const Self, input_adjoint: *mut Self, targets: *const Self, weights: *mut Self, frozen: *const u8, best: *mut Self, values: *const *mut Self, contexts: *const *mut Self, adjoints: *const *mut Self, descriptors: *const i32, arguments: *const Self, metrics: *mut Self, gradient: *mut Self, moments: *mut Self, variances: *mut Self, best_loss: *mut Self, rows: i32, nodes: i32, parameters: i32, loss: i32, threshold: Self, rate: Self, beta1: Self, beta2: Self, beta1_power: Self, beta2_power: Self, epsilon: Self, decay: Self, tolerance: Self, step: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, phase: i32, timings: *mut u64, tiles: *const Tile, format_exp: i32, format_man: i32);
 }
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+struct CpuF16(u16);
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+struct CpuF8(u8);
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+struct CpuBf16(u16);
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+struct CpuTf32(f32);
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+struct CpuInt8(u8);
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+struct CpuInt4(u8);
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+struct CpuInt1(u8);
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+struct CpuF(f64);
+macro_rules! cpu_float {
+	($value:ty, $forward:ident, $epoch:ident) => {
+		unsafe extern "C" {
+			fn $forward(samples: *const $value, weights: *const $value, value_pointers: *const *mut $value, context_pointers: *const *mut $value, descriptors: *const i32, arguments: *const $value, rows: i32, nodes: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, timings: *mut u64, tiles: *const Tile, format_exp: i32, format_man: i32);
+			fn $epoch(samples: *const $value, input_adjoint: *mut $value, targets: *const $value, weights: *mut $value, frozen: *const u8, best: *mut $value, values: *const *mut $value, contexts: *const *mut $value, adjoints: *const *mut $value, descriptors: *const i32, arguments: *const $value, metrics: *mut $value, gradient: *mut $value, moments: *mut $value, variances: *mut $value, best_loss: *mut $value, rows: i32, nodes: i32, parameters: i32, loss: i32, huber: $value, rate: $value, beta1: $value, beta2: $value, beta1_power: $value, beta2_power: $value, epsilon: $value, decay: $value, tolerance: $value, step: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, phase: i32, timings: *mut u64, tiles: *const Tile, format_exp: i32, format_man: i32);
+		}
+		impl CpuFloat for $value {
+			unsafe fn forward(samples: *const Self, weights: *const Self, values: *const *mut Self, contexts: *const *mut Self, descriptors: *const i32, arguments: *const Self, rows: i32, nodes: i32, timings: *mut u64, tiles: *const Tile, format_exp: i32, format_man: i32) { unsafe { $forward(samples, weights, values, contexts, descriptors, arguments, rows, nodes, 1, 1, 1, 1, timings, tiles, format_exp, format_man) } }
+			unsafe fn epoch(samples: *const Self, input_adjoint: *mut Self, targets: *const Self, weights: *mut Self, frozen: *const u8, best: *mut Self, values: *const *mut Self, contexts: *const *mut Self, adjoints: *const *mut Self, descriptors: *const i32, arguments: *const Self, metrics: *mut Self, gradient: *mut Self, moments: *mut Self, variances: *mut Self, best_loss: *mut Self, rows: i32, nodes: i32, parameters: i32, loss: i32, threshold: Self, rate: Self, beta1: Self, beta2: Self, beta1_power: Self, beta2_power: Self, epsilon: Self, decay: Self, tolerance: Self, step: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, phase: i32, timings: *mut u64, tiles: *const Tile, format_exp: i32, format_man: i32) { unsafe { $epoch(samples, input_adjoint, targets, weights, frozen, best, values, contexts, adjoints, descriptors, arguments, metrics, gradient, moments, variances, best_loss, rows, nodes, parameters, loss, threshold, rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay, tolerance, step, threads, tile_m, tile_n, tile_k, phase, timings, tiles, format_exp, format_man) } }
+		}
+	};
+}
+cpu_float!(f64, recipe_forward_cpu, recipe_epoch_cpu);
+cpu_float!(f32, recipe_forward_cpu_f32, recipe_epoch_cpu_f32);
+cpu_float!(CpuF16, recipe_forward_cpu_f16, recipe_epoch_cpu_f16);
+cpu_float!(CpuF8, recipe_forward_cpu_f8, recipe_epoch_cpu_f8);
+cpu_float!(CpuBf16, recipe_forward_cpu_bf16, recipe_epoch_cpu_bf16);
+cpu_float!(CpuTf32, recipe_forward_cpu_tf32, recipe_epoch_cpu_tf32);
+cpu_float!(CpuInt8, recipe_forward_cpu_int8, recipe_epoch_cpu_int8);
+cpu_float!(CpuInt4, recipe_forward_cpu_int4, recipe_epoch_cpu_int4);
+cpu_float!(CpuInt1, recipe_forward_cpu_int1, recipe_epoch_cpu_int1);
+cpu_float!(CpuF, recipe_forward_cpu_f, recipe_epoch_cpu_f);
 impl Recipe {
 	pub fn infer(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
 		let path = path.as_ref().to_string_lossy();
 		let result = devices().and_then(|devices| devices.first().ok_or_else(|| RecipeError::new("execution device is absent"))).and_then(|device| {
 			bundle::run_infer(&path, input, |stored, samples| {
 				let mut tape = GpuTape::new(&stored.graph, samples, &[], device, stored.precision)?;
-				inject_bn_stats(&stored.graph, &stored.bn_stats, &tape.contexts)?;
+				inject_bn_stats(&stored.graph, &stored.bn_stats, &tape.contexts, stored.precision)?;
 				tape.forward()?;
 				tape.predictions()
 			})
@@ -1536,18 +2087,44 @@ impl Recipe {
 	}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Shape { channels: usize, length: usize }
+struct Shape {
+	channels: usize,
+	length: usize,
+}
 impl Shape {
-	fn elements(self) -> usize {
-		self.channels * self.length
-	}
+	fn elements(self) -> usize { self.channels * self.length }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
-enum Primitive { Contraction = 0, Pool = 2, Gather = 3, Attention = 4, Scan = 5, Elementwise = 6, Route = 7, Normalize = 8, #[allow(dead_code, reason = "reserved for format-independent quantized lowering")] Quantized = 9 }
+enum Primitive {
+	Contraction = 0,
+	Pool = 2,
+	Gather = 3,
+	Attention = 4,
+	Scan = 5,
+	Elementwise = 6,
+	Route = 7,
+	Normalize = 8,
+	#[allow(dead_code, reason = "reserved for format-independent quantized lowering")]
+	Quantized = 9,
+}
 #[derive(Clone, Copy)]
 #[repr(i32)]
-enum ScalarOpcode { Add, Constant, Parameter, Subtract, Multiply, Divide, Absolute, Exp, Log, Sin = 10, Cos, Tanh, Greater }
+enum ScalarOpcode {
+	Add,
+	Constant,
+	Parameter,
+	Subtract,
+	Multiply,
+	Divide,
+	Absolute,
+	Exp,
+	Log,
+	Sin = 10,
+	Cos,
+	Tanh,
+	Greater,
+}
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
 	fn op(&mut self, opcode: ScalarOpcode, left: f64, right: f64) -> f64 {
@@ -1555,18 +2132,14 @@ impl ScalarProgram {
 		self.0.extend([opcode as i32 as f64, left, right]);
 		result
 	}
-	fn constant(&mut self, value: f64) -> f64 {
-		self.op(ScalarOpcode::Constant, value, 0.0)
-	}
+	fn constant(&mut self, value: f64) -> f64 { self.op(ScalarOpcode::Constant, value, 0.0) }
 	fn choose(&mut self, condition: f64, yes: f64, no: f64) -> f64 {
 		let one = self.constant(1.0);
 		let inv = self.op(ScalarOpcode::Subtract, one, condition);
 		let (a, b) = (self.op(ScalarOpcode::Multiply, condition, yes), self.op(ScalarOpcode::Multiply, inv, no));
 		self.op(ScalarOpcode::Add, a, b)
 	}
-	fn unary(&mut self, opcode: ScalarOpcode, value: f64) -> f64 {
-		self.op(opcode, value, 0.0)
-	}
+	fn unary(&mut self, opcode: ScalarOpcode, value: f64) -> f64 { self.op(opcode, value, 0.0) }
 }
 impl Node {
 	fn identity(&self, index: usize) -> String {
@@ -1633,19 +2206,15 @@ struct Graph {
 	block_kind: &'static str,
 }
 impl Graph {
-	fn new(shape: Shape) -> Self {
-		Self { nodes: Vec::new(), parameters: Vec::new(), frozen: Vec::new(), programs: Vec::new(), input: shape, output: shape, source: -1, state: TrainingState::default(), block_index: 0, block_kind: "" }
-	}
+	fn new(shape: Shape) -> Self { Self { nodes: Vec::new(), parameters: Vec::new(), frozen: Vec::new(), programs: Vec::new(), input: shape, output: shape, source: -1, state: TrainingState::default(), block_index: 0, block_kind: "" } }
 }
-fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<Graph> {
-	compile_graph(model, data, rows, gpu, config, None)
-}
-fn compile_output(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config, output: usize) -> Result<Graph> {
-	compile_graph(model, data, rows, gpu, config, Some(output))
-}
+fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<Graph> { compile_graph(model, data, rows, gpu, config, None) }
+fn compile_output(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config, output: usize) -> Result<Graph> { compile_graph(model, data, rows, gpu, config, Some(output)) }
 fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config, expected: Option<usize>) -> Result<Graph> {
 	require(!model.blocks.is_empty(), "model must contain a block")?;
-	if let Some(format)=model.blocks.iter().map(|block|IntegerFormat(block.quantization)).find(|format|format.0!=0&&!format.valid()){return Err(format.unavailable())}
+	if let Some(format) = model.blocks.iter().map(|block| IntegerFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
+		return Err(format.unavailable());
+	}
 	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..) | Operation::Embed(..));
 	let shape = if sequential { data.sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
@@ -1654,15 +2223,22 @@ fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu,
 		graph.block_kind = block.operation.name();
 		lower_block(&mut graph, block, model.blocks.len(), data, rows, gpu, config)?;
 	}
-	let mut output_profile=model.blocks.last().filter(|block|block.profile).map(|block|IntegerFormat(block.quantization));
+	let mut output_profile = model.blocks.last().filter(|block| block.profile).map(|block| IntegerFormat(block.quantization));
 	if let Some(expected) = expected {
 		require(graph.output.elements() == expected, "model output width does not match .out()")?;
 	} else if graph.output.elements() != 1 {
 		let length = graph.output.length;
 		lower_conv(&mut graph, 1, length)?;
-		if model.quantization!=0{graph.nodes.last_mut().unwrap().argument[8]=f64::from(model.quantization)}output_profile=IntegerFormat(model.quantization).selection().map(|_|IntegerFormat(model.quantization));
+		if model.quantization != 0 {
+			graph.nodes.last_mut().unwrap().argument[8] = f64::from(model.quantization)
+		}
+		output_profile = IntegerFormat(model.quantization).selection().map(|_| IntegerFormat(model.quantization));
 	}
-	if let Some(format)=output_profile&&let Some(node)=graph.nodes.iter_mut().rev().find(|node|node.parameters!=0&&node.block_index+1==model.blocks.len()){node.argument[8]=f64::from(format.tensor(0,false,true))}
+	if let Some(format) = output_profile
+		&& let Some(node) = graph.nodes.iter_mut().rev().find(|node| node.parameters != 0 && node.block_index + 1 == model.blocks.len())
+	{
+		node.argument[8] = f64::from(format.tensor(0, false, true))
+	}
 	initialize_graph(&mut graph, config);
 	if expected.is_none() {
 		if let Some(offset) = output_bias_offset(&graph) {
@@ -1673,10 +2249,12 @@ fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu,
 	Ok(graph)
 }
 #[derive(Clone, Copy)]
-struct Field { source: i32, stride: usize, index: usize }
-fn field(fields: &[(String, Field)], name: &str) -> Result<Field> {
-	fields.iter().find(|value| value.0 == name).map(|value| value.1).ok_or_else(|| RecipeError::new(format!("RAT value {name:?} is not yet available")))
+struct Field {
+	source: i32,
+	stride: usize,
+	index: usize,
 }
+fn field(fields: &[(String, Field)], name: &str) -> Result<Field> { fields.iter().find(|value| value.0 == name).map(|value| value.1).ok_or_else(|| RecipeError::new(format!("RAT value {name:?} is not yet available"))) }
 fn route_fields(graph: &mut Graph, fields: &[Field]) -> Result<()> {
 	let offset = graph.programs.len();
 	for value in fields {
@@ -1721,7 +2299,7 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	graph.source = narrow(graph.nodes.len(), "RAT graph nodes")? - 1;
 	Ok(graph.source)
 }
-fn lower_block(graph: &mut Graph, block: &Block, total:usize, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let skip = graph.source;
 	let first = graph.nodes.len();
 	match &block.operation {
@@ -1749,10 +2327,13 @@ fn lower_block(graph: &mut Graph, block: &Block, total:usize, data: &Prepared, r
 		push_node(graph, Primitive::Normalize, graph.output, 0, arguments(normalization as u8 as f64, epsilon), -2)?;
 	}
 	if block.quantization != 0 {
-		let more=graph.block_index<total/8||graph.block_index>=7*total/8||(graph.block_index-total/8)%3==2;let mut parameter=0;
+		let more = graph.block_index < total / 8 || graph.block_index >= 7 * total / 8 || (graph.block_index - total / 8) % 3 == 2;
+		let mut parameter = 0;
 		for node in &mut graph.nodes[first..] {
 			if node.parameters != 0 {
-				let role=if block.operation.name()=="attn"{parameter}else{0};node.argument[8]=f64::from(if block.profile{IntegerFormat(block.quantization).tensor(role,more,false)}else{block.quantization});parameter+=1
+				let role = if block.operation.name() == "attn" { parameter } else { 0 };
+				node.argument[8] = f64::from(if block.profile { IntegerFormat(block.quantization).tensor(role, more, false) } else { block.quantization });
+				parameter += 1
 			}
 		}
 	}
@@ -1885,9 +2466,7 @@ fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	let output = Shape { channels: filters, length: graph.output.length - kernel + 1 };
 	push_node(graph, Primitive::Contraction, output, parameters, arguments(kernel as f64, 0.0), -2)
 }
-fn output_bias_offset(graph: &Graph) -> Option<usize> {
-	graph.nodes.iter().rev().find(|node| node.op == Primitive::Contraction).map(|node| node.offset + node.parameters - node.output.channels)
-}
+fn output_bias_offset(graph: &Graph) -> Option<usize> { graph.nodes.iter().rev().find(|node| node.op == Primitive::Contraction).map(|node| node.offset + node.parameters - node.output.channels) }
 fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	require(size != 0, "pool window must be positive")?;
 	let output = Shape { channels: graph.output.channels, length: graph.output.length.div_ceil(size) };
@@ -2122,21 +2701,11 @@ fn initialize_graph(graph: &mut Graph, config: Config) {
 		}
 	}
 }
-fn arguments(first: f64, second: f64) -> [f64; 9] {
-	[first, second, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-}
-fn checked_add(left: usize, right: usize, role: &str) -> Result<usize> {
-	left.checked_add(right).ok_or_else(|| RecipeError::new(format!("{role} overflows")))
-}
-fn checked_mul(left: usize, right: usize, role: &str) -> Result<usize> {
-	left.checked_mul(right).ok_or_else(|| RecipeError::new(format!("{role} overflows")))
-}
-fn require(condition: bool, message: impl Into<String>) -> Result<()> {
-	condition.then_some(()).ok_or_else(|| RecipeError::new(message))
-}
-fn logistic(value: f64) -> f64 {
-	1.0 / (1.0 + (-value).exp())
-}
+fn arguments(first: f64, second: f64) -> [f64; 9] { [first, second, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] }
+fn checked_add(left: usize, right: usize, role: &str) -> Result<usize> { left.checked_add(right).ok_or_else(|| RecipeError::new(format!("{role} overflows"))) }
+fn checked_mul(left: usize, right: usize, role: &str) -> Result<usize> { left.checked_mul(right).ok_or_else(|| RecipeError::new(format!("{role} overflows"))) }
+fn require(condition: bool, message: impl Into<String>) -> Result<()> { condition.then_some(()).ok_or_else(|| RecipeError::new(message)) }
+fn logistic(value: f64) -> f64 { 1.0 / (1.0 + (-value).exp()) }
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 struct Tile {
@@ -2173,12 +2742,10 @@ struct Config {
 	vram_unit: usize,
 	random_seed: usize,
 	activation: [f64; 8],
-	precision: FloatFormat,
+	precision: Compute,
 }
 impl Config {
-	fn load() -> Result<Self> {
-		Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, rat_batch: natural("RAT batch rows", env!("RECIPE_RAT_BATCH_ROWS"))?, vram_unit: natural("tile VRAM unit bytes", env!("RECIPE_TILE_VRAM_UNIT_BYTES"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: FP64 })
-	}
+	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, rat_batch: natural("RAT batch rows", env!("RECIPE_RAT_BATCH_ROWS"))?, vram_unit: natural("tile VRAM unit bytes", env!("RECIPE_TILE_VRAM_UNIT_BYTES"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
 }
 fn number(name: &str, text: &str) -> Result<f64> {
 	let value = text.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))?;
@@ -2188,10 +2755,8 @@ fn natural(name: &str, text: &str) -> Result<usize> {
 	let value = text.parse::<usize>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))?;
 	require(value != 0, format!("{name} must be positive")).map(|_| value)
 }
-fn multi_device() -> bool {
-	env!("RECIPE_MULTI_DEVICE") == "true"
-}
-fn stored_graph(graph: &Graph, data: &Data, scale: Option<TargetScale>, precision: FloatFormat) -> bundle::StoredGraph {
+fn multi_device() -> bool { env!("RECIPE_MULTI_DEVICE") == "true" }
+fn stored_graph(graph: &Graph, data: &Data, scale: Option<TargetScale>, precision: Compute) -> bundle::StoredGraph {
 	let inputs = (0..graph.input.elements()).map(|index| format!("input{index}")).collect();
 	let output = data.target.first().cloned().unwrap_or_else(|| "target".to_owned());
 	let (norm_mean, norm_scale) = match data.prepared.get() {
@@ -2203,7 +2768,9 @@ fn stored_graph(graph: &Graph, data: &Data, scale: Option<TargetScale>, precisio
 }
 struct GpuTape {
 	gpu: &'static Gpu,
-	precision: FloatFormat,
+	precision: Compute,
+	format_exp: u32,
+	format_man: u32,
 	values: Vec<Buffer>,
 	contexts: Vec<Buffer>,
 	_adjoints: Vec<Buffer>,
@@ -2244,7 +2811,7 @@ enum EpochPhase {
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&mut $e as *mut _ as Ptr),*] } }
 impl GpuTape {
-	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: FloatFormat) -> Result<Self> {
+	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute) -> Result<Self> {
 		let inputs = graph.input.elements();
 		require(inputs != 0 && !samples.is_empty() && samples.len() % inputs == 0, "model input batch is invalid")?;
 		let rows = samples.len() / inputs;
@@ -2271,12 +2838,46 @@ impl GpuTape {
 		arguments.extend(&graph.programs);
 		let addresses = |buffers: &[Buffer]| buffers.iter().map(|buffer| buffer.pointer).collect::<Vec<_>>();
 		let zeros = vec![0.0; if training { graph.parameters.len().max(1) } else { 1 }];
-		fn resumed<'a>(saved: &'a [f64], cold: &'a [f64]) -> &'a [f64] {
-			if saved.is_empty() { cold } else { saved }
-		}
+		fn resumed<'a>(saved: &'a [f64], cold: &'a [f64]) -> &'a [f64] { if saved.is_empty() { cold } else { saved } }
 		let cold_loss = [f64::INFINITY, f64::NAN, f64::NAN, f64::INFINITY];
 		let target_values = if targets.is_empty() { vec![0.0] } else { targets.to_vec() };
-		Ok(Self { gpu, precision, value_pointers: Buffer::upload(gpu, &addresses(&values))?, context_pointers: Buffer::upload(gpu, &addresses(&contexts))?, adjoint_pointers: Buffer::upload(gpu, &addresses(&adjoints))?, descriptors: Buffer::upload(gpu, &descriptors)?, arguments: Buffer::upload_float(gpu, &arguments, precision)?, samples: Buffer::upload_float(gpu, samples, precision)?, timings: Buffer::upload(gpu, &vec![0_u64; graph.nodes.len().max(1)])?, tiles: Buffer::upload(gpu, &vec![tile; graph.nodes.len().max(1)])?, input_adjoint: Buffer::upload_float(gpu, &vec![0.0; if training { samples.len() } else { 1 }], precision)?, targets: Buffer::upload_float(gpu, &target_values, precision)?, weights: Buffer::upload_float(gpu, &graph.parameters, precision)?, frozen: Buffer::upload(gpu, if training && !graph.frozen.is_empty() { &graph.frozen } else { &[1] })?, best: Buffer::upload_float(gpu, if training { resumed(&graph.state.best, &graph.parameters) } else { &zeros }, precision)?, moments: Buffer::upload_float(gpu, if training { resumed(&graph.state.moments, &zeros) } else { &zeros }, precision)?, variances: Buffer::upload_float(gpu, if training { resumed(&graph.state.variances, &zeros) } else { &zeros }, precision)?, gradient: Buffer::upload_float(gpu, &zeros, precision)?, metrics: Buffer::upload_float(gpu, &[0.0, 0.0, 0.0], precision)?, best_loss: Buffer::upload_float(gpu, if training { resumed(&graph.state.best_loss, &cold_loss) } else { &zeros }, precision)?, rows: narrow(rows, "GPU rows")? as u32, nodes: narrow(graph.nodes.len(), "GPU nodes")? as u32, parameters: narrow(graph.parameters.len(), "GPU parameters")? as u32, threads: 0, step: narrow(graph.state.epoch, "optimizer epoch")? as u32, input: graph.input.elements(), output: graph.output.elements(), values, contexts: contexts, _adjoints: adjoints, capacity: rows, tile })
+		let format = precision.layout();
+		Ok(Self {
+			gpu,
+			precision,
+			format_exp: u32::from(format.exp),
+			format_man: u32::from(format.man),
+			value_pointers: Buffer::upload(gpu, &addresses(&values))?,
+			context_pointers: Buffer::upload(gpu, &addresses(&contexts))?,
+			adjoint_pointers: Buffer::upload(gpu, &addresses(&adjoints))?,
+			descriptors: Buffer::upload(gpu, &descriptors)?,
+			arguments: Buffer::upload_float(gpu, &arguments, precision)?,
+			samples: Buffer::upload_float(gpu, samples, precision)?,
+			timings: Buffer::upload(gpu, &vec![0_u64; graph.nodes.len().max(1)])?,
+			tiles: Buffer::upload(gpu, &vec![tile; graph.nodes.len().max(1)])?,
+			input_adjoint: Buffer::upload_float(gpu, &vec![0.0; if training { samples.len() } else { 1 }], precision)?,
+			targets: Buffer::upload_float(gpu, &target_values, precision)?,
+			weights: Buffer::upload_float(gpu, &graph.parameters, precision)?,
+			frozen: Buffer::upload(gpu, if training && !graph.frozen.is_empty() { &graph.frozen } else { &[1] })?,
+			best: Buffer::upload_float(gpu, if training { resumed(&graph.state.best, &graph.parameters) } else { &zeros }, precision)?,
+			moments: Buffer::upload_float(gpu, if training { resumed(&graph.state.moments, &zeros) } else { &zeros }, precision)?,
+			variances: Buffer::upload_float(gpu, if training { resumed(&graph.state.variances, &zeros) } else { &zeros }, precision)?,
+			gradient: Buffer::upload_float(gpu, &zeros, precision)?,
+			metrics: Buffer::upload_float(gpu, &[0.0, 0.0, 0.0], precision)?,
+			best_loss: Buffer::upload_float(gpu, if training { resumed(&graph.state.best_loss, &cold_loss) } else { &zeros }, precision)?,
+			rows: narrow(rows, "GPU rows")? as u32,
+			nodes: narrow(graph.nodes.len(), "GPU nodes")? as u32,
+			parameters: narrow(graph.parameters.len(), "GPU parameters")? as u32,
+			threads: 0,
+			step: narrow(graph.state.epoch, "optimizer epoch")? as u32,
+			input: graph.input.elements(),
+			output: graph.output.elements(),
+			values,
+			contexts: contexts,
+			_adjoints: adjoints,
+			capacity: rows,
+			tile,
+		})
 	}
 	fn forward(&mut self) -> Result<()> {
 		let d = self.gpu.kernels(self.precision)?.0;
@@ -2284,30 +2885,20 @@ impl GpuTape {
 		let mut a = self.forward_arguments();
 		self.gpu.launch(d, &mut a, self.threads, self.tile)
 	}
-	fn forward_arguments(&mut self) -> [*mut c_void; 14] {
-		ptrs![self.samples.pointer, self.weights.pointer, self.value_pointers.pointer, self.context_pointers.pointer, self.descriptors.pointer, self.arguments.pointer, self.rows, self.nodes, self.threads, self.tile.m, self.tile.n, self.tile.k, self.timings.pointer, self.tiles.pointer]
-	}
-	fn timings(&self) -> Result<Vec<u64>> {
-		self.timings.download(self.nodes as usize)
-	}
-	fn predictions(&self) -> Result<Vec<f64>> {
-		self.values.last().ok_or_else(|| RecipeError::new("GPU tape is empty"))?.download_float(self.rows as usize * self.output, self.precision)
-	}
+	fn forward_arguments(&mut self) -> [*mut c_void; 16] { ptrs![self.samples.pointer, self.weights.pointer, self.value_pointers.pointer, self.context_pointers.pointer, self.descriptors.pointer, self.arguments.pointer, self.rows, self.nodes, self.threads, self.tile.m, self.tile.n, self.tile.k, self.timings.pointer, self.tiles.pointer, self.format_exp, self.format_man] }
+	fn timings(&self) -> Result<Vec<u64>> { self.timings.download(self.nodes as usize) }
+	fn predictions(&self) -> Result<Vec<f64>> { self.values.last().ok_or_else(|| RecipeError::new("GPU tape is empty"))?.download_float(self.rows as usize * self.output, self.precision) }
 	fn launch_epoch(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool, phase: EpochPhase) -> Result<()> {
 		let mut loss = if direct { 7 } else { loss.0 as u32 };
 		let mut huber_threshold = config.activation[7];
 		require(self.step != 0, "optimizer epoch is absent")?;
-		let (mut step, mut rate, mut beta1, mut beta2, mut epsilon, mut decay, mut tolerance) = (self.step, rate, config.beta1, config.beta2, config.epsilon, config.decay, tolerance);
-		let (mut beta1_power, mut beta2_power) = (config.beta1.powi(self.step as i32), config.beta2.powi(self.step as i32));
+		let (mut step, mut rate, mut beta1, mut beta2, mut epsilon, mut decay, mut tolerance) = (self.step, rate, self.precision.optimizer_beta(config.beta1), self.precision.optimizer_beta(config.beta2), self.precision.optimizer_epsilon(config.epsilon), config.decay, tolerance);
+		let (mut beta1_power, mut beta2_power) = (beta1.powi(self.step as i32), beta2.powi(self.step as i32));
 		let mut phase = phase as u32;
-		let mut call = ptrs![self.samples.pointer, self.input_adjoint.pointer, self.targets.pointer, self.weights.pointer, self.frozen.pointer, self.best.pointer, self.value_pointers.pointer, self.context_pointers.pointer, self.adjoint_pointers.pointer, self.descriptors.pointer, self.arguments.pointer, self.metrics.pointer, self.gradient.pointer, self.moments.pointer, self.variances.pointer, self.best_loss.pointer, self.rows, self.nodes, self.parameters, loss, huber_threshold, rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay, tolerance, step, self.threads, self.tile.m, self.tile.n, self.tile.k, phase, self.timings.pointer, self.tiles.pointer];
-		let mut narrow = [huber_threshold as f32, rate as f32, beta1 as f32, beta2 as f32, beta1_power as f32, beta2_power as f32, epsilon as f32, decay as f32, tolerance as f32];
-		let mut half = narrow.map(fp16);
-		if self.precision.native() == Some(FP16) { for (slot, value) in call[20..29].iter_mut().zip(&mut half) { *slot = value as *mut u16 as Ptr } }
-		if self.precision.native() == Some(FP32) {
-			for (slot, value) in call[20..29].iter_mut().zip(&mut narrow) {
-				*slot = value as *mut f32 as Ptr;
-			}
+		let mut call = ptrs![self.samples.pointer, self.input_adjoint.pointer, self.targets.pointer, self.weights.pointer, self.frozen.pointer, self.best.pointer, self.value_pointers.pointer, self.context_pointers.pointer, self.adjoint_pointers.pointer, self.descriptors.pointer, self.arguments.pointer, self.metrics.pointer, self.gradient.pointer, self.moments.pointer, self.variances.pointer, self.best_loss.pointer, self.rows, self.nodes, self.parameters, loss, huber_threshold, rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay, tolerance, step, self.threads, self.tile.m, self.tile.n, self.tile.k, phase, self.timings.pointer, self.tiles.pointer, self.format_exp, self.format_man];
+		let mut encoded = [huber_threshold, rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay, tolerance].map(|value| self.precision.pack(value));
+		for (slot, value) in call[20..29].iter_mut().zip(&mut encoded) {
+			*slot = value as *mut u64 as Ptr
 		}
 		let dispatch = self.gpu.kernels(self.precision)?.1;
 		self.threads = dispatch.geometry.threads(self.rows)?;
@@ -2318,12 +2909,8 @@ impl GpuTape {
 		let metrics = self.metrics.download_float(3, self.precision)?;
 		Ok((metrics[0], metrics[1] != 0.0))
 	}
-	fn gradient(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool) -> Result<()> {
-		self.launch_epoch(rate, loss, tolerance, config, direct, EpochPhase::Gradient)
-	}
-	fn update(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool) -> Result<()> {
-		self.launch_epoch(rate, loss, tolerance, config, direct, EpochPhase::Optimizer)
-	}
+	fn gradient(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool) -> Result<()> { self.launch_epoch(rate, loss, tolerance, config, direct, EpochPhase::Gradient) }
+	fn update(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool) -> Result<()> { self.launch_epoch(rate, loss, tolerance, config, direct, EpochPhase::Optimizer) }
 	fn advance(&mut self) -> Result<()> {
 		self.step = self.step.checked_add(1).ok_or_else(|| RecipeError::new("optimizer epoch overflows"))?;
 		Ok(())
@@ -2345,9 +2932,7 @@ impl GpuTape {
 		require(node < self.values.len(), "RAT proposal node is absent")?;
 		self.values[node].download_float(self.capacity * width, self.precision)
 	}
-	fn weights(&self) -> Result<Vec<f64>> {
-		self.weights.download_float(self.parameters as usize, self.precision)
-	}
+	fn weights(&self) -> Result<Vec<f64>> { self.weights.download_float(self.parameters as usize, self.precision) }
 	fn capture(&self, graph: &mut Graph) -> Result<()> {
 		graph.parameters = self.weights()?;
 		graph.state.moments = self.moments.download_float(self.parameters as usize, self.precision)?;
@@ -2355,28 +2940,18 @@ impl GpuTape {
 		graph.state.epoch = self.step as usize;
 		Ok(())
 	}
-	fn gradient_values(&self) -> Result<Vec<f64>> {
-		self.gradient.download_float(self.parameters as usize, self.precision)
-	}
-	fn write_gradient(&self, values: &[f64]) -> Result<()> {
-		self.gradient.write_float(0, values, self.precision)
-	}
-	fn optimizer_state(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
-		Ok((self.weights()?, self.moments.download_float(self.parameters as usize, self.precision)?, self.variances.download_float(self.parameters as usize, self.precision)?))
-	}
+	fn gradient_values(&self) -> Result<Vec<f64>> { self.gradient.download_float(self.parameters as usize, self.precision) }
+	fn write_gradient(&self, values: &[f64]) -> Result<()> { self.gradient.write_float(0, values, self.precision) }
+	fn optimizer_state(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> { Ok((self.weights()?, self.moments.download_float(self.parameters as usize, self.precision)?, self.variances.download_float(self.parameters as usize, self.precision)?)) }
 	fn write_tiles(&mut self, values: &[Tile]) -> Result<()> {
 		require(values.len() == self.nodes as usize, "GPU tile count does not match graph nodes")?;
 		self.tile = values.iter().fold(Tile { m: 1, n: 1, k: 1 }, |prior, tile| Tile { m: prior.m.max(tile.m), n: prior.n.max(tile.n), k: prior.k.max(tile.k) });
 		self.tiles.write(0, values)
 	}
-	fn fill_tile(&mut self, tile: Tile) -> Result<()> {
-		self.write_tiles(&std::iter::repeat_n(tile, self.nodes as usize).collect::<Vec<_>>())
-	}
-	fn write_weights(&self, values: &[f64]) -> Result<()> {
-		self.weights.write_float(0, values, self.precision)
-	}
+	fn fill_tile(&mut self, tile: Tile) -> Result<()> { self.write_tiles(&std::iter::repeat_n(tile, self.nodes as usize).collect::<Vec<_>>()) }
+	fn write_weights(&self, values: &[f64]) -> Result<()> { self.weights.write_float(0, values, self.precision) }
 }
-fn tape_bytes(graph: &Graph, rows: usize, targets: bool, precision: FloatFormat) -> Result<usize> {
+fn tape_bytes(graph: &Graph, rows: usize, targets: bool, precision: Compute) -> Result<usize> {
 	let element = precision.bytes();
 	let mut bytes = 0_usize;
 	let mut add = |value| -> Result<()> {
@@ -2402,7 +2977,7 @@ fn tape_bytes(graph: &Graph, rows: usize, targets: bool, precision: FloatFormat)
 	add(7 * element)?;
 	Ok(bytes)
 }
-fn tape_row_limit(graph: &Graph, memory: u64, rows: usize, targets: bool, precision: FloatFormat) -> Result<usize> {
+fn tape_row_limit(graph: &Graph, memory: u64, rows: usize, targets: bool, precision: Compute) -> Result<usize> {
 	let memory = usize::try_from(memory).unwrap_or(usize::MAX);
 	let (mut low, mut high) = (0, rows);
 	while low < high {
@@ -2415,7 +2990,11 @@ fn tape_row_limit(graph: &Graph, memory: u64, rows: usize, targets: bool, precis
 	}
 	Ok(low)
 }
-struct Placement { tape: GpuTape, rows: Vec<usize>, share: f64 }
+struct Placement {
+	tape: GpuTape,
+	rows: Vec<usize>,
+	share: f64,
+}
 struct DeviceTape {
 	shards: Vec<Placement>,
 	targets: Vec<f64>,
@@ -2431,7 +3010,7 @@ struct DeviceTape {
 	step: u32,
 }
 impl DeviceTape {
-	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpus: &[&'static Gpu], precision: FloatFormat) -> Result<Self> {
+	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpus: &[&'static Gpu], precision: Compute) -> Result<Self> {
 		require(!gpus.is_empty(), "execution requires a GPU")?;
 		let input = graph.input.elements();
 		require(input != 0 && !samples.is_empty() && samples.len() % input == 0, "model input batch is invalid")?;
@@ -2495,9 +3074,7 @@ impl DeviceTape {
 			workers.into_iter().map(|worker| worker.join().map_err(|_| RecipeError::new("GPU dispatch panicked"))?).collect::<Result<Vec<_>>>()
 		})
 	}
-	fn forward(&mut self) -> Result<()> {
-		self.map(GpuTape::forward).map(|_| ())
-	}
+	fn forward(&mut self) -> Result<()> { self.map(GpuTape::forward).map(|_| ()) }
 	fn collect(&self, width: usize, values: impl Fn(&GpuTape) -> Result<Vec<f64>>) -> Result<Vec<f64>> {
 		if self.replicated {
 			return values(&self.shards[0].tape);
@@ -2511,9 +3088,7 @@ impl DeviceTape {
 		}
 		Ok(result)
 	}
-	fn predictions(&self) -> Result<Vec<f64>> {
-		self.collect(self.output, GpuTape::predictions)
-	}
+	fn predictions(&self) -> Result<Vec<f64>> { self.collect(self.output, GpuTape::predictions) }
 	fn advance(&mut self) -> Result<()> {
 		self.map(|tape| tape.advance())?;
 		self.step = self.shards[0].tape.step;
@@ -2576,9 +3151,7 @@ impl DeviceTape {
 		}
 		Ok(())
 	}
-	fn node_values(&self, node: usize, width: usize) -> Result<Vec<f64>> {
-		self.collect(width, |tape| tape.node_values(node, width))
-	}
+	fn node_values(&self, node: usize, width: usize) -> Result<Vec<f64>> { self.collect(width, |tape| tape.node_values(node, width)) }
 	fn placement(&self, row: usize) -> Result<usize> {
 		require(row < self.capacity, "GPU row is out of range")?;
 		Ok(row % self.shards.len())
@@ -2591,9 +3164,7 @@ impl DeviceTape {
 		let p = self.placement(row)?;
 		self.shards[p].tape.fill_tile(tile)
 	}
-	fn weights(&self) -> Result<Vec<f64>> {
-		self.shards[0].tape.weights()
-	}
+	fn weights(&self) -> Result<Vec<f64>> { self.shards[0].tape.weights() }
 	fn restore_best(&mut self) -> Result<()> {
 		for shard in &self.shards {
 			shard.tape.write_weights(&self.best)?
@@ -2611,9 +3182,7 @@ impl DeviceTape {
 		graph.state.best_loss = self.best_loss.to_vec();
 		Ok(())
 	}
-	fn tile(&self) -> Tile {
-		self.shards[0].tape.tile
-	}
+	fn tile(&self) -> Tile { self.shards[0].tape.tile }
 }
 fn checkpoint(path: &str, schema: &str, stored: &mut bundle::StoredGraph, tape: &DeviceTape, best: bool) -> Result<()> {
 	if let Ok((_, saved)) = bundle::load(path) {
@@ -2628,9 +3197,7 @@ fn node_descriptor(node: &Node, program_base: usize) -> Result<[i32; 11]> {
 	let program_offset = if node.program_count == 0 { 0 } else { checked_add(program_base, node.program_offset, "scalar program offset")? };
 	Ok([node.op as i32, node.source, node.second, narrow(node.input.channels, "input channels")?, narrow(node.input.length, "input length")?, narrow(node.output.channels, "output channels")?, narrow(node.output.length, "output length")?, narrow(node.offset, "weight offset")?, narrow(node.parameters, "parameter count")?, narrow(program_offset, "program offset")?, narrow(node.program_count, "scalar instruction count")?])
 }
-fn graph_rows_buffer(shape: Shape, rows: usize, element: usize) -> Result<usize> {
-	checked_mul(checked_mul(rows, shape.elements(), "node elements")?, element, "node bytes")
-}
+fn graph_rows_buffer(shape: Shape, rows: usize, element: usize) -> Result<usize> { checked_mul(checked_mul(rows, shape.elements(), "node elements")?, element, "node bytes") }
 fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 	if node.op == Primitive::Attention && node.argument[4] == 1.0 {
 		let values = checked_mul(node.argument[3] as usize, 2 * node.argument[1] as usize * node.argument[2] as usize, "attention cache")?;
@@ -2653,41 +3220,35 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 	};
 	checked_mul(elements.max(1), element, "context bytes")
 }
-fn narrow(value: usize, role: &str) -> Result<i32> {
-	i32::try_from(value).map_err(|_| RecipeError::new(format!("{role} exceeds i32")))
+fn narrow(value: usize, role: &str) -> Result<i32> { i32::try_from(value).map_err(|_| RecipeError::new(format!("{role} exceeds i32"))) }
+struct Buffer {
+	runtime: &'static Gpu,
+	pointer: u64,
+	bytes: usize,
 }
-struct Buffer { runtime: &'static Gpu, pointer: u64, bytes: usize }
 impl Buffer {
-	fn new(runtime: &'static Gpu, bytes: usize) -> Result<Self> {
-		Ok(Self { runtime, pointer: runtime.allocate(bytes)?, bytes })
-	}
+	fn new(runtime: &'static Gpu, bytes: usize) -> Result<Self> { Ok(Self { runtime, pointer: runtime.allocate(bytes)?, bytes }) }
 	fn upload<T>(runtime: &'static Gpu, values: &[T]) -> Result<Self> {
 		let buffer = Self::new(runtime, size_of_val(values))?;
 		runtime.upload(buffer.pointer, values.as_ptr().cast(), size_of_val(values))?;
 		Ok(buffer)
 	}
-	fn upload_float(runtime: &'static Gpu, values: &[f64], precision: FloatFormat) -> Result<Self> {
-		if precision.native() == Some(FP16) { return Self::upload(runtime, &values.iter().map(|value| fp16(*value as f32)).collect::<Vec<_>>()) }
-		if precision.native() == Some(FP32) {
-			return Self::upload(runtime, &values.iter().map(|value| *value as f32).collect::<Vec<_>>());
-		}
-		Self::upload(runtime, values)
+	fn upload_float(runtime: &'static Gpu, values: &[f64], precision: Compute) -> Result<Self> {
+		let bytes = precision.bytes();
+		let encoded = values.iter().flat_map(|value| precision.pack(*value).to_le_bytes().into_iter().take(bytes)).collect::<Vec<_>>();
+		Self::upload(runtime, &encoded)
 	}
 	fn write<T>(&self, offset: usize, values: &[T]) -> Result<()> {
 		let start = checked_mul(offset, size_of::<T>(), "GPU write offset")?;
 		require(checked_add(start, size_of_val(values), "GPU write")? <= self.bytes, "GPU write exceeds buffer")?;
 		self.runtime.upload(self.pointer + start as u64, values.as_ptr().cast(), size_of_val(values))
 	}
-	fn write_float(&self, offset: usize, values: &[f64], precision: FloatFormat) -> Result<()> {
-		if precision.native() == Some(FP16) { return self.write(offset, &values.iter().map(|value| fp16(*value as f32)).collect::<Vec<_>>()) }
-		if precision.native() == Some(FP32) {
-			return self.write(offset, &values.iter().map(|value| *value as f32).collect::<Vec<_>>());
-		}
-		self.write(offset, values)
+	fn write_float(&self, offset: usize, values: &[f64], precision: Compute) -> Result<()> {
+		let bytes = precision.bytes();
+		let encoded = values.iter().flat_map(|value| precision.pack(*value).to_le_bytes().into_iter().take(bytes)).collect::<Vec<_>>();
+		self.write(checked_mul(offset, bytes, "GPU float write offset")?, &encoded)
 	}
-	fn download<T: Copy + Default>(&self, count: usize) -> Result<Vec<T>> {
-		self.download_range(0, count)
-	}
+	fn download<T: Copy + Default>(&self, count: usize) -> Result<Vec<T>> { self.download_range(0, count) }
 	fn download_range<T: Copy + Default>(&self, offset: usize, count: usize) -> Result<Vec<T>> {
 		let start = checked_mul(offset, size_of::<T>(), "GPU read offset")?;
 		let mut values = std::iter::repeat_n(T::default(), count).collect::<Vec<_>>();
@@ -2696,18 +3257,22 @@ impl Buffer {
 		self.runtime.download(values.as_mut_ptr().cast(), self.pointer + start as u64, size_of_val(&*values))?;
 		Ok(values)
 	}
-	fn download_float(&self, count: usize, precision: FloatFormat) -> Result<Vec<f64>> {
-		if precision.native() == Some(FP16) { return Ok(self.download::<u16>(count)?.into_iter().map(|value| f64::from(unfp16(value))).collect()) }
-		if precision.native() == Some(FP32) {
-			return Ok(self.download::<f32>(count)?.into_iter().map(f64::from).collect());
-		}
-		self.download(count)
+	fn download_float(&self, count: usize, precision: Compute) -> Result<Vec<f64>> {
+		let bytes = precision.bytes();
+		self.download::<u8>(checked_mul(count, bytes, "GPU float download")?).map(|encoded| {
+			encoded
+				.chunks_exact(bytes)
+				.map(|chunk| {
+					let mut bits = [0u8; 8];
+					bits[..bytes].copy_from_slice(chunk);
+					precision.unpack(u64::from_le_bytes(bits))
+				})
+				.collect()
+		})
 	}
 }
 impl Drop for Buffer {
-	fn drop(&mut self) {
-		self.runtime.free(self.pointer);
-	}
+	fn drop(&mut self) { self.runtime.free(self.pointer); }
 }
 #[derive(Clone, Copy)]
 struct Kernel {
@@ -2739,10 +3304,11 @@ impl Kernel {
 		}
 	}
 }
-const FORWARD_ARGS: &[u8] = b"88888844444488";
-const EPOCH_ARGS: &[u8] = b"8888888888888888444488888888844444488";
-const EPOCH_F32_ARGS: &[u8] = b"8888888888888888444444444444444444488";
-const EPOCH_F16_ARGS: &[u8] = b"8888888888888888444422222222244444488";
+const FORWARD_ARGS: &[u8] = b"8888884444448844";
+const EPOCH_ARGS: &[u8] = b"888888888888888844448888888884444448844";
+const EPOCH_F32_ARGS: &[u8] = b"888888888888888844444444444444444448844";
+const EPOCH_F16_ARGS: &[u8] = b"888888888888888844442222222224444448844";
+const EPOCH_F8_ARGS: &[u8] = b"888888888888888844441111111114444448844";
 #[cfg(nvidia)]
 struct Cuda {
 	context: Ptr,
@@ -2803,7 +3369,7 @@ struct Gpu {
 	name: String,
 	backend: Backend,
 	driver: Driver,
-	kernels: [Option<(Dispatch, Dispatch)>; 3],
+	kernels: [Option<(Dispatch, Dispatch)>; 10],
 	memory: u64,
 	clock: u64,
 	shared_limit: u32,
@@ -2860,21 +3426,13 @@ impl Library {
 	}
 }
 #[cfg(any(amd, nvidia))]
-fn driver_status(backend: Backend, status: i32, action: &str) -> Result<()> {
-	(status == 0).then_some(()).ok_or_else(|| RecipeError::new(format!("{backend:?} {action} failed: {status}")))
-}
+fn driver_status(backend: Backend, status: i32, action: &str) -> Result<()> { (status == 0).then_some(()).ok_or_else(|| RecipeError::new(format!("{backend:?} {action} failed: {status}"))) }
 unsafe fn cpu_argument<T: Copy>(arguments: &[Ptr], index: usize) -> T { unsafe { *arguments[index].cast::<T>() } }
-unsafe fn cpu_forward_dispatch<T: CpuFloat>(arguments: &[Ptr]) {
-	unsafe { T::forward(cpu_argument::<u64>(arguments, 0) as *const T, cpu_argument::<u64>(arguments, 1) as *const T, cpu_argument::<u64>(arguments, 2) as *const *mut T, cpu_argument::<u64>(arguments, 3) as *const *mut T, cpu_argument::<u64>(arguments, 4) as *const i32, cpu_argument::<u64>(arguments, 5) as *const T, cpu_argument(arguments, 6), cpu_argument(arguments, 7), cpu_argument::<u64>(arguments, 12) as *mut u64, cpu_argument::<u64>(arguments, 13) as *const Tile) }
-}
-unsafe fn cpu_epoch_dispatch<T: CpuFloat>(a: &[Ptr]) {
-	unsafe { T::epoch(cpu_argument::<u64>(a, 0) as *const T, cpu_argument::<u64>(a, 1) as *mut T, cpu_argument::<u64>(a, 2) as *const T, cpu_argument::<u64>(a, 3) as *mut T, cpu_argument::<u64>(a, 4) as *const u8, cpu_argument::<u64>(a, 5) as *mut T, cpu_argument::<u64>(a, 6) as *const *mut T, cpu_argument::<u64>(a, 7) as *const *mut T, cpu_argument::<u64>(a, 8) as *const *mut T, cpu_argument::<u64>(a, 9) as *const i32, cpu_argument::<u64>(a, 10) as *const T, cpu_argument::<u64>(a, 11) as *mut T, cpu_argument::<u64>(a, 12) as *mut T, cpu_argument::<u64>(a, 13) as *mut T, cpu_argument::<u64>(a, 14) as *mut T, cpu_argument::<u64>(a, 15) as *mut T, cpu_argument(a, 16), cpu_argument(a, 17), cpu_argument(a, 18), cpu_argument(a, 19), cpu_argument(a, 20), cpu_argument(a, 21), cpu_argument(a, 22), cpu_argument(a, 23), cpu_argument(a, 24), cpu_argument(a, 25), cpu_argument(a, 26), cpu_argument(a, 27), cpu_argument(a, 28), cpu_argument(a, 29), cpu_argument(a, 30), cpu_argument(a, 31), cpu_argument(a, 32), cpu_argument(a, 33), cpu_argument(a, 34), cpu_argument::<u64>(a, 35) as *mut u64, cpu_argument::<u64>(a, 36) as *const Tile) }
-}
+unsafe fn cpu_forward_dispatch<T: CpuFloat>(arguments: &[Ptr]) { unsafe { T::forward(cpu_argument::<u64>(arguments, 0) as *const T, cpu_argument::<u64>(arguments, 1) as *const T, cpu_argument::<u64>(arguments, 2) as *const *mut T, cpu_argument::<u64>(arguments, 3) as *const *mut T, cpu_argument::<u64>(arguments, 4) as *const i32, cpu_argument::<u64>(arguments, 5) as *const T, cpu_argument(arguments, 6), cpu_argument(arguments, 7), cpu_argument::<u64>(arguments, 12) as *mut u64, cpu_argument::<u64>(arguments, 13) as *const Tile, cpu_argument(arguments, 14), cpu_argument(arguments, 15)) } }
+unsafe fn cpu_epoch_dispatch<T: CpuFloat>(a: &[Ptr]) { unsafe { T::epoch(cpu_argument::<u64>(a, 0) as *const T, cpu_argument::<u64>(a, 1) as *mut T, cpu_argument::<u64>(a, 2) as *const T, cpu_argument::<u64>(a, 3) as *mut T, cpu_argument::<u64>(a, 4) as *const u8, cpu_argument::<u64>(a, 5) as *mut T, cpu_argument::<u64>(a, 6) as *const *mut T, cpu_argument::<u64>(a, 7) as *const *mut T, cpu_argument::<u64>(a, 8) as *const *mut T, cpu_argument::<u64>(a, 9) as *const i32, cpu_argument::<u64>(a, 10) as *const T, cpu_argument::<u64>(a, 11) as *mut T, cpu_argument::<u64>(a, 12) as *mut T, cpu_argument::<u64>(a, 13) as *mut T, cpu_argument::<u64>(a, 14) as *mut T, cpu_argument::<u64>(a, 15) as *mut T, cpu_argument(a, 16), cpu_argument(a, 17), cpu_argument(a, 18), cpu_argument(a, 19), cpu_argument(a, 20), cpu_argument(a, 21), cpu_argument(a, 22), cpu_argument(a, 23), cpu_argument(a, 24), cpu_argument(a, 25), cpu_argument(a, 26), cpu_argument(a, 27), cpu_argument(a, 28), cpu_argument(a, 29), cpu_argument(a, 30), cpu_argument(a, 31), cpu_argument(a, 32), cpu_argument(a, 33), cpu_argument(a, 34), cpu_argument::<u64>(a, 35) as *mut u64, cpu_argument::<u64>(a, 36) as *const Tile, cpu_argument(a, 37), cpu_argument(a, 38)) } }
 impl Gpu {
 	#[cfg(any(amd, nvidia))]
-	fn status(&self, status: i32, action: &str) -> Result<()> {
-		driver_status(self.backend, status, action)
-	}
+	fn status(&self, status: i32, action: &str) -> Result<()> { driver_status(self.backend, status, action) }
 	fn activate(&self) -> Result<()> {
 		match &self.driver {
 			Driver::Cpu => Ok(()),
@@ -2885,10 +3443,8 @@ impl Gpu {
 			Driver::Remote(_) => Ok(()),
 		}
 	}
-	fn kernels(&self, precision: FloatFormat) -> Result<(Dispatch, Dispatch)> {
-		precision.kernel().and_then(|index| self.kernels[index]).ok_or_else(|| RecipeError::new(format!("{}({}) training is unavailable on {}", precision.family, precision.bits, self.name)))
-	}
-	fn shared_values(&self, precision: FloatFormat) -> Result<u32> {
+	fn kernels(&self, precision: Compute) -> Result<(Dispatch, Dispatch)> { precision.kernel().and_then(|index| self.kernels.get(index).copied().flatten()).ok_or_else(|| RecipeError::new(format!("{} training is unavailable on {}", precision.label(), self.name))) }
+	fn shared_values(&self, precision: Compute) -> Result<u32> {
 		let (forward, epoch) = self.kernels(precision)?;
 		let fixed = forward.kernel.shared.max(epoch.kernel.shared);
 		let shared = self.shared_limit.checked_sub(fixed).ok_or_else(|| RecipeError::new("GPU kernel exceeds shared memory"))?;
@@ -2896,21 +3452,21 @@ impl Gpu {
 		require(shared_values != 0, "GPU has no shared memory for contraction")?;
 		Ok(shared_values)
 	}
-	fn tile_limit(&self, graph: &Graph, precision: FloatFormat) -> Result<Tile> {
+	fn tile_limit(&self, graph: &Graph, precision: Compute) -> Result<Tile> {
 		let shared_values = self.shared_values(precision)?;
 		let m = graph.nodes.iter().map(|node| node.output.length).max().unwrap_or(graph.output.length).max(1);
 		let n = graph.nodes.iter().map(|node| node.output.channels).max().unwrap_or(graph.output.channels).max(1);
 		let k = graph.nodes.iter().map(|node| node.input.elements()).max().unwrap_or(graph.input.elements()).max(1);
 		Ok(Tile { m: narrow(m, "contraction M tile limit")? as u32, n: narrow(n, "contraction N tile limit")? as u32, k: (narrow(k, "contraction K tile limit")? as u32).min(shared_values) })
 	}
-	fn proposal_limit(&self, values: [f64; 3], precision: FloatFormat) -> Result<Tile> {
+	fn proposal_limit(&self, values: [f64; 3], precision: Compute) -> Result<Tile> {
 		let dimension = |value: f64, name| -> Result<u32> {
 			require(value.is_finite() && value >= 1.0 && value.fract() == 0.0, format!("RAT {name} must be a positive integer"))?;
 			Ok(narrow(value as usize, name)? as u32)
 		};
 		Ok(Tile { m: dimension(values[0], "M")?, n: dimension(values[1], "N")?, k: dimension(values[2], "K")?.min(self.shared_values(precision)?) })
 	}
-	fn prior_tile(&self, graph: &Graph, precision: FloatFormat) -> Result<Tile> {
+	fn prior_tile(&self, graph: &Graph, precision: Compute) -> Result<Tile> {
 		let limit = self.tile_limit(graph, precision)?;
 		let (forward, epoch) = self.kernels(precision)?;
 		let block = forward.geometry.block.min(epoch.geometry.block);
@@ -2921,7 +3477,14 @@ impl Gpu {
 		self.activate()?;
 		unsafe {
 			match &self.driver {
-				Driver::Cpu => { let size = checked_add(bytes.max(1), size_of::<usize>(), "CPU allocation")?; let layout = std::alloc::Layout::from_size_align(size, 8).map_err(|error| RecipeError::new(format!("CPU allocation layout is invalid: {error}")))?; let base = std::alloc::alloc_zeroed(layout); require(!base.is_null(), "CPU allocation failed")?; base.cast::<usize>().write(size); Ok(base.add(size_of::<usize>()) as u64) }
+				Driver::Cpu => {
+					let size = checked_add(bytes.max(1), size_of::<usize>(), "CPU allocation")?;
+					let layout = std::alloc::Layout::from_size_align(size, 8).map_err(|error| RecipeError::new(format!("CPU allocation layout is invalid: {error}")))?;
+					let base = std::alloc::alloc_zeroed(layout);
+					require(!base.is_null(), "CPU allocation failed")?;
+					base.cast::<usize>().write(size);
+					Ok(base.add(size_of::<usize>()) as u64)
+				}
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => {
 					let mut pointer = 0;
@@ -2943,7 +3506,11 @@ impl Gpu {
 	fn free(&self, pointer: u64) {
 		unsafe {
 			match &self.driver {
-				Driver::Cpu => { let base = (pointer as *mut u8).sub(size_of::<usize>()); let size = base.cast::<usize>().read(); std::alloc::dealloc(base, std::alloc::Layout::from_size_align_unchecked(size, 8)) },
+				Driver::Cpu => {
+					let base = (pointer as *mut u8).sub(size_of::<usize>());
+					let size = base.cast::<usize>().read();
+					std::alloc::dealloc(base, std::alloc::Layout::from_size_align_unchecked(size, 8))
+				}
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => {
 					(driver.set)(driver.context);
@@ -2962,7 +3529,10 @@ impl Gpu {
 		self.activate()?;
 		unsafe {
 			match &self.driver {
-				Driver::Cpu => { ptr::copy_nonoverlapping(src.cast::<u8>(), dst as *mut u8, bytes); Ok(()) }
+				Driver::Cpu => {
+					ptr::copy_nonoverlapping(src.cast::<u8>(), dst as *mut u8, bytes);
+					Ok(())
+				}
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => self.status((driver.upload)(dst, src, bytes), "upload"),
 				#[cfg(amd)]
@@ -2976,7 +3546,10 @@ impl Gpu {
 		self.activate()?;
 		unsafe {
 			match &self.driver {
-				Driver::Cpu => { ptr::copy_nonoverlapping(src as *const u8, dst.cast::<u8>(), bytes); Ok(()) }
+				Driver::Cpu => {
+					ptr::copy_nonoverlapping(src as *const u8, dst.cast::<u8>(), bytes);
+					Ok(())
+				}
 				#[cfg(nvidia)]
 				Driver::Cuda(cuda) => self.status((cuda.download)(dst, src, bytes), "download"),
 				#[cfg(amd)]
@@ -3011,7 +3584,32 @@ impl Gpu {
 		let _guard = self.dispatch.lock().map_err(|_| RecipeError::new("GPU dispatch lock is poisoned"))?;
 		unsafe {
 			match &self.driver {
-				Driver::Cpu => { match kernel.object { 0 => cpu_forward_dispatch::<f64>(arguments), 1 => cpu_epoch_dispatch::<f64>(arguments), 2 => cpu_forward_dispatch::<f32>(arguments), 3 => cpu_epoch_dispatch::<f32>(arguments), _ => unreachable!() } Ok(()) },
+				Driver::Cpu => {
+					match kernel.object {
+						0 => cpu_forward_dispatch::<f64>(arguments),
+						1 => cpu_epoch_dispatch::<f64>(arguments),
+						2 => cpu_forward_dispatch::<f32>(arguments),
+						3 => cpu_epoch_dispatch::<f32>(arguments),
+						4 => cpu_forward_dispatch::<CpuF16>(arguments),
+						5 => cpu_epoch_dispatch::<CpuF16>(arguments),
+						6 => cpu_forward_dispatch::<CpuF8>(arguments),
+						7 => cpu_epoch_dispatch::<CpuF8>(arguments),
+						8 => cpu_forward_dispatch::<CpuBf16>(arguments),
+						9 => cpu_epoch_dispatch::<CpuBf16>(arguments),
+						10 => cpu_forward_dispatch::<CpuTf32>(arguments),
+						11 => cpu_epoch_dispatch::<CpuTf32>(arguments),
+						12 => cpu_forward_dispatch::<CpuInt8>(arguments),
+						13 => cpu_epoch_dispatch::<CpuInt8>(arguments),
+						14 => cpu_forward_dispatch::<CpuInt4>(arguments),
+						15 => cpu_epoch_dispatch::<CpuInt4>(arguments),
+						16 => cpu_forward_dispatch::<CpuInt1>(arguments),
+						17 => cpu_epoch_dispatch::<CpuInt1>(arguments),
+						18 => cpu_forward_dispatch::<CpuF>(arguments),
+						19 => cpu_epoch_dispatch::<CpuF>(arguments),
+						_ => unreachable!(),
+					}
+					Ok(())
+				}
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => {
 					let stream = ptr::null_mut();
@@ -3048,12 +3646,20 @@ impl Gpu {
 static DEVICES: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
 fn cpu_device() -> Gpu {
 	let dispatch = |object, element, layout| Dispatch { kernel: Kernel::remote(object, 0, element, layout), geometry: Geometry { groups: 1, block: 1 } };
-	Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, driver: Driver::Cpu, kernels: [Some((dispatch(0, 8, FORWARD_ARGS), dispatch(1, 8, EPOCH_ARGS))), Some((dispatch(2, 4, FORWARD_ARGS), dispatch(3, 4, EPOCH_F32_ARGS))), None], memory: u64::MAX, clock: 1, shared_limit: u32::MAX, dispatch: Mutex::new(()) }
+	let mut object = 0;
+	let mut pair = |element, layout| {
+		let value = Some((dispatch(object, element, FORWARD_ARGS), dispatch(object + 1, element, layout)));
+		object += 2;
+		value
+	};
+	Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, driver: Driver::Cpu, kernels: [pair(8, EPOCH_ARGS), pair(4, EPOCH_F32_ARGS), pair(2, EPOCH_F16_ARGS), pair(1, EPOCH_F8_ARGS), pair(2, EPOCH_F16_ARGS), pair(4, EPOCH_F32_ARGS), pair(1, EPOCH_F8_ARGS), pair(1, EPOCH_F8_ARGS), pair(1, EPOCH_F8_ARGS), pair(8, EPOCH_ARGS)], memory: u64::MAX, clock: 1, shared_limit: u32::MAX, dispatch: Mutex::new(()) }
 }
 fn devices() -> Result<&'static [Gpu]> {
 	DEVICES
 		.get_or_init(|| {
-			if std::env::var_os("RECIPE_FORCE_CPU").is_some() { return Ok(vec![cpu_device()]) }
+			if std::env::var_os("RECIPE_FORCE_CPU").is_some() {
+				return Ok(vec![cpu_device()]);
+			}
 			let mut found = Vec::new();
 			let mut errors = Vec::new();
 			for load in [load_amd as fn() -> Result<Vec<Gpu>>, load_nvidia] {
@@ -3062,7 +3668,12 @@ fn devices() -> Result<&'static [Gpu]> {
 					Err(error) => errors.push(error.to_string()),
 				}
 			}
-			if found.is_empty() { if cfg!(any(amd, nvidia)) { return Err(RecipeError::new(errors.join("; "))) } found.push(cpu_device()) }
+			if found.is_empty() {
+				if cfg!(any(amd, nvidia)) {
+					return Err(RecipeError::new(errors.join("; ")));
+				}
+				found.push(cpu_device())
+			}
 			Ok(found)
 		})
 		.as_ref()
@@ -3080,8 +3691,12 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 fn worker_list() -> Result<()> {
 	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	for gpu in devices()? {
-		let (wide, f32) = (gpu.kernels[0].unwrap(), gpu.kernels[1]);
-		println!("{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}", host.trim(), gpu.name, gpu.backend, wide.0.geometry.groups, wide.0.geometry.block, wide.1.geometry.groups, wide.1.geometry.block, gpu.shared_limit, wide.0.kernel.shared, wide.1.kernel.shared, gpu.memory, gpu.clock, u8::from(f32.is_some()), f32.map_or(0, |value| value.0.geometry.groups), f32.map_or(0, |value| value.0.geometry.block), f32.map_or(0, |value| value.1.geometry.groups), f32.map_or(0, |value| value.1.geometry.block), f32.map_or(0, |value| value.0.kernel.shared), f32.map_or(0, |value| value.1.kernel.shared));
+		let mut fields = vec![host.trim().to_owned(), gpu.name.clone(), format!("{:?}", gpu.backend), gpu.shared_limit.to_string(), gpu.memory.to_string(), gpu.clock.to_string()];
+		for pair in gpu.kernels {
+			let values = pair.map_or([0; 7], |(forward, epoch)| [1, forward.geometry.groups, forward.geometry.block, epoch.geometry.groups, epoch.geometry.block, forward.kernel.shared, epoch.kernel.shared]);
+			fields.extend(values.map(|value| value.to_string()));
+		}
+		println!("{}", fields.join("|"));
 	}
 	Ok(())
 }
@@ -3190,34 +3805,30 @@ fn ssh_hosts() -> Result<Vec<String>> {
 	Ok(hosts)
 }
 #[derive(Clone)]
+struct RemoteKernel {
+	forward: Geometry,
+	epoch: Geometry,
+	forward_shared: u32,
+	epoch_shared: u32,
+}
+#[derive(Clone)]
 struct RemoteNode {
 	info: DeviceInfo,
 	transport: String,
 	device: String,
 	backend: Backend,
-	forward: Geometry,
-	epoch: Geometry,
 	memory: u64,
 	clock: u64,
 	shared_limit: u32,
-	forward_shared: u32,
-	epoch_shared: u32,
-	forward_f32: Option<Geometry>,
-	epoch_f32: Option<Geometry>,
-	forward_f32_shared: u32,
-	epoch_f32_shared: u32,
+	kernels: [Option<RemoteKernel>; 10],
 }
 struct Worker {
 	child: Child,
 	input: ChildStdin,
 	output: ChildStdout,
 }
-fn remote_io<T>(action: &str, result: io::Result<T>) -> Result<T> {
-	result.map_err(|error| RecipeError::new(format!("cannot {action} remote Recipe worker: {error}")))
-}
-fn put_u64(output: &mut impl Write, value: u64) -> Result<()> {
-	remote_io("write to", output.write_all(&value.to_le_bytes()))
-}
+fn remote_io<T>(action: &str, result: io::Result<T>) -> Result<T> { result.map_err(|error| RecipeError::new(format!("cannot {action} remote Recipe worker: {error}"))) }
+fn put_u64(output: &mut impl Write, value: u64) -> Result<()> { remote_io("write to", output.write_all(&value.to_le_bytes())) }
 fn get_u64(input: &mut impl Read) -> Result<u64> {
 	let mut bytes = u64::default().to_le_bytes();
 	remote_io("read from", input.read_exact(&mut bytes))?;
@@ -3245,9 +3856,7 @@ fn read_response(worker: &mut Worker) -> Result<Vec<u8>> {
 	Err(RecipeError::new(message))
 }
 impl Remote {
-	fn worker(&self) -> Result<std::sync::MutexGuard<'_, Worker>> {
-		self.io.lock().map_err(|_| RecipeError::new("remote Recipe worker lock is poisoned"))
-	}
+	fn worker(&self) -> Result<std::sync::MutexGuard<'_, Worker>> { self.io.lock().map_err(|_| RecipeError::new("remote Recipe worker lock is poisoned")) }
 	fn allocate(&self, bytes: usize) -> Result<u64> {
 		let mut worker = self.worker()?;
 		remote_io("write to", worker.input.write_all(&[1]))?;
@@ -3324,7 +3933,7 @@ fn remote_nodes(host: &str) -> Result<Vec<RemoteNode>> {
 	text.lines()
 		.map(|line| {
 			let fields = line.split('|').collect::<Vec<_>>();
-			require(fields.len() == 19, "Recipe worker device is invalid")?;
+			require(fields.len() == 76, "Recipe worker device is invalid")?;
 			let backend = match fields[2] {
 				"Amd" => Backend::Amd,
 				"Nvidia" => Backend::Nvidia,
@@ -3332,19 +3941,20 @@ fn remote_nodes(host: &str) -> Result<Vec<RemoteNode>> {
 			};
 			let positive = |index| -> Result<u32> { Ok(narrow(natural("remote device value", fields[index])?, "remote device value")? as u32) };
 			let fixed = |index: usize| fields[index].parse::<u32>().map_err(|error| RecipeError::new(format!("invalid remote device value: {error}")));
-			let f32 = match fields[12] {
-				"0" => false,
-				"1" => true,
-				_ => return Err(RecipeError::new("remote fp32 capability is invalid")),
-			};
-			let geometry = |groups, block| -> Result<Geometry> { Ok(Geometry { groups: positive(groups)?, block: positive(block)? }) };
-			Ok(RemoteNode { info: DeviceInfo { name: format!("{}:{}", fields[0], fields[1]), host: fields[0].to_owned() }, transport: host.to_owned(), device: fields[1].to_owned(), backend, forward: Geometry { groups: positive(3)?, block: positive(4)? }, epoch: Geometry { groups: positive(5)?, block: positive(6)? }, shared_limit: positive(7)?, forward_shared: fixed(8)?, epoch_shared: fixed(9)?, memory: fields[10].parse().map_err(|error| RecipeError::new(format!("invalid remote memory: {error}")))?, clock: natural("remote timestamp frequency", fields[11])? as u64, forward_f32: if f32 { Some(geometry(13, 14)?) } else { None }, epoch_f32: if f32 { Some(geometry(15, 16)?) } else { None }, forward_f32_shared: fixed(17)?, epoch_f32_shared: fixed(18)? })
+			let mut kernels = Vec::with_capacity(10);
+			for index in 0..10 {
+				let base = 6 + index * 7;
+				kernels.push(match fields[base] {
+					"0" => None,
+					"1" => Some(RemoteKernel { forward: Geometry { groups: positive(base + 1)?, block: positive(base + 2)? }, epoch: Geometry { groups: positive(base + 3)?, block: positive(base + 4)? }, forward_shared: fixed(base + 5)?, epoch_shared: fixed(base + 6)? }),
+					_ => return Err(RecipeError::new("remote precision capability is invalid")),
+				});
+			}
+			Ok(RemoteNode { info: DeviceInfo { name: format!("{}:{}", fields[0], fields[1]), host: fields[0].to_owned() }, transport: host.to_owned(), device: fields[1].to_owned(), backend, shared_limit: positive(3)?, memory: fields[4].parse().map_err(|error| RecipeError::new(format!("invalid remote memory: {error}")))?, clock: natural("remote timestamp frequency", fields[5])? as u64, kernels: kernels.try_into().map_err(|_| RecipeError::new("remote precision capability count is invalid"))? })
 		})
 		.collect()
 }
-fn host_has_gpu(host: &str) -> Result<bool> {
-	Ok(Command::new("ssh").arg("-F").arg(ssh_config()?).args(["-o", "BatchMode=yes", "-o"]).arg(format!("ConnectTimeout={}", env!("RECIPE_SSH_CONNECT_TIMEOUT"))).arg(host).arg("test -d /sys/class/kfd/kfd/topology/nodes || command -v nvidia-smi >/dev/null").stdout(Stdio::null()).stderr(Stdio::null()).status().map_err(|error| RecipeError::new(format!("cannot probe {host}: {error}")))?.success())
-}
+fn host_has_gpu(host: &str) -> Result<bool> { Ok(Command::new("ssh").arg("-F").arg(ssh_config()?).args(["-o", "BatchMode=yes", "-o"]).arg(format!("ConnectTimeout={}", env!("RECIPE_SSH_CONNECT_TIMEOUT"))).arg(host).arg("test -d /sys/class/kfd/kfd/topology/nodes || command -v nvidia-smi >/dev/null").stdout(Stdio::null()).stderr(Stdio::null()).status().map_err(|error| RecipeError::new(format!("cannot probe {host}: {error}")))?.success()) }
 static REMOTE_NODES: OnceLock<Result<Vec<RemoteNode>>> = OnceLock::new();
 fn reachable_nodes() -> Result<&'static [RemoteNode]> {
 	REMOTE_NODES
@@ -3368,14 +3978,16 @@ fn reachable_nodes() -> Result<&'static [RemoteNode]> {
 }
 fn remote_gpu(node: &RemoteNode) -> Result<Gpu> {
 	let worker = worker_process(&node.transport, &format!("serve|{}", node.device))?;
-	let wide = (Dispatch { kernel: Kernel::remote(0, node.forward_shared, 8, FORWARD_ARGS), geometry: node.forward }, Dispatch { kernel: Kernel::remote(1, node.epoch_shared, 8, EPOCH_ARGS), geometry: node.epoch });
-	let f32 = node.forward_f32.zip(node.epoch_f32).map(|geometry| (Dispatch { kernel: Kernel::remote(2, node.forward_f32_shared, 4, FORWARD_ARGS), geometry: geometry.0 }, Dispatch { kernel: Kernel::remote(3, node.epoch_f32_shared, 4, EPOCH_F32_ARGS), geometry: geometry.1 }));
-	Ok(Gpu { name: node.info.name.clone(), backend: node.backend, driver: Driver::Remote(Remote { io: Mutex::new(worker) }), kernels: [Some(wide), f32, None], memory: node.memory, clock: node.clock, shared_limit: node.shared_limit, dispatch: Mutex::new(()) })
+	let elements = [8, 4, 2, 1, 2, 4, 1, 1, 1, 8];
+	let layouts = [EPOCH_ARGS, EPOCH_F32_ARGS, EPOCH_F16_ARGS, EPOCH_F8_ARGS, EPOCH_F16_ARGS, EPOCH_F32_ARGS, EPOCH_F8_ARGS, EPOCH_F8_ARGS, EPOCH_F8_ARGS, EPOCH_ARGS];
+	let mut kernels = [None; 10];
+	for index in 0..node.kernels.len() {
+		kernels[index] = node.kernels[index].as_ref().map(|value| (Dispatch { kernel: Kernel::remote((index * 2) as u64, value.forward_shared, elements[index], FORWARD_ARGS), geometry: value.forward }, Dispatch { kernel: Kernel::remote((index * 2 + 1) as u64, value.epoch_shared, elements[index], layouts[index]), geometry: value.epoch }));
+	}
+	Ok(Gpu { name: node.info.name.clone(), backend: node.backend, driver: Driver::Remote(Remote { io: Mutex::new(worker) }), kernels, memory: node.memory, clock: node.clock, shared_limit: node.shared_limit, dispatch: Mutex::new(()) })
 }
 static REMOTE_GPUS: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
-fn remote_gpus() -> Result<&'static [Gpu]> {
-	REMOTE_GPUS.get_or_init(|| reachable_nodes()?.iter().map(remote_gpu).collect()).as_ref().map(Vec::as_slice).map_err(Clone::clone)
-}
+fn remote_gpus() -> Result<&'static [Gpu]> { REMOTE_GPUS.get_or_init(|| reachable_nodes()?.iter().map(remote_gpu).collect()).as_ref().map(Vec::as_slice).map_err(Clone::clone) }
 fn all_gpus() -> Result<Vec<&'static Gpu>> {
 	let mut found = devices()?.iter().collect::<Vec<_>>();
 	if multi_device() {
@@ -3384,9 +3996,7 @@ fn all_gpus() -> Result<Vec<&'static Gpu>> {
 	Ok(found)
 }
 static TOPOLOGY: OnceLock<Result<Topology>> = OnceLock::new();
-fn topology() -> Result<Topology> {
-	TOPOLOGY.get_or_init(discover_topology).as_ref().cloned().map_err(Clone::clone)
-}
+fn topology() -> Result<Topology> { TOPOLOGY.get_or_init(discover_topology).as_ref().cloned().map_err(Clone::clone) }
 fn discover_topology() -> Result<Topology> {
 	let found = devices()?;
 	let latency_bytes = natural("topology latency bytes", env!("RECIPE_TOPOLOGY_LATENCY_BYTES"))?;
@@ -3482,15 +4092,11 @@ unsafe fn hsa_kernel(symbol: HsaSymbol, info: HsaSymbolInfo, executable: u64, ag
 	Ok(kernel)
 }
 #[cfg(amd)]
-fn kfd_property(text: &str, name: &str) -> Result<u32> {
-	text.lines().find_map(|line| line.split_once(' ').filter(|value| value.0 == name)).ok_or_else(|| RecipeError::new(format!("KFD property {name:?} is absent")))?.1.parse::<u32>().map_err(|error| RecipeError::new(format!("KFD property {name:?} is invalid: {error}")))
-}
+fn kfd_property(text: &str, name: &str) -> Result<u32> { text.lines().find_map(|line| line.split_once(' ').filter(|value| value.0 == name)).ok_or_else(|| RecipeError::new(format!("KFD property {name:?} is absent")))?.1.parse::<u32>().map_err(|error| RecipeError::new(format!("KFD property {name:?} is invalid: {error}"))) }
 #[cfg(amd)]
 include!(concat!(env!("OUT_DIR"), "/hsa-embed.rs"));
 #[cfg(amd)]
-fn hsa_artifact(artifacts: &'static [(&str, &[u8])], target: &str) -> Result<&'static [u8]> {
-	artifacts.iter().find_map(|entry| (entry.0 == target).then_some(entry.1)).ok_or_else(|| RecipeError::new(format!("HSA artifact for {target} is absent")))
-}
+fn hsa_artifact(artifacts: &'static [(&str, &[u8])], target: &str) -> Result<&'static [u8]> { artifacts.iter().find_map(|entry| (entry.0 == target).then_some(entry.1)).ok_or_else(|| RecipeError::new(format!("HSA artifact for {target} is absent"))) }
 fn load_amd() -> Result<Vec<Gpu>> {
 	#[cfg(not(amd))]
 	return Err(RecipeError::new("AMD support is not compiled into this build"));
@@ -3534,22 +4140,30 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 		let properties = fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read {path}: {error}")))?;
 		let gfx = kfd_property(&properties, "gfx_target_version")?;
 		let target = format!("gfx{}{}{}", gfx / 10000, gfx / 100 % 100, gfx % 100);
-		let codes = [hsa_artifact(HSA_CODE_OBJECTS, &target)?, hsa_artifact(HSA_F32_CODE_OBJECTS, &target)?, hsa_artifact(HSA_F16_CODE_OBJECTS, &target)?];
+		let codes = [hsa_artifact(HSA_CODE_OBJECTS, &target)?, hsa_artifact(HSA_F32_CODE_OBJECTS, &target)?, hsa_artifact(HSA_F16_CODE_OBJECTS, &target)?, hsa_artifact(HSA_F8_CODE_OBJECTS, &target)?, hsa_artifact(HSA_BF16_CODE_OBJECTS, &target)?, hsa_artifact(HSA_TF32_CODE_OBJECTS, &target)?, hsa_artifact(HSA_INT8_CODE_OBJECTS, &target)?, hsa_artifact(HSA_INT4_CODE_OBJECTS, &target)?, hsa_artifact(HSA_INT1_CODE_OBJECTS, &target)?, hsa_artifact(HSA_F_CODE_OBJECTS, &target)?];
 		let reader_create: unsafe extern "C" fn(*const c_void, usize, *mut u64) -> i32 = runtime.function(b"hsa_code_object_reader_create_from_memory\0")?;
 		let executable_create: unsafe extern "C" fn(i32, i32, Ptr, *mut u64) -> i32 = runtime.function(b"hsa_executable_create_alt\0")?;
 		let executable_load: unsafe extern "C" fn(u64, u64, u64, Ptr, Ptr) -> i32 = runtime.function(b"hsa_executable_load_agent_code_object\0")?;
 		let executable_freeze: unsafe extern "C" fn(u64, Ptr) -> i32 = runtime.function(b"hsa_executable_freeze\0")?;
 		let symbol: HsaSymbol = runtime.function(b"hsa_executable_get_symbol_by_name\0")?;
 		let symbol_info: HsaSymbolInfo = runtime.function(b"hsa_executable_symbol_get_info\0")?;
-		let (mut readers, mut executable) = ([0; 3], 0);
-		for (index, code) in codes.into_iter().enumerate() { check(reader_create(code.as_ptr().cast(), code.len(), &mut readers[index]), "code-object reader")? }
+		let (mut readers, mut executable) = ([0; 10], 0);
+		for (index, code) in codes.into_iter().enumerate() {
+			check(reader_create(code.as_ptr().cast(), code.len(), &mut readers[index]), "code-object reader")?
+		}
 		check(executable_create(1, 0, ptr::null_mut(), &mut executable), "executable creation")?;
-		for reader in readers { check(executable_load(executable, agent, reader, ptr::null_mut(), ptr::null_mut()), "code-object load")? }
+		for reader in readers {
+			check(executable_load(executable, agent, reader, ptr::null_mut(), ptr::null_mut()), "code-object load")?
+		}
 		check(executable_freeze(executable, ptr::null_mut()), "executable freeze")?;
 		let lds = kfd_property(&properties, "lds_size_in_kb")?.checked_mul(1024).ok_or_else(|| RecipeError::new("AMD LDS size overflows"))?;
-		let specifications: [(&[u8], u8, &[u8]); 6] = [(b"forward_graph.kd\0", 8, FORWARD_ARGS), (b"tape_epoch_graph.kd\0", 8, EPOCH_ARGS), (b"forward_graph_f32.kd\0", 4, FORWARD_ARGS), (b"tape_epoch_graph_f32.kd\0", 4, EPOCH_F32_ARGS), (b"forward_graph_f16.kd\0", 2, FORWARD_ARGS), (b"tape_epoch_graph_f16.kd\0", 2, EPOCH_F16_ARGS)];
+		let specifications: [(&[u8], u8, &[u8]); 20] = [(b"forward_graph.kd\0", 8, FORWARD_ARGS), (b"tape_epoch_graph.kd\0", 8, EPOCH_ARGS), (b"forward_graph_f32.kd\0", 4, FORWARD_ARGS), (b"tape_epoch_graph_f32.kd\0", 4, EPOCH_F32_ARGS), (b"forward_graph_f16.kd\0", 2, FORWARD_ARGS), (b"tape_epoch_graph_f16.kd\0", 2, EPOCH_F16_ARGS), (b"forward_graph_f8.kd\0", 1, FORWARD_ARGS), (b"tape_epoch_graph_f8.kd\0", 1, EPOCH_F8_ARGS), (b"forward_graph_bf16.kd\0", 2, FORWARD_ARGS), (b"tape_epoch_graph_bf16.kd\0", 2, EPOCH_F16_ARGS), (b"forward_graph_tf32.kd\0", 4, FORWARD_ARGS), (b"tape_epoch_graph_tf32.kd\0", 4, EPOCH_F32_ARGS), (b"forward_graph_int8.kd\0", 1, FORWARD_ARGS), (b"tape_epoch_graph_int8.kd\0", 1, EPOCH_F8_ARGS), (b"forward_graph_int4.kd\0", 1, FORWARD_ARGS), (b"tape_epoch_graph_int4.kd\0", 1, EPOCH_F8_ARGS), (b"forward_graph_int1.kd\0", 1, FORWARD_ARGS), (b"tape_epoch_graph_int1.kd\0", 1, EPOCH_F8_ARGS), (b"forward_graph_f.kd\0", 8, FORWARD_ARGS), (b"tape_epoch_graph_f.kd\0", 8, EPOCH_ARGS)];
 		let mut dispatches = Vec::new();
-		for (name, element, layout) in specifications { let kernel = hsa_kernel(symbol, symbol_info, executable, agent, name, element, layout)?; let geometry = amd(cus, wave, workgroup, lds, Resources { shared: kernel.shared, max_block: workgroup, element })?; dispatches.push(Dispatch { kernel, geometry }) }
+		for (name, element, layout) in specifications {
+			let kernel = hsa_kernel(symbol, symbol_info, executable, agent, name, element, layout)?;
+			let geometry = amd(cus, wave, workgroup, lds, Resources { shared: kernel.shared, max_block: workgroup, element })?;
+			dispatches.push(Dispatch { kernel, geometry })
+		}
 		let queue_create: unsafe extern "C" fn(u64, u32, u32, Ptr, Ptr, u32, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_queue_create\0")?;
 		let signal_create: unsafe extern "C" fn(i64, u32, *const u64, *mut u64) -> i32 = runtime.function(b"hsa_signal_create\0")?;
 		let allocate: unsafe extern "C" fn(u64, usize, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_amd_memory_pool_allocate\0")?;
@@ -3561,7 +4175,8 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 		check(allocate(kernarg.found, ka_size, 0, &mut ka), "KERNARG allocation")?;
 		check(allow(1, &agent, ptr::null(), ka), "GPU KERNARG access")?;
 		let mut dispatches = dispatches.into_iter();
-		let kernels = std::array::from_fn(|_| Some((dispatches.next().unwrap(), dispatches.next().unwrap())));
+		let mut pair = || Some((dispatches.next().unwrap(), dispatches.next().unwrap()));
+		let kernels = [pair(), pair(), pair(), pair(), pair(), pair(), pair(), pair(), pair(), pair()];
 		eprintln!("AMD forward block {} epoch block {}", kernels[0].unwrap().0.geometry.block, kernels[0].unwrap().1.geometry.block);
 		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, driver: Driver::Hsa(Hsa { allocate, allow, queue, cpu_agent, kernarg_size: ka_size, kernarg: ka, free: runtime.function(b"hsa_amd_memory_pool_free\0")?, copy: runtime.function(b"hsa_memory_copy\0")?, store: runtime.function(b"hsa_signal_store_screlease\0")?, wait: runtime.function(b"hsa_signal_wait_scacquire\0")?, write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?, signal: completion, vram_pool: vram.found, kernarg_pool: kernarg.found }), kernels, memory: memory as u64, clock, shared_limit: lds, dispatch: Mutex::new(()) })
 	}
@@ -3598,7 +4213,6 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		check(count_devices(&mut count), "device enumeration")?;
 		let load_device = |device, index| -> Result<Gpu> {
 			let check = |s, a| driver_status(Backend::Nvidia, s, a);
-			let (mut forward, mut epoch, mut forward_f32, mut epoch_f32) = (0, 0, 0, 0);
 			let mut context = ptr::null_mut();
 			let (mut cus, mut wave, mut workgroup, mut block_lds, mut sm_lds, mut registers, mut threads, mut cooperative) = (0, 0, 0, 0, 0, 0, 0, 0);
 			let mut memory = 0;
@@ -3614,11 +4228,8 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 				check(load(&mut module, image.as_ptr().cast()), "module load")?;
 				Ok(module)
 			};
-			let wide = module(include_bytes!(env!("RECIPE_NV_PTX")))?;
-			let float = module(include_bytes!(env!("RECIPE_NV_F32_PTX")))?;
-			for (output, module, name, action) in [(&mut forward, wide, b"forward_graph\0".as_ptr(), "forward"), (&mut epoch, wide, b"tape_epoch_graph\0".as_ptr(), "epoch"), (&mut forward_f32, float, b"forward_graph_f32\0".as_ptr(), "fp32 forward"), (&mut epoch_f32, float, b"tape_epoch_graph_f32\0".as_ptr(), "fp32 epoch")] {
-				check(function(output, module, name), action)?;
-			}
+			let modules = [module(include_bytes!(env!("RECIPE_NV_PTX")))?, module(include_bytes!(env!("RECIPE_NV_F32_PTX")))?, module(include_bytes!(env!("RECIPE_NV_F16_PTX")))?, module(include_bytes!(env!("RECIPE_NV_F8_PTX")))?, module(include_bytes!(env!("RECIPE_NV_BF16_PTX")))?, module(include_bytes!(env!("RECIPE_NV_TF32_PTX")))?, module(include_bytes!(env!("RECIPE_NV_INT8_PTX")))?, module(include_bytes!(env!("RECIPE_NV_INT4_PTX")))?, module(include_bytes!(env!("RECIPE_NV_INT1_PTX")))?, module(include_bytes!(env!("RECIPE_NV_F_PTX")))?];
+			let specifications: [(Ptr, *const u8, u8, &[u8], &str); 20] = [(modules[0], b"forward_graph\0".as_ptr(), 8, FORWARD_ARGS, "forward"), (modules[0], b"tape_epoch_graph\0".as_ptr(), 8, EPOCH_ARGS, "epoch"), (modules[1], b"forward_graph_f32\0".as_ptr(), 4, FORWARD_ARGS, "fp32 forward"), (modules[1], b"tape_epoch_graph_f32\0".as_ptr(), 4, EPOCH_F32_ARGS, "fp32 epoch"), (modules[2], b"forward_graph_f16\0".as_ptr(), 2, FORWARD_ARGS, "fp16 forward"), (modules[2], b"tape_epoch_graph_f16\0".as_ptr(), 2, EPOCH_F16_ARGS, "fp16 epoch"), (modules[3], b"forward_graph_f8\0".as_ptr(), 1, FORWARD_ARGS, "fp8 forward"), (modules[3], b"tape_epoch_graph_f8\0".as_ptr(), 1, EPOCH_F8_ARGS, "fp8 epoch"), (modules[4], b"forward_graph_bf16\0".as_ptr(), 2, FORWARD_ARGS, "bf16 forward"), (modules[4], b"tape_epoch_graph_bf16\0".as_ptr(), 2, EPOCH_F16_ARGS, "bf16 epoch"), (modules[5], b"forward_graph_tf32\0".as_ptr(), 4, FORWARD_ARGS, "tf32 forward"), (modules[5], b"tape_epoch_graph_tf32\0".as_ptr(), 4, EPOCH_F32_ARGS, "tf32 epoch"), (modules[6], b"forward_graph_int8\0".as_ptr(), 1, FORWARD_ARGS, "int8 forward"), (modules[6], b"tape_epoch_graph_int8\0".as_ptr(), 1, EPOCH_F8_ARGS, "int8 epoch"), (modules[7], b"forward_graph_int4\0".as_ptr(), 1, FORWARD_ARGS, "int4 forward"), (modules[7], b"tape_epoch_graph_int4\0".as_ptr(), 1, EPOCH_F8_ARGS, "int4 epoch"), (modules[8], b"forward_graph_int1\0".as_ptr(), 1, FORWARD_ARGS, "int1 forward"), (modules[8], b"tape_epoch_graph_int1\0".as_ptr(), 1, EPOCH_F8_ARGS, "int1 epoch"), (modules[9], b"forward_graph_f\0".as_ptr(), 8, FORWARD_ARGS, "custom forward"), (modules[9], b"tape_epoch_graph_f\0".as_ptr(), 8, EPOCH_ARGS, "custom epoch")];
 			let resource = |kernel, element| -> Result<(Resources, u32)> {
 				let (mut max_block, mut shared, mut used_registers) = (0, 0, 0);
 				for (kind, output, action) in [(0, &mut max_block, "kernel workgroup query"), (1, &mut shared, "kernel LDS query"), (4, &mut used_registers, "kernel register query")] {
@@ -3627,27 +4238,28 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 				require(max_block > 0 && shared >= 0 && used_registers > 0, "Nvidia kernel resources are invalid")?;
 				Ok((Resources { shared: shared as u32, max_block: max_block as u32, element }, used_registers as u32))
 			};
-			let (forward_resource, forward_registers) = resource(forward, 8)?;
-			let (epoch_resource, epoch_registers) = resource(epoch, 8)?;
-			let (forward_f32_resource, forward_f32_registers) = resource(forward_f32, 4)?;
-			let (epoch_f32_resource, epoch_f32_registers) = resource(epoch_f32, 4)?;
 			let geometry = |resources: Resources, used_registers: u32| -> Result<Geometry> {
 				let register_wave = used_registers.checked_mul(wave as u32).ok_or_else(|| RecipeError::new("Nvidia wave register count overflows"))?;
 				let observed = (registers as u32 / register_wave).min(threads as u32 / wave as u32);
 				nvidia(cus as u32, wave as u32, workgroup as u32, block_lds as u32, sm_lds as u32, observed, resources)
 			};
-			let forward_geometry = geometry(forward_resource, forward_registers)?;
-			let epoch_geometry = geometry(epoch_resource, epoch_registers)?;
-			let forward_f32_geometry = geometry(forward_f32_resource, forward_f32_registers)?;
-			let epoch_f32_geometry = geometry(epoch_f32_resource, epoch_f32_registers)?;
-			for (kernel, geometry, action) in [(forward, forward_geometry, "forward occupancy"), (epoch, epoch_geometry, "epoch occupancy"), (forward_f32, forward_f32_geometry, "fp32 forward occupancy"), (epoch_f32, epoch_f32_geometry, "fp32 epoch occupancy")] {
+			let mut dispatches = Vec::new();
+			for (module, name, element, layout, action) in specifications {
+				let mut kernel = 0;
+				check(function(&mut kernel, module, name), action)?;
+				let (resources, used_registers) = resource(kernel, element)?;
+				let geometry = geometry(resources, used_registers)?;
 				let mut active = 0;
 				driver_status(Backend::Nvidia, occupancy(&mut active, kernel, geometry.block as i32, 0), action)?;
 				require(active > 0, format!("Nvidia {action} has no resident workgroup"))?;
+				dispatches.push(Dispatch { kernel: Kernel::cuda(kernel, resources.shared, element, layout), geometry });
 			}
+			let mut dispatches = dispatches.into_iter();
+			let mut pair = || Some((dispatches.next().unwrap(), dispatches.next().unwrap()));
+			let kernels = [pair(), pair(), pair(), pair(), pair(), pair(), pair(), pair(), pair(), pair()];
 			let cuda = Cuda { context, set: runtime.function(b"cuCtxSetCurrent\0")?, allocate: runtime.function(b"cuMemAlloc_v2\0")?, free: runtime.function(b"cuMemFree_v2\0")?, upload: runtime.function(b"cuMemcpyHtoD_v2\0")?, download: runtime.function(b"cuMemcpyDtoH_v2\0")?, synchronize: runtime.function(b"cuCtxSynchronize\0")?, launch: runtime.function(b"cuLaunchCooperativeKernel\0")? };
-			eprintln!("Nvidia forward block {} epoch block {}", forward_geometry.block, epoch_geometry.block);
-			Ok(Gpu { name: format!("nv{index}"), backend: Backend::Nvidia, driver: Driver::Cuda(cuda), kernels: [Some((Dispatch { kernel: Kernel::cuda(forward, forward_resource.shared, 8, FORWARD_ARGS), geometry: forward_geometry }, Dispatch { kernel: Kernel::cuda(epoch, epoch_resource.shared, 8, EPOCH_ARGS), geometry: epoch_geometry })), Some((Dispatch { kernel: Kernel::cuda(forward_f32, forward_f32_resource.shared, 4, FORWARD_ARGS), geometry: forward_f32_geometry }, Dispatch { kernel: Kernel::cuda(epoch_f32, epoch_f32_resource.shared, 4, EPOCH_F32_ARGS), geometry: epoch_f32_geometry })), None], memory: memory as u64, clock: NANOSECOND_TIMER_HZ, shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()) })
+			eprintln!("Nvidia forward block {} epoch block {}", kernels[0].unwrap().0.geometry.block, kernels[0].unwrap().1.geometry.block);
+			Ok(Gpu { name: format!("nv{index}"), backend: Backend::Nvidia, driver: Driver::Cuda(cuda), kernels, memory: memory as u64, clock: NANOSECOND_TIMER_HZ, shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()) })
 		};
 		let mut found = Vec::new();
 		for ordinal in 0..count {
@@ -3669,13 +4281,9 @@ unsafe extern "C" {
 	fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr;
 }
 #[cfg(all(nvidia, windows))]
-unsafe fn dlopen(name: *const std::ffi::c_char, _: i32) -> Ptr {
-	unsafe { LoadLibraryA(name) }
-}
+unsafe fn dlopen(name: *const std::ffi::c_char, _: i32) -> Ptr { unsafe { LoadLibraryA(name) } }
 #[cfg(all(nvidia, windows))]
-unsafe fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr {
-	unsafe { GetProcAddress(handle, name) }
-}
+unsafe fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr { unsafe { GetProcAddress(handle, name) } }
 #[cfg(all(nvidia, windows))]
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -3687,19 +4295,9 @@ unsafe extern "C" {
 	#[cfg_attr(windows, link_name = "_write")]
 	fn write(file: i32, bytes: *const c_void, length: usize) -> isize;
 }
-unsafe extern "C" {
-	fn recipe_forward_cpu(samples: *const f64, weights: *const f64, value_pointers: *const *mut f64, context_pointers: *const *mut f64, descriptors: *const i32, arguments: *const f64, rows: i32, nodes: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, timings: *mut u64, tiles: *const Tile);
-	fn recipe_forward_cpu_f32(samples: *const f32, weights: *const f32, value_pointers: *const *mut f32, context_pointers: *const *mut f32, descriptors: *const i32, arguments: *const f32, rows: i32, nodes: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, timings: *mut u64, tiles: *const Tile);
-	fn recipe_epoch_cpu(samples: *const f64, input_adjoint: *mut f64, targets: *const f64, weights: *mut f64, frozen: *const u8, best: *mut f64, values: *const *mut f64, contexts: *const *mut f64, adjoints: *const *mut f64, descriptors: *const i32, arguments: *const f64, metrics: *mut f64, gradient: *mut f64, moments: *mut f64, variances: *mut f64, best_loss: *mut f64, rows: i32, nodes: i32, parameters: i32, loss: i32, huber: f64, rate: f64, beta1: f64, beta2: f64, beta1_power: f64, beta2_power: f64, epsilon: f64, decay: f64, tolerance: f64, step: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, phase: i32, timings: *mut u64, tiles: *const Tile);
-	fn recipe_epoch_cpu_f32(samples: *const f32, input_adjoint: *mut f32, targets: *const f32, weights: *mut f32, frozen: *const u8, best: *mut f32, values: *const *mut f32, contexts: *const *mut f32, adjoints: *const *mut f32, descriptors: *const i32, arguments: *const f32, metrics: *mut f32, gradient: *mut f32, moments: *mut f32, variances: *mut f32, best_loss: *mut f32, rows: i32, nodes: i32, parameters: i32, loss: i32, huber: f32, rate: f32, beta1: f32, beta2: f32, beta1_power: f32, beta2_power: f32, epsilon: f32, decay: f32, tolerance: f32, step: i32, threads: i32, tile_m: i32, tile_n: i32, tile_k: i32, phase: i32, timings: *mut u64, tiles: *const Tile);
-}
-fn distance(left: &[f64], right: &[f64]) -> f64 {
-	left.iter().zip(right).map(|(a, b)| (a - b).powi(2)).sum()
-}
-fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) {
-	state.chunks_exact(features).enumerate().map(|(index, row)| (index, distance(query, row))).min_by(|left, right| left.1.total_cmp(&right.1)).unwrap_or((0, f64::INFINITY))
-}
-fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gpu: &'static Gpu, precision: FloatFormat) -> Result<Vec<f64>> {
+fn distance(left: &[f64], right: &[f64]) -> f64 { left.iter().zip(right).map(|(a, b)| (a - b).powi(2)).sum() }
+fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) { state.chunks_exact(features).enumerate().map(|(index, row)| (index, distance(query, row))).min_by(|left, right| left.1.total_cmp(&right.1)).unwrap_or((0, f64::INFINITY)) }
+fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gpu: &'static Gpu, precision: Compute) -> Result<Vec<f64>> {
 	let input_count = checked_mul(rows, graph.input.elements(), "estimator input slice")?;
 	if graph.nodes.is_empty() {
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
@@ -3769,14 +4367,10 @@ fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool)
 	}))
 }
 impl Estimator {
-	fn fit(&self, data: &Prepared, rows: usize, config: Config, exclude: bool) -> Result<Predictor> {
-		(self.fit)(self.param, data, rows, config, exclude)
-	}
+	fn fit(&self, data: &Prepared, rows: usize, config: Config, exclude: bool) -> Result<Predictor> { (self.fit)(self.param, data, rows, config, exclude) }
 }
 const DOUBLE_BUFFER_VALUES: u32 = 2;
-fn shared_bytes(tile: u32, element: u8) -> Result<u32> {
-	tile.max(DOUBLE_BUFFER_VALUES).checked_mul(u32::from(element)).ok_or_else(|| RecipeError::new("GPU shared memory size overflows"))
-}
+fn shared_bytes(tile: u32, element: u8) -> Result<u32> { tile.max(DOUBLE_BUFFER_VALUES).checked_mul(u32::from(element)).ok_or_else(|| RecipeError::new("GPU shared memory size overflows")) }
 #[cfg(any(amd, nvidia))]
 #[derive(Clone, Copy)]
 struct Resources {
@@ -3785,11 +4379,12 @@ struct Resources {
 	pub element: u8,
 }
 #[derive(Clone, Copy)]
-struct Geometry { pub groups: u32, pub block: u32 }
+struct Geometry {
+	pub groups: u32,
+	pub block: u32,
+}
 impl Geometry {
-	pub fn threads(self, work: u32) -> Result<u32> {
-		self.groups.min(work.div_ceil(self.block)).checked_mul(self.block).filter(|value| *value != 0).ok_or_else(|| RecipeError::new("GPU launch size overflows"))
-	}
+	pub fn threads(self, work: u32) -> Result<u32> { self.groups.min(work.div_ceil(self.block)).checked_mul(self.block).filter(|value| *value != 0).ok_or_else(|| RecipeError::new("GPU launch size overflows")) }
 }
 #[cfg(any(amd, nvidia))]
 fn geometry(cus: u32, wave: u32, workgroup: u32, lds: u32, groups_per_cu: u32, resources: Resources) -> Result<Geometry> {
@@ -3802,9 +4397,7 @@ fn geometry(cus: u32, wave: u32, workgroup: u32, lds: u32, groups_per_cu: u32, r
 	Ok(Geometry { groups: cus, block })
 }
 #[cfg(amd)]
-fn amd(cus: u32, wave: u32, workgroup: u32, lds: u32, resources: Resources) -> Result<Geometry> {
-	geometry(cus, wave, workgroup, lds, u32::from(wave != 0), resources)
-}
+fn amd(cus: u32, wave: u32, workgroup: u32, lds: u32, resources: Resources) -> Result<Geometry> { geometry(cus, wave, workgroup, lds, u32::from(wave != 0), resources) }
 #[cfg(nvidia)]
 fn nvidia(cus: u32, wave: u32, workgroup: u32, block_lds: u32, sm_lds: u32, waves_per_cu: u32, resources: Resources) -> Result<Geometry> {
 	let shared = resources.shared.checked_add(shared_bytes(0, resources.element)?).ok_or_else(|| RecipeError::new("Nvidia shared memory size overflows"))?;
@@ -3815,29 +4408,19 @@ pub trait IntoDataSources {
 	fn into_data_sources(self) -> Vec<String>;
 }
 impl IntoDataSources for &str {
-	fn into_data_sources(self) -> Vec<String> {
-		vec![self.to_owned()]
-	}
+	fn into_data_sources(self) -> Vec<String> { vec![self.to_owned()] }
 }
 impl IntoDataSources for String {
-	fn into_data_sources(self) -> Vec<String> {
-		vec![self]
-	}
+	fn into_data_sources(self) -> Vec<String> { vec![self] }
 }
 impl<T: Into<String>, const N: usize> IntoDataSources for [T; N] {
-	fn into_data_sources(self) -> Vec<String> {
-		self.into_iter().map(Into::into).collect()
-	}
+	fn into_data_sources(self) -> Vec<String> { self.into_iter().map(Into::into).collect() }
 }
 impl<T: Into<String>> IntoDataSources for Vec<T> {
-	fn into_data_sources(self) -> Vec<String> {
-		self.into_iter().map(Into::into).collect()
-	}
+	fn into_data_sources(self) -> Vec<String> { self.into_iter().map(Into::into).collect() }
 }
 impl<T: Clone + Into<String>> IntoDataSources for &[T] {
-	fn into_data_sources(self) -> Vec<String> {
-		self.iter().cloned().map(Into::into).collect()
-	}
+	fn into_data_sources(self) -> Vec<String> { self.iter().cloned().map(Into::into).collect() }
 }
 impl Data {
 	pub fn target(mut self, target: impl IntoDataSources) -> Self {
@@ -3880,8 +4463,17 @@ struct Prepared {
 	norm_scale: Vec<f64>,
 	identities: Vec<u64>,
 }
-struct ChildTable { name: String, headers: Vec<String>, rows: usize }
-struct Table { name: String, headers: Vec<String>, rows: Vec<Vec<String>>, children: Vec<ChildTable> }
+struct ChildTable {
+	name: String,
+	headers: Vec<String>,
+	rows: usize,
+}
+struct Table {
+	name: String,
+	headers: Vec<String>,
+	rows: Vec<Vec<String>>,
+	children: Vec<ChildTable>,
+}
 enum FeatureType {
 	Numeric(&'static str),
 	Categorical(Vec<String>),
@@ -3893,9 +4485,7 @@ fn prepare(data: &Data) -> Result<&Prepared> {
 		Err(error) => Err(error.clone()),
 	}
 }
-fn column_match(name: &str, table: &Table, header: &str, column: usize) -> bool {
-	name == header || name == format!("{}.{}", table.name, header) || name == format!("col{}", column + 1) || name == format!("{}.col{}", table.name, column + 1) || header.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.')) || header.rsplit_once('.').is_some_and(|(base, row)| row.parse::<usize>().is_ok() && (base == name || base.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.'))))
-}
+fn column_match(name: &str, table: &Table, header: &str, column: usize) -> bool { name == header || name == format!("{}.{}", table.name, header) || name == format!("col{}", column + 1) || name == format!("{}.col{}", table.name, column + 1) || header.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.')) || header.rsplit_once('.').is_some_and(|(base, row)| row.parse::<usize>().is_ok() && (base == name || base.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.')))) }
 fn print_table(table: &Table, fit: usize, targets: &[String], exclusions: &[String]) {
 	eprintln!("{:<37} {:<10} {:<9} {} samples", table.name, "", "", table.rows.len());
 	let mut base = 0;
@@ -4071,9 +4661,7 @@ fn sample_identity(sample: &[f64], target: f64, row: usize) -> u64 {
 	let hash = sample.iter().copied().chain(std::iter::once(target)).fold(OFFSET, |hash, value| (hash ^ value.to_bits()).wrapping_mul(PRIME));
 	(hash ^ row as u64).wrapping_mul(PRIME)
 }
-fn is_table(extension: &str) -> bool {
-	matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt")
-}
+fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt") }
 fn expand_home(source: &str) -> Result<PathBuf> {
 	if source == "~" || source.starts_with("~/") {
 		let home = std::env::var_os("HOME").ok_or_else(|| RecipeError::new("HOME is absent"))?;
@@ -4094,9 +4682,7 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
 	}
 	Ok(())
 }
-fn target_column(table: &Table, name: &str) -> Option<usize> {
-	table.headers.iter().enumerate().position(|(column, header)| column_match(name, table, header, column))
-}
+fn target_column(table: &Table, name: &str) -> Option<usize> { table.headers.iter().enumerate().position(|(column, header)| column_match(name, table, header, column)) }
 fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<Vec<Table>> {
 	let mut groups = BTreeMap::<PathBuf, Vec<Table>>::new();
 	for (directory, table) in tables {
@@ -4249,9 +4835,7 @@ fn records(bytes: &[u8], delimiter: u8) -> Result<Vec<Vec<String>>> {
 	}
 	Ok(rows)
 }
-fn categories(table: &Table, column: usize, rows: usize) -> Vec<String> {
-	table.rows.iter().take(rows).filter_map(|row| row.get(column)).filter(|value| !value.is_empty()).cloned().collect::<BTreeSet<_>>().into_iter().collect()
-}
+fn categories(table: &Table, column: usize, rows: usize) -> Vec<String> { table.rows.iter().take(rows).filter_map(|row| row.get(column)).filter(|value| !value.is_empty()).cloned().collect::<BTreeSet<_>>().into_iter().collect() }
 fn infer_feature(table: &Table, column: usize, rows: usize) -> FeatureType {
 	let values = table.rows.iter().take(rows).filter_map(|row| row.get(column)).filter(|value| !value.is_empty()).collect::<Vec<_>>();
 	if !values.is_empty() && values.iter().all(|value| value.parse::<f64>().is_ok()) {
@@ -4322,43 +4906,150 @@ pub struct Train {
 	resume: Option<String>,
 	save: Option<String>,
 	seed: Option<usize>,
-	precision: FloatFormat,
+	precision: Compute,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FloatFormat {
-	family: &'static str,
-	bits: u8,
-	exponent: u8,
-	mantissa: u8,
-	llvm: &'static str,
+enum Compute {
+	F(FloatFormat),
+	Fp(FloatFormat),
+	Int(IntFormat),
+	Bf(FloatFormat),
+	Tf(FloatFormat),
 }
-const FP64: FloatFormat = FloatFormat { family: "fp", bits: 64, exponent: 11, mantissa: 52, llvm: "double" };
-const FP32: FloatFormat = FloatFormat { family: "fp", bits: 32, exponent: 8, mantissa: 23, llvm: "float" };
-const FP16: FloatFormat = FloatFormat { family: "fp", bits: 16, exponent: 5, mantissa: 10, llvm: "half" };
-impl FloatFormat {
-	fn bytes(self) -> usize {
-		usize::from(self.bits.div_ceil(8))
+impl Compute {
+	const FP8: Self = Self::Fp(FloatFormat::FP8);
+	const FP16: Self = Self::Fp(FloatFormat::FP16);
+	const FP32: Self = Self::Fp(FloatFormat::FP32);
+	const FP64: Self = Self::Fp(FloatFormat::FP64);
+	const INT1: Self = Self::Int(IntFormat::INT1);
+	const INT4: Self = Self::Int(IntFormat::INT4);
+	const INT8: Self = Self::Int(IntFormat::INT8);
+	const BF16: Self = Self::Bf(FloatFormat::BF16);
+	const TF32: Self = Self::Tf(FloatFormat::TF32);
+	const fn layout(self) -> FloatLayout {
+		match self {
+			Self::F(value) | Self::Fp(value) | Self::Bf(value) | Self::Tf(value) => value.arithmetic,
+			Self::Int(_) => FloatFormat::FP64.arithmetic,
+		}
 	}
-	fn native(self) -> Option<Self> { match (self.bits, self.exponent, self.mantissa) { (16, 5, 10) => Some(FP16), (32, 8, 23) => Some(FP32), (64, 11, 52) => Some(FP64), _ => None } }
-	fn kernel(self) -> Option<usize> { [FP64, FP32, FP16].iter().position(|format| Some(*format) == self.native()) }
-	fn label(self)->String{if self.family=="f"{format!("f({},{})",self.exponent,self.mantissa)}else{format!("{}({})",self.family,self.bits)}}
+	const fn bits(self) -> u8 {
+		match self {
+			Self::F(value) => value.arithmetic.bits(),
+			Self::Fp(value) | Self::Bf(value) | Self::Tf(value) => value.storage.bits(),
+			Self::Int(value) => value.bits,
+		}
+	}
+	const fn bytes(self) -> usize {
+		match self {
+			Self::F(_) => FloatFormat::FP64.bytes(),
+			Self::Fp(value) | Self::Bf(value) | Self::Tf(value) => value.bytes(),
+			Self::Int(value) => value.bytes(),
+		}
+	}
+	fn pack(self, value: f64) -> u64 {
+		match self {
+			Self::F(format) | Self::Fp(format) | Self::Bf(format) | Self::Tf(format) => format.pack(value),
+			Self::Int(format) => format.pack(value),
+		}
+	}
+	fn unpack(self, bits: u64) -> f64 {
+		match self {
+			Self::F(format) | Self::Fp(format) | Self::Bf(format) | Self::Tf(format) => format.unpack(bits),
+			Self::Int(format) => format.unpack(bits),
+		}
+	}
+	fn optimizer_epsilon(self, value: f64) -> f64 {
+		let rounded = self.unpack(self.pack(value));
+		match self {
+			Self::F(format) | Self::Fp(format) | Self::Bf(format) | Self::Tf(format) if rounded == 0.0 => format.arithmetic.unpack(1u64 << format.arithmetic.man),
+			_ => rounded,
+		}
+	}
+	fn optimizer_beta(self, value: f64) -> f64 {
+		let rounded = self.unpack(self.pack(value));
+		match self {
+			Self::F(format) | Self::Fp(format) | Self::Bf(format) | Self::Tf(format) if rounded >= 1.0 => format.arithmetic.unpack(format.arithmetic.pack(1.0) - 1),
+			_ => rounded,
+		}
+	}
+	fn saved(family: &str, values: [u8; 4]) -> Option<Self> {
+		let [bits, exp, man, storage_man] = values;
+		match family {
+			"f" if bits == FloatFormat::FP64.storage.bits() && storage_man == FloatFormat::FP64.storage.man && exp != 0 && man != 0 && u16::from(exp) + u16::from(man) < 64 => Some(Self::F(FloatFormat::computed(exp, man))),
+			"fp" => [Self::FP8, Self::FP16, Self::FP32, Self::FP64].into_iter().find(|format| format.saved_fields().1 == values),
+			"int" => [Self::INT1, Self::INT4, Self::INT8].into_iter().find(|format| format.saved_fields().1 == values),
+			"bf" if values == Self::BF16.saved_fields().1 => Some(Self::BF16),
+			"tf" if values == Self::TF32.saved_fields().1 => Some(Self::TF32),
+			_ => None,
+		}
+	}
+	fn saved_fields(self) -> (&'static str, [u8; 4]) {
+		match self {
+			Self::F(value) => ("f", [value.storage.bits(), value.arithmetic.exp, value.arithmetic.man, value.storage.man]),
+			Self::Fp(value) => ("fp", [value.storage.bits(), value.arithmetic.exp, value.arithmetic.man, value.storage.man]),
+			Self::Int(value) => ("int", [value.bits, 0, 0, 0]),
+			Self::Bf(value) => ("bf", [value.storage.bits(), value.arithmetic.exp, value.arithmetic.man, value.storage.man]),
+			Self::Tf(value) => ("tf", [value.storage.bits(), value.arithmetic.exp, value.arithmetic.man, value.storage.man]),
+		}
+	}
+	fn kernel(self) -> Option<usize> {
+		match self {
+			Self::Fp(value) => [FloatFormat::FP64, FloatFormat::FP32, FloatFormat::FP16, FloatFormat::FP8].iter().position(|format| *format == value),
+			Self::F(_) => Some(9),
+			Self::Bf(FloatFormat::BF16) => Some(4),
+			Self::Tf(FloatFormat::TF32) => Some(5),
+			Self::Int(IntFormat::INT8) => Some(6),
+			Self::Int(IntFormat::INT4) => Some(7),
+			Self::Int(IntFormat::INT1) => Some(8),
+			_ => None,
+		}
+	}
+	fn label(self) -> String {
+		match self {
+			Self::F(value) => format!("f({},{})", value.arithmetic.exp, value.arithmetic.man),
+			Self::Fp(value) => format!("fp({})", value.storage.bits()),
+			Self::Int(value) => format!("int({})", value.bits),
+			Self::Bf(value) => format!("bf({})", value.storage.bits()),
+			Self::Tf(value) => format!("tf({})", value.storage.bits()),
+		}
+	}
 }
 impl Train {
-	fn arithmetic(mut self, format: FloatFormat) -> Self { self.precision = format; self }
-	pub fn f(self, exponent: u8, mantissa: u8) -> Self { assert!(exponent != 0 && mantissa != 0, "f requires exponent and mantissa fields"); let llvm = match (exponent, mantissa) { (5, 10) => "half", (8, 23) => "float", (11, 52) => "double", _ => "unsupported" }; self.arithmetic(FloatFormat { family: "f", bits: exponent + mantissa + 1, exponent, mantissa, llvm }) }
+	fn arithmetic(mut self, format: Compute) -> Self {
+		self.precision = format;
+		self
+	}
+	pub fn f(self, exp: u8, man: u8) -> Self {
+		assert!(exp != 0 && man != 0 && u16::from(exp) + u16::from(man) < 64, "f requires a representation no wider than 64 bits");
+		self.arithmetic(Compute::F(FloatFormat::computed(exp, man)))
+	}
 	pub fn fp(self, bits: u8) -> Self {
-		let (exponent, mantissa, llvm) = match bits {
-			8 => (4, 3, "unsupported"),
-			16 => (5, 10, "half"),
-			32 => (8, 23, "float"),
-			64 => (11, 52, "double"),
+		let format = match bits {
+			8 => Compute::FP8,
+			16 => Compute::FP16,
+			32 => Compute::FP32,
+			64 => Compute::FP64,
 			_ => panic!("fp bits must be 8, 16, 32, or 64"),
 		};
-		self.arithmetic(FloatFormat { family: "fp", bits, exponent, mantissa, llvm })
+		self.arithmetic(format)
 	}
-	pub fn int(self, bits: u8) -> Self { assert!([1, 4, 8].contains(&bits), "int bits must be 1, 4, or 8"); self.arithmetic(FloatFormat { family: "int", bits, exponent: 0, mantissa: 0, llvm: "unsupported" }) }
-	pub fn bf(self, bits: u8) -> Self { assert_eq!(bits, 16, "bf bits must be 16"); self.arithmetic(FloatFormat { family: "bf", bits, exponent: 8, mantissa: 7, llvm: "bfloat" }) }
-	pub fn tf(self, bits: u8) -> Self { assert_eq!(bits, 32, "tf bits must be 32"); self.arithmetic(FloatFormat { family: "tf", bits, exponent: 8, mantissa: 10, llvm: "unsupported" }) }
+	pub fn int(self, bits: u8) -> Self {
+		let format = match bits {
+			1 => Compute::INT1,
+			4 => Compute::INT4,
+			8 => Compute::INT8,
+			_ => panic!("int bits must be 1, 4, or 8"),
+		};
+		self.arithmetic(format)
+	}
+	pub fn bf(self, bits: u8) -> Self {
+		assert_eq!(bits, 16, "bf bits must be 16");
+		self.arithmetic(Compute::BF16)
+	}
+	pub fn tf(self, bits: u8) -> Self {
+		assert_eq!(bits, 32, "tf bits must be 32");
+		self.arithmetic(Compute::TF32)
+	}
 	pub const fn seed(mut self, value: usize) -> Self {
 		self.seed = Some(value);
 		self
@@ -4367,9 +5058,7 @@ impl Train {
 		self.stop = Some(value);
 		self
 	}
-	pub const fn optimizer(self, _: Adamw) -> Self {
-		self
-	}
+	pub const fn optimizer(self, _: Adamw) -> Self { self }
 	pub const fn epochs(mut self, value: usize) -> Self {
 		self.epochs = value;
 		self
@@ -4401,8 +5090,8 @@ impl Train {
 		drop(topology()?);
 		let (gpus, mut config) = (all_gpus()?, Config::load()?);
 		let precision = self.precision;
-		let support = |format: FloatFormat| format.kernel().is_some_and(|index| gpus.iter().all(|gpu| gpu.kernels[index].is_some()));
-		let available = [FP16, FP32, FP64].into_iter().filter(|format| support(*format)).flat_map(|format| [format!("f({},{}) [{}]", format.exponent, format.mantissa, format.llvm), format!("fp({}) [{}]", format.bits, format.llvm)]).collect::<Vec<_>>().join(", ");
+		let support = |format: Compute| format.kernel().is_some_and(|index| gpus.iter().all(|gpu| gpu.kernels.get(index).is_some_and(Option::is_some)));
+		let available = [Compute::FP8, Compute::FP16, Compute::FP32, Compute::FP64, Compute::INT1, Compute::INT4, Compute::INT8, Compute::BF16, Compute::TF32].into_iter().filter(|format| support(*format)).map(Compute::label).collect::<Vec<_>>().join(", ");
 		require(support(precision), format!("{} training is unavailable on {}; available precision: {available}", precision.label(), gpus.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ")))?;
 		config.precision = precision;
 		if let Some(seed) = self.seed {
@@ -4459,7 +5148,7 @@ impl Train {
 			tape.restore_best()?;
 		}
 		self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
-		stored.bn_stats = extract_bn_stats(&stored.graph, &tape.shards[0].tape.contexts)?;
+		stored.bn_stats = extract_bn_stats(&stored.graph, &tape.shards[0].tape.contexts, precision)?;
 		let raw_predictions = tape.predictions()?;
 		let final_loss = model_loss(&raw_predictions, targets, model.loss, config.activation[7]);
 		let predictions = raw_predictions.iter().map(|value| scale.map_or(*value, |scale| scale.decode(*value))).collect::<Vec<_>>();
@@ -4524,24 +5213,12 @@ impl Train {
 }
 pub struct TrainingReport(f64, f64, Vec<f64>, Vec<f64>, f64, Tile);
 impl TrainingReport {
-	pub const fn initial_loss(&self) -> f64 {
-		self.0
-	}
-	pub const fn final_loss(&self) -> f64 {
-		self.1
-	}
-	pub fn initial_predictions(&self) -> &[f64] {
-		&self.2
-	}
-	pub fn predictions(&self) -> &[f64] {
-		&self.3
-	}
-	pub const fn r2(&self) -> f64 {
-		self.4
-	}
-	pub const fn tile(&self) -> [u32; 3] {
-		[self.5.m, self.5.n, self.5.k]
-	}
+	pub const fn initial_loss(&self) -> f64 { self.0 }
+	pub const fn final_loss(&self) -> f64 { self.1 }
+	pub fn initial_predictions(&self) -> &[f64] { &self.2 }
+	pub fn predictions(&self) -> &[f64] { &self.3 }
+	pub const fn r2(&self) -> f64 { self.4 }
+	pub const fn tile(&self) -> [u32; 3] { [self.5.m, self.5.n, self.5.k] }
 }
 #[derive(Clone, Copy)]
 struct TargetScale {
@@ -4554,12 +5231,8 @@ impl TargetScale {
 		let maximum = targets.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 		Self { minimum, span: maximum - minimum }
 	}
-	fn encode(self, value: f64) -> f64 {
-		(value - self.minimum) / self.span
-	}
-	fn decode(self, value: f64) -> f64 {
-		self.minimum + self.span * logistic(value)
-	}
+	fn encode(self, value: f64) -> f64 { (value - self.minimum) / self.span }
+	fn decode(self, value: f64) -> f64 { self.minimum + self.span * logistic(value) }
 	fn logit(self, value: f64) -> f64 {
 		let value = value.clamp(f64::EPSILON, 1.0 - f64::EPSILON);
 		(value / (1.0 - value)).ln()
@@ -4583,17 +5256,11 @@ use std::{
 	io::{self, BufRead, BufReader, Read, Write},
 	process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
-fn process_io<T>(action: &str, result: io::Result<T>) -> Result<T> {
-	result.map_err(|error| RecipeError::new(format!("cannot {action} RAT command: {error}")))
-}
+fn process_io<T>(action: &str, result: io::Result<T>) -> Result<T> { result.map_err(|error| RecipeError::new(format!("cannot {action} RAT command: {error}"))) }
 struct Frame(Vec<(String, f64)>);
 impl Frame {
-	fn value(&self, name: &str) -> Result<f64> {
-		self.0.iter().find(|value| value.0 == name).map(|value| value.1).ok_or_else(|| RecipeError::new(format!("RAT value {name:?} is absent")))
-	}
-	fn values(&self, names: &[String]) -> Result<Vec<f64>> {
-		names.iter().map(|name| self.value(name)).collect()
-	}
+	fn value(&self, name: &str) -> Result<f64> { self.0.iter().find(|value| value.0 == name).map(|value| value.1).ok_or_else(|| RecipeError::new(format!("RAT value {name:?} is absent"))) }
+	fn values(&self, names: &[String]) -> Result<Vec<f64>> { names.iter().map(|name| self.value(name)).collect() }
 }
 struct Process {
 	child: Child,
@@ -4673,30 +5340,16 @@ pub struct RatReport {
 	measurement: Vec<f64>,
 }
 impl RatReport {
-	pub fn proposal(&self) -> &[f64] {
-		&self.proposal
-	}
-	pub fn prediction(&self) -> &[f64] {
-		&self.prediction
-	}
-	pub fn measurement(&self) -> &[f64] {
-		&self.measurement
-	}
+	pub fn proposal(&self) -> &[f64] { &self.proposal }
+	pub fn prediction(&self) -> &[f64] { &self.prediction }
+	pub fn measurement(&self) -> &[f64] { &self.measurement }
 }
-fn rat<const N: usize>(train: Train, models: [Model; N]) -> RatTrain<N> {
-	RatTrain { train, models, command: None, process: None, context: None, state: None }
-}
+fn rat<const N: usize>(train: Train, models: [Model; N]) -> RatTrain<N> { RatTrain { train, models, command: None, process: None, context: None, state: None } }
 impl Train {
-	pub fn rat(self, proposer: Model, predictor: Model) -> RatTrain<2> {
-		rat(self, [proposer, predictor])
-	}
-	pub fn rats<const N: usize>(self, models: [Model; N]) -> RatTrain<N> {
-		rat(self, models)
-	}
+	pub fn rat(self, proposer: Model, predictor: Model) -> RatTrain<2> { rat(self, [proposer, predictor]) }
+	pub fn rats<const N: usize>(self, models: [Model; N]) -> RatTrain<N> { rat(self, models) }
 }
-fn rat_schema(data: &Data) -> String {
-	data.routes.iter().map(|route| format!("{}->{}", route.inputs.join("|"), route.outputs.join("|"))).chain(std::iter::once(format!("target->{}", data.target.join("|")))).collect::<Vec<_>>().join("/")
-}
+fn rat_schema(data: &Data) -> String { data.routes.iter().map(|route| format!("{}->{}", route.inputs.join("|"), route.outputs.join("|"))).chain(std::iter::once(format!("target->{}", data.target.join("|")))).collect::<Vec<_>>().join("/") }
 fn append_model(graph: &mut Graph, model: &Model, features: usize, outputs: usize, rows: usize, gpu: &'static Gpu, config: Config, schema: &str) -> Result<(i32, (usize, usize))> {
 	let prepared = Prepared { samples: vec![0.0; rows * features], targets: vec![0.0; rows], rows, features, schema: schema.to_owned(), sequence: None, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new() };
 	let part = compile_output(model, &prepared, rows, gpu, config, outputs)?;
@@ -4764,7 +5417,7 @@ struct TileRuntime {
 static TILE_RUNTIME: OnceLock<Result<Mutex<TileRuntime>>> = OnceLock::new();
 impl TileRuntime {
 	fn new(gpus: &[&'static Gpu], mut config: Config) -> Result<Self> {
-		config.precision = FP64;
+		config.precision = Compute::FP64;
 		let predictor = recipe.model().layer(config.surrogate_width).tanh().layer(1).loss(mse);
 		let proposer = recipe.model().layer(config.surrogate_width).tanh().layer(3).loss(&predictor);
 		let models = [proposer, predictor];
@@ -4792,7 +5445,7 @@ impl TileRuntime {
 					let minimum = Tile { m: shard.tape.tile.m.min(limit.m), n: shard.tape.tile.n.min(limit.n), k: shard.tape.tile.k.min(limit.k) };
 					let work = dimensions[0] * f64::from(shard.tape.rows);
 					let vram = if shard.tape.gpu.backend == Backend::Cpu { 0.0 } else { shard.tape.gpu.memory as f64 / self.vram_unit as f64 };
-					cases.push((gpu, node, [f64::from(shard.tape.precision.bits), vram, work, dimensions[1], dimensions[2]], minimum, limit));
+					cases.push((gpu, node, [f64::from(shard.tape.precision.bits()), vram, work, dimensions[1], dimensions[2]], minimum, limit));
 				}
 			}
 		}
@@ -4825,9 +5478,7 @@ impl TileRuntime {
 		Ok(())
 	}
 }
-fn tile_runtime(gpus: &[&'static Gpu], config: Config) -> Result<std::sync::MutexGuard<'static, TileRuntime>> {
-	TILE_RUNTIME.get_or_init(|| TileRuntime::new(gpus, config).map(Mutex::new)).as_ref().map_err(Clone::clone)?.lock().map_err(|_| RecipeError::new("tile runtime lock is poisoned"))
-}
+fn tile_runtime(gpus: &[&'static Gpu], config: Config) -> Result<std::sync::MutexGuard<'static, TileRuntime>> { TILE_RUNTIME.get_or_init(|| TileRuntime::new(gpus, config).map(Mutex::new)).as_ref().map_err(Clone::clone)?.lock().map_err(|_| RecipeError::new("tile runtime lock is poisoned")) }
 impl State {
 	fn proposal(&self) -> Result<Vec<f64>> {
 		let blocks = self.proposals.iter().map(|&(node, width)| Ok((self.tape.node_values(node, width)?, width))).collect::<Result<Vec<_>>>()?;

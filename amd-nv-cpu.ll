@@ -1,7 +1,40 @@
-target triple = "amdgcn-amd-amdhsa" declare i32 @llvm.amdgcn.workitem.id.x()
-declare void @llvm.amdgcn.s.barrier() declare double @llvm.sqrt.f64(double) declare double @llvm.fabs.f64(double)
-declare double @__ocml_exp_f64(double) declare double @__ocml_tanh_f64(double) declare double @__ocml_cos_f64(double)
-declare double @__ocml_sin_f64(double) declare double @__ocml_log_f64(double) declare i64 @__ockl_steadyctr_u64()
+target triple = "amdgcn-amd-amdhsa"
+; NUMERIC BEGIN
+declare double @llvm.sqrt.f64(double) declare double @llvm.fabs.f64(double) declare double @llvm.floor.f64(double)
+declare double @__ocml_exp_f64(double) declare double @__ocml_tanh_f64(double) declare double @__ocml_cos_f64(double) declare double @__ocml_sin_f64(double) declare double @__ocml_log_f64(double)
+define internal double @recipe.add(double %left, double %right) #1 { entry: %result = fadd double %left, %right ret double %result }
+define internal double @recipe.sub(double %left, double %right) #1 { entry: %result = fsub double %left, %right ret double %result }
+define internal double @recipe.mul(double %left, double %right) #1 { entry: %result = fmul double %left, %right ret double %result }
+define internal double @recipe.div(double %left, double %right) #1 { entry: %result = fdiv double %left, %right ret double %result }
+define internal double @recipe.neg(double %value) #1 { entry: %result = fneg double %value ret double %result }
+define internal i1 @recipe.oeq(double %left, double %right) #1 { entry: %result = fcmp oeq double %left, %right ret i1 %result }
+define internal i1 @recipe.oge(double %left, double %right) #1 { entry: %result = fcmp oge double %left, %right ret i1 %result }
+define internal i1 @recipe.ogt(double %left, double %right) #1 { entry: %result = fcmp ogt double %left, %right ret i1 %result }
+define internal i1 @recipe.ole(double %left, double %right) #1 { entry: %result = fcmp ole double %left, %right ret i1 %result }
+define internal i1 @recipe.olt(double %left, double %right) #1 { entry: %result = fcmp olt double %left, %right ret i1 %result }
+define internal i1 @recipe.one(double %left, double %right) #1 { entry: %result = fcmp one double %left, %right ret i1 %result }
+define internal i1 @recipe.ord(double %left, double %right) #1 { entry: %result = fcmp ord double %left, %right ret i1 %result }
+define internal double @recipe.from.u1(i1 %value) #1 { entry: %result = uitofp i1 %value to double ret double %result }
+define internal double @recipe.from.u32(i32 %value) #1 { entry: %result = uitofp i32 %value to double ret double %result }
+define internal double @recipe.from.s32(i32 %value) #1 { entry: %result = sitofp i32 %value to double ret double %result }
+define internal i32 @recipe.to.u32(double %value) #1 { entry: %result = fptoui double %value to i32 ret i32 %result }
+define internal i32 @recipe.to.s32(double %value) #1 { entry: %result = fptosi double %value to i32 ret i32 %result }
+define internal double @recipe.from.f32(float %value) #1 { entry: %result = fpext float %value to double ret double %result }
+define internal double @recipe.from.f16(half %value) #1 { entry: %result = fpext half %value to double ret double %result }
+define internal half @recipe.to.f16(double %value) #1 { entry: %result = fptrunc double %value to half ret half %result }
+define internal double @recipe.abs(double %value) #1 { entry: %result = call double @llvm.fabs.f64(double %value) ret double %result }
+define internal double @recipe.floor(double %value) #1 { entry: %result = call double @llvm.floor.f64(double %value) ret double %result }
+define internal double @recipe.sqrt(double %value) #1 { entry: %result = call double @llvm.sqrt.f64(double %value) ret double %result }
+define internal double @recipe.exp(double %value) #1 { entry: %result = call double @__ocml_exp_f64(double %value) ret double %result }
+define internal double @recipe.tanh(double %value) #1 { entry: %result = call double @__ocml_tanh_f64(double %value) ret double %result }
+define internal double @recipe.cos(double %value) #1 { entry: %result = call double @__ocml_cos_f64(double %value) ret double %result }
+define internal double @recipe.sin(double %value) #1 { entry: %result = call double @__ocml_sin_f64(double %value) ret double %result }
+define internal double @recipe.log(double %value) #1 { entry: %result = call double @__ocml_log_f64(double %value) ret double %result }
+define internal double @recipe.atomic.add(ptr addrspace(1) %target, double %value) #1 { entry: %prior = atomicrmw fadd ptr addrspace(1) %target, double %value monotonic, align 8 ret double %prior }
+define internal void @recipe.set.format(i32 %exp, i32 %man) #1 { entry: ret void }
+; NUMERIC END
+declare i32 @llvm.amdgcn.workitem.id.x()
+declare void @llvm.amdgcn.s.barrier() declare i64 @__ockl_steadyctr_u64()
 declare void @llvm.trap() @contraction_tile = external addrspace(3) global [0 x double], align 8
 define internal double @contraction_input(
 ptr addrspace(1) %input, i32 %row.base, i32 %position, i32 %term, i32 %span, i32 %length, i1 %conv ) #1 { entry:
@@ -60,8 +93,8 @@ ptr addrspace(3) @contraction_tile, i32 0, i32 %i %x = load double, ptr addrspac
 %weight.channel.base = mul i32 %channel, %terms %weight.term = add i32 %term.base, %i
 %weight.index = add i32 %weight.channel.base, %weight.term
 %weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.index
-%w = load double, ptr addrspace(1) %weight.ptr, align 8 %product = fmul double %x, %w
-%candidate = fadd double %partial, %product %partial.next = select i1 %active, double %candidate, double %partial
+%w = load double, ptr addrspace(1) %weight.ptr, align 8 %product = call double @recipe.mul(double %x, double %w)
+%candidate = call double @recipe.add(double %partial, double %product) %partial.next = select i1 %active, double %candidate, double %partial
 %i.next = add i32 %i, 1 br label %compute.loop compute.done:
 %tile.sum = phi double [ %partial, %compute.loop ] call void @recipe.local.barrier()
 %term.next = add i32 %term.base, %k.count %term.more = icmp ult i32 %term.next, %terms
@@ -72,7 +105,7 @@ br i1 %active, label %store, label %position.done store:
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %output.index
 %bias.base = mul i32 %out.channels, %terms %bias.index = add i32 %bias.base, %channel.raw
 %bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %bias.index
-%bias = load double, ptr addrspace(1) %bias.ptr, align 8 %biased = fadd double %tile.sum, %bias
+%bias = load double, ptr addrspace(1) %bias.ptr, align 8 %biased = call double @recipe.add(double %tile.sum, double %bias)
 %result = select i1 %has.bias, double %biased, double %tile.sum
 store double %result, ptr addrspace(1) %output.ptr, align 8 br label %position.done position.done:
 %m.next = add i32 %m, 1 br label %position.loop channel.done:
@@ -87,7 +120,7 @@ f32:
 %f32.index = add i32 %f32.row, %column
 %f32.ptr = getelementptr inbounds float, ptr addrspace(1) %matrix, i32 %f32.index
 %f32.value = load float, ptr addrspace(1) %f32.ptr, align 4
-%f32.result = fpext float %f32.value to double
+%f32.result = call double @recipe.from.f32(float %f32.value)
 ret double %f32.result
 q4:
 %q4.blocks = udiv i32 %columns, 256
@@ -100,8 +133,8 @@ q4:
 %q4.min.ptr = getelementptr inbounds i8, ptr addrspace(1) %q4.block, i32 2
 %q4.d.half = load half, ptr addrspace(1) %q4.d.ptr, align 2
 %q4.min.half = load half, ptr addrspace(1) %q4.min.ptr, align 2
-%q4.d = fpext half %q4.d.half to double
-%q4.min = fpext half %q4.min.half to double
+%q4.d = call double @recipe.from.f16(half %q4.d.half)
+%q4.min = call double @recipe.from.f16(half %q4.min.half)
 %q4.local = urem i32 %column, 256
 %q4.sub = udiv i32 %q4.local, 32
 %q4.within = urem i32 %q4.local, 32
@@ -154,13 +187,13 @@ br label %q4.calculate
 q4.calculate:
 %q4.scale = phi i32 [ %q4.low.scale, %q4.scale.low ], [ %q4.high.scale, %q4.scale.high ]
 %q4.minimum = phi i32 [ %q4.low.min, %q4.scale.low ], [ %q4.high.min, %q4.scale.high ]
-%q4.scale.double = uitofp i32 %q4.scale to double
-%q4.minimum.double = uitofp i32 %q4.minimum to double
-%q4.q.double = uitofp i32 %q4.q to double
-%q4.step = fmul double %q4.d, %q4.scale.double
-%q4.base = fmul double %q4.min, %q4.minimum.double
-%q4.product = fmul double %q4.step, %q4.q.double
-%q4.result = fsub double %q4.product, %q4.base
+%q4.scale.double = call double @recipe.from.u32(i32 %q4.scale)
+%q4.minimum.double = call double @recipe.from.u32(i32 %q4.minimum)
+%q4.q.double = call double @recipe.from.u32(i32 %q4.q)
+%q4.step = call double @recipe.mul(double %q4.d, double %q4.scale.double)
+%q4.base = call double @recipe.mul(double %q4.min, double %q4.minimum.double)
+%q4.product = call double @recipe.mul(double %q4.step, double %q4.q.double)
+%q4.result = call double @recipe.sub(double %q4.product, double %q4.base)
 ret double %q4.result
 q6:
 %q6.blocks = udiv i32 %columns, 256
@@ -209,11 +242,11 @@ q6:
 %q6.scale = sext i8 %q6.scale.byte to i32
 %q6.d.ptr = getelementptr inbounds i8, ptr addrspace(1) %q6.block, i32 208
 %q6.d.half = load half, ptr addrspace(1) %q6.d.ptr, align 2
-%q6.d = fpext half %q6.d.half to double
-%q6.scale.double = sitofp i32 %q6.scale to double
-%q6.quant.double = sitofp i32 %q6.quant to double
-%q6.scaled = fmul double %q6.d, %q6.scale.double
-%q6.result = fmul double %q6.scaled, %q6.quant.double
+%q6.d = call double @recipe.from.f16(half %q6.d.half)
+%q6.scale.double = call double @recipe.from.s32(i32 %q6.scale)
+%q6.quant.double = call double @recipe.from.s32(i32 %q6.quant)
+%q6.scaled = call double @recipe.mul(double %q6.d, double %q6.scale.double)
+%q6.result = call double @recipe.mul(double %q6.scaled, double %q6.quant.double)
 ret double %q6.result
 invalid: call void @llvm.trap() ret double 0.0 }
 define internal void @quantized_forward_body(
@@ -241,7 +274,7 @@ scale.step:
 %scale.input = load double, ptr addrspace(1) %scale.input.ptr, align 8
 %scale.weight = call double @quantized_value(
 ptr addrspace(1) %matrix, i32 %kind, i32 0, i32 %scale.column, i32 %vector.width )
-%scale.value = fmul double %scale.input, %scale.weight
+%scale.value = call double @recipe.mul(double %scale.input, double %scale.weight)
 %scale.output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %scale.p
 store double %scale.value, ptr addrspace(1) %scale.output.ptr, align 8
 %scale.next = add i32 %scale.p, %threads
@@ -255,7 +288,7 @@ gather.step:
 %gather.channel = urem i32 %gather.p, %outputs
 %gather.token.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %gather.row
 %gather.token.double = load double, ptr addrspace(1) %gather.token.ptr, align 8
-%gather.token = fptoui double %gather.token.double to i32
+%gather.token = call i32 @recipe.to.u32(double %gather.token.double)
 %gather.value = call double @quantized_value(
 ptr addrspace(1) %matrix, i32 %kind, i32 %gather.token, i32 %gather.channel, i32 %outputs )
 %gather.output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %gather.p
@@ -303,8 +336,8 @@ term.step:
 %x = load double, ptr addrspace(1) %input.ptr, align 8
 %w = call double @quantized_value(
 ptr addrspace(1) %matrix, i32 %kind, i32 %channel, i32 %term, i32 %columns )
-%product = fmul double %x, %w
-%sum.next = fadd double %partial, %product
+%product = call double @recipe.mul(double %x, double %w)
+%sum.next = call double @recipe.add(double %partial, double %product)
 %i.next = add nuw i32 %i, 1
 br label %term.loop
 tile.done:
@@ -343,8 +376,8 @@ br i1 %more, label %step, label %done step: %instruction = mul i32 %i, 3 %left.i
 %right.ptr = getelementptr inbounds double, ptr addrspace(1) %program, i32 %right.index
 %opcode.double = load double, ptr addrspace(1) %opcode.ptr, align 8
 %left.double = load double, ptr addrspace(1) %left.ptr, align 8
-%right.double = load double, ptr addrspace(1) %right.ptr, align 8 %opcode = fptosi double %opcode.double to i32
-%left = fptosi double %left.double to i32 %right = fptosi double %right.double to i32
+%right.double = load double, ptr addrspace(1) %right.ptr, align 8 %opcode = call i32 @recipe.to.s32(double %opcode.double)
+%left = call i32 @recipe.to.s32(double %left.double) %right = call i32 @recipe.to.s32(double %right.double)
 %left.literal.constant = icmp eq i32 %opcode, 1
 %left.literal.parameter = icmp eq i32 %opcode, 2
 %left.literal = or i1 %left.literal.constant, %left.literal.parameter
@@ -355,21 +388,21 @@ i32 %left.operand, i32 %p, i32 %elements )
 i32 %right, i32 %p, i32 %elements ) switch i32 %opcode, label %invalid [ i32 0, label %add i32 1, label %constant
 i32 2, label %parameter i32 3, label %subtract i32 4, label %multiply i32 5, label %divide i32 6, label %absolute
 i32 7, label %exponential i32 8, label %logarithm i32 9, label %square.root i32 10, label %sine i32 11, label %cosine
-i32 12, label %hyperbolic i32 13, label %greater ] add: %add.result = fadd double %left.value, %right.value
+i32 12, label %hyperbolic i32 13, label %greater ] add: %add.result = call double @recipe.add(double %left.value, double %right.value)
 br label %operation.done constant: br label %operation.done parameter:
 %parameter.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %left
 %parameter.result = load double, ptr addrspace(1) %parameter.ptr, align 8 br label %operation.done subtract:
-%subtract.result = fsub double %left.value, %right.value br label %operation.done multiply:
-%multiply.result = fmul double %left.value, %right.value br label %operation.done divide:
-%divide.result = fdiv double %left.value, %right.value br label %operation.done absolute:
-%absolute.result = call double @llvm.fabs.f64(double %left.value) br label %operation.done exponential:
-%exponential.result = call double @__ocml_exp_f64(double %left.value) br label %operation.done logarithm:
-%logarithm.result = call double @__ocml_log_f64(double %left.value) br label %operation.done square.root:
-%square.root.result = call double @llvm.sqrt.f64(double %left.value) br label %operation.done sine:
-%sine.result = call double @__ocml_sin_f64(double %left.value) br label %operation.done cosine:
-%cosine.result = call double @__ocml_cos_f64(double %left.value) br label %operation.done hyperbolic:
-%hyperbolic.result = call double @__ocml_tanh_f64(double %left.value) br label %operation.done greater:
-%greater.condition = fcmp ogt double %left.value, %right.value %greater.result = uitofp i1 %greater.condition to double
+%subtract.result = call double @recipe.sub(double %left.value, double %right.value) br label %operation.done multiply:
+%multiply.result = call double @recipe.mul(double %left.value, double %right.value) br label %operation.done divide:
+%divide.result = call double @recipe.div(double %left.value, double %right.value) br label %operation.done absolute:
+%absolute.result = call double @recipe.abs(double %left.value) br label %operation.done exponential:
+%exponential.result = call double @recipe.exp(double %left.value) br label %operation.done logarithm:
+%logarithm.result = call double @recipe.log(double %left.value) br label %operation.done square.root:
+%square.root.result = call double @recipe.sqrt(double %left.value) br label %operation.done sine:
+%sine.result = call double @recipe.sin(double %left.value) br label %operation.done cosine:
+%cosine.result = call double @recipe.cos(double %left.value) br label %operation.done hyperbolic:
+%hyperbolic.result = call double @recipe.tanh(double %left.value) br label %operation.done greater:
+%greater.condition = call i1 @recipe.ogt(double %left.value, double %right.value) %greater.result = call double @recipe.from.u1(i1 %greater.condition)
 br label %operation.done operation.done: %result = phi double [ %add.result, %add ], [ %left.double, %constant ],
 [ %parameter.result, %parameter ], [ %subtract.result, %subtract ],
 [ %multiply.result, %multiply ], [ %divide.result, %divide ],
@@ -389,17 +422,17 @@ i32 %operand, i32 %p, i32 %elements, i32 %instructions, double %value, i1 %write
 %is.first = icmp eq i32 %operand, -1 %is.second = icmp eq i32 %operand, -2 %first.valid = and i1 %is.first, %write.first
 br i1 %first.valid, label %first.add, label %second.test first.add:
 %first.ptr = getelementptr inbounds double, ptr addrspace(1) %first, i32 %p
-%first.old = load double, ptr addrspace(1) %first.ptr, align 8 %first.next = fadd double %first.old, %value
+%first.old = load double, ptr addrspace(1) %first.ptr, align 8 %first.next = call double @recipe.add(double %first.old, double %value)
 store double %first.next, ptr addrspace(1) %first.ptr, align 8 ret void second.test:
 %second.valid = and i1 %is.second, %write.second br i1 %second.valid, label %second.add, label %register.test
 second.add: %second.ptr = getelementptr inbounds double, ptr addrspace(1) %second, i32 %p
-%second.old = load double, ptr addrspace(1) %second.ptr, align 8 %second.next = fadd double %second.old, %value
+%second.old = load double, ptr addrspace(1) %second.ptr, align 8 %second.next = call double @recipe.add(double %second.old, double %value)
 store double %second.next, ptr addrspace(1) %second.ptr, align 8 ret void register.test:
 %is.register = icmp sge i32 %operand, 0 br i1 %is.register, label %register.add, label %done register.add:
 %adjoint.plane = mul i32 %instructions, %elements %register.base = mul i32 %operand, %elements
 %register.local = add i32 %register.base, %p %register.index = add i32 %adjoint.plane, %register.local
 %register.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %register.index
-%register.old = load double, ptr addrspace(1) %register.ptr, align 8 %register.next = fadd double %register.old, %value
+%register.old = load double, ptr addrspace(1) %register.ptr, align 8 %register.next = call double @recipe.add(double %register.old, double %value)
 store double %register.next, ptr addrspace(1) %register.ptr, align 8 ret void done: ret void }
 define internal void @scalar_reverse_body( ptr addrspace(1) %first.values, ptr addrspace(1) %second.values,
 ptr addrspace(1) %first.adjoint, ptr addrspace(1) %second.adjoint,
@@ -428,8 +461,8 @@ br i1 %more, label %reverse.step, label %element.done reverse.step: %i.previous 
 %right.ptr = getelementptr inbounds double, ptr addrspace(1) %program, i32 %right.index
 %opcode.double = load double, ptr addrspace(1) %opcode.ptr, align 8
 %left.double = load double, ptr addrspace(1) %left.ptr, align 8
-%right.double = load double, ptr addrspace(1) %right.ptr, align 8 %opcode = fptosi double %opcode.double to i32
-%left = fptosi double %left.double to i32 %right = fptosi double %right.double to i32
+%right.double = load double, ptr addrspace(1) %right.ptr, align 8 %opcode = call i32 @recipe.to.s32(double %opcode.double)
+%left = call i32 @recipe.to.s32(double %left.double) %right = call i32 @recipe.to.s32(double %right.double)
 %first.value.ptr = getelementptr inbounds double, ptr addrspace(1) %first.values, i32 %p
 %second.value.ptr = getelementptr inbounds double, ptr addrspace(1) %second.values, i32 %p
 %first.value = load double, ptr addrspace(1) %first.value.ptr, align 8
@@ -453,35 +486,35 @@ i32 %left, i32 %p, i32 %elements, i32 %instructions, double %adjoint, i1 %write.
 call void @scalar_add_adjoint(
 ptr addrspace(1) %first.adjoint, ptr addrspace(1) %second.adjoint, ptr addrspace(1) %context,
 i32 %right, i32 %p, i32 %elements, i32 %instructions, double %adjoint, i1 %write.first, i1 %write.second )
-br label %reverse.done subtract.reverse: %subtract.right = fneg double %adjoint call void @scalar_add_adjoint(
+br label %reverse.done subtract.reverse: %subtract.right = call double @recipe.neg(double %adjoint) call void @scalar_add_adjoint(
 ptr addrspace(1) %first.adjoint, ptr addrspace(1) %second.adjoint, ptr addrspace(1) %context,
 i32 %left, i32 %p, i32 %elements, i32 %instructions, double %adjoint, i1 %write.first, i1 %write.second )
 call void @scalar_add_adjoint(
 ptr addrspace(1) %first.adjoint, ptr addrspace(1) %second.adjoint, ptr addrspace(1) %context,
 i32 %right, i32 %p, i32 %elements, i32 %instructions, double %subtract.right, i1 %write.first, i1 %write.second )
-br label %reverse.done multiply.reverse: %left.contribution = fmul double %adjoint, %right.value
-%right.contribution = fmul double %adjoint, %left.value call void @scalar_add_adjoint(
+br label %reverse.done multiply.reverse: %left.contribution = call double @recipe.mul(double %adjoint, double %right.value)
+%right.contribution = call double @recipe.mul(double %adjoint, double %left.value) call void @scalar_add_adjoint(
 ptr addrspace(1) %first.adjoint, ptr addrspace(1) %second.adjoint, ptr addrspace(1) %context,
 i32 %left, i32 %p, i32 %elements, i32 %instructions, double %left.contribution, i1 %write.first, i1 %write.second )
 call void @scalar_add_adjoint(
 ptr addrspace(1) %first.adjoint, ptr addrspace(1) %second.adjoint, ptr addrspace(1) %context,
 i32 %right, i32 %p, i32 %elements, i32 %instructions, double %right.contribution, i1 %write.first, i1 %write.second )
-br label %reverse.done divide.reverse: %divide.left = fdiv double %adjoint, %right.value
-%divide.square = fmul double %right.value, %right.value %divide.numerator = fmul double %adjoint, %left.value
-%divide.right.raw = fdiv double %divide.numerator, %divide.square %divide.right = fneg double %divide.right.raw
-br label %unary.pair absolute.reverse: %absolute.negative = fcmp olt double %left.value, 0.0
-%absolute.positive = fcmp ogt double %left.value, 0.0
-%absolute.upper = select i1 %absolute.positive, double %adjoint, double 0.0 %absolute.negated = fneg double %adjoint
+br label %reverse.done divide.reverse: %divide.left = call double @recipe.div(double %adjoint, double %right.value)
+%divide.square = call double @recipe.mul(double %right.value, double %right.value) %divide.numerator = call double @recipe.mul(double %adjoint, double %left.value)
+%divide.right.raw = call double @recipe.div(double %divide.numerator, double %divide.square) %divide.right = call double @recipe.neg(double %divide.right.raw)
+br label %unary.pair absolute.reverse: %absolute.negative = call i1 @recipe.olt(double %left.value, double 0.0)
+%absolute.positive = call i1 @recipe.ogt(double %left.value, double 0.0)
+%absolute.upper = select i1 %absolute.positive, double %adjoint, double 0.0 %absolute.negated = call double @recipe.neg(double %adjoint)
 %absolute.left = select i1 %absolute.negative, double %absolute.negated, double %absolute.upper br label %unary.single
-exponential.reverse: %exponential.left = fmul double %adjoint, %result.value br label %unary.single logarithm.reverse:
-%logarithm.left = fdiv double %adjoint, %left.value br label %unary.single square.root.reverse:
-%square.root.denominator = fadd double %result.value, %result.value
-%square.root.left = fdiv double %adjoint, %square.root.denominator br label %unary.single sine.reverse:
-%sine.cosine = call double @__ocml_cos_f64(double %left.value) %sine.left = fmul double %adjoint, %sine.cosine
-br label %unary.single cosine.reverse: %cosine.sine = call double @__ocml_sin_f64(double %left.value)
-%cosine.raw = fmul double %adjoint, %cosine.sine %cosine.left = fneg double %cosine.raw br label %unary.single
-hyperbolic.reverse: %hyperbolic.square = fmul double %result.value, %result.value
-%hyperbolic.base = fsub double 1.0, %hyperbolic.square %hyperbolic.left = fmul double %adjoint, %hyperbolic.base
+exponential.reverse: %exponential.left = call double @recipe.mul(double %adjoint, double %result.value) br label %unary.single logarithm.reverse:
+%logarithm.left = call double @recipe.div(double %adjoint, double %left.value) br label %unary.single square.root.reverse:
+%square.root.denominator = call double @recipe.add(double %result.value, double %result.value)
+%square.root.left = call double @recipe.div(double %adjoint, double %square.root.denominator) br label %unary.single sine.reverse:
+%sine.cosine = call double @recipe.cos(double %left.value) %sine.left = call double @recipe.mul(double %adjoint, double %sine.cosine)
+br label %unary.single cosine.reverse: %cosine.sine = call double @recipe.sin(double %left.value)
+%cosine.raw = call double @recipe.mul(double %adjoint, double %cosine.sine) %cosine.left = call double @recipe.neg(double %cosine.raw) br label %unary.single
+hyperbolic.reverse: %hyperbolic.square = call double @recipe.mul(double %result.value, double %result.value)
+%hyperbolic.base = call double @recipe.sub(double 1.0, double %hyperbolic.square) %hyperbolic.left = call double @recipe.mul(double %adjoint, double %hyperbolic.base)
 br label %unary.single unary.single: %unary.left = phi double [ %absolute.left, %absolute.reverse ],
 [ %exponential.left, %exponential.reverse ], [ %logarithm.left, %logarithm.reverse ],
 [ %square.root.left, %square.root.reverse ], [ %sine.left, %sine.reverse ],
@@ -505,7 +538,7 @@ parameter.load: %parameter.instruction = mul i32 %parameter.i, 3
 %parameter.operand.ptr = getelementptr inbounds double, ptr addrspace(1) %program, i32 %parameter.operand.index
 %parameter.opcode.double = load double, ptr addrspace(1) %parameter.opcode.ptr, align 8
 %parameter.operand.double = load double, ptr addrspace(1) %parameter.operand.ptr, align 8
-%parameter.opcode = fptosi double %parameter.opcode.double to i32 %parameter.is = icmp eq i32 %parameter.opcode, 2
+%parameter.opcode = call i32 @recipe.to.s32(double %parameter.opcode.double) %parameter.is = icmp eq i32 %parameter.opcode, 2
 br i1 %parameter.is, label %parameter.sum.loop, label %parameter.done parameter.sum.loop:
 %parameter.p = phi i32 [ 0, %parameter.load ], [ %parameter.p.next, %parameter.sum.step ]
 %parameter.sum = phi double [ 0.0, %parameter.load ], [ %parameter.sum.next, %parameter.sum.step ]
@@ -515,12 +548,12 @@ br i1 %parameter.p.more, label %parameter.sum.step, label %parameter.store param
 %parameter.index = add i32 %adjoint.plane, %parameter.local
 %parameter.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %parameter.index
 %parameter.value = load double, ptr addrspace(1) %parameter.ptr, align 8
-%parameter.sum.next = fadd double %parameter.sum, %parameter.value %parameter.p.next = add nuw i32 %parameter.p, 1
-br label %parameter.sum.loop parameter.store: %parameter.operand = fptosi double %parameter.operand.double to i32
+%parameter.sum.next = call double @recipe.add(double %parameter.sum, double %parameter.value) %parameter.p.next = add nuw i32 %parameter.p, 1
+br label %parameter.sum.loop parameter.store: %parameter.operand = call i32 @recipe.to.s32(double %parameter.operand.double)
 %parameter.gradient.index = add i32 %weight.offset, %parameter.operand
 %parameter.gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %parameter.gradient.index
 %parameter.old = load double, ptr addrspace(1) %parameter.gradient.ptr, align 8
-%parameter.updated = fadd double %parameter.old, %parameter.sum
+%parameter.updated = call double @recipe.add(double %parameter.old, double %parameter.sum)
 store double %parameter.updated, ptr addrspace(1) %parameter.gradient.ptr, align 8 br label %parameter.done
 parameter.done: %parameter.next = add nuw i32 %parameter.i, 1 br label %parameter.loop invalid: call void @llvm.trap()
 br label %exit exit: ret void }
@@ -536,22 +569,21 @@ i32 %p, i32 %from, i32 %to, i32 %size, i32 %channels ) #1 { entry: %length = udi
 %maximum.index = phi i32 [ %start, %entry ], [ %maximum.index.next, %step ] %more = icmp ult i32 %i, %end
 br i1 %more, label %step, label %done step: %index = add i32 %input.base, %i
 %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %index
-%value = load double, ptr addrspace(1) %input.ptr, align 8 %greater = fcmp ogt double %value, %maximum
+%value = load double, ptr addrspace(1) %input.ptr, align 8 %greater = call i1 @recipe.ogt(double %value, double %maximum)
 %maximum.next = select i1 %greater, double %value, double %maximum
 %maximum.index.next = select i1 %greater, i32 %index, i32 %maximum.index %next = add i32 %i, 1 br label %loop done:
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
 %context.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %p
-%maximum.index.double = uitofp i32 %maximum.index to double store double %maximum, ptr addrspace(1) %output.ptr, align 8
+%maximum.index.double = call double @recipe.from.u32(i32 %maximum.index) store double %maximum, ptr addrspace(1) %output.ptr, align 8
 store double %maximum.index.double, ptr addrspace(1) %context.ptr, align 8 ret void }
-declare double @llvm.floor.f64(double)
 define internal i32 @embedding_index(double %value, i32 %vocabulary) #1 { entry:
-%ordered = fcmp ord double %value, %value br i1 %ordered, label %convert, label %invalid convert:
-%floored = call double @llvm.floor.f64(double %value)
-%max.index = sub i32 %vocabulary, 1 %max.double = uitofp i32 %max.index to double
-%low = fcmp olt double %floored, 0.0 %clamped.low = select i1 %low, double 0.0, double %floored
-%high = fcmp ogt double %clamped.low, %max.double
+%ordered = call i1 @recipe.ord(double %value, double %value) br i1 %ordered, label %convert, label %invalid convert:
+%floored = call double @recipe.floor(double %value)
+%max.index = sub i32 %vocabulary, 1 %max.double = call double @recipe.from.u32(i32 %max.index)
+%low = call i1 @recipe.olt(double %floored, double 0.0) %clamped.low = select i1 %low, double 0.0, double %floored
+%high = call i1 @recipe.ogt(double %clamped.low, double %max.double)
 %clamped = select i1 %high, double %max.double, double %clamped.low
-%index = fptoui double %clamped to i32 ret i32 %index
+%index = call i32 @recipe.to.u32(double %clamped) ret i32 %index
 invalid: ret i32 0 } define internal void @embedding_forward_body(
 ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %table,
 ptr addrspace(1) nocapture writeonly %output, i32 %p, i32 %from, i32 %to, i32 %vocabulary ) #1 { entry:
@@ -587,15 +619,15 @@ br i1 %token.more, label %token.step, label %token.loop.done token.step: %input.
 %output.index = add i32 %output.row.base, %output.local
 %delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %output.index
 %delta.value = load double, ptr addrspace(1) %delta.ptr, align 8
-%contribution = select i1 %matched, double %delta.value, double 0.0 %sum.next = fadd double %token.sum, %contribution
+%contribution = select i1 %matched, double %delta.value, double 0.0 %sum.next = call double @recipe.add(double %token.sum, double %contribution)
 %token.next = add nuw i32 %token, 1 br label %token.loop token.loop.done:
 %row.sum = phi double [ %token.sum, %token.loop ] %row.next = add nuw i32 %row, 1 br label %row.loop store:
 %gradient.index = add i32 %offset, %p
 %gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %gradient.index
 store double %sum, ptr addrspace(1) %gradient.ptr, align 8 %next = add i32 %p, %threads br label %parameter.loop exit:
-ret void } define internal double @sigmoid(double %x) #1 { entry: %negative = fneg double %x
-%exponential = call double @__ocml_exp_f64(double %negative) %denominator = fadd double 1.0, %exponential
-%value = fdiv double 1.0, %denominator ret double %value }
+ret void } define internal double @sigmoid(double %x) #1 { entry: %negative = call double @recipe.neg(double %x)
+%exponential = call double @recipe.exp(double %negative) %denominator = call double @recipe.add(double 1.0, double %exponential)
+%value = call double @recipe.div(double 1.0, double %denominator) ret double %value }
 define internal double @attention_score( ptr addrspace(1) nocapture readonly %context, i32 %plane, i32 %row, i32 %head,
 i32 %query, i32 %key, i32 %from, i32 %length, i32 %head_width, double %scale ) #1 { entry:
 %batch.stride = mul i32 %from, 3 %row.base = mul i32 %row, %batch.stride
@@ -609,15 +641,15 @@ br i1 %more, label %channel.step, label %done channel.step: %channel = add i32 %
 %query.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %query.index
 %key.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %key.index
 %query.value = load double, ptr addrspace(1) %query.ptr, align 8
-%key.value = load double, ptr addrspace(1) %key.ptr, align 8 %product = fmul double %query.value, %key.value
-%sum.next = fadd double %sum, %product %offset.next = add i32 %offset, 1 br label %channel.loop done:
-%score = fdiv double %sum, %scale ret double %score } define internal void @attention_forward_body(
+%key.value = load double, ptr addrspace(1) %key.ptr, align 8 %product = call double @recipe.mul(double %query.value, double %key.value)
+%sum.next = call double @recipe.add(double %sum, double %product) %offset.next = add i32 %offset, 1 br label %channel.loop done:
+%score = call double @recipe.div(double %sum, double %scale) ret double %score } define internal void @attention_forward_body(
 ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %weights,
 ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) %context,
 i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #1 { entry:
 %tid = call i32 @llvm.amdgcn.workitem.id.x()
 %length = udiv i32 %from, %channels %head_width = udiv i32 %channels, %heads
-%head_width.double = uitofp i32 %head_width to double %scale = call double @llvm.sqrt.f64(double %head_width.double)
+%head_width.double = call double @recipe.from.u32(i32 %head_width) %scale = call double @recipe.sqrt(double %head_width.double)
 %plane = mul i32 %rows, %from br label %output.loop output.loop:
 %p = phi i32 [ %tid, %entry ], [ %p.next, %output.store ] %output.more = icmp ult i32 %p, %plane
 br i1 %output.more, label %output.step, label %exit output.step: %output.row = udiv i32 %p, %from
@@ -630,18 +662,18 @@ online.loop: %key = phi i32 [ 0, %output.step ], [ %key.next, %online.step ]
 %key.more = icmp ult i32 %key, %length br i1 %key.more, label %online.step, label %output.store online.step:
 %score = call double @attention_score( ptr addrspace(1) %input, i32 %plane, i32 %output.row, i32 %head, i32 %query,
 i32 %key, i32 %from, i32 %length, i32 %head_width, double %scale )
-%larger = fcmp ogt double %score, %maximum %maximum.next = select i1 %larger, double %score, double %maximum
-%old.centered = fsub double %maximum, %maximum.next %old.scale = call double @__ocml_exp_f64(double %old.centered)
-%new.centered = fsub double %score, %maximum.next %new.scale = call double @__ocml_exp_f64(double %new.centered)
-%old.denominator = fmul double %denominator, %old.scale
-%denominator.next = fadd double %old.denominator, %new.scale %value.batch.stride = mul i32 %from, 3
+%larger = call i1 @recipe.ogt(double %score, double %maximum) %maximum.next = select i1 %larger, double %score, double %maximum
+%old.centered = call double @recipe.sub(double %maximum, double %maximum.next) %old.scale = call double @recipe.exp(double %old.centered)
+%new.centered = call double @recipe.sub(double %score, double %maximum.next) %new.scale = call double @recipe.exp(double %new.centered)
+%old.denominator = call double @recipe.mul(double %denominator, double %old.scale)
+%denominator.next = call double @recipe.add(double %old.denominator, double %new.scale) %value.batch.stride = mul i32 %from, 3
 %value.row = mul i32 %output.row, %value.batch.stride %value.plane = mul i32 %from, 2
 %value.row.plane = add i32 %value.row, %value.plane %value.channel.base = mul i32 %output.channel.index, %length
 %value.local = add i32 %value.channel.base, %key %value.index = add i32 %value.row.plane, %value.local
 %value.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %value.index
-%value = load double, ptr addrspace(1) %value.ptr, align 8 %weighted = fmul double %new.scale, %value
-%old.numerator = fmul double %numerator, %old.scale %numerator.next = fadd double %old.numerator, %weighted
-%key.next = add i32 %key, 1 br label %online.loop output.store: %attention = fdiv double %numerator, %denominator
+%value = load double, ptr addrspace(1) %value.ptr, align 8 %weighted = call double @recipe.mul(double %new.scale, double %value)
+%old.numerator = call double @recipe.mul(double %numerator, double %old.scale) %numerator.next = call double @recipe.add(double %old.numerator, double %weighted)
+%key.next = add i32 %key, 1 br label %online.loop output.store: %attention = call double @recipe.div(double %numerator, double %denominator)
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
 store double %attention, ptr addrspace(1) %output.ptr, align 8 %p.next = add i32 %p, %threads br label %output.loop
 exit: ret void }
@@ -661,43 +693,43 @@ double %base, double %factor, i32 %range ) #1 { entry:
 %value = load double, ptr addrspace(1) %value.ptr, align 8
 %paired = load double, ptr addrspace(1) %pair.ptr, align 8
 %pair.number = urem i32 %offset, %half
-%pair.double = uitofp i32 %pair.number to double
-%width.double = uitofp i32 %width to double
-%exponent.top = fmul double %pair.double, -2.0
-%exponent = fdiv double %exponent.top, %width.double
-%base.log = call double @__ocml_log_f64(double %base)
-%power = fmul double %base.log, %exponent
-%frequency = call double @__ocml_exp_f64(double %power)
-%position.double = uitofp i32 %position to double
-%theta.extrap = fmul double %position.double, %frequency
-%theta.interp = fmul double %theta.extrap, %factor
+%pair.double = call double @recipe.from.u32(i32 %pair.number)
+%width.double = call double @recipe.from.u32(i32 %width)
+%exponent.top = call double @recipe.mul(double %pair.double, double -2.0)
+%exponent = call double @recipe.div(double %exponent.top, double %width.double)
+%base.log = call double @recipe.log(double %base)
+%power = call double @recipe.mul(double %base.log, double %exponent)
+%frequency = call double @recipe.exp(double %power)
+%position.double = call double @recipe.from.u32(i32 %position)
+%theta.extrap = call double @recipe.mul(double %position.double, double %frequency)
+%theta.interp = call double @recipe.mul(double %theta.extrap, double %factor)
 %range.low = and i32 %range, 65535
 %range.high = lshr i32 %range, 16
 %ramp.top.integer = sub i32 %pair.number, %range.low
 %ramp.bottom.integer = sub i32 %range.high, %range.low
-%ramp.top = sitofp i32 %ramp.top.integer to double
-%ramp.bottom = uitofp i32 %ramp.bottom.integer to double
-%ramp.raw = fdiv double %ramp.top, %ramp.bottom
-%ramp.low = fcmp olt double %ramp.raw, 0.0
+%ramp.top = call double @recipe.from.s32(i32 %ramp.top.integer)
+%ramp.bottom = call double @recipe.from.u32(i32 %ramp.bottom.integer)
+%ramp.raw = call double @recipe.div(double %ramp.top, double %ramp.bottom)
+%ramp.low = call i1 @recipe.olt(double %ramp.raw, double 0.0)
 %ramp.nonnegative = select i1 %ramp.low, double 0.0, double %ramp.raw
-%ramp.high = fcmp ogt double %ramp.nonnegative, 1.0
+%ramp.high = call i1 @recipe.ogt(double %ramp.nonnegative, double 1.0)
 %ramp = select i1 %ramp.high, double 1.0, double %ramp.nonnegative
-%one.minus.ramp = fsub double 1.0, %ramp
-%interp.part = fmul double %theta.interp, %ramp
-%extrap.part = fmul double %theta.extrap, %one.minus.ramp
-%theta = fadd double %interp.part, %extrap.part
-%inverse.factor = fdiv double 1.0, %factor
-%factor.log = call double @__ocml_log_f64(double %inverse.factor)
-%magnitude.extra = fmul double %factor.log, 0.1
-%magnitude = fadd double 1.0, %magnitude.extra
-%cosine.raw = call double @__ocml_cos_f64(double %theta)
-%sine.raw = call double @__ocml_sin_f64(double %theta)
-%cosine = fmul double %cosine.raw, %magnitude
-%sine = fmul double %sine.raw, %magnitude
-%primary = fmul double %value, %cosine
-%secondary = fmul double %paired, %sine
-%first.value = fsub double %primary, %secondary
-%second.value = fadd double %primary, %secondary
+%one.minus.ramp = call double @recipe.sub(double 1.0, double %ramp)
+%interp.part = call double @recipe.mul(double %theta.interp, double %ramp)
+%extrap.part = call double @recipe.mul(double %theta.extrap, double %one.minus.ramp)
+%theta = call double @recipe.add(double %interp.part, double %extrap.part)
+%inverse.factor = call double @recipe.div(double 1.0, double %factor)
+%factor.log = call double @recipe.log(double %inverse.factor)
+%magnitude.extra = call double @recipe.mul(double %factor.log, double 0.1)
+%magnitude = call double @recipe.add(double 1.0, double %magnitude.extra)
+%cosine.raw = call double @recipe.cos(double %theta)
+%sine.raw = call double @recipe.sin(double %theta)
+%cosine = call double @recipe.mul(double %cosine.raw, double %magnitude)
+%sine = call double @recipe.mul(double %sine.raw, double %magnitude)
+%primary = call double @recipe.mul(double %value, double %cosine)
+%secondary = call double @recipe.mul(double %paired, double %sine)
+%first.value = call double @recipe.sub(double %primary, double %secondary)
+%second.value = call double @recipe.add(double %primary, double %secondary)
 %result = select i1 %second, double %second.value, double %first.value
 ret double %result }
 define internal void @cached_attention_body(
@@ -708,7 +740,7 @@ double %scale, double %rope.base, double %rope.factor, i32 %rope.range, i32 %thr
 %q.width = mul i32 %heads, %width
 %kv.width = mul i32 %kv.heads, %width
 %position.double = load double, ptr addrspace(1) %context, align 8
-%position = fptoui double %position.double to i32
+%position = call i32 @recipe.to.u32(double %position.double)
 %valid = icmp ult i32 %position, %maximum
 br i1 %valid, label %cache.loop, label %invalid
 cache.loop:
@@ -725,7 +757,7 @@ double %rope.base, double %rope.factor, i32 %rope.range )
 %key.cache.index.raw = add i32 %cache.row, %cache.p
 %key.cache.index = add i32 %key.cache.index.raw, 4
 %key.cache.ptr = getelementptr inbounds half, ptr addrspace(1) %context, i32 %key.cache.index
-%key.half = fptrunc double %key to half
+%key.half = call half @recipe.to.f16(double %key)
 store half %key.half, ptr addrspace(1) %key.cache.ptr, align 2
 %value.input.base = add i32 %q.width, %kv.width
 %value.input.index = add i32 %value.input.base, %cache.p
@@ -736,7 +768,7 @@ store half %key.half, ptr addrspace(1) %key.cache.ptr, align 2
 %value.cache.local = add i32 %value.cache.row, %cache.p
 %value.cache.index = add i32 %value.cache.local, 4
 %value.cache.ptr = getelementptr inbounds half, ptr addrspace(1) %context, i32 %value.cache.index
-%value.half = fptrunc double %value to half
+%value.half = call half @recipe.to.f16(double %value)
 store half %value.half, ptr addrspace(1) %value.cache.ptr, align 2
 %cache.next = add i32 %cache.p, %threads
 br label %cache.loop
@@ -779,21 +811,21 @@ double %rope.base, double %rope.factor, i32 %rope.range )
 %key.index = add i32 %key.local, 4
 %key.ptr = getelementptr inbounds half, ptr addrspace(1) %context, i32 %key.index
 %key.half.value = load half, ptr addrspace(1) %key.ptr, align 2
-%key.value = fpext half %key.half.value to double
-%product = fmul double %query, %key.value
-%score.next = fadd double %score, %product
+%key.value = call double @recipe.from.f16(half %key.half.value)
+%product = call double @recipe.mul(double %query, double %key.value)
+%score.next = call double @recipe.add(double %score, double %product)
 %d.next = add nuw i32 %d, 1
 br label %score.loop
 online.step:
-%scaled.score = fmul double %score, %scale
-%larger = fcmp ogt double %scaled.score, %maximum.score
+%scaled.score = call double @recipe.mul(double %score, double %scale)
+%larger = call i1 @recipe.ogt(double %scaled.score, double %maximum.score)
 %maximum.next = select i1 %larger, double %scaled.score, double %maximum.score
-%old.centered = fsub double %maximum.score, %maximum.next
-%old.scale = call double @__ocml_exp_f64(double %old.centered)
-%new.centered = fsub double %scaled.score, %maximum.next
-%new.scale = call double @__ocml_exp_f64(double %new.centered)
-%old.denominator = fmul double %denominator, %old.scale
-%denominator.next = fadd double %old.denominator, %new.scale
+%old.centered = call double @recipe.sub(double %maximum.score, double %maximum.next)
+%old.scale = call double @recipe.exp(double %old.centered)
+%new.centered = call double @recipe.sub(double %scaled.score, double %maximum.next)
+%new.scale = call double @recipe.exp(double %new.centered)
+%old.denominator = call double @recipe.mul(double %denominator, double %old.scale)
+%denominator.next = call double @recipe.add(double %old.denominator, double %new.scale)
 %lookup.cache.base = mul i32 %maximum, %kv.width
 %lookup.row = mul i32 %key.position, %kv.width
 %lookup.local = add i32 %lookup.row, %value.channel
@@ -801,14 +833,14 @@ online.step:
 %lookup.index = add i32 %lookup.raw, 4
 %lookup.ptr = getelementptr inbounds half, ptr addrspace(1) %context, i32 %lookup.index
 %lookup.half = load half, ptr addrspace(1) %lookup.ptr, align 2
-%lookup.value = fpext half %lookup.half to double
-%weighted = fmul double %new.scale, %lookup.value
-%old.numerator = fmul double %numerator, %old.scale
-%numerator.next = fadd double %old.numerator, %weighted
+%lookup.value = call double @recipe.from.f16(half %lookup.half)
+%weighted = call double @recipe.mul(double %new.scale, double %lookup.value)
+%old.numerator = call double @recipe.mul(double %numerator, double %old.scale)
+%numerator.next = call double @recipe.add(double %old.numerator, double %weighted)
 %key.next = add nuw i32 %key.position, 1
 br label %online.loop
 output.store:
-%attention = fdiv double %numerator, %denominator
+%attention = call double @recipe.div(double %numerator, double %denominator)
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
 store double %attention, ptr addrspace(1) %output.ptr, align 8
 %p.next = add i32 %p, %threads
@@ -819,7 +851,7 @@ call void @llvm.amdgcn.s.barrier()
 br i1 %leader, label %position.store, label %exit
 position.store:
 %position.next = add i32 %position, 1
-%position.next.double = uitofp i32 %position.next to double
+%position.next.double = call double @recipe.from.u32(i32 %position.next)
 store double %position.next.double, ptr addrspace(1) %context, align 8
 br label %exit
 invalid: call void @llvm.trap() br label %exit
@@ -829,8 +861,8 @@ ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %context,
 ptr addrspace(1) %delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient,
 i1 %write.previous, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %offset, i32 %threads ) #1 { entry:
 %tid = call i32 @llvm.amdgcn.workitem.id.x() %length = udiv i32 %from, %channels
-%head.width = udiv i32 %channels, %heads %head.width.double = uitofp i32 %head.width to double
-%scale = call double @llvm.sqrt.f64(double %head.width.double) %plane = mul i32 %rows, %from br label %row.loop row.loop:
+%head.width = udiv i32 %channels, %heads %head.width.double = call double @recipe.from.u32(i32 %head.width)
+%scale = call double @recipe.sqrt(double %head.width.double) %plane = mul i32 %rows, %from br label %row.loop row.loop:
 %row = phi i32 [ %tid, %entry ], [ %row.next, %row.done ] %row.more = icmp ult i32 %row, %rows
 br i1 %row.more, label %head.loop, label %rows.done head.loop:
 %head = phi i32 [ 0, %row.loop ], [ %head.next, %head.done ] %head.more = icmp ult i32 %head, %heads
@@ -859,32 +891,32 @@ br i1 %online.channel.more, label %online.channel.step, label %online.statistics
 %online.value.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %online.value.index
 %online.delta = load double, ptr addrspace(1) %online.delta.ptr, align 8
 %online.value = load double, ptr addrspace(1) %online.value.ptr, align 8
-%online.dp.product = fmul double %online.delta, %online.value
-%online.dp.next = fadd double %online.dp, %online.dp.product
+%online.dp.product = call double @recipe.mul(double %online.delta, double %online.value)
+%online.dp.next = call double @recipe.add(double %online.dp, double %online.dp.product)
 %online.channel.next = add nuw i32 %online.channel.offset, 1 br label %online.channel.loop online.statistics.update:
 %online.score = call double @attention_score( ptr addrspace(1) %input, i32 %plane, i32 %row, i32 %head, i32 %query,
 i32 %online.key, i32 %from, i32 %length, i32 %head.width, double %scale )
-%online.larger = fcmp ogt double %online.score, %online.maximum
+%online.larger = call i1 @recipe.ogt(double %online.score, double %online.maximum)
 %online.maximum.next = select i1 %online.larger, double %online.score, double %online.maximum
-%online.old.centered = fsub double %online.maximum, %online.maximum.next
-%online.old.scale = call double @__ocml_exp_f64(double %online.old.centered)
-%online.new.centered = fsub double %online.score, %online.maximum.next
-%online.new.scale = call double @__ocml_exp_f64(double %online.new.centered)
-%online.old.denominator = fmul double %online.denominator, %online.old.scale
-%online.denominator.next = fadd double %online.old.denominator, %online.new.scale
-%online.old.weighted = fmul double %online.weighted, %online.old.scale
-%online.new.weighted = fmul double %online.dp, %online.new.scale
-%online.weighted.next = fadd double %online.old.weighted, %online.new.weighted
+%online.old.centered = call double @recipe.sub(double %online.maximum, double %online.maximum.next)
+%online.old.scale = call double @recipe.exp(double %online.old.centered)
+%online.new.centered = call double @recipe.sub(double %online.score, double %online.maximum.next)
+%online.new.scale = call double @recipe.exp(double %online.new.centered)
+%online.old.denominator = call double @recipe.mul(double %online.denominator, double %online.old.scale)
+%online.denominator.next = call double @recipe.add(double %online.old.denominator, double %online.new.scale)
+%online.old.weighted = call double @recipe.mul(double %online.weighted, double %online.old.scale)
+%online.new.weighted = call double @recipe.mul(double %online.dp, double %online.new.scale)
+%online.weighted.next = call double @recipe.add(double %online.old.weighted, double %online.new.weighted)
 %online.next = add nuw i32 %online.key, 1 br label %online.statistics.loop online.statistics.done:
-%online.mean = fdiv double %online.weighted, %online.denominator br label %key.loop key.loop:
+%online.mean = call double @recipe.div(double %online.weighted, double %online.denominator) br label %key.loop key.loop:
 %key = phi i32 [ 0, %online.statistics.done ], [ %key.next, %key.channel.done ] %key.more = icmp ult i32 %key, %length
 %key.head.start = mul i32 %head, %head.width %key.row.base = mul i32 %row, %from
 br i1 %key.more, label %key.prepare, label %query.done key.prepare:
 %key.score = call double @attention_score( ptr addrspace(1) %input, i32 %plane, i32 %row, i32 %head, i32 %query,
 i32 %key, i32 %from, i32 %length, i32 %head.width, double %scale )
-%key.centered = fsub double %key.score, %online.maximum
-%key.exponential = call double @__ocml_exp_f64(double %key.centered)
-%key.probability = fdiv double %key.exponential, %online.denominator br label %key.dp.loop key.dp.loop:
+%key.centered = call double @recipe.sub(double %key.score, double %online.maximum)
+%key.exponential = call double @recipe.exp(double %key.centered)
+%key.probability = call double @recipe.div(double %key.exponential, double %online.denominator) br label %key.dp.loop key.dp.loop:
 %key.dp.channel = phi i32 [ 0, %key.prepare ], [ %key.dp.next, %key.dp.step ]
 %key.dp = phi double [ 0.0, %key.prepare ], [ %key.dp.sum, %key.dp.step ]
 %key.dp.more = icmp ult i32 %key.dp.channel, %head.width
@@ -899,10 +931,10 @@ key.dp.step: %key.channel = add i32 %key.head.start, %key.dp.channel %key.channe
 %key.value.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %key.value.index
 %key.dp.delta = load double, ptr addrspace(1) %key.dp.delta.ptr, align 8
 %key.value = load double, ptr addrspace(1) %key.value.ptr, align 8
-%key.dp.product = fmul double %key.dp.delta, %key.value
-%key.dp.sum = fadd double %key.dp, %key.dp.product %key.dp.next = add nuw i32 %key.dp.channel, 1 br label %key.dp.loop
-key.channel.entry: %key.dp.centered = fsub double %key.dp, %online.mean
-%ds = fmul double %key.probability, %key.dp.centered br label %key.channel.loop key.channel.loop:
+%key.dp.product = call double @recipe.mul(double %key.dp.delta, double %key.value)
+%key.dp.sum = call double @recipe.add(double %key.dp, double %key.dp.product) %key.dp.next = add nuw i32 %key.dp.channel, 1 br label %key.dp.loop
+key.channel.entry: %key.dp.centered = call double @recipe.sub(double %key.dp, double %online.mean)
+%ds = call double @recipe.mul(double %key.probability, double %key.dp.centered) br label %key.channel.loop key.channel.loop:
 %key.channel.offset = phi i32 [ 0, %key.channel.entry ], [ %key.channel.next, %key.channel.step ]
 %key.channel.more = icmp ult i32 %key.channel.offset, %head.width
 br i1 %key.channel.more, label %key.channel.step, label %key.channel.done key.channel.step:
@@ -918,15 +950,15 @@ br i1 %key.channel.more, label %key.channel.step, label %key.channel.done key.ch
 %update.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %update.delta.index
 %query.value = load double, ptr addrspace(1) %query.ptr, align 8
 %key.value.current = load double, ptr addrspace(1) %key.ptr, align 8
-%update.delta = load double, ptr addrspace(1) %update.delta.ptr, align 8 %dq.raw = fmul double %ds, %key.value.current
-%dq = fdiv double %dq.raw, %scale %dk.raw = fmul double %ds, %query.value %dk = fdiv double %dk.raw, %scale
-%dv = fmul double %key.probability, %update.delta
+%update.delta = load double, ptr addrspace(1) %update.delta.ptr, align 8 %dq.raw = call double @recipe.mul(double %ds, double %key.value.current)
+%dq = call double @recipe.div(double %dq.raw, double %scale) %dk.raw = call double @recipe.mul(double %ds, double %query.value) %dk = call double @recipe.div(double %dk.raw, double %scale)
+%dv = call double @recipe.mul(double %key.probability, double %update.delta)
 %dq.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %query.index
 %dk.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %key.index
 %dv.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %value.index
-%dq.old = atomicrmw fadd ptr addrspace(1) %dq.ptr, double %dq monotonic, align 8
-%dk.old = atomicrmw fadd ptr addrspace(1) %dk.ptr, double %dk monotonic, align 8
-%dv.old = atomicrmw fadd ptr addrspace(1) %dv.ptr, double %dv monotonic, align 8
+%dq.old = call double @recipe.atomic.add(ptr addrspace(1) %dq.ptr, double %dq)
+%dk.old = call double @recipe.atomic.add(ptr addrspace(1) %dk.ptr, double %dk)
+%dv.old = call double @recipe.atomic.add(ptr addrspace(1) %dv.ptr, double %dv)
 %key.channel.next = add nuw i32 %key.channel.offset, 1
 br label %key.channel.loop key.channel.done: %key.next = add nuw i32 %key, 1 br label %key.loop query.done:
 %query.next = add nuw i32 %query, 1 br label %query.loop head.done: %head.next = add nuw i32 %head, 1
@@ -977,20 +1009,20 @@ state.sum.step: %previous.time = sub i32 %time, 1 %previous.safe = select i1 %pr
 %reset.channel.base = mul i32 %state.channel, %length %reset.local = add i32 %reset.channel.base, %time
 %reset.row.index = add i32 %output.row.base, %reset.local %reset.base = add i32 %gate.batch, %reset.row.index
 %reset.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %reset.base
-%reset = load double, ptr addrspace(1) %reset.ptr, align 8 %reset.state = fmul double %reset, %previous
+%reset = load double, ptr addrspace(1) %reset.ptr, align 8 %reset.state = call double @recipe.mul(double %reset, double %previous)
 %state.value = select i1 %reset.candidate, double %reset.state, double %previous
 %state.weight.base = add i32 %gate.weight.base, %input.matrix %state.weight.row = mul i32 %state.channel, %out.channels
 %state.weight.local = add i32 %state.weight.row, %hidden
 %state.weight.index = add i32 %state.weight.base, %state.weight.local
 %state.weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %state.weight.index
 %state.weight = load double, ptr addrspace(1) %state.weight.ptr, align 8
-%state.product = fmul double %state.value, %state.weight %state.sum.next = fadd double %state.sum, %state.product
+%state.product = call double @recipe.mul(double %state.value, double %state.weight) %state.sum.next = call double @recipe.add(double %state.sum, double %state.product)
 %state.next = add nuw i32 %state.channel, 1 br label %state.sum.loop gate.activate:
 %bias.base = add i32 %gate.weight.base, %matrix.span %bias.index = add i32 %bias.base, %hidden
 %bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %bias.index
-%bias = load double, ptr addrspace(1) %bias.ptr, align 8 %linear = fadd double %state.sum, %bias
+%bias = load double, ptr addrspace(1) %bias.ptr, align 8 %linear = call double @recipe.add(double %state.sum, double %bias)
 %rnn = icmp eq i32 %gates, 1 %last.gate = sub i32 %gates, 1 %candidate = icmp eq i32 %gate, %last.gate
-%use.tanh = or i1 %rnn, %candidate %tanh.value = call double @__ocml_tanh_f64(double %linear)
+%use.tanh = or i1 %rnn, %candidate %tanh.value = call double @recipe.tanh(double %linear)
 %sigmoid.value = call double @sigmoid(double %linear)
 %gate.value = select i1 %use.tanh, double %tanh.value, double %sigmoid.value br label %gate.store gate.store:
 %gate.context.base = mul i32 %gate, %gate.batch %gate.hidden.base = mul i32 %hidden, %length
@@ -1022,18 +1054,18 @@ output.step: %output.hidden.base = mul i32 %output.hidden, %length %output.local
 %output.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %output.previous.index
 %output.previous.loaded = load double, ptr addrspace(1) %output.previous.ptr, align 8
 %output.previous = select i1 %previous.exists, double %output.previous.loaded, double 0.0
-%one.update = fsub double 1.0, %gate0 %gru.old = fmul double %gate0, %output.previous
-%gru.new = fmul double %one.update, %gate2 %gru.value = fadd double %gru.old, %gru.new
+%one.update = call double @recipe.sub(double 1.0, double %gate0) %gru.old = call double @recipe.mul(double %gate0, double %output.previous)
+%gru.new = call double @recipe.mul(double %one.update, double %gate2) %gru.value = call double @recipe.add(double %gru.old, double %gru.new)
 %cell.base = mul i32 %gate.batch, %gates %cell.index = add i32 %cell.base, %output.index
 %cell.previous.index = add i32 %cell.base, %output.previous.index
 %cell.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %cell.previous.index
 %cell.previous.loaded = load double, ptr addrspace(1) %cell.previous.ptr, align 8
 %cell.previous = select i1 %previous.exists, double %cell.previous.loaded, double 0.0
-%cell.old = fmul double %gate1, %cell.previous %cell.new = fmul double %gate0, %gate3
-%cell = fadd double %cell.old, %cell.new
+%cell.old = call double @recipe.mul(double %gate1, double %cell.previous) %cell.new = call double @recipe.mul(double %gate0, double %gate3)
+%cell = call double @recipe.add(double %cell.old, double %cell.new)
 %cell.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %cell.index
-store double %cell, ptr addrspace(1) %cell.ptr, align 8 %cell.tanh = call double @__ocml_tanh_f64(double %cell)
-%lstm.value = fmul double %gate2, %cell.tanh
+store double %cell, ptr addrspace(1) %cell.ptr, align 8 %cell.tanh = call double @recipe.tanh(double %cell)
+%lstm.value = call double @recipe.mul(double %gate2, double %cell.tanh)
 %rnn.or.gru = select i1 %is.gru, double %gru.value, double %gate0
 %output.value = select i1 %is.lstm, double %lstm.value, double %rnn.or.gru br label %output.store output.store:
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %output.index
@@ -1088,8 +1120,8 @@ store double %next.delta, ptr addrspace(3) %next.tile.ptr, align 8 br label %gra
 %input.value = call double @contraction_input( ptr addrspace(1) %input, i32 %input.row.base, i32 %position,
 i32 %gradient.term, i32 %span, i32 %in.length, i1 %is.conv ) %tile.ptr = getelementptr [0 x double],
 ptr addrspace(3) @contraction_tile, i32 0, i32 %buffer
-%delta.value = load double, ptr addrspace(3) %tile.ptr, align 8 %product = fmul double %input.value, %delta.value
-%candidate = fadd double %sum, %product %sum.next = select i1 %active, double %candidate, double %sum
+%delta.value = load double, ptr addrspace(3) %tile.ptr, align 8 %product = call double @recipe.mul(double %input.value, double %delta.value)
+%candidate = call double @recipe.add(double %sum, double %product) %sum.next = select i1 %active, double %candidate, double %sum
 br label %gradient.tile.done gradient.tile.done: call void @recipe.local.barrier()
 br label %gradient.item.loop gradient.store: br i1 %active, label %gradient.write, label %gradient.job.done
 gradient.write: %p.0 = mul i32 %filter, %window %p = add i32 %p.0, %gradient.term %gradient.index = add i32 %offset, %p
@@ -1109,7 +1141,7 @@ br i1 %bias.p.more, label %bias.sum.step, label %bias.store bias.sum.step:
 %bias.local = add i32 %bias.filter.base, %bias.position %bias.delta.index = add i32 %bias.row.base, %bias.local
 %bias.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %bias.delta.index
 %bias.delta = load double, ptr addrspace(1) %bias.delta.ptr, align 8
-%bias.sum.next = fadd double %bias.sum, %bias.delta %bias.p.next = add nuw i32 %bias.p, 1 br label %bias.sum.loop
+%bias.sum.next = call double @recipe.add(double %bias.sum, double %bias.delta) %bias.p.next = add nuw i32 %bias.p, 1 br label %bias.sum.loop
 bias.store: %bias.weight.base = mul i32 %out.channels, %window %bias.weight = add i32 %bias.weight.base, %bias.filter
 %bias.gradient.index = add i32 %offset, %bias.weight
 %bias.gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %bias.gradient.index
@@ -1138,13 +1170,13 @@ br i1 %term.more, label %previous.sum.step, label %previous.store previous.sum.s
 %delta.ptr.1 = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %delta.index.1
 %weight.value = load double, ptr addrspace(1) %weight.ptr, align 8
 %delta.value.1 = load double, ptr addrspace(1) %delta.ptr.1, align 8
-%term.product = fmul double %weight.value, %delta.value.1
+%term.product = call double @recipe.mul(double %weight.value, double %delta.value.1)
 %contribution = select i1 %valid, double %term.product, double 0.0
-%previous.sum.next = fadd double %previous.sum, %contribution %term.next = add nuw i32 %term, 1
+%previous.sum.next = call double @recipe.add(double %previous.sum, double %contribution) %term.next = add nuw i32 %term, 1
 br label %previous.sum.loop previous.store: br i1 %write.input, label %previous.add, label %previous.done previous.add:
 %previous.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %previous.p
 %previous.old = load double, ptr addrspace(1) %previous.ptr, align 8
-%previous.value = fadd double %previous.old, %previous.sum
+%previous.value = call double @recipe.add(double %previous.old, double %previous.sum)
 store double %previous.value, ptr addrspace(1) %previous.ptr, align 8 br label %previous.done previous.done:
 %previous.next = add i32 %previous.p, %threads br label %previous.loop exit: ret void }
 define internal void @scan_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
@@ -1197,9 +1229,9 @@ ptr addrspace(1) %delta, i32 %rnn.index %rnn.future.index = add i32 %dh.start, %
 %rnn.gate.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %rnn.index
 %rnn.dy = load double, ptr addrspace(1) %rnn.dy.ptr, align 8
 %rnn.future = load double, ptr addrspace(1) %rnn.future.ptr, align 8
-%rnn.gate = load double, ptr addrspace(1) %rnn.gate.ptr, align 8 %rnn.dh = fadd double %rnn.dy, %rnn.future
-%rnn.square = fmul double %rnn.gate, %rnn.gate %rnn.derivative = fsub double 1.0, %rnn.square
-%rnn.delta = fmul double %rnn.dh, %rnn.derivative %rnn.delta.index = add i32 %delta.base, %rnn.index
+%rnn.gate = load double, ptr addrspace(1) %rnn.gate.ptr, align 8 %rnn.dh = call double @recipe.add(double %rnn.dy, double %rnn.future)
+%rnn.square = call double @recipe.mul(double %rnn.gate, double %rnn.gate) %rnn.derivative = call double @recipe.sub(double 1.0, double %rnn.square)
+%rnn.delta = call double @recipe.mul(double %rnn.dh, double %rnn.derivative) %rnn.delta.index = add i32 %delta.base, %rnn.index
 %rnn.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %rnn.delta.index
 store double %rnn.delta, ptr addrspace(1) %rnn.delta.ptr, align 8 %rnn.next = add i32 %rnn.hidden, 1
 br label %rnn.delta.loop gru.delta.loop: %gru.hidden = phi i32 [ 0, %rnn.test ], [ %gru.next, %gru.delta.step ]
@@ -1220,12 +1252,12 @@ br i1 %gru.more, label %gru.delta.step, label %gru.reset.loop gru.delta.step:
 %gru.previous.loaded = load double, ptr addrspace(1) %gru.previous.ptr, align 8
 %gru.previous = select i1 %previous.exists, double %gru.previous.loaded, double 0.0
 %gru.z = load double, ptr addrspace(1) %gru.z.ptr, align 8
-%gru.n = load double, ptr addrspace(1) %gru.n.ptr, align 8 %gru.dh = fadd double %gru.dy, %gru.future
-%gru.one.z = fsub double 1.0, %gru.z %gru.z.difference = fsub double %gru.previous, %gru.n
-%gru.dz.0 = fmul double %gru.dh, %gru.z.difference %gru.dz.1 = fmul double %gru.dz.0, %gru.z
-%gru.dz = fmul double %gru.dz.1, %gru.one.z %gru.n.square = fmul double %gru.n, %gru.n
-%gru.n.derivative = fsub double 1.0, %gru.n.square %gru.dn.0 = fmul double %gru.dh, %gru.one.z
-%gru.dn = fmul double %gru.dn.0, %gru.n.derivative %gru.dz.index = add i32 %delta.base, %gru.index
+%gru.n = load double, ptr addrspace(1) %gru.n.ptr, align 8 %gru.dh = call double @recipe.add(double %gru.dy, double %gru.future)
+%gru.one.z = call double @recipe.sub(double 1.0, double %gru.z) %gru.z.difference = call double @recipe.sub(double %gru.previous, double %gru.n)
+%gru.dz.0 = call double @recipe.mul(double %gru.dh, double %gru.z.difference) %gru.dz.1 = call double @recipe.mul(double %gru.dz.0, double %gru.z)
+%gru.dz = call double @recipe.mul(double %gru.dz.1, double %gru.one.z) %gru.n.square = call double @recipe.mul(double %gru.n, double %gru.n)
+%gru.n.derivative = call double @recipe.sub(double 1.0, double %gru.n.square) %gru.dn.0 = call double @recipe.mul(double %gru.dh, double %gru.one.z)
+%gru.dn = call double @recipe.mul(double %gru.dn.0, double %gru.n.derivative) %gru.dz.index = add i32 %delta.base, %gru.index
 %gru.dn.index.0 = add i32 %delta.base, %gate2.batch %gru.dn.index = add i32 %gru.dn.index.0, %gru.index
 %gru.dz.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gru.dz.index
 %gru.dn.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gru.dn.index
@@ -1249,8 +1281,8 @@ br i1 %gru.target.more, label %gru.reset.sum.step, label %gru.reset.store gru.re
 %gru.target.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gru.target.delta.index
 %gru.weight = load double, ptr addrspace(1) %gru.weight.ptr, align 8
 %gru.target.delta = load double, ptr addrspace(1) %gru.target.delta.ptr, align 8
-%gru.reset.product = fmul double %gru.weight, %gru.target.delta
-%gru.reset.sum.next = fadd double %gru.reset.sum, %gru.reset.product
+%gru.reset.product = call double @recipe.mul(double %gru.weight, double %gru.target.delta)
+%gru.reset.sum.next = call double @recipe.add(double %gru.reset.sum, double %gru.reset.product)
 %gru.target.next = add i32 %gru.target, 1 br label %gru.reset.sum.loop gru.reset.store:
 %gru.source.base = mul i32 %gru.source, %length %gru.source.local = add i32 %gru.source.base, %time.current
 %gru.source.index = add i32 %row.output.base, %gru.source.local
@@ -1262,8 +1294,8 @@ br i1 %gru.target.more, label %gru.reset.sum.step, label %gru.reset.store gru.re
 %gru.source.previous.loaded = load double, ptr addrspace(1) %gru.source.previous.ptr, align 8
 %gru.source.previous = select i1 %previous.exists, double %gru.source.previous.loaded, double 0.0
 %gru.r = load double, ptr addrspace(1) %gru.r.ptr, align 8
-%gru.dr = fmul double %gru.reset.sum, %gru.source.previous %gru.one.r = fsub double 1.0, %gru.r
-%gru.dr.0 = fmul double %gru.dr, %gru.r %gru.dr.1 = fmul double %gru.dr.0, %gru.one.r
+%gru.dr = call double @recipe.mul(double %gru.reset.sum, double %gru.source.previous) %gru.one.r = call double @recipe.sub(double 1.0, double %gru.r)
+%gru.dr.0 = call double @recipe.mul(double %gru.dr, double %gru.r) %gru.dr.1 = call double @recipe.mul(double %gru.dr.0, double %gru.one.r)
 %gru.dr.base = add i32 %delta.base, %batch %gru.dr.index = add i32 %gru.dr.base, %gru.source.index
 %gru.dr.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gru.dr.index
 store double %gru.dr.1, ptr addrspace(1) %gru.dr.ptr, align 8 %gru.source.next = add i32 %gru.source, 1
@@ -1289,15 +1321,15 @@ gate.delta.step: %hidden.base = mul i32 %hidden, %length %local = add i32 %hidde
 %g.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %g.index
 %i = load double, ptr addrspace(1) %i.ptr, align 8 %f = load double, ptr addrspace(1) %f.ptr, align 8
 %o = load double, ptr addrspace(1) %o.ptr, align 8 %g = load double, ptr addrspace(1) %g.ptr, align 8
-%dh = fadd double %dy, %dh.future %cell.tanh = call double @__ocml_tanh_f64(double %cell)
-%cell.tanh.square = fmul double %cell.tanh, %cell.tanh %cell.tanh.derivative = fsub double 1.0, %cell.tanh.square
-%cell.chain.0 = fmul double %dh, %o %cell.chain = fmul double %cell.chain.0, %cell.tanh.derivative
-%dc = fadd double %dc.future, %cell.chain %one.o = fsub double 1.0, %o %do.0 = fmul double %dh, %cell.tanh
-%do.1 = fmul double %do.0, %o %do = fmul double %do.1, %one.o %one.i = fsub double 1.0, %i %di.0 = fmul double %dc, %g
-%di.1 = fmul double %di.0, %i %di = fmul double %di.1, %one.i %one.f = fsub double 1.0, %f
-%df.0 = fmul double %dc, %cell.previous %df.1 = fmul double %df.0, %f %df = fmul double %df.1, %one.f
-%g.square = fmul double %g, %g %one.g.square = fsub double 1.0, %g.square %dg.0 = fmul double %dc, %i
-%dg = fmul double %dg.0, %one.g.square %dc.previous = fmul double %dc, %f
+%dh = call double @recipe.add(double %dy, double %dh.future) %cell.tanh = call double @recipe.tanh(double %cell)
+%cell.tanh.square = call double @recipe.mul(double %cell.tanh, double %cell.tanh) %cell.tanh.derivative = call double @recipe.sub(double 1.0, double %cell.tanh.square)
+%cell.chain.0 = call double @recipe.mul(double %dh, double %o) %cell.chain = call double @recipe.mul(double %cell.chain.0, double %cell.tanh.derivative)
+%dc = call double @recipe.add(double %dc.future, double %cell.chain) %one.o = call double @recipe.sub(double 1.0, double %o) %do.0 = call double @recipe.mul(double %dh, double %cell.tanh)
+%do.1 = call double @recipe.mul(double %do.0, double %o) %do = call double @recipe.mul(double %do.1, double %one.o) %one.i = call double @recipe.sub(double 1.0, double %i) %di.0 = call double @recipe.mul(double %dc, double %g)
+%di.1 = call double @recipe.mul(double %di.0, double %i) %di = call double @recipe.mul(double %di.1, double %one.i) %one.f = call double @recipe.sub(double 1.0, double %f)
+%df.0 = call double @recipe.mul(double %dc, double %cell.previous) %df.1 = call double @recipe.mul(double %df.0, double %f) %df = call double @recipe.mul(double %df.1, double %one.f)
+%g.square = call double @recipe.mul(double %g, double %g) %one.g.square = call double @recipe.sub(double 1.0, double %g.square) %dg.0 = call double @recipe.mul(double %dc, double %i)
+%dg = call double @recipe.mul(double %dg.0, double %one.g.square) %dc.previous = call double @recipe.mul(double %dc, double %f)
 store double %dc.previous, ptr addrspace(1) %dc.ptr, align 8 %delta0.index = add i32 %delta.base, %index
 %delta1.index = add i32 %delta0.index, %batch %delta2.index = add i32 %delta1.index, %batch
 %delta3.index = add i32 %delta2.index, %batch
@@ -1334,13 +1366,13 @@ br i1 %input.weight, label %parameter.advance, label %parameter.value parameter.
 %parameter.reset.index = select i1 %gru.candidate, i32 %parameter.reset.raw, i32 0
 %parameter.reset.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %parameter.reset.index
 %parameter.reset = load double, ptr addrspace(1) %parameter.reset.ptr, align 8
-%parameter.reset.state = fmul double %parameter.reset, %state.value
+%parameter.reset.state = call double @recipe.mul(double %parameter.reset, double %state.value)
 %parameter.state = select i1 %gru.candidate, double %parameter.reset.state, double %state.value
 %source.value = select i1 %state.weight, double %parameter.state, double 1.0
-%contribution = fmul double %source.value, %gate.delta %row.gradient.index = add i32 %row.gradient.start, %p
+%contribution = call double @recipe.mul(double %source.value, double %gate.delta) %row.gradient.index = add i32 %row.gradient.start, %p
 %row.gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %row.gradient.index
 %row.gradient.old = load double, ptr addrspace(1) %row.gradient.ptr, align 8
-%row.gradient.new = fadd double %row.gradient.old, %contribution
+%row.gradient.new = call double @recipe.add(double %row.gradient.old, double %contribution)
 store double %row.gradient.new, ptr addrspace(1) %row.gradient.ptr, align 8
 br label %parameter.advance parameter.advance:
 %p.next = add nuw i32 %p, 1 br label %parameter.loop hidden.gradient.loop:
@@ -1364,16 +1396,16 @@ br i1 %state.term.more, label %hidden.gradient.sum.step, label %hidden.gradient.
 %state.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %state.delta.index
 %state.weight.value = load double, ptr addrspace(1) %state.weight.ptr, align 8
 %state.delta.value = load double, ptr addrspace(1) %state.delta.ptr, align 8
-%state.product = fmul double %state.weight.value, %state.delta.value %state.candidate = icmp eq i32 %state.gate, 2
+%state.product = call double @recipe.mul(double %state.weight.value, double %state.delta.value) %state.candidate = icmp eq i32 %state.gate, 2
 %state.gru.candidate = and i1 %gru, %state.candidate %state.reset.hidden.base = mul i32 %state.channel, %length
 %state.reset.local = add i32 %state.reset.hidden.base, %time.current
 %state.reset.row = add i32 %row.output.base, %state.reset.local %state.reset.raw = add i32 %batch, %state.reset.row
 %state.reset.index = select i1 %state.gru.candidate, i32 %state.reset.raw, i32 0
 %state.reset.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %state.reset.index
 %state.reset = load double, ptr addrspace(1) %state.reset.ptr, align 8
-%state.reset.product = fmul double %state.product, %state.reset
+%state.reset.product = call double @recipe.mul(double %state.product, double %state.reset)
 %state.contribution = select i1 %state.gru.candidate, double %state.reset.product, double %state.product
-%state.sum.next = fadd double %state.sum, %state.contribution %state.term.next = add nuw i32 %state.term, 1
+%state.sum.next = call double @recipe.add(double %state.sum, double %state.contribution) %state.term.next = add nuw i32 %state.term, 1
 br label %hidden.gradient.sum.loop hidden.gradient.store: %state.dh.index = add i32 %dh.start, %state.channel
 %state.dh.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %state.dh.index
 %state.direct.hidden.base = mul i32 %state.channel, %length
@@ -1384,10 +1416,10 @@ br label %hidden.gradient.sum.loop hidden.gradient.store: %state.dh.index = add 
 %state.direct.dy = load double, ptr addrspace(1) %state.direct.delta.ptr, align 8
 %state.direct.future = load double, ptr addrspace(1) %state.dh.ptr, align 8
 %state.direct.z = load double, ptr addrspace(1) %state.direct.z.ptr, align 8
-%state.direct.dh = fadd double %state.direct.dy, %state.direct.future
-%state.direct.raw = fmul double %state.direct.z, %state.direct.dh
+%state.direct.dh = call double @recipe.add(double %state.direct.dy, double %state.direct.future)
+%state.direct.raw = call double @recipe.mul(double %state.direct.z, double %state.direct.dh)
 %state.direct = select i1 %gru, double %state.direct.raw, double 0.0
-%state.total = fadd double %state.sum, %state.direct
+%state.total = call double @recipe.add(double %state.sum, double %state.direct)
 store double %state.total, ptr addrspace(1) %state.dh.ptr, align 8 %state.channel.next = add nuw i32 %state.channel, 1
 br label %hidden.gradient.loop time.done: br label %time.loop row.done: %row.next = add i32 %row, %threads
 br label %row.loop reduce.entry: call void @llvm.amdgcn.s.barrier() br label %reduce.loop reduce.loop:
@@ -1400,7 +1432,7 @@ reduce.row.step: %reduce.row.offset = mul i32 %reduce.row, %parameters
 %reduce.local = add i32 %reduce.row.offset, %reduce.p %reduce.index = add i32 %row.gradient.base, %reduce.local
 %reduce.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %reduce.index
 %reduce.value = load double, ptr addrspace(1) %reduce.ptr, align 8
-%reduce.sum.next = fadd double %reduce.sum, %reduce.value %reduce.row.next = add nuw i32 %reduce.row, 1
+%reduce.sum.next = call double @recipe.add(double %reduce.sum, double %reduce.value) %reduce.row.next = add nuw i32 %reduce.row, 1
 br label %reduce.row.loop reduce.store: %reduce.gradient.index = add i32 %offset, %reduce.p
 %reduce.gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %reduce.gradient.index
 store double %reduce.sum, ptr addrspace(1) %reduce.gradient.ptr, align 8 %reduce.next = add i32 %reduce.p, %threads
@@ -1481,9 +1513,9 @@ br i1 %node.more, label %node.load, label %exit node.load: %base = mul i32 %node
 %count = mul i32 %rows, %out.elements %is.attention = icmp eq i32 %op, 4 %is.scan = icmp eq i32 %op, 5
 %is.contraction = icmp eq i32 %op, 0 %is.normalize = icmp eq i32 %op, 8 %is.quantized = icmp eq i32 %op, 9
 br i1 %is.attention, label %attention.node, label %scan.test attention.node:
-%heads = fptoui double %argument to i32
-%kv.heads = fptoui double %argument.second to i32
-%head.width = fptoui double %argument.third to i32
+%heads = call i32 @recipe.to.u32(double %argument)
+%kv.heads = call i32 @recipe.to.u32(double %argument.second)
+%head.width = call i32 @recipe.to.u32(double %argument.third)
 %attention.maximum.index = add i32 %argument.base, 3
 %attention.mode.index = add i32 %argument.base, 4
 %attention.scale.index = add i32 %argument.base, 5
@@ -1502,9 +1534,9 @@ br i1 %is.attention, label %attention.node, label %scan.test attention.node:
 %attention.rope.base = load double, ptr addrspace(1) %attention.rope.base.ptr, align 8
 %attention.rope.factor = load double, ptr addrspace(1) %attention.rope.factor.ptr, align 8
 %attention.rope.range.double = load double, ptr addrspace(1) %attention.rope.range.ptr, align 8
-%attention.maximum = fptoui double %attention.maximum.double to i32
-%attention.mode = fptoui double %attention.mode.double to i32
-%attention.rope.range = fptoui double %attention.rope.range.double to i32
+%attention.maximum = call i32 @recipe.to.u32(double %attention.maximum.double)
+%attention.mode = call i32 @recipe.to.u32(double %attention.mode.double)
+%attention.rope.range = call i32 @recipe.to.u32(double %attention.rope.range.double)
 %attention.cached = icmp eq i32 %attention.mode, 1
 br i1 %attention.cached, label %attention.cached.node, label %attention.full.node
 attention.full.node:
@@ -1517,28 +1549,28 @@ i32 %heads, i32 %kv.heads, i32 %head.width, i32 %attention.maximum,
 double %attention.scale, double %attention.rope.base, double %attention.rope.factor,
 i32 %attention.rope.range, i32 %threads ) br label %node.done
 scan.test: br i1 %is.scan, label %scan.node, label %quantized.test scan.node:
-%scan.gates = fptoui double %argument to i32
+%scan.gates = call i32 @recipe.to.u32(double %argument)
 call void @scan_forward_body( ptr addrspace(1) %source, ptr addrspace(1) %matrix, ptr addrspace(1) %values,
 ptr addrspace(1) %context, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels,
 i32 %scan.gates, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) br label %node.done quantized.test:
 br i1 %is.quantized, label %quantized.node, label %contraction.test quantized.node:
-%quantized.kind = fptoui double %argument to i32
-%quantized.mode = fptoui double %argument.second to i32
-%quantized.vector.width = fptoui double %argument.third to i32
+%quantized.kind = call i32 @recipe.to.u32(double %argument)
+%quantized.mode = call i32 @recipe.to.u32(double %argument.second)
+%quantized.vector.width = call i32 @recipe.to.u32(double %argument.third)
 call void @quantized_forward_body( ptr addrspace(1) %source, ptr addrspace(1) %matrix,
 ptr addrspace(1) %values, i32 %rows, i32 %in.elements, i32 %out.elements,
 i32 %quantized.kind, i32 %quantized.mode, i32 %quantized.vector.width,
 i32 %tile.n, i32 %tile.k, i32 %threads )
 br label %node.done contraction.test:
 br i1 %is.contraction, label %contraction.node, label %normalize.stats.entry contraction.node:
-%contraction.kernel = fptoui double %argument to i32
+%contraction.kernel = call i32 @recipe.to.u32(double %argument)
 call void @contraction_forward_body( ptr addrspace(1) %source, ptr addrspace(1) %matrix,
 ptr addrspace(1) %values, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels,
 i32 %out.length, i32 %contraction.kernel, i1 true, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )
 br label %node.done normalize.stats.entry: br label %normalize.test normalize.test:
 br i1 %is.normalize, label %normalize.stats.loop, label %element.loop
 normalize.stats.loop: %stats.group = phi i32 [ %tid, %normalize.test ], [ %stats.next, %stats.store ]
-%stats.mode = fptoui double %argument to i32 %stats.batch = icmp eq i32 %stats.mode, 0
+%stats.mode = call i32 @recipe.to.u32(double %argument) %stats.batch = icmp eq i32 %stats.mode, 0
 %stats.rms = icmp eq i32 %stats.mode, 2
 %stats.layer.groups = mul i32 %rows, %out.length
 %stats.groups = select i1 %stats.batch, i32 %out.channels, i32 %stats.layer.groups
@@ -1562,10 +1594,10 @@ br i1 %stats.p.more, label %stats.mean.step, label %stats.variance.loop stats.me
 %stats.index = select i1 %stats.batch, i32 %stats.batch.index, i32 %stats.layer.index
 %stats.input.ptr = getelementptr inbounds double, ptr addrspace(1) %source, i32 %stats.index
 %stats.input = load double, ptr addrspace(1) %stats.input.ptr, align 8
-%stats.sum.next = fadd double %stats.sum, %stats.input %stats.p.next = add nuw i32 %stats.p, 1 br label %stats.mean.loop
+%stats.sum.next = call double @recipe.add(double %stats.sum, double %stats.input) %stats.p.next = add nuw i32 %stats.p, 1 br label %stats.mean.loop
 stats.variance.loop: %stats.variance.p = phi i32 [ 0, %stats.mean.loop ], [ %stats.variance.next, %stats.variance.step ]
 %stats.variance.sum = phi double [ 0.0, %stats.mean.loop ], [ %stats.variance.sum.next, %stats.variance.step ]
-%stats.items.double = uitofp i32 %stats.items to double %stats.mean = fdiv double %stats.sum, %stats.items.double
+%stats.items.double = call double @recipe.from.u32(i32 %stats.items) %stats.mean = call double @recipe.div(double %stats.sum, double %stats.items.double)
 %stats.variance.more = icmp ult i32 %stats.variance.p, %stats.items
 br i1 %stats.variance.more, label %stats.variance.step, label %stats.store stats.variance.step:
 %stats.variance.batch.row = udiv i32 %stats.variance.p, %out.length
@@ -1583,14 +1615,14 @@ br i1 %stats.variance.more, label %stats.variance.step, label %stats.store stats
 %stats.variance.index = select i1 %stats.batch, i32 %stats.variance.batch.index, i32 %stats.variance.layer.index
 %stats.variance.input.ptr = getelementptr inbounds double, ptr addrspace(1) %source, i32 %stats.variance.index
 %stats.variance.input = load double, ptr addrspace(1) %stats.variance.input.ptr, align 8
-%stats.centered = fsub double %stats.variance.input, %stats.mean
+%stats.centered = call double @recipe.sub(double %stats.variance.input, double %stats.mean)
 %stats.difference = select i1 %stats.rms, double %stats.variance.input, double %stats.centered
-%stats.square = fmul double %stats.difference, %stats.difference
-%stats.variance.sum.next = fadd double %stats.variance.sum, %stats.square
+%stats.square = call double @recipe.mul(double %stats.difference, double %stats.difference)
+%stats.variance.sum.next = call double @recipe.add(double %stats.variance.sum, double %stats.square)
 %stats.variance.next = add nuw i32 %stats.variance.p, 1 br label %stats.variance.loop stats.store:
-%stats.variance = fdiv double %stats.variance.sum, %stats.items.double
-%stats.adjusted = fadd double %stats.variance, %argument.second
-%stats.deviation = call double @llvm.sqrt.f64(double %stats.adjusted) %stats.inverse = fdiv double 1.0, %stats.deviation
+%stats.variance = call double @recipe.div(double %stats.variance.sum, double %stats.items.double)
+%stats.adjusted = call double @recipe.add(double %stats.variance, double %argument.second)
+%stats.deviation = call double @recipe.sqrt(double %stats.adjusted) %stats.inverse = call double @recipe.div(double 1.0, double %stats.deviation)
 %stats.scale.index = add i32 %stats.groups, %stats.group
 %stats.mean.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %stats.group
 %stats.scale.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %stats.scale.index
@@ -1601,10 +1633,10 @@ br label %normalize.stats.loop stats.done: call void @llvm.amdgcn.s.barrier() br
 %p = phi i32 [ %tid, %normalize.test ], [ %tid, %stats.done ], [ %p.next, %element.done ]
 %p.more = icmp ult i32 %p, %count br i1 %p.more, label %element.step, label %node.done element.step:
 switch i32 %op, label %invalid [ i32 2, label %pool i32 3, label %gather
-i32 6, label %elementwise i32 7, label %route i32 8, label %normalize ] pool: %size = fptoui double %argument to i32
+i32 6, label %elementwise i32 7, label %route i32 8, label %normalize ] pool: %size = call i32 @recipe.to.u32(double %argument)
 call void @pool_forward_body( ptr addrspace(1) %source, ptr addrspace(1) %values, ptr addrspace(1) %context, i32 %p,
 i32 %in.elements, i32 %out.elements, i32 %size, i32 %in.channels ) br label %element.done gather:
-%vocabulary = fptoui double %argument to i32
+%vocabulary = call i32 @recipe.to.u32(double %argument)
 call void @embedding_forward_body( ptr addrspace(1) %source, ptr addrspace(1) %matrix, ptr addrspace(1) %values, i32 %p,
 i32 %in.elements, i32 %out.elements, i32 %vocabulary ) br label %element.done elementwise:
 call void @scalar_forward_body( ptr addrspace(1) %source, ptr addrspace(1) %second, ptr addrspace(1) %values,
@@ -1618,8 +1650,8 @@ br label %element.done route: %route.row = udiv i32 %p, %out.elements %route.col
 %route.source.double = load double, ptr addrspace(1) %route.source.ptr, align 8
 %route.stride.double = load double, ptr addrspace(1) %route.stride.ptr, align 8
 %route.field.double = load double, ptr addrspace(1) %route.field.ptr, align 8
-%route.source = fptosi double %route.source.double to i32 %route.stride = fptoui double %route.stride.double to i32
-%route.field = fptoui double %route.field.double to i32
+%route.source = call i32 @recipe.to.s32(double %route.source.double) %route.stride = call i32 @recipe.to.u32(double %route.stride.double)
+%route.field = call i32 @recipe.to.u32(double %route.field.double)
 %route.external = icmp slt i32 %route.source, 0 %route.safe = select i1 %route.external, i32 0, i32 %route.source
 %route.slot = getelementptr inbounds i64, ptr addrspace(1) %value.pointers, i32 %route.safe
 %route.address = load i64, ptr addrspace(1) %route.slot, align 8
@@ -1632,7 +1664,7 @@ br label %element.done route: %route.row = udiv i32 %p, %out.elements %route.col
 store double %route.value, ptr addrspace(1) %route.output.ptr, align 8 br label %element.done
 normalize: %normalize.row = udiv i32 %p, %out.elements
 %normalize.local = urem i32 %p, %out.elements %normalize.channel = udiv i32 %normalize.local, %out.length
-%normalize.position = urem i32 %normalize.local, %out.length %mode = fptoui double %argument to i32
+%normalize.position = urem i32 %normalize.local, %out.length %mode = call i32 @recipe.to.u32(double %argument)
 %is.batch = icmp eq i32 %mode, 0 %normalize.layer.group.base = mul i32 %normalize.row, %out.length
 %normalize.layer.group = add i32 %normalize.layer.group.base, %normalize.position
 %normalize.group = select i1 %is.batch, i32 %normalize.channel, i32 %normalize.layer.group
@@ -1645,7 +1677,7 @@ normalize: %normalize.row = udiv i32 %p, %out.elements
 %normalize.scale = load double, ptr addrspace(1) %normalize.scale.ptr, align 8
 %normalize.input.ptr = getelementptr inbounds double, ptr addrspace(1) %source, i32 %p
 %normalize.input = load double, ptr addrspace(1) %normalize.input.ptr, align 8
-%centered = fsub double %normalize.input, %normalize.mean %normalized = fmul double %centered, %normalize.scale
+%centered = call double @recipe.sub(double %normalize.input, double %normalize.mean) %normalized = call double @recipe.mul(double %centered, double %normalize.scale)
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %values, i32 %p
 store double %normalized, ptr addrspace(1) %output.ptr, align 8 br label %element.done element.done:
 %p.next = add i32 %p, %threads br label %element.loop node.done: call void @llvm.amdgcn.s.barrier()
@@ -1659,73 +1691,74 @@ ptr addrspace(1) nocapture readonly %samples, ptr addrspace(1) nocapture readonl
 ptr addrspace(1) nocapture readonly %value_pointers, ptr addrspace(1) nocapture readonly %context_pointers,
 ptr addrspace(1) nocapture readonly %descriptors, ptr addrspace(1) nocapture readonly %parameters,
 i32 %rows, i32 %stages, i32 %threads, i32 %tile.m, i32 %tile.n, i32 %tile.k,
-ptr addrspace(1) %timings, ptr addrspace(1) %tiles ) #0 { entry:
+ptr addrspace(1) %timings, ptr addrspace(1) %tiles, i32 %format.exp, i32 %format.man ) #0 { entry:
+call void @recipe.set.format(i32 %format.exp, i32 %format.man)
 call void @tape_forward_body( ptr addrspace(1) %samples, ptr addrspace(1) %weights, ptr addrspace(1) %value_pointers,
 ptr addrspace(1) %context_pointers, ptr addrspace(1) %descriptors, ptr addrspace(1) %parameters,
 i32 %rows, i32 %stages, i32 %threads, i32 %tile.m, i32 %tile.n, i32 %tile.k,
 ptr addrspace(1) %timings, ptr addrspace(1) %tiles ) ret void }
 define internal double @loss_item(double %prediction, double %target, i32 %code, double %threshold) #1 { entry:
-%difference = fsub double %prediction, %target %square = fmul double %difference, %difference
+%difference = call double @recipe.sub(double %prediction, double %target) %square = call double @recipe.mul(double %difference, double %difference)
 switch i32 %code, label %focal [ i32 0, label %mse i32 1, label %mse i32 2, label %huber i32 3, label %mae
 i32 4, label %cross i32 5, label %cross ] mse: br label %done huber:
-%absolute = call double @llvm.fabs.f64(double %difference) %small = fcmp ole double %absolute, %threshold
-%half.square = fmul double %square, 0.5 %half.threshold = fmul double %threshold, 0.5
-%large.base = fsub double %absolute, %half.threshold %large = fmul double %threshold, %large.base
+%absolute = call double @recipe.abs(double %difference) %small = call i1 @recipe.ole(double %absolute, double %threshold)
+%half.square = call double @recipe.mul(double %square, double 0.5) %half.threshold = call double @recipe.mul(double %threshold, double 0.5)
+%large.base = call double @recipe.sub(double %absolute, double %half.threshold) %large = call double @recipe.mul(double %threshold, double %large.base)
 %huber.value = select i1 %small, double %half.square, double %large br label %done mae:
-%mae.value = call double @llvm.fabs.f64(double %difference) br label %done cross:
+%mae.value = call double @recipe.abs(double %difference) br label %done cross:
 %probability.raw = call double @sigmoid(double %prediction)
-%probability.low = fcmp olt double %probability.raw, 0x3CB0000000000000
+%probability.low = call i1 @recipe.olt(double %probability.raw, double 0x3CB0000000000000)
 %probability.lowered = select i1 %probability.low, double 0x3CB0000000000000, double %probability.raw
-%probability.high = fcmp ogt double %probability.lowered, 0x3FEFFFFFFFFFFFFE
+%probability.high = call i1 @recipe.ogt(double %probability.lowered, double 0x3FEFFFFFFFFFFFFE)
 %probability = select i1 %probability.high, double 0x3FEFFFFFFFFFFFFE, double %probability.lowered
-%target.low = fcmp olt double %target, 0.0 %target.lowered = select i1 %target.low, double 0.0, double %target
-%target.high = fcmp ogt double %target.lowered, 1.0
+%target.low = call i1 @recipe.olt(double %target, double 0.0) %target.lowered = select i1 %target.low, double 0.0, double %target
+%target.high = call i1 @recipe.ogt(double %target.lowered, double 1.0)
 %target.clamped = select i1 %target.high, double 1.0, double %target.lowered
-%log.probability = call double @__ocml_log_f64(double %probability) %one.probability = fsub double 1.0, %probability
-%log.one.probability = call double @__ocml_log_f64(double %one.probability)
-%cross.first = fmul double %target.clamped, %log.probability %one.target = fsub double 1.0, %target.clamped
-%cross.second = fmul double %one.target, %log.one.probability %cross.sum = fadd double %cross.first, %cross.second
-%cross.value = fneg double %cross.sum br label %done focal:
-%focal.probability = call double @sigmoid(double %prediction) %focal.target = fcmp oge double %target, 0.5
-%focal.one = fsub double 1.0, %focal.probability
+%log.probability = call double @recipe.log(double %probability) %one.probability = call double @recipe.sub(double 1.0, double %probability)
+%log.one.probability = call double @recipe.log(double %one.probability)
+%cross.first = call double @recipe.mul(double %target.clamped, double %log.probability) %one.target = call double @recipe.sub(double 1.0, double %target.clamped)
+%cross.second = call double @recipe.mul(double %one.target, double %log.one.probability) %cross.sum = call double @recipe.add(double %cross.first, double %cross.second)
+%cross.value = call double @recipe.neg(double %cross.sum) br label %done focal:
+%focal.probability = call double @sigmoid(double %prediction) %focal.target = call i1 @recipe.oge(double %target, double 0.5)
+%focal.one = call double @recipe.sub(double 1.0, double %focal.probability)
 %focal.correct.raw = select i1 %focal.target, double %focal.probability, double %focal.one
-%focal.low = fcmp olt double %focal.correct.raw, 0x3CB0000000000000
+%focal.low = call i1 @recipe.olt(double %focal.correct.raw, double 0x3CB0000000000000)
 %focal.correct = select i1 %focal.low, double 0x3CB0000000000000, double %focal.correct.raw
-%focal.incorrect = fsub double 1.0, %focal.correct %focal.square = fmul double %focal.incorrect, %focal.incorrect
-%focal.log = call double @__ocml_log_f64(double %focal.correct) %focal.product = fmul double %focal.square, %focal.log
-%focal.value = fneg double %focal.product br label %done done:
+%focal.incorrect = call double @recipe.sub(double 1.0, double %focal.correct) %focal.square = call double @recipe.mul(double %focal.incorrect, double %focal.incorrect)
+%focal.log = call double @recipe.log(double %focal.correct) %focal.product = call double @recipe.mul(double %focal.square, double %focal.log)
+%focal.value = call double @recipe.neg(double %focal.product) br label %done done:
 %result = phi double [ %square, %mse ], [ %huber.value, %huber ], [ %mae.value, %mae ],
 [ %cross.value, %cross ], [ %focal.value, %focal ] ret double %result } define internal double @loss_gradient(
 double %prediction, double %target, i32 %code, double %threshold, double %loss, i32 %rows ) #1 { entry:
-%difference = fsub double %prediction, %target %rows.double = uitofp i32 %rows to double
+%difference = call double @recipe.sub(double %prediction, double %target) %rows.double = call double @recipe.from.u32(i32 %rows)
 switch i32 %code, label %focal [ i32 0, label %mse i32 1, label %rmse i32 2, label %huber i32 3, label %mae
-i32 4, label %cross i32 5, label %cross ] mse: %twice = fadd double %difference, %difference
-%mse.value = fdiv double %twice, %rows.double br label %done rmse: %rmse.denominator = fmul double %rows.double, %loss
-%rmse.zero = fcmp oeq double %loss, 0.0 %rmse.divided = fdiv double %difference, %rmse.denominator
+i32 4, label %cross i32 5, label %cross ] mse: %twice = call double @recipe.add(double %difference, double %difference)
+%mse.value = call double @recipe.div(double %twice, double %rows.double) br label %done rmse: %rmse.denominator = call double @recipe.mul(double %rows.double, double %loss)
+%rmse.zero = call i1 @recipe.oeq(double %loss, double 0.0) %rmse.divided = call double @recipe.div(double %difference, double %rmse.denominator)
 %rmse.value = select i1 %rmse.zero, double 0.0, double %rmse.divided br label %done huber:
-%negative.threshold = fneg double %threshold %huber.low = fcmp olt double %difference, %negative.threshold
-%huber.high = fcmp ogt double %difference, %threshold
+%negative.threshold = call double @recipe.neg(double %threshold) %huber.low = call i1 @recipe.olt(double %difference, double %negative.threshold)
+%huber.high = call i1 @recipe.ogt(double %difference, double %threshold)
 %huber.lower = select i1 %huber.low, double %negative.threshold, double %difference
 %huber.clamped = select i1 %huber.high, double %threshold, double %huber.lower
-%huber.value = fdiv double %huber.clamped, %rows.double br label %done mae:
-%mae.negative = fcmp olt double %difference, 0.0 %mae.positive = fcmp ogt double %difference, 0.0
+%huber.value = call double @recipe.div(double %huber.clamped, double %rows.double) br label %done mae:
+%mae.negative = call i1 @recipe.olt(double %difference, double 0.0) %mae.positive = call i1 @recipe.ogt(double %difference, double 0.0)
 %mae.upper = select i1 %mae.positive, double 1.0, double 0.0
-%mae.sign = select i1 %mae.negative, double -1.0, double %mae.upper %mae.value = fdiv double %mae.sign, %rows.double
+%mae.sign = select i1 %mae.negative, double -1.0, double %mae.upper %mae.value = call double @recipe.div(double %mae.sign, double %rows.double)
 br label %done cross: %cross.probability = call double @sigmoid(double %prediction)
-%cross.difference = fsub double %cross.probability, %target %cross.value = fdiv double %cross.difference, %rows.double
+%cross.difference = call double @recipe.sub(double %cross.probability, double %target) %cross.value = call double @recipe.div(double %cross.difference, double %rows.double)
 br label %done focal: %focal.probability = call double @sigmoid(double %prediction)
-%focal.target = fcmp oge double %target, 0.5 %focal.one = fsub double 1.0, %focal.probability
+%focal.target = call i1 @recipe.oge(double %target, double 0.5) %focal.one = call double @recipe.sub(double 1.0, double %focal.probability)
 %focal.correct.raw = select i1 %focal.target, double %focal.probability, double %focal.one
-%focal.low = fcmp olt double %focal.correct.raw, 0x3CB0000000000000
+%focal.low = call i1 @recipe.olt(double %focal.correct.raw, double 0x3CB0000000000000)
 %focal.correct = select i1 %focal.low, double 0x3CB0000000000000, double %focal.correct.raw
-%focal.incorrect = fsub double 1.0, %focal.correct %focal.log = call double @__ocml_log_f64(double %focal.correct)
-%focal.first = fmul double 2.0, %focal.incorrect %focal.first.value = fmul double %focal.first, %focal.log
-%focal.square = fmul double %focal.incorrect, %focal.incorrect %focal.second = fdiv double %focal.square, %focal.correct
-%focal.by.correct = fsub double %focal.first.value, %focal.second
-%focal.sigmoid.derivative = fmul double %focal.probability, %focal.one
-%focal.negative.direction = fneg double %focal.sigmoid.derivative
+%focal.incorrect = call double @recipe.sub(double 1.0, double %focal.correct) %focal.log = call double @recipe.log(double %focal.correct)
+%focal.first = call double @recipe.mul(double 2.0, double %focal.incorrect) %focal.first.value = call double @recipe.mul(double %focal.first, double %focal.log)
+%focal.square = call double @recipe.mul(double %focal.incorrect, double %focal.incorrect) %focal.second = call double @recipe.div(double %focal.square, double %focal.correct)
+%focal.by.correct = call double @recipe.sub(double %focal.first.value, double %focal.second)
+%focal.sigmoid.derivative = call double @recipe.mul(double %focal.probability, double %focal.one)
+%focal.negative.direction = call double @recipe.neg(double %focal.sigmoid.derivative)
 %focal.direction = select i1 %focal.target, double %focal.sigmoid.derivative, double %focal.negative.direction
-%focal.chain = fmul double %focal.by.correct, %focal.direction %focal.value = fdiv double %focal.chain, %rows.double
+%focal.chain = call double @recipe.mul(double %focal.by.correct, double %focal.direction) %focal.value = call double @recipe.div(double %focal.chain, double %rows.double)
 br label %done done: %result = phi double [ %mse.value, %mse ], [ %rmse.value, %rmse ], [ %huber.value, %huber ],
 [ %mae.value, %mae ], [ %cross.value, %cross ], [ %focal.value, %focal ] ret double %result }
 define protected amdgpu_kernel void @tape_epoch_graph(
@@ -1737,7 +1770,8 @@ ptr addrspace(1) %variances, ptr addrspace(1) %best.loss, i32 %rows, i32 %nodes,
 double %huber.threshold, double %rate, double %beta1, double %beta2,
 double %beta1.power, double %beta2.power, double %epsilon, double %decay, double %tolerance, i32 %step,
 i32 %threads, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %phase,
-ptr addrspace(1) %timings, ptr addrspace(1) %tiles ) #0 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
+ptr addrspace(1) %timings, ptr addrspace(1) %tiles, i32 %format.exp, i32 %format.man ) #0 { entry:
+call void @recipe.set.format(i32 %format.exp, i32 %format.man) %tid = call i32 @llvm.amdgcn.workitem.id.x()
 %optimizer.only = icmp eq i32 %phase, 2 %gradient.only = icmp eq i32 %phase, 1
 br i1 %optimizer.only, label %optimizer.entry, label %forward.entry forward.entry:
 call void @tape_forward_body( ptr addrspace(1) %samples, ptr addrspace(1) %weights, ptr addrspace(1) %value.pointers,
@@ -1773,9 +1807,9 @@ store double 0.0, ptr addrspace(1) %direct.better.ptr, align 8 br label %loss.do
 %loss.prediction = load double, ptr addrspace(1) %loss.prediction.ptr, align 8
 %loss.target = load double, ptr addrspace(1) %loss.target.ptr, align 8
 %loss.item = call double @loss_item( double %loss.prediction, double %loss.target, i32 %loss.code,
-double %huber.threshold ) %loss.sum.next = fadd double %loss.sum, %loss.item %loss.next = add nuw i32 %loss.p, 1
-br label %loss.loop loss.store: %items.double = uitofp i32 %items to double
-%loss.mean = fdiv double %loss.sum, %items.double %loss.root = call double @llvm.sqrt.f64(double %loss.mean)
+double %huber.threshold ) %loss.sum.next = call double @recipe.add(double %loss.sum, double %loss.item) %loss.next = add nuw i32 %loss.p, 1
+br label %loss.loop loss.store: %items.double = call double @recipe.from.u32(i32 %items)
+%loss.mean = call double @recipe.div(double %loss.sum, double %items.double) %loss.root = call double @recipe.sqrt(double %loss.mean)
 %loss.is.rmse = icmp eq i32 %loss.code, 1 %loss.value = select i1 %loss.is.rmse, double %loss.root, double %loss.mean
 %old.best = load double, ptr addrspace(1) %best.loss, align 8
 %last.loss.ptr = getelementptr inbounds double, ptr addrspace(1) %best.loss, i32 1
@@ -1783,13 +1817,13 @@ br label %loss.loop loss.store: %items.double = uitofp i32 %items to double
 %saved.ptr = getelementptr inbounds double, ptr addrspace(1) %best.loss, i32 3
 %last.loss = load double, ptr addrspace(1) %last.loss.ptr, align 8
 %trail = load double, ptr addrspace(1) %trail.ptr, align 8
-%better = fcmp olt double %loss.value, %old.best %best.value = select i1 %better, double %loss.value, double %old.best
-%last.exists = fcmp ord double %last.loss, %last.loss %trail.exists = fcmp ord double %trail, %trail
-%not.trail = xor i1 %trail.exists, true %increased = fcmp ogt double %loss.value, %last.loss
+%better = call i1 @recipe.olt(double %loss.value, double %old.best) %best.value = select i1 %better, double %loss.value, double %old.best
+%last.exists = call i1 @recipe.ord(double %last.loss, double %last.loss) %trail.exists = call i1 @recipe.ord(double %trail, double %trail)
+%not.trail = xor i1 %trail.exists, true %increased = call i1 @recipe.ogt(double %loss.value, double %last.loss)
 %start.base = and i1 %last.exists, %not.trail %start = and i1 %start.base, %increased
-%trail.value = select i1 %start, double %last.loss, double %trail %one.tolerance = fadd double 1.0, %tolerance
-%rise.floor = fmul double %last.loss, %one.tolerance %above.floor = fcmp ogt double %loss.value, %rise.floor
-%below.trail = fcmp olt double %loss.value, %trail.value %tolerance.active = fcmp ogt double %tolerance, 0.0
+%trail.value = select i1 %start, double %last.loss, double %trail %one.tolerance = call double @recipe.add(double 1.0, double %tolerance)
+%rise.floor = call double @recipe.mul(double %last.loss, double %one.tolerance) %above.floor = call i1 @recipe.ogt(double %loss.value, double %rise.floor)
+%below.trail = call i1 @recipe.olt(double %loss.value, double %trail.value) %tolerance.active = call i1 @recipe.ogt(double %tolerance, double 0.0)
 %trigger.base = and i1 %trail.exists, %above.floor %trigger.below = and i1 %trigger.base, %below.trail
 %trigger = and i1 %trigger.below, %tolerance.active %trigger.value = select i1 %trigger, double 1.0, double 0.0
 %better.value = select i1 %better, double 1.0, double 0.0 store double %loss.value, ptr addrspace(1) %metrics, align 8
@@ -1804,7 +1838,7 @@ save.state: store double %best.value, ptr addrspace(1) %saved.ptr, align 8 br la
 call void @llvm.amdgcn.s.barrier()
 %checkpoint.flag.ptr = getelementptr inbounds double, ptr addrspace(1) %metrics, i32 2
 %checkpoint.flag = load double, ptr addrspace(1) %checkpoint.flag.ptr, align 8
-%checkpoint.active = fcmp one double %checkpoint.flag, 0.0
+%checkpoint.active = call i1 @recipe.one(double %checkpoint.flag, double 0.0)
 br i1 %checkpoint.active, label %checkpoint.loop, label %clear.gradient.loop checkpoint.loop:
 %checkpoint.p = phi i32 [ %tid, %loss.done ], [ %checkpoint.next, %checkpoint.step ]
 %checkpoint.more = icmp ult i32 %checkpoint.p, %parameter.count
@@ -1914,19 +1948,19 @@ i32 0, label %contraction.gradient i32 2, label %pool.gradient.loop i32 3, label
 i32 4, label %attention.gradient i32 5, label %scan.gradient i32 6, label %elementwise.gradient
 i32 7, label %route.gradient.loop i32 8, label %normalization.stats.loop ] contraction.gradient:
 %contraction.matrix = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %offset
-%contraction.kernel = fptoui double %argument to i32 call void @contraction_reverse_body(
+%contraction.kernel = call i32 @recipe.to.u32(double %argument) call void @contraction_reverse_body(
 ptr addrspace(1) %source.values, ptr addrspace(1) %contraction.matrix, ptr addrspace(1) %delta,
 ptr addrspace(1) %source.adjoint, ptr addrspace(1) %gradient, i1 true, i1 true,
 i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels,
 i32 %out.length, i32 %contraction.kernel, i32 %offset, i32 %threads ) br label %node.done gather.gradient:
-%gather.vocabulary = fptoui double %argument to i32
+%gather.vocabulary = call i32 @recipe.to.u32(double %argument)
 call void @embedding_reverse_body( ptr addrspace(1) %source.values, ptr addrspace(1) %delta, ptr addrspace(1) %gradient,
 i32 %rows, i32 %in.elements, i32 %out.channels, i32 %gather.vocabulary, i32 %offset, i32 %threads ) br label %node.done
 attention.gradient: %attention.context.slot = getelementptr inbounds i64, ptr addrspace(1) %context.pointers, i32 %node
 %attention.context.address = load i64, ptr addrspace(1) %attention.context.slot, align 8
 %attention.context = inttoptr i64 %attention.context.address to ptr addrspace(1)
 %attention.matrix = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %offset
-%attention.heads = fptoui double %argument to i32
+%attention.heads = call i32 @recipe.to.u32(double %argument)
 call void @attention_reverse_body( ptr addrspace(1) %source.values, ptr addrspace(1) %attention.matrix,
 ptr addrspace(1) %attention.context, ptr addrspace(1) %delta,
 ptr addrspace(1) %source.adjoint, ptr addrspace(1) %gradient, i1 true,
@@ -1935,7 +1969,7 @@ scan.gradient: %scan.context.slot = getelementptr inbounds i64, ptr addrspace(1)
 %scan.context.address = load i64, ptr addrspace(1) %scan.context.slot, align 8
 %scan.context = inttoptr i64 %scan.context.address to ptr addrspace(1)
 %scan.matrix = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %offset
-%scan.gates = fptoui double %argument to i32 call void @scan_reverse_body(
+%scan.gates = call i32 @recipe.to.u32(double %argument) call void @scan_reverse_body(
 ptr addrspace(1) %source.values, ptr addrspace(1) %scan.matrix, ptr addrspace(1) %node.values,
 ptr addrspace(1) %scan.context, ptr addrspace(1) %delta, ptr addrspace(1) %source.adjoint,
 ptr addrspace(1) %gradient, i1 true, i32 %rows, i32 %in.channels,
@@ -1948,12 +1982,12 @@ br i1 %pool.more, label %pool.gradient.step, label %node.done pool.gradient.step
 %pool.context = inttoptr i64 %pool.context.address to ptr addrspace(1)
 %pool.index.ptr = getelementptr inbounds double, ptr addrspace(1) %pool.context, i32 %pool.p
 %pool.index.double = load double, ptr addrspace(1) %pool.index.ptr, align 8
-%pool.index = fptoui double %pool.index.double to i32
+%pool.index = call i32 @recipe.to.u32(double %pool.index.double)
 %pool.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %pool.p
 %pool.delta = load double, ptr addrspace(1) %pool.delta.ptr, align 8 br label %pool.gradient.add pool.gradient.add:
 %pool.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %source.adjoint, i32 %pool.index
 %pool.previous = load double, ptr addrspace(1) %pool.previous.ptr, align 8
-%pool.value = fadd double %pool.previous, %pool.delta
+%pool.value = call double @recipe.add(double %pool.previous, double %pool.delta)
 store double %pool.value, ptr addrspace(1) %pool.previous.ptr, align 8 br label %pool.gradient.next pool.gradient.next:
 %pool.next = add i32 %pool.p, %threads br label %pool.gradient.loop elementwise.gradient:
 %elementwise.context.slot = getelementptr inbounds i64, ptr addrspace(1) %context.pointers, i32 %node
@@ -1977,8 +2011,8 @@ br i1 %route.more, label %route.gradient.step, label %node.done route.gradient.s
 %route.source.double = load double, ptr addrspace(1) %route.source.ptr, align 8
 %route.stride.double = load double, ptr addrspace(1) %route.stride.ptr, align 8
 %route.field.double = load double, ptr addrspace(1) %route.field.ptr, align 8
-%route.source = fptosi double %route.source.double to i32 %route.stride = fptoui double %route.stride.double to i32
-%route.field = fptoui double %route.field.double to i32
+%route.source = call i32 @recipe.to.s32(double %route.source.double) %route.stride = call i32 @recipe.to.u32(double %route.stride.double)
+%route.field = call i32 @recipe.to.u32(double %route.field.double)
 %route.exists = icmp sge i32 %route.source, 0 %route.safe = select i1 %route.exists, i32 %route.source, i32 0
 %route.slot = getelementptr inbounds i64, ptr addrspace(1) %adjoint.pointers, i32 %route.safe
 %route.address = load i64, ptr addrspace(1) %route.slot, align 8
@@ -1988,10 +2022,10 @@ br i1 %route.more, label %route.gradient.step, label %node.done route.gradient.s
 %route.target.ptr = getelementptr inbounds double, ptr addrspace(1) %route.target, i32 %route.index
 %route.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %route.p
 %route.delta = load double, ptr addrspace(1) %route.delta.ptr, align 8
-%route.old = atomicrmw fadd ptr addrspace(1) %route.target.ptr, double %route.delta monotonic, align 8
+%route.old = call double @recipe.atomic.add(ptr addrspace(1) %route.target.ptr, double %route.delta)
 %route.next = add i32 %route.p, %threads br label %route.gradient.loop normalization.stats.loop:
 %normalization.stats.group = phi i32 [ %tid, %node.load ], [ %normalization.stats.next, %normalization.stats.store ]
-%normalization.mode = fptoui double %argument to i32 %normalization.batch = icmp eq i32 %normalization.mode, 0
+%normalization.mode = call i32 @recipe.to.u32(double %argument) %normalization.batch = icmp eq i32 %normalization.mode, 0
 %normalization.layer.groups = mul i32 %rows, %out.length
 %normalization.groups = select i1 %normalization.batch, i32 %out.channels, i32 %normalization.layer.groups
 %normalization.items.batch = mul i32 %rows, %out.length
@@ -2030,9 +2064,9 @@ i32 %normalization.stats.layer.index
 i32 %normalization.stats.index
 %normalization.stats.delta = load double, ptr addrspace(1) %normalization.stats.delta.ptr, align 8
 %normalization.stats.output = load double, ptr addrspace(1) %normalization.stats.output.ptr, align 8
-%normalization.stats.product = fmul double %normalization.stats.delta, %normalization.stats.output
-%normalization.stats.sum.next = fadd double %normalization.stats.sum, %normalization.stats.delta
-%normalization.stats.projected.next = fadd double %normalization.stats.projected, %normalization.stats.product
+%normalization.stats.product = call double @recipe.mul(double %normalization.stats.delta, double %normalization.stats.output)
+%normalization.stats.sum.next = call double @recipe.add(double %normalization.stats.sum, double %normalization.stats.delta)
+%normalization.stats.projected.next = call double @recipe.add(double %normalization.stats.projected, double %normalization.stats.product)
 %normalization.stats.item.next = add nuw i32 %normalization.stats.item, 1 br label %normalization.stats.sum.loop
 normalization.stats.store: %normalization.sum.index = add i32 %normalization.sum.base, %normalization.stats.group
 %normalization.projected.index = add i32 %normalization.projected.base, %normalization.stats.group
@@ -2073,24 +2107,23 @@ br label %normalization.store normalization.store:
 %normalization.current.output.ptr = getelementptr inbounds double, ptr addrspace(1) %node.values, i32 %normalization.p
 %normalization.current.delta = load double, ptr addrspace(1) %normalization.current.delta.ptr, align 8
 %normalization.current.output = load double, ptr addrspace(1) %normalization.current.output.ptr, align 8
-%normalization.items.double = uitofp i32 %normalization.items to double
-%normalization.scaled.delta = fmul double %normalization.items.double, %normalization.current.delta
-%normalization.output.projection = fmul double %normalization.current.output, %normalization.projected
-%normalization.centered = fsub double %normalization.scaled.delta, %normalization.sum
-%normalization.numerator = fsub double %normalization.centered, %normalization.output.projection
-%normalization.scaled = fmul double %normalization.scale, %normalization.numerator
-%normalization.contribution = fdiv double %normalization.scaled, %normalization.items.double
+%normalization.items.double = call double @recipe.from.u32(i32 %normalization.items)
+%normalization.scaled.delta = call double @recipe.mul(double %normalization.items.double, double %normalization.current.delta)
+%normalization.output.projection = call double @recipe.mul(double %normalization.current.output, double %normalization.projected)
+%normalization.centered = call double @recipe.sub(double %normalization.scaled.delta, double %normalization.sum)
+%normalization.numerator = call double @recipe.sub(double %normalization.centered, double %normalization.output.projection)
+%normalization.scaled = call double @recipe.mul(double %normalization.scale, double %normalization.numerator)
+%normalization.contribution = call double @recipe.div(double %normalization.scaled, double %normalization.items.double)
 %normalization.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %source.adjoint, i32 %normalization.p
 %normalization.previous = load double, ptr addrspace(1) %normalization.previous.ptr, align 8
-%normalization.value = fadd double %normalization.previous, %normalization.contribution
+%normalization.value = call double @recipe.add(double %normalization.previous, double %normalization.contribution)
 store double %normalization.value, ptr addrspace(1) %normalization.previous.ptr, align 8
 %normalization.next = add i32 %normalization.p, %threads br label %normalization.gradient.loop node.done:
 call void @llvm.amdgcn.s.barrier() %node.next = sub i32 %node, 1 br label %reverse.loop optimizer.entry:
 %optimizer.initial.more = icmp ult i32 %tid, %parameter.count
 br i1 %optimizer.initial.more, label %optimizer.initial.load, label %exit optimizer.initial.load:
-%one.beta1 = fsub double 1.0, %beta1 %one.beta2 = fsub double 1.0, %beta2
-%m.correction = fsub double 1.0, %beta1.power %v.correction = fsub double 1.0, %beta2.power
-%m.inverse = fdiv double 1.0, %m.correction %v.inverse = fdiv double 1.0, %v.correction
+%one.beta1 = call double @recipe.sub(double 1.0, double %beta1) %one.beta2 = call double @recipe.sub(double 1.0, double %beta2)
+%m.correction = call double @recipe.sub(double 1.0, double %beta1.power) %v.correction = call double @recipe.sub(double 1.0, double %beta2.power)
 %optimizer.initial.frozen.ptr = getelementptr inbounds i8, ptr addrspace(1) %frozen, i32 %tid
 %optimizer.initial.gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %tid
 %optimizer.initial.moment.ptr = getelementptr inbounds double, ptr addrspace(1) %moments, i32 %tid
@@ -2127,15 +2160,15 @@ br i1 %optimizer.is.frozen, label %optimizer.advance, label %optimizer.update op
 %optimizer.moment.ptr = getelementptr inbounds double, ptr addrspace(1) %moments, i32 %optimizer.p
 %optimizer.variance.ptr = getelementptr inbounds double, ptr addrspace(1) %variances, i32 %optimizer.p
 %optimizer.weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %optimizer.p
-%m.old.part = fmul double %beta1, %m.old %m.new.part = fmul double %one.beta1, %g
-%m = fadd double %m.old.part, %m.new.part %g.square = fmul double %g, %g %v.old.part = fmul double %beta2, %v.old
-%v.new.part = fmul double %one.beta2, %g.square %v = fadd double %v.old.part, %v.new.part
+%m.old.part = call double @recipe.mul(double %beta1, double %m.old) %m.new.part = call double @recipe.mul(double %one.beta1, double %g)
+%m = call double @recipe.add(double %m.old.part, double %m.new.part) %g.square = call double @recipe.mul(double %g, double %g) %v.old.part = call double @recipe.mul(double %beta2, double %v.old)
+%v.new.part = call double @recipe.mul(double %one.beta2, double %g.square) %v = call double @recipe.add(double %v.old.part, double %v.new.part)
 store double %m, ptr addrspace(1) %optimizer.moment.ptr, align 8
-store double %v, ptr addrspace(1) %optimizer.variance.ptr, align 8 %m.hat = fmul double %m, %m.inverse
-%v.hat = fmul double %v, %v.inverse %root = call double @llvm.sqrt.f64(double %v.hat)
-%denominator = fadd double %root, %epsilon %direction = fdiv double %m.hat, %denominator
-%decay.value = fmul double %decay, %weight %update.direction = fadd double %direction, %decay.value
-%update = fmul double %rate, %update.direction %updated = fsub double %weight, %update
+store double %v, ptr addrspace(1) %optimizer.variance.ptr, align 8 %m.hat = call double @recipe.div(double %m, double %m.correction)
+%v.hat = call double @recipe.div(double %v, double %v.correction) %root = call double @recipe.sqrt(double %v.hat)
+%denominator = call double @recipe.add(double %root, double %epsilon) %direction = call double @recipe.div(double %m.hat, double %denominator)
+%decay.value = call double @recipe.mul(double %decay, double %weight) %update.direction = call double @recipe.add(double %direction, double %decay.value)
+%update = call double @recipe.mul(double %rate, double %update.direction) %updated = call double @recipe.sub(double %weight, double %update)
 store double %updated, ptr addrspace(1) %optimizer.weight.ptr, align 8 br label %optimizer.advance optimizer.advance:
 br i1 %optimizer.next.more, label %optimizer.loop, label %exit
 invalid: call void @llvm.trap() br label %exit exit: ret void }
