@@ -4484,6 +4484,54 @@ struct Table {
 	rows: Vec<Vec<String>>,
 	children: Vec<ChildTable>,
 }
+#[derive(Default)]
+struct IgnoredRows {
+	first: String,
+	latest: String,
+	files: usize,
+	rows: usize,
+	open: bool,
+}
+impl IgnoredRows {
+	fn update(&mut self, path: &Path, rows: usize) -> Result<()> {
+		if rows == 0 {
+			return Ok(());
+		}
+		let path = path.display().to_string();
+		if self.files == 0 {
+			self.first = path.clone();
+		}
+		self.latest = path;
+		self.files += 1;
+		self.rows += rows;
+		self.open = true;
+		eprint!("\r\x1b[2Kignored: {} ({} files, {} blank rows)", path_range(&self.first, &self.latest), self.files, self.rows);
+		std::io::Write::flush(&mut std::io::stderr()).map_err(|error| RecipeError::new(format!("cannot flush ignored-row status: {error}")))
+	}
+	fn finish(&mut self) {
+		if self.open {
+			eprintln!();
+			self.open = false
+		}
+	}
+}
+impl Drop for IgnoredRows {
+	fn drop(&mut self) { self.finish() }
+}
+fn path_range(first: &str, latest: &str) -> String {
+	if first == latest {
+		return first.to_owned();
+	}
+	let mut prefix = first.bytes().zip(latest.bytes()).take_while(|(left, right)| left == right).count();
+	while !first.is_char_boundary(prefix) || !latest.is_char_boundary(prefix) {
+		prefix -= 1
+	}
+	let mut suffix = first[prefix..].bytes().rev().zip(latest[prefix..].bytes().rev()).take_while(|(left, right)| left == right).count();
+	while !first.is_char_boundary(first.len() - suffix) || !latest.is_char_boundary(latest.len() - suffix) {
+		suffix -= 1
+	}
+	format!("{}{{{}…{}}}{}", &first[..prefix], &first[prefix..first.len() - suffix], &latest[prefix..latest.len() - suffix], &first[first.len() - suffix..])
+}
 enum FeatureType {
 	Numeric(&'static str),
 	Categorical(Vec<String>),
@@ -4533,14 +4581,18 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	paths.sort();
 	paths.dedup();
 	let mut grouped = Vec::new();
+	let mut ignored = IgnoredRows::default();
 	for path in paths {
 		if !path.extension().and_then(|value| value.to_str()).is_some_and(is_table) {
 			continue;
 		}
 		let bytes = fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
 		let directory = path.parent().unwrap_or_else(|| Path::new("")).to_owned();
-		grouped.push((directory, parse_table(&path, &bytes)?));
+		let (table, blank) = parse_table(&path, &bytes)?;
+		ignored.update(&path, blank)?;
+		grouped.push((directory, table));
 	}
+	ignored.finish();
 	let mut tables = merge_captures(grouped, &data.target)?;
 	tables = merge_partitions(tables, &data.target, &data.exclusions)?;
 	require(!tables.is_empty(), "data source contains no supported table")?;
@@ -4780,7 +4832,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], exclusions: &[St
 	let children = vec![ChildTable { name: name.clone(), headers: headers.clone(), rows: 1 }];
 	Ok(vec![Table { name, headers, rows, children }])
 }
-fn parse_table(path: &Path, bytes: &[u8]) -> Result<Table> {
+fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	let first = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
 	let delimiter = [b',', b';', b'\t'].into_iter().max_by_key(|delimiter| first.iter().filter(|byte| *byte == delimiter).count()).unwrap_or(b',');
 	let (mut rows, blank) = records(bytes, delimiter)?;
@@ -4795,10 +4847,9 @@ fn parse_table(path: &Path, bytes: &[u8]) -> Result<Table> {
 	let width = headers.len();
 	let malformed = rows.iter().filter(|row| row.len() != width).count();
 	require(malformed == 0, format!("dataset {} has {malformed} rows differing from the expected {width} fields", path.display()))?;
-	if blank != 0 { eprintln!("ignored: {} ({blank} blank rows)", path.display()) }
 	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
 	let children = vec![ChildTable { name: name.clone(), headers: headers.clone(), rows: 1 }];
-	Ok(Table { name, headers, rows, children })
+	Ok((Table { name, headers, rows, children }, blank))
 }
 fn records(bytes: &[u8], delimiter: u8) -> Result<(Vec<Vec<String>>, usize)> {
 	let (mut rows, mut row, mut field, mut quoted, mut blank) = (Vec::new(), Vec::new(), Vec::new(), false, 0);
