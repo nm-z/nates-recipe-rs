@@ -442,6 +442,7 @@ enum Backend {
 }
 pub struct Data {
 	sources: Vec<String>,
+	autoregressive: bool,
 	target: Vec<String>,
 	exclusions: Vec<String>,
 	routes: Vec<Route>,
@@ -450,6 +451,10 @@ pub struct Data {
 	split: f64,
 	prepared: OnceLock<Result<Prepared>>,
 }
+#[derive(Clone, Copy)]
+pub struct Auto;
+pub const auto: Auto = Auto;
+const CHAR_IDS: [char; 100] = ['\t', '\n', ' ', '!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '<', '=', '>', '?', '@', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', '¦', '±', '€'];
 #[derive(Clone)]
 struct Route {
 	inputs: Vec<String>,
@@ -1733,6 +1738,7 @@ pub const Epoch: Metric = Metric(4);
 pub const blck: Metric = Metric(5);
 pub const atvn: Metric = Metric(6);
 pub const norm: Metric = Metric(7);
+pub const tok: Metric = Metric(8);
 pub const z_score: ZScore = ZScore;
 pub const batch: Normalization = batch_marker;
 const fn batch_marker(_: usize) -> Residual { Residual::Activation(Activation::Relu) }
@@ -1769,7 +1775,7 @@ impl LossFunction {
 	}
 }
 impl Recipe {
-	pub fn data(&self, sources: impl IntoDataSources) -> Data { Data { sources: sources.into_data_sources(), target: Vec::new(), exclusions: Vec::new(), routes: Vec::new(), broadcast: false, normalize: false, split: 1.0, prepared: OnceLock::new() } }
+	pub fn data<T: IntoDataSources>(&self, sources: T) -> Data { Data { sources: sources.into_data_sources(), autoregressive: T::AUTO, target: Vec::new(), exclusions: Vec::new(), routes: Vec::new(), broadcast: false, normalize: false, split: 1.0, prepared: OnceLock::new() } }
 	pub fn model(&self) -> Model { Model { blocks: Vec::new(), loss: mse, downstream: None, quantization: 0 } }
 	pub const fn train(&self) -> Train { Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: None, resume: None, save: None, seed: None, precision: Compute::FP64 } }
 }
@@ -2506,8 +2512,8 @@ fn natural(name: &str, text: &str) -> Result<usize> {
 }
 fn multi_device() -> bool { env!("RECIPE_MULTI_DEVICE") == "true" }
 fn stored_graph(graph: &Graph, data: &Data, scale: Option<TargetScale>, precision: Compute) -> bundle::StoredGraph {
-	let inputs = (0..graph.input.elements()).map(|index| format!("input{index}")).collect();
-	let output = data.target.first().cloned().unwrap_or_else(|| "target".to_owned());
+	let inputs = if data.autoregressive { CHAR_IDS.iter().enumerate().flat_map(|(id, character)| (0..graph.input.length).map(move |position| format!("char{id}.u{:04X}.{position}", *character as u32))).collect() } else { (0..graph.input.elements()).map(|index| format!("input{index}")).collect() };
+	let output = if data.autoregressive { "char-id".to_owned() } else { data.target.first().cloned().unwrap_or_else(|| "target".to_owned()) };
 	let (norm_mean, norm_scale) = match data.prepared.get() {
 		Some(Ok(prepared)) => (prepared.norm_mean.clone(), prepared.norm_scale.clone()),
 		_ => (Vec::new(), Vec::new()),
@@ -4329,7 +4335,12 @@ fn nvidia(cus: u32, wave: u32, workgroup: u32, block_lds: u32, sm_lds: u32, wave
 	geometry(cus, wave, workgroup, sm_lds, waves_per_cu, resources)
 }
 pub trait IntoDataSources {
+	const AUTO: bool = false;
 	fn into_data_sources(self) -> Vec<String>;
+}
+impl IntoDataSources for Auto {
+	const AUTO: bool = true;
+	fn into_data_sources(self) -> Vec<String> { Vec::new() }
 }
 impl IntoDataSources for &str {
 	fn into_data_sources(self) -> Vec<String> { vec![self.to_owned()] }
@@ -4511,6 +4522,9 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	let mut tables = merge_captures(grouped, &data.target)?;
 	tables = merge_partitions(tables, &data.target, &data.exclusions)?;
 	require(!tables.is_empty(), "data source contains no supported table")?;
+	if data.autoregressive {
+		return prepare_autoregression(data, &tables);
+	}
 	if tables.len() > 1 {
 		require(data.broadcast, "multiple tables require explicit .broadcast() alignment")?;
 		let rows = tables.iter().map(|table| table.rows.len()).max().unwrap_or(0);
@@ -4592,11 +4606,49 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 			}
 		}
 	}
-	let rows = targets.len();
-	require(rows != 0, "dataset has no complete training rows")?;
 	for (column, count) in columns.iter().zip(missing).filter(|value| value.1 != 0) {
 		eprintln!("imputed: {}.{} {count}", tables[column.0].name, tables[column.0].headers[column.1]);
 	}
+	let schema = columns.iter().map(|column| format!("{}.{}:{}", tables[column.0].name, tables[column.0].headers[column.1], column.2.width())).collect::<Vec<_>>().join("|") + "->" + &data.target.join("|");
+	finish_prepared(data, samples, targets, features, sequence, schema)
+}
+fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
+	let mut sequences = Vec::new();
+	for table in tables {
+		for column in 0..table.headers.len() {
+			if matches!(infer_feature(table, column, table.rows.len()), FeatureType::Numeric(_)) {
+				continue;
+			}
+			for (row, values) in table.rows.iter().enumerate() {
+				let text = values.get(column).cloned().unwrap_or_default();
+				let chars = text.chars().map(|character| CHAR_IDS.iter().position(|value| *value == character).ok_or_else(|| RecipeError::new(format!("unsupported character {character:?} in row {}", row + 1)))).collect::<Result<Vec<_>>>()?;
+				if !chars.is_empty() {
+					sequences.push(chars)
+				}
+			}
+		}
+	}
+	let length = sequences.iter().map(|sequence| sequence.len().saturating_sub(1)).max().unwrap_or(0);
+	require(length != 0, "autoregression requires a string containing at least two characters")?;
+	let features = checked_mul(CHAR_IDS.len(), length, "autoregression input width")?;
+	let mut samples = Vec::new();
+	let mut targets = Vec::new();
+	for sequence in &sequences {
+		for prefix in 1..sequence.len() {
+			let mut sample = vec![0.0; features];
+			for (position, id) in sequence[..prefix].iter().copied().enumerate() {
+				sample[id * length + position] = 1.0
+			}
+			samples.extend(sample);
+			targets.push(sequence[prefix] as f64)
+		}
+	}
+	let schema = format!("auto:{}", CHAR_IDS.iter().map(|character| format!("{:X}", *character as u32)).collect::<Vec<_>>().join(","));
+	finish_prepared(data, samples, targets, features, Some(Shape { channels: CHAR_IDS.len(), length }), schema)
+}
+fn finish_prepared(data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, features: usize, sequence: Option<Shape>, schema: String) -> Result<Prepared> {
+	let rows = targets.len();
+	require(rows != 0, "dataset has no complete training rows")?;
 	let mut identities = samples.chunks_exact(features).zip(&targets).enumerate().map(|(row, (sample, target))| sample_identity(sample, *target, row)).collect();
 	shuffle(&mut samples, &mut targets, &mut identities, features)?;
 	let (norm_mean, norm_scale) = if data.normalize {
@@ -4605,7 +4657,6 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 		impute_missing(&mut samples);
 		(Vec::new(), Vec::new())
 	};
-	let schema = columns.iter().map(|column| format!("{}.{}:{}", tables[column.0].name, tables[column.0].headers[column.1], column.2.width())).collect::<Vec<_>>().join("|") + "->" + &data.target.join("|");
 	Ok(Prepared { samples, targets, rows, features, schema, sequence, norm_mean, norm_scale, identities })
 }
 fn normalize_samples(samples: &mut [f64], features: usize, fit: usize) -> Result<(Vec<f64>, Vec<f64>)> {
@@ -5054,20 +5105,20 @@ impl Train {
 		self.resume = Some(path.into());
 		self
 	}
-	fn execute(&self, model: &Model, data: &Data) -> TrainingReport {
+	fn execute(&self, model: &Model, data: &Data, evaluation: bool) -> TrainingReport {
 		SIGNAL.get_or_init(|| unsafe { signal(SIGINT, interrupt) });
 		if INTERRUPTED.load(Ordering::Acquire) {
 			std::process::exit(INTERRUPTED_EXIT);
 		}
-		self.try_run(model, data).unwrap_or_else(|error| panic!("{error}"))
+		self.try_run(model, data, evaluation).unwrap_or_else(|error| panic!("{error}"))
 	}
-	pub fn run(&self, model: &Model, data: &Data) -> TrainingReport { self.execute(model, data) }
+	pub fn run(&self, model: &Model, data: &Data) -> TrainingReport { self.execute(model, data, false) }
 	pub fn eval(&self, model: &Model, data: &Data) -> TrainingReport {
-		let report = self.execute(model, data);
+		let report = self.execute(model, data, true);
 		self.print_evaluation(model, &report);
 		report
 	}
-	fn try_run(&self, model: &Model, data: &Data) -> Result<TrainingReport> {
+	fn try_run(&self, model: &Model, data: &Data, evaluation: bool) -> Result<TrainingReport> {
 		let started = Instant::now();
 		let topology = topology()?;
 		let (gpus, mut config) = (all_gpus()?, Config::load()?);
@@ -5146,25 +5197,53 @@ impl Train {
 		if self.stop.is_some() {
 			tape.restore_best()?;
 		}
-		stored.bn_stats = tape.shards[0].tape.extract_bn_stats()?; tape.inject_bn_stats(&stored.bn_stats)?;
+		stored.bn_stats = tape.shards[0].tape.extract_bn_stats()?;
+		tape.inject_bn_stats(&stored.bn_stats)?;
 		self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
 		let raw_predictions = tape.predictions()?;
-		let final_loss = model_loss(&raw_predictions, targets, model.loss, config.activation[7]);
-		let predictions = raw_predictions.iter().map(|value| scale.map_or(*value, |scale| scale.decode(*value))).collect::<Vec<_>>();
-		let r2 = if training_rows == prepared.rows {
-			coefficient(&prepared.targets, &predictions)
-		} else {
+		let mut final_loss = model_loss(&raw_predictions, targets, model.loss, config.activation[7]);
+		let mut predictions = raw_predictions.iter().map(|value| scale.map_or(*value, |scale| scale.decode(*value))).collect::<Vec<_>>();
+		let mut evaluated = Vec::new();
+		if evaluation && data.autoregressive {
+			let mut graph = stored.graph.clone();
+			graph.parameters = tape.weights()?;
+			predictions.clear();
+			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
+			for sample in prepared.samples.chunks_exact(prepared.features) {
+				let mut validation = DeviceTape::new(&graph, sample, &[], &selected, config.precision)?;
+				validation.inject_bn_stats(&stored.bn_stats)?;
+				validation.forward()?;
+				let raw = validation.predictions()?;
+				require(raw.len() == 1, "autoregressive forward must produce one char ID")?;
+				let prediction = scale.map_or(raw[0], |scale| scale.decode(raw[0]));
+				predictions.push(prediction);
+				if stream {
+					eprint!("{}", predicted_char(prediction)?);
+					std::io::Write::flush(&mut std::io::stderr()).map_err(|error| RecipeError::new(format!("cannot flush token stream: {error}")))?
+				}
+			}
+			if stream {
+				eprintln!()
+			}
+			final_loss = model_loss(&predictions, &prepared.targets, model.loss, config.activation[7]);
+		} else if training_rows < prepared.rows {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
 			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_rows..]);
-			let mut values = Vec::with_capacity(validation_targets.len());
+			evaluated.reserve(validation_targets.len());
 			for (samples, targets) in prepared.samples[start..].chunks(prepared.features * config.rat_batch).zip(validation_targets.chunks(config.rat_batch)) {
 				let mut validation = DeviceTape::new(&graph, samples, targets, &selected, config.precision)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
 				validation.forward()?;
-				values.extend(validation.predictions()?.into_iter().map(|value| scale.map_or(value, |scale| scale.decode(value))))
+				evaluated.extend(validation.predictions()?.into_iter().map(|value| scale.map_or(value, |scale| scale.decode(value))))
 			}
-			coefficient(&prepared.targets[training_rows..], &values)
+			}
+		let r2 = if training_rows == prepared.rows {
+			coefficient(&prepared.targets, &predictions)
+		} else if evaluation && data.autoregressive {
+			coefficient(&prepared.targets[training_rows..], &predictions[training_rows..])
+		} else {
+			coefficient(&prepared.targets[training_rows..], &evaluated)
 		};
 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(self.stop.is_some()))?;
 		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), run, epoch: tape.step as usize, seconds: started.elapsed().as_secs_f64() })
@@ -5210,6 +5289,7 @@ impl Train {
 					topology.clone()
 				}
 				5..=7 => continue,
+				8 => continue,
 				_ => unreachable!(),
 			};
 			values.push(value);
@@ -5217,7 +5297,9 @@ impl Train {
 		if measurement.checkpoint && self.stop.is_some() {
 			values.push("\x1b[1\x3b32m← checkpoint\x1b[0m".to_owned());
 		}
-		eprintln!("{}", values.join("  "));
+		if !values.is_empty() {
+			eprintln!("{}", values.join("  "))
+		}
 	}
 }
 struct Metrics {
@@ -5272,6 +5354,11 @@ fn model_loss(predictions: &[f64], targets: &[f64], loss: LossFunction, threshol
 		result = result.sqrt();
 	}
 	result
+}
+fn predicted_char(prediction: f64) -> Result<char> {
+	require(prediction.is_finite(), "autoregressive forward produced a nonfinite char ID")?;
+	let id = prediction.round().clamp(0.0, (CHAR_IDS.len() - 1) as f64) as usize;
+	Ok(CHAR_IDS[id])
 }
 fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let mean = targets.iter().sum::<f64>() / targets.len() as f64;
