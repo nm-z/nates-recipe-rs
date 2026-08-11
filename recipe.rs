@@ -1098,6 +1098,15 @@ trait Integer {
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>>;
 	fn bits(self) -> u8;
 }
+fn decode_blocks(data: &[u8], count: usize, block: usize, stride: usize, error: &str, mut decode: impl FnMut(&[u8], usize) -> f64) -> Result<Vec<f64>> {
+	require(data.len() >= count.div_ceil(block) * stride, error)?;
+	let mut weights = Vec::with_capacity(count);
+	for bytes in data.chunks_exact(stride) {
+		let remaining = block.min(count - weights.len());
+		weights.extend((0..remaining).map(|index| decode(bytes, index)));
+	}
+	Ok(weights)
+}
 impl Integer for IntegerFormat {
 	fn bits(self) -> u8 { self.0 as u8 }
 	fn compress(self, weights: &[f64], importance: &[f64], config: Config) -> Result<(Vec<u8>, Vec<f64>)> {
@@ -1450,350 +1459,138 @@ impl Integer for IntegerFormat {
 	}
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>> {
 		let (family, variant, bits) = (self.0 >> 12, self.0 >> 8 & 15, self.bits());
-		if family == 0 && variant < 2 && matches!(bits, 4 | 5 | 8) {
-			let block = 32;
-			let header = if variant == 1 { 4 } else { 2 };
-			let payload = match bits {
-				4 => 16,
-				5 => 20,
-				8 => 32,
-				_ => unreachable!(),
-			};
-			let stride = header + payload;
-			require(data.len() >= count.div_ceil(block) * stride, "GGML quantized weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(stride) {
-				let scale = half(bytes);
-				let minimum = if variant == 1 && bits != 8 { half(&bytes[2..]) } else { 0.0 };
-				let codes = &bytes[header..header + payload];
-				for index in 0..block.min(count - weights.len()) {
+		match (family, variant, bits) {
+			(0, 0 | 1, 4 | 5 | 8) => {
+				let header = if variant == 1 { 4 } else { 2 };
+				let payload = match bits {
+					4 => 16,
+					5 => 20,
+					8 => 32,
+					_ => unreachable!(),
+				};
+				decode_blocks(data, count, 32, header + payload, "GGML quantized weights are invalid", |bytes, index| {
+					let scale = half(bytes);
+					let minimum = if variant == 1 && bits != 8 { half(&bytes[2..]) } else { 0.0 };
+					let codes = &bytes[header..header + payload];
 					let code = match bits {
 						4 => codes[index % 16] >> (index / 16 * 4) & 15,
 						5 => (codes[4 + index % 16] >> (index / 16 * 4) & 15) | ((codes[index / 8] >> (index % 8) & 1) << 4),
 						8 => codes[index],
 						_ => unreachable!(),
 					};
-					let value = match (bits, variant) {
+					f64::from(match (bits, variant) {
 						(8, _) => i8::from_ne_bytes([code]) as f32 * scale,
 						(_, 0) => (i32::from(code) - (1_i32 << (bits - 1))) as f32 * scale,
 						(_, 1) => f32::from(code) * scale + minimum,
 						_ => unreachable!(),
-					};
-					weights.push(f64::from(value));
-				}
+					})
+				})
 			}
-			return Ok(weights);
-		}
-		if family == 0 && variant == 3 && bits == 2 {
-			const STRIDE: usize = 84;
-			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML Q2_K weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) {
+			(0, 3, 2) => decode_blocks(data, count, 256, 84, "GGML Q2_K weights are invalid", |bytes, index| {
 				let (scale, minimum) = (half(&bytes[80..]), half(&bytes[82..]));
-				let packed = &bytes[16..80];
-				for group in (0..256).step_by(128) {
-					for shift in (0..8).step_by(2) {
-						for half in 0..2 {
-							let block = group / 16 + shift + half;
-							let metadata = bytes[block];
-							let (d, m) = (scale * f32::from(metadata & 15), minimum * f32::from(metadata >> 4));
-							for offset in 0..16 {
-								if weights.len() == count {
-									return Ok(weights);
-								}
-								weights.push(f64::from(d * f32::from(packed[group / 4 + half * 16 + offset] >> shift & 3) - m));
-							}
-						}
-					}
-				}
-			}
-			return Ok(weights);
-		}
-		if family == 0 && variant == 3 && bits == 3 {
-			const STRIDE: usize = 110;
-			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML Q3_K weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) {
-				let scale = half(&bytes[108..]);
-				for index in 0..256 {
-					if weights.len() == count {
-						return Ok(weights);
-					}
-					let block = index / 16;
-					let low_scale = bytes[96 + if block < 8 { block } else { block - 8 }] >> if block < 8 { 0 } else { 4 } & 15;
-					let high_scale = bytes[104 + block % 4] >> (2 * (block / 4)) & 3;
-					let block_scale = (low_scale | high_scale << 4) as i8 - 32;
-					let low = bytes[32 + index / 128 * 32 + index % 32] >> (index % 128 / 32 * 2) & 3;
-					let quant = i8::try_from(low).unwrap() - if bytes[index % 32] >> (index / 32) & 1 == 0 { 4 } else { 0 };
-					weights.push(f64::from(scale * f32::from(block_scale) * f32::from(quant)));
-				}
-			}
-			return Ok(weights);
-		}
-		if family == 0 && variant == 3 && matches!(bits, 4 | 5) {
-			let stride = if bits == 4 { 144 } else { 176 };
-			require(data.len() >= count.div_ceil(256) * stride, "GGML Q4_K or Q5_K weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(stride) {
+				let order = index / 16;
+				let (section, shift, half, offset) = (order / 8, order % 8 / 2 * 2, order % 2, index % 16);
+				let metadata = bytes[section * 8 + shift + half];
+				f64::from(scale * f32::from(metadata & 15) * f32::from(bytes[16 + section * 32 + half * 16 + offset] >> shift & 3) - minimum * f32::from(metadata >> 4))
+			}),
+			(0, 3, 3) => decode_blocks(data, count, 256, 110, "GGML Q3_K weights are invalid", |bytes, index| {
+				let block = index / 16;
+				let low_scale = bytes[96 + if block < 8 { block } else { block - 8 }] >> if block < 8 { 0 } else { 4 } & 15;
+				let high_scale = bytes[104 + block % 4] >> (2 * (block / 4)) & 3;
+				let low = bytes[32 + index / 128 * 32 + index % 32] >> (index % 128 / 32 * 2) & 3;
+				let quant = i8::try_from(low).unwrap() - if bytes[index % 32] >> (index / 32) & 1 == 0 { 4 } else { 0 };
+				f64::from(half(&bytes[108..]) * f32::from((low_scale | high_scale << 4) as i8 - 32) * f32::from(quant))
+			}),
+			(0, 3, 4 | 5) => decode_blocks(data, count, 256, if bits == 4 { 144 } else { 176 }, "GGML Q4_K or Q5_K weights are invalid", |bytes, index| {
 				let (scale, minimum) = (half(bytes), half(&bytes[2..]));
-				for index in 0..256 {
-					if weights.len() == count {
-						return Ok(weights);
-					}
-					let block = index / 32;
-					let (scale_code, minimum_code) = k_scale(&bytes[4..16], block);
-					let packed = bytes[(if bits == 4 { 16 } else { 48 }) + index / 64 * 32 + index % 32];
-					let mut code = if index % 64 < 32 { packed & 15 } else { packed >> 4 };
-					if bits == 5 {
-						code |= (bytes[16 + index % 32] >> (index / 32) & 1) << 4
-					}
-					weights.push(f64::from(scale * f32::from(scale_code) * f32::from(code) - minimum * f32::from(minimum_code)));
-				}
+				let (scale_code, minimum_code) = k_scale(&bytes[4..16], index / 32);
+				let packed = bytes[(if bits == 4 { 16 } else { 48 }) + index / 64 * 32 + index % 32];
+				let code = (if index % 64 < 32 { packed & 15 } else { packed >> 4 }) | if bits == 5 { (bytes[16 + index % 32] >> (index / 32) & 1) << 4 } else { 0 };
+				f64::from(scale * f32::from(scale_code) * f32::from(code) - minimum * f32::from(minimum_code))
+			}),
+			(0, 3, 6) => decode_blocks(data, count, 256, 210, "GGML Q6_K weights are invalid", |bytes, index| {
+				let group = index / 128 * 128;
+				let quarter = index % 128 / 32;
+				let packed = bytes[group / 2 + index % 32 + if quarter % 2 == 0 { 0 } else { 32 }];
+				let low = if quarter < 2 { packed & 15 } else { packed >> 4 };
+				let high = bytes[128 + group / 4 + index % 32] >> (quarter * 2) & 3;
+				f64::from(half(&bytes[208..]) * f32::from(i8::from_ne_bytes([bytes[192 + index / 16]])) * f32::from((low | high << 4) as i8 - 32))
+			}),
+			(0, 3, 8) => decode_blocks(data, count, 256, 292, "GGML Q8_K weights are invalid", |bytes, index| f64::from(float(bytes) * f32::from(i8::from_ne_bytes([bytes[4 + index]])))),
+			(0, 2, 4) => {
+				let block = codebook.first().copied().unwrap_or(0.0) as usize;
+				require(block != 0 && codebook.len() >= 17 + count.div_ceil(block) && data.len() * 2 >= count, "NF4 weights are invalid")?;
+				(0..count).map(|index| codebook.get(1 + usize::from(data[index / 2] >> (index % 2 * 4) & 15)).zip(codebook.get(17 + index / block)).map(|(value, scale)| value * scale).ok_or_else(|| RecipeError::new("NF4 weight index is invalid"))).collect()
 			}
-			return Ok(weights);
-		}
-		if family == 0 && variant == 3 && bits == 6 {
-			const STRIDE: usize = 210;
-			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML Q6_K weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) {
-				let scale = half(&bytes[208..]);
-				for index in 0..256 {
-					if weights.len() == count {
-						return Ok(weights);
-					}
-					let group = index / 128 * 128;
-					let quarter = index % 128 / 32;
-					let packed = bytes[group / 2 + index % 32 + if quarter % 2 == 0 { 0 } else { 32 }];
-					let low = if quarter < 2 { packed & 15 } else { packed >> 4 };
-					let high = bytes[128 + group / 4 + index % 32] >> (quarter * 2) & 3;
-					let quant = (low | high << 4) as i8 - 32;
-					let block_scale = i8::from_ne_bytes([bytes[192 + index / 16]]);
-					weights.push(f64::from(scale * f32::from(block_scale) * f32::from(quant)));
-				}
-			}
-			return Ok(weights);
-		}
-		if family == 0 && variant == 3 && bits == 8 {
-			const STRIDE: usize = 292;
-			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML Q8_K weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) {
-				let scale = float(bytes);
-				for code in &bytes[4..260] {
-					if weights.len() == count {
-						return Ok(weights);
-					}
-					weights.push(f64::from(scale * f32::from(i8::from_ne_bytes([*code]))))
-				}
-			}
-			return Ok(weights);
-		}
-		if self.0 >> 12 == 0 && self.0 >> 8 & 15 == 2 {
-			let block = codebook.first().copied().unwrap_or(0.0) as usize;
-			require(block != 0 && codebook.len() >= 17 + count.div_ceil(block) && data.len() * 2 >= count, "NF4 weights are invalid")?;
-			return (0..count).map(|index| codebook.get(1 + usize::from(data[index / 2] >> (index % 2 * 4) & 15)).zip(codebook.get(17 + index / block)).map(|(value, scale)| value * scale).ok_or_else(|| RecipeError::new("NF4 weight index is invalid"))).collect();
-		}
-		if family == 1 && variant == 5 && bits == 4 {
-			const STRIDE: usize = 18;
-			require(data.len() >= count.div_ceil(32) * STRIDE, "GGML IQ4_NL weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) {
-				let scale = half(bytes);
-				for index in 0..32 {
-					if weights.len() == count {
-						return Ok(weights);
-					}
-					let code = if index < 16 { bytes[2 + index] & 15 } else { bytes[2 + index - 16] >> 4 };
-					weights.push(f64::from(scale * f32::from(IQ4[usize::from(code)])));
-				}
-			}
-			return Ok(weights);
-		}
-		if family == 1 && variant == 2 && bits == 4 {
-			const STRIDE: usize = 136;
-			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ4_XS weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) {
+			(1, 5, 4) => decode_blocks(data, count, 32, 18, "GGML IQ4_NL weights are invalid", |bytes, index| {
+				let code = if index < 16 { bytes[2 + index] & 15 } else { bytes[2 + index - 16] >> 4 };
+				f64::from(half(bytes) * f32::from(IQ4[usize::from(code)]))
+			}),
+			(1, 2, 4) => decode_blocks(data, count, 256, 136, "GGML IQ4_XS weights are invalid", |bytes, index| {
 				let (scale, high) = (half(bytes), u16::from_le_bytes([bytes[2], bytes[3]]));
-				for index in 0..256 {
-					if weights.len() == count {
-						return Ok(weights);
-					}
-					let block = index / 32;
-					let scale_code = (bytes[4 + block / 2] >> (block % 2 * 4) & 15) | ((high >> (block * 2) & 3) as u8) << 4;
-					let packed = bytes[8 + block * 16 + index % 16];
-					let code = if index % 32 < 16 { packed & 15 } else { packed >> 4 };
-					weights.push(f64::from(scale * f32::from(scale_code as i8 - 32) * f32::from(IQ4[usize::from(code)])));
-				}
-			}
-			return Ok(weights);
+				let block = index / 32;
+				let scale_code = (bytes[4 + block / 2] >> (block % 2 * 4) & 15) | ((high >> (block * 2) & 3) as u8) << 4;
+				let packed = bytes[8 + block * 16 + index % 16];
+				let code = if index % 32 < 16 { packed & 15 } else { packed >> 4 };
+				f64::from(scale * f32::from(scale_code as i8 - 32) * f32::from(IQ4[usize::from(code)]))
+			}),
+			(1, 1, 3) => decode_blocks(data, count, 256, 98, "GGML IQ3_XXS weights are invalid", |bytes, index| {
+				let (block, group, lane) = (index / 32, index % 32 / 8, index % 8);
+				let word = u32::from_le_bytes(bytes[66 + block * 4..70 + block * 4].try_into().unwrap());
+				let signs = (word >> (7 * group) & 127) as u8;
+				let signs = signs | ((signs.count_ones() as u8 & 1) << 7);
+				let grid = usize::from(bytes[2 + block * 8 + group * 2 + lane / 4]);
+				f64::from(half(bytes) * (0.5 + (word >> 28) as f32) * 0.5 * f32::from(iq3_grid(&IQ3_XXS, grid, lane % 4)) * if signs >> lane & 1 != 0 { -1.0 } else { 1.0 })
+			}),
+			(1, 1, 2) => decode_blocks(data, count, 256, 66, "GGML IQ2_XXS weights are invalid", |bytes, index| {
+				let (block, group, lane) = (index / 32, index % 32 / 8, index % 8);
+				let word = u32::from_le_bytes(bytes[6 + block * 8..10 + block * 8].try_into().unwrap());
+				let signs = (word >> (7 * group) & 127) as u8;
+				let signs = signs | ((signs.count_ones() as u8 & 1) << 7);
+				let sign = if signs >> lane & 1 != 0 { -1.0 } else { 1.0 };
+				f64::from(half(bytes) * (0.5 + (word >> 28) as f32) * 0.25 * f32::from(iq2_grid(&IQ2_XXS, usize::from(bytes[2 + block * 8 + group]), lane)) * sign)
+			}),
+			(1, 3, 2) => decode_blocks(data, count, 256, 82, "GGML IQ2_S weights are invalid", |bytes, index| {
+				let (block, slot) = (index / 16, index / 8);
+				let grid = usize::from(bytes[2 + slot]) | usize::from(bytes[66 + slot / 4] >> (2 * (slot % 4)) & 3) << 8;
+				let d = half(bytes) * (0.5 + f32::from(bytes[74 + block / 2] >> (4 * (block % 2)) & 15)) * 0.25;
+				let sign = if bytes[34 + slot] >> (index % 8) & 1 != 0 { -1.0 } else { 1.0 };
+				f64::from(d * f32::from(iq2_grid(&IQ2_S, grid, index % 8)) * sign)
+			}),
+			(1, 2, 2) => decode_blocks(data, count, 256, 74, "GGML IQ2_XS weights are invalid", |bytes, index| {
+				let (block, slot) = (index / 16, index / 8);
+				let word = u16::from_le_bytes(bytes[2 + 2 * slot..4 + 2 * slot].try_into().unwrap());
+				let signs = (word >> 9) as u8;
+				let signs = signs | ((signs.count_ones() as u8 & 1) << 7);
+				let d = half(bytes) * (0.5 + f32::from(bytes[66 + block / 2] >> (4 * (block % 2)) & 15)) * 0.25;
+				let sign = if signs >> (index % 8) & 1 != 0 { -1.0 } else { 1.0 };
+				f64::from(d * f32::from(iq2_grid(&IQ2_XS, usize::from(word & 511), index % 8)) * sign)
+			}),
+			(1, 3, 1) => decode_blocks(data, count, 256, 50, "GGML IQ1_S weights are invalid", |bytes, index| {
+				let (block, group) = (index / 32, index % 32 / 8);
+				let high = u16::from_le_bytes(bytes[34 + 2 * block..36 + 2 * block].try_into().unwrap());
+				let grid = usize::from(bytes[2 + 4 * block + group]) | usize::from(high >> (3 * group) & 7) << 8;
+				let delta = if high & 0x8000 != 0 { -0.125 } else { 0.125 };
+				f64::from(half(bytes) * f32::from(2 * ((high >> 12) & 7) + 1) * (f32::from(iq1_level(grid, index % 8)) - 1.0 + delta))
+			}),
+			(1, 4, 1) => decode_blocks(data, count, 256, 56, "GGML IQ1_M weights are invalid", |bytes, index| {
+				let scale = (0..4).fold(0_u16, |scale, word| scale | (u16::from_le_bytes(bytes[48 + 2 * word..50 + 2 * word].try_into().unwrap()) >> 12 & 15) << (4 * word));
+				let (block, group) = (index / 16, index % 16 / 8);
+				let high = bytes[32 + block];
+				let grid = usize::from(bytes[2 * block + group]) | usize::from(high >> (4 * group) & 7) << 8;
+				let stored = u16::from_le_bytes(bytes[48 + 2 * (block / 4)..50 + 2 * (block / 4)].try_into().unwrap());
+				let delta = if high >> (3 + 4 * group) & 1 != 0 { -0.125 } else { 0.125 };
+				f64::from(unfp16(scale) * f32::from(2 * ((stored >> (3 * (block % 4))) & 7) + 1) * (f32::from(iq1_level(grid, index % 8)) - 1.0 + delta))
+			}),
+			(1, 3, 3) => decode_blocks(data, count, 256, 110, "GGML IQ3_S weights are invalid", |bytes, index| {
+				let (block, group) = (index / 32, index / 4);
+				let grid = usize::from(bytes[2 + group]) | usize::from(bytes[66 + group / 8] >> (group % 8) & 1) << 8;
+				let d = half(bytes) * f32::from(1 + 2 * (bytes[106 + block / 2] >> (block % 2 * 4) & 15));
+				let sign = if bytes[74 + index / 8] >> (index % 8) & 1 != 0 { -1.0 } else { 1.0 };
+				f64::from(d * f32::from(iq3_grid(&IQ3_S, grid, index % 4)) * sign)
+			}),
+			_ => Err(self.unavailable()),
 		}
-		if family == 1 && variant == 1 && bits == 3 {
-			const STRIDE: usize = 98;
-			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ3_XXS weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) {
-				let scale = half(bytes);
-				for block in 0..8 {
-					let word = u32::from_le_bytes(bytes[66 + block * 4..70 + block * 4].try_into().unwrap());
-					let d = scale * (0.5 + (word >> 28) as f32) * 0.5;
-					for group in 0..4 {
-						let signs = (word >> (7 * group) & 127) as u8;
-						let signs = signs | ((signs.count_ones() as u8 & 1) << 7);
-						for lane in 0..8 {
-							if weights.len() == count {
-								return Ok(weights);
-							}
-							let grid = usize::from(bytes[2 + block * 8 + group * 2 + lane / 4]);
-							let magnitude = f32::from(iq3_grid(&IQ3_XXS, grid, lane % 4));
-							weights.push(f64::from(d * magnitude * if signs >> lane & 1 != 0 { -1.0 } else { 1.0 }))
-						}
-					}
-				}
-			}
-			return Ok(weights);
-		}
-		if family == 1 && variant == 1 && bits == 2 {
-			const STRIDE: usize = 66;
-			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ2_XXS weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) {
-				let scale = half(bytes);
-				for block in 0..8 {
-					let word = u32::from_le_bytes(bytes[6 + block * 8..10 + block * 8].try_into().unwrap());
-					let d = scale * (0.5 + (word >> 28) as f32) * 0.25;
-					for group in 0..4 {
-						let signs = (word >> (7 * group) & 127) as u8;
-						let signs = signs | ((signs.count_ones() as u8 & 1) << 7);
-						let grid = usize::from(bytes[2 + block * 8 + group]);
-						for lane in 0..8 {
-							if weights.len() == count {
-								return Ok(weights);
-							}
-							let sign = if signs >> lane & 1 != 0 { -1.0 } else { 1.0 };
-							weights.push(f64::from(d * f32::from(iq2_grid(&IQ2_XXS, grid, lane)) * sign))
-						}
-					}
-				}
-			}
-			return Ok(weights);
-		}
-		if family == 1 && variant == 3 && bits == 2 {
-			const STRIDE: usize = 82;
-			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ2_S weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) {
-				let scale = half(bytes);
-				for index in 0..256 {
-					if weights.len() == count {
-						return Ok(weights);
-					}
-					let block = index / 16;
-					let slot = index / 8;
-					let grid = usize::from(bytes[2 + slot]) | usize::from(bytes[66 + slot / 4] >> (2 * (slot % 4)) & 3) << 8;
-					let code = bytes[74 + block / 2] >> (4 * (block % 2)) & 15;
-					let d = scale * (0.5 + f32::from(code)) * 0.25;
-					let sign = if bytes[34 + slot] >> (index % 8) & 1 != 0 { -1.0 } else { 1.0 };
-					weights.push(f64::from(d * f32::from(iq2_grid(&IQ2_S, grid, index % 8)) * sign))
-				}
-			}
-			return Ok(weights);
-		}
-		if family == 1 && variant == 2 && bits == 2 {
-			const STRIDE: usize = 74;
-			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ2_XS weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) {
-				let scale = half(bytes);
-				for index in 0..256 {
-					if weights.len() == count {
-						return Ok(weights);
-					}
-					let block = index / 16;
-					let slot = index / 8;
-					let word = u16::from_le_bytes(bytes[2 + 2 * slot..4 + 2 * slot].try_into().unwrap());
-					let grid = usize::from(word & 511);
-					let signs = (word >> 9) as u8;
-					let signs = signs | ((signs.count_ones() as u8 & 1) << 7);
-					let code = bytes[66 + block / 2] >> (4 * (block % 2)) & 15;
-					let d = scale * (0.5 + f32::from(code)) * 0.25;
-					let sign = if signs >> (index % 8) & 1 != 0 { -1.0 } else { 1.0 };
-					weights.push(f64::from(d * f32::from(iq2_grid(&IQ2_XS, grid, index % 8)) * sign))
-				}
-			}
-			return Ok(weights);
-		}
-		if family == 1 && variant == 3 && bits == 1 {
-			const STRIDE: usize = 50;
-			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ1_S weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) {
-				let scale = half(bytes);
-				for index in 0..256 {
-					if weights.len() == count {
-						return Ok(weights);
-					}
-					let block = index / 32;
-					let group = index / 8;
-					let high = u16::from_le_bytes(bytes[34 + 2 * block..36 + 2 * block].try_into().unwrap());
-					let grid = usize::from(bytes[2 + 4 * block + group]) | usize::from(high >> (3 * group) & 7) << 8;
-					let d = scale * f32::from(2 * ((high >> 12) & 7) + 1);
-					let delta = if high & 0x8000 != 0 { -0.125 } else { 0.125 };
-					weights.push(f64::from(d * (f32::from(iq1_level(grid, index % 8)) - 1.0 + delta)))
-				}
-			}
-			return Ok(weights);
-		}
-		if family == 1 && variant == 4 && bits == 1 {
-			const STRIDE: usize = 56;
-			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ1_M weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) {
-				let mut scale = 0_u16;
-				for word in 0..4 {
-					let stored = u16::from_le_bytes(bytes[48 + 2 * word..50 + 2 * word].try_into().unwrap());
-					scale |= (stored >> 12 & 15) << (4 * word)
-				}
-				let scale = unfp16(scale);
-				for index in 0..256 {
-					if weights.len() == count {
-						return Ok(weights);
-					}
-					let block = index / 16;
-					let group = index % 16 / 8;
-					let high = bytes[32 + block];
-					let grid = usize::from(bytes[2 * block + group]) | usize::from(high >> (4 * group) & 7) << 8;
-					let stored = u16::from_le_bytes(bytes[48 + 2 * (block / 4)..50 + 2 * (block / 4)].try_into().unwrap());
-					let d = scale * f32::from(2 * ((stored >> (3 * (block % 4))) & 7) + 1);
-					let delta = if high >> (3 + 4 * group) & 1 != 0 { -0.125 } else { 0.125 };
-					weights.push(f64::from(d * (f32::from(iq1_level(grid, index % 8)) - 1.0 + delta)))
-				}
-			}
-			return Ok(weights);
-		}
-		if family == 1 && variant == 3 && bits == 3 {
-			const STRIDE: usize = 110;
-			require(data.len() >= count.div_ceil(256) * STRIDE, "GGML IQ3_S weights are invalid")?;
-			let mut weights = Vec::with_capacity(count);
-			for bytes in data.chunks_exact(STRIDE) {
-				let scale = half(bytes);
-				for index in 0..256 {
-					if weights.len() == count {
-						return Ok(weights);
-					}
-					let block = index / 32;
-					let group = index / 4;
-					let grid = usize::from(bytes[2 + group]) | usize::from(bytes[66 + group / 8] >> (group % 8) & 1) << 8;
-					let code = bytes[106 + block / 2] >> (block % 2 * 4) & 15;
-					let d = scale * f32::from(1 + 2 * code);
-					let sign = if bytes[74 + index / 8] >> (index % 8) & 1 != 0 { -1.0 } else { 1.0 };
-					weights.push(f64::from(d * f32::from(iq3_grid(&IQ3_S, grid, index % 4)) * sign))
-				}
-			}
-			return Ok(weights);
-		}
-		Err(self.unavailable())
 	}
 }
 pub struct Qi(pub Model, pub Model, QiSuffix);
@@ -3286,6 +3083,8 @@ impl Drop for Buffer {
 #[derive(Clone, Copy)]
 struct Kernel {
 	object: u64,
+	slot: u8,
+	epoch: bool,
 	shared: u32,
 	element: u8,
 	#[cfg(amd)]
@@ -3300,9 +3099,11 @@ struct Dispatch {
 	geometry: Geometry,
 }
 impl Kernel {
-	const fn remote(object: u64, shared: u32, element: u8, layout: &'static [u8]) -> Self {
+	const fn remote(slot: u8, epoch: bool, shared: u32, element: u8, layout: &'static [u8]) -> Self {
 		Self {
-			object,
+			object: 0,
+			slot,
+			epoch,
 			shared,
 			element,
 			#[cfg(amd)]
@@ -3318,6 +3119,130 @@ const EPOCH_ARGS: &[u8] = b"888888888888888844448888888884444448844";
 const EPOCH_F32_ARGS: &[u8] = b"888888888888888844444444444444444448844";
 const EPOCH_F16_ARGS: &[u8] = b"888888888888888844442222222224444448844";
 const EPOCH_F8_ARGS: &[u8] = b"888888888888888844441111111114444448844";
+fn argument_layout_size(layout: &[u8]) -> usize {
+	layout.iter().fold(0, |offset, kind| {
+		let bytes = usize::from(*kind - b'0');
+		offset.next_multiple_of(bytes) + bytes
+	})
+}
+type CpuKernel = unsafe fn(&[Ptr]);
+#[derive(Clone, Copy)]
+struct KernelSpec {
+	suffix: &'static str,
+	element: u8,
+	epoch_layout: &'static [u8],
+	cpu: [CpuKernel; 2],
+	#[cfg(amd)]
+	hsa: &'static [(&'static str, &'static [u8])],
+	#[cfg(nvidia)]
+	ptx: &'static [u8],
+}
+fn kernel_spec(index: usize) -> Result<KernelSpec> {
+	let spec = match index {
+		0 => KernelSpec {
+			suffix: "",
+			element: 8,
+			epoch_layout: EPOCH_ARGS,
+			cpu: [cpu_forward_dispatch::<f64>, cpu_epoch_dispatch::<f64>],
+			#[cfg(amd)]
+			hsa: HSA_CODE_OBJECTS,
+			#[cfg(nvidia)]
+			ptx: include_bytes!(env!("RECIPE_NV_PTX")),
+		},
+		1 => KernelSpec {
+			suffix: "_f32",
+			element: 4,
+			epoch_layout: EPOCH_F32_ARGS,
+			cpu: [cpu_forward_dispatch::<f32>, cpu_epoch_dispatch::<f32>],
+			#[cfg(amd)]
+			hsa: HSA_F32_CODE_OBJECTS,
+			#[cfg(nvidia)]
+			ptx: include_bytes!(env!("RECIPE_NV_F32_PTX")),
+		},
+		2 => KernelSpec {
+			suffix: "_f16",
+			element: 2,
+			epoch_layout: EPOCH_F16_ARGS,
+			cpu: [cpu_forward_dispatch::<CpuF16>, cpu_epoch_dispatch::<CpuF16>],
+			#[cfg(amd)]
+			hsa: HSA_F16_CODE_OBJECTS,
+			#[cfg(nvidia)]
+			ptx: include_bytes!(env!("RECIPE_NV_F16_PTX")),
+		},
+		3 => KernelSpec {
+			suffix: "_f8",
+			element: 1,
+			epoch_layout: EPOCH_F8_ARGS,
+			cpu: [cpu_forward_dispatch::<CpuF8>, cpu_epoch_dispatch::<CpuF8>],
+			#[cfg(amd)]
+			hsa: HSA_F8_CODE_OBJECTS,
+			#[cfg(nvidia)]
+			ptx: include_bytes!(env!("RECIPE_NV_F8_PTX")),
+		},
+		4 => KernelSpec {
+			suffix: "_bf16",
+			element: 2,
+			epoch_layout: EPOCH_F16_ARGS,
+			cpu: [cpu_forward_dispatch::<CpuBf16>, cpu_epoch_dispatch::<CpuBf16>],
+			#[cfg(amd)]
+			hsa: HSA_BF16_CODE_OBJECTS,
+			#[cfg(nvidia)]
+			ptx: include_bytes!(env!("RECIPE_NV_BF16_PTX")),
+		},
+		5 => KernelSpec {
+			suffix: "_tf32",
+			element: 4,
+			epoch_layout: EPOCH_F32_ARGS,
+			cpu: [cpu_forward_dispatch::<CpuTf32>, cpu_epoch_dispatch::<CpuTf32>],
+			#[cfg(amd)]
+			hsa: HSA_TF32_CODE_OBJECTS,
+			#[cfg(nvidia)]
+			ptx: include_bytes!(env!("RECIPE_NV_TF32_PTX")),
+		},
+		6 => KernelSpec {
+			suffix: "_int8",
+			element: 1,
+			epoch_layout: EPOCH_F8_ARGS,
+			cpu: [cpu_forward_dispatch::<CpuInt8>, cpu_epoch_dispatch::<CpuInt8>],
+			#[cfg(amd)]
+			hsa: HSA_INT8_CODE_OBJECTS,
+			#[cfg(nvidia)]
+			ptx: include_bytes!(env!("RECIPE_NV_INT8_PTX")),
+		},
+		7 => KernelSpec {
+			suffix: "_int4",
+			element: 1,
+			epoch_layout: EPOCH_F8_ARGS,
+			cpu: [cpu_forward_dispatch::<CpuInt4>, cpu_epoch_dispatch::<CpuInt4>],
+			#[cfg(amd)]
+			hsa: HSA_INT4_CODE_OBJECTS,
+			#[cfg(nvidia)]
+			ptx: include_bytes!(env!("RECIPE_NV_INT4_PTX")),
+		},
+		8 => KernelSpec {
+			suffix: "_int1",
+			element: 1,
+			epoch_layout: EPOCH_F8_ARGS,
+			cpu: [cpu_forward_dispatch::<CpuInt1>, cpu_epoch_dispatch::<CpuInt1>],
+			#[cfg(amd)]
+			hsa: HSA_INT1_CODE_OBJECTS,
+			#[cfg(nvidia)]
+			ptx: include_bytes!(env!("RECIPE_NV_INT1_PTX")),
+		},
+		9 => KernelSpec {
+			suffix: "_f",
+			element: 8,
+			epoch_layout: EPOCH_ARGS,
+			cpu: [cpu_forward_dispatch::<CpuF>, cpu_epoch_dispatch::<CpuF>],
+			#[cfg(amd)]
+			hsa: HSA_F_CODE_OBJECTS,
+			#[cfg(nvidia)]
+			ptx: include_bytes!(env!("RECIPE_NV_F_PTX")),
+		},
+		_ => return Err(RecipeError::new("numeric format kernel is unavailable")),
+	};
+	Ok(spec)
+}
 #[cfg(nvidia)]
 struct Cuda {
 	context: Ptr,
@@ -3328,12 +3253,25 @@ struct Cuda {
 	download: unsafe extern "C" fn(Ptr, u64, usize) -> i32,
 	synchronize: unsafe extern "C" fn() -> i32,
 	launch: unsafe extern "C" fn(usize, u32, u32, u32, u32, u32, u32, u32, Ptr, *mut Ptr) -> i32,
+	load: unsafe extern "C" fn(*mut Ptr, *const c_void) -> i32,
+	function: unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32,
+	function_attribute: unsafe extern "C" fn(*mut i32, i32, usize) -> i32,
+	occupancy: unsafe extern "C" fn(*mut i32, usize, i32, usize) -> i32,
+	cus: u32,
+	wave: u32,
+	workgroup: u32,
+	block_lds: u32,
+	sm_lds: u32,
+	registers: u32,
+	threads: u32,
 }
 #[cfg(nvidia)]
 impl Kernel {
-	const fn cuda(object: usize, shared: u32, element: u8, _layout: &'static [u8]) -> Self {
+	const fn cuda(object: usize, slot: u8, epoch: bool, shared: u32, element: u8, _layout: &'static [u8]) -> Self {
 		Self {
 			object: object as u64,
+			slot,
+			epoch,
 			shared,
 			element,
 			#[cfg(amd)]
@@ -3347,6 +3285,12 @@ impl Kernel {
 #[cfg(amd)]
 #[allow(dead_code)]
 struct Hsa {
+	reader_create: unsafe extern "C" fn(*const c_void, usize, *mut u64) -> i32,
+	executable_create: unsafe extern "C" fn(i32, i32, Ptr, *mut u64) -> i32,
+	executable_load: unsafe extern "C" fn(u64, u64, u64, Ptr, Ptr) -> i32,
+	executable_freeze: unsafe extern "C" fn(u64, Ptr) -> i32,
+	symbol: HsaSymbol,
+	symbol_info: HsaSymbolInfo,
 	allocate: unsafe extern "C" fn(u64, usize, u32, *mut Ptr) -> i32,
 	free: unsafe extern "C" fn(Ptr) -> i32,
 	allow: unsafe extern "C" fn(u32, *const u64, *const u32, *const c_void) -> i32,
@@ -3361,6 +3305,12 @@ struct Hsa {
 	kernarg_pool: u64,
 	kernarg_size: usize,
 	kernarg: Ptr,
+	agent: u64,
+	target: String,
+	cus: u32,
+	wave: u32,
+	workgroup: u32,
+	lds: u32,
 }
 struct Remote {
 	io: Mutex<Worker>,
@@ -3378,7 +3328,7 @@ struct Gpu {
 	name: String,
 	backend: Backend,
 	driver: Driver,
-	kernels: [Option<(Dispatch, Dispatch)>; 10],
+	kernels: Mutex<Vec<(usize, (Dispatch, Dispatch))>>,
 	memory: u64,
 	clock: u64,
 	shared_limit: u32,
@@ -3452,7 +3402,30 @@ impl Gpu {
 			Driver::Remote(_) => Ok(()),
 		}
 	}
-	fn kernels(&self, precision: Compute) -> Result<(Dispatch, Dispatch)> { precision.kernel().and_then(|index| self.kernels.get(index).copied().flatten()).ok_or_else(|| RecipeError::new(format!("{} training is unavailable on {}", precision.label(), self.name))) }
+	fn kernels(&self, precision: Compute) -> Result<(Dispatch, Dispatch)> {
+		let index = precision.kernel().ok_or_else(|| RecipeError::new(format!("{} training is unavailable on {}", precision.label(), self.name)))?;
+		self.kernel_slot(index)
+	}
+	fn kernel_slot(&self, index: usize) -> Result<(Dispatch, Dispatch)> {
+		let mut kernels = self.kernels.lock().map_err(|_| RecipeError::new("GPU kernel cache is poisoned"))?;
+		if let Some((_, pair)) = kernels.iter().find(|(slot, _)| *slot == index) {
+			return Ok(*pair);
+		}
+		let spec = kernel_spec(index)?;
+		let pair = match &self.driver {
+			Driver::Cpu => {
+				let dispatch = |epoch, layout| Dispatch { kernel: Kernel::remote(index as u8, epoch, 0, spec.element, layout), geometry: Geometry { groups: 1, block: 1 } };
+				(dispatch(false, FORWARD_ARGS), dispatch(true, spec.epoch_layout))
+			}
+			#[cfg(amd)]
+			Driver::Hsa(driver) => driver.kernels(index as u8, spec)?,
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => driver.kernels(index as u8, spec)?,
+			Driver::Remote(driver) => driver.kernels(index as u8, spec)?,
+		};
+		kernels.push((index, pair));
+		Ok(pair)
+	}
 	fn shared_values(&self, precision: Compute) -> Result<u32> {
 		let (forward, epoch) = self.kernels(precision)?;
 		let fixed = forward.kernel.shared.max(epoch.kernel.shared);
@@ -3594,29 +3567,7 @@ impl Gpu {
 		unsafe {
 			match &self.driver {
 				Driver::Cpu => {
-					match kernel.object {
-						0 => cpu_forward_dispatch::<f64>(arguments),
-						1 => cpu_epoch_dispatch::<f64>(arguments),
-						2 => cpu_forward_dispatch::<f32>(arguments),
-						3 => cpu_epoch_dispatch::<f32>(arguments),
-						4 => cpu_forward_dispatch::<CpuF16>(arguments),
-						5 => cpu_epoch_dispatch::<CpuF16>(arguments),
-						6 => cpu_forward_dispatch::<CpuF8>(arguments),
-						7 => cpu_epoch_dispatch::<CpuF8>(arguments),
-						8 => cpu_forward_dispatch::<CpuBf16>(arguments),
-						9 => cpu_epoch_dispatch::<CpuBf16>(arguments),
-						10 => cpu_forward_dispatch::<CpuTf32>(arguments),
-						11 => cpu_epoch_dispatch::<CpuTf32>(arguments),
-						12 => cpu_forward_dispatch::<CpuInt8>(arguments),
-						13 => cpu_epoch_dispatch::<CpuInt8>(arguments),
-						14 => cpu_forward_dispatch::<CpuInt4>(arguments),
-						15 => cpu_epoch_dispatch::<CpuInt4>(arguments),
-						16 => cpu_forward_dispatch::<CpuInt1>(arguments),
-						17 => cpu_epoch_dispatch::<CpuInt1>(arguments),
-						18 => cpu_forward_dispatch::<CpuF>(arguments),
-						19 => cpu_epoch_dispatch::<CpuF>(arguments),
-						_ => unreachable!(),
-					}
+					(kernel_spec(kernel.slot as usize)?.cpu[usize::from(kernel.epoch)])(arguments);
 					Ok(())
 				}
 				#[cfg(nvidia)]
@@ -3653,16 +3604,7 @@ impl Gpu {
 	}
 }
 static DEVICES: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
-fn cpu_device() -> Gpu {
-	let dispatch = |object, element, layout| Dispatch { kernel: Kernel::remote(object, 0, element, layout), geometry: Geometry { groups: 1, block: 1 } };
-	let mut object = 0;
-	let mut pair = |element, layout| {
-		let value = Some((dispatch(object, element, FORWARD_ARGS), dispatch(object + 1, element, layout)));
-		object += 2;
-		value
-	};
-	Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, driver: Driver::Cpu, kernels: [pair(8, EPOCH_ARGS), pair(4, EPOCH_F32_ARGS), pair(2, EPOCH_F16_ARGS), pair(1, EPOCH_F8_ARGS), pair(2, EPOCH_F16_ARGS), pair(4, EPOCH_F32_ARGS), pair(1, EPOCH_F8_ARGS), pair(1, EPOCH_F8_ARGS), pair(1, EPOCH_F8_ARGS), pair(8, EPOCH_ARGS)], memory: u64::MAX, clock: 1, shared_limit: u32::MAX, dispatch: Mutex::new(()) }
-}
+fn cpu_device() -> Gpu { Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, driver: Driver::Cpu, kernels: Mutex::new(Vec::new()), memory: u64::MAX, clock: 1, shared_limit: u32::MAX, dispatch: Mutex::new(()) } }
 fn devices() -> Result<&'static [Gpu]> {
 	DEVICES
 		.get_or_init(|| {
@@ -3700,12 +3642,7 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 fn worker_list() -> Result<()> {
 	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	for gpu in devices()? {
-		let mut fields = vec![host.trim().to_owned(), gpu.name.clone(), format!("{:?}", gpu.backend), gpu.shared_limit.to_string(), gpu.memory.to_string(), gpu.clock.to_string()];
-		for pair in gpu.kernels {
-			let values = pair.map_or([0; 7], |(forward, epoch)| [1, forward.geometry.groups, forward.geometry.block, epoch.geometry.groups, epoch.geometry.block, forward.kernel.shared, epoch.kernel.shared]);
-			fields.extend(values.map(|value| value.to_string()));
-		}
-		println!("{}", fields.join("|"));
+		println!("{}|{}|{:?}|{}|{}|{}", host.trim(), gpu.name, gpu.backend, gpu.shared_limit, gpu.memory, gpu.clock);
 	}
 	Ok(())
 }
@@ -3745,16 +3682,23 @@ fn worker_serve(name: &str) -> Result<()> {
 					Ok(Vec::new())
 				}
 				6 => {
-					let mut kernel = [0];
+					let mut kernel = [0; 2];
 					remote_io("read from", input.read_exact(&mut kernel))?;
 					let threads = get_u64(&mut input)? as u32;
 					let tile = Tile { m: get_u64(&mut input)? as u32, n: get_u64(&mut input)? as u32, k: get_u64(&mut input)? as u32 };
 					let count = get_u64(&mut input)? as usize;
 					let mut values = (0..count).map(|_| get_u64(&mut input)).collect::<Result<Vec<_>>>()?;
 					let mut arguments = values.iter_mut().map(|value| value as *mut u64 as Ptr).collect::<Vec<_>>();
-					let dispatch = gpu.kernels.get(usize::from(kernel[0]) / 2).and_then(|pair| *pair).map(|pair| if kernel[0] & 1 == 0 { pair.0 } else { pair.1 }).ok_or_else(|| RecipeError::new("remote Recipe kernel is unavailable"))?;
+					let pair = gpu.kernel_slot(usize::from(kernel[0]))?;
+					let dispatch = if kernel[1] == 0 { pair.0 } else { pair.1 };
 					gpu.launch(dispatch, &mut arguments, threads, tile)?;
 					Ok(Vec::new())
+				}
+				7 => {
+					let mut slot = [0];
+					remote_io("read from", input.read_exact(&mut slot))?;
+					let (forward, epoch) = gpu.kernel_slot(usize::from(slot[0]))?;
+					Ok([forward.geometry.groups, forward.geometry.block, forward.kernel.shared, epoch.geometry.groups, epoch.geometry.block, epoch.kernel.shared].into_iter().flat_map(u32::to_le_bytes).collect())
 				}
 				_ => Err(RecipeError::new("remote Recipe command is invalid")),
 			}
@@ -3814,13 +3758,6 @@ fn ssh_hosts() -> Result<Vec<String>> {
 	Ok(hosts)
 }
 #[derive(Clone)]
-struct RemoteKernel {
-	forward: Geometry,
-	epoch: Geometry,
-	forward_shared: u32,
-	epoch_shared: u32,
-}
-#[derive(Clone)]
 struct RemoteNode {
 	info: DeviceInfo,
 	transport: String,
@@ -3829,7 +3766,6 @@ struct RemoteNode {
 	memory: u64,
 	clock: u64,
 	shared_limit: u32,
-	kernels: [Option<RemoteKernel>; 10],
 }
 struct Worker {
 	child: Child,
@@ -3909,9 +3845,20 @@ impl Remote {
 		remote_io("flush", worker.input.flush())?;
 		read_response(&mut worker).map(|_| ())
 	}
+	fn kernels(&self, slot: u8, spec: KernelSpec) -> Result<(Dispatch, Dispatch)> {
+		let mut worker = self.worker()?;
+		remote_io("write to", worker.input.write_all(&[7, slot]))?;
+		remote_io("flush", worker.input.flush())?;
+		let payload = read_response(&mut worker)?;
+		require(payload.len() == 6 * size_of::<u32>(), "remote kernel response is invalid")?;
+		let values = payload.chunks_exact(size_of::<u32>()).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>();
+		let forward = Dispatch { kernel: Kernel::remote(slot, false, values[2], spec.element, FORWARD_ARGS), geometry: Geometry { groups: values[0], block: values[1] } };
+		let epoch = Dispatch { kernel: Kernel::remote(slot, true, values[5], spec.element, spec.epoch_layout), geometry: Geometry { groups: values[3], block: values[4] } };
+		Ok((forward, epoch))
+	}
 	fn launch(&self, dispatch: Dispatch, arguments: &mut [Ptr], threads: u32, tile: Tile) -> Result<()> {
 		let mut worker = self.worker()?;
-		remote_io("write to", worker.input.write_all(&[6, dispatch.kernel.object as u8]))?;
+		remote_io("write to", worker.input.write_all(&[6, dispatch.kernel.slot, u8::from(dispatch.kernel.epoch)]))?;
 		for value in [u64::from(threads), u64::from(tile.m), u64::from(tile.n), u64::from(tile.k), arguments.len() as u64] {
 			put_u64(&mut worker.input, value)?;
 		}
@@ -3942,24 +3889,14 @@ fn remote_nodes(host: &str) -> Result<Vec<RemoteNode>> {
 	text.lines()
 		.map(|line| {
 			let fields = line.split('|').collect::<Vec<_>>();
-			require(fields.len() == 76, "Recipe worker device is invalid")?;
+			require(fields.len() == 6, "Recipe worker device is invalid")?;
 			let backend = match fields[2] {
 				"Amd" => Backend::Amd,
 				"Nvidia" => Backend::Nvidia,
 				_ => return Err(RecipeError::new("Recipe worker backend is invalid")),
 			};
 			let positive = |index| -> Result<u32> { Ok(narrow(natural("remote device value", fields[index])?, "remote device value")? as u32) };
-			let fixed = |index: usize| fields[index].parse::<u32>().map_err(|error| RecipeError::new(format!("invalid remote device value: {error}")));
-			let mut kernels = Vec::with_capacity(10);
-			for index in 0..10 {
-				let base = 6 + index * 7;
-				kernels.push(match fields[base] {
-					"0" => None,
-					"1" => Some(RemoteKernel { forward: Geometry { groups: positive(base + 1)?, block: positive(base + 2)? }, epoch: Geometry { groups: positive(base + 3)?, block: positive(base + 4)? }, forward_shared: fixed(base + 5)?, epoch_shared: fixed(base + 6)? }),
-					_ => return Err(RecipeError::new("remote precision capability is invalid")),
-				});
-			}
-			Ok(RemoteNode { info: DeviceInfo { name: format!("{}:{}", fields[0], fields[1]), host: fields[0].to_owned() }, transport: host.to_owned(), device: fields[1].to_owned(), backend, shared_limit: positive(3)?, memory: fields[4].parse().map_err(|error| RecipeError::new(format!("invalid remote memory: {error}")))?, clock: natural("remote timestamp frequency", fields[5])? as u64, kernels: kernels.try_into().map_err(|_| RecipeError::new("remote precision capability count is invalid"))? })
+			Ok(RemoteNode { info: DeviceInfo { name: format!("{}:{}", fields[0], fields[1]), host: fields[0].to_owned() }, transport: host.to_owned(), device: fields[1].to_owned(), backend, shared_limit: positive(3)?, memory: fields[4].parse().map_err(|error| RecipeError::new(format!("invalid remote memory: {error}")))?, clock: natural("remote timestamp frequency", fields[5])? as u64 })
 		})
 		.collect()
 }
@@ -3987,13 +3924,7 @@ fn reachable_nodes() -> Result<&'static [RemoteNode]> {
 }
 fn remote_gpu(node: &RemoteNode) -> Result<Gpu> {
 	let worker = worker_process(&node.transport, &format!("serve|{}", node.device))?;
-	let elements = [8, 4, 2, 1, 2, 4, 1, 1, 1, 8];
-	let layouts = [EPOCH_ARGS, EPOCH_F32_ARGS, EPOCH_F16_ARGS, EPOCH_F8_ARGS, EPOCH_F16_ARGS, EPOCH_F32_ARGS, EPOCH_F8_ARGS, EPOCH_F8_ARGS, EPOCH_F8_ARGS, EPOCH_ARGS];
-	let mut kernels = [None; 10];
-	for index in 0..node.kernels.len() {
-		kernels[index] = node.kernels[index].as_ref().map(|value| (Dispatch { kernel: Kernel::remote((index * 2) as u64, value.forward_shared, elements[index], FORWARD_ARGS), geometry: value.forward }, Dispatch { kernel: Kernel::remote((index * 2 + 1) as u64, value.epoch_shared, elements[index], layouts[index]), geometry: value.epoch }));
-	}
-	Ok(Gpu { name: node.info.name.clone(), backend: node.backend, driver: Driver::Remote(Remote { io: Mutex::new(worker) }), kernels, memory: node.memory, clock: node.clock, shared_limit: node.shared_limit, dispatch: Mutex::new(()) })
+	Ok(Gpu { name: node.info.name.clone(), backend: node.backend, driver: Driver::Remote(Remote { io: Mutex::new(worker) }), kernels: Mutex::new(Vec::new()), memory: node.memory, clock: node.clock, shared_limit: node.shared_limit, dispatch: Mutex::new(()) })
 }
 static REMOTE_GPUS: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
 fn remote_gpus() -> Result<&'static [Gpu]> { REMOTE_GPUS.get_or_init(|| reachable_nodes()?.iter().map(remote_gpu).collect()).as_ref().map(Vec::as_slice).map_err(Clone::clone) }
@@ -4091,10 +4022,10 @@ type HsaSymbol = unsafe extern "C" fn(u64, *const u8, *const u64, *mut u64) -> i
 #[cfg(amd)]
 type HsaSymbolInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32;
 #[cfg(amd)]
-unsafe fn hsa_kernel(symbol: HsaSymbol, info: HsaSymbolInfo, executable: u64, agent: u64, name: &'static [u8], element: u8, layout: &'static [u8]) -> Result<Kernel> {
+unsafe fn hsa_kernel(symbol: HsaSymbol, info: HsaSymbolInfo, executable: u64, agent: u64, name: &std::ffi::CStr, slot: u8, epoch: bool, element: u8, layout: &'static [u8]) -> Result<Kernel> {
 	let mut handle = 0;
-	driver_status(Backend::Amd, unsafe { symbol(executable, name.as_ptr(), &agent, &mut handle) }, "kernel lookup")?;
-	let mut kernel = Kernel { object: 0, shared: 0, element, kernarg: 0, private: 0, layout };
+	driver_status(Backend::Amd, unsafe { symbol(executable, name.as_ptr().cast(), &agent, &mut handle) }, "kernel lookup")?;
+	let mut kernel = Kernel { object: 0, slot, epoch, shared: 0, element, kernarg: 0, private: 0, layout };
 	for (attribute, output) in [(22, (&mut kernel.object as *mut u64).cast()), (11, (&mut kernel.kernarg as *mut usize).cast()), (13, (&mut kernel.shared as *mut u32).cast()), (14, (&mut kernel.private as *mut u32).cast())] {
 		driver_status(Backend::Amd, unsafe { info(handle, attribute, output) }, "kernel metadata")?;
 	}
@@ -4106,6 +4037,57 @@ fn kfd_property(text: &str, name: &str) -> Result<u32> { text.lines().find_map(|
 include!(concat!(env!("OUT_DIR"), "/hsa-embed.rs"));
 #[cfg(amd)]
 fn hsa_artifact(artifacts: &'static [(&str, &[u8])], target: &str) -> Result<&'static [u8]> { artifacts.iter().find_map(|entry| (entry.0 == target).then_some(entry.1)).ok_or_else(|| RecipeError::new(format!("HSA artifact for {target} is absent"))) }
+#[cfg(amd)]
+impl Hsa {
+	fn kernels(&self, slot: u8, spec: KernelSpec) -> Result<(Dispatch, Dispatch)> {
+		unsafe {
+			let code = hsa_artifact(spec.hsa, &self.target)?;
+			let mut reader = 0;
+			let mut executable = 0;
+			driver_status(Backend::Amd, (self.reader_create)(code.as_ptr().cast(), code.len(), &mut reader), "code-object reader")?;
+			driver_status(Backend::Amd, (self.executable_create)(1, 0, ptr::null_mut(), &mut executable), "executable creation")?;
+			driver_status(Backend::Amd, (self.executable_load)(executable, self.agent, reader, ptr::null_mut(), ptr::null_mut()), "code-object load")?;
+			driver_status(Backend::Amd, (self.executable_freeze)(executable, ptr::null_mut()), "executable freeze")?;
+			let load = |epoch, stem: &str, layout| -> Result<Dispatch> {
+				let name = std::ffi::CString::new(format!("{stem}{}.kd", spec.suffix)).map_err(|error| RecipeError::new(format!("AMD kernel name is invalid: {error}")))?;
+				let kernel = hsa_kernel(self.symbol, self.symbol_info, executable, self.agent, &name, slot, epoch, spec.element, layout)?;
+				let geometry = amd(self.cus, self.wave, self.workgroup, self.lds, Resources { shared: kernel.shared, max_block: self.workgroup, element: spec.element })?;
+				Ok(Dispatch { kernel, geometry })
+			};
+			Ok((load(false, "forward_graph", FORWARD_ARGS)?, load(true, "tape_epoch_graph", spec.epoch_layout)?))
+		}
+	}
+}
+#[cfg(nvidia)]
+impl Cuda {
+	fn kernels(&self, slot: u8, spec: KernelSpec) -> Result<(Dispatch, Dispatch)> {
+		unsafe {
+			driver_status(Backend::Nvidia, (self.set)(self.context), "context")?;
+			let image = std::ffi::CString::new(spec.ptx).map_err(|error| RecipeError::new(format!("Nvidia PTX contains a zero byte: {error}")))?;
+			let mut module = ptr::null_mut();
+			driver_status(Backend::Nvidia, (self.load)(&mut module, image.as_ptr().cast()), "module load")?;
+			let load = |epoch, stem: &str, layout| -> Result<Dispatch> {
+				let name = std::ffi::CString::new(format!("{stem}{}", spec.suffix)).map_err(|error| RecipeError::new(format!("Nvidia kernel name is invalid: {error}")))?;
+				let mut object = 0;
+				driver_status(Backend::Nvidia, (self.function)(&mut object, module, name.as_ptr().cast()), "kernel lookup")?;
+				let (mut max_block, mut shared, mut used_registers) = (0, 0, 0);
+				for (kind, output, action) in [(0, &mut max_block, "kernel workgroup query"), (1, &mut shared, "kernel LDS query"), (4, &mut used_registers, "kernel register query")] {
+					driver_status(Backend::Nvidia, (self.function_attribute)(output, kind, object), action)?;
+				}
+				require(max_block > 0 && shared >= 0 && used_registers > 0, "Nvidia kernel resources are invalid")?;
+				let register_wave = (used_registers as u32).checked_mul(self.wave).ok_or_else(|| RecipeError::new("Nvidia wave register count overflows"))?;
+				let observed = (self.registers / register_wave).min(self.threads / self.wave);
+				let resources = Resources { shared: shared as u32, max_block: max_block as u32, element: spec.element };
+				let geometry = nvidia(self.cus, self.wave, self.workgroup, self.block_lds, self.sm_lds, observed, resources)?;
+				let mut active = 0;
+				driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, geometry.block as i32, 0), "kernel occupancy query")?;
+				require(active > 0, "Nvidia kernel has no resident workgroup")?;
+				Ok(Dispatch { kernel: Kernel::cuda(object, slot, epoch, resources.shared, spec.element, layout), geometry })
+			};
+			Ok((load(false, "forward_graph", FORWARD_ARGS)?, load(true, "tape_epoch_graph", spec.epoch_layout)?))
+		}
+	}
+}
 fn load_amd() -> Result<Vec<Gpu>> {
 	#[cfg(not(amd))]
 	return Err(RecipeError::new("AMD support is not compiled into this build"));
@@ -4149,45 +4131,25 @@ fn load_amd_gpu(runtime: &Library, info: HsaInfo, cpu_agent: u64, agent: u64, in
 		let properties = fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read {path}: {error}")))?;
 		let gfx = kfd_property(&properties, "gfx_target_version")?;
 		let target = format!("gfx{}{}{}", gfx / 10000, gfx / 100 % 100, gfx % 100);
-		let codes = [hsa_artifact(HSA_CODE_OBJECTS, &target)?, hsa_artifact(HSA_F32_CODE_OBJECTS, &target)?, hsa_artifact(HSA_F16_CODE_OBJECTS, &target)?, hsa_artifact(HSA_F8_CODE_OBJECTS, &target)?, hsa_artifact(HSA_BF16_CODE_OBJECTS, &target)?, hsa_artifact(HSA_TF32_CODE_OBJECTS, &target)?, hsa_artifact(HSA_INT8_CODE_OBJECTS, &target)?, hsa_artifact(HSA_INT4_CODE_OBJECTS, &target)?, hsa_artifact(HSA_INT1_CODE_OBJECTS, &target)?, hsa_artifact(HSA_F_CODE_OBJECTS, &target)?];
 		let reader_create: unsafe extern "C" fn(*const c_void, usize, *mut u64) -> i32 = runtime.function(b"hsa_code_object_reader_create_from_memory\0")?;
 		let executable_create: unsafe extern "C" fn(i32, i32, Ptr, *mut u64) -> i32 = runtime.function(b"hsa_executable_create_alt\0")?;
 		let executable_load: unsafe extern "C" fn(u64, u64, u64, Ptr, Ptr) -> i32 = runtime.function(b"hsa_executable_load_agent_code_object\0")?;
 		let executable_freeze: unsafe extern "C" fn(u64, Ptr) -> i32 = runtime.function(b"hsa_executable_freeze\0")?;
 		let symbol: HsaSymbol = runtime.function(b"hsa_executable_get_symbol_by_name\0")?;
 		let symbol_info: HsaSymbolInfo = runtime.function(b"hsa_executable_symbol_get_info\0")?;
-		let (mut readers, mut executable) = ([0; 10], 0);
-		for (index, code) in codes.into_iter().enumerate() {
-			check(reader_create(code.as_ptr().cast(), code.len(), &mut readers[index]), "code-object reader")?
-		}
-		check(executable_create(1, 0, ptr::null_mut(), &mut executable), "executable creation")?;
-		for reader in readers {
-			check(executable_load(executable, agent, reader, ptr::null_mut(), ptr::null_mut()), "code-object load")?
-		}
-		check(executable_freeze(executable, ptr::null_mut()), "executable freeze")?;
 		let lds = kfd_property(&properties, "lds_size_in_kb")?.checked_mul(1024).ok_or_else(|| RecipeError::new("AMD LDS size overflows"))?;
-		let specifications: [(&[u8], u8, &[u8]); 20] = [(b"forward_graph.kd\0", 8, FORWARD_ARGS), (b"tape_epoch_graph.kd\0", 8, EPOCH_ARGS), (b"forward_graph_f32.kd\0", 4, FORWARD_ARGS), (b"tape_epoch_graph_f32.kd\0", 4, EPOCH_F32_ARGS), (b"forward_graph_f16.kd\0", 2, FORWARD_ARGS), (b"tape_epoch_graph_f16.kd\0", 2, EPOCH_F16_ARGS), (b"forward_graph_f8.kd\0", 1, FORWARD_ARGS), (b"tape_epoch_graph_f8.kd\0", 1, EPOCH_F8_ARGS), (b"forward_graph_bf16.kd\0", 2, FORWARD_ARGS), (b"tape_epoch_graph_bf16.kd\0", 2, EPOCH_F16_ARGS), (b"forward_graph_tf32.kd\0", 4, FORWARD_ARGS), (b"tape_epoch_graph_tf32.kd\0", 4, EPOCH_F32_ARGS), (b"forward_graph_int8.kd\0", 1, FORWARD_ARGS), (b"tape_epoch_graph_int8.kd\0", 1, EPOCH_F8_ARGS), (b"forward_graph_int4.kd\0", 1, FORWARD_ARGS), (b"tape_epoch_graph_int4.kd\0", 1, EPOCH_F8_ARGS), (b"forward_graph_int1.kd\0", 1, FORWARD_ARGS), (b"tape_epoch_graph_int1.kd\0", 1, EPOCH_F8_ARGS), (b"forward_graph_f.kd\0", 8, FORWARD_ARGS), (b"tape_epoch_graph_f.kd\0", 8, EPOCH_ARGS)];
-		let mut dispatches = Vec::new();
-		for (name, element, layout) in specifications {
-			let kernel = hsa_kernel(symbol, symbol_info, executable, agent, name, element, layout)?;
-			let geometry = amd(cus, wave, workgroup, lds, Resources { shared: kernel.shared, max_block: workgroup, element })?;
-			dispatches.push(Dispatch { kernel, geometry })
-		}
 		let queue_create: unsafe extern "C" fn(u64, u32, u32, Ptr, Ptr, u32, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_queue_create\0")?;
 		let signal_create: unsafe extern "C" fn(i64, u32, *const u64, *mut u64) -> i32 = runtime.function(b"hsa_signal_create\0")?;
 		let allocate: unsafe extern "C" fn(u64, usize, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_amd_memory_pool_allocate\0")?;
 		let allow: unsafe extern "C" fn(u32, *const u64, *const u32, *const c_void) -> i32 = runtime.function(b"hsa_amd_agents_allow_access\0")?;
-		let (ka_size, mut ka) = (dispatches.iter().map(|dispatch| dispatch.kernel.kernarg).max().unwrap(), ptr::null_mut());
+		let (ka_size, mut ka) = (argument_layout_size(EPOCH_ARGS), ptr::null_mut());
 		let (mut queue, mut completion) = (ptr::null_mut(), 0);
 		driver_status(Backend::Amd, queue_create(agent, 256, 2, ptr::null_mut(), ptr::null_mut(), u32::MAX, u32::MAX, &mut queue), "queue creation")?;
 		check(signal_create(0, 0, ptr::null(), &mut completion), "signal creation")?;
 		check(allocate(kernarg.found, ka_size, 0, &mut ka), "KERNARG allocation")?;
 		check(allow(1, &agent, ptr::null(), ka), "GPU KERNARG access")?;
-		let mut dispatches = dispatches.into_iter();
-		let mut pair = || Some((dispatches.next().unwrap(), dispatches.next().unwrap()));
-		let kernels = [pair(), pair(), pair(), pair(), pair(), pair(), pair(), pair(), pair(), pair()];
-		eprintln!("AMD forward block {} epoch block {}", kernels[0].unwrap().0.geometry.block, kernels[0].unwrap().1.geometry.block);
-		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, driver: Driver::Hsa(Hsa { allocate, allow, queue, cpu_agent, kernarg_size: ka_size, kernarg: ka, free: runtime.function(b"hsa_amd_memory_pool_free\0")?, copy: runtime.function(b"hsa_memory_copy\0")?, store: runtime.function(b"hsa_signal_store_screlease\0")?, wait: runtime.function(b"hsa_signal_wait_scacquire\0")?, write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?, signal: completion, vram_pool: vram.found, kernarg_pool: kernarg.found }), kernels, memory: memory as u64, clock, shared_limit: lds, dispatch: Mutex::new(()) })
+		let hsa = Hsa { reader_create, executable_create, executable_load, executable_freeze, symbol, symbol_info, allocate, allow, queue, cpu_agent, kernarg_size: ka_size, kernarg: ka, free: runtime.function(b"hsa_amd_memory_pool_free\0")?, copy: runtime.function(b"hsa_memory_copy\0")?, store: runtime.function(b"hsa_signal_store_screlease\0")?, wait: runtime.function(b"hsa_signal_wait_scacquire\0")?, write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?, signal: completion, vram_pool: vram.found, kernarg_pool: kernarg.found, agent, target, cus, wave, workgroup, lds };
+		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, driver: Driver::Hsa(hsa), kernels: Mutex::new(Vec::new()), memory: memory as u64, clock, shared_limit: lds, dispatch: Mutex::new(()) })
 	}
 }
 fn load_nvidia() -> Result<Vec<Gpu>> {
@@ -4231,44 +4193,8 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 			}
 			require(cooperative != 0, "Nvidia device does not support cooperative launch")?;
 			check(create(&mut context, 0, device), "context creation")?;
-			let module = |bytes: &[u8]| -> Result<Ptr> {
-				let image = std::ffi::CString::new(bytes).map_err(|error| RecipeError::new(format!("Nvidia PTX contains a zero byte: {error}")))?;
-				let mut module = ptr::null_mut();
-				check(load(&mut module, image.as_ptr().cast()), "module load")?;
-				Ok(module)
-			};
-			let modules = [module(include_bytes!(env!("RECIPE_NV_PTX")))?, module(include_bytes!(env!("RECIPE_NV_F32_PTX")))?, module(include_bytes!(env!("RECIPE_NV_F16_PTX")))?, module(include_bytes!(env!("RECIPE_NV_F8_PTX")))?, module(include_bytes!(env!("RECIPE_NV_BF16_PTX")))?, module(include_bytes!(env!("RECIPE_NV_TF32_PTX")))?, module(include_bytes!(env!("RECIPE_NV_INT8_PTX")))?, module(include_bytes!(env!("RECIPE_NV_INT4_PTX")))?, module(include_bytes!(env!("RECIPE_NV_INT1_PTX")))?, module(include_bytes!(env!("RECIPE_NV_F_PTX")))?];
-			let specifications: [(Ptr, *const u8, u8, &[u8], &str); 20] = [(modules[0], b"forward_graph\0".as_ptr(), 8, FORWARD_ARGS, "forward"), (modules[0], b"tape_epoch_graph\0".as_ptr(), 8, EPOCH_ARGS, "epoch"), (modules[1], b"forward_graph_f32\0".as_ptr(), 4, FORWARD_ARGS, "fp32 forward"), (modules[1], b"tape_epoch_graph_f32\0".as_ptr(), 4, EPOCH_F32_ARGS, "fp32 epoch"), (modules[2], b"forward_graph_f16\0".as_ptr(), 2, FORWARD_ARGS, "fp16 forward"), (modules[2], b"tape_epoch_graph_f16\0".as_ptr(), 2, EPOCH_F16_ARGS, "fp16 epoch"), (modules[3], b"forward_graph_f8\0".as_ptr(), 1, FORWARD_ARGS, "fp8 forward"), (modules[3], b"tape_epoch_graph_f8\0".as_ptr(), 1, EPOCH_F8_ARGS, "fp8 epoch"), (modules[4], b"forward_graph_bf16\0".as_ptr(), 2, FORWARD_ARGS, "bf16 forward"), (modules[4], b"tape_epoch_graph_bf16\0".as_ptr(), 2, EPOCH_F16_ARGS, "bf16 epoch"), (modules[5], b"forward_graph_tf32\0".as_ptr(), 4, FORWARD_ARGS, "tf32 forward"), (modules[5], b"tape_epoch_graph_tf32\0".as_ptr(), 4, EPOCH_F32_ARGS, "tf32 epoch"), (modules[6], b"forward_graph_int8\0".as_ptr(), 1, FORWARD_ARGS, "int8 forward"), (modules[6], b"tape_epoch_graph_int8\0".as_ptr(), 1, EPOCH_F8_ARGS, "int8 epoch"), (modules[7], b"forward_graph_int4\0".as_ptr(), 1, FORWARD_ARGS, "int4 forward"), (modules[7], b"tape_epoch_graph_int4\0".as_ptr(), 1, EPOCH_F8_ARGS, "int4 epoch"), (modules[8], b"forward_graph_int1\0".as_ptr(), 1, FORWARD_ARGS, "int1 forward"), (modules[8], b"tape_epoch_graph_int1\0".as_ptr(), 1, EPOCH_F8_ARGS, "int1 epoch"), (modules[9], b"forward_graph_f\0".as_ptr(), 8, FORWARD_ARGS, "custom forward"), (modules[9], b"tape_epoch_graph_f\0".as_ptr(), 8, EPOCH_ARGS, "custom epoch")];
-			let resource = |kernel, element| -> Result<(Resources, u32)> {
-				let (mut max_block, mut shared, mut used_registers) = (0, 0, 0);
-				for (kind, output, action) in [(0, &mut max_block, "kernel workgroup query"), (1, &mut shared, "kernel LDS query"), (4, &mut used_registers, "kernel register query")] {
-					check(function_attribute(output, kind, kernel), action)?;
-				}
-				require(max_block > 0 && shared >= 0 && used_registers > 0, "Nvidia kernel resources are invalid")?;
-				Ok((Resources { shared: shared as u32, max_block: max_block as u32, element }, used_registers as u32))
-			};
-			let geometry = |resources: Resources, used_registers: u32| -> Result<Geometry> {
-				let register_wave = used_registers.checked_mul(wave as u32).ok_or_else(|| RecipeError::new("Nvidia wave register count overflows"))?;
-				let observed = (registers as u32 / register_wave).min(threads as u32 / wave as u32);
-				nvidia(cus as u32, wave as u32, workgroup as u32, block_lds as u32, sm_lds as u32, observed, resources)
-			};
-			let mut dispatches = Vec::new();
-			for (module, name, element, layout, action) in specifications {
-				let mut kernel = 0;
-				check(function(&mut kernel, module, name), action)?;
-				let (resources, used_registers) = resource(kernel, element)?;
-				let geometry = geometry(resources, used_registers)?;
-				let mut active = 0;
-				driver_status(Backend::Nvidia, occupancy(&mut active, kernel, geometry.block as i32, 0), action)?;
-				require(active > 0, format!("Nvidia {action} has no resident workgroup"))?;
-				dispatches.push(Dispatch { kernel: Kernel::cuda(kernel, resources.shared, element, layout), geometry });
-			}
-			let mut dispatches = dispatches.into_iter();
-			let mut pair = || Some((dispatches.next().unwrap(), dispatches.next().unwrap()));
-			let kernels = [pair(), pair(), pair(), pair(), pair(), pair(), pair(), pair(), pair(), pair()];
-			let cuda = Cuda { context, set: runtime.function(b"cuCtxSetCurrent\0")?, allocate: runtime.function(b"cuMemAlloc_v2\0")?, free: runtime.function(b"cuMemFree_v2\0")?, upload: runtime.function(b"cuMemcpyHtoD_v2\0")?, download: runtime.function(b"cuMemcpyDtoH_v2\0")?, synchronize: runtime.function(b"cuCtxSynchronize\0")?, launch: runtime.function(b"cuLaunchCooperativeKernel\0")? };
-			eprintln!("Nvidia forward block {} epoch block {}", kernels[0].unwrap().0.geometry.block, kernels[0].unwrap().1.geometry.block);
-			Ok(Gpu { name: format!("nv{index}"), backend: Backend::Nvidia, driver: Driver::Cuda(cuda), kernels, memory: memory as u64, clock: NANOSECOND_TIMER_HZ, shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()) })
+			let cuda = Cuda { context, set: runtime.function(b"cuCtxSetCurrent\0")?, allocate: runtime.function(b"cuMemAlloc_v2\0")?, free: runtime.function(b"cuMemFree_v2\0")?, upload: runtime.function(b"cuMemcpyHtoD_v2\0")?, download: runtime.function(b"cuMemcpyDtoH_v2\0")?, synchronize: runtime.function(b"cuCtxSynchronize\0")?, launch: runtime.function(b"cuLaunchCooperativeKernel\0")?, load, function, function_attribute, occupancy, cus: cus as u32, wave: wave as u32, workgroup: workgroup as u32, block_lds: block_lds as u32, sm_lds: sm_lds as u32, registers: registers as u32, threads: threads as u32 };
+			Ok(Gpu { name: format!("nv{index}"), backend: Backend::Nvidia, driver: Driver::Cuda(cuda), kernels: Mutex::new(Vec::new()), memory: memory as u64, clock: NANOSECOND_TIMER_HZ, shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()) })
 		};
 		let mut found = Vec::new();
 		for ordinal in 0..count {
@@ -5146,12 +5072,17 @@ impl Train {
 	fn try_run(&self, model: &Model, data: &Data) -> Result<TrainingReport> {
 		let started = Instant::now();
 		let topology = topology()?;
-		let (mut gpus, mut config) = (all_gpus()?, Config::load()?);
+		let (gpus, mut config) = (all_gpus()?, Config::load()?);
 		let precision = self.precision;
-		let support = |gpu: &&Gpu, format: Compute| format.kernel().is_some_and(|index| gpu.kernels.get(index).is_some_and(Option::is_some));
-		let available = [Compute::FP8, Compute::FP16, Compute::FP32, Compute::FP64, Compute::INT1, Compute::INT4, Compute::INT8, Compute::BF16, Compute::TF32].into_iter().filter(|format| gpus.iter().any(|gpu| support(gpu, *format))).map(Compute::label).collect::<Vec<_>>().join(", ");
-		for gpu in gpus.iter().filter(|gpu| !support(gpu, precision)) { eprintln!("excluded: {} ({} arithmetic unavailable)", gpu.name, precision.label()) } gpus.retain(|gpu| support(gpu, precision));
-		require(!gpus.is_empty(), format!("{} training is unavailable; available precision: {available}", precision.label()))?;
+		let mut selected_precision = Vec::new();
+		for gpu in gpus {
+			match gpu.kernels(precision) {
+				Ok(_) => selected_precision.push(gpu),
+				Err(error) => eprintln!("excluded: {} ({error})", gpu.name),
+			}
+		}
+		let gpus = selected_precision;
+		require(!gpus.is_empty(), format!("{} training is unavailable", precision.label()))?;
 		config.precision = precision;
 		if let Some(seed) = self.seed {
 			config.random_seed = seed;
