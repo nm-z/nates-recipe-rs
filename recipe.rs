@@ -400,6 +400,7 @@ use std::{
 	error::Error,
 	ffi::c_void,
 	fmt, fs,
+	io::IsTerminal,
 	mem::{size_of, size_of_val},
 	path::{Path, PathBuf},
 	ptr,
@@ -4419,6 +4420,7 @@ struct IgnoredRows {
 	open: bool,
 }
 impl IgnoredRows {
+	fn summary(&self) -> String { format!("ignored: {} ({} files, {} blank rows)", path_range(&self.first, &self.latest), self.files, self.rows) }
 	fn update(&mut self, path: &Path, rows: usize) -> Result<()> {
 		if rows == 0 {
 			return Ok(());
@@ -4430,13 +4432,24 @@ impl IgnoredRows {
 		self.latest = path;
 		self.files += 1;
 		self.rows += rows;
+		let terminal = std::io::stderr().is_terminal();
+		if !self.open && terminal {
+			eprint!("\x1b[s")
+		}
 		self.open = true;
-		eprint!("\r\x1b[2Kignored: {} ({} files, {} blank rows)", path_range(&self.first, &self.latest), self.files, self.rows);
+		if terminal {
+			eprint!("\x1b[u\x1b[J{}", self.summary());
 		std::io::Write::flush(&mut std::io::stderr()).map_err(|error| RecipeError::new(format!("cannot flush ignored-row status: {error}")))
+		} else {
+			Ok(())
+		}
 	}
 	fn finish(&mut self) {
 		if self.open {
-			eprintln!();
+			if std::io::stderr().is_terminal() {
+				eprint!("\x1b[u\x1b[J")
+			}
+			eprintln!("{}", self.summary());
 			self.open = false
 		}
 	}
