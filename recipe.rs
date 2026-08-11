@@ -5079,14 +5079,21 @@ impl Train {
 		self.resume = Some(path.into());
 		self
 	}
-	pub fn run(&self, model: &Model, data: &Data) -> TrainingReport {
+	fn execute(&self, model: &Model, data: &Data) -> TrainingReport {
 		SIGNAL.get_or_init(|| unsafe { signal(SIGINT, interrupt) });
 		if INTERRUPTED.load(Ordering::Acquire) {
 			std::process::exit(INTERRUPTED_EXIT);
 		}
 		self.try_run(model, data).unwrap_or_else(|error| panic!("{error}"))
 	}
+	pub fn run(&self, model: &Model, data: &Data) -> TrainingReport { self.execute(model, data) }
+	pub fn eval(&self, model: &Model, data: &Data) -> TrainingReport {
+		let report = self.execute(model, data);
+		self.print_evaluation(model, &report);
+		report
+	}
 	fn try_run(&self, model: &Model, data: &Data) -> Result<TrainingReport> {
+		let started = Instant::now();
 		let topology = topology()?;
 		let (mut gpus, mut config) = (all_gpus()?, Config::load()?);
 		let precision = self.precision;
@@ -5140,12 +5147,12 @@ impl Train {
 			}
 			let proposed = runtime.propose(&stored.graph, &mut tape);
 			let cases = self.finish_dispatch(proposed, &mut stored, &prepared.schema, &tape, None)?;
-			let started = Instant::now();
+			let epoch_started = Instant::now();
 			let dispatched = tape.advance().and_then(|_| tape.epoch(self.learning_rate, model.loss, tolerance, config, false));
 			let (loss, saved) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
 			if saved { stored.bn_stats = tape.shards[0].tape.extract_bn_stats()? }
 			self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, saved.then_some(true))?;
-			let (predictions, seconds) = (tape.predictions()?, started.elapsed().as_secs_f64());
+			let (predictions, seconds) = (tape.predictions()?, epoch_started.elapsed().as_secs_f64());
 			let learned = runtime.learn(&cases, &tape, config);
 			self.finish_dispatch(learned, &mut stored, &prepared.schema, &tape, None)?;
 			self.print(model, run, tape.step as usize, loss, targets, &predictions, seconds, saved);
@@ -5173,11 +5180,8 @@ impl Train {
 			}
 			coefficient(&prepared.targets[training_rows..], &values)
 		};
-		if training_rows < prepared.rows {
-			eprintln!("Evaluation: r2 {r2:.4}");
-		}
 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(self.stop.is_some()))?;
-		Ok(TrainingReport(initial_loss, final_loss, initial_predictions, predictions, r2, tape.tile()))
+		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), run, epoch: tape.step as usize, seconds: started.elapsed().as_secs_f64() })
 	}
 	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &str, tape: &DeviceTape, save: Option<bool>) -> Result<T> {
 		let interrupted = INTERRUPTED.load(Ordering::Acquire);
@@ -5196,18 +5200,25 @@ impl Train {
 		if self.log_metrics.is_empty() {
 			return;
 		}
-		let topology = model.description(&self.log_metrics);
-		let r2 = coefficient(targets, predictions);
-		let time = seconds * 1000.0;
+		self.print_metrics(model, &self.log_metrics, Metrics { run, epoch, loss, r2: coefficient(targets, predictions), seconds, checkpoint })
+	}
+	fn print_evaluation(&self, model: &Model, report: &TrainingReport) {
+		let defaults = [Loss, R2];
+		let metrics: &[Metric] = if self.log_metrics.is_empty() { &defaults } else { &self.log_metrics };
+		self.print_metrics(model, metrics, Metrics { run: report.run, epoch: report.epoch, loss: report.final_loss, r2: report.r2, seconds: report.seconds, checkpoint: false })
+	}
+	fn print_metrics(&self, model: &Model, metrics: &[Metric], measurement: Metrics) {
+		let topology = model.description(metrics);
+		let time = measurement.seconds * 1000.0;
 		let mut values = Vec::new();
 		let mut topology_printed = false;
-		for metric in &self.log_metrics {
+		for metric in metrics {
 			let value = match metric.0 {
-				0 => format!("run \x1b[38\x3b2\x3b242\x3b40\x3b60m{run:>5}\x1b[0m"),
-				1 => format!("{} \x1b[38\x3b2\x3b0\x3b174\x3b107m{loss:.4}\x1b[0m", model.loss.name()),
-				2 => format!("r2 \x1b[38\x3b2\x3b39\x3b125\x3b255m{r2:>7.4}\x1b[0m"),
+				0 => format!("run \x1b[38\x3b2\x3b242\x3b40\x3b60m{:>5}\x1b[0m", measurement.run),
+				1 => format!("{} \x1b[38\x3b2\x3b0\x3b174\x3b107m{:.4}\x1b[0m", model.loss.name(), measurement.loss),
+				2 => format!("r2 \x1b[38\x3b2\x3b39\x3b125\x3b255m{:>7.4}\x1b[0m", measurement.r2),
 				3 => format!("time \x1b[38\x3b2\x3b255\x3b194\x3b0m{time:>9.3} ms\x1b[0m"),
-				4 => format!("epoch \x1b[38\x3b2\x3b135\x3b90\x3b251m{epoch}\x1b[0m"),
+				4 => format!("epoch \x1b[38\x3b2\x3b135\x3b90\x3b251m{}\x1b[0m", measurement.epoch),
 				5..=7 if !topology_printed && !topology.is_empty() => {
 					topology_printed = true;
 					topology.clone()
@@ -5217,20 +5228,38 @@ impl Train {
 			};
 			values.push(value);
 		}
-		if checkpoint && self.stop.is_some() {
+		if measurement.checkpoint && self.stop.is_some() {
 			values.push("\x1b[1\x3b32m← checkpoint\x1b[0m".to_owned());
 		}
 		eprintln!("{}", values.join("  "));
 	}
 }
-pub struct TrainingReport(f64, f64, Vec<f64>, Vec<f64>, f64, Tile);
+struct Metrics {
+	run: u64,
+	epoch: usize,
+	loss: f64,
+	r2: f64,
+	seconds: f64,
+	checkpoint: bool,
+}
+pub struct TrainingReport {
+	initial_loss: f64,
+	final_loss: f64,
+	initial_predictions: Vec<f64>,
+	predictions: Vec<f64>,
+	r2: f64,
+	tile: Tile,
+	run: u64,
+	epoch: usize,
+	seconds: f64,
+}
 impl TrainingReport {
-	pub const fn initial_loss(&self) -> f64 { self.0 }
-	pub const fn final_loss(&self) -> f64 { self.1 }
-	pub fn initial_predictions(&self) -> &[f64] { &self.2 }
-	pub fn predictions(&self) -> &[f64] { &self.3 }
-	pub const fn r2(&self) -> f64 { self.4 }
-	pub const fn tile(&self) -> [u32; 3] { [self.5.m, self.5.n, self.5.k] }
+	pub const fn initial_loss(&self) -> f64 { self.initial_loss }
+	pub const fn final_loss(&self) -> f64 { self.final_loss }
+	pub fn initial_predictions(&self) -> &[f64] { &self.initial_predictions }
+	pub fn predictions(&self) -> &[f64] { &self.predictions }
+	pub const fn r2(&self) -> f64 { self.r2 }
+	pub const fn tile(&self) -> [u32; 3] { [self.tile.m, self.tile.n, self.tile.k] }
 }
 #[derive(Clone, Copy)]
 struct TargetScale {
