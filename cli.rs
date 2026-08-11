@@ -1,5 +1,12 @@
 use std::{fs, path::Path, process::Command};
 
+const USAGE: &str = "usage: recipe <source.rs> [export]";
+
+fn invalid(message: &str) -> ! {
+	eprintln!("{message}");
+	std::process::exit(2)
+}
+
 fn mapped(mapping: Option<&'static str>, suffix: &str) -> Vec<(String, &'static str)> { mapping.into_iter().flat_map(|values| values.split(';')).filter_map(|value| value.split_once('=')).map(|(target, path)| (format!("{target}.{suffix}"), path)).collect() }
 
 fn export(source: &Path) {
@@ -31,14 +38,18 @@ fn run(source: &Path) {
 
 fn main() {
 	let mut arguments = std::env::args().skip(1);
-	let source = arguments.next().expect("usage: recipe <source.rs> [export]");
+	let source = arguments.next().unwrap_or_else(|| invalid(USAGE));
 	let operation = arguments.next();
-	assert!(arguments.next().is_none(), "usage: recipe <source.rs> [export]");
+	if arguments.next().is_some() {
+		invalid(USAGE)
+	}
 	let source = Path::new(&source);
-	assert_eq!(source.extension().and_then(|value| value.to_str()), Some("rs"), "recipe requires a Rust source");
+	if source.extension().and_then(|value| value.to_str()) != Some("rs") {
+		invalid("recipe requires a Rust source")
+	}
 	match operation.as_deref() {
 		None => run(source),
 		Some("export") => export(source),
-		Some(_) => panic!("usage: recipe <source.rs> [export]"),
+		Some(_) => invalid(USAGE),
 	}
 }
