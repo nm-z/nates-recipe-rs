@@ -5135,6 +5135,10 @@ impl Train {
 	}
 	fn try_run(&self, model: &Model, data: &Data, evaluation: bool) -> Result<TrainingReport> {
 		let started = Instant::now();
+		require(model.downstream.is_none(), "model-valued loss requires .rat()")?;
+		let prepared = prepare(data)?;
+		let training_rows = ((prepared.rows as f64) * data.split).floor() as usize;
+		require(training_rows != 0 && training_rows <= prepared.rows, "split must select training rows")?;
 		let topology = topology()?;
 		let (gpus, mut config) = (all_gpus()?, Config::load()?);
 		let precision = self.precision;
@@ -5151,10 +5155,6 @@ impl Train {
 		if let Some(seed) = self.seed {
 			config.random_seed = seed;
 		}
-		require(model.downstream.is_none(), "model-valued loss requires .rat()")?;
-		let prepared = prepare(data)?;
-		let training_rows = ((prepared.rows as f64) * data.split).floor() as usize;
-		require(training_rows != 0 && training_rows <= prepared.rows, "split must select training rows")?;
 		let probability = model.loss.0 >= 4;
 		let scale = probability.then(|| TargetScale::fit(&prepared.targets[..training_rows]));
 		let target_values = prepared.targets.iter().map(|target| scale.map_or(*target, |scale| scale.encode(*target))).collect::<Vec<_>>();
