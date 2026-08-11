@@ -1771,35 +1771,7 @@ impl LossFunction {
 impl Recipe {
 	pub fn data(&self, sources: impl IntoDataSources) -> Data { Data { sources: sources.into_data_sources(), target: Vec::new(), exclusions: Vec::new(), routes: Vec::new(), broadcast: false, normalize: false, split: 1.0, prepared: OnceLock::new() } }
 	pub fn model(&self) -> Model { Model { blocks: Vec::new(), loss: mse, downstream: None, quantization: 0 } }
-	pub fn devices(&self) -> Vec<String> { self.topology().devices.into_iter().map(|device| device.name).collect() }
-	pub fn topology(&self) -> Topology { topology().unwrap_or_else(|error| panic!("{error}")) }
 	pub const fn train(&self) -> Train { Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: None, resume: None, save: None, seed: None, precision: Compute::FP64 } }
-	pub fn export(&self, source: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
-		let source = source.as_ref();
-		require(source.extension().and_then(|value| value.to_str()) == Some("rs"), "export requires a Rust source")?;
-		fs::metadata(source).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", source.display())))?;
-		let found = devices()?;
-		let backends = [Backend::Amd, Backend::Nvidia].into_iter().filter(|backend| found.iter().any(|gpu| gpu.backend == *backend)).collect::<Vec<_>>();
-		let mut outputs = Vec::new();
-		for backend in backends {
-			let artifacts = match backend {
-				Backend::Cpu => Vec::new(),
-				Backend::Amd => vec![mapped_artifacts(option_env!("RECIPE_HSA_CODE_OBJECTS"), "hsaco")?, mapped_artifacts(option_env!("RECIPE_HSA_ASSEMBLIES"), "amd.s")?].concat(),
-				Backend::Nvidia => vec![("ptx".to_owned(), option_env!("RECIPE_NV_PTX").ok_or_else(|| RecipeError::new("Nvidia artifacts were not compiled"))?)],
-			};
-			for (extension, compiled) in artifacts {
-				let output = source.with_file_name(format!("recipe.{extension}"));
-				fs::copy(compiled, &output).map_err(|error| RecipeError::new(format!("cannot export {}: {error}", output.display())))?;
-				eprintln!("exported: {}", output.display());
-				outputs.push(output);
-			}
-		}
-		Ok(outputs)
-	}
-}
-fn mapped_artifacts<'a>(mapping: Option<&'a str>, suffix: &str) -> Result<Vec<(String, &'a str)>> {
-	let mapping = mapping.ok_or_else(|| RecipeError::new("AMD artifacts were not compiled"))?;
-	Ok(mapping.split(';').filter_map(|value| value.split_once('=')).map(|(target, path)| (format!("{target}.{suffix}"), path)).collect())
 }
 trait CpuFloat: Copy + Default {
 	unsafe fn forward(samples: *const Self, weights: *const Self, values: *const *mut Self, contexts: *const *mut Self, descriptors: *const i32, arguments: *const Self, rows: i32, nodes: i32, timings: *mut u64, tiles: *const Tile, format_exp: i32, format_man: i32);
@@ -2860,7 +2832,24 @@ impl DeviceTape {
 		})
 	}
 	fn forward(&mut self) -> Result<()> { self.map(GpuTape::forward).map(|_| ()) }
-	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> { for shard in &self.shards { shard.tape.inject_bn_stats(stats)? } Ok(()) }
+	fn print_devices(&self, precision: Compute) -> Result<()> {
+		let hostname = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
+		for shard in &self.shards {
+			let gpu = shard.tape.gpu;
+			let forward = gpu.kernels(precision)?.0;
+			let name = if matches!(&gpu.driver, Driver::Remote(_)) { gpu.name.clone() } else { format!("{}:{}", hostname.trim(), gpu.name) };
+			let threads = shard.tape.threads;
+			require(threads % forward.geometry.block == 0, "GPU launch does not contain whole workgroups")?;
+			eprintln!("{name}.{}.wkgps:g|{}.threads:t|{}", precision.device_label(), threads / forward.geometry.block, forward.geometry.block);
+		}
+		Ok(())
+	}
+	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
+		for shard in &self.shards {
+			shard.tape.inject_bn_stats(stats)?
+		}
+		Ok(())
+	}
 	fn automatic_gpus(&self, topology: &Topology) -> Result<Vec<&'static Gpu>> {
 		let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?; let local = topology.devices.iter().find(|device| device.host == host.trim()).ok_or_else(|| RecipeError::new("local topology device is absent"))?; let mut selected = self.shards.iter().filter(|shard| !matches!(&shard.tape.gpu.driver, Driver::Remote(_))).map(|shard| (shard.tape.gpu, shard.limit)).collect::<Vec<_>>(); let mut remote = Vec::new();
 		for shard in &self.shards {
@@ -4990,6 +4979,15 @@ impl Compute {
 			Self::Tf(value) => format!("tf({})", value.storage.bits()),
 		}
 	}
+	fn device_label(self) -> String {
+		match self {
+			Self::F(value) => format!("f{}m{}", value.arithmetic.exp, value.arithmetic.man),
+			Self::Fp(value) => format!("fp{}", value.storage.bits()),
+			Self::Int(value) => format!("int{}", value.bits),
+			Self::Bf(value) => format!("bf{}", value.storage.bits()),
+			Self::Tf(value) => format!("tf{}", value.storage.bits()),
+		}
+	}
 }
 impl Train {
 	fn arithmetic(mut self, format: Compute) -> Self {
@@ -5115,7 +5113,13 @@ impl Train {
 		let mut tape = DeviceTape::new(&stored.graph, samples, targets, &gpus, config.precision)?;
 		self.finish_dispatch(if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) }, &mut stored, &prepared.schema, &tape, None)?;
 		let selected = tape.automatic_gpus(&topology)?;
-		if selected.len() != tape.shards.len() { drop(tape); tape = DeviceTape::new(&stored.graph, samples, targets, &selected, config.precision)?; let initial = if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) }; self.finish_dispatch(initial, &mut stored, &prepared.schema, &tape, None)? }
+		if selected.len() != tape.shards.len() {
+			drop(tape);
+			tape = DeviceTape::new(&stored.graph, samples, targets, &selected, config.precision)?;
+			let initial = if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) };
+			self.finish_dispatch(initial, &mut stored, &prepared.schema, &tape, None)?
+		}
+		tape.print_devices(config.precision)?;
 		let mut runtime = tile_runtime(&selected, config)?;
 		stored.bn_stats = tape.shards[0].tape.extract_bn_stats()?;
 		let initial_predictions = tape.predictions()?;
