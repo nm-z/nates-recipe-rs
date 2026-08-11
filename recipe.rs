@@ -4735,6 +4735,8 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 	if targets.is_empty() || groups.values().all(|group| !valid(group)) {
 		return Ok(groups.into_values().flatten().collect());
 	}
+	groups.retain(|_, group| group.iter().all(|table| !table.rows.is_empty()));
+	require(!groups.is_empty(), "data source contains no usable captures")?;
 	let mut captures = groups.into_values().collect::<Vec<_>>();
 	let key = |table: &Table| (table.headers.join("\0"), table.rows.len());
 	for capture in &mut captures {
