@@ -4874,7 +4874,8 @@ fn infer_feature(table: &Table, column: usize, rows: usize) -> FeatureType {
 		return FeatureType::Numeric("f64");
 	}
 	let categories = categories(table, column, rows);
-	if categories.len() < values.len() { FeatureType::Categorical(categories) } else { FeatureType::Text(values.iter().map(|value| value.len()).max().unwrap_or(0)) }
+	let categorical_ratio = env!("RECIPE_CATEGORICAL_RATIO").parse::<f64>().expect("categorical ratio must be numeric");
+	if categories.len() as f64 / values.len().max(1) as f64 <= categorical_ratio { FeatureType::Categorical(categories) } else { FeatureType::Text(values.iter().map(|value| value.len()).max().unwrap_or(0)) }
 }
 impl FeatureType {
 	const fn name(&self) -> &'static str {
