@@ -4868,74 +4868,68 @@ fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool)
 	let maximum = rows.checked_sub(usize::from(exclude)).unwrap_or(0);
 	require(count != 0 && count <= maximum, "knn neighbor count is invalid")?;
 	let mut program = PredictorBuilder::new();
-	let (best_distance, best_target, best_index, distance, condition, total) = (program.local(), program.local(), program.local(), program.local(), program.local(), program.local());
-	let selected = (0..count).map(|_| program.local()).collect::<Vec<_>>();
-	program.constant(0.0);
-	program.store(total);
-	for neighbor in 0..count {
+	let (distance, target, condition, prior_distance, prior_target) = (program.local(), program.local(), program.local(), program.local(), program.local());
+	let nearest = (0..count).map(|_| (program.local(), program.local())).collect::<Vec<_>>();
+	for &(slot_distance, slot_target) in &nearest {
 		program.constant(f64::MAX);
-		program.store(best_distance);
+		program.store(slot_distance);
 		program.constant(0.0);
-		program.store(best_target);
-		program.constant(-1.0);
-		program.store(best_index);
-		for (candidate, sample) in data.samples[..rows * data.features].chunks_exact(data.features).enumerate() {
-			predictor_distance(&mut program, sample);
+		program.store(slot_target);
+	}
+	for (candidate, sample) in data.samples[..rows * data.features].chunks_exact(data.features).enumerate() {
+		predictor_distance(&mut program, sample);
+		program.store(distance);
+		if exclude {
+			program.row();
+			program.constant(candidate as f64);
+			program.binary(PredictorOpcode::Greater);
+			program.constant(candidate as f64);
+			program.row();
+			program.binary(PredictorOpcode::Greater);
+			program.binary(PredictorOpcode::Add);
+			program.load(distance);
+			program.constant(f64::MAX);
+			program.choose();
 			program.store(distance);
-			if exclude {
-				program.row();
-				program.constant(candidate as f64);
-				program.binary(PredictorOpcode::Greater);
-				program.constant(candidate as f64);
-				program.row();
-				program.binary(PredictorOpcode::Greater);
-				program.binary(PredictorOpcode::Add);
-				program.load(distance);
-				program.constant(f64::MAX);
-				program.choose();
-				program.store(distance);
-			}
-			for &prior in &selected[..neighbor] {
-				program.constant(candidate as f64);
-				program.load(prior);
-				program.binary(PredictorOpcode::Greater);
-				program.load(prior);
-				program.constant(candidate as f64);
-				program.binary(PredictorOpcode::Greater);
-				program.binary(PredictorOpcode::Add);
-				program.load(distance);
-				program.constant(f64::MAX);
-				program.choose();
-				program.store(distance);
-			}
-			program.load(best_distance);
+		}
+		program.constant(data.targets[candidate]);
+		program.store(target);
+		for &(slot_distance, slot_target) in &nearest {
+			program.load(slot_distance);
+			program.store(prior_distance);
+			program.load(slot_target);
+			program.store(prior_target);
+			program.load(prior_distance);
 			program.load(distance);
 			program.binary(PredictorOpcode::Greater);
 			program.store(condition);
 			program.load(condition);
 			program.load(distance);
-			program.load(best_distance);
+			program.load(prior_distance);
 			program.choose();
-			program.store(best_distance);
+			program.store(slot_distance);
 			program.load(condition);
-			program.constant(data.targets[candidate]);
-			program.load(best_target);
+			program.load(target);
+			program.load(prior_target);
 			program.choose();
-			program.store(best_target);
+			program.store(slot_target);
 			program.load(condition);
-			program.constant(candidate as f64);
-			program.load(best_index);
+			program.load(prior_distance);
+			program.load(distance);
 			program.choose();
-			program.store(best_index);
+			program.store(distance);
+			program.load(condition);
+			program.load(prior_target);
+			program.load(target);
+			program.choose();
+			program.store(target);
 		}
-		program.load(best_index);
-		program.store(selected[neighbor]);
-		program.load(total);
-		program.load(best_target);
-		program.binary(PredictorOpcode::Add);
-		program.store(total);
 	}
-	program.load(total);
+	program.constant(0.0);
+	for &(_, target) in &nearest {
+		program.load(target);
+		program.binary(PredictorOpcode::Add)
+	}
 	program.constant(count as f64);
 	program.binary(PredictorOpcode::Divide);
 	Ok(Predictor::new(program.finish()?))
