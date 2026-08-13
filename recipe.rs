@@ -4456,66 +4456,6 @@ struct Table {
 	rows: Vec<Vec<String>>,
 	children: Vec<ChildTable>,
 }
-#[derive(Default)]
-struct IgnoredRows {
-	first: String,
-	latest: String,
-	files: usize,
-	rows: usize,
-	open: bool,
-}
-impl IgnoredRows {
-	fn summary(&self) -> String { format!("ignored: {} ({} files, {} blank rows)", path_range(&self.first, &self.latest), self.files, self.rows) }
-	fn update(&mut self, path: &Path, rows: usize) -> Result<()> {
-		if rows == 0 {
-			return Ok(());
-		}
-		let path = path.display().to_string();
-		if self.files == 0 {
-			self.first = path.clone();
-		}
-		self.latest = path;
-		self.files += 1;
-		self.rows += rows;
-		let terminal = std::io::stderr().is_terminal();
-		if !self.open && terminal {
-			eprint!("\x1b[s")
-		}
-		self.open = true;
-		if terminal {
-			eprint!("\x1b[u\x1b[J{}", self.summary());
-		std::io::Write::flush(&mut std::io::stderr()).map_err(|error| RecipeError::new(format!("cannot flush ignored-row status: {error}")))
-		} else {
-			Ok(())
-		}
-	}
-	fn finish(&mut self) {
-		if self.open {
-			if std::io::stderr().is_terminal() {
-				eprint!("\x1b[u\x1b[J")
-			}
-			eprintln!("{}", self.summary());
-			self.open = false
-		}
-	}
-}
-impl Drop for IgnoredRows {
-	fn drop(&mut self) { self.finish() }
-}
-fn path_range(first: &str, latest: &str) -> String {
-	if first == latest {
-		return first.to_owned();
-	}
-	let mut prefix = first.bytes().zip(latest.bytes()).take_while(|(left, right)| left == right).count();
-	while !first.is_char_boundary(prefix) || !latest.is_char_boundary(prefix) {
-		prefix -= 1
-	}
-	let mut suffix = first[prefix..].bytes().rev().zip(latest[prefix..].bytes().rev()).take_while(|(left, right)| left == right).count();
-	while !first.is_char_boundary(first.len() - suffix) || !latest.is_char_boundary(latest.len() - suffix) {
-		suffix -= 1
-	}
-	format!("{}{{{}…{}}}{}", &first[..prefix], &first[prefix..first.len() - suffix], &latest[prefix..latest.len() - suffix], &first[first.len() - suffix..])
-}
 enum FeatureType {
 	Numeric(&'static str),
 	Categorical(Vec<String>),
@@ -4528,35 +4468,6 @@ fn prepare(data: &Data) -> Result<&Prepared> {
 	}
 }
 fn column_match(name: &str, table: &Table, header: &str, column: usize) -> bool { name == header || name == format!("{}.{}", table.name, header) || name == format!("col{}", column + 1) || name == format!("{}.col{}", table.name, column + 1) || header.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.')) || header.rsplit_once('.').is_some_and(|(base, row)| row.parse::<usize>().is_ok() && (base == name || base.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.')))) }
-fn print_table(table: &Table, fit: usize, targets: &[String], exclusions: &[String]) {
-	eprintln!("{:<37} {:<10} {:<9} {} samples", table.name, "", "", table.rows.len());
-	let mut base = 0;
-	for child in &table.children {
-		let unit = if child.rows == 1 { "row/sample" } else { "rows/sample" };
-		eprintln!("{:<37} {:<10} {:<9} {} {unit}", format!("  {}", child.name), "", "", child.rows);
-		for (column, header) in child.headers.iter().enumerate().filter(|_| child.rows != 0) {
-			let index = base + column;
-			let tagged = |names: &[String]| names.iter().any(|name| column_match(name, table, header, index));
-			let tag = if tagged(targets) {
-				"\x1b[32m[target]\x1b[0m  "
-			} else if tagged(exclusions) {
-				"\x1b[31m[excluded]\x1b[0m"
-			} else {
-				"          "
-			};
-			let kind = infer_feature(table, index, fit).name();
-			let same = (1..child.rows).all(|r| infer_feature(table, base + r * child.headers.len() + column, fit).name() == kind);
-			let kind = if same { kind } else { "mixed" };
-			if child.rows == 1 {
-				let n = (0..table.rows.len()).filter(|&s| table.rows[s].get(index).is_some_and(|v| !v.is_empty())).count();
-				eprintln!("{:<37} {tag} {kind:<9} {n}", format!("    {header}"));
-			} else {
-				eprintln!("{:<37} {tag} {kind:<9}", format!("    {header}"));
-			}
-		}
-		base += child.rows * child.headers.len();
-	}
-}
 fn prepare_data(data: &Data) -> Result<Prepared> {
 	let mut paths = Vec::new();
 	for source in &data.sources {
@@ -4565,18 +4476,15 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	paths.sort();
 	paths.dedup();
 	let mut grouped = Vec::new();
-	let mut ignored = IgnoredRows::default();
 	for path in paths {
 		if !path.extension().and_then(|value| value.to_str()).is_some_and(is_table) {
 			continue;
 		}
 		let bytes = fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
 		let directory = path.parent().unwrap_or_else(|| Path::new("")).to_owned();
-		let (table, blank) = parse_table(&path, &bytes)?;
-		ignored.update(&path, blank)?;
+		let (table, _) = parse_table(&path, &bytes)?;
 		grouped.push((directory, table));
 	}
-	ignored.finish();
 	let mut tables = merge_captures(grouped, &data.target)?;
 	tables = merge_partitions(tables, &data.target, &data.exclusions)?;
 	require(!tables.is_empty(), "data source contains no supported table")?;
@@ -4609,10 +4517,6 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	let table_index = selected.first().map_or(0, |target| target.0);
 	let row_count = tables[table_index].rows.len();
 	for table in &tables { require(table.rows.len() == row_count, format!("table {:?} expected {row_count} positionally aligned rows, received {}", table.name, table.rows.len()))? }
-	eprintln!("Feature name:                                    Dtype:    Samples:");
-	for value in &tables {
-		print_table(value, row_count, &data.target, &data.exclusions);
-	}
 	let mut columns = Vec::new();
 	for (table, value) in tables.iter().enumerate() {
 		for (column, header) in value.headers.iter().enumerate() {
