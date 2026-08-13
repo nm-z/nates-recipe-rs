@@ -2872,6 +2872,7 @@ impl DeviceTape {
 		Ok(())
 	}
 	fn automatic_gpus(&self, topology: &Topology) -> Result<Vec<&'static Gpu>> {
+		if self.shards.len() == 1 { return Ok(vec![self.shards[0].tape.gpu]) }
 		let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?; let local = topology.devices.iter().find(|device| device.host == host.trim()).ok_or_else(|| RecipeError::new("local topology device is absent"))?; let mut selected = self.shards.iter().filter(|shard| !matches!(&shard.tape.gpu.driver, Driver::Remote(_))).map(|shard| (shard.tape.gpu, shard.limit)).collect::<Vec<_>>(); let mut remote = Vec::new();
 		for shard in &self.shards {
 			let gpu = shard.tape.gpu; if !matches!(&gpu.driver, Driver::Remote(_)) { continue }
@@ -3055,9 +3056,8 @@ struct Buffer {
 impl Buffer {
 	fn new(runtime: &'static Gpu, bytes: usize) -> Result<Self> { Ok(Self { runtime, pointer: runtime.allocate(bytes).map_err(|error| RecipeError::new(format!("device {} {:?} buffer allocation requested {bytes} bytes: {error}", runtime.name, runtime.backend)))?, bytes }) }
 	fn upload<T>(runtime: &'static Gpu, values: &[T]) -> Result<Self> {
-		let buffer = Self::new(runtime, size_of_val(values))?;
-		runtime.upload(buffer.pointer, values.as_ptr().cast(), size_of_val(values))?;
-		Ok(buffer)
+		let bytes = size_of_val(values);
+		Ok(Self { runtime, pointer: runtime.upload(0, values.as_ptr().cast(), bytes)?, bytes })
 	}
 	fn upload_float(runtime: &'static Gpu, values: &[f64], precision: Compute) -> Result<Self> {
 		let bytes = precision.bytes();
@@ -3067,7 +3067,7 @@ impl Buffer {
 	fn write<T>(&self, offset: usize, values: &[T]) -> Result<()> {
 		let start = checked_mul(offset, size_of::<T>(), "GPU write offset")?;
 		require(checked_add(start, size_of_val(values), "GPU write")? <= self.bytes, "GPU write exceeds buffer")?;
-		self.runtime.upload(self.pointer + start as u64, values.as_ptr().cast(), size_of_val(values))
+		self.runtime.upload(self.pointer + start as u64, values.as_ptr().cast(), size_of_val(values)).map(|_| ())
 	}
 	fn write_float(&self, offset: usize, values: &[f64], precision: Compute) -> Result<()> {
 		let bytes = precision.bytes();
@@ -3527,18 +3527,19 @@ impl Gpu {
 		}
 	}
 	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
-	fn upload(&self, dst: u64, src: *const c_void, bytes: usize) -> Result<()> {
+	fn upload(&self, dst: u64, src: *const c_void, bytes: usize) -> Result<u64> {
 		self.activate()?;
+		let dst = if dst == 0 && !matches!(&self.driver, Driver::Remote(_)) { self.allocate(bytes)? } else { dst };
 		unsafe {
 			match &self.driver {
 				Driver::Cpu => {
 					ptr::copy_nonoverlapping(src.cast::<u8>(), dst as *mut u8, bytes);
-					Ok(())
+					Ok(dst)
 				}
 				#[cfg(nvidia)]
-				Driver::Cuda(driver) => self.status((driver.upload)(dst, src, bytes), "upload"),
+				Driver::Cuda(driver) => self.status((driver.upload)(dst, src, bytes), "upload").map(|_| dst),
 				#[cfg(amd)]
-				Driver::Hsa(driver) => self.status((driver.copy)(dst as Ptr, src, bytes), "upload"),
+				Driver::Hsa(driver) => self.status((driver.copy)(dst as Ptr, src, bytes), "upload").map(|_| dst),
 				Driver::Remote(driver) => driver.upload(dst, src, bytes),
 			}
 		}
@@ -3675,20 +3676,16 @@ fn worker_serve(name: &str) -> Result<()> {
 		if remote_io("read from", input.read(&mut command))? == 0 {
 			return Ok(());
 		}
+		if command[0] == 2 { gpu.free(get_u64(&mut input)?); continue }
 		let result = (|| -> Result<Vec<u8>> {
 			match command[0] {
 				1 => Ok(gpu.allocate(get_u64(&mut input)? as usize)?.to_le_bytes().to_vec()),
-				2 => {
-					gpu.free(get_u64(&mut input)?);
-					Ok(Vec::new())
-				}
 				3 => {
 					let pointer = get_u64(&mut input)?;
 					let bytes = get_u64(&mut input)? as usize;
 					let mut payload = vec![0_u8; bytes];
 					remote_io("read from", input.read_exact(&mut payload))?;
-					gpu.upload(pointer, payload.as_ptr().cast(), bytes)?;
-					Ok(Vec::new())
+					Ok(gpu.upload(pointer, payload.as_ptr().cast(), bytes)?.to_le_bytes().to_vec())
 				}
 				4 => {
 					let pointer = get_u64(&mut input)?;
@@ -3835,18 +3832,18 @@ impl Remote {
 		if let Ok(mut worker) = self.worker() {
 			let _ = remote_io("write to", worker.input.write_all(&[2]));
 			let _ = put_u64(&mut worker.input, pointer);
-			let _ = worker.input.flush();
-			let _ = read_response(&mut worker);
 		}
 	}
-	fn upload(&self, dst: u64, src: *const c_void, bytes: usize) -> Result<()> {
+	fn upload(&self, dst: u64, src: *const c_void, bytes: usize) -> Result<u64> {
 		let mut worker = self.worker()?;
 		remote_io("write to", worker.input.write_all(&[3]))?;
 		put_u64(&mut worker.input, dst)?;
 		put_u64(&mut worker.input, bytes as u64)?;
 		remote_io("write to", worker.input.write_all(unsafe { std::slice::from_raw_parts(src.cast::<u8>(), bytes) }))?;
 		remote_io("flush", worker.input.flush())?;
-		read_response(&mut worker).map(|_| ())
+		let payload = read_response(&mut worker)?;
+		require(payload.len() == size_of::<u64>(), "remote upload response is invalid")?;
+		Ok(u64::from_le_bytes(payload.try_into().map_err(|_| RecipeError::new("remote pointer is invalid"))?))
 	}
 	fn download(&self, dst: Ptr, src: u64, bytes: usize) -> Result<()> {
 		let mut worker = self.worker()?;
@@ -3947,13 +3944,13 @@ fn remote_gpu(node: &RemoteNode) -> Result<Gpu> {
 	Ok(Gpu { name: node.info.name.clone(), backend: node.backend, driver: Driver::Remote(Remote { io: Mutex::new(worker) }), kernels: Mutex::new(Vec::new()), memory: node.memory, clock: node.clock, shared_limit: node.shared_limit, dispatch: Mutex::new(()) })
 }
 static REMOTE_GPUS: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
-fn remote_gpus() -> Result<&'static [Gpu]> {
+fn remote_gpus(name: Option<&str>) -> Result<&'static [Gpu]> {
 	REMOTE_GPUS.get_or_init(|| {
-		let mut nodes = Vec::new();
-		for node in reachable_nodes()?.iter() {
-			if let Ok(node) = remote_gpu(node) { nodes.push(node) }
-		}
-		Ok(nodes)
+		let nodes = match name.and_then(|name| name.split_once(':')) {
+			Some((host, device)) => remote_nodes(host)?.into_iter().filter(|node| node.device == device).collect(),
+			None => reachable_nodes()?.to_vec(),
+		};
+		Ok(nodes.iter().filter_map(|node| remote_gpu(node).ok()).collect())
 	})
 	.as_ref()
 	.map(Vec::as_slice)
@@ -3962,7 +3959,7 @@ fn remote_gpus() -> Result<&'static [Gpu]> {
 fn all_gpus() -> Result<Vec<&'static Gpu>> {
 	let mut found = devices()?.iter().collect::<Vec<_>>();
 	if multi_device() {
-		found.extend(remote_gpus()?.iter());
+		found.extend(remote_gpus(None)?.iter());
 	}
 	Ok(found)
 }
@@ -3971,7 +3968,10 @@ fn selected_gpus() -> Result<Vec<&'static Gpu>> {
 	match std::env::var("RECIPE_DEVICE").ok() {
 		Some(name) => {
 			let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-			all_gpus()?.into_iter().find(|gpu| gpu.name == name || device_name(gpu, host.trim()) == name).map(|gpu| vec![gpu]).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")))
+			if let Some(gpu) = devices()?.iter().find(|gpu| gpu.name == name || device_name(gpu, host.trim()) == name) { return Ok(vec![gpu]) }
+			let hosts = ssh_hosts()?;
+			require(name.split_once(':').is_some_and(|(host, _)| hosts.iter().any(|configured| configured == host)), format!("GPU {name:?} is absent"))?;
+			remote_gpus(Some(&name))?.iter().find(|gpu| gpu.name == name).map(|gpu| vec![gpu]).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")))
 		}
 		None => all_gpus(),
 	}
@@ -3979,14 +3979,13 @@ fn selected_gpus() -> Result<Vec<&'static Gpu>> {
 static TOPOLOGY: OnceLock<Result<Topology>> = OnceLock::new();
 fn topology() -> Result<Topology> { TOPOLOGY.get_or_init(discover_topology).as_ref().cloned().map_err(Clone::clone) }
 fn discover_topology() -> Result<Topology> {
-	let found = devices()?;
 	let latency_bytes = natural("topology latency bytes", env!("RECIPE_TOPOLOGY_LATENCY_BYTES"))?;
 	let bandwidth_bytes = natural("topology bandwidth bytes", env!("RECIPE_TOPOLOGY_BANDWIDTH_BYTES"))?;
 	let repetitions = natural("topology repetitions", env!("RECIPE_TOPOLOGY_REPETITIONS"))?;
 	require(latency_bytes != 0 && bandwidth_bytes >= latency_bytes && repetitions != 0, "topology probe is invalid")?;
 	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	let host = host.trim().to_owned();
-	let mut nodes = found.iter().map(|gpu| DeviceInfo { name: device_name(gpu, &host), host: host.clone() }).collect::<Vec<_>>();
+	let mut nodes = devices()?.iter().map(|gpu| DeviceInfo { name: device_name(gpu, &host), host: host.clone() }).collect::<Vec<_>>();
 	let remote: &[RemoteNode] = if multi_device() { reachable_nodes()? } else { &[] };
 	nodes.extend(remote.iter().map(|node| node.info.clone()));
 	let active = all_gpus()?;
