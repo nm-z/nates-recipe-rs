@@ -1,6 +1,6 @@
-use std::{fs, path::Path, process::Command};
+use std::{fs, os::unix::process::CommandExt, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe <source.rs> [export]";
+const USAGE: &str = "usage: recipe [--device <name>] <source.rs> [export]";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -9,12 +9,13 @@ fn invalid(message: &str) -> ! {
 
 fn mapped(mapping: Option<&'static str>, suffix: &str) -> Vec<(String, &'static str)> { mapping.into_iter().flat_map(|values| values.split(';')).filter_map(|value| value.split_once('=')).map(|(target, path)| (format!("{target}.{suffix}"), path)).collect() }
 
-fn export(source: &Path) {
-	fs::metadata(source).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", source.display()));
-	let mut artifacts = mapped(option_env!("RECIPE_HSA_CODE_OBJECTS"), "hsaco");
-	artifacts.extend(mapped(option_env!("RECIPE_HSA_ASSEMBLIES"), "amd.s"));
-	artifacts.extend(option_env!("RECIPE_NV_PTX").map(|path| ("ptx".to_owned(), path)));
-	assert!(!artifacts.is_empty(), "Recipe artifacts were not compiled");
+fn export(source: &Path, selected: Option<&str>) {
+	fs::metadata(source).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", source.display())); let device = selected.map(|name| name.rsplit(':').next().unwrap_or(name));
+	if device.is_some_and(|name| name != "cpu" && !name.starts_with("amd") && !name.starts_with("nv")) { invalid("export device must be cpu, an amd device, or an nv device") }
+	let mut artifacts = mapped(option_env!("RECIPE_HSA_CODE_OBJECTS"), "hsaco"); artifacts.push(("cpu.a".to_owned(), concat!(env!("OUT_DIR"), "/librecipe_cpu.a")));
+	artifacts.extend(mapped(option_env!("RECIPE_HSA_ASSEMBLIES"), "amd.s")); artifacts.extend(option_env!("RECIPE_NV_PTX").map(|path| ("ptx".to_owned(), path)));
+	artifacts.retain(|(extension, _)| device.is_none_or(|name| match name { "cpu" => extension == "cpu.a", name if name.starts_with("amd") => extension.ends_with(".hsaco") || extension.ends_with(".amd.s"), _ => extension == "ptx" }));
+	assert!(!artifacts.is_empty(), "Recipe artifacts for {} were not compiled", selected.unwrap_or("this build"));
 	for (extension, compiled) in artifacts {
 		let output = source.with_file_name(format!("recipe.{extension}"));
 		fs::copy(compiled, &output).unwrap_or_else(|error| panic!("cannot export {}: {error}", output.display()));
@@ -22,9 +23,31 @@ fn export(source: &Path) {
 	}
 }
 
-fn run(source: &Path) {
+fn library_path(directory: &Path) -> PathBuf {
+	let direct = directory.join("librecipe.rlib");
+	let dependencies = directory.join("deps");
+	let mut selected = direct.clone();
+	let mut selected_time = direct.metadata().and_then(|metadata| metadata.modified()).ok();
+	if let Ok(entries) = fs::read_dir(&dependencies) {
+		for candidate in entries.flatten() {
+			let path = candidate.path();
+			let name = path.file_name().map(|value| value.to_string_lossy()).unwrap_or_default();
+			if !name.starts_with("librecipe-") || !name.ends_with(".rlib") {
+				continue;
+			}
+			let Ok(modified) = path.metadata().and_then(|metadata| metadata.modified()) else { continue };
+			if selected_time.is_none_or(|time| modified > time) {
+				selected_time = Some(modified);
+				selected = path;
+			}
+		}
+	}
+	selected
+}
+
+fn run(source: &Path, device: Option<&str>) {
 	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
-	let library = directory.join("librecipe.rlib");
+	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
 	let output = directory.join("recipe-script");
 	fs::metadata(&library).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", library.display()));
@@ -32,24 +55,48 @@ fn run(source: &Path) {
 	if !status.success() {
 		std::process::exit(status.code().unwrap_or(1));
 	}
-	let status = Command::new(output).status().expect("cannot execute Recipe script");
-	std::process::exit(status.code().unwrap_or(1));
+	let mut command = Command::new(output);
+	if let Some(device) = device {
+		command.env("RECIPE_DEVICE", device);
+	}
+	let error = command.exec();
+	panic!("cannot execute Recipe script: {error}")
 }
 
 fn main() {
 	let mut arguments = std::env::args().skip(1);
-	let source = arguments.next().unwrap_or_else(|| invalid(USAGE));
-	let operation = arguments.next();
-	if arguments.next().is_some() {
+	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
+	while let Some(argument) = arguments.next() {
+		if argument == "--device" {
+			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
+			if device.is_some() {
+				invalid("duplicate --device")
+			}
+			device = Some(selected);
+			continue;
+		}
+		if argument.starts_with("--") {
+			invalid(USAGE)
+		}
+		if source.is_none() {
+			source = Some(argument);
+			continue;
+		}
+		if operation.is_none() {
+			operation = Some(argument);
+			continue;
+		}
 		invalid(USAGE)
 	}
+	let source = source.unwrap_or_else(|| invalid(USAGE));
+	let device = device.as_deref();
 	let source = Path::new(&source);
 	if source.extension().and_then(|value| value.to_str()) != Some("rs") {
 		invalid("recipe requires a Rust source")
 	}
 	match operation.as_deref() {
-		None => run(source),
-		Some("export") => export(source),
+		None => run(source, device),
+		Some("export") => export(source, device),
 		Some(_) => invalid(USAGE),
 	}
 }

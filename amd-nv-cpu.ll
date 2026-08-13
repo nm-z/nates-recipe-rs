@@ -355,6 +355,152 @@ output.done:
 %job.next = add i32 %job, %groups
 br label %job.loop
 exit: ret void }
+define internal void @predictor_forward_body(
+ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %context, ptr addrspace(1) %program,
+i32 %row, i32 %features, i32 %instructions, i32 %locals, i32 %workspace ) #1 { entry:
+%workspace.base = mul i32 %row, %workspace
+%stack.base = add i32 %workspace.base, %locals
+br label %loop
+loop:
+%i = phi i32 [ 0, %entry ], [ %next, %operation.done ]
+%sp = phi i32 [ 0, %entry ], [ %next.sp, %operation.done ]
+%more = icmp ult i32 %i, %instructions
+br i1 %more, label %step, label %done
+step:
+%instruction = mul i32 %i, 2
+%argument.index = add i32 %instruction, 1
+%opcode.ptr = getelementptr inbounds double, ptr addrspace(1) %program, i32 %instruction
+%argument.ptr = getelementptr inbounds double, ptr addrspace(1) %program, i32 %argument.index
+%opcode.double = load double, ptr addrspace(1) %opcode.ptr, align 8
+%argument = load double, ptr addrspace(1) %argument.ptr, align 8
+%opcode = call i32 @recipe.to.s32(double %opcode.double)
+switch i32 %opcode, label %invalid [
+i32 0, label %feature
+i32 1, label %row.value
+i32 2, label %constant
+i32 3, label %local.load
+i32 4, label %local.store
+i32 5, label %duplicate
+i32 6, label %binary
+i32 7, label %binary
+i32 8, label %binary
+i32 9, label %binary
+i32 10, label %binary
+i32 11, label %choose
+]
+feature:
+%feature.index = call i32 @recipe.to.u32(double %argument)
+%input.base = mul i32 %row, %features
+%input.index = add i32 %input.base, %feature.index
+%input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %input.index
+%feature.value = load double, ptr addrspace(1) %input.ptr, align 8
+br label %push
+row.value:
+%row.result = call double @recipe.from.u32(i32 %row)
+br label %push
+constant:
+br label %push
+local.load:
+%load.slot = call i32 @recipe.to.u32(double %argument)
+%load.index = add i32 %workspace.base, %load.slot
+%load.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %load.index
+%load.value = load double, ptr addrspace(1) %load.ptr, align 8
+br label %push
+push:
+%push.value = phi double [ %feature.value, %feature ], [ %row.result, %row.value ], [ %argument, %constant ], [ %load.value, %local.load ]
+%push.index = add i32 %stack.base, %sp
+%push.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %push.index
+store double %push.value, ptr addrspace(1) %push.ptr, align 8
+%push.sp = add i32 %sp, 1
+br label %operation.done
+local.store:
+%store.slot = call i32 @recipe.to.u32(double %argument)
+%store.sp = sub i32 %sp, 1
+%store.stack.index = add i32 %stack.base, %store.sp
+%store.stack.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %store.stack.index
+%store.value = load double, ptr addrspace(1) %store.stack.ptr, align 8
+%store.local.index = add i32 %workspace.base, %store.slot
+%store.local.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %store.local.index
+store double %store.value, ptr addrspace(1) %store.local.ptr, align 8
+br label %operation.done
+duplicate:
+%duplicate.source = sub i32 %sp, 1
+%duplicate.source.index = add i32 %stack.base, %duplicate.source
+%duplicate.source.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %duplicate.source.index
+%duplicate.value = load double, ptr addrspace(1) %duplicate.source.ptr, align 8
+%duplicate.target.index = add i32 %stack.base, %sp
+%duplicate.target.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %duplicate.target.index
+store double %duplicate.value, ptr addrspace(1) %duplicate.target.ptr, align 8
+%duplicate.sp = add i32 %sp, 1
+br label %operation.done
+binary:
+%right.sp = sub i32 %sp, 1
+%left.sp = sub i32 %sp, 2
+%right.stack.index = add i32 %stack.base, %right.sp
+%left.stack.index = add i32 %stack.base, %left.sp
+%right.stack.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %right.stack.index
+%left.stack.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %left.stack.index
+%right.value = load double, ptr addrspace(1) %right.stack.ptr, align 8
+%left.value = load double, ptr addrspace(1) %left.stack.ptr, align 8
+switch i32 %opcode, label %invalid [
+i32 6, label %add
+i32 7, label %subtract
+i32 8, label %multiply
+i32 9, label %divide
+i32 10, label %greater
+]
+add:
+%add.result = call double @recipe.add(double %left.value, double %right.value)
+br label %binary.store
+subtract:
+%subtract.result = call double @recipe.sub(double %left.value, double %right.value)
+br label %binary.store
+multiply:
+%multiply.result = call double @recipe.mul(double %left.value, double %right.value)
+br label %binary.store
+divide:
+%divide.result = call double @recipe.div(double %left.value, double %right.value)
+br label %binary.store
+greater:
+%greater.condition = call i1 @recipe.ogt(double %left.value, double %right.value)
+%greater.result = call double @recipe.from.u1(i1 %greater.condition)
+br label %binary.store
+binary.store:
+%binary.value = phi double [ %add.result, %add ], [ %subtract.result, %subtract ], [ %multiply.result, %multiply ], [ %divide.result, %divide ], [ %greater.result, %greater ]
+store double %binary.value, ptr addrspace(1) %left.stack.ptr, align 8
+br label %operation.done
+choose:
+%no.sp = sub i32 %sp, 1
+%yes.sp = sub i32 %sp, 2
+%condition.sp = sub i32 %sp, 3
+%no.index = add i32 %stack.base, %no.sp
+%yes.index = add i32 %stack.base, %yes.sp
+%condition.index = add i32 %stack.base, %condition.sp
+%no.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %no.index
+%yes.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %yes.index
+%condition.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %condition.index
+%no.value = load double, ptr addrspace(1) %no.ptr, align 8
+%yes.value = load double, ptr addrspace(1) %yes.ptr, align 8
+%condition.value = load double, ptr addrspace(1) %condition.ptr, align 8
+%condition.true = call i1 @recipe.one(double %condition.value, double 0.0)
+%choose.value = select i1 %condition.true, double %yes.value, double %no.value
+store double %choose.value, ptr addrspace(1) %condition.ptr, align 8
+%choose.sp = sub i32 %sp, 2
+br label %operation.done
+operation.done:
+%next.sp = phi i32 [ %push.sp, %push ], [ %store.sp, %local.store ], [ %duplicate.sp, %duplicate ], [ %right.sp, %binary.store ], [ %choose.sp, %choose ]
+%next = add nuw i32 %i, 1
+br label %loop
+done:
+%result.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %stack.base
+%result = load double, ptr addrspace(1) %result.ptr, align 8
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %row
+store double %result, ptr addrspace(1) %output.ptr, align 8
+ret void
+invalid:
+call void @llvm.trap()
+ret void
+}
 define internal double @scalar_operand( double %first, double %second, ptr addrspace(1) %context,
 i32 %operand, i32 %p, i32 %elements ) #1 { entry: %register = icmp sge i32 %operand, 0
 %safe = select i1 %register, i32 %operand, i32 0 %base = mul i32 %safe, %elements %index = add i32 %base, %p
@@ -388,7 +534,7 @@ i32 %left.operand, i32 %p, i32 %elements )
 i32 %right, i32 %p, i32 %elements ) switch i32 %opcode, label %invalid [ i32 0, label %add i32 1, label %constant
 i32 2, label %parameter i32 3, label %subtract i32 4, label %multiply i32 5, label %divide i32 6, label %absolute
 i32 7, label %exponential i32 8, label %logarithm i32 9, label %square.root i32 10, label %sine i32 11, label %cosine
-i32 12, label %hyperbolic i32 13, label %greater ] add: %add.result = call double @recipe.add(double %left.value, double %right.value)
+i32 12, label %hyperbolic i32 13, label %greater i32 14, label %rat ] add: %add.result = call double @recipe.add(double %left.value, double %right.value)
 br label %operation.done constant: br label %operation.done parameter:
 %parameter.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %left
 %parameter.result = load double, ptr addrspace(1) %parameter.ptr, align 8 br label %operation.done subtract:
@@ -403,12 +549,12 @@ br label %operation.done constant: br label %operation.done parameter:
 %cosine.result = call double @recipe.cos(double %left.value) br label %operation.done hyperbolic:
 %hyperbolic.result = call double @recipe.tanh(double %left.value) br label %operation.done greater:
 %greater.condition = call i1 @recipe.ogt(double %left.value, double %right.value) %greater.result = call double @recipe.from.u1(i1 %greater.condition)
-br label %operation.done operation.done: %result = phi double [ %add.result, %add ], [ %left.double, %constant ],
+br label %operation.done rat: br label %operation.done operation.done: %result = phi double [ %add.result, %add ], [ %left.double, %constant ],
 [ %parameter.result, %parameter ], [ %subtract.result, %subtract ],
 [ %multiply.result, %multiply ], [ %divide.result, %divide ],
 [ %absolute.result, %absolute ], [ %exponential.result, %exponential ],
 [ %logarithm.result, %logarithm ], [ %square.root.result, %square.root ],
-[ %sine.result, %sine ], [ %cosine.result, %cosine ], [ %hyperbolic.result, %hyperbolic ], [ %greater.result, %greater ]
+[ %sine.result, %sine ], [ %cosine.result, %cosine ], [ %hyperbolic.result, %hyperbolic ], [ %greater.result, %greater ], [ %left.value, %rat ]
 %result.base = mul i32 %i, %elements %result.index = add i32 %result.base, %p
 %result.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %result.index
 store double %result, ptr addrspace(1) %result.ptr, align 8 %next = add nuw i32 %i, 1 br label %loop done:
@@ -479,11 +625,14 @@ i32 %right, i32 %p, i32 %elements ) %adjoint.base = mul i32 %i.previous, %elemen
 i32 0, label %add.reverse i32 1, label %reverse.done i32 2, label %reverse.done i32 3, label %subtract.reverse
 i32 4, label %multiply.reverse i32 5, label %divide.reverse i32 6, label %absolute.reverse
 i32 7, label %exponential.reverse i32 8, label %logarithm.reverse i32 9, label %square.root.reverse
-i32 10, label %sine.reverse i32 11, label %cosine.reverse i32 12, label %hyperbolic.reverse i32 13, label %reverse.done
+i32 10, label %sine.reverse i32 11, label %cosine.reverse i32 12, label %hyperbolic.reverse i32 13, label %reverse.done i32 14, label %rat.reverse
 ] add.reverse: call void @scalar_add_adjoint(
 ptr addrspace(1) %first.adjoint, ptr addrspace(1) %second.adjoint, ptr addrspace(1) %context,
 i32 %left, i32 %p, i32 %elements, i32 %instructions, double %adjoint, i1 %write.first, i1 %write.second )
 call void @scalar_add_adjoint(
+ptr addrspace(1) %first.adjoint, ptr addrspace(1) %second.adjoint, ptr addrspace(1) %context,
+i32 %right, i32 %p, i32 %elements, i32 %instructions, double %adjoint, i1 %write.first, i1 %write.second )
+br label %reverse.done rat.reverse: call void @scalar_add_adjoint(
 ptr addrspace(1) %first.adjoint, ptr addrspace(1) %second.adjoint, ptr addrspace(1) %context,
 i32 %right, i32 %p, i32 %elements, i32 %instructions, double %adjoint, i1 %write.first, i1 %write.second )
 br label %reverse.done subtract.reverse: %subtract.right = call double @recipe.neg(double %adjoint) call void @scalar_add_adjoint(
@@ -1616,13 +1765,17 @@ br label %normalize.stats.loop stats.done: call void @llvm.amdgcn.s.barrier() br
 %p = phi i32 [ %tid, %normalize.stats.entry ], [ %tid, %normalize.test ], [ %tid, %stats.done ], [ %p.next, %element.done ]
 %p.more = icmp ult i32 %p, %count br i1 %p.more, label %element.step, label %node.done element.step:
 switch i32 %op, label %invalid [ i32 2, label %pool i32 3, label %gather
-i32 6, label %elementwise i32 7, label %route i32 8, label %normalize ] pool:
+i32 6, label %elementwise i32 7, label %route i32 8, label %normalize i32 9, label %predictor ] pool:
 call void @pool_forward_body( ptr addrspace(1) %source, ptr addrspace(1) %values, ptr addrspace(1) %context, i32 %p,
 i32 %in.elements, i32 %out.elements, i32 %argument.integer, i32 %in.channels ) br label %element.done gather:
 call void @embedding_forward_body( ptr addrspace(1) %source, ptr addrspace(1) %matrix, ptr addrspace(1) %values, ptr addrspace(1) %context, i32 %p,
 i32 %in.elements, i32 %out.elements, i32 %argument.integer ) br label %element.done elementwise:
 call void @scalar_forward_body( ptr addrspace(1) %source, ptr addrspace(1) %second, ptr addrspace(1) %values,
 ptr addrspace(1) %context, ptr addrspace(1) %program, ptr addrspace(1) %matrix, i32 %p, i32 %count, i32 %program.count )
+br label %element.done predictor:
+%predictor.workspace = add i32 %argument.integer, %argument.second.integer
+call void @predictor_forward_body( ptr addrspace(1) %source, ptr addrspace(1) %values, ptr addrspace(1) %context,
+ptr addrspace(1) %program, i32 %p, i32 %in.elements, i32 %program.count, i32 %argument.integer, i32 %predictor.workspace )
 br label %element.done route: %route.row = udiv i32 %p, %out.elements %route.column = urem i32 %p, %out.elements
 %route.base = mul i32 %route.column, 3 %route.stride.index = add i32 %route.base, 1
 %route.field.index = add i32 %route.base, 2
@@ -1827,8 +1980,19 @@ br i1 %checkpoint.active, label %checkpoint.loop, label %clear.gradient.loop che
 br i1 %checkpoint.more, label %checkpoint.step, label %clear.gradient.loop checkpoint.step:
 %checkpoint.source.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %checkpoint.p
 %checkpoint.target.ptr = getelementptr inbounds double, ptr addrspace(1) %best, i32 %checkpoint.p
+%checkpoint.moment.index = add i32 %parameter.count, %checkpoint.p
+%checkpoint.variance.base = mul i32 %parameter.count, 2
+%checkpoint.variance.index = add i32 %checkpoint.variance.base, %checkpoint.p
+%checkpoint.moment.source.ptr = getelementptr inbounds double, ptr addrspace(1) %moments, i32 %checkpoint.p
+%checkpoint.variance.source.ptr = getelementptr inbounds double, ptr addrspace(1) %variances, i32 %checkpoint.p
+%checkpoint.moment.target.ptr = getelementptr inbounds double, ptr addrspace(1) %best, i32 %checkpoint.moment.index
+%checkpoint.variance.target.ptr = getelementptr inbounds double, ptr addrspace(1) %best, i32 %checkpoint.variance.index
 %checkpoint.weight = load double, ptr addrspace(1) %checkpoint.source.ptr, align 8
+%checkpoint.moment = load double, ptr addrspace(1) %checkpoint.moment.source.ptr, align 8
+%checkpoint.variance = load double, ptr addrspace(1) %checkpoint.variance.source.ptr, align 8
 store double %checkpoint.weight, ptr addrspace(1) %checkpoint.target.ptr, align 8
+store double %checkpoint.moment, ptr addrspace(1) %checkpoint.moment.target.ptr, align 8
+store double %checkpoint.variance, ptr addrspace(1) %checkpoint.variance.target.ptr, align 8
 %checkpoint.next = add i32 %checkpoint.p, %threads br label %checkpoint.loop clear.gradient.loop:
 %gradient.p = phi i32 [ %tid, %loss.done ], [ %tid, %checkpoint.loop ], [ %gradient.next, %gradient.step ]
 %gradient.more = icmp ult i32 %gradient.p, %parameter.count
@@ -1928,7 +2092,7 @@ br i1 %gradient.only, label %exit, label %optimizer.entry node.load:
 %node.values = inttoptr i64 %node.value.address to ptr addrspace(1) switch i32 %op, label %invalid [
 i32 0, label %contraction.gradient i32 2, label %pool.gradient.loop i32 3, label %gather.gradient
 i32 4, label %attention.gradient i32 5, label %scan.gradient i32 6, label %elementwise.gradient
-i32 7, label %route.gradient.loop i32 8, label %normalization.stats.loop ] contraction.gradient:
+i32 7, label %route.gradient.loop i32 8, label %normalization.stats.loop i32 9, label %node.done ] contraction.gradient:
 %contraction.matrix = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %offset
 call void @contraction_reverse_body(
 ptr addrspace(1) %source.values, ptr addrspace(1) %contraction.matrix, ptr addrspace(1) %delta,

@@ -11,7 +11,7 @@ const BLOCKS: &[fn(Model) -> Model] = &[
 	|model| model.lstm(4),
 	|model| model.perc(8),
 	|model| model.moe(2, [const { layer(4) }; 4]),
-	|model| model.svm([tanh]),
+	|model| model.svm(),
 	|model| model.kmeans(4),
 	|model| model.knn(5),
 ];
@@ -87,8 +87,7 @@ fn main() {
 		let format = random(&mut state, PRECISIONS);
 		let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
 			let model = build(block, activation, normalization, first, second);
-			let train = recipe.train()
-				.log([Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant]);
+			let train = recipe.train().epochs(2).log([Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant]);
 			precision(train, format)
 				.run(&model, &data[dataset])
 		}));
