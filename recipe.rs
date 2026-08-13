@@ -566,7 +566,7 @@ impl Model {
 		model.blocks.push(Block { operation, activation: Activation::Linear, normalization: None, quantization: model.quantization, profile: IntegerFormat(model.quantization).selection().is_some() });
 		model
 	}
-	fn activate(&self, activation: Activation) -> Self {
+	pub fn activate(&self, activation: Activation) -> Self {
 		let mut model = self.clone();
 		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("activation requires a preceding block"));
 		if block.normalization.is_some() {
@@ -610,7 +610,7 @@ impl Model {
 		loss.apply(&mut model);
 		model
 	}
-	fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self {
+	pub fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self {
 		let mut model = self.clone();
 		let format = family << 12 | variant << 8 | u16::from(bits);
 		if let Some(block) = model.blocks.last_mut() {
@@ -633,7 +633,7 @@ impl Model {
 	}
 	fn description(&self, metrics: &[Metric]) -> String {
 		let has = |value| metrics.iter().any(|metric| metric.0 == value);
-		let (operation, activation, normalization) = (has(5), has(6), has(7));
+		let (operation, activation, normalization, quantized) = (has(5), has(6), has(7), has(9));
 		let output = usize::from(matches!(self.blocks.last(), Some(Block { operation: Operation::Layer(1), activation: Activation::Linear, normalization: None, .. })));
 		self.blocks
 			.iter()
@@ -641,13 +641,16 @@ impl Model {
 			.filter_map(|block| {
 				let mut names = Vec::new();
 				if operation {
-					names.push(block.operation.name());
+					names.push(block.operation.name().to_owned());
 				}
 				if activation && block.activation != Activation::Linear {
-					names.push(block.activation.name());
+					names.push(block.activation.name().to_owned());
 				}
 				if normalization && let Some(name) = block.normalization.map(BlockNormalization::name) {
-					names.push(name);
+					names.push(name.to_owned());
+				}
+				if quantized && block.quantization != 0 {
+					names.push(quantization(block.quantization));
 				}
 				(!names.is_empty()).then(|| names.join("."))
 			})
@@ -1740,6 +1743,7 @@ pub const blck: Metric = Metric(5);
 pub const atvn: Metric = Metric(6);
 pub const norm: Metric = Metric(7);
 pub const tok: Metric = Metric(8);
+pub const quant: Metric = Metric(9);
 pub const z_score: ZScore = ZScore;
 pub const batch: Normalization = batch_marker;
 const fn batch_marker(_: usize) -> Residual { Residual::Activation(Activation::Relu) }
@@ -1833,13 +1837,12 @@ cpu_float!(CpuF, recipe_forward_cpu_f, recipe_epoch_cpu_f);
 impl Recipe {
 	pub fn infer(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
 		let path = path.as_ref().to_string_lossy();
-		let result = devices().and_then(|devices| devices.first().ok_or_else(|| RecipeError::new("execution device is absent"))).and_then(|device| {
-			bundle::run_infer(&path, input, |stored, samples| {
-				let mut tape = GpuTape::new(&stored.graph, samples, &[], device, stored.precision)?;
-				tape.inject_bn_stats(&stored.bn_stats)?;
-				tape.forward()?;
-				tape.predictions()
-			})
+		let device = selected_gpus().and_then(|gpus| gpus.into_iter().next().ok_or_else(|| RecipeError::new("execution device is absent"))).unwrap_or_else(|error| panic!("{error}"));
+		let result = bundle::run_infer(&path, input, |stored, samples| {
+			let mut tape = GpuTape::new(&stored.graph, samples, &[], device, stored.precision)?;
+			tape.inject_bn_stats(&stored.bn_stats)?;
+			tape.forward()?;
+			tape.predictions()
 		});
 		result.unwrap_or_else(|error| panic!("{error}"))
 	}
@@ -2511,7 +2514,9 @@ fn natural(name: &str, text: &str) -> Result<usize> {
 	let value = text.parse::<usize>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))?;
 	require(value != 0, format!("{name} must be positive")).map(|_| value)
 }
-fn multi_device() -> bool { env!("RECIPE_MULTI_DEVICE") == "true" }
+fn multi_device() -> bool {
+	std::env::var_os("RECIPE_FORCE_CPU").is_none() && env!("RECIPE_MULTI_DEVICE") == "true"
+}
 fn stored_graph(graph: &Graph, data: &Data, scale: Option<TargetScale>, precision: Compute) -> bundle::StoredGraph {
 	let inputs = if data.autoregressive { CHAR_IDS.iter().enumerate().flat_map(|(id, character)| (0..graph.input.length).map(move |position| format!("char{id}.u{:04X}.{position}", *character as u32))).collect() } else { (0..graph.input.elements()).map(|index| format!("input{index}")).collect() };
 	let output = if data.autoregressive { "char-id".to_owned() } else { data.target.first().cloned().unwrap_or_else(|| "target".to_owned()) };
@@ -2640,7 +2645,19 @@ impl GpuTape {
 			tile,
 		})
 	}
-	fn forward(&mut self) -> Result<()> { let d = self.gpu.kernels(self.precision)?.0; self.threads = d.geometry.threads(u32::MAX)?; let mut a = self.forward_arguments(); self.gpu.launch(d, &mut a, self.threads, self.tile).map_err(|error| RecipeError::new(format!("forward: {error}")))?; self.gather_error("forward") }
+	fn forward(&mut self) -> Result<()> {
+		let d = self.gpu.kernels(self.precision)?.0;
+		self.threads = d.geometry.threads(self.rows)?;
+		if std::env::var_os("RECIPE_THREAD_TRACE").is_some() {
+			eprintln!(
+				"recipe-thread-trace forward rows={} groups={} block={} threads={}",
+				self.rows, d.geometry.groups, d.geometry.block, self.threads
+			);
+		}
+		let mut a = self.forward_arguments();
+		self.gpu.launch(d, &mut a, self.threads, self.tile).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
+		self.gather_error("forward")
+	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> { let expected = self.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>(); require(stats.len() == expected, format!("batch normalization expected {expected} saved statistics, received {}", stats.len()))?;
 		let mut offset = 0; for &(node, channels) in &self.batch_normalizations { let end = offset + 2 * channels; self.contexts[node].write_float(0, &stats[offset..end], self.precision)?; self.descriptors.write(node * NODE_DESCRIPTOR_FIELDS + NODE_STRUCTURE_OFFSET, &[BATCH_NORMALIZATION_EVALUATION])?; offset = end }
 		Ok(()) }
@@ -2844,10 +2861,14 @@ impl DeviceTape {
 		for shard in &self.shards {
 			let gpu = shard.tape.gpu;
 			let forward = gpu.kernels(precision)?.0;
-			let name = if matches!(&gpu.driver, Driver::Remote(_)) { gpu.name.clone() } else { format!("{}:{}", hostname.trim(), gpu.name) };
 			let threads = shard.tape.threads;
+			if std::env::var_os("RECIPE_THREAD_TRACE").is_some() {
+				eprintln!(
+					"recipe-thread-trace print rows={} threads_cached={} groups={} block={}",
+					shard.tape.rows, threads, forward.geometry.groups, forward.geometry.block
+				);
+			}
 			require(threads % forward.geometry.block == 0, "GPU launch does not contain whole workgroups")?;
-			eprintln!("{name}.{}.wkgps:g|{}.threads:t|{}", precision.device_label(), threads / forward.geometry.block, forward.geometry.block);
 		}
 		Ok(())
 	}
@@ -3909,7 +3930,10 @@ fn reachable_nodes() -> Result<&'static [RemoteNode]> {
 			let mut nodes = Vec::new();
 			for (host, capable) in hosts.iter().zip(capable) {
 				if capable {
-					nodes.extend(remote_nodes(host)?);
+					match remote_nodes(host) {
+						Ok(worker_nodes) => nodes.extend(worker_nodes),
+						Err(error) => eprintln!("excluded: {host} ({error})"),
+					}
 				}
 			}
 			Ok(nodes)
@@ -3923,13 +3947,34 @@ fn remote_gpu(node: &RemoteNode) -> Result<Gpu> {
 	Ok(Gpu { name: node.info.name.clone(), backend: node.backend, driver: Driver::Remote(Remote { io: Mutex::new(worker) }), kernels: Mutex::new(Vec::new()), memory: node.memory, clock: node.clock, shared_limit: node.shared_limit, dispatch: Mutex::new(()) })
 }
 static REMOTE_GPUS: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
-fn remote_gpus() -> Result<&'static [Gpu]> { REMOTE_GPUS.get_or_init(|| reachable_nodes()?.iter().map(remote_gpu).collect()).as_ref().map(Vec::as_slice).map_err(Clone::clone) }
+fn remote_gpus() -> Result<&'static [Gpu]> {
+	REMOTE_GPUS.get_or_init(|| {
+		let mut nodes = Vec::new();
+		for node in reachable_nodes()?.iter() {
+			match remote_gpu(node) {
+				Ok(node) => nodes.push(node),
+				Err(error) => eprintln!("excluded: {} ({error})", node.info.name),
+			}
+		}
+		Ok(nodes)
+	})
+	.as_ref()
+	.map(Vec::as_slice)
+	.map_err(Clone::clone)
+}
 fn all_gpus() -> Result<Vec<&'static Gpu>> {
 	let mut found = devices()?.iter().collect::<Vec<_>>();
 	if multi_device() {
 		found.extend(remote_gpus()?.iter());
 	}
 	Ok(found)
+}
+fn selected_gpus() -> Result<Vec<&'static Gpu>> {
+	let selection = std::env::var("RECIPE_DEVICE").ok();
+	match selection {
+		Some(name) => Ok(vec![device(Some(name.as_str()))?]),
+		None => all_gpus(),
+	}
 }
 static TOPOLOGY: OnceLock<Result<Topology>> = OnceLock::new();
 fn topology() -> Result<Topology> { TOPOLOGY.get_or_init(discover_topology).as_ref().cloned().map_err(Clone::clone) }
@@ -4539,10 +4584,13 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 		return prepare_autoregression(data, &tables);
 	}
 	if tables.len() > 1 {
-		require(data.broadcast, "multiple tables require explicit .broadcast() alignment")?;
 		let rows = tables.iter().map(|table| table.rows.len()).max().unwrap_or(0);
-		for table in &mut tables { let count = table.rows.len(); require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
-			if count != rows { eprintln!("aligned: {} ({count} rows broadcast to {rows})", table.name); table.rows = table.rows.iter().cloned().cycle().take(rows).collect() }
+		let aligned = rows != 0 && tables.iter().all(|table| table.rows.len() == rows);
+		require(aligned || data.broadcast, "multiple tables require explicit .broadcast() alignment")?;
+		if data.broadcast {
+			for table in &mut tables { let count = table.rows.len(); require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
+				if count != rows { table.rows = table.rows.iter().cloned().cycle().take(rows).collect() }
+			}
 		}
 	}
 	let mut selected = Vec::new();
@@ -4733,7 +4781,19 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 	}
 	let valid = |group: &[Table]| group.len() > 1 && targets.iter().all(|target| group.iter().filter(|table| target_column(table, target).is_some()).count() == 1 && group.iter().find(|table| target_column(table, target).is_some()).is_some_and(|table| table.rows.len() == 1));
 	if targets.is_empty() || groups.values().all(|group| !valid(group)) {
-		return Ok(groups.into_values().flatten().collect());
+		let mut tables = Vec::new();
+		for mut group in groups.into_values() {
+			let rows = group.iter().map(|table| table.rows.len()).max().unwrap_or(0);
+			for table in &mut group {
+				let count = table.rows.len();
+				require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
+				if count != rows {
+					table.rows = table.rows.iter().cloned().cycle().take(rows).collect();
+				}
+			}
+			tables.extend(group);
+		}
+		return Ok(tables);
 	}
 	groups.retain(|_, group| group.iter().all(|table| !table.rows.is_empty()));
 	require(!groups.is_empty(), "data source contains no usable captures")?;
@@ -5141,7 +5201,7 @@ impl Train {
 		let training_rows = ((prepared.rows as f64) * data.split).floor() as usize;
 		require(training_rows != 0 && training_rows <= prepared.rows, "split must select training rows")?;
 		let topology = topology()?;
-		let (gpus, mut config) = (all_gpus()?, Config::load()?);
+		let (gpus, mut config) = (selected_gpus()?, Config::load()?);
 		let precision = self.precision;
 		let mut selected_precision = Vec::new();
 		for gpu in gpus {
@@ -5201,7 +5261,8 @@ impl Train {
 			let proposed = runtime.propose(&stored.graph, &mut tape);
 			let cases = self.finish_dispatch(proposed, &mut stored, &prepared.schema, &tape, None)?;
 			let epoch_started = Instant::now();
-			let dispatched = tape.advance().and_then(|_| tape.epoch(self.learning_rate, model.loss, tolerance, config, false));
+			let direct = selected.len() == 1;
+			let dispatched = tape.advance().and_then(|_| tape.epoch(self.learning_rate, model.loss, tolerance, config, direct));
 			let (loss, saved) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
 			if saved { stored.bn_stats = tape.shards[0].tape.extract_bn_stats()? }
 			self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, saved.then_some(true))?;
@@ -5300,11 +5361,11 @@ impl Train {
 				2 => format!("r2 \x1b[38\x3b2\x3b39\x3b125\x3b255m{:>7.4}\x1b[0m", measurement.r2),
 				3 => format!("time \x1b[38\x3b2\x3b255\x3b194\x3b0m{time:>9.3} ms\x1b[0m"),
 				4 => format!("epoch \x1b[38\x3b2\x3b135\x3b90\x3b251m{}\x1b[0m", measurement.epoch),
-				5..=7 if !topology_printed && !topology.is_empty() => {
+				5..=7 | 9 if !topology_printed && !topology.is_empty() => {
 					topology_printed = true;
 					topology.clone()
 				}
-				5..=7 => continue,
+				5..=7 | 9 => continue,
 				8 => continue,
 				_ => unreachable!(),
 			};
@@ -5689,7 +5750,7 @@ impl<const N: usize> RatTrain<N> {
 			self.check_interrupt(state.as_mut())?;
 		}
 		drop(topology()?);
-		let gpus = all_gpus()?;
+		let gpus = selected_gpus()?;
 		let config = Config::load()?;
 		let context = match self.context.take() {
 			Some(context) => context,

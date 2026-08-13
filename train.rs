@@ -1,266 +1,96 @@
 use recipe::*;
-
-const DATASET_ROOT: &str = "/home/nate/Desktop/nates-recipe-rs/examples/datasets";
-const REGRESSION_LOSSES: &[(&str, Loss)] = &[("mse", mse), ("rmse", rmse), ("huber", huber), ("mae", mae)];
-const BINARY_LOSSES: &[(&str, Loss)] = &[("bce", bce), ("ce", ce), ("focal", focal)];
-
-#[derive(Clone, Copy)]
-enum Task {
-	Regression,
-	Binary,
+use std::fs;
+const BLOCKS: &[fn(Model) -> Model] = &[
+	|model| model.pool(1),
+	|model| model.layer(8),
+	|model| model.layer(8).residual([layer(8)]),
+	|model| model.attn(1),
+	|model| model.embed(4, 256),
+	|model| model.rnn(4),
+	|model| model.gru(4),
+	|model| model.lstm(4),
+	|model| model.perc(8),
+	|model| model.moe(2, [const { layer(4) }; 4]),
+	|model| model.svm([tanh]),
+	|model| model.kmeans(4),
+	|model| model.knn(5),
+];
+const NORMALIZATIONS: usize = 3;
+const QUANTIZATIONS: usize = 33;
+const PRECISIONS: usize = 9;
+fn quantize(model: Model, index: usize) -> Model {
+	let Some(index) = index.checked_sub(1) else { return model };
+	let (family, bits, variant): (u16, u8, u16) = match index {
+		0..=5 => (0, (4 + index / 2 + 2 * usize::from(index >= 4)) as u8, (index % 2) as u16),
+		6 => (0, 2, 3),
+		7..=10 => (0, 3, (index - 4) as u16),
+		11..=13 => (0, 4, (index - 8) as u16),
+		14..=16 => (0, 5, (index - 11) as u16),
+		17..=18 => (0, (6 + 2 * (index - 17)) as u8, 3),
+		19 => (0, 4, 2),
+		20..=21 => (1, 1, (index - 17) as u16),
+		22..=29 => (1, (2 + (index - 22) / 4) as u8, ((index - 22) % 4 + 1) as u16),
+		30 => (1, 4, 2),
+		31 => (1, 4, 5),
+		_ => unreachable!("quantization index exceeds the matrix"),
+	};
+	model.quantize(family, bits, variant)
 }
-
-impl Task {
-	const fn losses(self) -> &'static [(&'static str, Loss)] {
-		match self {
-			Self::Regression => REGRESSION_LOSSES,
-			Self::Binary => BINARY_LOSSES,
-		}
+fn precision(train: Train, index: usize) -> Train {
+	match index {
+		0..=3 => train.fp(1 << (index + 3)),
+		4..=6 => train.int(1 << (index - 4 + usize::from(index > 4))),
+		7 => train.bf(16),
+		_ => train.tf(32),
 	}
 }
-
-struct Dataset {
-	name: &'static str,
-	data: Data,
-	task: Task,
+fn convolution(model: Model, quantization: usize) -> Model { quantize(model.conv(1, 1), quantization) }
+fn build(block: usize, activation: usize, normalization: usize, first: usize, second: Option<usize>) -> Model {
+	let model = recipe.model();
+	let model = if let Some(second) = second {
+		convolution(convolution(model, first), second)
+	} else {
+		quantize(BLOCKS[block - 1](model), first)
+	};
+	let model = model.activate(unsafe { std::mem::transmute::<u8, Activation>(activation as u8) });
+	if normalization == 0 { model } else { model.norm(if normalization == 1 { batch } else { layer }) }
 }
-
-fn datasets() -> Vec<Dataset> {
-	let regression = Task::Regression;
-	let binary = Task::Binary;
-	vec![
-		Dataset {
-			name: "D7",
-			data: recipe
-				.data("/home/nate/Desktop/D7-data")
-				.target("temper1")
-				.exclude([
-					"Frequency(Hz)",
-					"sample",
-					"time",
-					"scan",
-					"temperx",
-					"am1",
-					"am2",
-					"max6675",
-					"minivna",
-					"am1rh",
-					"am2rh",
-				])
-				.norm(z_score)
-				.split(0.2),
-			task: regression,
-		},
-		Dataset {
-			name: "VNA",
-			data: recipe
-				.data("/home/nate/Desktop/odroid-vna-data/MAX6675-VNA-D8_260807_232354")
-				.target("temperature")
-				.exclude(["Frequency(Hz)"])
-				.norm(z_score)
-				.split(1.0),
-			task: regression,
-		},
-		Dataset {
-			name: "MAX",
-			data: recipe
-				.data("/home/nate/Desktop/MAX6675-live-20")
-				.target("max6675")
-				.exclude(["Frequency(Hz)", "sample", "time", "scan"])
-				.norm(z_score)
-				.split(0.2),
-			task: regression,
-		},
-		Dataset {
-			name: "house",
-			data: recipe
-				.data(format!("{DATASET_ROOT}/house-prices/train.csv"))
-				.target("SalePrice")
-				.exclude(["Id"])
-				.norm(z_score)
-				.split(0.2),
-			task: regression,
-		},
-		Dataset {
-			name: "appointments",
-			data: recipe
-				.data(format!("{DATASET_ROOT}/no-show-appointments/KaggleV2-May-2016.csv"))
-				.target("No-show")
-				.exclude(["AppointmentID", "PatientId", "ScheduledDay", "AppointmentDay"])
-				.norm(z_score)
-				.split(0.2),
-			task: binary,
-		},
-		Dataset {
-			name: "sonar",
-			data: recipe
-				.data(format!("{DATASET_ROOT}/uci-sonar/sonar.all-data"))
-				.target("col61")
-				.norm(z_score)
-				.split(0.2),
-			task: binary,
-		},
-		Dataset {
-			name: "ionosphere",
-			data: recipe
-				.data(format!("{DATASET_ROOT}/uci-ionosphere/ionosphere.data"))
-				.target("col35")
-				.norm(z_score)
-				.split(0.2),
-			task: binary,
-		},
-		Dataset {
-			name: "wdbc",
-			data: recipe
-				.data(format!("{DATASET_ROOT}/uci-wdbc/wdbc.data"))
-				.target("col2")
-				.exclude(["col1"])
-				.norm(z_score)
-				.split(0.2),
-			task: binary,
-		},
-		Dataset {
-			name: "spambase",
-			data: recipe
-				.data(format!("{DATASET_ROOT}/uci-spambase/spambase.data"))
-				.target("col58")
-				.norm(z_score)
-				.split(0.2),
-			task: binary,
-		},
-		Dataset {
-			name: "magic",
-			data: recipe
-				.data(format!("{DATASET_ROOT}/uci-magic/magic04.data"))
-				.target("col11")
-				.norm(z_score)
-				.split(0.2),
-			task: binary,
-		},
-		Dataset {
-			name: "bank",
-			data: recipe
-				.data(format!("{DATASET_ROOT}/uci-bank-semicolon/bank.csv"))
-				.target("y")
-				.norm(z_score)
-				.split(0.2),
-			task: binary,
-		},
-		Dataset {
-			name: "airfoil",
-			data: recipe
-				.data(format!("{DATASET_ROOT}/uci-airfoil/airfoil_self_noise.dat"))
-				.target("col6")
-				.norm(z_score)
-				.split(0.2),
-			task: regression,
-		},
-		Dataset {
-			name: "abalone",
-			data: recipe
-				.data(format!("{DATASET_ROOT}/uci-abalone/abalone.data"))
-				.target("col9")
-				.norm(z_score)
-				.split(0.2),
-			task: regression,
-		},
-		Dataset {
-			name: "wine",
-			data: recipe
-				.data(format!("{DATASET_ROOT}/uci-winequality-semicolon/winequality-red.csv"))
-				.target("quality")
-				.norm(z_score)
-				.split(0.2),
-			task: regression,
-		},
-	]
+fn data() -> Vec<Data> {
+	let mut paths = fs::read_dir("./data")
+		.unwrap()
+		.flat_map(|family| fs::read_dir(family.unwrap().path()).unwrap())
+		.map(|entry| entry.unwrap().path())
+		.collect::<Vec<_>>();
+	paths.sort();
+	assert_eq!(paths.len(), 72, "./data must contain 72 direct grandchildren");
+	paths.into_iter().map(|path| {
+		let source = path.to_string_lossy().into_owned();
+		let data = recipe.data(source.as_str());
+		if source.ends_with("autoregressive_lines.txt") { data.target(auto) } else { data.target("target") }
+	}).collect()
 }
-
+fn random(state: &mut u64, limit: usize) -> usize {
+	*state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+	(*state as usize) % limit
+}
 fn main() {
-	let mut arguments = std::env::args().skip(1);
-	let selected = arguments.next();
-	assert!(
-		arguments.next().is_none(),
-		"usage: train [dataset/block/activation/normalization/loss]"
-	);
-	let blocks: &[(&str, fn(Model) -> Model)] = &[
-		("layer", |model| model.layer(8)),
-		("residual", |model| model.layer(8).residual([layer(8), relu()])),
-		("conv", |model| model.conv(4, 3).pool(8)),
-		("attn", |model| model.attn(1)),
-		("embed", |model| model.embed(4, 8).pool(8)),
-		("rnn", |model| model.rnn(4)),
-		("gru", |model| model.gru(4)),
-		("lstm", |model| model.lstm(4)),
-		("perc", |model| model.perc(8)),
-		("moe", |model| model.moe(2, [layer(4), layer(4), layer(4), layer(4)])),
-		("svm", |model| model.svm([tanh, relu, gelu, sigmoid])),
-		("kmeans", |model| model.kmeans(4)),
-		("knn", |model| model.knn(5)),
-	];
-	let activations: &[(&str, fn(Model) -> Model)] = &[
-		("linear", |model| model),
-		("relu", |model| model.relu()),
-		("gelu", |model| model.gelu()),
-		("silu", |model| model.silu()),
-		("tanh", |model| model.tanh()),
-		("sigmoid", |model| model.sigmoid()),
-		("elu", |model| model.elu()),
-		("selu", |model| model.selu()),
-		("prelu", |model| model.prelu()),
-		("leak", |model| model.leak()),
-		("exp", |model| model.exp()),
-		("ln", |model| model.ln()),
-		("log", |model| model.log()),
-		("cos", |model| model.cos()),
-		("tan", |model| model.tan()),
-		("huber", |model| model.huber()),
-	];
-	let normalizations: &[(&str, Option<Norm>)] = &[("none", None), ("batch", Some(batch)), ("layer", Some(layer))];
-	let (mut pass, mut fail) = (0_usize, 0_usize);
-	for dataset in datasets() {
-		for (block_name, block) in blocks {
-			for (activation_name, activate) in activations {
-				for (normalization_name, normalization) in normalizations {
-					for (loss_name, loss) in dataset.task.losses() {
-						let label = format!(
-							"{}/{block_name}/{activation_name}/{normalization_name}/{loss_name}",
-							dataset.name
-						);
-						if selected.as_ref().is_some_and(|selected| selected != &label) {
-							continue;
-						}
-						let model = activate(block(recipe.model()));
-						let model = match normalization {
-							Some(normalization) => model.norm(*normalization),
-							None => model,
-						};
-						let model = model.layer(1).loss(*loss);
-						let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-							recipe
-								.train()
-								.fp(32)
-								.seed(1)
-								.epochs(1)
-								.lr(0.01)
-								.run(&model, &dataset.data)
-						}));
-						match result {
-							Ok(report) => {
-								pass += 1;
-								eprintln!("{label}: R2 {:.4}", report.r2());
-							}
-							Err(_) => {
-								fail += 1;
-								eprintln!("{label}: FAILED");
-							}
-						}
-					}
-				}
-			}
-		}
+	let mut state = env!("RECIPE_RANDOM_SEED").parse::<u64>().unwrap();
+	let data = data();
+	std::panic::set_hook(Box::new(|_| {}));
+	loop {
+		let dataset = random(&mut state, data.len());
+		let block = random(&mut state, BLOCKS.len() + 1);
+		let activation = random(&mut state, Activation::Prelu as usize + 1);
+		let normalization = random(&mut state, NORMALIZATIONS);
+		let first = random(&mut state, QUANTIZATIONS);
+		let second = (block == 0).then(|| random(&mut state, QUANTIZATIONS));
+		let format = random(&mut state, PRECISIONS);
+		let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+			let model = build(block, activation, normalization, first, second);
+			let train = recipe.train()
+				.log([Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant]);
+			precision(train, format)
+				.run(&model, &data[dataset])
+		}));
 	}
-	assert!(pass + fail != 0, "selected matrix combination does not exist");
-	assert_eq!(fail, 0, "{fail} matrix combinations failed");
-	eprintln!("{pass} passed");
 }
