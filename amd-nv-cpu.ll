@@ -751,7 +751,7 @@ store atomic i32 1, ptr addrspace(1) %context monotonic, align 4 br label %store
 store double %result, ptr addrspace(1) %output.ptr, align 8 ret void } define internal void @embedding_reverse_body(
 ptr addrspace(1) %input, ptr addrspace(1) %delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.previous,
 i32 %rows, i32 %tokens, i32 %dimensions, i32 %vocabulary, i32 %offset, i32 %threads ) #1 { entry:
-%tid = call i32 @llvm.amdgcn.workitem.id.x() %parameters = mul i32 %dimensions, %vocabulary br label %parameter.loop
+%tid = call i32 @llvm.amdgcn.workitem.id.x() %parameters = mul i32 %dimensions, %vocabulary %output.row.width = mul i32 %tokens, %dimensions br label %parameter.loop
 parameter.loop: %p = phi i32 [ %tid, %entry ], [ %next, %store ] %more = icmp ult i32 %p, %parameters
 br i1 %more, label %row.loop, label %input.test row.loop:
 %row = phi i32 [ 0, %parameter.loop ], [ %row.next, %token.loop.done ]
@@ -764,7 +764,7 @@ br i1 %token.more, label %token.step, label %token.loop.done token.step: %input.
 %input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %input.index
 %input.value = load double, ptr addrspace(1) %input.ptr, align 8
 %index = call i32 @embedding_index(double %input.value, i32 %vocabulary) %expected = udiv i32 %p, %dimensions
-%matched = icmp eq i32 %index, %expected %component = urem i32 %p, %dimensions %output.row.base = mul i32 %row, %tokens
+%matched = icmp eq i32 %index, %expected %component = urem i32 %p, %dimensions %output.row.base = mul i32 %row, %output.row.width
 %output.channel.base = mul i32 %component, %tokens %output.local = add i32 %output.channel.base, %token
 %output.index = add i32 %output.row.base, %output.local
 %delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %output.index
