@@ -5735,7 +5735,7 @@ impl Train {
 			let cases = self.finish_dispatch(proposed, &mut stored, &prepared.schema, &tape, None)?;
 			tape.advance()?;
 			let epoch = tape.step as usize;
-			let ((loss, saved, predictions), seconds, live) = self.live_epoch(model, run, epoch, config, || {
+			let ((loss, saved, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, || {
 				let dispatched = tape.epoch(self.learning_rate, model.loss, tolerance, config);
 				let (loss, saved) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
 				if saved { stored.bn_stats = tape.shards[0].tape.extract_bn_stats()? }
@@ -5744,7 +5744,7 @@ impl Train {
 				if !INTERRUPTED.load(Ordering::Acquire) { self.finish_dispatch(runtime.learn(&cases, &tape, config), &mut stored, &prepared.schema, &tape, None)? }; self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, None)?;
 				Ok((loss, saved, predictions))
 			})?;
-			self.print(model, run, epoch, loss, targets, &predictions, seconds, saved, live)?; if INTERRUPTED.load(Ordering::Acquire) { std::process::exit(INTERRUPTED_EXIT) }
+			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, saved, live)?; if INTERRUPTED.load(Ordering::Acquire) { std::process::exit(INTERRUPTED_EXIT) }
 		}
 		if self.stop.is_some() {
 			tape.restore_best()?;
@@ -5809,17 +5809,17 @@ impl Train {
 		}
 		result
 	}
-	fn print(&self, model: &Model, run: u64, epoch: usize, loss: f64, targets: &[f64], predictions: &[f64], seconds: f64, checkpoint: bool, live: bool) -> Result<()> { if self.log_metrics.is_empty() { Ok(()) } else { Self::write_progress(&Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), &self.log_metrics, Metrics { run, epoch, loss: Some(loss), r2: Some(coefficient(targets, predictions)), seconds, checkpoint }), live, true) } }
-	fn print_evaluation(&self, model: &Model, report: &TrainingReport) { let defaults = [Loss, R2]; let metrics = if self.log_metrics.is_empty() { &defaults[..] } else { &self.log_metrics }; Self::write_progress(&Self::metric_line(model.loss.name(), &model.description(metrics), metrics, Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: false }), false, true).unwrap_or_else(|error| panic!("{error}")) }
-	fn metric_line(loss: &str, topology: &str, metrics: &[Metric], measurement: Metrics) -> String {
+	fn print(&self, model: &Model, run: u64, epoch: usize, epochs: usize, loss: f64, targets: &[f64], predictions: &[f64], seconds: f64, checkpoint: bool, live: bool) -> Result<()> { if self.log_metrics.is_empty() { Ok(()) } else { Self::write_progress(&Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), &self.log_metrics, epochs, Metrics { run, epoch, loss: Some(loss), r2: Some(coefficient(targets, predictions)), seconds, checkpoint }), live, true) } }
+	fn print_evaluation(&self, model: &Model, report: &TrainingReport) { let defaults = [Loss, R2]; let metrics = if self.log_metrics.is_empty() { &defaults[..] } else { &self.log_metrics }; Self::write_progress(&Self::metric_line(model.loss.name(), &model.description(metrics), metrics, self.epochs, Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: false }), false, true).unwrap_or_else(|error| panic!("{error}")) }
+	fn metric_line(loss: &str, topology: &str, metrics: &[Metric], epochs: usize, measurement: Metrics) -> String {
 		let time = measurement.seconds * 1000.0; let mut values = Vec::new(); let mut topology_printed = false;
 		for metric in metrics {
 			let value = match metric.0 {
-				0 => format!("run \x1b[38\x3b2\x3b242\x3b40\x3b60m{:>5}\x1b[0m", measurement.run),
+				0 => format!("run \x1b[38\x3b2\x3b242\x3b40\x3b60m{}\x1b[0m", measurement.run),
 				1 => format!("{loss} \x1b[38\x3b2\x3b0\x3b174\x3b107m{}\x1b[0m", measurement.loss.map_or_else(|| format!("{:>6}", "..."), |value| format!("{value:.4}"))),
 				2 => format!("r2 \x1b[38\x3b2\x3b39\x3b125\x3b255m{}\x1b[0m", measurement.r2.map_or_else(|| format!("{:>7}", "..."), |value| format!("{value:>7.4}"))),
-				3 => if measurement.seconds < 1.0 { format!("time \x1b[38\x3b2\x3b255\x3b194\x3b0m{time:>9.3} ms\x1b[0m") } else { format!("time \x1b[38\x3b2\x3b255\x3b194\x3b0m{:>10.4} s\x1b[0m", measurement.seconds) },
-				4 => format!("epoch \x1b[38\x3b2\x3b135\x3b90\x3b251m{}\x1b[0m", measurement.epoch),
+				3 => if measurement.seconds < 1.0 { format!("time \x1b[38\x3b2\x3b255\x3b194\x3b0m{time:>7.3} ms\x1b[0m") } else { format!("time \x1b[38\x3b2\x3b255\x3b194\x3b0m{:>8.4} s\x1b[0m", measurement.seconds) },
+				4 => format!("epoch \x1b[38\x3b2\x3b135\x3b90\x3b251m{:>width$}\x1b[0m", measurement.epoch, width = epochs.max(1).ilog10() as usize + 1),
 				5..=7 | 9 if !topology_printed && !topology.is_empty() => { topology_printed = true; topology.to_owned() }
 				5..=7 | 9 => continue,
 				8 => continue,
@@ -5836,16 +5836,16 @@ impl Train {
 		let mut output = std::io::stderr().lock();
 		output.write_all(frame.as_bytes()).and_then(|_| output.flush()).map_err(|error| RecipeError::new(format!("cannot write epoch progress: {error}")))
 	}
-	fn live_epoch<T>(&self, model: &Model, run: u64, epoch: usize, config: Config, action: impl FnOnce() -> Result<T>) -> Result<(T, f64, bool)> {
+	fn live_epoch<T>(&self, model: &Model, run: u64, epoch: usize, epochs: usize, config: Config, action: impl FnOnce() -> Result<T>) -> Result<(T, f64, bool)> {
 		let started = Instant::now(); let partial = Metrics { run, epoch, loss: None, r2: None, seconds: 0.0, checkpoint: false };
-		let line = Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), &self.log_metrics, partial);
+		let line = Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), &self.log_metrics, epochs, partial);
 		let live = !line.is_empty() && std::io::stderr().is_terminal();
 		if !live { return action().map(|value| (value, started.elapsed().as_secs_f64(), false)) }
 		Self::write_progress(&line, false, false)?;
 		let (stop, wait) = std::sync::mpsc::channel(); let (metrics, loss, topology) = (self.log_metrics.clone(), model.loss.name(), model.description(&self.log_metrics));
 		let updates = std::thread::spawn(move || -> Result<bool> { let mut row = false; loop { match wait.recv_timeout(Duration::from_secs(1).div_f64(config.progress_refresh_hz as f64)) {
-			Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { if INTERRUPTED.load(Ordering::Acquire) && !row { Self::write_progress(&Self::metric_line(loss, &topology, &metrics, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), false, false)? }; return Ok(row || INTERRUPTED.load(Ordering::Acquire)) },
-			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { let interrupted = INTERRUPTED.load(Ordering::Acquire); Self::write_progress(&Self::metric_line(loss, &topology, &metrics, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), row || !interrupted, false)?; row |= interrupted },
+			Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { if INTERRUPTED.load(Ordering::Acquire) && !row { Self::write_progress(&Self::metric_line(loss, &topology, &metrics, epochs, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), false, false)? }; return Ok(row || INTERRUPTED.load(Ordering::Acquire)) },
+			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { let interrupted = INTERRUPTED.load(Ordering::Acquire); Self::write_progress(&Self::metric_line(loss, &topology, &metrics, epochs, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), row || !interrupted, false)?; row |= interrupted },
 		} } });
 		let result = action(); let _ = stop.send(()); updates.join().map_err(|_| RecipeError::new("epoch progress panicked"))??;
 		let value = match result { Ok(value) => value, Err(error) => { let _ = Self::write_progress("", true, false); return Err(error) } };
@@ -6159,7 +6159,7 @@ fn train_rat(state: &mut State, train: &Train, predictor: &Model, measurement: &
 	for _ in 0..train.epochs {
 		state.tape.advance()?;
 		let epoch = state.tape.step as usize;
-		let ((loss, predictions), seconds, live) = train.live_epoch(predictor, run, epoch, config, || {
+		let ((loss, predictions), seconds, live) = train.live_epoch(predictor, run, epoch, train.epochs, config, || {
 			state.tape.write_targets(measurement)?;
 			state.tape.trainable(&state.stored.graph, predictor_range)?;
 			let (loss, _) = state.tape.epoch(train.learning_rate, predictor.loss, 0.0, config)?;
@@ -6169,7 +6169,7 @@ fn train_rat(state: &mut State, train: &Train, predictor: &Model, measurement: &
 			state.tape.epoch(train.learning_rate, mse, 0.0, config)?;
 			Ok((loss, predictions))
 		})?;
-		train.print(predictor, run, epoch, loss, &state.targets, &predictions, seconds, false, live)?;
+		train.print(predictor, run, epoch, train.epochs, loss, &state.targets, &predictions, seconds, false, live)?;
 		current = predictions;
 	}
 	state.tape.write_targets(measurement)?;
