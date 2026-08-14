@@ -1726,6 +1726,7 @@ pub const atvn: Metric = Metric(6);
 pub const norm: Metric = Metric(7);
 pub const tok: Metric = Metric(8);
 pub const quant: Metric = Metric(9);
+pub const all: [Metric; 9] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant];
 pub const z_score: ZScore = ZScore;
 pub const batch: Normalization = batch_marker;
 const fn batch_marker(_: usize) -> Residual { Residual::Activation(Activation::Relu) }
