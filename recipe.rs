@@ -2662,9 +2662,9 @@ impl GpuTape {
 		let values = self.values.last().ok_or_else(|| RecipeError::new("GPU tape is empty"))?.download_float(self.rows as usize * self.output, self.precision)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.gpu.name)).map(|_| values)
 	}
-	fn launch_epoch(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool, phase: EpochPhase) -> Result<()> {
+	fn launch_epoch(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, phase: EpochPhase) -> Result<()> {
 		for &(node, _) in &self.batch_normalizations { self.descriptors.write(node * NODE_DESCRIPTOR_FIELDS + NODE_STRUCTURE_OFFSET, &[BATCH_NORMALIZATION_TRAINING])? }
-		let mut loss = if direct { 7 } else { loss.0 as u32 };
+		let mut loss = loss.0 as u32;
 		let mut huber_threshold = config.activation[7];
 		require(self.step != 0, "optimizer epoch is absent")?;
 		let (mut step, mut rate, mut beta1, mut beta2, mut epsilon, mut decay, mut tolerance) = (self.step, rate, self.precision.optimizer_beta(config.beta1), self.precision.optimizer_beta(config.beta2), self.precision.optimizer_epsilon(config.epsilon), config.decay, tolerance);
@@ -2680,13 +2680,13 @@ impl GpuTape {
 		self.gpu.launch(dispatch, &mut call, self.threads, self.tile).map_err(|error| RecipeError::new(format!("{operation}: {error}")))?;
 		self.gather_error(operation)
 	}
-	fn epoch(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool) -> Result<(f64, bool)> {
-		self.launch_epoch(rate, loss, tolerance, config, direct, EpochPhase::Full)?;
+	fn epoch(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config) -> Result<(f64, bool)> {
+		self.launch_epoch(rate, loss, tolerance, config, EpochPhase::Full)?;
 		let metrics = self.metrics.download_float(3, self.precision)?;
 		Ok((metrics[0], metrics[1] != 0.0))
 	}
-	fn gradient(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool) -> Result<()> { self.launch_epoch(rate, loss, tolerance, config, direct, EpochPhase::Gradient) }
-	fn update(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool) -> Result<()> { self.launch_epoch(rate, loss, tolerance, config, direct, EpochPhase::Optimizer) }
+	fn gradient(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config) -> Result<()> { self.launch_epoch(rate, loss, tolerance, config, EpochPhase::Gradient) }
+	fn update(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config) -> Result<()> { self.launch_epoch(rate, loss, tolerance, config, EpochPhase::Optimizer) }
 	fn advance(&mut self) -> Result<()> {
 		self.step = self.step.checked_add(1).ok_or_else(|| RecipeError::new("optimizer epoch overflows"))?;
 		Ok(())
@@ -2920,15 +2920,15 @@ impl DeviceTape {
 		}
 		Ok(trigger)
 	}
-	fn epoch(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config, direct: bool) -> Result<(f64, bool)> {
+	fn epoch(&mut self, rate: f64, loss: LossFunction, tolerance: f64, config: Config) -> Result<(f64, bool)> {
 		if self.shards.len() == 1 {
-			let (objective, saved) = self.shards[0].tape.epoch(rate, loss, tolerance, config, direct)?;
-			let observed = if direct { false } else { self.observe(objective, tolerance, false)? };
+			let (objective, saved) = self.shards[0].tape.epoch(rate, loss, tolerance, config)?;
+			let observed = self.observe(objective, tolerance, false)?;
 			require(saved == observed, "device checkpoint decision differs from its reported loss")?;
 			return Ok((objective, saved));
 		}
 		let gradients = self.map(|tape| {
-			tape.gradient(rate, loss, tolerance, config, direct)?;
+			tape.gradient(rate, loss, tolerance, config)?;
 			tape.gradient_values()
 		})?;
 		let mut gradient = vec![0.0; self.shards[0].tape.parameters as usize];
@@ -2937,11 +2937,11 @@ impl DeviceTape {
 				*total += value * shard.share;
 			}
 		}
-		let objective = if direct { 0.0 } else { model_loss(&self.predictions()?, &self.targets, loss, config.activation[7]) };
-		let saved = if direct { false } else { self.observe(objective, tolerance, true)? };
+		let objective = model_loss(&self.predictions()?, &self.targets, loss, config.activation[7]);
+		let saved = self.observe(objective, tolerance, true)?;
 		self.map(|tape| {
 			tape.write_gradient(&gradient)?;
-			tape.update(rate, loss, tolerance, config, direct)
+			tape.update(rate, loss, tolerance, config)
 		})?;
 		Ok((objective, saved))
 	}
@@ -4289,7 +4289,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	let mut tape = GpuTape::new(&graph, samples, targets, gpu, config.precision)?;
 	for _ in 0..config.surrogate_epochs {
 		tape.advance()?;
-		tape.epoch(config.surrogate_rate, mse, 0.0, config, false)?;
+		tape.epoch(config.surrogate_rate, mse, 0.0, config)?;
 	}
 	tape.capture(&mut graph)?;
 	graph.frozen.fill(1);
@@ -5732,10 +5732,9 @@ impl Train {
 			let proposed = runtime.propose(&stored.graph, &mut tape);
 			let cases = self.finish_dispatch(proposed, &mut stored, &prepared.schema, &tape, None)?;
 			tape.advance()?;
-			let direct = selected.len() == 1;
 			let epoch = tape.step as usize;
 			let ((loss, saved, predictions), seconds, live) = self.live_epoch(model, run, epoch, config, || {
-				let dispatched = tape.epoch(self.learning_rate, model.loss, tolerance, config, direct);
+				let dispatched = tape.epoch(self.learning_rate, model.loss, tolerance, config);
 				let (loss, saved) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
 				if saved { stored.bn_stats = tape.shards[0].tape.extract_bn_stats()? }
 				self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, saved.then_some(true))?;
@@ -6163,11 +6162,11 @@ fn train_rat(state: &mut State, train: &Train, predictor: &Model, measurement: &
 		let ((loss, predictions), seconds, live) = train.live_epoch(predictor, run, epoch, config, || {
 			state.tape.write_targets(measurement)?;
 			state.tape.trainable(&state.stored.graph, predictor_range)?;
-			let (loss, _) = state.tape.epoch(train.learning_rate, predictor.loss, 0.0, config, false)?;
+			let (loss, _) = state.tape.epoch(train.learning_rate, predictor.loss, 0.0, config)?;
 			let predictions = state.tape.predictions()?;
 			state.tape.trainable(&state.stored.graph, proposer_range)?;
 			state.tape.write_targets(&objective)?;
-			state.tape.epoch(train.learning_rate, mse, 0.0, config, false)?;
+			state.tape.epoch(train.learning_rate, mse, 0.0, config)?;
 			Ok((loss, predictions))
 		})?;
 		train.print(predictor, run, epoch, loss, &state.targets, &predictions, seconds, false, live)?;

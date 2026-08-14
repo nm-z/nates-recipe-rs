@@ -1927,13 +1927,10 @@ ptr addrspace(1) %timings, ptr addrspace(1) %tiles ) call void @llvm.amdgcn.s.ba
 %input.channels = load i32, ptr addrspace(1) %input.channels.ptr, align 4
 %input.length = load i32, ptr addrspace(1) %input.length.ptr, align 4
 %input.elements = mul i32 %input.channels, %input.length %input.items = mul i32 %rows, %input.elements
-%direct = icmp eq i32 %loss.code, 7 %leader = icmp eq i32 %tid, 0
+%leader = icmp eq i32 %tid, 0
 br i1 %leader, label %objective.test, label %loss.done objective.test:
-br i1 %direct, label %direct.loss, label %loss.loop direct.loss: store double 0.0, ptr addrspace(1) %metrics, align 8
-%direct.trigger.ptr = getelementptr inbounds double, ptr addrspace(1) %metrics, i32 1
-%direct.better.ptr = getelementptr inbounds double, ptr addrspace(1) %metrics, i32 2
-store double 0.0, ptr addrspace(1) %direct.trigger.ptr, align 8
-store double 0.0, ptr addrspace(1) %direct.better.ptr, align 8 br label %loss.done loss.loop:
+br label %loss.loop
+loss.loop:
 %loss.p = phi i32 [ 0, %objective.test ], [ %loss.next, %loss.step ]
 %loss.sum = phi double [ 0.0, %objective.test ], [ %loss.sum.next, %loss.step ]
 %loss.more = icmp ult i32 %loss.p, %items br i1 %loss.more, label %loss.step, label %loss.store loss.step:
@@ -2034,12 +2031,11 @@ br i1 %seed.more, label %seed.step, label %reverse.entry seed.step:
 %seed.loss = load double, ptr addrspace(1) %metrics, align 8
 %seed.loss.value = call double @loss_gradient( double %seed.prediction, double %seed.target, i32 %loss.code,
 double %huber.threshold, double %seed.loss, i32 %items )
-%seed.value = select i1 %direct, double %seed.target, double %seed.loss.value
 %last.adjoint.slot = getelementptr inbounds i64, ptr addrspace(1) %adjoint.pointers, i32 %last
 %last.adjoint.address = load i64, ptr addrspace(1) %last.adjoint.slot, align 8
 %last.adjoint = inttoptr i64 %last.adjoint.address to ptr addrspace(1)
 %seed.ptr = getelementptr inbounds double, ptr addrspace(1) %last.adjoint, i32 %seed.p
-store double %seed.value, ptr addrspace(1) %seed.ptr, align 8 %seed.next = add i32 %seed.p, %threads br label %seed.loop
+store double %seed.loss.value, ptr addrspace(1) %seed.ptr, align 8 %seed.next = add i32 %seed.p, %threads br label %seed.loop
 reverse.entry: call void @llvm.amdgcn.s.barrier() %reverse.first = sub i32 %nodes, 1 br label %reverse.loop
 reverse.loop: %node = phi i32 [ %reverse.first, %reverse.entry ], [ %node.next, %node.done ]
 %node.more = icmp sge i32 %node, 0 br i1 %node.more, label %node.load, label %backward.done backward.done:
