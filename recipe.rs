@@ -406,7 +406,7 @@ use std::{
 		Mutex, OnceLock,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
-	time::Instant,
+	time::{Duration, Instant},
 };
 pub static recipe: Recipe = Recipe;
 static RUN: AtomicU64 = AtomicU64::new(0);
@@ -2493,13 +2493,14 @@ struct Config {
 	epsilon: f64,
 	decay: f64,
 	rat_batch: usize,
+	progress_refresh_hz: usize,
 	vram_unit: usize,
 	random_seed: usize,
 	activation: [f64; 8],
 	precision: Compute,
 }
 impl Config {
-	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, rat_batch: natural("RAT batch rows", env!("RECIPE_RAT_BATCH_ROWS"))?, vram_unit: natural("tile VRAM unit bytes", env!("RECIPE_TILE_VRAM_UNIT_BYTES"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
+	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, rat_batch: natural("RAT batch rows", env!("RECIPE_RAT_BATCH_ROWS"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, vram_unit: natural("tile VRAM unit bytes", env!("RECIPE_TILE_VRAM_UNIT_BYTES"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
 }
 fn number(name: &str, text: &str) -> Result<f64> {
 	let value = text.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))?;
@@ -5733,7 +5734,7 @@ impl Train {
 			tape.advance()?;
 			let direct = selected.len() == 1;
 			let epoch = tape.step as usize;
-			let ((loss, saved, predictions), seconds, live) = self.live_epoch(model, run, epoch, || {
+			let ((loss, saved, predictions), seconds, live) = self.live_epoch(model, run, epoch, config, || {
 				let dispatched = tape.epoch(self.learning_rate, model.loss, tolerance, config, direct);
 				let (loss, saved) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
 				if saved { stored.bn_stats = tape.shards[0].tape.extract_bn_stats()? }
@@ -5836,16 +5837,16 @@ impl Train {
 		let mut output = std::io::stderr().lock();
 		output.write_all(frame.as_bytes()).and_then(|_| output.flush()).map_err(|error| RecipeError::new(format!("cannot write epoch progress: {error}")))
 	}
-	fn live_epoch<T>(&self, model: &Model, run: u64, epoch: usize, action: impl FnOnce() -> Result<T>) -> Result<(T, f64, bool)> {
+	fn live_epoch<T>(&self, model: &Model, run: u64, epoch: usize, config: Config, action: impl FnOnce() -> Result<T>) -> Result<(T, f64, bool)> {
 		let started = Instant::now(); let partial = Metrics { run, epoch, loss: None, r2: None, seconds: 0.0, checkpoint: false };
 		let line = Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), &self.log_metrics, partial);
 		let live = !line.is_empty() && std::io::stderr().is_terminal();
 		if !live { return action().map(|value| (value, started.elapsed().as_secs_f64(), false)) }
 		Self::write_progress(&line, false, false)?;
 		let (stop, wait) = std::sync::mpsc::channel(); let (metrics, loss, topology) = (self.log_metrics.clone(), model.loss.name(), model.description(&self.log_metrics));
-		let updates = std::thread::spawn(move || -> Result<()> { loop { match wait.try_recv() {
-			Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(()),
-			Err(std::sync::mpsc::TryRecvError::Empty) => Self::write_progress(&Self::metric_line(loss, &topology, &metrics, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), true, false)?,
+		let updates = std::thread::spawn(move || -> Result<()> { loop { match wait.recv_timeout(Duration::from_secs(1).div_f64(config.progress_refresh_hz as f64)) {
+			Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Self::write_progress(&Self::metric_line(loss, &topology, &metrics, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), true, false)?,
 		} } });
 		let result = action(); let _ = stop.send(()); let updated = updates.join().map_err(|_| RecipeError::new("epoch progress panicked"))?; if INTERRUPTED.load(Ordering::Acquire) { let _ = Self::write_progress("", true, false); std::process::exit(INTERRUPTED_EXIT) }
 		let value = match result { Ok(value) => value, Err(error) => { let _ = Self::write_progress("", true, false); return Err(error) } };
@@ -6159,7 +6160,7 @@ fn train_rat(state: &mut State, train: &Train, predictor: &Model, measurement: &
 	for _ in 0..train.epochs {
 		state.tape.advance()?;
 		let epoch = state.tape.step as usize;
-		let ((loss, predictions), seconds, live) = train.live_epoch(predictor, run, epoch, || {
+		let ((loss, predictions), seconds, live) = train.live_epoch(predictor, run, epoch, config, || {
 			state.tape.write_targets(measurement)?;
 			state.tape.trainable(&state.stored.graph, predictor_range)?;
 			let (loss, _) = state.tape.epoch(train.learning_rate, predictor.loss, 0.0, config, false)?;
