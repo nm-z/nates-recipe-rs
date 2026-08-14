@@ -2863,7 +2863,7 @@ impl DeviceTape {
 		let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 		for shard in &self.shards {
 			let gpu = shard.tape.gpu;
-			eprintln!("{}", device_name(gpu, host.trim()));
+			eprintln!("{}.{}", device_name(gpu, host.trim()), shard.tape.precision.label());
 		}
 		Ok(())
 	}
@@ -5587,10 +5587,10 @@ impl Compute {
 	fn label(self) -> String {
 		match self {
 			Self::F(value) => format!("f({},{})", value.arithmetic.exp, value.arithmetic.man),
-			Self::Fp(value) => format!("fp({})", value.storage.bits()),
-			Self::Int(value) => format!("int({})", value.bits),
-			Self::Bf(value) => format!("bf({})", value.storage.bits()),
-			Self::Tf(value) => format!("tf({})", value.storage.bits()),
+			Self::Fp(value) => format!("fp{}", value.storage.bits()),
+			Self::Int(value) => format!("int{}", value.bits),
+			Self::Bf(value) => format!("bf{}", value.storage.bits()),
+			Self::Tf(value) => format!("tf{}", value.storage.bits()),
 		}
 	}
 }
