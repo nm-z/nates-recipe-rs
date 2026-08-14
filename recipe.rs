@@ -1,6 +1,8 @@
 //! Recipe executes one model graph after automatically probing a compiled discrete GPU backend.
 //! Attention is three-projection scaled Q/K/V without an output projection.
 #![allow(non_upper_case_globals)]
+mod native;
+mod program_ir;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FloatLayout {
 	sign: u8,
@@ -3438,9 +3440,9 @@ fn kernel_spec(index: usize) -> Result<KernelSpec> {
 			epoch_layout: EPOCH_ARGS,
 			cpu: [cpu_forward_dispatch::<f64>, cpu_epoch_dispatch::<f64>],
 			#[cfg(amd)]
-			hsa: HSA_CODE_OBJECTS,
+			hsa: &[],
 			#[cfg(nvidia)]
-			ptx: include_bytes!(env!("RECIPE_NV_PTX")),
+			ptx: &[],
 		},
 		1 => KernelSpec {
 			suffix: "_f32",
@@ -3448,9 +3450,9 @@ fn kernel_spec(index: usize) -> Result<KernelSpec> {
 			epoch_layout: EPOCH_F32_ARGS,
 			cpu: [cpu_forward_dispatch::<f32>, cpu_epoch_dispatch::<f32>],
 			#[cfg(amd)]
-			hsa: HSA_F32_CODE_OBJECTS,
+			hsa: &[],
 			#[cfg(nvidia)]
-			ptx: include_bytes!(env!("RECIPE_NV_F32_PTX")),
+			ptx: &[],
 		},
 		2 => KernelSpec {
 			suffix: "_f16",
@@ -3458,9 +3460,9 @@ fn kernel_spec(index: usize) -> Result<KernelSpec> {
 			epoch_layout: EPOCH_F16_ARGS,
 			cpu: [cpu_forward_dispatch::<CpuF16>, cpu_epoch_dispatch::<CpuF16>],
 			#[cfg(amd)]
-			hsa: HSA_F16_CODE_OBJECTS,
+			hsa: &[],
 			#[cfg(nvidia)]
-			ptx: include_bytes!(env!("RECIPE_NV_F16_PTX")),
+			ptx: &[],
 		},
 		3 => KernelSpec {
 			suffix: "_f8",
@@ -3468,9 +3470,9 @@ fn kernel_spec(index: usize) -> Result<KernelSpec> {
 			epoch_layout: EPOCH_F8_ARGS,
 			cpu: [cpu_forward_dispatch::<CpuF8>, cpu_epoch_dispatch::<CpuF8>],
 			#[cfg(amd)]
-			hsa: HSA_F8_CODE_OBJECTS,
+			hsa: &[],
 			#[cfg(nvidia)]
-			ptx: include_bytes!(env!("RECIPE_NV_F8_PTX")),
+			ptx: &[],
 		},
 		4 => KernelSpec {
 			suffix: "_bf16",
@@ -3478,9 +3480,9 @@ fn kernel_spec(index: usize) -> Result<KernelSpec> {
 			epoch_layout: EPOCH_F16_ARGS,
 			cpu: [cpu_forward_dispatch::<CpuBf16>, cpu_epoch_dispatch::<CpuBf16>],
 			#[cfg(amd)]
-			hsa: HSA_BF16_CODE_OBJECTS,
+			hsa: &[],
 			#[cfg(nvidia)]
-			ptx: include_bytes!(env!("RECIPE_NV_BF16_PTX")),
+			ptx: &[],
 		},
 		5 => KernelSpec {
 			suffix: "_tf32",
@@ -3488,9 +3490,9 @@ fn kernel_spec(index: usize) -> Result<KernelSpec> {
 			epoch_layout: EPOCH_F32_ARGS,
 			cpu: [cpu_forward_dispatch::<CpuTf32>, cpu_epoch_dispatch::<CpuTf32>],
 			#[cfg(amd)]
-			hsa: HSA_TF32_CODE_OBJECTS,
+			hsa: &[],
 			#[cfg(nvidia)]
-			ptx: include_bytes!(env!("RECIPE_NV_TF32_PTX")),
+			ptx: &[],
 		},
 		6 => KernelSpec {
 			suffix: "_int8",
@@ -3498,9 +3500,9 @@ fn kernel_spec(index: usize) -> Result<KernelSpec> {
 			epoch_layout: EPOCH_F8_ARGS,
 			cpu: [cpu_forward_dispatch::<CpuInt8>, cpu_epoch_dispatch::<CpuInt8>],
 			#[cfg(amd)]
-			hsa: HSA_INT8_CODE_OBJECTS,
+			hsa: &[],
 			#[cfg(nvidia)]
-			ptx: include_bytes!(env!("RECIPE_NV_INT8_PTX")),
+			ptx: &[],
 		},
 		7 => KernelSpec {
 			suffix: "_int4",
@@ -3508,9 +3510,9 @@ fn kernel_spec(index: usize) -> Result<KernelSpec> {
 			epoch_layout: EPOCH_F8_ARGS,
 			cpu: [cpu_forward_dispatch::<CpuInt4>, cpu_epoch_dispatch::<CpuInt4>],
 			#[cfg(amd)]
-			hsa: HSA_INT4_CODE_OBJECTS,
+			hsa: &[],
 			#[cfg(nvidia)]
-			ptx: include_bytes!(env!("RECIPE_NV_INT4_PTX")),
+			ptx: &[],
 		},
 		8 => KernelSpec {
 			suffix: "_int1",
@@ -3518,9 +3520,9 @@ fn kernel_spec(index: usize) -> Result<KernelSpec> {
 			epoch_layout: EPOCH_F8_ARGS,
 			cpu: [cpu_forward_dispatch::<CpuInt1>, cpu_epoch_dispatch::<CpuInt1>],
 			#[cfg(amd)]
-			hsa: HSA_INT1_CODE_OBJECTS,
+			hsa: &[],
 			#[cfg(nvidia)]
-			ptx: include_bytes!(env!("RECIPE_NV_INT1_PTX")),
+			ptx: &[],
 		},
 		9 => KernelSpec {
 			suffix: "_f",
@@ -3528,9 +3530,9 @@ fn kernel_spec(index: usize) -> Result<KernelSpec> {
 			epoch_layout: EPOCH_ARGS,
 			cpu: [cpu_forward_dispatch::<CpuF>, cpu_epoch_dispatch::<CpuF>],
 			#[cfg(amd)]
-			hsa: HSA_F_CODE_OBJECTS,
+			hsa: &[],
 			#[cfg(nvidia)]
-			ptx: include_bytes!(env!("RECIPE_NV_F_PTX")),
+			ptx: &[],
 		},
 		_ => return Err(RecipeError::new("numeric format kernel is unavailable")),
 	};
@@ -4343,8 +4345,6 @@ unsafe fn hsa_kernel(symbol: HsaSymbol, info: HsaSymbolInfo, executable: u64, ag
 }
 #[cfg(amd)]
 fn kfd_property(text: &str, name: &str) -> Result<u32> { text.lines().find_map(|line| line.split_once(' ').filter(|value| value.0 == name)).ok_or_else(|| RecipeError::new(format!("KFD property {name:?} is absent")))?.1.parse::<u32>().map_err(|error| RecipeError::new(format!("KFD property {name:?} is invalid: {error}"))) }
-#[cfg(amd)]
-include!(concat!(env!("OUT_DIR"), "/hsa-embed.rs"));
 #[cfg(amd)]
 fn hsa_artifact(artifacts: &'static [(&str, &[u8])], target: &str) -> Result<&'static [u8]> { artifacts.iter().find_map(|entry| (entry.0 == target).then_some(entry.1)).ok_or_else(|| RecipeError::new(format!("HSA artifact for {target} is absent"))) }
 #[cfg(amd)]

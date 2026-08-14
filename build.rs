@@ -400,7 +400,7 @@ fn render(command: &mut Command, role: &str, path: &Path) -> BuildResult<()> {
 	fs::write(path, output.stdout)?;
 	Ok(())
 }
-fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+fn compile_amd_matrix(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, AMD_WIDTH);
 	let sources = [("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?), ("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?), ("-f16", encoded_ir(ir.clone(), "_f16", FloatFormat::FP16.bytes(), &float_codec("half", "i16"), |value| FloatFormat::FP16.pack(value))?), ("-f8", encoded_ir(ir.clone(), "_f8", FloatFormat::FP8.bytes(), fp8_codec(), |value| FloatFormat::FP8.pack(value))?), ("-bf16", encoded_ir(ir.clone(), "_bf16", FloatFormat::BF16.bytes(), bf16_codec(), |value| FloatFormat::BF16.pack(value))?), ("-tf32", native_ir(ir.clone(), "_tf32", "float", FloatFormat::TF32)?), ("-int8", encoded_ir(ir.clone(), "_int8", IntFormat::INT8.bytes(), &int_codec(IntFormat::INT8), |value| IntFormat::INT8.pack(value))?), ("-int4", encoded_ir(ir.clone(), "_int4", IntFormat::INT4.bytes(), &int_codec(IntFormat::INT4), |value| IntFormat::INT4.pack(value))?), ("-int1", encoded_ir(ir.clone(), "_int1", IntFormat::INT1.bytes(), &int_codec(IntFormat::INT1), |value| IntFormat::INT1.pack(value))?), ("-f", custom_ir(ir, "_f")?)]
 		.map(|(suffix, contents)| {
@@ -476,7 +476,7 @@ fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	println!("cargo:rustc-link-search=native={}", text(manifest, "hsa-library")?);
 	Ok(())
 }
-fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+fn compile_nvidia_matrix(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	let cuda = env::var_os("CUDA_PATH").map(PathBuf::from);
 	let gpu_architecture = text(manifest, "nvidia-minimum-architecture")?;
 	let architecture = format!("-march={gpu_architecture}");
@@ -505,7 +505,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	Ok(())
 }
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[("@contraction_tile = external addrspace(3) global [0 x double], align 8", "@contraction_tile = internal global [65536 x double] zeroinitializer, align 8"), (" addrspace(3)", ""), ("call i32 @llvm.amdgcn.workitem.id.x()", "add i32 0, 0"), ("call i32 @recipe.local.id.x()", "add i32 0, 0"), ("call i32 @recipe.group.id.x()", "add i32 0, 0"), ("call i32 @recipe.workgroup.size.x()", "add i32 1, 0"), ("call void @llvm.amdgcn.s.barrier()", ""), ("call void @recipe.local.barrier()", ""), ("call i64 @__ockl_steadyctr_u64()", "add i64 0, 0"), ("declare i32 @llvm.amdgcn.workitem.id.x()", ""), ("declare void @llvm.amdgcn.s.barrier()", ""), ("declare i64 @__ockl_steadyctr_u64()", ""), ("__ocml_exp_f64", "exp"), ("__ocml_tanh_f64", "tanh"), ("__ocml_cos_f64", "cos"), ("__ocml_sin_f64", "sin"), ("__ocml_log_f64", "log"), ("define protected amdgpu_kernel void @forward_graph(", "define void @recipe_forward_cpu("), ("define protected amdgpu_kernel void @tape_epoch_graph(", "define void @recipe_epoch_cpu("), ("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"1,1024\" }", "attributes #0 = { nounwind }")];
-fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+fn compile_cpu_matrix(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
 	let mut ir = fs::read_to_string("amd-nv-cpu.ll")?.replace("amdgcn-amd-amdhsa", &target);
 	for (pattern, replacement) in CPU_REPLACEMENTS {
@@ -536,6 +536,94 @@ fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("musl") {
 		println!("cargo:rustc-link-lib=m");
 	}
+	Ok(())
+}
+fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, AMD_WIDTH);
+	let sources = [
+		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
+		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
+		("-f16", encoded_ir(ir.clone(), "_f16", FloatFormat::FP16.bytes(), &float_codec("half", "i16"), |value| FloatFormat::FP16.pack(value))?),
+		("-f8", encoded_ir(ir.clone(), "_f8", FloatFormat::FP8.bytes(), fp8_codec(), |value| FloatFormat::FP8.pack(value))?),
+		("-bf16", encoded_ir(ir.clone(), "_bf16", FloatFormat::BF16.bytes(), bf16_codec(), |value| FloatFormat::BF16.pack(value))?),
+		("-tf32", native_ir(ir.clone(), "_tf32", "float", FloatFormat::TF32)?),
+		("-int8", encoded_ir(ir.clone(), "_int8", IntFormat::INT8.bytes(), &int_codec(IntFormat::INT8), |value| IntFormat::INT8.pack(value))?),
+		("-int4", encoded_ir(ir.clone(), "_int4", IntFormat::INT4.bytes(), &int_codec(IntFormat::INT4), |value| IntFormat::INT4.pack(value))?),
+		("-int1", encoded_ir(ir.clone(), "_int1", IntFormat::INT1.bytes(), &int_codec(IntFormat::INT1), |value| IntFormat::INT1.pack(value))?),
+		("-f", custom_ir(ir, "_f")?),
+	];
+	let mut values = Vec::new();
+	for (suffix, contents) in sources {
+		let path = out.join(format!("recipe-amd{suffix}.ll"));
+		fs::write(&path, contents)?;
+		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
+	}
+	println!("cargo:rustc-env=RECIPE_AMD_IR={}", values.join("\x3b"));
+	println!("cargo:rustc-env=RECIPE_HSA_COMPILER={}", text(manifest, "hsa-compiler")?);
+	for (key, environment) in [("hsa-device-library", "RECIPE_HSA_DEVICE_LIBRARY"), ("hsa-clock-library", "RECIPE_HSA_CLOCK_LIBRARY"), ("hsa-finite-library", "RECIPE_HSA_FINITE_LIBRARY"), ("hsa-math-library", "RECIPE_HSA_MATH_LIBRARY"), ("hsa-device-library-directory", "RECIPE_HSA_DEVICE_LIBRARY_DIRECTORY"), ("hsa-library", "RECIPE_HSA_LIBRARY")] {
+		println!("cargo:rustc-env={environment}={}", text(manifest, key)?);
+	}
+	Ok(())
+}
+fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, "declare i32 @recipe.workgroup.size.x()").replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda").replace("__ockl_steadyctr_u64", "llvm.nvvm.read.ptx.sreg.globaltimer").replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x").replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x").replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x").replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0").replace("__ocml_exp_f64", "__nv_exp").replace("__ocml_tanh_f64", "__nv_tanh").replace("__ocml_cos_f64", "__nv_cos").replace("__ocml_sin_f64", "__nv_sin").replace("__ocml_log_f64", "__nv_log").replace("define protected amdgpu_kernel", "define ptx_kernel").replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"1,1024\" }", "attributes #0 = { nounwind }");
+	let sources = [
+		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
+		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
+		("-f16", encoded_ir(ir.clone(), "_f16", FloatFormat::FP16.bytes(), &float_codec("half", "i16"), |value| FloatFormat::FP16.pack(value))?),
+		("-f8", encoded_ir(ir.clone(), "_f8", FloatFormat::FP8.bytes(), fp8_codec(), |value| FloatFormat::FP8.pack(value))?),
+		("-bf16", encoded_ir(ir.clone(), "_bf16", FloatFormat::BF16.bytes(), bf16_codec(), |value| FloatFormat::BF16.pack(value))?),
+		("-tf32", native_ir(ir.clone(), "_tf32", "float", FloatFormat::TF32)?),
+		("-int8", encoded_ir(ir.clone(), "_int8", IntFormat::INT8.bytes(), &int_codec(IntFormat::INT8), |value| IntFormat::INT8.pack(value))?),
+		("-int4", encoded_ir(ir.clone(), "_int4", IntFormat::INT4.bytes(), &int_codec(IntFormat::INT4), |value| IntFormat::INT4.pack(value))?),
+		("-int1", encoded_ir(ir.clone(), "_int1", IntFormat::INT1.bytes(), &int_codec(IntFormat::INT1), |value| IntFormat::INT1.pack(value))?),
+		("-f", custom_ir(ir, "_f")?),
+	];
+	let mut values = Vec::new();
+	for (suffix, contents) in sources {
+		let path = out.join(format!("recipe-nvidia{suffix}.ll"));
+		fs::write(&path, contents)?;
+		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
+	}
+	let cuda = env::var_os("CUDA_PATH").map(PathBuf::from);
+	let device = cuda.as_ref().map(|path| path.join("nvvm/libdevice/libdevice.10.bc")).filter(|path| path.exists()).unwrap_or_else(|| PathBuf::from(text(manifest, "nvidia-device-library").unwrap()));
+	println!("cargo:rustc-env=RECIPE_NV_IR={}", values.join("\x3b"));
+	println!("cargo:rustc-env=RECIPE_NV_COMPILER={}", text(manifest, "nvidia-compiler")?);
+	println!("cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}", device.display());
+	println!("cargo:rustc-env=RECIPE_NV_PTX_VERSION=+{}", text(manifest, "nvidia-ptx")?);
+	println!("cargo:rustc-env=RECIPE_NV_PTX_ASSEMBLER={}", cuda.map_or_else(|| "ptxas".to_owned(), |path| path.join("bin/ptxas").display().to_string()));
+	println!("cargo:rustc-env=RECIPE_NV_LIBRARY={}", text(manifest, "nvidia-library")?);
+	Ok(())
+}
+fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+	let target = env::var("TARGET")?;
+	let mut ir = fs::read_to_string("amd-nv-cpu.ll")?.replace("amdgcn-amd-amdhsa", &target);
+	for (pattern, replacement) in CPU_REPLACEMENTS {
+		ir = ir.replace(pattern, replacement);
+	}
+	let clang = ["nvidia-compiler", "hsa-compiler"].iter().filter_map(|key| text(manifest, key).ok()).find(|path| Path::new(path).exists()).unwrap_or("clang");
+	let sources = [
+		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
+		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
+		("-f16", encoded_ir(ir.clone(), "_f16", FloatFormat::FP16.bytes(), &float_codec("half", "i16"), |value| FloatFormat::FP16.pack(value))?),
+		("-f8", encoded_ir(ir.clone(), "_f8", FloatFormat::FP8.bytes(), fp8_codec(), |value| FloatFormat::FP8.pack(value))?),
+		("-bf16", encoded_ir(ir.clone(), "_bf16", FloatFormat::BF16.bytes(), bf16_codec(), |value| FloatFormat::BF16.pack(value))?),
+		("-tf32", native_ir(ir.clone(), "_tf32", "float", FloatFormat::TF32)?),
+		("-int8", encoded_ir(ir.clone(), "_int8", IntFormat::INT8.bytes(), &int_codec(IntFormat::INT8), |value| IntFormat::INT8.pack(value))?),
+		("-int4", encoded_ir(ir.clone(), "_int4", IntFormat::INT4.bytes(), &int_codec(IntFormat::INT4), |value| IntFormat::INT4.pack(value))?),
+		("-int1", encoded_ir(ir.clone(), "_int1", IntFormat::INT1.bytes(), &int_codec(IntFormat::INT1), |value| IntFormat::INT1.pack(value))?),
+		("-f", custom_ir(ir, "_f")?),
+	];
+	let mut values = Vec::new();
+	for (suffix, contents) in sources {
+		let contents = contents.replace(" addrspace(1)", "");
+		let path = out.join(format!("recipe-cpu{suffix}.ll"));
+		fs::write(&path, contents)?;
+		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
+	}
+	println!("cargo:rustc-env=RECIPE_CPU_IR={}", values.join("\x3b"));
+	println!("cargo:rustc-env=RECIPE_CPU_COMPILER={clang}");
+	println!("cargo:rustc-env=RECIPE_CPU_TARGET={target}");
 	Ok(())
 }
 fn main() -> BuildResult<()> {
