@@ -251,7 +251,7 @@ impl NativeModelIr {
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
 					let count = checked_mul(self.rows, node.output.elements(), "pool output count")?;
-						emit_fixed_loop(&mut ir, backend, index, "pool", count, |ir, p| {
+						emit_fixed_loop(&mut ir, index, "pool", count, |ir, p| {
 							ir.push_str(&format!("call void @pool_forward_body( {pointer} {source}, {pointer} {value}, {pointer} {context}, i32 {p}, i32 {from}, i32 {to}, i32 {size}, i32 {channels} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, p = p, from = node.input.elements(), to = node.output.elements(), size = size, channels = node.input.channels));
 					})?;
 					ir.push_str(barrier(backend));
@@ -259,7 +259,7 @@ impl NativeModelIr {
 				(false, Primitive::Gather) => {
 					let vocabulary = integer_argument(node.argument[0], "embedding vocabulary")?;
 					let count = checked_mul(self.rows, node.output.elements(), "embedding output count")?;
-						emit_fixed_loop(&mut ir, backend, index, "gather", count, |ir, p| {
+						emit_fixed_loop(&mut ir, index, "gather", count, |ir, p| {
 							ir.push_str(&format!("call void @embedding_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 {p}, i32 {from}, i32 {to}, i32 {vocabulary} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, p = p, from = node.input.elements(), to = node.output.elements(), vocabulary = vocabulary));
 					})?;
 					ir.push_str(barrier(backend));
@@ -286,7 +286,7 @@ impl NativeModelIr {
 					let code_end = node.program_offset.checked_add(node.program_count.checked_mul(3).ok_or_else(|| RecipeError::new("scalar program length overflows"))?).ok_or_else(|| RecipeError::new("scalar program range overflows"))?;
 					let code = self.graph.programs.get(node.program_offset..code_end).ok_or_else(|| RecipeError::new(format!("node {index} scalar program range is invalid")))?;
 					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, pointer_type: pointer, first: &first, second: &second, weights: &pointers.weights, parameter_base: "0", prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_fixed_loop(&mut ir, backend, index, "scalar", count, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "scalar", count, |ir, p| {
 						let first_pointer = format!("%{prefix}.first.ptr");
 						let second_pointer = format!("%{prefix}.second.ptr");
 						let output_pointer = format!("%{prefix}.output.ptr");
@@ -314,7 +314,7 @@ impl NativeModelIr {
 					let locals = usize::try_from(locals).map_err(|_| RecipeError::new("predictor locals exceed usize"))?;
 					let row = format!("%{prefix}.row");
 					let forward = program_ir::emit_predictor_forward(code, locals, program_ir::PredictorContext { value_type: ty, pointer_type: pointer, input: &pointers.source, row: &row, features: node.input.elements(), prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
-						emit_fixed_loop(&mut ir, backend, index, "predictor", count, |ir, p| {
+						emit_fixed_loop(&mut ir, index, "predictor", count, |ir, p| {
 							ir.push_str(&format!("{row} = udiv i32 {p}, {elements}\n", elements = node.output.elements()));
 							ir.push_str(&forward.code);
 							let output_pointer = format!("%{prefix}.output.ptr");
@@ -355,7 +355,7 @@ impl NativeModelIr {
 					let incoming = format!("%{prefix}.incoming");
 					let reverse = program_ir::emit_scalar_reverse(code, &forward, program_ir::ScalarContext { value_type: ty, pointer_type: pointer, first: &first, second: &second, weights: &pointers.weights, parameter_base: "0", prefix: &prefix, literal: &literal }, &incoming).map_err(|error| RecipeError::new(error.to_string()))?;
 					let gradients = reverse.parameter_adjoint.iter().map(|(&parameter, value)| Ok((checked_add(plan.node.offset, parameter, "scalar gradient offset")?, value.clone()))).collect::<Result<Vec<_>>>()?;
-						emit_fixed_loop(&mut ir, backend, index, "scalar.reverse", count, |ir, p| {
+						emit_fixed_loop(&mut ir, index, "scalar.reverse", count, |ir, p| {
 							let first_pointer = format!("%{prefix}.first.ptr");
 							let second_pointer = format!("%{prefix}.second.ptr");
 							let incoming_pointer = format!("%{prefix}.incoming.ptr");
@@ -390,7 +390,7 @@ impl NativeModelIr {
 					let field_refs = fields.iter().map(|(source, stride, field)| program_ir::RouteField { source, stride: *stride, index: *field }).collect::<Vec<_>>();
 					let row = format!("%{prefix}.row");
 					let fragment = program_ir::emit_route(&field_refs, program_ir::RouteContext { value_type: ty, pointer_type: pointer, row: &row, output: &pointers.value, prefix: &prefix }).map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_fixed_loop(&mut ir, backend, index, "route", count, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "route", count, |ir, p| {
 						ir.push_str(&format!("{row} = udiv i32 {p}, {width}\n", width = field_refs.len()));
 						ir.push_str(&fragment);
 					})?;
@@ -417,7 +417,7 @@ impl NativeModelIr {
 					let adjoint_refs = adjoint_sources.iter().map(String::as_str).collect::<Vec<_>>();
 					let row = format!("%{prefix}.row");
 					let fragment = program_ir::emit_route_reverse(&field_refs, &adjoint_refs, program_ir::RouteReverseContext { value_type: ty, pointer_type: pointer, row: &row, output_adjoint: &pointers.delta, prefix: &prefix }).map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_fixed_loop(&mut ir, backend, index, "route.reverse", count, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "route.reverse", count, |ir, p| {
 						ir.push_str(&format!("{row} = udiv i32 {p}, {width}\n", width = field_refs.len()));
 						ir.push_str(&fragment);
 					})?;
@@ -433,7 +433,7 @@ impl NativeModelIr {
 						ir.push_str(&self.emit_normalize_stats(backend, index, node, &pointers, mode)?);
 						ir.push_str(barrier(backend));
 					}
-					emit_fixed_loop(&mut ir, backend, index, "normalize", count, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "normalize", count, |ir, p| {
 						let source_pointer = format!("%{prefix}.source.ptr");
 						let source_value = format!("%{prefix}.source.value");
 						let row = format!("%{prefix}.row");
@@ -451,7 +451,7 @@ impl NativeModelIr {
 					let pointer = pointer_type(backend);
 					let ty = value_type(self.precision);
 					let prefix = format!("n{index}.normalize.reverse");
-					emit_fixed_loop(&mut ir, backend, index, "normalize.reverse", count, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "normalize.reverse", count, |ir, p| {
 						let delta_pointer = format!("%{prefix}.delta.ptr");
 						let delta_value = format!("%{prefix}.delta.value");
 						let output_pointer = format!("%{prefix}.output.ptr");
@@ -751,7 +751,7 @@ impl NativeModelIr {
 		}
 		ir.push_str(&format!("%metric.ptr = getelementptr {ty}, {pointer} %metrics, i32 0\nstore {ty} %loss.value, {pointer} %metric.ptr, align {align}\nbr label %loss.done\nloss.done:\n"));
 		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i32 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.done ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, {items}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred = load {ty}, {pointer} %seed.pred.ptr, align {align}\n%seed.target.ptr = getelementptr {ty}, {pointer} %targets, i32 %seed.p\n%seed.target = load {ty}, {pointer} %seed.target.ptr, align {align}\n",));
-		let gradient = emit_loss_gradient(&mut ir, loss, self.precision, ty, "%seed.pred", "%seed.target", "%loss.value", &format!("{items}"))?;
+		let gradient = emit_loss_gradient(&mut ir, loss, self.precision, ty, "%seed.pred", "%seed.target", &threshold, "%loss.value", &format!("{items}"))?;
 		ir.push_str(&format!("%seed.ptr = getelementptr {ty}, {pointer} %adjoint, i32 %seed.p\nstore {ty} {gradient}, {pointer} %seed.ptr, align {align}\n%seed.next = add i32 %seed.p, %threads\nbr label %seed.loop\nseed.done:\n"));
 		Ok(ir)
 	}
@@ -859,4 +859,83 @@ fn emit_loss_value(ir: &mut String, loss: LossFunction, precision: Compute, ty: 
 		}
 		4 | 5 => {
 			ir.push_str(&format!("%loss.probability.raw = call {ty} @sigmoid({ty} {prediction})\n%loss.probability.low = call i1 @recipe.olt({ty} %loss.probability.raw, {ty} {tiny})\n%loss.probability.floor = select i1 %loss.probability.low, {ty} {tiny}, {ty} %loss.probability.raw\n%loss.probability.high = call i1 @recipe.ogt({ty} %loss.probability.floor, {ty} {one_minus})\n%loss.probability = select i1 %loss.probability.high, {ty} {one_minus}, {ty} %loss.probability.floor\n%loss.log.probability = call {ty} @recipe.log({ty} %loss.probability)\n%loss.one.probability = call {ty} @recipe.sub({ty} {one}, {ty} %loss.probability)\n%loss.log.one.probability = call {ty} @recipe.log({ty} %loss.one.probability)\n%loss.first = call {ty} @recipe.mul({ty} {target}, {ty} %loss.log.probability)\n%loss.one.target = call {ty} @recipe.sub({ty} {one}, {ty} {target})\n%loss.second = call {ty} @recipe.mul({ty} %loss.one.target, {ty} %loss.log.one.probability)\n%loss.cross.sum = call {ty} @recipe.add({ty} %loss.first, {ty} %loss.second)\n%loss.cross = call {ty} @recipe.neg({ty} %loss.cross.sum)\n", ty = ty, tiny = literal(f64::EPSILON), one_minus = literal(1.0 - f64::EPSILON), target = target, one = one));
-			Ok("%loss.cross".to_ow
+			Ok("%loss.cross".to_owned())
+		}
+		6 => {
+			ir.push_str(&format!("%loss.probability = call {ty} @sigmoid({ty} {prediction})\n%loss.target.class = call i1 @recipe.oge({ty} {target}, {ty} {half})\n%loss.one.probability = call {ty} @recipe.sub({ty} {one}, {ty} %loss.probability)\n%loss.correct.raw = select i1 %loss.target.class, {ty} %loss.probability, {ty} %loss.one.probability\n%loss.correct.low = call i1 @recipe.olt({ty} %loss.correct.raw, {ty} {tiny})\n%loss.correct = select i1 %loss.correct.low, {ty} {tiny}, {ty} %loss.correct.raw\n%loss.incorrect = call {ty} @recipe.sub({ty} {one}, {ty} %loss.correct)\n%loss.incorrect.square = call {ty} @recipe.mul({ty} %loss.incorrect, {ty} %loss.incorrect)\n%loss.log.correct = call {ty} @recipe.log({ty} %loss.correct)\n%loss.focal.product = call {ty} @recipe.mul({ty} %loss.incorrect.square, {ty} %loss.log.correct)\n%loss.focal = call {ty} @recipe.neg({ty} %loss.focal.product)\n", ty = ty, target = target, one = one, half = literal(0.5), tiny = literal(f64::EPSILON)));
+			Ok("%loss.focal".to_owned())
+		}
+		_ => Err(RecipeError::new(format!("native loss {} is unsupported", loss.0))),
+	}
+}
+
+fn emit_loss_gradient(ir: &mut String, loss: LossFunction, precision: Compute, ty: &str, prediction: &str, target: &str, threshold: &str, loss_value: &str, rows: &str) -> Result<String> {
+	let literal = |value: f64| native_literal(precision, ty, value);
+	let zero = literal(0.0);
+	let one = literal(1.0);
+	let negative_one = literal(-1.0);
+	let two = literal(2.0);
+	let tiny = literal(f64::EPSILON);
+	let half = literal(0.5);
+	append_binary(ir, ty, "seed.difference", "sub", prediction, target);
+	let rows_value = "%seed.rows";
+	ir.push_str(&format!("{rows_value} = call {ty} @recipe.from.u32(i32 {rows})\n", rows_value = rows_value, ty = ty, rows = rows));
+	match loss.0 {
+		0 => {
+			append_binary(ir, ty, "seed.twice", "add", "%seed.difference", "%seed.difference");
+			append_binary(ir, ty, "seed.mse", "div", "%seed.twice", rows_value);
+			Ok("%seed.mse".to_owned())
+		}
+		1 => {
+			append_binary(ir, ty, "seed.rmse.denominator", "mul", rows_value, loss_value);
+			ir.push_str(&format!("%seed.rmse.zero = call i1 @recipe.oeq({ty} {loss_value}, {ty} {zero})\n", ty = ty, loss_value = loss_value, zero = zero));
+			append_binary(ir, ty, "seed.rmse.divided", "div", "%seed.difference", "%seed.rmse.denominator");
+			ir.push_str(&format!("%seed.rmse = select i1 %seed.rmse.zero, {ty} {zero}, {ty} %seed.rmse.divided\n", ty = ty, zero = zero));
+			Ok("%seed.rmse".to_owned())
+		}
+		2 => {
+			ir.push_str(&format!("%seed.huber.negative.threshold = call {ty} @recipe.neg({ty} {threshold})\n%seed.huber.low = call i1 @recipe.olt({ty} %seed.difference, {ty} %seed.huber.negative.threshold)\n%seed.huber.high = call i1 @recipe.ogt({ty} %seed.difference, {ty} {threshold})\n%seed.huber.lower = select i1 %seed.huber.low, {ty} %seed.huber.negative.threshold, {ty} %seed.difference\n%seed.huber.clamped = select i1 %seed.huber.high, {ty} {threshold}, {ty} %seed.huber.lower\n", ty = ty, threshold = threshold));
+			append_binary(ir, ty, "seed.huber", "div", "%seed.huber.clamped", rows_value);
+			Ok("%seed.huber".to_owned())
+		}
+		3 => {
+			ir.push_str(&format!("%seed.mae.negative = call i1 @recipe.olt({ty} %seed.difference, {ty} {zero})\n%seed.mae.positive = call i1 @recipe.ogt({ty} %seed.difference, {ty} {zero})\n%seed.mae.upper = select i1 %seed.mae.positive, {ty} {one}, {ty} {zero}\n%seed.mae.sign = select i1 %seed.mae.negative, {ty} {negative_one}, {ty} %seed.mae.upper\n", ty = ty, zero = zero, one = one, negative_one = negative_one));
+			append_binary(ir, ty, "seed.mae", "div", "%seed.mae.sign", rows_value);
+			Ok("%seed.mae".to_owned())
+		}
+		4 | 5 => {
+			ir.push_str(&format!("%seed.probability = call {ty} @sigmoid({ty} {prediction})\n", ty = ty, prediction = prediction));
+			append_binary(ir, ty, "seed.cross.difference", "sub", "%seed.probability", target);
+			append_binary(ir, ty, "seed.cross", "div", "%seed.cross.difference", rows_value);
+			Ok("%seed.cross".to_owned())
+		}
+		6 => {
+			ir.push_str(&format!("%seed.probability = call {ty} @sigmoid({ty} {prediction})\n%seed.target.class = call i1 @recipe.oge({ty} {target}, {ty} {half})\n%seed.one.probability = call {ty} @recipe.sub({ty} {one}, {ty} %seed.probability)\n%seed.correct.raw = select i1 %seed.target.class, {ty} %seed.probability, {ty} %seed.one.probability\n%seed.correct.low = call i1 @recipe.olt({ty} %seed.correct.raw, {ty} {tiny})\n%seed.correct = select i1 %seed.correct.low, {ty} {tiny}, {ty} %seed.correct.raw\n%seed.incorrect = call {ty} @recipe.sub({ty} {one}, {ty} %seed.correct)\n%seed.log.correct = call {ty} @recipe.log({ty} %seed.correct)\n", ty = ty, prediction = prediction, target = target, half = half, one = one, tiny = tiny));
+			append_binary(ir, ty, "seed.focal.first", "mul", &two, "%seed.incorrect");
+			append_binary(ir, ty, "seed.focal.first.value", "mul", "%seed.focal.first", "%seed.log.correct");
+			append_binary(ir, ty, "seed.focal.square", "mul", "%seed.incorrect", "%seed.incorrect");
+			append_binary(ir, ty, "seed.focal.second", "div", "%seed.focal.square", "%seed.correct");
+			append_binary(ir, ty, "seed.focal.by.correct", "sub", "%seed.focal.first.value", "%seed.focal.second");
+			append_binary(ir, ty, "seed.focal.sigmoid.derivative", "mul", "%seed.probability", "%seed.one.probability");
+			ir.push_str(&format!("%seed.focal.negative.direction = call {ty} @recipe.neg({ty} %seed.focal.sigmoid.derivative)\n%seed.focal.direction = select i1 %seed.target.class, {ty} %seed.focal.sigmoid.derivative, {ty} %seed.focal.negative.direction\n", ty = ty));
+			append_binary(ir, ty, "seed.focal.chain", "mul", "%seed.focal.by.correct", "%seed.focal.direction");
+			append_binary(ir, ty, "seed.focal", "div", "%seed.focal.chain", rows_value);
+			Ok("%seed.focal".to_owned())
+		}
+		_ => Err(RecipeError::new(format!("native loss {} is unsupported", loss.0))),
+	}
+}
+
+fn integer_argument(value: f64, role: &str) -> Result<i32> {
+	require(value.is_finite() && value.fract() == 0.0 && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX), format!("native {role} is not an integer"))?;
+	Ok(value as i32)
+}
+
+fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, count: usize, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
+	let prefix = format!("n{index}.{name}");
+	let count = i32::try_from(count).map_err(|_| RecipeError::new(format!("native {name} loop count exceeds i32")))?;
+	ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %{prefix}.entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n"));
+	body(ir, &format!("%{prefix}.p"));
+	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
+	Ok(())
+}
