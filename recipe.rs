@@ -416,7 +416,7 @@ const INTERRUPTED_EXIT: i32 = 128 + SIGINT;
 static SIGNAL: OnceLock<usize> = OnceLock::new();
 extern "C" fn interrupt(_: i32) {
 	if !INTERRUPTED.swap(true, Ordering::AcqRel) {
-		let message = b"interrupt received, finishing checkpoint\n";
+		let message = b"\ninterrupt received, finishing checkpoint\n";
 		unsafe {
 			write(2, message.as_ptr().cast(), message.len());
 		}
@@ -5846,9 +5846,9 @@ impl Train {
 		let (stop, wait) = std::sync::mpsc::channel(); let (metrics, loss, topology) = (self.log_metrics.clone(), model.loss.name(), model.description(&self.log_metrics));
 		let updates = std::thread::spawn(move || -> Result<()> { loop { match wait.recv_timeout(Duration::from_secs(1).div_f64(config.progress_refresh_hz as f64)) {
 			Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Self::write_progress(&Self::metric_line(loss, &topology, &metrics, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), true, false)?,
+			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => if INTERRUPTED.load(Ordering::Acquire) { return Ok(()) } else { Self::write_progress(&Self::metric_line(loss, &topology, &metrics, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), true, false)? },
 		} } });
-		let result = action(); let _ = stop.send(()); let updated = updates.join().map_err(|_| RecipeError::new("epoch progress panicked"))?; if INTERRUPTED.load(Ordering::Acquire) { let _ = Self::write_progress("", true, false); std::process::exit(INTERRUPTED_EXIT) }
+		let result = action(); let _ = stop.send(()); let updated = updates.join().map_err(|_| RecipeError::new("epoch progress panicked"))?; if INTERRUPTED.load(Ordering::Acquire) { std::process::exit(INTERRUPTED_EXIT) }
 		let value = match result { Ok(value) => value, Err(error) => { let _ = Self::write_progress("", true, false); return Err(error) } };
 		updated?; Ok((value, started.elapsed().as_secs_f64(), true))
 	}
