@@ -1,8 +1,6 @@
 //! Recipe executes one model graph after automatically probing a compiled discrete GPU backend.
 //! Attention is three-projection scaled Q/K/V without an output projection.
 #![allow(non_upper_case_globals)]
-mod native;
-mod program_ir;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FloatLayout {
 	sign: u8,

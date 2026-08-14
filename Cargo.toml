@@ -8,10 +8,6 @@ build = "build.rs"
 path = "recipe.rs"
 
 [[bin]]
-name = "train"
-path = "train.rs"
-
-[[bin]]
 name = "recipe"
 path = "cli.rs"
 
