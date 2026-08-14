@@ -411,6 +411,7 @@ use std::{
 pub static recipe: Recipe = Recipe;
 static RUN: AtomicU64 = AtomicU64::new(0);
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static INTERRUPT_CHECKPOINTED: AtomicBool = AtomicBool::new(false);
 const SIGINT: i32 = 2;
 const INTERRUPTED_EXIT: i32 = 128 + SIGINT;
 static SIGNAL: OnceLock<usize> = OnceLock::new();
@@ -5660,6 +5661,7 @@ impl Train {
 	}
 	fn execute(&self, model: &Model, data: &Data, evaluation: bool) -> TrainingReport {
 		SIGNAL.get_or_init(|| unsafe { signal(SIGINT, interrupt) });
+		INTERRUPT_CHECKPOINTED.store(false, Ordering::Release);
 		if INTERRUPTED.load(Ordering::Acquire) {
 			std::process::exit(INTERRUPTED_EXIT);
 		}
@@ -5739,11 +5741,10 @@ impl Train {
 				if saved { stored.bn_stats = tape.shards[0].tape.extract_bn_stats()? }
 				self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, saved.then_some(true))?;
 				let predictions = tape.predictions()?;
-				let learned = runtime.learn(&cases, &tape, config);
-				self.finish_dispatch(learned, &mut stored, &prepared.schema, &tape, None)?;
+				if !INTERRUPTED.load(Ordering::Acquire) { self.finish_dispatch(runtime.learn(&cases, &tape, config), &mut stored, &prepared.schema, &tape, None)? }; self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, None)?;
 				Ok((loss, saved, predictions))
 			})?;
-			self.print(model, run, epoch, loss, targets, &predictions, seconds, saved, live)?;
+			self.print(model, run, epoch, loss, targets, &predictions, seconds, saved, live)?; if INTERRUPTED.load(Ordering::Acquire) { std::process::exit(INTERRUPTED_EXIT) }
 		}
 		if self.stop.is_some() {
 			tape.restore_best()?;
@@ -5800,14 +5801,13 @@ impl Train {
 		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), run, epoch: tape.step as usize, seconds: started.elapsed().as_secs_f64() })
 	}
 	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &str, tape: &DeviceTape, save: Option<bool>) -> Result<T> {
-		let interrupted = INTERRUPTED.load(Ordering::Acquire);
-		let save = if interrupted { Some(self.stop.is_some()) } else { save };
+		let save = if INTERRUPTED.load(Ordering::Acquire) && !INTERRUPT_CHECKPOINTED.swap(true, Ordering::AcqRel) { Some(self.stop.is_some()) } else { save.filter(|_| !INTERRUPTED.load(Ordering::Acquire)) };
 		if let Some(best) = save
 			&& let Some(path) = &self.save
 		{
 			checkpoint(path, schema, stored, tape, best)?;
 		}
-		if interrupted { Err(RecipeError::new("interrupted")) } else { result }
+		result
 	}
 	fn print(&self, model: &Model, run: u64, epoch: usize, loss: f64, targets: &[f64], predictions: &[f64], seconds: f64, checkpoint: bool, live: bool) -> Result<()> { if self.log_metrics.is_empty() { Ok(()) } else { Self::write_progress(&Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), &self.log_metrics, Metrics { run, epoch, loss: Some(loss), r2: Some(coefficient(targets, predictions)), seconds, checkpoint }), live, true) } }
 	fn print_evaluation(&self, model: &Model, report: &TrainingReport) { let defaults = [Loss, R2]; let metrics = if self.log_metrics.is_empty() { &defaults[..] } else { &self.log_metrics }; Self::write_progress(&Self::metric_line(model.loss.name(), &model.description(metrics), metrics, Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: false }), false, true).unwrap_or_else(|error| panic!("{error}")) }
@@ -5843,13 +5843,13 @@ impl Train {
 		if !live { return action().map(|value| (value, started.elapsed().as_secs_f64(), false)) }
 		Self::write_progress(&line, false, false)?;
 		let (stop, wait) = std::sync::mpsc::channel(); let (metrics, loss, topology) = (self.log_metrics.clone(), model.loss.name(), model.description(&self.log_metrics));
-		let updates = std::thread::spawn(move || -> Result<()> { loop { match wait.recv_timeout(Duration::from_secs(1).div_f64(config.progress_refresh_hz as f64)) {
-			Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => if INTERRUPTED.load(Ordering::Acquire) { return Ok(()) } else { Self::write_progress(&Self::metric_line(loss, &topology, &metrics, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), true, false)? },
+		let updates = std::thread::spawn(move || -> Result<bool> { let mut row = false; loop { match wait.recv_timeout(Duration::from_secs(1).div_f64(config.progress_refresh_hz as f64)) {
+			Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { if INTERRUPTED.load(Ordering::Acquire) && !row { Self::write_progress(&Self::metric_line(loss, &topology, &metrics, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), false, false)? }; return Ok(row || INTERRUPTED.load(Ordering::Acquire)) },
+			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { let interrupted = INTERRUPTED.load(Ordering::Acquire); Self::write_progress(&Self::metric_line(loss, &topology, &metrics, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), row || !interrupted, false)?; row |= interrupted },
 		} } });
-		let result = action(); let _ = stop.send(()); let updated = updates.join().map_err(|_| RecipeError::new("epoch progress panicked"))?; if INTERRUPTED.load(Ordering::Acquire) { std::process::exit(INTERRUPTED_EXIT) }
+		let result = action(); let _ = stop.send(()); updates.join().map_err(|_| RecipeError::new("epoch progress panicked"))??;
 		let value = match result { Ok(value) => value, Err(error) => { let _ = Self::write_progress("", true, false); return Err(error) } };
-		updated?; Ok((value, started.elapsed().as_secs_f64(), true))
+		Ok((value, started.elapsed().as_secs_f64(), true))
 	}
 }
 #[derive(Clone, Copy)] struct Metrics { run: u64, epoch: usize, loss: Option<f64>, r2: Option<f64>, seconds: f64, checkpoint: bool }
