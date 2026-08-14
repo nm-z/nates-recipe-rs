@@ -5819,7 +5819,7 @@ impl Train {
 				0 => format!("run \x1b[38\x3b2\x3b242\x3b40\x3b60m{:>5}\x1b[0m", measurement.run),
 				1 => format!("{loss} \x1b[38\x3b2\x3b0\x3b174\x3b107m{}\x1b[0m", measurement.loss.map_or_else(|| format!("{:>6}", "..."), |value| format!("{value:.4}"))),
 				2 => format!("r2 \x1b[38\x3b2\x3b39\x3b125\x3b255m{}\x1b[0m", measurement.r2.map_or_else(|| format!("{:>7}", "..."), |value| format!("{value:>7.4}"))),
-				3 => format!("time \x1b[38\x3b2\x3b255\x3b194\x3b0m{time:>9.3} ms\x1b[0m"),
+				3 => if measurement.seconds < 1.0 { format!("time \x1b[38\x3b2\x3b255\x3b194\x3b0m{time:>9.3} ms\x1b[0m") } else { format!("time \x1b[38\x3b2\x3b255\x3b194\x3b0m{:>10.4} s\x1b[0m", measurement.seconds) },
 				4 => format!("epoch \x1b[38\x3b2\x3b135\x3b90\x3b251m{}\x1b[0m", measurement.epoch),
 				5..=7 | 9 if !topology_printed && !topology.is_empty() => { topology_printed = true; topology.to_owned() }
 				5..=7 | 9 => continue,
