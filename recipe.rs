@@ -106,10 +106,108 @@ impl IntFormat {
 mod bundle {
 	use super::*;
 	use std::{collections::BTreeMap, io::Write as _, str::FromStr};
-	const BLOCK_KINDS: [&str; 20] = ["", "layer", "conv", "pool", "kmeans", "knn", "embed", "attn", "rnn", "gru", "lstm", "residual", "moe", "svm", "perc", "forest", "bayes", "cbst", "xgbst", "lgbm"]; fn block_kind(value: i32) -> Result<&'static str> { usize::try_from(value).ok().and_then(|value| BLOCK_KINDS.get(value).copied()).ok_or_else(|| RecipeError::new(format!("invalid public block kind {value}"))) }
+	const BUNDLE_HEADER: &str = "recipe-native-model";
+
+	fn hex(value: &[u8]) -> String { value.iter().map(|byte| format!("{byte:02x}")).collect() }
+	fn unhex(value: &str, role: &str) -> Result<Vec<u8>> {
+		require(value.len() % 2 == 0, format!("{role} has an odd hexadecimal width"))?;
+		(0..value.len()).step_by(2).map(|index| u8::from_str_radix(&value[index..index + 2], 16).map_err(|error| RecipeError::new(format!("invalid {role}: {error}")))).collect()
+	}
+	fn text(value: &str) -> String { hex(value.as_bytes()) }
+	fn untext(value: &str, role: &str) -> Result<String> { String::from_utf8(unhex(value, role)?).map_err(|error| RecipeError::new(format!("invalid {role}: {error}"))) }
+	fn bool_value(value: &str, role: &str) -> Result<bool> { match value { "0" => Ok(false), "1" => Ok(true), _ => Err(RecipeError::new(format!("invalid {role}"))) } }
+
+	fn residual_text(value: &Residual) -> String {
+		match value {
+			Residual::Layer(width) => format!("layer,{width}"),
+			Residual::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
+			Residual::Activation(activation) => format!("activation,{}", *activation as u8),
+		}
+	}
+	fn residual(value: &str) -> Result<Residual> {
+		let mut fields = value.split(',');
+		match fields.next().unwrap_or("") {
+			"layer" => Ok(Residual::Layer(value_at(fields.next(), "residual layer width")?)),
+			"conv" => Ok(Residual::Conv(value_at(fields.next(), "residual filters")?, value_at(fields.next(), "residual kernel")?)),
+			"activation" => Ok(Residual::Activation(activation(value_at(fields.next(), "residual activation")?)?)),
+			_ => Err(RecipeError::new(format!("invalid residual {value:?}"))),
+		}
+	}
+	fn value_at<T: FromStr>(value: Option<&str>, role: &str) -> Result<T>
+	where T::Err: fmt::Display {
+		value.ok_or_else(|| RecipeError::new(format!("{role} is absent")))?.parse().map_err(|error| RecipeError::new(format!("invalid {role}: {error}")))
+	}
+	fn activation(value: u8) -> Result<Activation> { match value { 0 => Ok(Activation::Linear), 1 => Ok(Activation::Cos), 2 => Ok(Activation::Exp), 3 => Ok(Activation::Log), 4 => Ok(Activation::Ln), 5 => Ok(Activation::Huber), 6 => Ok(Activation::Tan), 7 => Ok(Activation::Relu), 8 => Ok(Activation::Leak), 9 => Ok(Activation::Sigmoid), 10 => Ok(Activation::Tanh), 11 => Ok(Activation::Selu), 12 => Ok(Activation::Gelu), 13 => Ok(Activation::Silu), 14 => Ok(Activation::Elu), 15 => Ok(Activation::Prelu), _ => Err(RecipeError::new(format!("invalid activation {value}"))) } }
+	fn operation_text(operation: &Operation) -> String {
+		match operation {
+			Operation::Layer(width) => format!("layer,{width}"),
+			Operation::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
+			Operation::Pool(size) => format!("pool,{size}"),
+			Operation::Estimator(estimator) => format!("estimator,{},{}", estimator.name, estimator.param),
+			Operation::Embed(dimensions, vocabulary) => format!("embed,{dimensions},{vocabulary}"),
+			Operation::Attention(heads) => format!("attn,{heads}"),
+			Operation::Rnn(width) => format!("rnn,{width}"),
+			Operation::Gru(width) => format!("gru,{width}"),
+			Operation::Lstm(width) => format!("lstm,{width}"),
+			Operation::Residual(parts) => format!("residual,{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
+			Operation::Moe(top_k, experts) => format!("moe,{top_k},{}", experts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
+			Operation::Perceptron(width) => format!("perc,{width}"),
+		}
+	}
+	fn estimator(name: &str, param: usize) -> Result<Estimator> {
+		let result = match name {
+			"kmeans" => Estimator { fit: fit_kmeans, validate: cluster_estimator, param, name: "kmeans" },
+			"knn" => Estimator { fit: fit_knn, validate: neighbor_estimator, param, name: "knn" },
+			"svm" => Estimator { fit: fit_svm, validate: valid_estimator, param, name: "svm" },
+			"forest" => Estimator { fit: fit_forest, validate: positive_estimator, param, name: "forest" },
+			"bayes" => Estimator { fit: fit_bayes, validate: valid_estimator, param, name: "bayes" },
+			"cbst" => Estimator { fit: fit_catboost, validate: valid_estimator, param, name: "cbst" },
+			"xgbst" => Estimator { fit: fit_xgboost, validate: valid_estimator, param, name: "xgbst" },
+			"lgbm" => Estimator { fit: fit_lightgbm, validate: valid_estimator, param, name: "lgbm" },
+			_ => return Err(RecipeError::new(format!("invalid estimator {name:?}"))),
+		};
+		Ok(result)
+	}
+	fn operation(value: &str) -> Result<Operation> {
+		let (name, rest) = value.split_once(',').unwrap_or((value, ""));
+		let mut fields = rest.split(',');
+		match name {
+			"layer" => Ok(Operation::Layer(value_at(Some(rest), "layer width")?)),
+			"conv" => Ok(Operation::Conv(value_at(fields.next(), "convolution filters")?, value_at(fields.next(), "convolution kernel")?)),
+			"pool" => Ok(Operation::Pool(value_at(Some(rest), "pool size")?)),
+			"estimator" => Ok(Operation::Estimator(estimator(fields.next().unwrap_or(""), value_at(fields.next(), "estimator parameter")? )?)),
+			"embed" => Ok(Operation::Embed(value_at(fields.next(), "embedding dimensions")?, value_at(fields.next(), "embedding vocabulary")?)),
+			"attn" => Ok(Operation::Attention(value_at(Some(rest), "attention heads")?)),
+			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
+			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
+			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
+			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { rest.split(';').map(residual).collect::<Result<Vec<_>>>()? })),
+			"moe" => Ok(Operation::Moe(value_at(fields.next(), "MoE top-k")?, fields.next().unwrap_or("").split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?)),
+			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
+			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
+		}
+	}
+	fn block_text(block: &Block) -> String { format!("{}|{}|{}|{}|{}", operation_text(&block.operation), block.activation as u8, block.normalization.map_or(0, |value| value as u8 + 1), block.quantization, u8::from(block.profile)) }
+	fn block(value: &str) -> Result<Block> {
+		let fields = value.split('|').collect::<Vec<_>>();
+		require(fields.len() == 5, "semantic model block has the wrong width")?;
+		let normalization = match value_at::<u8>(Some(fields[2]), "block normalization")? { 0 => None, 1 => Some(BlockNormalization::Batch), 2 => Some(BlockNormalization::Layer), _ => return Err(RecipeError::new("invalid block normalization")) };
+		Ok(Block { operation: operation(fields[0])?, activation: activation(value_at(Some(fields[1]), "block activation")?)?, normalization, quantization: value_at(Some(fields[3]), "block quantization")?, profile: bool_value(fields[4], "block quantization profile")? })
+	}
+	fn model_text(model: &Model) -> (Vec<String>, Vec<String>) {
+		let blocks = model.blocks.iter().map(block_text).collect();
+		let downstream = model.downstream.as_ref().map(|blocks| blocks.iter().map(block_text).collect()).unwrap_or_default();
+		(blocks, downstream)
+	}
+	fn model(blocks: Vec<Block>, downstream: Vec<Block>, loss: u8, quantization: u16) -> Result<Model> {
+		require(!blocks.is_empty(), "semantic model has no blocks")?;
+		Ok(Model { blocks, loss: LossFunction(loss), downstream: (!downstream.is_empty()).then_some(downstream), quantization })
+	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
 		pub graph: Graph,
+		pub models: Vec<Model>,
+		pub routes: Vec<Route>,
 		pub precision: Compute,
 		pub inputs: Vec<String>,
 		pub outputs: Vec<String>,
@@ -118,60 +216,50 @@ mod bundle {
 		pub target_min: f64,
 		pub target_span: f64,
 		pub bn_stats: Vec<f64>,
+		pub artifact: String,
 	}
-	#[derive(Default)]
-	struct Builder {
-		inputs: Vec<String>,
-		outputs: Vec<String>,
-		input: Option<Shape>,
-		output: Option<Shape>,
-		nodes: Vec<Node>,
-		arguments: usize,
-		parameters: Vec<f64>,
-		frozen: Vec<u8>,
-		programs: Vec<f64>,
-		stored: Vec<StoredWeight>,
-		state: TrainingState,
-		precision: Option<Compute>,
-		norm_mean: Vec<f64>,
-		norm_scale: Vec<f64>,
-		target_min: f64,
-		target_span: f64,
-		bn_stats: Vec<f64>,
+	#[derive(Clone)]
+	pub(super) struct SemanticGraph {
+		pub models: Vec<Model>,
+		pub routes: Vec<Route>,
+		pub precision: Compute,
+		pub input: Shape,
+		pub output: Shape,
+		pub inputs: Vec<String>,
+		pub outputs: Vec<String>,
+		pub tensors: Vec<StoredWeight>,
+		pub frozen: Vec<u8>,
+		pub state: TrainingState,
+		pub norm_mean: Vec<f64>,
+		pub norm_scale: Vec<f64>,
+		pub target_min: f64,
+		pub target_span: f64,
+		pub bn_stats: Vec<f64>,
+		pub artifact: String,
 	}
-	impl Builder {
-		fn finish(self) -> Result<StoredGraph> {
-			let (input, output) = (self.input.ok_or_else(|| RecipeError::new("model graph has no input shape"))?, self.output.ok_or_else(|| RecipeError::new("model graph has no output shape"))?);
-			require(!self.nodes.is_empty(), "model graph has no nodes")?;
-			require(self.arguments == self.nodes.len(), "model graph node arguments are incomplete")?;
-			require(self.parameters.len() == self.frozen.len(), "model graph frozen weights are incomplete")?;
-			for (name, values) in [("moments", &self.state.moments), ("variances", &self.state.variances), ("best weights", &self.state.best)] {
-				require(values.is_empty() || values.len() == self.parameters.len(), format!("model graph {name} are incomplete"))?;
+
+	fn raw_weight(values: &[f64]) -> StoredWeight {
+		let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect();
+		StoredWeight { format: StorageFormat(0), count: values.len(), bytes, codebook: Vec::new(), arithmetic: values.to_vec() }
+	}
+	fn semantic_graph(stored: &StoredGraph) -> Result<SemanticGraph> {
+		let graph = &stored.graph;
+		let mut tensors = Vec::new();
+		for (index, node) in graph.nodes.iter().enumerate() {
+			if node.parameters == 0 {
+				continue
 			}
-			require(self.state.best_loss.is_empty() || self.state.best_loss.len() == 4, "model graph best loss state is incomplete")?;
-			require(self.inputs.len() == input.elements(), "model graph input schema has the wrong width")?;
-			require(self.outputs.len() == output.elements(), "model graph output schema has the wrong width")?;
-			require(self.norm_mean.len() == self.norm_scale.len() && (self.norm_mean.is_empty() || self.norm_mean.len() == self.inputs.len()), "model graph normalization stats have the wrong width")?;
-			let mut stored = Vec::with_capacity(self.nodes.len());
-			let mut weight = 0;
-			for node in &self.nodes {
-				if node.parameters == 0 {
-					stored.push(None);
-					continue
-				}
-				if node.argument[8] == 0.0 {
-					stored.push(None);
-					continue
-				}
-				let encoded = self.stored.get(weight).ok_or_else(|| RecipeError::new("model graph quantized weights are incomplete"))?;
-				require(encoded.count == node.parameters && encoded.format.0 == node.argument[8] as u16, "model graph quantized weights do not match their node")?;
-				stored.push(Some(encoded.clone()));
-				weight += 1;
-			}
-			require(weight == self.stored.len(), "model graph has unused quantized weights")?;
-			let source = self.nodes.len() as i32 - 1;
-			Ok(StoredGraph { graph: Graph { nodes: self.nodes, parameters: self.parameters, frozen: self.frozen, programs: self.programs, stored, input, output, source, state: self.state, block_index: 0, block_kind: "" }, precision: self.precision.ok_or_else(|| RecipeError::new("model graph has no arithmetic format"))?, inputs: self.inputs, outputs: self.outputs, norm_mean: self.norm_mean, norm_scale: self.norm_scale, target_min: self.target_min, target_span: self.target_span, bn_stats: self.bn_stats })
+			let values = graph.parameters.get(node.offset..node.offset + node.parameters).ok_or_else(|| RecipeError::new("model parameter span is invalid"))?;
+			let encoded = graph.stored.get(index).and_then(Clone::clone).unwrap_or_else(|| raw_weight(values));
+			require(encoded.count == node.parameters && encoded.arithmetic.len() == node.parameters, format!("model tensor {index} has the wrong shape"))?;
+			tensors.push(encoded);
 		}
+		Ok(SemanticGraph { models: stored.models.clone(), routes: stored.routes.clone(), precision: stored.precision, input: graph.input, output: graph.output, inputs: stored.inputs.clone(), outputs: stored.outputs.clone(), tensors, frozen: graph.frozen.clone(), state: graph.state.clone(), norm_mean: stored.norm_mean.clone(), norm_scale: stored.norm_scale.clone(), target_min: stored.target_min, target_span: stored.target_span, bn_stats: stored.bn_stats.clone(), artifact: stored.artifact.clone() })
+	}
+	fn same_model(a: &Model, b: &Model) -> bool {
+		let (a_blocks, a_downstream) = model_text(a);
+		let (b_blocks, b_downstream) = model_text(b);
+		a.loss.0 == b.loss.0 && a.quantization == b.quantization && a_blocks == b_blocks && a_downstream == b_downstream
 	}
 	fn values<T: FromStr>(text: &str, role: &str) -> Result<Vec<T>>
 	where T::Err: fmt::Display {
@@ -181,190 +269,224 @@ mod bundle {
 	where T::Err: fmt::Display {
 		text.parse().map_err(|error| RecipeError::new(format!("invalid {role}: {error}")))
 	}
-	fn primitive(value: i32) -> Result<Primitive> {
-		match value {
-			0 => Ok(Primitive::Contraction),
-			2 => Ok(Primitive::Pool),
-			3 => Ok(Primitive::Gather),
-			4 => Ok(Primitive::Attention),
-			5 => Ok(Primitive::Scan),
-			6 => Ok(Primitive::Elementwise),
-			7 => Ok(Primitive::Route),
-			8 => Ok(Primitive::Normalize),
-			9 => Ok(Primitive::Predictor),
-			_ => Err(RecipeError::new(format!("invalid primitive {value}"))),
-		}
-	}
-	fn node(value: &str) -> Result<Node> {
-		let value = values::<i32>(value, "node descriptor")?;
-		require(value.len() == 11, "model graph node descriptor has the wrong width")?;
-		Ok(Node { op: primitive(value[0])?, source: value[1], second: value[2], input: Shape { channels: value[3] as usize, length: value[4] as usize }, output: Shape { channels: value[5] as usize, length: value[6] as usize }, offset: value[7] as usize, parameters: value[8] as usize, argument: [0.0; 9], program_offset: value[9] as usize, program_count: value[10] as usize, block_index: 0, block_kind: "" })
-	}
 	fn precision(value: &str) -> Result<Compute> {
 		let fields = value.split_whitespace().collect::<Vec<_>>();
 		require(fields.len() == 5, "arithmetic format has the wrong width")?;
 		let values = [self::value::<u8>(fields[1], "arithmetic bits")?, self::value::<u8>(fields[2], "arithmetic exponent")?, self::value::<u8>(fields[3], "arithmetic mantissa")?, self::value::<u8>(fields[4], "storage mantissa")?];
 		Compute::saved(fields[0], values).ok_or_else(|| RecipeError::new(format!("saved arithmetic format {} {} {} {} {} is unavailable", fields[0], values[0], values[1], values[2], values[3])))
 	}
-	pub(super) fn load(path: &Path) -> Result<(String, Vec<StoredGraph>)> {
+	#[derive(Default)]
+	struct ModelParts {
+		loss: Option<u8>,
+		quantization: Option<u16>,
+		blocks: Vec<Block>,
+		downstream: Vec<Block>,
+	}
+	#[derive(Default)]
+	struct SemanticBuilder {
+		models: Vec<ModelParts>,
+		current_model: Option<usize>,
+		routes: Vec<Route>,
+		inputs: Vec<String>,
+		outputs: Vec<String>,
+		input: Option<Shape>,
+		output: Option<Shape>,
+		precision: Option<Compute>,
+		tensors: Vec<StoredWeight>,
+		frozen: Vec<u8>,
+		state: TrainingState,
+		norm_mean: Vec<f64>,
+		norm_scale: Vec<f64>,
+		target_min: f64,
+		target_span: f64,
+		bn_stats: Vec<f64>,
+		artifact: String,
+	}
+	impl SemanticBuilder {
+		fn model_mut(&mut self, index: usize) -> Result<&mut ModelParts> {
+			require(index < self.models.len(), format!("semantic model index {index} is out of order"))?;
+			self.current_model = Some(index);
+			self.models.get_mut(index).ok_or_else(|| RecipeError::new("semantic model is absent"))
+		}
+		fn finish(self) -> Result<SemanticGraph> {
+			let (input, output) = (self.input.ok_or_else(|| RecipeError::new("semantic model has no input shape"))?, self.output.ok_or_else(|| RecipeError::new("semantic model has no output shape"))?);
+			require(!self.models.is_empty(), "semantic model has no models")?;
+			let models = self.models.into_iter().map(|parts| model(parts.blocks, parts.downstream, parts.loss.ok_or_else(|| RecipeError::new("semantic model has no loss"))?, parts.quantization.ok_or_else(|| RecipeError::new("semantic model has no quantization"))?)).collect::<Result<Vec<_>>>()?;
+			require(self.inputs.len() == input.elements(), "semantic model input schema has the wrong width")?;
+			require(self.outputs.len() == output.elements(), "semantic model output schema has the wrong width")?;
+			require(self.norm_mean.len() == self.norm_scale.len() && (self.norm_mean.is_empty() || self.norm_mean.len() == self.inputs.len()), "semantic model normalization stats have the wrong width")?;
+			require(!self.artifact.is_empty(), "native artifact identity is absent")?;
+			require(self.frozen.len() == self.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "semantic model frozen weights are incomplete")?;
+			for (name, values) in [("moments", &self.state.moments), ("variances", &self.state.variances), ("best weights", &self.state.best)] {
+				require(values.is_empty() || values.len() == self.frozen.len(), format!("semantic model {name} are incomplete"))?;
+			}
+			Ok(SemanticGraph { models, routes: self.routes, precision: self.precision.ok_or_else(|| RecipeError::new("semantic model has no arithmetic format"))?, input, output, inputs: self.inputs, outputs: self.outputs, tensors: self.tensors, frozen: self.frozen, state: self.state, norm_mean: self.norm_mean, norm_scale: self.norm_scale, target_min: self.target_min, target_span: self.target_span, bn_stats: self.bn_stats, artifact: self.artifact })
+		}
+	}
+	fn stored_weight(format: u16, count: usize, codebook: &str, encoded: &str) -> Result<StoredWeight> {
+		let bytes = unhex(encoded, "semantic tensor bytes")?;
+		let codebook = if codebook == "-" { Vec::new() } else { codebook.split(',').map(|value| value.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid semantic codebook value: {error}")))).collect::<Result<Vec<_>>>()? };
+		let arithmetic = if format == 0 {
+			require(bytes.len() == count.checked_mul(std::mem::size_of::<f64>()).ok_or_else(|| RecipeError::new("semantic tensor size overflows"))?, "semantic raw tensor has the wrong size")?;
+			bytes.chunks_exact(std::mem::size_of::<f64>()).map(|value| f64::from_le_bytes(value.try_into().unwrap())).collect()
+		} else {
+			StorageFormat(format).decompress(&bytes, &codebook, count)?
+		};
+		Ok(StoredWeight { format: StorageFormat(format), count, bytes, codebook, arithmetic })
+	}
+	pub(super) fn load_semantic(path: &Path) -> Result<(String, Vec<SemanticGraph>)> {
 		require(path.extension().and_then(|value| value.to_str()) == Some("ogdl"), "model path requires .ogdl")?;
 		let document = fs::read_to_string(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
 		let (mut schema, mut graphs) = (String::new(), Vec::new());
-		let mut current: Option<Builder> = None;
+		let mut current: Option<SemanticBuilder> = None;
 		for line in document.lines().map(str::trim) {
-			if line == "recipe-model" {
-				continue;
-			}
+			if line.is_empty() { continue }
+			if line == BUNDLE_HEADER { continue }
 			if line == "graph" {
-				if let Some(value) = current.take() {
-					graphs.push(value.finish()?)
-				}
-				current = Some(Builder::default());
-				continue;
+				if let Some(builder) = current.take() { graphs.push(builder.finish()?) }
+				current = Some(SemanticBuilder::default());
+				continue
 			}
 			let (kind, value) = line.split_once(' ').unwrap_or((line, ""));
 			if kind == "schema" {
-				schema = value.to_owned();
-				continue;
+				schema = untext(value, "model schema")?;
+				continue
 			}
-			let builder = current.as_mut().ok_or_else(|| RecipeError::new("model value precedes graph"))?;
+			let builder = current.as_mut().ok_or_else(|| RecipeError::new("semantic model value precedes graph"))?;
 			match kind {
+				"model" => {
+					let fields = value.split_whitespace().collect::<Vec<_>>();
+					require(fields.len() == 3, "semantic model header has the wrong width")?;
+					let index = value_at::<usize>(fields.first().copied(), "semantic model index")?;
+					require(index == builder.models.len(), "semantic model indexes are not contiguous")?;
+					builder.models.push(ModelParts { loss: Some(value_at(fields.get(1).copied(), "semantic model loss")?), quantization: Some(value_at(fields.get(2).copied(), "semantic model quantization")?), ..ModelParts::default() });
+					builder.current_model = Some(index);
+				}
+				"block" | "downstream" => {
+					let index = builder.current_model.ok_or_else(|| RecipeError::new("semantic block precedes model"))?;
+					let parts = builder.model_mut(index)?;
+					let block = block(value)?;
+					if kind == "block" { parts.blocks.push(block) } else { parts.downstream.push(block) }
+				}
+				"route" => {
+					let fields = value.split_whitespace().collect::<Vec<_>>();
+					require(fields.len() == 2, "semantic route has the wrong width")?;
+					let inputs = untext(fields[0], "route inputs")?.split('\0').map(str::to_owned).collect::<Vec<_>>();
+					let outputs = untext(fields[1], "route outputs")?.split('\0').map(str::to_owned).collect::<Vec<_>>();
+					builder.routes.push(Route { inputs, outputs });
+				}
 				"arithmetic" => builder.precision = Some(precision(value)?),
-				"in" => builder.inputs.push(value.to_owned()),
-				"out" => builder.outputs.push(value.to_owned()),
+				"in" => builder.inputs.push(untext(value, "model input")?),
+				"out" => builder.outputs.push(untext(value, "model output")?),
 				"shape" => {
 					let shape = values::<usize>(value, "model shape")?;
-					require(shape.len() == 4, "model graph shape has the wrong width")?;
+					require(shape.len() == 4, "semantic model shape has the wrong width")?;
 					builder.input = Some(Shape { channels: shape[0], length: shape[1] });
 					builder.output = Some(Shape { channels: shape[2], length: shape[3] });
 				}
-				"node" => builder.nodes.push(node(value)?),
-				"identity" => { let identity = values::<i32>(value, "node identity")?; require(identity.len() == 2, "model graph node identity has the wrong width")?; let node = builder.nodes.last_mut().ok_or_else(|| RecipeError::new("identity precedes node"))?; node.block_index = identity[0] as usize; node.block_kind = block_kind(identity[1])? }
-				"arguments" => {
-					let argument = values::<f64>(value, "node argument")?;
-					require(argument.len() == 9, "model graph node argument has the wrong width")?;
-					builder.nodes.last_mut().ok_or_else(|| RecipeError::new("argument precedes node"))?.argument.copy_from_slice(&argument);
-					builder.arguments += 1;
-				}
-				"quantization" => {}
-				"programs" => builder.programs = values(value, "scalar program")?,
-				"norm_mean" => builder.norm_mean = values(value, "normalization mean")?,
-				"norm_scale" => builder.norm_scale = values(value, "normalization scale")?,
-				"target_min" => builder.target_min = self::value(value, "target min")?,
-				"target_span" => builder.target_span = self::value(value, "target span")?,
-				"bn_stats" => builder.bn_stats = values(value, "batch norm stats")?,
-				"weights" => builder.parameters.extend(values::<f64>(value, "weight")?),
-				"quantized" => {
-					let mut fields = value.split_whitespace();
-					let code = self::value(fields.next().unwrap_or(""), "quantization code")?;
-					let count = self::value(fields.next().unwrap_or(""), "quantized weight count")?;
-					let codebook = fields.next().unwrap_or("");
-					let codebook = if codebook == "-" { Vec::new() } else { codebook.split(',').map(|value| self::value(value, "quantization codebook")).collect::<Result<Vec<_>>>()? };
-					let hex = fields.next().unwrap_or("");
-					require(hex.len() % 2 == 0, "quantized bytes are invalid")?;
-					let bytes = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|error| RecipeError::new(format!("invalid quantized byte: {error}")))).collect::<Result<Vec<_>>>()?;
-					let arithmetic = StorageFormat(code).decompress(&bytes, &codebook, count)?;
-					builder.parameters.extend(&arithmetic);
-					builder.stored.push(StoredWeight { format: StorageFormat(code), count, bytes, codebook, arithmetic });
+				"tensor" => {
+					let fields = value.split_whitespace().collect::<Vec<_>>();
+					require(fields.len() == 4, "semantic tensor has the wrong width")?;
+					builder.tensors.push(stored_weight(value_at(fields.first().copied(), "semantic tensor format")?, value_at(fields.get(1).copied(), "semantic tensor count")?, fields[2], fields[3])?);
 				}
 				"frozen" => builder.frozen = values(value, "frozen weight")?,
 				"moments" => builder.state.moments = values(value, "Adam moment")?,
 				"variances" => builder.state.variances = values(value, "Adam variance")?,
 				"best" => builder.state.best = values(value, "best weight")?,
 				"best_loss" => builder.state.best_loss = values(value, "best loss")?,
-				"epoch" => builder.state.epoch = self::value(value, "epoch")?,
-				"training_rows" => builder.state.training_rows = self::value(value, "training_rows")?,
+				"epoch" => builder.state.epoch = value.parse().map_err(|error| RecipeError::new(format!("invalid epoch: {error}")))?,
+				"training_rows" => builder.state.training_rows = value.parse().map_err(|error| RecipeError::new(format!("invalid training rows: {error}")))?,
 				"trained_samples" => builder.state.trained_samples = values(value, "trained sample identity")?,
-				"" => {}
-				_ => return Err(RecipeError::new(format!("invalid model value: {line}"))),
+				"norm_mean" => builder.norm_mean = values(value, "normalization mean")?,
+				"norm_scale" => builder.norm_scale = values(value, "normalization scale")?,
+				"target_min" => builder.target_min = value.parse().map_err(|error| RecipeError::new(format!("invalid target minimum: {error}")))?,
+				"target_span" => builder.target_span = value.parse().map_err(|error| RecipeError::new(format!("invalid target span: {error}")))?,
+				"bn_stats" => builder.bn_stats = values(value, "batch normalization statistics")?,
+				"artifact" => builder.artifact = untext(value, "native artifact identity")?,
+				_ => return Err(RecipeError::new(format!("invalid semantic model value: {line}"))),
 			}
 		}
-		if let Some(value) = current {
-			graphs.push(value.finish()?)
-		}
+		if let Some(builder) = current { graphs.push(builder.finish()?) }
 		require(!graphs.is_empty(), "model has no graphs")?;
 		Ok((schema, graphs))
 	}
-	fn join<T: ToString>(values: &[T]) -> String { values.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ") }
-	pub(super) fn save(path: &Path, schema: &str, graphs: &mut [StoredGraph]) -> Result<()> {
+	pub(super) fn save_semantic(path: &Path, schema: &str, graphs: &mut [StoredGraph]) -> Result<()> {
 		require(path.extension().and_then(|value| value.to_str()) == Some("ogdl"), "save requires an .ogdl model")?;
 		require(!graphs.is_empty(), "model bundle has no graphs")?;
 		fn field(document: &mut String, key: &str, value: &str) { document.push_str(&format!("        {key} {value}\n")); }
-		let mut document = format!("recipe-model\n    schema {schema}\n");
+		let mut document = format!("{BUNDLE_HEADER}\n    schema {}\n", text(schema));
 		let config = Config::load()?;
 		for stored in graphs.iter_mut() {
+			require(!stored.models.is_empty(), "semantic model is absent from saved graph")?;
 			stored.graph.refresh_storage(config)?;
+			let semantic = semantic_graph(stored)?;
 			document.push_str("    graph\n");
-			for name in &stored.inputs {
-				document.push_str(&format!("        in {name}\n"))
+			for (index, model) in semantic.models.iter().enumerate() {
+				field(&mut document, "model", &format!("{index} {} {}", model.loss.0, model.quantization));
+				for block in &model.blocks { field(&mut document, "block", &block_text(block)); }
+				if let Some(downstream) = &model.downstream {
+					for block in downstream { field(&mut document, "downstream", &block_text(block)); }
+				}
 			}
-			for name in &stored.outputs {
-				document.push_str(&format!("        out {name}\n"))
+			for route in &semantic.routes {
+				field(&mut document, "route", &format!("{} {}", text(&route.inputs.join("\0")), text(&route.outputs.join("\0"))));
 			}
-			let graph = &stored.graph;
-			let (family, values) = stored.precision.saved_fields();
+			for name in &semantic.inputs { field(&mut document, "in", &text(name)); }
+			for name in &semantic.outputs { field(&mut document, "out", &text(name)); }
+			let (family, values) = semantic.precision.saved_fields();
 			field(&mut document, "arithmetic", &format!("{family} {} {} {} {}", values[0], values[1], values[2], values[3]));
-			field(&mut document, "shape", &format!("{} {} {} {}", graph.input.channels, graph.input.length, graph.output.channels, graph.output.length));
-			for node in &graph.nodes {
-				let d = [node.op as i32, node.source, node.second, node.input.channels as i32, node.input.length as i32, node.output.channels as i32, node.output.length as i32, node.offset as i32, node.parameters as i32, node.program_offset as i32, node.program_count as i32];
-				field(&mut document, "node", &join(&d));
-				field(&mut document, "identity", &format!("{} {}", node.block_index, BLOCK_KINDS.iter().position(|kind| *kind == node.block_kind).unwrap()));
-				field(&mut document, "   arguments", &join(&node.argument));
-				if node.argument[8] != 0.0 {
-					field(&mut document, "   quantization", &quantization(node.argument[8] as u16))
-				}
+			field(&mut document, "shape", &format!("{} {} {} {}", semantic.input.channels, semantic.input.length, semantic.output.channels, semantic.output.length));
+			for tensor in &semantic.tensors {
+				let metadata = if tensor.codebook.is_empty() { "-".to_owned() } else { tensor.codebook.iter().map(ToString::to_string).collect::<Vec<_>>().join(",") };
+				field(&mut document, "tensor", &format!("{} {} {metadata} {}", tensor.format.0, tensor.count, hex(&tensor.bytes)));
 			}
-			for node in &graph.nodes {
-				if node.parameters != 0 {
-					let weights = &graph.parameters[node.offset..node.offset + node.parameters];
-					if node.argument[8] == 0.0 {
-						field(&mut document, "weights", &join(weights))
-					} else {
-						let format = StorageFormat(node.argument[8] as u16);
-						let importance = graph.state.variances.get(node.offset..node.offset + node.parameters).unwrap_or(&[]);
-						let (bytes, codebook) = format.compress(weights, importance, config)?;
-						let hex = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-						let metadata = if codebook.is_empty() { "-".to_owned() } else { codebook.iter().map(ToString::to_string).collect::<Vec<_>>().join(",") };
-						field(&mut document, "quantized", &format!("{} {} {metadata} {hex}", format.0, weights.len()))
-					}
-				}
-			}
-			for (key, value) in [("programs", join(&graph.programs)), ("norm_mean", join(&stored.norm_mean)), ("norm_scale", join(&stored.norm_scale)), ("frozen", join(&graph.frozen)), ("moments", join(&graph.state.moments)), ("variances", join(&graph.state.variances)), ("best", join(&graph.state.best)), ("best_loss", join(&graph.state.best_loss)), ("epoch", graph.state.epoch.to_string()), ("training_rows", graph.state.training_rows.to_string()), ("trained_samples", join(&graph.state.trained_samples))] {
+			for (key, value) in [("frozen", join(&semantic.frozen)), ("moments", join(&semantic.state.moments)), ("variances", join(&semantic.state.variances)), ("best", join(&semantic.state.best)), ("best_loss", join(&semantic.state.best_loss)), ("epoch", semantic.state.epoch.to_string()), ("training_rows", semantic.state.training_rows.to_string()), ("trained_samples", join(&semantic.state.trained_samples)), ("norm_mean", join(&semantic.norm_mean)), ("norm_scale", join(&semantic.norm_scale))] {
 				field(&mut document, key, &value)
 			}
-			if stored.target_span != 0.0 {
-				field(&mut document, "target_min", &stored.target_min.to_string());
-				field(&mut document, "target_span", &stored.target_span.to_string());
+			if semantic.target_span != 0.0 {
+				field(&mut document, "target_min", &semantic.target_min.to_string());
+				field(&mut document, "target_span", &semantic.target_span.to_string());
 			}
-			if !stored.bn_stats.is_empty() {
-				field(&mut document, "bn_stats", &join(&stored.bn_stats))
-			}
+			if !semantic.bn_stats.is_empty() { field(&mut document, "bn_stats", &join(&semantic.bn_stats)) }
+			require(!semantic.artifact.is_empty(), "native artifact identity is absent")?;
+			field(&mut document, "artifact", &text(&semantic.artifact));
 		}
 		fs::write(path, document).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", path.display())))
 	}
-	fn same_node(a: &Node, b: &Node) -> bool { a.op == b.op && a.source == b.source && a.second == b.second && a.input == b.input && a.output == b.output && a.offset == b.offset && a.parameters == b.parameters && a.argument.iter().zip(&b.argument).all(|(a, b)| a.to_bits() == b.to_bits()) && a.program_offset == b.program_offset && a.program_count == b.program_count && a.block_index == b.block_index && a.block_kind == b.block_kind }
-	fn same_stored(a: &Option<StoredWeight>, b: &Option<StoredWeight>) -> bool {
-		match (a, b) {
-			(None, None) => true,
-			(Some(a), Some(b)) => a.format.0 == b.format.0 && a.count == b.count,
-			_ => false,
-		}
+	fn join<T: ToString>(values: &[T]) -> String { values.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ") }
+	fn same_structure(a: &SemanticGraph, b: &SemanticGraph) -> bool {
+		a.precision == b.precision && a.input == b.input && a.output == b.output && a.inputs == b.inputs && a.outputs == b.outputs && a.models.len() == b.models.len() && a.models.iter().zip(&b.models).all(|(a, b)| same_model(a, b)) && a.routes.len() == b.routes.len() && a.routes.iter().zip(&b.routes).all(|(a, b)| a.inputs == b.inputs && a.outputs == b.outputs) && a.tensors.len() == b.tensors.len() && a.tensors.iter().zip(&b.tensors).all(|(a, b)| a.format.0 == b.format.0 && a.count == b.count) && a.frozen.len() == b.frozen.len()
 	}
-	fn same_graph(a: &StoredGraph, b: &StoredGraph) -> bool { a.precision == b.precision && a.inputs == b.inputs && a.outputs == b.outputs && a.graph.input == b.graph.input && a.graph.output == b.graph.output && a.graph.frozen == b.graph.frozen && a.graph.programs == b.graph.programs && a.graph.parameters.len() == b.graph.parameters.len() && a.graph.nodes.len() == b.graph.nodes.len() && a.graph.stored.len() == b.graph.stored.len() && a.graph.nodes.iter().zip(&b.graph.nodes).all(|(a, b)| same_node(a, b)) && a.graph.stored.iter().zip(&b.graph.stored).all(|(a, b)| same_stored(a, b)) }
+	pub(super) fn artifact_key(models: &[Model], routes: &[Route], schema: &str, precision: Compute, graph: &Graph, target: &str) -> String {
+		let mut hash = 0xcbf29ce484222325_u64;
+		let mut feed = |value: &str| { for byte in value.as_bytes() { hash ^= u64::from(*byte); hash = hash.wrapping_mul(0x100000001b3); } };
+		feed(BUNDLE_HEADER);
+		feed(schema);
+		feed(target);
+		feed(&format!("precision:{precision:?};"));
+		for model in models {
+			let (blocks, downstream) = model_text(model);
+			feed(&format!("loss:{};quant:{};blocks:{};downstream:{};", model.loss.0, model.quantization, blocks.join("/"), downstream.join("/")));
+		}
+		for route in routes { feed(&format!("route:{}>{};", route.inputs.join("\0"), route.outputs.join("\0"))); }
+		for node in &graph.nodes { feed(&format!("node:{}:{}:{}:{};", node.offset, node.parameters, node.argument[8].to_bits(), node.output.elements())); }
+		format!("recipe-native-{hash:016x}")
+	}
 	pub(super) fn restore(path: &Path, schema: &str, graphs: &mut [StoredGraph], identities: &[u64]) -> Result<()> {
 		if !fs::exists(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))? {
-			return save(path, schema, graphs);
+			return save_semantic(path, schema, graphs);
 		}
-		let (stored_schema, stored) = load(path)?;
-		let matches = stored_schema == schema && stored.len() == graphs.len() && stored.iter().zip(graphs.iter()).all(|(a, b)| same_graph(a, b));
+		let (stored_schema, stored) = load_semantic(path)?;
+		let current = graphs.iter().map(semantic_graph).collect::<Result<Vec<_>>>()?;
+		let matches = stored_schema == schema && stored.len() == current.len() && stored.iter().zip(&current).all(|(a, b)| same_structure(a, b));
 		if matches {
 			for (current, saved) in graphs.iter_mut().zip(&stored) {
-				let saved_boundary = saved.graph.state.training_rows;
+				let saved_boundary = saved.state.training_rows;
 				let current_boundary = current.graph.state.training_rows;
 				if saved_boundary != 0 {
-					require(!saved.graph.state.trained_samples.is_empty(), "resume rejected: saved model has no training membership identity")?;
+					require(!saved.state.trained_samples.is_empty(), "resume rejected: saved model has no training membership identity")?;
 					require(current_boundary <= identities.len(), "current training membership is incomplete")?;
-					let trained = saved.graph.state.trained_samples.iter().copied().collect::<BTreeSet<_>>();
+					let trained = saved.state.trained_samples.iter().copied().collect::<BTreeSet<_>>();
 					let overlap = identities[current_boundary..].iter().filter(|value| trained.contains(value)).count();
 					require(overlap == 0, format!("resume rejected: {overlap} evaluation samples were previously trained, current boundary is {current_boundary} and saved boundary was {saved_boundary}"))?;
 				}
@@ -373,9 +495,18 @@ mod bundle {
 			}
 			for (current, saved) in graphs.iter_mut().zip(stored) {
 				let current_training_rows = current.graph.state.training_rows;
-				current.graph.parameters = saved.graph.parameters;
-				current.graph.stored = saved.graph.stored;
-				current.graph.state = saved.graph.state;
+				let mut tensor = 0;
+				for (index, node) in current.graph.nodes.iter().enumerate() {
+					if node.parameters == 0 { continue }
+					let encoded = saved.tensors.get(tensor).ok_or_else(|| RecipeError::new("saved semantic tensor is absent"))?;
+					require(encoded.count == node.parameters, "saved semantic tensor has the wrong shape")?;
+					current.graph.parameters[node.offset..node.offset + node.parameters].copy_from_slice(&encoded.arithmetic);
+					if let Some(slot) = current.graph.stored.get_mut(index) { *slot = (encoded.format.0 != 0).then_some(encoded.clone()) }
+					tensor += 1;
+				}
+				require(tensor == saved.tensors.len(), "saved semantic tensors are incomplete")?;
+				current.graph.state = saved.state;
+				current.graph.frozen = saved.frozen;
 				current.graph.state.training_rows = current_training_rows;
 			}
 			return Ok(());
@@ -385,36 +516,22 @@ mod bundle {
 		let mut answer = String::new();
 		std::io::stdin().read_line(&mut answer).map_err(|error| RecipeError::new(format!("cannot read answer: {error}")))?;
 		require(answer.trim().is_empty() || answer.trim().eq_ignore_ascii_case("y"), "model mismatch not overwritten")?;
-		save(path, schema, graphs)
+		save_semantic(path, schema, graphs)
 	}
-	pub(super) fn normalize_input(samples: &mut [f64], stored: &StoredGraph) -> Result<()> {
-		if stored.norm_mean.is_empty() {
-			return Ok(());
-		}
-		require(stored.norm_mean.len() == samples.len(), format!("model normalization expected {} values, received {}", stored.norm_mean.len(), samples.len()))?;
-		for (value, (mean, scale)) in samples.iter_mut().zip(stored.norm_mean.iter().zip(&stored.norm_scale)) {
-			*value = (*value - mean) / scale;
-		}
-		Ok(())
-	}
-	pub(super) fn decode_output(result: &mut [f64], stored: &StoredGraph) {
-		if stored.target_span > 0.0 {
-			for value in result.iter_mut() {
-				*value = stored.target_min + stored.target_span * logistic(*value);
-			}
-		}
-	}
-	pub(super) fn run_infer(path: &Path, input: &[f64], forward: impl Fn(&StoredGraph, &[f64]) -> Result<Vec<f64>>) -> Result<Vec<f64>> {
-		let (_, graphs) = load(path)?;
+	pub(super) fn run_infer(path: &Path, input: &[f64], forward: impl Fn(&SemanticGraph, &[f64]) -> Result<Vec<f64>>) -> Result<Vec<f64>> {
+		let (_, graphs) = load_semantic(path)?;
 		let first = graphs.first().ok_or_else(|| RecipeError::new("model has no graph"))?;
 		require(input.len() == first.inputs.len(), format!("model input expected {} values, received {}", first.inputs.len(), input.len()))?;
 		let mut values = first.inputs.iter().cloned().zip(input.iter().copied()).collect::<BTreeMap<_, _>>();
 		let mut result = Vec::new();
 		for stored in graphs {
 			let mut samples = stored.inputs.iter().map(|name| values.get(name).copied().ok_or_else(|| RecipeError::new(format!("input {name:?} is absent")))).collect::<Result<Vec<_>>>()?;
-			normalize_input(&mut samples, &stored)?;
+			if !stored.norm_mean.is_empty() {
+				require(stored.norm_mean.len() == samples.len(), format!("model normalization expected {} values, received {}", stored.norm_mean.len(), samples.len()))?;
+				for (value, (mean, scale)) in samples.iter_mut().zip(stored.norm_mean.iter().zip(&stored.norm_scale)) { *value = (*value - mean) / scale; }
+			}
 			result = forward(&stored, &samples)?;
-			decode_output(&mut result, &stored);
+			if stored.target_span > 0.0 { for value in &mut result { *value = stored.target_min + stored.target_span * logistic(*value); } }
 			require(result.len() == stored.outputs.len(), format!("model output expected {} values, received {}", stored.outputs.len(), result.len()))?;
 			for (name, value) in stored.outputs.iter().cloned().zip(result.iter().copied()) {
 				values.insert(name, value);
@@ -1925,7 +2042,9 @@ impl Recipe {
 		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
 		let device = selected_gpus().and_then(|gpus| gpus.into_iter().next().ok_or_else(|| RecipeError::new("execution device is absent"))).unwrap_or_else(|error| panic!("{error}"));
 		let result = bundle::run_infer(&path, input, |stored, samples| {
-			let mut tape = GpuTape::new(&stored.graph, samples, &[], device, stored.precision)?;
+			let config = Config::load()?;
+			let graph = materialize_saved_graph(stored, samples, device, config)?;
+			let mut tape = GpuTape::new(&graph, samples, &[], device, stored.precision)?;
 			tape.inject_bn_stats(&stored.bn_stats)?;
 			tape.forward()?;
 			tape.predictions()
@@ -2110,6 +2229,25 @@ fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu,
 		}
 	}
 	encode_graph_storage(&mut graph, config)?;
+	Ok(graph)
+}
+fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: &'static Gpu, config: Config) -> Result<Graph> {
+	require(saved.models.len() == 1, "saved RAT models require the native multi-model compiler")?;
+	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], rows: 1, features: saved.input.elements(), schema: "saved-native-model".to_owned(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new() };
+	let mut graph = compile_graph(&saved.models[0], &prepared, 1, gpu, config, Some(saved.output.elements()))?;
+	require(graph.parameters.len() == saved.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "saved semantic weights do not match the compiled model")?;
+	let mut tensor = 0;
+	for (index, node) in graph.nodes.iter().enumerate() {
+		if node.parameters == 0 { continue }
+		let encoded = saved.tensors.get(tensor).ok_or_else(|| RecipeError::new("saved semantic tensor is absent"))?;
+		require(encoded.count == node.parameters, "saved semantic tensor has the wrong shape")?;
+		graph.parameters[node.offset..node.offset + node.parameters].copy_from_slice(&encoded.arithmetic);
+		if let Some(slot) = graph.stored.get_mut(index) { *slot = (encoded.format.0 != 0).then_some(encoded.clone()) }
+		tensor += 1;
+	}
+	require(tensor == saved.tensors.len(), "saved semantic tensors are incomplete")?;
+	graph.frozen = saved.frozen.clone();
+	graph.state = saved.state.clone();
 	Ok(graph)
 }
 #[derive(Clone, Copy)]
@@ -2640,7 +2778,7 @@ fn count(name: &str, text: &str) -> Result<usize> { text.parse::<usize>().map_er
 fn multi_device() -> bool {
 	std::env::var_os("RECIPE_FORCE_CPU").is_none() && env!("RECIPE_MULTI_DEVICE") == "true"
 }
-fn stored_graph(graph: &Graph, data: &Data, scale: Option<TargetScale>, precision: Compute) -> bundle::StoredGraph {
+fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetScale>, precision: Compute, target: &str) -> bundle::StoredGraph {
 	let inputs = if data.autoregressive { CHAR_IDS.iter().enumerate().flat_map(|(id, character)| (0..graph.input.length).map(move |position| format!("char{id}.u{:04X}.{position}", *character as u32))).collect() } else { (0..graph.input.elements()).map(|index| format!("input{index}")).collect() };
 	let output = if data.autoregressive { "char-id".to_owned() } else { data.target.first().cloned().unwrap_or_else(|| "target".to_owned()) };
 	let (norm_mean, norm_scale) = match data.prepared.get() {
@@ -2648,7 +2786,11 @@ fn stored_graph(graph: &Graph, data: &Data, scale: Option<TargetScale>, precisio
 		_ => (Vec::new(), Vec::new()),
 	};
 	let (target_min, target_span) = scale.map_or((0.0, 0.0), |s| (s.minimum, s.span));
-	bundle::StoredGraph { graph: graph.clone(), precision, inputs, outputs: vec![output], norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new() }
+	let routes = data.routes.clone();
+	let models = vec![model.clone()];
+	let schema = data.prepared.get().and_then(|prepared| prepared.as_ref().ok()).map_or("", |prepared| prepared.schema.as_str());
+	let artifact = bundle::artifact_key(&models, &routes, schema, precision, graph, target);
+	bundle::StoredGraph { graph: graph.clone(), models, routes, precision, inputs, outputs: vec![output], norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new(), artifact }
 }
 struct GpuTape {
 	gpu: &'static Gpu,
@@ -3127,13 +3269,13 @@ impl DeviceTape {
 	fn tile(&self) -> Tile { self.shards[0].tape.tile }
 }
 fn checkpoint(path: &Path, schema: &str, stored: &mut bundle::StoredGraph, tape: &DeviceTape, best: bool) -> Result<()> {
-	if let Ok((_, saved)) = bundle::load(path) {
-		if saved.first().and_then(|g| g.graph.state.best_loss.first().copied()).is_some_and(|v| v <= tape.best_loss[0]) {
+	if let Ok((_, saved)) = bundle::load_semantic(path) {
+		if saved.first().and_then(|g| g.state.best_loss.first().copied()).is_some_and(|v| v <= tape.best_loss[0]) {
 			return Ok(());
 		}
 	}
 	tape.capture(&mut stored.graph, best)?;
-	bundle::save(path, schema, std::slice::from_mut(stored))
+	bundle::save_semantic(path, schema, std::slice::from_mut(stored))
 }
 const NODE_DESCRIPTOR_FIELDS: usize = 17; const NODE_STRUCTURE_OFFSET: usize = 11; const BATCH_NORMALIZATION_TRAINING: i32 = 0; const BATCH_NORMALIZATION_EVALUATION: i32 = 3;
 fn structural(value: f64) -> Result<i32> { require(value.is_finite() && value.fract() == 0.0 && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX), "node structural argument is invalid").map(|_| value as i32) }
@@ -5826,7 +5968,7 @@ impl Train {
 			graph.parameters[offset] = scale.logit(mean);
 		}
 		graph.refresh_storage(config)?;
-		let mut stored = stored_graph(&graph, data, scale, precision);
+		let mut stored = stored_graph(&graph, model, data, scale, precision, &gpus[0].name);
 		require(stored.graph.output.elements() == 1, "model output width must be one")?;
 		if let Some(path) = &self.resume {
 			bundle::restore(path, &prepared.schema, std::slice::from_mut(&mut stored), &prepared.identities)?;
@@ -6180,7 +6322,10 @@ fn build<const N: usize>(models: &[Model; N], train: &Train, data: &Data, gpus: 
 	route_graph(&mut graph, &predictor_inputs, &fields, data.normalize)?;
 	let (_, range) = append_model(&mut graph, &models[N - 1], predictor_inputs.len(), data.target.len(), rows, gpus[0], config, &schema)?;
 	ranges.push(range);
-	let mut stored = bundle::StoredGraph { graph, precision: config.precision, inputs: input_names, outputs: data.target.clone(), norm_mean: Vec::new(), norm_scale: Vec::new(), target_min: 0.0, target_span: 0.0, bn_stats: Vec::new() };
+	let models_vec = models.to_vec();
+	let routes = data.routes.clone();
+	let artifact = bundle::artifact_key(&models_vec, &routes, &schema, config.precision, &graph, &gpus[0].name);
+	let mut stored = bundle::StoredGraph { graph, models: models_vec, routes, precision: config.precision, inputs: input_names, outputs: data.target.clone(), norm_mean: Vec::new(), norm_scale: Vec::new(), target_min: 0.0, target_span: 0.0, bn_stats: Vec::new(), artifact };
 	if let Some(path) = &train.resume {
 		bundle::restore(path, &schema, std::slice::from_mut(&mut stored), &[])?;
 	}
