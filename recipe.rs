@@ -411,15 +411,20 @@ mod bundle {
 		Ok((schema, graphs))
 	}
 	pub(super) fn save_semantic(path: &Path, schema: &str, graphs: &mut [StoredGraph]) -> Result<()> {
+		let config = Config::load()?;
+		let semantic = graphs.iter_mut().map(|stored| {
+			require(!stored.models.is_empty(), "semantic model is absent from saved graph")?;
+			stored.graph.refresh_storage(config)?;
+			semantic_graph(stored)
+		}).collect::<Result<Vec<_>>>()?;
+		save_semantic_graphs(path, schema, &semantic)
+	}
+	pub(super) fn save_semantic_graphs(path: &Path, schema: &str, graphs: &[SemanticGraph]) -> Result<()> {
 		require(path.extension().and_then(|value| value.to_str()) == Some("ogdl"), "save requires an .ogdl model")?;
 		require(!graphs.is_empty(), "model bundle has no graphs")?;
 		fn field(document: &mut String, key: &str, value: &str) { document.push_str(&format!("        {key} {value}\n")); }
 		let mut document = format!("{BUNDLE_HEADER}\n    schema {}\n", text(schema));
-		let config = Config::load()?;
-		for stored in graphs.iter_mut() {
-			require(!stored.models.is_empty(), "semantic model is absent from saved graph")?;
-			stored.graph.refresh_storage(config)?;
-			let semantic = semantic_graph(stored)?;
+		for semantic in graphs {
 			document.push_str("    graph\n");
 			for (index, model) in semantic.models.iter().enumerate() {
 				field(&mut document, "model", &format!("{index} {} {}", model.loss.0, model.quantization));
