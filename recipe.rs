@@ -130,6 +130,7 @@ mod bundle {
 		parameters: Vec<f64>,
 		frozen: Vec<u8>,
 		programs: Vec<f64>,
+		stored: Vec<StoredWeight>,
 		state: TrainingState,
 		precision: Option<Compute>,
 		norm_mean: Vec<f64>,
@@ -151,8 +152,25 @@ mod bundle {
 			require(self.inputs.len() == input.elements(), "model graph input schema has the wrong width")?;
 			require(self.outputs.len() == output.elements(), "model graph output schema has the wrong width")?;
 			require(self.norm_mean.len() == self.norm_scale.len() && (self.norm_mean.is_empty() || self.norm_mean.len() == self.inputs.len()), "model graph normalization stats have the wrong width")?;
+			let mut stored = Vec::with_capacity(self.nodes.len());
+			let mut weight = 0;
+			for node in &self.nodes {
+				if node.parameters == 0 {
+					stored.push(None);
+					continue
+				}
+				if node.argument[8] == 0.0 {
+					stored.push(None);
+					continue
+				}
+				let encoded = self.stored.get(weight).ok_or_else(|| RecipeError::new("model graph quantized weights are incomplete"))?;
+				require(encoded.count == node.parameters && encoded.format.0 == node.argument[8] as u16, "model graph quantized weights do not match their node")?;
+				stored.push(Some(encoded.clone()));
+				weight += 1;
+			}
+			require(weight == self.stored.len(), "model graph has unused quantized weights")?;
 			let source = self.nodes.len() as i32 - 1;
-			Ok(StoredGraph { graph: Graph { nodes: self.nodes, parameters: self.parameters, frozen: self.frozen, programs: self.programs, input, output, source, state: self.state, block_index: 0, block_kind: "" }, precision: self.precision.ok_or_else(|| RecipeError::new("model graph has no arithmetic format"))?, inputs: self.inputs, outputs: self.outputs, norm_mean: self.norm_mean, norm_scale: self.norm_scale, target_min: self.target_min, target_span: self.target_span, bn_stats: self.bn_stats })
+			Ok(StoredGraph { graph: Graph { nodes: self.nodes, parameters: self.parameters, frozen: self.frozen, programs: self.programs, stored, input, output, source, state: self.state, block_index: 0, block_kind: "" }, precision: self.precision.ok_or_else(|| RecipeError::new("model graph has no arithmetic format"))?, inputs: self.inputs, outputs: self.outputs, norm_mean: self.norm_mean, norm_scale: self.norm_scale, target_min: self.target_min, target_span: self.target_span, bn_stats: self.bn_stats })
 		}
 	}
 	fn values<T: FromStr>(text: &str, role: &str) -> Result<Vec<T>>
@@ -245,7 +263,9 @@ mod bundle {
 					let hex = fields.next().unwrap_or("");
 					require(hex.len() % 2 == 0, "quantized bytes are invalid")?;
 					let bytes = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|error| RecipeError::new(format!("invalid quantized byte: {error}")))).collect::<Result<Vec<_>>>()?;
-					builder.parameters.extend(IntegerFormat(code).decompress(&bytes, &codebook, count)?);
+					let arithmetic = StorageFormat(code).decompress(&bytes, &codebook, count)?;
+					builder.parameters.extend(&arithmetic);
+					builder.stored.push(StoredWeight { format: StorageFormat(code), count, bytes, codebook, arithmetic });
 				}
 				"frozen" => builder.frozen = values(value, "frozen weight")?,
 				"moments" => builder.state.moments = values(value, "Adam moment")?,
@@ -266,13 +286,14 @@ mod bundle {
 		Ok((schema, graphs))
 	}
 	fn join<T: ToString>(values: &[T]) -> String { values.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ") }
-	pub(super) fn save(path: &Path, schema: &str, graphs: &[StoredGraph]) -> Result<()> {
+	pub(super) fn save(path: &Path, schema: &str, graphs: &mut [StoredGraph]) -> Result<()> {
 		require(path.extension().and_then(|value| value.to_str()) == Some("ogdl"), "save requires an .ogdl model")?;
 		require(!graphs.is_empty(), "model bundle has no graphs")?;
 		fn field(document: &mut String, key: &str, value: &str) { document.push_str(&format!("        {key} {value}\n")); }
 		let mut document = format!("recipe-model\n    schema {schema}\n");
 		let config = Config::load()?;
-		for stored in graphs {
+		for stored in graphs.iter_mut() {
+			stored.graph.refresh_storage(config)?;
 			document.push_str("    graph\n");
 			for name in &stored.inputs {
 				document.push_str(&format!("        in {name}\n"))
@@ -299,7 +320,7 @@ mod bundle {
 					if node.argument[8] == 0.0 {
 						field(&mut document, "weights", &join(weights))
 					} else {
-						let format = IntegerFormat(node.argument[8] as u16);
+						let format = StorageFormat(node.argument[8] as u16);
 						let importance = graph.state.variances.get(node.offset..node.offset + node.parameters).unwrap_or(&[]);
 						let (bytes, codebook) = format.compress(weights, importance, config)?;
 						let hex = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
@@ -322,7 +343,14 @@ mod bundle {
 		fs::write(path, document).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", path.display())))
 	}
 	fn same_node(a: &Node, b: &Node) -> bool { a.op == b.op && a.source == b.source && a.second == b.second && a.input == b.input && a.output == b.output && a.offset == b.offset && a.parameters == b.parameters && a.argument.iter().zip(&b.argument).all(|(a, b)| a.to_bits() == b.to_bits()) && a.program_offset == b.program_offset && a.program_count == b.program_count && a.block_index == b.block_index && a.block_kind == b.block_kind }
-	fn same_graph(a: &StoredGraph, b: &StoredGraph) -> bool { a.precision == b.precision && a.inputs == b.inputs && a.outputs == b.outputs && a.graph.input == b.graph.input && a.graph.output == b.graph.output && a.graph.frozen == b.graph.frozen && a.graph.programs == b.graph.programs && a.graph.parameters.len() == b.graph.parameters.len() && a.graph.nodes.len() == b.graph.nodes.len() && a.graph.nodes.iter().zip(&b.graph.nodes).all(|(a, b)| same_node(a, b)) }
+	fn same_stored(a: &Option<StoredWeight>, b: &Option<StoredWeight>) -> bool {
+		match (a, b) {
+			(None, None) => true,
+			(Some(a), Some(b)) => a.format.0 == b.format.0 && a.count == b.count,
+			_ => false,
+		}
+	}
+	fn same_graph(a: &StoredGraph, b: &StoredGraph) -> bool { a.precision == b.precision && a.inputs == b.inputs && a.outputs == b.outputs && a.graph.input == b.graph.input && a.graph.output == b.graph.output && a.graph.frozen == b.graph.frozen && a.graph.programs == b.graph.programs && a.graph.parameters.len() == b.graph.parameters.len() && a.graph.nodes.len() == b.graph.nodes.len() && a.graph.stored.len() == b.graph.stored.len() && a.graph.nodes.iter().zip(&b.graph.nodes).all(|(a, b)| same_node(a, b)) && a.graph.stored.iter().zip(&b.graph.stored).all(|(a, b)| same_stored(a, b)) }
 	pub(super) fn restore(path: &Path, schema: &str, graphs: &mut [StoredGraph], identities: &[u64]) -> Result<()> {
 		if !fs::exists(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))? {
 			return save(path, schema, graphs);
@@ -346,6 +374,7 @@ mod bundle {
 			for (current, saved) in graphs.iter_mut().zip(stored) {
 				let current_training_rows = current.graph.state.training_rows;
 				current.graph.parameters = saved.graph.parameters;
+				current.graph.stored = saved.graph.stored;
 				current.graph.state = saved.graph.state;
 				current.graph.state.training_rows = current_training_rows;
 			}
@@ -563,7 +592,7 @@ $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) }
 impl Model {
 	fn push(&self, operation: Operation) -> Self {
 		let mut model = self.clone();
-		model.blocks.push(Block { operation, activation: Activation::Linear, normalization: None, quantization: model.quantization, profile: IntegerFormat(model.quantization).selection().is_some() });
+		model.blocks.push(Block { operation, activation: Activation::Linear, normalization: None, quantization: model.quantization, profile: StorageFormat(model.quantization).selection().is_some() });
 		model
 	}
 	pub fn activate(&self, activation: Activation) -> Self {
@@ -611,7 +640,7 @@ impl Model {
 		let format = family << 12 | variant << 8 | u16::from(bits);
 		if let Some(block) = model.blocks.last_mut() {
 			block.quantization = format;
-			block.profile = IntegerFormat(format).selection().is_some()
+			block.profile = StorageFormat(format).selection().is_some()
 		} else {
 			model.quantization = format
 		}
@@ -1045,9 +1074,84 @@ fn iq4_fit(values: &[f32], tries: i32) -> (f32, Vec<u8>) {
 	(scale, values.iter().map(|value| iq4_code(value * inverse)).collect())
 }
 #[derive(Clone, Copy)]
-struct IntegerFormat(u16);
-impl IntegerFormat {
+pub(crate) struct StorageFormat(pub(crate) u16);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StorageCodec {
+	Q4_0,
+	Q4_1,
+	Q5_0,
+	Q5_1,
+	Q8_0,
+	Q8_1,
+	Q2K,
+	Q3K,
+	Q4K,
+	Q5K,
+	Q6K,
+	Q8K,
+	NF4,
+	IQ4NL,
+	IQ4XS,
+	IQ3XXS,
+	IQ2XXS,
+	IQ2S,
+	IQ2XS,
+	IQ1S,
+	IQ1M,
+	IQ3S,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StorageSpec {
+	pub(crate) codec: StorageCodec,
+	pub(crate) block: usize,
+	pub(crate) stride: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct StoredWeight {
+	pub(crate) format: StorageFormat,
+	pub(crate) count: usize,
+	pub(crate) bytes: Vec<u8>,
+	pub(crate) codebook: Vec<f64>,
+	pub(crate) arithmetic: Vec<f64>,
+}
+
+impl StorageFormat {
 	fn valid(self) -> bool { matches!((self.0 >> 12, self.bits(), self.0 >> 8 & 15), (0, 4 | 5 | 8, 0 | 1) | (0, 4, 2) | (0, 2 | 3 | 4 | 5 | 6 | 8, 3) | (0, 3 | 4 | 5, 4 | 5) | (0, 3, 6) | (1, 1, 3 | 4) | (1, 2 | 3, 1 | 2 | 3 | 4) | (1, 4, 2 | 5)) }
+	pub(crate) fn spec(self) -> Option<StorageSpec> {
+		let (family, bits, variant) = (self.0 >> 12, self.bits(), self.0 >> 8 & 15);
+		Some(match (family, bits, variant) {
+			(0, 4, 0) => StorageSpec { codec: StorageCodec::Q4_0, block: 32, stride: 18 },
+			(0, 4, 1) => StorageSpec { codec: StorageCodec::Q4_1, block: 32, stride: 20 },
+			(0, 5, 0) => StorageSpec { codec: StorageCodec::Q5_0, block: 32, stride: 22 },
+			(0, 5, 1) => StorageSpec { codec: StorageCodec::Q5_1, block: 32, stride: 24 },
+			(0, 8, 0) => StorageSpec { codec: StorageCodec::Q8_0, block: 32, stride: 34 },
+			(0, 8, 1) => StorageSpec { codec: StorageCodec::Q8_1, block: 32, stride: 36 },
+			(0, 4, 2) => StorageSpec { codec: StorageCodec::NF4, block: 0, stride: 0 },
+			(0, 2, 3) => StorageSpec { codec: StorageCodec::Q2K, block: 256, stride: 84 },
+			(0, 3, 3 | 4 | 5 | 6) => StorageSpec { codec: StorageCodec::Q3K, block: 256, stride: 110 },
+			(0, 4, 3 | 4 | 5 | 6) => StorageSpec { codec: StorageCodec::Q4K, block: 256, stride: 144 },
+			(0, 5, 3 | 4 | 5 | 6) => StorageSpec { codec: StorageCodec::Q5K, block: 256, stride: 176 },
+			(0, 6, 3 | 4 | 5 | 6) => StorageSpec { codec: StorageCodec::Q6K, block: 256, stride: 210 },
+			(0, 8, 3) => StorageSpec { codec: StorageCodec::Q8K, block: 256, stride: 292 },
+			(1, 4, 5) => StorageSpec { codec: StorageCodec::IQ4NL, block: 32, stride: 18 },
+			(1, 4, 2) => StorageSpec { codec: StorageCodec::IQ4XS, block: 256, stride: 136 },
+			(1, 3, 1) => StorageSpec { codec: StorageCodec::IQ3XXS, block: 256, stride: 98 },
+			(1, 2, 1) => StorageSpec { codec: StorageCodec::IQ2XXS, block: 256, stride: 66 },
+			(1, 2, 2) => StorageSpec { codec: StorageCodec::IQ2XS, block: 256, stride: 74 },
+			(1, 2, 3) => StorageSpec { codec: StorageCodec::IQ2S, block: 256, stride: 82 },
+			(1, 1, 3) => StorageSpec { codec: StorageCodec::IQ1S, block: 256, stride: 50 },
+			(1, 1, 4) => StorageSpec { codec: StorageCodec::IQ1M, block: 256, stride: 56 },
+			(1, 3, 3) => StorageSpec { codec: StorageCodec::IQ3S, block: 256, stride: 110 },
+			_ => return None,
+		})
+	}
+	pub(crate) fn encode(self, arithmetic: &[f64], importance: &[f64], config: Config) -> Result<StoredWeight> {
+		let (bytes, codebook) = self.compress(arithmetic, importance, config)?;
+		Ok(StoredWeight { format: self, count: arithmetic.len(), bytes, codebook, arithmetic: arithmetic.to_vec() })
+	}
 	fn unavailable(self) -> RecipeError { RecipeError::new(format!("{} is unavailable; available GGML formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q3_K_S, Q3_K_M, Q3_K_L, Q4_K, Q4_K_S, Q4_K_M, Q5_K, Q5_K_S, Q5_K_M, Q6_K, Q8_K, Q4_NF, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ2_M, IQ3_XXS, IQ3_XS, IQ3_S, IQ3_M, IQ4_XS, and IQ4_NL", quantization(self.0))) }
 	fn selection(self) -> Option<u16> {
 		let (family, bits, variant) = (self.0 >> 12, self.bits(), self.0 >> 8 & 15);
@@ -1099,7 +1203,7 @@ fn decode_blocks(data: &[u8], count: usize, block: usize, stride: usize, error: 
 	}
 	Ok(weights)
 }
-impl Integer for IntegerFormat {
+impl Integer for StorageFormat {
 	fn bits(self) -> u8 { self.0 as u8 }
 	fn compress(self, weights: &[f64], importance: &[f64], config: Config) -> Result<(Vec<u8>, Vec<f64>)> {
 		let bits = self.bits();
@@ -1940,6 +2044,7 @@ struct Graph {
 	parameters: Vec<f64>,
 	frozen: Vec<u8>,
 	programs: Vec<f64>,
+	stored: Vec<Option<StoredWeight>>,
 	input: Shape,
 	output: Shape,
 	source: i32,
@@ -1948,13 +2053,29 @@ struct Graph {
 	block_kind: &'static str,
 }
 impl Graph {
-	fn new(shape: Shape) -> Self { Self { nodes: Vec::new(), parameters: Vec::new(), frozen: Vec::new(), programs: Vec::new(), input: shape, output: shape, source: -1, state: TrainingState::default(), block_index: 0, block_kind: "" } }
+	fn new(shape: Shape) -> Self { Self { nodes: Vec::new(), parameters: Vec::new(), frozen: Vec::new(), programs: Vec::new(), stored: Vec::new(), input: shape, output: shape, source: -1, state: TrainingState::default(), block_index: 0, block_kind: "" } }
+	fn refresh_storage(&mut self, config: Config) -> Result<()> { encode_graph_storage(self, config) }
 }
 fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<Graph> { compile_graph(model, data, rows, gpu, config, None) }
 fn compile_output(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config, output: usize) -> Result<Graph> { compile_graph(model, data, rows, gpu, config, Some(output)) }
+fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
+	require(graph.stored.len() == graph.nodes.len(), "model graph storage spans are incomplete")?;
+	for (index, node) in graph.nodes.iter().enumerate() {
+		if node.parameters == 0 || node.argument[8] == 0.0 {
+			graph.stored[index] = None;
+			continue
+		}
+		let format = StorageFormat(node.argument[8] as u16);
+		require(format.spec().is_some(), format.unavailable().to_string())?;
+		let weights = &graph.parameters[node.offset..node.offset + node.parameters];
+		let importance = graph.state.variances.get(node.offset..node.offset + node.parameters).filter(|values| values.len() == node.parameters).map_or_else(|| vec![1.0; node.parameters], |values| values.to_vec());
+		graph.stored[index] = Some(format.encode(weights, &importance, config)?);
+	}
+	Ok(())
+}
 fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config, expected: Option<usize>) -> Result<Graph> {
 	require(!model.blocks.is_empty(), "model must contain a block")?;
-	if let Some(format) = model.blocks.iter().map(|block| IntegerFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
+	if let Some(format) = model.blocks.iter().map(|block| StorageFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
 		return Err(format.unavailable());
 	}
 	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..) | Operation::Embed(..));
@@ -1965,7 +2086,7 @@ fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu,
 		graph.block_kind = block.operation.name();
 		lower_block(&mut graph, block, model.blocks.len(), data, rows, gpu, config)?;
 	}
-	let mut output_profile = model.blocks.last().filter(|block| block.profile).map(|block| IntegerFormat(block.quantization));
+	let mut output_profile = model.blocks.last().filter(|block| block.profile).map(|block| StorageFormat(block.quantization));
 	if let Some(expected) = expected {
 		require(graph.output.elements() == expected, "model output width does not match .out()")?;
 	} else if graph.output.elements() != 1 {
@@ -1974,7 +2095,7 @@ fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu,
 		if model.quantization != 0 {
 			graph.nodes.last_mut().unwrap().argument[8] = f64::from(model.quantization)
 		}
-		output_profile = IntegerFormat(model.quantization).selection().map(|_| IntegerFormat(model.quantization));
+		output_profile = StorageFormat(model.quantization).selection().map(|_| StorageFormat(model.quantization));
 	}
 	if let Some(format) = output_profile
 		&& let Some(node) = graph.nodes.iter_mut().rev().find(|node| node.parameters != 0 && node.block_index + 1 == model.blocks.len())
@@ -1988,6 +2109,7 @@ fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu,
 			graph.parameters[offset] = mean;
 		}
 	}
+	encode_graph_storage(&mut graph, config)?;
 	Ok(graph)
 }
 #[derive(Clone, Copy)]
@@ -2036,6 +2158,7 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	graph.parameters.extend(part.parameters);
 	graph.frozen.extend(part.frozen);
 	graph.programs.extend(part.programs);
+	graph.stored.extend(part.stored);
 	graph.nodes.extend(part.nodes);
 	graph.output = part.output;
 	graph.source = narrow(graph.nodes.len(), "RAT graph nodes")? - 1;
@@ -2073,7 +2196,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		for node in &mut graph.nodes[first..] {
 			if node.parameters != 0 {
 				let role = if block.operation.name() == "attn" { parameter } else { 0 };
-				node.argument[8] = f64::from(if block.profile { IntegerFormat(block.quantization).tensor(role, more, false) } else { block.quantization });
+				node.argument[8] = f64::from(if block.profile { StorageFormat(block.quantization).tensor(role, more, false) } else { block.quantization });
 				parameter += 1
 			}
 		}
@@ -2087,6 +2210,7 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 	graph.parameters.resize(checked_add(offset, parameters, "model parameters")?, 0.0);
 	graph.frozen.resize(graph.parameters.len(), 0);
 	graph.nodes.push(Node { op, source, second, input: graph.output, output, offset, parameters, argument, program_offset: 0, program_count: 0, block_index: graph.block_index, block_kind: graph.block_kind });
+	graph.stored.push(None);
 	graph.output = output;
 	graph.source = graph.nodes.len() as i32 - 1;
 	Ok(())
@@ -3009,7 +3133,7 @@ fn checkpoint(path: &Path, schema: &str, stored: &mut bundle::StoredGraph, tape:
 		}
 	}
 	tape.capture(&mut stored.graph, best)?;
-	bundle::save(path, schema, std::slice::from_ref(stored))
+	bundle::save(path, schema, std::slice::from_mut(stored))
 }
 const NODE_DESCRIPTOR_FIELDS: usize = 17; const NODE_STRUCTURE_OFFSET: usize = 11; const BATCH_NORMALIZATION_TRAINING: i32 = 0; const BATCH_NORMALIZATION_EVALUATION: i32 = 3;
 fn structural(value: f64) -> Result<i32> { require(value.is_finite() && value.fract() == 0.0 && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX), "node structural argument is invalid").map(|_| value as i32) }
@@ -5701,6 +5825,7 @@ impl Train {
 			let mean = target_values[..training_rows].iter().sum::<f64>() / training_rows as f64;
 			graph.parameters[offset] = scale.logit(mean);
 		}
+		graph.refresh_storage(config)?;
 		let mut stored = stored_graph(&graph, data, scale, precision);
 		require(stored.graph.output.elements() == 1, "model output width must be one")?;
 		if let Some(path) = &self.resume {
