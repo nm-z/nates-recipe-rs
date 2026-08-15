@@ -43,74 +43,58 @@ ptr addrspace(1) %input, i32 %row.base, i32 %position, i32 %term, i32 %span, i32
 %local.0 = add i32 %channel.base, %position %local = add i32 %local.0, %offset
 %index = add i32 %row.base, %local %ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %index
 %value = load double, ptr addrspace(1) %ptr, align 8 ret double %value } define internal void @contraction_forward_body(
-ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
-i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %kernel,
+ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %kernel,
 i1 %has.bias, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #1 { entry:
-%lid = call i32 @recipe.local.id.x() %group = call i32 @recipe.group.id.x()
-%block = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %block
+%lid = call i32 @recipe.local.id.x() %group = call i32 @recipe.group.id.x() %block = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %block
 %in.elements = mul i32 %in.channels, %in.length %out.elements = mul i32 %out.channels, %out.length
-%is.conv = icmp ne i32 %kernel, 0 %span = select i1 %is.conv, i32 %kernel, i32 1 %terms = mul i32 %in.channels, %span
-%m.short = icmp ult i32 %tile.m, %out.length %m.tile = select i1 %m.short, i32 %tile.m, i32 %out.length
-%n.short = icmp ult i32 %tile.n, %out.channels %n.tile = select i1 %n.short, i32 %tile.n, i32 %out.channels
+%is.conv = icmp ne i32 %kernel, 0 %span = select i1 %is.conv, i32 %kernel, i32 1 %terms = mul i32 %in.channels, %span %m.total = mul i32 %rows, %out.length
+%m.short = icmp ult i32 %tile.m, %m.total %m.tile = select i1 %m.short, i32 %tile.m, i32 %m.total %n.short = icmp ult i32 %tile.n, %out.channels %n.tile = select i1 %n.short, i32 %tile.n, i32 %out.channels
 %k.short = icmp ult i32 %tile.k, %terms %k.tile = select i1 %k.short, i32 %tile.k, i32 %terms
-%positions.adjusted = add i32 %out.length, %m.tile %positions.numerator = sub i32 %positions.adjusted, 1
-%position.tiles = udiv i32 %positions.numerator, %m.tile
-%channels.adjusted = add i32 %out.channels, %n.tile %channels.numerator = sub i32 %channels.adjusted, 1
-%channel.tiles = udiv i32 %channels.numerator, %n.tile
-%jobs.per.row = mul i32 %position.tiles, %channel.tiles %jobs = mul i32 %rows, %jobs.per.row
-br label %job.loop job.loop:
+%m.adjusted = add i32 %m.total, %m.tile %m.numerator = sub i32 %m.adjusted, 1 %m.tiles = udiv i32 %m.numerator, %m.tile %n.adjusted = add i32 %out.channels, %n.tile %n.numerator = sub i32 %n.adjusted, 1 %n.tiles = udiv i32 %n.numerator, %n.tile
+%jobs = mul i32 %m.tiles, %n.tiles br label %job.loop job.loop:
 %job = phi i32 [ %group, %entry ], [ %job.next, %job.done ] %job.more = icmp ult i32 %job, %jobs
 br i1 %job.more, label %job.step, label %exit job.step:
-%row = udiv i32 %job, %jobs.per.row %within = urem i32 %job, %jobs.per.row
-%position.tile = udiv i32 %within, %channel.tiles %channel.tile = urem i32 %within, %channel.tiles
-%position.base = mul i32 %position.tile, %m.tile %channel.base = mul i32 %channel.tile, %n.tile
-%m.remaining = sub i32 %out.length, %position.base %m.partial = icmp ult i32 %m.remaining, %m.tile
-%m.count = select i1 %m.partial, i32 %m.remaining, i32 %m.tile
-%n.remaining = sub i32 %out.channels, %channel.base %n.partial = icmp ult i32 %n.remaining, %n.tile
-%n.count = select i1 %n.partial, i32 %n.remaining, i32 %n.tile
-%row.base = mul i32 %row, %in.elements br label %channel.loop channel.loop:
-%n.offset = phi i32 [ 0, %job.step ], [ %n.next, %channel.done ] %n.index = add i32 %n.offset, %lid
-%active = icmp ult i32 %n.index, %n.count %channel.raw = add i32 %channel.base, %n.index
-%channel = select i1 %active, i32 %channel.raw, i32 0 br label %position.loop position.loop:
-%m = phi i32 [ 0, %channel.loop ], [ %m.next, %position.done ] %m.more = icmp ult i32 %m, %m.count
-br i1 %m.more, label %position.step, label %channel.done position.step:
-%position = add i32 %position.base, %m br label %tile.loop tile.loop:
-%term.base = phi i32 [ 0, %position.step ], [ %term.next, %tile.done ]
-%sum = phi double [ 0.0, %position.step ], [ %tile.sum, %tile.done ]
-%k.remaining = sub i32 %terms, %term.base %k.partial = icmp ult i32 %k.remaining, %k.tile
-%k.count = select i1 %k.partial, i32 %k.remaining, i32 %k.tile br label %load.loop load.loop:
-%load = phi i32 [ %lid, %tile.loop ], [ %load.next, %load.step ] %load.more = icmp ult i32 %load, %k.count
-br i1 %load.more, label %load.step, label %load.done load.step: %term = add i32 %term.base, %load
-%value = call double @contraction_input( ptr addrspace(1) %input, i32 %row.base, i32 %position,
-i32 %term, i32 %span, i32 %in.length, i1 %is.conv ) %tile.ptr = getelementptr [0 x double],
-ptr addrspace(3) @contraction_tile, i32 0, i32 %load store double %value, ptr addrspace(3) %tile.ptr, align 8
+%n.tile.index = udiv i32 %job, %m.tiles %m.tile.index = urem i32 %job, %m.tiles
+%m.base = mul i32 %m.tile.index, %m.tile %n.base = mul i32 %n.tile.index, %n.tile
+%m.remaining = sub i32 %m.total, %m.base %m.partial = icmp ult i32 %m.remaining, %m.tile %m.count = select i1 %m.partial, i32 %m.remaining, i32 %m.tile
+%n.remaining = sub i32 %out.channels, %n.base %n.partial = icmp ult i32 %n.remaining, %n.tile %n.count = select i1 %n.partial, i32 %n.remaining, i32 %n.tile
+%outputs = mul i32 %m.count, %n.count %active = icmp ult i32 %lid, %outputs %output.n.raw = udiv i32 %lid, %m.count %output.m.raw = urem i32 %lid, %m.count
+%output.n = select i1 %active, i32 %output.n.raw, i32 0 %output.m = select i1 %active, i32 %output.m.raw, i32 0
+%channel = add i32 %n.base, %output.n %m.global = add i32 %m.base, %output.m %position = urem i32 %m.global, %out.length %row = udiv i32 %m.global, %out.length
+br label %tile.loop tile.loop:
+%term.base = phi i32 [ 0, %job.step ], [ %term.next, %tile.done ] %sum = phi double [ 0.0, %job.step ], [ %tile.sum, %tile.done ]
+%k.remaining = sub i32 %terms, %term.base %k.partial = icmp ult i32 %k.remaining, %k.tile %k.count = select i1 %k.partial, i32 %k.remaining, i32 %k.tile
+%a.count = mul i32 %m.count, %k.count %b.count = mul i32 %n.count, %k.count %load.count = add i32 %a.count, %b.count br label %load.loop load.loop:
+%load = phi i32 [ %lid, %tile.loop ], [ %load.next, %load.store ] %load.more = icmp ult i32 %load, %load.count br i1 %load.more, label %load.classify, label %load.done
+load.classify: %load.a = icmp ult i32 %load, %a.count br i1 %load.a, label %load.a.step, label %load.b.step
+load.a.step: %a.k = udiv i32 %load, %m.count %a.m = urem i32 %load, %m.count %a.global = add i32 %m.base, %a.m %a.row = udiv i32 %a.global, %out.length
+%a.position = urem i32 %a.global, %out.length %a.row.base = mul i32 %a.row, %in.elements %a.term = add i32 %term.base, %a.k
+%a.value = call double @contraction_input( ptr addrspace(1) %input, i32 %a.row.base, i32 %a.position,
+i32 %a.term, i32 %span, i32 %in.length, i1 %is.conv )
+%a.tile.row = mul i32 %a.k, %m.tile %a.tile.index = add i32 %a.tile.row, %a.m br label %load.store
+load.b.step: %b.local = sub i32 %load, %a.count %b.n = udiv i32 %b.local, %k.count
+%b.k = urem i32 %b.local, %k.count %b.channel = add i32 %n.base, %b.n %b.channel.base = mul i32 %b.channel, %terms %b.term = add i32 %term.base, %b.k
+%b.index = add i32 %b.channel.base, %b.term %b.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %b.index %b.value = load double, ptr addrspace(1) %b.ptr, align 8
+%b.tile.base = mul i32 %m.tile, %k.tile %b.tile.row = mul i32 %b.k, %n.tile %b.tile.local = add i32 %b.tile.row, %b.n %b.tile.index = add i32 %b.tile.base, %b.tile.local br label %load.store
+load.store: %load.value = phi double [ %a.value, %load.a.step ], [ %b.value, %load.b.step ] %load.tile.index = phi i32 [ %a.tile.index, %load.a.step ], [ %b.tile.index, %load.b.step ]
+%load.tile.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %load.tile.index store double %load.value, ptr addrspace(3) %load.tile.ptr, align 8
 %load.next = add i32 %load, %block br label %load.loop load.done:
 call void @recipe.local.barrier() br label %compute.loop compute.loop:
-%i = phi i32 [ 0, %load.done ], [ %i.next, %compute.step ]
-%partial = phi double [ %sum, %load.done ], [ %partial.next, %compute.step ] %compute.more = icmp ult i32 %i, %k.count
-br i1 %compute.more, label %compute.step, label %compute.done compute.step: %input.ptr = getelementptr [0 x double],
-ptr addrspace(3) @contraction_tile, i32 0, i32 %i %x = load double, ptr addrspace(3) %input.ptr, align 8
-%weight.channel.base = mul i32 %channel, %terms %weight.term = add i32 %term.base, %i
-%weight.index = add i32 %weight.channel.base, %weight.term
-%weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.index
-%w = load double, ptr addrspace(1) %weight.ptr, align 8 %product = call double @recipe.mul(double %x, double %w)
-%candidate = call double @recipe.add(double %partial, double %product) %partial.next = select i1 %active, double %candidate, double %partial
+%i = phi i32 [ 0, %load.done ], [ %i.next, %compute.step ] %partial = phi double [ %sum, %load.done ], [ %partial.next, %compute.step ]
+%compute.more = icmp ult i32 %i, %k.count br i1 %compute.more, label %compute.step, label %compute.done
+compute.step: %a.compute.row = mul i32 %i, %m.tile %a.compute.index = add i32 %a.compute.row, %output.m %a.compute.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %a.compute.index
+%b.compute.base = mul i32 %m.tile, %k.tile %b.compute.row = mul i32 %i, %n.tile %b.compute.local = add i32 %b.compute.row, %output.n %b.compute.index = add i32 %b.compute.base, %b.compute.local
+%b.compute.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %b.compute.index %x = load double, ptr addrspace(3) %a.compute.ptr, align 8 %w = load double, ptr addrspace(3) %b.compute.ptr, align 8
+%product = call double @recipe.mul(double %x, double %w) %candidate = call double @recipe.add(double %partial, double %product) %partial.next = select i1 %active, double %candidate, double %partial
 %i.next = add i32 %i, 1 br label %compute.loop compute.done:
 %tile.sum = phi double [ %partial, %compute.loop ] call void @recipe.local.barrier()
 %term.next = add i32 %term.base, %k.count %term.more = icmp ult i32 %term.next, %terms
-br i1 %term.more, label %tile.done, label %store.test tile.done: br label %tile.loop store.test:
-br i1 %active, label %store, label %position.done store:
-%output.row.base = mul i32 %row, %out.elements %output.channel.base = mul i32 %channel.raw, %out.length
-%output.local = add i32 %output.channel.base, %position %output.index = add i32 %output.row.base, %output.local
-%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %output.index
-%bias.base = mul i32 %out.channels, %terms %bias.index = add i32 %bias.base, %channel.raw
-%bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %bias.index
-%bias = load double, ptr addrspace(1) %bias.ptr, align 8 %biased = call double @recipe.add(double %tile.sum, double %bias)
-%result = select i1 %has.bias, double %biased, double %tile.sum
-store double %result, ptr addrspace(1) %output.ptr, align 8 br label %position.done position.done:
-%m.next = add i32 %m, 1 br label %position.loop channel.done:
-%n.next = add i32 %n.offset, %block %n.more = icmp ult i32 %n.next, %n.count
-br i1 %n.more, label %channel.loop, label %job.done job.done:
+br i1 %term.more, label %tile.done, label %store.test tile.done: br label %tile.loop
+store.test: br i1 %active, label %store, label %job.done store:
+%output.row.base = mul i32 %row, %out.elements %output.channel.base = mul i32 %channel, %out.length %output.local = add i32 %output.channel.base, %position %output.index = add i32 %output.row.base, %output.local
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %output.index %bias.base = mul i32 %out.channels, %terms %bias.index = add i32 %bias.base, %channel %bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %bias.index
+%bias = load double, ptr addrspace(1) %bias.ptr, align 8 %biased = call double @recipe.add(double %tile.sum, double %bias) %result = select i1 %has.bias, double %biased, double %tile.sum
+store double %result, ptr addrspace(1) %output.ptr, align 8 br label %job.done job.done:
 %job.next = add i32 %job, %groups br label %job.loop exit: ret void }
 define internal void @pool_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %context,
 i32 %p, i32 %from, i32 %to, i32 %size, i32 %channels ) #1 { entry: %length = udiv i32 %from, %channels

@@ -5506,10 +5506,9 @@ impl NativeTape {
 		if program.model_load.is_some() {
 			require(!program.artifact.storage.is_empty(), "native model-load storage is empty")?;
 			let storage = Buffer::upload(gpu, &program.artifact.storage)?;
-			let items = narrow(parameters.max(1), "native model-load parameters")? as u32;
-			let threads = program.dispatch(NativeEntry::ModelLoad)?.geometry.threads(items)?;
+			let threads = program.dispatch(NativeEntry::ModelLoad)?.geometry.threads()?;
 			let mut call = ptrs![weights.pointer, storage.pointer, threads];
-			program.launch_model_load(&mut call, items)?;
+			program.launch_model_load(&mut call)?;
 			gpu.synchronize()?;
 		} else {
 			require(program.artifact.storage.is_empty(), "native artifact storage has no model-load entrypoint")?;
@@ -5547,14 +5546,14 @@ impl NativeTape {
 		})
 	}
 	fn forward(&mut self) -> Result<()> {
-		let threads = self.program.forward.geometry.threads(self.rows)?;
+		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
 		let tile_m = self.tile.m;
 		let tile_n = self.tile.n;
 		let tile_k = self.tile.k;
 		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, tile_m, tile_n, tile_k];
-		self.program.launch_forward(&mut call, self.rows, self.tile).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
+		self.program.launch_forward(&mut call, self.tile).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		self.gather_error("forward")
 	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
@@ -5589,7 +5588,7 @@ impl NativeTape {
 	}
 	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
 		require(self.step != 0, "optimizer epoch is absent")?;
-		let threads = self.program.epoch.geometry.threads(self.rows)?;
+		let threads = self.program.epoch.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
 		let tile_m = self.tile.m;
@@ -5630,7 +5629,7 @@ impl NativeTape {
 			encoded[6],
 			step
 		];
-		self.program.launch_epoch(&mut call, self.rows, self.tile).map_err(|error| RecipeError::new(format!("training forward/backward/optimizer update: {error}")))?;
+		self.program.launch_epoch(&mut call, self.tile).map_err(|error| RecipeError::new(format!("training forward/backward/optimizer update: {error}")))?;
 		self.gather_error("training forward/backward/optimizer update")?;
 		let objective = self.metrics.download_float(1, self.precision.state)?[0];
 		let saved = self.observe(objective, tolerance, true)?;
@@ -5706,7 +5705,7 @@ impl NativeTape {
 			require(value.is_finite() && value >= 1.0 && value.fract() == 0.0, format!("RAT {name} must be a positive integer"))?;
 			Ok(narrow(value as usize, name)? as u32)
 		};
-		Ok(Tile { m: dimension(values[0], "M")?, n: dimension(values[1], "N")?, k: dimension(values[2], "K")?.min(self.program.tile.k) })
+		Ok(Tile { m: dimension(values[0], "M")?.min(self.program.tile.m), n: dimension(values[1], "N")?.min(self.program.tile.n), k: dimension(values[2], "K")?.min(self.program.tile.k) })
 	}
 	fn print_devices(&self) -> Result<()> {
 		let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
@@ -6179,10 +6178,24 @@ impl Gpu {
 		let shared = self.shared_limit.checked_sub(fixed).ok_or_else(|| RecipeError::new("native model exceeds device shared memory"))?;
 		let shared_values = shared / precision.bytes() as u32;
 		require(shared_values != 0, "native model has no shared memory for contraction")?;
-		let m = graph.nodes.iter().map(|node| node.output.length).max().unwrap_or(graph.output.length).max(1);
-		let n = graph.nodes.iter().map(|node| node.output.channels).max().unwrap_or(graph.output.channels).max(1);
-		let k = graph.nodes.iter().map(|node| node.input.elements()).max().unwrap_or(graph.input.elements()).max(1);
-		program.tile = Tile { m: narrow(m, "native contraction M tile limit")? as u32, n: narrow(n, "native contraction N tile limit")? as u32, k: (narrow(k, "native contraction K tile limit")? as u32).min(shared_values) };
+		let mut limit = Tile { m: 1, n: 1, k: 1 };
+		for node in &graph.nodes {
+			let span = match node.op {
+				Primitive::Contraction => integer_argument(node.argument[0], "contraction kernel")?.max(1) as usize,
+				Primitive::Scan => 1,
+				_ => continue,
+			};
+			limit.m = limit.m.max(narrow(checked_mul(rows, node.output.length, "native contraction rows")?, "native contraction M tile limit")? as u32);
+			limit.n = limit.n.max(narrow(node.output.channels, "native contraction N tile limit")? as u32);
+			limit.k = limit.k.max(narrow(checked_mul(node.input.channels, span, "native contraction terms")?, "native contraction K tile limit")? as u32);
+		}
+		let block = program.forward.geometry.block.min(program.epoch.geometry.block);
+		limit.n = limit.n.min(block.isqrt().max(1));
+		limit.m = limit.m.min(block / limit.n);
+		let shared_width = limit.m.checked_add(limit.n).ok_or_else(|| RecipeError::new("native contraction tile width overflows"))?;
+		limit.k = limit.k.min(shared_values / shared_width);
+		require(limit.m != 0 && limit.n != 0 && limit.k != 0, "native contraction tile does not fit the device")?;
+		program.tile = limit;
 		Ok(program)
 	}
 	fn allocate(&self, bytes: usize) -> Result<u64> {
@@ -6567,17 +6580,17 @@ impl NativeProgram {
 		}
 	}
 
-	fn launch_forward(&self, arguments: &mut [Ptr], rows: u32, tile: Tile) -> Result<()> {
-		self.launch(NativeEntry::Forward, arguments, self.forward.geometry.threads(rows)?, tile)
+	fn launch_forward(&self, arguments: &mut [Ptr], tile: Tile) -> Result<()> {
+		self.launch(NativeEntry::Forward, arguments, self.forward.geometry.threads()?, tile)
 	}
 
-	fn launch_epoch(&self, arguments: &mut [Ptr], rows: u32, tile: Tile) -> Result<()> {
-		self.launch(NativeEntry::Epoch, arguments, self.epoch.geometry.threads(rows)?, tile)
+	fn launch_epoch(&self, arguments: &mut [Ptr], tile: Tile) -> Result<()> {
+		self.launch(NativeEntry::Epoch, arguments, self.epoch.geometry.threads()?, tile)
 	}
 
-	fn launch_model_load(&self, arguments: &mut [Ptr], items: u32) -> Result<()> {
+	fn launch_model_load(&self, arguments: &mut [Ptr]) -> Result<()> {
 		let dispatch = self.dispatch(NativeEntry::ModelLoad)?;
-		self.launch(NativeEntry::ModelLoad, arguments, dispatch.geometry.threads(items)?, self.tile)
+		self.launch(NativeEntry::ModelLoad, arguments, dispatch.geometry.threads()?, Tile { m: 0, n: 0, k: 0 })
 	}
 
 	fn launch(&self, entry: NativeEntry, arguments: &mut [Ptr], threads: u32, tile: Tile) -> Result<()> {
@@ -6587,7 +6600,7 @@ impl NativeProgram {
 		require(arguments.len() == dispatch.kernel.layout.len(), "native argument count is invalid")?;
 		gpu.activate()?;
 		let block = dispatch.geometry.block;
-		let dynamic = shared_bytes(tile.k, dispatch.kernel.element)?;
+		let dynamic = shared_bytes(tile, dispatch.kernel.element)?;
 		let shared = dispatch.kernel.shared.checked_add(dynamic).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
 		require(shared <= gpu.shared_limit, "native shared memory exceeds device limit")?;
 		let _guard = gpu.dispatch.lock().map_err(|_| RecipeError::new("GPU dispatch lock is poisoned"))?;
@@ -7438,7 +7451,9 @@ impl Estimator {
 	fn fit(&self, data: &Prepared, rows: usize, config: Config, exclude: bool) -> Result<Predictor> { (self.fit)(self.param, data, rows, config, exclude) }
 }
 const DOUBLE_BUFFER_VALUES: u32 = 2;
-fn shared_bytes(tile: u32, element: u8) -> Result<u32> { tile.max(DOUBLE_BUFFER_VALUES).checked_mul(u32::from(element)).ok_or_else(|| RecipeError::new("GPU shared memory size overflows")) }
+fn shared_bytes(tile: Tile, element: u8) -> Result<u32> {
+	tile.m.checked_add(tile.n).and_then(|width| width.checked_mul(tile.k)).map(|values| values.max(DOUBLE_BUFFER_VALUES)).and_then(|values| values.checked_mul(u32::from(element))).ok_or_else(|| RecipeError::new("GPU shared memory size overflows"))
+}
 #[cfg(any(amd, nvidia))]
 #[derive(Clone, Copy)]
 struct Resources {
@@ -7452,7 +7467,7 @@ struct Geometry {
 	pub block: u32,
 }
 impl Geometry {
-	pub fn threads(self, work: u32) -> Result<u32> { self.groups.min(work.div_ceil(self.block)).checked_mul(self.block).filter(|value| *value != 0).ok_or_else(|| RecipeError::new("GPU launch size overflows")) }
+	pub fn threads(self) -> Result<u32> { self.groups.checked_mul(self.block).filter(|value| *value != 0).ok_or_else(|| RecipeError::new("GPU launch size overflows")) }
 }
 #[cfg(any(amd, nvidia))]
 fn geometry(cus: u32, wave: u32, workgroup: u32, lds: u32, groups_per_cu: u32, resources: Resources) -> Result<Geometry> {
@@ -7460,7 +7475,7 @@ fn geometry(cus: u32, wave: u32, workgroup: u32, lds: u32, groups_per_cu: u32, r
 	let waves = groups_per_cu.min(workgroup / wave).min(resources.max_block / wave);
 	require(waves != 0, "GPU has no resident wave")?;
 	let block = waves.checked_mul(wave).ok_or_else(|| RecipeError::new("GPU workgroup size overflows"))?;
-	let shared = resources.shared.checked_add(shared_bytes(0, resources.element)?).ok_or_else(|| RecipeError::new("GPU shared memory size overflows"))?;
+	let shared = resources.shared.checked_add(shared_bytes(Tile { m: 0, n: 0, k: 0 }, resources.element)?).ok_or_else(|| RecipeError::new("GPU shared memory size overflows"))?;
 	require(shared <= lds, "GPU tile exceeds local memory")?;
 	Ok(Geometry { groups: cus, block })
 }
@@ -7468,7 +7483,7 @@ fn geometry(cus: u32, wave: u32, workgroup: u32, lds: u32, groups_per_cu: u32, r
 fn amd(cus: u32, wave: u32, workgroup: u32, lds: u32, resources: Resources) -> Result<Geometry> { geometry(cus, wave, workgroup, lds, u32::from(wave != 0), resources) }
 #[cfg(nvidia)]
 fn nvidia(cus: u32, wave: u32, workgroup: u32, block_lds: u32, sm_lds: u32, waves_per_cu: u32, resources: Resources) -> Result<Geometry> {
-	let shared = resources.shared.checked_add(shared_bytes(0, resources.element)?).ok_or_else(|| RecipeError::new("Nvidia shared memory size overflows"))?;
+	let shared = resources.shared.checked_add(shared_bytes(Tile { m: 0, n: 0, k: 0 }, resources.element)?).ok_or_else(|| RecipeError::new("Nvidia shared memory size overflows"))?;
 	require(shared <= block_lds, "Nvidia tile exceeds workgroup shared memory")?;
 	geometry(cus, wave, workgroup, sm_lds, waves_per_cu, resources)
 }
