@@ -6193,8 +6193,8 @@ impl Gpu {
 		};
 		let lane_n = tile.n.div_ceil(register_n).min(block.isqrt().max(1));
 		let lane_m = tile.m.div_ceil(register_m).min(block / lane_n);
-		tile.m = tile.m.min(lane_m.checked_mul(register_m).ok_or_else(|| RecipeError::new("native contraction M tile overflows"))?);
-		tile.n = tile.n.min(lane_n.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction N tile overflows"))?);
+		tile.m = lane_m.checked_mul(register_m).ok_or_else(|| RecipeError::new("native contraction M tile overflows"))?;
+		tile.n = lane_n.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction N tile overflows"))?;
 		let shared_width = tile.m.checked_add(tile.n).ok_or_else(|| RecipeError::new("native contraction tile width overflows"))?;
 		tile.k = tile.k.min(shared_values / shared_width);
 		require(tile.m != 0 && tile.n != 0 && tile.k != 0, "native contraction tile does not fit the device")?;
