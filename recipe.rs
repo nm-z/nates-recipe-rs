@@ -1969,7 +1969,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Contraction) => {
-						ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?, offset = plan.node.offset));
+						ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?, offset = plan.node.offset));
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Pool) => {
@@ -2002,7 +2002,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Scan) => {
-						ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {parameters}, i32 {offset}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset));
+						ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {parameters}, i32 {offset}, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset));
 						ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Predictor) => {

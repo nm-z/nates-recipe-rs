@@ -619,117 +619,108 @@ store double %cell, ptr addrspace(1) %cell.ptr, align 8 %cell.tanh = call double
 store double %output.value, ptr addrspace(1) %output.ptr, align 8 %output.next = add nuw i32 %output.hidden, 1
 br label %output.loop output.done: %time.next = add nuw i32 %time, 1 br label %time.loop time.done:
 %row.next = add i32 %row, %threads br label %row.loop exit: ret void } define internal void @contraction_reverse_body(
-ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %delta,
-ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.input,
-i1 %has.bias,
-i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %kernel, i32 %offset,
-i32 %threads ) #1 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
-%lid = call i32 @recipe.local.id.x() %group = call i32 @recipe.group.id.x()
-%block = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %block
-%in.elements = mul i32 %in.channels, %in.length
-%out.elements = mul i32 %out.channels, %out.length %is.conv = icmp ne i32 %kernel, 0
+ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.input, i1 %has.bias,
+i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %kernel, i32 %offset, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #1 { entry:
+%lid = call i32 @recipe.local.id.x() %group = call i32 @recipe.group.id.x() %block = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %block
+%in.elements = mul i32 %in.channels, %in.length %out.elements = mul i32 %out.channels, %out.length %is.conv = icmp ne i32 %kernel, 0
 %span = select i1 %is.conv, i32 %kernel, i32 1 %window = mul i32 %in.channels, %span
-%terms.adjusted = add i32 %window, %block %terms.numerator = sub i32 %terms.adjusted, 1
-%term.tiles = udiv i32 %terms.numerator, %block %jobs = mul i32 %out.channels, %term.tiles
-br label %gradient.job.loop gradient.job.loop:
-%job = phi i32 [ %group, %entry ], [ %job.next, %gradient.job.done ] %job.more = icmp ult i32 %job, %jobs
-br i1 %job.more, label %gradient.job.step, label %bias.test gradient.job.step:
-%filter = udiv i32 %job, %term.tiles %term.tile = urem i32 %job, %term.tiles
-%term.base = mul i32 %term.tile, %block %term.raw = add i32 %term.base, %lid
-%active = icmp ult i32 %term.raw, %window %gradient.term = select i1 %active, i32 %term.raw, i32 0
-%channel = udiv i32 %gradient.term, %span %kernel.position = urem i32 %gradient.term, %span
-%loader = icmp eq i32 %lid, 0 br i1 %loader, label %gradient.initial.load, label %gradient.initial.done
-gradient.initial.load: %initial.filter.base = mul i32 %filter, %out.length
-%initial.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %initial.filter.base
-%initial.delta = load double, ptr addrspace(1) %initial.delta.ptr, align 8
-%initial.tile.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 0
-store double %initial.delta, ptr addrspace(3) %initial.tile.ptr, align 8 br label %gradient.initial.done
-gradient.initial.done: call void @recipe.local.barrier() br label %gradient.item.loop gradient.item.loop:
-%row = phi i32 [ 0, %gradient.initial.done ], [ %next.row, %gradient.tile.done ]
-%position = phi i32 [ 0, %gradient.initial.done ], [ %next.position, %gradient.tile.done ]
-%buffer = phi i32 [ 0, %gradient.initial.done ], [ %next.buffer, %gradient.tile.done ]
-%sum = phi double [ 0.0, %gradient.initial.done ], [ %sum.next, %gradient.tile.done ]
-%row.more = icmp ult i32 %row, %rows br i1 %row.more, label %gradient.preload, label %gradient.store
-gradient.preload: %next.position.raw = add i32 %position, 1 %next.wrap = icmp eq i32 %next.position.raw, %out.length
-%next.position = select i1 %next.wrap, i32 0, i32 %next.position.raw
-%next.row.raw = add i32 %row, 1 %next.row = select i1 %next.wrap, i32 %next.row.raw, i32 %row
-%next.more = icmp ult i32 %next.row, %rows %next.buffer = xor i32 %buffer, 1
-%next.loader = and i1 %loader, %next.more br i1 %next.loader, label %gradient.next.load, label %gradient.compute
-gradient.next.load: %next.delta.row.base = mul i32 %next.row, %out.elements
-%next.delta.filter.base = mul i32 %filter, %out.length
-%next.delta.local = add i32 %next.delta.filter.base, %next.position
-%next.delta.index = add i32 %next.delta.row.base, %next.delta.local
-%next.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %next.delta.index
-%next.delta = load double, ptr addrspace(1) %next.delta.ptr, align 8 %next.tile.ptr = getelementptr [0 x double],
-ptr addrspace(3) @contraction_tile, i32 0, i32 %next.buffer
-store double %next.delta, ptr addrspace(3) %next.tile.ptr, align 8 br label %gradient.compute gradient.compute:
-%input.row.base = mul i32 %row, %in.elements
-%input.value = call double @contraction_input( ptr addrspace(1) %input, i32 %input.row.base, i32 %position,
-i32 %gradient.term, i32 %span, i32 %in.length, i1 %is.conv ) %tile.ptr = getelementptr [0 x double],
-ptr addrspace(3) @contraction_tile, i32 0, i32 %buffer
-%delta.value = load double, ptr addrspace(3) %tile.ptr, align 8 %product = call double @recipe.mul(double %input.value, double %delta.value)
-%candidate = call double @recipe.add(double %sum, double %product) %sum.next = select i1 %active, double %candidate, double %sum
-br label %gradient.tile.done gradient.tile.done: call void @recipe.local.barrier()
-br label %gradient.item.loop gradient.store: br i1 %active, label %gradient.write, label %gradient.job.done
-gradient.write: %p.0 = mul i32 %filter, %window %p = add i32 %p.0, %gradient.term %gradient.index = add i32 %offset, %p
-%gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %gradient.index
-store double %sum, ptr addrspace(1) %gradient.ptr, align 8 br label %gradient.job.done gradient.job.done:
-%job.next = add i32 %job, %groups br label %gradient.job.loop
-bias.test: br i1 %has.bias, label %bias.loop, label %previous.loop bias.loop:
-%bias.filter = phi i32 [ %tid, %bias.test ], [ %bias.next, %bias.store ]
-%bias.more = icmp ult i32 %bias.filter, %out.channels
-br i1 %bias.more, label %bias.sum.loop, label %previous.loop bias.sum.loop:
-%bias.p = phi i32 [ 0, %bias.loop ], [ %bias.p.next, %bias.sum.step ]
-%bias.sum = phi double [ 0.0, %bias.loop ], [ %bias.sum.next, %bias.sum.step ]
-%bias.count = mul i32 %rows, %out.length %bias.p.more = icmp ult i32 %bias.p, %bias.count
-br i1 %bias.p.more, label %bias.sum.step, label %bias.store bias.sum.step:
-%bias.row = udiv i32 %bias.p, %out.length %bias.position = urem i32 %bias.p, %out.length
-%bias.row.base = mul i32 %bias.row, %out.elements %bias.filter.base = mul i32 %bias.filter, %out.length
-%bias.local = add i32 %bias.filter.base, %bias.position %bias.delta.index = add i32 %bias.row.base, %bias.local
-%bias.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %bias.delta.index
-%bias.delta = load double, ptr addrspace(1) %bias.delta.ptr, align 8
-%bias.sum.next = call double @recipe.add(double %bias.sum, double %bias.delta) %bias.p.next = add nuw i32 %bias.p, 1 br label %bias.sum.loop
-bias.store: %bias.weight.base = mul i32 %out.channels, %window %bias.weight = add i32 %bias.weight.base, %bias.filter
-%bias.gradient.index = add i32 %offset, %bias.weight
-%bias.gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %bias.gradient.index
-store double %bias.sum, ptr addrspace(1) %bias.gradient.ptr, align 8
-%bias.next = add i32 %bias.filter, %threads br label %bias.loop
-previous.loop: %previous.p = phi i32 [ %tid, %bias.test ], [ %tid, %bias.loop ], [ %previous.next, %previous.done ]
-%previous.count = mul i32 %rows, %in.elements %previous.more = icmp ult i32 %previous.p, %previous.count
-br i1 %previous.more, label %previous.entry, label %exit previous.entry:
-%previous.row = udiv i32 %previous.p, %in.elements %previous.local = urem i32 %previous.p, %in.elements
-%previous.channel = udiv i32 %previous.local, %in.length %previous.position = urem i32 %previous.local, %in.length
-br label %previous.sum.loop previous.sum.loop:
-%term = phi i32 [ 0, %previous.entry ], [ %term.next, %previous.sum.step ]
-%previous.sum = phi double [ 0.0, %previous.entry ], [ %previous.sum.next, %previous.sum.step ]
-%terms = mul i32 %out.channels, %span %term.more = icmp ult i32 %term, %terms
-br i1 %term.more, label %previous.sum.step, label %previous.store previous.sum.step:
-%term.filter = udiv i32 %term, %span %term.kernel = urem i32 %term, %span
-%position.low = icmp uge i32 %previous.position, %term.kernel
-%output.position.raw = sub i32 %previous.position, %term.kernel
-%position.high = icmp ult i32 %output.position.raw, %out.length %valid = and i1 %position.low, %position.high
-%output.position = select i1 %valid, i32 %output.position.raw, i32 0 %weight.filter.base = mul i32 %term.filter, %window
-%weight.channel.base = mul i32 %previous.channel, %span %weight.local.0 = add i32 %weight.channel.base, %term.kernel
-%weight.local = add i32 %weight.filter.base, %weight.local.0 %delta.row.base.1 = mul i32 %previous.row, %out.elements
-%delta.filter.base.1 = mul i32 %term.filter, %out.length %delta.local = add i32 %delta.filter.base.1, %output.position
-%delta.index.1 = add i32 %delta.row.base.1, %delta.local
-%weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %weight.local
-%delta.ptr.1 = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %delta.index.1
-%weight.value = load double, ptr addrspace(1) %weight.ptr, align 8
-%delta.value.1 = load double, ptr addrspace(1) %delta.ptr.1, align 8
-%term.product = call double @recipe.mul(double %weight.value, double %delta.value.1)
-%contribution = select i1 %valid, double %term.product, double 0.0
-%previous.sum.next = call double @recipe.add(double %previous.sum, double %contribution) %term.next = add nuw i32 %term, 1
-br label %previous.sum.loop previous.store: br i1 %write.input, label %previous.add, label %previous.done previous.add:
-%previous.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %previous.p
-%previous.old = load double, ptr addrspace(1) %previous.ptr, align 8
-%previous.value = call double @recipe.add(double %previous.old, double %previous.sum)
-store double %previous.value, ptr addrspace(1) %previous.ptr, align 8 br label %previous.done previous.done:
-%previous.next = add i32 %previous.p, %threads br label %previous.loop exit: ret void }
+%gradient.r.total = mul i32 %rows, %out.length
+%gradient.m.short = icmp ult i32 %tile.m, %window %gradient.m.tile = select i1 %gradient.m.short, i32 %tile.m, i32 %window %gradient.n.short = icmp ult i32 %tile.n, %out.channels %gradient.n.tile = select i1 %gradient.n.short, i32 %tile.n, i32 %out.channels
+%gradient.k.short = icmp ult i32 %tile.k, %gradient.r.total %gradient.k.tile = select i1 %gradient.k.short, i32 %tile.k, i32 %gradient.r.total
+%gradient.m.adjusted = add i32 %window, %gradient.m.tile %gradient.m.numerator = sub i32 %gradient.m.adjusted, 1 %gradient.m.tiles = udiv i32 %gradient.m.numerator, %gradient.m.tile %gradient.n.adjusted = add i32 %out.channels, %gradient.n.tile %gradient.n.numerator = sub i32 %gradient.n.adjusted, 1 %gradient.n.tiles = udiv i32 %gradient.n.numerator, %gradient.n.tile
+%gradient.jobs = mul i32 %gradient.m.tiles, %gradient.n.tiles br label %gradient.job.loop gradient.job.loop:
+%gradient.job = phi i32 [ %group, %entry ], [ %gradient.job.next, %gradient.job.done ] %gradient.job.more = icmp ult i32 %gradient.job, %gradient.jobs
+br i1 %gradient.job.more, label %gradient.job.step, label %previous.test gradient.job.step:
+%gradient.n.index = udiv i32 %gradient.job, %gradient.m.tiles %gradient.m.index = urem i32 %gradient.job, %gradient.m.tiles %gradient.m.base = mul i32 %gradient.m.index, %gradient.m.tile %gradient.n.base = mul i32 %gradient.n.index, %gradient.n.tile
+%gradient.m.remaining = sub i32 %window, %gradient.m.base %gradient.m.partial = icmp ult i32 %gradient.m.remaining, %gradient.m.tile %gradient.m.count = select i1 %gradient.m.partial, i32 %gradient.m.remaining, i32 %gradient.m.tile
+%gradient.n.remaining = sub i32 %out.channels, %gradient.n.base %gradient.n.partial = icmp ult i32 %gradient.n.remaining, %gradient.n.tile %gradient.n.count = select i1 %gradient.n.partial, i32 %gradient.n.remaining, i32 %gradient.n.tile
+%gradient.outputs = mul i32 %gradient.m.count, %gradient.n.count %gradient.active = icmp ult i32 %lid, %gradient.outputs %gradient.output.n.raw = udiv i32 %lid, %gradient.m.count %gradient.output.m.raw = urem i32 %lid, %gradient.m.count
+%gradient.output.n = select i1 %gradient.active, i32 %gradient.output.n.raw, i32 0 %gradient.output.m = select i1 %gradient.active, i32 %gradient.output.m.raw, i32 0 %gradient.filter = add i32 %gradient.n.base, %gradient.output.n %gradient.term = add i32 %gradient.m.base, %gradient.output.m
+%gradient.bias.term = icmp eq i32 %gradient.term, 0 %gradient.bias.output = and i1 %gradient.active, %gradient.bias.term %gradient.bias.active = and i1 %has.bias, %gradient.bias.output
+br label %gradient.tile.loop gradient.tile.loop:
+%gradient.r.base = phi i32 [ 0, %gradient.job.step ], [ %gradient.r.next, %gradient.tile.done ] %gradient.sum = phi double [ 0.0, %gradient.job.step ], [ %gradient.tile.sum, %gradient.tile.done ] %gradient.bias.sum = phi double [ 0.0, %gradient.job.step ], [ %gradient.tile.bias, %gradient.tile.done ]
+%gradient.r.remaining = sub i32 %gradient.r.total, %gradient.r.base %gradient.r.partial = icmp ult i32 %gradient.r.remaining, %gradient.k.tile %gradient.r.count = select i1 %gradient.r.partial, i32 %gradient.r.remaining, i32 %gradient.k.tile
+%gradient.a.count = mul i32 %gradient.m.count, %gradient.r.count %gradient.b.count = mul i32 %gradient.n.count, %gradient.r.count %gradient.load.count = add i32 %gradient.a.count, %gradient.b.count br label %gradient.load.loop gradient.load.loop:
+%gradient.load = phi i32 [ %lid, %gradient.tile.loop ], [ %gradient.load.next, %gradient.load.store ] %gradient.load.more = icmp ult i32 %gradient.load, %gradient.load.count br i1 %gradient.load.more, label %gradient.load.classify, label %gradient.load.done
+gradient.load.classify: %gradient.load.a = icmp ult i32 %gradient.load, %gradient.a.count br i1 %gradient.load.a, label %gradient.load.a.step, label %gradient.load.b.step
+gradient.load.a.step: %gradient.a.r = udiv i32 %gradient.load, %gradient.m.count %gradient.a.m = urem i32 %gradient.load, %gradient.m.count %gradient.a.global = add i32 %gradient.r.base, %gradient.a.r
+%gradient.a.row = udiv i32 %gradient.a.global, %out.length %gradient.a.position = urem i32 %gradient.a.global, %out.length %gradient.a.row.base = mul i32 %gradient.a.row, %in.elements %gradient.a.term = add i32 %gradient.m.base, %gradient.a.m
+%gradient.a.value = call double @contraction_input( ptr addrspace(1) %input, i32 %gradient.a.row.base, i32 %gradient.a.position, i32 %gradient.a.term, i32 %span, i32 %in.length, i1 %is.conv )
+%gradient.a.tile.row = mul i32 %gradient.a.r, %gradient.m.tile %gradient.a.tile.index = add i32 %gradient.a.tile.row, %gradient.a.m br label %gradient.load.store
+gradient.load.b.step: %gradient.b.local = sub i32 %gradient.load, %gradient.a.count %gradient.b.r = udiv i32 %gradient.b.local, %gradient.n.count %gradient.b.n = urem i32 %gradient.b.local, %gradient.n.count %gradient.b.global = add i32 %gradient.r.base, %gradient.b.r
+%gradient.b.row = udiv i32 %gradient.b.global, %out.length %gradient.b.position = urem i32 %gradient.b.global, %out.length %gradient.b.filter = add i32 %gradient.n.base, %gradient.b.n
+%gradient.b.row.base = mul i32 %gradient.b.row, %out.elements %gradient.b.filter.base = mul i32 %gradient.b.filter, %out.length %gradient.b.local.index = add i32 %gradient.b.filter.base, %gradient.b.position %gradient.b.index = add i32 %gradient.b.row.base, %gradient.b.local.index
+%gradient.b.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %gradient.b.index %gradient.b.value = load double, ptr addrspace(1) %gradient.b.ptr, align 8 %gradient.b.tile.base = mul i32 %gradient.m.tile, %gradient.k.tile %gradient.b.tile.row = mul i32 %gradient.b.r, %gradient.n.tile
+%gradient.b.tile.local = add i32 %gradient.b.tile.row, %gradient.b.n %gradient.b.tile.index = add i32 %gradient.b.tile.base, %gradient.b.tile.local br label %gradient.load.store
+gradient.load.store: %gradient.load.value = phi double [ %gradient.a.value, %gradient.load.a.step ], [ %gradient.b.value, %gradient.load.b.step ] %gradient.load.index = phi i32 [ %gradient.a.tile.index, %gradient.load.a.step ], [ %gradient.b.tile.index, %gradient.load.b.step ]
+%gradient.load.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %gradient.load.index store double %gradient.load.value, ptr addrspace(3) %gradient.load.ptr, align 8
+%gradient.load.next = add i32 %gradient.load, %block br label %gradient.load.loop gradient.load.done:
+call void @recipe.local.barrier() br label %gradient.compute.loop gradient.compute.loop:
+%gradient.i = phi i32 [ 0, %gradient.load.done ], [ %gradient.i.next, %gradient.compute.step ] %gradient.partial = phi double [ %gradient.sum, %gradient.load.done ], [ %gradient.partial.next, %gradient.compute.step ] %gradient.bias.partial = phi double [ %gradient.bias.sum, %gradient.load.done ], [ %gradient.bias.next, %gradient.compute.step ]
+%gradient.compute.more = icmp ult i32 %gradient.i, %gradient.r.count br i1 %gradient.compute.more, label %gradient.compute.step, label %gradient.compute.done
+gradient.compute.step: %gradient.x.row = mul i32 %gradient.i, %gradient.m.tile %gradient.x.index = add i32 %gradient.x.row, %gradient.output.m %gradient.dy.base = mul i32 %gradient.m.tile, %gradient.k.tile %gradient.dy.row = mul i32 %gradient.i, %gradient.n.tile
+%gradient.dy.local = add i32 %gradient.dy.row, %gradient.output.n %gradient.dy.index = add i32 %gradient.dy.base, %gradient.dy.local %gradient.x.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %gradient.x.index %gradient.dy.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %gradient.dy.index
+%gradient.x = load double, ptr addrspace(3) %gradient.x.ptr, align 8 %gradient.dy = load double, ptr addrspace(3) %gradient.dy.ptr, align 8 %gradient.product = call double @recipe.mul(double %gradient.x, double %gradient.dy)
+%gradient.candidate = call double @recipe.add(double %gradient.partial, double %gradient.product) %gradient.bias.candidate = call double @recipe.add(double %gradient.bias.partial, double %gradient.dy)
+%gradient.partial.next = select i1 %gradient.active, double %gradient.candidate, double %gradient.partial %gradient.bias.next = select i1 %gradient.bias.active, double %gradient.bias.candidate, double %gradient.bias.partial
+%gradient.i.next = add i32 %gradient.i, 1 br label %gradient.compute.loop gradient.compute.done:
+%gradient.tile.sum = phi double [ %gradient.partial, %gradient.compute.loop ] %gradient.tile.bias = phi double [ %gradient.bias.partial, %gradient.compute.loop ] call void @recipe.local.barrier()
+%gradient.r.next = add i32 %gradient.r.base, %gradient.r.count %gradient.r.more = icmp ult i32 %gradient.r.next, %gradient.r.total
+br i1 %gradient.r.more, label %gradient.tile.done, label %gradient.store.test gradient.tile.done: br label %gradient.tile.loop
+gradient.store.test: br i1 %gradient.active, label %gradient.store, label %gradient.bias.test gradient.store: %gradient.filter.base = mul i32 %gradient.filter, %window %gradient.local = add i32 %gradient.filter.base, %gradient.term %gradient.index = add i32 %offset, %gradient.local
+%gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %gradient.index store double %gradient.tile.sum, ptr addrspace(1) %gradient.ptr, align 8 br label %gradient.bias.test
+gradient.bias.test: br i1 %gradient.bias.active, label %gradient.bias.store, label %gradient.job.done gradient.bias.store: %gradient.bias.base = mul i32 %out.channels, %window %gradient.bias.local = add i32 %gradient.bias.base, %gradient.filter %gradient.bias.index = add i32 %offset, %gradient.bias.local
+%gradient.bias.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %gradient.bias.index store double %gradient.tile.bias, ptr addrspace(1) %gradient.bias.ptr, align 8 br label %gradient.job.done
+gradient.job.done: %gradient.job.next = add i32 %gradient.job, %groups br label %gradient.job.loop
+previous.test: br i1 %write.input, label %previous.entry, label %exit previous.entry:
+%previous.m.total = mul i32 %rows, %in.length %previous.r.total = mul i32 %out.channels, %span
+%previous.m.short = icmp ult i32 %tile.m, %previous.m.total %previous.m.tile = select i1 %previous.m.short, i32 %tile.m, i32 %previous.m.total %previous.n.short = icmp ult i32 %tile.n, %in.channels %previous.n.tile = select i1 %previous.n.short, i32 %tile.n, i32 %in.channels
+%previous.k.short = icmp ult i32 %tile.k, %previous.r.total %previous.k.tile = select i1 %previous.k.short, i32 %tile.k, i32 %previous.r.total
+%previous.m.adjusted = add i32 %previous.m.total, %previous.m.tile %previous.m.numerator = sub i32 %previous.m.adjusted, 1 %previous.m.tiles = udiv i32 %previous.m.numerator, %previous.m.tile %previous.n.adjusted = add i32 %in.channels, %previous.n.tile %previous.n.numerator = sub i32 %previous.n.adjusted, 1 %previous.n.tiles = udiv i32 %previous.n.numerator, %previous.n.tile
+%previous.jobs = mul i32 %previous.m.tiles, %previous.n.tiles br label %previous.job.loop previous.job.loop:
+%previous.job = phi i32 [ %group, %previous.entry ], [ %previous.job.next, %previous.job.done ] %previous.job.more = icmp ult i32 %previous.job, %previous.jobs br i1 %previous.job.more, label %previous.job.step, label %exit
+previous.job.step: %previous.n.index = udiv i32 %previous.job, %previous.m.tiles %previous.m.index = urem i32 %previous.job, %previous.m.tiles %previous.m.base = mul i32 %previous.m.index, %previous.m.tile %previous.n.base = mul i32 %previous.n.index, %previous.n.tile
+%previous.m.remaining = sub i32 %previous.m.total, %previous.m.base %previous.m.partial = icmp ult i32 %previous.m.remaining, %previous.m.tile %previous.m.count = select i1 %previous.m.partial, i32 %previous.m.remaining, i32 %previous.m.tile
+%previous.n.remaining = sub i32 %in.channels, %previous.n.base %previous.n.partial = icmp ult i32 %previous.n.remaining, %previous.n.tile %previous.n.count = select i1 %previous.n.partial, i32 %previous.n.remaining, i32 %previous.n.tile
+%previous.outputs = mul i32 %previous.m.count, %previous.n.count %previous.active = icmp ult i32 %lid, %previous.outputs %previous.output.n.raw = udiv i32 %lid, %previous.m.count %previous.output.m.raw = urem i32 %lid, %previous.m.count
+%previous.output.n = select i1 %previous.active, i32 %previous.output.n.raw, i32 0 %previous.output.m = select i1 %previous.active, i32 %previous.output.m.raw, i32 0 %previous.channel = add i32 %previous.n.base, %previous.output.n %previous.m.global = add i32 %previous.m.base, %previous.output.m
+%previous.row = udiv i32 %previous.m.global, %in.length %previous.position = urem i32 %previous.m.global, %in.length br label %previous.tile.loop previous.tile.loop:
+%previous.r.base = phi i32 [ 0, %previous.job.step ], [ %previous.r.next, %previous.tile.done ] %previous.sum = phi double [ 0.0, %previous.job.step ], [ %previous.tile.sum, %previous.tile.done ]
+%previous.r.remaining = sub i32 %previous.r.total, %previous.r.base %previous.r.partial = icmp ult i32 %previous.r.remaining, %previous.k.tile %previous.r.count = select i1 %previous.r.partial, i32 %previous.r.remaining, i32 %previous.k.tile
+%previous.a.count = mul i32 %previous.m.count, %previous.r.count %previous.b.count = mul i32 %previous.n.count, %previous.r.count %previous.load.count = add i32 %previous.a.count, %previous.b.count br label %previous.load.loop previous.load.loop:
+%previous.load = phi i32 [ %lid, %previous.tile.loop ], [ %previous.load.next, %previous.load.store ] %previous.load.more = icmp ult i32 %previous.load, %previous.load.count br i1 %previous.load.more, label %previous.load.classify, label %previous.load.done
+previous.load.classify: %previous.load.a = icmp ult i32 %previous.load, %previous.a.count br i1 %previous.load.a, label %previous.load.a.step, label %previous.load.b.step
+previous.load.a.step: %previous.a.r = udiv i32 %previous.load, %previous.m.count %previous.a.m = urem i32 %previous.load, %previous.m.count %previous.a.term = add i32 %previous.r.base, %previous.a.r
+%previous.a.filter = udiv i32 %previous.a.term, %span %previous.a.kernel = urem i32 %previous.a.term, %span %previous.a.global = add i32 %previous.m.base, %previous.a.m %previous.a.row = udiv i32 %previous.a.global, %in.length %previous.a.position = urem i32 %previous.a.global, %in.length
+%previous.a.low = icmp uge i32 %previous.a.position, %previous.a.kernel %previous.a.position.raw = sub i32 %previous.a.position, %previous.a.kernel %previous.a.high = icmp ult i32 %previous.a.position.raw, %out.length %previous.a.valid = and i1 %previous.a.low, %previous.a.high
+%previous.a.position.safe = select i1 %previous.a.valid, i32 %previous.a.position.raw, i32 0 %previous.a.row.base = mul i32 %previous.a.row, %out.elements %previous.a.filter.base = mul i32 %previous.a.filter, %out.length
+%previous.a.local = add i32 %previous.a.filter.base, %previous.a.position.safe %previous.a.index = add i32 %previous.a.row.base, %previous.a.local %previous.a.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %previous.a.index %previous.a.raw = load double, ptr addrspace(1) %previous.a.ptr, align 8
+%previous.a.value = select i1 %previous.a.valid, double %previous.a.raw, double 0.0 %previous.a.tile.row = mul i32 %previous.a.r, %previous.m.tile %previous.a.tile.index = add i32 %previous.a.tile.row, %previous.a.m br label %previous.load.store
+previous.load.b.step: %previous.b.local = sub i32 %previous.load, %previous.a.count %previous.b.r = udiv i32 %previous.b.local, %previous.n.count %previous.b.n = urem i32 %previous.b.local, %previous.n.count %previous.b.term = add i32 %previous.r.base, %previous.b.r
+%previous.b.filter = udiv i32 %previous.b.term, %span %previous.b.kernel = urem i32 %previous.b.term, %span %previous.b.channel = add i32 %previous.n.base, %previous.b.n %previous.b.filter.base = mul i32 %previous.b.filter, %window
+%previous.b.channel.base = mul i32 %previous.b.channel, %span %previous.b.channel.local = add i32 %previous.b.channel.base, %previous.b.kernel %previous.b.index = add i32 %previous.b.filter.base, %previous.b.channel.local
+%previous.b.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %previous.b.index %previous.b.value = load double, ptr addrspace(1) %previous.b.ptr, align 8 %previous.b.tile.base = mul i32 %previous.m.tile, %previous.k.tile %previous.b.tile.row = mul i32 %previous.b.r, %previous.n.tile
+%previous.b.tile.local = add i32 %previous.b.tile.row, %previous.b.n %previous.b.tile.index = add i32 %previous.b.tile.base, %previous.b.tile.local br label %previous.load.store
+previous.load.store: %previous.load.value = phi double [ %previous.a.value, %previous.load.a.step ], [ %previous.b.value, %previous.load.b.step ] %previous.load.index = phi i32 [ %previous.a.tile.index, %previous.load.a.step ], [ %previous.b.tile.index, %previous.load.b.step ]
+%previous.load.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %previous.load.index store double %previous.load.value, ptr addrspace(3) %previous.load.ptr, align 8
+%previous.load.next = add i32 %previous.load, %block br label %previous.load.loop previous.load.done:
+call void @recipe.local.barrier() br label %previous.compute.loop previous.compute.loop:
+%previous.i = phi i32 [ 0, %previous.load.done ], [ %previous.i.next, %previous.compute.step ] %previous.partial = phi double [ %previous.sum, %previous.load.done ], [ %previous.partial.next, %previous.compute.step ]
+%previous.compute.more = icmp ult i32 %previous.i, %previous.r.count br i1 %previous.compute.more, label %previous.compute.step, label %previous.compute.done
+previous.compute.step: %previous.dy.row = mul i32 %previous.i, %previous.m.tile %previous.dy.index = add i32 %previous.dy.row, %previous.output.m %previous.w.base = mul i32 %previous.m.tile, %previous.k.tile %previous.w.row = mul i32 %previous.i, %previous.n.tile
+%previous.w.local = add i32 %previous.w.row, %previous.output.n %previous.w.index = add i32 %previous.w.base, %previous.w.local %previous.dy.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %previous.dy.index %previous.w.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %previous.w.index
+%previous.dy = load double, ptr addrspace(3) %previous.dy.ptr, align 8 %previous.w = load double, ptr addrspace(3) %previous.w.ptr, align 8 %previous.product = call double @recipe.mul(double %previous.dy, double %previous.w)
+%previous.candidate = call double @recipe.add(double %previous.partial, double %previous.product) %previous.partial.next = select i1 %previous.active, double %previous.candidate, double %previous.partial %previous.i.next = add i32 %previous.i, 1 br label %previous.compute.loop previous.compute.done:
+%previous.tile.sum = phi double [ %previous.partial, %previous.compute.loop ] call void @recipe.local.barrier()
+%previous.r.next = add i32 %previous.r.base, %previous.r.count %previous.r.more = icmp ult i32 %previous.r.next, %previous.r.total
+br i1 %previous.r.more, label %previous.tile.done, label %previous.store.test previous.tile.done: br label %previous.tile.loop
+previous.store.test: br i1 %previous.active, label %previous.store, label %previous.job.done previous.store: %previous.row.base = mul i32 %previous.row, %in.elements %previous.channel.base = mul i32 %previous.channel, %in.length %previous.local = add i32 %previous.channel.base, %previous.position %previous.index = add i32 %previous.row.base, %previous.local
+%previous.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %previous.index %previous.old = load double, ptr addrspace(1) %previous.ptr, align 8 %previous.value = call double @recipe.add(double %previous.old, double %previous.tile.sum) store double %previous.value, ptr addrspace(1) %previous.ptr, align 8 br label %previous.job.done
+previous.job.done: %previous.job.next = add i32 %previous.job, %groups br label %previous.job.loop exit: ret void }
 define internal void @scan_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
 ptr addrspace(1) %context, ptr addrspace(1) %delta, ptr addrspace(1) %previous,
 ptr addrspace(1) %gradient, i1 %write.input, i32 %rows, i32 %in.channels,
-i32 %length, i32 %out.channels, i32 %gates, i32 %parameters, i32 %offset, i32 %threads ) #1 { entry:
+i32 %length, i32 %out.channels, i32 %gates, i32 %parameters, i32 %offset, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #1 { entry:
 %tid = call i32 @llvm.amdgcn.workitem.id.x() %in.elements = mul i32 %in.channels, %length
 %out.elements = mul i32 %out.channels, %length %batch = mul i32 %rows, %out.elements
 %gate.stride.0 = mul i32 %in.channels, %out.channels %state.matrix = mul i32 %out.channels, %out.channels
@@ -996,5 +987,5 @@ br i1 %projection.more, label %projection.step, label %exit projection.step:
 call void @contraction_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %projection.weights,
 ptr addrspace(1) %projection.delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.input, i1 false,
 i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %length, i32 0,
-i32 %projection.gradient.offset, i32 %threads ) %projection.next = add i32 %projection.gate, 1 br label %projection.loop
+i32 %projection.gradient.offset, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) call void @llvm.amdgcn.s.barrier() %projection.next = add i32 %projection.gate, 1 br label %projection.loop
 invalid: call void @llvm.trap() br label %exit exit: ret void } attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1024" } attributes #1 = { alwaysinline nounwind }
