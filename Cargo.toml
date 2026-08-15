@@ -26,7 +26,6 @@ nvidia-ptx = "ptx71"
 nvidia-compiler = "/usr/bin/clang"
 nvidia-runtime = "libcuda.so.1"
 nvidia-device-library = "/opt/cuda/nvvm/libdevice/libdevice.10.bc"
-ssh-config = ".ssh/config"
 
 [package.metadata.train]
 epochs = 210
@@ -60,7 +59,6 @@ surrogate-rate = 0.01
 surrogate-width = 8
 rat-batch-rows = 32
 tile-vram-unit-bytes = 1073741824
-ssh-connect-timeout-seconds = 5
 random-seed = 17
 progress-refresh-hz = 240
 normalization-epsilon = 0.00001

@@ -3939,7 +3939,7 @@ impl Recipe {
 impl Recipe {
 	pub fn infer(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
 		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
-		let device = selected_gpus().and_then(|gpus| gpus.into_iter().next().ok_or_else(|| RecipeError::new("execution device is absent"))).unwrap_or_else(|error| panic!("{error}"));
+		let device = selected_gpu().unwrap_or_else(|error| panic!("{error}"));
 		let result = bundle::run_infer(&path, input, |stored, samples| {
 			let config = Config::load()?;
 			let graph = materialize_saved_graph(stored, samples, device, config)?;
@@ -4949,7 +4949,7 @@ impl NativeTape {
 	}
 	fn print_devices(&self) -> Result<()> {
 		let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-		eprintln!("{}.{}", device_name(self.program.gpu, host.trim()), self.precision.label());
+		eprintln!("{}:{}.{}", host.trim(), self.program.gpu.name, self.precision.label());
 		Ok(())
 	}
 }
@@ -5307,16 +5307,12 @@ struct Hsa {
 	workgroup: u32,
 	lds: u32,
 }
-struct Remote {
-	io: Mutex<Worker>,
-}
 enum Driver {
 	Cpu,
 	#[cfg(amd)]
 	Hsa(Hsa),
 	#[cfg(nvidia)]
 	Cuda(Cuda),
-	Remote(Remote),
 }
 #[allow(dead_code)]
 struct Gpu {
@@ -5325,7 +5321,6 @@ struct Gpu {
 	native_target: BackendTarget,
 	driver: Driver,
 	memory: u64,
-	clock: u64,
 	shared_limit: u32,
 	dispatch: Mutex<()>,
 }
@@ -5427,7 +5422,6 @@ impl Gpu {
 			Driver::Cuda(driver) => self.status(unsafe { (driver.set)(driver.context) }, "context"),
 			#[cfg(amd)]
 			Driver::Hsa(_) => Ok(()),
-			Driver::Remote(_) => Ok(()),
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: LossFunction) -> Result<NativeProgram> {
@@ -5468,7 +5462,6 @@ impl Gpu {
 					self.status((driver.allow)(1, &driver.cpu_agent, ptr::null(), pointer), "CPU allocation access")?;
 					Ok(pointer as u64)
 				}
-				Driver::Remote(driver) => driver.allocate(bytes),
 			}
 		}
 	}
@@ -5490,14 +5483,13 @@ impl Gpu {
 				Driver::Hsa(driver) => {
 					(driver.free)(pointer as Ptr);
 				}
-				Driver::Remote(driver) => driver.free(pointer),
 			}
 		}
 	}
 	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
 	fn upload(&self, dst: u64, src: *const c_void, bytes: usize) -> Result<u64> {
 		self.activate()?;
-		let dst = if dst == 0 && !matches!(&self.driver, Driver::Remote(_)) { self.allocate(bytes)? } else { dst };
+		let dst = if dst == 0 { self.allocate(bytes)? } else { dst };
 		unsafe {
 			match &self.driver {
 				Driver::Cpu => {
@@ -5508,7 +5500,6 @@ impl Gpu {
 				Driver::Cuda(driver) => self.status((driver.upload)(dst, src, bytes), "upload").map(|_| dst),
 				#[cfg(amd)]
 				Driver::Hsa(driver) => self.status((driver.copy)(dst as Ptr, src, bytes), "upload").map(|_| dst),
-				Driver::Remote(driver) => driver.upload(dst, src, bytes),
 			}
 		}
 	}
@@ -5525,7 +5516,6 @@ impl Gpu {
 				Driver::Cuda(cuda) => self.status((cuda.download)(dst, src, bytes), "download"),
 				#[cfg(amd)]
 				Driver::Hsa(driver) => self.status((driver.copy)(dst, src as *const c_void, bytes), "download"),
-				Driver::Remote(driver) => driver.download(dst, src, bytes),
 			}
 		}
 	}
@@ -5539,13 +5529,12 @@ impl Gpu {
 				Driver::Cuda(driver) => self.status((driver.synchronize)(), "synchronization"),
 				#[cfg(amd)]
 				Driver::Hsa(driver) => require((driver.wait)(driver.signal, 0, 0, u64::MAX, 1) == 0, "AMD synchronization failed"),
-				Driver::Remote(driver) => driver.synchronize(),
 			}
 		}
 	}
 }
 static DEVICES: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
-fn cpu_device() -> Result<Gpu> { Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, clock: 1, shared_limit: u32::MAX, dispatch: Mutex::new(()) }) }
+fn cpu_device() -> Result<Gpu> { Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) }) }
 fn devices() -> Result<&'static [Gpu]> {
 	DEVICES
 		.get_or_init(|| {
@@ -5580,242 +5569,10 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	require(found.len() == 1, "multiple GPUs require named selection")?;
 	Ok(&found[0])
 }
-fn worker_list() -> Result<()> {
+fn selected_gpu() -> Result<&'static Gpu> {
+	let Some(name) = std::env::var("RECIPE_DEVICE").ok() else { return device(None) };
 	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-	for gpu in devices()? {
-		println!("{}|{}|{:?}|{}|{}|{}|{}", host.trim(), gpu.name, gpu.backend, gpu.shared_limit, gpu.memory, gpu.clock, native_target_label(&gpu.native_target));
-	}
-	Ok(())
-}
-fn worker_serve(name: &str) -> Result<()> {
-	let gpu = device(Some(name))?;
-	let mut input = std::io::stdin().lock();
-	let mut output = std::io::stdout().lock();
-	loop {
-		let mut command = [0];
-		if remote_io("read from", input.read(&mut command))? == 0 {
-			return Ok(());
-		}
-		if command[0] == 2 { gpu.free(get_u64(&mut input)?); continue }
-		let result = (|| -> Result<Vec<u8>> {
-			match command[0] {
-				1 => Ok(gpu.allocate(get_u64(&mut input)? as usize)?.to_le_bytes().to_vec()),
-				3 => {
-					let pointer = get_u64(&mut input)?;
-					let bytes = get_u64(&mut input)? as usize;
-					let mut payload = vec![0_u8; bytes];
-					remote_io("read from", input.read_exact(&mut payload))?;
-					Ok(gpu.upload(pointer, payload.as_ptr().cast(), bytes)?.to_le_bytes().to_vec())
-				}
-				4 => {
-					let pointer = get_u64(&mut input)?;
-					let bytes = get_u64(&mut input)? as usize;
-					let mut payload = vec![0_u8; bytes];
-					gpu.download(payload.as_mut_ptr().cast(), pointer, bytes)?;
-					Ok(payload)
-				}
-				5 => {
-					gpu.synchronize()?;
-					Ok(Vec::new())
-				}
-				_ => Err(RecipeError::new("remote Recipe command is invalid")),
-			}
-		})();
-		write_response(&mut output, result)?;
-		remote_io("flush", output.flush())?;
-	}
-}
-extern "C" fn worker_init() {
-	if let Ok(mode) = std::env::var("RECIPE_WORKER") {
-		let result = if mode == "list" {
-			worker_list()
-		} else if let Some(name) = mode.strip_prefix("serve|") {
-			worker_serve(name)
-		} else {
-			Err(RecipeError::new("Recipe worker mode is invalid"))
-		};
-		let status = result.map_or_else(
-			|error| {
-				eprintln!("{error}");
-				1
-			},
-			|_| 0,
-		);
-		std::process::exit(status)
-	}
-}
-#[used]
-#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
-#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
-#[cfg_attr(target_os = "windows", unsafe(link_section = ".CRT$XCU"))]
-static WORKER_INIT: extern "C" fn() = worker_init;
-fn ssh_config() -> Result<PathBuf> {
-	let path = PathBuf::from(env!("RECIPE_SSH_CONFIG"));
-	if path.is_absolute() {
-		return Ok(path);
-	}
-	let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| RecipeError::new("home directory is absent"))?;
-	Ok(PathBuf::from(home).join(path))
-}
-fn ssh_hosts() -> Result<Vec<String>> {
-	let text = fs::read_to_string(ssh_config()?).map_err(|error| RecipeError::new(format!("cannot read SSH config: {error}")))?;
-	let mut hosts = text.lines().filter_map(|line| line.trim().strip_prefix("Host ")).flat_map(str::split_whitespace).filter(|host| !host.contains(['*', '?', '!'])).map(str::to_owned).collect::<Vec<_>>();
-	hosts.sort();
-	hosts.dedup();
-	Ok(hosts)
-}
-#[derive(Clone)]
-struct RemoteNode {
-	name: String,
-	transport: String,
-	device: String,
-	backend: Backend,
-	native_target: BackendTarget,
-	memory: u64,
-	clock: u64,
-	shared_limit: u32,
-}
-struct Worker {
-	child: Child,
-	input: ChildStdin,
-	output: ChildStdout,
-}
-fn remote_io<T>(action: &str, result: io::Result<T>) -> Result<T> { result.map_err(|error| RecipeError::new(format!("cannot {action} remote Recipe worker: {error}"))) }
-fn put_u64(output: &mut impl Write, value: u64) -> Result<()> { remote_io("write to", output.write_all(&value.to_le_bytes())) }
-fn get_u64(input: &mut impl Read) -> Result<u64> {
-	let mut bytes = u64::default().to_le_bytes();
-	remote_io("read from", input.read_exact(&mut bytes))?;
-	Ok(u64::from_le_bytes(bytes))
-}
-fn write_response(output: &mut impl Write, result: Result<Vec<u8>>) -> Result<()> {
-	let (status, payload) = match result {
-		Ok(payload) => (0, payload),
-		Err(error) => (1, error.to_string().into_bytes()),
-	};
-	remote_io("write to", output.write_all(&[status]))?;
-	put_u64(output, payload.len() as u64)?;
-	remote_io("write to", output.write_all(&payload))
-}
-fn read_response(worker: &mut Worker) -> Result<Vec<u8>> {
-	let mut status = [0];
-	remote_io("read from", worker.output.read_exact(&mut status))?;
-	let bytes = get_u64(&mut worker.output)? as usize;
-	let mut payload = vec![0_u8; bytes];
-	remote_io("read from", worker.output.read_exact(&mut payload))?;
-	if status[0] == 0 {
-		return Ok(payload);
-	}
-	let message = String::from_utf8(payload).map_err(|_| RecipeError::new("remote Recipe error is not UTF-8"))?;
-	Err(RecipeError::new(message))
-}
-impl Remote {
-	fn worker(&self) -> Result<std::sync::MutexGuard<'_, Worker>> { self.io.lock().map_err(|_| RecipeError::new("remote Recipe worker lock is poisoned")) }
-	fn allocate(&self, bytes: usize) -> Result<u64> {
-		let mut worker = self.worker()?;
-		remote_io("write to", worker.input.write_all(&[1]))?;
-		put_u64(&mut worker.input, bytes as u64)?;
-		remote_io("flush", worker.input.flush())?;
-		let payload = read_response(&mut worker)?;
-		require(payload.len() == size_of::<u64>(), "remote allocation response is invalid")?;
-		Ok(u64::from_le_bytes(payload.try_into().map_err(|_| RecipeError::new("remote pointer is invalid"))?))
-	}
-	fn free(&self, pointer: u64) {
-		if let Ok(mut worker) = self.worker() {
-			let _ = remote_io("write to", worker.input.write_all(&[2]));
-			let _ = put_u64(&mut worker.input, pointer);
-		}
-	}
-	fn upload(&self, dst: u64, src: *const c_void, bytes: usize) -> Result<u64> {
-		let mut worker = self.worker()?;
-		remote_io("write to", worker.input.write_all(&[3]))?;
-		put_u64(&mut worker.input, dst)?;
-		put_u64(&mut worker.input, bytes as u64)?;
-		remote_io("write to", worker.input.write_all(unsafe { std::slice::from_raw_parts(src.cast::<u8>(), bytes) }))?;
-		remote_io("flush", worker.input.flush())?;
-		let payload = read_response(&mut worker)?;
-		require(payload.len() == size_of::<u64>(), "remote upload response is invalid")?;
-		Ok(u64::from_le_bytes(payload.try_into().map_err(|_| RecipeError::new("remote pointer is invalid"))?))
-	}
-	fn download(&self, dst: Ptr, src: u64, bytes: usize) -> Result<()> {
-		let mut worker = self.worker()?;
-		remote_io("write to", worker.input.write_all(&[4]))?;
-		put_u64(&mut worker.input, src)?;
-		put_u64(&mut worker.input, bytes as u64)?;
-		remote_io("flush", worker.input.flush())?;
-		let payload = read_response(&mut worker)?;
-		require(payload.len() == bytes, "remote download response has the wrong size")?;
-		unsafe { ptr::copy_nonoverlapping(payload.as_ptr(), dst.cast::<u8>(), bytes) };
-		Ok(())
-	}
-	fn synchronize(&self) -> Result<()> {
-		let mut worker = self.worker()?;
-		remote_io("write to", worker.input.write_all(&[5]))?;
-		remote_io("flush", worker.input.flush())?;
-		read_response(&mut worker).map(|_| ())
-	}
-}
-fn worker_process(host: &str, mode: &str) -> Result<Worker> {
-	let executable = fs::read(std::env::current_exe().map_err(|error| RecipeError::new(format!("cannot locate Recipe executable: {error}")))?).map_err(|error| RecipeError::new(format!("cannot read Recipe executable: {error}")))?;
-	let command = format!(concat!("worker=$(mktemp /tmp/recipe-worker.XXXXXX)\x3b trap 'rm -f \"$worker\"' EXIT\x3b ", "dd bs={} count=1 iflag=fullblock of=\"$worker\" status=none\x3b chmod 700 \"$worker\"\x3b ", "RECIPE_WORKER='{}' \"$worker\"",), executable.len(), mode);
-	let mut child = Command::new("ssh").arg("-F").arg(ssh_config()?).args(["-o", "BatchMode=yes", "-o"]).arg(format!("ConnectTimeout={}", env!("RECIPE_SSH_CONNECT_TIMEOUT"))).arg(host).arg(command).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().map_err(|error| RecipeError::new(format!("cannot start Recipe worker on {host}: {error}")))?;
-	let mut input = child.stdin.take().ok_or_else(|| RecipeError::new("Recipe worker stdin is absent"))?;
-	let output = child.stdout.take().ok_or_else(|| RecipeError::new("Recipe worker stdout is absent"))?;
-	input.write_all(&executable).map_err(|error| RecipeError::new(format!("cannot upload Recipe worker: {error}")))?;
-	Ok(Worker { child, input, output })
-}
-fn remote_nodes(host: &str) -> Result<Vec<RemoteNode>> {
-	let Worker { mut child, input, mut output } = worker_process(host, "list")?;
-	drop(input);
-	let mut text = String::new();
-	output.read_to_string(&mut text).map_err(|error| RecipeError::new(format!("cannot read Recipe worker: {error}")))?;
-	require(child.wait().map_err(|error| RecipeError::new(format!("cannot wait for {host}: {error}")))?.success(), format!("Recipe worker on {host} failed"))?;
-	text.lines()
-		.map(|line| {
-			let fields = line.split('|').collect::<Vec<_>>();
-			require(fields.len() == 7, "Recipe worker device is invalid")?;
-			let backend = match fields[2] {
-				"Cpu" => Backend::Cpu,
-				"Amd" => Backend::Amd,
-				"Nvidia" => Backend::Nvidia,
-				_ => return Err(RecipeError::new("Recipe worker backend is invalid")),
-			};
-			let native_target = match backend {
-				Backend::Cpu => BackendTarget::Cpu { target: fields[6].to_owned() },
-				Backend::Amd => BackendTarget::Amd { architecture: fields[6].to_owned() },
-				Backend::Nvidia => BackendTarget::Nvidia { architecture: fields[6].to_owned() },
-			};
-			let positive = |index| -> Result<u32> { Ok(narrow(natural("remote device value", fields[index])?, "remote device value")? as u32) };
-			Ok(RemoteNode { name: format!("{}:{}", fields[0], fields[1]), transport: host.to_owned(), device: fields[1].to_owned(), backend, native_target, shared_limit: positive(3)?, memory: fields[4].parse().map_err(|error| RecipeError::new(format!("invalid remote memory: {error}")))?, clock: natural("remote timestamp frequency", fields[5])? as u64 })
-		})
-		.collect()
-}
-fn remote_gpu(node: &RemoteNode) -> Result<Gpu> {
-	let worker = worker_process(&node.transport, &format!("serve|{}", node.device))?;
-	Ok(Gpu { name: node.name.clone(), backend: node.backend, native_target: node.native_target.clone(), driver: Driver::Remote(Remote { io: Mutex::new(worker) }), memory: node.memory, clock: node.clock, shared_limit: node.shared_limit, dispatch: Mutex::new(()) })
-}
-static REMOTE_GPUS: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
-fn remote_gpus(name: &str) -> Result<&'static [Gpu]> {
-	REMOTE_GPUS.get_or_init(|| {
-		let (host, device) = name.split_once(':').ok_or_else(|| RecipeError::new("remote GPU name has no host"))?;
-		let nodes = remote_nodes(host)?.into_iter().filter(|node| node.device == device).collect::<Vec<_>>();
-		Ok(nodes.iter().filter_map(|node| remote_gpu(node).ok()).collect())
-	})
-	.as_ref()
-	.map(Vec::as_slice)
-	.map_err(Clone::clone)
-}
-fn device_name(gpu: &Gpu, host: &str) -> String { if matches!(&gpu.driver, Driver::Remote(_)) { gpu.name.clone() } else { format!("{host}:{}", gpu.name) } }
-fn selected_gpus() -> Result<Vec<&'static Gpu>> {
-	match std::env::var("RECIPE_DEVICE").ok() {
-		Some(name) => {
-			let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-			if let Some(gpu) = devices()?.iter().find(|gpu| gpu.name == name || device_name(gpu, host.trim()) == name) { return Ok(vec![gpu]) }
-			let hosts = ssh_hosts()?;
-			require(name.split_once(':').is_some_and(|(host, _)| hosts.iter().any(|configured| configured == host)), format!("GPU {name:?} is absent"))?;
-			remote_gpus(&name)?.iter().find(|gpu| gpu.name == name).map(|gpu| vec![gpu]).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")))
-		}
-		None => Ok(vec![device(None)?]),
-	}
+	devices()?.iter().find(|gpu| gpu.name == name || format!("{}:{}", host.trim(), gpu.name) == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")))
 }
 #[cfg(amd)]
 type HsaInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32;
@@ -6048,7 +5805,6 @@ impl NativeProgram {
 				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact)? };
 				(NativeBackend::Nvidia(program), forward, epoch, model_load)
 			}
-			Driver::Remote(_) => return Err(RecipeError::new("remote native artifact transport is not connected")),
 		};
 		Ok(Self { gpu, artifact, backend, forward, epoch, model_load, tile: Tile { m: 1, n: 1, k: 1 } })
 	}
@@ -6155,10 +5911,8 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		check(pool_iterate(agent, collect_hsa, (&mut vram as *mut HsaQuery).cast()), "VRAM pools")?;
 		check(pool_iterate(cpu_agent, collect_hsa, (&mut kernarg as *mut HsaQuery).cast()), "KERNARG pools")?;
 		require(vram.found != 0 && kernarg.found != 0, "AMD VRAM or KERNARG pool is absent")?;
-		let (mut memory, mut clock) = (0_usize, 0_u64);
+		let mut memory = 0_usize;
 		check(pool_info(vram.found, 2, (&mut memory as *mut usize).cast()), "VRAM size")?;
-		check(info(agent, 0xA016, (&mut clock as *mut u64).cast()), "timestamp frequency")?;
-		require(clock != 0, "AMD timestamp frequency must be positive")?;
 		let (mut wave, mut workgroup, mut available, mut node, mut cus) = (0_u32, 0_u32, 0_u32, 0_u32, 0_u32);
 		for (attribute, output, action) in [(6, (&mut wave as *mut u32).cast(), "wave query"), (8, (&mut workgroup as *mut u32).cast(), "workgroup query"), (0xA002, (&mut available as *mut u32).cast(), "CU query"), (0xA004, (&mut node as *mut u32).cast(), "KFD node query"), (0xA014, (&mut cus as *mut u32).cast(), "cooperative CU query")] {
 			check(info(agent, attribute, output), action)?;
@@ -6186,7 +5940,7 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		driver_status(Backend::Amd, queue_create(agent, 256, 2, ptr::null_mut(), ptr::null_mut(), u32::MAX, u32::MAX, &mut queue), "queue creation")?;
 		check(signal_create(0, 0, ptr::null(), &mut completion), "signal creation")?;
 		let hsa = Hsa { _runtime: runtime.clone(), reader_create, reader_destroy, executable_create, executable_destroy, executable_load, executable_freeze, symbol, symbol_info, allocate, allow, queue, cpu_agent, free: runtime.function(b"hsa_amd_memory_pool_free\0")?, copy: runtime.function(b"hsa_memory_copy\0")?, store: runtime.function(b"hsa_signal_store_screlease\0")?, wait: runtime.function(b"hsa_signal_wait_scacquire\0")?, write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?, signal: completion, vram_pool: vram.found, kernarg_pool: kernarg.found, agent, cus, wave, workgroup, lds };
-		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, native_target, driver: Driver::Hsa(hsa), memory: memory as u64, clock, shared_limit: lds, dispatch: Mutex::new(()) })
+		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, native_target, driver: Driver::Hsa(hsa), memory: memory as u64, shared_limit: lds, dispatch: Mutex::new(()) })
 	}
 }
 fn load_nvidia() -> Result<Vec<Gpu>> {
@@ -6205,7 +5959,6 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		const COOPERATIVE: i32 = 95;
 		const COMPUTE_MAJOR: i32 = 75;
 		const COMPUTE_MINOR: i32 = 76;
-		const NANOSECOND_TIMER_HZ: u64 = 1_000_000_000;
 		let runtime = std::sync::Arc::new(Library::open(if cfg!(windows) { "nvcuda.dll" } else { env!("RECIPE_NV_RUNTIME") })?);
 		let init: unsafe extern "C" fn(u32) -> i32 = runtime.function(b"cuInit\0")?;
 		let count_devices: unsafe extern "C" fn(*mut i32) -> i32 = runtime.function(b"cuDeviceGetCount\0")?;
@@ -6236,7 +5989,7 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 			let native_target = BackendTarget::Nvidia { architecture: format!("sm_{compute_major}{compute_minor}") };
 			check(create(&mut context, 0, device), "context creation")?;
 			let cuda = Cuda { _runtime: runtime.clone(), context, set: runtime.function(b"cuCtxSetCurrent\0")?, allocate: runtime.function(b"cuMemAlloc_v2\0")?, free: runtime.function(b"cuMemFree_v2\0")?, upload: runtime.function(b"cuMemcpyHtoD_v2\0")?, download: runtime.function(b"cuMemcpyDtoH_v2\0")?, synchronize: runtime.function(b"cuCtxSynchronize\0")?, launch: runtime.function(b"cuLaunchCooperativeKernel\0")?, load, unload, function, function_attribute, occupancy, cus: cus as u32, wave: wave as u32, workgroup: workgroup as u32, block_lds: block_lds as u32, sm_lds: sm_lds as u32, registers: registers as u32, threads: threads as u32 };
-			Ok(Gpu { name: format!("nv{index}"), backend: Backend::Nvidia, native_target, driver: Driver::Cuda(cuda), memory: memory as u64, clock: NANOSECOND_TIMER_HZ, shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()) })
+			Ok(Gpu { name: format!("nv{index}"), backend: Backend::Nvidia, native_target, driver: Driver::Cuda(cuda), memory: memory as u64, shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()) })
 		};
 		let mut found = Vec::new();
 		for ordinal in 0..count {
@@ -7651,10 +7404,8 @@ impl Train {
 		let prepared = prepare(data)?;
 		let training_rows = ((prepared.rows as f64) * data.split).floor() as usize;
 		require(training_rows != 0 && training_rows <= prepared.rows, "split must select training rows")?;
-		let (gpus, mut config) = (selected_gpus()?, Config::load()?);
+		let (gpu, mut config) = (selected_gpu()?, Config::load()?);
 		let precision = self.precision;
-		require(gpus.len() == 1, format!("one execution device is required for {} training", precision.label()))?;
-		let gpu = gpus[0];
 		config.precision = precision;
 		if let Some(seed) = self.seed {
 			config.random_seed = seed;
@@ -7877,7 +7628,7 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
 }
 use std::{
-	io::{self, BufRead, BufReader, IsTerminal, Read, Write},
+	io::{self, BufRead, BufReader, IsTerminal, Write},
 	process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
 fn process_io<T>(action: &str, result: io::Result<T>) -> Result<T> { result.map_err(|error| RecipeError::new(format!("cannot {action} RAT command: {error}"))) }
@@ -7981,9 +7732,8 @@ fn append_model(graph: &mut Graph, model: &Model, features: usize, outputs: usiz
 	let source = append_graph(graph, part)?;
 	Ok((source, (start, graph.parameters.len())))
 }
-fn build<const N: usize>(models: &[Model; N], train: &Train, data: &Data, gpus: &[&'static Gpu], config: Config) -> Result<State> {
+fn build<const N: usize>(models: &[Model; N], train: &Train, data: &Data, gpu: &'static Gpu, config: Config) -> Result<State> {
 	require(N >= 2, "RAT requires an intermediate model and a predictor")?;
-	require(gpus.len() == 1, "one execution device is required for RAT")?;
 	require(data.routes.len() + 1 == N, "RAT requires one .r#in().out() pair per intermediate model")?;
 	require(!data.target.is_empty(), "RAT requires .target()")?;
 	let (rows, input_names) = (config.rat_batch, require(!data.routes[0].inputs.is_empty(), "RAT requires an initial input").map(|_| data.routes[0].inputs.clone())?);
@@ -8002,7 +7752,7 @@ fn build<const N: usize>(models: &[Model; N], train: &Train, data: &Data, gpus: 
 		}
 		require(!route.inputs.is_empty() && !route.outputs.is_empty(), "RAT route names must not be empty")?;
 		route_graph(&mut graph, &route.inputs, &fields, data.normalize)?;
-		let (mut source, range) = append_model(&mut graph, &models[index], route.inputs.len(), route.outputs.len(), rows, gpus[0], config, &schema)?;
+		let (mut source, range) = append_model(&mut graph, &models[index], route.inputs.len(), route.outputs.len(), rows, gpu, config, &schema)?;
 		if index == 0 {
 			lower_activation(&mut graph, Activation::Sigmoid, config)?;
 			source = graph.source;
@@ -8021,17 +7771,17 @@ fn build<const N: usize>(models: &[Model; N], train: &Train, data: &Data, gpus: 
 	let mut predictor_inputs = route.inputs.clone();
 	predictor_inputs.extend(route.outputs.iter().cloned());
 	route_graph(&mut graph, &predictor_inputs, &fields, data.normalize)?;
-	let (_, range) = append_model(&mut graph, &models[N - 1], predictor_inputs.len(), data.target.len(), rows, gpus[0], config, &schema)?;
+	let (_, range) = append_model(&mut graph, &models[N - 1], predictor_inputs.len(), data.target.len(), rows, gpu, config, &schema)?;
 	ranges.push(range);
 	let models_vec = models.to_vec();
 	let routes = data.routes.clone();
-	let artifact = bundle::artifact_key(&models_vec, &routes, &schema, config.precision, &graph, native_target_label(&gpus[0].native_target));
+	let artifact = bundle::artifact_key(&models_vec, &routes, &schema, config.precision, &graph, native_target_label(&gpu.native_target));
 	let mut stored = bundle::StoredGraph { graph, models: models_vec, routes, precision: config.precision, inputs: input_names, outputs: data.target.clone(), norm_mean: Vec::new(), norm_scale: Vec::new(), target_min: 0.0, target_span: 0.0, bn_stats: Vec::new(), artifact };
 	if let Some(path) = &train.resume {
 		bundle::restore(path, &schema, std::slice::from_mut(&mut stored), &[])?;
 	}
 	let targets = vec![0.0; rows * stored.outputs.len()];
-	let tape = NativeTape::new(&stored.graph, &vec![0.0; rows * stored.inputs.len()], &targets, gpus[0], config.precision, models[N - 1].loss)?;
+	let tape = NativeTape::new(&stored.graph, &vec![0.0; rows * stored.inputs.len()], &targets, gpu, config.precision, models[N - 1].loss)?;
 	Ok(State { stored, tape, proposals, models: ranges, proposal_names, targets, schema })
 }
 type TileCase = (usize, usize, [f64; 5], Tile, Tile);
@@ -8050,7 +7800,7 @@ impl TileRuntime {
 		let models = [proposer, predictor];
 		let data = recipe.data(Vec::<String>::new()).r#in(["dtype", "VRAM", "M", "N", "K"]).out(["m", "n", "k"]).target(["Mtime"]).norm(z_score);
 		let train = recipe.train().epochs(config.surrogate_epochs).lr(config.surrogate_rate);
-		Ok(Self { state: build(&models, &train, &data, &[gpu], config)?, train, predictor: models.into_iter().last().unwrap(), vram_unit: config.vram_unit })
+		Ok(Self { state: build(&models, &train, &data, gpu, config)?, train, predictor: models.into_iter().last().unwrap(), vram_unit: config.vram_unit })
 	}
 	fn forward(&mut self, cases: &[TileCase]) -> Result<()> {
 		require(!cases.is_empty(), "tile proposal batch is empty")?;
@@ -8177,8 +7927,7 @@ impl<const N: usize> RatTrain<N> {
 			let mut state = self.state.take();
 			self.check_interrupt(state.as_mut())?;
 		}
-		let gpus = selected_gpus()?;
-		require(gpus.len() == 1, "one execution device is required for RAT")?;
+		let gpu = selected_gpu()?;
 		let config = Config::load()?;
 		let context = match self.context.take() {
 			Some(context) => context,
@@ -8186,7 +7935,7 @@ impl<const N: usize> RatTrain<N> {
 		};
 		self.check_interrupt(None)?;
 		if self.state.is_none() {
-			self.state = Some(build(&self.models, &self.train, data, &gpus, config)?);
+			self.state = Some(build(&self.models, &self.train, data, gpu, config)?);
 		}
 		let mut state = self.state.take().ok_or_else(|| RecipeError::new("RAT state is absent"))?;
 		let mut samples = Vec::new();
