@@ -1076,9 +1076,9 @@ impl NativeModelIr {
 			if let Some(weight) = &stored {
 				require(weight.count == node.parameters, format!("{} stored weight count {} does not match parameter count {}", id(), weight.count, node.parameters))?;
 			}
-			let storage_offset = storage_bytes;
+			let storage_offset = align(storage_bytes, alignment("float"))?;
 			if let Some(weight) = &stored {
-				storage_bytes = checked_add(storage_bytes, weight.bytes.len(), "native storage arena")?;
+				storage_bytes = checked_add(storage_offset, weight.bytes.len(), "native storage arena")?;
 			}
 			plans.push(NodePlan { node, value: layout.values[index], context: layout.contexts[index], adjoint: layout.adjoints[index], stored, storage_offset });
 		}
@@ -1088,6 +1088,7 @@ impl NativeModelIr {
 		let mut storage = Vec::with_capacity(self.storage_bytes);
 		for plan in &self.plans {
 			if let Some(weight) = &plan.stored {
+				storage.resize(plan.storage_offset, 0);
 				storage.extend_from_slice(&weight.bytes);
 			}
 		}
