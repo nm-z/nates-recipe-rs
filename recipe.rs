@@ -5465,7 +5465,6 @@ struct NativeTape {
 	input: usize,
 	output: usize,
 	capacity: usize,
-	tile: Tile,
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 impl NativeTape {
@@ -5478,7 +5477,6 @@ impl NativeTape {
 		let program = gpu.native_program(graph, rows, precision, loss)?;
 		let precision = program.artifact.precision;
 		let layout = program.artifact.layout.clone();
-		let tile = program.tile;
 		let parameters = graph.parameters.len();
 		let zeros = vec![0.0; parameters.max(1)];
 		require(graph.state.moments.is_empty() || graph.state.moments.len() == parameters, "saved optimizer moments have the wrong shape")?;
@@ -5542,18 +5540,18 @@ impl NativeTape {
 			input,
 			output,
 			capacity: rows,
-			tile,
 		})
 	}
 	fn forward(&mut self) -> Result<()> {
 		let threads = self.program.forward.geometry.threads()?;
+		let tile = self.program.tile;
 		let rows = self.rows;
 		let thread_count = threads;
-		let tile_m = self.tile.m;
-		let tile_n = self.tile.n;
-		let tile_k = self.tile.k;
+		let tile_m = tile.m;
+		let tile_n = tile.n;
+		let tile_k = tile.k;
 		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, tile_m, tile_n, tile_k];
-		self.program.launch_forward(&mut call, self.tile).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
+		self.program.launch_forward(&mut call, tile).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		self.gather_error("forward")
 	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
@@ -5589,11 +5587,12 @@ impl NativeTape {
 	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
 		require(self.step != 0, "optimizer epoch is absent")?;
 		let threads = self.program.epoch.geometry.threads()?;
+		let tile = self.program.tile;
 		let rows = self.rows;
 		let thread_count = threads;
-		let tile_m = self.tile.m;
-		let tile_n = self.tile.n;
-		let tile_k = self.tile.k;
+		let tile_m = tile.m;
+		let tile_n = tile.n;
+		let tile_k = tile.k;
 		let beta1 = self.precision.state.optimizer_beta(config.beta1);
 		let beta2 = self.precision.state.optimizer_beta(config.beta2);
 		let epsilon = self.precision.state.optimizer_epsilon(config.epsilon);
@@ -5629,7 +5628,7 @@ impl NativeTape {
 			encoded[6],
 			step
 		];
-		self.program.launch_epoch(&mut call, self.tile).map_err(|error| RecipeError::new(format!("training forward/backward/optimizer update: {error}")))?;
+		self.program.launch_epoch(&mut call, tile).map_err(|error| RecipeError::new(format!("training forward/backward/optimizer update: {error}")))?;
 		self.gather_error("training forward/backward/optimizer update")?;
 		let objective = self.metrics.download_float(1, self.precision.state)?[0];
 		let saved = self.observe(objective, tolerance, true)?;
@@ -5695,11 +5694,7 @@ impl NativeTape {
 		graph.state.best_loss = self.best_loss.to_vec();
 		Ok(())
 	}
-	fn fill_tile(&mut self, tile: Tile) -> Result<()> {
-		self.tile = tile;
-		Ok(())
-	}
-	fn tile(&self) -> Tile { self.tile }
+	fn tile(&self) -> Tile { self.program.tile }
 	fn proposal_limit(&self, values: [f64; 3]) -> Result<Tile> {
 		let dimension = |value: f64, name| -> Result<u32> {
 			require(value.is_finite() && value >= 1.0 && value.fract() == 0.0, format!("RAT {name} must be a positive integer"))?;
@@ -6172,30 +6167,36 @@ impl Gpu {
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: LossFunction) -> Result<NativeProgram> {
-		let artifact = compile_model(&self.native_target, graph, precision, loss, rows)?;
-		let mut program = NativeProgram::load(self, artifact)?;
-		let fixed = program.forward.kernel.shared.max(program.epoch.kernel.shared).max(program.model_load.map_or(0, |dispatch| dispatch.kernel.shared));
-		let shared = self.shared_limit.checked_sub(fixed).ok_or_else(|| RecipeError::new("native model exceeds device shared memory"))?;
-		let shared_values = shared / precision.bytes() as u32;
+		let shared_values = self.shared_limit / precision.bytes() as u32;
 		require(shared_values != 0, "native model has no shared memory for contraction")?;
-		let mut limit = Tile { m: 1, n: 1, k: 1 };
+		let mut tile = Tile { m: 1, n: 1, k: 1 };
 		for node in &graph.nodes {
 			let span = match node.op {
 				Primitive::Contraction => integer_argument(node.argument[0], "contraction kernel")?.max(1) as usize,
 				Primitive::Scan => 1,
 				_ => continue,
 			};
-			limit.m = limit.m.max(narrow(checked_mul(rows, node.output.length, "native contraction rows")?, "native contraction M tile limit")? as u32);
-			limit.n = limit.n.max(narrow(node.output.channels, "native contraction N tile limit")? as u32);
-			limit.k = limit.k.max(narrow(checked_mul(node.input.channels, span, "native contraction terms")?, "native contraction K tile limit")? as u32);
+			tile.m = tile.m.max(narrow(checked_mul(rows, node.output.length, "native contraction rows")?, "native contraction M tile limit")? as u32);
+			tile.n = tile.n.max(narrow(node.output.channels, "native contraction N tile limit")? as u32);
+			tile.k = tile.k.max(narrow(checked_mul(node.input.channels, span, "native contraction terms")?, "native contraction K tile limit")? as u32);
 		}
-		let block = program.forward.geometry.block.min(program.epoch.geometry.block);
-		limit.n = limit.n.min(block.isqrt().max(1));
-		limit.m = limit.m.min(block / limit.n);
-		let shared_width = limit.m.checked_add(limit.n).ok_or_else(|| RecipeError::new("native contraction tile width overflows"))?;
-		limit.k = limit.k.min(shared_values / shared_width);
-		require(limit.m != 0 && limit.n != 0 && limit.k != 0, "native contraction tile does not fit the device")?;
-		program.tile = limit;
+		let block = match &self.driver {
+			Driver::Cpu => 1,
+			#[cfg(amd)]
+			Driver::Hsa(driver) => driver.wave,
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => driver.wave,
+		};
+		tile.n = tile.n.min(block.isqrt().max(1));
+		tile.m = tile.m.min(block / tile.n);
+		let shared_width = tile.m.checked_add(tile.n).ok_or_else(|| RecipeError::new("native contraction tile width overflows"))?;
+		tile.k = tile.k.min(shared_values / shared_width);
+		require(tile.m != 0 && tile.n != 0 && tile.k != 0, "native contraction tile does not fit the device")?;
+		let artifact = compile_model(&self.native_target, graph, precision, loss, rows)?;
+		let program = NativeProgram::load(self, artifact, tile)?;
+		let fixed = program.forward.kernel.shared.max(program.epoch.kernel.shared).max(program.model_load.map_or(0, |dispatch| dispatch.kernel.shared));
+		let required = fixed.checked_add(shared_bytes(tile, precision.bytes() as u8)?).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
+		require(required <= self.shared_limit, "native model exceeds device shared memory")?;
 		Ok(program)
 	}
 	fn allocate(&self, bytes: usize) -> Result<u64> {
@@ -6542,7 +6543,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 }
 
 impl NativeProgram {
-	fn load(gpu: &'static Gpu, artifact: NativeArtifact) -> Result<Self> {
+	fn load(gpu: &'static Gpu, artifact: NativeArtifact, tile: Tile) -> Result<Self> {
 		native_artifact_contract(&artifact)?;
 		require(artifact.backend.backend() == gpu.backend, format!("native artifact backend {:?} does not match device {:?}", artifact.backend.backend(), gpu.backend))?;
 		let (backend, forward, epoch, model_load) = match &gpu.driver {
@@ -6569,7 +6570,7 @@ impl NativeProgram {
 				(NativeBackend::Nvidia(program), forward, epoch, model_load)
 			}
 		};
-		Ok(Self { gpu, artifact, backend, forward, epoch, model_load, tile: Tile { m: 1, n: 1, k: 1 } })
+		Ok(Self { gpu, artifact, backend, forward, epoch, model_load, tile })
 	}
 
 	fn dispatch(&self, entry: NativeEntry) -> Result<Dispatch> {
@@ -8643,8 +8644,7 @@ impl<const N: usize> RatTrain<N> {
 		require(!proposal.is_empty(), "RAT proposal batch is empty")?;
 		for (row, frame) in proposal.chunks_exact_mut(width).zip(&context) {
 			let limit = state.tape.proposal_limit([frame.value("M")?, frame.value("N")?, frame.value("K")?])?;
-			let tile = Tile::proposed(row, Tile { m: 1, n: 1, k: 1 }, limit)?;
-			state.tape.fill_tile(tile)?;
+			Tile::proposed(row, Tile { m: 1, n: 1, k: 1 }, limit)?;
 		}
 		let written = self.process()?.write(&state.proposal_names, &proposal);
 		self.check_interrupt(Some(&mut state))?;
