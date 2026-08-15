@@ -683,6 +683,8 @@ pub fn emit_normalize(context: NormalizeContext<'_>, element: &str) -> Normalize
 pub struct NormalizeReverseContext<'a> {
 	pub value_type: &'a str,
 	pub pointer_type: &'a str,
+	pub alignment: usize,
+	pub zero: &'a str,
 	pub context: &'a str,
 	pub rows: &'a str,
 	pub channels: usize,
@@ -694,6 +696,83 @@ pub struct NormalizeReverseContext<'a> {
 pub struct NormalizeReverseFragment {
 	pub code: String,
 	pub contribution: String,
+}
+
+pub fn emit_normalize_reverse_stats(context: NormalizeReverseContext<'_>, delta: &str, output_value: &str) -> String {
+	let mut code = String::new();
+	let elements = context.channels * context.length;
+	let prefix = context.prefix;
+	let group = format!("%{prefix}.group");
+	let groups = format!("%{prefix}.groups");
+	let items = format!("%{prefix}.items");
+	match context.mode {
+		NormalizeMode::Batch => {
+			let _ = writeln!(code, "{groups} = add i32 0, {}", context.channels);
+			let _ = writeln!(code, "{items} = mul i32 {}, {}", context.rows, context.length);
+		}
+		NormalizeMode::Layer | NormalizeMode::Rms => {
+			let _ = writeln!(code, "{groups} = mul i32 {}, {}", context.rows, context.length);
+			let _ = writeln!(code, "{items} = add i32 0, {}", context.channels);
+		}
+		NormalizeMode::Evaluation => return code,
+	}
+	let _ = writeln!(code, "br label %{prefix}.entry");
+	let _ = writeln!(code, "{prefix}.entry:");
+	let _ = writeln!(code, "br label %{prefix}.group.loop");
+	let _ = writeln!(code, "{prefix}.group.loop:");
+	let _ = writeln!(code, "{group} = phi i32 [ %tid, %{prefix}.entry ], [ %{prefix}.group.next, %{prefix}.store ]");
+	let _ = writeln!(code, "%{prefix}.group.more = icmp ult i32 {group}, {groups}");
+	let _ = writeln!(code, "br i1 %{prefix}.group.more, label %{prefix}.item.loop, label %{prefix}.done");
+	let _ = writeln!(code, "{prefix}.item.loop:");
+	let _ = writeln!(code, "%{prefix}.p = phi i32 [ 0, %{prefix}.group.loop ], [ %{prefix}.p.next, %{prefix}.item.step ]");
+	let _ = writeln!(code, "%{prefix}.sum = phi {ty} [ {zero}, %{prefix}.group.loop ], [ %{prefix}.sum.next, %{prefix}.item.step ]", ty = context.value_type, zero = context.zero);
+	let _ = writeln!(code, "%{prefix}.projected = phi {ty} [ {zero}, %{prefix}.group.loop ], [ %{prefix}.projected.next, %{prefix}.item.step ]", ty = context.value_type, zero = context.zero);
+	let _ = writeln!(code, "%{prefix}.item.more = icmp ult i32 %{prefix}.p, {items}");
+	let _ = writeln!(code, "br i1 %{prefix}.item.more, label %{prefix}.item.step, label %{prefix}.store");
+	let _ = writeln!(code, "{prefix}.item.step:");
+	match context.mode {
+		NormalizeMode::Batch => {
+			let _ = writeln!(code, "%{prefix}.row = udiv i32 %{prefix}.p, {}", context.length);
+			let _ = writeln!(code, "%{prefix}.position = urem i32 %{prefix}.p, {}", context.length);
+			let _ = writeln!(code, "%{prefix}.row.base = mul i32 %{prefix}.row, {elements}");
+			let _ = writeln!(code, "%{prefix}.channel.base = mul i32 {group}, {}", context.length);
+		}
+		NormalizeMode::Layer | NormalizeMode::Rms => {
+			let _ = writeln!(code, "%{prefix}.row = udiv i32 {group}, {}", context.length);
+			let _ = writeln!(code, "%{prefix}.position = urem i32 {group}, {}", context.length);
+			let _ = writeln!(code, "%{prefix}.row.base = mul i32 %{prefix}.row, {elements}");
+			let _ = writeln!(code, "%{prefix}.channel.base = mul i32 %{prefix}.p, {}", context.length);
+		}
+		NormalizeMode::Evaluation => unreachable!(),
+	}
+	let _ = writeln!(code, "%{prefix}.local = add i32 %{prefix}.channel.base, %{prefix}.position");
+	let _ = writeln!(code, "%{prefix}.index = add i32 %{prefix}.row.base, %{prefix}.local");
+	let _ = writeln!(code, "%{prefix}.delta.ptr = getelementptr inbounds {ty}, {ptrty} {delta}, i32 %{prefix}.index", ty = context.value_type, ptrty = context.pointer_type);
+	let _ = writeln!(code, "%{prefix}.output.ptr = getelementptr inbounds {ty}, {ptrty} {output}, i32 %{prefix}.index", ty = context.value_type, ptrty = context.pointer_type, output = output_value);
+	let _ = writeln!(code, "%{prefix}.delta = load {ty}, {ptrty} %{prefix}.delta.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+	let _ = writeln!(code, "%{prefix}.output = load {ty}, {ptrty} %{prefix}.output.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+	if context.mode == NormalizeMode::Rms {
+		let _ = writeln!(code, "%{prefix}.sum.next = call {ty} @recipe.add({ty} %{prefix}.sum, {ty} {zero})", ty = context.value_type, zero = context.zero);
+	} else {
+		let _ = writeln!(code, "%{prefix}.sum.next = call {ty} @recipe.add({ty} %{prefix}.sum, {ty} %{prefix}.delta)", ty = context.value_type);
+	}
+	let _ = writeln!(code, "%{prefix}.projection = call {ty} @recipe.mul({ty} %{prefix}.delta, {ty} %{prefix}.output)", ty = context.value_type);
+	let _ = writeln!(code, "%{prefix}.projected.next = call {ty} @recipe.add({ty} %{prefix}.projected, {ty} %{prefix}.projection)", ty = context.value_type);
+	let _ = writeln!(code, "%{prefix}.p.next = add i32 %{prefix}.p, 1");
+	let _ = writeln!(code, "br label %{prefix}.item.loop");
+	let _ = writeln!(code, "{prefix}.store:");
+	let _ = writeln!(code, "%{prefix}.sum.base = mul i32 {groups}, 2");
+	let _ = writeln!(code, "%{prefix}.projected.base = mul i32 {groups}, 3");
+	let _ = writeln!(code, "%{prefix}.sum.index = add i32 %{prefix}.sum.base, {group}");
+	let _ = writeln!(code, "%{prefix}.projected.index = add i32 %{prefix}.projected.base, {group}");
+	let _ = writeln!(code, "%{prefix}.sum.ptr = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i32 %{prefix}.sum.index", ty = context.value_type, ptrty = context.pointer_type, context_ptr = context.context);
+	let _ = writeln!(code, "%{prefix}.projected.ptr = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i32 %{prefix}.projected.index", ty = context.value_type, ptrty = context.pointer_type, context_ptr = context.context);
+	let _ = writeln!(code, "store {ty} %{prefix}.sum, {ptrty} %{prefix}.sum.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+	let _ = writeln!(code, "store {ty} %{prefix}.projected, {ptrty} %{prefix}.projected.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+	let _ = writeln!(code, "%{prefix}.group.next = add i32 {group}, %threads");
+	let _ = writeln!(code, "br label %{prefix}.group.loop");
+	let _ = writeln!(code, "{prefix}.done:");
+	code
 }
 
 /// Emit the fixed reverse formula for a normalized element. In training modes
@@ -748,7 +827,7 @@ pub fn emit_normalize_reverse(context: NormalizeReverseContext<'_>, element: &st
 	let _ = writeln!(code, "{scale_pointer} = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i32 {scale_index}", ty = context.value_type, ptrty = context.pointer_type, context_ptr = context.context);
 	let _ = writeln!(code, "{sum_pointer} = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i32 {sum_index}", ty = context.value_type, ptrty = context.pointer_type, context_ptr = context.context);
 	let _ = writeln!(code, "{projected_pointer} = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i32 {projected_index}", ty = context.value_type, ptrty = context.pointer_type, context_ptr = context.context);
-	let align = if context.value_type == "double" { 8 } else { 4 };
+	let align = context.alignment;
 	let _ = writeln!(code, "{scale} = load {ty}, {ptrty} {scale_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
 	if context.mode == NormalizeMode::Evaluation {
 		let contribution = format!("%{}.normalize.reverse.fixed", context.prefix);
@@ -2039,13 +2118,20 @@ impl NativeModelIr {
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
 					let prefix = format!("n{index}.normalize.reverse");
+					if mode != program_ir::NormalizeMode::Evaluation {
+						let stats_prefix = format!("{prefix}.stats");
+						let zero = native_literal(self.precision.model, ty, 0.0);
+						ir.push_str(&program_ir::emit_normalize_reverse_stats(program_ir::NormalizeReverseContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), zero: &zero, context: &pointers.context, rows: "%rows", channels: node.output.channels, length: node.output.length, mode, prefix: &stats_prefix }, &pointers.delta, &pointers.value));
+						ir.push_str(barrier(backend));
+					}
 					emit_fixed_loop(&mut ir, index, "normalize.reverse", count, |ir, p| {
 						let delta_pointer = format!("%{prefix}.delta.ptr");
 						let delta_value = format!("%{prefix}.delta.value");
 						let output_pointer = format!("%{prefix}.output.ptr");
 						let output_value = format!("%{prefix}.output.value");
 						ir.push_str(&format!("{delta_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i32 {p}\n{delta_value} = load {ty}, {pointer} {delta_pointer}, align {align}\n{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i32 {p}\n{output_value} = load {ty}, {pointer} {output_pointer}, align {align}\n", delta = pointers.delta, value = pointers.value, align = alignment(ty)));
-						let fragment = program_ir::emit_normalize_reverse(program_ir::NormalizeReverseContext { value_type: ty, pointer_type: pointer, context: &pointers.context, rows: "%rows", channels: node.output.channels, length: node.output.length, mode, prefix: &prefix }, p, &delta_value, &output_value);
+						let zero = native_literal(self.precision.model, ty, 0.0);
+						let fragment = program_ir::emit_normalize_reverse(program_ir::NormalizeReverseContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), zero: &zero, context: &pointers.context, rows: "%rows", channels: node.output.channels, length: node.output.length, mode, prefix: &prefix }, p, &delta_value, &output_value);
 						ir.push_str(&fragment.code);
 						let source_pointer = format!("%{prefix}.source.adjoint.ptr");
 						ir.push_str(&format!("{source_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i32 {p}\ncall {ty} @recipe.atomic.add({pointer} {source_pointer}, {ty} {contribution})\n", source_adjoint = pointers.source_adjoint, contribution = fragment.contribution));
