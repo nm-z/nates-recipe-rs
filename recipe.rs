@@ -893,7 +893,6 @@ pub(crate) struct NativeArtifact {
 	pub(crate) storage: Vec<u8>,
 	pub(crate) forward_layout: &'static [u8],
 	pub(crate) epoch_layout: &'static [u8],
-	pub(crate) model_load_layout: &'static [u8],
 	pub(crate) symbols: NativeSymbols,
 }
 
@@ -1466,10 +1465,17 @@ impl NativeModelIr {
 
 	fn emit_iq_definition(&self, backend: Backend, codec: StorageCodec) -> Result<String> {
 		let (pointer, ty) = (pointer_type(backend), value_type(self.precision));
-		let name = match codec { StorageCodec::IQ1S => "iq1s", StorageCodec::IQ1M => "iq1m", StorageCodec::IQ2S => "iq2s", _ => return Err(RecipeError::new(format!("native IQ decoder is unavailable for {codec:?}"))) };
+		let name = match codec { StorageCodec::IQ1S => "iq1s", StorageCodec::IQ1M => "iq1m", StorageCodec::IQ2S => "iq2s", StorageCodec::IQ2XS => "iq2xs", _ => return Err(RecipeError::new(format!("native IQ decoder is unavailable for {codec:?}"))) };
 		let mut ir = format!("define internal {ty} @recipe_model_quantized_{name}({pointer} %matrix, i32 %row, i32 %column, i32 %columns) #1 {{\nentry:\n");
-		if codec == StorageCodec::IQ2S {
-			ir.push_str(&format!("%blocks = udiv i32 %columns, 256\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, 256\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, 82\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local = urem i32 %column, 256\n%value.block = udiv i32 %local, 16\n%slot = udiv i32 %local, 8\n%grid.low.offset = add i32 2, %slot\n%grid.low.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.low.offset\n%grid.low.byte = load i8, {pointer} %grid.low.ptr, align 1\n%grid.low = zext i8 %grid.low.byte to i32\n%grid.high.slot = udiv i32 %slot, 4\n%grid.high.offset = add i32 66, %grid.high.slot\n%grid.high.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.high.offset\n%grid.high.byte = load i8, {pointer} %grid.high.ptr, align 1\n%grid.high.raw = zext i8 %grid.high.byte to i32\n%grid.shift.slot = urem i32 %slot, 4\n%grid.shift = mul i32 %grid.shift.slot, 2\n%grid.high.shifted = lshr i32 %grid.high.raw, %grid.shift\n%grid.high = and i32 %grid.high.shifted, 3\n%grid.high.bits = shl i32 %grid.high, 8\n%grid = or i32 %grid.low, %grid.high.bits\n%table.ptr = getelementptr inbounds [1024 x i16], ptr @recipe_model_iq2s, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane = urem i32 %local, 8\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.code = and i32 %level.shifted, 3\n%level.twice = shl i32 %level.code, 1\n%level.raw = add i32 %level.twice, 1\n%level = call {ty} @recipe.from.u32(i32 %level.raw)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 0\n%scale.half = load half, {pointer} %scale.ptr, align 2\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%factor.block = udiv i32 %value.block, 2\n%factor.offset = add i32 74, %factor.block\n%factor.ptr = getelementptr inbounds i8, {pointer} %block, i32 %factor.offset\n%factor.byte = load i8, {pointer} %factor.ptr, align 1\n%factor.raw = zext i8 %factor.byte to i32\n%factor.slot = urem i32 %value.block, 2\n%factor.shift = mul i32 %factor.slot, 4\n%factor.shifted = lshr i32 %factor.raw, %factor.shift\n%factor.code = and i32 %factor.shifted, 15\n%factor.integer = call {ty} @recipe.from.u32(i32 %factor.code)\n%factor = call {ty} @recipe.add({ty} %factor.integer, {ty} {half})\n%scaled.base = call {ty} @recipe.mul({ty} %scale, {ty} %factor)\n%scaled = call {ty} @recipe.mul({ty} %scaled.base, {ty} {quarter})\n%unsigned = call {ty} @recipe.mul({ty} %scaled, {ty} %level)\n%negative = call {ty} @recipe.neg({ty} %unsigned)\n%sign.offset = add i32 34, %slot\n%sign.ptr = getelementptr inbounds i8, {pointer} %block, i32 %sign.offset\n%sign.byte = load i8, {pointer} %sign.ptr, align 1\n%sign.raw = zext i8 %sign.byte to i32\n%sign.shifted = lshr i32 %sign.raw, %lane\n%sign.bit = and i32 %sign.shifted, 1\n%sign.set = icmp ne i32 %sign.bit, 0\n%result = select i1 %sign.set, {ty} %negative, {ty} %unsigned\nret {ty} %result\n}}\n", half = native_literal(self.precision, ty, 0.5), quarter = native_literal(self.precision, ty, 0.25)));
+		if matches!(codec, StorageCodec::IQ2S | StorageCodec::IQ2XS) {
+			let (stride, table, table_len, factor_offset) = match codec { StorageCodec::IQ2S => (82, "iq2s", 1024, 74), StorageCodec::IQ2XS => (74, "iq2xs", 512, 66), _ => unreachable!() };
+			ir.push_str(&format!("%blocks = udiv i32 %columns, 256\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, 256\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, {stride}\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local = urem i32 %column, 256\n%value.block = udiv i32 %local, 16\n%slot = udiv i32 %local, 8\n%lane = urem i32 %local, 8\n"));
+			if codec == StorageCodec::IQ2S {
+				ir.push_str(&format!("%grid.low.offset = add i32 2, %slot\n%grid.low.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.low.offset\n%grid.low.byte = load i8, {pointer} %grid.low.ptr, align 1\n%grid.low = zext i8 %grid.low.byte to i32\n%grid.high.slot = udiv i32 %slot, 4\n%grid.high.offset = add i32 66, %grid.high.slot\n%grid.high.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.high.offset\n%grid.high.byte = load i8, {pointer} %grid.high.ptr, align 1\n%grid.high.raw = zext i8 %grid.high.byte to i32\n%grid.shift.slot = urem i32 %slot, 4\n%grid.shift = mul i32 %grid.shift.slot, 2\n%grid.high.shifted = lshr i32 %grid.high.raw, %grid.shift\n%grid.high = and i32 %grid.high.shifted, 3\n%grid.high.bits = shl i32 %grid.high, 8\n%grid = or i32 %grid.low, %grid.high.bits\n%sign.offset = add i32 34, %slot\n%sign.ptr = getelementptr inbounds i8, {pointer} %block, i32 %sign.offset\n%sign.byte = load i8, {pointer} %sign.ptr, align 1\n%sign.raw = zext i8 %sign.byte to i32\n%sign.shifted = lshr i32 %sign.raw, %lane\n%sign.bit = and i32 %sign.shifted, 1\n"));
+			} else {
+				ir.push_str(&format!("%word.offset = mul i32 %slot, 2\n%word.data.offset = add i32 2, %word.offset\n%word.ptr = getelementptr inbounds i8, {pointer} %block, i32 %word.data.offset\n%word = load i16, {pointer} %word.ptr, align 2\n%word.raw = zext i16 %word to i32\n%grid = and i32 %word.raw, 511\n%signs = lshr i32 %word.raw, 9\n%signs.shifted = lshr i32 %signs, %lane\n%sign.base = and i32 %signs.shifted, 1\n%parity.4.shifted = lshr i32 %signs, 4\n%parity.4 = xor i32 %signs, %parity.4.shifted\n%parity.2.shifted = lshr i32 %parity.4, 2\n%parity.2 = xor i32 %parity.4, %parity.2.shifted\n%parity.1.shifted = lshr i32 %parity.2, 1\n%parity.1 = xor i32 %parity.2, %parity.1.shifted\n%parity = and i32 %parity.1, 1\n%lane.seven = icmp eq i32 %lane, 7\n%sign.bit = select i1 %lane.seven, i32 %parity, i32 %sign.base\n"));
+			}
+			ir.push_str(&format!("%table.ptr = getelementptr inbounds [{table_len} x i16], ptr @recipe_model_{table}, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.code = and i32 %level.shifted, 3\n%level.twice = shl i32 %level.code, 1\n%level.raw = add i32 %level.twice, 1\n%level = call {ty} @recipe.from.u32(i32 %level.raw)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 0\n%scale.half = load half, {pointer} %scale.ptr, align 2\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%factor.block = udiv i32 %value.block, 2\n%factor.offset = add i32 {factor_offset}, %factor.block\n%factor.ptr = getelementptr inbounds i8, {pointer} %block, i32 %factor.offset\n%factor.byte = load i8, {pointer} %factor.ptr, align 1\n%factor.raw = zext i8 %factor.byte to i32\n%factor.slot = urem i32 %value.block, 2\n%factor.shift = mul i32 %factor.slot, 4\n%factor.shifted = lshr i32 %factor.raw, %factor.shift\n%factor.code = and i32 %factor.shifted, 15\n%factor.integer = call {ty} @recipe.from.u32(i32 %factor.code)\n%factor = call {ty} @recipe.add({ty} %factor.integer, {ty} {half})\n%scaled.base = call {ty} @recipe.mul({ty} %scale, {ty} %factor)\n%scaled = call {ty} @recipe.mul({ty} %scaled.base, {ty} {quarter})\n%unsigned = call {ty} @recipe.mul({ty} %scaled, {ty} %level)\n%negative = call {ty} @recipe.neg({ty} %unsigned)\n%sign.set = icmp ne i32 %sign.bit, 0\n%result = select i1 %sign.set, {ty} %negative, {ty} %unsigned\nret {ty} %result\n}}\n", half = native_literal(self.precision, ty, 0.5), quarter = native_literal(self.precision, ty, 0.25)));
 			return Ok(ir)
 		}
 		if codec == StorageCodec::IQ1M {
@@ -1503,9 +1509,10 @@ impl NativeModelIr {
 			let Some(stored) = &plan.stored else { continue };
 			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
 			if seen.iter().any(|codec: &StorageCodec| *codec == spec.codec) { continue }
-			if matches!(spec.codec, StorageCodec::IQ1S | StorageCodec::IQ1M | StorageCodec::IQ2S) {
-				if spec.codec == StorageCodec::IQ2S {
-					emitted.push_str(&format!("@recipe_model_iq2s = private unnamed_addr constant [1024 x i16] [{}]\n", IQ2_S.iter().map(|value| format!("i16 {value}")).collect::<Vec<_>>().join(", ")));
+			if matches!(spec.codec, StorageCodec::IQ1S | StorageCodec::IQ1M | StorageCodec::IQ2S | StorageCodec::IQ2XS) {
+				if matches!(spec.codec, StorageCodec::IQ2S | StorageCodec::IQ2XS) {
+					let (name, table): (&str, &[u16]) = if spec.codec == StorageCodec::IQ2S { ("iq2s", &IQ2_S) } else { ("iq2xs", &IQ2_XS) };
+					emitted.push_str(&format!("@recipe_model_{name} = private unnamed_addr constant [{} x i16] [{}]\n", table.len(), table.iter().map(|value| format!("i16 {value}")).collect::<Vec<_>>().join(", ")));
 				} else if !seen.iter().any(|codec| matches!(codec, StorageCodec::IQ1S | StorageCodec::IQ1M)) {
 					emitted.push_str(&format!("@recipe_model_iq1 = private unnamed_addr constant [2048 x i16] [{}]\n", IQ1.iter().map(|value| format!("i16 {value}")).collect::<Vec<_>>().join(", ")));
 				}
@@ -1542,6 +1549,7 @@ impl NativeModelIr {
 				StorageCodec::IQ1S => "iq1s",
 				StorageCodec::IQ1M => "iq1m",
 				StorageCodec::IQ2S => "iq2s",
+				StorageCodec::IQ2XS => "iq2xs",
 				_ => return Err(RecipeError::new(format!("native quantized decoder is unavailable for node {index} format {:?}", spec.codec))),
 			};
 			let count = i32::try_from(stored.count).map_err(|_| RecipeError::new("native quantized weight count exceeds i32"))?;
@@ -1955,7 +1963,6 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		storage: model.storage(),
 		forward_layout: NATIVE_FORWARD_LAYOUT,
 		epoch_layout: native_precision_layout(precision),
-		model_load_layout: NATIVE_MODEL_LOAD_LAYOUT,
 		symbols: NativeSymbols { forward: "recipe_model_forward", epoch: "recipe_model_epoch", load: (model.storage_bytes != 0).then_some("recipe_model_load") },
 	})
 }
@@ -5184,23 +5191,14 @@ fn native_layout_size(layout: &[u8], role: &str) -> Result<usize> {
 fn native_artifact_contract(artifact: &NativeArtifact) -> Result<()> {
 	require(artifact.forward_layout == NATIVE_FORWARD_LAYOUT, "native forward ABI layout is invalid")?;
 	require(artifact.epoch_layout == native_precision_layout(artifact.precision), "native epoch ABI layout is invalid")?;
-	require(artifact.model_load_layout == NATIVE_MODEL_LOAD_LAYOUT, "native model-load ABI layout is invalid")?;
 	require(native_layout_size(artifact.forward_layout, "forward")? != 0, "native forward ABI layout is empty")?;
 	require(native_layout_size(artifact.epoch_layout, "epoch")? != 0, "native epoch ABI layout is empty")?;
-	require(native_layout_size(artifact.model_load_layout, "model-load")? != 0, "native model-load ABI layout is empty")?;
 	require(artifact.element_bytes == artifact.precision.bytes(), "native artifact precision width is invalid")?;
 	require(matches!(artifact.element_bytes, 1 | 2 | 4 | 8), "native artifact precision width is unsupported")?;
 	require(!artifact.artifact.is_empty(), "native artifact is empty")?;
 	Ok(())
 }
 
-fn native_target_backend(target: &BackendTarget) -> Backend {
-	match target {
-		BackendTarget::Cpu { .. } => Backend::Cpu,
-		BackendTarget::Amd { .. } => Backend::Amd,
-		BackendTarget::Nvidia { .. } => Backend::Nvidia,
-	}
-}
 impl Kernel {
 	const fn remote(shared: u32, element: u8, layout: &'static [u8]) -> Self {
 		Self {
@@ -5650,8 +5648,8 @@ impl Hsa {
 		driver_status(Backend::Amd, (self.executable_freeze)(executable.handle, ptr::null_mut()), "native executable freeze")?;
 		let forward = self.native_dispatch(executable.handle, artifact, artifact.symbols.forward, artifact.forward_layout)?;
 		let epoch = self.native_dispatch(executable.handle, artifact, artifact.symbols.epoch, artifact.epoch_layout)?;
-		let model_load = artifact.symbols.load.map(|name| self.native_dispatch(executable.handle, artifact, name, artifact.model_load_layout)).transpose()?;
-		let kernarg_size = [Some(artifact.forward_layout), Some(artifact.epoch_layout), artifact.symbols.load.map(|_| artifact.model_load_layout)].into_iter().flatten().map(argument_layout_size).max().ok_or_else(|| RecipeError::new("native AMD KERNARG layouts are absent"))?;
+		let model_load = artifact.symbols.load.map(|name| self.native_dispatch(executable.handle, artifact, name, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
+		let kernarg_size = [Some(artifact.forward_layout), Some(artifact.epoch_layout), artifact.symbols.load.map(|_| NATIVE_MODEL_LOAD_LAYOUT)].into_iter().flatten().map(argument_layout_size).max().ok_or_else(|| RecipeError::new("native AMD KERNARG layouts are absent"))?;
 		let mut kernarg = ptr::null_mut();
 		driver_status(Backend::Amd, (self.allocate)(self.kernarg_pool, kernarg_size, 0, &mut kernarg), "native KERNARG allocation")?;
 		driver_status(Backend::Amd, (self.allow)(1, &self.agent, ptr::null(), kernarg), "native GPU KERNARG access")?;
@@ -5692,7 +5690,7 @@ impl Cuda {
 		let element = u8::try_from(artifact.element_bytes).map_err(|_| RecipeError::new("native NVIDIA precision width is invalid"))?;
 		let forward = self.native_dispatch(program.module as Ptr, artifact.symbols.forward, element, artifact.forward_layout)?;
 		let epoch = self.native_dispatch(program.module as Ptr, artifact.symbols.epoch, element, artifact.epoch_layout)?;
-		let model_load = artifact.symbols.load.map(|name| self.native_dispatch(program.module as Ptr, name, element, artifact.model_load_layout)).transpose()?;
+		let model_load = artifact.symbols.load.map(|name| self.native_dispatch(program.module as Ptr, name, element, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
 		Ok((program, forward, epoch, model_load))
 		}
 	}
@@ -5764,7 +5762,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 impl NativeProgram {
 	fn load(gpu: &'static Gpu, artifact: NativeArtifact) -> Result<Self> {
 		native_artifact_contract(&artifact)?;
-		require(native_target_backend(&artifact.backend) == gpu.backend, format!("native artifact backend {:?} does not match device {:?}", native_target_backend(&artifact.backend), gpu.backend))?;
+		require(artifact.backend.backend() == gpu.backend, format!("native artifact backend {:?} does not match device {:?}", artifact.backend.backend(), gpu.backend))?;
 		let (backend, forward, epoch, model_load) = match &gpu.driver {
 			Driver::Cpu => {
 				#[cfg(unix)]
@@ -5772,7 +5770,7 @@ impl NativeProgram {
 					let cpu = load_native_cpu(&artifact)?;
 					let forward = Dispatch { kernel: Kernel::remote(0, artifact.element_bytes as u8, artifact.forward_layout), geometry: Geometry { groups: 1, block: 1 } };
 					let epoch = Dispatch { kernel: Kernel::remote(0, artifact.element_bytes as u8, artifact.epoch_layout), geometry: Geometry { groups: 1, block: 1 } };
-					let model_load = artifact.symbols.load.map(|_| Dispatch { kernel: Kernel::remote(0, artifact.element_bytes as u8, artifact.model_load_layout), geometry: Geometry { groups: 1, block: 1 } });
+					let model_load = artifact.symbols.load.map(|_| Dispatch { kernel: Kernel::remote(0, artifact.element_bytes as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } });
 					(NativeBackend::Cpu(cpu), forward, epoch, model_load)
 				}
 				#[cfg(not(unix))]
