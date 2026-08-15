@@ -1071,11 +1071,6 @@ fn strip_definition(mut ir: String, name: &str) -> String {
 	ir
 }
 
-fn definition(ir: &str, name: &str) -> Result<String> {
-	let (start, end) = definition_span(ir, name).ok_or_else(|| RecipeError::new(format!("native template definition {name} is absent or malformed")))?;
-	Ok(ir[start..end].to_owned())
-}
-
 fn barrier(backend: Backend) -> &'static str {
 	match backend {
 		Backend::Cpu => "",
@@ -1087,6 +1082,722 @@ fn ptr_gep(backend: Backend, base: &str, offset: usize, name: &str) -> String {
 	let pointer = pointer_type(backend);
 	format!("%{name} = getelementptr i8, {pointer} %{base}, i32 {offset}\n")
 }
+
+mod quantized {
+use super::{half, native_literal, pointer_type, unfp16, Backend, NativePrecision};
+
+#[derive(Clone, Copy)]
+pub(super) enum QuantIntOp {
+	Add,
+	Subtract,
+	Multiply,
+	Divide,
+	Remainder,
+	ShiftLeft,
+	ShiftRight,
+	And,
+	Or,
+	Xor,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum QuantValueOp {
+	Add,
+	Subtract,
+	Multiply,
+}
+
+pub(super) trait QuantOps {
+	type Int: Clone;
+	type Value: Clone;
+	fn index(&self) -> Self::Int;
+	fn integer(&self, value: u64) -> Self::Int;
+	fn int(&mut self, operation: QuantIntOp, left: Self::Int, right: Self::Int) -> Self::Int;
+	fn equal(&mut self, left: Self::Int, right: Self::Int) -> Self::Int;
+	fn less(&mut self, left: Self::Int, right: Self::Int) -> Self::Int;
+	fn select_int(&mut self, condition: Self::Int, yes: Self::Int, no: Self::Int) -> Self::Int;
+	fn sign_extend(&mut self, value: Self::Int, bits: u8) -> Self::Int;
+	fn load(&mut self, bits: u8, offset: Self::Int) -> Self::Int;
+	fn half(&mut self, offset: Self::Int) -> Self::Value;
+	fn float(&mut self, offset: Self::Int) -> Self::Value;
+	fn half_bits(&mut self, bits: Self::Int) -> Self::Value;
+	fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int;
+	fn signed_table(&mut self, name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int;
+	fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value;
+	fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value;
+	fn literal(&self, value: f64) -> Self::Value;
+	fn value(&mut self, operation: QuantValueOp, left: Self::Value, right: Self::Value) -> Self::Value;
+	fn select_value(&mut self, condition: Self::Int, yes: Self::Value, no: Self::Value) -> Self::Value;
+	fn signed(&mut self, magnitude: Self::Value, sign: Self::Int) -> Self::Value;
+}
+
+fn quant_int<Q: QuantOps>(quant: &mut Q, operation: QuantIntOp, left: Q::Int, right: u64) -> Q::Int { quant.int(operation, left, quant.integer(right)) }
+fn quant_bits<Q: QuantOps>(quant: &mut Q, value: Q::Int, shift: Q::Int, width: u8) -> Q::Int {
+	let shifted = quant.int(QuantIntOp::ShiftRight, value, shift);
+	quant_int(quant, QuantIntOp::And, shifted, (1_u64 << width) - 1)
+}
+fn quant_parity_sign<Q: QuantOps>(quant: &mut Q, signs: Q::Int, lane: Q::Int) -> Q::Int {
+	let shifted = quant.int(QuantIntOp::ShiftRight, signs.clone(), lane.clone());
+	let direct = quant_int(quant, QuantIntOp::And, shifted, 1);
+	let high = quant_int(quant, QuantIntOp::ShiftRight, signs.clone(), 4);
+	let parity4 = quant.int(QuantIntOp::Xor, signs, high);
+	let high = quant_int(quant, QuantIntOp::ShiftRight, parity4.clone(), 2);
+	let parity2 = quant.int(QuantIntOp::Xor, parity4, high);
+	let high = quant_int(quant, QuantIntOp::ShiftRight, parity2.clone(), 1);
+	let parity1 = quant.int(QuantIntOp::Xor, parity2, high);
+	let parity = quant_int(quant, QuantIntOp::And, parity1, 1);
+	let last = quant.equal(lane, quant.integer(7));
+	quant.select_int(last, parity, direct)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum IqPacking {
+	S,
+	Xs,
+	Xxs,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct IqLayout {
+	pub(super) man: u8,
+	pub(super) exp: u8,
+	pub(super) sign: u8,
+	pub(super) packing: IqPacking,
+	pub(super) table_name: &'static str,
+	pub(super) table: &'static [u16],
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Iq1Layout {
+	pub(super) man: u8,
+	pub(super) exp: u8,
+	pub(super) sign: u8,
+	pub(super) medium: bool,
+	pub(super) table_name: &'static str,
+	pub(super) table: &'static [u16],
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ScalarLayout {
+	pub(super) sign: u8,
+	pub(super) exp: u8,
+	pub(super) man: u8,
+	pub(super) variant: u8,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Iq4Layout {
+	pub(super) sign: u8,
+	pub(super) exp: u8,
+	pub(super) man: u8,
+	pub(super) xs: bool,
+	pub(super) table_name: &'static str,
+	pub(super) table: &'static [i8],
+}
+
+pub(super) fn dequant_iq<Q: QuantOps>(quant: &mut Q, layout: IqLayout) -> Q::Value {
+	let local = quant.index();
+	let lane = quant_int(quant, QuantIntOp::Remainder, local.clone(), 8);
+	let scale = quant.half(quant.integer(0));
+	let (grid, factor_code, sign, table_lane, multiplier, odd_factor) = match (layout.man, layout.packing) {
+		(2, IqPacking::S) => {
+			let value_block = quant_int(quant, QuantIntOp::Divide, local.clone(), 16);
+			let slot = quant_int(quant, QuantIntOp::Divide, local.clone(), 8);
+			let low_offset = quant_int(quant, QuantIntOp::Add, slot.clone(), 2);
+			let low = quant.load(8, low_offset);
+			let high_slot = quant_int(quant, QuantIntOp::Divide, slot.clone(), 4);
+			let high_offset = quant_int(quant, QuantIntOp::Add, high_slot, 66);
+			let high = quant.load(8, high_offset);
+			let high_lane = quant_int(quant, QuantIntOp::Remainder, slot.clone(), 4);
+			let high_shift = quant_int(quant, QuantIntOp::Multiply, high_lane, 2);
+			let high_bits = quant_bits(quant, high, high_shift, 2);
+			let high_bits = quant_int(quant, QuantIntOp::ShiftLeft, high_bits, 8);
+			let grid = quant.int(QuantIntOp::Or, low, high_bits);
+			let sign_offset = quant_int(quant, QuantIntOp::Add, slot, 34);
+			let signs = quant.load(8, sign_offset);
+			let sign = quant_bits(quant, signs, lane.clone(), layout.sign);
+			let factor_block = quant_int(quant, QuantIntOp::Divide, value_block.clone(), 2);
+			let factor_offset = quant_int(quant, QuantIntOp::Add, factor_block, 74);
+			let factor = quant.load(8, factor_offset);
+			let factor_lane = quant_int(quant, QuantIntOp::Remainder, value_block, 2);
+			let factor_shift = quant_int(quant, QuantIntOp::Multiply, factor_lane, layout.exp as u64);
+			let factor = quant_bits(quant, factor, factor_shift, layout.exp);
+			(grid, factor, sign, lane, 0.25, false)
+		}
+		(2, IqPacking::Xs) => {
+			let value_block = quant_int(quant, QuantIntOp::Divide, local.clone(), 16);
+			let slot = quant_int(quant, QuantIntOp::Divide, local.clone(), 8);
+			let word_offset = quant_int(quant, QuantIntOp::Multiply, slot, 2);
+			let word_offset = quant_int(quant, QuantIntOp::Add, word_offset, 2);
+			let word = quant.load(16, word_offset);
+			let grid = quant_int(quant, QuantIntOp::And, word.clone(), 511);
+			let signs = quant_int(quant, QuantIntOp::ShiftRight, word, 9);
+			let sign = quant_parity_sign(quant, signs, lane.clone());
+			let factor_block = quant_int(quant, QuantIntOp::Divide, value_block.clone(), 2);
+			let factor_offset = quant_int(quant, QuantIntOp::Add, factor_block, 66);
+			let factor = quant.load(8, factor_offset);
+			let factor_lane = quant_int(quant, QuantIntOp::Remainder, value_block, 2);
+			let factor_shift = quant_int(quant, QuantIntOp::Multiply, factor_lane, layout.exp as u64);
+			let factor = quant_bits(quant, factor, factor_shift, layout.exp);
+			(grid, factor, sign, lane, 0.25, false)
+		}
+		(2, IqPacking::Xxs) | (3, IqPacking::Xxs) => {
+			let value_block = quant_int(quant, QuantIntOp::Divide, local.clone(), 32);
+			let group_local = quant_int(quant, QuantIntOp::Remainder, local.clone(), 32);
+			let group = quant_int(quant, QuantIntOp::Divide, group_local, 8);
+			let grids_per_block = 8;
+			let grid_block = quant_int(quant, QuantIntOp::Multiply, value_block.clone(), grids_per_block);
+			let grid_group = if layout.man == 2 {
+				group.clone()
+			} else {
+				let group = quant_int(quant, QuantIntOp::Multiply, group.clone(), 2);
+				let half = quant_int(quant, QuantIntOp::Divide, lane.clone(), 4);
+				quant.int(QuantIntOp::Add, group, half)
+			};
+			let grid_offset = quant.int(QuantIntOp::Add, grid_block, grid_group);
+			let grid_offset = quant_int(quant, QuantIntOp::Add, grid_offset, 2);
+			let grid = quant.load(8, grid_offset);
+			let word_stride = if layout.man == 2 { 8 } else { 4 };
+			let word_base = if layout.man == 2 { 6 } else { 66 };
+			let word_offset = quant_int(quant, QuantIntOp::Multiply, value_block, word_stride);
+			let word_offset = quant_int(quant, QuantIntOp::Add, word_offset, word_base);
+			let word = quant.load(32, word_offset);
+			let sign_shift = quant_int(quant, QuantIntOp::Multiply, group, 7);
+			let signs = quant_bits(quant, word.clone(), sign_shift, 7);
+			let sign = quant_parity_sign(quant, signs, lane.clone());
+			let factor = quant_bits(quant, word, quant.integer(28), layout.exp);
+			let table_lane = if layout.man == 2 { lane } else { quant_int(quant, QuantIntOp::Remainder, lane, 4) };
+			(grid, factor, sign, table_lane, if layout.man == 2 { 0.25 } else { 0.5 }, false)
+		}
+		(3, IqPacking::S) => {
+			let value_block = quant_int(quant, QuantIntOp::Divide, local.clone(), 32);
+			let group = quant_int(quant, QuantIntOp::Divide, local.clone(), 4);
+			let low_offset = quant_int(quant, QuantIntOp::Add, group.clone(), 2);
+			let low = quant.load(8, low_offset);
+			let high_group = quant_int(quant, QuantIntOp::Divide, group.clone(), 8);
+			let high_offset = quant_int(quant, QuantIntOp::Add, high_group, 66);
+			let high = quant.load(8, high_offset);
+			let high_lane = quant_int(quant, QuantIntOp::Remainder, group, 8);
+			let high = quant_bits(quant, high, high_lane, 1);
+			let high = quant_int(quant, QuantIntOp::ShiftLeft, high, 8);
+			let grid = quant.int(QuantIntOp::Or, low, high);
+			let sign_group = quant_int(quant, QuantIntOp::Divide, local.clone(), 8);
+			let sign_offset = quant_int(quant, QuantIntOp::Add, sign_group, 74);
+			let signs = quant.load(8, sign_offset);
+			let sign = quant_bits(quant, signs, lane.clone(), layout.sign);
+			let factor_block = quant_int(quant, QuantIntOp::Divide, value_block.clone(), 2);
+			let factor_offset = quant_int(quant, QuantIntOp::Add, factor_block, 106);
+			let factor = quant.load(8, factor_offset);
+			let factor_lane = quant_int(quant, QuantIntOp::Remainder, value_block, 2);
+			let factor_shift = quant_int(quant, QuantIntOp::Multiply, factor_lane, layout.exp as u64);
+			let factor = quant_bits(quant, factor, factor_shift, layout.exp);
+			(grid, factor, sign, quant_int(quant, QuantIntOp::Remainder, lane, 4), 1.0, true)
+		}
+		_ => unreachable!(),
+	};
+	let table_word = quant.table(layout.table_name, layout.table, grid);
+	let man_shift = quant_int(quant, QuantIntOp::Multiply, table_lane, layout.man as u64);
+	let man_code = quant_bits(quant, table_word, man_shift, layout.man);
+	let man_code = quant_int(quant, QuantIntOp::Multiply, man_code, 2);
+	let man_code = quant_int(quant, QuantIntOp::Add, man_code, 1);
+	let mantissa = quant.number(man_code, false);
+	let exponent = if odd_factor {
+		let factor_code = quant_int(quant, QuantIntOp::Multiply, factor_code, 2);
+		let factor_code = quant_int(quant, QuantIntOp::Add, factor_code, 1);
+		quant.number(factor_code, false)
+	} else {
+		let factor = quant.number(factor_code, false);
+		quant.value(QuantValueOp::Add, factor, quant.literal(0.5))
+	};
+	let scaled = quant.value(QuantValueOp::Multiply, scale, exponent);
+	let scaled = quant.value(QuantValueOp::Multiply, scaled, quant.literal(multiplier));
+	let magnitude = quant.value(QuantValueOp::Multiply, scaled, mantissa);
+	quant.signed(magnitude, sign)
+}
+
+pub(super) fn dequant_iq1<Q: QuantOps>(quant: &mut Q, layout: Iq1Layout) -> Q::Value {
+	let local = quant.index();
+	let lane = quant_int(quant, QuantIntOp::Remainder, local.clone(), 8);
+	let (grid, scale, factor_code, delta_bit) = if layout.medium {
+		let value_block = quant_int(quant, QuantIntOp::Divide, local.clone(), 16);
+		let group_local = quant_int(quant, QuantIntOp::Remainder, local.clone(), 16);
+		let group = quant_int(quant, QuantIntOp::Divide, group_local, 8);
+		let high_offset = quant_int(quant, QuantIntOp::Add, value_block.clone(), 32);
+		let high = quant.load(8, high_offset);
+		let grid_block = quant_int(quant, QuantIntOp::Multiply, value_block.clone(), 2);
+		let grid_offset = quant.int(QuantIntOp::Add, grid_block, group.clone());
+		let grid_low = quant.load(8, grid_offset);
+		let group_shift = quant_int(quant, QuantIntOp::Multiply, group.clone(), 4);
+		let grid_high = quant_bits(quant, high.clone(), group_shift.clone(), 3);
+		let grid_high = quant_int(quant, QuantIntOp::ShiftLeft, grid_high, 8);
+		let grid = quant.int(QuantIntOp::Or, grid_low, grid_high);
+		let delta_shift = quant_int(quant, QuantIntOp::Add, group_shift, 3);
+		let delta = quant_bits(quant, high, delta_shift, layout.sign);
+		let packed = quant.load(64, quant.integer(48));
+		let s0 = quant_bits(quant, packed.clone(), quant.integer(12), 4);
+		let s1 = quant_bits(quant, packed.clone(), quant.integer(24), 8);
+		let s1 = quant_int(quant, QuantIntOp::And, s1, 240);
+		let scale = quant.int(QuantIntOp::Or, s0, s1);
+		let s2 = quant_bits(quant, packed.clone(), quant.integer(36), 12);
+		let s2 = quant_int(quant, QuantIntOp::And, s2, 3840);
+		let scale = quant.int(QuantIntOp::Or, scale, s2);
+		let s3 = quant_bits(quant, packed.clone(), quant.integer(48), 16);
+		let s3 = quant_int(quant, QuantIntOp::And, s3, 61440);
+		let scale = quant.int(QuantIntOp::Or, scale, s3);
+		let scale = quant.half_bits(scale);
+		let scale_word = quant_int(quant, QuantIntOp::Divide, value_block.clone(), 4);
+		let scale_word = quant_int(quant, QuantIntOp::Multiply, scale_word, 16);
+		let scale_local = quant_int(quant, QuantIntOp::Remainder, value_block, 4);
+		let scale_local = quant_int(quant, QuantIntOp::Multiply, scale_local, layout.exp as u64);
+		let scale_shift = quant.int(QuantIntOp::Add, scale_word, scale_local);
+		let factor = quant_bits(quant, packed, scale_shift, layout.exp);
+		(grid, scale, factor, delta)
+	} else {
+		let value_block = quant_int(quant, QuantIntOp::Divide, local.clone(), 32);
+		let group_local = quant_int(quant, QuantIntOp::Remainder, local.clone(), 32);
+		let group = quant_int(quant, QuantIntOp::Divide, group_local, 8);
+		let high_block = quant_int(quant, QuantIntOp::Multiply, value_block.clone(), 2);
+		let high_offset = quant_int(quant, QuantIntOp::Add, high_block, 34);
+		let high = quant.load(16, high_offset);
+		let grid_block = quant_int(quant, QuantIntOp::Multiply, value_block, 4);
+		let grid_base = quant_int(quant, QuantIntOp::Add, grid_block, 2);
+		let grid_offset = quant.int(QuantIntOp::Add, grid_base, group.clone());
+		let grid_low = quant.load(8, grid_offset);
+		let group_shift = quant_int(quant, QuantIntOp::Multiply, group, layout.exp as u64);
+		let grid_high = quant_bits(quant, high.clone(), group_shift, 3);
+		let grid_high = quant_int(quant, QuantIntOp::ShiftLeft, grid_high, 8);
+		let grid = quant.int(QuantIntOp::Or, grid_low, grid_high);
+		let delta = quant_bits(quant, high.clone(), quant.integer(15), layout.sign);
+		let factor = quant_bits(quant, high, quant.integer(12), layout.exp);
+		(grid, quant.half(quant.integer(0)), factor, delta)
+	};
+	let table_word = quant.table(layout.table_name, layout.table, grid);
+	let man_shift = quant_int(quant, QuantIntOp::Multiply, lane, layout.man as u64);
+	let man_code = quant_bits(quant, table_word, man_shift, layout.man);
+	let man_code = quant_int(quant, QuantIntOp::Subtract, man_code, 1);
+	let mantissa = quant.number(man_code, true);
+	let delta = quant.select_value(delta_bit, quant.literal(-0.125), quant.literal(0.125));
+	let mantissa = quant.value(QuantValueOp::Add, mantissa, delta);
+	let factor_code = quant_int(quant, QuantIntOp::Multiply, factor_code, 2);
+	let factor_code = quant_int(quant, QuantIntOp::Add, factor_code, 1);
+	let exponent = quant.number(factor_code, false);
+	let scaled = quant.value(QuantValueOp::Multiply, scale, exponent);
+	quant.value(QuantValueOp::Multiply, scaled, mantissa)
+}
+
+pub(super) fn dequant_q45k<Q: QuantOps>(quant: &mut Q, man: u8) -> Q::Value {
+	let local = quant.index();
+	let sub = quant_int(quant, QuantIntOp::Divide, local.clone(), 32);
+	let within = quant_int(quant, QuantIntOp::Remainder, local, 32);
+	let pair = quant_int(quant, QuantIntOp::Divide, sub.clone(), 2);
+	let packed_offset = quant_int(quant, QuantIntOp::Multiply, pair, 32);
+	let packed_offset = quant.int(QuantIntOp::Add, packed_offset, within);
+	let packed_offset = quant_int(quant, QuantIntOp::Add, packed_offset, if man == 4 { 16 } else { 48 });
+	let packed = quant.load(8, packed_offset);
+	let half = quant_int(quant, QuantIntOp::Remainder, sub.clone(), 2);
+	let shift = quant_int(quant, QuantIntOp::Multiply, half, 4);
+	let low_code = quant_bits(quant, packed, shift, 4);
+	let code = if man == 4 {
+		low_code
+	} else {
+		let high_offset = quant_int(quant, QuantIntOp::Remainder, quant.index(), 32);
+		let high_offset = quant_int(quant, QuantIntOp::Add, high_offset, 16);
+		let high = quant.load(8, high_offset);
+		let high_shift = quant_int(quant, QuantIntOp::Divide, sub.clone(), 1);
+		let high = quant_bits(quant, high, high_shift, 1);
+		let high = quant_int(quant, QuantIntOp::ShiftLeft, high, 4);
+		quant.int(QuantIntOp::Or, low_code, high)
+	};
+	let low_scale_offset = quant_int(quant, QuantIntOp::Add, sub.clone(), 4);
+	let low_scale = quant.load(8, low_scale_offset);
+	let low_scale = quant_int(quant, QuantIntOp::And, low_scale, 63);
+	let low_minimum_offset = quant_int(quant, QuantIntOp::Add, sub.clone(), 8);
+	let low_minimum = quant.load(8, low_minimum_offset);
+	let low_minimum = quant_int(quant, QuantIntOp::And, low_minimum, 63);
+	let high_packed_offset = quant_int(quant, QuantIntOp::Add, sub.clone(), 8);
+	let high_packed = quant.load(8, high_packed_offset);
+	let high_scale_bits = quant.load(8, sub.clone());
+	let high_scale_low = quant_int(quant, QuantIntOp::And, high_packed.clone(), 15);
+	let high_scale_top = quant_int(quant, QuantIntOp::ShiftRight, high_scale_bits, 6);
+	let high_scale_top = quant_int(quant, QuantIntOp::ShiftLeft, high_scale_top, 4);
+	let high_scale = quant.int(QuantIntOp::Or, high_scale_low, high_scale_top);
+	let high_minimum_offset = quant_int(quant, QuantIntOp::Add, sub.clone(), 4);
+	let high_minimum_bits = quant.load(8, high_minimum_offset);
+	let high_minimum_low = quant_int(quant, QuantIntOp::ShiftRight, high_packed, 4);
+	let high_minimum_top = quant_int(quant, QuantIntOp::ShiftRight, high_minimum_bits, 6);
+	let high_minimum_top = quant_int(quant, QuantIntOp::ShiftLeft, high_minimum_top, 4);
+	let high_minimum = quant.int(QuantIntOp::Or, high_minimum_low, high_minimum_top);
+	let low = quant.less(sub, quant.integer(4));
+	let scale_code = quant.select_int(low.clone(), low_scale, high_scale);
+	let minimum_code = quant.select_int(low, low_minimum, high_minimum);
+	let scale = quant.half(quant.integer(0));
+	let minimum = quant.half(quant.integer(2));
+	let scale_code = quant.number(scale_code, false);
+	let minimum_code = quant.number(minimum_code, false);
+	let code = quant.number(code, false);
+	let step = quant.value(QuantValueOp::Multiply, scale, scale_code);
+	let base = quant.value(QuantValueOp::Multiply, minimum, minimum_code);
+	let product = quant.value(QuantValueOp::Multiply, step, code);
+	quant.value(QuantValueOp::Subtract, product, base)
+}
+
+pub(super) fn dequant_q6k<Q: QuantOps>(quant: &mut Q) -> Q::Value {
+	let local = quant.index();
+	let chunk = quant_int(quant, QuantIntOp::Divide, local.clone(), 128);
+	let chunk_local = quant_int(quant, QuantIntOp::Remainder, local, 128);
+	let group = quant_int(quant, QuantIntOp::Divide, chunk_local.clone(), 32);
+	let within = quant_int(quant, QuantIntOp::Remainder, chunk_local, 32);
+	let low_group = quant_int(quant, QuantIntOp::And, group.clone(), 1);
+	let low_extra = quant_int(quant, QuantIntOp::Multiply, low_group, 32);
+	let low_local = quant.int(QuantIntOp::Add, within.clone(), low_extra);
+	let low_chunk = quant_int(quant, QuantIntOp::Multiply, chunk.clone(), 64);
+	let low_offset = quant.int(QuantIntOp::Add, low_chunk, low_local);
+	let low = quant.load(8, low_offset);
+	let high_chunk = quant_int(quant, QuantIntOp::Multiply, chunk.clone(), 32);
+	let high_offset = quant.int(QuantIntOp::Add, high_chunk, within.clone());
+	let high_offset = quant_int(quant, QuantIntOp::Add, high_offset, 128);
+	let high = quant.load(8, high_offset);
+	let low_half = quant_int(quant, QuantIntOp::Divide, group.clone(), 2);
+	let low_shift = quant_int(quant, QuantIntOp::Multiply, low_half, 4);
+	let low_bits = quant_bits(quant, low, low_shift, 4);
+	let high_shift = quant_int(quant, QuantIntOp::Multiply, group.clone(), 2);
+	let high_bits = quant_bits(quant, high, high_shift, 2);
+	let high_bits = quant_int(quant, QuantIntOp::ShiftLeft, high_bits, 4);
+	let code = quant.int(QuantIntOp::Or, low_bits, high_bits);
+	let code = quant_int(quant, QuantIntOp::Subtract, code, 32);
+	let scale_half = quant_int(quant, QuantIntOp::Divide, within, 16);
+	let scale_group = quant_int(quant, QuantIntOp::Multiply, group, 2);
+	let scale_local = quant.int(QuantIntOp::Add, scale_group, scale_half);
+	let scale_chunk = quant_int(quant, QuantIntOp::Multiply, chunk, 8);
+	let scale_offset = quant.int(QuantIntOp::Add, scale_chunk, scale_local);
+	let scale_offset = quant_int(quant, QuantIntOp::Add, scale_offset, 192);
+	let factor = quant.load(8, scale_offset);
+	let factor = quant.sign_extend(factor, 8);
+	let scale = quant.half(quant.integer(208));
+	let factor = quant.number(factor, true);
+	let code = quant.number(code, true);
+	let scaled = quant.value(QuantValueOp::Multiply, scale, factor);
+	quant.value(QuantValueOp::Multiply, scaled, code)
+}
+
+pub(super) fn dequant_scalar<Q: QuantOps>(quant: &mut Q, layout: ScalarLayout) -> Q::Value {
+	let local = quant.index();
+	let header = if layout.variant == 1 { 4 } else { 2 };
+	let code = match layout.man {
+		4 => {
+			let offset = quant_int(quant, QuantIntOp::Remainder, local.clone(), 16);
+			let offset = quant_int(quant, QuantIntOp::Add, offset, header);
+			let byte = quant.load(8, offset);
+			let half = quant_int(quant, QuantIntOp::Divide, local, 16);
+			let shift = quant_int(quant, QuantIntOp::Multiply, half, 4);
+			quant_bits(quant, byte, shift, 4)
+		}
+		5 => {
+			let low_offset = quant_int(quant, QuantIntOp::Remainder, local.clone(), 16);
+			let low_offset = quant_int(quant, QuantIntOp::Add, low_offset, header + 4);
+			let low = quant.load(8, low_offset);
+			let half = quant_int(quant, QuantIntOp::Divide, local.clone(), 16);
+			let shift = quant_int(quant, QuantIntOp::Multiply, half, 4);
+			let low = quant_bits(quant, low, shift, 4);
+			let high_offset = quant_int(quant, QuantIntOp::Divide, local.clone(), 8);
+			let high_offset = quant_int(quant, QuantIntOp::Add, high_offset, header);
+			let high = quant.load(8, high_offset);
+			let lane = quant_int(quant, QuantIntOp::Remainder, local, 8);
+			let high = quant_bits(quant, high, lane, 1);
+			let high = quant_int(quant, QuantIntOp::ShiftLeft, high, 4);
+			quant.int(QuantIntOp::Or, low, high)
+		}
+		8 => {
+			let offset = quant_int(quant, QuantIntOp::Add, local, header);
+			quant.load(8, offset)
+		}
+		_ => unreachable!(),
+	};
+	let scale = if layout.exp == 5 { quant.half(quant.integer(0)) } else { unreachable!() };
+	let code = if layout.man == 8 {
+		let code = quant.sign_extend(code, 8);
+		quant.number(code, true)
+	} else if layout.variant == 0 {
+		let offset = quant_int(quant, QuantIntOp::ShiftLeft, quant.integer(1), u64::from(layout.man - layout.sign));
+		let code = quant.int(QuantIntOp::Subtract, code, offset);
+		quant.number(code, true)
+	} else {
+		quant.number(code, false)
+	};
+	let product = quant.value(QuantValueOp::Multiply, code, scale);
+	if layout.variant == 1 && layout.man != 8 {
+		let minimum = quant.half(quant.integer(2));
+		quant.value(QuantValueOp::Add, product, minimum)
+	} else {
+		product
+	}
+}
+
+pub(super) fn dequant_q2k<Q: QuantOps>(quant: &mut Q) -> Q::Value {
+	let local = quant.index();
+	let order = quant_int(quant, QuantIntOp::Divide, local.clone(), 16);
+	let section = quant_int(quant, QuantIntOp::Divide, order.clone(), 8);
+	let shift_group = quant_int(quant, QuantIntOp::Remainder, order.clone(), 8);
+	let shift_group = quant_int(quant, QuantIntOp::Divide, shift_group, 2);
+	let shift = quant_int(quant, QuantIntOp::Multiply, shift_group, 2);
+	let half_index = quant_int(quant, QuantIntOp::Remainder, order, 2);
+	let offset = quant_int(quant, QuantIntOp::Remainder, local, 16);
+	let metadata_offset = quant_int(quant, QuantIntOp::Multiply, section.clone(), 8);
+	let metadata_offset = quant.int(QuantIntOp::Add, metadata_offset, shift.clone());
+	let metadata_offset = quant.int(QuantIntOp::Add, metadata_offset, half_index.clone());
+	let metadata = quant.load(8, metadata_offset);
+	let scale_code = quant_int(quant, QuantIntOp::And, metadata.clone(), 15);
+	let minimum_code = quant_int(quant, QuantIntOp::ShiftRight, metadata, 4);
+	let code_offset = quant_int(quant, QuantIntOp::Multiply, section, 32);
+	let half_offset = quant_int(quant, QuantIntOp::Multiply, half_index, 16);
+	let code_offset = quant.int(QuantIntOp::Add, code_offset, half_offset);
+	let code_offset = quant.int(QuantIntOp::Add, code_offset, offset);
+	let code_offset = quant_int(quant, QuantIntOp::Add, code_offset, 16);
+	let code = quant.load(8, code_offset);
+	let code = quant_bits(quant, code, shift, 2);
+	let scale = quant.half(quant.integer(80));
+	let minimum = quant.half(quant.integer(82));
+	let scale_code = quant.number(scale_code, false);
+	let minimum_code = quant.number(minimum_code, false);
+	let code = quant.number(code, false);
+	let scaled = quant.value(QuantValueOp::Multiply, scale, scale_code);
+	let product = quant.value(QuantValueOp::Multiply, scaled, code);
+	let minimum = quant.value(QuantValueOp::Multiply, minimum, minimum_code);
+	quant.value(QuantValueOp::Subtract, product, minimum)
+}
+
+pub(super) fn dequant_q3k<Q: QuantOps>(quant: &mut Q) -> Q::Value {
+	let local = quant.index();
+	let block = quant_int(quant, QuantIntOp::Divide, local.clone(), 16);
+	let low_block = quant_int(quant, QuantIntOp::Subtract, block.clone(), 8);
+	let low = quant.less(block.clone(), quant.integer(8));
+	let low_block = quant.select_int(low.clone(), block.clone(), low_block);
+	let low_offset = quant_int(quant, QuantIntOp::Add, low_block, 96);
+	let low_scale = quant.load(8, low_offset);
+	let low_shift = quant.select_int(low, quant.integer(0), quant.integer(4));
+	let low_scale = quant_bits(quant, low_scale, low_shift, 4);
+	let high_block = quant_int(quant, QuantIntOp::Remainder, block.clone(), 4);
+	let high_offset = quant_int(quant, QuantIntOp::Add, high_block, 104);
+	let high_scale = quant.load(8, high_offset);
+	let high_shift = quant_int(quant, QuantIntOp::Divide, block.clone(), 4);
+	let high_shift = quant_int(quant, QuantIntOp::Multiply, high_shift, 2);
+	let high_scale = quant_bits(quant, high_scale, high_shift, 2);
+	let high_scale = quant_int(quant, QuantIntOp::ShiftLeft, high_scale, 4);
+	let scale_code = quant.int(QuantIntOp::Or, low_scale, high_scale);
+	let scale_code = quant_int(quant, QuantIntOp::Subtract, scale_code, 32);
+	let section = quant_int(quant, QuantIntOp::Divide, local.clone(), 128);
+	let code_offset = quant_int(quant, QuantIntOp::Multiply, section, 32);
+	let within = quant_int(quant, QuantIntOp::Remainder, local.clone(), 32);
+	let code_offset = quant.int(QuantIntOp::Add, code_offset, within.clone());
+	let code_offset = quant_int(quant, QuantIntOp::Add, code_offset, 32);
+	let code = quant.load(8, code_offset);
+	let local128 = quant_int(quant, QuantIntOp::Remainder, local.clone(), 128);
+	let code_shift = quant_int(quant, QuantIntOp::Divide, local128, 32);
+	let code_shift = quant_int(quant, QuantIntOp::Multiply, code_shift, 2);
+	let code = quant_bits(quant, code, code_shift, 2);
+	let sign_byte = quant.load(8, within);
+	let sign_shift = quant_int(quant, QuantIntOp::Divide, local, 32);
+	let sign = quant_bits(quant, sign_byte, sign_shift, 1);
+	let subtract = quant.select_int(sign, quant.integer(0), quant.integer(4));
+	let code = quant.int(QuantIntOp::Subtract, code, subtract);
+	let scale = quant.half(quant.integer(108));
+	let scale_code = quant.number(scale_code, true);
+	let code = quant.number(code, true);
+	let scaled = quant.value(QuantValueOp::Multiply, scale, scale_code);
+	quant.value(QuantValueOp::Multiply, scaled, code)
+}
+
+pub(super) fn dequant_q8k<Q: QuantOps>(quant: &mut Q) -> Q::Value {
+	let local = quant.index();
+	let offset = quant_int(quant, QuantIntOp::Add, local, 4);
+	let code = quant.load(8, offset);
+	let code = quant.sign_extend(code, 8);
+	let code = quant.number(code, true);
+	let scale = quant.float(quant.integer(0));
+	quant.value(QuantValueOp::Multiply, scale, code)
+}
+
+pub(super) fn dequant_iq4<Q: QuantOps>(quant: &mut Q, layout: Iq4Layout) -> Q::Value {
+	let local = quant.index();
+	let scale = quant.half(quant.integer(0));
+	let (code, exponent) = if layout.xs {
+		let block = quant_int(quant, QuantIntOp::Divide, local.clone(), 32);
+		let high = quant.load(16, quant.integer(2));
+		let low_offset = quant_int(quant, QuantIntOp::Divide, block.clone(), 2);
+		let low_offset = quant_int(quant, QuantIntOp::Add, low_offset, 4);
+		let low = quant.load(8, low_offset);
+		let low_shift = quant_int(quant, QuantIntOp::Remainder, block.clone(), 2);
+		let low_shift = quant_int(quant, QuantIntOp::Multiply, low_shift, 4);
+		let low = quant_bits(quant, low, low_shift, layout.man);
+		let high_shift = quant_int(quant, QuantIntOp::Multiply, block.clone(), 2);
+		let high = quant_bits(quant, high, high_shift, layout.sign + 1);
+		let high = quant_int(quant, QuantIntOp::ShiftLeft, high, layout.man as u64);
+		let exponent = quant.int(QuantIntOp::Or, low, high);
+		let exponent = quant_int(quant, QuantIntOp::Subtract, exponent, 1_u64 << (layout.exp - 1));
+		let packed_offset = quant_int(quant, QuantIntOp::Multiply, block, 16);
+		let within = quant_int(quant, QuantIntOp::Remainder, local.clone(), 16);
+		let packed_offset = quant.int(QuantIntOp::Add, packed_offset, within);
+		let packed_offset = quant_int(quant, QuantIntOp::Add, packed_offset, 8);
+		let packed = quant.load(8, packed_offset);
+		let half = quant_int(quant, QuantIntOp::Remainder, local, 32);
+		let high_half = quant.less(half, quant.integer(16));
+		let shift = quant.select_int(high_half, quant.integer(0), quant.integer(4));
+		(quant_bits(quant, packed, shift, layout.man), exponent)
+	} else {
+		let offset = quant_int(quant, QuantIntOp::Remainder, local.clone(), 16);
+		let offset = quant_int(quant, QuantIntOp::Add, offset, 2);
+		let packed = quant.load(8, offset);
+		let low = quant.less(local, quant.integer(16));
+		let shift = quant.select_int(low, quant.integer(0), quant.integer(4));
+		(quant_bits(quant, packed, shift, layout.man), quant.integer(1))
+	};
+	let level = quant.signed_table(layout.table_name, layout.table, code);
+	let level = quant.number(level, true);
+	let exponent = quant.number(exponent, true);
+	let scaled = quant.value(QuantValueOp::Multiply, scale, exponent);
+	quant.value(QuantValueOp::Multiply, scaled, level)
+}
+
+pub(super) fn dequant_nf4<Q: QuantOps>(quant: &mut Q, block: usize, table_name: &str, table: &[f64], scales_name: &str, scales: &[f64]) -> Q::Value {
+	let local = quant.index();
+	let byte_offset = quant_int(quant, QuantIntOp::Divide, local.clone(), 2);
+	let packed = quant.load(8, byte_offset);
+	let half = quant_int(quant, QuantIntOp::Remainder, local.clone(), 2);
+	let shift = quant_int(quant, QuantIntOp::Multiply, half, 4);
+	let code = quant_bits(quant, packed, shift, 4);
+	let level = quant.value_table(table_name, table, code);
+	let scale_index = quant_int(quant, QuantIntOp::Divide, local, block as u64);
+	let scale = quant.value_table(scales_name, scales, scale_index);
+	quant.value(QuantValueOp::Multiply, level, scale)
+}
+
+pub(super) struct HostQuantOps<'a> {
+	pub(super) bytes: &'a [u8],
+	pub(super) index: usize,
+}
+
+impl QuantOps for HostQuantOps<'_> {
+	type Int = u64;
+	type Value = f64;
+	fn index(&self) -> Self::Int { self.index as u64 }
+	fn integer(&self, value: u64) -> Self::Int { value }
+	fn int(&mut self, operation: QuantIntOp, left: Self::Int, right: Self::Int) -> Self::Int {
+		match operation {
+			QuantIntOp::Add => left + right,
+			QuantIntOp::Subtract => left.wrapping_sub(right),
+			QuantIntOp::Multiply => left * right,
+			QuantIntOp::Divide => left / right,
+			QuantIntOp::Remainder => left % right,
+			QuantIntOp::ShiftLeft => left << right,
+			QuantIntOp::ShiftRight => left >> right,
+			QuantIntOp::And => left & right,
+			QuantIntOp::Or => left | right,
+			QuantIntOp::Xor => left ^ right,
+		}
+	}
+	fn equal(&mut self, left: Self::Int, right: Self::Int) -> Self::Int { u64::from(left == right) }
+	fn less(&mut self, left: Self::Int, right: Self::Int) -> Self::Int { u64::from(left < right) }
+	fn select_int(&mut self, condition: Self::Int, yes: Self::Int, no: Self::Int) -> Self::Int { if condition != 0 { yes } else { no } }
+	fn sign_extend(&mut self, value: Self::Int, bits: u8) -> Self::Int { ((value << (64 - bits)) as i64 >> (64 - bits)) as u64 }
+	fn load(&mut self, bits: u8, offset: Self::Int) -> Self::Int {
+		let offset = offset as usize;
+		(0..usize::from(bits / 8)).fold(0, |value, byte| value | u64::from(self.bytes[offset + byte]) << (8 * byte))
+	}
+	fn half(&mut self, offset: Self::Int) -> Self::Value { f64::from(half(&self.bytes[offset as usize..])) }
+	fn float(&mut self, offset: Self::Int) -> Self::Value { f64::from(f32::from_le_bytes(self.bytes[offset as usize..offset as usize + 4].try_into().unwrap())) }
+	fn half_bits(&mut self, bits: Self::Int) -> Self::Value { f64::from(unfp16(bits as u16)) }
+	fn table(&mut self, _name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int { u64::from(values[index as usize]) }
+	fn signed_table(&mut self, _name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int { values[index as usize] as i64 as u64 }
+	fn value_table(&mut self, _name: &str, values: &[f64], index: Self::Int) -> Self::Value { values[index as usize] }
+	fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value { if signed { value as i64 as f64 } else { value as f64 } }
+	fn literal(&self, value: f64) -> Self::Value { value }
+	fn value(&mut self, operation: QuantValueOp, left: Self::Value, right: Self::Value) -> Self::Value { match operation { QuantValueOp::Add => left + right, QuantValueOp::Subtract => left - right, QuantValueOp::Multiply => left * right } }
+	fn select_value(&mut self, condition: Self::Int, yes: Self::Value, no: Self::Value) -> Self::Value { if condition != 0 { yes } else { no } }
+	fn signed(&mut self, magnitude: Self::Value, sign: Self::Int) -> Self::Value { if sign != 0 { -magnitude } else { magnitude } }
+}
+
+pub(super) struct NativeQuantOps {
+	pub(super) globals: String,
+	pub(super) ir: String,
+	pub(super) backend: Backend,
+	pub(super) precision: NativePrecision,
+	pub(super) next: usize,
+}
+
+impl NativeQuantOps {
+	fn name(&mut self) -> String { let name = format!("%quant.{}", self.next); self.next += 1; name }
+	fn instruction(&mut self, instruction: String) -> String { let name = self.name(); self.ir.push_str(&format!("{name} = {instruction}\n")); name }
+}
+
+impl QuantOps for NativeQuantOps {
+	type Int = String;
+	type Value = String;
+	fn index(&self) -> Self::Int { "%local".to_owned() }
+	fn integer(&self, value: u64) -> Self::Int { value.to_string() }
+	fn int(&mut self, operation: QuantIntOp, left: Self::Int, right: Self::Int) -> Self::Int {
+		let operation = match operation { QuantIntOp::Add => "add", QuantIntOp::Subtract => "sub", QuantIntOp::Multiply => "mul", QuantIntOp::Divide => "udiv", QuantIntOp::Remainder => "urem", QuantIntOp::ShiftLeft => "shl", QuantIntOp::ShiftRight => "lshr", QuantIntOp::And => "and", QuantIntOp::Or => "or", QuantIntOp::Xor => "xor" };
+		self.instruction(format!("{operation} i64 {left}, {right}"))
+	}
+	fn equal(&mut self, left: Self::Int, right: Self::Int) -> Self::Int { let condition = self.instruction(format!("icmp eq i64 {left}, {right}")); self.instruction(format!("zext i1 {condition} to i64")) }
+	fn less(&mut self, left: Self::Int, right: Self::Int) -> Self::Int { let condition = self.instruction(format!("icmp ult i64 {left}, {right}")); self.instruction(format!("zext i1 {condition} to i64")) }
+	fn select_int(&mut self, condition: Self::Int, yes: Self::Int, no: Self::Int) -> Self::Int { let condition = self.instruction(format!("icmp ne i64 {condition}, 0")); self.instruction(format!("select i1 {condition}, i64 {yes}, i64 {no}")) }
+	fn sign_extend(&mut self, value: Self::Int, bits: u8) -> Self::Int { let narrow = self.instruction(format!("trunc i64 {value} to i{bits}")); self.instruction(format!("sext i{bits} {narrow} to i64")) }
+	fn load(&mut self, bits: u8, offset: Self::Int) -> Self::Int {
+		let pointer = pointer_type(self.backend);
+		let address = self.instruction(format!("getelementptr inbounds i8, {pointer} %block, i64 {offset}"));
+		let loaded = self.instruction(format!("load i{bits}, {pointer} {address}, align {}", if bits == 8 { 1 } else { 2 }));
+		self.instruction(format!("zext i{bits} {loaded} to i64"))
+	}
+	fn half(&mut self, offset: Self::Int) -> Self::Value {
+		let pointer = pointer_type(self.backend);
+		let ty = self.precision.model_type;
+		let address = self.instruction(format!("getelementptr inbounds i8, {pointer} %block, i64 {offset}"));
+		let loaded = self.instruction(format!("load half, {pointer} {address}, align 2"));
+		self.instruction(format!("call {ty} @recipe.from.f16(half {loaded})"))
+	}
+	fn float(&mut self, offset: Self::Int) -> Self::Value {
+		let pointer = pointer_type(self.backend);
+		let ty = self.precision.model_type;
+		let address = self.instruction(format!("getelementptr inbounds i8, {pointer} %block, i64 {offset}"));
+		let loaded = self.instruction(format!("load float, {pointer} {address}, align 4"));
+		self.instruction(format!("call {ty} @recipe.from.f32(float {loaded})"))
+	}
+	fn half_bits(&mut self, bits: Self::Int) -> Self::Value {
+		let ty = self.precision.model_type;
+		let bits = self.instruction(format!("trunc i64 {bits} to i16"));
+		let half = self.instruction(format!("bitcast i16 {bits} to half"));
+		self.instruction(format!("call {ty} @recipe.from.f16(half {half})"))
+	}
+	fn table(&mut self, name: &'static str, values: &'static [u16], index: Self::Int) -> Self::Int {
+		let address = self.instruction(format!("getelementptr inbounds [{} x i16], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
+		let loaded = self.instruction(format!("load i16, ptr {address}, align 2"));
+		self.instruction(format!("zext i16 {loaded} to i64"))
+	}
+	fn signed_table(&mut self, name: &'static str, values: &'static [i8], index: Self::Int) -> Self::Int {
+		let address = self.instruction(format!("getelementptr inbounds [{} x i8], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
+		let loaded = self.instruction(format!("load i8, ptr {address}, align 1"));
+		self.instruction(format!("sext i8 {loaded} to i64"))
+	}
+	fn value_table(&mut self, name: &str, values: &[f64], index: Self::Int) -> Self::Value {
+		let ty = self.precision.model_type;
+		if !self.globals.contains(&format!("@recipe_model_{name} =")) {
+			self.globals.push_str(&format!("@recipe_model_{name} = private unnamed_addr constant [{} x {ty}] [{}]\n", values.len(), values.iter().map(|value| format!("{ty} {}", native_literal(self.precision.model, ty, *value))).collect::<Vec<_>>().join(", ")));
+		}
+		let address = self.instruction(format!("getelementptr inbounds [{} x {ty}], ptr @recipe_model_{name}, i32 0, i64 {index}", values.len()));
+		self.instruction(format!("load {ty}, ptr {address}, align {}", super::alignment(ty)))
+	}
+	fn number(&mut self, value: Self::Int, signed: bool) -> Self::Value {
+		let ty = self.precision.model_type;
+		let value = self.instruction(format!("trunc i64 {value} to i32"));
+		self.instruction(format!("call {ty} @recipe.from.{}32(i32 {value})", if signed { "s" } else { "u" }))
+	}
+	fn literal(&self, value: f64) -> Self::Value { native_literal(self.precision.model, self.precision.model_type, value) }
+	fn value(&mut self, operation: QuantValueOp, left: Self::Value, right: Self::Value) -> Self::Value { let ty = self.precision.model_type; let operation = match operation { QuantValueOp::Add => "add", QuantValueOp::Subtract => "sub", QuantValueOp::Multiply => "mul" }; self.instruction(format!("call {ty} @recipe.{operation}({ty} {left}, {ty} {right})")) }
+	fn select_value(&mut self, condition: Self::Int, yes: Self::Value, no: Self::Value) -> Self::Value { let ty = self.precision.model_type; let condition = self.instruction(format!("icmp ne i64 {condition}, 0")); self.instruction(format!("select i1 {condition}, {ty} {yes}, {ty} {no}")) }
+	fn signed(&mut self, magnitude: Self::Value, sign: Self::Int) -> Self::Value { let ty = self.precision.model_type; let negative = self.instruction(format!("call {ty} @recipe.neg({ty} {magnitude})")); let sign = self.instruction(format!("icmp ne i64 {sign}, 0")); self.instruction(format!("select i1 {sign}, {ty} {negative}, {ty} {magnitude}")) }
+}
+}
+use quantized::{dequant_nf4, HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantOps, ScalarLayout};
 
 impl NativeModelIr {
 	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, reverse: bool, training: bool) -> Result<String> {
@@ -1467,76 +2178,46 @@ impl NativeModelIr {
 		Ok(ModelPointers { source, second, value, context, delta, weights, source_adjoint, second_adjoint })
 	}
 
-	fn emit_iq_definition(&self, backend: Backend, codec: StorageCodec) -> Result<String> {
+	fn emit_native_quantization(&self, backend: Backend, format: &'static Quantization, native: NativeDequant) -> Result<String> {
 		let (pointer, ty) = (pointer_type(backend), self.precision.model_type);
-		let name = match codec { StorageCodec::IQ1S => "iq1s", StorageCodec::IQ1M => "iq1m", StorageCodec::IQ2S => "iq2s", StorageCodec::IQ2XS => "iq2xs", StorageCodec::IQ2XXS => "iq2xxs", StorageCodec::IQ3S => "iq3s", _ => return Err(RecipeError::new(format!("native IQ decoder is unavailable for {codec:?}"))) };
-		let mut ir = format!("define internal {ty} @recipe_model_quantized_{name}({pointer} %matrix, i32 %row, i32 %column, i32 %columns) #1 {{\nentry:\n");
-		if matches!(codec, StorageCodec::IQ2S | StorageCodec::IQ2XS | StorageCodec::IQ2XXS) {
-			let (stride, table, table_len) = match codec { StorageCodec::IQ2S => (82, "iq2s", 1024), StorageCodec::IQ2XS => (74, "iq2xs", 512), StorageCodec::IQ2XXS => (66, "iq2xxs", 256), _ => unreachable!() };
-			ir.push_str(&format!("%blocks = udiv i32 %columns, 256\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, 256\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, {stride}\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local = urem i32 %column, 256\n%lane = urem i32 %local, 8\n"));
-			if codec == StorageCodec::IQ2XXS {
-				ir.push_str(&format!("%value.block = udiv i32 %local, 32\n%group.local = urem i32 %local, 32\n%group = udiv i32 %group.local, 8\n%grid.block = mul i32 %value.block, 8\n%grid.base = add i32 2, %grid.block\n%grid.offset = add i32 %grid.base, %group\n%grid.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.offset\n%grid.byte = load i8, {pointer} %grid.ptr, align 1\n%grid = zext i8 %grid.byte to i32\n%word.block = mul i32 %value.block, 8\n%word.offset = add i32 6, %word.block\n%word.ptr = getelementptr inbounds i8, {pointer} %block, i32 %word.offset\n%word = load i32, {pointer} %word.ptr, align 2\n%group.shift = mul i32 %group, 7\n%signs.shifted = lshr i32 %word, %group.shift\n%signs = and i32 %signs.shifted, 127\n%signs.lane = lshr i32 %signs, %lane\n%sign.base = and i32 %signs.lane, 1\n%parity.4.shifted = lshr i32 %signs, 4\n%parity.4 = xor i32 %signs, %parity.4.shifted\n%parity.2.shifted = lshr i32 %parity.4, 2\n%parity.2 = xor i32 %parity.4, %parity.2.shifted\n%parity.1.shifted = lshr i32 %parity.2, 1\n%parity.1 = xor i32 %parity.2, %parity.1.shifted\n%parity = and i32 %parity.1, 1\n%lane.seven = icmp eq i32 %lane, 7\n%sign.bit = select i1 %lane.seven, i32 %parity, i32 %sign.base\n%factor.shifted = lshr i32 %word, 28\n%factor.code = and i32 %factor.shifted, 15\n"));
-			} else {
-				ir.push_str("%value.block = udiv i32 %local, 16\n%slot = udiv i32 %local, 8\n");
-				if codec == StorageCodec::IQ2S {
-				ir.push_str(&format!("%grid.low.offset = add i32 2, %slot\n%grid.low.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.low.offset\n%grid.low.byte = load i8, {pointer} %grid.low.ptr, align 1\n%grid.low = zext i8 %grid.low.byte to i32\n%grid.high.slot = udiv i32 %slot, 4\n%grid.high.offset = add i32 66, %grid.high.slot\n%grid.high.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.high.offset\n%grid.high.byte = load i8, {pointer} %grid.high.ptr, align 1\n%grid.high.raw = zext i8 %grid.high.byte to i32\n%grid.shift.slot = urem i32 %slot, 4\n%grid.shift = mul i32 %grid.shift.slot, 2\n%grid.high.shifted = lshr i32 %grid.high.raw, %grid.shift\n%grid.high = and i32 %grid.high.shifted, 3\n%grid.high.bits = shl i32 %grid.high, 8\n%grid = or i32 %grid.low, %grid.high.bits\n%sign.offset = add i32 34, %slot\n%sign.ptr = getelementptr inbounds i8, {pointer} %block, i32 %sign.offset\n%sign.byte = load i8, {pointer} %sign.ptr, align 1\n%sign.raw = zext i8 %sign.byte to i32\n%sign.shifted = lshr i32 %sign.raw, %lane\n%sign.bit = and i32 %sign.shifted, 1\n"));
-				} else {
-				ir.push_str(&format!("%word.offset = mul i32 %slot, 2\n%word.data.offset = add i32 2, %word.offset\n%word.ptr = getelementptr inbounds i8, {pointer} %block, i32 %word.data.offset\n%word = load i16, {pointer} %word.ptr, align 2\n%word.raw = zext i16 %word to i32\n%grid = and i32 %word.raw, 511\n%signs = lshr i32 %word.raw, 9\n%signs.shifted = lshr i32 %signs, %lane\n%sign.base = and i32 %signs.shifted, 1\n%parity.4.shifted = lshr i32 %signs, 4\n%parity.4 = xor i32 %signs, %parity.4.shifted\n%parity.2.shifted = lshr i32 %parity.4, 2\n%parity.2 = xor i32 %parity.4, %parity.2.shifted\n%parity.1.shifted = lshr i32 %parity.2, 1\n%parity.1 = xor i32 %parity.2, %parity.1.shifted\n%parity = and i32 %parity.1, 1\n%lane.seven = icmp eq i32 %lane, 7\n%sign.bit = select i1 %lane.seven, i32 %parity, i32 %sign.base\n"));
-				}
-				let factor_offset = if codec == StorageCodec::IQ2S { 74 } else { 66 };
-				ir.push_str(&format!("%factor.block = udiv i32 %value.block, 2\n%factor.offset = add i32 {factor_offset}, %factor.block\n%factor.ptr = getelementptr inbounds i8, {pointer} %block, i32 %factor.offset\n%factor.byte = load i8, {pointer} %factor.ptr, align 1\n%factor.raw = zext i8 %factor.byte to i32\n%factor.slot = urem i32 %value.block, 2\n%factor.shift = mul i32 %factor.slot, 4\n%factor.shifted = lshr i32 %factor.raw, %factor.shift\n%factor.code = and i32 %factor.shifted, 15\n"));
-			}
-			ir.push_str(&format!("%table.ptr = getelementptr inbounds [{table_len} x i16], ptr @recipe_model_{table}, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.code = and i32 %level.shifted, 3\n%level.twice = shl i32 %level.code, 1\n%level.raw = add i32 %level.twice, 1\n%level = call {ty} @recipe.from.u32(i32 %level.raw)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 0\n%scale.half = load half, {pointer} %scale.ptr, align 2\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%factor.integer = call {ty} @recipe.from.u32(i32 %factor.code)\n%factor = call {ty} @recipe.add({ty} %factor.integer, {ty} {half})\n%scaled.base = call {ty} @recipe.mul({ty} %scale, {ty} %factor)\n%scaled = call {ty} @recipe.mul({ty} %scaled.base, {ty} {quarter})\n%unsigned = call {ty} @recipe.mul({ty} %scaled, {ty} %level)\n%negative = call {ty} @recipe.neg({ty} %unsigned)\n%sign.set = icmp ne i32 %sign.bit, 0\n%result = select i1 %sign.set, {ty} %negative, {ty} %unsigned\nret {ty} %result\n}}\n", half = native_literal(self.precision.model, ty, 0.5), quarter = native_literal(self.precision.model, ty, 0.25)));
-			return Ok(ir)
-		}
-		if codec == StorageCodec::IQ3S {
-			ir.push_str(&format!("%blocks = udiv i32 %columns, 256\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, 256\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, 110\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local = urem i32 %column, 256\n%value.block = udiv i32 %local, 32\n%group = udiv i32 %local, 4\n%lane = urem i32 %local, 4\n%grid.low.offset = add i32 2, %group\n%grid.low.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.low.offset\n%grid.low.byte = load i8, {pointer} %grid.low.ptr, align 1\n%grid.low = zext i8 %grid.low.byte to i32\n%grid.high.group = udiv i32 %group, 8\n%grid.high.offset = add i32 66, %grid.high.group\n%grid.high.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.high.offset\n%grid.high.byte = load i8, {pointer} %grid.high.ptr, align 1\n%grid.high.raw = zext i8 %grid.high.byte to i32\n%grid.high.lane = urem i32 %group, 8\n%grid.high.shifted = lshr i32 %grid.high.raw, %grid.high.lane\n%grid.high = and i32 %grid.high.shifted, 1\n%grid.high.bits = shl i32 %grid.high, 8\n%grid = or i32 %grid.low, %grid.high.bits\n%table.ptr = getelementptr inbounds [512 x i16], ptr @recipe_model_iq3s, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane.shift = mul i32 %lane, 3\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.code = and i32 %level.shifted, 7\n%level.twice = shl i32 %level.code, 1\n%level.raw = add i32 %level.twice, 1\n%level = call {ty} @recipe.from.u32(i32 %level.raw)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 0\n%scale.half = load half, {pointer} %scale.ptr, align 2\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%factor.block = udiv i32 %value.block, 2\n%factor.offset = add i32 106, %factor.block\n%factor.ptr = getelementptr inbounds i8, {pointer} %block, i32 %factor.offset\n%factor.byte = load i8, {pointer} %factor.ptr, align 1\n%factor.raw = zext i8 %factor.byte to i32\n%factor.slot = urem i32 %value.block, 2\n%factor.shift = mul i32 %factor.slot, 4\n%factor.shifted = lshr i32 %factor.raw, %factor.shift\n%factor.code = and i32 %factor.shifted, 15\n%factor.twice = shl i32 %factor.code, 1\n%factor.one = add i32 %factor.twice, 1\n%factor = call {ty} @recipe.from.u32(i32 %factor.one)\n%scaled = call {ty} @recipe.mul({ty} %scale, {ty} %factor)\n%unsigned = call {ty} @recipe.mul({ty} %scaled, {ty} %level)\n%negative = call {ty} @recipe.neg({ty} %unsigned)\n%sign.group = udiv i32 %local, 8\n%sign.offset = add i32 74, %sign.group\n%sign.ptr = getelementptr inbounds i8, {pointer} %block, i32 %sign.offset\n%sign.byte = load i8, {pointer} %sign.ptr, align 1\n%sign.raw = zext i8 %sign.byte to i32\n%sign.lane = urem i32 %local, 8\n%sign.shifted = lshr i32 %sign.raw, %sign.lane\n%sign.bit = and i32 %sign.shifted, 1\n%sign.set = icmp ne i32 %sign.bit, 0\n%result = select i1 %sign.set, {ty} %negative, {ty} %unsigned\nret {ty} %result\n}}\n"));
-			return Ok(ir)
-		}
-		if codec == StorageCodec::IQ1M {
-			ir.push_str(&format!("%blocks = udiv i32 %columns, 256\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, 256\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, 56\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local = urem i32 %column, 256\n%value.block = udiv i32 %local, 16\n%group.local = urem i32 %local, 16\n%group = udiv i32 %group.local, 8\n%high.offset = add i32 32, %value.block\n%high.ptr = getelementptr inbounds i8, {pointer} %block, i32 %high.offset\n%high.byte = load i8, {pointer} %high.ptr, align 1\n%high.raw = zext i8 %high.byte to i32\n%grid.block = mul i32 %value.block, 2\n%grid.offset = add i32 %grid.block, %group\n%grid.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.offset\n%grid.byte = load i8, {pointer} %grid.ptr, align 1\n%grid.raw = zext i8 %grid.byte to i32\n%group.shift = mul i32 %group, 4\n%high.shifted = lshr i32 %high.raw, %group.shift\n%high.grid = and i32 %high.shifted, 7\n%high.grid.shifted = shl i32 %high.grid, 8\n%grid = or i32 %grid.raw, %high.grid.shifted\n%table.ptr = getelementptr inbounds [2048 x i16], ptr @recipe_model_iq1, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane = urem i32 %local, 8\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.raw = and i32 %level.shifted, 3\n%level.offset = sub i32 %level.raw, 1\n%delta.shift = add i32 %group.shift, 3\n%delta.shifted = lshr i32 %high.raw, %delta.shift\n%delta.bit = and i32 %delta.shifted, 1\n%delta.zero = icmp eq i32 %delta.bit, 0\n%delta = select i1 %delta.zero, {ty} {positive_delta}, {ty} {negative_delta}\n%level = call {ty} @recipe.from.s32(i32 %level.offset)\n%level.delta = call {ty} @recipe.add({ty} %level, {ty} %delta)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 48\n%scale.packed = load i64, {pointer} %scale.ptr, align 2\n%scale.s0.shifted = lshr i64 %scale.packed, 12\n%scale.s0 = and i64 %scale.s0.shifted, 15\n%scale.s1.shifted = lshr i64 %scale.packed, 24\n%scale.s1 = and i64 %scale.s1.shifted, 240\n%scale.s01 = or i64 %scale.s0, %scale.s1\n%scale.s2.shifted = lshr i64 %scale.packed, 36\n%scale.s2 = and i64 %scale.s2.shifted, 3840\n%scale.s012 = or i64 %scale.s01, %scale.s2\n%scale.s3.shifted = lshr i64 %scale.packed, 48\n%scale.s3 = and i64 %scale.s3.shifted, 61440\n%scale.raw = or i64 %scale.s012, %scale.s3\n%scale.bits = trunc i64 %scale.raw to i16\n%scale.half = bitcast i16 %scale.bits to half\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%scale.word = udiv i32 %value.block, 4\n%scale.word.shift = mul i32 %scale.word, 16\n%scale.code.local = urem i32 %value.block, 4\n%scale.code.shift = mul i32 %scale.code.local, 3\n%scale.shift = add i32 %scale.word.shift, %scale.code.shift\n%scale.shift64 = zext i32 %scale.shift to i64\n%scale.code.shifted = lshr i64 %scale.packed, %scale.shift64\n%scale.code64 = and i64 %scale.code.shifted, 7\n%scale.code = trunc i64 %scale.code64 to i32\n%scale.twice = shl i32 %scale.code, 1\n%scale.one = add i32 %scale.twice, 1\n%scale.factor = call {ty} @recipe.from.u32(i32 %scale.one)\n%scaled = call {ty} @recipe.mul({ty} %scale, {ty} %scale.factor)\n%result = call {ty} @recipe.mul({ty} %scaled, {ty} %level.delta)\nret {ty} %result\n}}\n", positive_delta = native_literal(self.precision.model, ty, 0.125), negative_delta = native_literal(self.precision.model, ty, -0.125)));
-			return Ok(ir)
-		}
-		ir.push_str(&format!("%blocks = udiv i32 %columns, 256\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, 256\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, 50\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local = urem i32 %column, 256\n%value.block = udiv i32 %local, 32\n%group.local = urem i32 %local, 32\n%group = udiv i32 %group.local, 8\n%high.block = mul i32 %value.block, 2\n%high.offset = add i32 34, %high.block\n%high.ptr = getelementptr inbounds i8, {pointer} %block, i32 %high.offset\n%high = load i16, {pointer} %high.ptr, align 2\n%high.raw = zext i16 %high to i32\n%grid.block = mul i32 %value.block, 4\n%grid.base = add i32 2, %grid.block\n%grid.offset = add i32 %grid.base, %group\n%grid.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.offset\n%grid.byte = load i8, {pointer} %grid.ptr, align 1\n%grid.raw = zext i8 %grid.byte to i32\n%group.shift = mul i32 %group, 3\n%high.shifted = lshr i32 %high.raw, %group.shift\n%high.grid = and i32 %high.shifted, 7\n%high.grid.shifted = shl i32 %high.grid, 8\n%grid = or i32 %grid.raw, %high.grid.shifted\n%table.ptr = getelementptr inbounds [2048 x i16], ptr @recipe_model_iq1, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane = urem i32 %local, 8\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.raw = and i32 %level.shifted, 3\n%level.offset = sub i32 %level.raw, 1\n%delta.bits = and i32 %high.raw, 32768\n%delta.zero = icmp eq i32 %delta.bits, 0\n%delta = select i1 %delta.zero, {ty} {positive_delta}, {ty} {negative_delta}\n%level = call {ty} @recipe.from.s32(i32 %level.offset)\n%level.delta = call {ty} @recipe.add({ty} %level, {ty} %delta)\n%scale.code.shifted = lshr i32 %high.raw, 12\n%scale.code = and i32 %scale.code.shifted, 7\n%scale.twice = shl i32 %scale.code, 1\n%scale.one = add i32 %scale.twice, 1\n%scale.factor = call {ty} @recipe.from.u32(i32 %scale.one)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 0\n%scale.half = load half, {pointer} %scale.ptr, align 2\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%scaled = call {ty} @recipe.mul({ty} %scale, {ty} %scale.factor)\n%result = call {ty} @recipe.mul({ty} %scaled, {ty} %level.delta)\nret {ty} %result\n}}\n", positive_delta = native_literal(self.precision.model, ty, 0.125), negative_delta = native_literal(self.precision.model, ty, -0.125)));
-		Ok(ir)
+		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision: self.precision, next: 0 };
+		require(!matches!(native, NativeDequant::Nf4), "NF4 native dequantization requires its model codebook")?;
+		let result = native.decode(&mut operations);
+		Ok(format!("{globals}define internal {ty} @recipe_model_quantized_{name}({pointer} %matrix, i32 %row, i32 %column, i32 %columns) #1 {{\nentry:\n%blocks = udiv i32 %columns, {block}\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, {block}\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, {stride}\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local.i32 = urem i32 %column, {block}\n%local = zext i32 %local.i32 to i64\n{body}ret {ty} {result}\n}}\n", globals = operations.globals, name = format.name, block = format.block, stride = format.stride, body = operations.ir))
 	}
 
-	fn emit_quantized_definition(template: &str, codec: StorageCodec) -> Result<String> {
-		let (label, name) = match codec {
-			StorageCodec::Q4K => ("q4", "q4k"),
-			StorageCodec::Q6K => ("q6", "q6k"),
-			_ => return Err(RecipeError::new(format!("native quantized decoder is unavailable for {codec:?}"))),
-		};
-		let source = definition(template, "quantized_value")?;
-		let entry = source.find("entry:").ok_or_else(|| RecipeError::new("native quantized decoder has no entry"))?;
-		let branch = source.find(&format!("\n{label}:")).ok_or_else(|| RecipeError::new(format!("native quantized decoder branch {label} is absent")))? + 1;
-		let end_marker = if label == "q4" { "\nq6:" } else { "\ninvalid:" };
-		let end = source[branch..].find(end_marker).map(|offset| branch + offset).ok_or_else(|| RecipeError::new(format!("native quantized decoder branch {label} has no end")))?;
-		let header = source[..entry].replace("@quantized_value(", &format!("@recipe_model_quantized_{name}(" )).replace(", i32 %kind", "");
-		let body = source[branch..end].replacen(&format!("{label}:"), "entry:", 1);
-		Ok(format!("{header}{body}\n}}\n"))
+	fn emit_native_nf4(&self, backend: Backend, index: usize, stored: &StoredWeight) -> Result<String> {
+		let (block, table, scales) = nf4_codebook(&stored.codebook, stored.count, stored.bytes.len())?;
+		let (pointer, ty) = (pointer_type(backend), self.precision.model_type);
+		let name = format!("q4_nf_n{index}");
+		let table_name = format!("{name}_table");
+		let scales_name = format!("{name}_scales");
+		let mut operations = NativeQuantOps { globals: String::new(), ir: String::new(), backend, precision: self.precision, next: 0 };
+		let result = dequant_nf4(&mut operations, block, &table_name, table, &scales_name, scales);
+		Ok(format!("{globals}define internal {ty} @recipe_model_quantized_{name}({pointer} %matrix, i32 %row, i32 %column, i32 %columns) #1 {{\nentry:\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 0\n%local = zext i32 %column to i64\n{body}ret {ty} {result}\n}}\n", globals = operations.globals, body = operations.ir))
 	}
 
-	fn emit_quantized_decoders(&self, backend: Backend, template: &str) -> Result<String> {
+	fn emit_quantized_decoders(&self, backend: Backend) -> Result<String> {
 		let mut emitted = String::new();
 		let mut seen = Vec::new();
-		for plan in &self.plans {
+		let mut tables = Vec::new();
+		for (index, plan) in self.plans.iter().enumerate() {
 			let Some(stored) = &plan.stored else { continue };
 			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
-			if seen.iter().any(|codec: &StorageCodec| *codec == spec.codec) { continue }
-			if matches!(spec.codec, StorageCodec::IQ1S | StorageCodec::IQ1M | StorageCodec::IQ2S | StorageCodec::IQ2XS | StorageCodec::IQ2XXS | StorageCodec::IQ3S) {
-				if spec.codec == StorageCodec::IQ3S {
-					emitted.push_str(&format!("@recipe_model_iq3s = private unnamed_addr constant [512 x i16] [{}]\n", IQ3_S.iter().map(|value| format!("i16 {value}")).collect::<Vec<_>>().join(", ")));
-				} else if matches!(spec.codec, StorageCodec::IQ2S | StorageCodec::IQ2XS | StorageCodec::IQ2XXS) {
-					let (name, table): (&str, &[u16]) = match spec.codec { StorageCodec::IQ2S => ("iq2s", &IQ2_S), StorageCodec::IQ2XS => ("iq2xs", &IQ2_XS), StorageCodec::IQ2XXS => ("iq2xxs", &IQ2_XXS), _ => unreachable!() };
-					emitted.push_str(&format!("@recipe_model_{name} = private unnamed_addr constant [{} x i16] [{}]\n", table.len(), table.iter().map(|value| format!("i16 {value}")).collect::<Vec<_>>().join(", ")));
-				} else if !seen.iter().any(|codec| matches!(codec, StorageCodec::IQ1S | StorageCodec::IQ1M)) {
-					emitted.push_str(&format!("@recipe_model_iq1 = private unnamed_addr constant [2048 x i16] [{}]\n", IQ1.iter().map(|value| format!("i16 {value}")).collect::<Vec<_>>().join(", ")));
-				}
-				emitted.push_str(&self.emit_iq_definition(backend, spec.codec)?);
-			} else {
-				emitted.push_str(&Self::emit_quantized_definition(template, spec.codec)?);
+			let format = spec.codec.quantization();
+			let native = format.native;
+			if matches!(native, NativeDequant::Nf4) {
+				emitted.push_str(&self.emit_native_nf4(backend, index, stored)?);
+				continue;
 			}
+			if seen.iter().any(|codec: &StorageCodec| *codec == spec.codec) { continue }
+			if let Some(table) = native.table() {
+				if !tables.contains(&table.name()) {
+					emitted.push_str(&table.definition());
+					tables.push(table.name());
+				}
+			}
+			emitted.push_str(&self.emit_native_quantization(backend, format, native)?);
 			seen.push(spec.codec);
 		}
 		Ok(emitted)
@@ -1560,19 +2241,14 @@ impl NativeModelIr {
 		for (index, plan) in self.plans.iter().enumerate() {
 			let Some(stored) = &plan.stored else { continue };
 			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
-			let name = match spec.codec {
-				StorageCodec::Q4K => "q4k",
-				StorageCodec::Q6K => "q6k",
-				StorageCodec::IQ1S => "iq1s",
-				StorageCodec::IQ1M => "iq1m",
-				StorageCodec::IQ2S => "iq2s",
-				StorageCodec::IQ2XS => "iq2xs",
-				StorageCodec::IQ2XXS => "iq2xxs",
-				StorageCodec::IQ3S => "iq3s",
-				_ => return Err(RecipeError::new(format!("native quantized decoder is unavailable for node {index} format {:?}", spec.codec))),
+			let format = spec.codec.quantization();
+			let native = format.native;
+			let (name, block) = match native {
+				NativeDequant::Nf4 => (format!("{}_n{index}", format.name), nf4_codebook(&stored.codebook, stored.count, stored.bytes.len())?.0),
+				_ => (format.name.to_owned(), spec.block),
 			};
 			let count = i32::try_from(stored.count).map_err(|_| RecipeError::new("native quantized weight count exceeds i32"))?;
-			let columns = i32::try_from(stored.count.div_ceil(spec.block.max(1)) * spec.block.max(1)).map_err(|_| RecipeError::new("native quantized block count exceeds i32"))?;
+			let columns = i32::try_from(stored.count.div_ceil(block) * block).map_err(|_| RecipeError::new("native quantized block count exceeds i32"))?;
 			let prefix = format!("load.n{index}");
 			ir.push_str(&format!("br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.storage = getelementptr i8, {pointer} %storage, i32 {storage}\n%{prefix}.weights = getelementptr {ty}, {pointer} %weights, i32 {weight}\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} %{prefix}.storage, i32 0, i32 %{prefix}.p, i32 {columns})\nstore {ty} %{prefix}.value, {pointer} %{prefix}.weights, align {align}\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, count = count, storage = plan.storage_offset, weight = plan.node.offset, name = name, columns = columns, align = alignment(ty)).replace("%entry", &format!("%{predecessor}")));
 			ir.push_str(barrier(backend));
@@ -1584,9 +2260,9 @@ impl NativeModelIr {
 
 	pub(crate) fn emit(&self, backend: Backend, loss: LossFunction) -> Result<String> {
 		let mut ir = backend_template(backend, self.precision)?;
-		let quantized_definitions = self.emit_quantized_decoders(backend, &ir)?;
+		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let model_load = self.emit_model_load(backend)?;
-		for name in ["cached_attention_body", "quantized_value"] {
+		for name in ["cached_attention_body"] {
 			ir = strip_definition(ir, name);
 		}
 		ir.push_str(&quantized_definitions);
@@ -2843,7 +3519,6 @@ fn unfp16(value: u16) -> f32 {
 }
 fn put_half(output: &mut Vec<u8>, value: f32) { output.extend(fp16(value).to_le_bytes()) }
 fn half(input: &[u8]) -> f32 { unfp16(u16::from_le_bytes([input[0], input[1]])) }
-fn float(input: &[u8]) -> f32 { f32::from_le_bytes([input[0], input[1], input[2], input[3]]) }
 fn qround(value: f32) -> f32 { (((value + 12582912.0).to_bits() as i32 & 0x007fffff) - 0x00400000) as f32 }
 fn positive_max(values: &[f32]) -> f32 { values.iter().fold(0.0, |maximum, value| if *value > maximum { *value } else { maximum }) }
 #[rustfmt::skip]
@@ -3206,30 +3881,151 @@ fn iq4_fit(values: &[f32], tries: i32) -> (f32, Vec<u8>) {
 #[derive(Clone, Copy)]
 pub(crate) struct StorageFormat(pub(crate) u16);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StorageCodec {
-	Q4_0,
-	Q4_1,
-	Q5_0,
-	Q5_1,
-	Q8_0,
-	Q8_1,
+#[derive(Clone, Copy)]
+enum NativeDequant {
+	Nf4,
+	Scalar(ScalarLayout),
 	Q2K,
 	Q3K,
-	Q4K,
-	Q5K,
+	Q45K(u8),
 	Q6K,
 	Q8K,
-	NF4,
-	IQ4NL,
-	IQ4XS,
-	IQ3XXS,
-	IQ2XXS,
-	IQ2S,
-	IQ2XS,
-	IQ1S,
-	IQ1M,
-	IQ3S,
+	Iq4(Iq4Layout),
+	Iq1(Iq1Layout),
+	Iq(IqLayout),
+}
+
+impl NativeDequant {
+	fn decode<Q: QuantOps>(self, operations: &mut Q) -> Q::Value {
+		match self {
+			Self::Nf4 => unreachable!("NF4 dequantization requires its model codebook"),
+			Self::Scalar(layout) => quantized::dequant_scalar(operations, layout),
+			Self::Q2K => quantized::dequant_q2k(operations),
+			Self::Q3K => quantized::dequant_q3k(operations),
+			Self::Q45K(man) => quantized::dequant_q45k(operations, man),
+			Self::Q6K => quantized::dequant_q6k(operations),
+			Self::Q8K => quantized::dequant_q8k(operations),
+			Self::Iq4(layout) => quantized::dequant_iq4(operations, layout),
+			Self::Iq1(layout) => quantized::dequant_iq1(operations, layout),
+			Self::Iq(layout) => quantized::dequant_iq(operations, layout),
+		}
+	}
+
+	fn table(self) -> Option<NativeQuantTable> {
+		match self {
+			Self::Iq4(layout) => Some(NativeQuantTable::Signed(layout.table_name, layout.table)),
+			Self::Iq1(layout) => Some(NativeQuantTable::Unsigned(layout.table_name, layout.table)),
+			Self::Iq(layout) => Some(NativeQuantTable::Unsigned(layout.table_name, layout.table)),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone, Copy)]
+enum NativeQuantTable {
+	Unsigned(&'static str, &'static [u16]),
+	Signed(&'static str, &'static [i8]),
+}
+
+impl NativeQuantTable {
+	fn name(self) -> &'static str {
+		match self {
+			Self::Unsigned(name, _) | Self::Signed(name, _) => name,
+		}
+	}
+
+	fn definition(self) -> String {
+		match self {
+			Self::Unsigned(name, values) => format!("@recipe_model_{name} = private unnamed_addr constant [{} x i16] [{}]\n", values.len(), values.iter().map(|value| format!("i16 {value}")).collect::<Vec<_>>().join(", ")),
+			Self::Signed(name, values) => format!("@recipe_model_{name} = private unnamed_addr constant [{} x i8] [{}]\n", values.len(), values.iter().map(|value| format!("i8 {value}")).collect::<Vec<_>>().join(", ")),
+		}
+	}
+}
+
+#[derive(Clone, Copy)]
+enum Quantizer {
+	Scalar { bits: u8, variant: u8 },
+	Q2K,
+	Q3K,
+	Q45K { bits: u8 },
+	Q6K,
+	Q8K,
+	Nf4,
+	Iq4Nl,
+	Iq4Xs,
+	Iq2Xxs,
+	Iq2 { importance: bool, xs: bool },
+	Iq1 { medium: bool },
+	Iq3Xxs,
+	Iq3S,
+}
+
+#[derive(Clone, Copy)]
+struct Quantization {
+	codec: StorageCodec,
+	family: u16,
+	bits: u8,
+	variants: &'static [u16],
+	block: usize,
+	stride: usize,
+	name: &'static str,
+	quantizer: Quantizer,
+	native: NativeDequant,
+}
+
+macro_rules! quantizations {
+	($( $codec:ident { code: ($family:literal, $bits:literal, [$($variant:literal),+]), block: $block:literal, stride: $stride:literal, name: $name:literal, quant: $quantizer:expr, native: Some($native:expr) } )+) => {
+		#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+		pub(crate) enum StorageCodec { $($codec),+ }
+		const QUANTIZATIONS: &[Quantization] = &[$(Quantization { codec: StorageCodec::$codec, family: $family, bits: $bits, variants: &[$($variant),+], block: $block, stride: $stride, name: $name, quantizer: $quantizer, native: $native }),+];
+	};
+}
+
+quantizations! {
+	Q4_0 { code: (0, 4, [0]), block: 32, stride: 18, name: "q4_0", quant: Quantizer::Scalar { bits: 4, variant: 0 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 4, variant: 0 })) }
+	Q4_1 { code: (0, 4, [1]), block: 32, stride: 20, name: "q4_1", quant: Quantizer::Scalar { bits: 4, variant: 1 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 4, variant: 1 })) }
+	Q5_0 { code: (0, 5, [0]), block: 32, stride: 22, name: "q5_0", quant: Quantizer::Scalar { bits: 5, variant: 0 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 5, variant: 0 })) }
+	Q5_1 { code: (0, 5, [1]), block: 32, stride: 24, name: "q5_1", quant: Quantizer::Scalar { bits: 5, variant: 1 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 5, variant: 1 })) }
+	Q8_0 { code: (0, 8, [0]), block: 32, stride: 34, name: "q8_0", quant: Quantizer::Scalar { bits: 8, variant: 0 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 8, variant: 0 })) }
+	Q8_1 { code: (0, 8, [1]), block: 32, stride: 36, name: "q8_1", quant: Quantizer::Scalar { bits: 8, variant: 1 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 8, variant: 1 })) }
+	NF4 { code: (0, 4, [2]), block: 0, stride: 0, name: "q4_nf", quant: Quantizer::Nf4, native: Some(NativeDequant::Nf4) }
+	Q2K { code: (0, 2, [3]), block: 256, stride: 84, name: "q2k", quant: Quantizer::Q2K, native: Some(NativeDequant::Q2K) }
+	Q3K { code: (0, 3, [3, 4, 5, 6]), block: 256, stride: 110, name: "q3k", quant: Quantizer::Q3K, native: Some(NativeDequant::Q3K) }
+	Q4K { code: (0, 4, [3, 4, 5, 6]), block: 256, stride: 144, name: "q4k", quant: Quantizer::Q45K { bits: 4 }, native: Some(NativeDequant::Q45K(4)) }
+	Q5K { code: (0, 5, [3, 4, 5, 6]), block: 256, stride: 176, name: "q5k", quant: Quantizer::Q45K { bits: 5 }, native: Some(NativeDequant::Q45K(5)) }
+	Q6K { code: (0, 6, [3, 4, 5, 6]), block: 256, stride: 210, name: "q6k", quant: Quantizer::Q6K, native: Some(NativeDequant::Q6K) }
+	Q8K { code: (0, 8, [3]), block: 256, stride: 292, name: "q8k", quant: Quantizer::Q8K, native: Some(NativeDequant::Q8K) }
+	IQ4NL { code: (1, 4, [5]), block: 32, stride: 18, name: "iq4nl", quant: Quantizer::Iq4Nl, native: Some(NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 1, man: 4, xs: false, table_name: "iq4", table: &IQ4 })) }
+	IQ4XS { code: (1, 4, [2]), block: 256, stride: 136, name: "iq4xs", quant: Quantizer::Iq4Xs, native: Some(NativeDequant::Iq4(Iq4Layout { sign: 1, exp: 6, man: 4, xs: true, table_name: "iq4", table: &IQ4 })) }
+	IQ3XXS { code: (1, 3, [1]), block: 256, stride: 98, name: "iq3xxs", quant: Quantizer::Iq3Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq3xxs", table: &IQ3_XXS })) }
+	IQ2XXS { code: (1, 2, [1]), block: 256, stride: 66, name: "iq2xxs", quant: Quantizer::Iq2Xxs, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xxs, table_name: "iq2xxs", table: &IQ2_XXS })) }
+	IQ2XS { code: (1, 2, [2]), block: 256, stride: 74, name: "iq2xs", quant: Quantizer::Iq2 { importance: true, xs: true }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::Xs, table_name: "iq2xs", table: &IQ2_XS })) }
+	IQ2S { code: (1, 2, [3]), block: 256, stride: 82, name: "iq2s", quant: Quantizer::Iq2 { importance: false, xs: false }, native: Some(NativeDequant::Iq(IqLayout { man: 2, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq2s", table: &IQ2_S })) }
+	IQ1S { code: (1, 1, [3]), block: 256, stride: 50, name: "iq1s", quant: Quantizer::Iq1 { medium: false }, native: Some(NativeDequant::Iq1(Iq1Layout { man: 2, exp: 3, sign: 1, medium: false, table_name: "iq1", table: &IQ1 })) }
+	IQ1M { code: (1, 1, [4]), block: 256, stride: 56, name: "iq1m", quant: Quantizer::Iq1 { medium: true }, native: Some(NativeDequant::Iq1(Iq1Layout { man: 2, exp: 3, sign: 1, medium: true, table_name: "iq1", table: &IQ1 })) }
+	IQ3S { code: (1, 3, [3]), block: 256, stride: 110, name: "iq3s", quant: Quantizer::Iq3S, native: Some(NativeDequant::Iq(IqLayout { man: 3, exp: 4, sign: 1, packing: IqPacking::S, table_name: "iq3s", table: &IQ3_S })) }
+}
+
+fn nf4_codebook(codebook: &[f64], count: usize, bytes: usize) -> Result<(usize, &[f64], &[f64])> {
+	let block_value = codebook.first().copied().unwrap_or(0.0);
+	require(block_value.is_finite() && block_value.fract() == 0.0 && block_value >= 1.0 && block_value <= usize::MAX as f64, "NF4 block size is invalid")?;
+	let block = block_value as usize;
+	let scales = count.div_ceil(block);
+	require(codebook.len() == 17 + scales && bytes == count.div_ceil(2), "NF4 weights are invalid")?;
+	Ok((block, &codebook[1..17], &codebook[17..]))
+}
+
+impl StorageCodec {
+	fn quantization(self) -> &'static Quantization { QUANTIZATIONS.iter().find(|format| format.codec == self).unwrap() }
+	fn dequantize(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>> {
+		let format = self.quantization();
+		let native = format.native;
+		if matches!(native, NativeDequant::Nf4) {
+			let (block, table, scales) = nf4_codebook(codebook, count, data.len())?;
+			return Ok((0..count).map(|index| dequant_nf4(&mut HostQuantOps { bytes: data, index }, block, "nf4", table, "nf4_scales", scales)).collect());
+		}
+		decode_blocks(data, count, format.block, format.stride, "GGML quantized weights are invalid", |bytes, index| native.decode(&mut HostQuantOps { bytes, index }))
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3249,34 +4045,10 @@ pub(crate) struct StoredWeight {
 }
 
 impl StorageFormat {
-	fn valid(self) -> bool { matches!((self.0 >> 12, self.bits(), self.0 >> 8 & 15), (0, 4 | 5 | 8, 0 | 1) | (0, 4, 2) | (0, 2 | 3 | 4 | 5 | 6 | 8, 3) | (0, 3 | 4 | 5, 4 | 5) | (0, 3, 6) | (1, 1, 3 | 4) | (1, 2 | 3, 1 | 2 | 3 | 4) | (1, 4, 2 | 5)) }
+	fn valid(self) -> bool { self.spec().is_some() || self.selection().is_some() }
 	pub(crate) fn spec(self) -> Option<StorageSpec> {
 		let (family, bits, variant) = (self.0 >> 12, self.bits(), self.0 >> 8 & 15);
-		Some(match (family, bits, variant) {
-			(0, 4, 0) => StorageSpec { codec: StorageCodec::Q4_0, block: 32, stride: 18 },
-			(0, 4, 1) => StorageSpec { codec: StorageCodec::Q4_1, block: 32, stride: 20 },
-			(0, 5, 0) => StorageSpec { codec: StorageCodec::Q5_0, block: 32, stride: 22 },
-			(0, 5, 1) => StorageSpec { codec: StorageCodec::Q5_1, block: 32, stride: 24 },
-			(0, 8, 0) => StorageSpec { codec: StorageCodec::Q8_0, block: 32, stride: 34 },
-			(0, 8, 1) => StorageSpec { codec: StorageCodec::Q8_1, block: 32, stride: 36 },
-			(0, 4, 2) => StorageSpec { codec: StorageCodec::NF4, block: 0, stride: 0 },
-			(0, 2, 3) => StorageSpec { codec: StorageCodec::Q2K, block: 256, stride: 84 },
-			(0, 3, 3 | 4 | 5 | 6) => StorageSpec { codec: StorageCodec::Q3K, block: 256, stride: 110 },
-			(0, 4, 3 | 4 | 5 | 6) => StorageSpec { codec: StorageCodec::Q4K, block: 256, stride: 144 },
-			(0, 5, 3 | 4 | 5 | 6) => StorageSpec { codec: StorageCodec::Q5K, block: 256, stride: 176 },
-			(0, 6, 3 | 4 | 5 | 6) => StorageSpec { codec: StorageCodec::Q6K, block: 256, stride: 210 },
-			(0, 8, 3) => StorageSpec { codec: StorageCodec::Q8K, block: 256, stride: 292 },
-			(1, 4, 5) => StorageSpec { codec: StorageCodec::IQ4NL, block: 32, stride: 18 },
-			(1, 4, 2) => StorageSpec { codec: StorageCodec::IQ4XS, block: 256, stride: 136 },
-			(1, 3, 1) => StorageSpec { codec: StorageCodec::IQ3XXS, block: 256, stride: 98 },
-			(1, 2, 1) => StorageSpec { codec: StorageCodec::IQ2XXS, block: 256, stride: 66 },
-			(1, 2, 2) => StorageSpec { codec: StorageCodec::IQ2XS, block: 256, stride: 74 },
-			(1, 2, 3) => StorageSpec { codec: StorageCodec::IQ2S, block: 256, stride: 82 },
-			(1, 1, 3) => StorageSpec { codec: StorageCodec::IQ1S, block: 256, stride: 50 },
-			(1, 1, 4) => StorageSpec { codec: StorageCodec::IQ1M, block: 256, stride: 56 },
-			(1, 3, 3) => StorageSpec { codec: StorageCodec::IQ3S, block: 256, stride: 110 },
-			_ => return None,
-		})
+		QUANTIZATIONS.iter().find(|format| format.family == family && format.bits == bits && format.variants.contains(&variant)).map(|format| StorageSpec { codec: format.codec, block: format.block, stride: format.stride })
 	}
 	pub(crate) fn encode(self, arithmetic: &[f64], importance: &[f64], config: Config) -> Result<StoredWeight> {
 		let (bytes, codebook) = self.compress(arithmetic, importance, config)?;
@@ -3336,9 +4108,8 @@ fn decode_blocks(data: &[u8], count: usize, block: usize, stride: usize, error: 
 impl Integer for StorageFormat {
 	fn bits(self) -> u8 { self.0 as u8 }
 	fn compress(self, weights: &[f64], importance: &[f64], config: Config) -> Result<(Vec<u8>, Vec<f64>)> {
-		let bits = self.bits();
-		let (family, variant) = (self.0 >> 12, self.0 >> 8 & 15);
-		if family == 0 && variant < 2 && matches!(bits, 4 | 5 | 8) {
+		let quantizer = self.spec().ok_or_else(|| self.unavailable())?.codec.quantization().quantizer;
+		if let Quantizer::Scalar { bits, variant } = quantizer {
 			let block = 32;
 			let mut data = Vec::new();
 			for values in weights.chunks(block) {
@@ -3393,7 +4164,7 @@ impl Integer for StorageFormat {
 			}
 			return Ok((data, Vec::new()));
 		}
-		if family == 0 && variant == 3 && bits == 2 {
+		if matches!(quantizer, Quantizer::Q2K) {
 			let mut data = Vec::new();
 			for values in weights.chunks(256) {
 				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
@@ -3430,7 +4201,7 @@ impl Integer for StorageFormat {
 			}
 			return Ok((data, Vec::new()));
 		}
-		if family == 0 && variant == 3 && bits == 3 {
+		if matches!(quantizer, Quantizer::Q3K) {
 			let mut data = Vec::new();
 			for values in weights.chunks(256) {
 				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
@@ -3480,7 +4251,7 @@ impl Integer for StorageFormat {
 			}
 			return Ok((data, Vec::new()));
 		}
-		if family == 0 && variant == 3 && matches!(bits, 4 | 5) {
+		if let Quantizer::Q45K { bits } = quantizer {
 			let mut data = Vec::new();
 			for values in weights.chunks(256) {
 				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
@@ -3534,7 +4305,7 @@ impl Integer for StorageFormat {
 			}
 			return Ok((data, Vec::new()));
 		}
-		if family == 0 && variant == 3 && bits == 6 {
+		if matches!(quantizer, Quantizer::Q6K) {
 			let mut data = Vec::new();
 			for values in weights.chunks(256) {
 				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
@@ -3576,7 +4347,7 @@ impl Integer for StorageFormat {
 			}
 			return Ok((data, Vec::new()));
 		}
-		if family == 0 && variant == 3 && bits == 8 {
+		if matches!(quantizer, Quantizer::Q8K) {
 			let mut data = Vec::new();
 			for values in weights.chunks(256) {
 				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
@@ -3592,7 +4363,7 @@ impl Integer for StorageFormat {
 			}
 			return Ok((data, Vec::new()));
 		}
-		if family == 0 && variant == 2 && bits == 4 {
+		if matches!(quantizer, Quantizer::Nf4) {
 			const NF4: [f64; 16] = [-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0, 0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0];
 			let mut metadata = vec![config.quantization_block as f64];
 			metadata.extend(NF4);
@@ -3608,7 +4379,7 @@ impl Integer for StorageFormat {
 			}
 			return Ok((data, metadata));
 		}
-		if family == 1 && variant == 5 && bits == 4 {
+		if matches!(quantizer, Quantizer::Iq4Nl) {
 			let mut data = Vec::new();
 			for values in weights.chunks(32) {
 				let values = (0..32).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
@@ -3620,7 +4391,7 @@ impl Integer for StorageFormat {
 			}
 			return Ok((data, Vec::new()));
 		}
-		if family == 1 && variant == 2 && bits == 4 {
+		if matches!(quantizer, Quantizer::Iq4Xs) {
 			let mut data = Vec::new();
 			for values in weights.chunks(256) {
 				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
@@ -3660,163 +4431,31 @@ impl Integer for StorageFormat {
 			}
 			return Ok((data, Vec::new()));
 		}
-		if family == 1 && variant == 1 && bits == 2 {
+		if matches!(quantizer, Quantizer::Iq2Xxs) {
 			require(importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0), "GGML IQ2_XXS requires trained importance weights")?;
 			return Ok((iq2_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), &importance.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
 		}
-		if family == 1 && variant == 2 && bits == 2 {
+		if matches!(quantizer, Quantizer::Iq2 { importance: true, xs: true }) {
 			require(importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0), "GGML IQ2_XS requires trained importance weights")?;
 			return Ok((iq2_16(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), Some(&importance.iter().map(|value| *value as f32).collect::<Vec<_>>()), true), Vec::new()));
 		}
-		if family == 1 && matches!(variant, 3 | 4) && bits == 1 {
-			require(importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0), format!("GGML IQ1_{} requires trained importance weights", if variant == 3 { "S" } else { "M" }))?;
-			return Ok((iq1(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), &importance.iter().map(|value| *value as f32).collect::<Vec<_>>(), variant == 4), Vec::new()));
+		if let Quantizer::Iq1 { medium } = quantizer {
+			require(importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0), format!("GGML IQ1_{} requires trained importance weights", if medium { "M" } else { "S" }))?;
+			return Ok((iq1(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), &importance.iter().map(|value| *value as f32).collect::<Vec<_>>(), medium), Vec::new()));
 		}
-		if family == 1 && variant == 1 && bits == 3 {
+		if matches!(quantizer, Quantizer::Iq3Xxs) {
 			return Ok((iq3_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
 		}
-		if family == 1 && variant == 3 && bits == 2 {
+		if matches!(quantizer, Quantizer::Iq2 { importance: false, xs: false }) {
 			return Ok((iq2_16(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), None, false), Vec::new()));
 		}
-		if family == 1 && variant == 3 && bits == 3 {
+		if matches!(quantizer, Quantizer::Iq3S) {
 			return Ok((iq3_s(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
 		}
 		Err(self.unavailable())
 	}
 	fn decompress(self, data: &[u8], codebook: &[f64], count: usize) -> Result<Vec<f64>> {
-		let (family, variant, bits) = (self.0 >> 12, self.0 >> 8 & 15, self.bits());
-		match (family, variant, bits) {
-			(0, 0 | 1, 4 | 5 | 8) => {
-				let header = if variant == 1 { 4 } else { 2 };
-				let payload = match bits {
-					4 => 16,
-					5 => 20,
-					8 => 32,
-					_ => unreachable!(),
-				};
-				decode_blocks(data, count, 32, header + payload, "GGML quantized weights are invalid", |bytes, index| {
-					let scale = half(bytes);
-					let minimum = if variant == 1 && bits != 8 { half(&bytes[2..]) } else { 0.0 };
-					let codes = &bytes[header..header + payload];
-					let code = match bits {
-						4 => codes[index % 16] >> (index / 16 * 4) & 15,
-						5 => (codes[4 + index % 16] >> (index / 16 * 4) & 15) | ((codes[index / 8] >> (index % 8) & 1) << 4),
-						8 => codes[index],
-						_ => unreachable!(),
-					};
-					f64::from(match (bits, variant) {
-						(8, _) => i8::from_ne_bytes([code]) as f32 * scale,
-						(_, 0) => (i32::from(code) - (1_i32 << (bits - 1))) as f32 * scale,
-						(_, 1) => f32::from(code) * scale + minimum,
-						_ => unreachable!(),
-					})
-				})
-			}
-			(0, 3, 2) => decode_blocks(data, count, 256, 84, "GGML Q2_K weights are invalid", |bytes, index| {
-				let (scale, minimum) = (half(&bytes[80..]), half(&bytes[82..]));
-				let order = index / 16;
-				let (section, shift, half, offset) = (order / 8, order % 8 / 2 * 2, order % 2, index % 16);
-				let metadata = bytes[section * 8 + shift + half];
-				f64::from(scale * f32::from(metadata & 15) * f32::from(bytes[16 + section * 32 + half * 16 + offset] >> shift & 3) - minimum * f32::from(metadata >> 4))
-			}),
-			(0, 3, 3) => decode_blocks(data, count, 256, 110, "GGML Q3_K weights are invalid", |bytes, index| {
-				let block = index / 16;
-				let low_scale = bytes[96 + if block < 8 { block } else { block - 8 }] >> if block < 8 { 0 } else { 4 } & 15;
-				let high_scale = bytes[104 + block % 4] >> (2 * (block / 4)) & 3;
-				let low = bytes[32 + index / 128 * 32 + index % 32] >> (index % 128 / 32 * 2) & 3;
-				let level = i8::try_from(low).unwrap() - if bytes[index % 32] >> (index / 32) & 1 == 0 { 4 } else { 0 };
-				f64::from(half(&bytes[108..]) * f32::from((low_scale | high_scale << 4) as i8 - 32) * f32::from(level))
-			}),
-			(0, 3, 4 | 5) => decode_blocks(data, count, 256, if bits == 4 { 144 } else { 176 }, "GGML Q4_K or Q5_K weights are invalid", |bytes, index| {
-				let (scale, minimum) = (half(bytes), half(&bytes[2..]));
-				let (scale_code, minimum_code) = k_scale(&bytes[4..16], index / 32);
-				let packed = bytes[(if bits == 4 { 16 } else { 48 }) + index / 64 * 32 + index % 32];
-				let code = (if index % 64 < 32 { packed & 15 } else { packed >> 4 }) | if bits == 5 { (bytes[16 + index % 32] >> (index / 32) & 1) << 4 } else { 0 };
-				f64::from(scale * f32::from(scale_code) * f32::from(code) - minimum * f32::from(minimum_code))
-			}),
-			(0, 3, 6) => decode_blocks(data, count, 256, 210, "GGML Q6_K weights are invalid", |bytes, index| {
-				let group = index / 128 * 128;
-				let quarter = index % 128 / 32;
-				let packed = bytes[group / 2 + index % 32 + if quarter % 2 == 0 { 0 } else { 32 }];
-				let low = if quarter < 2 { packed & 15 } else { packed >> 4 };
-				let high = bytes[128 + group / 4 + index % 32] >> (quarter * 2) & 3;
-				f64::from(half(&bytes[208..]) * f32::from(i8::from_ne_bytes([bytes[192 + index / 16]])) * f32::from((low | high << 4) as i8 - 32))
-			}),
-			(0, 3, 8) => decode_blocks(data, count, 256, 292, "GGML Q8_K weights are invalid", |bytes, index| f64::from(float(bytes) * f32::from(i8::from_ne_bytes([bytes[4 + index]])))),
-			(0, 2, 4) => {
-				let block = codebook.first().copied().unwrap_or(0.0) as usize;
-				require(block != 0 && codebook.len() >= 17 + count.div_ceil(block) && data.len() * 2 >= count, "NF4 weights are invalid")?;
-				(0..count).map(|index| codebook.get(1 + usize::from(data[index / 2] >> (index % 2 * 4) & 15)).zip(codebook.get(17 + index / block)).map(|(value, scale)| value * scale).ok_or_else(|| RecipeError::new("NF4 weight index is invalid"))).collect()
-			}
-			(1, 5, 4) => decode_blocks(data, count, 32, 18, "GGML IQ4_NL weights are invalid", |bytes, index| {
-				let code = if index < 16 { bytes[2 + index] & 15 } else { bytes[2 + index - 16] >> 4 };
-				f64::from(half(bytes) * f32::from(IQ4[usize::from(code)]))
-			}),
-			(1, 2, 4) => decode_blocks(data, count, 256, 136, "GGML IQ4_XS weights are invalid", |bytes, index| {
-				let (scale, high) = (half(bytes), u16::from_le_bytes([bytes[2], bytes[3]]));
-				let block = index / 32;
-				let scale_code = (bytes[4 + block / 2] >> (block % 2 * 4) & 15) | ((high >> (block * 2) & 3) as u8) << 4;
-				let packed = bytes[8 + block * 16 + index % 16];
-				let code = if index % 32 < 16 { packed & 15 } else { packed >> 4 };
-				f64::from(scale * f32::from(scale_code as i8 - 32) * f32::from(IQ4[usize::from(code)]))
-			}),
-			(1, 1, 3) => decode_blocks(data, count, 256, 98, "GGML IQ3_XXS weights are invalid", |bytes, index| {
-				let (block, group, lane) = (index / 32, index % 32 / 8, index % 8);
-				let word = u32::from_le_bytes(bytes[66 + block * 4..70 + block * 4].try_into().unwrap());
-				let signs = (word >> (7 * group) & 127) as u8;
-				let signs = signs | ((signs.count_ones() as u8 & 1) << 7);
-				let grid = usize::from(bytes[2 + block * 8 + group * 2 + lane / 4]);
-				f64::from(half(bytes) * (0.5 + (word >> 28) as f32) * 0.5 * f32::from(iq3_grid(&IQ3_XXS, grid, lane % 4)) * if signs >> lane & 1 != 0 { -1.0 } else { 1.0 })
-			}),
-			(1, 1, 2) => decode_blocks(data, count, 256, 66, "GGML IQ2_XXS weights are invalid", |bytes, index| {
-				let (block, group, lane) = (index / 32, index % 32 / 8, index % 8);
-				let word = u32::from_le_bytes(bytes[6 + block * 8..10 + block * 8].try_into().unwrap());
-				let signs = (word >> (7 * group) & 127) as u8;
-				let signs = signs | ((signs.count_ones() as u8 & 1) << 7);
-				let sign = if signs >> lane & 1 != 0 { -1.0 } else { 1.0 };
-				f64::from(half(bytes) * (0.5 + (word >> 28) as f32) * 0.25 * f32::from(iq2_grid(&IQ2_XXS, usize::from(bytes[2 + block * 8 + group]), lane)) * sign)
-			}),
-			(1, 3, 2) => decode_blocks(data, count, 256, 82, "GGML IQ2_S weights are invalid", |bytes, index| {
-				let (block, slot) = (index / 16, index / 8);
-				let grid = usize::from(bytes[2 + slot]) | usize::from(bytes[66 + slot / 4] >> (2 * (slot % 4)) & 3) << 8;
-				let d = half(bytes) * (0.5 + f32::from(bytes[74 + block / 2] >> (4 * (block % 2)) & 15)) * 0.25;
-				let sign = if bytes[34 + slot] >> (index % 8) & 1 != 0 { -1.0 } else { 1.0 };
-				f64::from(d * f32::from(iq2_grid(&IQ2_S, grid, index % 8)) * sign)
-			}),
-			(1, 2, 2) => decode_blocks(data, count, 256, 74, "GGML IQ2_XS weights are invalid", |bytes, index| {
-				let (block, slot) = (index / 16, index / 8);
-				let word = u16::from_le_bytes(bytes[2 + 2 * slot..4 + 2 * slot].try_into().unwrap());
-				let signs = (word >> 9) as u8;
-				let signs = signs | ((signs.count_ones() as u8 & 1) << 7);
-				let d = half(bytes) * (0.5 + f32::from(bytes[66 + block / 2] >> (4 * (block % 2)) & 15)) * 0.25;
-				let sign = if signs >> (index % 8) & 1 != 0 { -1.0 } else { 1.0 };
-				f64::from(d * f32::from(iq2_grid(&IQ2_XS, usize::from(word & 511), index % 8)) * sign)
-			}),
-			(1, 3, 1) => decode_blocks(data, count, 256, 50, "GGML IQ1_S weights are invalid", |bytes, index| {
-				let (block, group) = (index / 32, index % 32 / 8);
-				let high = u16::from_le_bytes(bytes[34 + 2 * block..36 + 2 * block].try_into().unwrap());
-				let grid = usize::from(bytes[2 + 4 * block + group]) | usize::from(high >> (3 * group) & 7) << 8;
-				let delta = if high & 0x8000 != 0 { -0.125 } else { 0.125 };
-				f64::from(half(bytes) * f32::from(2 * ((high >> 12) & 7) + 1) * (f32::from(iq1_level(grid, index % 8)) - 1.0 + delta))
-			}),
-			(1, 4, 1) => decode_blocks(data, count, 256, 56, "GGML IQ1_M weights are invalid", |bytes, index| {
-				let scale = (0..4).fold(0_u16, |scale, word| scale | (u16::from_le_bytes(bytes[48 + 2 * word..50 + 2 * word].try_into().unwrap()) >> 12 & 15) << (4 * word));
-				let (block, group) = (index / 16, index % 16 / 8);
-				let high = bytes[32 + block];
-				let grid = usize::from(bytes[2 * block + group]) | usize::from(high >> (4 * group) & 7) << 8;
-				let stored = u16::from_le_bytes(bytes[48 + 2 * (block / 4)..50 + 2 * (block / 4)].try_into().unwrap());
-				let delta = if high >> (3 + 4 * group) & 1 != 0 { -0.125 } else { 0.125 };
-				f64::from(unfp16(scale) * f32::from(2 * ((stored >> (3 * (block % 4))) & 7) + 1) * (f32::from(iq1_level(grid, index % 8)) - 1.0 + delta))
-			}),
-			(1, 3, 3) => decode_blocks(data, count, 256, 110, "GGML IQ3_S weights are invalid", |bytes, index| {
-				let (block, group) = (index / 32, index / 4);
-				let grid = usize::from(bytes[2 + group]) | usize::from(bytes[66 + group / 8] >> (group % 8) & 1) << 8;
-				let d = half(bytes) * f32::from(1 + 2 * (bytes[106 + block / 2] >> (block % 2 * 4) & 15));
-				let sign = if bytes[74 + index / 8] >> (index % 8) & 1 != 0 { -1.0 } else { 1.0 };
-				f64::from(d * f32::from(iq3_grid(&IQ3_S, grid, index % 4)) * sign)
-			}),
-			_ => Err(self.unavailable()),
-		}
+		self.spec().ok_or_else(|| self.unavailable())?.codec.dequantize(data, codebook, count)
 	}
 }
 pub struct Qi(pub Model, pub Model, QiSuffix);
