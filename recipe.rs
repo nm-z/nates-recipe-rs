@@ -1053,13 +1053,13 @@ pub(crate) struct NativeModelIr {
 	layout: NativeLayout,
 	precision: NativePrecision,
 	rows: usize,
-	tile: Tile,
+	schedule: NativeSchedule,
 	plans: Vec<NodePlan>,
 	storage_bytes: usize,
 }
 
 impl NativeModelIr {
-	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, tile: Tile) -> Result<Self> {
+	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule) -> Result<Self> {
 		require(rows != 0, "native model rows must be positive")?;
 		let layout = NativeLayout::for_graph(graph, rows, precision)?;
 		let precision = NativePrecision::new(precision)?;
@@ -1083,7 +1083,7 @@ impl NativeModelIr {
 			}
 			plans.push(NodePlan { node, value: layout.values[index], context: layout.contexts[index], adjoint: layout.adjoints[index], stored, storage_offset });
 		}
-		Ok(Self { graph: graph.clone(), layout, precision, rows, tile, plans, storage_bytes })
+		Ok(Self { graph: graph.clone(), layout, precision, rows, schedule, plans, storage_bytes })
 	}
 	fn storage(&self) -> Vec<u8> {
 		let mut storage = Vec::with_capacity(self.storage_bytes);
@@ -2347,11 +2347,15 @@ impl NativeModelIr {
 	}
 
 	pub(crate) fn emit(&self, backend: Backend, loss: LossFunction) -> Result<String> {
+		let register_count = self.schedule.register_m.checked_mul(self.schedule.register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
 		let mut ir = backend_template(backend, self.precision)?
 			.replace("i32 %tile.m, i32 %tile.n, i32 %tile.k, ", "")
-			.replace("%tile.m", &self.tile.m.to_string())
-			.replace("%tile.n", &self.tile.n.to_string())
-			.replace("%tile.k", &self.tile.k.to_string());
+			.replace("%tile.m", &self.schedule.tile.m.to_string())
+			.replace("%tile.n", &self.schedule.tile.n.to_string())
+			.replace("%tile.k", &self.schedule.tile.k.to_string())
+			.replace("RECIPE_REGISTER_M", &self.schedule.register_m.to_string())
+			.replace("RECIPE_REGISTER_N", &self.schedule.register_n.to_string())
+			.replace("RECIPE_REGISTER_COUNT", &register_count.to_string());
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let model_load = self.emit_model_load(backend)?;
 		for name in ["cached_attention_body"] {
@@ -2745,9 +2749,9 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 	}
 }
 
-pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: LossFunction, rows: usize, tile: Tile) -> Result<NativeArtifact> {
+pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: LossFunction, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
 	target.validate()?;
-	let model = NativeModelIr::from_graph(graph, rows, precision, tile)?;
+	let model = NativeModelIr::from_graph(graph, rows, precision, schedule)?;
 	let ir = model.emit(target.backend(), loss)?;
 	let key = native_artifact_key(target, &ir);
 	let directory = native_artifact_directory(&key)?;
@@ -5366,6 +5370,11 @@ struct Tile {
 	n: u32,
 	k: u32,
 }
+struct NativeSchedule {
+	tile: Tile,
+	register_m: u32,
+	register_n: u32,
+}
 impl Tile {
 	fn proposed(values: &mut [f64], minimum: Self, maximum: Self) -> Result<Self> {
 		require(values.len() >= 3, "RAT requires M, N, and K proposal outputs")?;
@@ -6161,8 +6170,7 @@ impl Gpu {
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: LossFunction) -> Result<NativeProgram> {
-		let shared_values = self.shared_limit / precision.bytes() as u32;
-		require(shared_values != 0, "native model has no shared memory for contraction")?;
+		let shared_values = if matches!(&self.driver, Driver::Cpu) { narrow(natural("CPU contraction shared values", env!("RECIPE_CONTRACTION_CPU_SHARED_VALUES"))?, "CPU contraction shared values")? as u32 } else { self.shared_limit / precision.bytes() as u32 };
 		let mut tile = Tile { m: 1, n: 1, k: 1 };
 		for node in &graph.nodes {
 			let span = match node.op {
@@ -6174,6 +6182,8 @@ impl Gpu {
 			tile.n = tile.n.max(narrow(node.output.channels, "native contraction N tile limit")? as u32);
 			tile.k = tile.k.max(narrow(checked_mul(node.input.channels, span, "native contraction terms")?, "native contraction K tile limit")? as u32);
 		}
+		let register_m = (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(tile.m);
+		let register_n = (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(tile.n);
 		let block = match &self.driver {
 			Driver::Cpu => 1,
 			#[cfg(amd)]
@@ -6181,12 +6191,15 @@ impl Gpu {
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => driver.wave,
 		};
-		tile.n = tile.n.min(block.isqrt().max(1));
-		tile.m = tile.m.min(block / tile.n);
+		let lane_n = tile.n.div_ceil(register_n).min(block.isqrt().max(1));
+		let lane_m = tile.m.div_ceil(register_m).min(block / lane_n);
+		tile.m = tile.m.min(lane_m.checked_mul(register_m).ok_or_else(|| RecipeError::new("native contraction M tile overflows"))?);
+		tile.n = tile.n.min(lane_n.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction N tile overflows"))?);
 		let shared_width = tile.m.checked_add(tile.n).ok_or_else(|| RecipeError::new("native contraction tile width overflows"))?;
 		tile.k = tile.k.min(shared_values / shared_width);
 		require(tile.m != 0 && tile.n != 0 && tile.k != 0, "native contraction tile does not fit the device")?;
-		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, tile)?;
+		let schedule = NativeSchedule { tile, register_m, register_n };
+		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule)?;
 		let program = NativeProgram::load(self, artifact, tile)?;
 		let fixed = program.forward.kernel.shared.max(program.epoch.kernel.shared).max(program.model_load.map_or(0, |dispatch| dispatch.kernel.shared));
 		let required = fixed.checked_add(shared_bytes(tile, precision.bytes() as u8)?).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;

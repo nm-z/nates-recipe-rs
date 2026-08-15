@@ -15,6 +15,9 @@ path = "cli.rs"
 
 [package.metadata.recipe]
 dependency-allowlist = []
+contraction-cpu-shared-values = 65536
+contraction-register-m = 4
+contraction-register-n = 1
 hsa-compiler = "/opt/rocm/lib/llvm/bin/clang"
 hsa-runtime = "libhsa-runtime64.so.1"
 hsa-device-library = "/opt/rocm/amdgcn/bitcode/ocml.bc"
