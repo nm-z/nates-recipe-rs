@@ -1888,7 +1888,7 @@ fn native_nvidia_compiler() -> Result<&'static str> {
 }
 
 fn native_amd_library(name: &'static str) -> Result<&'static str> {
-	option_env!("RECIPE_HSA_DEVICE_LIBRARY").filter(|_| name == "device").or(option_env!("RECIPE_HSA_CLOCK_LIBRARY").filter(|_| name == "clock")).or(option_env!("RECIPE_HSA_FINITE_LIBRARY").filter(|_| name == "finite")).or(option_env!("RECIPE_HSA_MATH_LIBRARY").filter(|_| name == "math")).ok_or_else(|| RecipeError::new(format!("AMD native {name} library is unavailable")))
+	option_env!("RECIPE_HSA_DEVICE_LIBRARY").filter(|_| name == "device").or(option_env!("RECIPE_HSA_CLOCK_LIBRARY").filter(|_| name == "clock")).or(option_env!("RECIPE_HSA_ABI_LIBRARY").filter(|_| name == "abi")).or(option_env!("RECIPE_HSA_FINITE_LIBRARY").filter(|_| name == "finite")).or(option_env!("RECIPE_HSA_MATH_LIBRARY").filter(|_| name == "math")).ok_or_else(|| RecipeError::new(format!("AMD native {name} library is unavailable")))
 }
 
 fn native_precision_layout(precision: Compute) -> &'static [u8] {
@@ -1913,7 +1913,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			let compiler = native_amd_compiler()?;
 			let mut command = Command::new(compiler);
 			command.args(["-target", "amdgcn-amd-amdhsa"]).arg(format!("-mcpu={architecture}")).args(["-O2", "-nogpulib"]);
-			for name in ["device", "clock", "finite", "math"] {
+			for name in ["device", "clock", "abi", "finite", "math"] {
 				command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", native_amd_library(name)?]);
 			}
 			let library_directory = option_env!("RECIPE_HSA_DEVICE_LIBRARY_DIRECTORY").ok_or_else(|| RecipeError::new("AMD native device library directory is unavailable"))?;
@@ -5126,8 +5126,22 @@ struct NativeHsaProgram {
 	executable: HsaExecutable,
 	kernarg: usize,
 	kernarg_size: usize,
+	grid_sync: usize,
 	free: unsafe extern "C" fn(Ptr) -> i32,
 }
+
+#[cfg(amd)]
+const HSA_IMPLICIT_ARGUMENT_ALIGNMENT: usize = 8;
+#[cfg(amd)]
+const HSA_IMPLICIT_ARGUMENT_BYTES: usize = 256;
+#[cfg(amd)]
+const HSA_MULTIGRID_SYNC_POINTER_OFFSET: usize = 88;
+#[cfg(amd)]
+const HSA_GRID_SYNC_ALIGNMENT: usize = 8;
+#[cfg(amd)]
+const HSA_GRID_SYNC_BYTES: usize = 48;
+#[cfg(amd)]
+const HSA_GRID_SYNC_GROUPS_OFFSET: usize = 40;
 
 #[cfg(nvidia)]
 struct NativeCudaProgram {
@@ -5204,12 +5218,6 @@ impl Kernel {
 			layout,
 		}
 	}
-}
-fn argument_layout_size(layout: &[u8]) -> usize {
-	layout.iter().fold(0, |offset, kind| {
-		let bytes = usize::from(*kind - b'0');
-		offset.next_multiple_of(bytes) + bytes
-	})
 }
 #[cfg(nvidia)]
 struct Cuda {
@@ -5641,11 +5649,13 @@ impl Hsa {
 		let forward = self.native_dispatch(executable.handle, artifact, NATIVE_FORWARD_SYMBOL, NATIVE_FORWARD_LAYOUT)?;
 		let epoch = self.native_dispatch(executable.handle, artifact, NATIVE_EPOCH_SYMBOL, native_precision_layout(artifact.precision))?;
 		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(executable.handle, artifact, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
-		let kernarg_size = [Some(NATIVE_FORWARD_LAYOUT), Some(native_precision_layout(artifact.precision)), (!artifact.storage.is_empty()).then_some(NATIVE_MODEL_LOAD_LAYOUT)].into_iter().flatten().map(argument_layout_size).max().ok_or_else(|| RecipeError::new("native AMD KERNARG layouts are absent"))?;
+		let kernarg_size = [forward.kernel.kernarg, epoch.kernel.kernarg, model_load.map_or(0, |dispatch| dispatch.kernel.kernarg)].into_iter().max().ok_or_else(|| RecipeError::new("native AMD KERNARG layouts are absent"))?;
+		let grid_sync = kernarg_size.next_multiple_of(HSA_GRID_SYNC_ALIGNMENT);
+		let allocation_size = grid_sync.checked_add(HSA_GRID_SYNC_BYTES).ok_or_else(|| RecipeError::new("native AMD KERNARG allocation overflows"))?;
 		let mut kernarg = ptr::null_mut();
-		driver_status(Backend::Amd, (self.allocate)(self.kernarg_pool, kernarg_size, 0, &mut kernarg), "native KERNARG allocation")?;
+		driver_status(Backend::Amd, (self.allocate)(self.kernarg_pool, allocation_size, 0, &mut kernarg), "native KERNARG allocation")?;
 		driver_status(Backend::Amd, (self.allow)(1, &self.agent, ptr::null(), kernarg), "native GPU KERNARG access")?;
-		Ok((NativeHsaProgram { executable, kernarg: kernarg as usize, kernarg_size, free: self.free }, forward, epoch, model_load))
+		Ok((NativeHsaProgram { executable, kernarg: kernarg as usize, kernarg_size, grid_sync: kernarg.add(grid_sync) as usize, free: self.free }, forward, epoch, model_load))
 		}
 	}
 
@@ -5830,7 +5840,13 @@ impl NativeProgram {
 						ptr::copy_nonoverlapping((*argument).cast::<u8>(), kernarg.cast::<u8>().add(offset), bytes);
 						offset += bytes;
 					}
-					require(offset <= dispatch.kernel.kernarg && dispatch.kernel.kernarg <= program.kernarg_size, "native HSA KERNARG layout is invalid")?;
+					let implicit = offset.next_multiple_of(HSA_IMPLICIT_ARGUMENT_ALIGNMENT);
+					require(dispatch.kernel.kernarg == implicit + HSA_IMPLICIT_ARGUMENT_BYTES && dispatch.kernel.kernarg <= program.kernarg_size, "native HSA KERNARG layout is invalid")?;
+					let groups = threads.checked_div(block).filter(|groups| groups.saturating_mul(block) == threads && *groups <= u32::from(u16::MAX)).ok_or_else(|| RecipeError::new("native AMD grid size is invalid"))?;
+					let grid_sync = program.grid_sync as Ptr;
+					ptr::write_bytes(grid_sync.cast::<u8>(), 0, HSA_GRID_SYNC_BYTES);
+					grid_sync.cast::<u8>().add(HSA_GRID_SYNC_GROUPS_OFFSET).cast::<u32>().write(groups);
+					kernarg.cast::<u8>().add(implicit + HSA_MULTIGRID_SYNC_POINTER_OFFSET).cast::<u64>().write(program.grid_sync as u64);
 					(driver.store)(driver.signal, 1);
 					let queue = &mut *(driver.queue as *mut HsaQueue);
 					let index = (driver.write)(queue, 1);

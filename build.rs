@@ -110,17 +110,21 @@ impl IntFormat {
 	fn pack(self, value: f64) -> u64 { (value.round_ties_even() as i64).clamp(-(1i64 << (self.bits - 1)), (1i64 << (self.bits - 1)) - 1) as u64 & ((1u64 << self.bits) - 1) }
 }
 type BuildResult<T> = Result<T, Box<dyn Error>>;
-const PARALLEL: &str = r#"@grid.count = internal addrspace(1) global i32 0, align 4
-@grid.phase = internal addrspace(1) global i32 0, align 4
-declare i32 @llvm.amdgcn.workgroup.id.x()
+const PARALLEL: &str = r#"declare i32 @llvm.amdgcn.workgroup.id.x()
 declare i32 @recipe.workgroup.size.x()
 define internal i32 @global_id() #1 { entry:
 %lane = call i32 @llvm.amdgcn.workitem.id.x() %group = call i32 @llvm.amdgcn.workgroup.id.x()
 %width = call i32 @recipe.workgroup.size.x() %base = mul i32 %group, %width %id = add i32 %base, %lane ret i32 %id }
-define internal void @grid_barrier(i32 %threads) #1 { entry: call void @llvm.amdgcn.s.barrier()
-%lane = call i32 @llvm.amdgcn.workitem.id.x() %leader = icmp eq i32 %lane, 0
-br i1 %leader, label %arrive, label %joined arrive: %width = call i32 @recipe.workgroup.size.x()
-%groups = udiv i32 %threads, %width %phase = load atomic i32, ptr addrspace(1) @grid.phase acquire, align 4
+@RECIPE_GRID_BARRIER@"#;
+const AMD_GRID_BARRIER: &str = r#"declare void @__ockl_grid_sync()
+define internal void @grid_barrier(i32 %threads) #1 { entry: call void @__ockl_grid_sync() ret void }"#;
+const NVIDIA_GRID_BARRIER: &str = r#"@grid.count = internal addrspace(1) global i32 0, align 4
+@grid.phase = internal addrspace(1) global i32 0, align 4
+define internal void @grid_barrier(i32 %threads) #1 { entry:
+call void @llvm.amdgcn.s.barrier() %lane = call i32 @llvm.amdgcn.workitem.id.x()
+%leader = icmp eq i32 %lane, 0 br i1 %leader, label %arrive, label %joined arrive:
+%width = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %width
+%phase = load atomic i32, ptr addrspace(1) @grid.phase acquire, align 4
 %prior = atomicrmw add ptr addrspace(1) @grid.count, i32 1 acq_rel %limit = sub i32 %groups, 1
 %last = icmp eq i32 %prior, %limit br i1 %last, label %release, label %wait release:
 store atomic i32 0, ptr addrspace(1) @grid.count release, align 4 %next = xor i32 %phase, 1
@@ -131,10 +135,10 @@ const AMD_WIDTH: &str = r#"declare ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
 define internal i32 @recipe.workgroup.size.x() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
 %address = getelementptr i8, ptr addrspace(4) %args, i32 4 %value = load i16, ptr addrspace(4) %address, align 2
 %width = zext i16 %value to i32 ret i32 %width }"#;
-fn parallel_ir(ir: String, width: &str) -> String {
+fn parallel_ir(ir: String, width: &str, grid_barrier: &str) -> String {
 	let mut ir = ir.replace("call i32 @llvm.amdgcn.workitem.id.x()", "call i32 @global_id()").replace("call void @llvm.amdgcn.s.barrier()", "call void @grid_barrier(i32 %threads)");
 	let target = ir.find("target triple").and_then(|start| ir[start..].find('\n').map(|end| start + end + 1)).expect("kernel target triple is absent");
-	ir.insert_str(target, &format!("{}\n", PARALLEL.replace("declare i32 @recipe.workgroup.size.x()", width)));
+	ir.insert_str(target, &format!("{}\n", PARALLEL.replace("declare i32 @recipe.workgroup.size.x()", width).replace("@RECIPE_GRID_BARRIER@", grid_barrier)));
 	ir.replace("recipe.local.id.x", "llvm.amdgcn.workitem.id.x").replace("recipe.group.id.x", "llvm.amdgcn.workgroup.id.x").replace("recipe.local.barrier", "llvm.amdgcn.s.barrier")
 }
 fn word(text: String, from: &str, to: &str) -> String {
@@ -357,7 +361,7 @@ fn number<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> { setting(manifest, key)?.strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| io::Error::other(format!("{key} must be quoted")).into()) }
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[("@contraction_tile = external addrspace(3) global [0 x double], align 8", "@contraction_tile = internal global [65536 x double] zeroinitializer, align 8"), (" addrspace(3)", ""), ("call i32 @llvm.amdgcn.workitem.id.x()", "add i32 0, 0"), ("call i32 @recipe.local.id.x()", "add i32 0, 0"), ("call i32 @recipe.group.id.x()", "add i32 0, 0"), ("call i32 @recipe.workgroup.size.x()", "add i32 1, 0"), ("call void @llvm.amdgcn.s.barrier()", ""), ("call void @recipe.local.barrier()", ""), ("declare i32 @llvm.amdgcn.workitem.id.x()", ""), ("declare void @llvm.amdgcn.s.barrier()", ""), ("declare i64 @__ockl_steadyctr_u64()", ""), ("__ocml_exp_f64", "exp"), ("__ocml_tanh_f64", "tanh"), ("__ocml_cos_f64", "cos"), ("__ocml_sin_f64", "sin"), ("__ocml_log_f64", "log"), ("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"1,1024\" }", "attributes #0 = { nounwind }")];
 fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
-	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, AMD_WIDTH);
+	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, AMD_WIDTH, AMD_GRID_BARRIER);
 	let sources = [
 		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
 		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
@@ -378,13 +382,13 @@ fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	}
 	println!("cargo:rustc-env=RECIPE_AMD_IR={}", values.join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_HSA_COMPILER={}", text(manifest, "hsa-compiler")?);
-	for (key, environment) in [("hsa-device-library", "RECIPE_HSA_DEVICE_LIBRARY"), ("hsa-clock-library", "RECIPE_HSA_CLOCK_LIBRARY"), ("hsa-finite-library", "RECIPE_HSA_FINITE_LIBRARY"), ("hsa-math-library", "RECIPE_HSA_MATH_LIBRARY"), ("hsa-device-library-directory", "RECIPE_HSA_DEVICE_LIBRARY_DIRECTORY")] {
+	for (key, environment) in [("hsa-device-library", "RECIPE_HSA_DEVICE_LIBRARY"), ("hsa-clock-library", "RECIPE_HSA_CLOCK_LIBRARY"), ("hsa-abi-library", "RECIPE_HSA_ABI_LIBRARY"), ("hsa-finite-library", "RECIPE_HSA_FINITE_LIBRARY"), ("hsa-math-library", "RECIPE_HSA_MATH_LIBRARY"), ("hsa-device-library-directory", "RECIPE_HSA_DEVICE_LIBRARY_DIRECTORY")] {
 		println!("cargo:rustc-env={environment}={}", text(manifest, key)?);
 	}
 	Ok(())
 }
 fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
-	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, "declare i32 @recipe.workgroup.size.x()").replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda").replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x").replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x").replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x").replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0").replace("__ocml_exp_f64", "__nv_exp").replace("__ocml_tanh_f64", "__nv_tanh").replace("__ocml_cos_f64", "__nv_cos").replace("__ocml_sin_f64", "__nv_sin").replace("__ocml_log_f64", "__nv_log").replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"1,1024\" }", "attributes #0 = { nounwind }");
+	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER).replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda").replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x").replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x").replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x").replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0").replace("__ocml_exp_f64", "__nv_exp").replace("__ocml_tanh_f64", "__nv_tanh").replace("__ocml_cos_f64", "__nv_cos").replace("__ocml_sin_f64", "__nv_sin").replace("__ocml_log_f64", "__nv_log").replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"1,1024\" }", "attributes #0 = { nounwind }");
 	let sources = [
 		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
 		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
