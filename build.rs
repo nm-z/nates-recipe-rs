@@ -363,7 +363,8 @@ fn number<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 }
 fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> { setting(manifest, key)?.strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| io::Error::other(format!("{key} must be quoted")).into()) }
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[("@contraction_tile = external addrspace(3) global [0 x double], align 8", "@contraction_tile = internal global [RECIPE_CONTRACTION_CPU_SHARED_VALUES x double] zeroinitializer, align 8"), (" addrspace(3)", ""), ("call i32 @llvm.amdgcn.workitem.id.x()", "add i32 0, 0"), ("call i32 @recipe.local.id.x()", "add i32 0, 0"), ("call i32 @recipe.group.id.x()", "add i32 0, 0"), ("call i32 @recipe.workgroup.size.x()", "add i32 1, 0"), ("call void @llvm.amdgcn.s.barrier()", ""), ("call void @recipe.local.barrier()", ""), ("declare i32 @llvm.amdgcn.workitem.id.x()", ""), ("declare void @llvm.amdgcn.s.barrier()", ""), ("declare i64 @__ockl_steadyctr_u64()", ""), ("__ocml_exp_f64", "exp"), ("__ocml_tanh_f64", "tanh"), ("__ocml_cos_f64", "cos"), ("__ocml_sin_f64", "sin"), ("__ocml_log_f64", "log"), ("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"1,1024\" }", "attributes #0 = { nounwind }")];
-fn precision_sources(ir: String) -> BuildResult<[(&'static str, String); 10]> {
+fn precision_sources(ir: String, swizzle_m: u32) -> BuildResult<[(&'static str, String); 10]> {
+	let ir = ir.replace("RECIPE_CONTRACTION_SWIZZLE_M", &swizzle_m.to_string());
 	Ok([
 		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
 		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
@@ -377,11 +378,10 @@ fn precision_sources(ir: String) -> BuildResult<[(&'static str, String); 10]> {
 		("-f", custom_ir(ir, "_f")?),
 	])
 }
-fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+fn compile_amd(manifest: &str, out: &PathBuf, swizzle_m: u32) -> BuildResult<()> {
 	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, AMD_WIDTH, AMD_GRID_BARRIER);
-	let sources = precision_sources(ir)?;
 	let mut values = Vec::new();
-	for (suffix, contents) in sources {
+	for (suffix, contents) in precision_sources(ir, swizzle_m)? {
 		let path = out.join(format!("recipe-amd{suffix}.ll"));
 		fs::write(&path, contents)?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
@@ -393,11 +393,10 @@ fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	}
 	Ok(())
 }
-fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+fn compile_nvidia(manifest: &str, out: &PathBuf, swizzle_m: u32) -> BuildResult<()> {
 	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER).replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda").replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x").replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x").replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x").replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0").replace("__ocml_exp_f64", "__nv_exp").replace("__ocml_tanh_f64", "__nv_tanh").replace("__ocml_cos_f64", "__nv_cos").replace("__ocml_sin_f64", "__nv_sin").replace("__ocml_log_f64", "__nv_log").replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"1,1024\" }", "attributes #0 = { nounwind }");
-	let sources = precision_sources(ir)?;
 	let mut values = Vec::new();
-	for (suffix, contents) in sources {
+	for (suffix, contents) in precision_sources(ir, swizzle_m)? {
 		let path = out.join(format!("recipe-nvidia{suffix}.ll"));
 		fs::write(&path, contents)?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
@@ -411,16 +410,15 @@ fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	println!("cargo:rustc-env=RECIPE_NV_PTX_ASSEMBLER={}", cuda.map_or_else(|| "ptxas".to_owned(), |path| path.join("bin/ptxas").display().to_string()));
 	Ok(())
 }
-fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+fn compile_cpu(manifest: &str, out: &PathBuf, swizzle_m: u32) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
 	let mut ir = fs::read_to_string("amd-nv-cpu.ll")?.replace("amdgcn-amd-amdhsa", &target);
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
 	let clang = ["nvidia-compiler", "hsa-compiler"].iter().filter_map(|key| text(manifest, key).ok()).find(|path| Path::new(path).exists()).unwrap_or("clang");
-	let sources = precision_sources(ir)?;
 	let mut values = Vec::new();
-	for (suffix, contents) in sources {
+	for (suffix, contents) in precision_sources(ir, swizzle_m)? {
 		let contents = contents.replace(" addrspace(1)", "").replace(" addrspace(3)", "").replace(", addrspace(5)", "").replace(" addrspace(5)", "").replace("RECIPE_CONTRACTION_CPU_SHARED_VALUES", number(manifest, "contraction-cpu-shared-values")?);
 		let path = out.join(format!("recipe-cpu{suffix}.ll"));
 		fs::write(&path, contents)?;
@@ -433,6 +431,7 @@ fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 }
 fn main() -> BuildResult<()> {
 	let manifest = fs::read_to_string("Cargo.toml")?;
+	let swizzle_m = setting(&manifest, "contraction-swizzle-m-tiles")?.parse::<u32>().ok().filter(|value| *value != 0).ok_or_else(|| io::Error::other("contraction-swizzle-m-tiles must be a positive integer"))?;
 	for (key, environment) in [("epochs", "RECIPE_TRAIN_EPOCHS"), ("learning-rate", "RECIPE_TRAIN_LEARNING_RATE"), ("initial-weight", "RECIPE_TRAIN_INITIAL_WEIGHT"), ("adamw-beta1", "RECIPE_ADAMW_BETA1"), ("adamw-beta2", "RECIPE_ADAMW_BETA2"), ("adamw-epsilon", "RECIPE_ADAMW_EPSILON"), ("adamw-weight-decay", "RECIPE_ADAMW_WEIGHT_DECAY"), ("kmeans-iterations", "RECIPE_KMEANS_ITERATIONS"), ("svm-iterations", "RECIPE_SVM_ITERATIONS"), ("svm-learning-rate", "RECIPE_SVM_LEARNING_RATE"), ("svm-regularization", "RECIPE_SVM_REGULARIZATION"), ("svm-epsilon", "RECIPE_SVM_EPSILON"), ("tree-depth", "RECIPE_TREE_DEPTH"), ("tree-min-rows", "RECIPE_TREE_MIN_ROWS"), ("forest-feature-fraction", "RECIPE_FOREST_FEATURE_FRACTION"), ("bayes-prior-precision", "RECIPE_BAYES_PRIOR_PRECISION"), ("bayes-noise-variance", "RECIPE_BAYES_NOISE_VARIANCE"), ("bayes-variance-epsilon", "RECIPE_BAYES_VARIANCE_EPSILON"), ("boost-iterations", "RECIPE_BOOST_ITERATIONS"), ("boost-learning-rate", "RECIPE_BOOST_LEARNING_RATE"), ("catboost-ordered-prior", "RECIPE_CATBOOST_ORDERED_PRIOR"), ("xgboost-l2-regularization", "RECIPE_XGBOOST_L2_REGULARIZATION"), ("xgboost-minimum-gain", "RECIPE_XGBOOST_MINIMUM_GAIN"), ("lightgbm-histogram-bins", "RECIPE_LIGHTGBM_HISTOGRAM_BINS"), ("lightgbm-leaves", "RECIPE_LIGHTGBM_LEAVES"), ("quantization-block-weights", "RECIPE_QUANTIZATION_BLOCK_WEIGHTS"), ("surrogate-epochs", "RECIPE_SURROGATE_EPOCHS"), ("surrogate-rate", "RECIPE_SURROGATE_RATE"), ("surrogate-width", "RECIPE_SURROGATE_WIDTH"), ("rat-batch-rows", "RECIPE_RAT_BATCH_ROWS"), ("random-seed", "RECIPE_RANDOM_SEED"), ("progress-refresh-hz", "RECIPE_PROGRESS_REFRESH_HZ"), ("normalization-epsilon", "RECIPE_NORMALIZATION_EPSILON"), ("categorical-ratio", "RECIPE_CATEGORICAL_RATIO"), ("leak-slope", "RECIPE_LEAK_SLOPE"), ("prelu-slope", "RECIPE_PRELU_SLOPE"), ("elu-alpha", "RECIPE_ELU_ALPHA"), ("selu-alpha", "RECIPE_SELU_ALPHA"), ("selu-scale", "RECIPE_SELU_SCALE"), ("gelu-scale", "RECIPE_GELU_SCALE"), ("gelu-cubic", "RECIPE_GELU_CUBIC"), ("huber-threshold", "RECIPE_HUBER_THRESHOLD"), ("output-tolerance", "RECIPE_OUTPUT_TOLERANCE"), ("gradient-tolerance", "RECIPE_GRADIENT_TOLERANCE"), ("backend-tolerance", "RECIPE_BACKEND_TOLERANCE"), ("contraction-cpu-shared-values", "RECIPE_CONTRACTION_CPU_SHARED_VALUES"), ("contraction-register-m", "RECIPE_CONTRACTION_REGISTER_M"), ("contraction-register-n", "RECIPE_CONTRACTION_REGISTER_N")] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
@@ -443,18 +442,18 @@ fn main() -> BuildResult<()> {
 	println!("cargo::rustc-check-cfg=cfg(amd)");
 	println!("cargo::rustc-check-cfg=cfg(nvidia)");
 	let toolchain = |compiler: &str, library: &str| -> BuildResult<bool> { Ok(Path::new(text(&manifest, compiler)?).exists() && Path::new(text(&manifest, library)?).exists()) };
-	compile_cpu(&manifest, &out)?;
+	compile_cpu(&manifest, &out, swizzle_m)?;
 	// GPU driver stubs and library search paths are host-arch: cross-compiled builds are CPU-only.
 	let native = env::var("TARGET")? == env::var("HOST")?;
 	let amd = native && toolchain("hsa-compiler", "hsa-device-library")?;
 	let nvidia = native && (toolchain("nvidia-compiler", "nvidia-device-library")? || env::var_os("CUDA_PATH").is_some());
 	if amd {
 		println!("cargo:rustc-cfg=amd");
-		compile_amd(&manifest, &out)?;
+		compile_amd(&manifest, &out, swizzle_m)?;
 	}
 	if nvidia {
 		println!("cargo:rustc-cfg=nvidia");
-		compile_nvidia(&manifest, &out)?;
+		compile_nvidia(&manifest, &out, swizzle_m)?;
 	}
 	println!("cargo:rerun-if-changed=Cargo.toml");
 	println!("cargo:rerun-if-changed=amd-nv-cpu.ll");
