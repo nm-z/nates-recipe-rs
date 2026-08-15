@@ -891,7 +891,6 @@ pub(crate) struct NativeArtifact {
 	pub(crate) artifact: Vec<u8>,
 	pub(crate) path: PathBuf,
 	pub(crate) storage: Vec<u8>,
-	pub(crate) codebook: Vec<f64>,
 	pub(crate) forward_layout: &'static [u8],
 	pub(crate) epoch_layout: &'static [u8],
 	pub(crate) model_load_layout: &'static [u8],
@@ -903,7 +902,7 @@ const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"8888888888884444488888884";
 const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"8888888888884444444444444";
 const NATIVE_EPOCH_LAYOUT_FP16: &[u8] = b"8888888888884444422222224";
 const NATIVE_EPOCH_LAYOUT_FP8: &[u8] = b"8888888888884444411111114";
-const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"8884";
+const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"884";
 
 fn align(value: usize, boundary: usize) -> Result<usize> {
 	let boundary = boundary.max(1);
@@ -949,7 +948,6 @@ pub(crate) struct NativeModelIr {
 	rows: usize,
 	plans: Vec<NodePlan>,
 	storage_bytes: usize,
-	codebook_values: usize,
 }
 
 impl NativeModelIr {
@@ -958,7 +956,6 @@ impl NativeModelIr {
 		let layout = NativeLayout::for_graph(graph, rows, precision)?;
 		let mut plans = Vec::with_capacity(graph.nodes.len());
 		let mut storage_bytes = 0usize;
-		let mut codebook_values = 0usize;
 		for (index, node) in graph.nodes.iter().cloned().enumerate() {
 			let id = || node.identity(index);
 			require(node.source >= -1 && node.source < index as i32, format!("{} has invalid source node {}", id(), node.source))?;
@@ -974,22 +971,19 @@ impl NativeModelIr {
 			let storage_offset = storage_bytes;
 			if let Some(weight) = &stored {
 				storage_bytes = checked_add(storage_bytes, weight.bytes.len(), "native storage arena")?;
-				codebook_values = checked_add(codebook_values, weight.codebook.len(), "native codebook arena")?;
 			}
 			plans.push(NodePlan { node, value: layout.values[index], context: layout.contexts[index], adjoint: layout.adjoints[index], stored, storage_offset });
 		}
-		Ok(Self { graph: graph.clone(), layout, precision, rows, plans, storage_bytes, codebook_values })
+		Ok(Self { graph: graph.clone(), layout, precision, rows, plans, storage_bytes })
 	}
-	fn arenas(&self) -> (Vec<u8>, Vec<f64>) {
+	fn storage(&self) -> Vec<u8> {
 		let mut storage = Vec::with_capacity(self.storage_bytes);
-		let mut codebook = Vec::with_capacity(self.codebook_values);
 		for plan in &self.plans {
 			if let Some(weight) = &plan.stored {
 				storage.extend_from_slice(&weight.bytes);
-				codebook.extend_from_slice(&weight.codebook);
 			}
 		}
-		(storage, codebook)
+		storage
 	}
 }
 
@@ -1470,10 +1464,14 @@ impl NativeModelIr {
 		Ok(ModelPointers { source, second, value, context, delta, weights, source_adjoint, second_adjoint })
 	}
 
-	fn emit_iq1_definition(&self, backend: Backend, codec: StorageCodec) -> Result<String> {
+	fn emit_iq_definition(&self, backend: Backend, codec: StorageCodec) -> Result<String> {
 		let (pointer, ty) = (pointer_type(backend), value_type(self.precision));
-		let name = match codec { StorageCodec::IQ1S => "iq1s", StorageCodec::IQ1M => "iq1m", _ => return Err(RecipeError::new(format!("native IQ1 decoder is unavailable for {codec:?}"))) };
+		let name = match codec { StorageCodec::IQ1S => "iq1s", StorageCodec::IQ1M => "iq1m", StorageCodec::IQ2S => "iq2s", _ => return Err(RecipeError::new(format!("native IQ decoder is unavailable for {codec:?}"))) };
 		let mut ir = format!("define internal {ty} @recipe_model_quantized_{name}({pointer} %matrix, i32 %row, i32 %column, i32 %columns) #1 {{\nentry:\n");
+		if codec == StorageCodec::IQ2S {
+			ir.push_str(&format!("%blocks = udiv i32 %columns, 256\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, 256\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, 82\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local = urem i32 %column, 256\n%value.block = udiv i32 %local, 16\n%slot = udiv i32 %local, 8\n%grid.low.offset = add i32 2, %slot\n%grid.low.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.low.offset\n%grid.low.byte = load i8, {pointer} %grid.low.ptr, align 1\n%grid.low = zext i8 %grid.low.byte to i32\n%grid.high.slot = udiv i32 %slot, 4\n%grid.high.offset = add i32 66, %grid.high.slot\n%grid.high.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.high.offset\n%grid.high.byte = load i8, {pointer} %grid.high.ptr, align 1\n%grid.high.raw = zext i8 %grid.high.byte to i32\n%grid.shift.slot = urem i32 %slot, 4\n%grid.shift = mul i32 %grid.shift.slot, 2\n%grid.high.shifted = lshr i32 %grid.high.raw, %grid.shift\n%grid.high = and i32 %grid.high.shifted, 3\n%grid.high.bits = shl i32 %grid.high, 8\n%grid = or i32 %grid.low, %grid.high.bits\n%table.ptr = getelementptr inbounds [1024 x i16], ptr @recipe_model_iq2s, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane = urem i32 %local, 8\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.code = and i32 %level.shifted, 3\n%level.twice = shl i32 %level.code, 1\n%level.raw = add i32 %level.twice, 1\n%level = call {ty} @recipe.from.u32(i32 %level.raw)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 0\n%scale.half = load half, {pointer} %scale.ptr, align 2\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%factor.block = udiv i32 %value.block, 2\n%factor.offset = add i32 74, %factor.block\n%factor.ptr = getelementptr inbounds i8, {pointer} %block, i32 %factor.offset\n%factor.byte = load i8, {pointer} %factor.ptr, align 1\n%factor.raw = zext i8 %factor.byte to i32\n%factor.slot = urem i32 %value.block, 2\n%factor.shift = mul i32 %factor.slot, 4\n%factor.shifted = lshr i32 %factor.raw, %factor.shift\n%factor.code = and i32 %factor.shifted, 15\n%factor.integer = call {ty} @recipe.from.u32(i32 %factor.code)\n%factor = call {ty} @recipe.add({ty} %factor.integer, {ty} {half})\n%scaled.base = call {ty} @recipe.mul({ty} %scale, {ty} %factor)\n%scaled = call {ty} @recipe.mul({ty} %scaled.base, {ty} {quarter})\n%unsigned = call {ty} @recipe.mul({ty} %scaled, {ty} %level)\n%negative = call {ty} @recipe.neg({ty} %unsigned)\n%sign.offset = add i32 34, %slot\n%sign.ptr = getelementptr inbounds i8, {pointer} %block, i32 %sign.offset\n%sign.byte = load i8, {pointer} %sign.ptr, align 1\n%sign.raw = zext i8 %sign.byte to i32\n%sign.shifted = lshr i32 %sign.raw, %lane\n%sign.bit = and i32 %sign.shifted, 1\n%sign.set = icmp ne i32 %sign.bit, 0\n%result = select i1 %sign.set, {ty} %negative, {ty} %unsigned\nret {ty} %result\n}}\n", half = native_literal(self.precision, ty, 0.5), quarter = native_literal(self.precision, ty, 0.25)));
+			return Ok(ir)
+		}
 		if codec == StorageCodec::IQ1M {
 			ir.push_str(&format!("%blocks = udiv i32 %columns, 256\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, 256\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, 56\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local = urem i32 %column, 256\n%value.block = udiv i32 %local, 16\n%group.local = urem i32 %local, 16\n%group = udiv i32 %group.local, 8\n%high.offset = add i32 32, %value.block\n%high.ptr = getelementptr inbounds i8, {pointer} %block, i32 %high.offset\n%high.byte = load i8, {pointer} %high.ptr, align 1\n%high.raw = zext i8 %high.byte to i32\n%grid.block = mul i32 %value.block, 2\n%grid.offset = add i32 %grid.block, %group\n%grid.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.offset\n%grid.byte = load i8, {pointer} %grid.ptr, align 1\n%grid.raw = zext i8 %grid.byte to i32\n%group.shift = mul i32 %group, 4\n%high.shifted = lshr i32 %high.raw, %group.shift\n%high.grid = and i32 %high.shifted, 7\n%high.grid.shifted = shl i32 %high.grid, 8\n%grid = or i32 %grid.raw, %high.grid.shifted\n%table.ptr = getelementptr inbounds [2048 x i16], ptr @recipe_model_iq1, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane = urem i32 %local, 8\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.raw = and i32 %level.shifted, 3\n%level.offset = sub i32 %level.raw, 1\n%delta.shift = add i32 %group.shift, 3\n%delta.shifted = lshr i32 %high.raw, %delta.shift\n%delta.bit = and i32 %delta.shifted, 1\n%delta.zero = icmp eq i32 %delta.bit, 0\n%delta = select i1 %delta.zero, {ty} {positive_delta}, {ty} {negative_delta}\n%level = call {ty} @recipe.from.s32(i32 %level.offset)\n%level.delta = call {ty} @recipe.add({ty} %level, {ty} %delta)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 48\n%scale.packed = load i64, {pointer} %scale.ptr, align 2\n%scale.s0.shifted = lshr i64 %scale.packed, 12\n%scale.s0 = and i64 %scale.s0.shifted, 15\n%scale.s1.shifted = lshr i64 %scale.packed, 24\n%scale.s1 = and i64 %scale.s1.shifted, 240\n%scale.s01 = or i64 %scale.s0, %scale.s1\n%scale.s2.shifted = lshr i64 %scale.packed, 36\n%scale.s2 = and i64 %scale.s2.shifted, 3840\n%scale.s012 = or i64 %scale.s01, %scale.s2\n%scale.s3.shifted = lshr i64 %scale.packed, 48\n%scale.s3 = and i64 %scale.s3.shifted, 61440\n%scale.raw = or i64 %scale.s012, %scale.s3\n%scale.bits = trunc i64 %scale.raw to i16\n%scale.half = bitcast i16 %scale.bits to half\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%scale.word = udiv i32 %value.block, 4\n%scale.word.shift = mul i32 %scale.word, 16\n%scale.code.local = urem i32 %value.block, 4\n%scale.code.shift = mul i32 %scale.code.local, 3\n%scale.shift = add i32 %scale.word.shift, %scale.code.shift\n%scale.shift64 = zext i32 %scale.shift to i64\n%scale.code.shifted = lshr i64 %scale.packed, %scale.shift64\n%scale.code64 = and i64 %scale.code.shifted, 7\n%scale.code = trunc i64 %scale.code64 to i32\n%scale.twice = shl i32 %scale.code, 1\n%scale.one = add i32 %scale.twice, 1\n%scale.factor = call {ty} @recipe.from.u32(i32 %scale.one)\n%scaled = call {ty} @recipe.mul({ty} %scale, {ty} %scale.factor)\n%result = call {ty} @recipe.mul({ty} %scaled, {ty} %level.delta)\nret {ty} %result\n}}\n", positive_delta = native_literal(self.precision, ty, 0.125), negative_delta = native_literal(self.precision, ty, -0.125)));
 			return Ok(ir)
@@ -1505,11 +1503,13 @@ impl NativeModelIr {
 			let Some(stored) = &plan.stored else { continue };
 			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
 			if seen.iter().any(|codec: &StorageCodec| *codec == spec.codec) { continue }
-			if matches!(spec.codec, StorageCodec::IQ1S | StorageCodec::IQ1M) {
-				if !seen.iter().any(|codec| matches!(codec, StorageCodec::IQ1S | StorageCodec::IQ1M)) {
+			if matches!(spec.codec, StorageCodec::IQ1S | StorageCodec::IQ1M | StorageCodec::IQ2S) {
+				if spec.codec == StorageCodec::IQ2S {
+					emitted.push_str(&format!("@recipe_model_iq2s = private unnamed_addr constant [1024 x i16] [{}]\n", IQ2_S.iter().map(|value| format!("i16 {value}")).collect::<Vec<_>>().join(", ")));
+				} else if !seen.iter().any(|codec| matches!(codec, StorageCodec::IQ1S | StorageCodec::IQ1M)) {
 					emitted.push_str(&format!("@recipe_model_iq1 = private unnamed_addr constant [2048 x i16] [{}]\n", IQ1.iter().map(|value| format!("i16 {value}")).collect::<Vec<_>>().join(", ")));
 				}
-				emitted.push_str(&self.emit_iq1_definition(backend, spec.codec)?);
+				emitted.push_str(&self.emit_iq_definition(backend, spec.codec)?);
 			} else {
 				emitted.push_str(&Self::emit_quantized_definition(template, spec.codec)?);
 			}
@@ -1531,7 +1531,7 @@ impl NativeModelIr {
 			Backend::Amd => "protected amdgpu_kernel ",
 			Backend::Nvidia => "protected ptx_kernel ",
 		};
-		let mut ir = format!("define {kernel}void @recipe_model_load({pointer} %weights, {pointer} %storage, {pointer} %codebook, i32 %threads) #0 {{\nentry:\n%tid = {thread}\n", kernel = kernel, pointer = pointer, thread = thread);
+		let mut ir = format!("define {kernel}void @recipe_model_load({pointer} %weights, {pointer} %storage, i32 %threads) #0 {{\nentry:\n%tid = {thread}\n", kernel = kernel, pointer = pointer, thread = thread);
 		let mut predecessor = "entry".to_owned();
 		for (index, plan) in self.plans.iter().enumerate() {
 			let Some(stored) = &plan.stored else { continue };
@@ -1541,6 +1541,7 @@ impl NativeModelIr {
 				StorageCodec::Q6K => "q6k",
 				StorageCodec::IQ1S => "iq1s",
 				StorageCodec::IQ1M => "iq1m",
+				StorageCodec::IQ2S => "iq2s",
 				_ => return Err(RecipeError::new(format!("native quantized decoder is unavailable for node {index} format {:?}", spec.codec))),
 			};
 			let count = i32::try_from(stored.count).map_err(|_| RecipeError::new("native quantized weight count exceeds i32"))?;
@@ -1944,7 +1945,6 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	};
 	require(!artifact.is_empty(), format!("native artifact {} is empty", path.display()))?;
-	let (storage, codebook) = model.arenas();
 	Ok(NativeArtifact {
 		backend: target.clone(),
 		layout: model.layout.clone(),
@@ -1952,8 +1952,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		element_bytes: precision.bytes(),
 		artifact,
 		path,
-		storage,
-		codebook,
+		storage: model.storage(),
 		forward_layout: NATIVE_FORWARD_LAYOUT,
 		epoch_layout: native_precision_layout(precision),
 		model_load_layout: NATIVE_MODEL_LOAD_LAYOUT,
@@ -4729,14 +4728,13 @@ impl NativeTape {
 		if program.model_load.is_some() {
 			require(!program.artifact.storage.is_empty(), "native model-load storage is empty")?;
 			let storage = Buffer::upload(gpu, &program.artifact.storage)?;
-			let codebook = if program.artifact.codebook.is_empty() { Buffer::upload(gpu, &[0_u8])? } else { Buffer::upload(gpu, &program.artifact.codebook)? };
 			let items = narrow(parameters.max(1), "native model-load parameters")? as u32;
 			let threads = program.dispatch(NativeEntry::ModelLoad)?.geometry.threads(items)?;
-			let mut call = ptrs![weights.pointer, storage.pointer, codebook.pointer, threads];
+			let mut call = ptrs![weights.pointer, storage.pointer, threads];
 			program.launch_model_load(&mut call, items)?;
 			gpu.synchronize()?;
 		} else {
-			require(program.artifact.storage.is_empty() && program.artifact.codebook.is_empty(), "native artifact storage has no model-load entrypoint")?;
+			require(program.artifact.storage.is_empty(), "native artifact storage has no model-load entrypoint")?;
 		}
 		Ok(Self {
 			program,
@@ -5060,7 +5058,7 @@ struct Dispatch {
 	geometry: Geometry,
 }
 type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32, i32);
-type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, Ptr, i32);
+type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32);
 type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32);
 type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32);
 type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32);
@@ -5756,7 +5754,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 		NativeEntry::ModelLoad => {
 			require(arguments.len() == NATIVE_MODEL_LOAD_LAYOUT.len(), "native CPU model-load argument count is invalid")?;
 			let function = cpu.model_load.ok_or_else(|| RecipeError::new("native model-load symbol is absent"))?;
-			function(native_cpu_pointer(arguments, 0), native_cpu_pointer(arguments, 1), native_cpu_pointer(arguments, 2), native_cpu_value(arguments, 3));
+			function(native_cpu_pointer(arguments, 0), native_cpu_pointer(arguments, 1), native_cpu_value(arguments, 2));
 		}
 	}
 	Ok(())
