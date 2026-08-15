@@ -6529,7 +6529,7 @@ impl NativeProgram {
 					let queue = &mut *(driver.queue as *mut HsaQueue);
 					let index = (driver.write)(queue, 1);
 					let packet = queue.base.cast::<HsaPacket>().add(index as usize & (queue.size as usize - 1));
-					packet.write(HsaPacket { header: 0, setup: 1, workgroup_x: block as u16, workgroup_y: 1, workgroup_z: 1, reserved0: 0, grid_x: threads, grid_y: 1, grid_z: 1, private: dispatch.kernel.private, group: shared, object: dispatch.kernel.object, kernarg, reserved1: 0, completion: driver.signal });
+					packet.write(HsaPacket { header: 1, setup: 1, workgroup_x: block as u16, workgroup_y: 1, workgroup_z: 1, reserved0: 0, grid_x: threads, grid_y: 1, grid_z: 1, private: dispatch.kernel.private, group: shared, object: dispatch.kernel.object, kernarg, reserved1: 0, completion: driver.signal });
 					std::sync::atomic::fence(Ordering::Release);
 					let header = &*(&mut (*packet).header as *mut u16 as *mut std::sync::atomic::AtomicU16);
 					header.store(2 | 2 << 9 | 2 << 11, Ordering::Release);
