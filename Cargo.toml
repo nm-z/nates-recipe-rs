@@ -8,10 +8,6 @@ build = "build.rs"
 path = "recipe.rs"
 
 [[bin]]
-name = "train"
-path = "train.rs"
-
-[[bin]]
 name = "recipe"
 path = "cli.rs"
 
@@ -20,24 +16,19 @@ path = "cli.rs"
 [package.metadata.recipe]
 dependency-allowlist = []
 hsa-compiler = "/opt/rocm/lib/llvm/bin/clang"
-hsa-disassembler = "/opt/rocm/lib/llvm/bin/llvm-objdump"
-hsa-library = "/opt/rocm/lib"
 hsa-runtime = "libhsa-runtime64.so.1"
 hsa-device-library = "/opt/rocm/amdgcn/bitcode/ocml.bc"
 hsa-clock-library = "/opt/rocm/amdgcn/bitcode/ockl.bc"
 hsa-device-library-directory = "/opt/rocm/amdgcn/bitcode"
 hsa-finite-library = "/opt/rocm/amdgcn/bitcode/oclc_finite_only_off.bc"
 hsa-math-library = "/opt/rocm/amdgcn/bitcode/oclc_unsafe_math_off.bc"
-nvidia-minimum-architecture = "sm_70"
 nvidia-ptx = "ptx71"
 nvidia-compiler = "/usr/bin/clang"
-nvidia-library = "/usr/lib"
 nvidia-runtime = "libcuda.so.1"
 nvidia-device-library = "/opt/cuda/nvvm/libdevice/libdevice.10.bc"
 ssh-config = ".ssh/config"
 
 [package.metadata.train]
-multi-device = false
 epochs = 210
 learning-rate = 0.0092
 initial-weight = 0.01
@@ -68,9 +59,6 @@ surrogate-epochs = 8
 surrogate-rate = 0.01
 surrogate-width = 8
 rat-batch-rows = 32
-topology-latency-bytes = 8
-topology-bandwidth-bytes = 1048576
-topology-probe-repetitions = 4
 tile-vram-unit-bytes = 1073741824
 ssh-connect-timeout-seconds = 5
 random-seed = 17
