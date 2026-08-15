@@ -1470,13 +1470,16 @@ impl NativeModelIr {
 		Ok(ModelPointers { source, second, value, context, delta, weights, source_adjoint, second_adjoint })
 	}
 
-	fn emit_iq1s_definition(&self, backend: Backend) -> String {
-		let pointer = pointer_type(backend);
-		let ty = value_type(self.precision);
-		let table = IQ1.iter().map(|value| format!("i16 {value}")).collect::<Vec<_>>().join(", ");
-		let mut ir = format!("@recipe_model_iq1 = private unnamed_addr constant [2048 x i16] [{table}]\ndefine internal {ty} @recipe_model_quantized_iq1s({pointer} %matrix, i32 %row, i32 %column, i32 %columns) #1 {{\nentry:\n");
+	fn emit_iq1_definition(&self, backend: Backend, codec: StorageCodec) -> Result<String> {
+		let (pointer, ty) = (pointer_type(backend), value_type(self.precision));
+		let name = match codec { StorageCodec::IQ1S => "iq1s", StorageCodec::IQ1M => "iq1m", _ => return Err(RecipeError::new(format!("native IQ1 decoder is unavailable for {codec:?}"))) };
+		let mut ir = format!("define internal {ty} @recipe_model_quantized_{name}({pointer} %matrix, i32 %row, i32 %column, i32 %columns) #1 {{\nentry:\n");
+		if codec == StorageCodec::IQ1M {
+			ir.push_str(&format!("%blocks = udiv i32 %columns, 256\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, 256\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, 56\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local = urem i32 %column, 256\n%value.block = udiv i32 %local, 16\n%group.local = urem i32 %local, 16\n%group = udiv i32 %group.local, 8\n%high.offset = add i32 32, %value.block\n%high.ptr = getelementptr inbounds i8, {pointer} %block, i32 %high.offset\n%high.byte = load i8, {pointer} %high.ptr, align 1\n%high.raw = zext i8 %high.byte to i32\n%grid.block = mul i32 %value.block, 2\n%grid.offset = add i32 %grid.block, %group\n%grid.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.offset\n%grid.byte = load i8, {pointer} %grid.ptr, align 1\n%grid.raw = zext i8 %grid.byte to i32\n%group.shift = mul i32 %group, 4\n%high.shifted = lshr i32 %high.raw, %group.shift\n%high.grid = and i32 %high.shifted, 7\n%high.grid.shifted = shl i32 %high.grid, 8\n%grid = or i32 %grid.raw, %high.grid.shifted\n%table.ptr = getelementptr inbounds [2048 x i16], ptr @recipe_model_iq1, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane = urem i32 %local, 8\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.raw = and i32 %level.shifted, 3\n%level.offset = sub i32 %level.raw, 1\n%delta.shift = add i32 %group.shift, 3\n%delta.shifted = lshr i32 %high.raw, %delta.shift\n%delta.bit = and i32 %delta.shifted, 1\n%delta.zero = icmp eq i32 %delta.bit, 0\n%delta = select i1 %delta.zero, {ty} {positive_delta}, {ty} {negative_delta}\n%level = call {ty} @recipe.from.s32(i32 %level.offset)\n%level.delta = call {ty} @recipe.add({ty} %level, {ty} %delta)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 48\n%scale.packed = load i64, {pointer} %scale.ptr, align 2\n%scale.s0.shifted = lshr i64 %scale.packed, 12\n%scale.s0 = and i64 %scale.s0.shifted, 15\n%scale.s1.shifted = lshr i64 %scale.packed, 24\n%scale.s1 = and i64 %scale.s1.shifted, 240\n%scale.s01 = or i64 %scale.s0, %scale.s1\n%scale.s2.shifted = lshr i64 %scale.packed, 36\n%scale.s2 = and i64 %scale.s2.shifted, 3840\n%scale.s012 = or i64 %scale.s01, %scale.s2\n%scale.s3.shifted = lshr i64 %scale.packed, 48\n%scale.s3 = and i64 %scale.s3.shifted, 61440\n%scale.raw = or i64 %scale.s012, %scale.s3\n%scale.bits = trunc i64 %scale.raw to i16\n%scale.half = bitcast i16 %scale.bits to half\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%scale.word = udiv i32 %value.block, 4\n%scale.word.shift = mul i32 %scale.word, 16\n%scale.code.local = urem i32 %value.block, 4\n%scale.code.shift = mul i32 %scale.code.local, 3\n%scale.shift = add i32 %scale.word.shift, %scale.code.shift\n%scale.shift64 = zext i32 %scale.shift to i64\n%scale.code.shifted = lshr i64 %scale.packed, %scale.shift64\n%scale.code64 = and i64 %scale.code.shifted, 7\n%scale.code = trunc i64 %scale.code64 to i32\n%scale.twice = shl i32 %scale.code, 1\n%scale.one = add i32 %scale.twice, 1\n%scale.factor = call {ty} @recipe.from.u32(i32 %scale.one)\n%scaled = call {ty} @recipe.mul({ty} %scale, {ty} %scale.factor)\n%result = call {ty} @recipe.mul({ty} %scaled, {ty} %level.delta)\nret {ty} %result\n}}\n", positive_delta = native_literal(self.precision, ty, 0.125), negative_delta = native_literal(self.precision, ty, -0.125)));
+			return Ok(ir)
+		}
 		ir.push_str(&format!("%blocks = udiv i32 %columns, 256\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, 256\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, 50\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local = urem i32 %column, 256\n%value.block = udiv i32 %local, 32\n%group.local = urem i32 %local, 32\n%group = udiv i32 %group.local, 8\n%high.block = mul i32 %value.block, 2\n%high.offset = add i32 34, %high.block\n%high.ptr = getelementptr inbounds i8, {pointer} %block, i32 %high.offset\n%high = load i16, {pointer} %high.ptr, align 2\n%high.raw = zext i16 %high to i32\n%grid.block = mul i32 %value.block, 4\n%grid.base = add i32 2, %grid.block\n%grid.offset = add i32 %grid.base, %group\n%grid.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.offset\n%grid.byte = load i8, {pointer} %grid.ptr, align 1\n%grid.raw = zext i8 %grid.byte to i32\n%group.shift = mul i32 %group, 3\n%high.shifted = lshr i32 %high.raw, %group.shift\n%high.grid = and i32 %high.shifted, 7\n%high.grid.shifted = shl i32 %high.grid, 8\n%grid = or i32 %grid.raw, %high.grid.shifted\n%table.ptr = getelementptr inbounds [2048 x i16], ptr @recipe_model_iq1, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane = urem i32 %local, 8\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.raw = and i32 %level.shifted, 3\n%level.offset = sub i32 %level.raw, 1\n%delta.bits = and i32 %high.raw, 32768\n%delta.zero = icmp eq i32 %delta.bits, 0\n%delta = select i1 %delta.zero, {ty} {positive_delta}, {ty} {negative_delta}\n%level = call {ty} @recipe.from.s32(i32 %level.offset)\n%level.delta = call {ty} @recipe.add({ty} %level, {ty} %delta)\n%scale.code.shifted = lshr i32 %high.raw, 12\n%scale.code = and i32 %scale.code.shifted, 7\n%scale.twice = shl i32 %scale.code, 1\n%scale.one = add i32 %scale.twice, 1\n%scale.factor = call {ty} @recipe.from.u32(i32 %scale.one)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 0\n%scale.half = load half, {pointer} %scale.ptr, align 2\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%scaled = call {ty} @recipe.mul({ty} %scale, {ty} %scale.factor)\n%result = call {ty} @recipe.mul({ty} %scaled, {ty} %level.delta)\nret {ty} %result\n}}\n", positive_delta = native_literal(self.precision, ty, 0.125), negative_delta = native_literal(self.precision, ty, -0.125)));
-		ir
+		Ok(ir)
 	}
 
 	fn emit_quantized_definition(template: &str, codec: StorageCodec) -> Result<String> {
@@ -1502,8 +1505,11 @@ impl NativeModelIr {
 			let Some(stored) = &plan.stored else { continue };
 			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
 			if seen.iter().any(|codec: &StorageCodec| *codec == spec.codec) { continue }
-			if spec.codec == StorageCodec::IQ1S {
-				emitted.push_str(&self.emit_iq1s_definition(backend));
+			if matches!(spec.codec, StorageCodec::IQ1S | StorageCodec::IQ1M) {
+				if !seen.iter().any(|codec| matches!(codec, StorageCodec::IQ1S | StorageCodec::IQ1M)) {
+					emitted.push_str(&format!("@recipe_model_iq1 = private unnamed_addr constant [2048 x i16] [{}]\n", IQ1.iter().map(|value| format!("i16 {value}")).collect::<Vec<_>>().join(", ")));
+				}
+				emitted.push_str(&self.emit_iq1_definition(backend, spec.codec)?);
 			} else {
 				emitted.push_str(&Self::emit_quantized_definition(template, spec.codec)?);
 			}
@@ -1534,6 +1540,7 @@ impl NativeModelIr {
 				StorageCodec::Q4K => "q4k",
 				StorageCodec::Q6K => "q6k",
 				StorageCodec::IQ1S => "iq1s",
+				StorageCodec::IQ1M => "iq1m",
 				_ => return Err(RecipeError::new(format!("native quantized decoder is unavailable for node {index} format {:?}", spec.codec))),
 			};
 			let count = i32::try_from(stored.count).map_err(|_| RecipeError::new("native quantized weight count exceeds i32"))?;
@@ -8049,13 +8056,6 @@ impl TileRuntime {
 		require(!cases.is_empty(), "tile proposal batch is empty")?;
 		let samples = (0..self.state.tape.capacity).flat_map(|index| cases[index % cases.len()].2).collect::<Vec<_>>();
 		self.state.tape.write_samples(&samples).and_then(|_| self.state.tape.forward())
-	}
-	#[allow(dead_code, reason = "reserved for the public inference executor")]
-	fn infer(&mut self, graph: &Graph, tape: &mut NativeTape, config: Config) -> Result<Vec<f64>> {
-		let cases = self.propose(graph, tape)?;
-		tape.forward()?;
-		self.learn(&cases, tape, config)?;
-		tape.predictions()
 	}
 	fn propose(&mut self, graph: &Graph, tape: &mut NativeTape) -> Result<Vec<TileCase>> {
 		let mut cases = Vec::new();
