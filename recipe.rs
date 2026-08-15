@@ -983,9 +983,9 @@ pub(crate) struct NativePrecision {
 const NATIVE_FORWARD_SYMBOL: &str = "recipe_model_forward";
 const NATIVE_EPOCH_SYMBOL: &str = "recipe_model_epoch";
 const NATIVE_MODEL_LOAD_SYMBOL: &str = "recipe_model_load";
-const NATIVE_FORWARD_LAYOUT: &[u8] = b"888844444";
-const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"8888888888884444488888884";
-const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"8888888888884444444444444";
+const NATIVE_FORWARD_LAYOUT: &[u8] = b"888844";
+const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"8888888888884488888884";
+const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"8888888888884444444444";
 const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"884";
 macro_rules! native_precisions {
 	($($pattern:pat $(if $guard:expr)? => ($source:literal, $model_type:literal, $state:expr, $state_type:literal, $layout:expr)),+ $(,)?) => {
@@ -1053,12 +1053,13 @@ pub(crate) struct NativeModelIr {
 	layout: NativeLayout,
 	precision: NativePrecision,
 	rows: usize,
+	tile: Tile,
 	plans: Vec<NodePlan>,
 	storage_bytes: usize,
 }
 
 impl NativeModelIr {
-	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute) -> Result<Self> {
+	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, tile: Tile) -> Result<Self> {
 		require(rows != 0, "native model rows must be positive")?;
 		let layout = NativeLayout::for_graph(graph, rows, precision)?;
 		let precision = NativePrecision::new(precision)?;
@@ -1082,7 +1083,7 @@ impl NativeModelIr {
 			}
 			plans.push(NodePlan { node, value: layout.values[index], context: layout.contexts[index], adjoint: layout.adjoints[index], stored, storage_offset });
 		}
-		Ok(Self { graph: graph.clone(), layout, precision, rows, plans, storage_bytes })
+		Ok(Self { graph: graph.clone(), layout, precision, rows, tile, plans, storage_bytes })
 	}
 	fn storage(&self) -> Vec<u8> {
 		let mut storage = Vec::with_capacity(self.storage_bytes);
@@ -1892,7 +1893,7 @@ impl NativeModelIr {
 			let node = &plan.node;
 			match (reverse, node.op) {
 				(false, Primitive::Contraction) => {
-					ir.push_str(&format!("call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?));
+					ir.push_str(&format!("call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Pool) => {
@@ -1915,11 +1916,11 @@ impl NativeModelIr {
 					if node.argument[4] == 1.0 {
 						return Err(RecipeError::new("cached attention has no model-specific reverse ABI"));
 					}
-					ir.push_str(&format!("call void @attention_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels));
+					ir.push_str(&format!("call void @attention_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Scan) => {
-					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?));
+					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?));
 						ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Elementwise) => {
@@ -1969,7 +1970,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Contraction) => {
-						ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?, offset = plan.node.offset));
+						ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?, offset = plan.node.offset));
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Pool) => {
@@ -2002,7 +2003,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Scan) => {
-						ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {parameters}, i32 {offset}, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset));
+						ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {parameters}, i32 {offset}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset));
 						ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Predictor) => {
@@ -2346,7 +2347,11 @@ impl NativeModelIr {
 	}
 
 	pub(crate) fn emit(&self, backend: Backend, loss: LossFunction) -> Result<String> {
-		let mut ir = backend_template(backend, self.precision)?;
+		let mut ir = backend_template(backend, self.precision)?
+			.replace("i32 %tile.m, i32 %tile.n, i32 %tile.k, ", "")
+			.replace("%tile.m", &self.tile.m.to_string())
+			.replace("%tile.n", &self.tile.n.to_string())
+			.replace("%tile.k", &self.tile.k.to_string());
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let model_load = self.emit_model_load(backend)?;
 		for name in ["cached_attention_body"] {
@@ -2373,7 +2378,7 @@ impl NativeModelIr {
 		let training_forward = self.emit_fixed_primitives(backend, false, true)?;
 		let reverse = self.emit_fixed_primitives(backend, true, false)?;
 		let mut body = String::new();
-		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 %tile.m, i32 %tile.n, i32 %tile.k");
+		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads");
 		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&inference_forward);
 		body.push_str("ret void\n}\n");
@@ -2383,12 +2388,12 @@ impl NativeModelIr {
 		body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"));
 		let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
 		let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
-		body.push_str(&format!("define {kernel}void @recipe_model_epoch({pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, i32 %tile.m, i32 %tile.n, i32 %tile.k, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %step) #0 {{\nentry:\n%tid = {thread}\n",));
+		body.push_str(&format!("define {kernel}void @recipe_model_epoch({pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %step) #0 {{\nentry:\n%tid = {thread}\n",));
 		body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "entry")?);
 		body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
 		body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
 		body.push_str(barrier(backend));
-		body.push_str(&format!("\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 %tile.m, i32 %tile.n, i32 %tile.k)\n"));
+		body.push_str(&format!("\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads)\n"));
 		body.push_str(barrier(backend));
 		body.push('\n');
 		body.push_str(&self.emit_loss_and_seed(backend, loss, model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
@@ -2740,9 +2745,9 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 	}
 }
 
-pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: LossFunction, rows: usize) -> Result<NativeArtifact> {
+pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: LossFunction, rows: usize, tile: Tile) -> Result<NativeArtifact> {
 	target.validate()?;
-	let model = NativeModelIr::from_graph(graph, rows, precision)?;
+	let model = NativeModelIr::from_graph(graph, rows, precision, tile)?;
 	let ir = model.emit(target.backend(), loss)?;
 	let key = native_artifact_key(target, &ir);
 	let directory = native_artifact_directory(&key)?;
@@ -5544,14 +5549,10 @@ impl NativeTape {
 	}
 	fn forward(&mut self) -> Result<()> {
 		let threads = self.program.forward.geometry.threads()?;
-		let tile = self.program.tile;
 		let rows = self.rows;
 		let thread_count = threads;
-		let tile_m = tile.m;
-		let tile_n = tile.n;
-		let tile_k = tile.k;
-		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, tile_m, tile_n, tile_k];
-		self.program.launch_forward(&mut call, tile).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
+		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count];
+		self.program.launch_forward(&mut call).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		self.gather_error("forward")
 	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
@@ -5587,12 +5588,8 @@ impl NativeTape {
 	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
 		require(self.step != 0, "optimizer epoch is absent")?;
 		let threads = self.program.epoch.geometry.threads()?;
-		let tile = self.program.tile;
 		let rows = self.rows;
 		let thread_count = threads;
-		let tile_m = tile.m;
-		let tile_n = tile.n;
-		let tile_k = tile.k;
 		let beta1 = self.precision.state.optimizer_beta(config.beta1);
 		let beta2 = self.precision.state.optimizer_beta(config.beta2);
 		let epsilon = self.precision.state.optimizer_epsilon(config.epsilon);
@@ -5616,9 +5613,6 @@ impl NativeTape {
 			self.adjoints.pointer,
 			rows,
 			thread_count,
-			tile_m,
-			tile_n,
-			tile_k,
 			encoded[0],
 			encoded[1],
 			encoded[2],
@@ -5628,7 +5622,7 @@ impl NativeTape {
 			encoded[6],
 			step
 		];
-		self.program.launch_epoch(&mut call, tile).map_err(|error| RecipeError::new(format!("training forward/backward/optimizer update: {error}")))?;
+		self.program.launch_epoch(&mut call).map_err(|error| RecipeError::new(format!("training forward/backward/optimizer update: {error}")))?;
 		self.gather_error("training forward/backward/optimizer update")?;
 		let objective = self.metrics.download_float(1, self.precision.state)?[0];
 		let saved = self.observe(objective, tolerance, true)?;
@@ -5829,12 +5823,12 @@ struct Dispatch {
 	kernel: Kernel,
 	geometry: Geometry,
 }
-type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32, i32);
+type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32);
-type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32);
-type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32);
-type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32);
-type NativeEpochF8 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32, i32, i8, i8, i8, i8, i8, i8, i8, i32);
+type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32);
+type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32);
+type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32);
+type NativeEpochF8 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i8, i8, i8, i8, i8, i8, i8, i32);
 
 #[derive(Clone, Copy)]
 enum NativeCpuEpoch {
@@ -6192,7 +6186,7 @@ impl Gpu {
 		let shared_width = tile.m.checked_add(tile.n).ok_or_else(|| RecipeError::new("native contraction tile width overflows"))?;
 		tile.k = tile.k.min(shared_values / shared_width);
 		require(tile.m != 0 && tile.n != 0 && tile.k != 0, "native contraction tile does not fit the device")?;
-		let artifact = compile_model(&self.native_target, graph, precision, loss, rows)?;
+		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, tile)?;
 		let program = NativeProgram::load(self, artifact, tile)?;
 		let fixed = program.forward.kernel.shared.max(program.epoch.kernel.shared).max(program.model_load.map_or(0, |dispatch| dispatch.kernel.shared));
 		let required = fixed.checked_add(shared_bytes(tile, precision.bytes() as u8)?).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
@@ -6501,9 +6495,6 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 				native_cpu_pointer(arguments, 3),
 				native_cpu_value(arguments, 4),
 				native_cpu_value(arguments, 5),
-				native_cpu_value(arguments, 6),
-				native_cpu_value(arguments, 7),
-				native_cpu_value(arguments, 8),
 			);
 		}
 		NativeEntry::Epoch => {
@@ -6512,23 +6503,19 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 			match cpu.epoch {
 				NativeCpuEpoch::F64(function) => function(
 					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11],
-					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16),
-					native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21), native_cpu_value(arguments, 22), native_cpu_value(arguments, 23), native_cpu_value(arguments, 24),
+					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21),
 				),
 				NativeCpuEpoch::F32(function) => function(
 					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11],
-					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16),
-					native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21), native_cpu_value(arguments, 22), native_cpu_value(arguments, 23), native_cpu_value(arguments, 24),
+					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21),
 				),
 				NativeCpuEpoch::F16(function) => function(
 					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11],
-					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16),
-					native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21), native_cpu_value(arguments, 22), native_cpu_value(arguments, 23), native_cpu_value(arguments, 24),
+					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21),
 				),
 				NativeCpuEpoch::F8(function) => function(
 					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11],
-					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16),
-					native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21), native_cpu_value(arguments, 22), native_cpu_value(arguments, 23), native_cpu_value(arguments, 24),
+					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21),
 				),
 			}
 		}
@@ -6581,12 +6568,12 @@ impl NativeProgram {
 		}
 	}
 
-	fn launch_forward(&self, arguments: &mut [Ptr], tile: Tile) -> Result<()> {
-		self.launch(NativeEntry::Forward, arguments, self.forward.geometry.threads()?, tile)
+	fn launch_forward(&self, arguments: &mut [Ptr]) -> Result<()> {
+		self.launch(NativeEntry::Forward, arguments, self.forward.geometry.threads()?, self.tile)
 	}
 
-	fn launch_epoch(&self, arguments: &mut [Ptr], tile: Tile) -> Result<()> {
-		self.launch(NativeEntry::Epoch, arguments, self.epoch.geometry.threads()?, tile)
+	fn launch_epoch(&self, arguments: &mut [Ptr]) -> Result<()> {
+		self.launch(NativeEntry::Epoch, arguments, self.epoch.geometry.threads()?, self.tile)
 	}
 
 	fn launch_model_load(&self, arguments: &mut [Ptr]) -> Result<()> {
