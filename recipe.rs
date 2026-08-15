@@ -856,7 +856,7 @@ pub fn emit_normalize_reverse(context: NormalizeReverseContext<'_>, element: &st
 }
 
 use program_ir::{PredictorOpcode, ScalarOpcode};
-use std::{collections::hash_map::DefaultHasher, hash::{Hash, Hasher}, sync::atomic::AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 
 #[derive(Clone)]
 pub(crate) struct NativeLayout {
@@ -868,7 +868,7 @@ pub(crate) struct NativeLayout {
 	pub adjoints_bytes: usize,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BackendTarget {
 	Cpu { target: String },
 	Amd { architecture: String },
@@ -2669,11 +2669,13 @@ fn native_artifact_directory(key: &str) -> Result<PathBuf> {
 }
 
 fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
-	let mut hasher = DefaultHasher::new();
-	"recipe-native-v1".hash(&mut hasher);
-	target.hash(&mut hasher);
-	ir.hash(&mut hasher);
-	format!("recipe-native-{hash:016x}", hash = hasher.finish())
+	let mut hash = 14695981039346656037_u64;
+	for part in [b"recipe-native-v2".as_slice(), native_target_label(target).as_bytes(), ir.as_bytes()] {
+		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
+			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
+		}
+	}
+	format!("recipe-native-{hash:016x}")
 }
 
 fn native_command(mut command: Command, role: &str) -> Result<()> {
