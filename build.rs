@@ -433,7 +433,7 @@ fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	];
 	let mut values = Vec::new();
 	for (suffix, contents) in sources {
-		let contents = contents.replace(" addrspace(1)", "");
+		let contents = contents.replace(" addrspace(1)", "").replace(" addrspace(3)", "");
 		let path = out.join(format!("recipe-cpu{suffix}.ll"));
 		fs::write(&path, contents)?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));

@@ -995,7 +995,7 @@ impl NativeModelIr {
 
 fn precision_source(precision: Compute) -> &'static str {
 	match precision {
-		Compute::F(_) => "default",
+		Compute::F(_) => "-f",
 		Compute::Fp(format) if format == FloatFormat::FP64 => "default",
 		Compute::Fp(format) if format == FloatFormat::FP32 => "-f32",
 		Compute::Fp(format) if format == FloatFormat::FP16 => "-f16",
@@ -1023,7 +1023,19 @@ fn backend_template(backend: Backend, precision: Compute) -> Result<String> {
 		Backend::Amd => option_env!("RECIPE_AMD_IR").ok_or_else(|| RecipeError::new("AMD native LLVM templates are unavailable"))?,
 		Backend::Nvidia => option_env!("RECIPE_NV_IR").ok_or_else(|| RecipeError::new("NVIDIA native LLVM templates are unavailable"))?,
 	};
-	fs::read_to_string(template_path(mapping, suffix)?).map_err(|error| RecipeError::new(format!("cannot read native LLVM template: {error}")))
+	let mut ir = fs::read_to_string(template_path(mapping, suffix)?).map_err(|error| RecipeError::new(format!("cannot read native LLVM template: {error}")))?;
+	if let Compute::F(format) = precision {
+		for address_space in [" addrspace(3)", ""] {
+			ir = ir.replace(&format!("load atomic i32, ptr{address_space} @recipe_f_exp monotonic, align 4"), &format!("add i32 0, {}", format.arithmetic.exp));
+			ir = ir.replace(&format!("load atomic i32, ptr{address_space} @recipe_f_man monotonic, align 4"), &format!("add i32 0, {}", format.arithmetic.man));
+		}
+		let narrow = if format.arithmetic == FloatFormat::FP16.arithmetic { Some("half") } else if format.arithmetic == FloatFormat::FP32.arithmetic { Some("float") } else { None };
+		if let Some(narrow) = narrow {
+			ir = strip_definition(ir, "recipe.round");
+			ir.push_str(&format!("define internal double @recipe.round(double %value) #1 {{ entry: %narrow = fptrunc double %value to {narrow} %result = fpext {narrow} %narrow to double ret double %result }}\n"));
+		}
+	}
+	Ok(ir)
 }
 
 fn value_type(precision: Compute) -> &'static str {
@@ -1037,54 +1049,33 @@ fn value_type(precision: Compute) -> &'static str {
 
 fn pointer_type(backend: Backend) -> &'static str { if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(1)" } }
 
-fn strip_definition(mut ir: String, name: &str) -> String {
-	let needle = format!("define ");
-	while let Some(relative) = ir.find(&format!("@{name}(")) {
-		let start = ir[..relative].rfind(&needle).unwrap_or(relative);
-		let body = &ir[relative..];
-		let Some(open) = body.find('{') else { break };
-		let mut depth = 0usize;
-		let mut end = relative + open;
-		for (index, byte) in ir[relative + open..].bytes().enumerate() {
-			match byte {
-				b'{' => depth += 1,
-				b'}' => {
-					depth = depth.saturating_sub(1);
-					if depth == 0 {
-						end = relative + open + index + 1;
-						break;
-					}
-				}
-				_ => {}
-			}
-		}
-		if end <= start { break }
-		ir.replace_range(start..end, "");
-	}
-	ir
-}
-
-fn definition(ir: &str, name: &str) -> Result<String> {
-	let relative = ir.find(&format!("@{name}(")).ok_or_else(|| RecipeError::new(format!("native template definition {name} is absent")))?;
-	let start = ir[..relative].rfind("define ").ok_or_else(|| RecipeError::new(format!("native template definition {name} has no header")))?;
-	let body = &ir[relative..];
-	let open = body.find('{').ok_or_else(|| RecipeError::new(format!("native template definition {name} has no body")))?;
+fn definition_span(ir: &str, name: &str) -> Option<(usize, usize)> {
+	let signature = format!("@{name}(");
+	let (start, open) = ir.match_indices("define ").find_map(|(start, _)| {
+		let open = start + ir[start..].find('{')?;
+		ir[start..open].contains(&signature).then_some((start, open))
+	})?;
 	let mut depth = 0usize;
-	let mut end = relative + open;
-	for (offset, byte) in ir[relative + open..].bytes().enumerate() {
+	for (index, byte) in ir[open..].bytes().enumerate() {
 		match byte {
 			b'{' => depth += 1,
 			b'}' => {
 				depth = depth.saturating_sub(1);
-				if depth == 0 {
-					end = relative + open + offset + 1;
-					break;
-				}
+				if depth == 0 { return Some((start, open + index + 1)) }
 			}
 			_ => {}
-		}
 	}
-	require(end > start, format!("native template definition {name} is malformed"))?;
+	}
+	None
+}
+
+fn strip_definition(mut ir: String, name: &str) -> String {
+	if let Some((start, end)) = definition_span(&ir, name) { ir.replace_range(start..end, "") }
+	ir
+}
+
+fn definition(ir: &str, name: &str) -> Result<String> {
+	let (start, end) = definition_span(ir, name).ok_or_else(|| RecipeError::new(format!("native template definition {name} is absent or malformed")))?;
 	Ok(ir[start..end].to_owned())
 }
 
