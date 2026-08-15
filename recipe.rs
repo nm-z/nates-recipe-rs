@@ -7704,7 +7704,7 @@ fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 fn finish_prepared(data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, features: usize, sequence: Option<Shape>, target_categorical: bool, schema: String) -> Result<Prepared> {
 	let rows = targets.len();
 	require(rows != 0, "dataset has no complete training rows")?;
-	let mut identities = samples.chunks_exact(features).zip(&targets).enumerate().map(|(row, (sample, target))| sample_identity(sample, *target, row)).collect();
+	let mut identities = samples.chunks_exact(features).zip(&targets).map(|(sample, target)| sample_identity(sample, *target)).collect();
 	shuffle(&mut samples, &mut targets, &mut identities, features)?;
 	let (norm_mean, norm_scale) = if data.normalize {
 		normalize_samples(&mut samples, features, ((rows as f64) * data.split).floor() as usize)?
@@ -7740,11 +7740,10 @@ fn impute_missing(samples: &mut [f64]) {
 		}
 	}
 }
-fn sample_identity(sample: &[f64], target: f64, row: usize) -> u64 {
+fn sample_identity(sample: &[f64], target: f64) -> u64 {
 	const OFFSET: u64 = 14695981039346656037;
 	const PRIME: u64 = 1099511628211;
-	let hash = sample.iter().copied().chain(std::iter::once(target)).fold(OFFSET, |hash, value| (hash ^ value.to_bits()).wrapping_mul(PRIME));
-	(hash ^ row as u64).wrapping_mul(PRIME)
+	sample.iter().copied().chain(std::iter::once(target)).fold(OFFSET, |hash, value| (hash ^ value.to_bits()).wrapping_mul(PRIME))
 }
 fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data") }
 fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
