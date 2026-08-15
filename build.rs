@@ -169,78 +169,106 @@ fn math_names(ir: &str, bits: u8) -> [&'static str; 5] {
 		(false, false, _) => ["__ocml_exp_f32", "__ocml_tanh_f32", "__ocml_cos_f32", "__ocml_sin_f32", "__ocml_log_f32"],
 	}
 }
-fn native_numeric(ir: &str, llvm: &str, format: FloatFormat) -> String {
-	let bits = format.storage.bits();
-	let rounded = format == FloatFormat::TF32;
-	let wide = bits < 32;
-	let math_type = if wide { "float" } else { llvm };
-	let intrinsic = if wide {
-		"f32"
-	} else if bits == 64 {
-		"f64"
-	} else {
-		"f32"
-	};
-	let math = math_names(ir, if wide { 32 } else { bits });
-	let mut block = format!("; NUMERIC BEGIN\ndeclare {math_type} @llvm.sqrt.{intrinsic}({math_type}) declare {math_type} @llvm.fabs.{intrinsic}({math_type}) declare {math_type} @llvm.floor.{intrinsic}({math_type})\ndeclare {math_type} @{}({math_type}) declare {math_type} @{}({math_type}) declare {math_type} @{}({math_type}) declare {math_type} @{}({math_type}) declare {math_type} @{}({math_type})\n", math[0], math[1], math[2], math[3], math[4]);
-	if rounded {
-		block.push_str("define internal float @recipe.round(float %value) #1 { entry: %bits = bitcast float %value to i32 %absolute = and i32 %bits, 2147483647 %special = icmp uge i32 %absolute, 2139095040 %shifted = lshr i32 %bits, 13 %least = and i32 %shifted, 1 %bias = add i32 4095, %least %biased = add i32 %bits, %bias %masked = and i32 %biased, -8192 %encoded = select i1 %special, i32 %bits, i32 %masked %result = bitcast i32 %encoded to float ret float %result }\n")
-	}
-	for (name, opcode) in [("add", "fadd"), ("sub", "fsub"), ("mul", "fmul"), ("div", "fdiv")] {
-		if rounded { block.push_str(&format!("define internal float @recipe.{name}(float %left, float %right) #1 {{ entry: %left.format = call float @recipe.round(float %left) %right.format = call float @recipe.round(float %right) %wide = {opcode} float %left.format, %right.format %result = call float @recipe.round(float %wide) ret float %result }}\n")) } else { block.push_str(&format!("define internal {llvm} @recipe.{name}({llvm} %left, {llvm} %right) #1 {{ entry: %result = {opcode} {llvm} %left, %right ret {llvm} %result }}\n")) }
-	}
-	if rounded {
-		block.push_str("define internal float @recipe.neg(float %value) #1 { entry: %format = call float @recipe.round(float %value) %wide = fneg float %format %result = call float @recipe.round(float %wide) ret float %result }\n")
-	} else {
-		block.push_str(&format!("define internal {llvm} @recipe.neg({llvm} %value) #1 {{ entry: %result = fneg {llvm} %value ret {llvm} %result }}\n"))
-	}
-	for predicate in ["oeq", "oge", "ogt", "ole", "olt", "one", "ord"] {
-		if rounded { block.push_str(&format!("define internal i1 @recipe.{predicate}(float %left, float %right) #1 {{ entry: %left.format = call float @recipe.round(float %left) %right.format = call float @recipe.round(float %right) %result = fcmp {predicate} float %left.format, %right.format ret i1 %result }}\n")) } else { block.push_str(&format!("define internal i1 @recipe.{predicate}({llvm} %left, {llvm} %right) #1 {{ entry: %result = fcmp {predicate} {llvm} %left, %right ret i1 %result }}\n")) }
-	}
-	if rounded {
-		block.push_str("define internal float @recipe.from.u1(i1 %value) #1 { entry: %wide = uitofp i1 %value to float %result = call float @recipe.round(float %wide) ret float %result }\ndefine internal float @recipe.from.u32(i32 %value) #1 { entry: %wide = uitofp i32 %value to float %result = call float @recipe.round(float %wide) ret float %result }\ndefine internal float @recipe.from.s32(i32 %value) #1 { entry: %wide = sitofp i32 %value to float %result = call float @recipe.round(float %wide) ret float %result }\ndefine internal i32 @recipe.to.u32(float %value) #1 { entry: %format = call float @recipe.round(float %value) %result = fptoui float %format to i32 ret i32 %result }\ndefine internal i32 @recipe.to.s32(float %value) #1 { entry: %format = call float @recipe.round(float %value) %result = fptosi float %format to i32 ret i32 %result }\n")
-	} else {
-		block.push_str(&format!("define internal {llvm} @recipe.from.u1(i1 %value) #1 {{ entry: %result = uitofp i1 %value to {llvm} ret {llvm} %result }}\ndefine internal {llvm} @recipe.from.u32(i32 %value) #1 {{ entry: %result = uitofp i32 %value to {llvm} ret {llvm} %result }}\ndefine internal {llvm} @recipe.from.s32(i32 %value) #1 {{ entry: %result = sitofp i32 %value to {llvm} ret {llvm} %result }}\ndefine internal i32 @recipe.to.u32({llvm} %value) #1 {{ entry: %result = fptoui {llvm} %value to i32 ret i32 %result }}\ndefine internal i32 @recipe.to.s32({llvm} %value) #1 {{ entry: %result = fptosi {llvm} %value to i32 ret i32 %result }}\n"))
-	}
-	let from_f32 = match llvm {
-		"double" => "%result = fpext float %value to double",
-		"float" => "%result = fadd float %value, 0.0",
-		"half" => "%result = fptrunc float %value to half",
-		_ => "%result = fptrunc float %value to bfloat",
-	};
-	let from_f16 = match llvm {
-		"double" => "%result = fpext half %value to double",
-		"float" => "%result = fpext half %value to float",
-		"half" => "%result = fadd half %value, 0.0",
-		_ => "%wide = fpext half %value to float %result = fptrunc float %wide to bfloat",
-	};
-	let to_f16 = match llvm {
-		"double" => "%result = fptrunc double %value to half",
-		"float" => "%result = fptrunc float %value to half",
-		"half" => "%result = fadd half %value, 0.0",
-		_ => "%wide = fpext bfloat %value to float %result = fptrunc float %wide to half",
-	};
-	if rounded {
-		block.push_str("define internal float @recipe.from.f32(float %value) #1 { entry: %result = call float @recipe.round(float %value) ret float %result }\ndefine internal float @recipe.from.f16(half %value) #1 { entry: %wide = fpext half %value to float %result = call float @recipe.round(float %wide) ret float %result }\ndefine internal half @recipe.to.f16(float %value) #1 { entry: %format = call float @recipe.round(float %value) %result = fptrunc float %format to half ret half %result }\n")
-	} else {
-		block.push_str(&format!("define internal {llvm} @recipe.from.f32(float %value) #1 {{ entry: {from_f32} ret {llvm} %result }}\ndefine internal {llvm} @recipe.from.f16(half %value) #1 {{ entry: {from_f16} ret {llvm} %result }}\ndefine internal half @recipe.to.f16({llvm} %value) #1 {{ entry: {to_f16} ret half %result }}\n"))
-	}
-	for (name, symbol) in [("abs", format!("llvm.fabs.{intrinsic}")), ("floor", format!("llvm.floor.{intrinsic}")), ("sqrt", format!("llvm.sqrt.{intrinsic}")), ("exp", math[0].to_owned()), ("tanh", math[1].to_owned()), ("cos", math[2].to_owned()), ("sin", math[3].to_owned()), ("log", math[4].to_owned())] {
-		if wide {
-			block.push_str(&format!("define internal {llvm} @recipe.{name}({llvm} %value) #1 {{ entry: %wide = fpext {llvm} %value to float %computed = call float @{symbol}(float %wide) %result = fptrunc float %computed to {llvm} ret {llvm} %result }}\n"))
-		} else if rounded {
-			block.push_str(&format!("define internal float @recipe.{name}(float %value) #1 {{ entry: %format = call float @recipe.round(float %value) %wide = call float @{symbol}(float %format) %result = call float @recipe.round(float %wide) ret float %result }}\n"))
+fn native_codec(ty: &str, rounded: bool) -> String {
+	let round = if rounded {
+		"define internal float @recipe.round(float %value) #1 { entry: %bits = bitcast float %value to i32 %absolute = and i32 %bits, 2147483647 %special = icmp uge i32 %absolute, 2139095040 %shifted = lshr i32 %bits, 13 %least = and i32 %shifted, 1 %bias = add i32 4095, %least %biased = add i32 %bits, %bias %masked = and i32 %biased, -8192 %encoded = select i1 %special, i32 %bits, i32 %masked %result = bitcast i32 %encoded to float ret float %result }\n"
+	} else { "" };
+	let conversion = if rounded { format!("%result = call {ty} @recipe.round({ty} %value)") } else { format!("ret {ty} %value") };
+	let returned = if rounded { format!("ret {ty} %result") } else { String::new() };
+	format!("{round}define internal {ty} @recipe.decode({ty} %value) #1 {{ entry: {conversion} {returned} }}\ndefine internal {ty} @recipe.encode({ty} %value) #1 {{ entry: {conversion} {returned} }}\n")
+}
+
+fn numeric_operations(ir: &str, prefix: &str, value: &str, arithmetic: &str, encoded: bool) -> String {
+	let bits = if arithmetic == "double" { 64 } else { 32 };
+	let intrinsic = if bits == 64 { "f64" } else { "f32" };
+	let math = math_names(ir, bits);
+	let mut block = String::new();
+	for (name, operation) in [("add", "fadd"), ("sub", "fsub"), ("mul", "fmul"), ("div", "fdiv")] {
+		if encoded {
+			block.push_str(&format!("define internal {value} @{prefix}.{name}({value} %left, {value} %right) #1 {{ entry: %left.wide = call {arithmetic} @recipe.decode({value} %left) %right.wide = call {arithmetic} @recipe.decode({value} %right) %wide = {operation} {arithmetic} %left.wide, %right.wide %result = call {value} @recipe.encode({arithmetic} %wide) ret {value} %result }}\n"))
 		} else {
-			block.push_str(&format!("define internal {llvm} @recipe.{name}({llvm} %value) #1 {{ entry: %result = call {llvm} @{symbol}({llvm} %value) ret {llvm} %result }}\n"))
+			block.push_str(&format!("define internal {value} @{prefix}.{name}({value} %left, {value} %right) #1 {{ entry: %result = {operation} {value} %left, %right ret {value} %result }}\n"))
 		}
 	}
-	if rounded {
-		block.push_str("define internal float @recipe.atomic.add(ptr addrspace(1) %target, float %value) #1 { entry: %value.format = call float @recipe.round(float %value) %initial = load atomic i32, ptr addrspace(1) %target monotonic, align 4 br label %attempt attempt: %prior.bits = phi i32 [ %initial, %entry ], [ %observed, %attempt ] %prior = bitcast i32 %prior.bits to float %prior.format = call float @recipe.round(float %prior) %sum = fadd float %prior.format, %value.format %rounded = call float @recipe.round(float %sum) %next = bitcast float %rounded to i32 %exchange = cmpxchg ptr addrspace(1) %target, i32 %prior.bits, i32 %next monotonic monotonic, align 4 %observed = extractvalue { i32, i1 } %exchange, 0 %stored = extractvalue { i32, i1 } %exchange, 1 br i1 %stored, label %done, label %attempt done: ret float %prior.format }\ndefine internal void @recipe.set.format(i32 %exp, i32 %man) #1 { entry: ret void }\n; NUMERIC END")
+	if encoded {
+		block.push_str(&format!("define internal {value} @{prefix}.neg({value} %value) #1 {{ entry: %wide = call {arithmetic} @recipe.decode({value} %value) %negative = fneg {arithmetic} %wide %result = call {value} @recipe.encode({arithmetic} %negative) ret {value} %result }}\n"));
 	} else {
-		block.push_str(&format!("define internal {llvm} @recipe.atomic.add(ptr addrspace(1) %target, {llvm} %value) #1 {{ entry: %prior = atomicrmw fadd ptr addrspace(1) %target, {llvm} %value monotonic, align {} ret {llvm} %prior }}\ndefine internal void @recipe.set.format(i32 %exp, i32 %man) #1 {{ entry: ret void }}\n; NUMERIC END", bits / 8))
+		block.push_str(&format!("define internal {value} @{prefix}.neg({value} %value) #1 {{ entry: %result = fneg {value} %value ret {value} %result }}\n"));
 	}
+	for predicate in ["oeq", "oge", "ogt", "ole", "olt", "one", "ord"] {
+		if encoded {
+			block.push_str(&format!("define internal i1 @{prefix}.{predicate}({value} %left, {value} %right) #1 {{ entry: %left.wide = call {arithmetic} @recipe.decode({value} %left) %right.wide = call {arithmetic} @recipe.decode({value} %right) %result = fcmp {predicate} {arithmetic} %left.wide, %right.wide ret i1 %result }}\n"))
+		} else {
+			block.push_str(&format!("define internal i1 @{prefix}.{predicate}({value} %left, {value} %right) #1 {{ entry: %result = fcmp {predicate} {value} %left, %right ret i1 %result }}\n"))
+		}
+	}
+	for (name, operation) in [("from.u1", "uitofp i1"), ("from.u32", "uitofp i32"), ("from.s32", "sitofp i32")] {
+		let source = if name == "from.u1" { "i1" } else { "i32" };
+		if encoded {
+			block.push_str(&format!("define internal {value} @{prefix}.{name}({source} %value) #1 {{ entry: %wide = {operation} %value to {arithmetic} %result = call {value} @recipe.encode({arithmetic} %wide) ret {value} %result }}\n"))
+		} else {
+			block.push_str(&format!("define internal {value} @{prefix}.{name}({source} %value) #1 {{ entry: %result = {operation} %value to {value} ret {value} %result }}\n"))
+		}
+	}
+	for (name, operation) in [("to.u32", "fptoui"), ("to.s32", "fptosi")] {
+		if encoded {
+			block.push_str(&format!("define internal i32 @{prefix}.{name}({value} %value) #1 {{ entry: %wide = call {arithmetic} @recipe.decode({value} %value) %result = {operation} {arithmetic} %wide to i32 ret i32 %result }}\n"))
+		} else {
+			block.push_str(&format!("define internal i32 @{prefix}.{name}({value} %value) #1 {{ entry: %result = {operation} {value} %value to i32 ret i32 %result }}\n"))
+		}
+	}
+	let from_f32 = if arithmetic == "double" { format!("%wide = fpext float %value to double") } else { format!("%wide = fadd float %value, 0.0") };
+	let from_f16 = format!("%wide = fpext half %value to {arithmetic}");
+	let to_f16 = format!("%result = fptrunc {arithmetic} %wide to half");
+	for (name, source, conversion) in [("from.f32", "float", from_f32), ("from.f16", "half", from_f16)] {
+		if encoded {
+			block.push_str(&format!("define internal {value} @{prefix}.{name}({source} %value) #1 {{ entry: {conversion} %result = call {value} @recipe.encode({arithmetic} %wide) ret {value} %result }}\n"))
+		} else {
+			block.push_str(&format!("define internal {value} @{prefix}.{name}({source} %value) #1 {{ entry: {conversion} ret {value} %wide }}\n"))
+		}
+	}
+	if encoded {
+		block.push_str(&format!("define internal half @{prefix}.to.f16({value} %value) #1 {{ entry: %wide = call {arithmetic} @recipe.decode({value} %value) {to_f16} ret half %result }}\n"));
+	} else {
+		block.push_str(&format!("define internal half @{prefix}.to.f16({value} %value) #1 {{ entry: %wide = fadd {value} %value, 0.0 {to_f16} ret half %result }}\n"));
+	}
+	for (name, symbol) in [("abs", format!("llvm.fabs.{intrinsic}")), ("floor", format!("llvm.floor.{intrinsic}")), ("sqrt", format!("llvm.sqrt.{intrinsic}")), ("exp", math[0].to_owned()), ("tanh", math[1].to_owned()), ("cos", math[2].to_owned()), ("sin", math[3].to_owned()), ("log", math[4].to_owned())] {
+		if encoded {
+			block.push_str(&format!("define internal {value} @{prefix}.{name}({value} %value) #1 {{ entry: %wide = call {arithmetic} @recipe.decode({value} %value) %computed = call {arithmetic} @{symbol}({arithmetic} %wide) %result = call {value} @recipe.encode({arithmetic} %computed) ret {value} %result }}\n"))
+		} else {
+			block.push_str(&format!("define internal {value} @{prefix}.{name}({value} %value) #1 {{ entry: %result = call {value} @{symbol}({value} %value) ret {value} %result }}\n"))
+		}
+	}
+	block.push_str(&format!("define internal {value} @{prefix}.sigmoid({value} %value) #1 {{ entry: %negative = call {value} @{prefix}.neg({value} %value) %exponential = call {value} @{prefix}.exp({value} %negative) %one = call {value} @{prefix}.from.u1(i1 true) %denominator = call {value} @{prefix}.add({value} %exponential, {value} %one) %result = call {value} @{prefix}.div({value} %one, {value} %denominator) ret {value} %result }}\n"));
 	block
 }
+
+fn numeric_program(ir: &str, value: &str, arithmetic: &str, bits: u8, codec: &str) -> String {
+	let intrinsic = if arithmetic == "double" { "f64" } else { "f32" };
+	let math = math_names(ir, if arithmetic == "double" { 64 } else { 32 });
+	let mut block = if codec.starts_with("; NUMERIC BEGIN") {
+		format!("{codec}\n")
+	} else {
+		format!("; NUMERIC BEGIN\ndeclare {arithmetic} @llvm.sqrt.{intrinsic}({arithmetic}) declare {arithmetic} @llvm.fabs.{intrinsic}({arithmetic}) declare {arithmetic} @llvm.floor.{intrinsic}({arithmetic})\ndeclare {arithmetic} @{}({arithmetic}) declare {arithmetic} @{}({arithmetic}) declare {arithmetic} @{}({arithmetic}) declare {arithmetic} @{}({arithmetic}) declare {arithmetic} @{}({arithmetic})\n{codec}\n", math[0], math[1], math[2], math[3], math[4])
+	};
+	block.push_str(&numeric_operations(ir, "recipe", value, arithmetic, true));
+	let integer = format!("i{bits}");
+	let prior = if value == integer { format!("%prior = add {value} %prior.bits, 0") } else { format!("%prior = bitcast {integer} %prior.bits to {value}") };
+	let next = if value == integer { format!("%next.bits = add {value} %next, 0") } else { format!("%next.bits = bitcast {value} %next to {integer}") };
+	block.push_str(&format!("define internal {value} @recipe.atomic.add(ptr addrspace(1) %target, {value} %value) #1 {{ entry: %initial = load atomic {integer}, ptr addrspace(1) %target monotonic, align {align} br label %attempt attempt: %prior.bits = phi {integer} [ %initial, %entry ], [ %observed, %attempt ] {prior} %prior.wide = call {arithmetic} @recipe.decode({value} %prior) %value.wide = call {arithmetic} @recipe.decode({value} %value) %sum = fadd {arithmetic} %prior.wide, %value.wide %next = call {value} @recipe.encode({arithmetic} %sum) {next} %exchange = cmpxchg ptr addrspace(1) %target, {integer} %prior.bits, {integer} %next.bits monotonic monotonic, align {align} %observed = extractvalue {{ {integer}, i1 }} %exchange, 0 %stored = extractvalue {{ {integer}, i1 }} %exchange, 1 br i1 %stored, label %done, label %attempt done: ret {value} %prior }}\n", align = bits / 8));
+	if !codec.contains("@recipe.set.format") {
+		block.push_str("define internal void @recipe.set.format(i32 %exp, i32 %man) #1 { entry: ret void }\n")
+	}
+	block.push_str(&numeric_operations(ir, "recipe.state", arithmetic, arithmetic, false));
+	block.push_str(&format!("define internal {arithmetic} @recipe.state.from.model({value} %value) #1 {{ entry: %result = call {arithmetic} @recipe.decode({value} %value) ret {arithmetic} %result }}\ndefine internal {value} @recipe.model.from.state({arithmetic} %value) #1 {{ entry: %result = call {value} @recipe.encode({arithmetic} %value) ret {value} %result }}\n; NUMERIC END"));
+	block
+}
+
+fn native_numeric(ir: &str, llvm: &str, format: FloatFormat) -> String {
+	let codec = native_codec(llvm, format == FloatFormat::TF32);
+	numeric_program(ir, llvm, llvm, format.storage.bits(), &codec)
+}
+
 fn native_ir(ir: String, suffix: &str, llvm: &str, format: FloatFormat) -> BuildResult<String> {
 	let (start, end) = numeric_region(&ir)?;
 	let bits = format.storage.bits();
@@ -280,40 +308,15 @@ define internal double @recipe.f.decode(i64 %bits) #2 {{ entry: %exp.word = load
 "#,
 		math[0], math[1], math[2], math[3], math[4]
 	);
-	for (name, opcode) in [("add", "fadd"), ("sub", "fsub"), ("mul", "fmul"), ("div", "fdiv")] {
-		block.push_str(&format!("define internal double @recipe.{name}(double %left, double %right) #1 {{ entry: %left.format = call double @recipe.round(double %left) %right.format = call double @recipe.round(double %right) %wide = {opcode} double %left.format, %right.format %result = call double @recipe.round(double %wide) ret double %result }}\n"))
-	}
-	block.push_str("define internal double @recipe.neg(double %value) #1 { entry: %format = call double @recipe.round(double %value) %wide = fneg double %format %result = call double @recipe.round(double %wide) ret double %result }\n");
-	for predicate in ["oeq", "oge", "ogt", "ole", "olt", "one", "ord"] {
-		block.push_str(&format!("define internal i1 @recipe.{predicate}(double %left, double %right) #1 {{ entry: %left.format = call double @recipe.round(double %left) %right.format = call double @recipe.round(double %right) %result = fcmp {predicate} double %left.format, %right.format ret i1 %result }}\n"))
-	}
-	block.push_str("define internal double @recipe.from.u1(i1 %value) #1 { entry: %wide = uitofp i1 %value to double %result = call double @recipe.round(double %wide) ret double %result }\ndefine internal double @recipe.from.u32(i32 %value) #1 { entry: %wide = uitofp i32 %value to double %result = call double @recipe.round(double %wide) ret double %result }\ndefine internal double @recipe.from.s32(i32 %value) #1 { entry: %wide = sitofp i32 %value to double %result = call double @recipe.round(double %wide) ret double %result }\ndefine internal i32 @recipe.to.u32(double %value) #1 { entry: %format = call double @recipe.round(double %value) %result = fptoui double %format to i32 ret i32 %result }\ndefine internal i32 @recipe.to.s32(double %value) #1 { entry: %format = call double @recipe.round(double %value) %result = fptosi double %format to i32 ret i32 %result }\ndefine internal double @recipe.from.f32(float %value) #1 { entry: %wide = fpext float %value to double %result = call double @recipe.round(double %wide) ret double %result }\ndefine internal double @recipe.from.f16(half %value) #1 { entry: %wide = fpext half %value to double %result = call double @recipe.round(double %wide) ret double %result }\ndefine internal half @recipe.to.f16(double %value) #1 { entry: %format = call double @recipe.round(double %value) %result = fptrunc double %format to half ret half %result }\n");
-	for (name, symbol) in [("abs", "llvm.fabs.f64"), ("floor", "llvm.floor.f64"), ("sqrt", "llvm.sqrt.f64"), ("exp", math[0]), ("tanh", math[1]), ("cos", math[2]), ("sin", math[3]), ("log", math[4])] {
-		block.push_str(&format!("define internal double @recipe.{name}(double %value) #1 {{ entry: %format = call double @recipe.round(double %value) %wide = call double @{symbol}(double %format) %result = call double @recipe.round(double %wide) ret double %result }}\n"))
-	}
-	block.push_str("define internal double @recipe.atomic.add(ptr addrspace(1) %target, double %value) #1 { entry: %value.format = call double @recipe.round(double %value) %initial = load atomic i64, ptr addrspace(1) %target monotonic, align 8 br label %attempt attempt: %prior.bits = phi i64 [ %initial, %entry ], [ %observed, %attempt ] %prior = bitcast i64 %prior.bits to double %prior.format = call double @recipe.round(double %prior) %sum = fadd double %prior.format, %value.format %rounded = call double @recipe.round(double %sum) %next = bitcast double %rounded to i64 %exchange = cmpxchg ptr addrspace(1) %target, i64 %prior.bits, i64 %next monotonic monotonic, align 8 %observed = extractvalue { i64, i1 } %exchange, 0 %stored = extractvalue { i64, i1 } %exchange, 1 br i1 %stored, label %done, label %attempt done: ret double %prior.format }\nattributes #2 = { noinline nounwind }\n; NUMERIC END");
-	block
+	block.push_str("define internal double @recipe.decode(double %value) #1 { entry: %result = call double @recipe.round(double %value) ret double %result }\ndefine internal double @recipe.encode(double %value) #1 { entry: %result = call double @recipe.round(double %value) ret double %result }\n");
+	numeric_program(ir, "double", "double", 64, &block)
 }
 fn custom_ir(ir: String, suffix: &str) -> BuildResult<String> {
 	let (start, end) = numeric_region(&ir)?;
 	Ok(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]).replace("@contraction_tile", &format!("@contraction_tile{suffix}")).replace("@RECIPE_NUMERIC@", &custom_numeric(&ir)))
 }
-fn encoded_numeric(ir: &str, llvm: &str, align: u8, codec: &str) -> String {
-	let math = math_names(ir, 32);
-	let mut block = format!("; NUMERIC BEGIN\ndeclare float @llvm.sqrt.f32(float) declare float @llvm.fabs.f32(float) declare float @llvm.floor.f32(float)\ndeclare float @{}(float) declare float @{}(float) declare float @{}(float) declare float @{}(float) declare float @{}(float)\n{codec}\n", math[0], math[1], math[2], math[3], math[4]);
-	for (name, opcode) in [("add", "fadd"), ("sub", "fsub"), ("mul", "fmul"), ("div", "fdiv")] {
-		block.push_str(&format!("define internal {llvm} @recipe.{name}({llvm} %left, {llvm} %right) #1 {{ entry: %left.wide = call float @recipe.decode({llvm} %left) %right.wide = call float @recipe.decode({llvm} %right) %wide = {opcode} float %left.wide, %right.wide %result = call {llvm} @recipe.encode(float %wide) ret {llvm} %result }}\n"))
-	}
-	block.push_str(&format!("define internal {llvm} @recipe.neg({llvm} %value) #1 {{ entry: %decoded = call float @recipe.decode({llvm} %value) %wide = fneg float %decoded %result = call {llvm} @recipe.encode(float %wide) ret {llvm} %result }}\n"));
-	for predicate in ["oeq", "oge", "ogt", "ole", "olt", "one", "ord"] {
-		block.push_str(&format!("define internal i1 @recipe.{predicate}({llvm} %left, {llvm} %right) #1 {{ entry: %left.wide = call float @recipe.decode({llvm} %left) %right.wide = call float @recipe.decode({llvm} %right) %result = fcmp {predicate} float %left.wide, %right.wide ret i1 %result }}\n"))
-	}
-	block.push_str(&format!("define internal {llvm} @recipe.from.u1(i1 %value) #1 {{ entry: %wide = uitofp i1 %value to float %result = call {llvm} @recipe.encode(float %wide) ret {llvm} %result }}\ndefine internal {llvm} @recipe.from.u32(i32 %value) #1 {{ entry: %wide = uitofp i32 %value to float %result = call {llvm} @recipe.encode(float %wide) ret {llvm} %result }}\ndefine internal {llvm} @recipe.from.s32(i32 %value) #1 {{ entry: %wide = sitofp i32 %value to float %result = call {llvm} @recipe.encode(float %wide) ret {llvm} %result }}\ndefine internal i32 @recipe.to.u32({llvm} %value) #1 {{ entry: %wide = call float @recipe.decode({llvm} %value) %result = fptoui float %wide to i32 ret i32 %result }}\ndefine internal i32 @recipe.to.s32({llvm} %value) #1 {{ entry: %wide = call float @recipe.decode({llvm} %value) %result = fptosi float %wide to i32 ret i32 %result }}\ndefine internal {llvm} @recipe.from.f32(float %value) #1 {{ entry: %result = call {llvm} @recipe.encode(float %value) ret {llvm} %result }}\ndefine internal {llvm} @recipe.from.f16(half %value) #1 {{ entry: %wide = fpext half %value to float %result = call {llvm} @recipe.encode(float %wide) ret {llvm} %result }}\ndefine internal half @recipe.to.f16({llvm} %value) #1 {{ entry: %wide = call float @recipe.decode({llvm} %value) %result = fptrunc float %wide to half ret half %result }}\n"));
-	for (name, symbol) in [("abs", "llvm.fabs.f32"), ("floor", "llvm.floor.f32"), ("sqrt", "llvm.sqrt.f32"), ("exp", math[0]), ("tanh", math[1]), ("cos", math[2]), ("sin", math[3]), ("log", math[4])] {
-		block.push_str(&format!("define internal {llvm} @recipe.{name}({llvm} %value) #1 {{ entry: %decoded = call float @recipe.decode({llvm} %value) %wide = call float @{symbol}(float %decoded) %result = call {llvm} @recipe.encode(float %wide) ret {llvm} %result }}\n"))
-	}
-	block.push_str(&format!("define internal {llvm} @recipe.atomic.add(ptr addrspace(1) %target, {llvm} %value) #1 {{ entry: %initial = load atomic {llvm}, ptr addrspace(1) %target monotonic, align {align} br label %attempt attempt: %prior = phi {llvm} [ %initial, %entry ], [ %observed, %attempt ] %prior.wide = call float @recipe.decode({llvm} %prior) %value.wide = call float @recipe.decode({llvm} %value) %sum = fadd float %prior.wide, %value.wide %next = call {llvm} @recipe.encode(float %sum) %exchange = cmpxchg ptr addrspace(1) %target, {llvm} %prior, {llvm} %next monotonic monotonic, align {align} %observed = extractvalue {{ {llvm}, i1 }} %exchange, 0 %stored = extractvalue {{ {llvm}, i1 }} %exchange, 1 br i1 %stored, label %done, label %attempt done: ret {llvm} %prior }}\ndefine internal void @recipe.set.format(i32 %exp, i32 %man) #1 {{ entry: ret void }}\n; NUMERIC END"));
-	block
+fn encoded_numeric(ir: &str, llvm: &str, bytes: u8, codec: &str) -> String {
+	numeric_program(ir, llvm, "float", bytes * 8, codec)
 }
 fn fp8_codec() -> &'static str {
 	r#"define internal float @recipe.decode(i8 %value) #1 { entry: %wide = zext i8 %value to i32 %sign = and i32 %wide, 128 %exponent.shifted = lshr i32 %wide, 2 %exponent = and i32 %exponent.shifted, 31 %mantissa = and i32 %wide, 3 %zero.exponent = icmp eq i32 %exponent, 0 br i1 %zero.exponent, label %subnormal, label %nonzero subnormal: %mantissa.float = uitofp i32 %mantissa to float %negative = icmp ne i32 %sign, 0 %subnormal.value = select i1 %negative, float 0xBEF0000000000000, float 0x3EF0000000000000 %scaled = fmul float %mantissa.float, %subnormal.value ret float %scaled nonzero: %special = icmp eq i32 %exponent, 31 %biased.exponent = add i32 %exponent, 112 %float.exponent = select i1 %special, i32 255, i32 %biased.exponent %float.sign = shl i32 %sign, 24 %float.exponent.bits = shl i32 %float.exponent, 23 %float.mantissa = shl i32 %mantissa, 21 %signed = or i32 %float.sign, %float.exponent.bits %bits = or i32 %signed, %float.mantissa %result = bitcast i32 %bits to float ret float %result }
@@ -360,9 +363,8 @@ fn number<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 }
 fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> { setting(manifest, key)?.strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| io::Error::other(format!("{key} must be quoted")).into()) }
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[("@contraction_tile = external addrspace(3) global [0 x double], align 8", "@contraction_tile = internal global [65536 x double] zeroinitializer, align 8"), (" addrspace(3)", ""), ("call i32 @llvm.amdgcn.workitem.id.x()", "add i32 0, 0"), ("call i32 @recipe.local.id.x()", "add i32 0, 0"), ("call i32 @recipe.group.id.x()", "add i32 0, 0"), ("call i32 @recipe.workgroup.size.x()", "add i32 1, 0"), ("call void @llvm.amdgcn.s.barrier()", ""), ("call void @recipe.local.barrier()", ""), ("declare i32 @llvm.amdgcn.workitem.id.x()", ""), ("declare void @llvm.amdgcn.s.barrier()", ""), ("declare i64 @__ockl_steadyctr_u64()", ""), ("__ocml_exp_f64", "exp"), ("__ocml_tanh_f64", "tanh"), ("__ocml_cos_f64", "cos"), ("__ocml_sin_f64", "sin"), ("__ocml_log_f64", "log"), ("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"1,1024\" }", "attributes #0 = { nounwind }")];
-fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
-	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, AMD_WIDTH, AMD_GRID_BARRIER);
-	let sources = [
+fn precision_sources(ir: String) -> BuildResult<[(&'static str, String); 10]> {
+	Ok([
 		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
 		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
 		("-f16", encoded_ir(ir.clone(), "_f16", FloatFormat::FP16.bytes(), &float_codec("half", "i16"), |value| FloatFormat::FP16.pack(value))?),
@@ -373,7 +375,11 @@ fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 		("-int4", encoded_ir(ir.clone(), "_int4", IntFormat::INT4.bytes(), &int_codec(IntFormat::INT4), |value| IntFormat::INT4.pack(value))?),
 		("-int1", encoded_ir(ir.clone(), "_int1", IntFormat::INT1.bytes(), &int_codec(IntFormat::INT1), |value| IntFormat::INT1.pack(value))?),
 		("-f", custom_ir(ir, "_f")?),
-	];
+	])
+}
+fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, AMD_WIDTH, AMD_GRID_BARRIER);
+	let sources = precision_sources(ir)?;
 	let mut values = Vec::new();
 	for (suffix, contents) in sources {
 		let path = out.join(format!("recipe-amd{suffix}.ll"));
@@ -389,18 +395,7 @@ fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 }
 fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER).replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda").replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x").replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x").replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x").replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0").replace("__ocml_exp_f64", "__nv_exp").replace("__ocml_tanh_f64", "__nv_tanh").replace("__ocml_cos_f64", "__nv_cos").replace("__ocml_sin_f64", "__nv_sin").replace("__ocml_log_f64", "__nv_log").replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"1,1024\" }", "attributes #0 = { nounwind }");
-	let sources = [
-		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
-		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
-		("-f16", encoded_ir(ir.clone(), "_f16", FloatFormat::FP16.bytes(), &float_codec("half", "i16"), |value| FloatFormat::FP16.pack(value))?),
-		("-f8", encoded_ir(ir.clone(), "_f8", FloatFormat::FP8.bytes(), fp8_codec(), |value| FloatFormat::FP8.pack(value))?),
-		("-bf16", encoded_ir(ir.clone(), "_bf16", FloatFormat::BF16.bytes(), bf16_codec(), |value| FloatFormat::BF16.pack(value))?),
-		("-tf32", native_ir(ir.clone(), "_tf32", "float", FloatFormat::TF32)?),
-		("-int8", encoded_ir(ir.clone(), "_int8", IntFormat::INT8.bytes(), &int_codec(IntFormat::INT8), |value| IntFormat::INT8.pack(value))?),
-		("-int4", encoded_ir(ir.clone(), "_int4", IntFormat::INT4.bytes(), &int_codec(IntFormat::INT4), |value| IntFormat::INT4.pack(value))?),
-		("-int1", encoded_ir(ir.clone(), "_int1", IntFormat::INT1.bytes(), &int_codec(IntFormat::INT1), |value| IntFormat::INT1.pack(value))?),
-		("-f", custom_ir(ir, "_f")?),
-	];
+	let sources = precision_sources(ir)?;
 	let mut values = Vec::new();
 	for (suffix, contents) in sources {
 		let path = out.join(format!("recipe-nvidia{suffix}.ll"));
@@ -423,18 +418,7 @@ fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 		ir = ir.replace(pattern, replacement);
 	}
 	let clang = ["nvidia-compiler", "hsa-compiler"].iter().filter_map(|key| text(manifest, key).ok()).find(|path| Path::new(path).exists()).unwrap_or("clang");
-	let sources = [
-		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
-		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
-		("-f16", encoded_ir(ir.clone(), "_f16", FloatFormat::FP16.bytes(), &float_codec("half", "i16"), |value| FloatFormat::FP16.pack(value))?),
-		("-f8", encoded_ir(ir.clone(), "_f8", FloatFormat::FP8.bytes(), fp8_codec(), |value| FloatFormat::FP8.pack(value))?),
-		("-bf16", encoded_ir(ir.clone(), "_bf16", FloatFormat::BF16.bytes(), bf16_codec(), |value| FloatFormat::BF16.pack(value))?),
-		("-tf32", native_ir(ir.clone(), "_tf32", "float", FloatFormat::TF32)?),
-		("-int8", encoded_ir(ir.clone(), "_int8", IntFormat::INT8.bytes(), &int_codec(IntFormat::INT8), |value| IntFormat::INT8.pack(value))?),
-		("-int4", encoded_ir(ir.clone(), "_int4", IntFormat::INT4.bytes(), &int_codec(IntFormat::INT4), |value| IntFormat::INT4.pack(value))?),
-		("-int1", encoded_ir(ir.clone(), "_int1", IntFormat::INT1.bytes(), &int_codec(IntFormat::INT1), |value| IntFormat::INT1.pack(value))?),
-		("-f", custom_ir(ir, "_f")?),
-	];
+	let sources = precision_sources(ir)?;
 	let mut values = Vec::new();
 	for (suffix, contents) in sources {
 		let contents = contents.replace(" addrspace(1)", "").replace(" addrspace(3)", "");

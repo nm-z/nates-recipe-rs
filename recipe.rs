@@ -122,6 +122,7 @@ pub type LiteralFn<'a> = dyn Fn(f64, &str) -> String + 'a;
 pub struct ScalarContext<'a> {
 	pub value_type: &'a str,
 	pub pointer_type: &'a str,
+	pub alignment: usize,
 	pub first: &'a str,
 	pub second: &'a str,
 	pub weights: &'a str,
@@ -202,7 +203,7 @@ pub fn emit_scalar_forward(code: &[f64], context: ScalarContext<'_>) -> Result<S
 				}
 				let pointer = format!("{name}.ptr");
 				let _ = writeln!(output, "{pointer} = getelementptr inbounds {ty}, {ptrty} {weights}, i32 {parameter}", ty = context.value_type, ptrty = context.pointer_type, weights = context.weights, parameter = parameter);
-				let _ = writeln!(output, "{name} = load {ty}, {ptrty} {pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, pointer = pointer, align = if context.value_type == "double" { 8 } else { 4 });
+				let _ = writeln!(output, "{name} = load {ty}, {ptrty} {pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, pointer = pointer, align = context.alignment);
 				name
 			},
 			ScalarOpcode::Rat => scalar_operand(instruction.left, &values, context.first, context.second)?,
@@ -406,6 +407,7 @@ pub fn emit_scalar_reverse(code: &[f64], context: ScalarContext<'_>, incoming: &
 pub struct PredictorContext<'a> {
 	pub value_type: &'a str,
 	pub pointer_type: &'a str,
+	pub alignment: usize,
 	pub input: &'a str,
 	pub row: &'a str,
 	pub features: usize,
@@ -460,7 +462,7 @@ pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorCon
 				let _ = writeln!(output, "{row_base} = mul i32 {row}, {features}", row = context.row, features = context.features);
 				let _ = writeln!(output, "{index} = add i32 {row_base}, {feature}");
 				let _ = writeln!(output, "{pointer} = getelementptr inbounds {ty}, {ptrty} {input}, i32 {index}", ty = context.value_type, ptrty = context.pointer_type, input = context.input);
-				let _ = writeln!(output, "{value} = load {ty}, {ptrty} {pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, pointer = pointer, align = if context.value_type == "double" { 8 } else { 4 });
+				let _ = writeln!(output, "{value} = load {ty}, {ptrty} {pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, pointer = pointer, align = context.alignment);
 				stack.push(value);
 			}
 			PredictorOpcode::Row => {
@@ -527,6 +529,7 @@ pub struct RouteField<'a> {
 pub struct RouteContext<'a> {
 	pub value_type: &'a str,
 	pub pointer_type: &'a str,
+	pub alignment: usize,
 	pub row: &'a str,
 	pub output: &'a str,
 	pub prefix: &'a str,
@@ -551,10 +554,10 @@ pub fn emit_route(fields: &[RouteField<'_>], context: RouteContext<'_>) -> Resul
 		let _ = writeln!(output, "{source_base} = mul i32 {row}, {stride}", row = context.row, stride = field.stride);
 		let _ = writeln!(output, "{source_index} = add i32 {source_base}, {field}", field = field.index);
 		let _ = writeln!(output, "{source_pointer} = getelementptr inbounds {ty}, {ptrty} {source}, i32 {source_index}", ty = context.value_type, ptrty = context.pointer_type, source = field.source);
-		let _ = writeln!(output, "{value} = load {ty}, {ptrty} {source_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, source_pointer = source_pointer, align = if context.value_type == "double" { 8 } else { 4 });
+		let _ = writeln!(output, "{value} = load {ty}, {ptrty} {source_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, source_pointer = source_pointer, align = context.alignment);
 		let _ = writeln!(output, "{output_index} = add i32 {output_base}, {column}");
 		let _ = writeln!(output, "{output_pointer} = getelementptr inbounds {ty}, {ptrty} {output}, i32 {output_index}", ty = context.value_type, ptrty = context.pointer_type, output = context.output);
-		let _ = writeln!(output, "store {ty} {value}, {ptrty} {output_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, value = value, output_pointer = output_pointer, align = if context.value_type == "double" { 8 } else { 4 });
+		let _ = writeln!(output, "store {ty} {value}, {ptrty} {output_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, value = value, output_pointer = output_pointer, align = context.alignment);
 	}
 	Ok(output)
 }
@@ -563,6 +566,7 @@ pub fn emit_route(fields: &[RouteField<'_>], context: RouteContext<'_>) -> Resul
 pub struct RouteReverseContext<'a> {
 	pub value_type: &'a str,
 	pub pointer_type: &'a str,
+	pub alignment: usize,
 	pub row: &'a str,
 	pub output_adjoint: &'a str,
 	pub prefix: &'a str,
@@ -590,7 +594,7 @@ pub fn emit_route_reverse(fields: &[RouteField<'_>], source_adjoint: &[&str], co
 		let source_pointer = format!("%{}.route.reverse.source.ptr.{column}", context.prefix);
 		let _ = writeln!(output, "{output_index} = add i32 {output_base}, {column}");
 		let _ = writeln!(output, "{output_pointer} = getelementptr inbounds {ty}, {ptrty} {output_adjoint}, i32 {output_index}", ty = context.value_type, ptrty = context.pointer_type, output_adjoint = context.output_adjoint);
-		let _ = writeln!(output, "{delta} = load {ty}, {ptrty} {output_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, output_pointer = output_pointer, align = if context.value_type == "double" { 8 } else { 4 });
+		let _ = writeln!(output, "{delta} = load {ty}, {ptrty} {output_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, output_pointer = output_pointer, align = context.alignment);
 		let _ = writeln!(output, "{source_base} = mul i32 {row}, {stride}", row = context.row, stride = field.stride);
 		let _ = writeln!(output, "{source_index} = add i32 {source_base}, {field}", field = field.index);
 		let _ = writeln!(output, "{source_pointer} = getelementptr inbounds {ty}, {ptrty} {source}, i32 {source_index}", ty = context.value_type, ptrty = context.pointer_type, source = source);
@@ -613,6 +617,7 @@ pub enum NormalizeMode {
 pub struct NormalizeContext<'a> {
 	pub value_type: &'a str,
 	pub pointer_type: &'a str,
+	pub alignment: usize,
 	pub source_value: &'a str,
 	pub context: &'a str,
 	pub rows: &'a str,
@@ -667,8 +672,8 @@ pub fn emit_normalize(context: NormalizeContext<'_>, element: &str) -> Normalize
 	let _ = writeln!(output, "{scale_index} = add i32 {groups}, {group}");
 	let _ = writeln!(output, "{mean_pointer} = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i32 {group}", ty = context.value_type, ptrty = context.pointer_type, context_ptr = context.context);
 	let _ = writeln!(output, "{scale_pointer} = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i32 {scale_index}", ty = context.value_type, ptrty = context.pointer_type, context_ptr = context.context);
-	let _ = writeln!(output, "{mean} = load {ty}, {ptrty} {mean_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, mean_pointer = mean_pointer, align = if context.value_type == "double" { 8 } else { 4 });
-	let _ = writeln!(output, "{scale} = load {ty}, {ptrty} {scale_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, scale_pointer = scale_pointer, align = if context.value_type == "double" { 8 } else { 4 });
+	let _ = writeln!(output, "{mean} = load {ty}, {ptrty} {mean_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, mean_pointer = mean_pointer, align = context.alignment);
+	let _ = writeln!(output, "{scale} = load {ty}, {ptrty} {scale_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, scale_pointer = scale_pointer, align = context.alignment);
 	let _ = writeln!(output, "{centered} = call {ty} @recipe.sub({ty} {source}, {ty} {mean})", ty = context.value_type, source = context.source_value);
 	let _ = writeln!(output, "{value} = call {ty} @recipe.mul({ty} {centered}, {ty} {scale})", ty = context.value_type);
 	NormalizeFragment { code: output, value }
@@ -880,10 +885,20 @@ fn native_cpu_target() -> Result<BackendTarget> {
 pub(crate) struct NativeArtifact {
 	pub(crate) backend: BackendTarget,
 	pub(crate) layout: NativeLayout,
-	pub(crate) precision: Compute,
+	pub(crate) precision: NativePrecision,
 	pub(crate) artifact: Vec<u8>,
 	pub(crate) path: PathBuf,
 	pub(crate) storage: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativePrecision {
+	model: Compute,
+	state: Compute,
+	source: &'static str,
+	model_type: &'static str,
+	state_type: &'static str,
+	epoch_layout: &'static [u8],
 }
 
 const NATIVE_FORWARD_SYMBOL: &str = "recipe_model_forward";
@@ -892,10 +907,31 @@ const NATIVE_MODEL_LOAD_SYMBOL: &str = "recipe_model_load";
 const NATIVE_FORWARD_LAYOUT: &[u8] = b"888844444";
 const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"8888888888884444488888884";
 const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"8888888888884444444444444";
-const NATIVE_EPOCH_LAYOUT_FP16: &[u8] = b"8888888888884444422222224";
-const NATIVE_EPOCH_LAYOUT_FP8: &[u8] = b"8888888888884444411111114";
 const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"884";
-
+macro_rules! native_precisions {
+	($($pattern:pat $(if $guard:expr)? => ($source:literal, $model_type:literal, $state:expr, $state_type:literal, $layout:expr)),+ $(,)?) => {
+		impl NativePrecision {
+			fn new(model: Compute) -> Result<Self> {
+				match model {
+					$($pattern $(if $guard)? => Ok(Self { model, state: $state, source: $source, model_type: $model_type, state_type: $state_type, epoch_layout: $layout }),)+
+					_ => Err(RecipeError::new(format!("{} has no native precision composition", model.label()))),
+				}
+			}
+		}
+	};
+}
+native_precisions! {
+	Compute::F(_) => ("-f", "double", Compute::FP64, "double", NATIVE_EPOCH_LAYOUT_FP64),
+	Compute::Fp(format) if format == FloatFormat::FP64 => ("default", "double", Compute::FP64, "double", NATIVE_EPOCH_LAYOUT_FP64),
+	Compute::Fp(format) if format == FloatFormat::FP32 => ("-f32", "float", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
+	Compute::Fp(format) if format == FloatFormat::FP16 => ("-f16", "i16", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
+	Compute::Fp(format) if format == FloatFormat::FP8 => ("-f8", "i8", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
+	Compute::Bf(format) if format == FloatFormat::BF16 => ("-bf16", "i16", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
+	Compute::Tf(format) if format == FloatFormat::TF32 => ("-tf32", "float", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
+	Compute::Int(format) if format == IntFormat::INT8 => ("-int8", "i8", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
+	Compute::Int(format) if format == IntFormat::INT4 => ("-int4", "i8", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
+	Compute::Int(format) if format == IntFormat::INT1 => ("-int1", "i8", Compute::FP32, "float", NATIVE_EPOCH_LAYOUT_FP32),
+}
 fn align(value: usize, boundary: usize) -> Result<usize> {
 	let boundary = boundary.max(1);
 	let remainder = value % boundary;
@@ -936,7 +972,7 @@ struct NodePlan {
 pub(crate) struct NativeModelIr {
 	graph: Graph,
 	layout: NativeLayout,
-	precision: Compute,
+	precision: NativePrecision,
 	rows: usize,
 	plans: Vec<NodePlan>,
 	storage_bytes: usize,
@@ -946,6 +982,7 @@ impl NativeModelIr {
 	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute) -> Result<Self> {
 		require(rows != 0, "native model rows must be positive")?;
 		let layout = NativeLayout::for_graph(graph, rows, precision)?;
+		let precision = NativePrecision::new(precision)?;
 		let mut plans = Vec::with_capacity(graph.nodes.len());
 		let mut storage_bytes = 0usize;
 		for (index, node) in graph.nodes.iter().cloned().enumerate() {
@@ -979,38 +1016,21 @@ impl NativeModelIr {
 	}
 }
 
-fn precision_source(precision: Compute) -> &'static str {
-	match precision {
-		Compute::F(_) => "-f",
-		Compute::Fp(format) if format == FloatFormat::FP64 => "default",
-		Compute::Fp(format) if format == FloatFormat::FP32 => "-f32",
-		Compute::Fp(format) if format == FloatFormat::FP16 => "-f16",
-		Compute::Fp(format) if format == FloatFormat::FP8 => "-f8",
-		Compute::Fp(_) => "-f8",
-		Compute::Bf(_) => "-bf16",
-		Compute::Tf(_) => "-tf32",
-		Compute::Int(IntFormat { bits: 8 }) => "-int8",
-		Compute::Int(IntFormat { bits: 4 }) => "-int4",
-		Compute::Int(IntFormat { bits: 1 }) => "-int1",
-		Compute::Int(_) => "-int8",
-	}
-}
-
 fn template_path(mapping: &str, suffix: &str) -> Result<PathBuf> {
 	let key = if suffix.is_empty() { "default" } else { suffix };
 	let path = mapping.split(';').find_map(|entry| entry.split_once('=').filter(|(name, _)| *name == key).map(|(_, path)| PathBuf::from(path))).ok_or_else(|| RecipeError::new(format!("native LLVM template {key:?} is absent")))?;
 	Ok(path)
 }
 
-fn backend_template(backend: Backend, precision: Compute) -> Result<String> {
-	let suffix = precision_source(precision);
+fn backend_template(backend: Backend, precision: NativePrecision) -> Result<String> {
+	let suffix = precision.source;
 	let mapping = match backend {
 		Backend::Cpu => option_env!("RECIPE_CPU_IR").ok_or_else(|| RecipeError::new("CPU native LLVM templates are unavailable"))?,
 		Backend::Amd => option_env!("RECIPE_AMD_IR").ok_or_else(|| RecipeError::new("AMD native LLVM templates are unavailable"))?,
 		Backend::Nvidia => option_env!("RECIPE_NV_IR").ok_or_else(|| RecipeError::new("NVIDIA native LLVM templates are unavailable"))?,
 	};
 	let mut ir = fs::read_to_string(template_path(mapping, suffix)?).map_err(|error| RecipeError::new(format!("cannot read native LLVM template: {error}")))?;
-	if let Compute::F(format) = precision {
+	if let Compute::F(format) = precision.model {
 		for address_space in [" addrspace(3)", ""] {
 			ir = ir.replace(&format!("load atomic i32, ptr{address_space} @recipe_f_exp monotonic, align 4"), &format!("add i32 0, {}", format.arithmetic.exp));
 			ir = ir.replace(&format!("load atomic i32, ptr{address_space} @recipe_f_man monotonic, align 4"), &format!("add i32 0, {}", format.arithmetic.man));
@@ -1022,15 +1042,6 @@ fn backend_template(backend: Backend, precision: Compute) -> Result<String> {
 		}
 	}
 	Ok(ir)
-}
-
-fn value_type(precision: Compute) -> &'static str {
-	match precision {
-		Compute::F(_) | Compute::Fp(FloatFormat { storage: FloatLayout { exp: 11, man: 52, .. }, .. }) => "double",
-		Compute::Fp(FloatFormat { storage: FloatLayout { exp: 8, man: 23, .. }, .. }) | Compute::Tf(_) => "float",
-		Compute::Fp(FloatFormat { storage: FloatLayout { exp: 5, man: 10, .. }, .. }) | Compute::Bf(_) => "i16",
-		Compute::Fp(_) | Compute::Int(_) => "i8",
-	}
 }
 
 fn pointer_type(backend: Backend) -> &'static str { if backend == Backend::Cpu { "ptr" } else { "ptr addrspace(1)" } }
@@ -1123,15 +1134,15 @@ impl NativeModelIr {
 				(false, Primitive::Elementwise) => {
 					let count = checked_mul(self.rows, node.output.elements(), "scalar output count")?;
 					let pointer = pointer_type(backend);
-					let ty = value_type(self.precision);
-					let literal = |value: f64, ty: &str| native_literal(self.precision, ty, value);
+					let ty = self.precision.model_type;
+					let literal = |value: f64, ty: &str| native_literal(self.precision.model, ty, value);
 					let prefix = format!("n{index}.scalar");
 					let first = format!("%{prefix}.first");
 					let second = format!("%{prefix}.second");
 					let second_operand = if pointers.second == pointers.source { first.as_str() } else { second.as_str() };
 					let code_end = node.program_offset.checked_add(node.program_count.checked_mul(3).ok_or_else(|| RecipeError::new("scalar program length overflows"))?).ok_or_else(|| RecipeError::new("scalar program range overflows"))?;
 					let code = self.graph.programs.get(node.program_offset..code_end).ok_or_else(|| RecipeError::new(format!("node {index} scalar program range is invalid")))?;
-					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, pointer_type: pointer, first: &first, second: second_operand, weights: &pointers.weights, prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
+					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), first: &first, second: second_operand, weights: &pointers.weights, prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
 					emit_fixed_loop(&mut ir, index, "scalar", count, |ir, p| {
 						let first_pointer = format!("%{prefix}.first.ptr");
 						let output_pointer = format!("%{prefix}.output.ptr");
@@ -1150,14 +1161,14 @@ impl NativeModelIr {
 					let count = checked_mul(self.rows, node.output.elements(), "predictor output count")?;
 					let locals = integer_argument(node.argument[0], "predictor locals")?;
 					let pointer = pointer_type(backend);
-					let ty = value_type(self.precision);
-					let literal = |value: f64, ty: &str| native_literal(self.precision, ty, value);
+					let ty = self.precision.model_type;
+					let literal = |value: f64, ty: &str| native_literal(self.precision.model, ty, value);
 					let prefix = format!("n{index}.predictor");
 					let code_end = node.program_offset.checked_add(node.program_count.checked_mul(2).ok_or_else(|| RecipeError::new("predictor program length overflows"))?).ok_or_else(|| RecipeError::new("predictor program range overflows"))?;
 					let code = self.graph.programs.get(node.program_offset..code_end).ok_or_else(|| RecipeError::new(format!("node {index} predictor program range is invalid")))?;
 					let locals = usize::try_from(locals).map_err(|_| RecipeError::new("predictor locals exceed usize"))?;
 					let row = format!("%{prefix}.row");
-					let forward = program_ir::emit_predictor_forward(code, locals, program_ir::PredictorContext { value_type: ty, pointer_type: pointer, input: &pointers.source, row: &row, features: node.input.elements(), prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
+					let forward = program_ir::emit_predictor_forward(code, locals, program_ir::PredictorContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), input: &pointers.source, row: &row, features: node.input.elements(), prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
 						emit_fixed_loop(&mut ir, index, "predictor", count, |ir, p| {
 							ir.push_str(&format!("{row} = udiv i32 {p}, {elements}\n", elements = node.output.elements()));
 							ir.push_str(&forward.code);
@@ -1173,7 +1184,7 @@ impl NativeModelIr {
 				(true, Primitive::Pool) => {
 					let count = checked_mul(self.rows, node.output.elements(), "pool reverse count")?;
 					let pointer = pointer_type(backend);
-					let ty = value_type(self.precision);
+					let ty = self.precision.model_type;
 					let prefix = format!("n{index}.pool.reverse");
 					emit_fixed_loop(&mut ir, index, "pool.reverse", count, |ir, p| {
 						let context_pointer = format!("%{prefix}.context.ptr");
@@ -1209,17 +1220,17 @@ impl NativeModelIr {
 				(true, Primitive::Elementwise) => {
 					let count = checked_mul(self.rows, node.output.elements(), "scalar reverse count")?;
 					let pointer = pointer_type(backend);
-					let ty = value_type(self.precision);
-					let literal = |value: f64, ty: &str| native_literal(self.precision, ty, value);
+					let ty = self.precision.model_type;
+					let literal = |value: f64, ty: &str| native_literal(self.precision.model, ty, value);
 					let prefix = format!("n{index}.scalar.reverse");
 					let first = format!("%{prefix}.first");
 					let second = format!("%{prefix}.second");
 					let second_operand = if pointers.second == pointers.source { first.as_str() } else { second.as_str() };
 					let code_end = node.program_offset.checked_add(node.program_count.checked_mul(3).ok_or_else(|| RecipeError::new("scalar reverse program length overflows"))?).ok_or_else(|| RecipeError::new("scalar reverse program range overflows"))?;
 					let code = self.graph.programs.get(node.program_offset..code_end).ok_or_else(|| RecipeError::new(format!("node {index} scalar reverse program range is invalid")))?;
-					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, pointer_type: pointer, first: &first, second: second_operand, weights: &pointers.weights, prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
+					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), first: &first, second: second_operand, weights: &pointers.weights, prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
 					let incoming = format!("%{prefix}.incoming");
-					let reverse = program_ir::emit_scalar_reverse(code, program_ir::ScalarContext { value_type: ty, pointer_type: pointer, first: &first, second: second_operand, weights: &pointers.weights, prefix: &prefix, literal: &literal }, &incoming).map_err(|error| RecipeError::new(error.to_string()))?;
+					let reverse = program_ir::emit_scalar_reverse(code, program_ir::ScalarContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), first: &first, second: second_operand, weights: &pointers.weights, prefix: &prefix, literal: &literal }, &incoming).map_err(|error| RecipeError::new(error.to_string()))?;
 					let gradients = reverse.parameter_adjoint.iter().map(|(&parameter, value)| Ok((checked_add(plan.node.offset, parameter, "scalar gradient offset")?, value.clone()))).collect::<Result<Vec<_>>>()?;
 						emit_fixed_loop(&mut ir, index, "scalar.reverse", count, |ir, p| {
 							let first_pointer = format!("%{prefix}.first.ptr");
@@ -1252,11 +1263,11 @@ impl NativeModelIr {
 					let fields = self.route_fields(backend, index, node, &mut ir)?;
 					let count = checked_mul(self.rows, node.output.elements(), "route output count")?;
 					let pointer = pointer_type(backend);
-					let ty = value_type(self.precision);
+					let ty = self.precision.model_type;
 					let prefix = format!("n{index}.route");
 					let field_refs = fields.iter().map(|(source, stride, field)| program_ir::RouteField { source, stride: *stride, index: *field }).collect::<Vec<_>>();
 					let row = format!("%{prefix}.row");
-					let fragment = program_ir::emit_route(&field_refs, program_ir::RouteContext { value_type: ty, pointer_type: pointer, row: &row, output: &pointers.value, prefix: &prefix }).map_err(|error| RecipeError::new(error.to_string()))?;
+					let fragment = program_ir::emit_route(&field_refs, program_ir::RouteContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), row: &row, output: &pointers.value, prefix: &prefix }).map_err(|error| RecipeError::new(error.to_string()))?;
 					emit_fixed_loop(&mut ir, index, "route", count, |ir, p| {
 						ir.push_str(&format!("{row} = udiv i32 {p}, {width}\n", width = field_refs.len()));
 						ir.push_str(&fragment);
@@ -1267,7 +1278,7 @@ impl NativeModelIr {
 					let fields = self.route_fields(backend, index, node, &mut ir)?;
 					let count = checked_mul(self.rows, node.output.elements(), "route reverse count")?;
 					let pointer = pointer_type(backend);
-					let ty = value_type(self.precision);
+					let ty = self.precision.model_type;
 					let prefix = format!("n{index}.route.reverse");
 					let field_refs = fields.iter().map(|(source, stride, field)| program_ir::RouteField { source, stride: *stride, index: *field }).collect::<Vec<_>>();
 					let mut adjoint_sources = Vec::with_capacity(node.program_count);
@@ -1283,7 +1294,7 @@ impl NativeModelIr {
 					}
 					let adjoint_refs = adjoint_sources.iter().map(String::as_str).collect::<Vec<_>>();
 					let row = format!("%{prefix}.row");
-					let fragment = program_ir::emit_route_reverse(&field_refs, &adjoint_refs, program_ir::RouteReverseContext { value_type: ty, pointer_type: pointer, row: &row, output_adjoint: &pointers.delta, prefix: &prefix }).map_err(|error| RecipeError::new(error.to_string()))?;
+					let fragment = program_ir::emit_route_reverse(&field_refs, &adjoint_refs, program_ir::RouteReverseContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), row: &row, output_adjoint: &pointers.delta, prefix: &prefix }).map_err(|error| RecipeError::new(error.to_string()))?;
 					emit_fixed_loop(&mut ir, index, "route.reverse", count, |ir, p| {
 						ir.push_str(&format!("{row} = udiv i32 {p}, {width}\n", width = field_refs.len()));
 						ir.push_str(&fragment);
@@ -1294,7 +1305,7 @@ impl NativeModelIr {
 					let count = checked_mul(self.rows, node.output.elements(), "normalize output count")?;
 					let mode = normalize_mode(node.argument[0])?;
 					let pointer = pointer_type(backend);
-					let ty = value_type(self.precision);
+					let ty = self.precision.model_type;
 					let prefix = format!("n{index}.normalize");
 					if mode != program_ir::NormalizeMode::Evaluation && (training || matches!(mode, program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms)) {
 						ir.push_str(&self.emit_normalize_stats(backend, index, node, &pointers, mode)?);
@@ -1304,7 +1315,7 @@ impl NativeModelIr {
 						let source_pointer = format!("%{prefix}.source.ptr");
 						let source_value = format!("%{prefix}.source.value");
 						ir.push_str(&format!("{source_pointer} = getelementptr inbounds {ty}, {pointer} {source}, i32 {p}\n{source_value} = load {ty}, {pointer} {source_pointer}, align {align}\n", source = pointers.source, align = alignment(ty)));
-						let fragment = program_ir::emit_normalize(program_ir::NormalizeContext { value_type: ty, pointer_type: pointer, source_value: &source_value, context: &pointers.context, rows: "%rows", channels: node.output.channels, length: node.output.length, mode, prefix: &prefix }, p);
+						let fragment = program_ir::emit_normalize(program_ir::NormalizeContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), source_value: &source_value, context: &pointers.context, rows: "%rows", channels: node.output.channels, length: node.output.length, mode, prefix: &prefix }, p);
 						ir.push_str(&fragment.code);
 						let output_pointer = format!("%{prefix}.output.ptr");
 						ir.push_str(&format!("{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i32 {p}\nstore {ty} {result}, {pointer} {output_pointer}, align {align}\n", value = pointers.value, result = fragment.value, align = alignment(ty)));
@@ -1315,7 +1326,7 @@ impl NativeModelIr {
 					let count = checked_mul(self.rows, node.output.elements(), "normalize reverse count")?;
 					let mode = normalize_mode(node.argument[0])?;
 					let pointer = pointer_type(backend);
-					let ty = value_type(self.precision);
+					let ty = self.precision.model_type;
 					let prefix = format!("n{index}.normalize.reverse");
 					emit_fixed_loop(&mut ir, index, "normalize.reverse", count, |ir, p| {
 						let delta_pointer = format!("%{prefix}.delta.ptr");
@@ -1337,15 +1348,15 @@ impl NativeModelIr {
 
 	fn emit_normalize_stats(&self, backend: Backend, index: usize, node: &Node, pointers: &ModelPointers, mode: program_ir::NormalizeMode) -> Result<String> {
 		let pointer = pointer_type(backend);
-		let ty = value_type(self.precision);
+		let ty = self.precision.model_type;
 		let prefix = format!("n{index}.normalize.stats");
 		let elements = i32::try_from(node.output.elements()).map_err(|_| RecipeError::new("normalization element count exceeds i32"))?;
 		let length = i32::try_from(node.output.length).map_err(|_| RecipeError::new("normalization length exceeds i32"))?;
 		let channels = i32::try_from(node.output.channels).map_err(|_| RecipeError::new("normalization channels exceed i32"))?;
 		let mut ir = String::new();
-		let zero = native_literal(self.precision, ty, 0.0);
-		let one = native_literal(self.precision, ty, 1.0);
-		let epsilon = native_literal(self.precision, ty, node.argument[1]);
+		let zero = native_literal(self.precision.model, ty, 0.0);
+		let one = native_literal(self.precision.model, ty, 1.0);
+		let epsilon = native_literal(self.precision.model, ty, node.argument[1]);
 		let groups = format!("%{prefix}.groups");
 		let items = format!("%{prefix}.items");
 		match mode {
@@ -1441,7 +1452,7 @@ impl NativeModelIr {
 		if reverse {
 			ir.push_str(&ptr_gep(backend, "adjoints", plan.adjoint, &format!("{prefix}.delta")));
 		}
-		let weight_bytes = checked_mul(plan.node.offset, self.precision.bytes(), "native parameter offset")?;
+		let weight_bytes = checked_mul(plan.node.offset, self.precision.model.bytes(), "native parameter offset")?;
 		ir.push_str(&ptr_gep(backend, "weights", weight_bytes, &format!("{prefix}.weights")));
 		let source_adjoint = if reverse && plan.node.source >= 0 {
 			let source = usize::try_from(plan.node.source).map_err(|_| RecipeError::new("native source adjoint node is invalid"))?;
@@ -1457,7 +1468,7 @@ impl NativeModelIr {
 	}
 
 	fn emit_iq_definition(&self, backend: Backend, codec: StorageCodec) -> Result<String> {
-		let (pointer, ty) = (pointer_type(backend), value_type(self.precision));
+		let (pointer, ty) = (pointer_type(backend), self.precision.model_type);
 		let name = match codec { StorageCodec::IQ1S => "iq1s", StorageCodec::IQ1M => "iq1m", StorageCodec::IQ2S => "iq2s", StorageCodec::IQ2XS => "iq2xs", StorageCodec::IQ2XXS => "iq2xxs", StorageCodec::IQ3S => "iq3s", _ => return Err(RecipeError::new(format!("native IQ decoder is unavailable for {codec:?}"))) };
 		let mut ir = format!("define internal {ty} @recipe_model_quantized_{name}({pointer} %matrix, i32 %row, i32 %column, i32 %columns) #1 {{\nentry:\n");
 		if matches!(codec, StorageCodec::IQ2S | StorageCodec::IQ2XS | StorageCodec::IQ2XXS) {
@@ -1475,7 +1486,7 @@ impl NativeModelIr {
 				let factor_offset = if codec == StorageCodec::IQ2S { 74 } else { 66 };
 				ir.push_str(&format!("%factor.block = udiv i32 %value.block, 2\n%factor.offset = add i32 {factor_offset}, %factor.block\n%factor.ptr = getelementptr inbounds i8, {pointer} %block, i32 %factor.offset\n%factor.byte = load i8, {pointer} %factor.ptr, align 1\n%factor.raw = zext i8 %factor.byte to i32\n%factor.slot = urem i32 %value.block, 2\n%factor.shift = mul i32 %factor.slot, 4\n%factor.shifted = lshr i32 %factor.raw, %factor.shift\n%factor.code = and i32 %factor.shifted, 15\n"));
 			}
-			ir.push_str(&format!("%table.ptr = getelementptr inbounds [{table_len} x i16], ptr @recipe_model_{table}, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.code = and i32 %level.shifted, 3\n%level.twice = shl i32 %level.code, 1\n%level.raw = add i32 %level.twice, 1\n%level = call {ty} @recipe.from.u32(i32 %level.raw)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 0\n%scale.half = load half, {pointer} %scale.ptr, align 2\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%factor.integer = call {ty} @recipe.from.u32(i32 %factor.code)\n%factor = call {ty} @recipe.add({ty} %factor.integer, {ty} {half})\n%scaled.base = call {ty} @recipe.mul({ty} %scale, {ty} %factor)\n%scaled = call {ty} @recipe.mul({ty} %scaled.base, {ty} {quarter})\n%unsigned = call {ty} @recipe.mul({ty} %scaled, {ty} %level)\n%negative = call {ty} @recipe.neg({ty} %unsigned)\n%sign.set = icmp ne i32 %sign.bit, 0\n%result = select i1 %sign.set, {ty} %negative, {ty} %unsigned\nret {ty} %result\n}}\n", half = native_literal(self.precision, ty, 0.5), quarter = native_literal(self.precision, ty, 0.25)));
+			ir.push_str(&format!("%table.ptr = getelementptr inbounds [{table_len} x i16], ptr @recipe_model_{table}, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.code = and i32 %level.shifted, 3\n%level.twice = shl i32 %level.code, 1\n%level.raw = add i32 %level.twice, 1\n%level = call {ty} @recipe.from.u32(i32 %level.raw)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 0\n%scale.half = load half, {pointer} %scale.ptr, align 2\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%factor.integer = call {ty} @recipe.from.u32(i32 %factor.code)\n%factor = call {ty} @recipe.add({ty} %factor.integer, {ty} {half})\n%scaled.base = call {ty} @recipe.mul({ty} %scale, {ty} %factor)\n%scaled = call {ty} @recipe.mul({ty} %scaled.base, {ty} {quarter})\n%unsigned = call {ty} @recipe.mul({ty} %scaled, {ty} %level)\n%negative = call {ty} @recipe.neg({ty} %unsigned)\n%sign.set = icmp ne i32 %sign.bit, 0\n%result = select i1 %sign.set, {ty} %negative, {ty} %unsigned\nret {ty} %result\n}}\n", half = native_literal(self.precision.model, ty, 0.5), quarter = native_literal(self.precision.model, ty, 0.25)));
 			return Ok(ir)
 		}
 		if codec == StorageCodec::IQ3S {
@@ -1483,10 +1494,10 @@ impl NativeModelIr {
 			return Ok(ir)
 		}
 		if codec == StorageCodec::IQ1M {
-			ir.push_str(&format!("%blocks = udiv i32 %columns, 256\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, 256\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, 56\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local = urem i32 %column, 256\n%value.block = udiv i32 %local, 16\n%group.local = urem i32 %local, 16\n%group = udiv i32 %group.local, 8\n%high.offset = add i32 32, %value.block\n%high.ptr = getelementptr inbounds i8, {pointer} %block, i32 %high.offset\n%high.byte = load i8, {pointer} %high.ptr, align 1\n%high.raw = zext i8 %high.byte to i32\n%grid.block = mul i32 %value.block, 2\n%grid.offset = add i32 %grid.block, %group\n%grid.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.offset\n%grid.byte = load i8, {pointer} %grid.ptr, align 1\n%grid.raw = zext i8 %grid.byte to i32\n%group.shift = mul i32 %group, 4\n%high.shifted = lshr i32 %high.raw, %group.shift\n%high.grid = and i32 %high.shifted, 7\n%high.grid.shifted = shl i32 %high.grid, 8\n%grid = or i32 %grid.raw, %high.grid.shifted\n%table.ptr = getelementptr inbounds [2048 x i16], ptr @recipe_model_iq1, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane = urem i32 %local, 8\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.raw = and i32 %level.shifted, 3\n%level.offset = sub i32 %level.raw, 1\n%delta.shift = add i32 %group.shift, 3\n%delta.shifted = lshr i32 %high.raw, %delta.shift\n%delta.bit = and i32 %delta.shifted, 1\n%delta.zero = icmp eq i32 %delta.bit, 0\n%delta = select i1 %delta.zero, {ty} {positive_delta}, {ty} {negative_delta}\n%level = call {ty} @recipe.from.s32(i32 %level.offset)\n%level.delta = call {ty} @recipe.add({ty} %level, {ty} %delta)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 48\n%scale.packed = load i64, {pointer} %scale.ptr, align 2\n%scale.s0.shifted = lshr i64 %scale.packed, 12\n%scale.s0 = and i64 %scale.s0.shifted, 15\n%scale.s1.shifted = lshr i64 %scale.packed, 24\n%scale.s1 = and i64 %scale.s1.shifted, 240\n%scale.s01 = or i64 %scale.s0, %scale.s1\n%scale.s2.shifted = lshr i64 %scale.packed, 36\n%scale.s2 = and i64 %scale.s2.shifted, 3840\n%scale.s012 = or i64 %scale.s01, %scale.s2\n%scale.s3.shifted = lshr i64 %scale.packed, 48\n%scale.s3 = and i64 %scale.s3.shifted, 61440\n%scale.raw = or i64 %scale.s012, %scale.s3\n%scale.bits = trunc i64 %scale.raw to i16\n%scale.half = bitcast i16 %scale.bits to half\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%scale.word = udiv i32 %value.block, 4\n%scale.word.shift = mul i32 %scale.word, 16\n%scale.code.local = urem i32 %value.block, 4\n%scale.code.shift = mul i32 %scale.code.local, 3\n%scale.shift = add i32 %scale.word.shift, %scale.code.shift\n%scale.shift64 = zext i32 %scale.shift to i64\n%scale.code.shifted = lshr i64 %scale.packed, %scale.shift64\n%scale.code64 = and i64 %scale.code.shifted, 7\n%scale.code = trunc i64 %scale.code64 to i32\n%scale.twice = shl i32 %scale.code, 1\n%scale.one = add i32 %scale.twice, 1\n%scale.factor = call {ty} @recipe.from.u32(i32 %scale.one)\n%scaled = call {ty} @recipe.mul({ty} %scale, {ty} %scale.factor)\n%result = call {ty} @recipe.mul({ty} %scaled, {ty} %level.delta)\nret {ty} %result\n}}\n", positive_delta = native_literal(self.precision, ty, 0.125), negative_delta = native_literal(self.precision, ty, -0.125)));
+			ir.push_str(&format!("%blocks = udiv i32 %columns, 256\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, 256\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, 56\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local = urem i32 %column, 256\n%value.block = udiv i32 %local, 16\n%group.local = urem i32 %local, 16\n%group = udiv i32 %group.local, 8\n%high.offset = add i32 32, %value.block\n%high.ptr = getelementptr inbounds i8, {pointer} %block, i32 %high.offset\n%high.byte = load i8, {pointer} %high.ptr, align 1\n%high.raw = zext i8 %high.byte to i32\n%grid.block = mul i32 %value.block, 2\n%grid.offset = add i32 %grid.block, %group\n%grid.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.offset\n%grid.byte = load i8, {pointer} %grid.ptr, align 1\n%grid.raw = zext i8 %grid.byte to i32\n%group.shift = mul i32 %group, 4\n%high.shifted = lshr i32 %high.raw, %group.shift\n%high.grid = and i32 %high.shifted, 7\n%high.grid.shifted = shl i32 %high.grid, 8\n%grid = or i32 %grid.raw, %high.grid.shifted\n%table.ptr = getelementptr inbounds [2048 x i16], ptr @recipe_model_iq1, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane = urem i32 %local, 8\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.raw = and i32 %level.shifted, 3\n%level.offset = sub i32 %level.raw, 1\n%delta.shift = add i32 %group.shift, 3\n%delta.shifted = lshr i32 %high.raw, %delta.shift\n%delta.bit = and i32 %delta.shifted, 1\n%delta.zero = icmp eq i32 %delta.bit, 0\n%delta = select i1 %delta.zero, {ty} {positive_delta}, {ty} {negative_delta}\n%level = call {ty} @recipe.from.s32(i32 %level.offset)\n%level.delta = call {ty} @recipe.add({ty} %level, {ty} %delta)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 48\n%scale.packed = load i64, {pointer} %scale.ptr, align 2\n%scale.s0.shifted = lshr i64 %scale.packed, 12\n%scale.s0 = and i64 %scale.s0.shifted, 15\n%scale.s1.shifted = lshr i64 %scale.packed, 24\n%scale.s1 = and i64 %scale.s1.shifted, 240\n%scale.s01 = or i64 %scale.s0, %scale.s1\n%scale.s2.shifted = lshr i64 %scale.packed, 36\n%scale.s2 = and i64 %scale.s2.shifted, 3840\n%scale.s012 = or i64 %scale.s01, %scale.s2\n%scale.s3.shifted = lshr i64 %scale.packed, 48\n%scale.s3 = and i64 %scale.s3.shifted, 61440\n%scale.raw = or i64 %scale.s012, %scale.s3\n%scale.bits = trunc i64 %scale.raw to i16\n%scale.half = bitcast i16 %scale.bits to half\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%scale.word = udiv i32 %value.block, 4\n%scale.word.shift = mul i32 %scale.word, 16\n%scale.code.local = urem i32 %value.block, 4\n%scale.code.shift = mul i32 %scale.code.local, 3\n%scale.shift = add i32 %scale.word.shift, %scale.code.shift\n%scale.shift64 = zext i32 %scale.shift to i64\n%scale.code.shifted = lshr i64 %scale.packed, %scale.shift64\n%scale.code64 = and i64 %scale.code.shifted, 7\n%scale.code = trunc i64 %scale.code64 to i32\n%scale.twice = shl i32 %scale.code, 1\n%scale.one = add i32 %scale.twice, 1\n%scale.factor = call {ty} @recipe.from.u32(i32 %scale.one)\n%scaled = call {ty} @recipe.mul({ty} %scale, {ty} %scale.factor)\n%result = call {ty} @recipe.mul({ty} %scaled, {ty} %level.delta)\nret {ty} %result\n}}\n", positive_delta = native_literal(self.precision.model, ty, 0.125), negative_delta = native_literal(self.precision.model, ty, -0.125)));
 			return Ok(ir)
 		}
-		ir.push_str(&format!("%blocks = udiv i32 %columns, 256\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, 256\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, 50\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local = urem i32 %column, 256\n%value.block = udiv i32 %local, 32\n%group.local = urem i32 %local, 32\n%group = udiv i32 %group.local, 8\n%high.block = mul i32 %value.block, 2\n%high.offset = add i32 34, %high.block\n%high.ptr = getelementptr inbounds i8, {pointer} %block, i32 %high.offset\n%high = load i16, {pointer} %high.ptr, align 2\n%high.raw = zext i16 %high to i32\n%grid.block = mul i32 %value.block, 4\n%grid.base = add i32 2, %grid.block\n%grid.offset = add i32 %grid.base, %group\n%grid.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.offset\n%grid.byte = load i8, {pointer} %grid.ptr, align 1\n%grid.raw = zext i8 %grid.byte to i32\n%group.shift = mul i32 %group, 3\n%high.shifted = lshr i32 %high.raw, %group.shift\n%high.grid = and i32 %high.shifted, 7\n%high.grid.shifted = shl i32 %high.grid, 8\n%grid = or i32 %grid.raw, %high.grid.shifted\n%table.ptr = getelementptr inbounds [2048 x i16], ptr @recipe_model_iq1, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane = urem i32 %local, 8\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.raw = and i32 %level.shifted, 3\n%level.offset = sub i32 %level.raw, 1\n%delta.bits = and i32 %high.raw, 32768\n%delta.zero = icmp eq i32 %delta.bits, 0\n%delta = select i1 %delta.zero, {ty} {positive_delta}, {ty} {negative_delta}\n%level = call {ty} @recipe.from.s32(i32 %level.offset)\n%level.delta = call {ty} @recipe.add({ty} %level, {ty} %delta)\n%scale.code.shifted = lshr i32 %high.raw, 12\n%scale.code = and i32 %scale.code.shifted, 7\n%scale.twice = shl i32 %scale.code, 1\n%scale.one = add i32 %scale.twice, 1\n%scale.factor = call {ty} @recipe.from.u32(i32 %scale.one)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 0\n%scale.half = load half, {pointer} %scale.ptr, align 2\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%scaled = call {ty} @recipe.mul({ty} %scale, {ty} %scale.factor)\n%result = call {ty} @recipe.mul({ty} %scaled, {ty} %level.delta)\nret {ty} %result\n}}\n", positive_delta = native_literal(self.precision, ty, 0.125), negative_delta = native_literal(self.precision, ty, -0.125)));
+		ir.push_str(&format!("%blocks = udiv i32 %columns, 256\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, 256\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, 50\n%block = getelementptr inbounds i8, {pointer} %matrix, i32 %block.offset\n%local = urem i32 %column, 256\n%value.block = udiv i32 %local, 32\n%group.local = urem i32 %local, 32\n%group = udiv i32 %group.local, 8\n%high.block = mul i32 %value.block, 2\n%high.offset = add i32 34, %high.block\n%high.ptr = getelementptr inbounds i8, {pointer} %block, i32 %high.offset\n%high = load i16, {pointer} %high.ptr, align 2\n%high.raw = zext i16 %high to i32\n%grid.block = mul i32 %value.block, 4\n%grid.base = add i32 2, %grid.block\n%grid.offset = add i32 %grid.base, %group\n%grid.ptr = getelementptr inbounds i8, {pointer} %block, i32 %grid.offset\n%grid.byte = load i8, {pointer} %grid.ptr, align 1\n%grid.raw = zext i8 %grid.byte to i32\n%group.shift = mul i32 %group, 3\n%high.shifted = lshr i32 %high.raw, %group.shift\n%high.grid = and i32 %high.shifted, 7\n%high.grid.shifted = shl i32 %high.grid, 8\n%grid = or i32 %grid.raw, %high.grid.shifted\n%table.ptr = getelementptr inbounds [2048 x i16], ptr @recipe_model_iq1, i32 0, i32 %grid\n%table.word = load i16, ptr %table.ptr, align 2\n%table.raw = zext i16 %table.word to i32\n%lane = urem i32 %local, 8\n%lane.shift = mul i32 %lane, 2\n%level.shifted = lshr i32 %table.raw, %lane.shift\n%level.raw = and i32 %level.shifted, 3\n%level.offset = sub i32 %level.raw, 1\n%delta.bits = and i32 %high.raw, 32768\n%delta.zero = icmp eq i32 %delta.bits, 0\n%delta = select i1 %delta.zero, {ty} {positive_delta}, {ty} {negative_delta}\n%level = call {ty} @recipe.from.s32(i32 %level.offset)\n%level.delta = call {ty} @recipe.add({ty} %level, {ty} %delta)\n%scale.code.shifted = lshr i32 %high.raw, 12\n%scale.code = and i32 %scale.code.shifted, 7\n%scale.twice = shl i32 %scale.code, 1\n%scale.one = add i32 %scale.twice, 1\n%scale.factor = call {ty} @recipe.from.u32(i32 %scale.one)\n%scale.ptr = getelementptr inbounds i8, {pointer} %block, i32 0\n%scale.half = load half, {pointer} %scale.ptr, align 2\n%scale = call {ty} @recipe.from.f16(half %scale.half)\n%scaled = call {ty} @recipe.mul({ty} %scale, {ty} %scale.factor)\n%result = call {ty} @recipe.mul({ty} %scaled, {ty} %level.delta)\nret {ty} %result\n}}\n", positive_delta = native_literal(self.precision.model, ty, 0.125), negative_delta = native_literal(self.precision.model, ty, -0.125)));
 		Ok(ir)
 	}
 
@@ -1534,7 +1545,7 @@ impl NativeModelIr {
 	fn emit_model_load(&self, backend: Backend) -> Result<String> {
 		if self.storage_bytes == 0 { return Ok(String::new()) }
 		let pointer = pointer_type(backend);
-		let ty = value_type(self.precision);
+		let ty = self.precision.model_type;
 		let thread = match backend {
 			Backend::Cpu => "add i32 0, 0".to_owned(),
 			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
@@ -1581,8 +1592,11 @@ impl NativeModelIr {
 		ir.push_str(&quantized_definitions);
 		ir.push_str(&model_load);
 		let pointer = pointer_type(backend);
-		let ty = value_type(self.precision);
-		let align = alignment(ty);
+		let model_ty = self.precision.model_type;
+		let state_precision = self.precision.state;
+		let state_ty = self.precision.state_type;
+		let model_align = alignment(model_ty);
+		let state_align = alignment(state_ty);
 		let kernel = match backend {
 			Backend::Cpu => "",
 			Backend::Amd => "protected amdgpu_kernel ",
@@ -1604,9 +1618,9 @@ impl NativeModelIr {
 		body.push_str(&training_forward);
 		body.push_str("ret void\n}\n");
 		body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"));
-		let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.bytes(), "native gradient clear bytes")?;
-		let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.bytes(), "native input clear bytes")?;
-		body.push_str(&format!("define {kernel}void @recipe_model_epoch({pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, i32 %tile.m, i32 %tile.n, i32 %tile.k, {ty} %rate, {ty} %beta1, {ty} %beta2, {ty} %beta1.power, {ty} %beta2.power, {ty} %epsilon, {ty} %decay, i32 %step) #0 {{\nentry:\n%tid = {thread}\n",));
+		let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
+		let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
+		body.push_str(&format!("define {kernel}void @recipe_model_epoch({pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, i32 %tile.m, i32 %tile.n, i32 %tile.k, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %step) #0 {{\nentry:\n%tid = {thread}\n",));
 		body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "entry")?);
 		body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
 		body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
@@ -1614,60 +1628,89 @@ impl NativeModelIr {
 		body.push_str(&format!("\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 %tile.m, i32 %tile.n, i32 %tile.k)\n"));
 		body.push_str(barrier(backend));
 		body.push('\n');
-		body.push_str(&self.emit_loss_and_seed(backend, loss, ty, pointer, align)?);
+		body.push_str(&self.emit_loss_and_seed(backend, loss, model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
 		body.push_str(barrier(backend));
 		body.push('\n');
 		body.push_str(&reverse);
-		body.push_str(&self.emit_adamw(ty, pointer, align)?);
+		body.push_str(&self.emit_adamw(model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
 		body.push_str("ret void\n}\n");
 		ir.push_str(&body);
 		Ok(ir)
 	}
 
-	fn emit_loss_and_seed(&self, backend: Backend, loss: LossFunction, ty: &str, pointer: &str, align: usize) -> Result<String> {
+	fn emit_loss_and_seed(&self, backend: Backend, loss: LossFunction, model_ty: &str, state_precision: Compute, state_ty: &str, pointer: &str, model_align: usize, state_align: usize) -> Result<String> {
 		let output = self.graph.output.elements();
 		let items = checked_mul(self.rows, output, "native loss items")?;
 		let last = self.plans.last().ok_or_else(|| RecipeError::new("native model has no output node"))?;
 		let prediction_offset = last.value;
 		let adjoint_offset = last.adjoint;
 		let mut ir = String::new();
-		let zero = native_literal(self.precision, ty, 0.0);
-		ir.push_str(&format!("%prediction.base = getelementptr i8, {pointer} %values, i32 {prediction_offset}\n%prediction = bitcast {pointer} %prediction.base to {pointer}\n%metric.ptr = getelementptr {ty}, {pointer} %metrics, i32 0\n%loss.leader = icmp eq i32 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
-		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.sum = phi {ty} [ {zero}, %loss.entry ], [ %loss.sum.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, {items}\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
-		let prediction = format!("%loss.prediction");
-		let target = format!("%loss.target");
+		let zero = native_literal(state_precision, state_ty, 0.0);
+		ir.push_str(&format!("%prediction.base = getelementptr i8, {pointer} %values, i32 {prediction_offset}\n%prediction = bitcast {pointer} %prediction.base to {pointer}\n%metric.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 0\n%loss.leader = icmp eq i32 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
+		ir.push_str(&format!("%loss.items = call {state_ty} @recipe.state.from.u32(i32 {items})\n"));
+		if loss.0 <= 1 {
+			ir.push_str(&format!("%loss.normalizer = call {state_ty} @recipe.state.sqrt({state_ty} %loss.items)\n"));
+		}
+		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, {items}\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
+		let prediction = "%loss.prediction";
+		let target = "%loss.target";
 		let pred_ptr = "%loss.prediction.ptr";
 		let target_ptr = "%loss.target.ptr";
-		ir.push_str(&format!("{pred_ptr} = getelementptr {ty}, {pointer} %prediction, i32 %loss.p\n{prediction} = load {ty}, {pointer} {pred_ptr}, align {align}\n{target_ptr} = getelementptr {ty}, {pointer} %targets, i32 %loss.p\n{target} = load {ty}, {pointer} {target_ptr}, align {align}\n"));
-		let threshold = loss_threshold(self.precision, ty)?;
-		let loss_value = emit_loss_value(&mut ir, loss, self.precision, ty, &prediction, &target, &threshold)?;
-		ir.push_str(&format!("%loss.sum.next = call {ty} @recipe.add({ty} %loss.sum, {ty} {loss_value})\n%loss.next = add i32 %loss.p, 1\nbr label %loss.step\nloss.store:\n%items = call {ty} @recipe.from.u32(i32 {items})\n%loss.mean = call {ty} @recipe.div({ty} %loss.sum, {ty} %items)\n"));
-		if loss.0 == 1 {
-			ir.push_str(&format!("%loss.value = call {ty} @recipe.sqrt({ty} %loss.mean)\n"));
+		ir.push_str(&format!("{pred_ptr} = getelementptr {model_ty}, {pointer} %prediction, i32 %loss.p\n%loss.prediction.model = load {model_ty}, {pointer} {pred_ptr}, align {model_align}\n{prediction} = call {state_ty} @recipe.state.from.model({model_ty} %loss.prediction.model)\n{target_ptr} = getelementptr {model_ty}, {pointer} %targets, i32 %loss.p\n%loss.target.model = load {model_ty}, {pointer} {target_ptr}, align {model_align}\n{target} = call {state_ty} @recipe.state.from.model({model_ty} %loss.target.model)\n"));
+		let threshold = loss_threshold(state_precision, state_ty)?;
+		let loss_value = emit_loss_value(&mut ir, loss, state_precision, state_ty, prediction, target, &threshold)?;
+		let contribution = if loss.0 <= 1 {
+			loss_value
 		} else {
-			ir.push_str(&format!("%loss.value = call {ty} @recipe.add({ty} %loss.mean, {ty} {zero})\n"));
+			ir.push_str(&format!("%loss.contribution = call {state_ty} @recipe.state.div({state_ty} {loss_value}, {state_ty} %loss.items)\n"));
+			"%loss.contribution".to_owned()
+		};
+		ir.push_str(&format!("%loss.mean.next = call {state_ty} @recipe.state.add({state_ty} %loss.mean, {state_ty} {contribution})\n%loss.next = add i32 %loss.p, 1\nbr label %loss.step\nloss.store:\n"));
+		if loss.0 == 1 {
+			ir.push_str(&format!("%loss.value = call {state_ty} @recipe.state.sqrt({state_ty} %loss.mean)\n"));
+		} else {
+			ir.push_str(&format!("%loss.value = call {state_ty} @recipe.state.add({state_ty} %loss.mean, {state_ty} {zero})\n"));
 		}
-		ir.push_str(&format!("store {ty} %loss.value, {pointer} %metric.ptr, align {align}\nbr label %loss.wait\nloss.wait:\n"));
+		ir.push_str(&format!("store {state_ty} %loss.value, {pointer} %metric.ptr, align {state_align}\nbr label %loss.wait\nloss.wait:\n"));
 		ir.push_str(barrier(backend));
-		ir.push_str(&format!("%loss.value.shared = load {ty}, {pointer} %metric.ptr, align {align}\n%adjoint.base = getelementptr i8, {pointer} %adjoints, i32 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, {items}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred = load {ty}, {pointer} %seed.pred.ptr, align {align}\n%seed.target.ptr = getelementptr {ty}, {pointer} %targets, i32 %seed.p\n%seed.target = load {ty}, {pointer} %seed.target.ptr, align {align}\n",));
-		let gradient = emit_loss_gradient(&mut ir, loss, self.precision, ty, "%seed.pred", "%seed.target", &threshold, "%loss.value.shared", &format!("{items}"))?;
-		ir.push_str(&format!("%seed.ptr = getelementptr {ty}, {pointer} %adjoint, i32 %seed.p\nstore {ty} {gradient}, {pointer} %seed.ptr, align {align}\n%seed.next = add i32 %seed.p, %threads\nbr label %seed.loop\nseed.done:\n"));
+		ir.push_str(&format!("%loss.value.shared = load {state_ty}, {pointer} %metric.ptr, align {state_align}\n%adjoint.base = getelementptr i8, {pointer} %adjoints, i32 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, {items}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
+		let gradient = emit_loss_gradient(&mut ir, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, "%loss.value.shared", &format!("{items}"))?;
+		ir.push_str(&format!("%seed.model = call {model_ty} @recipe.model.from.state({state_ty} {gradient})\n%seed.ptr = getelementptr {model_ty}, {pointer} %adjoint, i32 %seed.p\nstore {model_ty} %seed.model, {pointer} %seed.ptr, align {model_align}\n%seed.next = add i32 %seed.p, %threads\nbr label %seed.loop\nseed.done:\n"));
 		Ok(ir)
 	}
 
-	fn emit_adamw(&self, ty: &str, pointer: &str, align: usize) -> Result<String> {
+	fn emit_adamw(&self, model_ty: &str, state_precision: Compute, state_ty: &str, pointer: &str, model_align: usize, state_align: usize) -> Result<String> {
 		let parameters = i32::try_from(self.graph.parameters.len()).map_err(|_| RecipeError::new("native parameter count exceeds i32"))?;
+		let one = native_literal(state_precision, state_ty, 1.0);
 		let mut ir = String::new();
 		ir.push_str(&format!("br label %optimizer.entry\noptimizer.entry:\n%optimizer.base = add i32 0, %tid\nbr label %optimizer.loop\noptimizer.loop:\n%optimizer.p = phi i32 [ %optimizer.base, %optimizer.entry ], [ %optimizer.next, %optimizer.advance ]\n%optimizer.more = icmp ult i32 %optimizer.p, {parameters}\nbr i1 %optimizer.more, label %optimizer.step, label %optimizer.done\noptimizer.step:\n"));
-		for (name, base) in [("frozen", "%frozen"), ("gradient", "%gradient"), ("moment", "%moments"), ("variance", "%variances"), ("weight", "%weights")] {
-			ir.push_str(&format!("%optimizer.{name}.ptr = getelementptr {ty}, {pointer} {base}, i32 %optimizer.p\n", name = name, ty = if name == "frozen" { "i8" } else { ty }, pointer = pointer));
-		}
-		ir.push_str("%optimizer.frozen.value = load i8, ");
-		ir.push_str(&format!("{pointer} %optimizer.frozen.ptr, align 1\n%optimizer.is.frozen = icmp ne i8 %optimizer.frozen.value, 0\nbr i1 %optimizer.is.frozen, label %optimizer.advance, label %optimizer.update\noptimizer.update:\n", pointer = pointer));
-		ir.push_str(&format!("%optimizer.gradient.value = load {ty}, {pointer} %optimizer.gradient.ptr, align {align}\n%optimizer.moment.old = load {ty}, {pointer} %optimizer.moment.ptr, align {align}\n%optimizer.variance.old = load {ty}, {pointer} %optimizer.variance.ptr, align {align}\n%optimizer.weight.value = load {ty}, {pointer} %optimizer.weight.ptr, align {align}\n%optimizer.one.beta1 = call {ty} @recipe.sub({ty} {one}, {ty} %beta1)\n%optimizer.one.beta2 = call {ty} @recipe.sub({ty} {one}, {ty} %beta2)\n%optimizer.moment.part = call {ty} @recipe.mul({ty} %beta1, {ty} %optimizer.moment.old)\n%optimizer.gradient.part = call {ty} @recipe.mul({ty} %optimizer.one.beta1, {ty} %optimizer.gradient.value)\n%optimizer.moment.new = call {ty} @recipe.add({ty} %optimizer.moment.part, {ty} %optimizer.gradient.part)\n%optimizer.gradient.square = call {ty} @recipe.mul({ty} %optimizer.gradient.value, {ty} %optimizer.gradient.value)\n%optimizer.variance.part = call {ty} @recipe.mul({ty} %beta2, {ty} %optimizer.variance.old)\n%optimizer.gradient.variance = call {ty} @recipe.mul({ty} %optimizer.one.beta2, {ty} %optimizer.gradient.square)\n%optimizer.variance.new = call {ty} @recipe.add({ty} %optimizer.variance.part, {ty} %optimizer.gradient.variance)\nstore {ty} %optimizer.moment.new, {pointer} %optimizer.moment.ptr, align {align}\nstore {ty} %optimizer.variance.new, {pointer} %optimizer.variance.ptr, align {align}\n%optimizer.m.correct = call {ty} @recipe.sub({ty} {one}, {ty} %beta1.power)\n%optimizer.v.correct = call {ty} @recipe.sub({ty} {one}, {ty} %beta2.power)\n%optimizer.m.hat = call {ty} @recipe.div({ty} %optimizer.moment.new, {ty} %optimizer.m.correct)\n%optimizer.v.hat = call {ty} @recipe.div({ty} %optimizer.variance.new, {ty} %optimizer.v.correct)\n%optimizer.root = call {ty} @recipe.sqrt({ty} %optimizer.v.hat)\n%optimizer.denominator = call {ty} @recipe.add({ty} %optimizer.root, {ty} %epsilon)\n%optimizer.direction = call {ty} @recipe.div({ty} %optimizer.m.hat, {ty} %optimizer.denominator)\n%optimizer.decay = call {ty} @recipe.mul({ty} %decay, {ty} %optimizer.weight.value)\n%optimizer.total = call {ty} @recipe.add({ty} %optimizer.direction, {ty} %optimizer.decay)\n%optimizer.change = call {ty} @recipe.mul({ty} %rate, {ty} %optimizer.total)\n%optimizer.next.weight = call {ty} @recipe.sub({ty} %optimizer.weight.value, {ty} %optimizer.change)\nstore {ty} %optimizer.next.weight, {pointer} %optimizer.weight.ptr, align {align}\nbr label %optimizer.advance\noptimizer.advance:\n%optimizer.next = add i32 %optimizer.p, %threads\nbr label %optimizer.loop\noptimizer.done:\n", one = native_literal(self.precision, ty, 1.0)));
+		ir.push_str(&format!("%optimizer.frozen.ptr = getelementptr i8, {pointer} %frozen, i32 %optimizer.p\n%optimizer.gradient.ptr = getelementptr {model_ty}, {pointer} %gradient, i32 %optimizer.p\n%optimizer.moment.ptr = getelementptr {state_ty}, {pointer} %moments, i32 %optimizer.p\n%optimizer.variance.ptr = getelementptr {state_ty}, {pointer} %variances, i32 %optimizer.p\n%optimizer.weight.ptr = getelementptr {model_ty}, {pointer} %weights, i32 %optimizer.p\n"));
+		ir.push_str(&format!("%optimizer.frozen.value = load i8, {pointer} %optimizer.frozen.ptr, align 1\n%optimizer.is.frozen = icmp ne i8 %optimizer.frozen.value, 0\nbr i1 %optimizer.is.frozen, label %optimizer.advance, label %optimizer.update\noptimizer.update:\n"));
+		ir.push_str(&format!("%optimizer.gradient.model = load {model_ty}, {pointer} %optimizer.gradient.ptr, align {model_align}\n%optimizer.gradient.value = call {state_ty} @recipe.state.from.model({model_ty} %optimizer.gradient.model)\n%optimizer.moment.old = load {state_ty}, {pointer} %optimizer.moment.ptr, align {state_align}\n%optimizer.variance.old = load {state_ty}, {pointer} %optimizer.variance.ptr, align {state_align}\n%optimizer.weight.model = load {model_ty}, {pointer} %optimizer.weight.ptr, align {model_align}\n%optimizer.weight.value = call {state_ty} @recipe.state.from.model({model_ty} %optimizer.weight.model)\n"));
+		append_binary(&mut ir, state_ty, "optimizer.one.beta1", "sub", &one, "%beta1");
+		append_binary(&mut ir, state_ty, "optimizer.one.beta2", "sub", &one, "%beta2");
+		append_binary(&mut ir, state_ty, "optimizer.moment.part", "mul", "%beta1", "%optimizer.moment.old");
+		append_binary(&mut ir, state_ty, "optimizer.gradient.part", "mul", "%optimizer.one.beta1", "%optimizer.gradient.value");
+		append_binary(&mut ir, state_ty, "optimizer.moment.new", "add", "%optimizer.moment.part", "%optimizer.gradient.part");
+		append_binary(&mut ir, state_ty, "optimizer.gradient.square", "mul", "%optimizer.gradient.value", "%optimizer.gradient.value");
+		append_binary(&mut ir, state_ty, "optimizer.variance.part", "mul", "%beta2", "%optimizer.variance.old");
+		append_binary(&mut ir, state_ty, "optimizer.gradient.variance", "mul", "%optimizer.one.beta2", "%optimizer.gradient.square");
+		append_binary(&mut ir, state_ty, "optimizer.variance.new", "add", "%optimizer.variance.part", "%optimizer.gradient.variance");
+		ir.push_str(&format!("store {state_ty} %optimizer.moment.new, {pointer} %optimizer.moment.ptr, align {state_align}\nstore {state_ty} %optimizer.variance.new, {pointer} %optimizer.variance.ptr, align {state_align}\n"));
+		append_binary(&mut ir, state_ty, "optimizer.m.correct", "sub", &one, "%beta1.power");
+		append_binary(&mut ir, state_ty, "optimizer.v.correct", "sub", &one, "%beta2.power");
+		append_binary(&mut ir, state_ty, "optimizer.m.hat", "div", "%optimizer.moment.new", "%optimizer.m.correct");
+		append_binary(&mut ir, state_ty, "optimizer.v.hat", "div", "%optimizer.variance.new", "%optimizer.v.correct");
+		ir.push_str(&format!("%optimizer.root = call {state_ty} @recipe.state.sqrt({state_ty} %optimizer.v.hat)\n"));
+		append_binary(&mut ir, state_ty, "optimizer.denominator", "add", "%optimizer.root", "%epsilon");
+		append_binary(&mut ir, state_ty, "optimizer.direction", "div", "%optimizer.m.hat", "%optimizer.denominator");
+		append_binary(&mut ir, state_ty, "optimizer.decay", "mul", "%decay", "%optimizer.weight.value");
+		append_binary(&mut ir, state_ty, "optimizer.total", "add", "%optimizer.direction", "%optimizer.decay");
+		append_binary(&mut ir, state_ty, "optimizer.change", "mul", "%rate", "%optimizer.total");
+		append_binary(&mut ir, state_ty, "optimizer.next.state", "sub", "%optimizer.weight.value", "%optimizer.change");
+		ir.push_str(&format!("%optimizer.next.weight = call {model_ty} @recipe.model.from.state({state_ty} %optimizer.next.state)\nstore {model_ty} %optimizer.next.weight, {pointer} %optimizer.weight.ptr, align {model_align}\nbr label %optimizer.advance\noptimizer.advance:\n%optimizer.next = add i32 %optimizer.p, %threads\nbr label %optimizer.loop\noptimizer.done:\n"));
 		Ok(ir)
 	}
-
 	fn emit_clear_bytes(&self, backend: Backend, base: &str, bytes: usize, label: &str, from: &str) -> Result<String> {
 		let count = i32::try_from(bytes).map_err(|_| RecipeError::new(format!("native {label} clear count exceeds i32")))?;
 		let pointer = pointer_type(backend);
@@ -1731,18 +1774,22 @@ fn loss_threshold(precision: Compute, ty: &str) -> Result<String> {
 }
 
 fn append_binary(ir: &mut String, ty: &str, name: &str, operation: &str, left: &str, right: &str) {
-	ir.push_str(&format!("%{name} = call {ty} @recipe.{operation}({ty} {left}, {ty} {right})\n"));
+	ir.push_str(&format!("%{name} = call {ty} @recipe.state.{operation}({ty} {left}, {ty} {right})\n"));
 }
 
 fn emit_loss_value(ir: &mut String, loss: LossFunction, precision: Compute, ty: &str, prediction: &str, target: &str, threshold: &str) -> Result<String> {
 	let literal = |value: f64| native_literal(precision, ty, value);
 	let one = literal(1.0);
 	append_binary(ir, ty, "loss.difference", "sub", prediction, target);
-	append_binary(ir, ty, "loss.square", "mul", "%loss.difference", "%loss.difference");
 	match loss.0 {
-		0 | 1 => Ok("%loss.square".to_owned()),
+		0 | 1 => {
+			append_binary(ir, ty, "loss.scaled", "div", "%loss.difference", "%loss.normalizer");
+			append_binary(ir, ty, "loss.square", "mul", "%loss.scaled", "%loss.scaled");
+			Ok("%loss.square".to_owned())
+		}
 		2 => {
-			ir.push_str(&format!("%loss.absolute = call {ty} @recipe.abs({ty} %loss.difference)\n%loss.small = call i1 @recipe.ole({ty} %loss.absolute, {ty} {threshold})\n", ty = ty));
+			append_binary(ir, ty, "loss.square", "mul", "%loss.difference", "%loss.difference");
+			ir.push_str(&format!("%loss.absolute = call {ty} @recipe.state.abs({ty} %loss.difference)\n%loss.small = call i1 @recipe.state.ole({ty} %loss.absolute, {ty} {threshold})\n", ty = ty));
 			append_binary(ir, ty, "loss.half.square", "mul", "%loss.square", &literal(0.5));
 			append_binary(ir, ty, "loss.half.threshold", "mul", threshold, &literal(0.5));
 			append_binary(ir, ty, "loss.large.base", "sub", "%loss.absolute", "%loss.half.threshold");
@@ -1751,15 +1798,15 @@ fn emit_loss_value(ir: &mut String, loss: LossFunction, precision: Compute, ty: 
 			Ok("%loss.huber".to_owned())
 		}
 		3 => {
-			ir.push_str(&format!("%loss.mae = call {ty} @recipe.abs({ty} %loss.difference)\n", ty = ty));
+			ir.push_str(&format!("%loss.mae = call {ty} @recipe.state.abs({ty} %loss.difference)\n", ty = ty));
 			Ok("%loss.mae".to_owned())
 		}
 		4 | 5 => {
-			ir.push_str(&format!("%loss.probability.raw = call {ty} @sigmoid({ty} {prediction})\n%loss.probability.low = call i1 @recipe.olt({ty} %loss.probability.raw, {ty} {tiny})\n%loss.probability.floor = select i1 %loss.probability.low, {ty} {tiny}, {ty} %loss.probability.raw\n%loss.probability.high = call i1 @recipe.ogt({ty} %loss.probability.floor, {ty} {one_minus})\n%loss.probability = select i1 %loss.probability.high, {ty} {one_minus}, {ty} %loss.probability.floor\n%loss.log.probability = call {ty} @recipe.log({ty} %loss.probability)\n%loss.one.probability = call {ty} @recipe.sub({ty} {one}, {ty} %loss.probability)\n%loss.log.one.probability = call {ty} @recipe.log({ty} %loss.one.probability)\n%loss.first = call {ty} @recipe.mul({ty} {target}, {ty} %loss.log.probability)\n%loss.one.target = call {ty} @recipe.sub({ty} {one}, {ty} {target})\n%loss.second = call {ty} @recipe.mul({ty} %loss.one.target, {ty} %loss.log.one.probability)\n%loss.cross.sum = call {ty} @recipe.add({ty} %loss.first, {ty} %loss.second)\n%loss.cross = call {ty} @recipe.neg({ty} %loss.cross.sum)\n", ty = ty, tiny = literal(f64::EPSILON), one_minus = literal(1.0 - f64::EPSILON), target = target, one = one));
+			ir.push_str(&format!("%loss.probability.raw = call {ty} @recipe.state.sigmoid({ty} {prediction})\n%loss.probability.low = call i1 @recipe.state.olt({ty} %loss.probability.raw, {ty} {tiny})\n%loss.probability.floor = select i1 %loss.probability.low, {ty} {tiny}, {ty} %loss.probability.raw\n%loss.probability.high = call i1 @recipe.state.ogt({ty} %loss.probability.floor, {ty} {one_minus})\n%loss.probability = select i1 %loss.probability.high, {ty} {one_minus}, {ty} %loss.probability.floor\n%loss.log.probability = call {ty} @recipe.state.log({ty} %loss.probability)\n%loss.one.probability = call {ty} @recipe.state.sub({ty} {one}, {ty} %loss.probability)\n%loss.log.one.probability = call {ty} @recipe.state.log({ty} %loss.one.probability)\n%loss.first = call {ty} @recipe.state.mul({ty} {target}, {ty} %loss.log.probability)\n%loss.one.target = call {ty} @recipe.state.sub({ty} {one}, {ty} {target})\n%loss.second = call {ty} @recipe.state.mul({ty} %loss.one.target, {ty} %loss.log.one.probability)\n%loss.cross.sum = call {ty} @recipe.state.add({ty} %loss.first, {ty} %loss.second)\n%loss.cross = call {ty} @recipe.state.neg({ty} %loss.cross.sum)\n", ty = ty, tiny = literal(f64::EPSILON), one_minus = literal(1.0 - f64::EPSILON), target = target, one = one));
 			Ok("%loss.cross".to_owned())
 		}
 		6 => {
-			ir.push_str(&format!("%loss.probability = call {ty} @sigmoid({ty} {prediction})\n%loss.target.class = call i1 @recipe.oge({ty} {target}, {ty} {half})\n%loss.one.probability = call {ty} @recipe.sub({ty} {one}, {ty} %loss.probability)\n%loss.correct.raw = select i1 %loss.target.class, {ty} %loss.probability, {ty} %loss.one.probability\n%loss.correct.low = call i1 @recipe.olt({ty} %loss.correct.raw, {ty} {tiny})\n%loss.correct = select i1 %loss.correct.low, {ty} {tiny}, {ty} %loss.correct.raw\n%loss.incorrect = call {ty} @recipe.sub({ty} {one}, {ty} %loss.correct)\n%loss.incorrect.square = call {ty} @recipe.mul({ty} %loss.incorrect, {ty} %loss.incorrect)\n%loss.log.correct = call {ty} @recipe.log({ty} %loss.correct)\n%loss.focal.product = call {ty} @recipe.mul({ty} %loss.incorrect.square, {ty} %loss.log.correct)\n%loss.focal = call {ty} @recipe.neg({ty} %loss.focal.product)\n", ty = ty, target = target, one = one, half = literal(0.5), tiny = literal(f64::EPSILON)));
+			ir.push_str(&format!("%loss.probability = call {ty} @recipe.state.sigmoid({ty} {prediction})\n%loss.target.class = call i1 @recipe.state.oge({ty} {target}, {ty} {half})\n%loss.one.probability = call {ty} @recipe.state.sub({ty} {one}, {ty} %loss.probability)\n%loss.correct.raw = select i1 %loss.target.class, {ty} %loss.probability, {ty} %loss.one.probability\n%loss.correct.low = call i1 @recipe.state.olt({ty} %loss.correct.raw, {ty} {tiny})\n%loss.correct = select i1 %loss.correct.low, {ty} {tiny}, {ty} %loss.correct.raw\n%loss.incorrect = call {ty} @recipe.state.sub({ty} {one}, {ty} %loss.correct)\n%loss.incorrect.square = call {ty} @recipe.state.mul({ty} %loss.incorrect, {ty} %loss.incorrect)\n%loss.log.correct = call {ty} @recipe.state.log({ty} %loss.correct)\n%loss.focal.product = call {ty} @recipe.state.mul({ty} %loss.incorrect.square, {ty} %loss.log.correct)\n%loss.focal = call {ty} @recipe.state.neg({ty} %loss.focal.product)\n", ty = ty, target = target, one = one, half = literal(0.5), tiny = literal(f64::EPSILON)));
 			Ok("%loss.focal".to_owned())
 		}
 		_ => Err(RecipeError::new(format!("native loss {} is unsupported", loss.0))),
@@ -1776,7 +1823,7 @@ fn emit_loss_gradient(ir: &mut String, loss: LossFunction, precision: Compute, t
 	let half = literal(0.5);
 	append_binary(ir, ty, "seed.difference", "sub", prediction, target);
 	let rows_value = "%seed.rows";
-	ir.push_str(&format!("{rows_value} = call {ty} @recipe.from.u32(i32 {rows})\n", rows_value = rows_value, ty = ty, rows = rows));
+	ir.push_str(&format!("{rows_value} = call {ty} @recipe.state.from.u32(i32 {rows})\n", rows_value = rows_value, ty = ty, rows = rows));
 	match loss.0 {
 		0 => {
 			append_binary(ir, ty, "seed.twice", "add", "%seed.difference", "%seed.difference");
@@ -1785,36 +1832,36 @@ fn emit_loss_gradient(ir: &mut String, loss: LossFunction, precision: Compute, t
 		}
 		1 => {
 			append_binary(ir, ty, "seed.rmse.denominator", "mul", rows_value, loss_value);
-			ir.push_str(&format!("%seed.rmse.zero = call i1 @recipe.oeq({ty} {loss_value}, {ty} {zero})\n", ty = ty, loss_value = loss_value, zero = zero));
+			ir.push_str(&format!("%seed.rmse.zero = call i1 @recipe.state.oeq({ty} {loss_value}, {ty} {zero})\n", ty = ty, loss_value = loss_value, zero = zero));
 			append_binary(ir, ty, "seed.rmse.divided", "div", "%seed.difference", "%seed.rmse.denominator");
 			ir.push_str(&format!("%seed.rmse = select i1 %seed.rmse.zero, {ty} {zero}, {ty} %seed.rmse.divided\n", ty = ty, zero = zero));
 			Ok("%seed.rmse".to_owned())
 		}
 		2 => {
-			ir.push_str(&format!("%seed.huber.negative.threshold = call {ty} @recipe.neg({ty} {threshold})\n%seed.huber.low = call i1 @recipe.olt({ty} %seed.difference, {ty} %seed.huber.negative.threshold)\n%seed.huber.high = call i1 @recipe.ogt({ty} %seed.difference, {ty} {threshold})\n%seed.huber.lower = select i1 %seed.huber.low, {ty} %seed.huber.negative.threshold, {ty} %seed.difference\n%seed.huber.clamped = select i1 %seed.huber.high, {ty} {threshold}, {ty} %seed.huber.lower\n", ty = ty, threshold = threshold));
+			ir.push_str(&format!("%seed.huber.negative.threshold = call {ty} @recipe.state.neg({ty} {threshold})\n%seed.huber.low = call i1 @recipe.state.olt({ty} %seed.difference, {ty} %seed.huber.negative.threshold)\n%seed.huber.high = call i1 @recipe.state.ogt({ty} %seed.difference, {ty} {threshold})\n%seed.huber.lower = select i1 %seed.huber.low, {ty} %seed.huber.negative.threshold, {ty} %seed.difference\n%seed.huber.clamped = select i1 %seed.huber.high, {ty} {threshold}, {ty} %seed.huber.lower\n", ty = ty, threshold = threshold));
 			append_binary(ir, ty, "seed.huber", "div", "%seed.huber.clamped", rows_value);
 			Ok("%seed.huber".to_owned())
 		}
 		3 => {
-			ir.push_str(&format!("%seed.mae.negative = call i1 @recipe.olt({ty} %seed.difference, {ty} {zero})\n%seed.mae.positive = call i1 @recipe.ogt({ty} %seed.difference, {ty} {zero})\n%seed.mae.upper = select i1 %seed.mae.positive, {ty} {one}, {ty} {zero}\n%seed.mae.sign = select i1 %seed.mae.negative, {ty} {negative_one}, {ty} %seed.mae.upper\n", ty = ty, zero = zero, one = one, negative_one = negative_one));
+			ir.push_str(&format!("%seed.mae.negative = call i1 @recipe.state.olt({ty} %seed.difference, {ty} {zero})\n%seed.mae.positive = call i1 @recipe.state.ogt({ty} %seed.difference, {ty} {zero})\n%seed.mae.upper = select i1 %seed.mae.positive, {ty} {one}, {ty} {zero}\n%seed.mae.sign = select i1 %seed.mae.negative, {ty} {negative_one}, {ty} %seed.mae.upper\n", ty = ty, zero = zero, one = one, negative_one = negative_one));
 			append_binary(ir, ty, "seed.mae", "div", "%seed.mae.sign", rows_value);
 			Ok("%seed.mae".to_owned())
 		}
 		4 | 5 => {
-			ir.push_str(&format!("%seed.probability = call {ty} @sigmoid({ty} {prediction})\n", ty = ty, prediction = prediction));
+			ir.push_str(&format!("%seed.probability = call {ty} @recipe.state.sigmoid({ty} {prediction})\n", ty = ty, prediction = prediction));
 			append_binary(ir, ty, "seed.cross.difference", "sub", "%seed.probability", target);
 			append_binary(ir, ty, "seed.cross", "div", "%seed.cross.difference", rows_value);
 			Ok("%seed.cross".to_owned())
 		}
 		6 => {
-			ir.push_str(&format!("%seed.probability = call {ty} @sigmoid({ty} {prediction})\n%seed.target.class = call i1 @recipe.oge({ty} {target}, {ty} {half})\n%seed.one.probability = call {ty} @recipe.sub({ty} {one}, {ty} %seed.probability)\n%seed.correct.raw = select i1 %seed.target.class, {ty} %seed.probability, {ty} %seed.one.probability\n%seed.correct.low = call i1 @recipe.olt({ty} %seed.correct.raw, {ty} {tiny})\n%seed.correct = select i1 %seed.correct.low, {ty} {tiny}, {ty} %seed.correct.raw\n%seed.incorrect = call {ty} @recipe.sub({ty} {one}, {ty} %seed.correct)\n%seed.log.correct = call {ty} @recipe.log({ty} %seed.correct)\n", ty = ty, prediction = prediction, target = target, half = half, one = one, tiny = tiny));
+			ir.push_str(&format!("%seed.probability = call {ty} @recipe.state.sigmoid({ty} {prediction})\n%seed.target.class = call i1 @recipe.state.oge({ty} {target}, {ty} {half})\n%seed.one.probability = call {ty} @recipe.state.sub({ty} {one}, {ty} %seed.probability)\n%seed.correct.raw = select i1 %seed.target.class, {ty} %seed.probability, {ty} %seed.one.probability\n%seed.correct.low = call i1 @recipe.state.olt({ty} %seed.correct.raw, {ty} {tiny})\n%seed.correct = select i1 %seed.correct.low, {ty} {tiny}, {ty} %seed.correct.raw\n%seed.incorrect = call {ty} @recipe.state.sub({ty} {one}, {ty} %seed.correct)\n%seed.log.correct = call {ty} @recipe.state.log({ty} %seed.correct)\n", ty = ty, prediction = prediction, target = target, half = half, one = one, tiny = tiny));
 			append_binary(ir, ty, "seed.focal.first", "mul", &two, "%seed.incorrect");
 			append_binary(ir, ty, "seed.focal.first.value", "mul", "%seed.focal.first", "%seed.log.correct");
 			append_binary(ir, ty, "seed.focal.square", "mul", "%seed.incorrect", "%seed.incorrect");
 			append_binary(ir, ty, "seed.focal.second", "div", "%seed.focal.square", "%seed.correct");
 			append_binary(ir, ty, "seed.focal.by.correct", "sub", "%seed.focal.first.value", "%seed.focal.second");
 			append_binary(ir, ty, "seed.focal.sigmoid.derivative", "mul", "%seed.probability", "%seed.one.probability");
-			ir.push_str(&format!("%seed.focal.negative.direction = call {ty} @recipe.neg({ty} %seed.focal.sigmoid.derivative)\n%seed.focal.direction = select i1 %seed.target.class, {ty} %seed.focal.sigmoid.derivative, {ty} %seed.focal.negative.direction\n", ty = ty));
+			ir.push_str(&format!("%seed.focal.negative.direction = call {ty} @recipe.state.neg({ty} %seed.focal.sigmoid.derivative)\n%seed.focal.direction = select i1 %seed.target.class, {ty} %seed.focal.sigmoid.derivative, {ty} %seed.focal.negative.direction\n", ty = ty));
 			append_binary(ir, ty, "seed.focal.chain", "mul", "%seed.focal.by.correct", "%seed.focal.direction");
 			append_binary(ir, ty, "seed.focal", "div", "%seed.focal.chain", rows_value);
 			Ok("%seed.focal".to_owned())
@@ -1891,15 +1938,6 @@ fn native_amd_library(name: &'static str) -> Result<&'static str> {
 	option_env!("RECIPE_HSA_DEVICE_LIBRARY").filter(|_| name == "device").or(option_env!("RECIPE_HSA_CLOCK_LIBRARY").filter(|_| name == "clock")).or(option_env!("RECIPE_HSA_ABI_LIBRARY").filter(|_| name == "abi")).or(option_env!("RECIPE_HSA_FINITE_LIBRARY").filter(|_| name == "finite")).or(option_env!("RECIPE_HSA_MATH_LIBRARY").filter(|_| name == "math")).ok_or_else(|| RecipeError::new(format!("AMD native {name} library is unavailable")))
 }
 
-fn native_precision_layout(precision: Compute) -> &'static [u8] {
-	match precision {
-		Compute::F(_) | Compute::Fp(FloatFormat { storage: FloatLayout { exp: 11, man: 52, .. }, .. }) => NATIVE_EPOCH_LAYOUT_FP64,
-		Compute::Fp(FloatFormat { storage: FloatLayout { exp: 8, man: 23, .. }, .. }) | Compute::Tf(_) => NATIVE_EPOCH_LAYOUT_FP32,
-		Compute::Fp(FloatFormat { storage: FloatLayout { exp: 5, man: 10, .. }, .. }) | Compute::Bf(_) => NATIVE_EPOCH_LAYOUT_FP16,
-		Compute::Fp(_) | Compute::Int(_) => NATIVE_EPOCH_LAYOUT_FP8,
-	}
-}
-
 fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, ptx: Option<&Path>) -> Result<()> {
 	match target {
 		BackendTarget::Cpu { target } => {
@@ -1964,7 +2002,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 	Ok(NativeArtifact {
 		backend: target.clone(),
 		layout: model.layout.clone(),
-		precision,
+		precision: model.precision,
 		artifact,
 		path,
 		storage: model.storage(),
@@ -4672,7 +4710,7 @@ fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetS
 }
 struct NativeTape {
 	program: NativeProgram,
-	precision: Compute,
+	precision: NativePrecision,
 	values: Buffer,
 	contexts: Buffer,
 	adjoints: Buffer,
@@ -4710,6 +4748,7 @@ impl NativeTape {
 		let output = graph.output.elements();
 		require(targets.is_empty() || targets.len() == rows * output, format!("target batch expected 0 or {} values, received {}", rows * output, targets.len()))?;
 		let program = gpu.native_program(graph, rows, precision, loss)?;
+		let precision = program.artifact.precision;
 		let layout = program.artifact.layout.clone();
 		let tile = program.tile;
 		let parameters = graph.parameters.len();
@@ -4735,7 +4774,7 @@ impl NativeTape {
 		let best_variances = saved(&graph.state.variances, "best optimizer variances")?;
 		let target_buffer = if targets.is_empty() { vec![0.0] } else { targets.to_vec() };
 		let parameter_values = if graph.parameters.is_empty() { vec![0.0] } else { graph.parameters.clone() };
-		let weights = Buffer::upload_float(gpu, &parameter_values, precision)?;
+		let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
 		if program.model_load.is_some() {
 			require(!program.artifact.storage.is_empty(), "native model-load storage is empty")?;
 			let storage = Buffer::upload(gpu, &program.artifact.storage)?;
@@ -4755,15 +4794,15 @@ impl NativeTape {
 			adjoints: Buffer::upload(gpu, &vec![0_u8; layout.adjoints_bytes.max(1)])?,
 			gathers,
 			batch_normalizations,
-			samples: Buffer::upload_float(gpu, samples, precision)?,
-			input_adjoint: Buffer::upload_float(gpu, &vec![0.0; samples.len().max(1)], precision)?,
-			targets: Buffer::upload_float(gpu, &target_buffer, precision)?,
+			samples: Buffer::upload_float(gpu, samples, precision.model)?,
+			input_adjoint: Buffer::upload_float(gpu, &vec![0.0; samples.len().max(1)], precision.model)?,
+			targets: Buffer::upload_float(gpu, &target_buffer, precision.model)?,
 			weights,
 			frozen: Buffer::upload(gpu, &frozen)?,
-			moments: Buffer::upload_float(gpu, &moments, precision)?,
-			variances: Buffer::upload_float(gpu, &variances, precision)?,
-			gradient: Buffer::upload_float(gpu, &zeros, precision)?,
-			metrics: Buffer::upload_float(gpu, &[0.0], precision)?,
+			moments: Buffer::upload_float(gpu, &moments, precision.state)?,
+			variances: Buffer::upload_float(gpu, &variances, precision.state)?,
+			gradient: Buffer::upload_float(gpu, &zeros, precision.model)?,
+			metrics: Buffer::upload_float(gpu, &[0.0], precision.state)?,
 			target_values,
 			best,
 			best_moments,
@@ -4796,7 +4835,7 @@ impl NativeTape {
 		let mut offset = 0;
 		for &(node, channels) in &self.batch_normalizations {
 			let end = offset + 2 * channels;
-			self.contexts.write_float_bytes(self.program.artifact.layout.contexts[node], &stats[offset..end], self.precision)?;
+			self.contexts.write_float_bytes(self.program.artifact.layout.contexts[node], &stats[offset..end], self.precision.model)?;
 			offset = end;
 		}
 		Ok(())
@@ -4804,7 +4843,7 @@ impl NativeTape {
 	fn extract_bn_stats(&self) -> Result<Vec<f64>> {
 		let mut stats = Vec::new();
 		for &(node, channels) in &self.batch_normalizations {
-			stats.extend(self.contexts.download_float_bytes(self.program.artifact.layout.contexts[node], 2 * channels, self.precision)?);
+			stats.extend(self.contexts.download_float_bytes(self.program.artifact.layout.contexts[node], 2 * channels, self.precision.model)?);
 		}
 		Ok(stats)
 	}
@@ -4817,7 +4856,7 @@ impl NativeTape {
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
 		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
-		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision)?;
+		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision.model)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
@@ -4828,14 +4867,14 @@ impl NativeTape {
 		let tile_m = self.tile.m;
 		let tile_n = self.tile.n;
 		let tile_k = self.tile.k;
-		let beta1 = self.precision.optimizer_beta(config.beta1);
-		let beta2 = self.precision.optimizer_beta(config.beta2);
-		let epsilon = self.precision.optimizer_epsilon(config.epsilon);
+		let beta1 = self.precision.state.optimizer_beta(config.beta1);
+		let beta2 = self.precision.state.optimizer_beta(config.beta2);
+		let epsilon = self.precision.state.optimizer_epsilon(config.epsilon);
 		let beta1_power = beta1.powi(self.step as i32);
 		let beta2_power = beta2.powi(self.step as i32);
 		let decay = config.decay;
 		let step = self.step;
-		let encoded = [rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay].map(|value| self.precision.pack(value));
+		let encoded = [rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay].map(|value| self.precision.state.pack(value));
 		let mut call = ptrs![
 			self.samples.pointer,
 			self.targets.pointer,
@@ -4865,7 +4904,7 @@ impl NativeTape {
 		];
 		self.program.launch_epoch(&mut call, self.rows, self.tile).map_err(|error| RecipeError::new(format!("training forward/backward/optimizer update: {error}")))?;
 		self.gather_error("training forward/backward/optimizer update")?;
-		let objective = self.metrics.download_float(1, self.precision)?[0];
+		let objective = self.metrics.download_float(1, self.precision.state)?[0];
 		let saved = self.observe(objective, tolerance, true)?;
 		Ok((objective, saved))
 	}
@@ -4890,12 +4929,12 @@ impl NativeTape {
 	}
 	fn write_samples(&self, values: &[f64]) -> Result<()> {
 		require(values.len() == self.capacity * self.input, "RAT input batch has the wrong shape")?;
-		self.samples.write_float(0, values, self.precision)
+		self.samples.write_float(0, values, self.precision.model)
 	}
 	fn write_targets(&mut self, values: &[f64]) -> Result<()> {
 		require(values.len() == self.capacity * self.output, "RAT target batch has the wrong shape")?;
 		self.target_values.copy_from_slice(values);
-		self.targets.write_float(0, values, self.precision)
+		self.targets.write_float(0, values, self.precision.model)
 	}
 	fn trainable(&self, graph: &Graph, range: (usize, usize)) -> Result<()> {
 		require(graph.frozen.len() == self.parameters && range.1 <= graph.frozen.len(), "RAT model range is invalid")?;
@@ -4904,16 +4943,16 @@ impl NativeTape {
 	}
 	fn node_values(&self, node: usize, width: usize) -> Result<Vec<f64>> {
 		let offset = *self.program.artifact.layout.values.get(node).ok_or_else(|| RecipeError::new("RAT proposal node is absent"))?;
-		self.values.download_float_bytes(offset, self.capacity * width, self.precision)
+		self.values.download_float_bytes(offset, self.capacity * width, self.precision.model)
 	}
-	fn weights(&self) -> Result<Vec<f64>> { self.weights.download_float(self.parameters, self.precision) }
+	fn weights(&self) -> Result<Vec<f64>> { self.weights.download_float(self.parameters, self.precision.model) }
 	fn optimizer_state(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
-		Ok((self.weights()?, self.moments.download_float(self.parameters, self.precision)?, self.variances.download_float(self.parameters, self.precision)?))
+		Ok((self.weights()?, self.moments.download_float(self.parameters, self.precision.state)?, self.variances.download_float(self.parameters, self.precision.state)?))
 	}
 	fn restore_best(&self) -> Result<()> {
-		self.weights.write_float(0, &self.best, self.precision)?;
-		self.moments.write_float(0, &self.best_moments, self.precision)?;
-		self.variances.write_float(0, &self.best_variances, self.precision)
+		self.weights.write_float(0, &self.best, self.precision.model)?;
+		self.moments.write_float(0, &self.best_moments, self.precision.state)?;
+		self.variances.write_float(0, &self.best_variances, self.precision.state)
 	}
 	fn capture(&self, graph: &mut Graph, best: bool) -> Result<()> {
 		let (weights, moments, variances) = if best {
@@ -4943,7 +4982,7 @@ impl NativeTape {
 	}
 	fn print_devices(&self) -> Result<()> {
 		let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-		eprintln!("{}:{}.{}", host.trim(), self.program.gpu.name, self.precision.label());
+		eprintln!("{}:{}.{}", host.trim(), self.program.gpu.name, self.precision.model.label());
 		Ok(())
 	}
 }
@@ -5200,7 +5239,7 @@ fn native_symbol(name: &str) -> Vec<u8> {
 }
 
 fn native_artifact_contract(artifact: &NativeArtifact) -> Result<()> {
-	require(matches!(artifact.precision.bytes(), 1 | 2 | 4 | 8), "native artifact precision width is unsupported")?;
+	require(matches!(artifact.precision.model.bytes(), 1 | 2 | 4 | 8) && matches!(artifact.precision.state.bytes(), 4 | 8), "native artifact precision composition is unsupported")?;
 	require(!artifact.artifact.is_empty(), "native artifact is empty")?;
 	Ok(())
 }
@@ -5380,7 +5419,7 @@ fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
 	let path = artifact.path.to_str().ok_or_else(|| RecipeError::new("CPU native artifact path is not UTF-8"))?;
 	let library = Library::open(path)?;
 	let forward = library.function::<NativeForward>(&native_symbol(NATIVE_FORWARD_SYMBOL))?;
-	let epoch = match artifact.precision.bytes() {
+	let epoch = match artifact.precision.state.bytes() {
 		8 => NativeCpuEpoch::F64(library.function::<NativeEpochF64>(&native_symbol(NATIVE_EPOCH_SYMBOL))?),
 		4 => NativeCpuEpoch::F32(library.function::<NativeEpochF32>(&native_symbol(NATIVE_EPOCH_SYMBOL))?),
 		2 => NativeCpuEpoch::F16(library.function::<NativeEpochF16>(&native_symbol(NATIVE_EPOCH_SYMBOL))?),
@@ -5631,8 +5670,8 @@ impl Hsa {
 	unsafe fn native_dispatch(&self, executable: u64, artifact: &NativeArtifact, name: &str, layout: &'static [u8]) -> Result<Dispatch> {
 		unsafe {
 		let name = std::ffi::CString::new(format!("{name}.kd")).map_err(|error| RecipeError::new(format!("AMD native symbol is invalid: {error}")))?;
-		let kernel = hsa_kernel(self.symbol, self.symbol_info, executable, self.agent, &name, artifact.precision.bytes() as u8, layout)?;
-		let geometry = amd(self.cus, self.wave, self.workgroup, self.lds, Resources { shared: kernel.shared, max_block: self.workgroup, element: artifact.precision.bytes() as u8 })?;
+		let kernel = hsa_kernel(self.symbol, self.symbol_info, executable, self.agent, &name, artifact.precision.model.bytes() as u8, layout)?;
+		let geometry = amd(self.cus, self.wave, self.workgroup, self.lds, Resources { shared: kernel.shared, max_block: self.workgroup, element: artifact.precision.model.bytes() as u8 })?;
 		Ok(Dispatch { kernel, geometry })
 		}
 	}
@@ -5647,7 +5686,7 @@ impl Hsa {
 		driver_status(Backend::Amd, (self.executable_load)(executable.handle, self.agent, reader.handle, ptr::null_mut(), ptr::null_mut()), "native code-object load")?;
 		driver_status(Backend::Amd, (self.executable_freeze)(executable.handle, ptr::null_mut()), "native executable freeze")?;
 		let forward = self.native_dispatch(executable.handle, artifact, NATIVE_FORWARD_SYMBOL, NATIVE_FORWARD_LAYOUT)?;
-		let epoch = self.native_dispatch(executable.handle, artifact, NATIVE_EPOCH_SYMBOL, native_precision_layout(artifact.precision))?;
+		let epoch = self.native_dispatch(executable.handle, artifact, NATIVE_EPOCH_SYMBOL, artifact.precision.epoch_layout)?;
 		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(executable.handle, artifact, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
 		let kernarg_size = [forward.kernel.kernarg, epoch.kernel.kernarg, model_load.map_or(0, |dispatch| dispatch.kernel.kernarg)].into_iter().max().ok_or_else(|| RecipeError::new("native AMD KERNARG layouts are absent"))?;
 		let grid_sync = kernarg_size.next_multiple_of(HSA_GRID_SYNC_ALIGNMENT);
@@ -5689,9 +5728,9 @@ impl Cuda {
 		let mut module = ptr::null_mut();
 		driver_status(Backend::Nvidia, (self.load)(&mut module, artifact.artifact.as_ptr().cast()), "native cubin load")?;
 		let program = NativeCudaProgram { module: module as usize, unload: self.unload };
-		let element = u8::try_from(artifact.precision.bytes()).map_err(|_| RecipeError::new("native NVIDIA precision width is invalid"))?;
+		let element = u8::try_from(artifact.precision.model.bytes()).map_err(|_| RecipeError::new("native NVIDIA precision width is invalid"))?;
 		let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT)?;
-		let epoch = self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, native_precision_layout(artifact.precision))?;
+		let epoch = self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, artifact.precision.epoch_layout)?;
 		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
 		Ok((program, forward, epoch, model_load))
 		}
@@ -5770,9 +5809,9 @@ impl NativeProgram {
 				#[cfg(unix)]
 				{
 					let cpu = load_native_cpu(&artifact)?;
-					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } };
-					let epoch = Dispatch { kernel: Kernel::remote(0, artifact.precision.bytes() as u8, native_precision_layout(artifact.precision)), geometry: Geometry { groups: 1, block: 1 } };
-					let model_load = (!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } });
+					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } };
+					let epoch = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry: Geometry { groups: 1, block: 1 } };
+					let model_load = (!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } });
 					(NativeBackend::Cpu(cpu), forward, epoch, model_load)
 				}
 				#[cfg(not(unix))]
