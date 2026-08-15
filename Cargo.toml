@@ -58,7 +58,6 @@ surrogate-epochs = 8
 surrogate-rate = 0.01
 surrogate-width = 8
 rat-batch-rows = 32
-tile-vram-unit-bytes = 1073741824
 random-seed = 17
 progress-refresh-hz = 240
 normalization-epsilon = 0.00001

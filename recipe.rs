@@ -4019,15 +4019,6 @@ struct Node {
 	block_index: usize,
 	block_kind: &'static str,
 }
-impl Node {
-	fn tile_dimensions(&self) -> Option<[f64; 3]> {
-		match self.op {
-			Primitive::Contraction => Some([self.output.length as f64, self.output.channels as f64, self.input.channels as f64 * self.argument[0].max(1.0)]),
-			Primitive::Attention => Some([self.output.length as f64, self.output.channels as f64, self.input.channels as f64]),
-			_ => None,
-		}
-	}
-}
 #[derive(Clone, Default)]
 struct TrainingState {
 	moments: Vec<f64>,
@@ -4638,13 +4629,12 @@ struct Config {
 	decay: f64,
 	rat_batch: usize,
 	progress_refresh_hz: usize,
-	vram_unit: usize,
 	random_seed: usize,
 	activation: [f64; 8],
 	precision: Compute,
 }
 impl Config {
-	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, rat_batch: natural("RAT batch rows", env!("RECIPE_RAT_BATCH_ROWS"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, vram_unit: natural("tile VRAM unit bytes", env!("RECIPE_TILE_VRAM_UNIT_BYTES"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
+	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, rat_batch: natural("RAT batch rows", env!("RECIPE_RAT_BATCH_ROWS"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
 }
 fn number(name: &str, text: &str) -> Result<f64> {
 	let value = text.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))?;
@@ -4928,11 +4918,6 @@ impl NativeTape {
 		graph.state.epoch = (if best { self.best_epoch } else { self.step }) as usize;
 		graph.state.best = self.best.clone();
 		graph.state.best_loss = self.best_loss.to_vec();
-		Ok(())
-	}
-	fn write_tiles(&mut self, values: &[Tile]) -> Result<()> {
-		require(!values.is_empty(), "native tile set is empty")?;
-		self.tile = values.iter().fold(Tile { m: 1, n: 1, k: 1 }, |prior, tile| Tile { m: prior.m.max(tile.m), n: prior.n.max(tile.n), k: prior.k.max(tile.k) });
 		Ok(())
 	}
 	fn fill_tile(&mut self, tile: Tile) -> Result<()> {
@@ -7249,13 +7234,6 @@ impl Compute {
 	const INT8: Self = Self::Int(IntFormat::INT8);
 	const BF16: Self = Self::Bf(FloatFormat::BF16);
 	const TF32: Self = Self::Tf(FloatFormat::TF32);
-	const fn bits(self) -> u8 {
-		match self {
-			Self::F(value) => value.arithmetic.bits(),
-			Self::Fp(value) | Self::Bf(value) | Self::Tf(value) => value.storage.bits(),
-			Self::Int(value) => value.bits,
-		}
-	}
 	const fn bytes(self) -> usize {
 		match self {
 			Self::F(_) => FloatFormat::FP64.bytes(),
@@ -7434,7 +7412,6 @@ impl Train {
 		let mut tape = NativeTape::new(&stored.graph, samples, targets, gpu, config.precision, model.loss)?;
 		self.finish_dispatch(if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) }, &mut stored, &prepared.schema, &tape, None)?;
 		tape.print_devices()?;
-		let mut runtime = tile_runtime(gpu, config)?;
 		stored.bn_stats = tape.extract_bn_stats()?;
 		let initial_predictions = tape.predictions()?;
 		let initial_loss = model_loss(&initial_predictions, targets, model.loss, config.activation[7]);
@@ -7445,8 +7422,6 @@ impl Train {
 				self.finish_dispatch::<()>(Err(RecipeError::new("interrupted")), &mut stored, &prepared.schema, &tape, None).ok();
 				break;
 			}
-			let proposed = runtime.propose(&stored.graph, &mut tape);
-			let cases = self.finish_dispatch(proposed, &mut stored, &prepared.schema, &tape, None)?;
 			tape.advance()?;
 			let epoch = tape.step as usize;
 			let ((loss, saved, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, || {
@@ -7455,10 +7430,6 @@ impl Train {
 				if saved { stored.bn_stats = tape.extract_bn_stats()? }
 				self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, saved.then_some(true))?;
 				let predictions = tape.predictions()?;
-				if !INTERRUPTED.load(Ordering::Acquire) {
-					let learned = runtime.learn(&cases, &mut tape, config);
-					self.finish_dispatch(learned, &mut stored, &prepared.schema, &tape, None)?
-				}
 				self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, None)?;
 				Ok((loss, saved, predictions))
 			})?;
@@ -7783,68 +7754,6 @@ fn build<const N: usize>(models: &[Model; N], train: &Train, data: &Data, gpu: &
 	let targets = vec![0.0; rows * stored.outputs.len()];
 	let tape = NativeTape::new(&stored.graph, &vec![0.0; rows * stored.inputs.len()], &targets, gpu, config.precision, models[N - 1].loss)?;
 	Ok(State { stored, tape, proposals, models: ranges, proposal_names, targets, schema })
-}
-type TileCase = (usize, usize, [f64; 5], Tile, Tile);
-struct TileRuntime {
-	state: State,
-	train: Train,
-	predictor: Model,
-	vram_unit: usize,
-}
-static TILE_RUNTIME: OnceLock<Result<Mutex<TileRuntime>>> = OnceLock::new();
-impl TileRuntime {
-	fn new(gpu: &'static Gpu, mut config: Config) -> Result<Self> {
-		config.precision = Compute::FP64;
-		let predictor = recipe.model().layer(config.surrogate_width).tanh().layer(1).loss(mse);
-		let proposer = recipe.model().layer(config.surrogate_width).tanh().layer(3).loss(&predictor);
-		let models = [proposer, predictor];
-		let data = recipe.data(Vec::<String>::new()).r#in(["dtype", "VRAM", "M", "N", "K"]).out(["m", "n", "k"]).target(["Mtime"]).norm(z_score);
-		let train = recipe.train().epochs(config.surrogate_epochs).lr(config.surrogate_rate);
-		Ok(Self { state: build(&models, &train, &data, gpu, config)?, train, predictor: models.into_iter().last().unwrap(), vram_unit: config.vram_unit })
-	}
-	fn forward(&mut self, cases: &[TileCase]) -> Result<()> {
-		require(!cases.is_empty(), "tile proposal batch is empty")?;
-		let samples = (0..self.state.tape.capacity).flat_map(|index| cases[index % cases.len()].2).collect::<Vec<_>>();
-		self.state.tape.write_samples(&samples).and_then(|_| self.state.tape.forward())
-	}
-	fn propose(&mut self, graph: &Graph, tape: &mut NativeTape) -> Result<Vec<TileCase>> {
-		let mut cases = Vec::new();
-		for (node, operation) in graph.nodes.iter().enumerate() {
-			if let Some(dimensions) = operation.tile_dimensions() {
-				let limit = tape.proposal_limit(dimensions)?;
-				let minimum = Tile { m: tape.tile().m.min(limit.m), n: tape.tile().n.min(limit.n), k: tape.tile().k.min(limit.k) };
-				let work = dimensions[0] * f64::from(tape.rows);
-				let vram = if tape.program.gpu.backend == Backend::Cpu { 0.0 } else { tape.program.gpu.memory as f64 / self.vram_unit as f64 };
-				cases.push((0, node, [f64::from(tape.precision.bits()), vram, work, dimensions[1], dimensions[2]], minimum, limit));
-			}
-		}
-		let mut tiles = std::iter::repeat_n(tape.tile(), graph.nodes.len()).collect::<Vec<_>>();
-		for chunk in cases.chunks(self.state.tape.capacity) {
-			let mut proposal = self.forward(chunk).and_then(|_| self.state.proposal())?;
-			for (case, row) in chunk.iter().zip(proposal.chunks_exact_mut(self.state.proposal_names.len())) {
-				tiles[case.1] = Tile::proposed(row, case.3, case.4)?;
-			}
-		}
-		tape.write_tiles(&tiles)?;
-		Ok(cases)
-	}
-	fn learn(&mut self, cases: &[TileCase], tape: &mut NativeTape, config: Config) -> Result<()> {
-		for chunk in cases.chunks(self.state.tape.capacity) {
-			self.forward(chunk)?;
-			let elapsed = chunk.iter().map(|case| {
-				tape.fill_tile(case.3)?;
-				let started = Instant::now();
-				tape.forward()?;
-				Ok::<f64, RecipeError>(started.elapsed().as_secs_f64() * 1000.0)
-			}).collect::<Result<Vec<_>>>()?;
-			let measurement = (0..self.state.tape.capacity).map(|index| elapsed[index % elapsed.len()]).collect::<Vec<_>>();
-			train_rat(&mut self.state, &self.train, &self.predictor, &measurement, config)?;
-		}
-		Ok(())
-	}
-}
-fn tile_runtime(gpu: &'static Gpu, config: Config) -> Result<std::sync::MutexGuard<'static, TileRuntime>> {
-	TILE_RUNTIME.get_or_init(|| TileRuntime::new(gpu, config).map(Mutex::new)).as_ref().map_err(Clone::clone)?.lock().map_err(|_| RecipeError::new("tile runtime lock is poisoned"))
 }
 impl State {
 	fn proposal(&self) -> Result<Vec<f64>> {
