@@ -1,5 +1,5 @@
 //! Recipe executes one model graph after automatically probing a compiled discrete GPU backend.
-//! Attention is three-projection scaled Q/K/V without an output projection.
+//! Attention uses learned Q/K/V and output projections.
 #![allow(non_upper_case_globals)]
 mod program_ir {
 //! Compile-time lowering for the scalar, predictor, route, and normalization
