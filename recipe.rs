@@ -98,7 +98,6 @@ pub enum EmitError {
 	StackUnderflow { kind: &'static str },
 	StackDepth { kind: &'static str, depth: usize },
 	LocalIndex { index: usize, locals: usize },
-	EmptyRoute,
 }
 
 impl fmt::Display for EmitError {
@@ -111,7 +110,6 @@ impl fmt::Display for EmitError {
 			Self::StackUnderflow { kind } => write!(f, "{kind} program stack underflows"),
 			Self::StackDepth { kind, depth } => write!(f, "{kind} program ends at stack depth {depth}"),
 			Self::LocalIndex { index, locals } => write!(f, "predictor local {index} is outside {locals} locals"),
-			Self::EmptyRoute => f.write_str("route has no fields"),
 		}
 	}
 }
@@ -516,91 +514,6 @@ pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorCon
 		return Err(EmitError::StackDepth { kind: "predictor", depth: stack.len() });
 	}
 	Ok(PredictorForward { code: output, value: stack.remove(0) })
-}
-
-#[derive(Clone, Copy)]
-pub struct RouteField<'a> {
-	pub source: &'a str,
-	pub stride: usize,
-	pub index: usize,
-}
-
-#[derive(Clone, Copy)]
-pub struct RouteContext<'a> {
-	pub value_type: &'a str,
-	pub pointer_type: &'a str,
-	pub alignment: usize,
-	pub row: &'a str,
-	pub output: &'a str,
-	pub prefix: &'a str,
-}
-
-/// Emit a route as one fixed load/store per selected field. The fields are
-/// unrolled, so the output contains no runtime source lookup or field switch.
-pub fn emit_route(fields: &[RouteField<'_>], context: RouteContext<'_>) -> Result<String, EmitError> {
-	if fields.is_empty() {
-		return Err(EmitError::EmptyRoute);
-	}
-	let mut output = String::new();
-	let output_base = format!("%{}.route.output.base", context.prefix);
-	let _ = writeln!(output, "{output_base} = mul i32 {row}, {}", fields.len(), row = context.row);
-	for (column, field) in fields.iter().enumerate() {
-		let source_base = format!("%{}.route.source.base.{column}", context.prefix);
-		let source_index = format!("%{}.route.source.index.{column}", context.prefix);
-		let source_pointer = format!("%{}.route.source.ptr.{column}", context.prefix);
-		let value = format!("%{}.route.value.{column}", context.prefix);
-		let output_index = format!("%{}.route.output.index.{column}", context.prefix);
-		let output_pointer = format!("%{}.route.output.ptr.{column}", context.prefix);
-		let _ = writeln!(output, "{source_base} = mul i32 {row}, {stride}", row = context.row, stride = field.stride);
-		let _ = writeln!(output, "{source_index} = add i32 {source_base}, {field}", field = field.index);
-		let _ = writeln!(output, "{source_pointer} = getelementptr inbounds {ty}, {ptrty} {source}, i32 {source_index}", ty = context.value_type, ptrty = context.pointer_type, source = field.source);
-		let _ = writeln!(output, "{value} = load {ty}, {ptrty} {source_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, source_pointer = source_pointer, align = context.alignment);
-		let _ = writeln!(output, "{output_index} = add i32 {output_base}, {column}");
-		let _ = writeln!(output, "{output_pointer} = getelementptr inbounds {ty}, {ptrty} {output}, i32 {output_index}", ty = context.value_type, ptrty = context.pointer_type, output = context.output);
-		let _ = writeln!(output, "store {ty} {value}, {ptrty} {output_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, value = value, output_pointer = output_pointer, align = context.alignment);
-	}
-	Ok(output)
-}
-
-#[derive(Clone, Copy)]
-pub struct RouteReverseContext<'a> {
-	pub value_type: &'a str,
-	pub pointer_type: &'a str,
-	pub alignment: usize,
-	pub row: &'a str,
-	pub output_adjoint: &'a str,
-	pub prefix: &'a str,
-}
-
-/// Emit route reverse accumulation. `source_adjoint` is one fixed pointer per
-/// field, already resolved by the caller to either the input adjoint arena or
-/// a concrete preceding node's adjoint arena.
-pub fn emit_route_reverse(fields: &[RouteField<'_>], source_adjoint: &[&str], context: RouteReverseContext<'_>) -> Result<String, EmitError> {
-	if fields.is_empty() {
-		return Err(EmitError::EmptyRoute);
-	}
-	if source_adjoint.len() != fields.len() {
-		return Err(EmitError::WrongWidth { kind: "route adjoint", width: source_adjoint.len() });
-	}
-	let mut output = String::new();
-	let output_base = format!("%{}.route.reverse.output.base", context.prefix);
-	let _ = writeln!(output, "{output_base} = mul i32 {row}, {}", fields.len(), row = context.row);
-	for (column, (field, source)) in fields.iter().zip(source_adjoint).enumerate() {
-		let output_index = format!("%{}.route.reverse.output.index.{column}", context.prefix);
-		let output_pointer = format!("%{}.route.reverse.output.ptr.{column}", context.prefix);
-		let delta = format!("%{}.route.reverse.delta.{column}", context.prefix);
-		let source_base = format!("%{}.route.reverse.source.base.{column}", context.prefix);
-		let source_index = format!("%{}.route.reverse.source.index.{column}", context.prefix);
-		let source_pointer = format!("%{}.route.reverse.source.ptr.{column}", context.prefix);
-		let _ = writeln!(output, "{output_index} = add i32 {output_base}, {column}");
-		let _ = writeln!(output, "{output_pointer} = getelementptr inbounds {ty}, {ptrty} {output_adjoint}, i32 {output_index}", ty = context.value_type, ptrty = context.pointer_type, output_adjoint = context.output_adjoint);
-		let _ = writeln!(output, "{delta} = load {ty}, {ptrty} {output_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type, output_pointer = output_pointer, align = context.alignment);
-		let _ = writeln!(output, "{source_base} = mul i32 {row}, {stride}", row = context.row, stride = field.stride);
-		let _ = writeln!(output, "{source_index} = add i32 {source_base}, {field}", field = field.index);
-		let _ = writeln!(output, "{source_pointer} = getelementptr inbounds {ty}, {ptrty} {source}, i32 {source_index}", ty = context.value_type, ptrty = context.pointer_type, source = source);
-		let _ = writeln!(output, "call {ty} @recipe.atomic.add({ptrty} {source_pointer}, {ty} {delta})", ty = context.value_type, ptrty = context.pointer_type);
-	}
-	Ok(output)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1122,15 +1035,6 @@ fn backend_template(backend: Backend, precision: NativePrecision) -> Result<Stri
 			ir.push_str(&format!("define internal double @recipe.round(double %value) #1 {{ entry: %narrow = fptrunc double %value to {narrow} %result = fpext {narrow} %narrow to double ret double %result }}\n"));
 		}
 	}
-	Ok(ir)
-}
-
-fn remove_ir_definition(mut ir: String, name: &str) -> Result<String> {
-	let symbol = format!("@{name}(");
-	let Some(symbol_start) = ir.find(&symbol) else { return Ok(ir) };
-	let definition_start = ir[..symbol_start].rfind("define internal ").ok_or_else(|| RecipeError::new(format!("native IR definition {name:?} has no start")))?;
-	let definition_end = ir[symbol_start..].find("\n}\n").map(|offset| symbol_start + offset + 3).ok_or_else(|| RecipeError::new(format!("native IR definition {name:?} has no end")))?;
-	ir.replace_range(definition_start..definition_end, "");
 	Ok(ir)
 }
 
@@ -1902,7 +1806,7 @@ impl QuantOps for NativeQuantOps {
 use quantized::{dequant_nf4, HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantOps, ScalarLayout};
 
 impl NativeModelIr {
-	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, reverse: bool, training: bool) -> Result<String> {
+	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool) -> Result<String> {
 		let mut ir = String::new();
 		let order = if reverse {
 			self.plans.iter().rev().enumerate().map(|(position, plan)| (self.plans.len() - position - 1, plan)).collect::<Vec<_>>()
@@ -1916,7 +1820,9 @@ impl NativeModelIr {
 				(false, Primitive::Contraction) => {
 					let tile = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?.forward;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
-					ir.push_str(&format!("call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i1 {relu}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?, relu = node.argument[1] == 1.0, tile_m = tile.m, tile_n = tile.n, tile_k = tile.k));
+					let contraction = if matrix { "contraction_forward_matrix_body" } else { "contraction_forward_body" };
+					let call = if matrix { format!("call void @{contraction}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?, relu = node.argument[1] == 1.0, tile_m = tile.m, tile_n = tile.n, tile_k = tile.k) } else { format!("call void @{contraction}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i1 {relu}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?, relu = node.argument[1] == 1.0, tile_m = tile.m, tile_n = tile.n, tile_k = tile.k) };
+					ir.push_str(&call);
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Pool) => {
@@ -1936,10 +1842,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Attention) => {
-					if node.argument[4] == 1.0 {
-						return Err(RecipeError::new("cached attention has no model-specific reverse ABI"));
-					}
-					ir.push_str(&format!("call void @attention_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels));
+					let tile = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
+					let attention = if matrix && tile.m as usize == node.output.length { "attention_forward_matrix_body" } else { "attention_forward_body" };
+					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = tile.m, tile_n = tile.n, tile_k = tile.k));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Scan) => {
@@ -1996,7 +1901,14 @@ impl NativeModelIr {
 				(true, Primitive::Contraction) => {
 					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
-					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i1 true, i1 {relu}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+					let kernel = integer_argument(node.argument[0], "contraction kernel")?;
+					let matrix_previous = matrix && kernel <= 1;
+					let matrix_gradient = matrix_previous && node.output.channels >= 16 && tiles.gradient.k as usize >= NATIVE_MATRIX_SPLIT_SPAN;
+					let accumulate_previous = self.plans[index + 1..].iter().any(|candidate| candidate.node.source == node.source || candidate.node.second == node.source);
+					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 true, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !matrix_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+					if matrix_previous {
+						ir.push_str(&format!("call void @contraction_forward_matrix_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+					}
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Pool) => {
@@ -2022,10 +1934,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Attention) => {
-					if node.argument[4] == 1.0 {
-						return Err(RecipeError::new("cached attention has no model-specific reverse ABI"));
-					}
-						ir.push_str(&format!("call void @attention_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {offset}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, offset = plan.node.offset));
+					let tile = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
+					let attention = if matrix && tile.m as usize == node.output.length { "attention_reverse_matrix_body" } else { "attention_reverse_body" };
+						ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = tile.m, tile_n = tile.n, tile_k = tile.k));
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Scan) => {
@@ -2050,8 +1961,8 @@ impl NativeModelIr {
 					let forward = program_ir::emit_scalar_forward(code, program_ir::ScalarContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), first: &first, second: second_operand, weights: &pointers.weights, prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
 					let incoming = format!("%{prefix}.incoming");
 					let reverse = program_ir::emit_scalar_reverse(code, program_ir::ScalarContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), first: &first, second: second_operand, weights: &pointers.weights, prefix: &prefix, literal: &literal }, &incoming).map_err(|error| RecipeError::new(error.to_string()))?;
-					let gradients = reverse.parameter_adjoint.iter().map(|(&parameter, value)| Ok((checked_add(plan.node.offset, parameter, "scalar gradient offset")?, value.clone()))).collect::<Result<Vec<_>>>()?;
-						emit_fixed_loop(&mut ir, index, "scalar.reverse", count, |ir, p| {
+					let gradients = reverse.parameter_adjoint.iter().map(|(&parameter, value)| Ok((parameter, value.clone()))).collect::<Result<Vec<_>>>()?;
+						let scalar_body = |ir: &mut String, p: &str| {
 							let first_pointer = format!("%{prefix}.first.ptr");
 							let incoming_pointer = format!("%{prefix}.incoming.ptr");
 							let first_adjoint_pointer = format!("%{prefix}.first.adjoint.ptr");
@@ -2066,60 +1977,32 @@ impl NativeModelIr {
 							ir.push_str(&format!("{first_adjoint_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i32 {p}\n", source_adjoint = pointers.source_adjoint));
 							if node.second >= 0 {
 								let second_adjoint_pointer = format!("%{prefix}.second.adjoint.ptr");
-								ir.push_str(&format!("call {ty} @recipe.atomic.add({pointer} {first_adjoint_pointer}, {ty} {first_adjoint})\n{second_adjoint_pointer} = getelementptr inbounds {ty}, {pointer} {second_adjoint}, i32 {p}\ncall {ty} @recipe.atomic.add({pointer} {second_adjoint_pointer}, {ty} {second_adjoint_value})\n", first_adjoint = reverse.first_adjoint, second_adjoint = pointers.second_adjoint, second_adjoint_value = reverse.second_adjoint));
+								ir.push_str(&accumulate_owned(&first_adjoint_pointer, &reverse.first_adjoint, ty, pointer, &format!("{prefix}.first.owned")));
+								ir.push_str(&format!("{second_adjoint_pointer} = getelementptr inbounds {ty}, {pointer} {second_adjoint}, i32 {p}\n", second_adjoint = pointers.second_adjoint));
+								ir.push_str(&accumulate_owned(&second_adjoint_pointer, &reverse.second_adjoint, ty, pointer, &format!("{prefix}.second.owned")));
 							} else {
 								let combined = format!("%{prefix}.combined");
-								ir.push_str(&format!("{combined} = call {ty} @recipe.add({ty} {first_adjoint}, {ty} {second_adjoint})\ncall {ty} @recipe.atomic.add({pointer} {first_adjoint_pointer}, {ty} {combined})\n", first_adjoint = reverse.first_adjoint, second_adjoint = reverse.second_adjoint));
+								ir.push_str(&format!("{combined} = call {ty} @recipe.add({ty} {first_adjoint}, {ty} {second_adjoint})\n", first_adjoint = reverse.first_adjoint, second_adjoint = reverse.second_adjoint));
+								ir.push_str(&accumulate_owned(&first_adjoint_pointer, &combined, ty, pointer, &format!("{prefix}.combined.owned")));
 							}
-							for (parameter, value) in &gradients {
-								let gradient_pointer = format!("%{prefix}.gradient.{parameter}");
-								ir.push_str(&format!("{gradient_pointer} = getelementptr inbounds {ty}, {pointer} %gradient, i32 {parameter}\ncall {ty} @recipe.atomic.add({pointer} {gradient_pointer}, {ty} {value})\n"));
-							}
-						})?;
-					ir.push_str(barrier(backend));
-				}
-				(false, Primitive::Route) => {
-					let fields = self.route_fields(backend, index, node, &mut ir)?;
-					let count = checked_mul(self.rows, node.output.elements(), "route output count")?;
-					let pointer = pointer_type(backend);
-					let ty = self.precision.model_type;
-					let prefix = format!("n{index}.route");
-					let field_refs = fields.iter().map(|(source, stride, field)| program_ir::RouteField { source, stride: *stride, index: *field }).collect::<Vec<_>>();
-					let row = format!("%{prefix}.row");
-					let fragment = program_ir::emit_route(&field_refs, program_ir::RouteContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), row: &row, output: &pointers.value, prefix: &prefix }).map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_fixed_loop(&mut ir, index, "route", count, |ir, p| {
-						ir.push_str(&format!("{row} = udiv i32 {p}, {width}\n", width = field_refs.len()));
-						ir.push_str(&fragment);
-					})?;
-					ir.push_str(barrier(backend));
-				}
-				(true, Primitive::Route) => {
-					let fields = self.route_fields(backend, index, node, &mut ir)?;
-					let count = checked_mul(self.rows, node.output.elements(), "route reverse count")?;
-					let pointer = pointer_type(backend);
-					let ty = self.precision.model_type;
-					let prefix = format!("n{index}.route.reverse");
-					let field_refs = fields.iter().map(|(source, stride, field)| program_ir::RouteField { source, stride: *stride, index: *field }).collect::<Vec<_>>();
-					let mut adjoint_sources = Vec::with_capacity(node.program_count);
-					for (column, value) in self.route_program(node)?.into_iter().enumerate() {
-						let source = value.0;
-						if source < 0 { adjoint_sources.push("%input_adjoint".to_owned()); }
-						else {
-							let source = usize::try_from(source).map_err(|_| RecipeError::new("route source is invalid"))?;
-							let name = format!("%n{index}.route.source.{column}.adjoint");
-							ir.push_str(&ptr_gep(backend, "adjoints", self.layout.adjoints[source], &format!("n{index}.route.source.{column}.adjoint")));
-							adjoint_sources.push(name);
+						};
+						if gradients.is_empty() {
+							emit_fixed_loop(&mut ir, index, "scalar.reverse", count, scalar_body)?;
+							ir.push_str(barrier(backend));
+						} else {
+							// A trainable scalar is one destination shared by every element, so
+							// the summation order has to belong to the program rather than to
+							// the schedule. Each partition sums its own contiguous run of
+							// elements in ascending order into its own scratch row, and one
+							// owner then folds the rows in ascending partition order.
+							let partitions = count.min(NATIVE_SCALAR_PARTITIONS).max(1);
+							emit_partitioned_loop(&mut ir, index, "scalar.reverse", PartitionedLoop { count, partitions, columns: node.parameters, value_type: ty, pointer_type: pointer, scratch: &pointers.context, zero: &literal(0.0, ty), gradients: &gradients }, scalar_body)?;
+							ir.push_str(barrier(backend));
+							let (columns, offset) = (narrow(node.parameters, "scalar gradient columns")?, narrow(plan.node.offset, "scalar gradient offset")?);
+							ir.push_str(&format!("call void @reduce_rows({pointer} {context}, {pointer} %gradient, i32 {partitions}, i32 {columns}, i32 {columns}, i32 0, i32 {offset}, i32 %threads)\n", context = pointers.context));
+							ir.push_str(barrier(backend));
 						}
 					}
-					let adjoint_refs = adjoint_sources.iter().map(String::as_str).collect::<Vec<_>>();
-					let row = format!("%{prefix}.row");
-					let fragment = program_ir::emit_route_reverse(&field_refs, &adjoint_refs, program_ir::RouteReverseContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), row: &row, output_adjoint: &pointers.delta, prefix: &prefix }).map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_fixed_loop(&mut ir, index, "route.reverse", count, |ir, p| {
-						ir.push_str(&format!("{row} = udiv i32 {p}, {width}\n", width = field_refs.len()));
-						ir.push_str(&fragment);
-					})?;
-					ir.push_str(barrier(backend));
-				}
 				(false, Primitive::Normalize) => {
 					let count = checked_mul(self.rows, node.output.elements(), "normalize output count")?;
 					let mode = normalize_mode(node.argument[0])?;
@@ -2163,7 +2046,8 @@ impl NativeModelIr {
 						let fragment = program_ir::emit_normalize_reverse(program_ir::NormalizeReverseContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), zero: &zero, context: &pointers.context, rows: "%rows", channels: node.output.channels, length: node.output.length, mode, prefix: &prefix }, p, &delta_value, &output_value);
 						ir.push_str(&fragment.code);
 						let source_pointer = format!("%{prefix}.source.adjoint.ptr");
-						ir.push_str(&format!("{source_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i32 {p}\ncall {ty} @recipe.atomic.add({pointer} {source_pointer}, {ty} {contribution})\n", source_adjoint = pointers.source_adjoint, contribution = fragment.contribution));
+						ir.push_str(&format!("{source_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i32 {p}\n", source_adjoint = pointers.source_adjoint));
+						ir.push_str(&accumulate_owned(&source_pointer, &fragment.contribution, ty, pointer, &format!("{prefix}.owned")));
 					})?;
 					ir.push_str(barrier(backend));
 				}
@@ -2227,32 +2111,6 @@ impl NativeModelIr {
 		let stored_mean = if mode == program_ir::NormalizeMode::Rms { zero.clone() } else { format!("%{prefix}.mean") };
 		ir.push_str(&format!("store {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\n%{prefix}.group.next = add i32 {group}, %threads\nbr label %{prefix}.group.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, stored_mean = stored_mean, align = alignment(ty), group = group));
 		Ok(ir)
-	}
-
-	fn route_program(&self, node: &Node) -> Result<Vec<(i32, usize, usize)>> {
-		let width = node.program_count.checked_mul(3).ok_or_else(|| RecipeError::new("route program length overflows"))?;
-		let end = node.program_offset.checked_add(width).ok_or_else(|| RecipeError::new("route program range overflows"))?;
-		let code = self.graph.programs.get(node.program_offset..end).ok_or_else(|| RecipeError::new("route program range is invalid"))?;
-		code.chunks_exact(3).map(|field| {
-			let source = integer_argument(field[0], "route source")?;
-			let stride = usize::try_from(integer_argument(field[1], "route stride")?).map_err(|_| RecipeError::new("route stride is negative"))?;
-			let index = usize::try_from(integer_argument(field[2], "route field")?).map_err(|_| RecipeError::new("route field is negative"))?;
-			Ok((source, stride, index))
-		}).collect()
-	}
-
-	fn route_fields(&self, backend: Backend, index: usize, node: &Node, ir: &mut String) -> Result<Vec<(String, usize, usize)>> {
-		let mut fields = Vec::with_capacity(node.program_count);
-		for (column, (source, stride, field)) in self.route_program(node)?.into_iter().enumerate() {
-			let source_name = if source < 0 { "%samples".to_owned() } else {
-				let source = usize::try_from(source).map_err(|_| RecipeError::new("route source is invalid"))?;
-				let name = format!("n{index}.route.source.{column}");
-				ir.push_str(&ptr_gep(backend, "values", self.layout.values[source], &name));
-				format!("%{name}")
-			};
-			fields.push((source_name, stride, field));
-		}
-		Ok(fields)
 	}
 
 	fn emit_pointers(&self, backend: Backend, index: usize, plan: &NodePlan, reverse: bool, ir: &mut String) -> Result<ModelPointers> {
@@ -2365,7 +2223,7 @@ impl NativeModelIr {
 			let count = i32::try_from(stored.count).map_err(|_| RecipeError::new("native quantized weight count exceeds i32"))?;
 			let columns = i32::try_from(stored.count.div_ceil(block) * block).map_err(|_| RecipeError::new("native quantized block count exceeds i32"))?;
 			let prefix = format!("load.n{index}");
-			ir.push_str(&format!("br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.storage = getelementptr i8, {pointer} %storage, i32 {storage}\n%{prefix}.weights = getelementptr {ty}, {pointer} %weights, i32 {weight}\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} %{prefix}.storage, i32 0, i32 %{prefix}.p, i32 {columns})\nstore {ty} %{prefix}.value, {pointer} %{prefix}.weights, align {align}\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, count = count, storage = plan.storage_offset, weight = plan.node.offset, name = name, columns = columns, align = alignment(ty)).replace("%entry", &format!("%{predecessor}")));
+			ir.push_str(&format!("br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.storage = getelementptr i8, {pointer} %storage, i32 {storage}\n%{prefix}.index = add i32 %{prefix}.p, {weight}\n%{prefix}.weights = getelementptr {ty}, {pointer} %weights, i32 %{prefix}.index\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} %{prefix}.storage, i32 0, i32 %{prefix}.p, i32 {columns})\nstore {ty} %{prefix}.value, {pointer} %{prefix}.weights, align {align}\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, count = count, storage = plan.storage_offset, weight = plan.node.offset, name = name, columns = columns, align = alignment(ty)).replace("%entry", &format!("%{predecessor}")));
 			ir.push_str(barrier(backend));
 			predecessor = format!("{prefix}.done");
 		}
@@ -2373,60 +2231,20 @@ impl NativeModelIr {
 		Ok(ir)
 	}
 
-	pub(crate) fn emit(&self, backend: Backend, loss: LossFunction) -> Result<String> {
+	pub(crate) fn emit(&self, backend: Backend, matrix: bool, loss: LossFunction) -> Result<String> {
 		let register_count = self.schedule.register_count;
-		let matrix = self.schedule.matrix;
 		let mut ir = backend_template(backend, self.precision)?
+			.replace("RECIPE_WORKGROUP_SIZE", &self.schedule.block.to_string())
 			.replace("RECIPE_REGISTER_M", &self.schedule.register_m.to_string())
 			.replace("RECIPE_REGISTER_N", &self.schedule.register_n.to_string())
 			.replace("RECIPE_REGISTER_COUNT", &register_count.to_string())
-			.replace("RECIPE_WMMA_K", &self.schedule.wmma_k.to_string())
-			.replace("RECIPE_CONTRACTION_GRADIENT_TASKS", &self.schedule.gradient_tasks.to_string())
-			.replace("RECIPE_WMMA_B_PADDING", &if matrix.wmma() { self.schedule.wmma_b_padding } else { 0 }.to_string())
-			.replace("RECIPE_CONTRACTION_MATRIX", if matrix.wmma() { "true" } else { "false" })
-			.replace("RECIPE_CONTRACTION_B_INDEX", if matrix.wmma() { "%matrix" } else { "%vector" })
-			.replace("RECIPE_GRADIENT_ELEMENTS", &narrow(self.graph.parameters.len(), "native gradient elements")?.to_string());
-		for (canonical, vector, wmma) in [
-			("contraction_output_lanes", "contraction_output_lanes_vector", "contraction_output_lanes_wmma"),
-			("contraction_output_m", "contraction_output_m_vector", "contraction_output_m_wmma"),
-			("contraction_output_n", "contraction_output_n_vector", "contraction_output_n_wmma"),
-			("contraction_output_register_valid", "contraction_output_register_valid_vector", "contraction_output_register_valid_wmma"),
-			("contraction_bias_enable", "contraction_bias_enable_vector", "contraction_bias_enable_wmma"),
-		] {
-			let (selected, discarded) = if matrix.wmma() { (wmma, vector) } else { (vector, wmma) };
-			ir = ir.replace(&format!("@{selected}"), &format!("@{canonical}"));
-			ir = remove_ir_definition(ir, discarded)?;
-		}
-		let accumulator = match matrix {
-			NativeMatrix::Vector => "contraction_accumulate_vector",
-			NativeMatrix::F16 => "contraction_accumulate_wmma",
-			NativeMatrix::I8 | NativeMatrix::I4 => "contraction_accumulate_wmma_integer",
-		};
-		ir = ir.replace(&format!("@{accumulator}"), "@contraction_accumulate");
-		for discarded in ["contraction_accumulate_vector", "contraction_accumulate_wmma", "contraction_accumulate_wmma_integer"] {
-			if discarded != accumulator {
-				ir = remove_ir_definition(ir, discarded)?;
-			}
-		}
-		for discarded in match matrix {
-			NativeMatrix::I8 => &["contraction_pack_i4"][..],
-			NativeMatrix::I4 => &["contraction_pack_i8"][..],
-			NativeMatrix::Vector | NativeMatrix::F16 => &["contraction_pack_i8", "contraction_pack_i4"][..],
-		} {
-			ir = remove_ir_definition(ir, discarded)?;
-		}
-		match matrix {
-			NativeMatrix::Vector => {}
-			NativeMatrix::F16 => ir.push_str("declare <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16(<16 x half>, <16 x half>, <8 x float>)\n"),
-			NativeMatrix::I8 => {
-				ir = ir.replace("RECIPE_WMMA_INTEGER_VECTOR", "<4 x i32>").replace("RECIPE_WMMA_INTEGER_PACK", "contraction_pack_i8").replace("RECIPE_WMMA_INTEGER_INTRINSIC", "llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v4i32").replace("RECIPE_WMMA_INTEGER_SHIFT", "24").replace("RECIPE_WMMA_INTEGER_MIN", "-128").replace("RECIPE_WMMA_INTEGER_MAX", "127").replace("RECIPE_WMMA_INTEGER_MASK", "255");
-				ir.push_str("declare <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v4i32(i1 immarg, <4 x i32>, i1 immarg, <4 x i32>, <8 x i32>, i1 immarg)\n");
-			}
-			NativeMatrix::I4 => {
-				ir = ir.replace("RECIPE_WMMA_INTEGER_VECTOR", "<2 x i32>").replace("RECIPE_WMMA_INTEGER_PACK", "contraction_pack_i4").replace("RECIPE_WMMA_INTEGER_INTRINSIC", "llvm.amdgcn.wmma.i32.16x16x16.iu4.v8i32.v2i32").replace("RECIPE_WMMA_INTEGER_SHIFT", "28").replace("RECIPE_WMMA_INTEGER_MIN", "-8").replace("RECIPE_WMMA_INTEGER_MAX", "7").replace("RECIPE_WMMA_INTEGER_MASK", "15");
-				ir.push_str("declare <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu4.v8i32.v2i32(i1 immarg, <2 x i32>, i1 immarg, <2 x i32>, <8 x i32>, i1 immarg)\n");
-			}
-		}
+			.replace("RECIPE_FRAGMENT_K", &self.schedule.fragment_k.to_string())
+			.replace("RECIPE_CHUNK_K", &self.schedule.chunk_k.to_string())
+			.replace("RECIPE_CHUNK_VALUES", &self.schedule.chunk_values.to_string())
+			.replace("RECIPE_CHUNK_BIAS_VALUES", &self.schedule.chunk_bias_values.to_string())
+			.replace("RECIPE_SCRATCH_ROW_MASK", &(NATIVE_SCRATCH_ROW_VALUES - 1).to_string())
+			.replace("RECIPE_SCRATCH_ROW_CLEAR", &(-(NATIVE_SCRATCH_ROW_VALUES as i64)).to_string())
+			.replace("RECIPE_GRADIENT_SCRATCH_BASE", &self.schedule.scratch_base.to_string());
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let model_load = self.emit_model_load(backend)?;
 		ir.push_str(&quantized_definitions);
@@ -2446,9 +2264,9 @@ impl NativeModelIr {
 			Backend::Cpu => "add i32 0, 0".to_owned(),
 			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
 		};
-		let inference_forward = self.emit_fixed_primitives(backend, false, false)?;
-		let training_forward = self.emit_fixed_primitives(backend, false, true)?;
-		let reverse = self.emit_fixed_primitives(backend, true, false)?;
+		let inference_forward = self.emit_fixed_primitives(backend, matrix, false, false)?;
+		let training_forward = self.emit_fixed_primitives(backend, matrix, false, true)?;
+		let reverse = self.emit_fixed_primitives(backend, matrix, true, false)?;
 		let mut body = String::new();
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads");
 		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
@@ -2460,21 +2278,23 @@ impl NativeModelIr {
 		body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"));
 		let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
 		let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
-		body.push_str(&format!("define {kernel}void @recipe_model_epoch({pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %step) #0 {{\nentry:\n%tid = {thread}\n",));
+		let epoch_args = format!("{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %step");
+		body.push_str(&format!("define {kernel}void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "entry")?);
 		body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
 		body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
 		body.push_str(barrier(backend));
 		body.push_str(&format!("\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads)\n"));
-		body.push_str(barrier(backend));
 		body.push('\n');
 		body.push_str(&self.emit_loss_and_seed(backend, loss, model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
 		body.push_str(barrier(backend));
-		body.push('\n');
 		body.push_str(&reverse);
 		body.push_str(&self.emit_adamw(model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
 		body.push_str("ret void\n}\n");
 		ir.push_str(&body);
+		if matrix {
+			ir = ir.replace("@recipe.wmma(", "@llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v16f16(");
+		}
 		Ok(prune_internal_definitions(ir))
 	}
 
@@ -2512,9 +2332,15 @@ impl NativeModelIr {
 			ir.push_str(&format!("%loss.value = call {state_ty} @recipe.state.add({state_ty} %loss.mean, {state_ty} {zero})\n"));
 		}
 		ir.push_str(&format!("store {state_ty} %loss.value, {pointer} %metric.ptr, align {state_align}\nbr label %loss.wait\nloss.wait:\n"));
-		ir.push_str(barrier(backend));
-		ir.push_str(&format!("%loss.value.shared = load {state_ty}, {pointer} %metric.ptr, align {state_align}\n%adjoint.base = getelementptr i8, {pointer} %adjoints, i32 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, {items}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
-		let gradient = emit_loss_gradient(&mut ir, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, "%loss.value.shared", &format!("{items}"))?;
+		let loss_value = if loss.0 == 1 {
+			ir.push_str(barrier(backend));
+			ir.push_str(&format!("%loss.value.shared = load {state_ty}, {pointer} %metric.ptr, align {state_align}\n"));
+			"%loss.value.shared"
+		} else {
+			zero.as_str()
+		};
+		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i32 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, {items}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
+		let gradient = emit_loss_gradient(&mut ir, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, loss_value, &format!("{items}"))?;
 		ir.push_str(&format!("%seed.model = call {model_ty} @recipe.model.from.state({state_ty} {gradient})\n%seed.ptr = getelementptr {model_ty}, {pointer} %adjoint, i32 %seed.p\nstore {model_ty} %seed.model, {pointer} %seed.ptr, align {model_align}\n%seed.next = add i32 %seed.p, %threads\nbr label %seed.loop\nseed.done:\n"));
 		Ok(ir)
 	}
@@ -2716,6 +2542,68 @@ fn integer_argument(value: f64, role: &str) -> Result<i32> {
 	Ok(value as i32)
 }
 
+/// Accumulate into an adjoint element with exactly one writing lane. Every
+/// caller must own the destination element for the current barrier interval.
+fn accumulate_owned(target: &str, value: &str, ty: &str, pointer: &str, prefix: &str) -> String {
+	format!("%{prefix}.prior = load {ty}, {pointer} {target}, align {align}\n%{prefix}.sum = call {ty} @recipe.add({ty} %{prefix}.prior, {ty} {value})\nstore {ty} %{prefix}.sum, {pointer} {target}, align {align}\n", align = alignment(ty))
+}
+
+/// Contiguous pieces an elementwise reduction over a shared destination is cut
+/// into. The count is `min(elements, this)`, so it follows the shape of the work
+/// and never the width of the launch.
+const NATIVE_SCALAR_PARTITIONS: usize = 4096;
+
+struct PartitionedLoop<'a> {
+	count: usize,
+	partitions: usize,
+	columns: usize,
+	value_type: &'a str,
+	pointer_type: &'a str,
+	scratch: &'a str,
+	zero: &'a str,
+	gradients: &'a [(usize, String)],
+}
+
+/// Walk `count` elements as `partitions` contiguous runs, each summed in
+/// ascending element order into its own scratch row. Partition `t` spans
+/// `[t * q + min(t, r), (t + 1) * q + min(t + 1, r))` for the quotient `q` and
+/// remainder `r` of the element count over the partition count, so both the
+/// boundaries and the number of rows are fixed by the program.
+fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: PartitionedLoop<'_>, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
+	// The body owns the `n{index}.{name}` namespace, so every value this function
+	// introduces sits under a suffix of its own.
+	let prefix = format!("n{index}.{name}.partition");
+	let PartitionedLoop { count, partitions, columns, value_type: ty, pointer_type: pointer, scratch, zero, gradients } = shape;
+	require(partitions != 0 && columns != 0, "native partitioned loop is empty")?;
+	require(gradients.iter().all(|(parameter, _)| *parameter < columns), "native partitioned loop parameter is out of range")?;
+	let (whole, extra) = (narrow(count / partitions, "native partition span")?, narrow(count % partitions, "native partition remainder")?);
+	let partitions = narrow(partitions, "native partition count")?;
+	let columns = narrow(columns, "native partition columns")?;
+	let align = alignment(ty);
+	ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.t = phi i32 [ %tid, %{prefix}.entry ], [ %{prefix}.advance, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.t, {partitions}\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n"));
+	ir.push_str(&format!("%{prefix}.t.plus = add i32 %{prefix}.t, 1\n%{prefix}.first.short = icmp ult i32 %{prefix}.t, {extra}\n%{prefix}.first.extra = select i1 %{prefix}.first.short, i32 %{prefix}.t, i32 {extra}\n%{prefix}.first.whole = mul i32 %{prefix}.t, {whole}\n%{prefix}.first = add i32 %{prefix}.first.whole, %{prefix}.first.extra\n"));
+	ir.push_str(&format!("%{prefix}.limit.short = icmp ult i32 %{prefix}.t.plus, {extra}\n%{prefix}.limit.extra = select i1 %{prefix}.limit.short, i32 %{prefix}.t.plus, i32 {extra}\n%{prefix}.limit.whole = mul i32 %{prefix}.t.plus, {whole}\n%{prefix}.limit = add i32 %{prefix}.limit.whole, %{prefix}.limit.extra\n"));
+	ir.push_str(&format!("%{prefix}.row = mul i32 %{prefix}.t, {columns}\nbr label %{prefix}.inner\n{prefix}.inner:\n%{prefix}.p = phi i32 [ %{prefix}.first, %{prefix}.body ], [ %{prefix}.p.next, %{prefix}.fold ]\n"));
+	for (parameter, _) in gradients {
+		ir.push_str(&format!("%{prefix}.sum.{parameter} = phi {ty} [ {zero}, %{prefix}.body ], [ %{prefix}.sum.{parameter}.next, %{prefix}.fold ]\n"));
+	}
+	ir.push_str(&format!("%{prefix}.inner.more = icmp ult i32 %{prefix}.p, %{prefix}.limit\nbr i1 %{prefix}.inner.more, label %{prefix}.inner.body, label %{prefix}.store\n{prefix}.inner.body:\n"));
+	body(ir, &format!("%{prefix}.p"));
+	ir.push_str(&format!("br label %{prefix}.fold\n{prefix}.fold:\n"));
+	for (parameter, value) in gradients {
+		ir.push_str(&format!("%{prefix}.sum.{parameter}.next = call {ty} @recipe.add({ty} %{prefix}.sum.{parameter}, {ty} {value})\n"));
+	}
+	ir.push_str(&format!("%{prefix}.p.next = add i32 %{prefix}.p, 1\nbr label %{prefix}.inner\n{prefix}.store:\n"));
+	// Every column of the row is written, including the parameters this program
+	// never touches, so the fold below never reads an uninitialised slot.
+	for column in 0..columns {
+		let stored = gradients.iter().find(|(parameter, _)| *parameter as i32 == column).map_or_else(|| zero.to_owned(), |(parameter, _)| format!("%{prefix}.sum.{parameter}"));
+		ir.push_str(&format!("%{prefix}.index.{column} = add i32 %{prefix}.row, {column}\n%{prefix}.column.{column} = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{prefix}.index.{column}\nstore {ty} {stored}, {pointer} %{prefix}.column.{column}, align {align}\n"));
+	}
+	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.advance = add i32 %{prefix}.t, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
+	Ok(())
+}
+
 fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, count: usize, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
 	let prefix = format!("n{index}.{name}");
 	let count = i32::try_from(count).map_err(|_| RecipeError::new(format!("native {name} loop count exceeds i32")))?;
@@ -2756,13 +2644,49 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
 	format!("recipe-native-{hash:016x}")
 }
 
-fn native_command(mut command: Command, role: &str) -> Result<()> {
+/// Run a compiler and return whatever it wrote to its diagnostic stream, which
+/// is where the resource-usage remarks below arrive.
+fn native_command(mut command: Command, role: &str) -> Result<String> {
 	let output = command.output().map_err(|error| RecipeError::new(format!("cannot start {role}: {error}")))?;
-	if output.status.success() {
-		return Ok(());
-	}
 	let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+	if output.status.success() {
+		return Ok(diagnostic);
+	}
 	Err(RecipeError::new(format!("{role} failed: {diagnostic}")))
+}
+
+/// What the AMD backend reports about a compiled kernel. `occupancy` is the
+/// number of waves the register allocation leaves resident per SIMD, so zero
+/// means the kernel cannot be resident at the requested workgroup size and a
+/// cooperative grid built from it would never complete.
+#[derive(Clone, Debug)]
+struct KernelResources {
+	name: String,
+	registers: u32,
+	scalars: u32,
+	occupancy: u32,
+}
+
+/// Parse `-Rpass-analysis=kernel-resource-usage` remarks. The remark text is a
+/// compiler courtesy rather than a stable interface, so an unrecognised or
+/// absent report yields no entries and simply leaves the check unexercised.
+fn kernel_resources(diagnostic: &str) -> Vec<KernelResources> {
+	// A remark reads "remark: <file>:<line>:<column>:     <label>: <value> [-Rpass...]",
+	// so the value follows the last colon and the label precedes it.
+	let mut found: Vec<KernelResources> = Vec::new();
+	for line in diagnostic.lines().filter(|line| line.contains("kernel-resource-usage")) {
+		let body = line.rsplit_once(" [-").map_or(line, |(head, _)| head);
+		let Some((head, value)) = body.rsplit_once(':') else { continue };
+		let (label, value) = (head.rsplit(':').next().unwrap_or_default().trim(), value.trim());
+		match label {
+			"Function Name" => found.push(KernelResources { name: value.to_owned(), registers: 0, scalars: 0, occupancy: 0 }),
+			"VGPRs" => { if let Some(entry) = found.last_mut() { entry.registers = value.parse().unwrap_or(0) } }
+			"TotalSGPRs" => { if let Some(entry) = found.last_mut() { entry.scalars = value.parse().unwrap_or(0) } }
+			"Occupancy [waves/SIMD]" => { if let Some(entry) = found.last_mut() { entry.occupancy = value.parse().unwrap_or(0) } }
+			_ => {}
+		}
+	}
+	found
 }
 
 fn native_cpu_compiler() -> Result<&'static str> {
@@ -2781,26 +2705,29 @@ fn native_amd_library(name: &'static str) -> Result<&'static str> {
 	option_env!("RECIPE_HSA_DEVICE_LIBRARY").filter(|_| name == "device").or(option_env!("RECIPE_HSA_CLOCK_LIBRARY").filter(|_| name == "clock")).or(option_env!("RECIPE_HSA_ABI_LIBRARY").filter(|_| name == "abi")).or(option_env!("RECIPE_HSA_FINITE_LIBRARY").filter(|_| name == "finite")).or(option_env!("RECIPE_HSA_MATH_LIBRARY").filter(|_| name == "math")).ok_or_else(|| RecipeError::new(format!("AMD native {name} library is unavailable")))
 }
 
-fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, ptx: Option<&Path>) -> Result<()> {
+fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, ptx: Option<&Path>) -> Result<Vec<KernelResources>> {
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
 			let (target, _, _, _) = cpu_identity(target)?;
 			let mut command = Command::new(compiler);
 			command.args(["-target", target, "-march=native", "-Xclang", "-opaque-pointers", "-x", "ir", "-O2", "-fPIC", "-shared", "-o"]).arg(output).arg(source);
-			native_command(command, "CPU LLVM IR compiler")
+			native_command(command, "CPU LLVM IR compiler").map(|_| Vec::new())
 		}
 		BackendTarget::Amd { architecture } => {
 			let compiler = native_amd_compiler()?;
 			let mut command = Command::new(compiler);
-			command.args(["-target", "amdgcn-amd-amdhsa"]).arg(format!("-mcpu={architecture}")).args(["-O2", "-nogpulib"]);
+			// The resource-usage remarks are the only route to the register
+			// allocation of the compiled kernel, which decides whether the requested
+			// workgroup can be resident at all.
+			command.args(["-target", "amdgcn-amd-amdhsa"]).arg(format!("-mcpu={architecture}")).args(["-O3", "-nogpulib", "-Rpass-analysis=kernel-resource-usage"]);
 			for name in ["device", "clock", "abi", "finite", "math"] {
 				command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", native_amd_library(name)?]);
 			}
 			let library_directory = option_env!("RECIPE_HSA_DEVICE_LIBRARY_DIRECTORY").ok_or_else(|| RecipeError::new("AMD native device library directory is unavailable"))?;
 			let isa = Path::new(library_directory).join(format!("oclc_isa_version_{}.bc", architecture.trim_start_matches("gfx")));
 			command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(isa).arg(source).arg("-o").arg(output);
-			native_command(command, "AMD LLVM IR compiler")
+			native_command(command, "AMD LLVM IR compiler").map(|diagnostic| kernel_resources(&diagnostic))
 		}
 		BackendTarget::Nvidia { architecture } => {
 			let compiler = native_nvidia_compiler()?;
@@ -2813,7 +2740,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			let assembler = option_env!("RECIPE_NV_PTX_ASSEMBLER").ok_or_else(|| RecipeError::new("NVIDIA PTX assembler is unavailable"))?;
 			let mut ptxas = Command::new(assembler);
 			ptxas.arg(format!("-arch={architecture}")).args(["-o"]).arg(output).arg(ptx);
-			native_command(ptxas, "NVIDIA PTX assembler")
+			native_command(ptxas, "NVIDIA PTX assembler").map(|_| Vec::new())
 		}
 	}
 }
@@ -2821,7 +2748,14 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: LossFunction, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
 	target.validate()?;
 	let model = NativeModelIr::from_graph(graph, rows, precision, schedule)?;
-	let ir = model.emit(target.backend(), loss)?;
+	let fragment = natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?;
+	let (has_attention, aligned_attention) = graph.nodes.iter().filter(|node| node.op == Primitive::Attention).try_fold((false, true), |(_, aligned), node| {
+		let heads = integer_argument(node.argument[0], "attention heads")?;
+		require(heads != 0, "attention heads are empty")?;
+		Ok::<_, RecipeError>((true, aligned && node.output.channels / heads as usize % fragment == 0))
+	})?;
+	let matrix = matches!(target, BackendTarget::Amd { architecture } if architecture.starts_with("gfx11")) && model.precision.source == "-f16" && has_attention && aligned_attention;
+	let ir = model.emit(target.backend(), matrix, loss)?;
 	let key = native_artifact_key(target, &ir);
 	let directory = native_artifact_directory(&key)?;
 	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native artifact directory: {error}")))?;
@@ -2836,7 +2770,17 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		let ptx = (target.backend() == Backend::Nvidia).then(|| directory.join(format!("{stem}.ptx")));
 		let temporary = NativeTemporaryFiles { paths: std::iter::once(source.clone()).chain(std::iter::once(output.clone())).chain(ptx.iter().cloned()).collect() };
 		fs::write(&source, ir).map_err(|error| RecipeError::new(format!("cannot write native LLVM IR: {error}")))?;
-		compile_native_artifact(target, &source, &output, ptx.as_deref())?;
+		// The artifact is cached on disk, so this is the one moment the compiler's
+		// view of the kernel exists. A cooperative grid requires every workgroup to
+		// be resident at once, and the register allocation is what decides that.
+		// The kernel declares a workgroup range up to the device maximum, so a
+		// nonzero occupancy here holds for every workgroup width the schedule can
+		// pick. It does not bound the tile: local memory is checked separately, and
+		// the schedule still does not resize itself from these numbers.
+		for kernel in compile_native_artifact(target, &source, &output, ptx.as_deref())? {
+			debug(&format!("native kernel {} registers={} scalars={} occupancy={} waves per SIMD", kernel.name, kernel.registers, kernel.scalars, kernel.occupancy))?;
+			require(kernel.occupancy != 0, format!("native kernel {} cannot be resident at any workgroup width", kernel.name))?;
+		}
 		fs::rename(&output, &path).map_err(|error| RecipeError::new(format!("cannot publish native artifact {}: {error}", path.display())))?;
 		drop(temporary);
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
@@ -4774,7 +4718,6 @@ enum Primitive {
 	Attention = 4,
 	Scan = 5,
 	Elementwise = 6,
-	Route = 7,
 	Normalize = 8,
 	Predictor = 9,
 }
@@ -4803,7 +4746,6 @@ impl Node {
 			Primitive::Attention => "Attention",
 			Primitive::Scan => "Scan",
 			Primitive::Elementwise => "Elementwise",
-			Primitive::Route => "Route",
 			Primitive::Normalize => "Normalize",
 			Primitive::Predictor => "Predictor",
 		};
@@ -4926,24 +4868,6 @@ fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: 
 	graph.frozen = saved.frozen.clone();
 	graph.state = saved.state.clone();
 	Ok(graph)
-}
-#[derive(Clone, Copy)]
-struct Field {
-	source: i32,
-	stride: usize,
-	index: usize,
-}
-fn route_fields(graph: &mut Graph, fields: &[Field]) -> Result<()> {
-	let offset = graph.programs.len();
-	for value in fields {
-		graph.programs.extend([f64::from(value.source), value.stride as f64, value.index as f64]);
-	}
-	let output = Shape { channels: fields.len(), length: 1 };
-	push_node(graph, Primitive::Route, output, 0, [0.0; 9], -2)?;
-	let node = graph.nodes.last_mut().ok_or_else(|| RecipeError::new("route node is absent"))?;
-	node.program_offset = offset;
-	node.program_count = fields.len();
-	Ok(())
 }
 fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	let source = graph.source;
@@ -5169,18 +5093,8 @@ fn lower_gather(graph: &mut Graph, dimensions: usize, vocabulary: usize) -> Resu
 }
 fn lower_attention(graph: &mut Graph, heads: usize) -> Result<()> {
 	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
-	let (input, source) = (graph.output, graph.source);
-	let mut projections = Vec::new();
-	for _ in 0..3 {
-		reset(graph, source, input);
-		lower_project(graph, input.channels)?;
-		projections.push(graph.source);
-	}
-	let mut fields = Vec::new();
-	for source in projections {
-		fields.extend((0..input.elements()).map(|index| Field { source, stride: input.elements(), index }));
-	}
-	route_fields(graph, &fields)?;
+	let input = graph.output;
+	lower_project(graph, checked_mul(input.channels, 3, "attention QKV projection width")?)?;
 	let width = input.channels / heads;
 	push_node(graph, Primitive::Attention, input, 0, [heads as f64, heads as f64, width as f64, 0.0, 0.0, (width as f64).sqrt(), 0.0, 0.0, 0.0], -2)?;
 	lower_project(graph, input.channels)
@@ -5393,26 +5307,19 @@ struct Tile {
 }
 #[derive(Clone)]
 struct NativeSchedule {
+	block: u32,
 	tile: Tile,
 	register_m: u32,
 	register_n: u32,
 	register_count: u32,
-	matrix: NativeMatrix,
-	gradient_tasks: u32,
-	wmma_k: u32,
-	wmma_b_padding: u32,
+	fragment_k: u32,
+	chunk_k: u32,
+	chunk_values: u32,
+	chunk_bias_values: u32,
+	scratch_base: i32,
 	shared_values: u32,
 	contractions: Vec<Option<NativeContractionTiles>>,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NativeMatrix {
-	Vector,
-	F16,
-	I8,
-	I4,
-}
-impl NativeMatrix {
-	fn wmma(self) -> bool { self != Self::Vector }
+	attention: Vec<Option<Tile>>,
 }
 #[derive(Clone, Copy, Debug)]
 struct NativeContractionTiles {
@@ -5736,13 +5643,13 @@ fn checkpoint(path: &Path, schema: &str, stored: &mut bundle::StoredGraph, tape:
 fn structural(value: f64) -> Result<i32> { require(value.is_finite() && value.fract() == 0.0 && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX), "node structural argument is invalid").map(|_| value as i32) }
 fn graph_rows_buffer(shape: Shape, rows: usize, element: usize) -> Result<usize> { checked_mul(checked_mul(rows, shape.elements(), "node elements")?, element, "node bytes") }
 fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
-	if node.op == Primitive::Attention && node.argument[4] == 1.0 {
-		let values = checked_mul(node.argument[3] as usize, 2 * node.argument[1] as usize * node.argument[2] as usize, "attention cache")?;
-		return checked_add(element, checked_mul(values, size_of::<u16>(), "FP16 attention cache")?, "attention context");
-	}
 	let elements = match node.op {
-		Primitive::Elementwise => checked_mul(2 * node.program_count, checked_mul(rows, node.output.elements(), "program batch")?, "program")?,
+		// One scratch row per reduction partition, holding this node's trainable
+		// scalars. Programs without trainable scalars reduce nothing and take the
+		// minimum allocation below.
+		Primitive::Elementwise => checked_mul(checked_mul(rows, node.output.elements(), "program batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "scalar gradient partials")?,
 		Primitive::Predictor => checked_mul(checked_add(node.argument[0] as usize, node.argument[1] as usize, "predictor workspace")?, rows, "predictor batch")?,
+		Primitive::Attention => checked_mul(checked_mul(checked_mul(rows, node.output.length, "attention statistics rows")?, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?,
 		Primitive::Scan => {
 			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
 			let states = checked_mul(2 * gates + 1, state_count, "scan states")?;
@@ -6160,13 +6067,14 @@ fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
 	let path = artifact.path.to_str().ok_or_else(|| RecipeError::new("CPU native artifact path is not UTF-8"))?;
 	let library = Library::open(path)?;
 	let forward = library.function::<NativeForward>(&native_symbol(NATIVE_FORWARD_SYMBOL))?;
-	let epoch = match artifact.precision.state.bytes() {
-		8 => NativeCpuEpoch::F64(library.function::<NativeEpochF64>(&native_symbol(NATIVE_EPOCH_SYMBOL))?),
-		4 => NativeCpuEpoch::F32(library.function::<NativeEpochF32>(&native_symbol(NATIVE_EPOCH_SYMBOL))?),
-		2 => NativeCpuEpoch::F16(library.function::<NativeEpochF16>(&native_symbol(NATIVE_EPOCH_SYMBOL))?),
-		1 => NativeCpuEpoch::F8(library.function::<NativeEpochF8>(&native_symbol(NATIVE_EPOCH_SYMBOL))?),
-		_ => return Err(RecipeError::new("native CPU precision width is invalid")),
-	};
+	let epoch = |symbol: &str| -> Result<NativeCpuEpoch> { match artifact.precision.state.bytes() {
+		8 => library.function::<NativeEpochF64>(&native_symbol(symbol)).map(NativeCpuEpoch::F64),
+		4 => library.function::<NativeEpochF32>(&native_symbol(symbol)).map(NativeCpuEpoch::F32),
+		2 => library.function::<NativeEpochF16>(&native_symbol(symbol)).map(NativeCpuEpoch::F16),
+		1 => library.function::<NativeEpochF8>(&native_symbol(symbol)).map(NativeCpuEpoch::F8),
+		_ => Err(RecipeError::new("native CPU precision width is invalid")),
+	} };
+	let epoch = epoch(NATIVE_EPOCH_SYMBOL)?;
 	let model_load = (!artifact.storage.is_empty()).then(|| library.function::<NativeModelLoad>(&native_symbol(NATIVE_MODEL_LOAD_SYMBOL))).transpose()?;
 	Ok(NativeCpuProgram { _library: library, forward, epoch, model_load })
 }
@@ -6186,7 +6094,7 @@ impl Gpu {
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: LossFunction) -> Result<NativeProgram> {
-		let maximum_residency = if matches!(&self.driver, Driver::Cpu) { 1 } else { narrow(natural("contraction resident waves per CU", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_CU"))?, "contraction resident waves per CU")? as u32 };
+		let waves_per_workgroup = if matches!(&self.driver, Driver::Cpu) { 1 } else { narrow(natural("contraction resident waves per workgroup", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"))?, "contraction resident waves per workgroup")? as u32 };
 		let shared_values = if matches!(&self.driver, Driver::Cpu) { narrow(natural("CPU contraction shared values", env!("RECIPE_CONTRACTION_CPU_SHARED_VALUES"))?, "CPU contraction shared values")? as u32 } else { self.shared_limit / precision.bytes() as u32 };
 		let shapes = native_contraction_shapes(graph, rows)?;
 		let mut limits = Tile { m: 1, n: 1, k: 1 };
@@ -6208,56 +6116,66 @@ impl Gpu {
 			Driver::Cuda(driver) => driver.wave,
 		};
 		let dominant_shape = dominant.and_then(|(index, _)| shapes[index]).map_or(limits, |shape| shape.gradient);
-		let matrix = if self.backend == Backend::Amd && wave == 32 && dominant_shape.m >= 16 && dominant_shape.n >= 16 {
-			match precision {
-				Compute::FP16 => NativeMatrix::F16,
-				Compute::Int(format) if format == IntFormat::INT8 => NativeMatrix::I8,
-				Compute::Int(format) if format == IntFormat::INT4 => NativeMatrix::I4,
-				_ => NativeMatrix::Vector,
-			}
-		} else {
-			NativeMatrix::Vector
-		};
-		let wmma = matrix.wmma();
-		let wmma_max_m = narrow(natural("contraction WMMA maximum M", env!("RECIPE_CONTRACTION_WMMA_MAX_M"))?, "contraction WMMA maximum M")? as u32;
-		let wmma_k = narrow(natural("contraction WMMA K", env!("RECIPE_CONTRACTION_WMMA_K"))?, "contraction WMMA K")? as u32;
-		let wmma_b_padding = narrow(natural("contraction WMMA B padding", env!("RECIPE_CONTRACTION_WMMA_B_PADDING"))?, "contraction WMMA B padding")? as u32;
-		let gradient_tasks = narrow(natural("contraction gradient tasks", env!("RECIPE_CONTRACTION_GRADIENT_TASKS"))?, "contraction gradient tasks")? as u32;
-		let maximum_register_m = if wmma { 16 } else { (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(limits.m) };
-		let register_n = if wmma { 1 } else { (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(limits.n) };
-		let mut waves = 1;
-		let mut register_m = maximum_register_m;
-		let mut tile = native_contraction_direction_tile(dominant_shape, register_m, register_n, wave, shared_values / maximum_residency, wmma, wmma_max_m, wmma_k, wmma_b_padding)?;
-		let residency = if self.backend == Backend::Amd { native_contraction_residency(&shapes, tile, gradient_tasks, maximum_residency)? } else { 1 };
-		if self.backend == Backend::Amd && residency == 1 {
-			waves = maximum_residency;
-		}
-		if residency > 1 && !wmma {
-			register_m = (maximum_register_m / residency).max(1);
-		}
+		let fragment_k = narrow(natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?, "contraction fragment K")? as u32;
+		// The reduction chunk is a multiple of the staging fragment so a chunk
+		// boundary never falls inside a vector staging load.
+		let chunk_k = narrow(natural("contraction chunk K", env!("RECIPE_CONTRACTION_CHUNK_K"))?, "contraction chunk K")? as u32;
+		require(chunk_k % fragment_k == 0, "contraction chunk K must be a multiple of the staging fragment")?;
+		let register_m = (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(limits.m);
+		let waves = if self.backend == Backend::Amd { waves_per_workgroup } else { 1 };
 		let block = wave.checked_mul(waves).ok_or_else(|| RecipeError::new("native contraction workgroup overflows"))?;
-		let shared_budget = shared_values / residency;
+		let register_n = (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(limits.n).min((self.shared_limit / precision.bytes() as u32 / block / register_m.checked_add(1).ok_or_else(|| RecipeError::new("native contraction register width overflows"))?).max(1));
+		// A cooperative grid deadlocks unless every workgroup is resident, so the
+		// tile must leave local memory unclaimed for the waves that share a compute
+		// unit. Local memory is allocated per workgroup rather than per wave, so
+		// this divisor is a margin and not the exact resource equation: it is the
+		// wave count because that is the multiple by which the workgroup was
+		// widened. Claiming the whole local store deadlocks even at one wave,
+		// because the kernel's own fixed allocation shares the same store.
+		let shared_budget = shared_values / waves_per_workgroup;
+		// Chunk partials keep the arithmetic width while the tile allocation is
+		// counted in model elements, so a narrow model needs proportionally more
+		// elements per partial value.
+		let ratio = narrow(NativePrecision::new(precision)?.state.bytes().div_ceil(precision.bytes()), "native contraction state ratio")? as u32;
+		let mut tile = native_contraction_tile(dominant_shape, register_m, register_n, block, shared_budget, chunk_k, ratio)?;
 		let contractions = shapes.iter().map(|shape| shape.map(|shape| {
 			Ok(NativeContractionTiles {
-				forward: native_contraction_direction_tile(shape.forward, register_m, register_n, block, shared_budget, wmma, wmma_max_m, wmma_k, wmma_b_padding)?,
-				gradient: native_contraction_direction_tile(shape.gradient, register_m, register_n, block, shared_budget, wmma, wmma_max_m, wmma_k, wmma_b_padding)?,
-				previous: native_contraction_direction_tile(shape.previous, register_m, register_n, block, shared_budget, wmma, wmma_max_m, wmma_k, wmma_b_padding)?,
+				forward: native_contraction_tile(shape.forward, register_m, register_n, block, shared_budget, chunk_k, ratio)?,
+				gradient: native_contraction_tile(shape.gradient, register_m, register_n, block, shared_budget, chunk_k, ratio)?,
+				previous: native_contraction_tile(shape.previous, register_m, register_n, block, shared_budget, chunk_k, ratio)?,
 				gradient_shape: shape.gradient,
 				parameters: shape.parameters,
 			})
 		}).transpose()).collect::<Result<Vec<_>>>()?;
 		tile = dominant.and_then(|(index, _)| contractions[index]).map_or(tile, |contraction| contraction.gradient);
-		let shared_values = contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]).map(|tile| native_contraction_shared_values(tile, wmma, wmma_b_padding)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
-		let register_count = if wmma { contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]).map(|tile| tile.m / 2).max().unwrap_or(8) } else { register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))? };
-		let register_values = register_count.checked_add(register_n).ok_or_else(|| RecipeError::new("native contraction register reduction overflows"))?;
-		debug(&format!("native contraction schedule matrix={matrix:?} block={block} residency={residency} waves={waves} registers={register_count} shared={shared_values} tiles={contractions:?}"))?;
-		let schedule = NativeSchedule { tile, register_m, register_n, register_count, matrix, gradient_tasks, wmma_k, wmma_b_padding, shared_values, contractions };
+		let contraction_shared_values = contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]).map(|tile| native_contraction_shared_values(tile, register_m, register_n, block, chunk_k, ratio)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
+		let attention_query_tile = narrow(natural("attention query tile", env!("RECIPE_ATTENTION_QUERY_TILE"))?, "attention query tile")? as u32;
+		let attention = native_attention_tiles(graph, shared_budget, attention_query_tile)?;
+		let attention_shared_values = attention.iter().enumerate().filter_map(|(index, tile)| tile.map(|tile| native_attention_shared_values(tile, tile.m as usize == graph.nodes[index].output.length))).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
+		let shared_values = contraction_shared_values.max(attention_shared_values);
+		let register_count = register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
+		let register_values = register_count.checked_add(register_n).and_then(|values| values.checked_mul(ratio)).ok_or_else(|| RecipeError::new("native contraction register reduction overflows"))?;
+		// The private chunk buffer holds every partial a single lane can own at
+		// once. A full tile with one k lane folds locally and reuses one slot; the
+		// exchange only ever runs with at least two k lanes, and tails only shrink
+		// the output lanes and so grow the k lanes, so the full-tile lane count
+		// bounds how many chunks a lane can hold.
+		let mut owned = 1_u32;
+		for tile in contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]) {
+			let output_lanes = (tile.m / register_m).max(1).checked_mul((tile.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
+			let k_lanes = (block / output_lanes).max(2);
+			owned = owned.max(tile.k.div_ceil(chunk_k).div_ceil(k_lanes));
+		}
+		let chunk_values = owned.checked_mul(register_count).ok_or_else(|| RecipeError::new("native contraction chunk buffer overflows"))?;
+		let chunk_bias_values = owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?;
+		let scratch_base = narrow(graph.parameters.len().next_multiple_of(NATIVE_SCRATCH_ROW_VALUES), "native gradient scratch base")?;
+		debug(&format!("native schedule block={block} waves={waves} registers={register_count} shared={shared_values} contractions={contractions:?} attention={attention:?}"))?;
+		let schedule = NativeSchedule { block, tile, register_m, register_n, register_count, fragment_k, chunk_k, chunk_values, chunk_bias_values, scratch_base, shared_values, contractions, attention };
 		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
-		let program = NativeProgram::load(self, artifact, graph, schedule, register_values, residency, waves)?;
+		let program = NativeProgram::load(self, artifact, graph, schedule, register_values, waves)?;
 		let fixed = program.forward.kernel.shared.max(program.epoch.kernel.shared).max(program.model_load.map_or(0, |dispatch| dispatch.kernel.shared));
-		let required = fixed.checked_add(shared_values.max(program.reduction_values).max(DOUBLE_BUFFER_VALUES).checked_mul(precision.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
-		let resident_required = required.checked_mul(residency).ok_or_else(|| RecipeError::new("native resident shared memory overflows"))?;
-		require(resident_required <= self.shared_limit, "native model exceeds resident device shared memory")?;
+		let required = fixed.checked_add(shared_values.max(program.reduction_values).checked_mul(precision.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
+		require(required <= self.shared_limit, "native model exceeds resident device shared memory")?;
 		Ok(program)
 	}
 	fn allocate(&self, bytes: usize) -> Result<u64> {
@@ -6470,16 +6388,16 @@ unsafe fn hsa_kernel(symbol: HsaSymbol, info: HsaSymbolInfo, executable: u64, ag
 fn kfd_property(text: &str, name: &str) -> Result<u32> { text.lines().find_map(|line| line.split_once(' ').filter(|value| value.0 == name)).ok_or_else(|| RecipeError::new(format!("KFD property {name:?} is absent")))?.1.parse::<u32>().map_err(|error| RecipeError::new(format!("KFD property {name:?} is invalid: {error}"))) }
 #[cfg(amd)]
 impl Hsa {
-	unsafe fn native_dispatch(&self, executable: u64, artifact: &NativeArtifact, residency: u32, waves: u32, name: &str, layout: &'static [u8]) -> Result<Dispatch> {
+	unsafe fn native_dispatch(&self, executable: u64, artifact: &NativeArtifact, waves: u32, name: &str, layout: &'static [u8]) -> Result<Dispatch> {
 		unsafe {
 		let name = std::ffi::CString::new(format!("{name}.kd")).map_err(|error| RecipeError::new(format!("AMD native symbol is invalid: {error}")))?;
 		let kernel = hsa_kernel(self.symbol, self.symbol_info, executable, self.agent, &name, artifact.precision.model.bytes() as u8, layout)?;
-		let geometry = amd(self.cus, self.wave, self.workgroup, self.lds, residency, waves, Resources { shared: kernel.shared, max_block: self.workgroup, element: artifact.precision.model.bytes() as u8 })?;
+		let geometry = amd(self.cus, self.wave, self.workgroup, self.lds, waves, Resources { shared: kernel.shared, max_block: self.workgroup })?;
 		Ok(Dispatch { kernel, geometry })
 		}
 	}
 
-	unsafe fn load_native(&self, artifact: &NativeArtifact, residency: u32, waves: u32) -> Result<(NativeHsaProgram, Dispatch, Dispatch, Option<Dispatch>)> {
+	unsafe fn load_native(&self, artifact: &NativeArtifact, waves: u32) -> Result<(NativeHsaProgram, Dispatch, Dispatch, Option<Dispatch>)> {
 		unsafe {
 		require(artifact.artifact.len() != 0, "native AMD artifact is empty")?;
 		let mut reader = HsaReader { handle: 0, destroy: self.reader_destroy };
@@ -6488,10 +6406,10 @@ impl Hsa {
 		driver_status(Backend::Amd, (self.executable_create)(1, 0, ptr::null_mut(), &mut executable.handle), "native executable creation")?;
 		driver_status(Backend::Amd, (self.executable_load)(executable.handle, self.agent, reader.handle, ptr::null_mut(), ptr::null_mut()), "native code-object load")?;
 		driver_status(Backend::Amd, (self.executable_freeze)(executable.handle, ptr::null_mut()), "native executable freeze")?;
-		let forward = self.native_dispatch(executable.handle, artifact, residency, waves, NATIVE_FORWARD_SYMBOL, NATIVE_FORWARD_LAYOUT)?;
-		let epoch = self.native_dispatch(executable.handle, artifact, residency, waves, NATIVE_EPOCH_SYMBOL, artifact.precision.epoch_layout)?;
-		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(executable.handle, artifact, residency, waves, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
-		let kernarg_size = [forward.kernel.kernarg, epoch.kernel.kernarg, model_load.map_or(0, |dispatch| dispatch.kernel.kernarg)].into_iter().max().ok_or_else(|| RecipeError::new("native AMD KERNARG layouts are absent"))?;
+		let forward = self.native_dispatch(executable.handle, artifact, waves, NATIVE_FORWARD_SYMBOL, NATIVE_FORWARD_LAYOUT)?;
+		let epoch = self.native_dispatch(executable.handle, artifact, waves, NATIVE_EPOCH_SYMBOL, artifact.precision.epoch_layout)?;
+		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(executable.handle, artifact, waves, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
+		let kernarg_size = forward.kernel.kernarg.max(epoch.kernel.kernarg).max(model_load.map_or(0, |dispatch| dispatch.kernel.kernarg));
 		let grid_sync = kernarg_size.next_multiple_of(HSA_GRID_SYNC_ALIGNMENT);
 		let allocation_size = grid_sync.checked_add(HSA_GRID_SYNC_BYTES).ok_or_else(|| RecipeError::new("native AMD KERNARG allocation overflows"))?;
 		let mut kernarg = ptr::null_mut();
@@ -6516,7 +6434,7 @@ impl Cuda {
 		require(max_block > 0 && shared >= 0 && used_registers > 0, "NVIDIA native symbol resources are invalid")?;
 		let register_wave = (used_registers as u32).checked_mul(self.wave).ok_or_else(|| RecipeError::new("NVIDIA native register count overflows"))?;
 		let observed = (self.registers / register_wave).min(self.threads / self.wave);
-		let resources = Resources { shared: shared as u32, max_block: max_block as u32, element };
+		let resources = Resources { shared: shared as u32, max_block: max_block as u32 };
 		let geometry = nvidia(self.cus, self.wave, self.workgroup, self.block_lds, self.sm_lds, observed, resources)?;
 		let mut active = 0;
 		driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, geometry.block as i32, 0), "native occupancy query")?;
@@ -6597,7 +6515,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 }
 
 impl NativeProgram {
-	fn load(gpu: &'static Gpu, artifact: NativeArtifact, graph: &Graph, schedule: NativeSchedule, register_values: u32, residency: u32, waves: u32) -> Result<Self> {
+	fn load(gpu: &'static Gpu, artifact: NativeArtifact, graph: &Graph, schedule: NativeSchedule, register_values: u32, waves: u32) -> Result<Self> {
 		native_artifact_contract(&artifact)?;
 		require(artifact.backend.backend() == gpu.backend, format!("native artifact backend {:?} does not match device {:?}", artifact.backend.backend(), gpu.backend))?;
 		let (backend, forward, epoch, model_load) = match &gpu.driver {
@@ -6615,7 +6533,7 @@ impl NativeProgram {
 			}
 			#[cfg(amd)]
 			Driver::Hsa(driver) => {
-				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact, residency, waves)? };
+				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact, waves)? };
 				(NativeBackend::Amd(program), forward, epoch, model_load)
 			}
 			#[cfg(nvidia)]
@@ -6626,7 +6544,7 @@ impl NativeProgram {
 		};
 		let block = forward.geometry.block.max(epoch.geometry.block);
 		let reduction_values = block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native contraction lane reduction overflows"))?;
-		let gradient_values = native_gradient_values(graph, &schedule.contractions, schedule.gradient_tasks)?;
+		let gradient_values = native_gradient_values(graph.parameters.len(), &schedule.contractions)?;
 		Ok(Self { gpu, artifact, backend, forward, epoch, model_load, tile: schedule.tile, shared_values: schedule.shared_values, reduction_values, gradient_values })
 	}
 
@@ -6658,7 +6576,7 @@ impl NativeProgram {
 		require(arguments.len() == dispatch.kernel.layout.len(), "native argument count is invalid")?;
 		gpu.activate()?;
 		let block = dispatch.geometry.block;
-		let values = if matches!(entry, NativeEntry::ModelLoad) { 0 } else { self.shared_values.max(self.reduction_values).max(DOUBLE_BUFFER_VALUES) };
+		let values = if matches!(entry, NativeEntry::ModelLoad) { 0 } else { self.shared_values.max(self.reduction_values) };
 		let dynamic = values.checked_mul(u32::from(dispatch.kernel.element)).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
 		let shared = dispatch.kernel.shared.checked_add(dynamic).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
 		require(shared <= gpu.shared_limit, "native shared memory exceeds device limit")?;
@@ -7515,7 +7433,6 @@ fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool)
 impl Estimator {
 	fn fit(&self, data: &Prepared, rows: usize, config: Config, exclude: bool) -> Result<Predictor> { (self.fit)(self.param, data, rows, config, exclude) }
 }
-const DOUBLE_BUFFER_VALUES: u32 = 2;
 fn native_contraction_shapes(graph: &Graph, rows: usize) -> Result<Vec<Option<NativeContractionShapes>>> {
 	graph.nodes.iter().map(|node| {
 		let dimensions = match node.op {
@@ -7540,85 +7457,176 @@ fn native_contraction_shapes(graph: &Graph, rows: usize) -> Result<Vec<Option<Na
 		}).transpose()
 	}).collect()
 }
+fn native_attention_shared_values(tile: Tile, full: bool) -> Result<u32> {
+	let queries = tile.m.checked_mul(tile.k).ok_or_else(|| RecipeError::new("native attention query tile overflows"))?;
+	let keys = tile.n.checked_mul(tile.k).ok_or_else(|| RecipeError::new("native attention key tile overflows"))?;
+	let pairs = tile.m.checked_mul(tile.n).ok_or_else(|| RecipeError::new("native attention pair tile overflows"))?;
+	let forward = queries.checked_mul(2)
+		.and_then(|values| keys.checked_mul(2).and_then(|keys| values.checked_add(keys)))
+		.and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs)))
+		.and_then(|values| tile.m.checked_mul(3).and_then(|statistics| values.checked_add(statistics)));
+	let query_gradient = queries.checked_mul(3)
+		.and_then(|values| keys.checked_mul(2).and_then(|keys| values.checked_add(keys)))
+		.and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs)))
+		.and_then(|values| values.checked_add(tile.m));
+	let key_value_gradient = queries.checked_mul(2)
+		.and_then(|values| keys.checked_mul(4).and_then(|keys| values.checked_add(keys)))
+		.and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs)))
+		.and_then(|values| values.checked_add(tile.m));
+	let matrix_pairs = tile.m.checked_mul(tile.m);
+	let matrix = queries.checked_mul(4)
+		.and_then(|values| matrix_pairs.and_then(|pairs| pairs.checked_mul(2)).and_then(|pairs| values.checked_add(pairs)))
+		.and_then(|values| values.checked_add(tile.m));
+	forward.zip(query_gradient).zip(key_value_gradient).zip(matrix)
+		.map(|(((forward, query_gradient), key_value_gradient), matrix)| forward.max(query_gradient).max(key_value_gradient).max(if full { matrix } else { 0 }))
+		.ok_or_else(|| RecipeError::new("native attention shared values overflow"))
+}
+fn native_attention_tile(length: u32, width: u32, shared_values: u32, query_tile: u32) -> Result<Tile> {
+	require(length != 0 && width != 0 && shared_values != 0 && query_tile != 0, "native attention tile inputs are empty")?;
+	let mut queries = length.min(query_tile);
+	loop {
+		let query_values = queries.checked_mul(width).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
+		let forward_fixed = query_values.checked_mul(2).and_then(|values| queries.checked_mul(3).and_then(|statistics| values.checked_add(statistics))).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
+		let forward_per_key = width.checked_add(queries).and_then(|values| values.checked_mul(2)).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
+		let query_gradient_fixed = query_values.checked_mul(3).and_then(|values| values.checked_add(queries)).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
+		let query_gradient_per_key = width.checked_mul(2).and_then(|values| queries.checked_mul(2).and_then(|queries| values.checked_add(queries))).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
+		let key_value_gradient_fixed = query_values.checked_mul(2).and_then(|values| values.checked_add(queries)).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
+		let key_value_gradient_per_key = width.checked_mul(4).and_then(|values| queries.checked_mul(2).and_then(|queries| values.checked_add(queries))).ok_or_else(|| RecipeError::new("native attention tile overflows"))?;
+		let keys = (shared_values.saturating_sub(forward_fixed) / forward_per_key)
+			.min(shared_values.saturating_sub(query_gradient_fixed) / query_gradient_per_key)
+			.min(shared_values.saturating_sub(key_value_gradient_fixed) / key_value_gradient_per_key);
+		let pairs = queries.checked_mul(queries).ok_or_else(|| RecipeError::new("native attention matrix tile overflows"))?;
+		let matrix = query_values.checked_mul(4)
+			.and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs)))
+			.and_then(|values| values.checked_add(queries))
+			.ok_or_else(|| RecipeError::new("native attention matrix tile overflows"))?;
+		if keys != 0 && (queries != length || matrix <= shared_values) {
+			return Ok(Tile { m: queries, n: keys.min(length), k: width })
+		}
+		queries = queries.checked_sub(1).filter(|value| *value != 0).ok_or_else(|| RecipeError::new("native attention tile does not fit the device"))?;
+	}
+}
+fn native_attention_tiles(graph: &Graph, shared_values: u32, query_tile: u32) -> Result<Vec<Option<Tile>>> {
+	graph.nodes.iter().map(|node| {
+		if node.op != Primitive::Attention {
+			return Ok(None)
+		}
+		let heads = integer_argument(node.argument[0], "native attention heads")? as u32;
+		let channels = narrow(node.output.channels, "native attention channels")? as u32;
+		let length = narrow(node.output.length, "native attention length")? as u32;
+		require(channels % heads == 0, "native attention head partition is invalid")?;
+		native_attention_tile(length, channels / heads, shared_values, query_tile).map(Some)
+	}).collect()
+}
 fn native_tiles(total: usize, width: u32, role: &str) -> Result<usize> {
 	let width = width as usize;
 	require(total != 0 && width != 0, format!("{role} is empty"))?;
 	checked_add(total / width, usize::from(total % width != 0), role)
 }
-fn native_contraction_direction_tile(shape: Tile, register_m: u32, register_n: u32, block: u32, shared_values: u32, wmma: bool, wmma_max_m: u32, wmma_k: u32, wmma_b_padding: u32) -> Result<Tile> {
-	let wmma_tile = if wmma {
-		let m = shape.m.div_ceil(16).checked_mul(16).ok_or_else(|| RecipeError::new("native WMMA M tile overflows"))?.min(wmma_max_m).max(16);
-		Some((m, wmma_k, wmma_b_padding))
-	} else {
-		None
-	};
-	native_contraction_tile(shape, register_m, register_n, block, shared_values, wmma_tile)
+/// Chunk partials that the k lanes of one job exchange, in model-sized elements
+/// per chunk. A job whose output fills the workgroup has a single k lane and
+/// folds its own chunks locally, so the exchange only ever happens with at most
+/// half the workgroup holding output positions; the region is sized for that
+/// worst case. `ratio` converts state-typed partial values into model-sized
+/// elements, because the allocation is counted in model elements while the
+/// partials keep the arithmetic width.
+fn native_contraction_partial_per_chunk(m: u32, n: u32, register_m: u32, register_n: u32, block: u32, ratio: u32) -> Result<u32> {
+	let output_lanes = (m / register_m).max(1).checked_mul((n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
+	let exchange_lanes = output_lanes.min((block / 2).max(1));
+	let registers = register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
+	let sums = exchange_lanes.checked_mul(registers).ok_or_else(|| RecipeError::new("native contraction partial region overflows"))?;
+	let biases = (n / register_n).max(1).checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction partial region overflows"))?;
+	sums.checked_add(biases).and_then(|values| values.checked_mul(ratio)).ok_or_else(|| RecipeError::new("native contraction partial region overflows"))
 }
-fn native_contraction_residency(shapes: &[Option<NativeContractionShapes>], tile: Tile, gradient_tasks: u32, maximum: u32) -> Result<u32> {
-	require(gradient_tasks != 0 && maximum != 0, "native contraction residency is empty")?;
-	let mut dominant = (0_usize, 0_usize);
-	for shape in shapes.iter().flatten() {
-		let (m, n, k) = (shape.gradient.m as usize, shape.gradient.n as usize, shape.gradient.k as usize);
-		let work = checked_mul(checked_mul(m, n, "native contraction output work")?, k, "native contraction work")?;
-		let jobs = checked_mul(native_tiles(m, tile.m, "native contraction M tiles")?, native_tiles(n, tile.n, "native contraction N tiles")?, "native contraction jobs")?;
-		if work > dominant.0 { dominant = (work, jobs) }
-	}
-	let target = (gradient_tasks as usize).div_ceil(maximum as usize);
-	Ok(if dominant.0 != 0 && dominant.1 < target { maximum } else { 1 })
-}
-fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block: u32, shared_values: u32, wmma: Option<(u32, u32, u32)>) -> Result<Tile> {
-	require(register_m != 0 && register_n != 0 && block != 0, "native contraction tile inputs are empty")?;
-	if let Some((m, fragment, b_padding)) = wmma {
-		require(block % 32 == 0 && m % 16 == 0 && fragment == 16, "native gfx11 WMMA tile is invalid")?;
-		let n = (block / 32).checked_mul(16).ok_or_else(|| RecipeError::new("native WMMA N tile overflows"))?;
-		let width = m.checked_add(n).ok_or_else(|| RecipeError::new("native WMMA tile width overflows"))?;
-		let padding = n.checked_mul(b_padding).ok_or_else(|| RecipeError::new("native WMMA B padding overflows"))?;
-		let available = shared_values.checked_sub(padding).ok_or_else(|| RecipeError::new("native WMMA B padding exceeds shared memory"))? / width;
-		let k = (available / fragment).checked_mul(fragment).ok_or_else(|| RecipeError::new("native WMMA K tile overflows"))?;
-		require(k != 0, "native WMMA tile does not fit the device")?;
-		return Ok(Tile { m, n, k });
-	}
+/// The tile's local memory serves two phases in turn: the staged operands, and
+/// then the chunk partials the k lanes exchange after a barrier. Both live in
+/// the same allocation, so K is bounded by whichever phase is larger, and a tile
+/// too wide to stage a whole chunk narrows its M lanes until one fits.
+fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block: u32, shared_values: u32, fragment: u32, ratio: u32) -> Result<Tile> {
+	require(register_m != 0 && register_n != 0 && block != 0 && fragment != 0 && ratio != 0, "native contraction tile inputs are empty")?;
 	let lane_n = limits.n.div_ceil(register_n).min(block.isqrt().max(1));
-	let lane_m = limits.m.div_ceil(register_m).min(block / lane_n);
-	let m = lane_m.checked_mul(register_m).ok_or_else(|| RecipeError::new("native contraction M tile overflows"))?;
-	let n = lane_n.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction N tile overflows"))?;
-	let width = m.checked_add(n).ok_or_else(|| RecipeError::new("native contraction tile width overflows"))?;
-	let k = limits.k.min(shared_values / width);
-	require(m != 0 && n != 0 && k != 0, "native contraction tile does not fit the device")?;
-	Ok(Tile { m, n, k })
+	let mut lane_m = limits.m.div_ceil(register_m).min(block / lane_n);
+	loop {
+		let m = lane_m.checked_mul(register_m).ok_or_else(|| RecipeError::new("native contraction M tile overflows"))?;
+		let n = lane_n.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction N tile overflows"))?;
+		let width = m.checked_add(n).ok_or_else(|| RecipeError::new("native contraction tile width overflows"))?;
+		let staging_k = shared_values / width;
+		let partial_per_chunk = native_contraction_partial_per_chunk(m, n, register_m, register_n, block, ratio)?;
+		let partial_k = (shared_values / partial_per_chunk).checked_mul(fragment).ok_or_else(|| RecipeError::new("native contraction partial K overflows"))?;
+		let room = staging_k.min(partial_k);
+		// Reduction chunks are RECIPE_FRAGMENT_K elements of K, aligned to the
+		// start of the walk. A multi-tile walk must therefore stage whole chunks,
+		// so the tile is rounded down to a chunk multiple; a walk that fits in one
+		// staged tile has no interior tile boundary and may keep its exact length.
+		if room >= limits.k {
+			return Ok(Tile { m, n, k: limits.k });
+		}
+		if room >= fragment {
+			return Ok(Tile { m, n, k: room - room % fragment });
+		}
+		lane_m = lane_m.checked_sub(1).filter(|lanes| *lanes != 0).ok_or_else(|| RecipeError::new("native contraction tile does not fit the device"))?;
+	}
 }
-fn native_contraction_shared_values(tile: Tile, wmma: bool, wmma_b_padding: u32) -> Result<u32> {
-	let values = tile.m.checked_add(tile.n).and_then(|width| width.checked_mul(tile.k)).ok_or_else(|| RecipeError::new("native contraction shared values overflow"))?;
-	if wmma { values.checked_add(tile.n.checked_mul(wmma_b_padding).ok_or_else(|| RecipeError::new("native WMMA B padding overflows"))?).ok_or_else(|| RecipeError::new("native WMMA shared values overflow")) } else { Ok(values) }
+fn native_contraction_shared_values(tile: Tile, register_m: u32, register_n: u32, block: u32, fragment: u32, ratio: u32) -> Result<u32> {
+	let staging = tile.m.checked_add(tile.n).and_then(|width| width.checked_mul(tile.k)).ok_or_else(|| RecipeError::new("native contraction shared values overflow"))?;
+	let partials = tile.k.div_ceil(fragment).checked_mul(native_contraction_partial_per_chunk(tile.m, tile.n, register_m, register_n, block, ratio)?).ok_or_else(|| RecipeError::new("native contraction partial region overflows"))?;
+	Ok(staging.max(partials))
 }
-fn native_gradient_values(graph: &Graph, contractions: &[Option<NativeContractionTiles>], gradient_tasks: u32) -> Result<usize> {
-	require(contractions.len() == graph.nodes.len(), "native split-K schedule is invalid")?;
+/// Values per split-K scratch row. Rows are written by separate workgroups, so
+/// each row starts on a machine-word boundary for every supported element width.
+const NATIVE_SCRATCH_ROW_VALUES: usize = 4;
+/// A reverse K extent is cut into one contiguous partition per span of elements,
+/// capped at the partition limit. The count and the boundaries are a function of
+/// the extent and these two constants alone, so the summation order does not
+/// follow the tile, the workgroup width, or the number of compute units, while a
+/// long K still spreads across enough workgroups to cover the device when the
+/// output produces few jobs.
+const NATIVE_SPLIT_SPAN: usize = parse_natural(env!("RECIPE_CONTRACTION_SPLIT_SPAN"), "contraction split span must be a positive integer");
+const NATIVE_MATRIX_SPLIT_SPAN: usize = parse_natural(env!("RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN"), "contraction matrix split span must be a positive integer");
+const NATIVE_K_PARTITIONS: usize = parse_natural(env!("RECIPE_CONTRACTION_K_PARTITIONS"), "contraction K partitions must be a positive integer");
+const fn parse_natural(text: &str, role: &'static str) -> usize {
+	let text = text.as_bytes();
+	let (mut value, mut index) = (0_usize, 0);
+	while index < text.len() {
+		assert!(text[index].is_ascii_digit(), "{}", role);
+		value = value * 10 + (text[index] - b'0') as usize;
+		index += 1;
+	}
+	assert!(value != 0, "{}", role);
+	value
+}
+
+fn native_gradient_values(parameters: usize, contractions: &[Option<NativeContractionTiles>]) -> Result<usize> {
 	let mut scratch = 0_usize;
-	for contraction in contractions.iter().flatten() {
-		let tile = contraction.gradient;
-		let shape = contraction.gradient_shape;
-		let (m, n, k) = (shape.m as usize, shape.n as usize, shape.k as usize);
-		let jobs = checked_mul(native_tiles(m, tile.m, "native split-K M tiles")?, native_tiles(n, tile.n, "native split-K N tiles")?, "native split-K jobs")?;
-		let r_tiles = native_tiles(k, tile.k, "native split-K K tiles")?;
-		let splits = (gradient_tasks as usize / jobs).max(1).min(r_tiles);
+	for contraction in contractions {
+		let Some(contraction) = contraction else { continue };
+		// The allocation covers either scalar or matrix partitioning. A backend
+		// using the larger span leaves the extra rows untouched.
+		let extent = contraction.gradient_shape.k as usize;
+		let splits = extent.div_ceil(NATIVE_SPLIT_SPAN.min(NATIVE_MATRIX_SPLIT_SPAN)).min(NATIVE_K_PARTITIONS).max(1);
+		let jobs = checked_mul(
+			native_tiles(contraction.gradient_shape.m as usize, contraction.gradient.m, "native split-K M tiles")?,
+			native_tiles(contraction.gradient_shape.n as usize, contraction.gradient.n, "native split-K N tiles")?,
+			"native split-K jobs",
+		)?;
 		narrow(checked_mul(jobs, splits, "native split-K tasks")?, "native split-K tasks")?;
 		if splits > 1 {
-			scratch = scratch.max(checked_mul(splits, contraction.parameters, "native split-K scratch")?);
+			scratch = scratch.max(checked_mul(splits, contraction.parameters.next_multiple_of(NATIVE_SCRATCH_ROW_VALUES), "native split-K scratch")?);
 		}
 	}
-	let values = checked_add(graph.parameters.len(), scratch, "native gradient and split-K scratch")?;
+	// Row zero has to start on the same boundary as every later row, so the base
+	// is the aligned parameter count rather than the raw one. The optimiser still
+	// walks only the parameters themselves.
+	let base = parameters.next_multiple_of(NATIVE_SCRATCH_ROW_VALUES);
+	let values = checked_add(base, scratch, "native gradient and split-K scratch")?;
 	narrow(values, "native gradient and split-K scratch")?;
 	Ok(values)
-}
-fn shared_bytes(tile: Tile, element: u8, reduction_values: u32) -> Result<u32> {
-	tile.m.checked_add(tile.n).and_then(|width| width.checked_mul(tile.k)).map(|values| values.max(reduction_values).max(DOUBLE_BUFFER_VALUES)).and_then(|values| values.checked_mul(u32::from(element))).ok_or_else(|| RecipeError::new("GPU shared memory size overflows"))
 }
 #[cfg(any(amd, nvidia))]
 #[derive(Clone, Copy)]
 struct Resources {
 	pub shared: u32,
 	pub max_block: u32,
-	pub element: u8,
 }
 #[derive(Clone, Copy)]
 struct Geometry {
@@ -7634,24 +7642,19 @@ fn geometry(cus: u32, wave: u32, workgroup: u32, lds: u32, groups_per_cu: u32, r
 	let waves = groups_per_cu.min(workgroup / wave).min(resources.max_block / wave);
 	require(waves != 0, "GPU has no resident wave")?;
 	let block = waves.checked_mul(wave).ok_or_else(|| RecipeError::new("GPU workgroup size overflows"))?;
-	let shared = resources.shared.checked_add(shared_bytes(Tile { m: 0, n: 0, k: 0 }, resources.element, 0)?).ok_or_else(|| RecipeError::new("GPU shared memory size overflows"))?;
-	require(shared <= lds, "GPU tile exceeds local memory")?;
+	require(resources.shared <= lds, "GPU tile exceeds local memory")?;
 	Ok(Geometry { groups: cus, block })
 }
 #[cfg(amd)]
-fn amd(cus: u32, wave: u32, workgroup: u32, lds: u32, groups_per_cu: u32, waves: u32, resources: Resources) -> Result<Geometry> {
+fn amd(cus: u32, wave: u32, workgroup: u32, lds: u32, waves: u32, resources: Resources) -> Result<Geometry> {
 	let block = wave.checked_mul(waves).ok_or_else(|| RecipeError::new("AMD workgroup size overflows"))?;
-	require(wave != 0 && block <= workgroup && block <= resources.max_block && groups_per_cu != 0 && waves != 0, "AMD workgroup geometry is invalid")?;
-	let shared = resources.shared.checked_add(shared_bytes(Tile { m: 0, n: 0, k: 0 }, resources.element, 0)?).ok_or_else(|| RecipeError::new("AMD shared memory size overflows"))?;
-	let resident_shared = shared.checked_mul(groups_per_cu).ok_or_else(|| RecipeError::new("AMD resident shared memory overflows"))?;
-	require(resident_shared <= lds, "AMD resident workgroups exceed local memory")?;
-	let groups = cus.checked_mul(groups_per_cu).ok_or_else(|| RecipeError::new("AMD cooperative group count overflows"))?;
-	Ok(Geometry { groups, block })
+	require(wave != 0 && block <= workgroup && block <= resources.max_block && waves != 0, "AMD workgroup geometry is invalid")?;
+	require(resources.shared <= lds, "AMD workgroup exceeds local memory")?;
+	Ok(Geometry { groups: cus, block })
 }
 #[cfg(nvidia)]
 fn nvidia(cus: u32, wave: u32, workgroup: u32, block_lds: u32, sm_lds: u32, waves_per_cu: u32, resources: Resources) -> Result<Geometry> {
-	let shared = resources.shared.checked_add(shared_bytes(Tile { m: 0, n: 0, k: 0 }, resources.element, 0)?).ok_or_else(|| RecipeError::new("Nvidia shared memory size overflows"))?;
-	require(shared <= block_lds, "Nvidia tile exceeds workgroup shared memory")?;
+	require(resources.shared <= block_lds, "Nvidia tile exceeds workgroup shared memory")?;
 	geometry(cus, wave, workgroup, sm_lds, waves_per_cu, resources)
 }
 pub trait IntoDataSources {
