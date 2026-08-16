@@ -191,6 +191,23 @@ fn numeric_operations(ir: &str, prefix: &str, value: &str, arithmetic: &str, enc
 		}
 	}
 	if encoded {
+		block.push_str(&format!("define internal {value} @{prefix}.madd({value} %sum, {value} %left, {value} %right) #1 {{ entry: %sum.wide = call {arithmetic} @recipe.decode({value} %sum) %left.wide = call {arithmetic} @recipe.decode({value} %left) %right.wide = call {arithmetic} @recipe.decode({value} %right) %wide = call {arithmetic} @llvm.fma.{intrinsic}({arithmetic} %left.wide, {arithmetic} %right.wide, {arithmetic} %sum.wide) %result = call {value} @recipe.encode({arithmetic} %wide) ret {value} %result }}\n"));
+	} else {
+		block.push_str(&format!("define internal {value} @{prefix}.madd({value} %sum, {value} %left, {value} %right) #1 {{ entry: %result = call {value} @llvm.fma.{intrinsic}({value} %left, {value} %right, {value} %sum) ret {value} %result }}\n"));
+	}
+	if prefix == "recipe" {
+		if let Some(intrinsic) = match value {
+			"half" => Some("f16"),
+			"float" => Some("f32"),
+			"double" => Some("f64"),
+			_ => None,
+		} {
+			block.push_str(&format!("declare <RECIPE_REGISTER_M x {value}> @llvm.fma.vRECIPE_REGISTER_M{intrinsic}(<RECIPE_REGISTER_M x {value}>, <RECIPE_REGISTER_M x {value}>, <RECIPE_REGISTER_M x {value}>)\ndefine internal <RECIPE_REGISTER_M x {value}> @recipe.madd.vector(<RECIPE_REGISTER_M x {value}> %sum, <RECIPE_REGISTER_M x {value}> %left, <RECIPE_REGISTER_M x {value}> %right) #1 {{\nentry:\n%result = call <RECIPE_REGISTER_M x {value}> @llvm.fma.vRECIPE_REGISTER_M{intrinsic}(<RECIPE_REGISTER_M x {value}> %left, <RECIPE_REGISTER_M x {value}> %right, <RECIPE_REGISTER_M x {value}> %sum)\nret <RECIPE_REGISTER_M x {value}> %result\n}}\n"));
+		} else {
+			block.push_str(&format!("define internal <RECIPE_REGISTER_M x {value}> @recipe.madd.vector(<RECIPE_REGISTER_M x {value}> %sum, <RECIPE_REGISTER_M x {value}> %left, <RECIPE_REGISTER_M x {value}> %right) #1 {{\nentry:\nbr label %loop\nloop:\n%p = phi i32 [ 0, %entry ], [ %p.next, %step ]\n%result = phi <RECIPE_REGISTER_M x {value}> [ poison, %entry ], [ %next, %step ]\n%more = icmp ult i32 %p, RECIPE_REGISTER_M\nbr i1 %more, label %step, label %done\nstep:\n%sum.value = extractelement <RECIPE_REGISTER_M x {value}> %sum, i32 %p\n%left.value = extractelement <RECIPE_REGISTER_M x {value}> %left, i32 %p\n%right.value = extractelement <RECIPE_REGISTER_M x {value}> %right, i32 %p\n%value = call {value} @recipe.madd({value} %sum.value, {value} %left.value, {value} %right.value)\n%next = insertelement <RECIPE_REGISTER_M x {value}> %result, {value} %value, i32 %p\n%p.next = add i32 %p, 1\nbr label %loop\ndone:\nret <RECIPE_REGISTER_M x {value}> %result\n}}\n"));
+		}
+	}
+	if encoded {
 		block.push_str(&format!("define internal {value} @{prefix}.neg({value} %value) #1 {{ entry: %wide = call {arithmetic} @recipe.decode({value} %value) %negative = fneg {arithmetic} %wide %result = call {value} @recipe.encode({arithmetic} %negative) ret {value} %result }}\n"));
 	} else {
 		block.push_str(&format!("define internal {value} @{prefix}.neg({value} %value) #1 {{ entry: %result = fneg {value} %value ret {value} %result }}\n"));
@@ -251,6 +268,7 @@ fn numeric_program(ir: &str, value: &str, arithmetic: &str, bits: u8, codec: &st
 	} else {
 		format!("; NUMERIC BEGIN\ndeclare {arithmetic} @llvm.sqrt.{intrinsic}({arithmetic}) declare {arithmetic} @llvm.fabs.{intrinsic}({arithmetic}) declare {arithmetic} @llvm.floor.{intrinsic}({arithmetic})\ndeclare {arithmetic} @{}({arithmetic}) declare {arithmetic} @{}({arithmetic}) declare {arithmetic} @{}({arithmetic}) declare {arithmetic} @{}({arithmetic}) declare {arithmetic} @{}({arithmetic})\n{codec}\n", math[0], math[1], math[2], math[3], math[4])
 	};
+	block.push_str(&format!("\ndeclare {arithmetic} @llvm.fma.{intrinsic}({arithmetic}, {arithmetic}, {arithmetic})\n"));
 	block.push_str(&numeric_operations(ir, "recipe", value, arithmetic, true));
 	let integer = format!("i{bits}");
 	let prior = if value == integer { format!("%prior = add {value} %prior.bits, 0") } else { format!("%prior = bitcast {integer} %prior.bits to {value}") };
@@ -326,7 +344,6 @@ fn bf16_codec() -> &'static str {
 	r#"define internal float @recipe.decode(i16 %value) #1 { entry: %wide = zext i16 %value to i32 %bits = shl i32 %wide, 16 %result = bitcast i32 %bits to float ret float %result }
 define internal i16 @recipe.encode(float %value) #1 { entry: %bits = bitcast float %value to i32 %absolute = and i32 %bits, 2147483647 %special = icmp uge i32 %absolute, 2139095040 %upper = lshr i32 %bits, 16 %mantissa = and i32 %absolute, 8388607 %nan = icmp ne i32 %mantissa, 0 %quiet = or i32 %upper, 64 %special.bits = select i1 %nan, i32 %quiet, i32 %upper %lower = and i32 %bits, 65535 %above = icmp ugt i32 %lower, 32768 %tie = icmp eq i32 %lower, 32768 %odd.bit = and i32 %upper, 1 %odd = icmp ne i32 %odd.bit, 0 %tie.odd = and i1 %tie, %odd %round = or i1 %above, %tie.odd %increment = zext i1 %round to i32 %rounded = add i32 %upper, %increment %encoded = select i1 %special, i32 %special.bits, i32 %rounded %result = trunc i32 %encoded to i16 ret i16 %result }"#
 }
-fn float_codec(native: &str, llvm: &str) -> String { format!("define internal float @recipe.decode({llvm} %value) #1 {{ entry: %native = bitcast {llvm} %value to {native} %result = fpext {native} %native to float ret float %result }}\ndefine internal {llvm} @recipe.encode(float %value) #1 {{ entry: %native = fptrunc float %value to {native} %result = bitcast {native} %native to {llvm} ret {llvm} %result }}") }
 fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn(f64) -> u64) -> BuildResult<String> {
 	let (start, end) = numeric_region(&ir)?;
 	let llvm = match bytes {
@@ -342,6 +359,19 @@ fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn
 	}
 	for bits in [0x3CB0000000000000, 0x3FEFFFFFFFFFFFFE, 0xFFF0000000000000, 0x7FF8000000000000] {
 		kernel = kernel.replace(&format!("0x{bits:016X}"), &format!("{}", pack(f64::from_bits(bits))))
+	}
+	Ok(kernel.replace("@RECIPE_NUMERIC@", &numeric))
+}
+fn half_ir(ir: String) -> BuildResult<String> {
+	let (start, end) = numeric_region(&ir)?;
+	let codec = "define internal float @recipe.decode(half %value) #1 { entry: %result = fpext half %value to float ret float %result }\ndefine internal half @recipe.encode(float %value) #1 { entry: %result = fptrunc float %value to half ret half %result }";
+	let numeric = numeric_program(&ir, "half", "float", 16, codec);
+	let mut kernel = word(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]), "double", "half").replace("@contraction_tile", "@contraction_tile_f16").replace("align 8", "align 2");
+	for (source, value) in [("-2.0", -2.0), ("-1.0", -1.0), ("0.0", 0.0), ("0.1", 0.1), ("0.5", 0.5), ("1.0", 1.0), ("2.0", 2.0)] {
+		kernel = word(kernel, source, &format!("0xH{:04X}", FloatFormat::FP16.pack(value)))
+	}
+	for bits in [0x3CB0000000000000, 0x3FEFFFFFFFFFFFFE, 0xFFF0000000000000, 0x7FF8000000000000] {
+		kernel = kernel.replace(&format!("0x{bits:016X}"), &format!("0xH{:04X}", FloatFormat::FP16.pack(f64::from_bits(bits))))
 	}
 	Ok(kernel.replace("@RECIPE_NUMERIC@", &numeric))
 }
@@ -368,7 +398,7 @@ fn precision_sources(ir: String, swizzle_m: u32) -> BuildResult<[(&'static str, 
 	Ok([
 		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
 		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
-		("-f16", encoded_ir(ir.clone(), "_f16", FloatFormat::FP16.bytes(), &float_codec("half", "i16"), |value| FloatFormat::FP16.pack(value))?),
+		("-f16", half_ir(ir.clone())?),
 		("-f8", encoded_ir(ir.clone(), "_f8", FloatFormat::FP8.bytes(), fp8_codec(), |value| FloatFormat::FP8.pack(value))?),
 		("-bf16", encoded_ir(ir.clone(), "_bf16", FloatFormat::BF16.bytes(), bf16_codec(), |value| FloatFormat::BF16.pack(value))?),
 		("-tf32", native_ir(ir.clone(), "_tf32", "float", FloatFormat::TF32)?),
@@ -401,13 +431,11 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, swizzle_m: u32) -> BuildResult<
 		fs::write(&path, contents)?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
 	}
-	let cuda = env::var_os("CUDA_PATH").map(PathBuf::from);
-	let device = cuda.as_ref().map(|path| path.join("nvvm/libdevice/libdevice.10.bc")).filter(|path| path.exists()).unwrap_or_else(|| PathBuf::from(text(manifest, "nvidia-device-library").unwrap()));
 	println!("cargo:rustc-env=RECIPE_NV_IR={}", values.join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_NV_COMPILER={}", text(manifest, "nvidia-compiler")?);
-	println!("cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}", device.display());
+	println!("cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}", text(manifest, "nvidia-device-library")?);
 	println!("cargo:rustc-env=RECIPE_NV_PTX_VERSION=+{}", text(manifest, "nvidia-ptx")?);
-	println!("cargo:rustc-env=RECIPE_NV_PTX_ASSEMBLER={}", cuda.map_or_else(|| "ptxas".to_owned(), |path| path.join("bin/ptxas").display().to_string()));
+	println!("cargo:rustc-env=RECIPE_NV_PTX_ASSEMBLER={}", text(manifest, "nvidia-ptx-assembler")?);
 	Ok(())
 }
 fn compile_cpu(manifest: &str, out: &PathBuf, swizzle_m: u32) -> BuildResult<()> {
@@ -416,7 +444,10 @@ fn compile_cpu(manifest: &str, out: &PathBuf, swizzle_m: u32) -> BuildResult<()>
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
-	let clang = ["nvidia-compiler", "hsa-compiler"].iter().filter_map(|key| text(manifest, key).ok()).find(|path| Path::new(path).exists()).unwrap_or("clang");
+	let clang = text(manifest, "cpu-compiler")?;
+	if !Path::new(clang).exists() {
+		return Err(io::Error::other(format!("cpu-compiler {clang:?} is absent")).into())
+	}
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, swizzle_m)? {
 		let contents = contents.replace(" addrspace(1)", "").replace(" addrspace(3)", "").replace(", addrspace(5)", "").replace(" addrspace(5)", "").replace("RECIPE_CONTRACTION_CPU_SHARED_VALUES", number(manifest, "contraction-cpu-shared-values")?);
@@ -432,7 +463,60 @@ fn compile_cpu(manifest: &str, out: &PathBuf, swizzle_m: u32) -> BuildResult<()>
 fn main() -> BuildResult<()> {
 	let manifest = fs::read_to_string("Cargo.toml")?;
 	let swizzle_m = setting(&manifest, "contraction-swizzle-m-tiles")?.parse::<u32>().ok().filter(|value| *value != 0).ok_or_else(|| io::Error::other("contraction-swizzle-m-tiles must be a positive integer"))?;
-	for (key, environment) in [("epochs", "RECIPE_TRAIN_EPOCHS"), ("learning-rate", "RECIPE_TRAIN_LEARNING_RATE"), ("initial-weight", "RECIPE_TRAIN_INITIAL_WEIGHT"), ("adamw-beta1", "RECIPE_ADAMW_BETA1"), ("adamw-beta2", "RECIPE_ADAMW_BETA2"), ("adamw-epsilon", "RECIPE_ADAMW_EPSILON"), ("adamw-weight-decay", "RECIPE_ADAMW_WEIGHT_DECAY"), ("kmeans-iterations", "RECIPE_KMEANS_ITERATIONS"), ("svm-iterations", "RECIPE_SVM_ITERATIONS"), ("svm-learning-rate", "RECIPE_SVM_LEARNING_RATE"), ("svm-regularization", "RECIPE_SVM_REGULARIZATION"), ("svm-epsilon", "RECIPE_SVM_EPSILON"), ("tree-depth", "RECIPE_TREE_DEPTH"), ("tree-min-rows", "RECIPE_TREE_MIN_ROWS"), ("forest-feature-fraction", "RECIPE_FOREST_FEATURE_FRACTION"), ("bayes-prior-precision", "RECIPE_BAYES_PRIOR_PRECISION"), ("bayes-noise-variance", "RECIPE_BAYES_NOISE_VARIANCE"), ("bayes-variance-epsilon", "RECIPE_BAYES_VARIANCE_EPSILON"), ("boost-iterations", "RECIPE_BOOST_ITERATIONS"), ("boost-learning-rate", "RECIPE_BOOST_LEARNING_RATE"), ("catboost-ordered-prior", "RECIPE_CATBOOST_ORDERED_PRIOR"), ("xgboost-l2-regularization", "RECIPE_XGBOOST_L2_REGULARIZATION"), ("xgboost-minimum-gain", "RECIPE_XGBOOST_MINIMUM_GAIN"), ("lightgbm-histogram-bins", "RECIPE_LIGHTGBM_HISTOGRAM_BINS"), ("lightgbm-leaves", "RECIPE_LIGHTGBM_LEAVES"), ("quantization-block-weights", "RECIPE_QUANTIZATION_BLOCK_WEIGHTS"), ("surrogate-epochs", "RECIPE_SURROGATE_EPOCHS"), ("surrogate-rate", "RECIPE_SURROGATE_RATE"), ("surrogate-width", "RECIPE_SURROGATE_WIDTH"), ("rat-batch-rows", "RECIPE_RAT_BATCH_ROWS"), ("random-seed", "RECIPE_RANDOM_SEED"), ("progress-refresh-hz", "RECIPE_PROGRESS_REFRESH_HZ"), ("normalization-epsilon", "RECIPE_NORMALIZATION_EPSILON"), ("categorical-ratio", "RECIPE_CATEGORICAL_RATIO"), ("leak-slope", "RECIPE_LEAK_SLOPE"), ("prelu-slope", "RECIPE_PRELU_SLOPE"), ("elu-alpha", "RECIPE_ELU_ALPHA"), ("selu-alpha", "RECIPE_SELU_ALPHA"), ("selu-scale", "RECIPE_SELU_SCALE"), ("gelu-scale", "RECIPE_GELU_SCALE"), ("gelu-cubic", "RECIPE_GELU_CUBIC"), ("huber-threshold", "RECIPE_HUBER_THRESHOLD"), ("output-tolerance", "RECIPE_OUTPUT_TOLERANCE"), ("gradient-tolerance", "RECIPE_GRADIENT_TOLERANCE"), ("backend-tolerance", "RECIPE_BACKEND_TOLERANCE"), ("contraction-cpu-shared-values", "RECIPE_CONTRACTION_CPU_SHARED_VALUES"), ("contraction-register-m", "RECIPE_CONTRACTION_REGISTER_M"), ("contraction-register-n", "RECIPE_CONTRACTION_REGISTER_N")] {
+	for (key, environment) in [
+		("epochs", "RECIPE_TRAIN_EPOCHS"),
+		("learning-rate", "RECIPE_TRAIN_LEARNING_RATE"),
+		("initial-weight", "RECIPE_TRAIN_INITIAL_WEIGHT"),
+		("adamw-beta1", "RECIPE_ADAMW_BETA1"),
+		("adamw-beta2", "RECIPE_ADAMW_BETA2"),
+		("adamw-epsilon", "RECIPE_ADAMW_EPSILON"),
+		("adamw-weight-decay", "RECIPE_ADAMW_WEIGHT_DECAY"),
+		("kmeans-iterations", "RECIPE_KMEANS_ITERATIONS"),
+		("svm-iterations", "RECIPE_SVM_ITERATIONS"),
+		("svm-learning-rate", "RECIPE_SVM_LEARNING_RATE"),
+		("svm-regularization", "RECIPE_SVM_REGULARIZATION"),
+		("svm-epsilon", "RECIPE_SVM_EPSILON"),
+		("tree-depth", "RECIPE_TREE_DEPTH"),
+		("tree-min-rows", "RECIPE_TREE_MIN_ROWS"),
+		("forest-feature-fraction", "RECIPE_FOREST_FEATURE_FRACTION"),
+		("bayes-prior-precision", "RECIPE_BAYES_PRIOR_PRECISION"),
+		("bayes-noise-variance", "RECIPE_BAYES_NOISE_VARIANCE"),
+		("bayes-variance-epsilon", "RECIPE_BAYES_VARIANCE_EPSILON"),
+		("boost-iterations", "RECIPE_BOOST_ITERATIONS"),
+		("boost-learning-rate", "RECIPE_BOOST_LEARNING_RATE"),
+		("catboost-ordered-prior", "RECIPE_CATBOOST_ORDERED_PRIOR"),
+		("xgboost-l2-regularization", "RECIPE_XGBOOST_L2_REGULARIZATION"),
+		("xgboost-minimum-gain", "RECIPE_XGBOOST_MINIMUM_GAIN"),
+		("lightgbm-histogram-bins", "RECIPE_LIGHTGBM_HISTOGRAM_BINS"),
+		("lightgbm-leaves", "RECIPE_LIGHTGBM_LEAVES"),
+		("quantization-block-weights", "RECIPE_QUANTIZATION_BLOCK_WEIGHTS"),
+		("surrogate-epochs", "RECIPE_SURROGATE_EPOCHS"),
+		("surrogate-rate", "RECIPE_SURROGATE_RATE"),
+		("surrogate-width", "RECIPE_SURROGATE_WIDTH"),
+		("random-seed", "RECIPE_RANDOM_SEED"),
+		("progress-refresh-hz", "RECIPE_PROGRESS_REFRESH_HZ"),
+		("normalization-epsilon", "RECIPE_NORMALIZATION_EPSILON"),
+		("categorical-ratio", "RECIPE_CATEGORICAL_RATIO"),
+		("leak-slope", "RECIPE_LEAK_SLOPE"),
+		("prelu-slope", "RECIPE_PRELU_SLOPE"),
+		("elu-alpha", "RECIPE_ELU_ALPHA"),
+		("selu-alpha", "RECIPE_SELU_ALPHA"),
+		("selu-scale", "RECIPE_SELU_SCALE"),
+		("gelu-scale", "RECIPE_GELU_SCALE"),
+		("gelu-cubic", "RECIPE_GELU_CUBIC"),
+		("huber-threshold", "RECIPE_HUBER_THRESHOLD"),
+		("output-tolerance", "RECIPE_OUTPUT_TOLERANCE"),
+		("gradient-tolerance", "RECIPE_GRADIENT_TOLERANCE"),
+		("backend-tolerance", "RECIPE_BACKEND_TOLERANCE"),
+		("contraction-cpu-shared-values", "RECIPE_CONTRACTION_CPU_SHARED_VALUES"),
+		("contraction-register-m", "RECIPE_CONTRACTION_REGISTER_M"),
+		("contraction-register-n", "RECIPE_CONTRACTION_REGISTER_N"),
+		("contraction-wmma-k", "RECIPE_CONTRACTION_WMMA_K"),
+		("contraction-wmma-max-m", "RECIPE_CONTRACTION_WMMA_MAX_M"),
+		("contraction-wmma-b-padding", "RECIPE_CONTRACTION_WMMA_B_PADDING"),
+		("contraction-gradient-tasks", "RECIPE_CONTRACTION_GRADIENT_TASKS"),
+		("contraction-resident-waves-per-cu", "RECIPE_CONTRACTION_RESIDENT_WAVES_PER_CU"),
+	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
 	for (key, environment) in [("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME")] {
@@ -446,7 +530,7 @@ fn main() -> BuildResult<()> {
 	// GPU driver stubs and library search paths are host-arch: cross-compiled builds are CPU-only.
 	let native = env::var("TARGET")? == env::var("HOST")?;
 	let amd = native && toolchain("hsa-compiler", "hsa-device-library")?;
-	let nvidia = native && (toolchain("nvidia-compiler", "nvidia-device-library")? || env::var_os("CUDA_PATH").is_some());
+	let nvidia = native && toolchain("nvidia-compiler", "nvidia-device-library")? && Path::new(text(&manifest, "nvidia-ptx-assembler")?).exists();
 	if amd {
 		println!("cargo:rustc-cfg=amd");
 		compile_amd(&manifest, &out, swizzle_m)?;
