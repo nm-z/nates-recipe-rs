@@ -3113,22 +3113,23 @@ mod bundle {
 		};
 		Ok(StoredWeight { format: StorageFormat(format), count, bytes, codebook, arithmetic })
 	}
-	pub(super) fn load_semantic(path: &Path) -> Result<(String, Vec<SemanticGraph>)> {
+	pub(super) fn load_semantic(path: &Path) -> Result<(DataSchema, Vec<SemanticGraph>)> {
 		require(path.extension().and_then(|value| value.to_str()) == Some("ogdl"), "model path requires .ogdl")?;
 		let document = fs::read_to_string(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-		let (mut schema, mut graphs) = (String::new(), Vec::new());
-		let mut current: Option<SemanticBuilder> = None;
+		let (mut schema, mut graphs, mut current): (Option<DataSchema>, Vec<SemanticGraph>, Option<SemanticBuilder>) = (None, Vec::new(), None);
 		for line in document.lines().map(str::trim) {
 			if line.is_empty() { continue }
 			if line == BUNDLE_HEADER { continue }
+			if line == "schema" { require(schema.is_none() && current.is_none(), "semantic model has more than one schema")?; schema = Some(DataSchema::default()); continue }
 			if line == "graph" {
+				require(schema.is_some(), "semantic model has no schema")?;
 				if let Some(builder) = current.take() { graphs.push(builder.finish()?) }
 				current = Some(SemanticBuilder::default());
 				continue
 			}
 			let (kind, value) = line.split_once(' ').unwrap_or((line, ""));
-			if kind == "schema" {
-				schema = untext(value, "model schema")?;
+			if current.is_none() {
+				schema.as_mut().ok_or_else(|| RecipeError::new("semantic schema value precedes schema"))?.push((kind.to_owned(), value.to_owned()));
 				continue
 			}
 			let builder = current.as_mut().ok_or_else(|| RecipeError::new("semantic model value precedes graph"))?;
@@ -3175,21 +3176,19 @@ mod bundle {
 		}
 		if let Some(builder) = current { graphs.push(builder.finish()?) }
 		require(!graphs.is_empty(), "model has no graphs")?;
-		Ok((schema, graphs))
+		Ok((schema.ok_or_else(|| RecipeError::new("semantic model has no schema"))?, graphs))
 	}
-	pub(super) fn save_semantic(path: &Path, schema: &str, graphs: &mut [StoredGraph]) -> Result<()> {
+	pub(super) fn save_semantic(path: &Path, schema: &DataSchema, graphs: &mut [StoredGraph]) -> Result<()> {
 		let config = Config::load()?;
-		let semantic = graphs.iter_mut().map(|stored| {
-			stored.graph.refresh_storage(config)?;
-			semantic_graph(stored)
-		}).collect::<Result<Vec<_>>>()?;
+		let semantic = graphs.iter_mut().map(|stored| { stored.graph.refresh_storage(config)?; semantic_graph(stored) }).collect::<Result<Vec<_>>>()?;
 		save_semantic_graphs(path, schema, &semantic)
 	}
-	pub(super) fn save_semantic_graphs(path: &Path, schema: &str, graphs: &[SemanticGraph]) -> Result<()> {
+	pub(super) fn save_semantic_graphs(path: &Path, schema: &DataSchema, graphs: &[SemanticGraph]) -> Result<()> {
 		require(path.extension().and_then(|value| value.to_str()) == Some("ogdl"), "save requires an .ogdl model")?;
 		require(!graphs.is_empty(), "model bundle has no graphs")?;
 		fn field(document: &mut String, key: &str, value: &str) { document.push_str(&format!("        {key} {value}\n")); }
-		let mut document = format!("{BUNDLE_HEADER}\n    schema {}\n", text(schema));
+		let mut document = format!("{BUNDLE_HEADER}\n    schema\n");
+		for (kind, value) in schema { document.push_str(&format!("        {kind} {value}\n")) }
 		for semantic in graphs {
 			document.push_str("    graph\n");
 			field(&mut document, "model", &format!("{} {}", semantic.model.loss.0, semantic.model.quantization));
@@ -3220,24 +3219,24 @@ mod bundle {
 	fn same_structure(a: &SemanticGraph, b: &SemanticGraph) -> bool {
 		a.precision == b.precision && a.input == b.input && a.output == b.output && a.inputs == b.inputs && a.outputs == b.outputs && same_model(&a.model, &b.model) && a.tensors.len() == b.tensors.len() && a.tensors.iter().zip(&b.tensors).all(|(a, b)| a.format.0 == b.format.0 && a.count == b.count) && a.frozen.len() == b.frozen.len()
 	}
-	pub(super) fn artifact_key(model: &Model, schema: &str, precision: Compute, graph: &Graph, target: &str) -> String {
+	pub(super) fn artifact_key(model: &Model, schema: &DataSchema, precision: Compute, graph: &Graph, target: &str) -> String {
 		let mut hash = 0xcbf29ce484222325_u64;
 		let mut feed = |value: &str| { for byte in value.as_bytes() { hash ^= u64::from(*byte); hash = hash.wrapping_mul(0x100000001b3); } };
 		feed(BUNDLE_HEADER);
-		feed(schema);
+		for (kind, value) in schema { feed(&format!("{kind}:{value};")) }
 		feed(target);
 		feed(&format!("precision:{precision:?};"));
 		feed(&format!("loss:{};quant:{};blocks:{};", model.loss.0, model.quantization, model_text(model).join("/")));
 		for node in &graph.nodes { feed(&format!("node:{}:{}:{}:{};", node.offset, node.parameters, node.argument[8].to_bits(), node.output.elements())); }
 		format!("recipe-native-{hash:016x}")
 	}
-	pub(super) fn restore(path: &Path, schema: &str, graphs: &mut [StoredGraph], identities: &[u64]) -> Result<()> {
+	pub(super) fn restore(path: &Path, schema: &DataSchema, graphs: &mut [StoredGraph], identities: &[u64]) -> Result<()> {
 		if !fs::exists(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))? {
 			return save_semantic(path, schema, graphs);
 		}
 		let (stored_schema, stored) = load_semantic(path)?;
 		let current = graphs.iter().map(semantic_graph).collect::<Result<Vec<_>>>()?;
-		let matches = stored_schema == schema && stored.len() == current.len() && stored.iter().zip(&current).all(|(a, b)| same_structure(a, b));
+		let matches = &stored_schema == schema && stored.len() == current.len() && stored.iter().zip(&current).all(|(a, b)| same_structure(a, b));
 		if matches {
 			for (current, saved) in graphs.iter_mut().zip(&stored) {
 				let saved_boundary = saved.state.training_rows;
@@ -4853,7 +4852,7 @@ fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu,
 	Ok(graph)
 }
 fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: &'static Gpu, config: Config) -> Result<Graph> {
-	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], rows: 1, source_rows: 1, features: saved.input.elements(), schema: "saved-native-model".to_owned(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new() };
+	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], rows: 1, source_rows: 1, features: saved.input.elements(), schema: DataSchema::default(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new() };
 	let mut graph = compile_graph(&saved.model, &prepared, 1, gpu, config, Some(saved.output.elements()))?;
 	require(graph.parameters.len() == saved.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "saved semantic weights do not match the compiled model")?;
 	let mut tensor = 0;
@@ -5250,7 +5249,7 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ro
 	(estimator.validate)(estimator.param, rows)?;
 	let (source, input) = (graph.source, graph.output);
 	let inputs = graph_inputs(graph, &data.samples, &data.targets, rows, gpu, config.precision)?;
-	let prepared = Prepared { samples: inputs.clone(), targets: data.targets[..rows].to_vec(), rows, source_rows: rows, features: input.elements(), schema: String::new(), sequence: None, target_categorical: data.target_categorical, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new() };
+	let prepared = Prepared { samples: inputs.clone(), targets: data.targets[..rows].to_vec(), rows, source_rows: rows, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: data.target_categorical, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new() };
 	let teacher = estimator.fit(&prepared, rows, config, true)?;
 	let targets = inputs.chunks_exact(input.elements()).enumerate().map(|(row, query)| (teacher.predict)(row, query)).collect::<Result<Vec<_>>>()?;
 	let predictor = estimator.fit(&prepared, rows, config, false)?;
@@ -5392,8 +5391,8 @@ fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetS
 		_ => (Vec::new(), Vec::new()),
 	};
 	let (target_min, target_span) = scale.map_or((0.0, 0.0), |s| (s.minimum, s.span));
-	let schema = data.prepared.get().and_then(|prepared| prepared.as_ref().ok()).map_or("", |prepared| prepared.schema.as_str());
-	let artifact = bundle::artifact_key(model, schema, precision, graph, target);
+	let schema = data.prepared.get().and_then(|prepared| prepared.as_ref().ok()).map_or_else(DataSchema::default, |prepared| prepared.schema.clone());
+	let artifact = bundle::artifact_key(model, &schema, precision, graph, target);
 	bundle::StoredGraph { graph: graph.clone(), model: model.clone(), precision, inputs, outputs: vec![output], norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new(), artifact }
 }
 struct NativeTape {
@@ -5632,7 +5631,7 @@ impl NativeTape {
 		Ok(())
 	}
 }
-fn checkpoint(path: &Path, schema: &str, stored: &mut bundle::StoredGraph, tape: &NativeTape, best: bool) -> Result<()> {
+fn checkpoint(path: &Path, schema: &DataSchema, stored: &mut bundle::StoredGraph, tape: &NativeTape, best: bool) -> Result<()> {
 	if let Ok((_, saved)) = bundle::load_semantic(path) {
 		if saved.first().and_then(|g| g.state.best_loss.first().copied()).is_some_and(|v| v <= tape.best_loss[0]) {
 			return Ok(());
@@ -6797,7 +6796,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	let sample_count = checked_mul(targets.len(), input.elements(), "surrogate samples")?;
 	require(samples.len() == sample_count, "surrogate sample batch is invalid")?;
 	let model = recipe.model().layer(hidden).tanh().layer(1);
-	let prepared = Prepared { samples: samples.to_vec(), targets: targets.to_vec(), rows: targets.len(), source_rows: targets.len(), features: input.elements(), schema: String::new(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new() };
+	let prepared = Prepared { samples: samples.to_vec(), targets: targets.to_vec(), rows: targets.len(), source_rows: targets.len(), features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new() };
 	let mut graph = compile_output(&model, &prepared, prepared.rows, gpu, config, 1)?;
 	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, mse)?;
 	for _ in 0..config.surrogate_epochs {
@@ -7708,13 +7707,14 @@ impl Data {
 		self
 	}
 }
+type DataSchema = Vec<(String, String)>;
 struct Prepared {
 	samples: Vec<f64>,
 	targets: Vec<f64>,
 	rows: usize,
 	source_rows: usize,
 	features: usize,
-	schema: String,
+	schema: DataSchema,
 	sequence: Option<Shape>,
 	target_categorical: bool,
 	norm_mean: Vec<f64>,
@@ -7864,7 +7864,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 		let precision = 4_usize.max((-percentage.log10()).ceil().max(0.0) as usize);
 		eprintln!("imputed {}.{}: {percentage:.precision$}%", tables[column.0].name, tables[column.0].headers[column.1]);
 	}
-	let schema = columns.iter().map(|column| format!("{}.{}:{}", tables[column.0].name, tables[column.0].headers[column.1], column.2.width())).collect::<Vec<_>>().join("|") + "->" + &data.target.join("|");
+	let schema = columns.iter().map(|column| ("feature".to_owned(), format!("{} {}.{}", column.2.width(), tables[column.0].name, tables[column.0].headers[column.1]))).chain(data.target.iter().cloned().map(|target| ("target".to_owned(), target))).collect();
 	finish_prepared(data, samples, targets, source_rows, features, sequence, target_categorical, schema)
 }
 fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
@@ -7898,11 +7898,11 @@ fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 			targets.push(sequence[prefix] as f64)
 		}
 	}
-	let schema = format!("auto:{}", CHAR_IDS.iter().map(|character| format!("{:X}", *character as u32)).collect::<Vec<_>>().join(","));
+	let schema = CHAR_IDS.iter().map(|character| ("character".to_owned(), format!("U+{:04X}", *character as u32))).collect();
 	let source_rows = targets.len();
 	finish_prepared(data, samples, targets, source_rows, features, Some(Shape { channels: CHAR_IDS.len(), length }), true, schema)
 }
-fn finish_prepared(data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, source_rows: usize, features: usize, sequence: Option<Shape>, target_categorical: bool, schema: String) -> Result<Prepared> {
+fn finish_prepared(data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, source_rows: usize, features: usize, sequence: Option<Shape>, target_categorical: bool, schema: DataSchema) -> Result<Prepared> {
 	let rows = targets.len();
 	require(source_rows != 0 && source_rows <= rows, "dataset has no complete training rows")?;
 	let mut identities = samples.chunks_exact(features).zip(&targets).map(|(sample, target)| sample_identity(sample, *target)).collect();
@@ -8467,7 +8467,7 @@ impl Train {
 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(self.stop.is_some()))?;
 		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), run, epoch: tape.step as usize, seconds: started.elapsed().as_secs_f64(), epoch_seconds })
 	}
-	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &str, tape: &NativeTape, save: Option<bool>) -> Result<T> {
+	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &DataSchema, tape: &NativeTape, save: Option<bool>) -> Result<T> {
 		let save = if INTERRUPTED.load(Ordering::Acquire) && !INTERRUPT_CHECKPOINTED.swap(true, Ordering::AcqRel) { Some(self.stop.is_some()) } else { save.filter(|_| !INTERRUPTED.load(Ordering::Acquire)) };
 		if let Some(best) = save
 			&& let Some(path) = &self.save
