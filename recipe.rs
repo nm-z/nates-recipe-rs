@@ -4685,7 +4685,7 @@ impl LossFunction {
 impl Recipe {
 	pub fn data<T: IntoDataSources>(&self, sources: T) -> Data { Data { sources: sources.into_data_sources(), tests: Vec::new(), autoregressive: T::AUTO, target: Vec::new(), exclusions: Vec::new(), broadcast: false, normalize: false, split: 1.0, prepared: OnceLock::new() } }
 	pub fn model(&self) -> Model { Model { blocks: Vec::new(), loss: mse, quantization: 0 } }
-	pub const fn train(&self) -> Train { Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: None, resume: None, save: None, seed: None, precision: Compute::FP64 } }
+	pub const fn train(&self) -> Train { Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64 } }
 }
 impl Recipe {
 	pub fn infer(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
@@ -5584,18 +5584,18 @@ impl NativeTape {
 		Ok((objective, saved))
 	}
 	fn observe(&mut self, loss: f64, tolerance: f64, download: bool) -> Result<bool> {
-		let (old_best, last, trail) = (self.best_loss[0], self.best_loss[1], self.best_loss[2]);
+		let (old_best, last, armed, saved) = (self.best_loss[0], self.best_loss[1], self.best_loss[2].is_finite(), self.best_loss[3]);
 		let better = loss < old_best;
 		if better && download {
 			(self.best, self.best_moments, self.best_variances) = self.optimizer_state()?;
 			self.best_epoch = self.step.saturating_sub(1);
 		}
-		let next_trail = if last.is_finite() && !trail.is_finite() && loss > last { last } else { trail };
-		let trigger = next_trail.is_finite() && loss > last * (1.0 + tolerance) && loss < next_trail && tolerance > 0.0;
-		self.best_loss[0] = if better { loss } else { old_best };
+		let best = if better { loss } else { old_best };
+		let trigger = armed && loss > last * (2.0 - tolerance) && tolerance > 0.0;
+		self.best_loss[0] = best;
 		self.best_loss[1] = loss;
-		self.best_loss[2] = next_trail;
-		if trigger { self.best_loss[3] = self.best_loss[0]; }
+		self.best_loss[2] = if trigger { f64::NAN } else if last.is_finite() && last < saved && loss < saved { best } else { self.best_loss[2] };
+		if trigger { self.best_loss[3] = best; }
 		Ok(trigger)
 	}
 	fn advance(&mut self) -> Result<()> {
@@ -5622,7 +5622,7 @@ impl NativeTape {
 		graph.state.variances = variances;
 		graph.state.epoch = (if best { self.best_epoch } else { self.step }) as usize;
 		graph.state.best = self.best.clone();
-		graph.state.best_loss = self.best_loss.to_vec();
+		graph.state.best_loss = if best { vec![self.best_loss[0], self.best_loss[0], f64::NAN, self.best_loss[0]] } else { self.best_loss.to_vec() };
 		Ok(())
 	}
 	fn tile(&self) -> Tile { self.program.tile }
@@ -8313,7 +8313,7 @@ impl Train {
 		self
 	}
 	pub const fn stop(mut self, value: f64) -> Self {
-		self.stop = Some(value);
+		self.stop = if value == 0.0 { None } else { Some(value) };
 		self
 	}
 	pub const fn optimizer(self, _: Adamw) -> Self { self }
@@ -8329,6 +8329,7 @@ impl Train {
 		self.log_metrics = metrics.into();
 		self
 	}
+	// Recipe has no checkpoints: save and resume use the same file.
 	pub fn save(mut self, path: impl AsRef<Path>) -> Self {
 		self.save = Some(resolve_path(path).unwrap_or_else(|error| panic!("{error}")));
 		self
