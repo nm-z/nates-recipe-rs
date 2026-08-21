@@ -7748,20 +7748,21 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	}
 	for path in &mut paths { *path = fs::canonicalize(&*path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))? }
 	paths.sort(); paths.dedup();
-	let mut grouped = Vec::new();
-	let mut table_files = Vec::new();
+	let mut files = Vec::new();
 	for path in &paths {
+		files.push((path.clone(), fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?));
+	}
+	let mut grouped = Vec::new();
+	for (path, bytes) in &files {
 		if !path.extension().and_then(|value| value.to_str()).is_some_and(is_table) {
 			continue;
 		}
-		let bytes = fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
 		let directory = path.parent().unwrap_or_else(|| Path::new("")).to_owned();
-		for table in decode_tables(path, &bytes)? {
+		for table in decode_tables(path, bytes)? {
 			grouped.push((directory.clone(), table));
 		}
-		table_files.push(path.clone());
 	}
-	if let Some(table) = class_directory_table(data, sources, &grouped, &table_files, &paths)? {
+	if let Some(table) = directory_samples(data, sources, &files, &grouped)? {
 		return Ok((vec![table], paths));
 	}
 	let mut tables = merge_captures(grouped, &data.target)?;
@@ -7779,60 +7780,162 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	}
 	Ok((tables, paths))
 }
-/// A class-labeled sample tree: the requested target names no column in any file, and every
-/// sample file lives in a class subdirectory of the source root. Each text file becomes one
-/// row whose text is the feature; each image file becomes one row of pixel columns. The
-/// class directory name is the synthesized target either way.
-fn class_directory_table(data: &Data, sources: &[String], grouped: &[(PathBuf, Table)], table_files: &[PathBuf], paths: &[PathBuf]) -> Result<Option<Table>> {
+/// One interpretation of directory layout for sample trees whose target is not a table
+/// column: flat sidecar-labeled samples, class-labeled subdirectories, and paired
+/// subdirectories. Each file is read once; text samples contribute their content and image
+/// samples their decoded pixels. Anything else falls through to the table flow.
+fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>)], parsed: &[(PathBuf, Table)]) -> Result<Option<Table>> {
 	let [source] = sources else { return Ok(None) };
 	let [target] = data.target.as_slice() else { return Ok(None) };
-	if grouped.iter().any(|(_, table)| target_column(table, target).is_some()) {
+	if parsed.iter().any(|(_, table)| target_column(table, target).is_some()) {
 		return Ok(None);
 	}
-	let images = paths.iter().filter(|path| path.extension().and_then(|value| value.to_str()).is_some_and(is_image)).collect::<Vec<_>>();
-	require(table_files.is_empty() || images.is_empty() || grouped.is_empty(), "class directories mix text and image samples")?;
-	let samples = if images.is_empty() { table_files.to_vec() } else { images.into_iter().cloned().collect() };
+	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension));
+	let samples = files.iter().filter(|(path, _)| sample(path)).collect::<Vec<_>>();
 	if samples.is_empty() {
 		return Ok(None);
 	}
 	let root = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve {source}: {error}")))?;
-	let sidecars = samples.iter().map(|path| path.with_extension("label")).collect::<Vec<_>>();
-	let flat = samples.iter().all(|path| path.parent() == Some(root.as_path())) && sidecars.iter().all(|path| path.exists());
-	let classes = samples.iter().filter_map(|path| path.parent()).collect::<BTreeSet<_>>();
-	if !flat && (classes.len() < 2 || classes.iter().any(|directory| directory.parent() != Some(root.as_path()))) {
+	let name = root.file_name().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
+	let stem = |path: &Path| path.file_stem().and_then(|value| value.to_str()).unwrap_or("").to_owned();
+	// Flat sidecar samples: every file directly under the root, labeled by a .label sibling.
+	if samples.iter().all(|(path, _)| path.parent() == Some(root.as_path())) {
+		let sidecar = |path: &Path| files.iter().find(|(candidate, _)| *candidate == path.with_extension("label"));
+		if samples.iter().all(|(path, _)| sidecar(path).is_some()) {
+			let mut builder = SampleTableBuilder::new(target.clone());
+			for (path, bytes) in &samples {
+				let (_, label) = sidecar(path).unwrap();
+				builder.push(path, bytes, sample_text(path, label)?)?;
+			}
+			return builder.finish(name).map(Some);
+		}
 		return Ok(None);
 	}
-	let name = root.file_name().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
-	let mut rows = Vec::new();
-	let mut headers = Vec::new();
-	for (path, sidecar) in samples.iter().zip(&sidecars) {
-		let class = if flat {
-			fs::read_to_string(sidecar).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", sidecar.display())))?.trim().to_owned()
-		} else {
-			path.parent().and_then(Path::file_name).and_then(|value| value.to_str()).ok_or_else(|| RecipeError::new(format!("class directory of {} is unreadable", path.display())))?.to_owned()
-		};
-		if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
-			let bytes = fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-			let jpeg = path.extension().and_then(|value| value.to_str()).is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "jpg" | "jpeg"));
-			let decoded = if jpeg { jpeg_pixels(&bytes) } else { png_pixels(&bytes) };
-			let (width, height, channels, pixels) = decoded.map_err(|error| RecipeError::new(format!("image {}: {error}", path.display())))?;
-			if headers.is_empty() {
-				headers = (1..=width * height * channels).map(|pixel| format!("pixel.{pixel}")).collect();
-				headers.push(target.clone());
+	// One level of subdirectories under the root.
+	if !samples.iter().all(|(path, _)| path.parent().and_then(Path::parent) == Some(root.as_path())) {
+		return Ok(None);
+	}
+	let mut directories = BTreeMap::<String, Vec<&(PathBuf, Vec<u8>)>>::new();
+	for entry in &samples {
+		let directory = entry.0.parent().and_then(Path::file_name).and_then(|value| value.to_str()).ok_or_else(|| RecipeError::new(format!("sample directory of {} is unreadable", entry.0.display())))?;
+		directories.entry(directory.to_owned()).or_default().push(entry);
+	}
+	if directories.len() < 2 {
+		return Ok(None);
+	}
+	// Paired subdirectories: identical sample stems in every directory, one directory named
+	// for the requested target. Each stem is one sample and each directory one column group.
+	let singular = |directory: &str| directory.strip_suffix('s').filter(|value| !value.is_empty()).unwrap_or(directory).to_owned();
+	let stems = directories.values().map(|entries| entries.iter().map(|(path, _)| stem(path)).collect::<BTreeSet<_>>()).collect::<Vec<_>>();
+	let aligned = stems.windows(2).all(|pair| pair[0] == pair[1]);
+	let paired_target = directories.keys().any(|directory| singular(directory) == *target);
+	let sample_target = stems[0].contains(target);
+	require(!(aligned && paired_target && sample_target), format!("target {target:?} names both a paired directory and a per-sample file"))?;
+	// Per-sample subdirectories: identical file stems per directory, one stem naming the
+	// target. Each directory is one sample and each file stem one column.
+	if aligned && sample_target {
+		let columns = stems[0].iter().cloned().collect::<Vec<_>>();
+		let mut headers = Vec::new();
+		let mut rows: Vec<Vec<String>> = vec![Vec::new(); directories.len()];
+		for column in &columns {
+			let mut width = None;
+			for (row, entries) in directories.values().enumerate() {
+				let (path, bytes) = entries.iter().find(|(path, _)| stem(path) == *column).unwrap();
+				let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
+					require(column != target, format!("per-sample target files {column:?} hold images, not values"))?;
+					image_values(path, bytes)?
+				} else {
+					vec![sample_text(path, bytes)?]
+				};
+				require(*width.get_or_insert(values.len()) == values.len(), format!("sample {} expected {} values, received {}", path.display(), width.unwrap(), values.len()))?;
+				rows[row].extend(values);
 			}
-			require(pixels.len() + 1 == headers.len(), format!("image {} expected {} pixel values, received {}", path.display(), headers.len() - 1, pixels.len()))?;
-			let mut row = pixels.iter().map(|value| value.to_string()).collect::<Vec<_>>();
-			row.push(class);
-			rows.push(row);
-		} else {
-			let text = fs::read_to_string(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-			if headers.is_empty() {
-				headers = vec!["content".to_owned(), target.clone()];
+			match width.unwrap_or(0) {
+				1 => headers.push(column.clone()),
+				width => headers.extend((1..=width).map(|index| format!("{column}.{index}"))),
 			}
-			rows.push(vec![text.trim().to_owned(), class]);
+		}
+		return Ok(Some(Table { name, headers, rows }));
+	}
+	if aligned && paired_target {
+		let mut columns = Vec::new();
+		for (directory, entries) in &directories {
+			let mut ordered = entries.clone();
+			ordered.sort_by_key(|(path, _)| stem(path));
+			columns.push((singular(directory), ordered));
+		}
+		let mut headers = Vec::new();
+		let mut rows: Vec<Vec<String>> = vec![Vec::new(); stems[0].len()];
+		for (column, ordered) in &columns {
+			let mut width = None;
+			for (row, (path, bytes)) in ordered.iter().enumerate() {
+				let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
+					require(column != target, format!("paired target directory {column:?} holds images, not values"))?;
+					image_values(path, bytes)?
+				} else {
+					vec![sample_text(path, bytes)?]
+				};
+				require(*width.get_or_insert(values.len()) == values.len(), format!("paired sample {} expected {} values, received {}", path.display(), width.unwrap(), values.len()))?;
+				rows[row].extend(values);
+			}
+			match width.unwrap_or(0) {
+				1 => headers.push(column.clone()),
+				width => headers.extend((1..=width).map(|index| format!("{column}.{index}"))),
+			}
+		}
+		return Ok(Some(Table { name, headers, rows }));
+	}
+	if aligned {
+		return Ok(None);
+	}
+	// Class subdirectories: differing sample stems, the directory name is the target value.
+	let mut builder = SampleTableBuilder::new(target.clone());
+	for (directory, entries) in &directories {
+		for (path, bytes) in entries {
+			builder.push(path, bytes, directory.clone())?;
 		}
 	}
-	Ok(Some(Table { name, headers, rows }))
+	builder.finish(name).map(Some)
+}
+/// Rows of one sample table: each sample contributes its content columns plus the target.
+struct SampleTableBuilder {
+	target: String,
+	headers: Vec<String>,
+	rows: Vec<Vec<String>>,
+}
+impl SampleTableBuilder {
+	fn new(target: String) -> Self { Self { target, headers: Vec::new(), rows: Vec::new() } }
+	fn push(&mut self, path: &Path, bytes: &[u8], target: String) -> Result<()> {
+		let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
+			image_values(path, bytes)?
+		} else {
+			vec![sample_text(path, bytes)?]
+		};
+		if self.headers.is_empty() {
+			self.headers = match values.len() {
+				1 => vec!["content".to_owned()],
+				width => (1..=width).map(|index| format!("pixel.{index}")).collect(),
+			};
+			self.headers.push(self.target.clone());
+		}
+		require(values.len() + 1 == self.headers.len(), format!("sample {} expected {} values, received {}", path.display(), self.headers.len() - 1, values.len()))?;
+		let mut row = values;
+		row.push(target);
+		self.rows.push(row);
+		Ok(())
+	}
+	fn finish(self, name: String) -> Result<Table> {
+		Ok(Table { name, headers: self.headers, rows: self.rows })
+	}
+}
+fn sample_text(path: &Path, bytes: &[u8]) -> Result<String> {
+	Ok(str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("sample {} is not UTF-8: {error}", path.display())))?.trim().to_owned())
+}
+fn image_values(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
+	let jpeg = path.extension().and_then(|value| value.to_str()).is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "jpg" | "jpeg"));
+	let decoded = if jpeg { jpeg_pixels(bytes) } else { png_pixels(bytes) };
+	let (_, _, _, pixels) = decoded.map_err(|error| RecipeError::new(format!("image {}: {error}", path.display())))?;
+	Ok(pixels.iter().map(|value| value.to_string()).collect())
 }
 fn is_image(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg") }
 /// Decoded baseline JFIF pixels: 8-bit precision, Huffman entropy coding, and the
@@ -8458,7 +8561,11 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 	match path.extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase).as_deref() {
 		Some("jsonl") => {
 			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("dataset {} is not UTF-8: {error}", path.display())))?;
-			let records = text.lines().map(str::trim).filter(|line| !line.is_empty()).map(|line| json_value(line).map(|(value, _)| value)).collect::<Result<Vec<_>>>().map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
+			let records = text.lines().map(str::trim).filter(|line| !line.is_empty()).map(|line| {
+				let (value, rest) = json_value(line)?;
+				require(rest.trim().is_empty(), format!("JSONL record has trailing content {:?}", rest.trim()))?;
+				Ok(value)
+			}).collect::<Result<Vec<_>>>().map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
 			Ok(vec![json_records_table(name, &records).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
 		}
 		Some("json") => {
@@ -9137,8 +9244,20 @@ fn json_string(text: &str) -> Result<(String, &str)> {
 				Some('r') => value.push('\r'),
 				Some('t') => value.push('\t'),
 				Some('u') => {
-					let digits = (0..4).map(|_| characters.next().map(|(_, digit)| digit).ok_or_else(|| RecipeError::new("JSON unicode escape is truncated"))).collect::<Result<String>>()?;
-					let code = u32::from_str_radix(&digits, 16).map_err(|error| RecipeError::new(format!("invalid JSON unicode escape: {error}")))?;
+					let mut unit = |characters: &mut std::str::CharIndices| -> Result<u32> {
+						let digits = (0..4).map(|_| characters.next().map(|(_, digit)| digit).ok_or_else(|| RecipeError::new("JSON unicode escape is truncated"))).collect::<Result<String>>()?;
+						u32::from_str_radix(&digits, 16).map_err(|error| RecipeError::new(format!("invalid JSON unicode escape: {error}")))
+					};
+					let code = match unit(&mut characters)? {
+						high @ 0xd800..=0xdbff => {
+							require(characters.next().map(|(_, escape)| escape) == Some('\\') && characters.next().map(|(_, escape)| escape) == Some('u'), "JSON high surrogate expects a paired low surrogate")?;
+							let low = unit(&mut characters)?;
+							require((0xdc00..=0xdfff).contains(&low), "JSON high surrogate expects a paired low surrogate")?;
+							0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00)
+						}
+						low @ 0xdc00..=0xdfff => return Err(RecipeError::new(format!("JSON low surrogate {low:#x} has no preceding high surrogate"))),
+						code => code,
+					};
 					value.push(char::from_u32(code).ok_or_else(|| RecipeError::new("invalid JSON unicode escape"))?);
 				}
 				_ => return Err(RecipeError::new("invalid JSON escape")),
@@ -9242,7 +9361,7 @@ fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	require(!rows.is_empty(), format!("dataset {} is empty", path.display()))?;
 	let first = rows.remove(0);
 	let numeric = |value: &String| value.parse::<f64>().is_ok();
-	let headerless = first.iter().all(numeric);
+	let headerless = first.iter().all(numeric) || rows.is_empty();
 	let headers = if headerless { (1..=first.len()).map(|column| format!("col{column}")).collect() } else { first.clone() };
 	if headerless {
 		rows.insert(0, first);
