@@ -8309,7 +8309,7 @@ fn sample_identity(sample: &[f64], target: f64) -> u64 {
 	const PRIME: u64 = 1099511628211;
 	sample.iter().copied().chain(std::iter::once(target)).fold(OFFSET, |hash, value| (hash ^ value.to_bits()).wrapping_mul(PRIME))
 }
-fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5") }
+fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5" | "xml") }
 fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	let path = path.as_ref();
 	let mut components = path.components();
@@ -8453,6 +8453,11 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 			Ok(vec![array_table(name, columns).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
 		}
 		Some("sqlite" | "sqlite3" | "db") => sqlite_tables(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display()))),
+		Some("xml") => {
+			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("dataset {} is not UTF-8: {error}", path.display())))?;
+			let records = xml_records(text).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
+			Ok(vec![json_records_table(name, &records).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
+		}
 		Some("h5" | "hdf5") => {
 			let columns = hdf5_columns(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
 			Ok(vec![array_table(name, columns).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
@@ -9120,6 +9125,69 @@ fn json_string(text: &str) -> Result<(String, &str)> {
 		}
 	}
 	Err(RecipeError::new("JSON string is unterminated"))
+}
+/// Flat records from an XML document: each first-level child of the root is one record and
+/// each of its child elements is one text field, expressed as the shared record objects.
+fn xml_records(text: &str) -> Result<Vec<JsonValue>> {
+	fn tag(rest: &str) -> Result<(&str, &str)> {
+		let rest = rest.strip_prefix('<').ok_or_else(|| RecipeError::new("XML expects an element"))?;
+		let end = rest.find('>').ok_or_else(|| RecipeError::new("XML tag is unterminated"))?;
+		let name = rest[..end].split_whitespace().next().unwrap_or("").trim_end_matches('/');
+		require(!name.is_empty(), "XML tag has no name")?;
+		Ok((name, &rest[end + 1..]))
+	}
+	fn unescape(value: &str) -> Result<String> {
+		let mut output = String::with_capacity(value.len());
+		let mut rest = value;
+		while let Some(position) = rest.find('&') {
+			output.push_str(&rest[..position]);
+			let entity = rest[position + 1..].split(';').next().ok_or_else(|| RecipeError::new("XML entity is unterminated"))?;
+			match entity {
+				"amp" => output.push('&'),
+				"lt" => output.push('<'),
+				"gt" => output.push('>'),
+				"quot" => output.push('"'),
+				"apos" => output.push('\''),
+				entity => {
+					let code = entity.strip_prefix("#x").map(|digits| u32::from_str_radix(digits, 16)).or_else(|| entity.strip_prefix('#').map(|digits| digits.parse())).ok_or_else(|| RecipeError::new(format!("XML entity {entity:?} is unsupported")))?.map_err(|error| RecipeError::new(format!("invalid XML entity: {error}")))?;
+					output.push(char::from_u32(code).ok_or_else(|| RecipeError::new("XML entity is out of range"))?);
+				}
+			}
+			rest = &rest[position + entity.len() + 2..];
+		}
+		output.push_str(rest);
+		Ok(output)
+	}
+	let mut rest = text.trim_start();
+	if let Some(after) = rest.strip_prefix("<?") {
+		rest = after.split_once("?>").ok_or_else(|| RecipeError::new("XML declaration is unterminated"))?.1.trim_start();
+	}
+	let (root, mut rest) = tag(rest)?;
+	let mut records = Vec::new();
+	loop {
+		rest = rest.trim_start();
+		if let Some(after) = rest.strip_prefix(&format!("</{root}>")) {
+			require(after.trim().is_empty(), "XML document has trailing content")?;
+			return Ok(records);
+		}
+		let (record, mut inner) = tag(rest)?;
+		let mut fields = Vec::new();
+		loop {
+			inner = inner.trim_start();
+			if let Some(after) = inner.strip_prefix(&format!("</{record}>")) {
+				rest = after;
+				break;
+			}
+			let (field, after) = tag(inner)?;
+			let close = format!("</{field}>");
+			let end = after.find(&close).ok_or_else(|| RecipeError::new(format!("XML field {field:?} is unterminated")))?;
+			let value = &after[..end];
+			require(!value.contains('<'), format!("XML field {field:?} nests elements"))?;
+			fields.push((field.to_owned(), JsonValue::Text(unescape(value)?)));
+			inner = &after[end + close.len()..];
+		}
+		records.push(JsonValue::Object(fields));
+	}
 }
 /// One table from flat JSON records: the ordered union of keys becomes the header row.
 fn json_records_table(name: String, records: &[JsonValue]) -> Result<Table> {
