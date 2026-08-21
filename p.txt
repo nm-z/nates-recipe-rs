@@ -1,0 +1,6 @@
+remote: 
+remote: Create a pull request for 'fix/92-contraction-feed' on GitHub by visiting:        
+remote:      https://github.com/nm-z/nates-recipe-rs/pull/new/fix/92-contraction-feed        
+remote: 
+To https://github.com/nm-z/nates-recipe-rs.git
+ * [new branch]        fix/92-contraction-feed -> fix/92-contraction-feed
