@@ -8428,7 +8428,14 @@ fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 fn finish_prepared(data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, source_rows: usize, features: usize, sequence: Option<Shape>, target_categorical: bool, schema: DataSchema) -> Result<Prepared> {
 	let rows = targets.len();
 	require(source_rows != 0 && source_rows <= rows, "dataset has no complete training rows")?;
-	let mut identities = samples.chunks_exact(features).zip(&targets).map(|(sample, target)| sample_identity(sample, *target)).collect();
+	// Sources may repeat a row verbatim; each copy is its own sample, so its identity mixes
+	// in how many identical rows precede it in source order, which the seed never changes.
+	let mut occurrences = BTreeMap::new();
+	let mut identities = samples.chunks_exact(features).zip(&targets).map(|(sample, target)| {
+		let content = sample_identity(sample, *target);
+		let occurrence = occurrences.entry(content).and_modify(|count| *count += 1_u64).or_insert(0);
+		occurrence.to_le_bytes().iter().fold(content, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(1099511628211))
+	}).collect();
 	shuffle(&mut samples, &mut targets, &mut identities, features, source_rows)?;
 	let (norm_mean, norm_scale) = if data.normalize {
 		normalize_samples(&mut samples, features, ((source_rows as f64) * data.split).floor() as usize)?
@@ -8467,7 +8474,9 @@ fn impute_missing(samples: &mut [f64]) {
 fn sample_identity(sample: &[f64], target: f64) -> u64 {
 	const OFFSET: u64 = 14695981039346656037;
 	const PRIME: u64 = 1099511628211;
-	sample.iter().copied().chain(std::iter::once(target)).fold(OFFSET, |hash, value| (hash ^ value.to_bits()).wrapping_mul(PRIME))
+	// Feed the hash bytewise: word-wide mixing leaves the low hash bits untouched by the
+	// all-zero low mantissa bits of small integer values, collapsing the identity space.
+	sample.iter().copied().chain(std::iter::once(target)).flat_map(|value| value.to_bits().to_le_bytes()).fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
 }
 fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5" | "xml") }
 fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
@@ -9279,7 +9288,7 @@ fn json_string(text: &str) -> Result<(String, &str)> {
 				Some('r') => value.push('\r'),
 				Some('t') => value.push('\t'),
 				Some('u') => {
-					let mut unit = |characters: &mut std::str::CharIndices| -> Result<u32> {
+					let unit = |characters: &mut std::str::CharIndices| -> Result<u32> {
 						let digits = (0..4).map(|_| characters.next().map(|(_, digit)| digit).ok_or_else(|| RecipeError::new("JSON unicode escape is truncated"))).collect::<Result<String>>()?;
 						u32::from_str_radix(&digits, 16).map_err(|error| RecipeError::new(format!("invalid JSON unicode escape: {error}")))
 					};
