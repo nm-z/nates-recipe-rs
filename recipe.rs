@@ -961,6 +961,9 @@ struct NodePlan {
 	storage_offset: usize,
 }
 
+#[derive(Clone, Copy)]
+enum NativeMatrix { Gfx11, Gfx12 }
+
 pub(crate) struct NativeModelIr {
 	graph: Graph,
 	layout: NativeLayout,
@@ -1820,8 +1823,7 @@ impl NativeModelIr {
 				(false, Primitive::Contraction) => {
 					let tile = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?.forward;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
-					let contraction = if matrix { "contraction_forward_matrix_body" } else { "contraction_forward_body" };
-					let call = if matrix { format!("call void @{contraction}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?, relu = node.argument[1] == 1.0, tile_m = tile.m, tile_n = tile.n, tile_k = tile.k) } else { format!("call void @{contraction}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i1 {relu}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?, relu = node.argument[1] == 1.0, tile_m = tile.m, tile_n = tile.n, tile_k = tile.k) };
+					let call = format!("call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?, relu = node.argument[1] == 1.0, tile_m = tile.m, tile_n = tile.n, tile_k = tile.k);
 					ir.push_str(&call);
 					ir.push_str(barrier(backend));
 				}
@@ -1902,12 +1904,12 @@ impl NativeModelIr {
 					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let kernel = integer_argument(node.argument[0], "contraction kernel")?;
-					let matrix_previous = matrix && kernel <= 1;
-					let matrix_gradient = matrix_previous && node.output.channels >= 16 && tiles.gradient.k as usize >= NATIVE_MATRIX_SPLIT_SPAN;
+					let composed_previous = kernel <= 1;
+					let matrix_gradient = matrix;
 					let accumulate_previous = self.plans[index + 1..].iter().any(|candidate| candidate.node.source == node.source || candidate.node.second == node.source);
-					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 true, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !matrix_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
-					if matrix_previous {
-						ir.push_str(&format!("call void @contraction_forward_matrix_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 true, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+					if composed_previous {
+						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					}
 					ir.push_str(barrier(backend));
 				}
@@ -2231,7 +2233,7 @@ impl NativeModelIr {
 		Ok(ir)
 	}
 
-	pub(crate) fn emit(&self, backend: Backend, matrix: bool, loss: LossFunction) -> Result<String> {
+	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: LossFunction) -> Result<String> {
 		let register_count = self.schedule.register_count;
 		let mut ir = backend_template(backend, self.precision)?
 			.replace("RECIPE_WORKGROUP_SIZE", &self.schedule.block.to_string())
@@ -2264,9 +2266,9 @@ impl NativeModelIr {
 			Backend::Cpu => "add i32 0, 0".to_owned(),
 			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
 		};
-		let inference_forward = self.emit_fixed_primitives(backend, matrix, false, false)?;
-		let training_forward = self.emit_fixed_primitives(backend, matrix, false, true)?;
-		let reverse = self.emit_fixed_primitives(backend, matrix, true, false)?;
+		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
+		let training_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, true)?;
+		let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
 		let mut body = String::new();
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads");
 		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
@@ -2292,8 +2294,27 @@ impl NativeModelIr {
 		body.push_str(&self.emit_adamw(model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
 		body.push_str("ret void\n}\n");
 		ir.push_str(&body);
-		if matrix {
-			ir = ir.replace("@recipe.wmma(", "@llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v16f16(");
+		let matrix_method = matrix.is_some();
+		for (operation, vector, native) in [
+			("@contraction_product_accumulate(", "@contraction_vector_accumulate(", "@contraction_matrix_accumulate("),
+			("@contraction_a_index(", "@contraction_vector_a_index(", "@contraction_matrix_a_index("),
+			("@contraction_b_index(", "@contraction_vector_b_index(", "@contraction_matrix_b_index("),
+			("@contraction_output_m(", "@contraction_vector_output_m(", "@contraction_matrix_output_m("),
+			("@contraction_output_n(", "@contraction_vector_output_n(", "@contraction_matrix_output_n("),
+			("@contraction_store_lane(", "@contraction_vector_store_lane(", "@contraction_matrix_store_lane("),
+		] {
+			ir = ir.replace(operation, if matrix_method { native } else { vector });
+		}
+		if let Some(matrix) = matrix {
+			let instruction = match (matrix, self.precision.source) {
+				(NativeMatrix::Gfx11, "-bf16") => "@llvm.amdgcn.wmma.f32.16x16x16.bf16.v8f32.v16i16(",
+				(NativeMatrix::Gfx11, "-int8" | "-int4") => { ir = ir.replace("declare <8 x float> @recipe.wmma(<16 x i8>, <16 x i8>, <8 x float>)", "declare <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v4i32(i1 immarg, <4 x i32>, i1 immarg, <4 x i32>, <8 x i32>, i1 immarg)\ndefine internal <8 x float> @recipe.wmma(<16 x i8> %a, <16 x i8> %b, <8 x float> %state) #1 { entry: %a.packed = bitcast <16 x i8> %a to <4 x i32> %b.packed = bitcast <16 x i8> %b to <4 x i32> %product = call <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v4i32(i1 true, <4 x i32> %a.packed, i1 true, <4 x i32> %b.packed, <8 x i32> zeroinitializer, i1 false) %wide = sitofp <8 x i32> %product to <8 x float> %result = fadd <8 x float> %state, %wide ret <8 x float> %result }\n"); "@recipe.wmma(" },
+				(NativeMatrix::Gfx12, "-f16") => { ir = ir.replace("declare <8 x float> @recipe.wmma(<16 x half>, <16 x half>, <8 x float>)", "declare <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16(<8 x half>, <8 x half>, <8 x float>)\ndefine internal <8 x float> @recipe.wmma(<16 x half> %a, <16 x half> %b, <8 x float> %state) #1 { entry: %a.low = shufflevector <16 x half> %a, <16 x half> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7> %a.high = shufflevector <16 x half> %a, <16 x half> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15> %b.low = shufflevector <16 x half> %b, <16 x half> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7> %b.high = shufflevector <16 x half> %b, <16 x half> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15> %first = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16(<8 x half> %a.low, <8 x half> %b.low, <8 x float> %state) %result = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16(<8 x half> %a.high, <8 x half> %b.high, <8 x float> %first) ret <8 x float> %result }\n"); "@recipe.wmma(" },
+				(NativeMatrix::Gfx12, "-bf16") => { ir = ir.replace("declare <8 x float> @recipe.wmma(<16 x i16>, <16 x i16>, <8 x float>)", "declare <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.bf16.v8f32.v8i16(<8 x i16>, <8 x i16>, <8 x float>)\ndefine internal <8 x float> @recipe.wmma(<16 x i16> %a, <16 x i16> %b, <8 x float> %state) #1 { entry: %a.low = shufflevector <16 x i16> %a, <16 x i16> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7> %a.high = shufflevector <16 x i16> %a, <16 x i16> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15> %b.low = shufflevector <16 x i16> %b, <16 x i16> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7> %b.high = shufflevector <16 x i16> %b, <16 x i16> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15> %first = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.bf16.v8f32.v8i16(<8 x i16> %a.low, <8 x i16> %b.low, <8 x float> %state) %result = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.bf16.v8f32.v8i16(<8 x i16> %a.high, <8 x i16> %b.high, <8 x float> %first) ret <8 x float> %result }\n"); "@recipe.wmma(" },
+				(NativeMatrix::Gfx12, "-int8" | "-int4") => { ir = ir.replace("declare <8 x float> @recipe.wmma(<16 x i8>, <16 x i8>, <8 x float>)", "declare <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v2i32(i1 immarg, <2 x i32>, i1 immarg, <2 x i32>, <8 x i32>, i1 immarg)\ndefine internal <8 x float> @recipe.wmma(<16 x i8> %a, <16 x i8> %b, <8 x float> %state) #1 { entry: %a.low.values = shufflevector <16 x i8> %a, <16 x i8> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7> %a.high.values = shufflevector <16 x i8> %a, <16 x i8> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15> %b.low.values = shufflevector <16 x i8> %b, <16 x i8> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7> %b.high.values = shufflevector <16 x i8> %b, <16 x i8> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15> %a.low = bitcast <8 x i8> %a.low.values to <2 x i32> %a.high = bitcast <8 x i8> %a.high.values to <2 x i32> %b.low = bitcast <8 x i8> %b.low.values to <2 x i32> %b.high = bitcast <8 x i8> %b.high.values to <2 x i32> %first = call <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v2i32(i1 true, <2 x i32> %a.low, i1 true, <2 x i32> %b.low, <8 x i32> zeroinitializer, i1 false) %product = call <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v2i32(i1 true, <2 x i32> %a.high, i1 true, <2 x i32> %b.high, <8 x i32> %first, i1 false) %wide = sitofp <8 x i32> %product to <8 x float> %result = fadd <8 x float> %state, %wide ret <8 x float> %result }\n"); "@recipe.wmma(" },
+				_ => "@llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v16f16(",
+			};
+			ir = ir.replace("@recipe.wmma(", instruction);
 		}
 		Ok(prune_internal_definitions(ir))
 	}
@@ -2749,12 +2770,12 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 	target.validate()?;
 	let model = NativeModelIr::from_graph(graph, rows, precision, schedule)?;
 	let fragment = natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?;
-	let (has_attention, aligned_attention) = graph.nodes.iter().filter(|node| node.op == Primitive::Attention).try_fold((false, true), |(_, aligned), node| {
+	let aligned_attention = graph.nodes.iter().filter(|node| node.op == Primitive::Attention).try_fold(true, |aligned, node| {
 		let heads = integer_argument(node.argument[0], "attention heads")?;
 		require(heads != 0, "attention heads are empty")?;
-		Ok::<_, RecipeError>((true, aligned && node.output.channels / heads as usize % fragment == 0))
+		Ok::<_, RecipeError>(aligned && node.output.channels / heads as usize % fragment == 0)
 	})?;
-	let matrix = matches!(target, BackendTarget::Amd { architecture } if architecture.starts_with("gfx11")) && model.precision.source == "-f16" && has_attention && aligned_attention;
+	let matrix = match target { BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") => Some(NativeMatrix::Gfx11), BackendTarget::Amd { architecture } if architecture.starts_with("gfx12") => Some(NativeMatrix::Gfx12), _ => None }.filter(|_| matches!(model.precision.source, "-f16" | "-bf16" | "-int8" | "-int4") && aligned_attention);
 	let ir = model.emit(target.backend(), matrix, loss)?;
 	let key = native_artifact_key(target, &ir);
 	let directory = native_artifact_directory(&key)?;
@@ -6115,6 +6136,7 @@ impl Gpu {
 		};
 		let dominant_shape = dominant.and_then(|(index, _)| shapes[index]).map_or(limits, |shape| shape.gradient);
 		let fragment_k = narrow(natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?, "contraction fragment K")? as u32;
+		let matrix = matches!(&self.native_target, BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") || architecture.starts_with("gfx12")) && [Compute::FP16, Compute::BF16, Compute::INT8, Compute::INT4].contains(&precision);
 		// The reduction chunk is a multiple of the staging fragment so a chunk
 		// boundary never falls inside a vector staging load.
 		let chunk_k = narrow(natural("contraction chunk K", env!("RECIPE_CONTRACTION_CHUNK_K"))?, "contraction chunk K")? as u32;
@@ -6135,18 +6157,18 @@ impl Gpu {
 		// counted in model elements, so a narrow model needs proportionally more
 		// elements per partial value.
 		let ratio = narrow(NativePrecision::new(precision)?.state.bytes().div_ceil(precision.bytes()), "native contraction state ratio")? as u32;
-		let mut tile = native_contraction_tile(dominant_shape, register_m, register_n, block, shared_budget, chunk_k, ratio)?;
+		let mut tile = native_contraction_tile(dominant_shape, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?;
 		let contractions = shapes.iter().map(|shape| shape.map(|shape| {
 			Ok(NativeContractionTiles {
-				forward: native_contraction_tile(shape.forward, register_m, register_n, block, shared_budget, chunk_k, ratio)?,
-				gradient: native_contraction_tile(shape.gradient, register_m, register_n, block, shared_budget, chunk_k, ratio)?,
-				previous: native_contraction_tile(shape.previous, register_m, register_n, block, shared_budget, chunk_k, ratio)?,
+				forward: native_contraction_tile(shape.forward, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
+				gradient: native_contraction_tile(shape.gradient, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
+				previous: native_contraction_tile(shape.previous, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
 				gradient_shape: shape.gradient,
 				parameters: shape.parameters,
 			})
 		}).transpose()).collect::<Result<Vec<_>>>()?;
 		tile = dominant.and_then(|(index, _)| contractions[index]).map_or(tile, |contraction| contraction.gradient);
-		let contraction_shared_values = contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]).map(|tile| native_contraction_shared_values(tile, register_m, register_n, block, chunk_k, ratio)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
+		let contraction_shared_values = contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]).map(|tile| native_contraction_shared_values(tile, register_m, register_n, block, chunk_k, ratio, matrix)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
 		let attention_query_tile = narrow(natural("attention query tile", env!("RECIPE_ATTENTION_QUERY_TILE"))?, "attention query tile")? as u32;
 		let attention = native_attention_tiles(graph, shared_budget, attention_query_tile)?;
 		let attention_shared_values = attention.iter().enumerate().filter_map(|(index, tile)| tile.map(|tile| native_attention_shared_values(tile, tile.m as usize == graph.nodes[index].output.length))).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
@@ -7540,8 +7562,19 @@ fn native_contraction_partial_per_chunk(m: u32, n: u32, register_m: u32, registe
 /// then the chunk partials the k lanes exchange after a barrier. Both live in
 /// the same allocation, so K is bounded by whichever phase is larger, and a tile
 /// too wide to stage a whole chunk narrows its M lanes until one fits.
-fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block: u32, shared_values: u32, fragment: u32, ratio: u32) -> Result<Tile> {
+fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block: u32, shared_values: u32, fragment: u32, ratio: u32, matrix: bool) -> Result<Tile> {
 	require(register_m != 0 && register_n != 0 && block != 0 && fragment != 0 && ratio != 0, "native contraction tile inputs are empty")?;
+	if matrix {
+		let waves = block / 32;
+		require(waves != 0, "native matrix contraction has no wave")?;
+		let m = waves.checked_mul(16).ok_or_else(|| RecipeError::new("native matrix contraction M tile overflows"))?;
+		let n = 32;
+		let width = m.checked_add(n).ok_or_else(|| RecipeError::new("native matrix contraction tile width overflows"))?;
+		let room = shared_values / width;
+		let k = if room >= limits.k { limits.k } else { room - room % fragment };
+		require(k != 0, "native matrix contraction tile does not fit the device")?;
+		return Ok(Tile { m, n, k })
+	}
 	let lane_n = limits.n.div_ceil(register_n).min(block.isqrt().max(1));
 	let mut lane_m = limits.m.div_ceil(register_m).min(block / lane_n);
 	loop {
@@ -7565,8 +7598,11 @@ fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block
 		lane_m = lane_m.checked_sub(1).filter(|lanes| *lanes != 0).ok_or_else(|| RecipeError::new("native contraction tile does not fit the device"))?;
 	}
 }
-fn native_contraction_shared_values(tile: Tile, register_m: u32, register_n: u32, block: u32, fragment: u32, ratio: u32) -> Result<u32> {
+fn native_contraction_shared_values(tile: Tile, register_m: u32, register_n: u32, block: u32, fragment: u32, ratio: u32, matrix: bool) -> Result<u32> {
 	let staging = tile.m.checked_add(tile.n).and_then(|width| width.checked_mul(tile.k)).ok_or_else(|| RecipeError::new("native contraction shared values overflow"))?;
+	if matrix {
+		return Ok(staging)
+	}
 	let partials = tile.k.div_ceil(fragment).checked_mul(native_contraction_partial_per_chunk(tile.m, tile.n, register_m, register_n, block, ratio)?).ok_or_else(|| RecipeError::new("native contraction partial region overflows"))?;
 	Ok(staging.max(partials))
 }
