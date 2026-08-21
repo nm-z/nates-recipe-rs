@@ -3268,8 +3268,8 @@ mod bundle {
 		eprint!("mismatch: overwrite {}? Y/n ", path.display());
 		std::io::stderr().flush().map_err(|error| RecipeError::new(format!("cannot prompt: {error}")))?;
 		let mut answer = String::new();
-		std::io::stdin().read_line(&mut answer).map_err(|error| RecipeError::new(format!("cannot read answer: {error}")))?;
-		require(answer.trim().is_empty() || answer.trim().eq_ignore_ascii_case("y"), "model mismatch not overwritten")?;
+		let received = std::io::stdin().read_line(&mut answer).map_err(|error| RecipeError::new(format!("cannot read answer: {error}")))?;
+		require(received != 0 && (answer.trim().is_empty() || answer.trim().eq_ignore_ascii_case("y")), "model mismatch not overwritten")?;
 		save_semantic(path, schema, graphs)
 	}
 	pub(super) fn run_infer(path: &Path, input: &[f64], forward: impl Fn(&SemanticGraph, &[f64]) -> Result<Vec<f64>>) -> Result<Vec<f64>> {
@@ -8385,11 +8385,9 @@ impl Train {
 		let probability = model.loss.0 >= 4;
 		let scale = probability.then(|| TargetScale::fit(&prepared.targets[..training_rows]));
 		let target_values = prepared.targets.iter().map(|target| scale.map_or(*target, |scale| scale.encode(*target))).collect::<Vec<_>>();
-		let initialize = if let Some(path) = &self.resume { !fs::exists(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))? } else { true };
-		let (run, mut graph) = (RUN.fetch_add(1, Ordering::Relaxed) + 1, compile(model, prepared, training_rows, gpu, config, initialize)?);
+		let (run, mut graph) = (RUN.fetch_add(1, Ordering::Relaxed) + 1, compile(model, prepared, training_rows, gpu, config, true)?);
 		graph.state.training_rows = training_rows;
-		if initialize
-			&& let Some(scale) = scale
+		if let Some(scale) = scale
 			&& let Some(offset) = output_bias_offset(&graph)
 		{
 			let mean = target_values[..training_rows].iter().sum::<f64>() / training_rows as f64;
