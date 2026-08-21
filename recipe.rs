@@ -7571,7 +7571,9 @@ fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block
 		let n = 32;
 		let width = m.checked_add(n).ok_or_else(|| RecipeError::new("native matrix contraction tile width overflows"))?;
 		let room = shared_values / width;
-		let k = if room >= limits.k { limits.k } else { room - room % fragment };
+		let capacity = room - room % fragment;
+		let required = limits.k.div_ceil(fragment).checked_mul(fragment).ok_or_else(|| RecipeError::new("native matrix contraction K tile overflows"))?;
+		let k = required.min(capacity);
 		require(k != 0, "native matrix contraction tile does not fit the device")?;
 		return Ok(Tile { m, n, k })
 	}
