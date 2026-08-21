@@ -7928,7 +7928,7 @@ fn sample_identity(sample: &[f64], target: f64) -> u64 {
 	const PRIME: u64 = 1099511628211;
 	sample.iter().copied().chain(std::iter::once(target)).fold(OFFSET, |hash, value| (hash ^ value.to_bits()).wrapping_mul(PRIME))
 }
-fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json") }
+fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz") }
 fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	let path = path.as_ref();
 	let mut components = path.components();
@@ -8063,8 +8063,100 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 			let records = json_array(text).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
 			Ok(vec![json_records_table(name, &records).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
 		}
+		Some("npz") => {
+			let mut columns = Vec::new();
+			for (entry, contents) in zip_entries(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
+				let array = entry.strip_suffix(".npy").unwrap_or(&entry).to_owned();
+				columns.extend(npy_columns(&array, &contents).map_err(|error| RecipeError::new(format!("dataset {} entry {entry}: {error}", path.display())))?);
+			}
+			Ok(vec![array_table(name, columns).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
+		}
 		_ => parse_table(path, bytes).map(|(table, _)| vec![table]),
 	}
+}
+/// The stored entries of a ZIP archive, resolved through the central directory.
+fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+	let read16 = |offset: usize| bytes.get(offset..offset + 2).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize);
+	let read32 = |offset: usize| bytes.get(offset..offset + 4).map(|value| u32::from_le_bytes(value.try_into().unwrap()) as usize);
+	let tail = bytes.len().checked_sub(22).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?;
+	let end = (0..=tail.min(65535)).map(|back| tail - back).find(|&offset| bytes[offset..offset + 4] == [0x50, 0x4b, 0x05, 0x06]).ok_or_else(|| RecipeError::new("ZIP end of central directory is absent"))?;
+	let count = read16(end + 10).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?;
+	let mut offset = read32(end + 16).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?;
+	let mut entries = Vec::new();
+	for _ in 0..count {
+		require(bytes.get(offset..offset + 4) == Some(&[0x50, 0x4b, 0x01, 0x02]), "ZIP central directory entry is invalid")?;
+		let (method, size, name_length, extra, comment) = (read16(offset + 10), read32(offset + 24), read16(offset + 28), read16(offset + 30), read16(offset + 32));
+		let (method, size) = (method.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?, size.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?);
+		let local = read32(offset + 42).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?;
+		let name = String::from_utf8(bytes.get(offset + 46..offset + 46 + name_length.unwrap_or(0)).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?.to_vec()).map_err(|error| RecipeError::new(format!("ZIP entry name is not UTF-8: {error}")))?;
+		require(bytes.get(local..local + 4) == Some(&[0x50, 0x4b, 0x03, 0x04]), "ZIP local header is invalid")?;
+		let (local_name, local_extra) = (read16(local + 26).unwrap_or(0), read16(local + 28).unwrap_or(0));
+		let start = local + 30 + local_name + local_extra;
+		require(method == 0, format!("ZIP entry {name:?} uses unsupported compression method {method}"))?;
+		let contents = bytes.get(start..start + size).ok_or_else(|| RecipeError::new(format!("ZIP entry {name:?} is truncated")))?.to_vec();
+		if !name.ends_with('/') {
+			entries.push((name, contents));
+		}
+		offset += 46 + name_length.unwrap_or(0) + extra.unwrap_or(0) + comment.unwrap_or(0);
+	}
+	require(!entries.is_empty(), "ZIP archive has no entries")?;
+	Ok(entries)
+}
+/// One named column group from an NPY array: trailing dimensions flatten to `name.1..name.k` columns.
+fn npy_columns(name: &str, bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
+	require(bytes.get(..6) == Some(b"\x93NUMPY"), "NPY magic is absent")?;
+	let header_length = match bytes.get(6) {
+		Some(1) => bytes.get(8..10).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize + 10),
+		Some(2 | 3) => bytes.get(8..12).map(|value| u32::from_le_bytes(value.try_into().unwrap()) as usize + 12),
+		_ => None,
+	}
+	.ok_or_else(|| RecipeError::new("NPY header is invalid"))?;
+	let header = str::from_utf8(bytes.get(if bytes[6] == 1 { 10 } else { 12 }..header_length).ok_or_else(|| RecipeError::new("NPY header is truncated"))?).map_err(|error| RecipeError::new(format!("NPY header is not UTF-8: {error}")))?;
+	let field = |key: &str| header.split(key).nth(1).and_then(|rest| rest.split(':').nth(1)).map(str::trim_start);
+	let descr = field("'descr'").and_then(|value| value.split('\'').nth(1)).ok_or_else(|| RecipeError::new("NPY descr is absent"))?.to_owned();
+	require(field("'fortran_order'").is_some_and(|value| value.starts_with("False")), "NPY fortran order is unsupported")?;
+	let shape_text = field("'shape'").and_then(|value| value.split(')').next()).and_then(|value| value.split('(').nth(1)).ok_or_else(|| RecipeError::new("NPY shape is absent"))?;
+	let shape = shape_text.split(',').map(str::trim).filter(|value| !value.is_empty()).map(|value| value.parse::<usize>().map_err(|error| RecipeError::new(format!("invalid NPY dimension: {error}")))).collect::<Result<Vec<_>>>()?;
+	let rows = shape.first().copied().unwrap_or(1);
+	let width = shape.iter().skip(1).product::<usize>().max(1);
+	let element = descr.as_bytes().last().and_then(|digit| char::from(*digit).to_digit(10)).ok_or_else(|| RecipeError::new(format!("NPY dtype {descr:?} is unsupported")))? as usize;
+	let count = checked_mul(rows, width, "NPY elements")?;
+	let values = bytes.get(header_length..header_length + count * element).ok_or_else(|| RecipeError::new("NPY data is truncated"))?;
+	let kind = &descr[descr.len() - 2..];
+	let decode = |value: &[u8]| -> Result<f64> {
+		Ok(match (kind, element) {
+			("f4", 4) => f64::from(f32::from_le_bytes(value.try_into().unwrap())),
+			("f8", 8) => f64::from_le_bytes(value.try_into().unwrap()),
+			("i1", 1) => f64::from(value[0] as i8),
+			("i2", 2) => f64::from(i16::from_le_bytes(value.try_into().unwrap())),
+			("i4", 4) => f64::from(i32::from_le_bytes(value.try_into().unwrap())),
+			("i8", 8) => i64::from_le_bytes(value.try_into().unwrap()) as f64,
+			("u1", 1) => f64::from(value[0]),
+			("u2", 2) => f64::from(u16::from_le_bytes(value.try_into().unwrap())),
+			("u4", 4) => f64::from(u32::from_le_bytes(value.try_into().unwrap())),
+			("u8", 8) => u64::from_le_bytes(value.try_into().unwrap()) as f64,
+			_ => return Err(RecipeError::new(format!("NPY dtype {descr:?} is unsupported"))),
+		})
+	};
+	require(matches!(descr.as_bytes().first(), Some(b'<' | b'|')) || element == 1, format!("NPY dtype {descr:?} is unsupported"))?;
+	let decoded = values.chunks_exact(element).map(decode).collect::<Result<Vec<_>>>()?;
+	let mut columns = Vec::with_capacity(width);
+	for column in 0..width {
+		let header = if width == 1 { name.to_owned() } else { format!("{name}.{}", column + 1) };
+		columns.push((header, rows, (0..rows).map(|row| decoded[row * width + column]).collect()));
+	}
+	Ok(columns)
+}
+/// One table from named numeric columns; every column must agree on the row count.
+fn array_table(name: String, columns: Vec<(String, usize, Vec<f64>)>) -> Result<Table> {
+	require(!columns.is_empty(), "array source has no columns")?;
+	let rows = columns[0].1;
+	for (header, count, _) in &columns {
+		require(*count == rows, format!("array column {header:?} expected {rows} rows, received {count}"))?;
+	}
+	let headers = columns.iter().map(|(header, _, _)| header.clone()).collect();
+	let table_rows = (0..rows).map(|row| columns.iter().map(|(_, _, values)| values[row].to_string()).collect()).collect();
+	Ok(Table { name, headers, rows: table_rows })
 }
 /// The records of a top-level JSON array.
 fn json_array(text: &str) -> Result<Vec<JsonValue>> {
