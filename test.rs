@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DATA_MODES: usize = 7;
+const DATA_MODES: usize = 4;
 const AUTOREGRESSIVE_DATA_MODES: usize = 4;
 const MODEL_OPERATIONS: usize = 22;
 const ACTIVATIONS: usize = 16;
@@ -30,6 +30,7 @@ const LIFECYCLES: usize = 2;
 
 struct DataCase {
 	path: String,
+	test: Option<String>,
 	mode: usize,
 	autoregressive: bool,
 }
@@ -168,8 +169,13 @@ fn datasets() -> Vec<DataCase> {
 			let autoregressive = path.ends_with("autoregressive_lines.txt");
 			let modes = if autoregressive { AUTOREGRESSIVE_DATA_MODES } else { DATA_MODES };
 			let path = path.to_string_lossy().into_owned();
-			cases.extend((0..modes).map(|mode| DataCase { path: path.clone(), mode, autoregressive }));
+			cases.extend((0..modes).map(|mode| DataCase { path: path.clone(), test: None, mode, autoregressive }));
 		}
+	}
+	for family in ["numeric", "temporal"] {
+		let directory = format!("data/{family}/{}", if family == "numeric" { "split_files" } else { "chronological_splits" });
+		let (path, test) = (format!("{directory}/train.csv"), format!("{directory}/test.csv"));
+		cases.extend((4..7).map(|mode| DataCase { path: path.clone(), test: Some(test.clone()), mode, autoregressive: false }));
 	}
 	assert!(!cases.is_empty(), "data defines no composition cases");
 	cases
@@ -185,11 +191,10 @@ fn data(case: &DataCase) -> (Data, String) {
 		0 => {}
 		1 => { data = data.norm(z_score); source.push_str(".norm(z_score)") }
 		2 => { data = data.split(0.8); source.push_str(".split(0.8)") }
-		3 if case.autoregressive => { data = data.broadcast(); source.push_str(".broadcast()") }
-		3 => { data = data.test(case.path.clone()); source.push_str(&format!(".test({:?})", case.path)) }
-		4 => { data = data.test(case.path.clone()).split(0.8); source.push_str(&format!(".test({:?}).split(0.8)", case.path)) }
-		5 => { data = data.broadcast(); source.push_str(".broadcast()") }
-		6 => { data = data.norm(z_score).broadcast().test(case.path.clone()).split(0.8); source.push_str(&format!(".norm(z_score).broadcast().test({:?}).split(0.8)", case.path)) }
+		3 => { data = data.broadcast(); source.push_str(".broadcast()") }
+		4 => { let test = case.test.clone().expect("test source is absent"); data = data.test(test.clone()); source.push_str(&format!(".test({test:?})")) }
+		5 => { let test = case.test.clone().expect("test source is absent"); data = data.test(test.clone()).split(0.8); source.push_str(&format!(".test({test:?}).split(0.8)")) }
+		6 => { let test = case.test.clone().expect("test source is absent"); data = data.norm(z_score).broadcast().test(test.clone()).split(0.8); source.push_str(&format!(".norm(z_score).broadcast().test({test:?}).split(0.8)")) }
 		_ => unreachable!(),
 	}
 	(data, source)

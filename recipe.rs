@@ -7719,15 +7719,15 @@ fn prepare(data: &Data) -> Result<&Prepared> {
 	}
 }
 fn column_match(name: &str, table: &Table, header: &str, column: usize) -> bool { name == header || name == format!("{}.{}", table.name, header) || name == format!("col{}", column + 1) || name == format!("{}.col{}", table.name, column + 1) || header.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.')) || header.rsplit_once('.').is_some_and(|(base, row)| row.parse::<usize>().is_ok() && (base == name || base.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.')))) }
-fn load_tables(data: &Data, sources: &[String]) -> Result<Vec<Table>> {
+fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathBuf>)> {
 	let mut paths = Vec::new();
 	for source in sources {
 		collect_files(&resolve_path(source)?, &mut paths)?;
 	}
-	paths.sort();
-	paths.dedup();
+	for path in &mut paths { *path = fs::canonicalize(&*path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))? }
+	paths.sort(); paths.dedup();
 	let mut grouped = Vec::new();
-	for path in paths {
+	for path in &paths {
 		if !path.extension().and_then(|value| value.to_str()).is_some_and(is_table) {
 			continue;
 		}
@@ -7749,16 +7749,16 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<Vec<Table>> {
 			}
 		}
 	}
-	Ok(tables)
+	Ok((tables, paths))
 }
 fn prepare_data(data: &Data) -> Result<Prepared> {
-	let mut tables = load_tables(data, &data.sources)?;
+	let (mut tables, sources) = load_tables(data, &data.sources)?;
 	let source_table_rows = tables.first().map_or(0, |table| table.rows.len());
 	if !data.tests.is_empty() {
-		let tests = load_tables(data, &data.tests)?;
+		let (tests, test_sources) = load_tables(data, &data.tests)?; require(!sources.iter().any(|source| test_sources.binary_search(source).is_ok()), "training and test data must use separate files")?;
 		require(tables.len() == tests.len(), "test data table count differs from training data")?;
 		for (table, test) in tables.iter_mut().zip(tests) {
-			require(table.name == test.name && table.headers == test.headers, format!("test table {:?} differs from training table {:?}", test.name, table.name))?;
+			require(table.headers == test.headers, format!("test table {:?} differs from training table {:?}", test.name, table.name))?;
 			table.rows.extend(test.rows);
 		}
 	}
