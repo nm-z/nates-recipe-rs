@@ -7570,7 +7570,7 @@ fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block
 		let waves = block / 32;
 		require(waves != 0, "native matrix contraction has no wave")?;
 		let m = waves.checked_mul(16).ok_or_else(|| RecipeError::new("native matrix contraction M tile overflows"))?;
-		let n = 32;
+		let n = (block / 2).max(32);
 		let width = m.checked_add(n).ok_or_else(|| RecipeError::new("native matrix contraction tile width overflows"))?;
 		let room = shared_values / width;
 		let capacity = room - room % fragment;
