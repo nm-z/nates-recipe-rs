@@ -430,6 +430,7 @@ fn emit_failure(seed: u64, cursor: u64, next_cursor: u64, step: u64, case: u64, 
 	eprintln!("configuration=data_mode:{} model:{} loss:{} arithmetic:{} stop:{} rate:{} lifecycle:{}", data_case.mode, description, loss_ordinal, train_case.arithmetic, train_case.stop, train_case.rate, lifecycle);
 	eprintln!("expected=training, optional resume, and inference produce finite numerical results through the public Recipe API");
 	eprintln!("observed=phase:{} message:{}", failure.phase, failure.message);
+	eprintln!("output=phase:{} message:{}", failure.phase, failure.message);
 	eprintln!("replay=phase:{} message:{} stable:{}", replay.phase, replay.message, failure.phase == replay.phase && failure.message == replay.message);
 	eprintln!("command=cargo run --bin recipe -- /tmp/recipe-composition-repro.rs");
 	eprintln!("reproduction:\n```rust\n{source}```");
