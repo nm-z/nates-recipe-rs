@@ -2973,7 +2973,10 @@ mod bundle {
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
 			"lstm" => Ok(Operation::Lstm(value_at(Some(rest), "LSTM width")?)),
 			"residual" => Ok(Operation::Residual(if rest.is_empty() { Vec::new() } else { rest.split(';').map(residual).collect::<Result<Vec<_>>>()? })),
-			"moe" => Ok(Operation::Moe(value_at(fields.next(), "MoE top-k")?, fields.next().unwrap_or("").split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?)),
+			"moe" => {
+				let (top_k, experts) = rest.split_once(',').unwrap_or((rest, ""));
+				Ok(Operation::Moe(value_at(Some(top_k), "MoE top-k")?, experts.split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?))
+			}
 			"perc" => Ok(Operation::Perceptron(value_at(Some(rest), "perceptron width")?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
