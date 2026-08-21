@@ -3013,6 +3013,7 @@ mod bundle {
 		pub inputs: Vec<String>,
 		pub outputs: Vec<String>,
 		pub tensors: Vec<StoredWeight>,
+		pub predictors: Vec<PredictorProgram>,
 		pub frozen: Vec<u8>,
 		pub state: TrainingState,
 		pub norm_mean: Vec<f64>,
@@ -3039,7 +3040,13 @@ mod bundle {
 			require(encoded.count == node.parameters && encoded.arithmetic.len() == node.parameters, format!("model tensor {index} has the wrong shape"))?;
 			tensors.push(encoded);
 		}
-		Ok(SemanticGraph { model: stored.model.clone(), precision: stored.precision, input: graph.input, output: graph.output, inputs: stored.inputs.clone(), outputs: stored.outputs.clone(), tensors, frozen: graph.frozen.clone(), state: graph.state.clone(), norm_mean: stored.norm_mean.clone(), norm_scale: stored.norm_scale.clone(), target_min: stored.target_min, target_span: stored.target_span, bn_stats: stored.bn_stats.clone(), artifact: stored.artifact.clone() })
+		let mut predictors = Vec::new();
+		for node in &graph.nodes {
+			if node.op != Primitive::Predictor { continue }
+			let code = graph.programs.get(node.program_offset..node.program_offset + node.program_count * 2).ok_or_else(|| RecipeError::new("fitted estimator program span is invalid"))?.to_vec();
+			predictors.push(PredictorProgram { code, locals: node.argument[0] as usize, stack: node.argument[1] as usize });
+		}
+		Ok(SemanticGraph { model: stored.model.clone(), precision: stored.precision, input: graph.input, output: graph.output, inputs: stored.inputs.clone(), outputs: stored.outputs.clone(), tensors, predictors, frozen: graph.frozen.clone(), state: graph.state.clone(), norm_mean: stored.norm_mean.clone(), norm_scale: stored.norm_scale.clone(), target_min: stored.target_min, target_span: stored.target_span, bn_stats: stored.bn_stats.clone(), artifact: stored.artifact.clone() })
 	}
 	fn same_model(a: &Model, b: &Model) -> bool {
 		a.loss.0 == b.loss.0 && a.quantization == b.quantization && model_text(a) == model_text(b)
@@ -3073,6 +3080,7 @@ mod bundle {
 		output: Option<Shape>,
 		precision: Option<Compute>,
 		tensors: Vec<StoredWeight>,
+		predictors: Vec<PredictorProgram>,
 		frozen: Vec<u8>,
 		state: TrainingState,
 		norm_mean: Vec<f64>,
@@ -3095,7 +3103,9 @@ mod bundle {
 			for (name, values) in [("moments", &self.state.moments), ("variances", &self.state.variances), ("best weights", &self.state.best)] {
 				require(values.is_empty() || values.len() == self.frozen.len(), format!("semantic model {name} are incomplete"))?;
 			}
-			Ok(SemanticGraph { model, precision: self.precision.ok_or_else(|| RecipeError::new("semantic model has no arithmetic format"))?, input, output, inputs: self.inputs, outputs: self.outputs, tensors: self.tensors, frozen: self.frozen, state: self.state, norm_mean: self.norm_mean, norm_scale: self.norm_scale, target_min: self.target_min, target_span: self.target_span, bn_stats: self.bn_stats, artifact: self.artifact })
+			let estimators = model.blocks.iter().filter(|block| matches!(block.operation, Operation::Estimator(_))).count();
+			require(self.predictors.len() == estimators, "semantic model fitted estimator programs are incomplete")?;
+			Ok(SemanticGraph { model, precision: self.precision.ok_or_else(|| RecipeError::new("semantic model has no arithmetic format"))?, input, output, inputs: self.inputs, outputs: self.outputs, tensors: self.tensors, predictors: self.predictors, frozen: self.frozen, state: self.state, norm_mean: self.norm_mean, norm_scale: self.norm_scale, target_min: self.target_min, target_span: self.target_span, bn_stats: self.bn_stats, artifact: self.artifact })
 		}
 	}
 	fn stored_weight(format: u16, count: usize, codebook: &str, encoded: &str) -> Result<StoredWeight> {
@@ -3153,6 +3163,12 @@ mod bundle {
 					require(fields.len() == 4, "semantic tensor has the wrong width")?;
 					builder.tensors.push(stored_weight(value_at(fields.first().copied(), "semantic tensor format")?, value_at(fields.get(1).copied(), "semantic tensor count")?, fields[2], fields[3])?);
 				}
+				"predictor" => {
+					let fields = values::<f64>(value, "fitted estimator program")?;
+					require(fields.len() >= 2 && (fields.len() - 2) % 2 == 0, "fitted estimator program has the wrong width")?;
+					let slot = |value: f64, role| usize::try_from(value as i64).ok().filter(|_| value.fract() == 0.0).ok_or_else(|| RecipeError::new(format!("invalid fitted estimator {role}")));
+					builder.predictors.push(PredictorProgram { locals: slot(fields[0], "locals")?, stack: slot(fields[1], "stack")?, code: fields[2..].to_vec() });
+				}
 				"frozen" => builder.frozen = values(value, "frozen weight")?,
 				"moments" => builder.state.moments = values(value, "Adam moment")?,
 				"variances" => builder.state.variances = values(value, "Adam variance")?,
@@ -3197,6 +3213,9 @@ mod bundle {
 			for tensor in &semantic.tensors {
 				let metadata = if tensor.codebook.is_empty() { "-".to_owned() } else { tensor.codebook.iter().map(ToString::to_string).collect::<Vec<_>>().join(",") };
 				field(&mut document, "tensor", &format!("{} {} {metadata} {}", tensor.format.0, tensor.count, hex(&tensor.bytes)));
+			}
+			for predictor in &semantic.predictors {
+				field(&mut document, "predictor", &format!("{} {} {}", predictor.locals, predictor.stack, join(&predictor.code)));
 			}
 			for (key, value) in [("frozen", join(&semantic.frozen)), ("moments", join(&semantic.state.moments)), ("variances", join(&semantic.state.variances)), ("best", join(&semantic.state.best)), ("best_loss", join(&semantic.state.best_loss)), ("epoch", semantic.state.epoch.to_string()), ("training_rows", semantic.state.training_rows.to_string()), ("trained_samples", join(&semantic.state.trained_samples)), ("norm_mean", join(&semantic.norm_mean)), ("norm_scale", join(&semantic.norm_scale))] {
 				field(&mut document, key, &value)
@@ -4844,7 +4863,7 @@ fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, confi
 	Ok(graph)
 }
 fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: &'static Gpu, config: Config) -> Result<Graph> {
-	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], rows: 1, source_rows: 1, features: saved.input.elements(), schema: DataSchema::default(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new() };
+	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], rows: 1, source_rows: 1, features: saved.input.elements(), schema: DataSchema::default(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new(), fitted: saved.predictors.clone() };
 	let mut graph = compile(&saved.model, &prepared, 1, gpu, config, false)?;
 	require(graph.input == saved.input, "saved semantic input shape does not match the compiled model")?;
 	require(graph.output == saved.output, "saved semantic output shape does not match the compiled model")?;
@@ -5240,18 +5259,27 @@ fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Conf
 	push_program(graph, skip, &[], program)
 }
 fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
-	(estimator.validate)(estimator.param, rows)?;
 	let (source, input) = (graph.source, graph.output);
-	let inputs = graph_inputs(graph, &data.samples, &data.targets, rows, gpu, config.precision)?;
-	let prepared = Prepared { samples: inputs.clone(), targets: data.targets[..rows].to_vec(), rows, source_rows: rows, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: data.target_categorical, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new() };
-	let teacher = estimator.fit(&prepared, rows, config, true)?;
-	let targets = inputs.chunks_exact(input.elements()).enumerate().map(|(row, query)| (teacher.predict)(row, query)).collect::<Result<Vec<_>>>()?;
-	let predictor = estimator.fit(&prepared, rows, config, false)?;
+	let restored = data.fitted.get(graph.nodes.iter().filter(|node| node.op == Primitive::Predictor).count()).cloned();
+	let (predictor, surrogate) = if let Some(program) = restored {
+		let blank = Prepared { samples: vec![0.0; input.elements()], targets: vec![0.0], rows: 1, source_rows: 1, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
+		let mut surrogate = compile(&surrogate_model(config.surrogate_width), &blank, 1, gpu, config, false)?;
+		surrogate.frozen.fill(1);
+		(program, surrogate)
+	} else {
+		(estimator.validate)(estimator.param, rows)?;
+		let inputs = graph_inputs(graph, &data.samples, &data.targets, rows, gpu, config.precision)?;
+		let prepared = Prepared { samples: inputs.clone(), targets: data.targets[..rows].to_vec(), rows, source_rows: rows, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: data.target_categorical, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
+		let teacher = estimator.fit(&prepared, rows, config, true)?;
+		let targets = inputs.chunks_exact(input.elements()).enumerate().map(|(row, query)| (teacher.predict)(row, query)).collect::<Result<Vec<_>>>()?;
+		let predictor = estimator.fit(&prepared, rows, config, false)?;
+		(predictor.program, fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?)
+	};
 	reset(graph, source, input);
-	push_predictor(graph, predictor.program)?;
+	push_predictor(graph, predictor)?;
 	let real = graph.source;
 	reset(graph, source, input);
-	let surrogate = append_graph(graph, fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?)?;
+	let surrogate = append_graph(graph, surrogate)?;
 	let mut rat = ScalarProgram(Vec::new());
 	rat.op(ScalarOpcode::StraightThrough, -1.0, -2.0);
 	program(graph, real, surrogate, Shape { channels: 1, length: 1 }, &[], rat).map(drop)
@@ -6794,12 +6822,13 @@ fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gp
 	tape.forward()?;
 	tape.predictions()
 }
+fn surrogate_model(hidden: usize) -> Model { recipe.model().layer(hidden).tanh().layer(1) }
 fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, gpu: &'static Gpu, config: Config) -> Result<Graph> {
 	require(!targets.is_empty(), "surrogate requires teacher outputs")?;
 	let sample_count = checked_mul(targets.len(), input.elements(), "surrogate samples")?;
 	require(samples.len() == sample_count, "surrogate sample batch is invalid")?;
-	let model = recipe.model().layer(hidden).tanh().layer(1);
-	let prepared = Prepared { samples: samples.to_vec(), targets: targets.to_vec(), rows: targets.len(), source_rows: targets.len(), features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new() };
+	let model = surrogate_model(hidden);
+	let prepared = Prepared { samples: samples.to_vec(), targets: targets.to_vec(), rows: targets.len(), source_rows: targets.len(), features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
 	let mut graph = compile(&model, &prepared, prepared.rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, mse)?;
 	for _ in 0..config.surrogate_epochs {
@@ -7739,6 +7768,7 @@ struct Prepared {
 	norm_mean: Vec<f64>,
 	norm_scale: Vec<f64>,
 	identities: Vec<u64>,
+	fitted: Vec<PredictorProgram>,
 }
 struct Table {
 	name: String,
@@ -7932,7 +7962,7 @@ fn finish_prepared(data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, so
 		impute_missing(&mut samples);
 		(Vec::new(), Vec::new())
 	};
-	Ok(Prepared { samples, targets, rows, source_rows, features, schema, sequence, target_categorical, norm_mean, norm_scale, identities })
+	Ok(Prepared { samples, targets, rows, source_rows, features, schema, sequence, target_categorical, norm_mean, norm_scale, identities, fitted: Vec::new() })
 }
 fn normalize_samples(samples: &mut [f64], features: usize, fit: usize) -> Result<(Vec<f64>, Vec<f64>)> {
 	require(fit != 0, "split must retain normalization rows")?;
