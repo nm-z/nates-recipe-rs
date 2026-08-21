@@ -13,6 +13,7 @@ kimi_skills = "/home/nate/Desktop/recipe-issue-machine/.issue-machine/empty-skil
 agy_binary = "/home/nate/.local/bin/agy"
 agy_models = "gemini-3.1-pro-high,gemini-3.7-flash-high"
 provider_poll_seconds = 60
+slow_cursor_seconds = 60
 discovery_devices = "amd0,cpu"
 seed = 0
 cursor = 108

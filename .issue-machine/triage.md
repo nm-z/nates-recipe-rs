@@ -37,6 +37,16 @@ the smallest useful explanation because the machine appends provenance and the
 exact reproduction packet. Do not repeat the full configuration or classifier
 rationale in the body. Do not use em dashes.
 
+For a `kind=performance` packet, determine whether the measured one-epoch wall
+time is theoretically justified. Derive the loaded row count, feature count,
+model operations, tree candidates, depth, boosting iterations, arithmetic work,
+memory traffic, and relevant CPU or GPU capabilities from the exact reproduction
+and current source. State the measured runtime, a defensible expected runtime or
+throughput range, and the dominant gap. Return `new` or `comment` only when the
+measured path is materially slower than that workload and hardware justify. Do
+not reject a performance packet merely because the implementation performs more
+work than the public composition implies.
+
 ## Recipe presentation contract
 
 Follow Recipe's public API and visual grammar whenever you mention or quote a

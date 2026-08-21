@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 const RED: &str = "\x1b[38;2;242;40;60m";
 const YELLOW: &str = "\x1b[38;2;255;194;0m";
@@ -29,6 +30,7 @@ struct Config {
     agy_binary: PathBuf,
     agy_models: Vec<String>,
     provider_poll_seconds: u64,
+    slow_cursor_seconds: u64,
     discovery_devices: Vec<String>,
     seed: u64,
     cursor: u64,
@@ -84,6 +86,9 @@ fn config(path: &Path) -> Config {
         provider_poll_seconds: value(&text, "provider_poll_seconds")
             .parse()
             .expect("provider_poll_seconds must be an unsigned integer"),
+        slow_cursor_seconds: value(&text, "slow_cursor_seconds")
+            .parse()
+            .expect("slow_cursor_seconds must be an unsigned integer"),
         discovery_devices: values(&text, "discovery_devices"),
         seed: value(&text, "seed")
             .parse()
@@ -123,6 +128,25 @@ struct Trial {
     cursor: u64,
     reproduction: PathBuf,
     output: std::process::Output,
+}
+
+struct SlowTrial {
+    config: Config,
+    device: String,
+    cursor: u64,
+    reproduction: PathBuf,
+    elapsed_seconds: u64,
+}
+
+enum Discovery {
+    Slow(SlowTrial),
+    Complete(Trial),
+}
+
+enum Review {
+    Done,
+    Deferred,
+    Stop,
 }
 
 fn queued(text: &str) -> VecDeque<String> {
@@ -299,7 +323,13 @@ fn reproduction_path(config: &Config, device: &str, cursor: u64) -> PathBuf {
     config.reproduction_directory.join(format!("recipe-composition-repro-{device}-{cursor}.rs"))
 }
 
-fn trial(config: &Config, device: &str, cursor: u64, reproduction: &Path) -> std::process::Output {
+fn trial(
+    config: &Config,
+    device: &str,
+    cursor: u64,
+    reproduction: &Path,
+    send: &mpsc::Sender<Discovery>,
+) -> std::process::Output {
     let mut command = Command::new("cargo");
     command
         .args(["run", "--bin", "recipe", "--", "test.rs"])
@@ -318,7 +348,43 @@ fn trial(config: &Config, device: &str, cursor: u64, reproduction: &Path) -> std
     } else {
         command.env("RECIPE_DEVICE", device);
     }
-    output(&mut command, None)
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().expect("cannot start Recipe traversal");
+    let mut child_stdout = child.stdout.take().expect("Recipe traversal stdout is absent");
+    let mut child_stderr = child.stderr.take().expect("Recipe traversal stderr is absent");
+    let stdout = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        child_stdout.read_to_end(&mut output).expect("cannot read Recipe traversal stdout");
+        output
+    });
+    let stderr = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        child_stderr.read_to_end(&mut output).expect("cannot read Recipe traversal stderr");
+        output
+    });
+    let started = Instant::now();
+    let mut reported = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("cannot inspect Recipe traversal") {
+            break status;
+        }
+        if !reported && started.elapsed() >= Duration::from_secs(config.slow_cursor_seconds) {
+            reported = true;
+            let _ = send.send(Discovery::Slow(SlowTrial {
+                config: config.clone(),
+                device: device.to_owned(),
+                cursor,
+                reproduction: reproduction.to_owned(),
+                elapsed_seconds: started.elapsed().as_secs(),
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    std::process::Output {
+        status,
+        stdout: stdout.join().expect("Recipe traversal stdout reader failed"),
+        stderr: stderr.join().expect("Recipe traversal stderr reader failed"),
+    }
 }
 
 fn termination_signal(status: std::process::ExitStatus) -> Option<i32> {
@@ -344,6 +410,20 @@ fn crash_packet(trial: &Trial, text: &str, signal: i32) -> String {
     }
     let message = format!("device {} terminated by signal {signal}", trial.device);
     format!("id={fingerprint:016x}\nbase={}\ncursor=seed:{} cursor:{} next:{} step:{step} composition:{case}\nconfiguration={}\nexpected=training, optional resume, and inference produce finite numerical results through the public Recipe API\nobserved=phase:process message:{message}\noutput=phase:process message:{message}\nreplay=phase:process message:the process terminated before in-process replay stable:unknown\ncommand=cargo run --bin recipe -- {}\nreproduction:\n```rust\n{source}```", repository_base(&trial.config.repository), trial.config.seed, trial.cursor, trial.cursor + 1, configuration.trim(), trial.reproduction.display())
+}
+
+fn slow_packet(trial: &SlowTrial) -> String {
+    let source = std::fs::read_to_string(&trial.reproduction).expect("slow traversal staged no reproduction");
+    let composition = source
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(".seed(")?.strip_suffix(')'))
+        .expect("slow traversal reproduction has no composition seed");
+    let mut fingerprint = 1_469_598_103_934_665_603_u64;
+    for byte in format!("performance:{}:{composition}", trial.device).bytes().chain(source.bytes()) {
+        fingerprint ^= u64::from(byte);
+        fingerprint = fingerprint.wrapping_mul(1_099_511_628_211);
+    }
+    format!("kind=performance\nid={fingerprint:016x}\nbase={}\ncursor=seed:{} cursor:{} next:{} composition:{composition}\nexpected=one training epoch uses throughput proportionate to its operations, data volume, memory traffic, and available hardware\nobserved=the public Recipe run remained active after {} seconds\nmeasurement=elapsed_seconds:{} backend:{}\nreplay=the configured slow-runtime threshold was crossed stable:true\ncommand=cargo run --bin recipe -- {}\nreproduction:\n```rust\n{source}```\nbackend={}", repository_base(&trial.config.repository), trial.config.seed, trial.cursor, trial.cursor + 1, trial.elapsed_seconds, trial.elapsed_seconds, trial.device, trial.reproduction.display(), trial.device)
 }
 
 fn jq(json: &str, filter: &str) -> std::result::Result<String, String> {
@@ -609,7 +689,7 @@ fn classify(config: &Config, prompt: &str) -> Decision {
     }
 }
 
-fn triage(config: &Config, instructions: &str, packet: &str) -> bool {
+fn triage(config: &Config, instructions: &str, packet: &str) -> Review {
     if field(packet, "replay=").ends_with("stable:false") {
         event(
             config,
@@ -619,7 +699,7 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> bool {
                 field(packet, "id=")
             ),
         );
-        return true;
+        return Review::Done;
     }
     let cursor = field(packet, "cursor=");
     let composition = cursor
@@ -629,7 +709,18 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> bool {
     let schema =
         std::fs::read_to_string(&config.decision_schema).expect("cannot read decision schema");
     let prompt = format!("{instructions}\n\n## Failure packet\n\n{packet}\n\n## Required decision schema\n\n{schema}");
-    let decision = classify(config, &prompt);
+    let performance = packet.starts_with("kind=performance\n");
+    let decision = if performance {
+        match kimi(config, "Kimi managed", &config.kimi_k3_model, &prompt) {
+            Ok(decision) => decision,
+            Err(error) => {
+                trace(config, &format!("model={} unavailable error={error}", config.kimi_k3_model));
+                return Review::Deferred;
+            }
+        }
+    } else {
+        classify(config, &prompt)
+    };
     event(
         config,
         RED,
@@ -651,7 +742,7 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> bool {
                 decision.model
             ),
         );
-        return false;
+        return Review::Stop;
     }
     if verdict == "reject" {
         event(
@@ -659,7 +750,7 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> bool {
             YELLOW,
             &format!("REJECT model={} composition={composition}", decision.model),
         );
-        return true;
+        return Review::Done;
     }
     assert!(
         !title.is_empty() && !body.is_empty(),
@@ -725,7 +816,7 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> bool {
             decision.model
         ),
     );
-    true
+    Review::Done
 }
 
 fn main() {
@@ -770,12 +861,16 @@ fn main() {
                 .clone()
         };
         let current = config(&reviewer_path);
-        if !triage(&current, &reviewer_instructions, &packet) {
-            let (lock, ready) = &*reviewer_work;
-            let mut state = lock.lock().expect("failure queue lock is poisoned");
-            state.halted = true;
-            ready.notify_all();
-            break;
+        match triage(&current, &reviewer_instructions, &packet) {
+            Review::Done => {}
+            Review::Deferred => break,
+            Review::Stop => {
+                let (lock, ready) = &*reviewer_work;
+                let mut state = lock.lock().expect("failure queue lock is poisoned");
+                state.halted = true;
+                ready.notify_all();
+                break;
+            }
         }
         let (lock, _) = &*reviewer_work;
         let mut state = lock.lock().expect("failure queue lock is poisoned");
@@ -822,15 +917,15 @@ fn main() {
                 start
             };
             let reproduction = reproduction_path(&current, &device, start);
-            let result = trial(&current, &device, start, &reproduction);
+            let result = trial(&current, &device, start, &reproduction, &worker_send);
             if worker_send
-                .send(Trial {
+                .send(Discovery::Complete(Trial {
                     config: current,
                     device: device.clone(),
                     cursor: start,
                     reproduction,
                     output: result,
-                })
+                }))
                 .is_err()
             {
                 break;
@@ -840,7 +935,27 @@ fn main() {
     drop(send);
     let mut frontier = initial.cursor;
     let mut completed = BTreeMap::new();
-    for trial in receive {
+    for discovery in receive {
+        let trial = match discovery {
+            Discovery::Slow(trial) => {
+                let packet = slow_packet(&trial);
+                let composition = field(&packet, "cursor=")
+                    .split_whitespace()
+                    .find_map(|value| value.strip_prefix("composition:"))
+                    .expect("slow cursor has no composition")
+                    .to_owned();
+                let (lock, ready) = &*work;
+                let mut state = lock.lock().expect("failure queue lock is poisoned");
+                if !state.packets.iter().any(|queued| same_failure(queued, &packet)) {
+                    state.packets.push_back(packet);
+                    persist_queue(&trial.config.queue_path, &state.packets);
+                    event(&trial.config, YELLOW, &format!("SLOW device={} cursor={} composition={composition} elapsed={}s depth={}", trial.device, trial.cursor, trial.elapsed_seconds, state.packets.len()));
+                    ready.notify_one();
+                }
+                continue;
+            }
+            Discovery::Complete(trial) => trial,
+        };
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&trial.output.stderr),
