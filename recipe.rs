@@ -2524,7 +2524,7 @@ fn emit_loss_value(ir: &mut String, loss: LossFunction, precision: Compute, ty: 
 			ir.push_str(&format!("%loss.mae = call {ty} @recipe.state.abs({ty} %loss.difference)\n", ty = ty));
 			Ok("%loss.mae".to_owned())
 		}
-		4 | 5 => {
+		4 => {
 			ir.push_str(&format!("%loss.probability.raw = call {ty} @recipe.state.sigmoid({ty} {prediction})\n%loss.probability.low = call i1 @recipe.state.olt({ty} %loss.probability.raw, {ty} {tiny})\n%loss.probability.floor = select i1 %loss.probability.low, {ty} {tiny}, {ty} %loss.probability.raw\n%loss.probability.high = call i1 @recipe.state.ogt({ty} %loss.probability.floor, {ty} {one_minus})\n%loss.probability = select i1 %loss.probability.high, {ty} {one_minus}, {ty} %loss.probability.floor\n%loss.log.probability = call {ty} @recipe.state.log({ty} %loss.probability)\n%loss.one.probability = call {ty} @recipe.state.sub({ty} {one}, {ty} %loss.probability)\n%loss.log.one.probability = call {ty} @recipe.state.log({ty} %loss.one.probability)\n%loss.first = call {ty} @recipe.state.mul({ty} {target}, {ty} %loss.log.probability)\n%loss.one.target = call {ty} @recipe.state.sub({ty} {one}, {ty} {target})\n%loss.second = call {ty} @recipe.state.mul({ty} %loss.one.target, {ty} %loss.log.one.probability)\n%loss.cross.sum = call {ty} @recipe.state.add({ty} %loss.first, {ty} %loss.second)\n%loss.cross = call {ty} @recipe.state.neg({ty} %loss.cross.sum)\n", ty = ty, tiny = literal(f64::EPSILON), one_minus = literal(1.0 - f64::EPSILON), target = target, one = one));
 			Ok("%loss.cross".to_owned())
 		}
@@ -2570,7 +2570,7 @@ fn emit_loss_gradient(ir: &mut String, loss: LossFunction, precision: Compute, t
 			append_binary(ir, ty, "seed.mae", "div", "%seed.mae.sign", rows_value);
 			Ok("%seed.mae".to_owned())
 		}
-		4 | 5 => {
+		4 => {
 			ir.push_str(&format!("%seed.probability = call {ty} @recipe.state.sigmoid({ty} {prediction})\n", ty = ty, prediction = prediction));
 			append_binary(ir, ty, "seed.cross.difference", "sub", "%seed.probability", target);
 			append_binary(ir, ty, "seed.cross", "div", "%seed.cross.difference", rows_value);
@@ -3040,6 +3040,7 @@ mod bundle {
 	fn model_text(model: &Model) -> Vec<String> { model.blocks.iter().map(block_text).collect() }
 	fn model(blocks: Vec<Block>, loss: u8, quantization: u16) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
+		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
 		Ok(Model { blocks, loss: LossFunction(loss), quantization })
 	}
 	#[derive(Clone)]
@@ -4697,7 +4698,8 @@ pub const rmse: LossFunction = LossFunction(1);
 pub const huber: LossFunction = LossFunction(2);
 pub const mae: LossFunction = LossFunction(3);
 pub const bce: LossFunction = LossFunction(4);
-pub const ce: LossFunction = LossFunction(5);
+// Width-one outputs make cross-entropy and binary cross-entropy the same computation: one identity.
+pub const ce: LossFunction = LossFunction(4);
 pub const focal: LossFunction = LossFunction(6);
 pub const Run: Metric = Metric(0);
 pub const Loss: Metric = Metric(1);
@@ -4721,7 +4723,6 @@ impl LossFunction {
 			2 => "huber",
 			3 => "mae",
 			4 => "bce",
-			5 => "ce",
 			6 => "focal",
 			_ => unreachable!(),
 		}
@@ -4736,7 +4737,7 @@ impl LossFunction {
 				if absolute <= threshold { 0.5 * difference * difference } else { threshold * (absolute - 0.5 * threshold) }
 			}
 			3 => difference.abs(),
-			4 | 5 => -target * probability.ln() - (1.0 - target) * (1.0 - probability).ln(),
+			4 => -target * probability.ln() - (1.0 - target) * (1.0 - probability).ln(),
 			6 => {
 				let correct = if target >= 0.5 { probability } else { 1.0 - probability };
 				-(1.0 - correct).powi(2) * correct.ln()
