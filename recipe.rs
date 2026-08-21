@@ -7774,18 +7774,26 @@ fn class_directory_table(data: &Data, sources: &[String], grouped: &[(PathBuf, T
 		return Ok(None);
 	}
 	let root = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve {source}: {error}")))?;
+	let sidecars = samples.iter().map(|path| path.with_extension("label")).collect::<Vec<_>>();
+	let flat = samples.iter().all(|path| path.parent() == Some(root.as_path())) && sidecars.iter().all(|path| path.exists());
 	let classes = samples.iter().filter_map(|path| path.parent()).collect::<BTreeSet<_>>();
-	if classes.len() < 2 || classes.iter().any(|directory| directory.parent() != Some(root.as_path())) {
+	if !flat && (classes.len() < 2 || classes.iter().any(|directory| directory.parent() != Some(root.as_path()))) {
 		return Ok(None);
 	}
 	let name = root.file_name().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
 	let mut rows = Vec::new();
 	let mut headers = Vec::new();
-	for path in &samples {
-		let class = path.parent().and_then(Path::file_name).and_then(|value| value.to_str()).ok_or_else(|| RecipeError::new(format!("class directory of {} is unreadable", path.display())))?.to_owned();
+	for (path, sidecar) in samples.iter().zip(&sidecars) {
+		let class = if flat {
+			fs::read_to_string(sidecar).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", sidecar.display())))?.trim().to_owned()
+		} else {
+			path.parent().and_then(Path::file_name).and_then(|value| value.to_str()).ok_or_else(|| RecipeError::new(format!("class directory of {} is unreadable", path.display())))?.to_owned()
+		};
 		if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
 			let bytes = fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-			let (width, height, channels, pixels) = png_pixels(&bytes).map_err(|error| RecipeError::new(format!("image {}: {error}", path.display())))?;
+			let jpeg = path.extension().and_then(|value| value.to_str()).is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "jpg" | "jpeg"));
+			let decoded = if jpeg { jpeg_pixels(&bytes) } else { png_pixels(&bytes) };
+			let (width, height, channels, pixels) = decoded.map_err(|error| RecipeError::new(format!("image {}: {error}", path.display())))?;
 			if headers.is_empty() {
 				headers = (1..=width * height * channels).map(|pixel| format!("pixel.{pixel}")).collect();
 				headers.push(target.clone());
@@ -7804,7 +7812,273 @@ fn class_directory_table(data: &Data, sources: &[String], grouped: &[(PathBuf, T
 	}
 	Ok(Some(Table { name, headers, rows }))
 }
-fn is_image(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "png") }
+fn is_image(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg") }
+/// Decoded baseline JFIF pixels: 8-bit precision, Huffman entropy coding, and the
+/// libjpeg fixed-point inverse DCT and color conversion so pixels match its output.
+fn jpeg_pixels(bytes: &[u8]) -> Result<(usize, usize, usize, Vec<u8>)> {
+	const ZIGZAG: [usize; 64] = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63];
+	let truncated = || RecipeError::new("JPEG stream is truncated");
+	require(bytes.get(..2) == Some(&[0xff, 0xd8]), "JPEG signature is absent")?;
+	let mut quantization = [[0_u16; 64]; 4];
+	let mut huffman: [[Option<(Vec<u8>, Vec<u8>)>; 4]; 2] = Default::default();
+	let (mut frame, mut restart_interval) = (None, 0_usize);
+	let mut offset = 2;
+	let scan;
+	loop {
+		require(bytes.get(offset) == Some(&0xff), "JPEG marker is invalid")?;
+		let marker = *bytes.get(offset + 1).ok_or_else(truncated)?;
+		let length = usize::from(u16::from_be_bytes(bytes.get(offset + 2..offset + 4).ok_or_else(truncated)?.try_into().unwrap()));
+		let body = bytes.get(offset + 4..offset + 2 + length).ok_or_else(truncated)?;
+		match marker {
+			0xdb => {
+				let mut position = 0;
+				while position < body.len() {
+					let (precision, table) = (body[position] >> 4, usize::from(body[position] & 15));
+					require(precision == 0 && table < 4, "JPEG quantization table is unsupported")?;
+					for index in 0..64 {
+						quantization[table][ZIGZAG[index]] = u16::from(*body.get(position + 1 + index).ok_or_else(truncated)?);
+					}
+					position += 65;
+				}
+			}
+			0xc4 => {
+				let mut position = 0;
+				while position < body.len() {
+					let (class, table) = (usize::from(body[position] >> 4), usize::from(body[position] & 15));
+					require(class < 2 && table < 4, "JPEG Huffman table is unsupported")?;
+					let counts = body.get(position + 1..position + 17).ok_or_else(truncated)?.to_vec();
+					let total = counts.iter().map(|&count| usize::from(count)).sum::<usize>();
+					let symbols = body.get(position + 17..position + 17 + total).ok_or_else(truncated)?.to_vec();
+					huffman[class][table] = Some((counts, symbols));
+					position += 17 + total;
+				}
+			}
+			0xc0 => {
+				let (height, width, components) = (usize::from(u16::from_be_bytes(body[1..3].try_into().unwrap())), usize::from(u16::from_be_bytes(body[3..5].try_into().unwrap())), usize::from(body[5]));
+				require(body[0] == 8, "JPEG precision is unsupported")?;
+				require(matches!(components, 1 | 3), format!("JPEG component count {components} is unsupported"))?;
+				let mut layout = Vec::new();
+				for component in 0..components {
+					let (sampling, table) = (body[7 + 3 * component], usize::from(body[8 + 3 * component]));
+					require(sampling == 0x11, "JPEG chroma subsampling is unsupported")?;
+					layout.push(table);
+				}
+				frame = Some((width, height, layout));
+			}
+			0xc1..=0xcf if marker != 0xc4 && marker != 0xc8 && marker != 0xcc => return Err(RecipeError::new(format!("JPEG frame type {marker:#x} is unsupported"))),
+			0xdd => restart_interval = usize::from(u16::from_be_bytes(body[..2].try_into().unwrap())),
+			0xda => {
+				let components = usize::from(body[0]);
+				let mut tables = Vec::new();
+				for component in 0..components {
+					tables.push((usize::from(body[2 + 2 * component] >> 4), usize::from(body[2 + 2 * component] & 15)));
+				}
+				scan = (tables, offset + 2 + length);
+				break;
+			}
+			_ => {}
+		}
+		offset += 2 + length;
+	}
+	let (width, height, layout) = frame.ok_or_else(|| RecipeError::new("JPEG frame header is absent"))?;
+	let (scan_tables, mut position) = scan;
+	require(scan_tables.len() == layout.len(), "JPEG scan does not cover the frame components")?;
+	// Entropy-coded segment with byte stuffing and restart markers.
+	struct Entropy<'a> {
+		bytes: &'a [u8],
+		position: usize,
+		bits: u32,
+		count: u32,
+	}
+	impl Entropy<'_> {
+		fn bit(&mut self) -> Result<u32> {
+			if self.count == 0 {
+				let byte = *self.bytes.get(self.position).ok_or_else(|| RecipeError::new("JPEG entropy data is truncated"))?;
+				self.position += 1;
+				if byte == 0xff {
+					let stuffed = *self.bytes.get(self.position).ok_or_else(|| RecipeError::new("JPEG entropy data is truncated"))?;
+					require(stuffed == 0, "JPEG marker interrupts entropy data")?;
+					self.position += 1;
+				}
+				self.bits = u32::from(byte);
+				self.count = 8;
+			}
+			self.count -= 1;
+			Ok(self.bits >> self.count & 1)
+		}
+		fn receive(&mut self, length: u32) -> Result<i32> {
+			let mut value = 0_i32;
+			for _ in 0..length {
+				value = value << 1 | self.bit()? as i32;
+			}
+			Ok(value)
+		}
+		fn decode(&mut self, table: &(Vec<u8>, Vec<u8>)) -> Result<u8> {
+			let (mut code, mut first, mut index) = (0_u32, 0_u32, 0_u32);
+			for length in 0..16 {
+				code = code << 1 | self.bit()?;
+				let count = u32::from(table.0[length]);
+				if code < first + count {
+					return Ok(table.1[(index + code - first) as usize]);
+				}
+				index += count;
+				first = (first + count) << 1;
+			}
+			Err(RecipeError::new("JPEG Huffman code is invalid"))
+		}
+	}
+	fn extend(value: i32, length: u32) -> i32 {
+		if length != 0 && value < 1 << (length - 1) { value - (1 << length) + 1 } else { value }
+	}
+	// libjpeg jpeg_idct_islow: 13-bit fixed point, two passes, descale rounding.
+	fn idct(block: &[i32; 64], quantum: &[u16; 64]) -> [u8; 64] {
+		let mut workspace = [0_i32; 64];
+		for column in 0..8 {
+			let at = |row: usize| block[row * 8 + column] * i32::from(quantum[row * 8 + column]);
+			if (1..8).all(|row| at(row) == 0) {
+				let value = at(0) << 2;
+				for row in 0..8 {
+					workspace[row * 8 + column] = value;
+				}
+				continue;
+			}
+			let (z2, z3) = (at(2), at(6));
+			let z1 = (z2 + z3) * 4433;
+			let tmp2 = z1 + z3 * -15137;
+			let tmp3 = z1 + z2 * 6270;
+			let (tmp0, tmp1) = ((at(0) + at(4)) << 13, (at(0) - at(4)) << 13);
+			let (t10, t13, t11, t12) = (tmp0 + tmp3, tmp0 - tmp3, tmp1 + tmp2, tmp1 - tmp2);
+			let (o0, o1, o2, o3) = (at(7), at(5), at(3), at(1));
+			let (z1, z2, z3, z4) = (o0 + o3, o1 + o2, o0 + o2, o1 + o3);
+			let z5 = (z3 + z4) * 9633;
+			let (mut t0, mut t1, mut t2, mut t3) = (o0 * 2446, o1 * 16819, o2 * 25172, o3 * 12299);
+			let (z1, z2) = (z1 * -7373, z2 * -20995);
+			let z3 = z3 * -16069 + z5;
+			let z4 = z4 * -3196 + z5;
+			t0 += z1 + z3;
+			t1 += z2 + z4;
+			t2 += z2 + z3;
+			t3 += z1 + z4;
+			workspace[column] = t10 + t3 + 1024 >> 11;
+			workspace[56 + column] = t10 - t3 + 1024 >> 11;
+			workspace[8 + column] = t11 + t2 + 1024 >> 11;
+			workspace[48 + column] = t11 - t2 + 1024 >> 11;
+			workspace[16 + column] = t12 + t1 + 1024 >> 11;
+			workspace[40 + column] = t12 - t1 + 1024 >> 11;
+			workspace[24 + column] = t13 + t0 + 1024 >> 11;
+			workspace[32 + column] = t13 - t0 + 1024 >> 11;
+		}
+		let mut output = [0_u8; 64];
+		let clamp = |value: i32| value.clamp(0, 255) as u8;
+		for row in 0..8 {
+			let at = |column: usize| workspace[row * 8 + column];
+			let (z2, z3) = (at(2), at(6));
+			let z1 = (z2 + z3) * 4433;
+			let tmp2 = z1 + z3 * -15137;
+			let tmp3 = z1 + z2 * 6270;
+			let (tmp0, tmp1) = ((at(0) + at(4)) << 13, (at(0) - at(4)) << 13);
+			let (t10, t13, t11, t12) = (tmp0 + tmp3, tmp0 - tmp3, tmp1 + tmp2, tmp1 - tmp2);
+			let (o0, o1, o2, o3) = (at(7), at(5), at(3), at(1));
+			let (z1, z2, z3, z4) = (o0 + o3, o1 + o2, o0 + o2, o1 + o3);
+			let z5 = (z3 + z4) * 9633;
+			let (mut t0, mut t1, mut t2, mut t3) = (o0 * 2446, o1 * 16819, o2 * 25172, o3 * 12299);
+			let (z1, z2) = (z1 * -7373, z2 * -20995);
+			let z3 = z3 * -16069 + z5;
+			let z4 = z4 * -3196 + z5;
+			t0 += z1 + z3;
+			t1 += z2 + z4;
+			t2 += z2 + z3;
+			t3 += z1 + z4;
+			output[row * 8] = clamp((t10 + t3 + (1 << 17) >> 18) + 128);
+			output[row * 8 + 7] = clamp((t10 - t3 + (1 << 17) >> 18) + 128);
+			output[row * 8 + 1] = clamp((t11 + t2 + (1 << 17) >> 18) + 128);
+			output[row * 8 + 6] = clamp((t11 - t2 + (1 << 17) >> 18) + 128);
+			output[row * 8 + 2] = clamp((t12 + t1 + (1 << 17) >> 18) + 128);
+			output[row * 8 + 5] = clamp((t12 - t1 + (1 << 17) >> 18) + 128);
+			output[row * 8 + 3] = clamp((t13 + t0 + (1 << 17) >> 18) + 128);
+			output[row * 8 + 4] = clamp((t13 - t0 + (1 << 17) >> 18) + 128);
+		}
+		output
+	}
+	let components = layout.len();
+	let (blocks_x, blocks_y) = (width.div_ceil(8), height.div_ceil(8));
+	let mut planes = vec![vec![0_u8; blocks_x * blocks_y * 64]; components];
+	let mut entropy = Entropy { bytes, position, bits: 0, count: 0 };
+	let mut predictions = vec![0_i32; components];
+	let mut units = 0_usize;
+	for block_y in 0..blocks_y {
+		for block_x in 0..blocks_x {
+			if restart_interval != 0 && units == restart_interval {
+				entropy.count = 0;
+				require(bytes.get(entropy.position) == Some(&0xff) && bytes.get(entropy.position + 1).is_some_and(|marker| (0xd0..=0xd7).contains(marker)), "JPEG restart marker is absent")?;
+				entropy.position += 2;
+				predictions.fill(0);
+				units = 0;
+			}
+			for component in 0..components {
+				let (dc_table, ac_table) = scan_tables[component];
+				let dc = huffman[0][dc_table].as_ref().ok_or_else(|| RecipeError::new("JPEG DC table is absent"))?;
+				let ac = huffman[1][ac_table].as_ref().ok_or_else(|| RecipeError::new("JPEG AC table is absent"))?;
+				let mut block = [0_i32; 64];
+				let length = u32::from(entropy.decode(dc)?);
+				predictions[component] += extend(entropy.receive(length)?, length);
+				block[0] = predictions[component];
+				let mut index = 1;
+				while index < 64 {
+					let symbol = entropy.decode(ac)?;
+					let (run, length) = (usize::from(symbol >> 4), u32::from(symbol & 15));
+					if length == 0 {
+						if run == 15 {
+							index += 16;
+							continue;
+						}
+						break;
+					}
+					index += run;
+					require(index < 64, "JPEG coefficient index overflows")?;
+					block[ZIGZAG[index]] = extend(entropy.receive(length)?, length);
+					index += 1;
+				}
+				let decoded = idct(&block, &quantization[layout[component]]);
+				let plane = &mut planes[component];
+				for row in 0..8 {
+					for column in 0..8 {
+						plane[(block_y * 8 + row) * blocks_x * 8 + block_x * 8 + column] = decoded[row * 8 + column];
+					}
+				}
+			}
+			units += 1;
+		}
+	}
+	position = entropy.position;
+	let _ = position;
+	let mut pixels = vec![0_u8; width * height * components];
+	if components == 1 {
+		for row in 0..height {
+			for column in 0..width {
+				pixels[row * width + column] = planes[0][row * blocks_x * 8 + column];
+			}
+		}
+	} else {
+		// libjpeg ycc_rgb_convert: 16-bit fixed-point coefficients with one-half rounding.
+		let fix = |value: f64| (value * 65536.0 + 0.5) as i64;
+		for row in 0..height {
+			for column in 0..width {
+				let index = row * blocks_x * 8 + column;
+				let (y, cb, cr) = (i64::from(planes[0][index]), i64::from(planes[1][index]) - 128, i64::from(planes[2][index]) - 128);
+				let clamp = |value: i64| value.clamp(0, 255) as u8;
+				let red = y + (fix(1.40200) * cr + 32768 >> 16);
+				let green = y + (-fix(0.34414) * cb - fix(0.71414) * cr + 32768 >> 16);
+				let blue = y + (fix(1.77200) * cb + 32768 >> 16);
+				let out = (row * width + column) * 3;
+				pixels[out] = clamp(red);
+				pixels[out + 1] = clamp(green);
+				pixels[out + 2] = clamp(blue);
+			}
+		}
+	}
+	Ok((width, height, components, pixels))
+}
 /// Decoded 8-bit PNG pixels: grayscale or RGB, no interlacing, all five scanline filters.
 fn png_pixels(bytes: &[u8]) -> Result<(usize, usize, usize, Vec<u8>)> {
 	require(bytes.get(..8) == Some(&b"\x89PNG\r\n\x1a\n"[..]), "PNG signature is absent")?;
