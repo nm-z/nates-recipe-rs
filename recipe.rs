@@ -6113,7 +6113,7 @@ impl Gpu {
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: LossFunction) -> Result<NativeProgram> {
-		let waves_per_workgroup = if matches!(&self.driver, Driver::Cpu) { 1 } else { narrow(natural("contraction resident waves per workgroup", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"))?, "contraction resident waves per workgroup")? as u32 };
+		let vector_waves = if matches!(&self.driver, Driver::Cpu) { 1 } else { narrow(natural("contraction resident waves per workgroup", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"))?, "contraction resident waves per workgroup")? as u32 };
 		let shared_values = if matches!(&self.driver, Driver::Cpu) { narrow(natural("CPU contraction shared values", env!("RECIPE_CONTRACTION_CPU_SHARED_VALUES"))?, "CPU contraction shared values")? as u32 } else { self.shared_limit / precision.bytes() as u32 };
 		let shapes = native_contraction_shapes(graph, rows)?;
 		let mut limits = Tile { m: 1, n: 1, k: 1 };
@@ -6137,6 +6137,8 @@ impl Gpu {
 		let dominant_shape = dominant.and_then(|(index, _)| shapes[index]).map_or(limits, |shape| shape.gradient);
 		let fragment_k = narrow(natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?, "contraction fragment K")? as u32;
 		let matrix = matches!(&self.native_target, BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") || architecture.starts_with("gfx12")) && [Compute::FP16, Compute::BF16, Compute::INT8, Compute::INT4].contains(&precision);
+		let matrix_waves = narrow(natural("contraction matrix maximum waves per workgroup", env!("RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"))?, "contraction matrix maximum waves per workgroup")? as u32;
+		let waves_per_workgroup = if matrix { matrix_waves.min(dominant_shape.m.div_ceil(fragment_k)).max(1) } else { vector_waves };
 		// The reduction chunk is a multiple of the staging fragment so a chunk
 		// boundary never falls inside a vector staging load.
 		let chunk_k = narrow(natural("contraction chunk K", env!("RECIPE_CONTRACTION_CHUNK_K"))?, "contraction chunk K")? as u32;
