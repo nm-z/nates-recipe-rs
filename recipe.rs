@@ -7727,6 +7727,7 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	for path in &mut paths { *path = fs::canonicalize(&*path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))? }
 	paths.sort(); paths.dedup();
 	let mut grouped = Vec::new();
+	let mut table_files = Vec::new();
 	for path in &paths {
 		if !path.extension().and_then(|value| value.to_str()).is_some_and(is_table) {
 			continue;
@@ -7736,6 +7737,10 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 		for table in decode_tables(path, &bytes)? {
 			grouped.push((directory.clone(), table));
 		}
+		table_files.push(path.clone());
+	}
+	if let Some(table) = class_directory_table(data, sources, &grouped, &table_files)? {
+		return Ok((vec![table], paths));
 	}
 	let mut tables = merge_captures(grouped, &data.target)?;
 	tables = merge_partitions(tables, &data.target, &data.exclusions)?;
@@ -7751,6 +7756,29 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 		}
 	}
 	Ok((tables, paths))
+}
+/// A class-labeled sample tree: the requested target names no column in any file, and every
+/// sample file lives in a class subdirectory of the source root. Each file becomes one row
+/// whose text is the feature and whose class directory name is the synthesized target.
+fn class_directory_table(data: &Data, sources: &[String], grouped: &[(PathBuf, Table)], table_files: &[PathBuf]) -> Result<Option<Table>> {
+	let [source] = sources else { return Ok(None) };
+	let [target] = data.target.as_slice() else { return Ok(None) };
+	if grouped.is_empty() || grouped.iter().any(|(_, table)| target_column(table, target).is_some()) {
+		return Ok(None);
+	}
+	let root = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve {source}: {error}")))?;
+	let classes = grouped.iter().map(|(directory, _)| directory).collect::<BTreeSet<_>>();
+	if classes.len() < 2 || classes.iter().any(|directory| directory.parent() != Some(root.as_path())) {
+		return Ok(None);
+	}
+	let mut rows = Vec::new();
+	for path in table_files {
+		let text = fs::read_to_string(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+		let class = path.parent().and_then(Path::file_name).and_then(|value| value.to_str()).ok_or_else(|| RecipeError::new(format!("class directory of {} is unreadable", path.display())))?;
+		rows.push(vec![text.trim().to_owned(), class.to_owned()]);
+	}
+	let name = root.file_name().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
+	Ok(Some(Table { name, headers: vec!["content".to_owned(), target.clone()], rows }))
 }
 fn prepare_data(data: &Data) -> Result<Prepared> {
 	let (mut tables, sources) = load_tables(data, &data.sources)?;
