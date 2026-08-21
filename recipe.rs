@@ -7928,7 +7928,7 @@ fn sample_identity(sample: &[f64], target: f64) -> u64 {
 	const PRIME: u64 = 1099511628211;
 	sample.iter().copied().chain(std::iter::once(target)).fold(OFFSET, |hash, value| (hash ^ value.to_bits()).wrapping_mul(PRIME))
 }
-fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz") }
+fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db") }
 fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	let path = path.as_ref();
 	let mut components = path.components();
@@ -8071,8 +8071,129 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 			}
 			Ok(vec![array_table(name, columns).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
 		}
+		Some("sqlite" | "sqlite3" | "db") => sqlite_tables(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display()))),
 		_ => parse_table(path, bytes).map(|(table, _)| vec![table]),
 	}
+}
+/// Every user table of a SQLite database, walked from its rowid b-trees.
+fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
+	require(bytes.get(..16) == Some(b"SQLite format 3\0"), "SQLite header is absent")?;
+	let page_size = match u16::from_be_bytes(bytes[16..18].try_into().unwrap()) as usize { 1 => 65536, size => size };
+	let mut schema = Vec::new();
+	sqlite_rows(bytes, page_size, 1, &mut schema)?;
+	let mut tables = Vec::new();
+	for row in schema {
+		let [kind, name, _, root, sql] = row.as_slice() else { return Err(RecipeError::new("SQLite schema row has the wrong width")) };
+		if kind != "table" || name.starts_with("sqlite_") {
+			continue;
+		}
+		let root = root.parse::<usize>().map_err(|error| RecipeError::new(format!("invalid SQLite root page: {error}")))?;
+		let columns = sql.split_once('(').map(|(_, rest)| rest.rsplit_once(')').map_or(rest, |(inner, _)| inner)).ok_or_else(|| RecipeError::new(format!("SQLite table {name:?} has no column list")))?;
+		let headers = columns.split(',').map(|column| column.trim().split_whitespace().next().unwrap_or("").trim_matches(['"', '\'', '`', '[', ']']).to_owned()).collect::<Vec<_>>();
+		require(headers.iter().all(|header| !header.is_empty()), format!("SQLite table {name:?} has an unreadable column list"))?;
+		let mut rows = Vec::new();
+		sqlite_rows(bytes, page_size, root, &mut rows)?;
+		for row in &mut rows {
+			require(row.len() <= headers.len(), format!("SQLite table {name:?} row exceeds {} columns", headers.len()))?;
+			row.resize_with(headers.len(), String::new);
+		}
+		tables.push(Table { name: name.clone(), headers, rows });
+	}
+	require(!tables.is_empty(), "SQLite database has no tables")?;
+	Ok(tables)
+}
+/// In-order rowid b-tree walk appending each leaf record's decoded values.
+fn sqlite_rows(bytes: &[u8], page_size: usize, page: usize, rows: &mut Vec<Vec<String>>) -> Result<()> {
+	let start = checked_mul(page - 1, page_size, "SQLite page offset")?;
+	let header = start + if page == 1 { 100 } else { 0 };
+	let contents = bytes.get(start..start + page_size).ok_or_else(|| RecipeError::new(format!("SQLite page {page} is truncated")))?;
+	let kind = *bytes.get(header).ok_or_else(|| RecipeError::new(format!("SQLite page {page} is truncated")))?;
+	let cells = u16::from_be_bytes(bytes[header + 3..header + 5].try_into().unwrap()) as usize;
+	let pointers = header + if kind == 5 { 12 } else { 8 };
+	for cell in 0..cells {
+		let pointer = u16::from_be_bytes(bytes[pointers + cell * 2..pointers + cell * 2 + 2].try_into().unwrap()) as usize;
+		let mut offset = start + pointer;
+		match kind {
+			5 => {
+				let child = u32::from_be_bytes(bytes.get(offset..offset + 4).ok_or_else(|| RecipeError::new("SQLite interior cell is truncated"))?.try_into().unwrap()) as usize;
+				sqlite_rows(bytes, page_size, child, rows)?;
+			}
+			13 => {
+				let (payload, _) = sqlite_varint(bytes, &mut offset)?;
+				let _ = sqlite_varint(bytes, &mut offset)?;
+				let usable = page_size - 35;
+				require((payload as usize) <= usable, format!("SQLite page {page} overflows; overflow pages are unsupported"))?;
+				rows.push(sqlite_record(bytes.get(offset..offset + payload as usize).ok_or_else(|| RecipeError::new("SQLite record is truncated"))?)?);
+			}
+			_ => return Err(RecipeError::new(format!("SQLite page type {kind} is unsupported"))),
+		}
+	}
+	if kind == 5 {
+		let right = u32::from_be_bytes(bytes[header + 8..header + 12].try_into().unwrap()) as usize;
+		sqlite_rows(bytes, page_size, right, rows)?;
+	}
+	let _ = contents;
+	Ok(())
+}
+fn sqlite_varint(bytes: &[u8], offset: &mut usize) -> Result<(i64, usize)> {
+	let mut value = 0_i64;
+	for length in 1..=9 {
+		let byte = *bytes.get(*offset).ok_or_else(|| RecipeError::new("SQLite varint is truncated"))?;
+		*offset += 1;
+		if length == 9 {
+			value = value << 8 | i64::from(byte);
+			return Ok((value, length));
+		}
+		value = value << 7 | i64::from(byte & 0x7f);
+		if byte & 0x80 == 0 {
+			return Ok((value, length));
+		}
+	}
+	unreachable!()
+}
+/// Decode one SQLite record into per-column text values.
+fn sqlite_record(record: &[u8]) -> Result<Vec<String>> {
+	let mut offset = 0;
+	let (header, _) = sqlite_varint(record, &mut offset)?;
+	let mut serials = Vec::new();
+	while offset < header as usize {
+		serials.push(sqlite_varint(record, &mut offset)?.0);
+	}
+	let mut body = header as usize;
+	let mut values = Vec::with_capacity(serials.len());
+	for serial in serials {
+		let mut integer = |width: usize| -> Result<i64> {
+			let mut value = if record.get(body).is_some_and(|byte| byte & 0x80 != 0) { -1_i64 } else { 0 };
+			for _ in 0..width {
+				value = value << 8 | i64::from(*record.get(body).ok_or_else(|| RecipeError::new("SQLite value is truncated"))?);
+				body += 1;
+			}
+			Ok(value)
+		};
+		values.push(match serial {
+			0 => String::new(),
+			1 => integer(1)?.to_string(),
+			2 => integer(2)?.to_string(),
+			3 => integer(3)?.to_string(),
+			4 => integer(4)?.to_string(),
+			5 => integer(6)?.to_string(),
+			6 => integer(8)?.to_string(),
+			7 => {
+				let value = f64::from_bits(integer(8)? as u64);
+				value.to_string()
+			}
+			8 => "0".to_owned(),
+			9 => "1".to_owned(),
+			serial if serial >= 13 && serial % 2 == 1 => {
+				let length = (serial as usize - 13) / 2;
+				let text = record.get(body..body + length).ok_or_else(|| RecipeError::new("SQLite text is truncated"))?;
+				body += length;
+				String::from_utf8(text.to_vec()).map_err(|error| RecipeError::new(format!("SQLite text is not UTF-8: {error}")))?
+			}
+			serial => return Err(RecipeError::new(format!("SQLite serial type {serial} is unsupported"))),
+		});
+	}
+	Ok(values)
 }
 /// The stored entries of a ZIP archive, resolved through the central directory.
 fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
