@@ -6276,7 +6276,7 @@ impl Gpu {
 		let probing = !sequential && !matrix && !NATIVE_TILE_SEARCH.with(std::cell::Cell::get);
 		// The probe is only built on a store miss: a model whose schedules were
 		// all measured before loads nothing extra.
-		let mut probe: Option<Option<NativeTileProbe>> = None;
+		let mut probe: Option<NativeTileProbe> = None;
 		let config = probing.then(Config::load).transpose()?;
 		let prefix = format!("{}|{}|b{block}|r{register_m}x{register_n}|c{chunk_k}", native_target_label(&self.native_target).split(";features=").next().unwrap_or("unknown"), precision.label());
 		let single = |tile: Tile| -> Result<NativeChoice> {
@@ -6308,25 +6308,13 @@ impl Gpu {
 					}
 				}
 				if probe.is_none() {
-					*probe = Some(match native_tile_probe(self, &shapes, register_m, register_n, block, waves, shared_budget, fragment_k, chunk_k, ratio, precision) {
-						Ok(probe) => probe,
-						Err(error) => {
-							debug(&format!("native schedule probing unavailable: {error}"))?;
-							None
-						}
-					});
+					*probe = Some(native_tile_probe(self, &shapes, register_m, register_n, block, waves, shared_budget, fragment_k, chunk_k, ratio, precision)?);
 				}
-				let Some(Some(probe)) = probe.as_ref() else { return Ok(analytic) };
+				let probe = probe.as_ref().ok_or_else(|| RecipeError::new("native schedule probe is absent"))?;
 				NATIVE_TILE_SEARCH.with(|flag| flag.set(true));
 				let selected = rat_contraction_tile(self, probe, &prefix, direction, limits, relu, analytic, &candidates, config);
 				NATIVE_TILE_SEARCH.with(|flag| flag.set(false));
-				match selected {
-					Ok(choice) => Ok(choice),
-					Err(error) => {
-						debug(&format!("native schedule search failed, keeping the analytic tile: {error}"))?;
-						Ok(analytic)
-					}
-				}
+				selected
 			};
 			let forward = pick(shape.forward, ContractionDirection::Forward)?;
 			let gradient = pick(shape.gradient, ContractionDirection::Gradient)?;
@@ -8077,13 +8065,10 @@ fn rat_contraction_tile(gpu: &'static Gpu, probe: &NativeTileProbe, prefix: &str
 }
 /// Build the tile probe for a model's contraction shapes: one artifact and one
 /// set of device buffers sized for every candidate of every shape, so each
-/// measurement is a single launch. Declines when there is nothing to measure or
-/// the operands would not fit the probe's allocation ceiling.
-fn native_tile_probe(gpu: &'static Gpu, shapes: &[Option<NativeContractionShapes>], register_m: u32, register_n: u32, block: u32, waves: u32, shared_budget: u32, fragment_k: u32, chunk_k: u32, ratio: u32, precision: Compute) -> Result<Option<NativeTileProbe>> {
+/// measurement is a single launch.
+fn native_tile_probe(gpu: &'static Gpu, shapes: &[Option<NativeContractionShapes>], register_m: u32, register_n: u32, block: u32, waves: u32, shared_budget: u32, fragment_k: u32, chunk_k: u32, ratio: u32, precision: Compute) -> Result<NativeTileProbe> {
 	let directions = shapes.iter().flatten().flat_map(|shape| [shape.forward, shape.gradient, shape.previous]).collect::<Vec<_>>();
-	if directions.is_empty() {
-		return Ok(None);
-	}
+	require(!directions.is_empty(), "native schedule probe has no contraction shapes")?;
 	let native = NativePrecision::new(precision)?;
 	let (mut samples_capacity, mut weights_capacity, mut output_capacity, mut gradient_stride) = (1_usize, 1_usize, 1_usize, NATIVE_SCRATCH_ROW_VALUES);
 	let (mut shared_values, mut owned, mut widest) = (1_u32, 1_u32, Tile { m: 1, n: 1, k: 1 });
@@ -8108,9 +8093,7 @@ fn native_tile_probe(gpu: &'static Gpu, shapes: &[Option<NativeContractionShapes
 	let scratch_base = gradient_stride;
 	let gradient_capacity = checked_add(scratch_base, checked_mul(NATIVE_K_PARTITIONS, gradient_stride, "probe gradient scratch")?, "probe gradient buffer")?;
 	let values_capacity = checked_add(output_capacity, gradient_capacity, "probe value buffer")?;
-	if checked_add(checked_add(samples_capacity, weights_capacity, "probe operands")?, values_capacity, "probe allocation")? > PROBE_CAPACITY {
-		return Ok(None);
-	}
+	require(checked_add(checked_add(samples_capacity, weights_capacity, "probe operands")?, values_capacity, "probe allocation")? <= PROBE_CAPACITY, "native schedule probe operands exceed the allocation ceiling")?;
 	let register_count = register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
 	let chunk_values = owned.checked_mul(register_count).ok_or_else(|| RecipeError::new("native contraction chunk buffer overflows"))?;
 	let chunk_bias_values = owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?;
@@ -8133,14 +8116,14 @@ fn native_tile_probe(gpu: &'static Gpu, shapes: &[Option<NativeContractionShapes
 	};
 	let register_values = register_count.checked_add(register_n).and_then(|values| values.checked_mul(ratio)).ok_or_else(|| RecipeError::new("native contraction register reduction overflows"))?;
 	let program = NativeProgram::load(gpu, artifact, &Graph::new(Shape { channels: 1, length: 1 }), schedule, register_values, waves)?;
-	Ok(Some(NativeTileProbe {
+	Ok(NativeTileProbe {
 		program,
 		samples: Buffer::upload_float(gpu, &vec![0.01; samples_capacity], precision)?,
 		weights: Buffer::upload_float(gpu, &vec![0.01; weights_capacity], precision)?,
 		values: Buffer::upload_float(gpu, &vec![0.0; values_capacity], precision)?,
 		parameters: Buffer::upload(gpu, &[0_i32; PROBE_PARAMETER_COUNT])?,
 		gradient_offset: output_capacity,
-	}))
+	})
 }
 fn native_gradient_values(parameters: usize, contractions: &[Option<NativeContractionTiles>]) -> Result<usize> {
 	let mut scratch = 0_usize;
