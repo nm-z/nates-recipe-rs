@@ -7928,7 +7928,7 @@ fn sample_identity(sample: &[f64], target: f64) -> u64 {
 	const PRIME: u64 = 1099511628211;
 	sample.iter().copied().chain(std::iter::once(target)).fold(OFFSET, |hash, value| (hash ^ value.to_bits()).wrapping_mul(PRIME))
 }
-fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl") }
+fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json") }
 fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	let path = path.as_ref();
 	let mut components = path.components();
@@ -8058,7 +8058,29 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 			let records = text.lines().map(str::trim).filter(|line| !line.is_empty()).map(|line| json_value(line).map(|(value, _)| value)).collect::<Result<Vec<_>>>().map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
 			Ok(vec![json_records_table(name, &records).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
 		}
+		Some("json") => {
+			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("dataset {} is not UTF-8: {error}", path.display())))?;
+			let records = json_array(text).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
+			Ok(vec![json_records_table(name, &records).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
+		}
 		_ => parse_table(path, bytes).map(|(table, _)| vec![table]),
+	}
+}
+/// The records of a top-level JSON array.
+fn json_array(text: &str) -> Result<Vec<JsonValue>> {
+	let mut rest = text.trim_start().strip_prefix('[').ok_or_else(|| RecipeError::new("JSON records expect a top-level array"))?.trim_start();
+	let mut values = Vec::new();
+	loop {
+		if let Some(after) = rest.strip_prefix(']') {
+			require(after.trim().is_empty(), "JSON records have trailing content")?;
+			return Ok(values);
+		}
+		if !values.is_empty() {
+			rest = rest.strip_prefix(',').ok_or_else(|| RecipeError::new("JSON array expects a comma"))?.trim_start();
+		}
+		let (value, remaining) = json_value(rest)?;
+		values.push(value);
+		rest = remaining.trim_start();
 	}
 }
 enum JsonValue {
