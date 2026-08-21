@@ -3283,7 +3283,25 @@ mod bundle {
 			require(!semantic.artifact.is_empty(), "native artifact identity is absent")?;
 			field(&mut document, "artifact", &text(&semantic.artifact));
 		}
-		fs::write(path, document).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", path.display())))
+		// Publish atomically through an exclusively created temporary sibling: the path always
+		// holds one publisher's complete model, and concurrent publishers never share a file.
+		let mut serial = 0;
+		let (temporary, mut file) = loop {
+			let candidate = path.with_extension(format!("ogdl.{}.{serial}.tmp", std::process::id()));
+			match fs::File::create_new(&candidate) {
+				Ok(file) => break (candidate, file),
+				Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => serial += 1,
+				Err(error) => return Err(RecipeError::new(format!("cannot write {}: {error}", candidate.display()))),
+			}
+		};
+		let published = file.write_all(document.as_bytes()).and_then(|()| file.sync_all()).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", temporary.display()))).and_then(|()| {
+			drop(file);
+			fs::rename(&temporary, path).map_err(|error| RecipeError::new(format!("cannot publish {}: {error}", path.display())))
+		});
+		if published.is_err() {
+			fs::remove_file(&temporary).ok();
+		}
+		published
 	}
 	fn join<T: ToString>(values: &[T]) -> String { values.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ") }
 	fn same_structure(a: &SemanticGraph, b: &SemanticGraph) -> bool {
