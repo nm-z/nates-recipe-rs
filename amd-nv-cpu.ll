@@ -904,67 +904,7 @@ br i1 %more, label %step, label %done step: %index = add i32 %input.base, %i
 %maximum.index.wide = zext i32 %maximum.index to i64
 store double %maximum, ptr addrspace(1) %output.ptr, align 8
 store i64 %maximum.index.wide, ptr addrspace(1) %context.ptr, align 8 ret void }
-define internal i32 @embedding_index(double %value, i32 %vocabulary) #1 { entry:
-%difference = call double @recipe.sub(double %value, double %value) %finite = call i1 @recipe.ord(double %difference, double %difference) br i1 %finite, label %convert, label %invalid convert:
-%floored = call double @recipe.floor(double %value)
-%max.index = sub i32 %vocabulary, 1 %max.double = call double @recipe.from.u32(i32 %max.index)
-%low = call i1 @recipe.olt(double %floored, double 0.0) %clamped.low = select i1 %low, double 0.0, double %floored
-%high = call i1 @recipe.ogt(double %clamped.low, double %max.double)
-%clamped = select i1 %high, double %max.double, double %clamped.low
-%index = call i32 @recipe.to.u32(double %clamped) ret i32 %index
-invalid: ret i32 %vocabulary } define internal void @embedding_forward_body(
-ptr addrspace(1) nocapture readonly %input, ptr addrspace(1) nocapture readonly %table, ptr addrspace(1) nocapture writeonly %output, ptr addrspace(1) %context, i32 %p, i32 %from, i32 %to, i32 %vocabulary ) #1 { entry:
-%dimensions = udiv i32 %to, %from %row = udiv i32 %p, %to %local = urem i32 %p, %to %component = udiv i32 %local, %from
-%slot = urem i32 %local, %from %row.base = mul i32 %row, %from %input.index = add i32 %row.base, %slot
-%input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %input.index
-%value = load double, ptr addrspace(1) %input.ptr, align 8
-%index = call i32 @embedding_index(double %value, i32 %vocabulary) %valid = icmp ult i32 %index, %vocabulary
-br i1 %valid, label %lookup, label %invalid lookup: %table.base = mul i32 %index, %dimensions
-%table.index = add i32 %table.base, %component
-%table.ptr = getelementptr inbounds double, ptr addrspace(1) %table, i32 %table.index
-%embedded = load double, ptr addrspace(1) %table.ptr, align 8 br label %store invalid:
-store atomic i32 1, ptr addrspace(1) %context monotonic, align 4 br label %store store:
-%result = phi double [ %embedded, %lookup ], [ 0x7FF8000000000000, %invalid ]
-%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
-store double %result, ptr addrspace(1) %output.ptr, align 8 ret void } define internal void @embedding_reverse_body(
-ptr addrspace(1) %input, ptr addrspace(1) %delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.previous,
-i32 %rows, i32 %tokens, i32 %dimensions, i32 %vocabulary, i32 %offset, i32 %threads ) #1 { entry:
-%tid = call i32 @llvm.amdgcn.workitem.id.x() %parameters = mul i32 %dimensions, %vocabulary %output.row.width = mul i32 %tokens, %dimensions br label %parameter.loop
-parameter.loop: %p = phi i32 [ %tid, %entry ], [ %next, %store ] %more = icmp ult i32 %p, %parameters
-br i1 %more, label %row.loop, label %input.test row.loop:
-%row = phi i32 [ 0, %parameter.loop ], [ %row.next, %token.loop.done ]
-%sum = phi double [ 0.0, %parameter.loop ], [ %row.sum, %token.loop.done ] %row.more = icmp ult i32 %row, %rows
-br i1 %row.more, label %token.loop, label %store token.loop:
-%token = phi i32 [ 0, %row.loop ], [ %token.next, %token.step ]
-%token.sum = phi double [ %sum, %row.loop ], [ %sum.next, %token.step ] %token.more = icmp ult i32 %token, %tokens
-br i1 %token.more, label %token.step, label %token.loop.done token.step: %input.base = mul i32 %row, %tokens
-%input.index = add i32 %input.base, %token
-%input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %input.index
-%input.value = load double, ptr addrspace(1) %input.ptr, align 8
-%index = call i32 @embedding_index(double %input.value, i32 %vocabulary) %expected = udiv i32 %p, %dimensions
-%matched = icmp eq i32 %index, %expected %component = urem i32 %p, %dimensions %output.row.base = mul i32 %row, %output.row.width
-%output.channel.base = mul i32 %component, %tokens %output.local = add i32 %output.channel.base, %token
-%output.index = add i32 %output.row.base, %output.local
-%delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %output.index
-%delta.value = load double, ptr addrspace(1) %delta.ptr, align 8
-%contribution = select i1 %matched, double %delta.value, double 0.0 %sum.next = call double @recipe.add(double %token.sum, double %contribution)
-%token.next = add nuw i32 %token, 1 br label %token.loop token.loop.done:
-%row.sum = phi double [ %token.sum, %token.loop ] %row.next = add nuw i32 %row, 1 br label %row.loop store:
-%gradient.index = add i32 %offset, %p
-%gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient, i32 %gradient.index
-store double %sum, ptr addrspace(1) %gradient.ptr, align 8 %next = add i32 %p, %threads br label %parameter.loop input.test:
-br i1 %write.previous, label %input.loop, label %exit input.loop: %input.p = phi i32 [ %tid, %input.test ], [ %input.next, %input.store ] %input.count = mul i32 %rows, %tokens
-%input.more = icmp ult i32 %input.p, %input.count br i1 %input.more, label %input.component.loop, label %exit input.component.loop: %input.component = phi i32 [ 0, %input.loop ], [ %input.component.next, %input.component.step ]
-%input.sum = phi double [ 0.0, %input.loop ], [ %input.sum.next, %input.component.step ] %input.component.more = icmp ult i32 %input.component, %dimensions br i1 %input.component.more, label %input.component.step, label %input.store input.component.step:
-%input.row = udiv i32 %input.p, %tokens %input.token = urem i32 %input.p, %tokens %input.row.width = mul i32 %tokens, %dimensions %input.row.base = mul i32 %input.row, %input.row.width %input.component.base = mul i32 %input.component, %tokens %input.local = add i32 %input.component.base, %input.token
-%input.delta.index = add i32 %input.row.base, %input.local %input.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %input.delta.index
-%input.delta = load double, ptr addrspace(1) %input.delta.ptr, align 8 %input.sum.next = call double @recipe.add(double %input.sum, double %input.delta)
-%input.component.next = add nuw i32 %input.component, 1 br label %input.component.loop input.store: %input.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %input.p
-%input.prior = load double, ptr addrspace(1) %input.previous.ptr, align 8
-%input.accumulated = call double @recipe.add(double %input.prior, double %input.sum)
-store double %input.accumulated, ptr addrspace(1) %input.previous.ptr, align 8
-%input.next = add i32 %input.p, %threads br label %input.loop exit:
-ret void } define internal double @sigmoid(double %x) #1 { entry: %negative = call double @recipe.neg(double %x)
+define internal double @sigmoid(double %x) #1 { entry: %negative = call double @recipe.neg(double %x)
 %exponential = call double @recipe.exp(double %negative) %denominator = call double @recipe.add(double 1.0, double %exponential)
 %value = call double @recipe.div(double 1.0, double %denominator) ret double %value }
 define internal double @attention_tile_dot(i32 %left, i32 %right, i32 %width, i32 %left.base, i32 %right.base) #1 { entry:

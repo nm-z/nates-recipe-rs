@@ -1838,14 +1838,6 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 				}
-				(false, Primitive::Gather) => {
-					let vocabulary = integer_argument(node.argument[0], "embedding vocabulary")?;
-					let count = checked_mul(self.rows, node.output.elements(), "embedding output count")?;
-						emit_fixed_loop(&mut ir, index, "gather", count, |ir, p| {
-							ir.push_str(&format!("call void @embedding_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 {p}, i32 {from}, i32 {to}, i32 {vocabulary} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, p = p, from = node.input.elements(), to = node.output.elements(), vocabulary = vocabulary));
-					})?;
-					ir.push_str(barrier(backend));
-				}
 				(false, Primitive::Attention) => {
 					let tile = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && tile.m as usize == node.output.length { "attention_forward_matrix_body" } else { "attention_forward_body" };
@@ -1932,10 +1924,6 @@ impl NativeModelIr {
 						let source_sum = format!("%{prefix}.source.adjoint.sum");
 						ir.push_str(&format!("{context_pointer} = getelementptr inbounds i64, {pointer} {context}, i32 {p}\n{context_wide} = load i64, {pointer} {context_pointer}, align 8\n{context_index} = trunc i64 {context_wide} to i32\n{delta_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i32 {p}\n{delta_value} = load {ty}, {pointer} {delta_pointer}, align {align}\n{source_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i32 {context_index}\n{source_value} = load {ty}, {pointer} {source_pointer}, align {align}\n{source_sum} = call {ty} @recipe.add({ty} {source_value}, {ty} {delta_value})\nstore {ty} {source_sum}, {pointer} {source_pointer}, align {align}\n", context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, align = alignment(ty), pointer = pointer, ty = ty));
 					})?;
-					ir.push_str(barrier(backend));
-				}
-				(true, Primitive::Gather) => {
-						ir.push_str(&format!("call void @embedding_reverse_body( {pointer} {source}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_source}, i32 %rows, i32 {tokens}, i32 {dimensions}, i32 {vocabulary}, i32 {offset}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_source = if node.source >= 0 { "true" } else { "false" }, tokens = node.input.elements(), dimensions = node.output.channels, vocabulary = integer_argument(node.argument[0], "embedding vocabulary")?, offset = plan.node.offset));
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Attention) => {
@@ -2935,7 +2923,6 @@ mod bundle {
 			Operation::Conv(filters, kernel) => format!("conv,{filters},{kernel}"),
 			Operation::Pool(size) => format!("pool,{size}"),
 			Operation::Estimator(estimator) => format!("estimator,{},{}", estimator.name, estimator.param),
-			Operation::Embed(dimensions, vocabulary) => format!("embed,{dimensions},{vocabulary}"),
 			Operation::Attention(heads) => format!("attn,{heads}"),
 			Operation::Rnn(width) => format!("rnn,{width}"),
 			Operation::Gru(width) => format!("gru,{width}"),
@@ -2967,7 +2954,6 @@ mod bundle {
 			"conv" => Ok(Operation::Conv(value_at(fields.next(), "convolution filters")?, value_at(fields.next(), "convolution kernel")?)),
 			"pool" => Ok(Operation::Pool(value_at(Some(rest), "pool size")?)),
 			"estimator" => Ok(Operation::Estimator(estimator(fields.next().unwrap_or(""), value_at(fields.next(), "estimator parameter")? )?)),
-			"embed" => Ok(Operation::Embed(value_at(fields.next(), "embedding dimensions")?, value_at(fields.next(), "embedding vocabulary")?)),
 			"attn" => Ok(Operation::Attention(value_at(Some(rest), "attention heads")?)),
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
 			"gru" => Ok(Operation::Gru(value_at(Some(rest), "GRU width")?)),
@@ -3394,7 +3380,6 @@ enum Operation {
 	Conv(usize, usize),
 	Pool(usize),
 	Estimator(Estimator),
-	Embed(usize, usize),
 	Attention(usize),
 	Rnn(usize),
 	Gru(usize),
@@ -3481,7 +3466,6 @@ impl Model {
 	fn cbst() = Operation::Estimator(Estimator { fit: fit_catboost, validate: valid_estimator, param: 0, name: "cbst" });
 	fn xgbst() = Operation::Estimator(Estimator { fit: fit_xgboost, validate: valid_estimator, param: 0, name: "xgbst" });
 	fn lgbm() = Operation::Estimator(Estimator { fit: fit_lightgbm, validate: valid_estimator, param: 0, name: "lgbm" });
-	fn embed(dimensions: usize, vocabulary: usize) = Operation::Embed(dimensions, vocabulary);
 	fn attn(heads: usize) = Operation::Attention(heads);
 	fn rnn(width: usize) = Operation::Rnn(width);
 	fn gru(width: usize) = Operation::Gru(width);
@@ -4554,7 +4538,6 @@ impl Operation {
 			Self::Conv(..) => "conv",
 			Self::Pool(_) => "pool",
 			Self::Estimator(value) => value.name(),
-			Self::Embed(..) => "embed",
 			Self::Attention(_) => "attn",
 			Self::Rnn(_) => "rnn",
 			Self::Gru(_) => "gru",
@@ -4710,7 +4693,6 @@ impl Shape {
 enum Primitive {
 	Contraction = 0,
 	Pool = 2,
-	Gather = 3,
 	Attention = 4,
 	Scan = 5,
 	Elementwise = 6,
@@ -4738,7 +4720,6 @@ impl Node {
 		let prim = match self.op {
 			Primitive::Contraction => "Contraction",
 			Primitive::Pool => "Pool",
-			Primitive::Gather => "Gather",
 			Primitive::Attention => "Attention",
 			Primitive::Scan => "Scan",
 			Primitive::Elementwise => "Elementwise",
@@ -4811,7 +4792,7 @@ fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, confi
 	if let Some(format) = model.blocks.iter().map(|block| StorageFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
 		return Err(format.unavailable());
 	}
-	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..) | Operation::Embed(..));
+	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..));
 	let shape = if sequential { data.sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
 	for (index, block) in model.blocks.iter().enumerate() {
@@ -4893,7 +4874,6 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Layer(width) | Operation::Perceptron(width) => lower_project(graph, *width)?,
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
-		Operation::Embed(dimensions, vocabulary) => lower_gather(graph, *dimensions, *vocabulary)?,
 		Operation::Attention(heads) => lower_attention(graph, *heads)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
@@ -5079,11 +5059,6 @@ fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	require(size != 0, "pool window must be positive")?;
 	let output = Shape { channels: graph.output.channels, length: graph.output.length.div_ceil(size) };
 	push_node(graph, Primitive::Pool, output, 0, arguments(size as f64, 0.0), -2)
-}
-fn lower_gather(graph: &mut Graph, dimensions: usize, vocabulary: usize) -> Result<()> {
-	require(dimensions != 0 && vocabulary != 0, "embedding dimensions must be positive")?;
-	let (parameters, output) = (checked_mul(dimensions, vocabulary, "embedding table")?, Shape { channels: dimensions, length: graph.output.elements() });
-	push_node(graph, Primitive::Gather, output, parameters, arguments(vocabulary as f64, 0.0), -2)
 }
 fn lower_attention(graph: &mut Graph, heads: usize) -> Result<()> {
 	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
@@ -5396,7 +5371,6 @@ struct NativeTape {
 	values: Buffer,
 	contexts: Buffer,
 	adjoints: Buffer,
-	gathers: Vec<(usize, String)>,
 	batch_normalizations: Vec<(usize, usize)>,
 	samples: Buffer,
 	input_adjoint: Buffer,
@@ -5439,7 +5413,6 @@ impl NativeTape {
 		let variances = if graph.state.variances.is_empty() { zeros.clone() } else { graph.state.variances.clone() };
 		let frozen = if graph.frozen.is_empty() { vec![0_u8; parameters.max(1)] } else { graph.frozen.clone() };
 		let batch_normalizations = graph.nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels))).collect();
-		let gathers = graph.nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Gather).then_some((index, node.identity(index)))).collect();
 		let best = if graph.state.best.is_empty() { graph.parameters.clone() } else { graph.state.best.clone() };
 		require(best.len() == parameters, "saved best model has the wrong shape")?;
 		let best_loss = if graph.state.best_loss.is_empty() { [f64::INFINITY, f64::NAN, f64::NAN, f64::INFINITY] } else { graph.state.best_loss.as_slice().try_into().map_err(|_| RecipeError::new("saved loss state is invalid"))? };
@@ -5469,7 +5442,6 @@ impl NativeTape {
 			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
 			contexts: Buffer::upload(gpu, &vec![0_u8; layout.contexts_bytes.max(1)])?,
 			adjoints: Buffer::upload(gpu, &vec![0_u8; layout.adjoints_bytes.max(1)])?,
-			gathers,
 			batch_normalizations,
 			samples: Buffer::upload_float(gpu, samples, precision.model)?,
 			input_adjoint: Buffer::upload_float(gpu, &vec![0.0; samples.len().max(1)], precision.model)?,
@@ -5498,7 +5470,7 @@ impl NativeTape {
 		let thread_count = threads;
 		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count];
 		self.program.launch_forward(&mut call).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
-		self.gather_error("forward")
+		Ok(())
 	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
 		let expected = self.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
@@ -5517,13 +5489,6 @@ impl NativeTape {
 			stats.extend(self.contexts.download_float_bytes(self.program.artifact.layout.contexts[node], 2 * channels, self.precision.model)?);
 		}
 		Ok(stats)
-	}
-	fn gather_error(&self, operation: &str) -> Result<()> {
-		for (index, identity) in &self.gathers {
-			let offset = self.program.artifact.layout.contexts[*index] / size_of::<u32>();
-			require(self.contexts.download_range::<u32>(offset, 1)?[0] == 0, format!("{identity}, device {} {:?} {operation} received nonfinite input", self.program.gpu.name, self.program.gpu.backend))?;
-		}
-		Ok(())
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
 		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
@@ -5570,8 +5535,6 @@ impl NativeTape {
 		debug(&format!("epoch {step} launch"))?;
 		self.program.launch_epoch(&mut call).map_err(|error| RecipeError::new(format!("training forward/backward/optimizer update: {error}")))?;
 		debug(&format!("epoch {step} launch complete"))?;
-		self.gather_error("training forward/backward/optimizer update")?;
-		debug(&format!("epoch {step} gather complete"))?;
 		let objective = self.metrics.download_float(1, self.precision.state)?[0];
 		debug(&format!("epoch {step} metric complete"))?;
 		let saved = self.observe(objective, tolerance, track_best)?;
@@ -5652,7 +5615,6 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 			checked_add(states, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?
 		}
 		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),
-		Primitive::Gather => return Ok(size_of::<u32>()),
 		Primitive::Normalize => {
 			let groups = node.output.channels.max(checked_mul(rows, node.output.length, "layer groups")?);
 			checked_mul(4, groups, "normalization context")?

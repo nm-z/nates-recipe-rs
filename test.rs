@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DATA_MODES: usize = 7;
 const AUTOREGRESSIVE_DATA_MODES: usize = 4;
-const MODEL_OPERATIONS: usize = 23;
+const MODEL_OPERATIONS: usize = 22;
 const ACTIVATIONS: usize = 16;
 const NORMALIZATIONS: usize = 2;
 const QUANTIZATIONS: &[(u16, u8, u16)] = &[
@@ -219,16 +219,15 @@ fn operation(model: Model, operation: usize) -> (Model, &'static str) {
 		10 => (model.cbst(), ".cbst()"),
 		11 => (model.xgbst(), ".xgbst()"),
 		12 => (model.lgbm(), ".lgbm()"),
-		13 => (model.embed(8, 256), ".embed(8, 256)"),
-		14 => (model.attn(1), ".attn(1)"),
-		15 => (model.rnn(8), ".rnn(8)"),
-		16 => (model.gru(8), ".gru(8)"),
-		17 => (model.lstm(8), ".lstm(8)"),
-		18 => (model.layer(8).residual([layer(8), layer(8)]), ".layer(8).residual([layer(8), layer(8)])"),
-		19 => (model.layer(8).residual([conv(8, 1), conv(8, 1)]), ".layer(8).residual([conv(8, 1), conv(8, 1)])"),
-		20 => (model.layer(8).residual([conv(8, 1), relu(), layer(8)]), ".layer(8).residual([conv(8, 1), relu(), layer(8)])"),
-		21 => (model.layer(8).moe(1, [layer(8), layer(8)]), ".layer(8).moe(1, [layer(8), layer(8)])"),
-		22 => (model.perc(8), ".perc(8)"),
+		13 => (model.attn(1), ".attn(1)"),
+		14 => (model.rnn(8), ".rnn(8)"),
+		15 => (model.gru(8), ".gru(8)"),
+		16 => (model.lstm(8), ".lstm(8)"),
+		17 => (model.layer(8).residual([layer(8), layer(8)]), ".layer(8).residual([layer(8), layer(8)])"),
+		18 => (model.layer(8).residual([conv(8, 1), conv(8, 1)]), ".layer(8).residual([conv(8, 1), conv(8, 1)])"),
+		19 => (model.layer(8).residual([conv(8, 1), relu(), layer(8)]), ".layer(8).residual([conv(8, 1), relu(), layer(8)])"),
+		20 => (model.layer(8).moe(1, [layer(8), layer(8)]), ".layer(8).moe(1, [layer(8), layer(8)])"),
+		21 => (model.perc(8), ".perc(8)"),
 		_ => unreachable!(),
 	}
 }
