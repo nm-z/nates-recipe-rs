@@ -68,6 +68,7 @@ pub enum PredictorOpcode {
 	Divide = 9,
 	Greater = 10,
 	Choose = 11,
+	Nearest = 12,
 }
 
 impl PredictorOpcode {
@@ -85,6 +86,7 @@ impl PredictorOpcode {
 			9 => Ok(Self::Divide),
 			10 => Ok(Self::Greater),
 			11 => Ok(Self::Choose),
+			12 => Ok(Self::Nearest),
 			_ => Err(EmitError::InvalidOpcode { kind: "predictor", value }),
 		}
 	}
@@ -409,6 +411,9 @@ pub struct PredictorContext<'a> {
 	pub input: &'a str,
 	pub row: &'a str,
 	pub features: usize,
+	pub weights: &'a str,
+	pub offset: usize,
+	pub parameters: usize,
 	pub prefix: &'a str,
 	pub literal: &'a LiteralFn<'a>,
 }
@@ -507,6 +512,67 @@ pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorCon
 				let _ = writeln!(output, "{condition_true} = call i1 @recipe.one({ty} {condition}, {ty} {zero})", ty = context.value_type, zero = (context.literal)(0.0, context.value_type));
 				let _ = writeln!(output, "{value} = select i1 {condition_true}, {ty} {yes}, {ty} {no}", ty = context.value_type);
 				stack.push(value);
+			}
+			PredictorOpcode::Nearest => {
+				let count = integer(argument.abs(), "nearest count")?;
+				if count <= 0 {
+					return Err(EmitError::InvalidOperand { kind: "nearest count", value: argument });
+				}
+				let (count, exclude) = (count as usize, argument < 0.0);
+				let rows = context.parameters / (context.features + 1);
+				if rows == 0 || rows * (context.features + 1) != context.parameters {
+					return Err(EmitError::InvalidOperand { kind: "nearest table width", value: context.parameters as f64 });
+				}
+				let ty = context.value_type;
+				let (ptr, align) = (context.pointer_type, context.alignment);
+				let p = format!("{}.nearest.{sequence}", context.prefix);
+				sequence += 1;
+				let (zero, maximum) = ((context.literal)(0.0, ty), (context.literal)(f64::MAX, ty));
+				// Row loop head: induction variable plus the k best (distance, target) pairs as phis.
+				let _ = writeln!(output, "br label %{p}.entry\n{p}.entry:\nbr label %{p}.head\n{p}.head:");
+				let _ = writeln!(output, "%{p}.i = phi i32 [ 0, %{p}.entry ], [ %{p}.i.next, %{p}.latch ]");
+				for slot in 0..count {
+					let _ = writeln!(output, "%{p}.d{slot} = phi {ty} [ {maximum}, %{p}.entry ], [ %{p}.d{slot}.new, %{p}.latch ]");
+					let _ = writeln!(output, "%{p}.t{slot} = phi {ty} [ {zero}, %{p}.entry ], [ %{p}.t{slot}.new, %{p}.latch ]");
+				}
+				let _ = writeln!(output, "%{p}.more = icmp ult i32 %{p}.i, {rows}\nbr i1 %{p}.more, label %{p}.distance, label %{p}.done");
+				// Squared distance between the query row and stored row i, accumulated per feature.
+				let _ = writeln!(output, "{p}.distance:\nbr label %{p}.d.head\n{p}.d.head:");
+				let _ = writeln!(output, "%{p}.j = phi i32 [ 0, %{p}.distance ], [ %{p}.j.next, %{p}.d.body ]");
+				let _ = writeln!(output, "%{p}.acc = phi {ty} [ {zero}, %{p}.distance ], [ %{p}.acc.next, %{p}.d.body ]");
+				let _ = writeln!(output, "%{p}.d.more = icmp ult i32 %{p}.j, {features}\nbr i1 %{p}.d.more, label %{p}.d.body, label %{p}.d.done", features = context.features);
+				let _ = writeln!(output, "{p}.d.body:");
+				let _ = writeln!(output, "%{p}.q.base = mul i32 {row}, {features}\n%{p}.q.index = add i32 %{p}.q.base, %{p}.j\n%{p}.q.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.q.index\n%{p}.q = load {ty}, {ptr} %{p}.q.ptr, align {align}", row = context.row, features = context.features, input = context.input);
+				let _ = writeln!(output, "%{p}.w.base = mul i32 %{p}.i, {features}\n%{p}.w.relative = add i32 %{p}.w.base, %{p}.j\n%{p}.w.index = add i32 %{p}.w.relative, {offset}\n%{p}.w.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.w.index\n%{p}.w = load {ty}, {ptr} %{p}.w.ptr, align {align}", features = context.features, offset = context.offset, weights = context.weights);
+				let _ = writeln!(output, "%{p}.diff = call {ty} @recipe.sub({ty} %{p}.q, {ty} %{p}.w)\n%{p}.square = call {ty} @recipe.mul({ty} %{p}.diff, {ty} %{p}.diff)\n%{p}.acc.next = call {ty} @recipe.add({ty} %{p}.acc, {ty} %{p}.square)");
+				let _ = writeln!(output, "%{p}.j.next = add i32 %{p}.j, 1\nbr label %{p}.d.head\n{p}.d.done:");
+				let candidate_distance = if exclude {
+					let _ = writeln!(output, "%{p}.self = icmp eq i32 %{p}.i, {row}\n%{p}.candidate = select i1 %{p}.self, {ty} {maximum}, {ty} %{p}.acc", row = context.row);
+					format!("%{p}.candidate")
+				} else {
+					format!("%{p}.acc")
+				};
+				let _ = writeln!(output, "%{p}.target.relative = add i32 {base}, %{p}.i\n%{p}.target.index = add i32 %{p}.target.relative, {offset}\n%{p}.target.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.target.index\n%{p}.target = load {ty}, {ptr} %{p}.target.ptr, align {align}", base = rows * context.features, offset = context.offset, weights = context.weights);
+				// Bubble the candidate through the k slots, keeping each slot's strictly nearer entry.
+				let (mut carry_distance, mut carry_target) = (candidate_distance, format!("%{p}.target"));
+				for slot in 0..count {
+					let _ = writeln!(output, "%{p}.swap{slot} = call i1 @recipe.ogt({ty} %{p}.d{slot}, {ty} {carry_distance})");
+					let _ = writeln!(output, "%{p}.d{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_distance}, {ty} %{p}.d{slot}");
+					let _ = writeln!(output, "%{p}.t{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_target}, {ty} %{p}.t{slot}");
+					let _ = writeln!(output, "%{p}.carry.d{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.d{slot}, {ty} {carry_distance}");
+					let _ = writeln!(output, "%{p}.carry.t{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.t{slot}, {ty} {carry_target}");
+					carry_distance = format!("%{p}.carry.d{slot}");
+					carry_target = format!("%{p}.carry.t{slot}");
+				}
+				let _ = writeln!(output, "br label %{p}.latch\n{p}.latch:\n%{p}.i.next = add i32 %{p}.i, 1\nbr label %{p}.head\n{p}.done:");
+				let mut sum = zero;
+				for slot in 0..count {
+					let name = format!("%{p}.sum{slot}");
+					let _ = writeln!(output, "{name} = call {ty} @recipe.add({ty} {sum}, {ty} %{p}.t{slot})");
+					sum = name;
+				}
+				let _ = writeln!(output, "%{p}.result = call {ty} @recipe.div({ty} {sum}, {ty} {count})", count = (context.literal)(count as f64, ty));
+				stack.push(format!("%{p}.result"));
 			}
 		}
 	}
@@ -1894,7 +1960,7 @@ impl NativeModelIr {
 					let code = self.graph.programs.get(node.program_offset..code_end).ok_or_else(|| RecipeError::new(format!("node {index} predictor program range is invalid")))?;
 					let locals = usize::try_from(locals).map_err(|_| RecipeError::new("predictor locals exceed usize"))?;
 					let row = format!("%{prefix}.row");
-					let forward = program_ir::emit_predictor_forward(code, locals, program_ir::PredictorContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), input: &pointers.source, row: &row, features: node.input.elements(), prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
+					let forward = program_ir::emit_predictor_forward(code, locals, program_ir::PredictorContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), input: &pointers.source, row: &row, features: node.input.elements(), weights: &pointers.weights, offset: node.offset, parameters: node.parameters, prefix: &prefix, literal: &literal }).map_err(|error| RecipeError::new(error.to_string()))?;
 						emit_fixed_loop(&mut ir, index, "predictor", count, |ir, p| {
 							ir.push_str(&format!("{row} = udiv i32 {p}, {elements}\n", elements = node.output.elements()));
 							ir.push_str(&forward.code);
@@ -3044,7 +3110,7 @@ mod bundle {
 		for node in &graph.nodes {
 			if node.op != Primitive::Predictor { continue }
 			let code = graph.programs.get(node.program_offset..node.program_offset + node.program_count * 2).ok_or_else(|| RecipeError::new("fitted estimator program span is invalid"))?.to_vec();
-			predictors.push(PredictorProgram { code, locals: node.argument[0] as usize, stack: node.argument[1] as usize });
+			predictors.push(PredictorProgram { code, locals: node.argument[0] as usize, stack: node.argument[1] as usize, table: vec![0.0; node.parameters] });
 		}
 		Ok(SemanticGraph { model: stored.model.clone(), precision: stored.precision, input: graph.input, output: graph.output, inputs: stored.inputs.clone(), outputs: stored.outputs.clone(), tensors, predictors, frozen: graph.frozen.clone(), state: graph.state.clone(), norm_mean: stored.norm_mean.clone(), norm_scale: stored.norm_scale.clone(), target_min: stored.target_min, target_span: stored.target_span, bn_stats: stored.bn_stats.clone(), artifact: stored.artifact.clone() })
 	}
@@ -3165,9 +3231,9 @@ mod bundle {
 				}
 				"predictor" => {
 					let fields = values::<f64>(value, "fitted estimator program")?;
-					require(fields.len() >= 2 && (fields.len() - 2) % 2 == 0, "fitted estimator program has the wrong width")?;
+					require(fields.len() >= 3 && (fields.len() - 3) % 2 == 0, "fitted estimator program has the wrong width")?;
 					let slot = |value: f64, role| usize::try_from(value as i64).ok().filter(|_| value.fract() == 0.0).ok_or_else(|| RecipeError::new(format!("invalid fitted estimator {role}")));
-					builder.predictors.push(PredictorProgram { locals: slot(fields[0], "locals")?, stack: slot(fields[1], "stack")?, code: fields[2..].to_vec() });
+					builder.predictors.push(PredictorProgram { locals: slot(fields[0], "locals")?, stack: slot(fields[1], "stack")?, table: vec![0.0; slot(fields[2], "table width")?], code: fields[3..].to_vec() });
 				}
 				"frozen" => builder.frozen = values(value, "frozen weight")?,
 				"moments" => builder.state.moments = values(value, "Adam moment")?,
@@ -3215,7 +3281,7 @@ mod bundle {
 				field(&mut document, "tensor", &format!("{} {} {metadata} {}", tensor.format.0, tensor.count, hex(&tensor.bytes)));
 			}
 			for predictor in &semantic.predictors {
-				field(&mut document, "predictor", &format!("{} {} {}", predictor.locals, predictor.stack, join(&predictor.code)));
+				field(&mut document, "predictor", &format!("{} {} {} {}", predictor.locals, predictor.stack, predictor.table.len(), join(&predictor.code)));
 			}
 			for (key, value) in [("frozen", join(&semantic.frozen)), ("moments", join(&semantic.state.moments)), ("variances", join(&semantic.state.variances)), ("best", join(&semantic.state.best)), ("best_loss", join(&semantic.state.best_loss)), ("epoch", semantic.state.epoch.to_string()), ("training_rows", semantic.state.training_rows.to_string()), ("trained_samples", join(&semantic.state.trained_samples)), ("norm_mean", join(&semantic.norm_mean)), ("norm_scale", join(&semantic.norm_scale))] {
 				field(&mut document, key, &value)
@@ -4970,10 +5036,13 @@ fn push_program(graph: &mut Graph, second: i32, initial: &[f64], program: Scalar
 fn push_predictor(graph: &mut Graph, program: PredictorProgram) -> Result<()> {
 	let (program_offset, program_count) = (graph.programs.len(), program.code.len() / 2);
 	graph.programs.extend(program.code);
-	push_node(graph, Primitive::Predictor, Shape { channels: 1, length: 1 }, 0, arguments(program.locals as f64, program.stack as f64), -2)?;
+	push_node(graph, Primitive::Predictor, Shape { channels: 1, length: 1 }, program.table.len(), arguments(program.locals as f64, program.stack as f64), -2)?;
 	let node = graph.nodes.last_mut().ok_or_else(|| RecipeError::new("predictor node is absent"))?;
 	node.program_offset = program_offset;
 	node.program_count = program_count;
+	let (offset, parameters) = (node.offset, node.parameters);
+	graph.parameters[offset..offset + parameters].copy_from_slice(&program.table);
+	graph.frozen[offset..offset + parameters].fill(1);
 	Ok(())
 }
 fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -> Result<()> {
@@ -6844,6 +6913,7 @@ struct PredictorProgram {
 	code: Vec<f64>,
 	locals: usize,
 	stack: usize,
+	table: Vec<f64>,
 }
 impl PredictorProgram {
 	fn evaluate(&self, row: usize, query: &[f64]) -> Result<f64> {
@@ -6866,6 +6936,24 @@ impl PredictorProgram {
 				value if value == PredictorOpcode::Divide as i32 => { let right = pop(&mut stack)?; let left = pop(&mut stack)?; stack.push(left / right) },
 				value if value == PredictorOpcode::Greater as i32 => { let right = pop(&mut stack)?; let left = pop(&mut stack)?; stack.push(f64::from(left > right)) },
 				value if value == PredictorOpcode::Choose as i32 => { let no = pop(&mut stack)?; let yes = pop(&mut stack)?; let condition = pop(&mut stack)?; stack.push(if condition != 0.0 { yes } else { no }) },
+				value if value == PredictorOpcode::Nearest as i32 => {
+					let count = instruction[1].abs() as usize;
+					let exclude = instruction[1] < 0.0;
+					let features = query.len();
+					let rows = self.table.len().checked_div(features + 1).filter(|rows| rows * (features + 1) == self.table.len()).ok_or_else(|| RecipeError::new("nearest table width is invalid"))?;
+					let (samples, targets) = self.table.split_at(rows * features);
+					let mut best = vec![(f64::MAX, 0.0); count];
+					for (candidate, sample) in samples.chunks_exact(features).enumerate() {
+						let (mut carry_distance, mut carry_target) = (if exclude && candidate == row { f64::MAX } else { distance(query, sample) }, targets[candidate]);
+						for slot in &mut best {
+							if slot.0 > carry_distance {
+								std::mem::swap(&mut slot.0, &mut carry_distance);
+								std::mem::swap(&mut slot.1, &mut carry_target);
+							}
+						}
+					}
+					stack.push(best.iter().map(|slot| slot.1).sum::<f64>() / count as f64)
+				},
 				_ => return Err(RecipeError::new(format!("invalid predictor opcode {opcode}"))),
 			}
 		}
@@ -6879,13 +6967,17 @@ struct PredictorBuilder {
 	locals: usize,
 	depth: usize,
 	stack: usize,
+	table: Vec<f64>,
 }
 impl PredictorBuilder {
-	fn new() -> Self { Self { code: Vec::new(), locals: 0, depth: 0, stack: 0 } }
+	fn new() -> Self { Self { code: Vec::new(), locals: 0, depth: 0, stack: 0, table: Vec::new() } }
+	fn nearest(&mut self, count: usize, exclude: bool, table: Vec<f64>) {
+		self.table = table;
+		self.push(PredictorOpcode::Nearest, if exclude { -(count as f64) } else { count as f64 });
+	}
 	fn emit(&mut self, opcode: PredictorOpcode, argument: f64) { self.code.extend([opcode as i32 as f64, argument]) }
 	fn push(&mut self, opcode: PredictorOpcode, argument: f64) { self.emit(opcode, argument); self.depth += 1; self.stack = self.stack.max(self.depth) }
 	fn feature(&mut self, index: usize) { self.push(PredictorOpcode::Feature, index as f64) }
-	fn row(&mut self) { self.push(PredictorOpcode::Row, 0.0) }
 	fn constant(&mut self, value: f64) { self.push(PredictorOpcode::Constant, value) }
 	fn load(&mut self, slot: usize) { self.push(PredictorOpcode::Load, slot as f64) }
 	fn store(&mut self, slot: usize) { self.emit(PredictorOpcode::Store, slot as f64); self.depth -= 1 }
@@ -6896,7 +6988,7 @@ impl PredictorBuilder {
 	fn finish(self) -> Result<PredictorProgram> {
 		require(self.depth == 1 && self.stack != 0 && self.code.len() % 2 == 0, "predictor program is invalid")?;
 		require(self.code.chunks_exact(2).all(|instruction| instruction[0].is_finite() && instruction[1].is_finite()), "predictor program contains a nonfinite value")?;
-		Ok(PredictorProgram { code: self.code, locals: self.locals, stack: self.stack })
+		Ok(PredictorProgram { code: self.code, locals: self.locals, stack: self.stack, table: self.table })
 	}
 }
 struct Predictor {
@@ -7395,71 +7487,10 @@ fn fit_kmeans(clusters: usize, data: &Prepared, rows: usize, config: Config, _: 
 fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool) -> Result<Predictor> {
 	let maximum = rows.checked_sub(usize::from(exclude)).unwrap_or(0);
 	require(count != 0 && count <= maximum, "knn neighbor count is invalid")?;
+	let mut table = data.samples[..rows * data.features].to_vec();
+	table.extend_from_slice(&data.targets[..rows]);
 	let mut program = PredictorBuilder::new();
-	let (distance, target, condition, prior_distance, prior_target) = (program.local(), program.local(), program.local(), program.local(), program.local());
-	let nearest = (0..count).map(|_| (program.local(), program.local())).collect::<Vec<_>>();
-	for &(slot_distance, slot_target) in &nearest {
-		program.constant(f64::MAX);
-		program.store(slot_distance);
-		program.constant(0.0);
-		program.store(slot_target);
-	}
-	for (candidate, sample) in data.samples[..rows * data.features].chunks_exact(data.features).enumerate() {
-		predictor_distance(&mut program, sample);
-		program.store(distance);
-		if exclude {
-			program.row();
-			program.constant(candidate as f64);
-			program.binary(PredictorOpcode::Greater);
-			program.constant(candidate as f64);
-			program.row();
-			program.binary(PredictorOpcode::Greater);
-			program.binary(PredictorOpcode::Add);
-			program.load(distance);
-			program.constant(f64::MAX);
-			program.choose();
-			program.store(distance);
-		}
-		program.constant(data.targets[candidate]);
-		program.store(target);
-		for &(slot_distance, slot_target) in &nearest {
-			program.load(slot_distance);
-			program.store(prior_distance);
-			program.load(slot_target);
-			program.store(prior_target);
-			program.load(prior_distance);
-			program.load(distance);
-			program.binary(PredictorOpcode::Greater);
-			program.store(condition);
-			program.load(condition);
-			program.load(distance);
-			program.load(prior_distance);
-			program.choose();
-			program.store(slot_distance);
-			program.load(condition);
-			program.load(target);
-			program.load(prior_target);
-			program.choose();
-			program.store(slot_target);
-			program.load(condition);
-			program.load(prior_distance);
-			program.load(distance);
-			program.choose();
-			program.store(distance);
-			program.load(condition);
-			program.load(prior_target);
-			program.load(target);
-			program.choose();
-			program.store(target);
-		}
-	}
-	program.constant(0.0);
-	for &(_, target) in &nearest {
-		program.load(target);
-		program.binary(PredictorOpcode::Add)
-	}
-	program.constant(count as f64);
-	program.binary(PredictorOpcode::Divide);
+	program.nearest(count, exclude, table);
 	Ok(Predictor::new(program.finish()?))
 }
 impl Estimator {
