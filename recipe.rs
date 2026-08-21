@@ -5410,6 +5410,7 @@ struct NativeTape {
 	best: Vec<f64>,
 	best_moments: Vec<f64>,
 	best_variances: Vec<f64>,
+	pending: (Vec<f64>, Vec<f64>, Vec<f64>),
 	best_epoch: u32,
 	best_loss: [f64; 4],
 	rows: u32,
@@ -5480,6 +5481,7 @@ impl NativeTape {
 			variances: Buffer::upload_float(gpu, &variances, precision.state)?,
 			gradient: Buffer::upload(gpu, &vec![0_u8; gradient_bytes])?,
 			metrics: Buffer::upload_float(gpu, &[0.0], precision.state)?,
+			pending: (graph.parameters.clone(), best_moments.clone(), best_variances.clone()),
 			best,
 			best_moments,
 			best_variances,
@@ -5575,13 +5577,17 @@ impl NativeTape {
 		let objective = self.metrics.download_float(1, self.precision.state)?[0];
 		debug(&format!("epoch {step} metric complete"))?;
 		let saved = self.observe(objective, tolerance, track_best)?;
+		if track_best {
+			self.pending = self.optimizer_state()?;
+		}
 		Ok((objective, saved))
 	}
 	fn observe(&mut self, loss: f64, tolerance: f64, download: bool) -> Result<bool> {
 		let (old_best, last, armed, saved) = (self.best_loss[0], self.best_loss[1], self.best_loss[2].is_finite(), self.best_loss[3]);
 		let better = loss < old_best;
 		if better && download {
-			(self.best, self.best_moments, self.best_variances) = self.optimizer_state()?;
+			// The epoch's loss describes the state before its update; that state was held from the previous step.
+			(self.best, self.best_moments, self.best_variances) = self.pending.clone();
 			self.best_epoch = self.step.saturating_sub(1);
 		}
 		let best = if better { loss } else { old_best };
