@@ -7928,7 +7928,7 @@ fn sample_identity(sample: &[f64], target: f64) -> u64 {
 	const PRIME: u64 = 1099511628211;
 	sample.iter().copied().chain(std::iter::once(target)).fold(OFFSET, |hash, value| (hash ^ value.to_bits()).wrapping_mul(PRIME))
 }
-fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db") }
+fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5") }
 fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	let path = path.as_ref();
 	let mut components = path.components();
@@ -8072,6 +8072,10 @@ fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
 			Ok(vec![array_table(name, columns).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
 		}
 		Some("sqlite" | "sqlite3" | "db") => sqlite_tables(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display()))),
+		Some("h5" | "hdf5") => {
+			let columns = hdf5_columns(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
+			Ok(vec![array_table(name, columns).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
+		}
 		_ => parse_table(path, bytes).map(|(table, _)| vec![table]),
 	}
 }
@@ -8194,6 +8198,348 @@ fn sqlite_record(record: &[u8]) -> Result<Vec<String>> {
 		});
 	}
 	Ok(values)
+}
+/// Raw DEFLATE decompression (RFC 1951): stored, fixed, and dynamic Huffman blocks.
+fn inflate(bytes: &[u8]) -> Result<Vec<u8>> {
+	struct Bits<'a> {
+		bytes: &'a [u8],
+		position: usize,
+	}
+	impl Bits<'_> {
+		fn bit(&mut self) -> Result<u64> {
+			let byte = *self.bytes.get(self.position / 8).ok_or_else(|| RecipeError::new("DEFLATE stream is truncated"))?;
+			let bit = u64::from(byte >> (self.position % 8) & 1);
+			self.position += 1;
+			Ok(bit)
+		}
+		fn bits(&mut self, count: u32) -> Result<u64> {
+			let mut value = 0;
+			for index in 0..count {
+				value |= self.bit()? << index;
+			}
+			Ok(value)
+		}
+	}
+	struct Huffman {
+		counts: [u16; 16],
+		symbols: Vec<u16>,
+	}
+	impl Huffman {
+		fn new(lengths: &[u8]) -> Result<Self> {
+			let mut counts = [0_u16; 16];
+			for &length in lengths {
+				require(length < 16, "DEFLATE code length exceeds 15")?;
+				counts[length as usize] += 1;
+			}
+			counts[0] = 0;
+			let mut offsets = [0_u16; 16];
+			for length in 1..16 {
+				offsets[length] = offsets[length - 1] + counts[length - 1];
+			}
+			let mut symbols = vec![0_u16; lengths.iter().filter(|length| **length != 0).count()];
+			for (symbol, &length) in lengths.iter().enumerate() {
+				if length != 0 {
+					symbols[offsets[length as usize] as usize] = symbol as u16;
+					offsets[length as usize] += 1;
+				}
+			}
+			Ok(Self { counts, symbols })
+		}
+		fn decode(&self, bits: &mut Bits) -> Result<u16> {
+			let (mut code, mut first, mut index) = (0_u32, 0_u32, 0_u32);
+			for length in 1..16 {
+				code |= bits.bit()? as u32;
+				let count = u32::from(self.counts[length]);
+				if code < first + count {
+					return Ok(self.symbols[(index + code - first) as usize]);
+				}
+				index += count;
+				first = (first + count) << 1;
+				code <<= 1;
+			}
+			Err(RecipeError::new("DEFLATE code is invalid"))
+		}
+	}
+	const LENGTH_BASE: [u16; 29] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+	const LENGTH_EXTRA: [u32; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+	const DISTANCE_BASE: [u16; 30] = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+	const DISTANCE_EXTRA: [u32; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+	let mut bits = Bits { bytes, position: 0 };
+	let mut output = Vec::new();
+	loop {
+		let last = bits.bit()?;
+		match bits.bits(2)? {
+			0 => {
+				bits.position = bits.position.div_ceil(8) * 8;
+				let start = bits.position / 8;
+				let length = u16::from_le_bytes(bytes.get(start..start + 2).ok_or_else(|| RecipeError::new("DEFLATE stream is truncated"))?.try_into().unwrap()) as usize;
+				output.extend_from_slice(bytes.get(start + 4..start + 4 + length).ok_or_else(|| RecipeError::new("DEFLATE stream is truncated"))?);
+				bits.position = (start + 4 + length) * 8;
+			}
+			kind @ (1 | 2) => {
+				let (literals, distances) = if kind == 1 {
+					let mut lengths = [8_u8; 288];
+					lengths[144..256].fill(9);
+					lengths[256..280].fill(7);
+					(Huffman::new(&lengths)?, Huffman::new(&[5; 30])?)
+				} else {
+					const ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+					let literal_count = bits.bits(5)? as usize + 257;
+					let distance_count = bits.bits(5)? as usize + 1;
+					let code_count = bits.bits(4)? as usize + 4;
+					let mut code_lengths = [0_u8; 19];
+					for index in 0..code_count {
+						code_lengths[ORDER[index]] = bits.bits(3)? as u8;
+					}
+					let codes = Huffman::new(&code_lengths)?;
+					let mut lengths = vec![0_u8; literal_count + distance_count];
+					let mut index = 0;
+					while index < lengths.len() {
+						match codes.decode(&mut bits)? {
+							16 => {
+								let previous = *lengths.get(index.wrapping_sub(1)).ok_or_else(|| RecipeError::new("DEFLATE repeat has no previous length"))?;
+								for _ in 0..bits.bits(2)? + 3 {
+									require(index < lengths.len(), "DEFLATE code lengths overflow")?;
+									lengths[index] = previous;
+									index += 1;
+								}
+							}
+							17 => index += bits.bits(3)? as usize + 3,
+							18 => index += bits.bits(7)? as usize + 11,
+							length => {
+								lengths[index] = length as u8;
+								index += 1;
+							}
+						}
+					}
+					(Huffman::new(&lengths[..literal_count])?, Huffman::new(&lengths[literal_count..])?)
+				};
+				loop {
+					match literals.decode(&mut bits)? {
+						symbol if symbol < 256 => output.push(symbol as u8),
+						256 => break,
+						symbol => {
+							let entry = symbol as usize - 257;
+							require(entry < LENGTH_BASE.len(), "DEFLATE length code is invalid")?;
+							let length = LENGTH_BASE[entry] as usize + bits.bits(LENGTH_EXTRA[entry])? as usize;
+							let code = distances.decode(&mut bits)? as usize;
+							require(code < DISTANCE_BASE.len(), "DEFLATE distance code is invalid")?;
+							let distance = DISTANCE_BASE[code] as usize + bits.bits(DISTANCE_EXTRA[code])? as usize;
+							require(distance <= output.len(), "DEFLATE distance exceeds output")?;
+							for _ in 0..length {
+								output.push(output[output.len() - distance]);
+							}
+						}
+					}
+				}
+			}
+			_ => return Err(RecipeError::new("DEFLATE block type is invalid")),
+		}
+		if last == 1 {
+			return Ok(output);
+		}
+	}
+}
+/// zlib envelope: header check, DEFLATE body, Adler-32 verification.
+fn zlib_inflate(bytes: &[u8]) -> Result<Vec<u8>> {
+	require(bytes.len() > 6 && bytes[0] & 0xf == 8 && (u16::from(bytes[0]) << 8 | u16::from(bytes[1])) % 31 == 0 && bytes[1] & 0x20 == 0, "zlib header is invalid")?;
+	let output = inflate(&bytes[2..bytes.len() - 4])?;
+	let (mut low, mut high) = (1_u32, 0_u32);
+	for byte in &output {
+		low = (low + u32::from(*byte)) % 65521;
+		high = (high + low) % 65521;
+	}
+	let expected = u32::from_be_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+	require(high << 16 | low == expected, "zlib checksum mismatch")?;
+	Ok(output)
+}
+/// Named columns from every dataset of an HDF5 file (version-0 superblock, symbol-table
+/// groups, version-1 object headers, contiguous or chunked layouts, optional deflate filter).
+fn hdf5_columns(bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
+	let read16 = |offset: usize| bytes.get(offset..offset + 2).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize);
+	let read32 = |offset: usize| bytes.get(offset..offset + 4).map(|value| u32::from_le_bytes(value.try_into().unwrap()) as usize);
+	let read64 = |offset: usize| bytes.get(offset..offset + 8).map(|value| u64::from_le_bytes(value.try_into().unwrap()) as usize);
+	let truncated = || RecipeError::new("HDF5 file is truncated");
+	require(bytes.get(..8) == Some(&b"\x89HDF\r\n\x1a\n"[..]), "HDF5 signature is absent")?;
+	require(bytes.get(8) == Some(&0), "HDF5 superblock version is unsupported")?;
+	require(bytes.get(13) == Some(&8) && bytes.get(14) == Some(&8), "HDF5 offset or length size is unsupported")?;
+	let root_header = read64(0x40).ok_or_else(truncated)?;
+	fn messages(bytes: &[u8], output: &mut Vec<(u16, usize, usize)>, remaining: &mut usize, start: usize, end: usize) -> Result<()> {
+		let mut offset = start;
+		while offset + 8 <= end && *remaining != 0 {
+			let kind = u16::from_le_bytes(bytes.get(offset..offset + 2).ok_or_else(|| RecipeError::new("HDF5 message is truncated"))?.try_into().unwrap());
+			let size = u16::from_le_bytes(bytes[offset + 2..offset + 4].try_into().unwrap()) as usize;
+			let body = offset + 8;
+			*remaining -= 1;
+			if kind == 0x10 {
+				let continuation = u64::from_le_bytes(bytes.get(body..body + 8).ok_or_else(|| RecipeError::new("HDF5 continuation is truncated"))?.try_into().unwrap()) as usize;
+				let length = u64::from_le_bytes(bytes[body + 8..body + 16].try_into().unwrap()) as usize;
+				messages(bytes, output, remaining, continuation, continuation + length)?;
+			} else {
+				output.push((kind, body, size));
+			}
+			offset = body + size;
+		}
+		Ok(())
+	}
+	let object_messages = |header: usize| -> Result<Vec<(u16, usize, usize)>> {
+		require(bytes.get(header) == Some(&1), "HDF5 object header version is unsupported")?;
+		let mut count = read16(header + 2).ok_or_else(truncated)?;
+		let size = read32(header + 8).ok_or_else(truncated)?;
+		let mut output = Vec::new();
+		messages(bytes, &mut output, &mut count, header + 16, header + 16 + size)?;
+		Ok(output)
+	};
+	let (mut btree, mut heap) = (None, None);
+	for (kind, body, _) in object_messages(root_header)? {
+		if kind == 0x11 {
+			btree = read64(body);
+			heap = read64(body + 8);
+		}
+	}
+	let (btree, heap) = (btree.ok_or_else(|| RecipeError::new("HDF5 root group has no symbol table"))?, heap.ok_or_else(truncated)?);
+	require(bytes.get(heap..heap + 4) == Some(&b"HEAP"[..]), "HDF5 local heap is invalid")?;
+	let heap_data = read64(heap + 24).ok_or_else(truncated)?;
+	let mut datasets = Vec::new();
+	let mut group_nodes = vec![btree];
+	while let Some(node) = group_nodes.pop() {
+		require(bytes.get(node..node + 4) == Some(&b"TREE"[..]), "HDF5 group b-tree is invalid")?;
+		let (level, entries) = (bytes[node + 5], read16(node + 6).ok_or_else(truncated)?);
+		let mut offset = node + 24 + 8;
+		for _ in 0..entries {
+			let child = read64(offset).ok_or_else(truncated)?;
+			offset += 16;
+			if level > 0 {
+				group_nodes.push(child);
+				continue;
+			}
+			require(bytes.get(child..child + 4) == Some(&b"SNOD"[..]), "HDF5 symbol table node is invalid")?;
+			let symbols = read16(child + 6).ok_or_else(truncated)?;
+			for symbol in 0..symbols {
+				let entry = child + 8 + symbol * 40;
+				let name_offset = heap_data + read64(entry).ok_or_else(truncated)?;
+				let terminator = bytes.get(name_offset..).and_then(|tail| tail.iter().position(|byte| *byte == 0)).ok_or_else(truncated)?;
+				let dataset_name = String::from_utf8(bytes[name_offset..name_offset + terminator].to_vec()).map_err(|error| RecipeError::new(format!("HDF5 dataset name is not UTF-8: {error}")))?;
+				datasets.push((dataset_name, read64(entry + 8).ok_or_else(truncated)?));
+			}
+		}
+	}
+	let mut columns = Vec::new();
+	for (dataset, header) in datasets {
+		let (mut dims, mut chunk_dims, mut address, mut contiguous_size, mut deflated, mut element, mut float, mut signed) = (Vec::new(), Vec::new(), None, 0, false, 0_usize, false, false);
+		for (kind, body, size) in object_messages(header)? {
+			match kind {
+				1 => {
+					let rank = bytes[body + 1] as usize;
+					dims = (0..rank).map(|index| read64(body + 8 + 8 * index).ok_or_else(truncated)).collect::<Result<Vec<_>>>()?;
+				}
+				3 => {
+					let class = bytes[body] & 0xf;
+					require(bytes[body] >> 4 <= 1, "HDF5 datatype version is unsupported")?;
+					require(class <= 1, format!("HDF5 datatype class {class} of dataset {dataset:?} is unsupported"))?;
+					require(bytes[body + 1] & 1 == 0, format!("HDF5 dataset {dataset:?} is not little-endian"))?;
+					float = class == 1;
+					signed = class == 0 && bytes[body + 1] & 8 != 0;
+					element = read32(body + 4).ok_or_else(truncated)?;
+				}
+				8 => {
+					require(bytes[body] == 3, "HDF5 data layout version is unsupported")?;
+					match bytes[body + 1] {
+						1 => {
+							address = read64(body + 2);
+							contiguous_size = read64(body + 10).ok_or_else(truncated)?;
+						}
+						2 => {
+							let rank = bytes[body + 2] as usize;
+							address = read64(body + 3);
+							chunk_dims = (0..rank.checked_sub(1).ok_or_else(truncated)?).map(|index| read32(body + 11 + 4 * index).ok_or_else(truncated)).collect::<Result<Vec<_>>>()?;
+						}
+						class => return Err(RecipeError::new(format!("HDF5 data layout class {class} is unsupported"))),
+					}
+				}
+				11 => {
+					deflated = bytes.get(body..body + size).ok_or_else(truncated)?.windows(7).any(|window| window == b"deflate");
+					require(deflated, format!("HDF5 dataset {dataset:?} uses an unsupported filter"))?;
+				}
+				_ => {}
+			}
+		}
+		require(!dims.is_empty() && element != 0, format!("HDF5 dataset {dataset:?} has no shape or type"))?;
+		require(matches!((float, element), (false, 1 | 2 | 4 | 8) | (true, 4 | 8)), format!("HDF5 dataset {dataset:?} element size {element} is unsupported"))?;
+		let count = dims.iter().try_fold(1_usize, |product, dimension| product.checked_mul(*dimension)).ok_or_else(|| RecipeError::new("HDF5 dataset size overflows"))?;
+		let mut raw = vec![0_u8; checked_mul(count, element, "HDF5 dataset bytes")?];
+		let address = address.ok_or_else(|| RecipeError::new(format!("HDF5 dataset {dataset:?} has no data address")))?;
+		if chunk_dims.is_empty() {
+			require(contiguous_size == raw.len(), format!("HDF5 dataset {dataset:?} has the wrong contiguous size"))?;
+			raw.copy_from_slice(bytes.get(address..address + contiguous_size).ok_or_else(truncated)?);
+		} else {
+			require(chunk_dims.len() == dims.len(), format!("HDF5 dataset {dataset:?} chunk rank differs from its shape"))?;
+			let mut chunk_nodes = vec![address];
+			let key_length = 8 + 8 * (chunk_dims.len() + 1);
+			while let Some(node) = chunk_nodes.pop() {
+				require(bytes.get(node..node + 4) == Some(&b"TREE"[..]) && bytes.get(node + 4) == Some(&1), "HDF5 chunk b-tree is invalid")?;
+				let (level, entries) = (bytes[node + 5], read16(node + 6).ok_or_else(truncated)?);
+				let mut offset = node + 24;
+				for _ in 0..entries {
+					let compressed = read32(offset).ok_or_else(truncated)?;
+					let mask = read32(offset + 4).ok_or_else(truncated)?;
+					let starts = (0..chunk_dims.len()).map(|index| read64(offset + 8 + 8 * index).ok_or_else(truncated)).collect::<Result<Vec<_>>>()?;
+					let child = read64(offset + key_length).ok_or_else(truncated)?;
+					offset += key_length + 8;
+					if level > 0 {
+						chunk_nodes.push(child);
+						continue;
+					}
+					require(mask == 0, format!("HDF5 dataset {dataset:?} chunk filter mask is unsupported"))?;
+					let chunk = bytes.get(child..child + compressed).ok_or_else(truncated)?;
+					let chunk = if deflated { zlib_inflate(chunk)? } else { chunk.to_vec() };
+					let chunk_count = chunk_dims.iter().product::<usize>();
+					require(chunk.len() == chunk_count * element, format!("HDF5 dataset {dataset:?} chunk has the wrong size"))?;
+					for local in 0..chunk_count {
+						let (mut remainder, mut inside) = (local, true);
+						let mut coordinates = vec![0_usize; chunk_dims.len()];
+						for axis in (0..chunk_dims.len()).rev() {
+							coordinates[axis] = starts[axis] + remainder % chunk_dims[axis];
+							remainder /= chunk_dims[axis];
+							inside &= coordinates[axis] < dims[axis];
+						}
+						if !inside {
+							continue;
+						}
+						let mut index = 0;
+						for axis in 0..chunk_dims.len() {
+							index = index * dims[axis] + coordinates[axis];
+						}
+						raw[index * element..(index + 1) * element].copy_from_slice(&chunk[local * element..(local + 1) * element]);
+					}
+				}
+			}
+		}
+		let decode = |value: &[u8]| -> f64 {
+			match (float, signed, element) {
+				(true, _, 4) => f64::from(f32::from_le_bytes(value.try_into().unwrap())),
+				(true, _, 8) => f64::from_le_bytes(value.try_into().unwrap()),
+				(false, true, 1) => f64::from(value[0] as i8),
+				(false, true, 2) => f64::from(i16::from_le_bytes(value.try_into().unwrap())),
+				(false, true, 4) => f64::from(i32::from_le_bytes(value.try_into().unwrap())),
+				(false, true, 8) => i64::from_le_bytes(value.try_into().unwrap()) as f64,
+				(false, false, 1) => f64::from(value[0]),
+				(false, false, 2) => f64::from(u16::from_le_bytes(value.try_into().unwrap())),
+				(false, false, 4) => f64::from(u32::from_le_bytes(value.try_into().unwrap())),
+				(false, false, 8) => u64::from_le_bytes(value.try_into().unwrap()) as f64,
+				_ => unreachable!(),
+			}
+		};
+		let decoded = raw.chunks_exact(element).map(decode).collect::<Vec<_>>();
+		let rows = dims[0];
+		let width = decoded.len() / rows.max(1);
+		for column in 0..width {
+			let header = if width == 1 { dataset.clone() } else { format!("{dataset}.{}", column + 1) };
+			columns.push((header, rows, (0..rows).map(|row| decoded[row * width + column]).collect()));
+		}
+	}
+	require(!columns.is_empty(), "HDF5 file has no datasets")?;
+	Ok(columns)
 }
 /// The stored entries of a ZIP archive, resolved through the central directory.
 fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
