@@ -8596,7 +8596,8 @@ impl TargetScale {
 	fn fit(targets: &[f64]) -> Self {
 		let minimum = targets.iter().copied().fold(f64::INFINITY, f64::min);
 		let maximum = targets.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-		Self { minimum, span: maximum - minimum }
+		// A constant target spans nothing; encode it as the minimum of a unit span so scaling stays finite.
+		Self { minimum, span: if maximum == minimum { 1.0 } else { maximum - minimum } }
 	}
 	fn encode(self, value: f64) -> f64 { (value - self.minimum) / self.span }
 	fn decode(self, value: f64) -> f64 { self.minimum + self.span * logistic(value) }
