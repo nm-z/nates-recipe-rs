@@ -3209,7 +3209,12 @@ mod bundle {
 			require(!semantic.artifact.is_empty(), "native artifact identity is absent")?;
 			field(&mut document, "artifact", &text(&semantic.artifact));
 		}
-		fs::write(path, document).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", path.display())))
+		// Publish atomically: the path always holds a complete old or complete new model.
+		let temporary = path.with_extension("ogdl.tmp");
+		let mut file = fs::File::create(&temporary).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", temporary.display())))?;
+		file.write_all(document.as_bytes()).and_then(|()| file.sync_all()).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", temporary.display())))?;
+		drop(file);
+		fs::rename(&temporary, path).map_err(|error| RecipeError::new(format!("cannot publish {}: {error}", path.display())))
 	}
 	fn join<T: ToString>(values: &[T]) -> String { values.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ") }
 	fn same_structure(a: &SemanticGraph, b: &SemanticGraph) -> bool {
