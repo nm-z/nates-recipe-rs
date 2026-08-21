@@ -264,7 +264,21 @@ fn quantization(model: Model, quantization: usize) -> (Model, String) {
 		return (model, String::new());
 	}
 	let (family, bits, variant) = QUANTIZATIONS[quantization - 1];
-	(model.quantize(family, bits, variant), format!(".quantize({family}, {bits}, {variant})"))
+	let source = match (family, variant) {
+		(0, 0 | 1) => format!(".qi({bits}).{variant}"),
+		(0, 2) => format!(".qi({bits}).nf"),
+		(0, 3) => format!(".qi({bits}).k"),
+		(0, 4) => format!(".qi({bits}).k.s"),
+		(0, 5) => format!(".qi({bits}).k.m"),
+		(0, 6) => format!(".qi({bits}).k.l"),
+		(1, 1) => format!(".iq({bits}).xxs"),
+		(1, 2) => format!(".iq({bits}).xs"),
+		(1, 3) => format!(".iq({bits}).s"),
+		(1, 4) => format!(".iq({bits}).m"),
+		(1, 5) => format!(".iq({bits}).nl"),
+		_ => unreachable!(),
+	};
+	(model.quantize(family, bits, variant), source)
 }
 
 fn apply(model: Model, stage: Stage) -> (Model, String) {
@@ -353,37 +367,44 @@ fn input_width(path: &Path) -> usize {
 	channels.checked_mul(length).expect("saved input width overflows")
 }
 
-fn reproduction(case: u64, data_case: &DataCase, model_ordinal: u64, loss_ordinal: usize, train_case: TrainCase, lifecycle: usize) -> String {
+fn readable(source: &str) -> String {
+	let mut source = source.replace(").", ")\n\t\t.").replace("].", "]\n\t\t.");
+	for suffix in ["k.s", "k.m", "k.l", "xxs", "xs", "nf", "nl", "k", "s", "m", "0", "1"] {
+		source = source.replace(&format!(")\n\t\t.{suffix}."), &format!(").{suffix}\n\t\t."));
+	}
+	source
+}
+
+fn reproduction(case: u64, data_case: &DataCase, model_ordinal: u64, loss_ordinal: usize, train_case: TrainCase, lifecycle: usize, phase: &str) -> String {
 	let (_, data) = data(data_case);
 	let (model, mut model_source) = model(model_ordinal);
 	let (_, loss) = loss(model, loss_ordinal);
 	model_source.push_str(loss);
 	let (_, train) = train(train_case, case as usize);
-	let resume = if lifecycle == 1 {
-		format!("\n\tlet resumed = {train}.resume(&bundle).save(&bundle).run(&model, &data);\n\tassert!(resumed.final_loss().is_finite());")
-	} else {
-		String::new()
-	};
-	format!(r#"use recipe::*;
-use std::path::Path;
-
-fn input_width(path: &Path) -> usize {{
-	let text = std::fs::read_to_string(path).unwrap();
-	let mut shape = text.lines().find_map(|line| line.trim().strip_prefix("shape ")).unwrap().split_whitespace();
-	shape.next().unwrap().parse::<usize>().unwrap() * shape.next().unwrap().parse::<usize>().unwrap()
-}}
+	let (data, model, train) = (readable(&data), readable(&model_source), readable(&train));
+	let mut body = format!(r#"use recipe::*;
 
 fn main() {{
 	let bundle = "/tmp/recipe-composition-repro.ogdl";
 	let data = {data};
-	let model = {model_source};
-	let report = {train}.save(&bundle).run(&model, &data);
-	assert!(report.final_loss().is_finite());{resume}
-	let output = recipe.infer(&bundle, &vec![0.0; input_width(Path::new(bundle))]);
-	assert!(!output.is_empty());
-	assert!(output.iter().all(|value| value.is_finite()));
-}}
-"#)
+	let model = {model};"#);
+	if phase == "setup" {
+		return format!("{body}\n}}\n");
+	}
+	body.push_str(&format!("\n\tlet report = {train}\n\t\t.save(bundle)\n\t\t.run(&model, &data);\n\tassert!(report.final_loss().is_finite());"));
+	if phase == "training" {
+		return format!("{body}\n}}\n");
+	}
+	if lifecycle == 1 {
+		body.push_str(&format!("\n\tlet resumed = {train}\n\t\t.resume(bundle)\n\t\t.save(bundle)\n\t\t.run(&model, &data);\n\tassert!(resumed.final_loss().is_finite());"));
+	}
+	if phase == "resumed training" {
+		return format!("{body}\n}}\n");
+	}
+	let bundle_path = PathBuf::from(format!("/tmp/recipe-composition-{}.ogdl", std::process::id()));
+	let width = input_width(&bundle_path);
+	body.push_str(&format!("\n\tlet output = recipe.infer(bundle, &[0.0; {width}]);\n\tassert!(!output.is_empty());\n\tassert!(output.iter().all(|value| value.is_finite()));"));
+	format!("{body}\n}}\n")
 }
 
 fn execute(case: u64, data_case: &DataCase, model_ordinal: u64, loss_ordinal: usize, train_case: TrainCase, lifecycle: usize, phase: &Cell<&'static str>) {
@@ -426,6 +447,7 @@ fn attempt(case: u64, data_case: &DataCase, model_ordinal: u64, loss_ordinal: us
 fn emit_failure(seed: u64, cursor: u64, next_cursor: u64, step: u64, case: u64, data_case: &DataCase, description: &str, loss_ordinal: usize, train_case: TrainCase, lifecycle: usize, failure: &Failure, replay: &Failure, source: &str) {
 	let mut fingerprint = hash_bytes(1_469_598_103_934_665_603, failure.phase.as_bytes());
 	fingerprint = hash_bytes(fingerprint, failure.message.as_bytes());
+	std::fs::write("/tmp/recipe-composition-repro.rs", source).expect("cannot write composition reproduction");
 	eprintln!("RECIPE FAILURE BEGIN");
 	eprintln!("id={fingerprint:016x}");
 	eprintln!("base={}", base());
@@ -485,7 +507,7 @@ fn main() {
 			let replay = attempt(case, &datasets[data_ordinal], model_ordinal, loss_ordinal, train_case, lifecycle)
 				.err()
 				.unwrap_or(Failure { phase: "replay", message: "the exact replay passed".to_owned() });
-			let source = reproduction(case, &datasets[data_ordinal], model_ordinal, loss_ordinal, train_case, lifecycle);
+			let source = reproduction(case, &datasets[data_ordinal], model_ordinal, loss_ordinal, train_case, lifecycle, failure.phase);
 			emit_failure(seed, cursor, cursor + 1, step, case, &datasets[data_ordinal], &description, loss_ordinal, train_case, lifecycle, &failure, &replay, &source);
 		}
 	}
