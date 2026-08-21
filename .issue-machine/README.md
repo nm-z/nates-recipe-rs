@@ -4,6 +4,7 @@ This branch is the persistent reboot-safe machine snapshot. Create its worktree
 at the configured path and start the tmux session:
 
 ```text
+git worktree prune
 git worktree add /home/nate/Desktop/recipe-issue-machine machine
 tmux new-session -d -s recipe-issue-machine /home/nate/Desktop/recipe-issue-machine/.issue-machine/session
 tmux attach -t recipe-issue-machine
