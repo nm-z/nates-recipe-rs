@@ -177,9 +177,14 @@ define internal void @contraction_zero_edges(i32 %m.count, i32 %n.count, i32 %k.
 entry:
 %a.missing = sub i32 %tile.m, %m.count
 %b.missing = sub i32 %tile.n, %n.count
+%k.missing = sub i32 %tile.k, %k.count
 %a.count = mul i32 %a.missing, %k.count
 %b.count = mul i32 %b.missing, %k.count
-%count = add i32 %a.count, %b.count
+%output.count = add i32 %a.count, %b.count
+%a.k.count = mul i32 %k.missing, %m.count
+%a.k.limit = add i32 %output.count, %a.k.count
+%b.k.count = mul i32 %k.missing, %n.count
+%count = add i32 %a.k.limit, %b.k.count
 br label %loop
 loop:
 %p = phi i32 [ %lid, %entry ], [ %next, %store ]
@@ -187,7 +192,13 @@ loop:
 br i1 %more, label %classify, label %exit
 classify:
 %a = icmp ult i32 %p, %a.count
-br i1 %a, label %a.step, label %b.step
+br i1 %a, label %a.step, label %classify.b
+classify.b:
+%b = icmp ult i32 %p, %output.count
+br i1 %b, label %b.step, label %classify.a.k
+classify.a.k:
+%is.a.k = icmp ult i32 %p, %a.k.limit
+br i1 %is.a.k, label %a.k.step, label %b.k.step
 a.step:
 %a.k = udiv i32 %p, %a.missing
 %a.local = urem i32 %p, %a.missing
@@ -203,8 +214,24 @@ b.step:
 %b.local.index = call i32 @contraction_b_index(i32 %b.k, i32 %b.n, i32 %tile.n, i32 %tile.k)
 %b.index = add i32 %b.base, %b.local.index
 br label %store
+a.k.step:
+%a.k.p = sub i32 %p, %output.count
+%a.k.local = udiv i32 %a.k.p, %m.count
+%a.k.value = add i32 %k.count, %a.k.local
+%a.k.m = urem i32 %a.k.p, %m.count
+%a.k.index = call i32 @contraction_a_index(i32 %a.k.value, i32 %a.k.m, i32 %tile.m, i32 %tile.k)
+br label %store
+b.k.step:
+%b.k.p = sub i32 %p, %a.k.limit
+%b.k.local = udiv i32 %b.k.p, %n.count
+%b.k.value = add i32 %k.count, %b.k.local
+%b.k.n = urem i32 %b.k.p, %n.count
+%b.k.base = mul i32 %tile.m, %tile.k
+%b.k.local.index = call i32 @contraction_b_index(i32 %b.k.value, i32 %b.k.n, i32 %tile.n, i32 %tile.k)
+%b.k.index = add i32 %b.k.base, %b.k.local.index
+br label %store
 store:
-%index = phi i32 [ %a.index, %a.step ], [ %b.index, %b.step ]
+%index = phi i32 [ %a.index, %a.step ], [ %b.index, %b.step ], [ %a.k.index, %a.k.step ], [ %b.k.index, %b.k.step ]
 %ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %index
 store double 0.0, ptr addrspace(3) %ptr, align 8
 %next = add i32 %p, %block
@@ -677,7 +704,8 @@ i32 %k.count, i32 %tile.m, i32 %tile.n, i32 %tile.k ) #1 { entry:
 %n.second.safe = select i1 %n.second.valid, i32 %n.second, i32 0
 %n.third.safe = select i1 %n.third.valid, i32 %n.third, i32 0
 %n.fourth.safe = select i1 %n.fourth.valid, i32 %n.fourth, i32 0
-%zero = call double @recipe.from.u1(i1 false)
+%matrix.k.adjusted = add i32 %k.count, 15
+%matrix.k.rounded = and i32 %matrix.k.adjusted, -16
 br label %matrix.k.loop
 matrix.k.loop:
 %matrix.k = phi i32 [ 0, %entry ], [ %matrix.k.next, %matrix.k.done ]
@@ -685,12 +713,8 @@ matrix.k.loop:
 %matrix.second = phi <8 x RECIPE_STATE> [ zeroinitializer, %entry ], [ %matrix.second.next, %matrix.k.done ]
 %matrix.third = phi <8 x RECIPE_STATE> [ zeroinitializer, %entry ], [ %matrix.third.next, %matrix.k.done ]
 %matrix.fourth = phi <8 x RECIPE_STATE> [ zeroinitializer, %entry ], [ %matrix.fourth.next, %matrix.k.done ]
-%matrix.k.more = icmp ult i32 %matrix.k, %k.count
-br i1 %matrix.k.more, label %matrix.k.classify, label %matrix.store.loop
-matrix.k.classify:
-%matrix.k.limit = add i32 %matrix.k, 16
-%matrix.k.full = icmp ule i32 %matrix.k.limit, %k.count
-br i1 %matrix.k.full, label %matrix.full, label %matrix.tail.loop
+%matrix.k.more = icmp ult i32 %matrix.k, %matrix.k.rounded
+br i1 %matrix.k.more, label %matrix.full, label %matrix.store.loop
 matrix.full:
 %matrix.a.index = call i32 @contraction_a_index(i32 %matrix.k, i32 %m.safe, i32 %tile.m, i32 %tile.k)
 %matrix.a.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %matrix.a.index
@@ -717,67 +741,10 @@ matrix.full:
 %matrix.b.fourth.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %matrix.b.fourth.index
 %matrix.b.fourth.loaded = load <16 x double>, ptr addrspace(3) %matrix.b.fourth.ptr, align 16
 %matrix.b.fourth.full = select i1 %n.fourth.valid, <16 x double> %matrix.b.fourth.loaded, <16 x double> zeroinitializer
-br label %matrix.k.ready
-matrix.tail.loop:
-%matrix.tail = phi i32 [ 0, %matrix.k.classify ], [ %matrix.tail.next, %matrix.tail.step ]
-%matrix.a.tail = phi <16 x double> [ zeroinitializer, %matrix.k.classify ], [ %matrix.a.tail.next, %matrix.tail.step ]
-%matrix.b.first.tail = phi <16 x double> [ zeroinitializer, %matrix.k.classify ], [ %matrix.b.first.tail.next, %matrix.tail.step ]
-%matrix.b.second.tail = phi <16 x double> [ zeroinitializer, %matrix.k.classify ], [ %matrix.b.second.tail.next, %matrix.tail.step ]
-%matrix.b.third.tail = phi <16 x double> [ zeroinitializer, %matrix.k.classify ], [ %matrix.b.third.tail.next, %matrix.tail.step ]
-%matrix.b.fourth.tail = phi <16 x double> [ zeroinitializer, %matrix.k.classify ], [ %matrix.b.fourth.tail.next, %matrix.tail.step ]
-%matrix.tail.more = icmp ult i32 %matrix.tail, 16
-br i1 %matrix.tail.more, label %matrix.tail.step, label %matrix.k.ready
-matrix.tail.step:
-%matrix.term = add i32 %matrix.k, %matrix.tail
-%matrix.term.valid = icmp ult i32 %matrix.term, %k.count
-%matrix.term.safe = select i1 %matrix.term.valid, i32 %matrix.term, i32 0
-%matrix.a.tail.index = call i32 @contraction_a_index(i32 %matrix.term.safe, i32 %m.safe, i32 %tile.m, i32 %tile.k)
-%matrix.a.tail.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %matrix.a.tail.index
-%matrix.a.tail.loaded = load double, ptr addrspace(3) %matrix.a.tail.ptr, align 2
-%matrix.a.tail.valid = and i1 %matrix.term.valid, %m.valid
-%matrix.a.tail.value = select i1 %matrix.a.tail.valid, double %matrix.a.tail.loaded, double %zero
-%matrix.a.tail.next = insertelement <16 x double> %matrix.a.tail, double %matrix.a.tail.value, i32 %matrix.tail
-%matrix.b.tail.base = mul i32 %tile.m, %tile.k
-%matrix.b.first.tail.local = call i32 @contraction_b_index(i32 %matrix.term.safe, i32 %n.first.safe, i32 %tile.n, i32 %tile.k)
-%matrix.b.first.tail.index = add i32 %matrix.b.tail.base, %matrix.b.first.tail.local
-%matrix.b.first.tail.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %matrix.b.first.tail.index
-%matrix.b.first.tail.loaded = load double, ptr addrspace(3) %matrix.b.first.tail.ptr, align 2
-%matrix.b.first.tail.valid = and i1 %matrix.term.valid, %n.first.valid
-%matrix.b.first.tail.value = select i1 %matrix.b.first.tail.valid, double %matrix.b.first.tail.loaded, double %zero
-%matrix.b.first.tail.next = insertelement <16 x double> %matrix.b.first.tail, double %matrix.b.first.tail.value, i32 %matrix.tail
-%matrix.b.second.tail.local = call i32 @contraction_b_index(i32 %matrix.term.safe, i32 %n.second.safe, i32 %tile.n, i32 %tile.k)
-%matrix.b.second.tail.index = add i32 %matrix.b.tail.base, %matrix.b.second.tail.local
-%matrix.b.second.tail.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %matrix.b.second.tail.index
-%matrix.b.second.tail.loaded = load double, ptr addrspace(3) %matrix.b.second.tail.ptr, align 2
-%matrix.b.second.tail.valid = and i1 %matrix.term.valid, %n.second.valid
-%matrix.b.second.tail.value = select i1 %matrix.b.second.tail.valid, double %matrix.b.second.tail.loaded, double %zero
-%matrix.b.second.tail.next = insertelement <16 x double> %matrix.b.second.tail, double %matrix.b.second.tail.value, i32 %matrix.tail
-%matrix.b.third.tail.local = call i32 @contraction_b_index(i32 %matrix.term.safe, i32 %n.third.safe, i32 %tile.n, i32 %tile.k)
-%matrix.b.third.tail.index = add i32 %matrix.b.tail.base, %matrix.b.third.tail.local
-%matrix.b.third.tail.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %matrix.b.third.tail.index
-%matrix.b.third.tail.loaded = load double, ptr addrspace(3) %matrix.b.third.tail.ptr, align 2
-%matrix.b.third.tail.valid = and i1 %matrix.term.valid, %n.third.valid
-%matrix.b.third.tail.value = select i1 %matrix.b.third.tail.valid, double %matrix.b.third.tail.loaded, double %zero
-%matrix.b.third.tail.next = insertelement <16 x double> %matrix.b.third.tail, double %matrix.b.third.tail.value, i32 %matrix.tail
-%matrix.b.fourth.tail.local = call i32 @contraction_b_index(i32 %matrix.term.safe, i32 %n.fourth.safe, i32 %tile.n, i32 %tile.k)
-%matrix.b.fourth.tail.index = add i32 %matrix.b.tail.base, %matrix.b.fourth.tail.local
-%matrix.b.fourth.tail.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %matrix.b.fourth.tail.index
-%matrix.b.fourth.tail.loaded = load double, ptr addrspace(3) %matrix.b.fourth.tail.ptr, align 2
-%matrix.b.fourth.tail.valid = and i1 %matrix.term.valid, %n.fourth.valid
-%matrix.b.fourth.tail.value = select i1 %matrix.b.fourth.tail.valid, double %matrix.b.fourth.tail.loaded, double %zero
-%matrix.b.fourth.tail.next = insertelement <16 x double> %matrix.b.fourth.tail, double %matrix.b.fourth.tail.value, i32 %matrix.tail
-%matrix.tail.next = add i32 %matrix.tail, 1
-br label %matrix.tail.loop
-matrix.k.ready:
-%matrix.a.fragment = phi <16 x double> [ %matrix.a.full, %matrix.full ], [ %matrix.a.tail, %matrix.tail.loop ]
-%matrix.b.first.fragment = phi <16 x double> [ %matrix.b.first.full, %matrix.full ], [ %matrix.b.first.tail, %matrix.tail.loop ]
-%matrix.b.second.fragment = phi <16 x double> [ %matrix.b.second.full, %matrix.full ], [ %matrix.b.second.tail, %matrix.tail.loop ]
-%matrix.b.third.fragment = phi <16 x double> [ %matrix.b.third.full, %matrix.full ], [ %matrix.b.third.tail, %matrix.tail.loop ]
-%matrix.b.fourth.fragment = phi <16 x double> [ %matrix.b.fourth.full, %matrix.full ], [ %matrix.b.fourth.tail, %matrix.tail.loop ]
-%matrix.first.next = call <8 x RECIPE_STATE> @recipe.wmma(<16 x double> %matrix.a.fragment, <16 x double> %matrix.b.first.fragment, <8 x RECIPE_STATE> %matrix.first)
-%matrix.second.next = call <8 x RECIPE_STATE> @recipe.wmma(<16 x double> %matrix.a.fragment, <16 x double> %matrix.b.second.fragment, <8 x RECIPE_STATE> %matrix.second)
-%matrix.third.next = call <8 x RECIPE_STATE> @recipe.wmma(<16 x double> %matrix.a.fragment, <16 x double> %matrix.b.third.fragment, <8 x RECIPE_STATE> %matrix.third)
-%matrix.fourth.next = call <8 x RECIPE_STATE> @recipe.wmma(<16 x double> %matrix.a.fragment, <16 x double> %matrix.b.fourth.fragment, <8 x RECIPE_STATE> %matrix.fourth)
+%matrix.first.next = call <8 x RECIPE_STATE> @recipe.wmma(<16 x double> %matrix.a.full, <16 x double> %matrix.b.first.full, <8 x RECIPE_STATE> %matrix.first)
+%matrix.second.next = call <8 x RECIPE_STATE> @recipe.wmma(<16 x double> %matrix.a.full, <16 x double> %matrix.b.second.full, <8 x RECIPE_STATE> %matrix.second)
+%matrix.third.next = call <8 x RECIPE_STATE> @recipe.wmma(<16 x double> %matrix.a.full, <16 x double> %matrix.b.third.full, <8 x RECIPE_STATE> %matrix.third)
+%matrix.fourth.next = call <8 x RECIPE_STATE> @recipe.wmma(<16 x double> %matrix.a.full, <16 x double> %matrix.b.fourth.full, <8 x RECIPE_STATE> %matrix.fourth)
 br label %matrix.k.done
 matrix.k.done:
 %matrix.k.next = add i32 %matrix.k, 16
