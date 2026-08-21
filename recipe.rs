@@ -8427,6 +8427,7 @@ impl Train {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
 			predictions.clear();
+			let mut raw_outputs = Vec::new();
 			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
 			for sample in prepared.samples.chunks_exact(prepared.features) {
 				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, model.loss)?;
@@ -8434,6 +8435,7 @@ impl Train {
 				validation.forward()?;
 				let raw = validation.predictions()?;
 				require(raw.len() == 1, "autoregressive forward must produce one char ID")?;
+				raw_outputs.push(raw[0]);
 				let prediction = scale.map_or(raw[0], |scale| scale.decode(raw[0]));
 				predictions.push(prediction);
 				if stream {
@@ -8444,7 +8446,9 @@ impl Train {
 			if stream {
 				eprintln!()
 			}
-			final_loss = model_loss(&predictions, &prepared.targets, model.loss, config.activation[7]);
+			// Evaluation loss lives in the training representation and covers only held-out rows;
+			// decoding is for the user-facing predictions, r2, and tokens.
+			final_loss = model_loss(&raw_outputs[training_rows..], &target_values[training_rows..], model.loss, config.activation[7]);
 		} else if training_rows < prepared.rows {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
