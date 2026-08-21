@@ -7785,15 +7785,22 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	}
 	for path in &mut paths { *path = fs::canonicalize(&*path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))? }
 	paths.sort(); paths.dedup();
-	let mut grouped = Vec::new();
+	let mut files = Vec::new();
 	for path in &paths {
+		files.push((path.clone(), fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?));
+	}
+	let mut grouped = Vec::new();
+	for (path, bytes) in &files {
 		if !path.extension().and_then(|value| value.to_str()).is_some_and(is_table) {
 			continue;
 		}
-		let bytes = fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
 		let directory = path.parent().unwrap_or_else(|| Path::new("")).to_owned();
-		let (table, _) = parse_table(&path, &bytes)?;
-		grouped.push((directory, table));
+		for table in decode_tables(path, bytes)? {
+			grouped.push((directory.clone(), table));
+		}
+	}
+	if let Some(table) = directory_samples(data, sources, &files, &grouped)? {
+		return Ok((vec![table], paths));
 	}
 	let mut tables = merge_captures(grouped, &data.target)?;
 	tables = merge_partitions(tables, &data.target, &data.exclusions)?;
@@ -7809,6 +7816,484 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 		}
 	}
 	Ok((tables, paths))
+}
+/// One interpretation of directory layout for sample trees whose target is not a table
+/// column: flat sidecar-labeled samples, class-labeled subdirectories, and paired
+/// subdirectories. Each file is read once; text samples contribute their content and image
+/// samples their decoded pixels. Anything else falls through to the table flow.
+fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>)], parsed: &[(PathBuf, Table)]) -> Result<Option<Table>> {
+	let [source] = sources else { return Ok(None) };
+	let [target] = data.target.as_slice() else { return Ok(None) };
+	if parsed.iter().any(|(_, table)| target_column(table, target).is_some()) {
+		return Ok(None);
+	}
+	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension));
+	let samples = files.iter().filter(|(path, _)| sample(path)).collect::<Vec<_>>();
+	if samples.is_empty() {
+		return Ok(None);
+	}
+	let root = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve {source}: {error}")))?;
+	let name = root.file_name().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
+	let stem = |path: &Path| path.file_stem().and_then(|value| value.to_str()).unwrap_or("").to_owned();
+	// Flat sidecar samples: every file directly under the root, labeled by a .label sibling.
+	if samples.iter().all(|(path, _)| path.parent() == Some(root.as_path())) {
+		let sidecar = |path: &Path| files.iter().find(|(candidate, _)| *candidate == path.with_extension("label"));
+		if samples.iter().all(|(path, _)| sidecar(path).is_some()) {
+			let mut builder = SampleTableBuilder::new(target.clone());
+			for (path, bytes) in &samples {
+				let (_, label) = sidecar(path).unwrap();
+				builder.push(path, bytes, sample_text(path, label)?)?;
+			}
+			return builder.finish(name).map(Some);
+		}
+		return Ok(None);
+	}
+	// One level of subdirectories under the root.
+	if !samples.iter().all(|(path, _)| path.parent().and_then(Path::parent) == Some(root.as_path())) {
+		return Ok(None);
+	}
+	let mut directories = BTreeMap::<String, Vec<&(PathBuf, Vec<u8>)>>::new();
+	for entry in &samples {
+		let directory = entry.0.parent().and_then(Path::file_name).and_then(|value| value.to_str()).ok_or_else(|| RecipeError::new(format!("sample directory of {} is unreadable", entry.0.display())))?;
+		directories.entry(directory.to_owned()).or_default().push(entry);
+	}
+	if directories.len() < 2 {
+		return Ok(None);
+	}
+	// Paired subdirectories: identical sample stems in every directory, one directory named
+	// for the requested target. Each stem is one sample and each directory one column group.
+	let singular = |directory: &str| directory.strip_suffix('s').filter(|value| !value.is_empty()).unwrap_or(directory).to_owned();
+	let stems = directories.values().map(|entries| entries.iter().map(|(path, _)| stem(path)).collect::<BTreeSet<_>>()).collect::<Vec<_>>();
+	let aligned = stems.windows(2).all(|pair| pair[0] == pair[1]);
+	let paired_target = directories.keys().any(|directory| singular(directory) == *target);
+	let sample_target = stems[0].contains(target);
+	require(!(aligned && paired_target && sample_target), format!("target {target:?} names both a paired directory and a per-sample file"))?;
+	// Per-sample subdirectories: identical file stems per directory, one stem naming the
+	// target. Each directory is one sample and each file stem one column.
+	if aligned && sample_target {
+		let columns = stems[0].iter().cloned().collect::<Vec<_>>();
+		let mut headers = Vec::new();
+		let mut rows: Vec<Vec<String>> = vec![Vec::new(); directories.len()];
+		for column in &columns {
+			let mut width = None;
+			for (row, entries) in directories.values().enumerate() {
+				let (path, bytes) = entries.iter().find(|(path, _)| stem(path) == *column).unwrap();
+				let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
+					require(column != target, format!("per-sample target files {column:?} hold images, not values"))?;
+					image_values(path, bytes)?
+				} else {
+					vec![sample_text(path, bytes)?]
+				};
+				require(*width.get_or_insert(values.len()) == values.len(), format!("sample {} expected {} values, received {}", path.display(), width.unwrap(), values.len()))?;
+				rows[row].extend(values);
+			}
+			match width.unwrap_or(0) {
+				1 => headers.push(column.clone()),
+				width => headers.extend((1..=width).map(|index| format!("{column}.{index}"))),
+			}
+		}
+		return Ok(Some(Table { name, headers, rows }));
+	}
+	if aligned && paired_target {
+		let mut columns = Vec::new();
+		for (directory, entries) in &directories {
+			let mut ordered = entries.clone();
+			ordered.sort_by_key(|(path, _)| stem(path));
+			columns.push((singular(directory), ordered));
+		}
+		let mut headers = Vec::new();
+		let mut rows: Vec<Vec<String>> = vec![Vec::new(); stems[0].len()];
+		for (column, ordered) in &columns {
+			let mut width = None;
+			for (row, (path, bytes)) in ordered.iter().enumerate() {
+				let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
+					require(column != target, format!("paired target directory {column:?} holds images, not values"))?;
+					image_values(path, bytes)?
+				} else {
+					vec![sample_text(path, bytes)?]
+				};
+				require(*width.get_or_insert(values.len()) == values.len(), format!("paired sample {} expected {} values, received {}", path.display(), width.unwrap(), values.len()))?;
+				rows[row].extend(values);
+			}
+			match width.unwrap_or(0) {
+				1 => headers.push(column.clone()),
+				width => headers.extend((1..=width).map(|index| format!("{column}.{index}"))),
+			}
+		}
+		return Ok(Some(Table { name, headers, rows }));
+	}
+	if aligned {
+		return Ok(None);
+	}
+	// Class subdirectories: differing sample stems, the directory name is the target value.
+	let mut builder = SampleTableBuilder::new(target.clone());
+	for (directory, entries) in &directories {
+		for (path, bytes) in entries {
+			builder.push(path, bytes, directory.clone())?;
+		}
+	}
+	builder.finish(name).map(Some)
+}
+/// Rows of one sample table: each sample contributes its content columns plus the target.
+struct SampleTableBuilder {
+	target: String,
+	headers: Vec<String>,
+	rows: Vec<Vec<String>>,
+}
+impl SampleTableBuilder {
+	fn new(target: String) -> Self { Self { target, headers: Vec::new(), rows: Vec::new() } }
+	fn push(&mut self, path: &Path, bytes: &[u8], target: String) -> Result<()> {
+		let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
+			image_values(path, bytes)?
+		} else {
+			vec![sample_text(path, bytes)?]
+		};
+		if self.headers.is_empty() {
+			self.headers = match values.len() {
+				1 => vec!["content".to_owned()],
+				width => (1..=width).map(|index| format!("pixel.{index}")).collect(),
+			};
+			self.headers.push(self.target.clone());
+		}
+		require(values.len() + 1 == self.headers.len(), format!("sample {} expected {} values, received {}", path.display(), self.headers.len() - 1, values.len()))?;
+		let mut row = values;
+		row.push(target);
+		self.rows.push(row);
+		Ok(())
+	}
+	fn finish(self, name: String) -> Result<Table> {
+		Ok(Table { name, headers: self.headers, rows: self.rows })
+	}
+}
+fn sample_text(path: &Path, bytes: &[u8]) -> Result<String> {
+	Ok(str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("sample {} is not UTF-8: {error}", path.display())))?.trim().to_owned())
+}
+fn image_values(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
+	let jpeg = path.extension().and_then(|value| value.to_str()).is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "jpg" | "jpeg"));
+	let decoded = if jpeg { jpeg_pixels(bytes) } else { png_pixels(bytes) };
+	let (_, _, _, pixels) = decoded.map_err(|error| RecipeError::new(format!("image {}: {error}", path.display())))?;
+	Ok(pixels.iter().map(|value| value.to_string()).collect())
+}
+fn is_image(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg") }
+/// Decoded baseline JFIF pixels: 8-bit precision, Huffman entropy coding, and the
+/// libjpeg fixed-point inverse DCT and color conversion so pixels match its output.
+fn jpeg_pixels(bytes: &[u8]) -> Result<(usize, usize, usize, Vec<u8>)> {
+	const ZIGZAG: [usize; 64] = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63];
+	let truncated = || RecipeError::new("JPEG stream is truncated");
+	require(bytes.get(..2) == Some(&[0xff, 0xd8]), "JPEG signature is absent")?;
+	let mut quantization = [[0_u16; 64]; 4];
+	let mut huffman: [[Option<(Vec<u8>, Vec<u8>)>; 4]; 2] = Default::default();
+	let (mut frame, mut restart_interval) = (None, 0_usize);
+	let mut offset = 2;
+	let scan;
+	loop {
+		require(bytes.get(offset) == Some(&0xff), "JPEG marker is invalid")?;
+		let marker = *bytes.get(offset + 1).ok_or_else(truncated)?;
+		let length = usize::from(u16::from_be_bytes(bytes.get(offset + 2..offset + 4).ok_or_else(truncated)?.try_into().unwrap()));
+		let body = bytes.get(offset + 4..offset + 2 + length).ok_or_else(truncated)?;
+		match marker {
+			0xdb => {
+				let mut position = 0;
+				while position < body.len() {
+					let (precision, table) = (body[position] >> 4, usize::from(body[position] & 15));
+					require(precision == 0 && table < 4, "JPEG quantization table is unsupported")?;
+					for index in 0..64 {
+						quantization[table][ZIGZAG[index]] = u16::from(*body.get(position + 1 + index).ok_or_else(truncated)?);
+					}
+					position += 65;
+				}
+			}
+			0xc4 => {
+				let mut position = 0;
+				while position < body.len() {
+					let (class, table) = (usize::from(body[position] >> 4), usize::from(body[position] & 15));
+					require(class < 2 && table < 4, "JPEG Huffman table is unsupported")?;
+					let counts = body.get(position + 1..position + 17).ok_or_else(truncated)?.to_vec();
+					let total = counts.iter().map(|&count| usize::from(count)).sum::<usize>();
+					let symbols = body.get(position + 17..position + 17 + total).ok_or_else(truncated)?.to_vec();
+					huffman[class][table] = Some((counts, symbols));
+					position += 17 + total;
+				}
+			}
+			0xc0 => {
+				let (height, width, components) = (usize::from(u16::from_be_bytes(body[1..3].try_into().unwrap())), usize::from(u16::from_be_bytes(body[3..5].try_into().unwrap())), usize::from(body[5]));
+				require(body[0] == 8, "JPEG precision is unsupported")?;
+				require(matches!(components, 1 | 3), format!("JPEG component count {components} is unsupported"))?;
+				let mut layout = Vec::new();
+				for component in 0..components {
+					let (sampling, table) = (body[7 + 3 * component], usize::from(body[8 + 3 * component]));
+					require(sampling == 0x11, "JPEG chroma subsampling is unsupported")?;
+					layout.push(table);
+				}
+				frame = Some((width, height, layout));
+			}
+			0xc1..=0xcf if marker != 0xc4 && marker != 0xc8 && marker != 0xcc => return Err(RecipeError::new(format!("JPEG frame type {marker:#x} is unsupported"))),
+			0xdd => restart_interval = usize::from(u16::from_be_bytes(body[..2].try_into().unwrap())),
+			0xda => {
+				let components = usize::from(body[0]);
+				let mut tables = Vec::new();
+				for component in 0..components {
+					tables.push((usize::from(body[2 + 2 * component] >> 4), usize::from(body[2 + 2 * component] & 15)));
+				}
+				scan = (tables, offset + 2 + length);
+				break;
+			}
+			_ => {}
+		}
+		offset += 2 + length;
+	}
+	let (width, height, layout) = frame.ok_or_else(|| RecipeError::new("JPEG frame header is absent"))?;
+	let (scan_tables, mut position) = scan;
+	require(scan_tables.len() == layout.len(), "JPEG scan does not cover the frame components")?;
+	// Entropy-coded segment with byte stuffing and restart markers.
+	struct Entropy<'a> {
+		bytes: &'a [u8],
+		position: usize,
+		bits: u32,
+		count: u32,
+	}
+	impl Entropy<'_> {
+		fn bit(&mut self) -> Result<u32> {
+			if self.count == 0 {
+				let byte = *self.bytes.get(self.position).ok_or_else(|| RecipeError::new("JPEG entropy data is truncated"))?;
+				self.position += 1;
+				if byte == 0xff {
+					let stuffed = *self.bytes.get(self.position).ok_or_else(|| RecipeError::new("JPEG entropy data is truncated"))?;
+					require(stuffed == 0, "JPEG marker interrupts entropy data")?;
+					self.position += 1;
+				}
+				self.bits = u32::from(byte);
+				self.count = 8;
+			}
+			self.count -= 1;
+			Ok(self.bits >> self.count & 1)
+		}
+		fn receive(&mut self, length: u32) -> Result<i32> {
+			let mut value = 0_i32;
+			for _ in 0..length {
+				value = value << 1 | self.bit()? as i32;
+			}
+			Ok(value)
+		}
+		fn decode(&mut self, table: &(Vec<u8>, Vec<u8>)) -> Result<u8> {
+			let (mut code, mut first, mut index) = (0_u32, 0_u32, 0_u32);
+			for length in 0..16 {
+				code = code << 1 | self.bit()?;
+				let count = u32::from(table.0[length]);
+				if code < first + count {
+					return Ok(table.1[(index + code - first) as usize]);
+				}
+				index += count;
+				first = (first + count) << 1;
+			}
+			Err(RecipeError::new("JPEG Huffman code is invalid"))
+		}
+	}
+	fn extend(value: i32, length: u32) -> i32 {
+		if length != 0 && value < 1 << (length - 1) { value - (1 << length) + 1 } else { value }
+	}
+	// libjpeg jpeg_idct_islow: 13-bit fixed point, two passes, descale rounding.
+	fn idct(block: &[i32; 64], quantum: &[u16; 64]) -> [u8; 64] {
+		let mut workspace = [0_i32; 64];
+		for column in 0..8 {
+			let at = |row: usize| block[row * 8 + column] * i32::from(quantum[row * 8 + column]);
+			if (1..8).all(|row| at(row) == 0) {
+				let value = at(0) << 2;
+				for row in 0..8 {
+					workspace[row * 8 + column] = value;
+				}
+				continue;
+			}
+			let (z2, z3) = (at(2), at(6));
+			let z1 = (z2 + z3) * 4433;
+			let tmp2 = z1 + z3 * -15137;
+			let tmp3 = z1 + z2 * 6270;
+			let (tmp0, tmp1) = ((at(0) + at(4)) << 13, (at(0) - at(4)) << 13);
+			let (t10, t13, t11, t12) = (tmp0 + tmp3, tmp0 - tmp3, tmp1 + tmp2, tmp1 - tmp2);
+			let (o0, o1, o2, o3) = (at(7), at(5), at(3), at(1));
+			let (z1, z2, z3, z4) = (o0 + o3, o1 + o2, o0 + o2, o1 + o3);
+			let z5 = (z3 + z4) * 9633;
+			let (mut t0, mut t1, mut t2, mut t3) = (o0 * 2446, o1 * 16819, o2 * 25172, o3 * 12299);
+			let (z1, z2) = (z1 * -7373, z2 * -20995);
+			let z3 = z3 * -16069 + z5;
+			let z4 = z4 * -3196 + z5;
+			t0 += z1 + z3;
+			t1 += z2 + z4;
+			t2 += z2 + z3;
+			t3 += z1 + z4;
+			workspace[column] = t10 + t3 + 1024 >> 11;
+			workspace[56 + column] = t10 - t3 + 1024 >> 11;
+			workspace[8 + column] = t11 + t2 + 1024 >> 11;
+			workspace[48 + column] = t11 - t2 + 1024 >> 11;
+			workspace[16 + column] = t12 + t1 + 1024 >> 11;
+			workspace[40 + column] = t12 - t1 + 1024 >> 11;
+			workspace[24 + column] = t13 + t0 + 1024 >> 11;
+			workspace[32 + column] = t13 - t0 + 1024 >> 11;
+		}
+		let mut output = [0_u8; 64];
+		let clamp = |value: i32| value.clamp(0, 255) as u8;
+		for row in 0..8 {
+			let at = |column: usize| workspace[row * 8 + column];
+			let (z2, z3) = (at(2), at(6));
+			let z1 = (z2 + z3) * 4433;
+			let tmp2 = z1 + z3 * -15137;
+			let tmp3 = z1 + z2 * 6270;
+			let (tmp0, tmp1) = ((at(0) + at(4)) << 13, (at(0) - at(4)) << 13);
+			let (t10, t13, t11, t12) = (tmp0 + tmp3, tmp0 - tmp3, tmp1 + tmp2, tmp1 - tmp2);
+			let (o0, o1, o2, o3) = (at(7), at(5), at(3), at(1));
+			let (z1, z2, z3, z4) = (o0 + o3, o1 + o2, o0 + o2, o1 + o3);
+			let z5 = (z3 + z4) * 9633;
+			let (mut t0, mut t1, mut t2, mut t3) = (o0 * 2446, o1 * 16819, o2 * 25172, o3 * 12299);
+			let (z1, z2) = (z1 * -7373, z2 * -20995);
+			let z3 = z3 * -16069 + z5;
+			let z4 = z4 * -3196 + z5;
+			t0 += z1 + z3;
+			t1 += z2 + z4;
+			t2 += z2 + z3;
+			t3 += z1 + z4;
+			output[row * 8] = clamp((t10 + t3 + (1 << 17) >> 18) + 128);
+			output[row * 8 + 7] = clamp((t10 - t3 + (1 << 17) >> 18) + 128);
+			output[row * 8 + 1] = clamp((t11 + t2 + (1 << 17) >> 18) + 128);
+			output[row * 8 + 6] = clamp((t11 - t2 + (1 << 17) >> 18) + 128);
+			output[row * 8 + 2] = clamp((t12 + t1 + (1 << 17) >> 18) + 128);
+			output[row * 8 + 5] = clamp((t12 - t1 + (1 << 17) >> 18) + 128);
+			output[row * 8 + 3] = clamp((t13 + t0 + (1 << 17) >> 18) + 128);
+			output[row * 8 + 4] = clamp((t13 - t0 + (1 << 17) >> 18) + 128);
+		}
+		output
+	}
+	let components = layout.len();
+	let (blocks_x, blocks_y) = (width.div_ceil(8), height.div_ceil(8));
+	let mut planes = vec![vec![0_u8; blocks_x * blocks_y * 64]; components];
+	let mut entropy = Entropy { bytes, position, bits: 0, count: 0 };
+	let mut predictions = vec![0_i32; components];
+	let mut units = 0_usize;
+	for block_y in 0..blocks_y {
+		for block_x in 0..blocks_x {
+			if restart_interval != 0 && units == restart_interval {
+				entropy.count = 0;
+				require(bytes.get(entropy.position) == Some(&0xff) && bytes.get(entropy.position + 1).is_some_and(|marker| (0xd0..=0xd7).contains(marker)), "JPEG restart marker is absent")?;
+				entropy.position += 2;
+				predictions.fill(0);
+				units = 0;
+			}
+			for component in 0..components {
+				let (dc_table, ac_table) = scan_tables[component];
+				let dc = huffman[0][dc_table].as_ref().ok_or_else(|| RecipeError::new("JPEG DC table is absent"))?;
+				let ac = huffman[1][ac_table].as_ref().ok_or_else(|| RecipeError::new("JPEG AC table is absent"))?;
+				let mut block = [0_i32; 64];
+				let length = u32::from(entropy.decode(dc)?);
+				predictions[component] += extend(entropy.receive(length)?, length);
+				block[0] = predictions[component];
+				let mut index = 1;
+				while index < 64 {
+					let symbol = entropy.decode(ac)?;
+					let (run, length) = (usize::from(symbol >> 4), u32::from(symbol & 15));
+					if length == 0 {
+						if run == 15 {
+							index += 16;
+							continue;
+						}
+						break;
+					}
+					index += run;
+					require(index < 64, "JPEG coefficient index overflows")?;
+					block[ZIGZAG[index]] = extend(entropy.receive(length)?, length);
+					index += 1;
+				}
+				let decoded = idct(&block, &quantization[layout[component]]);
+				let plane = &mut planes[component];
+				for row in 0..8 {
+					for column in 0..8 {
+						plane[(block_y * 8 + row) * blocks_x * 8 + block_x * 8 + column] = decoded[row * 8 + column];
+					}
+				}
+			}
+			units += 1;
+		}
+	}
+	position = entropy.position;
+	let _ = position;
+	let mut pixels = vec![0_u8; width * height * components];
+	if components == 1 {
+		for row in 0..height {
+			for column in 0..width {
+				pixels[row * width + column] = planes[0][row * blocks_x * 8 + column];
+			}
+		}
+	} else {
+		// libjpeg ycc_rgb_convert: 16-bit fixed-point coefficients with one-half rounding.
+		let fix = |value: f64| (value * 65536.0 + 0.5) as i64;
+		for row in 0..height {
+			for column in 0..width {
+				let index = row * blocks_x * 8 + column;
+				let (y, cb, cr) = (i64::from(planes[0][index]), i64::from(planes[1][index]) - 128, i64::from(planes[2][index]) - 128);
+				let clamp = |value: i64| value.clamp(0, 255) as u8;
+				let red = y + (fix(1.40200) * cr + 32768 >> 16);
+				let green = y + (-fix(0.34414) * cb - fix(0.71414) * cr + 32768 >> 16);
+				let blue = y + (fix(1.77200) * cb + 32768 >> 16);
+				let out = (row * width + column) * 3;
+				pixels[out] = clamp(red);
+				pixels[out + 1] = clamp(green);
+				pixels[out + 2] = clamp(blue);
+			}
+		}
+	}
+	Ok((width, height, components, pixels))
+}
+/// Decoded 8-bit PNG pixels: grayscale or RGB, no interlacing, all five scanline filters.
+fn png_pixels(bytes: &[u8]) -> Result<(usize, usize, usize, Vec<u8>)> {
+	require(bytes.get(..8) == Some(&b"\x89PNG\r\n\x1a\n"[..]), "PNG signature is absent")?;
+	let (mut offset, mut header, mut compressed) = (8, None, Vec::new());
+	while offset + 8 <= bytes.len() {
+		let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+		let kind = &bytes[offset + 4..offset + 8];
+		let body = bytes.get(offset + 8..offset + 8 + length).ok_or_else(|| RecipeError::new("PNG chunk is truncated"))?;
+		match kind {
+			b"IHDR" => {
+				require(body.len() == 13, "PNG header has the wrong size")?;
+				let width = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
+				let height = u32::from_be_bytes(body[4..8].try_into().unwrap()) as usize;
+				let (depth, color, interlace) = (body[8], body[9], body[12]);
+				require(depth == 8, format!("PNG bit depth {depth} is unsupported"))?;
+				require(interlace == 0, "PNG interlacing is unsupported")?;
+				let channels = match color { 0 => 1, 2 => 3, color => return Err(RecipeError::new(format!("PNG color type {color} is unsupported"))) };
+				header = Some((width, height, channels));
+			}
+			b"IDAT" => compressed.extend_from_slice(body),
+			b"IEND" => break,
+			_ => {}
+		}
+		offset += 12 + length;
+	}
+	let (width, height, channels) = header.ok_or_else(|| RecipeError::new("PNG header is absent"))?;
+	let raw = zlib_inflate(&compressed)?;
+	let stride = checked_mul(width, channels, "PNG scanline")?;
+	require(raw.len() == checked_mul(height, stride + 1, "PNG image")?, "PNG data has the wrong size")?;
+	let mut pixels = vec![0_u8; height * stride];
+	for row in 0..height {
+		let filter = raw[row * (stride + 1)];
+		let line = &raw[row * (stride + 1) + 1..(row + 1) * (stride + 1)];
+		for column in 0..stride {
+			let left = if column >= channels { pixels[row * stride + column - channels] } else { 0 };
+			let above = if row > 0 { pixels[(row - 1) * stride + column] } else { 0 };
+			let corner = if row > 0 && column >= channels { pixels[(row - 1) * stride + column - channels] } else { 0 };
+			let predictor = match filter {
+				0 => 0,
+				1 => left,
+				2 => above,
+				3 => ((u16::from(left) + u16::from(above)) / 2) as u8,
+				4 => {
+					let estimate = i32::from(left) + i32::from(above) - i32::from(corner);
+					let (da, db, dc) = ((estimate - i32::from(left)).abs(), (estimate - i32::from(above)).abs(), (estimate - i32::from(corner)).abs());
+					if da <= db && da <= dc { left } else if db <= dc { above } else { corner }
+				}
+				filter => return Err(RecipeError::new(format!("PNG filter {filter} is unsupported"))),
+			};
+			pixels[row * stride + column] = line[column].wrapping_add(predictor);
+		}
+	}
+	Ok((width, height, channels, pixels))
 }
 fn prepare_data(data: &Data) -> Result<Prepared> {
 	let (mut tables, sources) = load_tables(data, &data.sources)?;
@@ -7945,7 +8430,14 @@ fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 fn finish_prepared(data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, source_rows: usize, features: usize, sequence: Option<Shape>, target_categorical: bool, schema: DataSchema) -> Result<Prepared> {
 	let rows = targets.len();
 	require(source_rows != 0 && source_rows <= rows, "dataset has no complete training rows")?;
-	let mut identities = samples.chunks_exact(features).zip(&targets).map(|(sample, target)| sample_identity(sample, *target)).collect();
+	// Sources may repeat a row verbatim; each copy is its own sample, so its identity mixes
+	// in how many identical rows precede it in source order, which the seed never changes.
+	let mut occurrences = BTreeMap::new();
+	let mut identities = samples.chunks_exact(features).zip(&targets).map(|(sample, target)| {
+		let content = sample_identity(sample, *target);
+		let occurrence = occurrences.entry(content).and_modify(|count| *count += 1_u64).or_insert(0);
+		occurrence.to_le_bytes().iter().fold(content, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(1099511628211))
+	}).collect();
 	shuffle(&mut samples, &mut targets, &mut identities, features, source_rows)?;
 	let (norm_mean, norm_scale) = if data.normalize {
 		normalize_samples(&mut samples, features, ((source_rows as f64) * data.split).floor() as usize)?
@@ -7984,9 +8476,11 @@ fn impute_missing(samples: &mut [f64]) {
 fn sample_identity(sample: &[f64], target: f64) -> u64 {
 	const OFFSET: u64 = 14695981039346656037;
 	const PRIME: u64 = 1099511628211;
-	sample.iter().copied().chain(std::iter::once(target)).fold(OFFSET, |hash, value| (hash ^ value.to_bits()).wrapping_mul(PRIME))
+	// Feed the hash bytewise: word-wide mixing leaves the low hash bits untouched by the
+	// all-zero low mantissa bits of small integer values, collapsing the identity space.
+	sample.iter().copied().chain(std::iter::once(target)).flat_map(|value| value.to_bits().to_le_bytes()).fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
 }
-fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data") }
+fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5" | "xml") }
 fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	let path = path.as_ref();
 	let mut components = path.components();
@@ -8107,6 +8601,805 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], exclusions: &[St
 	let name = "data".to_owned();
 	Ok(vec![Table { name, headers, rows }])
 }
+/// Decode one source file into its tables, dispatching on the container format.
+fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
+	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
+	match path.extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase).as_deref() {
+		Some("jsonl") => {
+			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("dataset {} is not UTF-8: {error}", path.display())))?;
+			let records = text.lines().map(str::trim).filter(|line| !line.is_empty()).map(|line| {
+				let (value, rest) = json_value(line)?;
+				require(rest.trim().is_empty(), format!("JSONL record has trailing content {:?}", rest.trim()))?;
+				Ok(value)
+			}).collect::<Result<Vec<_>>>().map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
+			Ok(vec![json_records_table(name, &records).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
+		}
+		Some("json") => {
+			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("dataset {} is not UTF-8: {error}", path.display())))?;
+			let records = json_array(text).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
+			Ok(vec![json_records_table(name, &records).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
+		}
+		Some("npz") => {
+			let mut columns = Vec::new();
+			for (entry, contents) in zip_entries(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
+				let array = entry.strip_suffix(".npy").unwrap_or(&entry).to_owned();
+				columns.extend(npy_columns(&array, &contents).map_err(|error| RecipeError::new(format!("dataset {} entry {entry}: {error}", path.display())))?);
+			}
+			Ok(vec![array_table(name, columns).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
+		}
+		Some("sqlite" | "sqlite3" | "db") => sqlite_tables(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display()))),
+		Some("xml") => {
+			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("dataset {} is not UTF-8: {error}", path.display())))?;
+			let records = xml_records(text).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
+			Ok(vec![json_records_table(name, &records).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
+		}
+		Some("h5" | "hdf5") => {
+			let columns = hdf5_columns(bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
+			Ok(vec![array_table(name, columns).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
+		}
+		_ => parse_table(path, bytes).map(|(table, _)| vec![table]),
+	}
+}
+/// Every user table of a SQLite database, walked from its rowid b-trees.
+fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
+	require(bytes.get(..16) == Some(b"SQLite format 3\0"), "SQLite header is absent")?;
+	let page_size = match u16::from_be_bytes(bytes[16..18].try_into().unwrap()) as usize { 1 => 65536, size => size };
+	let mut schema = Vec::new();
+	sqlite_rows(bytes, page_size, 1, &mut schema)?;
+	let mut tables = Vec::new();
+	for row in schema {
+		let [kind, name, _, root, sql] = row.as_slice() else { return Err(RecipeError::new("SQLite schema row has the wrong width")) };
+		if kind != "table" || name.starts_with("sqlite_") {
+			continue;
+		}
+		let root = root.parse::<usize>().map_err(|error| RecipeError::new(format!("invalid SQLite root page: {error}")))?;
+		let columns = sql.split_once('(').map(|(_, rest)| rest.rsplit_once(')').map_or(rest, |(inner, _)| inner)).ok_or_else(|| RecipeError::new(format!("SQLite table {name:?} has no column list")))?;
+		let headers = columns.split(',').map(|column| column.trim().split_whitespace().next().unwrap_or("").trim_matches(['"', '\'', '`', '[', ']']).to_owned()).collect::<Vec<_>>();
+		require(headers.iter().all(|header| !header.is_empty()), format!("SQLite table {name:?} has an unreadable column list"))?;
+		let mut rows = Vec::new();
+		sqlite_rows(bytes, page_size, root, &mut rows)?;
+		for row in &mut rows {
+			require(row.len() <= headers.len(), format!("SQLite table {name:?} row exceeds {} columns", headers.len()))?;
+			row.resize_with(headers.len(), String::new);
+		}
+		tables.push(Table { name: name.clone(), headers, rows });
+	}
+	require(!tables.is_empty(), "SQLite database has no tables")?;
+	Ok(tables)
+}
+/// In-order rowid b-tree walk appending each leaf record's decoded values.
+fn sqlite_rows(bytes: &[u8], page_size: usize, page: usize, rows: &mut Vec<Vec<String>>) -> Result<()> {
+	let start = checked_mul(page - 1, page_size, "SQLite page offset")?;
+	let header = start + if page == 1 { 100 } else { 0 };
+	let contents = bytes.get(start..start + page_size).ok_or_else(|| RecipeError::new(format!("SQLite page {page} is truncated")))?;
+	let kind = *bytes.get(header).ok_or_else(|| RecipeError::new(format!("SQLite page {page} is truncated")))?;
+	let cells = u16::from_be_bytes(bytes[header + 3..header + 5].try_into().unwrap()) as usize;
+	let pointers = header + if kind == 5 { 12 } else { 8 };
+	for cell in 0..cells {
+		let pointer = u16::from_be_bytes(bytes[pointers + cell * 2..pointers + cell * 2 + 2].try_into().unwrap()) as usize;
+		let mut offset = start + pointer;
+		match kind {
+			5 => {
+				let child = u32::from_be_bytes(bytes.get(offset..offset + 4).ok_or_else(|| RecipeError::new("SQLite interior cell is truncated"))?.try_into().unwrap()) as usize;
+				sqlite_rows(bytes, page_size, child, rows)?;
+			}
+			13 => {
+				let (payload, _) = sqlite_varint(bytes, &mut offset)?;
+				let _ = sqlite_varint(bytes, &mut offset)?;
+				let usable = page_size - 35;
+				require((payload as usize) <= usable, format!("SQLite page {page} overflows; overflow pages are unsupported"))?;
+				rows.push(sqlite_record(bytes.get(offset..offset + payload as usize).ok_or_else(|| RecipeError::new("SQLite record is truncated"))?)?);
+			}
+			_ => return Err(RecipeError::new(format!("SQLite page type {kind} is unsupported"))),
+		}
+	}
+	if kind == 5 {
+		let right = u32::from_be_bytes(bytes[header + 8..header + 12].try_into().unwrap()) as usize;
+		sqlite_rows(bytes, page_size, right, rows)?;
+	}
+	let _ = contents;
+	Ok(())
+}
+fn sqlite_varint(bytes: &[u8], offset: &mut usize) -> Result<(i64, usize)> {
+	let mut value = 0_i64;
+	for length in 1..=9 {
+		let byte = *bytes.get(*offset).ok_or_else(|| RecipeError::new("SQLite varint is truncated"))?;
+		*offset += 1;
+		if length == 9 {
+			value = value << 8 | i64::from(byte);
+			return Ok((value, length));
+		}
+		value = value << 7 | i64::from(byte & 0x7f);
+		if byte & 0x80 == 0 {
+			return Ok((value, length));
+		}
+	}
+	unreachable!()
+}
+/// Decode one SQLite record into per-column text values.
+fn sqlite_record(record: &[u8]) -> Result<Vec<String>> {
+	let mut offset = 0;
+	let (header, _) = sqlite_varint(record, &mut offset)?;
+	let mut serials = Vec::new();
+	while offset < header as usize {
+		serials.push(sqlite_varint(record, &mut offset)?.0);
+	}
+	let mut body = header as usize;
+	let mut values = Vec::with_capacity(serials.len());
+	for serial in serials {
+		let mut integer = |width: usize| -> Result<i64> {
+			let mut value = if record.get(body).is_some_and(|byte| byte & 0x80 != 0) { -1_i64 } else { 0 };
+			for _ in 0..width {
+				value = value << 8 | i64::from(*record.get(body).ok_or_else(|| RecipeError::new("SQLite value is truncated"))?);
+				body += 1;
+			}
+			Ok(value)
+		};
+		values.push(match serial {
+			0 => String::new(),
+			1 => integer(1)?.to_string(),
+			2 => integer(2)?.to_string(),
+			3 => integer(3)?.to_string(),
+			4 => integer(4)?.to_string(),
+			5 => integer(6)?.to_string(),
+			6 => integer(8)?.to_string(),
+			7 => {
+				let value = f64::from_bits(integer(8)? as u64);
+				value.to_string()
+			}
+			8 => "0".to_owned(),
+			9 => "1".to_owned(),
+			serial if serial >= 13 && serial % 2 == 1 => {
+				let length = (serial as usize - 13) / 2;
+				let text = record.get(body..body + length).ok_or_else(|| RecipeError::new("SQLite text is truncated"))?;
+				body += length;
+				String::from_utf8(text.to_vec()).map_err(|error| RecipeError::new(format!("SQLite text is not UTF-8: {error}")))?
+			}
+			serial => return Err(RecipeError::new(format!("SQLite serial type {serial} is unsupported"))),
+		});
+	}
+	Ok(values)
+}
+/// Raw DEFLATE decompression (RFC 1951): stored, fixed, and dynamic Huffman blocks.
+fn inflate(bytes: &[u8]) -> Result<Vec<u8>> {
+	struct Bits<'a> {
+		bytes: &'a [u8],
+		position: usize,
+	}
+	impl Bits<'_> {
+		fn bit(&mut self) -> Result<u64> {
+			let byte = *self.bytes.get(self.position / 8).ok_or_else(|| RecipeError::new("DEFLATE stream is truncated"))?;
+			let bit = u64::from(byte >> (self.position % 8) & 1);
+			self.position += 1;
+			Ok(bit)
+		}
+		fn bits(&mut self, count: u32) -> Result<u64> {
+			let mut value = 0;
+			for index in 0..count {
+				value |= self.bit()? << index;
+			}
+			Ok(value)
+		}
+	}
+	struct Huffman {
+		counts: [u16; 16],
+		symbols: Vec<u16>,
+	}
+	impl Huffman {
+		fn new(lengths: &[u8]) -> Result<Self> {
+			let mut counts = [0_u16; 16];
+			for &length in lengths {
+				require(length < 16, "DEFLATE code length exceeds 15")?;
+				counts[length as usize] += 1;
+			}
+			counts[0] = 0;
+			let mut offsets = [0_u16; 16];
+			for length in 1..16 {
+				offsets[length] = offsets[length - 1] + counts[length - 1];
+			}
+			let mut symbols = vec![0_u16; lengths.iter().filter(|length| **length != 0).count()];
+			for (symbol, &length) in lengths.iter().enumerate() {
+				if length != 0 {
+					symbols[offsets[length as usize] as usize] = symbol as u16;
+					offsets[length as usize] += 1;
+				}
+			}
+			Ok(Self { counts, symbols })
+		}
+		fn decode(&self, bits: &mut Bits) -> Result<u16> {
+			let (mut code, mut first, mut index) = (0_u32, 0_u32, 0_u32);
+			for length in 1..16 {
+				code |= bits.bit()? as u32;
+				let count = u32::from(self.counts[length]);
+				if code < first + count {
+					return Ok(self.symbols[(index + code - first) as usize]);
+				}
+				index += count;
+				first = (first + count) << 1;
+				code <<= 1;
+			}
+			Err(RecipeError::new("DEFLATE code is invalid"))
+		}
+	}
+	const LENGTH_BASE: [u16; 29] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+	const LENGTH_EXTRA: [u32; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+	const DISTANCE_BASE: [u16; 30] = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+	const DISTANCE_EXTRA: [u32; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+	let mut bits = Bits { bytes, position: 0 };
+	let mut output = Vec::new();
+	loop {
+		let last = bits.bit()?;
+		match bits.bits(2)? {
+			0 => {
+				bits.position = bits.position.div_ceil(8) * 8;
+				let start = bits.position / 8;
+				let length = u16::from_le_bytes(bytes.get(start..start + 2).ok_or_else(|| RecipeError::new("DEFLATE stream is truncated"))?.try_into().unwrap()) as usize;
+				output.extend_from_slice(bytes.get(start + 4..start + 4 + length).ok_or_else(|| RecipeError::new("DEFLATE stream is truncated"))?);
+				bits.position = (start + 4 + length) * 8;
+			}
+			kind @ (1 | 2) => {
+				let (literals, distances) = if kind == 1 {
+					let mut lengths = [8_u8; 288];
+					lengths[144..256].fill(9);
+					lengths[256..280].fill(7);
+					(Huffman::new(&lengths)?, Huffman::new(&[5; 30])?)
+				} else {
+					const ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+					let literal_count = bits.bits(5)? as usize + 257;
+					let distance_count = bits.bits(5)? as usize + 1;
+					let code_count = bits.bits(4)? as usize + 4;
+					let mut code_lengths = [0_u8; 19];
+					for index in 0..code_count {
+						code_lengths[ORDER[index]] = bits.bits(3)? as u8;
+					}
+					let codes = Huffman::new(&code_lengths)?;
+					let mut lengths = vec![0_u8; literal_count + distance_count];
+					let mut index = 0;
+					while index < lengths.len() {
+						match codes.decode(&mut bits)? {
+							16 => {
+								let previous = *lengths.get(index.wrapping_sub(1)).ok_or_else(|| RecipeError::new("DEFLATE repeat has no previous length"))?;
+								for _ in 0..bits.bits(2)? + 3 {
+									require(index < lengths.len(), "DEFLATE code lengths overflow")?;
+									lengths[index] = previous;
+									index += 1;
+								}
+							}
+							17 => index += bits.bits(3)? as usize + 3,
+							18 => index += bits.bits(7)? as usize + 11,
+							length => {
+								lengths[index] = length as u8;
+								index += 1;
+							}
+						}
+					}
+					(Huffman::new(&lengths[..literal_count])?, Huffman::new(&lengths[literal_count..])?)
+				};
+				loop {
+					match literals.decode(&mut bits)? {
+						symbol if symbol < 256 => output.push(symbol as u8),
+						256 => break,
+						symbol => {
+							let entry = symbol as usize - 257;
+							require(entry < LENGTH_BASE.len(), "DEFLATE length code is invalid")?;
+							let length = LENGTH_BASE[entry] as usize + bits.bits(LENGTH_EXTRA[entry])? as usize;
+							let code = distances.decode(&mut bits)? as usize;
+							require(code < DISTANCE_BASE.len(), "DEFLATE distance code is invalid")?;
+							let distance = DISTANCE_BASE[code] as usize + bits.bits(DISTANCE_EXTRA[code])? as usize;
+							require(distance <= output.len(), "DEFLATE distance exceeds output")?;
+							for _ in 0..length {
+								output.push(output[output.len() - distance]);
+							}
+						}
+					}
+				}
+			}
+			_ => return Err(RecipeError::new("DEFLATE block type is invalid")),
+		}
+		if last == 1 {
+			return Ok(output);
+		}
+	}
+}
+/// zlib envelope: header check, DEFLATE body, Adler-32 verification.
+fn zlib_inflate(bytes: &[u8]) -> Result<Vec<u8>> {
+	require(bytes.len() > 6 && bytes[0] & 0xf == 8 && (u16::from(bytes[0]) << 8 | u16::from(bytes[1])) % 31 == 0 && bytes[1] & 0x20 == 0, "zlib header is invalid")?;
+	let output = inflate(&bytes[2..bytes.len() - 4])?;
+	let (mut low, mut high) = (1_u32, 0_u32);
+	for byte in &output {
+		low = (low + u32::from(*byte)) % 65521;
+		high = (high + low) % 65521;
+	}
+	let expected = u32::from_be_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+	require(high << 16 | low == expected, "zlib checksum mismatch")?;
+	Ok(output)
+}
+/// Named columns from every dataset of an HDF5 file (version-0 superblock, symbol-table
+/// groups, version-1 object headers, contiguous or chunked layouts, optional deflate filter).
+fn hdf5_columns(bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
+	let read16 = |offset: usize| bytes.get(offset..offset + 2).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize);
+	let read32 = |offset: usize| bytes.get(offset..offset + 4).map(|value| u32::from_le_bytes(value.try_into().unwrap()) as usize);
+	let read64 = |offset: usize| bytes.get(offset..offset + 8).map(|value| u64::from_le_bytes(value.try_into().unwrap()) as usize);
+	let truncated = || RecipeError::new("HDF5 file is truncated");
+	require(bytes.get(..8) == Some(&b"\x89HDF\r\n\x1a\n"[..]), "HDF5 signature is absent")?;
+	require(bytes.get(8) == Some(&0), "HDF5 superblock version is unsupported")?;
+	require(bytes.get(13) == Some(&8) && bytes.get(14) == Some(&8), "HDF5 offset or length size is unsupported")?;
+	let root_header = read64(0x40).ok_or_else(truncated)?;
+	fn messages(bytes: &[u8], output: &mut Vec<(u16, usize, usize)>, remaining: &mut usize, start: usize, end: usize) -> Result<()> {
+		let mut offset = start;
+		while offset + 8 <= end && *remaining != 0 {
+			let kind = u16::from_le_bytes(bytes.get(offset..offset + 2).ok_or_else(|| RecipeError::new("HDF5 message is truncated"))?.try_into().unwrap());
+			let size = u16::from_le_bytes(bytes[offset + 2..offset + 4].try_into().unwrap()) as usize;
+			let body = offset + 8;
+			*remaining -= 1;
+			if kind == 0x10 {
+				let continuation = u64::from_le_bytes(bytes.get(body..body + 8).ok_or_else(|| RecipeError::new("HDF5 continuation is truncated"))?.try_into().unwrap()) as usize;
+				let length = u64::from_le_bytes(bytes[body + 8..body + 16].try_into().unwrap()) as usize;
+				messages(bytes, output, remaining, continuation, continuation + length)?;
+			} else {
+				output.push((kind, body, size));
+			}
+			offset = body + size;
+		}
+		Ok(())
+	}
+	let object_messages = |header: usize| -> Result<Vec<(u16, usize, usize)>> {
+		require(bytes.get(header) == Some(&1), "HDF5 object header version is unsupported")?;
+		let mut count = read16(header + 2).ok_or_else(truncated)?;
+		let size = read32(header + 8).ok_or_else(truncated)?;
+		let mut output = Vec::new();
+		messages(bytes, &mut output, &mut count, header + 16, header + 16 + size)?;
+		Ok(output)
+	};
+	let (mut btree, mut heap) = (None, None);
+	for (kind, body, _) in object_messages(root_header)? {
+		if kind == 0x11 {
+			btree = read64(body);
+			heap = read64(body + 8);
+		}
+	}
+	let (btree, heap) = (btree.ok_or_else(|| RecipeError::new("HDF5 root group has no symbol table"))?, heap.ok_or_else(truncated)?);
+	require(bytes.get(heap..heap + 4) == Some(&b"HEAP"[..]), "HDF5 local heap is invalid")?;
+	let heap_data = read64(heap + 24).ok_or_else(truncated)?;
+	let mut datasets = Vec::new();
+	let mut group_nodes = vec![btree];
+	while let Some(node) = group_nodes.pop() {
+		require(bytes.get(node..node + 4) == Some(&b"TREE"[..]), "HDF5 group b-tree is invalid")?;
+		let (level, entries) = (bytes[node + 5], read16(node + 6).ok_or_else(truncated)?);
+		let mut offset = node + 24 + 8;
+		for _ in 0..entries {
+			let child = read64(offset).ok_or_else(truncated)?;
+			offset += 16;
+			if level > 0 {
+				group_nodes.push(child);
+				continue;
+			}
+			require(bytes.get(child..child + 4) == Some(&b"SNOD"[..]), "HDF5 symbol table node is invalid")?;
+			let symbols = read16(child + 6).ok_or_else(truncated)?;
+			for symbol in 0..symbols {
+				let entry = child + 8 + symbol * 40;
+				let name_offset = heap_data + read64(entry).ok_or_else(truncated)?;
+				let terminator = bytes.get(name_offset..).and_then(|tail| tail.iter().position(|byte| *byte == 0)).ok_or_else(truncated)?;
+				let dataset_name = String::from_utf8(bytes[name_offset..name_offset + terminator].to_vec()).map_err(|error| RecipeError::new(format!("HDF5 dataset name is not UTF-8: {error}")))?;
+				datasets.push((dataset_name, read64(entry + 8).ok_or_else(truncated)?));
+			}
+		}
+	}
+	let mut columns = Vec::new();
+	for (dataset, header) in datasets {
+		let (mut dims, mut chunk_dims, mut address, mut contiguous_size, mut deflated, mut element, mut float, mut signed) = (Vec::new(), Vec::new(), None, 0, false, 0_usize, false, false);
+		for (kind, body, size) in object_messages(header)? {
+			match kind {
+				1 => {
+					let rank = bytes[body + 1] as usize;
+					dims = (0..rank).map(|index| read64(body + 8 + 8 * index).ok_or_else(truncated)).collect::<Result<Vec<_>>>()?;
+				}
+				3 => {
+					let class = bytes[body] & 0xf;
+					require(bytes[body] >> 4 <= 1, "HDF5 datatype version is unsupported")?;
+					require(class <= 1, format!("HDF5 datatype class {class} of dataset {dataset:?} is unsupported"))?;
+					require(bytes[body + 1] & 1 == 0, format!("HDF5 dataset {dataset:?} is not little-endian"))?;
+					float = class == 1;
+					signed = class == 0 && bytes[body + 1] & 8 != 0;
+					element = read32(body + 4).ok_or_else(truncated)?;
+				}
+				8 => {
+					require(bytes[body] == 3, "HDF5 data layout version is unsupported")?;
+					match bytes[body + 1] {
+						1 => {
+							address = read64(body + 2);
+							contiguous_size = read64(body + 10).ok_or_else(truncated)?;
+						}
+						2 => {
+							let rank = bytes[body + 2] as usize;
+							address = read64(body + 3);
+							chunk_dims = (0..rank.checked_sub(1).ok_or_else(truncated)?).map(|index| read32(body + 11 + 4 * index).ok_or_else(truncated)).collect::<Result<Vec<_>>>()?;
+						}
+						class => return Err(RecipeError::new(format!("HDF5 data layout class {class} is unsupported"))),
+					}
+				}
+				11 => {
+					deflated = bytes.get(body..body + size).ok_or_else(truncated)?.windows(7).any(|window| window == b"deflate");
+					require(deflated, format!("HDF5 dataset {dataset:?} uses an unsupported filter"))?;
+				}
+				_ => {}
+			}
+		}
+		require(!dims.is_empty() && element != 0, format!("HDF5 dataset {dataset:?} has no shape or type"))?;
+		require(matches!((float, element), (false, 1 | 2 | 4 | 8) | (true, 4 | 8)), format!("HDF5 dataset {dataset:?} element size {element} is unsupported"))?;
+		let count = dims.iter().try_fold(1_usize, |product, dimension| product.checked_mul(*dimension)).ok_or_else(|| RecipeError::new("HDF5 dataset size overflows"))?;
+		let mut raw = vec![0_u8; checked_mul(count, element, "HDF5 dataset bytes")?];
+		let address = address.ok_or_else(|| RecipeError::new(format!("HDF5 dataset {dataset:?} has no data address")))?;
+		if chunk_dims.is_empty() {
+			require(contiguous_size == raw.len(), format!("HDF5 dataset {dataset:?} has the wrong contiguous size"))?;
+			raw.copy_from_slice(bytes.get(address..address + contiguous_size).ok_or_else(truncated)?);
+		} else {
+			require(chunk_dims.len() == dims.len(), format!("HDF5 dataset {dataset:?} chunk rank differs from its shape"))?;
+			let mut chunk_nodes = vec![address];
+			let key_length = 8 + 8 * (chunk_dims.len() + 1);
+			while let Some(node) = chunk_nodes.pop() {
+				require(bytes.get(node..node + 4) == Some(&b"TREE"[..]) && bytes.get(node + 4) == Some(&1), "HDF5 chunk b-tree is invalid")?;
+				let (level, entries) = (bytes[node + 5], read16(node + 6).ok_or_else(truncated)?);
+				let mut offset = node + 24;
+				for _ in 0..entries {
+					let compressed = read32(offset).ok_or_else(truncated)?;
+					let mask = read32(offset + 4).ok_or_else(truncated)?;
+					let starts = (0..chunk_dims.len()).map(|index| read64(offset + 8 + 8 * index).ok_or_else(truncated)).collect::<Result<Vec<_>>>()?;
+					let child = read64(offset + key_length).ok_or_else(truncated)?;
+					offset += key_length + 8;
+					if level > 0 {
+						chunk_nodes.push(child);
+						continue;
+					}
+					require(mask == 0, format!("HDF5 dataset {dataset:?} chunk filter mask is unsupported"))?;
+					let chunk = bytes.get(child..child + compressed).ok_or_else(truncated)?;
+					let chunk = if deflated { zlib_inflate(chunk)? } else { chunk.to_vec() };
+					let chunk_count = chunk_dims.iter().product::<usize>();
+					require(chunk.len() == chunk_count * element, format!("HDF5 dataset {dataset:?} chunk has the wrong size"))?;
+					for local in 0..chunk_count {
+						let (mut remainder, mut inside) = (local, true);
+						let mut coordinates = vec![0_usize; chunk_dims.len()];
+						for axis in (0..chunk_dims.len()).rev() {
+							coordinates[axis] = starts[axis] + remainder % chunk_dims[axis];
+							remainder /= chunk_dims[axis];
+							inside &= coordinates[axis] < dims[axis];
+						}
+						if !inside {
+							continue;
+						}
+						let mut index = 0;
+						for axis in 0..chunk_dims.len() {
+							index = index * dims[axis] + coordinates[axis];
+						}
+						raw[index * element..(index + 1) * element].copy_from_slice(&chunk[local * element..(local + 1) * element]);
+					}
+				}
+			}
+		}
+		let decode = |value: &[u8]| -> f64 {
+			match (float, signed, element) {
+				(true, _, 4) => f64::from(f32::from_le_bytes(value.try_into().unwrap())),
+				(true, _, 8) => f64::from_le_bytes(value.try_into().unwrap()),
+				(false, true, 1) => f64::from(value[0] as i8),
+				(false, true, 2) => f64::from(i16::from_le_bytes(value.try_into().unwrap())),
+				(false, true, 4) => f64::from(i32::from_le_bytes(value.try_into().unwrap())),
+				(false, true, 8) => i64::from_le_bytes(value.try_into().unwrap()) as f64,
+				(false, false, 1) => f64::from(value[0]),
+				(false, false, 2) => f64::from(u16::from_le_bytes(value.try_into().unwrap())),
+				(false, false, 4) => f64::from(u32::from_le_bytes(value.try_into().unwrap())),
+				(false, false, 8) => u64::from_le_bytes(value.try_into().unwrap()) as f64,
+				_ => unreachable!(),
+			}
+		};
+		let decoded = raw.chunks_exact(element).map(decode).collect::<Vec<_>>();
+		let rows = dims[0];
+		let width = decoded.len() / rows.max(1);
+		for column in 0..width {
+			let header = if width == 1 { dataset.clone() } else { format!("{dataset}.{}", column + 1) };
+			columns.push((header, rows, (0..rows).map(|row| decoded[row * width + column]).collect()));
+		}
+	}
+	require(!columns.is_empty(), "HDF5 file has no datasets")?;
+	Ok(columns)
+}
+/// The stored entries of a ZIP archive, resolved through the central directory.
+fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+	let read16 = |offset: usize| bytes.get(offset..offset + 2).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize);
+	let read32 = |offset: usize| bytes.get(offset..offset + 4).map(|value| u32::from_le_bytes(value.try_into().unwrap()) as usize);
+	let tail = bytes.len().checked_sub(22).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?;
+	let end = (0..=tail.min(65535)).map(|back| tail - back).find(|&offset| bytes[offset..offset + 4] == [0x50, 0x4b, 0x05, 0x06]).ok_or_else(|| RecipeError::new("ZIP end of central directory is absent"))?;
+	let count = read16(end + 10).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?;
+	let mut offset = read32(end + 16).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?;
+	let mut entries = Vec::new();
+	for _ in 0..count {
+		require(bytes.get(offset..offset + 4) == Some(&[0x50, 0x4b, 0x01, 0x02]), "ZIP central directory entry is invalid")?;
+		let (method, size, name_length, extra, comment) = (read16(offset + 10), read32(offset + 24), read16(offset + 28), read16(offset + 30), read16(offset + 32));
+		let (method, size) = (method.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?, size.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?);
+		let local = read32(offset + 42).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?;
+		let name = String::from_utf8(bytes.get(offset + 46..offset + 46 + name_length.unwrap_or(0)).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?.to_vec()).map_err(|error| RecipeError::new(format!("ZIP entry name is not UTF-8: {error}")))?;
+		require(bytes.get(local..local + 4) == Some(&[0x50, 0x4b, 0x03, 0x04]), "ZIP local header is invalid")?;
+		let (local_name, local_extra) = (read16(local + 26).unwrap_or(0), read16(local + 28).unwrap_or(0));
+		let start = local + 30 + local_name + local_extra;
+		require(method == 0, format!("ZIP entry {name:?} uses unsupported compression method {method}"))?;
+		let contents = bytes.get(start..start + size).ok_or_else(|| RecipeError::new(format!("ZIP entry {name:?} is truncated")))?.to_vec();
+		if !name.ends_with('/') {
+			entries.push((name, contents));
+		}
+		offset += 46 + name_length.unwrap_or(0) + extra.unwrap_or(0) + comment.unwrap_or(0);
+	}
+	require(!entries.is_empty(), "ZIP archive has no entries")?;
+	Ok(entries)
+}
+/// One named column group from an NPY array: trailing dimensions flatten to `name.1..name.k` columns.
+fn npy_columns(name: &str, bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
+	require(bytes.get(..6) == Some(b"\x93NUMPY"), "NPY magic is absent")?;
+	let header_length = match bytes.get(6) {
+		Some(1) => bytes.get(8..10).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize + 10),
+		Some(2 | 3) => bytes.get(8..12).map(|value| u32::from_le_bytes(value.try_into().unwrap()) as usize + 12),
+		_ => None,
+	}
+	.ok_or_else(|| RecipeError::new("NPY header is invalid"))?;
+	let header = str::from_utf8(bytes.get(if bytes[6] == 1 { 10 } else { 12 }..header_length).ok_or_else(|| RecipeError::new("NPY header is truncated"))?).map_err(|error| RecipeError::new(format!("NPY header is not UTF-8: {error}")))?;
+	let field = |key: &str| header.split(key).nth(1).and_then(|rest| rest.split(':').nth(1)).map(str::trim_start);
+	let descr = field("'descr'").and_then(|value| value.split('\'').nth(1)).ok_or_else(|| RecipeError::new("NPY descr is absent"))?.to_owned();
+	require(field("'fortran_order'").is_some_and(|value| value.starts_with("False")), "NPY fortran order is unsupported")?;
+	let shape_text = field("'shape'").and_then(|value| value.split(')').next()).and_then(|value| value.split('(').nth(1)).ok_or_else(|| RecipeError::new("NPY shape is absent"))?;
+	let shape = shape_text.split(',').map(str::trim).filter(|value| !value.is_empty()).map(|value| value.parse::<usize>().map_err(|error| RecipeError::new(format!("invalid NPY dimension: {error}")))).collect::<Result<Vec<_>>>()?;
+	let rows = shape.first().copied().unwrap_or(1);
+	let width = shape.iter().skip(1).product::<usize>().max(1);
+	let element = descr.as_bytes().last().and_then(|digit| char::from(*digit).to_digit(10)).ok_or_else(|| RecipeError::new(format!("NPY dtype {descr:?} is unsupported")))? as usize;
+	let count = checked_mul(rows, width, "NPY elements")?;
+	let values = bytes.get(header_length..header_length + count * element).ok_or_else(|| RecipeError::new("NPY data is truncated"))?;
+	let kind = &descr[descr.len() - 2..];
+	let decode = |value: &[u8]| -> Result<f64> {
+		Ok(match (kind, element) {
+			("f4", 4) => f64::from(f32::from_le_bytes(value.try_into().unwrap())),
+			("f8", 8) => f64::from_le_bytes(value.try_into().unwrap()),
+			("i1", 1) => f64::from(value[0] as i8),
+			("i2", 2) => f64::from(i16::from_le_bytes(value.try_into().unwrap())),
+			("i4", 4) => f64::from(i32::from_le_bytes(value.try_into().unwrap())),
+			("i8", 8) => i64::from_le_bytes(value.try_into().unwrap()) as f64,
+			("u1", 1) => f64::from(value[0]),
+			("u2", 2) => f64::from(u16::from_le_bytes(value.try_into().unwrap())),
+			("u4", 4) => f64::from(u32::from_le_bytes(value.try_into().unwrap())),
+			("u8", 8) => u64::from_le_bytes(value.try_into().unwrap()) as f64,
+			_ => return Err(RecipeError::new(format!("NPY dtype {descr:?} is unsupported"))),
+		})
+	};
+	require(matches!(descr.as_bytes().first(), Some(b'<' | b'|')) || element == 1, format!("NPY dtype {descr:?} is unsupported"))?;
+	let decoded = values.chunks_exact(element).map(decode).collect::<Result<Vec<_>>>()?;
+	let mut columns = Vec::with_capacity(width);
+	for column in 0..width {
+		let header = if width == 1 { name.to_owned() } else { format!("{name}.{}", column + 1) };
+		columns.push((header, rows, (0..rows).map(|row| decoded[row * width + column]).collect()));
+	}
+	Ok(columns)
+}
+/// One table from named numeric columns; every column must agree on the row count.
+fn array_table(name: String, columns: Vec<(String, usize, Vec<f64>)>) -> Result<Table> {
+	require(!columns.is_empty(), "array source has no columns")?;
+	let rows = columns[0].1;
+	for (header, count, _) in &columns {
+		require(*count == rows, format!("array column {header:?} expected {rows} rows, received {count}"))?;
+	}
+	let headers = columns.iter().map(|(header, _, _)| header.clone()).collect();
+	let table_rows = (0..rows).map(|row| columns.iter().map(|(_, _, values)| values[row].to_string()).collect()).collect();
+	Ok(Table { name, headers, rows: table_rows })
+}
+/// The records of a top-level JSON array.
+fn json_array(text: &str) -> Result<Vec<JsonValue>> {
+	let mut rest = text.trim_start().strip_prefix('[').ok_or_else(|| RecipeError::new("JSON records expect a top-level array"))?.trim_start();
+	let mut values = Vec::new();
+	loop {
+		if let Some(after) = rest.strip_prefix(']') {
+			require(after.trim().is_empty(), "JSON records have trailing content")?;
+			return Ok(values);
+		}
+		if !values.is_empty() {
+			rest = rest.strip_prefix(',').ok_or_else(|| RecipeError::new("JSON array expects a comma"))?.trim_start();
+		}
+		let (value, remaining) = json_value(rest)?;
+		values.push(value);
+		rest = remaining.trim_start();
+	}
+}
+enum JsonValue {
+	Null,
+	Bool(bool),
+	Number(String),
+	Text(String),
+	Array,
+	Object(Vec<(String, JsonValue)>),
+}
+impl JsonValue {
+	fn scalar(&self) -> Option<String> {
+		match self {
+			Self::Null => Some(String::new()),
+			Self::Bool(value) => Some(value.to_string()),
+			Self::Number(value) | Self::Text(value) => Some(value.clone()),
+			Self::Array | Self::Object(_) => None,
+		}
+	}
+}
+/// Parse one JSON value from the start of `text`, returning it with the unconsumed remainder.
+fn json_value(text: &str) -> Result<(JsonValue, &str)> {
+	let text = text.trim_start();
+	let mut characters = text.char_indices();
+	match characters.next().map(|(_, character)| character) {
+		Some('n') => Ok((JsonValue::Null, text.strip_prefix("null").ok_or_else(|| RecipeError::new("invalid JSON literal"))?)),
+		Some('t') => Ok((JsonValue::Bool(true), text.strip_prefix("true").ok_or_else(|| RecipeError::new("invalid JSON literal"))?)),
+		Some('f') => Ok((JsonValue::Bool(false), text.strip_prefix("false").ok_or_else(|| RecipeError::new("invalid JSON literal"))?)),
+		Some('"') => {
+			let (value, rest) = json_string(text)?;
+			Ok((JsonValue::Text(value), rest))
+		}
+		Some('[') => {
+			let mut rest = text[1..].trim_start();
+			let mut values = 0;
+			loop {
+				if let Some(after) = rest.strip_prefix(']') {
+					return Ok((JsonValue::Array, after));
+				}
+				if values != 0 {
+					rest = rest.strip_prefix(',').ok_or_else(|| RecipeError::new("JSON array expects a comma"))?.trim_start();
+				}
+				let (_, remaining) = json_value(rest)?;
+				values += 1;
+				rest = remaining.trim_start();
+			}
+		}
+		Some('{') => {
+			let mut rest = text[1..].trim_start();
+			let mut fields = Vec::new();
+			loop {
+				if let Some(after) = rest.strip_prefix('}') {
+					return Ok((JsonValue::Object(fields), after));
+				}
+				if !fields.is_empty() {
+					rest = rest.strip_prefix(',').ok_or_else(|| RecipeError::new("JSON object expects a comma"))?.trim_start();
+				}
+				let (key, remaining) = json_string(rest)?;
+				rest = remaining.trim_start().strip_prefix(':').ok_or_else(|| RecipeError::new("JSON object expects a colon"))?;
+				let (value, remaining) = json_value(rest)?;
+				fields.push((key, value));
+				rest = remaining.trim_start();
+			}
+		}
+		Some(character) if character == '-' || character.is_ascii_digit() => {
+			let end = text.find(|character: char| !matches!(character, '0'..='9' | '-' | '+' | '.' | 'e' | 'E')).unwrap_or(text.len());
+			let (number, rest) = text.split_at(end);
+			number.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid JSON number {number:?}: {error}")))?;
+			Ok((JsonValue::Number(number.to_owned()), rest))
+		}
+		_ => Err(RecipeError::new("invalid JSON value")),
+	}
+}
+fn json_string(text: &str) -> Result<(String, &str)> {
+	let mut characters = text.strip_prefix('"').ok_or_else(|| RecipeError::new("JSON expects a string"))?.char_indices();
+	let mut value = String::new();
+	while let Some((index, character)) = characters.next() {
+		match character {
+			'"' => return Ok((value, &text[index + 2..])),
+			'\\' => match characters.next().map(|(_, escape)| escape) {
+				Some('"') => value.push('"'),
+				Some('\\') => value.push('\\'),
+				Some('/') => value.push('/'),
+				Some('b') => value.push('\u{8}'),
+				Some('f') => value.push('\u{c}'),
+				Some('n') => value.push('\n'),
+				Some('r') => value.push('\r'),
+				Some('t') => value.push('\t'),
+				Some('u') => {
+					let unit = |characters: &mut std::str::CharIndices| -> Result<u32> {
+						let digits = (0..4).map(|_| characters.next().map(|(_, digit)| digit).ok_or_else(|| RecipeError::new("JSON unicode escape is truncated"))).collect::<Result<String>>()?;
+						u32::from_str_radix(&digits, 16).map_err(|error| RecipeError::new(format!("invalid JSON unicode escape: {error}")))
+					};
+					let code = match unit(&mut characters)? {
+						high @ 0xd800..=0xdbff => {
+							require(characters.next().map(|(_, escape)| escape) == Some('\\') && characters.next().map(|(_, escape)| escape) == Some('u'), "JSON high surrogate expects a paired low surrogate")?;
+							let low = unit(&mut characters)?;
+							require((0xdc00..=0xdfff).contains(&low), "JSON high surrogate expects a paired low surrogate")?;
+							0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00)
+						}
+						low @ 0xdc00..=0xdfff => return Err(RecipeError::new(format!("JSON low surrogate {low:#x} has no preceding high surrogate"))),
+						code => code,
+					};
+					value.push(char::from_u32(code).ok_or_else(|| RecipeError::new("invalid JSON unicode escape"))?);
+				}
+				_ => return Err(RecipeError::new("invalid JSON escape")),
+			},
+			character => value.push(character),
+		}
+	}
+	Err(RecipeError::new("JSON string is unterminated"))
+}
+/// Flat records from an XML document: each first-level child of the root is one record and
+/// each of its child elements is one text field, expressed as the shared record objects.
+fn xml_records(text: &str) -> Result<Vec<JsonValue>> {
+	fn tag(rest: &str) -> Result<(&str, &str)> {
+		let rest = rest.strip_prefix('<').ok_or_else(|| RecipeError::new("XML expects an element"))?;
+		let end = rest.find('>').ok_or_else(|| RecipeError::new("XML tag is unterminated"))?;
+		let name = rest[..end].split_whitespace().next().unwrap_or("").trim_end_matches('/');
+		require(!name.is_empty(), "XML tag has no name")?;
+		Ok((name, &rest[end + 1..]))
+	}
+	fn unescape(value: &str) -> Result<String> {
+		let mut output = String::with_capacity(value.len());
+		let mut rest = value;
+		while let Some(position) = rest.find('&') {
+			output.push_str(&rest[..position]);
+			let entity = rest[position + 1..].split(';').next().ok_or_else(|| RecipeError::new("XML entity is unterminated"))?;
+			match entity {
+				"amp" => output.push('&'),
+				"lt" => output.push('<'),
+				"gt" => output.push('>'),
+				"quot" => output.push('"'),
+				"apos" => output.push('\''),
+				entity => {
+					let code = entity.strip_prefix("#x").map(|digits| u32::from_str_radix(digits, 16)).or_else(|| entity.strip_prefix('#').map(|digits| digits.parse())).ok_or_else(|| RecipeError::new(format!("XML entity {entity:?} is unsupported")))?.map_err(|error| RecipeError::new(format!("invalid XML entity: {error}")))?;
+					output.push(char::from_u32(code).ok_or_else(|| RecipeError::new("XML entity is out of range"))?);
+				}
+			}
+			rest = &rest[position + entity.len() + 2..];
+		}
+		output.push_str(rest);
+		Ok(output)
+	}
+	let mut rest = text.trim_start();
+	if let Some(after) = rest.strip_prefix("<?") {
+		rest = after.split_once("?>").ok_or_else(|| RecipeError::new("XML declaration is unterminated"))?.1.trim_start();
+	}
+	let (root, mut rest) = tag(rest)?;
+	let mut records = Vec::new();
+	loop {
+		rest = rest.trim_start();
+		if let Some(after) = rest.strip_prefix(&format!("</{root}>")) {
+			require(after.trim().is_empty(), "XML document has trailing content")?;
+			return Ok(records);
+		}
+		let (record, mut inner) = tag(rest)?;
+		let mut fields = Vec::new();
+		loop {
+			inner = inner.trim_start();
+			if let Some(after) = inner.strip_prefix(&format!("</{record}>")) {
+				rest = after;
+				break;
+			}
+			let (field, after) = tag(inner)?;
+			let close = format!("</{field}>");
+			let end = after.find(&close).ok_or_else(|| RecipeError::new(format!("XML field {field:?} is unterminated")))?;
+			let value = &after[..end];
+			require(!value.contains('<'), format!("XML field {field:?} nests elements"))?;
+			fields.push((field.to_owned(), JsonValue::Text(unescape(value)?)));
+			inner = &after[end + close.len()..];
+		}
+		records.push(JsonValue::Object(fields));
+	}
+}
+/// One table from flat JSON records: the ordered union of keys becomes the header row.
+fn json_records_table(name: String, records: &[JsonValue]) -> Result<Table> {
+	let mut headers = Vec::<String>::new();
+	for record in records {
+		let JsonValue::Object(fields) = record else { return Err(RecipeError::new("JSON record is not an object")) };
+		for (key, _) in fields {
+			if !headers.contains(key) {
+				headers.push(key.clone());
+			}
+		}
+	}
+	require(!headers.is_empty(), "JSON records have no fields")?;
+	let mut rows = Vec::with_capacity(records.len());
+	for record in records {
+		let JsonValue::Object(fields) = record else { unreachable!() };
+		let mut row = std::iter::repeat_with(String::new).take(headers.len()).collect::<Vec<_>>();
+		for (key, value) in fields {
+			let column = headers.iter().position(|header| header == key).unwrap();
+			row[column] = value.scalar().ok_or_else(|| RecipeError::new(format!("JSON record field {key:?} is not a scalar")))?;
+		}
+		rows.push(row);
+	}
+	Ok(Table { name, headers, rows })
+}
 fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	let first = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
 	let delimiter = [b',', b';', b'\t'].into_iter().max_by_key(|delimiter| first.iter().filter(|byte| *byte == delimiter).count()).unwrap_or(b',');
@@ -8114,7 +9407,7 @@ fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	require(!rows.is_empty(), format!("dataset {} is empty", path.display()))?;
 	let first = rows.remove(0);
 	let numeric = |value: &String| value.parse::<f64>().is_ok();
-	let headerless = first.iter().all(numeric);
+	let headerless = first.iter().all(numeric) || rows.is_empty();
 	let headers = if headerless { (1..=first.len()).map(|column| format!("col{column}")).collect() } else { first.clone() };
 	if headerless {
 		rows.insert(0, first);
