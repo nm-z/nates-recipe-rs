@@ -7904,7 +7904,7 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 	if parsed.iter().any(|(_, table)| target_column(table, target).is_some()) {
 		return Ok(None);
 	}
-	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension));
+	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension) || is_document(extension));
 	let samples = files.iter().filter(|(path, _)| sample(path)).collect::<Vec<_>>();
 	if samples.is_empty() {
 		return Ok(None);
@@ -7920,6 +7920,19 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 			for (path, bytes) in &samples {
 				let (_, label) = sidecar(path).unwrap();
 				builder.push(path, bytes, sample_text(path, label)?)?;
+			}
+			return builder.finish(name).map(Some);
+		}
+		// Name-labeled samples: `<target>__<name>` carries the label in the file name
+		// rather than in a sibling or a directory. Every file under the root has to be
+		// one labeled sample, so a tree whose samples are only partly recognized never
+		// trains on the recognized part alone.
+		const SEPARATOR: &str = "__";
+		let labels = samples.iter().map(|(path, _)| stem(path).split_once(SEPARATOR).map(|(label, _)| label.to_owned())).collect::<Option<Vec<_>>>();
+		if let Some(labels) = labels.filter(|labels| samples.len() == files.len() && labels.iter().collect::<BTreeSet<_>>().len() > 1) {
+			let mut builder = SampleTableBuilder::new(target.clone());
+			for ((path, bytes), label) in samples.iter().zip(labels) {
+				builder.push(path, bytes, label)?;
 			}
 			return builder.finish(name).map(Some);
 		}
@@ -8052,6 +8065,9 @@ fn image_values(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
 	Ok(pixels.iter().map(|value| value.to_string()).collect())
 }
 fn is_image(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg") }
+/// Document formats that carry sample text but never decode as tables, so they only
+/// count as samples inside a recognized directory layout.
+fn is_document(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "md" | "html" | "htm") }
 /// Decoded baseline JFIF pixels: 8-bit precision, Huffman entropy coding, and the
 /// libjpeg fixed-point inverse DCT and color conversion so pixels match its output.
 fn jpeg_pixels(bytes: &[u8]) -> Result<(usize, usize, usize, Vec<u8>)> {
