@@ -2646,8 +2646,8 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
 
 /// Run a compiler and return whatever it wrote to its diagnostic stream, which
 /// is where the resource-usage remarks below arrive.
-fn native_command(mut command: Command, role: &str) -> Result<String> {
-	let output = command.output().map_err(|error| RecipeError::new(format!("cannot start {role}: {error}")))?;
+fn native_command(mut command: Command, role: &str, key: &str) -> Result<String> {
+	debug(&format!("native compiler key={key} role={role} command={command:?}"))?; let output = command.output().map_err(|error| RecipeError::new(format!("cannot start {role}: {error}")))?;
 	let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_owned();
 	if output.status.success() {
 		return Ok(diagnostic);
@@ -2705,14 +2705,14 @@ fn native_amd_library(name: &'static str) -> Result<&'static str> {
 	option_env!("RECIPE_HSA_DEVICE_LIBRARY").filter(|_| name == "device").or(option_env!("RECIPE_HSA_CLOCK_LIBRARY").filter(|_| name == "clock")).or(option_env!("RECIPE_HSA_ABI_LIBRARY").filter(|_| name == "abi")).or(option_env!("RECIPE_HSA_FINITE_LIBRARY").filter(|_| name == "finite")).or(option_env!("RECIPE_HSA_MATH_LIBRARY").filter(|_| name == "math")).ok_or_else(|| RecipeError::new(format!("AMD native {name} library is unavailable")))
 }
 
-fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, ptx: Option<&Path>) -> Result<Vec<KernelResources>> {
+fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, ptx: Option<&Path>, key: &str) -> Result<Vec<KernelResources>> {
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
 			let (target, _, _, _) = cpu_identity(target)?;
 			let mut command = Command::new(compiler);
 			command.args(["-target", target, "-march=native", "-Xclang", "-opaque-pointers", "-x", "ir", "-O2", "-fPIC", "-shared", "-o"]).arg(output).arg(source);
-			native_command(command, "CPU LLVM IR compiler").map(|_| Vec::new())
+			native_command(command, "CPU LLVM IR compiler", key).map(|_| Vec::new())
 		}
 		BackendTarget::Amd { architecture } => {
 			let compiler = native_amd_compiler()?;
@@ -2727,7 +2727,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			let library_directory = option_env!("RECIPE_HSA_DEVICE_LIBRARY_DIRECTORY").ok_or_else(|| RecipeError::new("AMD native device library directory is unavailable"))?;
 			let isa = Path::new(library_directory).join(format!("oclc_isa_version_{}.bc", architecture.trim_start_matches("gfx")));
 			command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(isa).arg(source).arg("-o").arg(output);
-			native_command(command, "AMD LLVM IR compiler").map(|diagnostic| kernel_resources(&diagnostic))
+			native_command(command, "AMD LLVM IR compiler", key).map(|diagnostic| kernel_resources(&diagnostic))
 		}
 		BackendTarget::Nvidia { architecture } => {
 			let compiler = native_nvidia_compiler()?;
@@ -2736,11 +2736,11 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			let ptx_version = option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))?;
 			let mut llvm = Command::new(compiler);
 			llvm.args(["-target", "nvptx64-nvidia-cuda"]).arg(format!("-march={architecture}")).args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-S", "-x", "ir"]).arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(ptx);
-			native_command(llvm, "NVIDIA LLVM IR compiler")?;
+			native_command(llvm, "NVIDIA LLVM IR compiler", key)?;
 			let assembler = option_env!("RECIPE_NV_PTX_ASSEMBLER").ok_or_else(|| RecipeError::new("NVIDIA PTX assembler is unavailable"))?;
 			let mut ptxas = Command::new(assembler);
 			ptxas.arg(format!("-arch={architecture}")).args(["-o"]).arg(output).arg(ptx);
-			native_command(ptxas, "NVIDIA PTX assembler").map(|_| Vec::new())
+			native_command(ptxas, "NVIDIA PTX assembler", key).map(|_| Vec::new())
 		}
 	}
 }
@@ -2759,8 +2759,8 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 	let key = native_artifact_key(target, &ir);
 	let directory = native_artifact_directory(&key)?;
 	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native artifact directory: {error}")))?;
-	let path = directory.join(format!("artifact.{}", target.artifact_extension()));
-	let artifact = if path.is_file() {
+	let path = directory.join(format!("artifact.{}", target.artifact_extension())); let cached = path.is_file(); debug(&format!("native artifact key={key} target={} arithmetic={} loss={} rows={rows} cache={} path={}", native_target_label(target).split(";features=").next().unwrap_or("unknown"), model.precision.model.label(), loss.name(), if cached { "hit" } else { "miss" }, path.display()))?;
+	let artifact = if cached {
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	} else {
 		let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
@@ -2769,7 +2769,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		let output = directory.join(format!("{stem}.{}", target.artifact_extension()));
 		let ptx = (target.backend() == Backend::Nvidia).then(|| directory.join(format!("{stem}.ptx")));
 		let temporary = NativeTemporaryFiles { paths: std::iter::once(source.clone()).chain(std::iter::once(output.clone())).chain(ptx.iter().cloned()).collect() };
-		fs::write(&source, ir).map_err(|error| RecipeError::new(format!("cannot write native LLVM IR: {error}")))?;
+		fs::write(&source, ir).map_err(|error| RecipeError::new(format!("cannot write native LLVM IR: {error}")))?; debug(&format!("native source key={key} path={}", source.display()))?;
 		// The artifact is cached on disk, so this is the one moment the compiler's
 		// view of the kernel exists. A cooperative grid requires every workgroup to
 		// be resident at once, and the register allocation is what decides that.
@@ -2777,7 +2777,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		// nonzero occupancy here holds for every workgroup width the schedule can
 		// pick. It does not bound the tile: local memory is checked separately, and
 		// the schedule still does not resize itself from these numbers.
-		for kernel in compile_native_artifact(target, &source, &output, ptx.as_deref())? {
+		for kernel in compile_native_artifact(target, &source, &output, ptx.as_deref(), &key)? {
 			debug(&format!("native kernel {} registers={} scalars={} occupancy={} waves per SIMD", kernel.name, kernel.registers, kernel.scalars, kernel.occupancy))?;
 			require(kernel.occupancy != 0, format!("native kernel {} cannot be resident at any workgroup width", kernel.name))?;
 		}
@@ -4693,7 +4693,7 @@ impl Recipe {
 		let result = bundle::run_infer(&path, input, |stored, samples| {
 			let config = Config::load()?;
 			let graph = materialize_saved_graph(stored, samples, device, config)?;
-			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, mse)?;
+			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, stored.model.loss)?;
 			tape.inject_bn_stats(&stored.bn_stats)?;
 			tape.forward()?;
 			tape.predictions()
@@ -6540,7 +6540,7 @@ impl NativeProgram {
 				(NativeBackend::Nvidia(program), forward, epoch, model_load)
 			}
 		};
-		let block = forward.geometry.block.max(epoch.geometry.block);
+		debug(&format!("native load key={} path={} entrypoints={}", artifact.path.parent().and_then(Path::file_name).and_then(|key| key.to_str()).unwrap_or("unknown"), artifact.path.display(), if model_load.is_some() { "recipe_model_forward,recipe_model_epoch,recipe_model_load" } else { "recipe_model_forward,recipe_model_epoch" }))?; let block = forward.geometry.block.max(epoch.geometry.block);
 		let reduction_values = block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native contraction lane reduction overflows"))?;
 		let gradient_values = native_gradient_values(graph.parameters.len(), &schedule.contractions)?;
 		Ok(Self { gpu, artifact, backend, forward, epoch, model_load, tile: schedule.tile, shared_values: schedule.shared_values, reduction_values, gradient_values })
