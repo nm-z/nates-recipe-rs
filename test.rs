@@ -7,7 +7,17 @@ const AUTOREGRESSIVE_DATA_MODES: usize = 4;
 const MODEL_OPERATIONS: usize = 23;
 const ACTIVATIONS: usize = 16;
 const NORMALIZATIONS: usize = 2;
-const QUANTIZATIONS: usize = 63;
+const QUANTIZATIONS: &[(u16, u8, u16)] = &[
+	(0, 4, 0), (0, 4, 1), (0, 5, 0), (0, 5, 1), (0, 8, 0), (0, 8, 1),
+	(0, 2, 3), (0, 6, 3), (0, 8, 3),
+	(0, 3, 3), (0, 3, 4), (0, 3, 5), (0, 3, 6),
+	(0, 4, 3), (0, 4, 4), (0, 4, 5), (0, 5, 3), (0, 5, 4), (0, 5, 5),
+	(0, 4, 2),
+	(1, 1, 3), (1, 1, 4),
+	(1, 2, 1), (1, 2, 2), (1, 2, 3), (1, 2, 4),
+	(1, 3, 1), (1, 3, 2), (1, 3, 3), (1, 3, 4),
+	(1, 4, 2), (1, 4, 5),
+];
 const LOSSES: usize = 7;
 const ARITHMETICS: usize = 10;
 const STOP_MODES: usize = 3;
@@ -133,7 +143,7 @@ fn stage(mut value: u64) -> Stage {
 		operation: take(&mut value, MODEL_OPERATIONS),
 		activation: take(&mut value, ACTIVATIONS),
 		normalization: take(&mut value, NORMALIZATIONS),
-		quantization: take(&mut value, QUANTIZATIONS),
+		quantization: take(&mut value, QUANTIZATIONS.len() + 1),
 	}
 }
 
@@ -192,14 +202,8 @@ fn quantization(model: Model, quantization: usize) -> Model {
 	if quantization == 0 {
 		return model;
 	}
-	let quantization = quantization - 1;
-	if quantization < 42 {
-		let bits = [2, 3, 4, 5, 6, 8][quantization / 7];
-		return model.quantize(0, bits, (quantization % 7) as u16);
-	}
-	let quantization = quantization - 42;
-	let bits = [1, 2, 3, 4][quantization / 5];
-	model.quantize(1, bits, (quantization % 5 + 1) as u16)
+	let (family, bits, variant) = QUANTIZATIONS[quantization - 1];
+	model.quantize(family, bits, variant)
 }
 
 fn apply(model: Model, stage: Stage) -> Model {
@@ -210,7 +214,7 @@ fn apply(model: Model, stage: Stage) -> Model {
 }
 
 fn model(mut ordinal: u64) -> (Model, String) {
-	let stages = checked_product(&[MODEL_OPERATIONS as u64, ACTIVATIONS as u64, NORMALIZATIONS as u64, QUANTIZATIONS as u64]);
+	let stages = checked_product(&[MODEL_OPERATIONS as u64, ACTIVATIONS as u64, NORMALIZATIONS as u64, (QUANTIZATIONS.len() + 1) as u64]);
 	let one = stages;
 	let mut model = recipe.model();
 	let mut description = Vec::new();
@@ -307,7 +311,7 @@ fn execute(case: u64, data_case: &DataCase, model_ordinal: u64, loss_ordinal: us
 
 fn main() {
 	let datasets = datasets();
-	let stages = checked_product(&[MODEL_OPERATIONS as u64, ACTIVATIONS as u64, NORMALIZATIONS as u64, QUANTIZATIONS as u64]);
+	let stages = checked_product(&[MODEL_OPERATIONS as u64, ACTIVATIONS as u64, NORMALIZATIONS as u64, (QUANTIZATIONS.len() + 1) as u64]);
 	let models = stages.checked_add(stages.checked_mul(stages).expect("two-stage model count overflows")).expect("model count overflows");
 	let total = checked_product(&[
 		datasets.len() as u64,
