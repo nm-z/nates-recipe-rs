@@ -1,6 +1,7 @@
 repository = "/home/nate/Desktop/recipe-issue-machine"
 log_path = "/home/nate/Desktop/recipe-issue-machine/recipe.log"
 queue_path = "/home/nate/Desktop/recipe-issue-machine/.issue-machine/queue.ogdl"
+reproduction_directory = "/tmp"
 decision_schema = "/home/nate/Desktop/recipe-issue-machine/.issue-machine/decision.schema.json"
 spark_model = "gpt-5.3-codex-spark"
 spark_effort = "xhigh"

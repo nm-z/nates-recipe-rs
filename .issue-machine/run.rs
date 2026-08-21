@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -9,12 +10,14 @@ const YELLOW: &str = "\x1b[38;2;255;194;0m";
 const GREEN: &str = "\x1b[38;2;0;174;107m";
 const BLUE: &str = "\x1b[38;2;39;125;255m";
 const RESET: &str = "\x1b[0m";
+const SHELL_SIGNAL_OFFSET: i32 = 128;
 
 #[derive(Clone)]
 struct Config {
     repository: PathBuf,
     log_path: PathBuf,
     queue_path: PathBuf,
+    reproduction_directory: PathBuf,
     decision_schema: PathBuf,
     spark_model: String,
     spark_effort: String,
@@ -67,6 +70,7 @@ fn config(path: &Path) -> Config {
         repository: value(&text, "repository").into(),
         log_path: value(&text, "log_path").into(),
         queue_path: value(&text, "queue_path").into(),
+        reproduction_directory: value(&text, "reproduction_directory").into(),
         decision_schema: value(&text, "decision_schema").into(),
         spark_model: value(&text, "spark_model"),
         spark_effort: value(&text, "spark_effort"),
@@ -117,6 +121,7 @@ struct Trial {
     config: Config,
     device: String,
     cursor: u64,
+    reproduction: PathBuf,
     output: std::process::Output,
 }
 
@@ -290,7 +295,11 @@ fn same_failure(left: &str, right: &str) -> bool {
             == right.lines().find_map(|line| line.strip_prefix("backend="))
 }
 
-fn trial(config: &Config, device: &str, cursor: u64) -> std::process::Output {
+fn reproduction_path(config: &Config, device: &str, cursor: u64) -> PathBuf {
+    config.reproduction_directory.join(format!("recipe-composition-repro-{device}-{cursor}.rs"))
+}
+
+fn trial(config: &Config, device: &str, cursor: u64, reproduction: &Path) -> std::process::Output {
     let mut command = Command::new("cargo");
     command
         .args(["run", "--bin", "recipe", "--", "test.rs"])
@@ -300,6 +309,7 @@ fn trial(config: &Config, device: &str, cursor: u64) -> std::process::Output {
             "RECIPE_COMPOSITION_COUNT",
             config.compositions_per_batch.to_string(),
         )
+        .env("RECIPE_COMPOSITION_REPRO", reproduction)
         .env_remove("RECIPE_DEVICE")
         .env_remove("RECIPE_FORCE_CPU")
         .current_dir(&config.repository);
@@ -309,6 +319,31 @@ fn trial(config: &Config, device: &str, cursor: u64) -> std::process::Output {
         command.env("RECIPE_DEVICE", device);
     }
     output(&mut command, None)
+}
+
+fn termination_signal(status: std::process::ExitStatus) -> Option<i32> {
+    status.signal().or_else(|| status.code().filter(|code| *code > SHELL_SIGNAL_OFFSET).map(|code| code - SHELL_SIGNAL_OFFSET))
+}
+
+fn repository_base(repository: &Path) -> String {
+    let commit = output(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(repository), None);
+    let status = output(Command::new("git").args(["status", "--porcelain", "--untracked-files=no"]).current_dir(repository), None);
+    assert!(commit.status.success() && status.status.success(), "cannot inspect the composition base");
+    format!("commit={} tracked_tree={}", String::from_utf8_lossy(&commit.stdout).trim(), if status.stdout.is_empty() { "clean" } else { "modified" })
+}
+
+fn crash_packet(trial: &Trial, text: &str, signal: i32) -> String {
+    let line = text.lines().find(|line| line.starts_with("composition ") && line.contains(':')).expect("signaled traversal emitted no composition");
+    let (case, configuration) = line.strip_prefix("composition ").expect("composition prefix disappeared").split_once(':').expect("composition description has no separator");
+    let step = text.lines().find_map(|line| line.split_whitespace().find_map(|value| value.strip_prefix("step="))).expect("signaled traversal emitted no permutation step");
+    let source = std::fs::read_to_string(&trial.reproduction).expect("signaled traversal staged no reproduction");
+    let mut fingerprint = 1_469_598_103_934_665_603_u64;
+    for byte in format!("{}:{signal}:{case}", trial.device).bytes().chain(source.bytes()) {
+        fingerprint ^= u64::from(byte);
+        fingerprint = fingerprint.wrapping_mul(1_099_511_628_211);
+    }
+    let message = format!("device {} terminated by signal {signal}", trial.device);
+    format!("id={fingerprint:016x}\nbase={}\ncursor=seed:{} cursor:{} next:{} step:{step} composition:{case}\nconfiguration={}\nexpected=training, optional resume, and inference produce finite numerical results through the public Recipe API\nobserved=phase:process message:{message}\noutput=phase:process message:{message}\nreplay=phase:process message:the process terminated before in-process replay stable:unknown\ncommand=cargo run --bin recipe -- {}\nreproduction:\n```rust\n{source}```", repository_base(&trial.config.repository), trial.config.seed, trial.cursor, trial.cursor + 1, configuration.trim(), trial.reproduction.display())
 }
 
 fn jq(json: &str, filter: &str) -> std::result::Result<String, String> {
@@ -786,12 +821,14 @@ fn main() {
                 allocation.claimed += 1;
                 start
             };
-            let result = trial(&current, &device, start);
+            let reproduction = reproduction_path(&current, &device, start);
+            let result = trial(&current, &device, start, &reproduction);
             if worker_send
                 .send(Trial {
                     config: current,
                     device: device.clone(),
                     cursor: start,
+                    reproduction,
                     output: result,
                 })
                 .is_err()
@@ -809,17 +846,21 @@ fn main() {
             String::from_utf8_lossy(&trial.output.stderr),
             String::from_utf8_lossy(&trial.output.stdout)
         );
+        let signal = termination_signal(trial.output.status);
         assert!(
-            trial.output.status.success(),
+            trial.output.status.success() || signal.is_some(),
             "Recipe traversal failed outside a failure packet on {} with status {:?}: {}",
             trial.device,
             trial.output.status,
             failure(&trial.output)
         );
-        let failures = packets(&text)
+        let mut failures = packets(&text)
             .into_iter()
             .map(|packet| packet_for_device(packet, &trial.device))
             .collect::<Vec<_>>();
+        if let Some(signal) = signal {
+            failures.push(packet_for_device(&crash_packet(&trial, &text, signal), &trial.device));
+        }
         for (offset, composition) in text
             .lines()
             .filter_map(|line| {
@@ -873,12 +914,15 @@ fn main() {
                 ready.notify_one();
             }
         }
-        let next = text
-            .lines()
-            .find_map(|line| line.strip_prefix("composition cursor="))
-            .expect("Recipe traversal emitted no next cursor")
-            .parse()
-            .expect("Recipe next cursor is invalid");
+        let next = if signal.is_some() {
+            trial.cursor + 1
+        } else {
+            text.lines()
+                .find_map(|line| line.strip_prefix("composition cursor="))
+                .expect("Recipe traversal emitted no next cursor")
+                .parse()
+                .expect("Recipe next cursor is invalid")
+        };
         completed.insert(trial.cursor, next);
         while let Some(next) = completed.remove(&frontier) {
             cursor(&path, next);
