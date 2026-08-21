@@ -150,13 +150,18 @@ enum Review {
 }
 
 fn queued(text: &str) -> VecDeque<String> {
-    text.split("RECIPE QUEUED FAILURE BEGIN\n")
+    let mut packets = text.split("RECIPE QUEUED FAILURE BEGIN\n")
         .skip(1)
         .filter_map(|tail| {
             tail.split_once("\nRECIPE QUEUED FAILURE END")
                 .map(|(packet, _)| packet.to_owned())
         })
-        .collect()
+        .collect::<VecDeque<_>>();
+    if let Some(index) = packets.iter().position(|packet| packet.starts_with("kind=performance\n")) {
+        let packet = packets.remove(index).expect("performance packet disappeared from the queue");
+        packets.push_front(packet);
+    }
+    packets
 }
 
 fn persist_queue(path: &Path, packets: &VecDeque<String>) {
@@ -874,7 +879,13 @@ fn main() {
         }
         let (lock, _) = &*reviewer_work;
         let mut state = lock.lock().expect("failure queue lock is poisoned");
-        state.packets.pop_front();
+        let reviewed = field(&packet, "id=");
+        let index = state
+            .packets
+            .iter()
+            .position(|queued| field(queued, "id=") == reviewed)
+            .expect("reviewed packet disappeared from the failure queue");
+        state.packets.remove(index);
         persist_queue(&current.queue_path, &state.packets);
     });
     assert!(
@@ -947,7 +958,7 @@ fn main() {
                 let (lock, ready) = &*work;
                 let mut state = lock.lock().expect("failure queue lock is poisoned");
                 if !state.packets.iter().any(|queued| same_failure(queued, &packet)) {
-                    state.packets.push_back(packet);
+                    state.packets.push_front(packet);
                     persist_queue(&trial.config.queue_path, &state.packets);
                     event(&trial.config, YELLOW, &format!("SLOW device={} cursor={} composition={composition} elapsed={}s depth={}", trial.device, trial.cursor, trial.elapsed_seconds, state.packets.len()));
                     ready.notify_one();
