@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "recipe_issues": {
+      "command": "/home/nate/Desktop/recipe-issue-machine/.issue-machine/issue-reader"
+    }
+  }
+}

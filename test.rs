@@ -414,6 +414,12 @@ fn main() {{
 	format!("{body}\n}}\n")
 }
 
+fn reproduction_path() -> PathBuf {
+	std::env::var_os("RECIPE_COMPOSITION_REPRO")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from(format!("/tmp/recipe-composition-repro-{}.rs", std::process::id())))
+}
+
 fn execute(case: u64, data_case: &DataCase, model_ordinal: u64, loss_ordinal: usize, train_case: TrainCase, lifecycle: usize, phase: &Cell<&'static str>) {
 	let bundle = PathBuf::from(format!("/tmp/recipe-composition-{}.ogdl", std::process::id()));
 	if bundle.exists() {
@@ -454,7 +460,8 @@ fn attempt(case: u64, data_case: &DataCase, model_ordinal: u64, loss_ordinal: us
 fn emit_failure(seed: u64, cursor: u64, next_cursor: u64, step: u64, case: u64, data_case: &DataCase, description: &str, loss_ordinal: usize, train_case: TrainCase, lifecycle: usize, failure: &Failure, replay: &Failure, source: &str) {
 	let mut fingerprint = hash_bytes(1_469_598_103_934_665_603, failure.phase.as_bytes());
 	fingerprint = hash_bytes(fingerprint, failure.message.as_bytes());
-	std::fs::write("/tmp/recipe-composition-repro.rs", source).expect("cannot write composition reproduction");
+	let reproduction = reproduction_path();
+	std::fs::write(&reproduction, source).expect("cannot write composition reproduction");
 	eprintln!("RECIPE FAILURE BEGIN");
 	eprintln!("id={fingerprint:016x}");
 	eprintln!("base={}", base());
@@ -465,7 +472,7 @@ fn emit_failure(seed: u64, cursor: u64, next_cursor: u64, step: u64, case: u64, 
 	eprintln!("observed=phase:{} message:{}", failure.phase, failure.message);
 	eprintln!("output=phase:{} message:{}", failure.phase, failure.message);
 	eprintln!("replay=phase:{} message:{} stable:{}", replay.phase, replay.message, failure.phase == replay.phase && failure.message == replay.message);
-	eprintln!("command=cargo run --bin recipe -- /tmp/recipe-composition-repro.rs");
+	eprintln!("command=cargo run --bin recipe -- {}", reproduction.display());
 	eprintln!("reproduction:\n```rust\n{source}```");
 	eprintln!("RECIPE FAILURE END");
 }
@@ -510,6 +517,8 @@ fn main() {
 		let (_, selected_loss) = loss(selected_model, loss_ordinal);
 		description.push_str(selected_loss);
 		description = description.replace('|', "");
+		let source = reproduction(case, &datasets[data_ordinal], model_ordinal, loss_ordinal, train_case, lifecycle, "training");
+		std::fs::write(reproduction_path(), source).expect("cannot stage composition reproduction");
 		eprintln!("composition {case}: data={} mode={} model={} loss={} arithmetic={} stop={} rate={} lifecycle={}", datasets[data_ordinal].path, datasets[data_ordinal].mode, description, loss_ordinal, train_case.arithmetic, train_case.stop, train_case.rate, lifecycle);
 		if let Err(failure) = attempt(case, &datasets[data_ordinal], model_ordinal, loss_ordinal, train_case, lifecycle) {
 			let replay = attempt(case, &datasets[data_ordinal], model_ordinal, loss_ordinal, train_case, lifecycle)

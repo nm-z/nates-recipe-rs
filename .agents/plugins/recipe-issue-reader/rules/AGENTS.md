@@ -1,0 +1,1 @@
+Use only read-only repository inspection tools, `search_issues`, `read_issue`, and the structured `finish` tool. Search issues on demand and read every plausible match in full. Never use terminal commands, mutation tools, subagents, or network tools other than the supplied issue reader.

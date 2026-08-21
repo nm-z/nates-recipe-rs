@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "verdict": { "type": "string", "enum": ["new", "comment", "reject"] },
+    "issue": { "type": "integer", "minimum": 0 },
+    "title": { "type": "string" },
+    "body": { "type": "string" },
+    "rationale": { "type": "string" }
+  },
+  "required": ["verdict", "issue", "title", "body", "rationale"],
+  "additionalProperties": false
+}
