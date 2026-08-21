@@ -2525,7 +2525,7 @@ fn emit_loss_value(ir: &mut String, loss: LossFunction, precision: Compute, ty: 
 			Ok("%loss.mae".to_owned())
 		}
 		4 => {
-			ir.push_str(&format!("%loss.probability.raw = call {ty} @recipe.state.sigmoid({ty} {prediction})\n%loss.probability.low = call i1 @recipe.state.olt({ty} %loss.probability.raw, {ty} {tiny})\n%loss.probability.floor = select i1 %loss.probability.low, {ty} {tiny}, {ty} %loss.probability.raw\n%loss.probability.high = call i1 @recipe.state.ogt({ty} %loss.probability.floor, {ty} {one_minus})\n%loss.probability = select i1 %loss.probability.high, {ty} {one_minus}, {ty} %loss.probability.floor\n%loss.log.probability = call {ty} @recipe.state.log({ty} %loss.probability)\n%loss.one.probability = call {ty} @recipe.state.sub({ty} {one}, {ty} %loss.probability)\n%loss.log.one.probability = call {ty} @recipe.state.log({ty} %loss.one.probability)\n%loss.first = call {ty} @recipe.state.mul({ty} {target}, {ty} %loss.log.probability)\n%loss.one.target = call {ty} @recipe.state.sub({ty} {one}, {ty} {target})\n%loss.second = call {ty} @recipe.state.mul({ty} %loss.one.target, {ty} %loss.log.one.probability)\n%loss.cross.sum = call {ty} @recipe.state.add({ty} %loss.first, {ty} %loss.second)\n%loss.cross = call {ty} @recipe.state.neg({ty} %loss.cross.sum)\n", ty = ty, tiny = literal(f64::EPSILON), one_minus = literal(1.0 - f64::EPSILON), target = target, one = one));
+			ir.push_str(&format!("%loss.probability.raw = call {ty} @recipe.state.sigmoid({ty} {prediction})\n%loss.probability.low = call i1 @recipe.state.olt({ty} %loss.probability.raw, {ty} {tiny})\n%loss.probability.floor = select i1 %loss.probability.low, {ty} {tiny}, {ty} %loss.probability.raw\n%loss.probability.high = call i1 @recipe.state.ogt({ty} %loss.probability.floor, {ty} {one_minus})\n%loss.probability = select i1 %loss.probability.high, {ty} {one_minus}, {ty} %loss.probability.floor\n%loss.log.probability = call {ty} @recipe.state.log({ty} %loss.probability)\n%loss.one.probability = call {ty} @recipe.state.sub({ty} {one}, {ty} %loss.probability)\n%loss.log.one.probability = call {ty} @recipe.state.log({ty} %loss.one.probability)\n%loss.first = call {ty} @recipe.state.mul({ty} {target}, {ty} %loss.log.probability)\n%loss.one.target = call {ty} @recipe.state.sub({ty} {one}, {ty} {target})\n%loss.second = call {ty} @recipe.state.mul({ty} %loss.one.target, {ty} %loss.log.one.probability)\n%loss.cross.sum = call {ty} @recipe.state.add({ty} %loss.first, {ty} %loss.second)\n%loss.cross = call {ty} @recipe.state.neg({ty} %loss.cross.sum)\n", ty = ty, tiny = literal(f64::EPSILON), one_minus = literal(precision.below_one(1.0 - f64::EPSILON)), target = target, one = one));
 			Ok("%loss.cross".to_owned())
 		}
 		6 => {
@@ -5601,8 +5601,8 @@ impl NativeTape {
 		let threads = self.program.epoch.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
-		let beta1 = self.precision.state.optimizer_beta(config.beta1);
-		let beta2 = self.precision.state.optimizer_beta(config.beta2);
+		let beta1 = self.precision.state.below_one(config.beta1);
+		let beta2 = self.precision.state.below_one(config.beta2);
 		let epsilon = self.precision.state.optimizer_epsilon(config.epsilon);
 		let beta1_power = beta1.powi(self.step as i32);
 		let beta2_power = beta2.powi(self.step as i32);
@@ -8281,7 +8281,7 @@ impl Compute {
 			_ => rounded,
 		}
 	}
-	fn optimizer_beta(self, value: f64) -> f64 {
+	fn below_one(self, value: f64) -> f64 {
 		let rounded = self.unpack(self.pack(value));
 		match self {
 			Self::F(format) | Self::Fp(format) | Self::Bf(format) | Self::Tf(format) if rounded >= 1.0 => format.arithmetic.unpack(format.arithmetic.pack(1.0) - 1),
