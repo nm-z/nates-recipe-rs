@@ -52,7 +52,7 @@ fn stack(width: usize, layers: usize) -> Model {
 }
 
 fn train(precision: &str, epochs: usize) -> Train {
-	let train = recipe.train().optimizer(adamw).lr(0.0001).seed(17).epochs(epochs);
+	let train = recipe.train().optimizer(adamw).lr(0.0001).seed(17).epochs(epochs).log(all);
 	match precision {
 		"fp64" => train.fp(64),
 		"fp32" => train.fp(32),

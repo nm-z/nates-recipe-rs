@@ -119,7 +119,7 @@ fn build(case: &Case) -> Model {
 }
 
 fn configure(precision: &str) -> Train {
-	let train = recipe.train().optimizer(adamw).lr(0.01).seed(17).epochs(3);
+	let train = recipe.train().optimizer(adamw).lr(0.01).seed(17).epochs(3).log(all);
 	match precision {
 		"f6.9" => train.f(6, 9),
 		"fp8" => train.fp(8),
