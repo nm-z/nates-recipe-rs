@@ -3078,7 +3078,7 @@ mod bundle {
 			require(self.norm_mean.len() == self.norm_scale.len() && (self.norm_mean.is_empty() || self.norm_mean.len() == self.inputs.len()), "semantic model normalization stats have the wrong width")?;
 			require(!self.artifact.is_empty(), "native artifact identity is absent")?;
 			require(self.frozen.len() == self.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "semantic model frozen weights are incomplete")?;
-			for (name, values) in [("moments", &self.state.moments), ("variances", &self.state.variances), ("best weights", &self.state.best)] {
+			for (name, values) in [("moments", &self.state.moments), ("variances", &self.state.variances)] {
 				require(values.is_empty() || values.len() == self.frozen.len(), format!("semantic model {name} are incomplete"))?;
 			}
 			Ok(SemanticGraph { model, precision: self.precision.ok_or_else(|| RecipeError::new("semantic model has no arithmetic format"))?, input, output, inputs: self.inputs, outputs: self.outputs, tensors: self.tensors, frozen: self.frozen, state: self.state, norm_mean: self.norm_mean, norm_scale: self.norm_scale, target_min: self.target_min, target_span: self.target_span, bn_stats: self.bn_stats, artifact: self.artifact })
@@ -3142,7 +3142,6 @@ mod bundle {
 				"frozen" => builder.frozen = values(value, "frozen weight")?,
 				"moments" => builder.state.moments = values(value, "Adam moment")?,
 				"variances" => builder.state.variances = values(value, "Adam variance")?,
-				"best" => builder.state.best = values(value, "best weight")?,
 				"best_loss" => builder.state.best_loss = values(value, "best loss")?,
 				"epoch" => builder.state.epoch = value.parse().map_err(|error| RecipeError::new(format!("invalid epoch: {error}")))?,
 				"training_rows" => builder.state.training_rows = value.parse().map_err(|error| RecipeError::new(format!("invalid training rows: {error}")))?,
@@ -3184,7 +3183,7 @@ mod bundle {
 				let metadata = if tensor.codebook.is_empty() { "-".to_owned() } else { tensor.codebook.iter().map(ToString::to_string).collect::<Vec<_>>().join(",") };
 				field(&mut document, "tensor", &format!("{} {} {metadata} {}", tensor.format.0, tensor.count, hex(&tensor.bytes)));
 			}
-			for (key, value) in [("frozen", join(&semantic.frozen)), ("moments", join(&semantic.state.moments)), ("variances", join(&semantic.state.variances)), ("best", join(&semantic.state.best)), ("best_loss", join(&semantic.state.best_loss)), ("epoch", semantic.state.epoch.to_string()), ("training_rows", semantic.state.training_rows.to_string()), ("trained_samples", join(&semantic.state.trained_samples)), ("norm_mean", join(&semantic.norm_mean)), ("norm_scale", join(&semantic.norm_scale))] {
+			for (key, value) in [("frozen", join(&semantic.frozen)), ("moments", join(&semantic.state.moments)), ("variances", join(&semantic.state.variances)), ("best_loss", join(&semantic.state.best_loss)), ("epoch", semantic.state.epoch.to_string()), ("training_rows", semantic.state.training_rows.to_string()), ("trained_samples", join(&semantic.state.trained_samples)), ("norm_mean", join(&semantic.norm_mean)), ("norm_scale", join(&semantic.norm_scale))] {
 				field(&mut document, key, &value)
 			}
 			if semantic.target_span != 0.0 {
@@ -4748,7 +4747,6 @@ struct Node {
 struct TrainingState {
 	moments: Vec<f64>,
 	variances: Vec<f64>,
-	best: Vec<f64>,
 	best_loss: Vec<f64>,
 	trained_samples: Vec<u64>,
 	epoch: usize,
@@ -5381,10 +5379,6 @@ struct NativeTape {
 	variances: Buffer,
 	gradient: Buffer,
 	metrics: Buffer,
-	best: Vec<f64>,
-	best_moments: Vec<f64>,
-	best_variances: Vec<f64>,
-	best_epoch: u32,
 	best_loss: [f64; 4],
 	rows: u32,
 	parameters: usize,
@@ -5413,16 +5407,8 @@ impl NativeTape {
 		let variances = if graph.state.variances.is_empty() { zeros.clone() } else { graph.state.variances.clone() };
 		let frozen = if graph.frozen.is_empty() { vec![0_u8; parameters.max(1)] } else { graph.frozen.clone() };
 		let batch_normalizations = graph.nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels))).collect();
-		let best = if graph.state.best.is_empty() { graph.parameters.clone() } else { graph.state.best.clone() };
-		require(best.len() == parameters, "saved best model has the wrong shape")?;
 		let best_loss = if graph.state.best_loss.is_empty() { [f64::INFINITY, f64::NAN, f64::NAN, f64::INFINITY] } else { graph.state.best_loss.as_slice().try_into().map_err(|_| RecipeError::new("saved loss state is invalid"))? };
 		let step = narrow(graph.state.epoch, "optimizer epoch")? as u32;
-		let saved = |values: &Vec<f64>, role: &str| -> Result<Vec<f64>> {
-			require(values.is_empty() || values.len() == parameters, format!("saved {role} have the wrong shape"))?;
-			Ok(if values.is_empty() { vec![0.0; parameters.max(1)] } else { values.clone() })
-		};
-		let best_moments = saved(&graph.state.moments, "best optimizer moments")?;
-		let best_variances = saved(&graph.state.variances, "best optimizer variances")?;
 		let target_buffer = if targets.is_empty() { vec![0.0] } else { targets.to_vec() };
 		let parameter_values = if graph.parameters.is_empty() { vec![0.0] } else { graph.parameters.clone() };
 		let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
@@ -5452,10 +5438,6 @@ impl NativeTape {
 			variances: Buffer::upload_float(gpu, &variances, precision.state)?,
 			gradient: Buffer::upload(gpu, &vec![0_u8; gradient_bytes])?,
 			metrics: Buffer::upload_float(gpu, &[0.0], precision.state)?,
-			best,
-			best_moments,
-			best_variances,
-			best_epoch: step,
 			best_loss,
 			rows: narrow(rows, "native rows")? as u32,
 			parameters,
@@ -5495,7 +5477,7 @@ impl NativeTape {
 		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision.model)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
-	fn epoch(&mut self, rate: f64, tolerance: f64, track_best: bool, config: Config) -> Result<(f64, bool)> {
+	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
 		require(self.step != 0, "optimizer epoch is absent")?;
 		let threads = self.program.epoch.geometry.threads()?;
 		let rows = self.rows;
@@ -5537,17 +5519,12 @@ impl NativeTape {
 		debug(&format!("epoch {step} launch complete"))?;
 		let objective = self.metrics.download_float(1, self.precision.state)?[0];
 		debug(&format!("epoch {step} metric complete"))?;
-		let saved = self.observe(objective, tolerance, track_best)?;
+		let saved = self.observe(objective, tolerance)?;
 		Ok((objective, saved))
 	}
-	fn observe(&mut self, loss: f64, tolerance: f64, download: bool) -> Result<bool> {
+	fn observe(&mut self, loss: f64, tolerance: f64) -> Result<bool> {
 		let (old_best, last, armed, saved) = (self.best_loss[0], self.best_loss[1], self.best_loss[2].is_finite(), self.best_loss[3]);
-		let better = loss < old_best;
-		if better && download {
-			(self.best, self.best_moments, self.best_variances) = self.optimizer_state()?;
-			self.best_epoch = self.step.saturating_sub(1);
-		}
-		let best = if better { loss } else { old_best };
+		let best = if loss < old_best { loss } else { old_best };
 		let trigger = armed && loss > last * (2.0 - tolerance) && tolerance > 0.0;
 		self.best_loss[0] = best;
 		self.best_loss[1] = loss;
@@ -5563,23 +5540,13 @@ impl NativeTape {
 	fn optimizer_state(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
 		Ok((self.weights()?, self.moments.download_float(self.parameters, self.precision.state)?, self.variances.download_float(self.parameters, self.precision.state)?))
 	}
-	fn restore_best(&self) -> Result<()> {
-		self.weights.write_float(0, &self.best, self.precision.model)?;
-		self.moments.write_float(0, &self.best_moments, self.precision.state)?;
-		self.variances.write_float(0, &self.best_variances, self.precision.state)
-	}
-	fn capture(&self, graph: &mut Graph, best: bool) -> Result<()> {
-		let (weights, moments, variances) = if best {
-			(self.best.clone(), self.best_moments.clone(), self.best_variances.clone())
-		} else {
-			self.optimizer_state()?
-		};
-		graph.parameters = weights.clone();
+	fn capture(&self, graph: &mut Graph) -> Result<()> {
+		let (weights, moments, variances) = self.optimizer_state()?;
+		graph.parameters = weights;
 		graph.state.moments = moments;
 		graph.state.variances = variances;
-		graph.state.epoch = (if best { self.best_epoch } else { self.step }) as usize;
-		graph.state.best = self.best.clone();
-		graph.state.best_loss = if best { vec![self.best_loss[0], self.best_loss[0], f64::NAN, self.best_loss[0]] } else { self.best_loss.to_vec() };
+		graph.state.epoch = self.step as usize;
+		graph.state.best_loss = self.best_loss.to_vec();
 		Ok(())
 	}
 	fn tile(&self) -> Tile { self.program.tile }
@@ -5589,13 +5556,13 @@ impl NativeTape {
 		Ok(())
 	}
 }
-fn checkpoint(path: &Path, schema: &DataSchema, stored: &mut bundle::StoredGraph, tape: &NativeTape, best: bool) -> Result<()> {
+fn checkpoint(path: &Path, schema: &DataSchema, stored: &mut bundle::StoredGraph, tape: &NativeTape) -> Result<()> {
 	if let Ok((_, saved)) = bundle::load_semantic(path) {
 		if saved.first().and_then(|g| g.state.best_loss.first().copied()).is_some_and(|v| v <= tape.best_loss[0]) {
 			return Ok(());
 		}
 	}
-	tape.capture(&mut stored.graph, best)?;
+	tape.capture(&mut stored.graph)?;
 	bundle::save_semantic(path, schema, std::slice::from_mut(stored))
 }
 fn structural(value: f64) -> Result<i32> { require(value.is_finite() && value.fract() == 0.0 && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX), "node structural argument is invalid").map(|_| value as i32) }
@@ -5638,16 +5605,6 @@ impl Buffer {
 		let bytes = precision.bytes();
 		let encoded = values.iter().flat_map(|value| precision.pack(*value).to_le_bytes().into_iter().take(bytes)).collect::<Vec<_>>();
 		Self::upload(runtime, &encoded)
-	}
-	fn write<T>(&self, offset: usize, values: &[T]) -> Result<()> {
-		let start = checked_mul(offset, size_of::<T>(), "GPU write offset")?;
-		require(checked_add(start, size_of_val(values), "GPU write")? <= self.bytes, "GPU write exceeds buffer")?;
-		self.runtime.upload(self.pointer + start as u64, values.as_ptr().cast(), size_of_val(values)).map(|_| ())
-	}
-	fn write_float(&self, offset: usize, values: &[f64], precision: Compute) -> Result<()> {
-		let bytes = precision.bytes();
-		let encoded = values.iter().flat_map(|value| precision.pack(*value).to_le_bytes().into_iter().take(bytes)).collect::<Vec<_>>();
-		self.write(checked_mul(offset, bytes, "GPU float write offset")?, &encoded)
 	}
 	fn write_float_bytes(&self, offset: usize, values: &[f64], precision: Compute) -> Result<()> {
 		let bytes = precision.bytes();
@@ -6766,9 +6723,9 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, mse)?;
 	for _ in 0..config.surrogate_epochs {
 		tape.advance()?;
-		tape.epoch(config.surrogate_rate, 0.0, false, config)?;
+		tape.epoch(config.surrogate_rate, 0.0, config)?;
 	}
-	tape.capture(&mut graph, false)?;
+	tape.capture(&mut graph)?;
 	graph.frozen.fill(1);
 	Ok(graph)
 }
@@ -8385,19 +8342,16 @@ impl Train {
 			tape.advance()?;
 			let epoch = tape.step as usize;
 			let ((loss, saved, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, || {
-				let dispatched = tape.epoch(self.learning_rate, tolerance, self.stop.is_some(), config);
+				let dispatched = tape.epoch(self.learning_rate, tolerance, config);
 				let (loss, saved) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
 				if saved { stored.bn_stats = tape.extract_bn_stats()? }
-				self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, saved.then_some(true))?;
+				self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, saved.then_some(()))?;
 				let predictions = if report_r2 { tape.predictions()? } else { Vec::new() };
 				self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, None)?;
 				Ok((loss, saved, predictions))
 			})?;
 			epoch_seconds += seconds;
 			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, saved, live)?; if INTERRUPTED.load(Ordering::Acquire) { std::process::exit(INTERRUPTED_EXIT) }
-		}
-		if self.stop.is_some() {
-			tape.restore_best()?;
 		}
 		stored.bn_stats = tape.extract_bn_stats()?;
 		tape.inject_bn_stats(&stored.bn_stats)?;
@@ -8447,15 +8401,15 @@ impl Train {
 			coefficient(&prepared.targets[training_rows..], &evaluated)
 		};
 		if !evaluated.is_empty() { predictions = evaluated }
-		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(self.stop.is_some()))?;
+		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(()))?;
 		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), run, epoch: tape.step as usize, seconds: started.elapsed().as_secs_f64(), epoch_seconds })
 	}
-	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &DataSchema, tape: &NativeTape, save: Option<bool>) -> Result<T> {
-		let save = if INTERRUPTED.load(Ordering::Acquire) && !INTERRUPT_CHECKPOINTED.swap(true, Ordering::AcqRel) { Some(self.stop.is_some()) } else { save.filter(|_| !INTERRUPTED.load(Ordering::Acquire)) };
-		if let Some(best) = save
+	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &DataSchema, tape: &NativeTape, save: Option<()>) -> Result<T> {
+		let save = if INTERRUPTED.load(Ordering::Acquire) && !INTERRUPT_CHECKPOINTED.swap(true, Ordering::AcqRel) { Some(()) } else { save.filter(|_| !INTERRUPTED.load(Ordering::Acquire)) };
+		if save.is_some()
 			&& let Some(path) = &self.save
 		{
-			checkpoint(path, schema, stored, tape, best)?;
+			checkpoint(path, schema, stored, tape)?;
 		}
 		result
 	}
