@@ -7785,9 +7785,20 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	}
 	for path in &mut paths { *path = fs::canonicalize(&*path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))? }
 	paths.sort(); paths.dedup();
+	// A ZIP source contributes its entries, not itself: the container is not a
+	// table or a sample, and its entries take virtual paths anchored at the
+	// archive's own path, so the directory-layout rules that already interpret
+	// a real class-subfolder tree interpret an archived one identically.
 	let mut files = Vec::new();
 	for path in &paths {
-		files.push((path.clone(), fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?));
+		let bytes = fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+		if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
+			for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
+				files.push((path.join(entry), contents));
+			}
+		} else {
+			files.push((path.clone(), bytes));
+		}
 	}
 	let mut grouped = Vec::new();
 	for (path, bytes) in &files {
@@ -8481,6 +8492,7 @@ fn sample_identity(sample: &[f64], target: f64) -> u64 {
 	sample.iter().copied().chain(std::iter::once(target)).flat_map(|value| value.to_bits().to_le_bytes()).fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
 }
 fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5" | "xml") }
+fn is_archive(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "zip") }
 fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	let path = path.as_ref();
 	let mut components = path.components();
