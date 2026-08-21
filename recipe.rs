@@ -1890,9 +1890,10 @@ impl NativeModelIr {
 			let node = &plan.node;
 			match (reverse, node.op) {
 				(false, Primitive::Contraction) => {
-					let tile = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?.forward;
+					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?;
+					let tile = tiles.forward;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
-					let call = format!("call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?, relu = node.argument[1] == 1.0, tile_m = tile.m, tile_n = tile.n, tile_k = tile.k);
+					let call = format!("call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i1 true, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i1 {pipelined}, i32 {exchange}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = integer_argument(node.argument[0], "contraction kernel")?, relu = node.argument[1] == 1.0, tile_m = tile.m, tile_n = tile.n, tile_k = tile.k, pipelined = tiles.forward_pipeline.enabled, exchange = tiles.forward_pipeline.exchange);
 					ir.push_str(&call);
 					ir.push_str(barrier(backend));
 				}
@@ -1970,7 +1971,7 @@ impl NativeModelIr {
 					let accumulate_previous = self.plans[index + 1..].iter().any(|candidate| candidate.node.source == node.source || candidate.node.second == node.source);
 					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 true, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					if composed_previous {
-						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i1 {pipelined}, i32 {exchange}, i32 %threads )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k, pipelined = tiles.previous_pipeline.enabled, exchange = tiles.previous_pipeline.exchange));
 					}
 					ir.push_str(barrier(backend));
 				}
@@ -5434,6 +5435,61 @@ struct NativeContractionTiles {
 	previous: Tile,
 	gradient_shape: Tile,
 	parameters: usize,
+	forward_pipeline: NativePipeline,
+	previous_pipeline: NativePipeline,
+}
+/// Whether one direction's staging is double-buffered, and where the chunk
+/// exchange then lives. `exchange` is in state-typed elements past the two
+/// staging buffers; a single-buffered direction keeps both at zero and behaves
+/// exactly as before.
+#[derive(Clone, Copy, Debug)]
+struct NativePipeline {
+	enabled: bool,
+	exchange: u32,
+	shared: u32,
+	tile: Tile,
+}
+/// Decide pipelining for one tile: the two staging buffers plus the exchange
+/// region must fit the same local-memory budget the analytic tile obeys.
+fn native_contraction_pipeline(shape: Tile, tile: Tile, register_m: u32, register_n: u32, block: u32, fragment: u32, model_bytes: u32, state_bytes: u32, budget: u32, matrix: bool) -> Result<NativePipeline> {
+	let single = native_contraction_shared_values(tile, register_m, register_n, block, fragment, state_bytes.div_ceil(model_bytes).max(1), matrix)?;
+	// A walk that stages its whole K extent at once has nothing to overlap:
+	// double buffering would only add work and local memory.
+	if matrix || shape.k <= tile.k {
+		return Ok(NativePipeline { enabled: false, exchange: 0, shared: single, tile });
+	}
+	// The analytic tile fills local memory with one staging buffer, so the
+	// pipelined walk stages a shorter K per buffer: the longest chunk multiple
+	// whose two buffers and exchange region still fit the same budget.
+	let partial_state = |m: u32| -> Result<u32> {
+		let output_lanes = (m / register_m).max(1).checked_mul((tile.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
+		let exchange_lanes = output_lanes.min((block / 2).max(1));
+		exchange_lanes.checked_mul(register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?).and_then(|sums| sums.checked_add((tile.n / register_n).max(1).checked_mul(register_n)?)).ok_or_else(|| RecipeError::new("native contraction partial region overflows"))
+	};
+	let extent_limit = tile.k.div_ceil(fragment).checked_mul(fragment).ok_or_else(|| RecipeError::new("native contraction K tile overflows"))?;
+	let mut m = tile.m;
+	while m >= register_m {
+	let width = m.checked_add(tile.n).ok_or_else(|| RecipeError::new("native contraction tile width overflows"))?;
+	let mut extent = extent_limit;
+	while extent >= fragment {
+		// The chunk exchange overlays whichever buffer was just consumed: its
+		// staged operands are dead before the partials are published, and the
+		// prefetched buffer stays untouched. `exchange` is one buffer's span in
+		// state-typed elements, scaled by the live buffer index at runtime.
+		let staging = width.checked_mul(extent).ok_or_else(|| RecipeError::new("native contraction staging overflows"))?;
+		let staging_bytes = staging.checked_mul(model_bytes).ok_or_else(|| RecipeError::new("native contraction staging bytes overflow"))?;
+		let partial_bytes = extent.div_ceil(fragment).checked_mul(partial_state(m)?).and_then(|values| values.checked_mul(state_bytes)).ok_or_else(|| RecipeError::new("native contraction partial region overflows"))?;
+		let shared = staging.checked_mul(2).ok_or_else(|| RecipeError::new("native contraction pipeline shared overflows"))?;
+		if shared <= budget && partial_bytes <= staging_bytes {
+			return Ok(NativePipeline { enabled: true, exchange: staging_bytes.div_ceil(state_bytes), shared, tile: Tile { m, n: tile.n, k: extent } });
+		}
+		extent -= fragment;
+	}
+	// Every K extent overflows at this width: surrender one register row of
+	// output instead, trading the least staged reuse for the overlap.
+	m -= register_m;
+	}
+	Ok(NativePipeline { enabled: false, exchange: 0, shared: single, tile })
 }
 #[derive(Clone, Copy)]
 struct NativeContractionShapes {
@@ -6198,17 +6254,33 @@ impl Gpu {
 		// elements per partial value.
 		let ratio = narrow(NativePrecision::new(precision)?.state.bytes().div_ceil(precision.bytes()), "native contraction state ratio")? as u32;
 		let mut tile = native_contraction_tile(dominant_shape, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?;
+		// The CPU backend runs the workgroup serially, so double buffering only
+		// costs local memory there.
+		let sequential = matches!(&self.driver, Driver::Cpu);
+		let (model_bytes, state_bytes) = (precision.bytes() as u32, NativePrecision::new(precision)?.state.bytes() as u32);
+		let pipeline = |shape: Tile, tile: Tile| -> Result<NativePipeline> {
+			if sequential {
+				return Ok(NativePipeline { enabled: false, exchange: 0, shared: native_contraction_shared_values(tile, register_m, register_n, block, chunk_k, ratio, matrix)?, tile });
+			}
+			native_contraction_pipeline(shape, tile, register_m, register_n, block, chunk_k, model_bytes, state_bytes, shared_budget, matrix)
+		};
 		let contractions = shapes.iter().map(|shape| shape.map(|shape| {
+			let forward_pipeline = pipeline(shape.forward, native_contraction_tile(shape.forward, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?)?;
+			let previous_pipeline = pipeline(shape.previous, native_contraction_tile(shape.previous, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?)?;
 			Ok(NativeContractionTiles {
-				forward: native_contraction_tile(shape.forward, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
+				forward: forward_pipeline.tile,
 				gradient: native_contraction_tile(shape.gradient, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
-				previous: native_contraction_tile(shape.previous, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
+				previous: previous_pipeline.tile,
 				gradient_shape: shape.gradient,
 				parameters: shape.parameters,
+				forward_pipeline,
+				previous_pipeline,
 			})
 		}).transpose()).collect::<Result<Vec<_>>>()?;
 		tile = dominant.and_then(|(index, _)| contractions[index]).map_or(tile, |contraction| contraction.gradient);
-		let contraction_shared_values = contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]).map(|tile| native_contraction_shared_values(tile, register_m, register_n, block, chunk_k, ratio, matrix)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
+		let contraction_shared_values = contractions.iter().flatten().flat_map(|contraction| {
+			[Ok(contraction.forward_pipeline.shared), native_contraction_shared_values(contraction.gradient, register_m, register_n, block, chunk_k, ratio, matrix), Ok(contraction.previous_pipeline.shared)]
+		}).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
 		let attention_query_tile = narrow(natural("attention query tile", env!("RECIPE_ATTENTION_QUERY_TILE"))?, "attention query tile")? as u32;
 		let attention = native_attention_tiles(graph, shared_budget, attention_query_tile)?;
 		let attention_shared_values = attention.iter().enumerate().filter_map(|(index, tile)| tile.map(|tile| native_attention_shared_values(tile, tile.m as usize == graph.nodes[index].output.length))).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
