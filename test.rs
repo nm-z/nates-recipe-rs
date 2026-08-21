@@ -228,10 +228,10 @@ fn operation(model: Model, operation: usize) -> (Model, &'static str) {
 		14 => (model.rnn(8), ".rnn(8)"),
 		15 => (model.gru(8), ".gru(8)"),
 		16 => (model.lstm(8), ".lstm(8)"),
-		17 => (model.layer(8).residual([layer(8), layer(8)]), ".layer(8).residual([layer(8), layer(8)])"),
-		18 => (model.layer(8).residual([conv(8, 1), conv(8, 1)]), ".layer(8).residual([conv(8, 1), conv(8, 1)])"),
-		19 => (model.layer(8).residual([conv(8, 1), relu(), layer(8)]), ".layer(8).residual([conv(8, 1), relu(), layer(8)])"),
-		20 => (model.layer(8).moe(1, [layer(8), layer(8)]), ".layer(8).moe(1, [layer(8), layer(8)])"),
+		17 => (model.layer(8).residual([layer(8), layer(8)]), ".layer(8)|.residual([layer(8), layer(8)])"),
+		18 => (model.layer(8).residual([conv(8, 1), conv(8, 1)]), ".layer(8)|.residual([conv(8, 1), conv(8, 1)])"),
+		19 => (model.layer(8).residual([conv(8, 1), relu(), layer(8)]), ".layer(8)|.residual([conv(8, 1), relu(), layer(8)])"),
+		20 => (model.layer(8).moe(1, [layer(8), layer(8)]), ".layer(8)|.moe(1, [layer(8), layer(8)])"),
 		21 => (model.perc(8), ".perc(8)"),
 		_ => unreachable!(),
 	}
@@ -298,12 +298,14 @@ fn model(mut ordinal: u64) -> (Model, String) {
 		let selected = stage(ordinal);
 		let (next, source) = apply(model, selected);
 		model = next;
+		description.push('|');
 		description.push_str(&source);
 	} else {
 		ordinal -= one;
 		for selected in [stage(ordinal % stages), stage(ordinal / stages)] {
 			let (next, source) = apply(model, selected);
 			model = next;
+			description.push('|');
 			description.push_str(&source);
 		}
 	}
@@ -367,7 +369,7 @@ fn input_width(path: &Path) -> usize {
 	channels.checked_mul(length).expect("saved input width overflows")
 }
 
-fn readable(source: &str) -> String {
+fn readable_chain(source: &str) -> String {
 	let mut source = source.replace(").", ")\n\t\t.").replace("].", "]\n\t\t.");
 	for suffix in ["k.s", "k.m", "k.l", "xxs", "xs", "nf", "nl", "k", "s", "m", "0", "1"] {
 		source = source.replace(&format!(")\n\t\t.{suffix}."), &format!(").{suffix}\n\t\t."));
@@ -375,13 +377,18 @@ fn readable(source: &str) -> String {
 	source
 }
 
+fn readable_model(source: &str) -> String {
+	source.replace('|', "\n\t\t")
+}
+
 fn reproduction(case: u64, data_case: &DataCase, model_ordinal: u64, loss_ordinal: usize, train_case: TrainCase, lifecycle: usize, phase: &str) -> String {
 	let (_, data) = data(data_case);
 	let (model, mut model_source) = model(model_ordinal);
 	let (_, loss) = loss(model, loss_ordinal);
+	model_source.push('|');
 	model_source.push_str(loss);
 	let (_, train) = train(train_case, case as usize);
-	let (data, model, train) = (readable(&data), readable(&model_source), readable(&train));
+	let (data, model, train) = (readable_chain(&data), readable_model(&model_source), readable_chain(&train));
 	let mut body = format!(r#"use recipe::*;
 
 fn main() {{
@@ -502,6 +509,7 @@ fn main() {
 		let (selected_model, mut description) = model(model_ordinal);
 		let (_, selected_loss) = loss(selected_model, loss_ordinal);
 		description.push_str(selected_loss);
+		description = description.replace('|', "");
 		eprintln!("composition {case}: data={} mode={} model={} loss={} arithmetic={} stop={} rate={} lifecycle={}", datasets[data_ordinal].path, datasets[data_ordinal].mode, description, loss_ordinal, train_case.arithmetic, train_case.stop, train_case.rate, lifecycle);
 		if let Err(failure) = attempt(case, &datasets[data_ordinal], model_ordinal, loss_ordinal, train_case, lifecycle) {
 			let replay = attempt(case, &datasets[data_ordinal], model_ordinal, loss_ordinal, train_case, lifecycle)
