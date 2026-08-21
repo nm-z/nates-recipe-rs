@@ -7739,7 +7739,7 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 		}
 		table_files.push(path.clone());
 	}
-	if let Some(table) = class_directory_table(data, sources, &grouped, &table_files)? {
+	if let Some(table) = class_directory_table(data, sources, &grouped, &table_files, &paths)? {
 		return Ok((vec![table], paths));
 	}
 	let mut tables = merge_captures(grouped, &data.target)?;
@@ -7758,27 +7758,106 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	Ok((tables, paths))
 }
 /// A class-labeled sample tree: the requested target names no column in any file, and every
-/// sample file lives in a class subdirectory of the source root. Each file becomes one row
-/// whose text is the feature and whose class directory name is the synthesized target.
-fn class_directory_table(data: &Data, sources: &[String], grouped: &[(PathBuf, Table)], table_files: &[PathBuf]) -> Result<Option<Table>> {
+/// sample file lives in a class subdirectory of the source root. Each text file becomes one
+/// row whose text is the feature; each image file becomes one row of pixel columns. The
+/// class directory name is the synthesized target either way.
+fn class_directory_table(data: &Data, sources: &[String], grouped: &[(PathBuf, Table)], table_files: &[PathBuf], paths: &[PathBuf]) -> Result<Option<Table>> {
 	let [source] = sources else { return Ok(None) };
 	let [target] = data.target.as_slice() else { return Ok(None) };
-	if grouped.is_empty() || grouped.iter().any(|(_, table)| target_column(table, target).is_some()) {
+	if grouped.iter().any(|(_, table)| target_column(table, target).is_some()) {
+		return Ok(None);
+	}
+	let images = paths.iter().filter(|path| path.extension().and_then(|value| value.to_str()).is_some_and(is_image)).collect::<Vec<_>>();
+	require(table_files.is_empty() || images.is_empty() || grouped.is_empty(), "class directories mix text and image samples")?;
+	let samples = if images.is_empty() { table_files.to_vec() } else { images.into_iter().cloned().collect() };
+	if samples.is_empty() {
 		return Ok(None);
 	}
 	let root = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve {source}: {error}")))?;
-	let classes = grouped.iter().map(|(directory, _)| directory).collect::<BTreeSet<_>>();
+	let classes = samples.iter().filter_map(|path| path.parent()).collect::<BTreeSet<_>>();
 	if classes.len() < 2 || classes.iter().any(|directory| directory.parent() != Some(root.as_path())) {
 		return Ok(None);
 	}
-	let mut rows = Vec::new();
-	for path in table_files {
-		let text = fs::read_to_string(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-		let class = path.parent().and_then(Path::file_name).and_then(|value| value.to_str()).ok_or_else(|| RecipeError::new(format!("class directory of {} is unreadable", path.display())))?;
-		rows.push(vec![text.trim().to_owned(), class.to_owned()]);
-	}
 	let name = root.file_name().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
-	Ok(Some(Table { name, headers: vec!["content".to_owned(), target.clone()], rows }))
+	let mut rows = Vec::new();
+	let mut headers = Vec::new();
+	for path in &samples {
+		let class = path.parent().and_then(Path::file_name).and_then(|value| value.to_str()).ok_or_else(|| RecipeError::new(format!("class directory of {} is unreadable", path.display())))?.to_owned();
+		if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
+			let bytes = fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+			let (width, height, channels, pixels) = png_pixels(&bytes).map_err(|error| RecipeError::new(format!("image {}: {error}", path.display())))?;
+			if headers.is_empty() {
+				headers = (1..=width * height * channels).map(|pixel| format!("pixel.{pixel}")).collect();
+				headers.push(target.clone());
+			}
+			require(pixels.len() + 1 == headers.len(), format!("image {} expected {} pixel values, received {}", path.display(), headers.len() - 1, pixels.len()))?;
+			let mut row = pixels.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+			row.push(class);
+			rows.push(row);
+		} else {
+			let text = fs::read_to_string(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+			if headers.is_empty() {
+				headers = vec!["content".to_owned(), target.clone()];
+			}
+			rows.push(vec![text.trim().to_owned(), class]);
+		}
+	}
+	Ok(Some(Table { name, headers, rows }))
+}
+fn is_image(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "png") }
+/// Decoded 8-bit PNG pixels: grayscale or RGB, no interlacing, all five scanline filters.
+fn png_pixels(bytes: &[u8]) -> Result<(usize, usize, usize, Vec<u8>)> {
+	require(bytes.get(..8) == Some(&b"\x89PNG\r\n\x1a\n"[..]), "PNG signature is absent")?;
+	let (mut offset, mut header, mut compressed) = (8, None, Vec::new());
+	while offset + 8 <= bytes.len() {
+		let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+		let kind = &bytes[offset + 4..offset + 8];
+		let body = bytes.get(offset + 8..offset + 8 + length).ok_or_else(|| RecipeError::new("PNG chunk is truncated"))?;
+		match kind {
+			b"IHDR" => {
+				require(body.len() == 13, "PNG header has the wrong size")?;
+				let width = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
+				let height = u32::from_be_bytes(body[4..8].try_into().unwrap()) as usize;
+				let (depth, color, interlace) = (body[8], body[9], body[12]);
+				require(depth == 8, format!("PNG bit depth {depth} is unsupported"))?;
+				require(interlace == 0, "PNG interlacing is unsupported")?;
+				let channels = match color { 0 => 1, 2 => 3, color => return Err(RecipeError::new(format!("PNG color type {color} is unsupported"))) };
+				header = Some((width, height, channels));
+			}
+			b"IDAT" => compressed.extend_from_slice(body),
+			b"IEND" => break,
+			_ => {}
+		}
+		offset += 12 + length;
+	}
+	let (width, height, channels) = header.ok_or_else(|| RecipeError::new("PNG header is absent"))?;
+	let raw = zlib_inflate(&compressed)?;
+	let stride = checked_mul(width, channels, "PNG scanline")?;
+	require(raw.len() == checked_mul(height, stride + 1, "PNG image")?, "PNG data has the wrong size")?;
+	let mut pixels = vec![0_u8; height * stride];
+	for row in 0..height {
+		let filter = raw[row * (stride + 1)];
+		let line = &raw[row * (stride + 1) + 1..(row + 1) * (stride + 1)];
+		for column in 0..stride {
+			let left = if column >= channels { pixels[row * stride + column - channels] } else { 0 };
+			let above = if row > 0 { pixels[(row - 1) * stride + column] } else { 0 };
+			let corner = if row > 0 && column >= channels { pixels[(row - 1) * stride + column - channels] } else { 0 };
+			let predictor = match filter {
+				0 => 0,
+				1 => left,
+				2 => above,
+				3 => ((u16::from(left) + u16::from(above)) / 2) as u8,
+				4 => {
+					let estimate = i32::from(left) + i32::from(above) - i32::from(corner);
+					let (da, db, dc) = ((estimate - i32::from(left)).abs(), (estimate - i32::from(above)).abs(), (estimate - i32::from(corner)).abs());
+					if da <= db && da <= dc { left } else if db <= dc { above } else { corner }
+				}
+				filter => return Err(RecipeError::new(format!("PNG filter {filter} is unsupported"))),
+			};
+			pixels[row * stride + column] = line[column].wrapping_add(predictor);
+		}
+	}
+	Ok((width, height, channels, pixels))
 }
 fn prepare_data(data: &Data) -> Result<Prepared> {
 	let (mut tables, sources) = load_tables(data, &data.sources)?;
