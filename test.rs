@@ -1,5 +1,9 @@
 use recipe::*;
+use std::any::Any;
+use std::cell::Cell;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DATA_MODES: usize = 7;
@@ -45,6 +49,11 @@ struct TrainCase {
 	rate: usize,
 }
 
+struct Failure {
+	phase: &'static str,
+	message: String,
+}
+
 fn checked_product(values: &[u64]) -> u64 {
 	values.iter().copied().try_fold(1_u64, u64::checked_mul).expect("composition count exceeds u64")
 }
@@ -70,6 +79,47 @@ fn mix(mut value: u64) -> u64 {
 	value ^ value >> 31
 }
 
+fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+	for byte in bytes {
+		hash ^= u64::from(*byte);
+		hash = hash.wrapping_mul(1_099_511_628_211);
+	}
+	hash
+}
+
+fn content_hash(path: &Path) -> u64 {
+	fn visit(path: &Path, hash: &mut u64) {
+		if path.is_dir() {
+			let mut entries = std::fs::read_dir(path)
+				.unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
+				.map(|entry| entry.expect("cannot read data entry").path())
+				.filter(|path| !matches!(path.extension().and_then(|value| value.to_str()), Some("py" | "pyi" | "ipynb")))
+				.collect::<Vec<_>>();
+			entries.sort();
+			for entry in entries { visit(&entry, hash) }
+		} else {
+			*hash = hash_bytes(*hash, path.to_string_lossy().as_bytes());
+			*hash = hash_bytes(*hash, &std::fs::read(path).unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display())));
+		}
+	}
+	let mut hash = 1_469_598_103_934_665_603;
+	visit(path, &mut hash);
+	hash
+}
+
+fn base() -> String {
+	let commit = Command::new("git").args(["rev-parse", "HEAD"]).output().expect("cannot read composition commit");
+	let status = Command::new("git").args(["status", "--porcelain", "--untracked-files=no"]).output().expect("cannot read composition tree state");
+	format!("commit={} tracked_tree={}", String::from_utf8_lossy(&commit.stdout).trim(), if status.stdout.is_empty() { "clean" } else { "modified" })
+}
+
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+	match payload.downcast::<String>() {
+		Ok(message) => *message,
+		Err(payload) => payload.downcast::<&str>().map_or_else(|_| "non-string panic".to_owned(), |message| (*message).to_owned()),
+	}
+}
+
 fn seed() -> u64 {
 	std::env::var("RECIPE_COMPOSITION_SEED")
 		.ok()
@@ -88,6 +138,13 @@ fn start_cursor(total: u64) -> u64 {
 		.map(|value| value.parse().expect("RECIPE_COMPOSITION_CURSOR must be an unsigned integer"))
 		.unwrap_or(0)
 		.min(total)
+}
+
+fn end_cursor(start: u64, total: u64) -> u64 {
+	std::env::var("RECIPE_COMPOSITION_COUNT")
+		.ok()
+		.map(|value| value.parse::<u64>().expect("RECIPE_COMPOSITION_COUNT must be an unsigned integer"))
+		.map_or(total, |count| start.saturating_add(count).min(total))
 }
 
 fn datasets() -> Vec<DataCase> {
@@ -118,24 +175,24 @@ fn datasets() -> Vec<DataCase> {
 	cases
 }
 
-fn data(case: &DataCase) -> Data {
-	let mut data = if case.autoregressive {
-		recipe.data(auto).set(case.path.clone())
+fn data(case: &DataCase) -> (Data, String) {
+	let (mut data, mut source) = if case.autoregressive {
+		(recipe.data(auto).set(case.path.clone()), format!("recipe.data(auto).set({:?})", case.path))
 	} else {
-		recipe.data(case.path.clone()).target("target")
+		(recipe.data(case.path.clone()).target("target"), format!("recipe.data({:?}).target(\"target\")", case.path))
 	};
 	match case.mode {
 		0 => {}
-		1 => data = data.norm(z_score),
-		2 => data = data.split(0.8),
-		3 if case.autoregressive => data = data.broadcast(),
-		3 => data = data.test(case.path.clone()),
-		4 => data = data.test(case.path.clone()).split(0.8),
-		5 => data = data.broadcast(),
-		6 => data = data.norm(z_score).broadcast().test(case.path.clone()).split(0.8),
+		1 => { data = data.norm(z_score); source.push_str(".norm(z_score)") }
+		2 => { data = data.split(0.8); source.push_str(".split(0.8)") }
+		3 if case.autoregressive => { data = data.broadcast(); source.push_str(".broadcast()") }
+		3 => { data = data.test(case.path.clone()); source.push_str(&format!(".test({:?})", case.path)) }
+		4 => { data = data.test(case.path.clone()).split(0.8); source.push_str(&format!(".test({:?}).split(0.8)", case.path)) }
+		5 => { data = data.broadcast(); source.push_str(".broadcast()") }
+		6 => { data = data.norm(z_score).broadcast().test(case.path.clone()).split(0.8); source.push_str(&format!(".norm(z_score).broadcast().test({:?}).split(0.8)", case.path)) }
 		_ => unreachable!(),
 	}
-	data
+	(data, source)
 }
 
 fn stage(mut value: u64) -> Stage {
@@ -147,105 +204,108 @@ fn stage(mut value: u64) -> Stage {
 	}
 }
 
-fn operation(model: Model, operation: usize) -> Model {
+fn operation(model: Model, operation: usize) -> (Model, &'static str) {
 	match operation {
-		0 => model.layer(4),
-		1 => model.layer(8),
-		2 => model.conv(8, 1),
-		3 => model.conv(8, 3),
-		4 => model.pool(2),
-		5 => model.kmeans(2),
-		6 => model.knn(3),
-		7 => model.svm(),
-		8 => model.forest(2),
-		9 => model.bayes(),
-		10 => model.cbst(),
-		11 => model.xgbst(),
-		12 => model.lgbm(),
-		13 => model.embed(8, 256),
-		14 => model.attn(1),
-		15 => model.rnn(8),
-		16 => model.gru(8),
-		17 => model.lstm(8),
-		18 => model.layer(8).residual([layer(8), layer(8)]),
-		19 => model.layer(8).residual([conv(8, 1), conv(8, 1)]),
-		20 => model.layer(8).residual([conv(8, 1), relu(), layer(8)]),
-		21 => model.layer(8).moe(1, [layer(8), layer(8)]),
-		22 => model.perc(8),
+		0 => (model.layer(4), ".layer(4)"),
+		1 => (model.layer(8), ".layer(8)"),
+		2 => (model.conv(8, 1), ".conv(8, 1)"),
+		3 => (model.conv(8, 3), ".conv(8, 3)"),
+		4 => (model.pool(2), ".pool(2)"),
+		5 => (model.kmeans(2), ".kmeans(2)"),
+		6 => (model.knn(3), ".knn(3)"),
+		7 => (model.svm(), ".svm()"),
+		8 => (model.forest(2), ".forest(2)"),
+		9 => (model.bayes(), ".bayes()"),
+		10 => (model.cbst(), ".cbst()"),
+		11 => (model.xgbst(), ".xgbst()"),
+		12 => (model.lgbm(), ".lgbm()"),
+		13 => (model.embed(8, 256), ".embed(8, 256)"),
+		14 => (model.attn(1), ".attn(1)"),
+		15 => (model.rnn(8), ".rnn(8)"),
+		16 => (model.gru(8), ".gru(8)"),
+		17 => (model.lstm(8), ".lstm(8)"),
+		18 => (model.layer(8).residual([layer(8), layer(8)]), ".layer(8).residual([layer(8), layer(8)])"),
+		19 => (model.layer(8).residual([conv(8, 1), conv(8, 1)]), ".layer(8).residual([conv(8, 1), conv(8, 1)])"),
+		20 => (model.layer(8).residual([conv(8, 1), relu(), layer(8)]), ".layer(8).residual([conv(8, 1), relu(), layer(8)])"),
+		21 => (model.layer(8).moe(1, [layer(8), layer(8)]), ".layer(8).moe(1, [layer(8), layer(8)])"),
+		22 => (model.perc(8), ".perc(8)"),
 		_ => unreachable!(),
 	}
 }
 
-fn activation(model: Model, activation: usize) -> Model {
+fn activation(model: Model, activation: usize) -> (Model, &'static str) {
 	match activation {
-		0 => model,
-		1 => model.cos(),
-		2 => model.exp(),
-		3 => model.log(),
-		4 => model.ln(),
-		5 => model.huber(),
-		6 => model.tan(),
-		7 => model.relu(),
-		8 => model.leak(),
-		9 => model.sigmoid(),
-		10 => model.tanh(),
-		11 => model.selu(),
-		12 => model.gelu(),
-		13 => model.silu(),
-		14 => model.elu(),
-		15 => model.prelu(),
+		0 => (model, ""),
+		1 => (model.cos(), ".cos()"),
+		2 => (model.exp(), ".exp()"),
+		3 => (model.log(), ".log()"),
+		4 => (model.ln(), ".ln()"),
+		5 => (model.huber(), ".huber()"),
+		6 => (model.tan(), ".tan()"),
+		7 => (model.relu(), ".relu()"),
+		8 => (model.leak(), ".leak()"),
+		9 => (model.sigmoid(), ".sigmoid()"),
+		10 => (model.tanh(), ".tanh()"),
+		11 => (model.selu(), ".selu()"),
+		12 => (model.gelu(), ".gelu()"),
+		13 => (model.silu(), ".silu()"),
+		14 => (model.elu(), ".elu()"),
+		15 => (model.prelu(), ".prelu()"),
 		_ => unreachable!(),
 	}
 }
 
-fn quantization(model: Model, quantization: usize) -> Model {
+fn quantization(model: Model, quantization: usize) -> (Model, String) {
 	if quantization == 0 {
-		return model;
+		return (model, String::new());
 	}
 	let (family, bits, variant) = QUANTIZATIONS[quantization - 1];
-	model.quantize(family, bits, variant)
+	(model.quantize(family, bits, variant), format!(".quantize({family}, {bits}, {variant})"))
 }
 
-fn apply(model: Model, stage: Stage) -> Model {
-	let model = operation(model, stage.operation);
-	let model = activation(model, stage.activation);
-	let model = if stage.normalization == 0 { model } else { model.norm(batch) };
-	quantization(model, stage.quantization)
+fn apply(model: Model, stage: Stage) -> (Model, String) {
+	let (model, operation) = operation(model, stage.operation);
+	let (model, activation) = activation(model, stage.activation);
+	let (model, normalization) = if stage.normalization == 0 { (model, "") } else { (model.norm(batch), ".norm(batch)") };
+	let (model, quantization) = quantization(model, stage.quantization);
+	(model, format!("{operation}{activation}{normalization}{quantization}"))
 }
 
 fn model(mut ordinal: u64) -> (Model, String) {
 	let stages = checked_product(&[MODEL_OPERATIONS as u64, ACTIVATIONS as u64, NORMALIZATIONS as u64, (QUANTIZATIONS.len() + 1) as u64]);
 	let one = stages;
 	let mut model = recipe.model();
-	let mut description = Vec::new();
+	let mut description = String::from("recipe.model()");
 	if ordinal < one {
 		let selected = stage(ordinal);
-		model = apply(model, selected);
-		description.push(format!("{}:{}:{}:{}", selected.operation, selected.activation, selected.normalization, selected.quantization));
+		let (next, source) = apply(model, selected);
+		model = next;
+		description.push_str(&source);
 	} else {
 		ordinal -= one;
 		for selected in [stage(ordinal % stages), stage(ordinal / stages)] {
-			model = apply(model, selected);
-			description.push(format!("{}:{}:{}:{}", selected.operation, selected.activation, selected.normalization, selected.quantization));
+			let (next, source) = apply(model, selected);
+			model = next;
+			description.push_str(&source);
 		}
 	}
-	(model, description.join("/"))
+	(model, description)
 }
 
-fn loss(model: Model, loss: usize) -> Model {
-	model.loss(match loss {
-		0 => mse,
-		1 => rmse,
-		2 => huber,
-		3 => mae,
-		4 => bce,
-		5 => ce,
-		6 => focal,
+fn loss(model: Model, loss: usize) -> (Model, &'static str) {
+	match loss {
+		0 => (model.loss(mse), ".loss(mse)"),
+		1 => (model.loss(rmse), ".loss(rmse)"),
+		2 => (model.loss(huber), ".loss(huber)"),
+		3 => (model.loss(mae), ".loss(mae)"),
+		4 => (model.loss(bce), ".loss(bce)"),
+		5 => (model.loss(ce), ".loss(ce)"),
+		6 => (model.loss(focal), ".loss(focal)"),
 		_ => unreachable!(),
-	})
+	}
 }
 
-fn train(case: TrainCase, seed: usize) -> Train {
+fn train(case: TrainCase, seed: usize) -> (Train, String) {
 	let train = recipe
 		.train()
 		.optimizer(adamw)
@@ -253,25 +313,28 @@ fn train(case: TrainCase, seed: usize) -> Train {
 		.seed(seed)
 		.epochs(1)
 		.log(all);
+	let mut source = format!("recipe.train().optimizer(adamw).lr({}).seed({seed}).epochs(1).log(all)", [0.001, 0.0001][case.rate]);
 	let train = match case.stop {
 		0 => train,
-		1 => train.stop(0.0),
-		2 => train.stop(0.8),
+		1 => { source.push_str(".stop(0.0)"); train.stop(0.0) }
+		2 => { source.push_str(".stop(0.8)"); train.stop(0.8) }
 		_ => unreachable!(),
 	};
-	match case.arithmetic {
-		0 => train.fp(8),
-		1 => train.fp(16),
-		2 => train.fp(32),
-		3 => train.fp(64),
-		4 => train.int(1),
-		5 => train.int(4),
-		6 => train.int(8),
-		7 => train.bf(16),
-		8 => train.tf(32),
-		9 => train.f(6, 9),
+	let (train, arithmetic) = match case.arithmetic {
+		0 => (train.fp(8), ".fp(8)"),
+		1 => (train.fp(16), ".fp(16)"),
+		2 => (train.fp(32), ".fp(32)"),
+		3 => (train.fp(64), ".fp(64)"),
+		4 => (train.int(1), ".int(1)"),
+		5 => (train.int(4), ".int(4)"),
+		6 => (train.int(8), ".int(8)"),
+		7 => (train.bf(16), ".bf(16)"),
+		8 => (train.tf(32), ".tf(32)"),
+		9 => (train.f(6, 9), ".f(6, 9)"),
 		_ => unreachable!(),
-	}
+	};
+	source.push_str(arithmetic);
+	(train, source)
 }
 
 fn input_width(path: &Path) -> usize {
@@ -286,27 +349,91 @@ fn input_width(path: &Path) -> usize {
 	channels.checked_mul(length).expect("saved input width overflows")
 }
 
-fn execute(case: u64, data_case: &DataCase, model_ordinal: u64, loss_ordinal: usize, train_case: TrainCase, lifecycle: usize, description: &str) {
+fn reproduction(case: u64, data_case: &DataCase, model_ordinal: u64, loss_ordinal: usize, train_case: TrainCase, lifecycle: usize) -> String {
+	let (_, data) = data(data_case);
+	let (model, mut model_source) = model(model_ordinal);
+	let (_, loss) = loss(model, loss_ordinal);
+	model_source.push_str(loss);
+	let (_, train) = train(train_case, case as usize);
+	let resume = if lifecycle == 1 {
+		format!("\n\tlet resumed = {train}.resume(&bundle).save(&bundle).run(&model, &data);\n\tassert!(resumed.final_loss().is_finite());")
+	} else {
+		String::new()
+	};
+	format!(r#"use recipe::*;
+use std::path::Path;
+
+fn input_width(path: &Path) -> usize {{
+	let text = std::fs::read_to_string(path).unwrap();
+	let mut shape = text.lines().find_map(|line| line.trim().strip_prefix("shape ")).unwrap().split_whitespace();
+	shape.next().unwrap().parse::<usize>().unwrap() * shape.next().unwrap().parse::<usize>().unwrap()
+}}
+
+fn main() {{
+	let bundle = "/tmp/recipe-composition-repro.ogdl";
+	let data = {data};
+	let model = {model_source};
+	let report = {train}.save(&bundle).run(&model, &data);
+	assert!(report.final_loss().is_finite());{resume}
+	let output = recipe.infer(&bundle, &vec![0.0; input_width(Path::new(bundle))]);
+	assert!(!output.is_empty());
+	assert!(output.iter().all(|value| value.is_finite()));
+}}
+"#)
+}
+
+fn execute(case: u64, data_case: &DataCase, model_ordinal: u64, loss_ordinal: usize, train_case: TrainCase, lifecycle: usize, phase: &Cell<&'static str>) {
 	let bundle = PathBuf::from(format!("/tmp/recipe-composition-{}.ogdl", std::process::id()));
 	if bundle.exists() {
 		std::fs::remove_file(&bundle).unwrap_or_else(|error| panic!("cannot remove {}: {error}", bundle.display()));
 	}
-	eprintln!("composition {case}: data={} mode={} model={} loss={} arithmetic={} stop={} rate={} lifecycle={}", data_case.path, data_case.mode, description, loss_ordinal, train_case.arithmetic, train_case.stop, train_case.rate, lifecycle);
-	let data = data(data_case);
+	let (data, _) = data(data_case);
 	let (model, _) = model(model_ordinal);
-	let model = loss(model, loss_ordinal);
+	let (model, _) = loss(model, loss_ordinal);
 	// Recipe has no checkpoints: save and resume use the same file.
-	let report = train(train_case, case as usize).save(&bundle).run(&model, &data);
+	phase.set("training");
+	let (training, _) = train(train_case, case as usize);
+	let report = training.save(&bundle).run(&model, &data);
 	assert!(report.final_loss().is_finite(), "composition {case} produced a nonfinite training loss");
 	if lifecycle == 1 {
-		let report = train(train_case, case as usize).resume(&bundle).save(&bundle).run(&model, &data);
+		phase.set("resumed training");
+		let (training, _) = train(train_case, case as usize);
+		let report = training.resume(&bundle).save(&bundle).run(&model, &data);
 		assert!(report.final_loss().is_finite(), "composition {case} produced a nonfinite resumed loss");
 	}
+	phase.set("inference");
 	let input = vec![0.0; input_width(&bundle)];
 	let output = recipe.infer(&bundle, &input);
 	assert!(!output.is_empty(), "composition {case} inference produced no values");
 	assert!(output.iter().all(|value| value.is_finite()), "composition {case} inference produced a nonfinite value");
 	std::fs::remove_file(&bundle).unwrap_or_else(|error| panic!("cannot remove {}: {error}", bundle.display()));
+}
+
+fn attempt(case: u64, data_case: &DataCase, model_ordinal: u64, loss_ordinal: usize, train_case: TrainCase, lifecycle: usize) -> std::result::Result<(), Failure> {
+	let phase = Cell::new("setup");
+	let hook = std::panic::take_hook();
+	std::panic::set_hook(Box::new(|_| {}));
+	let result = catch_unwind(AssertUnwindSafe(|| execute(case, data_case, model_ordinal, loss_ordinal, train_case, lifecycle, &phase)))
+		.map_err(|payload| Failure { phase: phase.get(), message: panic_message(payload) });
+	std::panic::set_hook(hook);
+	result
+}
+
+fn emit_failure(seed: u64, cursor: u64, next_cursor: u64, step: u64, case: u64, data_case: &DataCase, description: &str, loss_ordinal: usize, train_case: TrainCase, lifecycle: usize, failure: &Failure, replay: &Failure, source: &str) {
+	let mut fingerprint = hash_bytes(1_469_598_103_934_665_603, failure.phase.as_bytes());
+	fingerprint = hash_bytes(fingerprint, failure.message.as_bytes());
+	eprintln!("RECIPE FAILURE BEGIN");
+	eprintln!("id={fingerprint:016x}");
+	eprintln!("base={}", base());
+	eprintln!("cursor=seed:{seed} cursor:{cursor} next:{next_cursor} step:{step} composition:{case}");
+	eprintln!("data=path:{:?} hash:{:016x}", data_case.path, content_hash(Path::new(&data_case.path)));
+	eprintln!("configuration=data_mode:{} model:{} loss:{} arithmetic:{} stop:{} rate:{} lifecycle:{}", data_case.mode, description, loss_ordinal, train_case.arithmetic, train_case.stop, train_case.rate, lifecycle);
+	eprintln!("expected=training, optional resume, and inference produce finite numerical results through the public Recipe API");
+	eprintln!("observed=phase:{} message:{}", failure.phase, failure.message);
+	eprintln!("replay=phase:{} message:{} stable:{}", replay.phase, replay.message, failure.phase == replay.phase && failure.message == replay.message);
+	eprintln!("command=cargo run --bin recipe -- /tmp/recipe-composition-repro.rs");
+	eprintln!("reproduction:\n```rust\n{source}```");
+	eprintln!("RECIPE FAILURE END");
 }
 
 fn main() {
@@ -329,8 +456,9 @@ fn main() {
 		step = (step + 1) % total;
 	}
 	let start = start_cursor(total);
-	eprintln!("composition space={total} seed={seed} cursor={start} step={step}");
-	for cursor in start..total {
+	let end = end_cursor(start, total);
+	eprintln!("composition space={total} seed={seed} cursor={start} end={end} step={step}");
+	for cursor in start..end {
 		let mut ordinal = ((offset as u128 + cursor as u128 * step as u128) % total as u128) as u64;
 		let data_ordinal = take(&mut ordinal, datasets.len());
 		let model_ordinal = ordinal % models;
@@ -343,15 +471,18 @@ fn main() {
 		};
 		let lifecycle = take(&mut ordinal, LIFECYCLES);
 		assert_eq!(ordinal, 0, "composition decoder left unused state");
-		let (_, description) = model(model_ordinal);
-		execute(
-			((offset as u128 + cursor as u128 * step as u128) % total as u128) as u64,
-			&datasets[data_ordinal],
-			model_ordinal,
-			loss_ordinal,
-			train_case,
-			lifecycle,
-			&description,
-		);
+		let case = ((offset as u128 + cursor as u128 * step as u128) % total as u128) as u64;
+		let (selected_model, mut description) = model(model_ordinal);
+		let (_, selected_loss) = loss(selected_model, loss_ordinal);
+		description.push_str(selected_loss);
+		eprintln!("composition {case}: data={} mode={} model={} loss={} arithmetic={} stop={} rate={} lifecycle={}", datasets[data_ordinal].path, datasets[data_ordinal].mode, description, loss_ordinal, train_case.arithmetic, train_case.stop, train_case.rate, lifecycle);
+		if let Err(failure) = attempt(case, &datasets[data_ordinal], model_ordinal, loss_ordinal, train_case, lifecycle) {
+			let replay = attempt(case, &datasets[data_ordinal], model_ordinal, loss_ordinal, train_case, lifecycle)
+				.err()
+				.unwrap_or(Failure { phase: "replay", message: "the exact replay passed".to_owned() });
+			let source = reproduction(case, &datasets[data_ordinal], model_ordinal, loss_ordinal, train_case, lifecycle);
+			emit_failure(seed, cursor, cursor + 1, step, case, &datasets[data_ordinal], &description, loss_ordinal, train_case, lifecycle, &failure, &replay, &source);
+		}
 	}
+	eprintln!("composition cursor={end}");
 }
