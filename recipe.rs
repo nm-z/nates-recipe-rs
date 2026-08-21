@@ -7846,6 +7846,19 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 			}
 			return builder.finish(name).map(Some);
 		}
+		// Name-labeled samples: `<target>__<name>` carries the label in the file name
+		// rather than in a sibling or a directory. Every file under the root has to be
+		// one labeled sample, so a tree whose samples are only partly recognized never
+		// trains on the recognized part alone.
+		const SEPARATOR: &str = "__";
+		let labels = samples.iter().map(|(path, _)| stem(path).split_once(SEPARATOR).map(|(label, _)| label.to_owned())).collect::<Option<Vec<_>>>();
+		if let Some(labels) = labels.filter(|labels| samples.len() == files.len() && labels.iter().collect::<BTreeSet<_>>().len() > 1) {
+			let mut builder = SampleTableBuilder::new(target.clone());
+			for ((path, bytes), label) in samples.iter().zip(labels) {
+				builder.push(path, bytes, label)?;
+			}
+			return builder.finish(name).map(Some);
+		}
 		return Ok(None);
 	}
 	// One level of subdirectories under the root.
