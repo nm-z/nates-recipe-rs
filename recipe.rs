@@ -1824,7 +1824,7 @@ impl QuantOps for NativeQuantOps {
 		let pointer = pointer_type(self.backend);
 		let address = self.instruction(format!("getelementptr inbounds i8, {pointer} %block, i64 {offset}"));
 		let loaded = self.instruction(format!("load i{bits}, {pointer} {address}, align {}", if bits == 8 { 1 } else { 2 }));
-		self.instruction(format!("zext i{bits} {loaded} to i64"))
+		if bits == 64 { loaded } else { self.instruction(format!("zext i{bits} {loaded} to i64")) }
 	}
 	fn half(&mut self, offset: Self::Int) -> Self::Value {
 		let pointer = pointer_type(self.backend);
