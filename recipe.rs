@@ -7733,8 +7733,9 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 		}
 		let bytes = fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
 		let directory = path.parent().unwrap_or_else(|| Path::new("")).to_owned();
-		let (table, _) = parse_table(&path, &bytes)?;
-		grouped.push((directory, table));
+		for table in decode_tables(path, &bytes)? {
+			grouped.push((directory.clone(), table));
+		}
 	}
 	let mut tables = merge_captures(grouped, &data.target)?;
 	tables = merge_partitions(tables, &data.target, &data.exclusions)?;
@@ -7927,7 +7928,7 @@ fn sample_identity(sample: &[f64], target: f64) -> u64 {
 	const PRIME: u64 = 1099511628211;
 	sample.iter().copied().chain(std::iter::once(target)).fold(OFFSET, |hash, value| (hash ^ value.to_bits()).wrapping_mul(PRIME))
 }
-fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data") }
+fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl") }
 fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	let path = path.as_ref();
 	let mut components = path.components();
@@ -8047,6 +8048,140 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], exclusions: &[St
 	}
 	let name = "data".to_owned();
 	Ok(vec![Table { name, headers, rows }])
+}
+/// Decode one source file into its tables, dispatching on the container format.
+fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
+	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
+	match path.extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase).as_deref() {
+		Some("jsonl") => {
+			let text = str::from_utf8(bytes).map_err(|error| RecipeError::new(format!("dataset {} is not UTF-8: {error}", path.display())))?;
+			let records = text.lines().map(str::trim).filter(|line| !line.is_empty()).map(|line| json_value(line).map(|(value, _)| value)).collect::<Result<Vec<_>>>().map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?;
+			Ok(vec![json_records_table(name, &records).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))?])
+		}
+		_ => parse_table(path, bytes).map(|(table, _)| vec![table]),
+	}
+}
+enum JsonValue {
+	Null,
+	Bool(bool),
+	Number(String),
+	Text(String),
+	Array,
+	Object(Vec<(String, JsonValue)>),
+}
+impl JsonValue {
+	fn scalar(&self) -> Option<String> {
+		match self {
+			Self::Null => Some(String::new()),
+			Self::Bool(value) => Some(value.to_string()),
+			Self::Number(value) | Self::Text(value) => Some(value.clone()),
+			Self::Array | Self::Object(_) => None,
+		}
+	}
+}
+/// Parse one JSON value from the start of `text`, returning it with the unconsumed remainder.
+fn json_value(text: &str) -> Result<(JsonValue, &str)> {
+	let text = text.trim_start();
+	let mut characters = text.char_indices();
+	match characters.next().map(|(_, character)| character) {
+		Some('n') => Ok((JsonValue::Null, text.strip_prefix("null").ok_or_else(|| RecipeError::new("invalid JSON literal"))?)),
+		Some('t') => Ok((JsonValue::Bool(true), text.strip_prefix("true").ok_or_else(|| RecipeError::new("invalid JSON literal"))?)),
+		Some('f') => Ok((JsonValue::Bool(false), text.strip_prefix("false").ok_or_else(|| RecipeError::new("invalid JSON literal"))?)),
+		Some('"') => {
+			let (value, rest) = json_string(text)?;
+			Ok((JsonValue::Text(value), rest))
+		}
+		Some('[') => {
+			let mut rest = text[1..].trim_start();
+			let mut values = 0;
+			loop {
+				if let Some(after) = rest.strip_prefix(']') {
+					return Ok((JsonValue::Array, after));
+				}
+				if values != 0 {
+					rest = rest.strip_prefix(',').ok_or_else(|| RecipeError::new("JSON array expects a comma"))?.trim_start();
+				}
+				let (_, remaining) = json_value(rest)?;
+				values += 1;
+				rest = remaining.trim_start();
+			}
+		}
+		Some('{') => {
+			let mut rest = text[1..].trim_start();
+			let mut fields = Vec::new();
+			loop {
+				if let Some(after) = rest.strip_prefix('}') {
+					return Ok((JsonValue::Object(fields), after));
+				}
+				if !fields.is_empty() {
+					rest = rest.strip_prefix(',').ok_or_else(|| RecipeError::new("JSON object expects a comma"))?.trim_start();
+				}
+				let (key, remaining) = json_string(rest)?;
+				rest = remaining.trim_start().strip_prefix(':').ok_or_else(|| RecipeError::new("JSON object expects a colon"))?;
+				let (value, remaining) = json_value(rest)?;
+				fields.push((key, value));
+				rest = remaining.trim_start();
+			}
+		}
+		Some(character) if character == '-' || character.is_ascii_digit() => {
+			let end = text.find(|character: char| !matches!(character, '0'..='9' | '-' | '+' | '.' | 'e' | 'E')).unwrap_or(text.len());
+			let (number, rest) = text.split_at(end);
+			number.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid JSON number {number:?}: {error}")))?;
+			Ok((JsonValue::Number(number.to_owned()), rest))
+		}
+		_ => Err(RecipeError::new("invalid JSON value")),
+	}
+}
+fn json_string(text: &str) -> Result<(String, &str)> {
+	let mut characters = text.strip_prefix('"').ok_or_else(|| RecipeError::new("JSON expects a string"))?.char_indices();
+	let mut value = String::new();
+	while let Some((index, character)) = characters.next() {
+		match character {
+			'"' => return Ok((value, &text[index + 2..])),
+			'\\' => match characters.next().map(|(_, escape)| escape) {
+				Some('"') => value.push('"'),
+				Some('\\') => value.push('\\'),
+				Some('/') => value.push('/'),
+				Some('b') => value.push('\u{8}'),
+				Some('f') => value.push('\u{c}'),
+				Some('n') => value.push('\n'),
+				Some('r') => value.push('\r'),
+				Some('t') => value.push('\t'),
+				Some('u') => {
+					let digits = (0..4).map(|_| characters.next().map(|(_, digit)| digit).ok_or_else(|| RecipeError::new("JSON unicode escape is truncated"))).collect::<Result<String>>()?;
+					let code = u32::from_str_radix(&digits, 16).map_err(|error| RecipeError::new(format!("invalid JSON unicode escape: {error}")))?;
+					value.push(char::from_u32(code).ok_or_else(|| RecipeError::new("invalid JSON unicode escape"))?);
+				}
+				_ => return Err(RecipeError::new("invalid JSON escape")),
+			},
+			character => value.push(character),
+		}
+	}
+	Err(RecipeError::new("JSON string is unterminated"))
+}
+/// One table from flat JSON records: the ordered union of keys becomes the header row.
+fn json_records_table(name: String, records: &[JsonValue]) -> Result<Table> {
+	let mut headers = Vec::<String>::new();
+	for record in records {
+		let JsonValue::Object(fields) = record else { return Err(RecipeError::new("JSON record is not an object")) };
+		for (key, _) in fields {
+			if !headers.contains(key) {
+				headers.push(key.clone());
+			}
+		}
+	}
+	require(!headers.is_empty(), "JSON records have no fields")?;
+	let mut rows = Vec::with_capacity(records.len());
+	for record in records {
+		let JsonValue::Object(fields) = record else { unreachable!() };
+		let mut row = std::iter::repeat_with(String::new).take(headers.len()).collect::<Vec<_>>();
+		for (key, value) in fields {
+			let column = headers.iter().position(|header| header == key).unwrap();
+			row[column] = value.scalar().ok_or_else(|| RecipeError::new(format!("JSON record field {key:?} is not a scalar")))?;
+		}
+		rows.push(row);
+	}
+	Ok(Table { name, headers, rows })
 }
 fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	let first = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
