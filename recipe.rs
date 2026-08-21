@@ -4795,8 +4795,6 @@ impl Graph {
 	fn new(shape: Shape) -> Self { Self { nodes: Vec::new(), parameters: Vec::new(), frozen: Vec::new(), programs: Vec::new(), stored: Vec::new(), input: shape, output: shape, source: -1, state: TrainingState::default(), block_index: 0, block_kind: "" } }
 	fn refresh_storage(&mut self, config: Config) -> Result<()> { encode_graph_storage(self, config) }
 }
-fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<Graph> { compile_graph(model, data, rows, gpu, config, None) }
-fn compile_output(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config, output: usize) -> Result<Graph> { compile_graph(model, data, rows, gpu, config, Some(output)) }
 fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 	require(graph.stored.len() == graph.nodes.len(), "model graph storage spans are incomplete")?;
 	for (index, node) in graph.nodes.iter().enumerate() {
@@ -4812,7 +4810,7 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 	}
 	Ok(())
 }
-fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config, expected: Option<usize>) -> Result<Graph> {
+fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config, initialize: bool) -> Result<Graph> {
 	require(!model.blocks.is_empty(), "model must contain a block")?;
 	if let Some(format) = model.blocks.iter().map(|block| StorageFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
 		return Err(format.unavailable());
@@ -4826,9 +4824,7 @@ fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu,
 		lower_block(&mut graph, block, model.blocks.len(), data, rows, gpu, config)?;
 	}
 	let mut output_profile = model.blocks.last().filter(|block| block.profile).map(|block| StorageFormat(block.quantization));
-	if let Some(expected) = expected {
-		require(graph.output.elements() == expected, "model output width does not match .out()")?;
-	} else if graph.output.elements() != 1 {
+	if graph.output.elements() != 1 {
 		let length = graph.output.length;
 		lower_conv(&mut graph, 1, length)?;
 		if model.quantization != 0 {
@@ -4841,8 +4837,8 @@ fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu,
 	{
 		node.argument[8] = f64::from(format.tensor(0, false, true))
 	}
-	initialize_graph(&mut graph, config);
-	if expected.is_none() {
+	if initialize {
+		initialize_graph(&mut graph, config);
 		if let Some(offset) = output_bias_offset(&graph) {
 			let mean = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 			graph.parameters[offset] = mean;
@@ -4853,7 +4849,9 @@ fn compile_graph(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu,
 }
 fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: &'static Gpu, config: Config) -> Result<Graph> {
 	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], rows: 1, source_rows: 1, features: saved.input.elements(), schema: DataSchema::default(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new() };
-	let mut graph = compile_graph(&saved.model, &prepared, 1, gpu, config, Some(saved.output.elements()))?;
+	let mut graph = compile(&saved.model, &prepared, 1, gpu, config, false)?;
+	require(graph.input == saved.input, "saved semantic input shape does not match the compiled model")?;
+	require(graph.output == saved.output, "saved semantic output shape does not match the compiled model")?;
 	require(graph.parameters.len() == saved.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "saved semantic weights do not match the compiled model")?;
 	let mut tensor = 0;
 	for (index, node) in graph.nodes.iter().enumerate() {
@@ -6797,7 +6795,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	require(samples.len() == sample_count, "surrogate sample batch is invalid")?;
 	let model = recipe.model().layer(hidden).tanh().layer(1);
 	let prepared = Prepared { samples: samples.to_vec(), targets: targets.to_vec(), rows: targets.len(), source_rows: targets.len(), features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new() };
-	let mut graph = compile_output(&model, &prepared, prepared.rows, gpu, config, 1)?;
+	let mut graph = compile(&model, &prepared, prepared.rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, mse)?;
 	for _ in 0..config.surrogate_epochs {
 		tape.advance()?;
@@ -8366,9 +8364,11 @@ impl Train {
 		let probability = model.loss.0 >= 4;
 		let scale = probability.then(|| TargetScale::fit(&prepared.targets[..training_rows]));
 		let target_values = prepared.targets.iter().map(|target| scale.map_or(*target, |scale| scale.encode(*target))).collect::<Vec<_>>();
-		let (run, mut graph) = (RUN.fetch_add(1, Ordering::Relaxed) + 1, compile(model, prepared, training_rows, gpu, config)?);
+		let initialize = if let Some(path) = &self.resume { !fs::exists(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))? } else { true };
+		let (run, mut graph) = (RUN.fetch_add(1, Ordering::Relaxed) + 1, compile(model, prepared, training_rows, gpu, config, initialize)?);
 		graph.state.training_rows = training_rows;
-		if let Some(scale) = scale
+		if initialize
+			&& let Some(scale) = scale
 			&& let Some(offset) = output_bias_offset(&graph)
 		{
 			let mean = target_values[..training_rows].iter().sum::<f64>() / training_rows as f64;
