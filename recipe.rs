@@ -2769,13 +2769,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: LossFunction, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
 	target.validate()?;
 	let model = NativeModelIr::from_graph(graph, rows, precision, schedule)?;
-	let fragment = natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?;
-	let aligned_attention = graph.nodes.iter().filter(|node| node.op == Primitive::Attention).try_fold(true, |aligned, node| {
-		let heads = integer_argument(node.argument[0], "attention heads")?;
-		require(heads != 0, "attention heads are empty")?;
-		Ok::<_, RecipeError>(aligned && node.output.channels / heads as usize % fragment == 0)
-	})?;
-	let matrix = match target { BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") => Some(NativeMatrix::Gfx11), BackendTarget::Amd { architecture } if architecture.starts_with("gfx12") => Some(NativeMatrix::Gfx12), _ => None }.filter(|_| matches!(model.precision.source, "-f16" | "-bf16" | "-int8" | "-int4") && aligned_attention);
+	let matrix = match target { BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") => Some(NativeMatrix::Gfx11), BackendTarget::Amd { architecture } if architecture.starts_with("gfx12") => Some(NativeMatrix::Gfx12), _ => None }.filter(|_| model.schedule.matrix);
 	let ir = model.emit(target.backend(), matrix, loss)?;
 	let key = native_artifact_key(target, &ir);
 	let directory = native_artifact_directory(&key)?;
@@ -5326,6 +5320,7 @@ struct Tile {
 }
 #[derive(Clone)]
 struct NativeSchedule {
+	matrix: bool,
 	block: u32,
 	tile: Tile,
 	register_m: u32,
@@ -6136,7 +6131,12 @@ impl Gpu {
 		};
 		let dominant_shape = dominant.and_then(|(index, _)| shapes[index]).map_or(limits, |shape| shape.gradient);
 		let fragment_k = narrow(natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?, "contraction fragment K")? as u32;
-		let matrix = matches!(&self.native_target, BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") || architecture.starts_with("gfx12")) && [Compute::FP16, Compute::BF16, Compute::INT8, Compute::INT4].contains(&precision);
+		let aligned_attention = graph.nodes.iter().filter(|node| node.op == Primitive::Attention).try_fold(true, |aligned, node| {
+			let heads = integer_argument(node.argument[0], "attention heads")?;
+			require(heads != 0, "attention heads are empty")?;
+			Ok::<_, RecipeError>(aligned && node.output.channels / heads as usize % fragment_k as usize == 0)
+		})?;
+		let matrix = matches!(&self.native_target, BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") || architecture.starts_with("gfx12")) && [Compute::FP16, Compute::BF16, Compute::INT8, Compute::INT4].contains(&precision) && dominant_shape.m >= fragment_k && dominant_shape.n >= fragment_k && dominant_shape.k >= fragment_k && aligned_attention;
 		let matrix_waves = narrow(natural("contraction matrix maximum waves per workgroup", env!("RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"))?, "contraction matrix maximum waves per workgroup")? as u32;
 		let waves_per_workgroup = if matrix { matrix_waves.min(dominant_shape.m.div_ceil(fragment_k)).max(1) } else { vector_waves };
 		// The reduction chunk is a multiple of the staging fragment so a chunk
@@ -6192,7 +6192,7 @@ impl Gpu {
 		let chunk_bias_values = owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?;
 		let scratch_base = narrow(graph.parameters.len().next_multiple_of(NATIVE_SCRATCH_ROW_VALUES), "native gradient scratch base")?;
 		debug(&format!("native schedule block={block} waves={waves} registers={register_count} shared={shared_values} contractions={contractions:?} attention={attention:?}"))?;
-		let schedule = NativeSchedule { block, tile, register_m, register_n, register_count, fragment_k, chunk_k, chunk_values, chunk_bias_values, scratch_base, shared_values, contractions, attention };
+		let schedule = NativeSchedule { matrix, block, tile, register_m, register_n, register_count, fragment_k, chunk_k, chunk_values, chunk_bias_values, scratch_base, shared_values, contractions, attention };
 		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
 		let program = NativeProgram::load(self, artifact, graph, schedule, register_values, waves)?;
 		let fixed = program.forward.kernel.shared.max(program.epoch.kernel.shared).max(program.model_load.map_or(0, |dispatch| dispatch.kernel.shared));
