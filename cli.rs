@@ -1,4 +1,4 @@
-use std::{fs, os::unix::process::CommandExt, path::Path, path::PathBuf, process::Command};
+use std::{fs, os::unix::process::ExitStatusExt, path::Path, path::PathBuf, process::Command};
 
 const USAGE: &str = "usage: recipe [--device <name>] <source.rs> [export]";
 
@@ -49,18 +49,22 @@ fn run(source: &Path, device: Option<&str>) {
 	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
-	let output = directory.join("recipe-script");
+	// Each invocation compiles to its own output, so concurrent invocations never share one.
+	let output = directory.join(format!("recipe-script-{}", std::process::id()));
 	fs::metadata(&library).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", library.display()));
 	let status = Command::new("rustc").arg("--edition=2024").arg(source).arg("--extern").arg(format!("recipe={}", library.display())).arg("-L").arg(format!("dependency={}", dependencies.display())).arg("-o").arg(&output).status().expect("cannot execute rustc");
 	if !status.success() {
+		fs::remove_file(&output).ok();
 		std::process::exit(status.code().unwrap_or(1));
 	}
-	let mut command = Command::new(output);
+	let mut command = Command::new(&output);
 	if let Some(device) = device {
 		command.env("RECIPE_DEVICE", device);
 	}
-	let error = command.exec();
-	panic!("cannot execute Recipe script: {error}")
+	let status = command.status();
+	fs::remove_file(&output).ok();
+	let status = status.unwrap_or_else(|error| panic!("cannot execute Recipe script: {error}"));
+	std::process::exit(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)));
 }
 
 fn main() {

@@ -3283,7 +3283,25 @@ mod bundle {
 			require(!semantic.artifact.is_empty(), "native artifact identity is absent")?;
 			field(&mut document, "artifact", &text(&semantic.artifact));
 		}
-		fs::write(path, document).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", path.display())))
+		// Publish atomically through an exclusively created temporary sibling: the path always
+		// holds one publisher's complete model, and concurrent publishers never share a file.
+		let mut serial = 0;
+		let (temporary, mut file) = loop {
+			let candidate = path.with_extension(format!("ogdl.{}.{serial}.tmp", std::process::id()));
+			match fs::File::create_new(&candidate) {
+				Ok(file) => break (candidate, file),
+				Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => serial += 1,
+				Err(error) => return Err(RecipeError::new(format!("cannot write {}: {error}", candidate.display()))),
+			}
+		};
+		let published = file.write_all(document.as_bytes()).and_then(|()| file.sync_all()).map_err(|error| RecipeError::new(format!("cannot write {}: {error}", temporary.display()))).and_then(|()| {
+			drop(file);
+			fs::rename(&temporary, path).map_err(|error| RecipeError::new(format!("cannot publish {}: {error}", path.display())))
+		});
+		if published.is_err() {
+			fs::remove_file(&temporary).ok();
+		}
+		published
 	}
 	fn join<T: ToString>(values: &[T]) -> String { values.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ") }
 	fn same_structure(a: &SemanticGraph, b: &SemanticGraph) -> bool {
@@ -3497,9 +3515,25 @@ pub enum Activation {
 	Prelu,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BlockNormalization {
+pub enum BlockNormalization {
 	Batch,
 	Layer,
+}
+/// The normalization selectors with a declared identity: the batch marker and the layer
+/// residual constructor. Any other selector is rejected instead of guessing a mode.
+pub trait NormalizationSelector {
+	fn normalization(self) -> BlockNormalization;
+}
+impl NormalizationSelector for Batch {
+	fn normalization(self) -> BlockNormalization { BlockNormalization::Batch }
+}
+impl<F: Fn(usize) -> Residual> NormalizationSelector for F {
+	fn normalization(self) -> BlockNormalization {
+		match self(0) {
+			Residual::Layer(_) => BlockNormalization::Layer,
+			_ => panic!("normalization selector must be batch or layer"),
+		}
+	}
 }
 macro_rules! slots { ($(fn $name:ident = $value:ident),+ $(,)?) => {$(pub const fn $name() -> Residual {
 	Residual::Activation(Activation::$value) })+}; }
@@ -3561,10 +3595,10 @@ impl Model {
 	fn perc(width: usize) = Operation::Perceptron(width); }
 	pub fn residual<const N: usize>(&self, parts: [Residual; N]) -> Self { self.push(Operation::Residual(parts.into())) }
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Residual; N]) -> Self { self.push(Operation::Moe(top_k, experts.into())) }
-	pub fn norm(&self, normalization: Normalization) -> Self {
+	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
 		let mut model = self.clone();
 		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("normalization requires a preceding block"));
-		block.normalization = Some(if normalization as usize == batch as usize { BlockNormalization::Batch } else { BlockNormalization::Layer });
+		block.normalization = Some(normalization.normalization());
 		model
 	}
 	pub fn loss(&self, loss: LossFunction) -> Self {
@@ -4715,8 +4749,9 @@ pub const tok: Metric = Metric(8);
 pub const quant: Metric = Metric(9);
 pub const all: [Metric; 9] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant];
 pub const z_score: ZScore = ZScore;
-pub const batch: Normalization = batch_marker;
-const fn batch_marker(_: usize) -> Residual { Residual::Activation(Activation::Relu) }
+pub const batch: Batch = Batch;
+#[derive(Clone, Copy, Debug)]
+pub struct Batch;
 impl LossFunction {
 	const fn name(self) -> &'static str {
 		match self.0 {
@@ -9711,6 +9746,7 @@ impl Train {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
 			predictions.clear();
+			let mut raw_outputs = Vec::new();
 			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
 			for sample in prepared.samples.chunks_exact(prepared.features) {
 				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, model.loss)?;
@@ -9718,6 +9754,7 @@ impl Train {
 				validation.forward()?;
 				let raw = validation.predictions()?;
 				require(raw.len() == 1, "autoregressive forward must produce one char ID")?;
+				raw_outputs.push(raw[0]);
 				let prediction = scale.map_or(raw[0], |scale| scale.decode(raw[0]));
 				predictions.push(prediction);
 				if stream {
@@ -9728,7 +9765,9 @@ impl Train {
 			if stream {
 				eprintln!()
 			}
-			final_loss = model_loss(&predictions, &prepared.targets, model.loss, config.activation[7]);
+			// Evaluation loss lives in the training representation and covers only held-out rows;
+			// decoding is for the user-facing predictions, r2, and tokens.
+			final_loss = model_loss(&raw_outputs[training_rows..], &target_values[training_rows..], model.loss, config.activation[7]);
 		} else if training_rows < prepared.rows {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
