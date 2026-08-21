@@ -3492,7 +3492,11 @@ impl Model {
 	pub fn norm(&self, normalization: Normalization) -> Self {
 		let mut model = self.clone();
 		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("normalization requires a preceding block"));
-		block.normalization = Some(if normalization as usize == batch as usize { BlockNormalization::Batch } else { BlockNormalization::Layer });
+		// Fn-pointer addresses are not stable identities; classify the selector by the residual it constructs.
+		block.normalization = Some(match normalization(0) {
+			Residual::Layer(_) => BlockNormalization::Layer,
+			_ => BlockNormalization::Batch,
+		});
 		model
 	}
 	pub fn loss(&self, loss: LossFunction) -> Self {
