@@ -4886,7 +4886,9 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 		let format = StorageFormat(node.argument[8] as u16);
 		require(format.spec().is_some(), format.unavailable().to_string())?;
 		let weights = &graph.parameters[node.offset..node.offset + node.parameters];
-		let importance = graph.state.variances.get(node.offset..node.offset + node.parameters).filter(|values| values.len() == node.parameters).map_or_else(|| vec![1.0; node.parameters], |values| values.to_vec());
+		// A node that never received gradient, like an unrouted expert, has an all-zero
+		// variance slice: it carries no importance signal, so weight it uniformly.
+		let importance = graph.state.variances.get(node.offset..node.offset + node.parameters).filter(|values| values.len() == node.parameters && values.iter().any(|value| *value > 0.0)).map_or_else(|| vec![1.0; node.parameters], |values| values.to_vec());
 		graph.stored[index] = Some(format.encode(weights, &importance, config)?);
 	}
 	Ok(())
