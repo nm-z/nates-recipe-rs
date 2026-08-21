@@ -1,0 +1,2 @@
+   Compiling recipe v0.1.0 (/tmp/recipe-fix-92)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 10.73s

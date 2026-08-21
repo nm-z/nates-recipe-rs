@@ -2802,17 +2802,9 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 	}
 }
 
-pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: LossFunction, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
-	target.validate()?;
-	let model = NativeModelIr::from_graph(graph, rows, precision, schedule)?;
-	let matrix = match target { BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") => Some(NativeMatrix::Gfx11), BackendTarget::Amd { architecture } if architecture.starts_with("gfx12") => Some(NativeMatrix::Gfx12), _ => None }.filter(|_| model.schedule.matrix);
-	let ir = model.emit(target.backend(), matrix, loss)?;
-	let key = native_artifact_key(target, &ir);
-	let directory = native_artifact_directory(&key)?;
-	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native artifact directory: {error}")))?;
-	let path = directory.join(format!("artifact.{}", target.artifact_extension())); let cached = path.is_file(); debug(&format!("native artifact key={key} target={} arithmetic={} loss={} rows={rows} cache={} path={}", native_target_label(target).split(";features=").next().unwrap_or("unknown"), model.precision.model.label(), loss.name(), if cached { "hit" } else { "miss" }, path.display()))?;
+fn build_native_artifact(target: &BackendTarget, ir: &str, key: &str, directory: &Path, path: &Path, cached: bool) -> Result<Vec<u8>> {
 	let artifact = if cached {
-		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
+		fs::read(path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	} else {
 		let serial = NATIVE_ARTIFACT_SERIAL.fetch_add(1, Ordering::Relaxed);
 		let stem = format!(".recipe-native-{}-{serial}", std::process::id());
@@ -2828,15 +2820,27 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		// nonzero occupancy here holds for every workgroup width the schedule can
 		// pick. It does not bound the tile: local memory is checked separately, and
 		// the schedule still does not resize itself from these numbers.
-		for kernel in compile_native_artifact(target, &source, &output, ptx.as_deref(), &key)? {
+		for kernel in compile_native_artifact(target, &source, &output, ptx.as_deref(), key)? {
 			debug(&format!("native kernel {} registers={} scalars={} occupancy={} waves per SIMD", kernel.name, kernel.registers, kernel.scalars, kernel.occupancy))?;
 			require(kernel.occupancy != 0, format!("native kernel {} cannot be resident at any workgroup width", kernel.name))?;
 		}
-		fs::rename(&output, &path).map_err(|error| RecipeError::new(format!("cannot publish native artifact {}: {error}", path.display())))?;
+		fs::rename(&output, path).map_err(|error| RecipeError::new(format!("cannot publish native artifact {}: {error}", path.display())))?;
 		drop(temporary);
-		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
+		fs::read(path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	};
 	require(!artifact.is_empty(), format!("native artifact {} is empty", path.display()))?;
+	Ok(artifact)
+}
+pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: LossFunction, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
+	target.validate()?;
+	let model = NativeModelIr::from_graph(graph, rows, precision, schedule)?;
+	let matrix = match target { BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") => Some(NativeMatrix::Gfx11), BackendTarget::Amd { architecture } if architecture.starts_with("gfx12") => Some(NativeMatrix::Gfx12), _ => None }.filter(|_| model.schedule.matrix);
+	let ir = model.emit(target.backend(), matrix, loss)?;
+	let key = native_artifact_key(target, &ir);
+	let directory = native_artifact_directory(&key)?;
+	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native artifact directory: {error}")))?;
+	let path = directory.join(format!("artifact.{}", target.artifact_extension())); let cached = path.is_file(); debug(&format!("native artifact key={key} target={} arithmetic={} loss={} rows={rows} cache={} path={}", native_target_label(target).split(";features=").next().unwrap_or("unknown"), model.precision.model.label(), loss.name(), if cached { "hit" } else { "miss" }, path.display()))?;
+	let artifact = build_native_artifact(target, &ir, &key, &directory, &path, cached)?;
 	Ok(NativeArtifact {
 		backend: target.clone(),
 		layout: model.layout.clone(),
@@ -5442,54 +5446,60 @@ struct NativeContractionTiles {
 /// exchange then lives. `exchange` is in state-typed elements past the two
 /// staging buffers; a single-buffered direction keeps both at zero and behaves
 /// exactly as before.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct NativePipeline {
 	enabled: bool,
 	exchange: u32,
 	shared: u32,
-	tile: Tile,
 }
-/// Decide pipelining for one tile: the two staging buffers plus the exchange
-/// region must fit the same local-memory budget the analytic tile obeys.
-fn native_contraction_pipeline(shape: Tile, tile: Tile, register_m: u32, register_n: u32, block: u32, fragment: u32, model_bytes: u32, state_bytes: u32, budget: u32, matrix: bool) -> Result<NativePipeline> {
-	let single = native_contraction_shared_values(tile, register_m, register_n, block, fragment, state_bytes.div_ceil(model_bytes).max(1), matrix)?;
-	// A walk that stages its whole K extent at once has nothing to overlap:
-	// double buffering would only add work and local memory.
-	if matrix || shape.k <= tile.k {
-		return Ok(NativePipeline { enabled: false, exchange: 0, shared: single, tile });
+/// One schedule candidate for a contraction direction: the tile, and whether
+/// its staging is double-buffered.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NativeChoice {
+	tile: Tile,
+	pipeline: NativePipeline,
+}
+/// Every measurable schedule for one direction of one shape: the legal
+/// single-buffered tiles, and for multi-chunk walks the double-buffered
+/// variants whose two staging buffers fit the same local-memory budget. The
+/// chunk exchange overlays whichever buffer was just consumed, so it needs no
+/// allocation of its own beyond one buffer's span.
+fn native_schedule_candidates(limits: Tile, direction: ContractionDirection, register_m: u32, register_n: u32, block: u32, shared_values: u32, fragment: u32, ratio: u32, model_bytes: u32, state_bytes: u32) -> Result<Vec<NativeChoice>> {
+	let mut choices = Vec::new();
+	for tile in native_tile_candidates(limits, register_m, register_n, block, shared_values, fragment, ratio)? {
+		choices.push(NativeChoice { tile, pipeline: NativePipeline { enabled: false, exchange: 0, shared: native_contraction_shared_values(tile, register_m, register_n, block, fragment, ratio, false)? } });
 	}
-	// The analytic tile fills local memory with one staging buffer, so the
-	// pipelined walk stages a shorter K per buffer: the longest chunk multiple
-	// whose two buffers and exchange region still fit the same budget.
-	let partial_state = |m: u32| -> Result<u32> {
-		let output_lanes = (m / register_m).max(1).checked_mul((tile.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
-		let exchange_lanes = output_lanes.min((block / 2).max(1));
-		exchange_lanes.checked_mul(register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?).and_then(|sums| sums.checked_add((tile.n / register_n).max(1).checked_mul(register_n)?)).ok_or_else(|| RecipeError::new("native contraction partial region overflows"))
-	};
-	let extent_limit = tile.k.div_ceil(fragment).checked_mul(fragment).ok_or_else(|| RecipeError::new("native contraction K tile overflows"))?;
-	let mut m = tile.m;
-	while m >= register_m {
-	let width = m.checked_add(tile.n).ok_or_else(|| RecipeError::new("native contraction tile width overflows"))?;
-	let mut extent = extent_limit;
-	while extent >= fragment {
-		// The chunk exchange overlays whichever buffer was just consumed: its
-		// staged operands are dead before the partials are published, and the
-		// prefetched buffer stays untouched. `exchange` is one buffer's span in
-		// state-typed elements, scaled by the live buffer index at runtime.
-		let staging = width.checked_mul(extent).ok_or_else(|| RecipeError::new("native contraction staging overflows"))?;
-		let staging_bytes = staging.checked_mul(model_bytes).ok_or_else(|| RecipeError::new("native contraction staging bytes overflow"))?;
-		let partial_bytes = extent.div_ceil(fragment).checked_mul(partial_state(m)?).and_then(|values| values.checked_mul(state_bytes)).ok_or_else(|| RecipeError::new("native contraction partial region overflows"))?;
-		let shared = staging.checked_mul(2).ok_or_else(|| RecipeError::new("native contraction pipeline shared overflows"))?;
-		if shared <= budget && partial_bytes <= staging_bytes {
-			return Ok(NativePipeline { enabled: true, exchange: staging_bytes.div_ceil(state_bytes), shared, tile: Tile { m, n: tile.n, k: extent } });
+	if matches!(direction, ContractionDirection::Gradient) {
+		return Ok(choices);
+	}
+	let mut lane_m = 1_u32;
+	while lane_m <= block {
+		let mut lane_n = 1_u32;
+		while lane_m * lane_n <= block {
+			let m = lane_m * register_m;
+			let n = lane_n * register_n;
+			if m < limits.m + register_m && n < limits.n + register_n {
+				let width = m.checked_add(n).ok_or_else(|| RecipeError::new("native contraction tile width overflows"))?;
+				let output_lanes = (m / register_m).max(1).checked_mul((n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
+				let exchange_lanes = output_lanes.min((block / 2).max(1));
+				let partial_state = exchange_lanes.checked_mul(register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?).and_then(|sums| sums.checked_add((n / register_n).max(1).checked_mul(register_n)?)).ok_or_else(|| RecipeError::new("native contraction partial region overflows"))?;
+				let mut k = fragment;
+				while k < limits.k && shared_values >= width.checked_mul(k).and_then(|staging| staging.checked_mul(2)).ok_or_else(|| RecipeError::new("native contraction pipeline shared overflows"))? {
+					let staging = width * k;
+					let staging_bytes = staging.checked_mul(model_bytes).ok_or_else(|| RecipeError::new("native contraction staging bytes overflow"))?;
+					let partial_bytes = k.div_ceil(fragment).checked_mul(partial_state).and_then(|values| values.checked_mul(state_bytes)).ok_or_else(|| RecipeError::new("native contraction partial region overflows"))?;
+					if partial_bytes <= staging_bytes {
+						choices.push(NativeChoice { tile: Tile { m, n, k }, pipeline: NativePipeline { enabled: true, exchange: staging_bytes.div_ceil(state_bytes), shared: staging * 2 } });
+					}
+					k = k.saturating_mul(2);
+				}
+			}
+			lane_n = lane_n.saturating_mul(2);
 		}
-		extent -= fragment;
+		lane_m = lane_m.saturating_mul(2);
 	}
-	// Every K extent overflows at this width: surrender one register row of
-	// output instead, trading the least staged reuse for the overlap.
-	m -= register_m;
-	}
-	Ok(NativePipeline { enabled: false, exchange: 0, shared: single, tile })
+	choices.truncate(PROBE_SCORE_ROWS);
+	Ok(choices)
 }
 #[derive(Clone, Copy)]
 struct NativeContractionShapes {
@@ -6254,29 +6264,84 @@ impl Gpu {
 		// elements per partial value.
 		let ratio = narrow(NativePrecision::new(precision)?.state.bytes().div_ceil(precision.bytes()), "native contraction state ratio")? as u32;
 		let mut tile = native_contraction_tile(dominant_shape, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?;
-		// The CPU backend runs the workgroup serially, so double buffering only
-		// costs local memory there.
+		// Measured per-node schedules: the vector contraction hierarchy takes its
+		// dimensions, tiles, and staging mode as runtime arguments, so each node's
+		// directions are timed on this device and the fastest legal schedule is
+		// dispatched, including whether the forward walk double-buffers its
+		// staging. The CPU backend, the matrix path with its hardware-fixed
+		// fragments, and the surrogate models the search itself builds all keep
+		// the analytic single-buffered tiles.
 		let sequential = matches!(&self.driver, Driver::Cpu);
 		let (model_bytes, state_bytes) = (precision.bytes() as u32, NativePrecision::new(precision)?.state.bytes() as u32);
-		let pipeline = |shape: Tile, tile: Tile| -> Result<NativePipeline> {
-			if sequential {
-				return Ok(NativePipeline { enabled: false, exchange: 0, shared: native_contraction_shared_values(tile, register_m, register_n, block, chunk_k, ratio, matrix)?, tile });
-			}
-			native_contraction_pipeline(shape, tile, register_m, register_n, block, chunk_k, model_bytes, state_bytes, shared_budget, matrix)
+		let probing = !sequential && !matrix && !NATIVE_TILE_SEARCH.with(std::cell::Cell::get);
+		// The probe is only built on a store miss: a model whose schedules were
+		// all measured before loads nothing extra.
+		let mut probe: Option<Option<NativeTileProbe>> = None;
+		let config = probing.then(Config::load).transpose()?;
+		let prefix = format!("{}|{}|b{block}|r{register_m}x{register_n}|c{chunk_k}", native_target_label(&self.native_target).split(";features=").next().unwrap_or("unknown"), precision.label());
+		let single = |tile: Tile| -> Result<NativeChoice> {
+			Ok(NativeChoice { tile, pipeline: NativePipeline { enabled: false, exchange: 0, shared: native_contraction_shared_values(tile, register_m, register_n, block, chunk_k, ratio, matrix)? } })
 		};
-		let contractions = shapes.iter().map(|shape| shape.map(|shape| {
-			let forward_pipeline = pipeline(shape.forward, native_contraction_tile(shape.forward, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?)?;
-			let previous_pipeline = pipeline(shape.previous, native_contraction_tile(shape.previous, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?)?;
-			Ok(NativeContractionTiles {
-				forward: forward_pipeline.tile,
-				gradient: native_contraction_tile(shape.gradient, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
-				previous: previous_pipeline.tile,
+		let mut contractions = Vec::new();
+		for (index, shape) in shapes.iter().enumerate() {
+			let Some(shape) = shape else {
+				contractions.push(None);
+				continue;
+			};
+			let node = &graph.nodes[index];
+			let relu = node.op == Primitive::Contraction && node.argument[1] == 1.0;
+			let probe = &mut probe;
+			let single = &single;
+			let mut pick = |limits: Tile, direction: ContractionDirection| -> Result<NativeChoice> {
+				let analytic = single(native_contraction_tile(limits, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?)?;
+				let Some(config) = config else { return Ok(analytic) };
+				let candidates = native_schedule_candidates(limits, direction, register_m, register_n, block, shared_budget, chunk_k, ratio, model_bytes, state_bytes)?;
+				if candidates.is_empty() {
+					return Ok(analytic);
+				}
+				if let Some((tile, pipelined)) = native_schedule_selection(&prefix, direction, limits)? {
+					if let Some(choice) = candidates.iter().find(|choice| choice.tile == tile && choice.pipeline.enabled == pipelined).copied() {
+						return Ok(choice);
+					}
+					if tile == analytic.tile && !pipelined {
+						return Ok(analytic);
+					}
+				}
+				if probe.is_none() {
+					*probe = Some(match native_tile_probe(self, &shapes, register_m, register_n, block, waves, shared_budget, fragment_k, chunk_k, ratio, precision) {
+						Ok(probe) => probe,
+						Err(error) => {
+							debug(&format!("native schedule probing unavailable: {error}"))?;
+							None
+						}
+					});
+				}
+				let Some(Some(probe)) = probe.as_ref() else { return Ok(analytic) };
+				NATIVE_TILE_SEARCH.with(|flag| flag.set(true));
+				let selected = rat_contraction_tile(self, probe, &prefix, direction, limits, relu, analytic, &candidates, config);
+				NATIVE_TILE_SEARCH.with(|flag| flag.set(false));
+				match selected {
+					Ok(choice) => Ok(choice),
+					Err(error) => {
+						debug(&format!("native schedule search failed, keeping the analytic tile: {error}"))?;
+						Ok(analytic)
+					}
+				}
+			};
+			let forward = pick(shape.forward, ContractionDirection::Forward)?;
+			let gradient = pick(shape.gradient, ContractionDirection::Gradient)?;
+			let previous = pick(shape.previous, ContractionDirection::Previous)?;
+			contractions.push(Some(NativeContractionTiles {
+				forward: forward.tile,
+				gradient: gradient.tile,
+				previous: previous.tile,
 				gradient_shape: shape.gradient,
 				parameters: shape.parameters,
-				forward_pipeline,
-				previous_pipeline,
-			})
-		}).transpose()).collect::<Result<Vec<_>>>()?;
+				forward_pipeline: forward.pipeline,
+				previous_pipeline: previous.pipeline,
+			}));
+		}
+		drop(probe);
 		tile = dominant.and_then(|(index, _)| contractions[index]).map_or(tile, |contraction| contraction.gradient);
 		let contraction_shared_values = contractions.iter().flatten().flat_map(|contraction| {
 			[Ok(contraction.forward_pipeline.shared), native_contraction_shared_values(contraction.gradient, register_m, register_n, block, chunk_k, ratio, matrix), Ok(contraction.previous_pipeline.shared)]
@@ -7707,6 +7772,376 @@ const fn parse_natural(text: &str, role: &'static str) -> usize {
 	value
 }
 
+/// A schedule probe measures one contraction direction of one shape with one
+/// candidate tile through the shared contraction bodies, whose dimensions,
+/// flags, and tiles are runtime arguments: one compiled artifact times every
+/// candidate. The probe reuses the standard entry symbols so the ordinary
+/// loader and launch paths apply; the parameter buffer rides in the contexts
+/// argument and the epoch entry is a stub that only satisfies the loader.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ContractionDirection {
+	Forward,
+	Gradient,
+	Previous,
+}
+impl ContractionDirection {
+	fn label(self) -> &'static str {
+		match self { Self::Forward => "forward", Self::Gradient => "gradient", Self::Previous => "previous" }
+	}
+}
+fn emit_native_probe(backend: Backend, precision: NativePrecision, schedule: &NativeSchedule) -> Result<String> {
+	let mut ir = backend_template(backend, precision, None)?
+		.replace("RECIPE_WORKGROUP_SIZE", &schedule.block.to_string())
+		.replace("RECIPE_REGISTER_M", &schedule.register_m.to_string())
+		.replace("RECIPE_REGISTER_N", &schedule.register_n.to_string())
+		.replace("RECIPE_REGISTER_COUNT", &schedule.register_count.to_string())
+		.replace("RECIPE_FRAGMENT_K", &schedule.fragment_k.to_string())
+		.replace("RECIPE_CHUNK_K", &schedule.chunk_k.to_string())
+		.replace("RECIPE_CHUNK_VALUES", &schedule.chunk_values.to_string())
+		.replace("RECIPE_CHUNK_BIAS_VALUES", &schedule.chunk_bias_values.to_string())
+		.replace("RECIPE_SCRATCH_ROW_MASK", &(NATIVE_SCRATCH_ROW_VALUES - 1).to_string())
+		.replace("RECIPE_SCRATCH_ROW_CLEAR", &(-(NATIVE_SCRATCH_ROW_VALUES as i64)).to_string())
+		.replace("RECIPE_GRADIENT_SCRATCH_BASE", &schedule.scratch_base.to_string());
+	let pointer = pointer_type(backend);
+	let kernel = match backend {
+		Backend::Cpu => "",
+		Backend::Amd => "protected amdgpu_kernel ",
+		Backend::Nvidia => "protected ptx_kernel ",
+	};
+	let model_ty = precision.model_type;
+	let state_ty = precision.state_type;
+	let mut body = String::new();
+	let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads");
+	body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_args}) #0 {{\nentry:\n"));
+	for index in 0..PROBE_PARAMETER_COUNT {
+		body.push_str(&format!("%parameter.{index}.ptr = getelementptr inbounds i32, {pointer} %contexts, i32 {index}\n%parameter.{index} = load i32, {pointer} %parameter.{index}.ptr, align 4\n"));
+	}
+	for (flag, index) in [("pipelined", 3), ("bias", 5), ("relu", 6), ("transpose", 7), ("reverse", 8), ("accumulate", 9)] {
+		body.push_str(&format!("%flag.{flag} = trunc i32 %parameter.{index} to i1\n"));
+	}
+	body.push_str(&format!("%gradient.ptr = getelementptr inbounds {model_ty}, {pointer} %values, i32 %parameter.15\n"));
+	body.push_str("%is.reverse = icmp ne i32 %parameter.0, 0\nbr i1 %is.reverse, label %probe.reverse, label %probe.forward\nprobe.forward:\n");
+	body.push_str(&format!("call void @contraction_forward_body( {pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %samples, i32 %rows, i32 %parameter.1, i32 1, i32 %parameter.2, i32 1, i32 0, i1 %flag.bias, i1 %flag.relu, i1 %flag.transpose, i1 %flag.reverse, i1 %flag.accumulate, i32 %parameter.10, i32 %parameter.11, i32 %parameter.12, i1 %flag.pipelined, i32 %parameter.4, i32 %threads )\nret void\nprobe.reverse:\n"));
+	body.push_str(&format!("call void @contraction_reverse_body( {pointer} %samples, {pointer} %weights, {pointer} %samples, {pointer} %samples, {pointer} %values, {pointer} %gradient.ptr, i1 false, i1 %flag.bias, i1 %flag.relu, i1 false, i32 %rows, i32 %parameter.1, i32 1, i32 %parameter.2, i32 1, i32 0, i32 0, i32 %parameter.10, i32 %parameter.11, i32 %parameter.12, i32 %parameter.10, i32 %parameter.11, i32 %parameter.12, i32 %threads )\nret void\n}}\n"));
+	let epoch_args = format!("{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %step");
+	body.push_str(&format!("define {kernel}void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\nret void\n}}\n"));
+	ir.push_str(&body);
+	Ok(prune_internal_definitions(ir))
+}
+const PROBE_PARAMETER_COUNT: usize = 16;
+/// Timed launches per candidate after one warm-up launch.
+const PROBE_REPEATS: usize = 2;
+/// Measured candidates per direction across all rounds of the search.
+const PROBE_BUDGET: usize = 10;
+/// Device elements the probe may allocate before probing is declined.
+const PROBE_CAPACITY: usize = 1 << 28;
+/// Rows the surrogate batches are padded to, so its two compiled artifacts are
+/// shared by every fit and every scoring pass.
+const PROBE_FIT_ROWS: usize = 32;
+const PROBE_SCORE_ROWS: usize = 128;
+struct NativeTileProbe {
+	program: NativeProgram,
+	samples: Buffer,
+	weights: Buffer,
+	values: Buffer,
+	parameters: Buffer,
+	gradient_offset: usize,
+}
+impl NativeTileProbe {
+	fn measure(&self, direction: ContractionDirection, shape: Tile, relu: bool, choice: NativeChoice) -> Result<f64> {
+		let tile = choice.tile;
+		let (body, rows, terms, channels, bias, transpose, reverse) = match direction {
+			ContractionDirection::Forward => (0, shape.m, shape.k, shape.n, 1, 0, 0),
+			ContractionDirection::Previous => (0, shape.m, shape.k, shape.n, 0, 1, 1),
+			ContractionDirection::Gradient => (1, shape.k, shape.m, shape.n, 1, 0, 0),
+		};
+		require(body == 0 || !choice.pipeline.enabled, "probe cannot pipeline the reverse body")?;
+		let mut parameters = [0_i32; PROBE_PARAMETER_COUNT];
+		parameters[0] = body;
+		parameters[1] = narrow(terms as usize, "probe contraction terms")?;
+		parameters[2] = narrow(channels as usize, "probe contraction channels")?;
+		[parameters[3], parameters[4]] = [i32::from(choice.pipeline.enabled), narrow(choice.pipeline.exchange as usize, "probe exchange base")?];
+		[parameters[5], parameters[6], parameters[7], parameters[8]] = [bias, i32::from(relu), transpose, reverse];
+		[parameters[10], parameters[11], parameters[12]] = [narrow(tile.m as usize, "probe tile M")?, narrow(tile.n as usize, "probe tile N")?, narrow(tile.k as usize, "probe tile K")?];
+		parameters[15] = narrow(self.gradient_offset, "probe gradient offset")?;
+		let encoded = parameters.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+		self.parameters.write_bytes(0, &encoded)?;
+		let threads = self.program.forward.geometry.threads()?;
+		let mut best = f64::INFINITY;
+		let gpu = self.program.gpu;
+		for repeat in 0..=PROBE_REPEATS {
+			gpu.synchronize()?;
+			let start = std::time::Instant::now();
+			let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.parameters.pointer, rows, threads];
+			self.program.launch_forward(&mut call)?;
+			gpu.synchronize()?;
+			if repeat != 0 {
+				best = best.min(start.elapsed().as_secs_f64());
+			}
+		}
+		require(best.is_finite() && best > 0.0, "probe produced no measurement")?;
+		Ok(best)
+	}
+}
+/// Legal tile candidates for one shape: power-of-two lane splits of the
+/// workgroup, and staged K extents on chunk boundaries within local memory,
+/// the same limits the analytic derivation obeys.
+fn native_tile_candidates(limits: Tile, register_m: u32, register_n: u32, block: u32, shared_values: u32, fragment: u32, ratio: u32) -> Result<Vec<Tile>> {
+	let mut candidates = Vec::new();
+	let mut lane_m = 1_u32;
+	while lane_m <= block {
+		let mut lane_n = 1_u32;
+		while lane_m * lane_n <= block {
+			let m = lane_m * register_m;
+			let n = lane_n * register_n;
+			if m < limits.m + register_m && n < limits.n + register_n {
+				let width = m.checked_add(n).ok_or_else(|| RecipeError::new("native contraction tile width overflows"))?;
+				let staging_k = shared_values / width;
+				let partial_per_chunk = native_contraction_partial_per_chunk(m, n, register_m, register_n, block, ratio)?;
+				let partial_k = (shared_values / partial_per_chunk).checked_mul(fragment).ok_or_else(|| RecipeError::new("native contraction partial K overflows"))?;
+				let room = staging_k.min(partial_k);
+				let mut extents = Vec::new();
+				if room >= limits.k {
+					extents.push(limits.k);
+				}
+				let ceiling = room.min(limits.k.div_ceil(fragment).saturating_mul(fragment));
+				let mut k = fragment;
+				while k <= ceiling {
+					extents.push(k);
+					k = k.saturating_mul(2);
+				}
+				if ceiling >= fragment {
+					extents.push(ceiling - ceiling % fragment);
+				}
+				extents.sort_unstable();
+				extents.dedup();
+				for k in extents {
+					candidates.push(Tile { m, n, k });
+				}
+			}
+			lane_n = lane_n.saturating_mul(2);
+		}
+		lane_m = lane_m.saturating_mul(2);
+	}
+	candidates.sort_unstable_by_key(|tile| (tile.m, tile.n, tile.k));
+	candidates.dedup();
+	candidates.truncate(PROBE_SCORE_ROWS);
+	Ok(candidates)
+}
+/// The measured-schedule store: every probe measurement and every concluded
+/// selection, persisted beside the native artifact cache so later builds skip
+/// the search entirely.
+struct ScheduleStore {
+	measurements: BTreeMap<String, f64>,
+	selections: BTreeMap<String, (Tile, bool)>,
+}
+fn native_schedule_store_path() -> Result<PathBuf> {
+	let executable = std::env::current_exe().map_err(|error| RecipeError::new(format!("cannot locate Recipe executable for native schedules: {error}")))?;
+	let parent = executable.parent().ok_or_else(|| RecipeError::new("Recipe executable has no artifact directory"))?;
+	Ok(parent.join("recipe-native").join("schedules.tsv"))
+}
+fn native_schedule_store() -> &'static std::sync::Mutex<ScheduleStore> {
+	static STORE: std::sync::OnceLock<std::sync::Mutex<ScheduleStore>> = std::sync::OnceLock::new();
+	STORE.get_or_init(|| {
+		let mut store = ScheduleStore { measurements: BTreeMap::new(), selections: BTreeMap::new() };
+		if let Ok(text) = native_schedule_store_path().and_then(|path| fs::read_to_string(path).map_err(|error| RecipeError::new(error.to_string()))) {
+			for line in text.lines() {
+				let mut fields = line.split('\t');
+				match (fields.next(), fields.next(), fields.next()) {
+					(Some("measure"), Some(key), Some(value)) => {
+						if let Ok(seconds) = value.parse::<f64>() {
+							store.measurements.insert(key.to_owned(), seconds);
+						}
+					}
+					(Some("select"), Some(key), Some(value)) => {
+						let mut parts = value.split('x').filter_map(|part| part.parse::<u32>().ok());
+						if let (Some(m), Some(n), Some(k)) = (parts.next(), parts.next(), parts.next()) {
+							store.selections.insert(key.to_owned(), (Tile { m, n, k }, parts.next() == Some(1)));
+						}
+					}
+					_ => {}
+				}
+			}
+		}
+		std::sync::Mutex::new(store)
+	})
+}
+fn native_schedule_persist(store: &ScheduleStore) -> Result<()> {
+	let path = native_schedule_store_path()?;
+	if let Some(parent) = path.parent() {
+		fs::create_dir_all(parent).map_err(|error| RecipeError::new(format!("cannot create native schedule directory: {error}")))?;
+	}
+	let mut text = String::new();
+	for (key, seconds) in &store.measurements {
+		text.push_str(&format!("measure\t{key}\t{seconds:e}\n"));
+	}
+	for (key, (tile, pipelined)) in &store.selections {
+		text.push_str(&format!("select\t{key}\t{}x{}x{}x{}\n", tile.m, tile.n, tile.k, u32::from(*pipelined)));
+	}
+	let temporary = path.with_extension(format!("tsv.{}.tmp", std::process::id()));
+	fs::write(&temporary, text).map_err(|error| RecipeError::new(format!("cannot write native schedule store: {error}")))?;
+	fs::rename(&temporary, &path).map_err(|error| RecipeError::new(format!("cannot publish native schedule store: {error}")))
+}
+thread_local! {
+	static NATIVE_TILE_SEARCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// One selection: the lookup state feeds the tile proposer, proposals are
+/// measured on the device, measurements train the benchmark surrogate, and the
+/// surrogate's predictions choose the next proposals, until the predicted and
+/// the measured optimum agree or the budget ends. The surrogate is the internal
+/// RAT machinery: the same model, fit, and inference paths estimators use.
+fn native_schedule_selection(prefix: &str, direction: ContractionDirection, shape: Tile) -> Result<Option<(Tile, bool)>> {
+	let key = format!("{prefix}|{}|{}x{}x{}", direction.label(), shape.m, shape.n, shape.k);
+	Ok(native_schedule_store().lock().map_err(|_| RecipeError::new("native schedule store is poisoned"))?.selections.get(&key).copied())
+}
+fn rat_contraction_tile(gpu: &'static Gpu, probe: &NativeTileProbe, prefix: &str, direction: ContractionDirection, shape: Tile, relu: bool, analytic: NativeChoice, candidates: &[NativeChoice], config: Config) -> Result<NativeChoice> {
+	let shape_key = format!("{prefix}|{}|{}x{}x{}", direction.label(), shape.m, shape.n, shape.k);
+	let choice_key = |choice: &NativeChoice| format!("{shape_key}|{}x{}x{}x{}", choice.tile.m, choice.tile.n, choice.tile.k, u32::from(choice.pipeline.enabled));
+	let mut measured: Vec<(NativeChoice, f64)> = Vec::new();
+	{
+		let store = native_schedule_store().lock().map_err(|_| RecipeError::new("native schedule store is poisoned"))?;
+		for choice in candidates {
+			if let Some(seconds) = store.measurements.get(&choice_key(choice)) {
+				measured.push((*choice, *seconds));
+			}
+		}
+	}
+	let probe_choice = |measured: &mut Vec<(NativeChoice, f64)>, choice: NativeChoice| -> Result<()> {
+		if measured.iter().any(|(existing, _)| *existing == choice) {
+			return Ok(());
+		}
+		let seconds = probe.measure(direction, shape, relu, choice)?;
+		measured.push((choice, seconds));
+		let mut store = native_schedule_store().lock().map_err(|_| RecipeError::new("native schedule store is poisoned"))?;
+		store.measurements.insert(choice_key(&choice), seconds);
+		Ok(())
+	};
+	// R: the analytic derivation plus deterministic random exploration.
+	let mut state = config.random_seed as u64 ^ sample_identity(&[shape.m as f64, shape.n as f64, shape.k as f64], direction as usize as f64);
+	let mut random = |count: usize| {
+		let mut chosen = Vec::new();
+		for _ in 0..count.min(candidates.len()) {
+			state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+			chosen.push(candidates[(state >> 33) as usize % candidates.len()]);
+		}
+		chosen
+	};
+	probe_choice(&mut measured, analytic)?;
+	for choice in random(3) {
+		probe_choice(&mut measured, choice)?;
+		if measured.len() >= PROBE_BUDGET { break }
+	}
+	let features = |choice: &NativeChoice| [f64::from(choice.tile.m).ln() / 8.0, f64::from(choice.tile.n).ln() / 8.0, f64::from(choice.tile.k).ln() / 12.0, f64::from(u8::from(choice.pipeline.enabled))];
+	let input = Shape { channels: 4, length: 1 };
+	while measured.len() < PROBE_BUDGET.min(candidates.len()) {
+		// B: fit the surrogate on every measurement of this shape so far.
+		let mut samples = Vec::new();
+		let mut targets = Vec::new();
+		for (choice, seconds) in measured.iter().cycle().take(PROBE_FIT_ROWS) {
+			samples.extend(features(choice));
+			targets.push((seconds * 1e6).ln() / 10.0);
+		}
+		let surrogate = fit_surrogate(input, &samples, &targets, config.surrogate_width, gpu, config)?;
+		// P: score every candidate through the surrogate's own inference path.
+		let mut queries = Vec::new();
+		for index in 0..PROBE_SCORE_ROWS {
+			queries.extend(features(&candidates[index % candidates.len()]));
+		}
+		let mut tape = NativeTape::new(&surrogate, &queries, &[], gpu, config.precision, mse)?;
+		tape.forward()?;
+		let predicted = tape.predictions()?;
+		let mut order = (0..candidates.len()).collect::<Vec<_>>();
+		order.sort_by(|left, right| predicted[*left].total_cmp(&predicted[*right]));
+		let measured_best = measured.iter().min_by(|left, right| left.1.total_cmp(&right.1)).map(|(choice, _)| *choice);
+		// T -> M: the predicted optimum settles the search when it is already
+		// the measured optimum; otherwise measure it plus one exploration.
+		let proposal = candidates[order[0]];
+		if measured_best == Some(proposal) {
+			break;
+		}
+		probe_choice(&mut measured, proposal)?;
+		if measured.len() < PROBE_BUDGET {
+			if let Some(choice) = order.iter().map(|index| candidates[*index]).find(|choice| !measured.iter().any(|(existing, _)| existing == choice)) {
+				probe_choice(&mut measured, choice)?;
+			}
+		}
+	}
+	let (selected, seconds) = measured.into_iter().min_by(|left, right| left.1.total_cmp(&right.1)).ok_or_else(|| RecipeError::new("native schedule search measured nothing"))?;
+	debug(&format!("native schedule {shape_key}: selected {}x{}x{} pipelined={} at {seconds:.3e}s, analytic {}x{}x{}", selected.tile.m, selected.tile.n, selected.tile.k, selected.pipeline.enabled, analytic.tile.m, analytic.tile.n, analytic.tile.k))?;
+	{
+		let mut store = native_schedule_store().lock().map_err(|_| RecipeError::new("native schedule store is poisoned"))?;
+		store.selections.insert(shape_key, (selected.tile, selected.pipeline.enabled));
+		native_schedule_persist(&store)?;
+	}
+	Ok(selected)
+}
+/// Build the tile probe for a model's contraction shapes: one artifact and one
+/// set of device buffers sized for every candidate of every shape, so each
+/// measurement is a single launch. Declines when there is nothing to measure or
+/// the operands would not fit the probe's allocation ceiling.
+fn native_tile_probe(gpu: &'static Gpu, shapes: &[Option<NativeContractionShapes>], register_m: u32, register_n: u32, block: u32, waves: u32, shared_budget: u32, fragment_k: u32, chunk_k: u32, ratio: u32, precision: Compute) -> Result<Option<NativeTileProbe>> {
+	let directions = shapes.iter().flatten().flat_map(|shape| [shape.forward, shape.gradient, shape.previous]).collect::<Vec<_>>();
+	if directions.is_empty() {
+		return Ok(None);
+	}
+	let native = NativePrecision::new(precision)?;
+	let (mut samples_capacity, mut weights_capacity, mut output_capacity, mut gradient_stride) = (1_usize, 1_usize, 1_usize, NATIVE_SCRATCH_ROW_VALUES);
+	let (mut shared_values, mut owned, mut widest) = (1_u32, 1_u32, Tile { m: 1, n: 1, k: 1 });
+	for shape in &directions {
+		let (m, n, k) = (shape.m as usize, shape.n as usize, shape.k as usize);
+		let operands = checked_mul(m, k, "probe input operand")?.max(checked_mul(m, n, "probe output operand")?).max(checked_mul(k, n, "probe delta operand")?);
+		samples_capacity = samples_capacity.max(operands);
+		weights_capacity = weights_capacity.max(checked_add(checked_mul(k, n, "probe weight matrix")?, n, "probe weight operand")?);
+		output_capacity = output_capacity.max(checked_mul(m, n, "probe output")?);
+		gradient_stride = gradient_stride.max(checked_add(checked_mul(m, n, "probe gradient matrix")?, n, "probe gradient values")?.next_multiple_of(NATIVE_SCRATCH_ROW_VALUES));
+		let mut candidates = native_tile_candidates(*shape, register_m, register_n, block, shared_budget, chunk_k, ratio)?;
+		candidates.push(native_contraction_tile(*shape, register_m, register_n, block, shared_budget, chunk_k, ratio, false)?);
+		for tile in candidates {
+			shared_values = shared_values.max(native_contraction_shared_values(tile, register_m, register_n, block, chunk_k, ratio, false)?);
+			let output_lanes = (tile.m / register_m).max(1).checked_mul((tile.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
+			let k_lanes = (block / output_lanes).max(2);
+			owned = owned.max(tile.k.div_ceil(chunk_k).div_ceil(k_lanes));
+			widest = Tile { m: widest.m.max(tile.m), n: widest.n.max(tile.n), k: widest.k.max(tile.k) };
+		}
+	}
+	shared_values = shared_values.max(shared_budget);
+	let scratch_base = gradient_stride;
+	let gradient_capacity = checked_add(scratch_base, checked_mul(NATIVE_K_PARTITIONS, gradient_stride, "probe gradient scratch")?, "probe gradient buffer")?;
+	let values_capacity = checked_add(output_capacity, gradient_capacity, "probe value buffer")?;
+	if checked_add(checked_add(samples_capacity, weights_capacity, "probe operands")?, values_capacity, "probe allocation")? > PROBE_CAPACITY {
+		return Ok(None);
+	}
+	let register_count = register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
+	let chunk_values = owned.checked_mul(register_count).ok_or_else(|| RecipeError::new("native contraction chunk buffer overflows"))?;
+	let chunk_bias_values = owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?;
+	let schedule = NativeSchedule { matrix: false, block, tile: widest, register_m, register_n, register_count, fragment_k, chunk_k, chunk_values, chunk_bias_values, scratch_base: narrow(scratch_base, "probe gradient scratch base")?, shared_values, contractions: Vec::new(), attention: Vec::new() };
+	let ir = emit_native_probe(gpu.backend, native, &schedule)?;
+	let key = native_artifact_key(&gpu.native_target, &ir);
+	let directory = native_artifact_directory(&key)?;
+	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native artifact directory: {error}")))?;
+	let path = directory.join(format!("artifact.{}", gpu.native_target.artifact_extension()));
+	let cached = path.is_file();
+	debug(&format!("native probe key={key} cache={} path={}", if cached { "hit" } else { "miss" }, path.display()))?;
+	let bytes = build_native_artifact(&gpu.native_target, &ir, &key, &directory, &path, cached)?;
+	let artifact = NativeArtifact {
+		backend: gpu.native_target.clone(),
+		layout: NativeLayout { values: Vec::new(), contexts: Vec::new(), adjoints: Vec::new(), values_bytes: 0, contexts_bytes: 0, adjoints_bytes: 0 },
+		precision: native,
+		artifact: bytes,
+		path,
+		storage: Vec::new(),
+	};
+	let register_values = register_count.checked_add(register_n).and_then(|values| values.checked_mul(ratio)).ok_or_else(|| RecipeError::new("native contraction register reduction overflows"))?;
+	let program = NativeProgram::load(gpu, artifact, &Graph::new(Shape { channels: 1, length: 1 }), schedule, register_values, waves)?;
+	Ok(Some(NativeTileProbe {
+		program,
+		samples: Buffer::upload_float(gpu, &vec![0.01; samples_capacity], precision)?,
+		weights: Buffer::upload_float(gpu, &vec![0.01; weights_capacity], precision)?,
+		values: Buffer::upload_float(gpu, &vec![0.0; values_capacity], precision)?,
+		parameters: Buffer::upload(gpu, &[0_i32; PROBE_PARAMETER_COUNT])?,
+		gradient_offset: output_capacity,
+	}))
+}
 fn native_gradient_values(parameters: usize, contractions: &[Option<NativeContractionTiles>]) -> Result<usize> {
 	let mut scratch = 0_usize;
 	for contraction in contractions {
