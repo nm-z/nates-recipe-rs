@@ -964,6 +964,8 @@ struct NodePlan {
 #[derive(Clone, Copy)]
 enum NativeMatrix { Gfx11, Gfx12 }
 
+impl NativeMatrix { fn key(self) -> &'static str { match self { Self::Gfx11 => "gfx11", Self::Gfx12 => "gfx12" } } }
+
 pub(crate) struct NativeModelIr {
 	graph: Graph,
 	layout: NativeLayout,
@@ -1019,14 +1021,15 @@ fn template_path(mapping: &str, suffix: &str) -> Result<PathBuf> {
 	Ok(path)
 }
 
-fn backend_template(backend: Backend, precision: NativePrecision) -> Result<String> {
+fn backend_template(backend: Backend, precision: NativePrecision, matrix: Option<NativeMatrix>) -> Result<String> {
 	let suffix = precision.source;
 	let mapping = match backend {
 		Backend::Cpu => option_env!("RECIPE_CPU_IR").ok_or_else(|| RecipeError::new("CPU native LLVM templates are unavailable"))?,
 		Backend::Amd => option_env!("RECIPE_AMD_IR").ok_or_else(|| RecipeError::new("AMD native LLVM templates are unavailable"))?,
 		Backend::Nvidia => option_env!("RECIPE_NV_IR").ok_or_else(|| RecipeError::new("NVIDIA native LLVM templates are unavailable"))?,
 	};
-	let mut ir = fs::read_to_string(template_path(mapping, suffix)?).map_err(|error| RecipeError::new(format!("cannot read native LLVM template: {error}")))?;
+	let key = matrix.map_or_else(|| suffix.to_owned(), |method| format!("{}{suffix}", method.key()));
+	let mut ir = fs::read_to_string(template_path(mapping, &key)?).map_err(|error| RecipeError::new(format!("cannot read native LLVM template: {error}")))?;
 	if let Compute::F(format) = precision.model {
 		for address_space in [" addrspace(3)", ""] {
 			ir = ir.replace(&format!("load atomic i32, ptr{address_space} @recipe_f_exp monotonic, align 4"), &format!("add i32 0, {}", format.arithmetic.exp));
@@ -2235,7 +2238,7 @@ impl NativeModelIr {
 
 	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: LossFunction) -> Result<String> {
 		let register_count = self.schedule.register_count;
-		let mut ir = backend_template(backend, self.precision)?
+		let mut ir = backend_template(backend, self.precision, matrix)?
 			.replace("RECIPE_WORKGROUP_SIZE", &self.schedule.block.to_string())
 			.replace("RECIPE_REGISTER_M", &self.schedule.register_m.to_string())
 			.replace("RECIPE_REGISTER_N", &self.schedule.register_n.to_string())
@@ -2294,29 +2297,6 @@ impl NativeModelIr {
 		body.push_str(&self.emit_adamw(model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
 		body.push_str("ret void\n}\n");
 		ir.push_str(&body);
-		let matrix_method = matrix.is_some();
-		for (operation, vector, native) in [
-			("@contraction_product_accumulate(", "@contraction_vector_accumulate(", "@contraction_matrix_accumulate("),
-			("@contraction_a_index(", "@contraction_vector_a_index(", "@contraction_matrix_a_index("),
-			("@contraction_b_index(", "@contraction_vector_b_index(", "@contraction_matrix_b_index("),
-			("@contraction_output_m(", "@contraction_vector_output_m(", "@contraction_matrix_output_m("),
-			("@contraction_output_n(", "@contraction_vector_output_n(", "@contraction_matrix_output_n("),
-			("@contraction_store_lane(", "@contraction_vector_store_lane(", "@contraction_matrix_store_lane("),
-		] {
-			ir = ir.replace(operation, if matrix_method { native } else { vector });
-		}
-		if let Some(matrix) = matrix {
-			let instruction = match (matrix, self.precision.source) {
-				(NativeMatrix::Gfx11, "-bf16") => "@llvm.amdgcn.wmma.f32.16x16x16.bf16.v8f32.v16i16(",
-				(NativeMatrix::Gfx11, "-int8") => { ir = ir.replace("declare <8 x float> @recipe.wmma(<16 x i8>, <16 x i8>, <8 x float>)", "declare <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v4i32(i1 immarg, <4 x i32>, i1 immarg, <4 x i32>, <8 x i32>, i1 immarg)\ndefine internal <8 x float> @recipe.wmma(<16 x i8> %a, <16 x i8> %b, <8 x float> %state) #1 { entry: %a.packed = bitcast <16 x i8> %a to <4 x i32> %b.packed = bitcast <16 x i8> %b to <4 x i32> %product = call <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v4i32(i1 true, <4 x i32> %a.packed, i1 true, <4 x i32> %b.packed, <8 x i32> zeroinitializer, i1 false) %wide = sitofp <8 x i32> %product to <8 x float> %result = fadd <8 x float> %state, %wide ret <8 x float> %result }\n"); "@recipe.wmma(" },
-				(NativeMatrix::Gfx11, "-int4") => { ir = ir.replace("declare <8 x float> @recipe.wmma(<16 x i8>, <16 x i8>, <8 x float>)", "declare <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu4.v8i32.v2i32(i1 immarg, <2 x i32>, i1 immarg, <2 x i32>, <8 x i32>, i1 immarg)\ndefine internal i32 @recipe.pack.i4.word(i32 %bytes) #1 { entry: %nibbles = and i32 %bytes, 252645135 %pair.shift = lshr i32 %nibbles, 4 %pair.raw = or i32 %nibbles, %pair.shift %pair = and i32 %pair.raw, 16711935 %word.shift = lshr i32 %pair, 8 %word.raw = or i32 %pair, %word.shift %word = and i32 %word.raw, 65535 ret i32 %word }\ndefine internal <2 x i32> @recipe.pack.i4(<16 x i8> %values) #1 { entry: %bytes = bitcast <16 x i8> %values to <4 x i32> %bytes.0 = extractelement <4 x i32> %bytes, i32 0 %bytes.1 = extractelement <4 x i32> %bytes, i32 1 %bytes.2 = extractelement <4 x i32> %bytes, i32 2 %bytes.3 = extractelement <4 x i32> %bytes, i32 3 %word.0 = call i32 @recipe.pack.i4.word(i32 %bytes.0) %word.1 = call i32 @recipe.pack.i4.word(i32 %bytes.1) %word.2 = call i32 @recipe.pack.i4.word(i32 %bytes.2) %word.3 = call i32 @recipe.pack.i4.word(i32 %bytes.3) %word.1.high = shl i32 %word.1, 16 %packed.0 = or i32 %word.0, %word.1.high %word.3.high = shl i32 %word.3, 16 %packed.1 = or i32 %word.2, %word.3.high %result.0 = insertelement <2 x i32> poison, i32 %packed.0, i32 0 %result = insertelement <2 x i32> %result.0, i32 %packed.1, i32 1 ret <2 x i32> %result }\ndefine internal <8 x float> @recipe.wmma(<16 x i8> %a, <16 x i8> %b, <8 x float> %state) #1 { entry: %a.packed = call <2 x i32> @recipe.pack.i4(<16 x i8> %a) %b.packed = call <2 x i32> @recipe.pack.i4(<16 x i8> %b) %product = call <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu4.v8i32.v2i32(i1 true, <2 x i32> %a.packed, i1 true, <2 x i32> %b.packed, <8 x i32> zeroinitializer, i1 false) %wide = sitofp <8 x i32> %product to <8 x float> %result = fadd <8 x float> %state, %wide ret <8 x float> %result }\n"); "@recipe.wmma(" },
-				(NativeMatrix::Gfx12, "-f16") => { ir = ir.replace("declare <8 x float> @recipe.wmma(<16 x half>, <16 x half>, <8 x float>)", "declare <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16(<8 x half>, <8 x half>, <8 x float>)\ndefine internal <8 x float> @recipe.wmma(<16 x half> %a, <16 x half> %b, <8 x float> %state) #1 { entry: %a.low = shufflevector <16 x half> %a, <16 x half> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7> %a.high = shufflevector <16 x half> %a, <16 x half> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15> %b.low = shufflevector <16 x half> %b, <16 x half> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7> %b.high = shufflevector <16 x half> %b, <16 x half> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15> %first = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16(<8 x half> %a.low, <8 x half> %b.low, <8 x float> %state) %result = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16(<8 x half> %a.high, <8 x half> %b.high, <8 x float> %first) ret <8 x float> %result }\n"); "@recipe.wmma(" },
-				(NativeMatrix::Gfx12, "-bf16") => { ir = ir.replace("declare <8 x float> @recipe.wmma(<16 x i16>, <16 x i16>, <8 x float>)", "declare <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.bf16.v8f32.v8i16(<8 x i16>, <8 x i16>, <8 x float>)\ndefine internal <8 x float> @recipe.wmma(<16 x i16> %a, <16 x i16> %b, <8 x float> %state) #1 { entry: %a.low = shufflevector <16 x i16> %a, <16 x i16> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7> %a.high = shufflevector <16 x i16> %a, <16 x i16> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15> %b.low = shufflevector <16 x i16> %b, <16 x i16> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7> %b.high = shufflevector <16 x i16> %b, <16 x i16> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15> %first = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.bf16.v8f32.v8i16(<8 x i16> %a.low, <8 x i16> %b.low, <8 x float> %state) %result = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.bf16.v8f32.v8i16(<8 x i16> %a.high, <8 x i16> %b.high, <8 x float> %first) ret <8 x float> %result }\n"); "@recipe.wmma(" },
-				(NativeMatrix::Gfx12, "-int8" | "-int4") => { ir = ir.replace("declare <8 x float> @recipe.wmma(<16 x i8>, <16 x i8>, <8 x float>)", "declare <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v2i32(i1 immarg, <2 x i32>, i1 immarg, <2 x i32>, <8 x i32>, i1 immarg)\ndefine internal <8 x float> @recipe.wmma(<16 x i8> %a, <16 x i8> %b, <8 x float> %state) #1 { entry: %a.low.values = shufflevector <16 x i8> %a, <16 x i8> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7> %a.high.values = shufflevector <16 x i8> %a, <16 x i8> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15> %b.low.values = shufflevector <16 x i8> %b, <16 x i8> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7> %b.high.values = shufflevector <16 x i8> %b, <16 x i8> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15> %a.low = bitcast <8 x i8> %a.low.values to <2 x i32> %a.high = bitcast <8 x i8> %a.high.values to <2 x i32> %b.low = bitcast <8 x i8> %b.low.values to <2 x i32> %b.high = bitcast <8 x i8> %b.high.values to <2 x i32> %first = call <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v2i32(i1 true, <2 x i32> %a.low, i1 true, <2 x i32> %b.low, <8 x i32> zeroinitializer, i1 false) %product = call <8 x i32> @llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v2i32(i1 true, <2 x i32> %a.high, i1 true, <2 x i32> %b.high, <8 x i32> %first, i1 false) %wide = sitofp <8 x i32> %product to <8 x float> %result = fadd <8 x float> %state, %wide ret <8 x float> %result }\n"); "@recipe.wmma(" },
-				_ => "@llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v16f16(",
-			};
-			ir = ir.replace("@recipe.wmma(", instruction);
-		}
 		Ok(prune_internal_definitions(ir))
 	}
 

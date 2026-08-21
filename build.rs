@@ -517,13 +517,27 @@ fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<[(&'static s
 		("-f", custom_ir(ir, "_f")?),
 	])
 }
+fn wmma_source(source: &str) -> String { source.lines().filter(|line| !line.starts_with("; RECIPE_WMMA ")).collect::<Vec<_>>().join("\n") }
+fn wmma_method(source: &str, key: &str) -> BuildResult<(String, String)> { let marker = format!("{key} "); let catalog = source.lines().find_map(|line| line.strip_prefix("; RECIPE_WMMA ")).ok_or_else(|| io::Error::other("WMMA methods are absent"))?; let method = catalog.split(" || ").find_map(|method| method.strip_prefix(&marker)).ok_or_else(|| io::Error::other(format!("WMMA method {key} is absent")))?; let (kind, body) = method.split_once(' ').ok_or_else(|| io::Error::other(format!("WMMA method {key} has no body")))?; Ok((kind.to_owned(), body.replace("\\n", "\n"))) }
+fn compose_wmma(ir: String, source: &str, key: &str) -> BuildResult<String> { let (kind, body) = wmma_method(source, key)?; if kind == "call" { return Ok(ir.replace("@recipe.wmma(", &body)) } if kind != "definition" { return Err(io::Error::other(format!("WMMA method {key} has an invalid kind")).into()) } let declaration = ir.lines().find(|line| line.starts_with("declare ") && line.contains("@recipe.wmma(")).ok_or_else(|| io::Error::other("specialized WMMA declaration is absent"))?.to_owned(); Ok(ir.replace(&declaration, &body)) }
+fn compose_contraction(mut ir: String, matrix: bool) -> String { for (operation, vector, native) in [("@contraction_product_accumulate(", "@contraction_vector_accumulate(", "@contraction_matrix_accumulate("), ("@contraction_a_index(", "@contraction_vector_a_index(", "@contraction_matrix_a_index("), ("@contraction_b_index(", "@contraction_vector_b_index(", "@contraction_matrix_b_index("), ("@contraction_output_m(", "@contraction_vector_output_m(", "@contraction_matrix_output_m("), ("@contraction_output_n(", "@contraction_vector_output_n(", "@contraction_matrix_output_n("), ("@contraction_store_lane(", "@contraction_vector_store_lane(", "@contraction_matrix_store_lane(")] { ir = ir.replace(operation, if matrix { native } else { vector }) } ir }
 fn compile_amd(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
-	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, AMD_WIDTH, AMD_GRID_BARRIER);
+	let source = fs::read_to_string("amd-nv-cpu.ll")?;
+	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER);
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let path = out.join(format!("recipe-amd{suffix}.ll"));
-		fs::write(&path, contents)?;
+		fs::write(&path, compose_contraction(contents.clone(), false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
+		if ["-f16", "-bf16", "-int8", "-int4"].contains(&suffix) {
+			for architecture in ["gfx11", "gfx12"] {
+				let template = format!("{architecture}{suffix}");
+				let method = if template == "gfx12-int4" { "gfx12-int8" } else { &template };
+				let path = out.join(format!("recipe-amd-{template}.ll"));
+				fs::write(&path, compose_wmma(compose_contraction(contents.clone(), true), &source, method)?)?;
+				values.push(format!("{template}={}", path.display()));
+			}
+		}
 	}
 	println!("cargo:rustc-env=RECIPE_AMD_IR={}", values.join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_HSA_COMPILER={}", text(manifest, "hsa-compiler")?);
@@ -533,11 +547,12 @@ fn compile_amd(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 	Ok(())
 }
 fn compile_nvidia(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
-	let ir = parallel_ir(fs::read_to_string("amd-nv-cpu.ll")?, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER).replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda").replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x").replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x").replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x").replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0").replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }");
+	let ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?);
+	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER).replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda").replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x").replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x").replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x").replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0").replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }");
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let path = out.join(format!("recipe-nvidia{suffix}.ll"));
-		fs::write(&path, contents)?;
+		fs::write(&path, compose_contraction(contents, false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
 	}
 	println!("cargo:rustc-env=RECIPE_NV_IR={}", values.join("\x3b"));
@@ -549,7 +564,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildRes
 }
 fn compile_cpu(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
-	let mut ir = fs::read_to_string("amd-nv-cpu.ll")?.replace("amdgcn-amd-amdhsa", &target);
+	let mut ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target);
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
@@ -561,7 +576,7 @@ fn compile_cpu(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let contents = contents.replace(" addrspace(1)", "").replace(" addrspace(3)", "").replace(", addrspace(5)", "").replace(" addrspace(5)", "").replace("RECIPE_CONTRACTION_CPU_SHARED_VALUES", number(manifest, "contraction-cpu-shared-values")?);
 		let path = out.join(format!("recipe-cpu{suffix}.ll"));
-		fs::write(&path, contents)?;
+		fs::write(&path, compose_contraction(contents, false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
 	}
 	println!("cargo:rustc-env=RECIPE_CPU_IR={}", values.join("\x3b"));
