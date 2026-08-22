@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -34,6 +34,8 @@ struct Config {
     opencode_config: PathBuf,
     opencode_models: Vec<String>,
     opencode_agent: String,
+    copilot_binary: PathBuf,
+    copilot_model: String,
     provider_poll_seconds: u64,
     slow_cursor_seconds: u64,
     discovery_devices: Vec<String>,
@@ -92,6 +94,8 @@ fn config(path: &Path) -> Config {
         opencode_config: value(&text, "opencode_config").into(),
         opencode_models: values(&text, "opencode_models"),
         opencode_agent: value(&text, "opencode_agent"),
+        copilot_binary: value(&text, "copilot_binary").into(),
+        copilot_model: value(&text, "copilot_model"),
         provider_poll_seconds: value(&text, "provider_poll_seconds")
             .parse()
             .expect("provider_poll_seconds must be an unsigned integer"),
@@ -184,6 +188,7 @@ static SPARK: OnceLock<Mutex<()>> = OnceLock::new();
 static KIMI: OnceLock<Mutex<()>> = OnceLock::new();
 static AGY: OnceLock<Mutex<()>> = OnceLock::new();
 static OPENCODE: OnceLock<Mutex<()>> = OnceLock::new();
+static COPILOT: OnceLock<Mutex<()>> = OnceLock::new();
 static DEEPSEEK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn display() -> &'static Mutex<Display> { DISPLAY.get_or_init(|| Mutex::new(Display::default())) }
@@ -195,6 +200,8 @@ fn provider(slot: &'static OnceLock<Mutex<()>>) -> Option<std::sync::MutexGuard<
         Err(std::sync::TryLockError::Poisoned(_)) => panic!("provider lock is poisoned"),
     }
 }
+
+fn identity(provider: &str, model: &str) -> String { format!("{provider}/{model}") }
 
 fn display_clear(display: &mut Display) {
     if display.rows == 0 {
@@ -745,7 +752,7 @@ fn spark(config: &Config, prompt: &str) -> std::result::Result<Decision, String>
             config,
             &format!(
                 "model={} repairing structured output thread={thread}",
-                config.spark_model
+                identity("codex", &config.spark_model)
             ),
         );
         let repair = output(Command::new("codex").args([
@@ -757,7 +764,7 @@ fn spark(config: &Config, prompt: &str) -> std::result::Result<Decision, String>
     }
     let json = json.map_err(|error| format!("{}; {error}", failure(&result)))?;
     Ok(Decision {
-        provider: "OpenAI Codex",
+        provider: "codex",
         model: config.spark_model.clone(),
         effort: config.spark_effort.clone(),
         json,
@@ -806,7 +813,7 @@ fn kimi(
         )?;
         trace(
             config,
-            &format!("model={model} repairing structured output session={session}"),
+            &format!("model={} repairing structured output session={session}", identity(provider, model)),
         );
         let repair = output(Command::new(&config.kimi_binary).args([
 			"--session", &session, "--prompt", "Return only one corrected JSON object matching the required schema. Do not repeat the investigation.",
@@ -852,7 +859,7 @@ fn agy(config: &Config, model: &str, prompt: &str) -> std::result::Result<Decisi
         let conversation = jq(&text, ".conversation_id")?;
         trace(
             config,
-            &format!("model={model} repairing structured output conversation={conversation}"),
+            &format!("model={} repairing structured output conversation={conversation}", identity("agy", model)),
         );
         let repair = output(Command::new(&config.agy_binary).args([
 			"--conversation", &conversation, "--print", "Return only one corrected JSON object matching the required schema. Do not repeat the investigation.",
@@ -873,7 +880,7 @@ fn agy(config: &Config, model: &str, prompt: &str) -> std::result::Result<Decisi
         "thinking"
     };
     Ok(Decision {
-        provider: "Google Antigravity",
+        provider: "agy",
         model: model.to_owned(),
         effort: effort.to_owned(),
         json,
@@ -914,7 +921,7 @@ fn opencode(config: &Config, model: &str, prompt: &str) -> std::result::Result<D
         let session = jq_lines(&stream, "[.[] | .sessionID][-1]")?;
         trace(
             config,
-            &format!("model={model} repairing structured output session={session}"),
+            &format!("model={} repairing structured output session={session}", identity("opencode", model.strip_prefix("opencode/").unwrap_or(model))),
         );
         let repair = output(
             Command::new(&config.opencode_binary)
@@ -943,9 +950,91 @@ fn opencode(config: &Config, model: &str, prompt: &str) -> std::result::Result<D
     }
     let json = json.map_err(|error| format!("{}; {error}", failure(&result)))?;
     Ok(Decision {
-        provider: "OpenCode",
-        model: model.to_owned(),
+        provider: "opencode",
+        model: model.strip_prefix("opencode/").unwrap_or(model).to_owned(),
         effort: "default".to_owned(),
+        json,
+    })
+}
+
+fn copilot_command(
+    config: &Config,
+    packet: &str,
+    prompt: &str,
+    session: Option<&str>,
+) -> std::process::Output {
+    let mut command = Command::new(&config.copilot_binary);
+    command
+        .arg("-C")
+        .arg(&config.repository)
+        .args(["-p", prompt, "--output-format", "json", "--available-tools=view,grep,glob,recipe_issues", "--allow-all-tools", "--disable-builtin-mcps", "--disallow-temp-dir", "--no-custom-instructions", "--no-ask-user", "--no-remote", "--no-remote-export", "--no-auto-update", "--log-level", "none"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(session) = session {
+        command.arg(format!("--resume={session}"));
+    } else {
+        command.args(["--model", &config.copilot_model]);
+    }
+    let mut child = command.spawn().expect("cannot start GitHub Copilot");
+    let mut stdout = BufReader::new(child.stdout.take().expect("GitHub Copilot stdout is absent"));
+    let mut stderr = child.stderr.take().expect("GitHub Copilot stderr is absent");
+    let stderr = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).expect("cannot read GitHub Copilot stderr");
+        bytes
+    });
+    let mut bytes = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if stdout.read_line(&mut line).expect("cannot read GitHub Copilot output") == 0 {
+            break;
+        }
+        bytes.extend_from_slice(line.as_bytes());
+        if line.contains(r#""type":"session.auto_mode_resolved""#) {
+            if let Ok(model) = jq(&line, ".data.chosenModel") {
+                display_reviewing(packet, &identity("copilot", &model));
+            }
+        }
+    }
+    std::process::Output {
+        status: child.wait().expect("cannot collect GitHub Copilot"),
+        stdout: bytes,
+        stderr: stderr.join().expect("GitHub Copilot stderr reader failed"),
+    }
+}
+
+fn copilot(config: &Config, packet: &str, prompt: &str) -> std::result::Result<Decision, String> {
+    let result = copilot_command(config, packet, prompt, None);
+    let stream = String::from_utf8_lossy(&result.stdout);
+    let response = jq_lines(&stream, "[.[] | select(.type == \"assistant.message\") | .data.content][-1]");
+    if !result.status.success() && response.is_err() {
+        return Err(failure(&result));
+    }
+    let model = jq_lines(&stream, "[.[] | select(.type == \"assistant.message\") | .data.model][-1]")
+        .unwrap_or_else(|_| config.copilot_model.clone());
+    let mut json = response.and_then(object);
+    if json.is_err() {
+        let session = jq_lines(&stream, "[.[] | select(.type == \"result\") | .sessionId][-1]")?;
+        trace(
+            config,
+            &format!("model={} repairing structured output session={session}", identity("copilot", &model)),
+        );
+        let repair = copilot_command(
+            config,
+            packet,
+            "Return only one corrected JSON object matching the required schema. Do not repeat the investigation.",
+            Some(&session),
+        );
+        let repaired = String::from_utf8_lossy(&repair.stdout);
+        json = jq_lines(&repaired, "[.[] | select(.type == \"assistant.message\") | .data.content][-1]")
+            .and_then(object);
+    }
+    let json = json.map_err(|error| format!("{}; {error}", failure(&result)))?;
+    Ok(Decision {
+        provider: "copilot",
+        model,
+        effort: "auto".to_owned(),
         json,
     })
 }
@@ -953,62 +1042,73 @@ fn opencode(config: &Config, model: &str, prompt: &str) -> std::result::Result<D
 fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
     loop {
         if let Some(_provider) = provider(&SPARK) {
-            display_reviewing(packet, &config.spark_model);
+            let classifier = identity("codex", &config.spark_model);
+            display_reviewing(packet, &classifier);
             match spark(config, prompt) {
                 Ok(decision) => return decision,
                 Err(error) => trace(
                     config,
-                    &format!("model={} unavailable error={error}", config.spark_model),
+                    &format!("model={classifier} unavailable error={error}"),
                 ),
             }
             display_reviewing(packet, "queued");
         }
         if let Some(_provider) = provider(&KIMI) {
-            display_reviewing(packet, &config.kimi_k3_model);
-            match kimi(config, "Kimi managed", &config.kimi_k3_model, prompt) {
+            let classifier = identity("kimi", &config.kimi_k3_model);
+            display_reviewing(packet, &classifier);
+            match kimi(config, "kimi", &config.kimi_k3_model, prompt) {
                 Ok(decision) => return decision,
                 Err(error) => trace(
                     config,
-                    &format!("model={} unavailable error={error}", config.kimi_k3_model),
+                    &format!("model={classifier} unavailable error={error}"),
                 ),
             }
             display_reviewing(packet, "queued");
         }
         if let Some(_provider) = provider(&OPENCODE) {
             for model in &config.opencode_models {
-                display_reviewing(packet, model);
+                let classifier = identity("opencode", model.strip_prefix("opencode/").unwrap_or(model));
+                display_reviewing(packet, &classifier);
                 match opencode(config, model, prompt) {
                     Ok(decision) => return decision,
-                    Err(error) => trace(config, &format!("model={model} unavailable error={error}")),
+                    Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
                 }
+            }
+            display_reviewing(packet, "queued");
+        }
+        if let Some(_provider) = provider(&COPILOT) {
+            let classifier = identity("copilot", &config.copilot_model);
+            display_reviewing(packet, &classifier);
+            match copilot(config, packet, prompt) {
+                Ok(decision) => return decision,
+                Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
             }
             display_reviewing(packet, "queued");
         }
         if let Some(_provider) = provider(&AGY) {
             for model in &config.agy_models {
-                display_reviewing(packet, model);
+                let classifier = identity("agy", model);
+                display_reviewing(packet, &classifier);
                 match agy(config, model, prompt) {
                     Ok(decision) => return decision,
-                    Err(error) => trace(config, &format!("model={model} unavailable error={error}")),
+                    Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
                 }
             }
             display_reviewing(packet, "queued");
         }
         if let Some(_provider) = provider(&DEEPSEEK) {
-            display_reviewing(packet, &config.kimi_deepseek_model);
+            let classifier = identity("deepseek", &config.kimi_deepseek_model);
+            display_reviewing(packet, &classifier);
             match kimi(
                 config,
-                "DeepSeek through Kimi",
+                "deepseek",
                 &config.kimi_deepseek_model,
                 prompt,
             ) {
                 Ok(decision) => return decision,
                 Err(error) => trace(
                     config,
-                    &format!(
-                        "model={} unavailable error={error}",
-                        config.kimi_deepseek_model
-                    ),
+                    &format!("model={classifier} unavailable error={error}"),
                 ),
             }
             display_reviewing(packet, "queued");
@@ -1042,11 +1142,11 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> Review {
         std::fs::read_to_string(&config.decision_schema).expect("cannot read decision schema");
     let prompt = format!("{instructions}\n\n## Failure packet\n\n{packet}\n\n## Required decision schema\n\n{schema}");
     let decision = classify(config, &prompt, packet);
+    let classifier = identity(decision.provider, &decision.model);
     event(
         config,
         &format!(
-            "CLASSIFY model={} composition={composition}",
-            decision.model
+            "CLASSIFY model={classifier} composition={composition}"
         ),
     );
     let verdict = jq(&decision.json, ".verdict").expect("validated decision lost its verdict");
@@ -1058,18 +1158,18 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> Review {
             config,
             &format!(
                 "DECISION model={} verdict={verdict} issue={issue} title={title}",
-                decision.model
+                classifier
             ),
         );
-        display_reviewed(packet, &decision.model, &verdict, None);
+        display_reviewed(packet, &classifier, &verdict, None);
         return Review::Stop;
     }
     if verdict == "reject" {
         event(
             config,
-            &format!("REJECT model={} composition={composition}", decision.model),
+            &format!("REJECT model={classifier} composition={composition}"),
         );
-        display_reviewed(packet, &decision.model, "rejected", None);
+        display_reviewed(packet, &classifier, "rejected", None);
         return Review::Done;
     }
     assert!(
@@ -1131,10 +1231,10 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> Review {
         config,
         &format!(
             "ISSUE model={} {action} issue=#{published_issue} url={url}",
-            decision.model
+            classifier
         ),
     );
-    display_reviewed(packet, &decision.model, if verdict == "new" { "issue" } else { "comment" }, Some(&url));
+    display_reviewed(packet, &classifier, if verdict == "new" { "issue" } else { "comment" }, Some(&url));
     Review::Done
 }
 

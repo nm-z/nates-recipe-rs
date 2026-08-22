@@ -30,17 +30,16 @@ advances only across the contiguous completed cursor frontier. A crash can
 repeat unfinished work but cannot skip it. Every terminal record and failure
 packet identifies the backend that executed the cursor.
 
-The provider waterfall is:
+The machine runs one request from each provider concurrently. Each live
+reviewer uses the `provider/model` identity shown in the terminal and log. The
+configured providers and model order are:
 
-1. Codex Spark with xhigh reasoning
-2. Kimi K3
-3. OpenCode free models in configured order
-4. Claude Opus 4.6 Thinking
-5. Claude Sonnet 4.6 Thinking
-6. GPT-OSS 120B Medium
-7. Gemini 3.1 Pro High
-8. Gemini 3.7 Flash High
-9. DeepSeek V4 Pro 1M
+- `codex/gpt-5.3-codex-spark`
+- `kimi/kimi-code/k3`
+- `opencode/<free-model>` in configured order
+- `copilot/auto`, updated to the model selected by Copilot routing
+- `agy/<model>` in configured order
+- `deepseek/deepseek-v4-pro`
 
 The machine uses each provider until that provider is unavailable. It does not
 wait for consensus. If every route is unavailable, the reviewer retains the
@@ -57,8 +56,8 @@ Every classifier can read the Recipe repository and call only two GitHub tools:
 
 The classifiers search issues on demand and read every plausible match in full.
 The machine does not preload, cache, summarize, or truncate the issue tree.
-Codex and OpenCode use project-scoped MCP configurations. Kimi uses
-`/home/nate/.kimi-code/mcp.json`. Antigravity uses the imported
+Codex, OpenCode, and GitHub Copilot use project-scoped MCP configurations.
+Kimi uses `/home/nate/.kimi-code/mcp.json`. Agy uses the imported
 `recipe-issue-reader` plugin and a pre-tool hook that rejects mutation tools.
 
 The classifier tool surfaces contain only repository readers and the two issue
@@ -90,18 +89,27 @@ stops. Set `batches = 0` for continuous traversal.
 
 ## Observability
 
-Normal terminal output contains one result for every analyzed cursor:
+The terminal keeps completed cursor results above a live tree:
 
 ```text
-PASS device=<device> cursor=<cursor> composition=<composition>
-FAIL device=<device> cursor=<cursor> composition=<composition>
+cpu   cursor 572     time  13.3093 s  status PASS
+queued
+└─ 69 reviews
+live
+├─ trial
+│  ├─ amd0  cursor 571     time  50.8573 s
+│  └─ cpu   cursor 575     time  20.1335 s
+└─ review
+   ├─ opencode/big-pickle              cursor 561  time 51.0895 s
+   ├─ copilot/claude-haiku-4.5         cursor 570  time 12.0031 s
+   └─ agy/claude-opus-4-6-thinking     cursor 536  time 51.0867 s
 ```
 
 A failed cursor then contains two classification lifecycle records:
 
 ```text
-CLASSIFY model=<model> composition=<composition>
-ISSUE model=<model> <action> issue=#<number> url=<url>
+CLASSIFY model=<provider/model> composition=<composition>
+ISSUE model=<provider/model> <action> issue=#<number> url=<url>
 ```
 
 A rejected composition ends with `REJECT` instead of `ISSUE`. An unpublished
