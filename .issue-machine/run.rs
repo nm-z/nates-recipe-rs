@@ -32,6 +32,7 @@ struct Config {
     opencode_binary: PathBuf,
     opencode_config: PathBuf,
     opencode_server: String,
+    opencode_request_seconds: u64,
     opencode_server_start_seconds: u64,
     opencode_server_poll_milliseconds: u64,
     opencode_status_poll_milliseconds: u64,
@@ -135,6 +136,7 @@ fn config(path: &Path) -> Config {
         opencode_binary: value(&text, "opencode_binary").into(),
         opencode_config: value(&text, "opencode_config").into(),
         opencode_server: value(&text, "opencode_server"),
+        opencode_request_seconds: value(&text, "opencode_request_seconds").parse().expect("opencode_request_seconds must be an unsigned integer"),
         opencode_server_start_seconds: value(&text, "opencode_server_start_seconds")
             .parse()
             .expect("opencode_server_start_seconds must be an unsigned integer"),
@@ -287,6 +289,7 @@ static AGY: OnceLock<Mutex<usize>> = OnceLock::new();
 static OPENCODE: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
 static COPILOT: OnceLock<Mutex<usize>> = OnceLock::new();
 static OLLAMA: OnceLock<Mutex<usize>> = OnceLock::new();
+static OPENCODE_SESSION: Mutex<()> = Mutex::new(());
 static PUBLICATION: Mutex<()> = Mutex::new(());
 static COOLDOWNS: OnceLock<Mutex<BTreeMap<String, Option<Instant>>>> = OnceLock::new();
 
@@ -426,25 +429,16 @@ fn opencode_server(config: &Config) -> OpenCodeServer {
 }
 
 fn opencode_request(config: &Config, method: &str, path: &str, body: &str) -> std::result::Result<String, String> {
-    let address = config.opencode_server.strip_prefix("http://").expect("opencode_server must use http://");
-    let mut stream = std::net::TcpStream::connect(address).map_err(|error| error.to_string())?;
-    write!(stream, "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).map_err(|error| error.to_string())?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).map_err(|error| error.to_string())?;
-    if !line.starts_with("HTTP/1.1 2") { return Err(line.trim().to_owned()) }
-    let mut length = None;
-    loop {
-        line.clear();
-        reader.read_line(&mut line).map_err(|error| error.to_string())?;
-        if line == "\r\n" { break }
-        if let Some(value) = line.strip_prefix("Content-Length:").or_else(|| line.strip_prefix("content-length:")) {
-            length = Some(value.trim().parse::<usize>().map_err(|error| error.to_string())?);
-        }
-    }
-    let mut body = vec![0; length.ok_or_else(|| "OpenCode server returned no content length".to_owned())?];
-    reader.read_exact(&mut body).map_err(|error| error.to_string())?;
-    String::from_utf8(body).map_err(|error| error.to_string())
+    let timeout = config.opencode_request_seconds.to_string();
+    let result = output(
+        Command::new("curl").args([
+            "--fail-with-body", "--silent", "--show-error", "--max-time", &timeout,
+            "--request", method, "--header", "Content-Type: application/json", "--data-binary", body,
+            &format!("{}{path}", config.opencode_server),
+        ]),
+        None,
+    );
+    result.status.success().then(|| String::from_utf8_lossy(&result.stdout).into_owned()).ok_or_else(|| failure(&result))
 }
 
 fn opencode_turn(config: &Config, model: &str, prompt: &str, session: &str) -> std::result::Result<String, String> {
@@ -1208,7 +1202,10 @@ fn agy(config: &Config, model: &str, prompt: &str) -> std::result::Result<Decisi
 }
 
 fn opencode(config: &Config, model: &str, prompt: &str) -> std::result::Result<Decision, String> {
-    let session = jq(&opencode_request(config, "POST", "/session", r#"{"title":"Recipe issue review"}"#)?, ".id")?;
+    let session = {
+        let _creation = OPENCODE_SESSION.lock().expect("OpenCode session lock is poisoned");
+        jq(&opencode_request(config, "POST", "/session", r#"{"title":"Recipe issue review"}"#)?, ".id")?
+    };
     let response = opencode_turn(config, model, prompt, &session)?;
     let mut json = object(response);
     if json.is_err() {

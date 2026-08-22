@@ -70,12 +70,16 @@ configured providers and model order are:
 All OpenCode and OpenRouter reviews use separate sessions on one headless
 OpenCode server. The machine submits each turn through the server API, polls the
 authoritative session state, and reads the completed assistant message without
-starting an OpenCode client process. The machine uses each provider until that
-provider is unavailable. It does not wait for consensus. When a route fails,
-the machine records its reported reset duration and does not dispatch that
-route again before the reset. If the diagnostic contains no parseable reset
-duration, the route remains unavailable for the current machine run. If every
-route is unavailable, the reviewer retains the failure, waits for
+starting an OpenCode client process. Session creation is serialized because the
+server blocks simultaneous project-scoped creation requests. Model turns run
+concurrently after their sessions exist. Every local API request uses the
+configured deadline, so a blocked request cannot remain visible as live model
+work. The machine uses each provider until that provider is unavailable. It
+does not wait for consensus. When a route fails, the machine records its
+reported reset duration and does not dispatch that route again before the
+reset. If the diagnostic contains no parseable reset duration, the route
+remains unavailable for the current machine run. If every route is unavailable,
+the reviewer retains the failure, waits for
 `provider_poll_seconds`, and checks the available routes while cursor discovery
 continues.
 
