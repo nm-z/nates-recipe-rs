@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DATA_MODES: usize = 4;
 const AUTOREGRESSIVE_DATA_MODES: usize = 4;
-const MODEL_OPERATIONS: usize = 22;
+const MODEL_OPERATIONS: usize = 21;
 const ACTIVATIONS: usize = 16;
 const NORMALIZATIONS: usize = 2;
 const QUANTIZATIONS: &[(u16, u8, u16)] = &[
@@ -214,25 +214,24 @@ fn operation(model: Model, operation: usize) -> (Model, &'static str) {
 		0 => (model.layer(4), ".layer(4)"),
 		1 => (model.layer(8), ".layer(8)"),
 		2 => (model.conv(8, 1), ".conv(8, 1)"),
-		3 => (model.conv(8, 3), ".conv(8, 3)"),
-		4 => (model.pool(2), ".pool(2)"),
-		5 => (model.kmeans(2), ".kmeans(2)"),
-		6 => (model.knn(3), ".knn(3)"),
-		7 => (model.svm(), ".svm()"),
-		8 => (model.forest(2), ".forest(2)"),
-		9 => (model.bayes(), ".bayes()"),
-		10 => (model.cbst(), ".cbst()"),
-		11 => (model.xgbst(), ".xgbst()"),
-		12 => (model.lgbm(), ".lgbm()"),
-		13 => (model.attn(1), ".attn(1)"),
-		14 => (model.rnn(8), ".rnn(8)"),
-		15 => (model.gru(8), ".gru(8)"),
-		16 => (model.lstm(8), ".lstm(8)"),
-		17 => (model.layer(8).res([layer(8), layer(8)]), ".layer(8)|.res([layer(8), layer(8)])"),
-		18 => (model.layer(8).res([conv(8, 1), conv(8, 1)]), ".layer(8)|.res([conv(8, 1), conv(8, 1)])"),
-		19 => (model.layer(8).res([conv(8, 1), relu(), layer(8)]), ".layer(8)|.res([conv(8, 1), relu(), layer(8)])"),
-		20 => (model.layer(8).moe(1, [layer(8), layer(8)]), ".layer(8)|.moe(1, [layer(8), layer(8)])"),
-		21 => (model.perc(8), ".perc(8)"),
+		3 => (model.pool(2), ".pool(2)"),
+		4 => (model.kmeans(2), ".kmeans(2)"),
+		5 => (model.knn(3), ".knn(3)"),
+		6 => (model.svm(), ".svm()"),
+		7 => (model.forest(2), ".forest(2)"),
+		8 => (model.bayes(), ".bayes()"),
+		9 => (model.cbst(), ".cbst()"),
+		10 => (model.xgbst(), ".xgbst()"),
+		11 => (model.lgbm(), ".lgbm()"),
+		12 => (model.attn(1), ".attn(1)"),
+		13 => (model.rnn(8), ".rnn(8)"),
+		14 => (model.gru(8), ".gru(8)"),
+		15 => (model.lstm(8), ".lstm(8)"),
+		16 => (model.layer(8).res([layer(8), layer(8)]), ".layer(8)|.res([layer(8), layer(8)])"),
+		17 => (model.layer(8).res([conv(8, 1), conv(8, 1)]), ".layer(8)|.res([conv(8, 1), conv(8, 1)])"),
+		18 => (model.layer(8).res([conv(8, 1), relu(), layer(8)]), ".layer(8)|.res([conv(8, 1), relu(), layer(8)])"),
+		19 => (model.layer(8).moe(1, [layer(8), layer(8)]), ".layer(8)|.moe(1, [layer(8), layer(8)])"),
+		20 => (model.perc(8), ".perc(8)"),
 		_ => unreachable!(),
 	}
 }
