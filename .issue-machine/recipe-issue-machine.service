@@ -1,0 +1,20 @@
+[Unit]
+Description=Recipe issue machine
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nate/Desktop/recipe-issue-machine
+Environment=HOME=/home/nate
+Environment=PATH=/home/nate/.local/bin:/home/nate/.cargo/bin:/usr/local/bin:/usr/bin:/opt/rocm/bin
+ExecStartPre=/usr/bin/rustc --edition 2021 .issue-machine/run.rs -o .issue-machine/run
+ExecStart=/home/nate/Desktop/recipe-issue-machine/.issue-machine/run
+Restart=always
+RestartSec=5s
+KillMode=control-group
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=default.target
