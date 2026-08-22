@@ -1597,7 +1597,15 @@ fn enqueue_review(
     depth
 }
 
-fn resolver_issue(config: &Config, active: &BTreeSet<u64>) -> std::result::Result<Option<(u64, String)>, String> {
+fn resolver_units() -> std::result::Result<BTreeSet<u64>, String> {
+    let resolvers = output(Command::new("systemctl").args(["--user", "list-units", "recipe-resolve-*", "--state=running", "--plain", "--no-legend"]), None);
+    if !resolvers.status.success() { return Err(failure(&resolvers)) }
+    Ok(String::from_utf8_lossy(&resolvers.stdout).lines().filter_map(|line| {
+        line.split_whitespace().next()?.strip_prefix("recipe-resolve-")?.strip_suffix(".service")?.parse::<u64>().ok()
+    }).collect())
+}
+
+fn resolver_issue(config: &Config, active: &BTreeSet<u64>, running: &BTreeSet<u64>) -> std::result::Result<Option<(u64, String)>, String> {
     let issues = output(
         Command::new("gh")
             .args(["issue", "list", "--state", "open", "--limit", "100", "--json", "number,url", "--jq", ".[] | [.number, .url] | @tsv"])
@@ -1616,10 +1624,11 @@ fn resolver_issue(config: &Config, active: &BTreeSet<u64>) -> std::result::Resul
     if !pull_requests.status.success() {
         return Err(failure(&pull_requests));
     }
-    let claimed = String::from_utf8_lossy(&pull_requests.stdout)
+    let mut claimed = String::from_utf8_lossy(&pull_requests.stdout)
         .lines()
         .filter_map(|number| number.parse::<u64>().ok())
         .collect::<BTreeSet<_>>();
+    claimed.extend(running);
     Ok(String::from_utf8_lossy(&issues.stdout).lines().find_map(|line| {
         let (number, url) = line.split_once('\t')?;
         let number = number.parse::<u64>().ok()?;
@@ -1643,8 +1652,9 @@ fn resolver_claim(config: &Config, active: &Arc<Mutex<BTreeSet<u64>>>) -> std::r
     let mut issues = active.lock().expect("resolver claim lock is poisoned");
     let limit = config.resolver_memory_budget_mib / config.resolver_memory_mib;
     assert!(limit != 0, "resolver_memory_budget_mib must hold at least one resolver");
-    if issues.len() >= limit as usize { return Ok(None) }
-    let Some((number, url)) = resolver_issue(config, &issues)? else { return Ok(None) };
+    let running = resolver_units()?;
+    if issues.union(&running).count() >= limit as usize { return Ok(None) }
+    let Some((number, url)) = resolver_issue(config, &issues, &running)? else { return Ok(None) };
     issues.insert(number);
     drop(issues);
     Ok(Some(ResolverClaim { active: Arc::clone(active), number, url }))
