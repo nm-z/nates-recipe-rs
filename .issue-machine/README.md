@@ -59,7 +59,6 @@ configured providers and model order are:
 - `claude/sonnet-5-max`
 - `ollama/minimax-m3:cloud`
 - `agy/<model>` in configured order
-- `deepseek/deepseek-v4-pro`
 
 The machine uses each provider until that provider is unavailable. It does not
 wait for consensus. If every route is unavailable, the reviewer retains the

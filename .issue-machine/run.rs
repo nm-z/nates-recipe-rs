@@ -25,7 +25,6 @@ struct Config {
     spark_effort: String,
     kimi_binary: PathBuf,
     kimi_k3_model: String,
-    kimi_deepseek_model: String,
     kimi_agent: PathBuf,
     kimi_skills: PathBuf,
     agy_binary: PathBuf,
@@ -121,7 +120,6 @@ fn config(path: &Path) -> Config {
         spark_effort: value(&text, "spark_effort"),
         kimi_binary: value(&text, "kimi_binary").into(),
         kimi_k3_model: value(&text, "kimi_k3_model"),
-        kimi_deepseek_model: value(&text, "kimi_deepseek_model"),
         kimi_agent: value(&text, "kimi_agent").into(),
         kimi_skills: value(&text, "kimi_skills").into(),
         agy_binary: value(&text, "agy_binary").into(),
@@ -253,7 +251,6 @@ static OPENCODE: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
 static COPILOT: OnceLock<Mutex<()>> = OnceLock::new();
 static CLAUDE: OnceLock<Mutex<()>> = OnceLock::new();
 static OLLAMA: OnceLock<Mutex<()>> = OnceLock::new();
-static DEEPSEEK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn display() -> &'static Mutex<Display> { DISPLAY.get_or_init(|| Mutex::new(Display::default())) }
 
@@ -1334,23 +1331,6 @@ fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
                     Ok(decision) => return decision,
                     Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
                 }
-            }
-            display_reviewing(packet, "queued");
-        }
-        if let Some(_provider) = provider(&DEEPSEEK) {
-            let classifier = identity("deepseek", &config.kimi_deepseek_model);
-            display_reviewing(packet, &classifier);
-            match kimi(
-                config,
-                "deepseek",
-                &config.kimi_deepseek_model,
-                prompt,
-            ) {
-                Ok(decision) => return decision,
-                Err(error) => trace(
-                    config,
-                    &format!("model={classifier} unavailable error={error}"),
-                ),
             }
             display_reviewing(packet, "queued");
         }
