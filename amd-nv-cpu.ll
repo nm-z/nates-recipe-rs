@@ -2416,9 +2416,11 @@ state.sum.step: %previous.time = sub i32 %time, 1 %previous.safe = select i1 %pr
 %bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %bias.index
 %bias = load double, ptr addrspace(1) %bias.ptr, align 8 %linear = call double @recipe.add(double %state.sum, double %bias)
 %rnn = icmp eq i32 %gates, 1 %last.gate = sub i32 %gates, 1 %candidate = icmp eq i32 %gate, %last.gate
-%use.tanh = or i1 %rnn, %candidate %tanh.value = call double @recipe.tanh(double %linear)
-%sigmoid.value = call double @sigmoid(double %linear)
-%gate.value = select i1 %use.tanh, double %tanh.value, double %sigmoid.value br label %gate.store gate.store:
+%use.tanh = or i1 %rnn, %candidate
+br i1 %use.tanh, label %gate.tanh, label %gate.sigmoid
+gate.tanh: %tanh.value = call double @recipe.tanh(double %linear) br label %gate.store
+gate.sigmoid: %sigmoid.value = call double @sigmoid(double %linear) br label %gate.store
+gate.store: %gate.value = phi double [ %tanh.value, %gate.tanh ], [ %sigmoid.value, %gate.sigmoid ]
 %gate.context.base = mul i32 %gate, %gate.batch %gate.hidden.base = mul i32 %hidden, %length
 %gate.local = add i32 %gate.hidden.base, %time %gate.row.local = add i32 %output.row.base, %gate.local
 %gate.index = add i32 %gate.context.base, %gate.row.local
@@ -2432,24 +2434,35 @@ output.step: %output.hidden.base = mul i32 %output.hidden, %length %output.local
 %gate0.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %output.index
 %gate0 = load double, ptr addrspace(1) %gate0.ptr, align 8
 %is.gru = icmp eq i32 %gates, 3 %is.lstm = icmp eq i32 %gates, 4
-%gate1.raw = add i32 %gate.batch, %output.index %gate1.index = select i1 %is.lstm, i32 %gate1.raw, i32 %output.index
-%gate1.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate1.index
-%gate1 = load double, ptr addrspace(1) %gate1.ptr, align 8 %gate2.base = mul i32 %gate.batch, 2
-%gate2.raw = add i32 %gate2.base, %output.index %gate2.valid = or i1 %is.gru, %is.lstm
-%gate2.index = select i1 %gate2.valid, i32 %gate2.raw, i32 %output.index
-%gate2.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate2.index
-%gate2 = load double, ptr addrspace(1) %gate2.ptr, align 8 %gate3.base = mul i32 %gate.batch, 3
-%gate3.raw = add i32 %gate3.base, %output.index %gate3.index = select i1 %is.lstm, i32 %gate3.raw, i32 %output.index
-%gate3.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate3.index
-%gate3 = load double, ptr addrspace(1) %gate3.ptr, align 8 %output.previous.time = sub i32 %time, 1
+%output.previous.time = sub i32 %time, 1
 %output.previous.safe = select i1 %previous.exists, i32 %output.previous.time, i32 0
 %output.previous.local = add i32 %output.hidden.base, %output.previous.safe
 %output.previous.index = add i32 %output.row.base, %output.previous.local
 %output.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %output.previous.index
 %output.previous.loaded = load double, ptr addrspace(1) %output.previous.ptr, align 8
 %output.previous = select i1 %previous.exists, double %output.previous.loaded, double 0.0
+%gate2.base = mul i32 %gate.batch, 2
+br i1 %is.lstm, label %output.lstm, label %output.simple
+output.simple:
+%gate2.simple.raw = add i32 %gate2.base, %output.index
+%gate2.simple.index = select i1 %is.gru, i32 %gate2.simple.raw, i32 %output.index
+%gate2.simple.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate2.simple.index
+%gate2.simple = load double, ptr addrspace(1) %gate2.simple.ptr, align 8
 %one.update = call double @recipe.sub(double 1.0, double %gate0) %gru.old = call double @recipe.mul(double %gate0, double %output.previous)
-%gru.new = call double @recipe.mul(double %one.update, double %gate2) %gru.value = call double @recipe.add(double %gru.old, double %gru.new)
+%gru.new = call double @recipe.mul(double %one.update, double %gate2.simple) %gru.value = call double @recipe.add(double %gru.old, double %gru.new)
+%rnn.or.gru = select i1 %is.gru, double %gru.value, double %gate0
+br label %output.store
+output.lstm:
+%gate1.index = add i32 %gate.batch, %output.index
+%gate1.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate1.index
+%gate1 = load double, ptr addrspace(1) %gate1.ptr, align 8
+%gate2.lstm.index = add i32 %gate2.base, %output.index
+%gate2.lstm.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate2.lstm.index
+%gate2.lstm = load double, ptr addrspace(1) %gate2.lstm.ptr, align 8
+%gate3.base = mul i32 %gate.batch, 3
+%gate3.index = add i32 %gate3.base, %output.index
+%gate3.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gate3.index
+%gate3 = load double, ptr addrspace(1) %gate3.ptr, align 8
 %cell.base = mul i32 %gate.batch, %gates %cell.index = add i32 %cell.base, %output.index
 %cell.previous.index = add i32 %cell.base, %output.previous.index
 %cell.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %cell.previous.index
@@ -2459,9 +2472,11 @@ output.step: %output.hidden.base = mul i32 %output.hidden, %length %output.local
 %cell = call double @recipe.add(double %cell.old, double %cell.new)
 %cell.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %cell.index
 store double %cell, ptr addrspace(1) %cell.ptr, align 8 %cell.tanh = call double @recipe.tanh(double %cell)
-%lstm.value = call double @recipe.mul(double %gate2, double %cell.tanh)
-%rnn.or.gru = select i1 %is.gru, double %gru.value, double %gate0
-%output.value = select i1 %is.lstm, double %lstm.value, double %rnn.or.gru br label %output.store output.store:
+%lstm.value = call double @recipe.mul(double %gate2.lstm, double %cell.tanh)
+br label %output.store
+output.store:
+%output.value = phi double [ %rnn.or.gru, %output.simple ], [ %lstm.value, %output.lstm ]
+
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %output.index
 store double %output.value, ptr addrspace(1) %output.ptr, align 8 %output.next = add nuw i32 %output.hidden, 1
 br label %output.loop output.done: %time.next = add nuw i32 %time, 1 br label %time.loop time.done:
@@ -2914,26 +2929,39 @@ store double %dc.previous, ptr addrspace(1) %dc.ptr, align 8 %delta0.index = add
 store double %di, ptr addrspace(1) %delta0.ptr, align 8 store double %df, ptr addrspace(1) %delta1.ptr, align 8
 store double %do, ptr addrspace(1) %delta2.ptr, align 8 store double %dg, ptr addrspace(1) %delta3.ptr, align 8
 %hidden.next = add nuw i32 %hidden, 1 br label %gate.delta.loop delta.done: br label %parameter.loop parameter.loop:
-%p = phi i32 [ 0, %delta.done ], [ %p.next, %parameter.advance ] %p.more = icmp ult i32 %p, %parameters
-br i1 %p.more, label %parameter.step, label %hidden.gradient.loop parameter.step:
-%gate = udiv i32 %p, %gate.stride %within = urem i32 %p, %gate.stride
-%input.weight = icmp ult i32 %within, %gate.stride.0
-br i1 %input.weight, label %parameter.advance, label %parameter.value parameter.value:
-%state.end = add i32 %gate.stride.0, %state.matrix %state.weight = icmp ult i32 %within, %state.end
-%state.index = sub i32 %within, %gate.stride.0 %selected.index = select i1 %state.weight, i32 %state.index, i32 0
-%source.channel = udiv i32 %selected.index, %out.channels %target.hidden = urem i32 %selected.index, %out.channels
+%parameter.gate = phi i32 [ 0, %delta.done ], [ %parameter.gate.next, %parameter.gate.done ]
+%parameter.gate.more = icmp ult i32 %parameter.gate, %gates
+br i1 %parameter.gate.more, label %parameter.gate.begin, label %hidden.gradient.loop
+parameter.gate.begin:
+%parameter.gate.base = mul i32 %parameter.gate, %gate.stride
+%state.end = add i32 %gate.stride.0, %state.matrix
+%parameter.width = sub i32 %gate.stride, %gate.stride.0
+%candidate.gate = icmp eq i32 %parameter.gate, 2 %gru.candidate = and i1 %gru, %candidate.gate
+%delta.gate.base = mul i32 %parameter.gate, %batch
+%delta.gate.local = add i32 %delta.base, %delta.gate.base
+br label %parameter.value.loop
+parameter.value.loop:
+%parameter.offset = phi i32 [ 0, %parameter.gate.begin ], [ %parameter.offset.next, %parameter.value.advance ]
+%source.channel = phi i32 [ 0, %parameter.gate.begin ], [ %source.channel.next, %parameter.value.advance ]
+%target.hidden = phi i32 [ 0, %parameter.gate.begin ], [ %target.hidden.next, %parameter.value.advance ]
+%parameter.value.more = icmp ult i32 %parameter.offset, %parameter.width
+br i1 %parameter.value.more, label %parameter.value, label %parameter.gate.done
+parameter.value:
+%within = add i32 %gate.stride.0, %parameter.offset
+%p = add i32 %parameter.gate.base, %within
+%state.weight = icmp ult i32 %within, %state.end
+%load.channel = select i1 %state.weight, i32 %source.channel, i32 0
 %bias.hidden = sub i32 %within, %state.end %delta.hidden = select i1 %state.weight, i32 %target.hidden, i32 %bias.hidden
 %delta.hidden.base = mul i32 %delta.hidden, %length %delta.local = add i32 %delta.hidden.base, %time.current
-%delta.row.local = add i32 %row.output.base, %delta.local %delta.gate.base = mul i32 %gate, %batch
-%delta.gate.local = add i32 %delta.base, %delta.gate.base %delta.index = add i32 %delta.gate.local, %delta.row.local
+%delta.row.local = add i32 %row.output.base, %delta.local
+%delta.index = add i32 %delta.gate.local, %delta.row.local
 %gate.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %delta.index
 %gate.delta = load double, ptr addrspace(1) %gate.delta.ptr, align 8
-%state.hidden.base = mul i32 %source.channel, %length
+%state.hidden.base = mul i32 %load.channel, %length
 %state.local = add i32 %state.hidden.base, %previous.safe %state.index.value = add i32 %row.output.base, %state.local
 %state.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %state.index.value
 %state.loaded = load double, ptr addrspace(1) %state.ptr, align 8
 %state.value = select i1 %previous.exists, double %state.loaded, double 0.0
-%candidate.gate = icmp eq i32 %gate, 2 %gru.candidate = and i1 %gru, %candidate.gate
 %parameter.reset.local = add i32 %state.hidden.base, %time.current
 %parameter.reset.row = add i32 %row.output.base, %parameter.reset.local
 %parameter.reset.raw = add i32 %batch, %parameter.reset.row
@@ -2948,8 +2976,16 @@ br i1 %input.weight, label %parameter.advance, label %parameter.value parameter.
 %row.gradient.old = load double, ptr addrspace(1) %row.gradient.ptr, align 8
 %row.gradient.new = call double @recipe.add(double %row.gradient.old, double %contribution)
 store double %row.gradient.new, ptr addrspace(1) %row.gradient.ptr, align 8
-br label %parameter.advance parameter.advance:
-%p.next = add nuw i32 %p, 1 br label %parameter.loop hidden.gradient.loop:
+br label %parameter.value.advance parameter.value.advance:
+%target.hidden.raw = add nuw i32 %target.hidden, 1
+%target.wrap = icmp eq i32 %target.hidden.raw, %out.channels
+%target.hidden.next = select i1 %target.wrap, i32 0, i32 %target.hidden.raw
+%source.channel.raw = add nuw i32 %source.channel, 1
+%source.channel.next = select i1 %target.wrap, i32 %source.channel.raw, i32 %source.channel
+%parameter.offset.next = add nuw i32 %parameter.offset, 1
+br label %parameter.value.loop parameter.gate.done:
+%parameter.gate.next = add nuw i32 %parameter.gate, 1 br label %parameter.loop
+hidden.gradient.loop:
 %state.channel = phi i32 [ 0, %parameter.loop ], [ %state.channel.next, %hidden.gradient.store ]
 %state.channel.more = icmp ult i32 %state.channel, %out.channels
 br i1 %state.channel.more, label %hidden.gradient.sum.loop, label %time.done hidden.gradient.sum.loop:

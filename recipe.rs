@@ -2692,7 +2692,7 @@ fn native_artifact_directory(key: &str) -> Result<PathBuf> {
 
 fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
 	let mut hash = 14695981039346656037_u64;
-	for part in [b"recipe-native-v2".as_slice(), native_target_label(target).as_bytes(), ir.as_bytes()] {
+	for part in [b"recipe-native-v3".as_slice(), native_target_label(target).as_bytes(), ir.as_bytes()] {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
 		}
@@ -2767,7 +2767,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			let compiler = native_cpu_compiler()?;
 			let (target, _, _, _) = cpu_identity(target)?;
 			let mut command = Command::new(compiler);
-			command.args(["-target", target, "-march=native", "-Xclang", "-opaque-pointers", "-x", "ir", "-O2", "-fPIC", "-shared", "-o"]).arg(output).arg(source);
+			command.args(["-target", target, "-march=native", "-Xclang", "-opaque-pointers", "-x", "ir", "-O3", "-fPIC", "-shared", "-o"]).arg(output).arg(source);
 			native_command(command, "CPU LLVM IR compiler", key).map(|_| Vec::new())
 		}
 		BackendTarget::Amd { architecture } => {
