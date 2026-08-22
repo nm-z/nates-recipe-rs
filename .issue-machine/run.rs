@@ -1710,6 +1710,8 @@ fn resolver_loop(path: PathBuf, active: Arc<Mutex<BTreeSet<u64>>>) {
 
 Use unrestricted tools and make every required repository and GitHub change yourself. Never edit the current issue-machine worktree. Work in one separate Git worktree under {root}, based on the latest origin/{base}. Reuse coherent existing work for issue #{number} if it exists. Reproduce the exact public failure first, identify the earliest cause in current origin/{base}, implement the root fix without a fallback or parallel implementation, and validate the exact public Recipe path end to end. Test reachable edge cases one at a time through the same public entrypoint. Preserve unrelated user changes.
 
+Do not read, inspect, execute, edit, create, install, or delegate Python code, files, tooling, dependencies, documentation, or artifacts. Do not create or redirect output into additional log files. The public Recipe entrypoint may write only the repository-root recipe.log. Use Google developer documentation style and never use em dashes.
+
 Commit and push the coherent fix, then create one pull request targeting {base}. The pull request body must contain `Fixes #{number}`, the exact reproduction, the root cause, the change, and measured end-to-end evidence. Do not stop until the pull request exists and its URL is visible. Target issue: {url}"#, number = issue.number, root = current.resolver_worktree_root.display(), base = current.resolver_base, url = issue.url);
         event(&current, &format!("RESOLVE model={model} issue=#{} url={}", issue.number, issue.url));
         let memory = format!("MemoryMax={}M", current.resolver_memory_mib);
