@@ -71,6 +71,7 @@ pub enum PredictorOpcode {
 	Greater = 10,
 	Choose = 11,
 	Nearest = 12,
+	Affine = 13,
 }
 
 impl PredictorOpcode {
@@ -89,6 +90,7 @@ impl PredictorOpcode {
 			10 => Ok(Self::Greater),
 			11 => Ok(Self::Choose),
 			12 => Ok(Self::Nearest),
+			13 => Ok(Self::Affine),
 			_ => Err(EmitError::InvalidOpcode { kind: "predictor", value }),
 		}
 	}
@@ -592,6 +594,33 @@ pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorCon
 				}
 				let _ = writeln!(output, "%{p}.result = call {ty} @recipe.div({ty} {sum}, {ty} {count})", count = (context.literal)(count as f64, ty));
 				stack.push(format!("%{p}.result"));
+			}
+			PredictorOpcode::Affine => {
+				if context.features == 0 || context.parameters != 3 * context.features {
+					return Err(EmitError::InvalidOperand { kind: "affine table width", value: context.parameters as f64 });
+				}
+				let ty = context.value_type;
+				let (ptr, align) = (context.pointer_type, context.alignment);
+				let p = format!("{}.affine.{sequence}", context.prefix);
+				sequence += 1;
+				let zero = (context.literal)(0.0, ty);
+				// Feature loop head: induction variable plus the running sum as phis.
+				let _ = writeln!(output, "br label %{p}.entry\n{p}.entry:\nbr label %{p}.head\n{p}.head:");
+				let _ = writeln!(output, "%{p}.j = phi i32 [ 0, %{p}.entry ], [ %{p}.j.next, %{p}.body ]");
+				let _ = writeln!(output, "%{p}.acc = phi {ty} [ {zero}, %{p}.entry ], [ %{p}.acc.next, %{p}.body ]");
+				let _ = writeln!(output, "%{p}.more = icmp ult i32 %{p}.j, {features}\nbr i1 %{p}.more, label %{p}.body, label %{p}.done", features = context.features);
+				// The table is three feature-length planes (means, scales, weights),
+				// accumulated per feature as (x - mean) * scale * weight. The
+				// weights pointer is already advanced to this node's parameter
+				// span, so the plane indices are node-relative.
+				let _ = writeln!(output, "{p}.body:");
+				let _ = writeln!(output, "%{p}.q.base = mul i32 {row}, {features}\n%{p}.q.index = add i32 %{p}.q.base, %{p}.j\n%{p}.q.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.q.index\n%{p}.q = load {ty}, {ptr} %{p}.q.ptr, align {align}", row = context.row, features = context.features, input = context.input);
+				let _ = writeln!(output, "%{p}.mean.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.j\n%{p}.mean = load {ty}, {ptr} %{p}.mean.ptr, align {align}", weights = context.weights);
+				let _ = writeln!(output, "%{p}.scale.index = add i32 %{p}.j, {features}\n%{p}.scale.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.scale.index\n%{p}.scale = load {ty}, {ptr} %{p}.scale.ptr, align {align}", features = context.features, weights = context.weights);
+				let _ = writeln!(output, "%{p}.weight.index = add i32 %{p}.scale.index, {features}\n%{p}.weight.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.weight.index\n%{p}.weight = load {ty}, {ptr} %{p}.weight.ptr, align {align}", features = context.features, weights = context.weights);
+				let _ = writeln!(output, "%{p}.centered = call {ty} @recipe.sub({ty} %{p}.q, {ty} %{p}.mean)\n%{p}.scaled = call {ty} @recipe.mul({ty} %{p}.centered, {ty} %{p}.scale)\n%{p}.term = call {ty} @recipe.mul({ty} %{p}.scaled, {ty} %{p}.weight)\n%{p}.acc.next = call {ty} @recipe.add({ty} %{p}.acc, {ty} %{p}.term)");
+				let _ = writeln!(output, "%{p}.j.next = add i32 %{p}.j, 1\nbr label %{p}.head\n{p}.done:");
+				stack.push(format!("%{p}.acc"));
 			}
 		}
 	}
@@ -3811,32 +3840,77 @@ const IQ2_S: [u16; 1024] = [
 	34068, 34080, 34113, 34116, 34128, 34176, 34186, 34305, 34308, 34320, 34345, 34368, 34816, 34821, 34833, 34836, 34881, 34884, 34896, 34978, 35073, 35076, 35136, 35173, 35362, 35416, 35418, 35458, 35490, 36865, 36868, 36873, 36880, 36882, 36885, 36888, 36900, 36928, 36930, 36933, 36936, 36945, 36948, 36960, 36993, 36996, 37008, 37120, 37125, 37137, 37140, 37185, 37188, 37200, 37210, 37377, 37380, 37392, 37440, 37542, 37888, 37890, 37893, 37896, 37905, 37908, 37920, 37953, 37956, 37968, 38016, 38038, 38145, 38148, 38160, 38208, 38296, 38305, 38400, 38470, 38500, 38913, 38916, 38928, 38950, 38976, 39081, 39168, 39241, 39250, 39568, 40960, 40965, 40970, 40980, 40994, 41002, 41025, 41028, 41040, 41122, 41130, 41280, 41317, 41474, 41482, 41506, 41512, 41514, 41602, 41608, 41610, 41640, 41985, 41988, 42000, 42048, 42121, 42148, 42240, 42265, 42577, 43018, 43048, 43170, 43348, 43398, 43528, 43530, 43552, 43554, 43560, 43656, 43690,
 ];
 fn iq3_grid(grid: &[u16], index: usize, lane: usize) -> i8 { (2 * (grid[index] >> (3 * lane) & 7) + 1) as i8 }
-fn iq3_nearest(grid: &[u16], levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32) -> usize {
+/// Every 12-bit level key resolved against one IQ3 grid: either the first
+/// exact grid index, or the first two distance shells in (distance, index)
+/// order, which is the same candidate order an exhaustive sorted scan yields.
+struct Iq3Neighbours {
+	exact: Vec<i32>,
+	offsets: Vec<u32>,
+	candidates: Vec<u16>,
+}
+fn iq3_neighbours(grid: &'static [u16]) -> &'static Iq3Neighbours {
+	static XXS: OnceLock<Iq3Neighbours> = OnceLock::new();
+	static S: OnceLock<Iq3Neighbours> = OnceLock::new();
+	let cache = if std::ptr::eq(grid.as_ptr(), IQ3_XXS.as_ptr()) { &XXS } else { &S };
+	cache.get_or_init(|| {
+		let keys = 1_usize << 12;
+		let mut exact = vec![-1_i32; keys];
+		for (index, point) in grid.iter().enumerate() {
+			if exact[usize::from(*point)] < 0 {
+				exact[usize::from(*point)] = index as i32
+			}
+		}
+		let (mut offsets, mut candidates) = (Vec::with_capacity(keys + 1), Vec::new());
+		offsets.push(0_u32);
+		for key in 0..keys {
+			if exact[key] >= 0 {
+				offsets.push(candidates.len() as u32);
+				continue;
+			}
+			let distance = |point: u16| {
+				let mut total = 0_i32;
+				for lane in 0..4 {
+					let difference = i32::from(point >> (3 * lane) & 7) - (key as i32 >> (3 * lane) & 7);
+					total += difference * difference
+				}
+				total
+			};
+			let (mut first, mut second) = (i32::MAX, i32::MAX);
+			for point in grid {
+				let d = distance(*point);
+				if d < first {
+					second = first;
+					first = d
+				} else if d > first && d < second {
+					second = d
+				}
+			}
+			for shell in [first, second] {
+				for (index, point) in grid.iter().enumerate() {
+					if distance(*point) == shell {
+						candidates.push(index as u16)
+					}
+				}
+				if second == first || second == i32::MAX {
+					break;
+				}
+			}
+			offsets.push(candidates.len() as u32);
+		}
+		Iq3Neighbours { exact, offsets, candidates }
+	})
+}
+fn iq3_nearest(grid: &'static [u16], levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32) -> usize {
 	let key = levels.iter().enumerate().fold(0_u16, |key, (lane, level)| key | (*level as u16) << (3 * lane));
-	if let Some(index) = grid.iter().position(|value| *value == key) {
-		return index;
+	let neighbours = iq3_neighbours(grid);
+	let exact = neighbours.exact[usize::from(key)];
+	if exact >= 0 {
+		return exact as usize;
 	}
-	let mut candidates = grid
+	let span = neighbours.offsets[usize::from(key)] as usize..neighbours.offsets[usize::from(key) + 1] as usize;
+	let index = neighbours.candidates[span]
 		.iter()
-		.enumerate()
-		.map(|(index, point)| {
-			(
-				(0..4).map(|lane| {
-					let difference = i32::from((*point >> (3 * lane) & 7) as i8 - levels[lane]);
-					difference * difference
-				})
-				.sum::<i32>(),
-				index,
-			)
-		})
-		.collect::<Vec<_>>();
-	candidates.sort_unstable();
-	let first = candidates[0].0;
-	let second = candidates.iter().find(|item| item.0 != first).map(|item| item.0).unwrap_or(first);
-	let index = candidates
-		.into_iter()
-		.take_while(|item| item.0 <= second)
-		.map(|item| item.1)
+		.map(|index| usize::from(*index))
 		.min_by(|left, right| {
 			let error = |index| {
 				(0..4).map(|lane| {
@@ -6955,6 +7029,12 @@ impl PredictorProgram {
 					}
 					stack.push(best.iter().map(|slot| slot.1).sum::<f64>() / count as f64)
 				},
+				value if value == PredictorOpcode::Affine as i32 => {
+					require(self.table.len() == 3 * query.len() && !query.is_empty(), "affine table width is invalid")?;
+					let (means, rest) = self.table.split_at(query.len());
+					let (scales, weights) = rest.split_at(query.len());
+					stack.push(query.iter().zip(means).zip(scales).zip(weights).map(|(((value, mean), scale), weight)| (value - mean) * scale * weight).sum())
+				},
 				_ => return Err(RecipeError::new(format!("invalid predictor opcode {opcode}"))),
 			}
 		}
@@ -6975,6 +7055,10 @@ impl PredictorBuilder {
 	fn nearest(&mut self, count: usize, exclude: bool, table: Vec<f64>) {
 		self.table = table;
 		self.push(PredictorOpcode::Nearest, if exclude { -(count as f64) } else { count as f64 });
+	}
+	fn affine(&mut self, table: Vec<f64>) {
+		self.table = table;
+		self.push(PredictorOpcode::Affine, 0.0);
 	}
 	fn emit(&mut self, opcode: PredictorOpcode, argument: f64) { self.code.extend([opcode as i32 as f64, argument]) }
 	fn push(&mut self, opcode: PredictorOpcode, argument: f64) { self.emit(opcode, argument); self.depth += 1; self.stack = self.stack.max(self.depth) }
@@ -7080,8 +7164,12 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> R
 			*variance += (value - mean).powi(2) / rows as f64
 		}
 	}
+	// Regularize the variance like normalize_samples does: an exact-zero guard
+	// misses float-residue variances on numerically constant features, whose
+	// unbounded inverses cannot survive the model's storage format.
+	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
 	for value in &mut inverse {
-		*value = if *value == 0.0 { 0.0 } else { value.sqrt().recip() }
+		*value = (*value + epsilon).sqrt().recip()
 	}
 	let mut weights = vec![0.0; data.features];
 	let mut bias = data.targets[..rows].iter().sum::<f64>() / rows as f64;
@@ -7102,18 +7190,18 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> R
 			*weight -= config.svm_rate * gradient
 		}
 	}
+	// The fitted model lives in the predictor table as three feature-length
+	// planes (means, scales, weights), so the emitted program is a fixed-size
+	// feature loop instead of straight-line code that grows with the feature
+	// count, and each storage block quantizes values of one magnitude family.
+	let mut table = Vec::with_capacity(3 * data.features);
+	table.extend(means);
+	table.extend(inverse);
+	table.extend(weights);
 	let mut program = PredictorBuilder::new();
 	program.constant(bias);
-	for (feature, ((weight, mean), scale)) in weights.into_iter().zip(means).zip(inverse).enumerate() {
-		program.feature(feature);
-		program.constant(mean);
-		program.binary(PredictorOpcode::Subtract);
-		program.constant(scale);
-		program.binary(PredictorOpcode::Multiply);
-		program.constant(weight);
-		program.binary(PredictorOpcode::Multiply);
-		program.binary(PredictorOpcode::Add);
-	}
+	program.affine(table);
+	program.binary(PredictorOpcode::Add);
 	Ok(Predictor::new(program.finish()?))
 }
 fn fit_forest(trees: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
