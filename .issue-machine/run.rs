@@ -936,7 +936,7 @@ fn trial(
         child_stderr.read_to_end(&mut output).expect("cannot read Recipe traversal stderr");
         output
     });
-    let (status, timed_out) = loop {
+    let (status, deadline_reached) = loop {
         if started.elapsed() >= Duration::from_secs(config.slow_cursor_seconds) {
             let status = if let Some(status) = child.try_wait().expect("cannot inspect Recipe traversal") {
                 status
@@ -948,13 +948,6 @@ fn trial(
                 assert!(terminated.success(), "cannot terminate slow Recipe traversal process group");
                 child.wait().expect("cannot collect slow Recipe traversal")
             };
-            let _ = send.send(Discovery::Slow(SlowTrial {
-                config: config.clone(),
-                device: device.to_owned(),
-                cursor,
-                reproduction: reproduction.to_owned(),
-                elapsed_seconds: started.elapsed().as_secs(),
-            }));
             break (status, true);
         }
         if let Some(status) = child.try_wait().expect("cannot inspect Recipe traversal") {
@@ -962,15 +955,23 @@ fn trial(
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    (
-        std::process::Output {
+    let output = std::process::Output {
             status,
             stdout: stdout.join().expect("Recipe traversal stdout reader failed"),
             stderr: stderr.join().expect("Recipe traversal stderr reader failed"),
-        },
-        timed_out,
-        started.elapsed(),
-    )
+        };
+    let elapsed = started.elapsed();
+    let timed_out = deadline_reached || elapsed >= Duration::from_secs(config.slow_cursor_seconds);
+    if timed_out {
+        let _ = send.send(Discovery::Slow(SlowTrial {
+            config: config.clone(),
+            device: device.to_owned(),
+            cursor,
+            reproduction: reproduction.to_owned(),
+            elapsed_seconds: elapsed.as_secs(),
+        }));
+    }
+    (output, timed_out, elapsed)
 }
 
 fn termination_signal(status: std::process::ExitStatus) -> Option<i32> {
@@ -1620,7 +1621,7 @@ fn enqueue_review(
             Some(state.packets.len())
         }
     };
-    if depth.is_none() { display_queue(packet) }
+    display_queue(packet);
     depth
 }
 
