@@ -1537,17 +1537,20 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> Review {
         let limit = config.issue_history_limit.to_string();
         let existing = output(
             Command::new("gh")
-                .args(["issue", "list", "--state", "all", "--limit", &limit, "--json", "number,title", "--jq", ".[] | [.number, .title] | @tsv"])
+                .args(["issue", "list", "--state", "all", "--limit", &limit, "--json", "number,title,body"])
                 .current_dir(&config.repository),
             None,
         );
         assert!(existing.status.success(), "GitHub duplicate check failed: {}", failure(&existing));
-        if let Some(number) = String::from_utf8_lossy(&existing.stdout).lines().find_map(|line| {
-            let (number, existing_title) = line.split_once('\t')?;
-            existing_title.trim().eq_ignore_ascii_case(title.trim()).then(|| number.to_owned())
-        }) {
+        let existing = String::from_utf8(existing.stdout).expect("GitHub issue history is not UTF-8");
+        let cause = packet.lines().find(|line| line.starts_with("observed=phase:process message:")).unwrap_or("");
+        let duplicate = output(Command::new("jq").args([
+            "-er", "--arg", "title", &title, "--arg", "cause", cause,
+            r#"[.[] | select((.title | ascii_downcase) == ($title | ascii_downcase) or ($cause != "" and ((.body // "") | contains($cause))))] | sort_by(.number) | .[0].number // empty"#,
+        ]), Some(&existing));
+        if duplicate.status.success() {
             verdict = "comment".to_owned();
-            issue = number;
+            issue = String::from_utf8(duplicate.stdout).expect("duplicate issue number is not UTF-8").trim().to_owned();
         }
     }
     let published = match verdict.as_str() {
