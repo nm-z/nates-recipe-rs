@@ -44,8 +44,9 @@ process boundary and enters the normal review queue instead of exhausting the
 host and terminating the machine.
 
 The machine runs each model up to its configured concurrency limit. Ox Alpha,
-whose current catalog key is `opencode/x-preview-f-free`, runs up to 20
-requests concurrently. Every other OpenCode model runs one request at a time.
+whose current catalog key is `opencode/x-preview-f-free`, and OpenRouter's
+`openrouter/free` route each run up to 20 requests concurrently. Every other
+OpenCode model runs one request at a time.
 Each live
 reviewer uses the `provider/model` identity shown in the terminal and log. The
 configured providers and model order are:
@@ -53,6 +54,7 @@ configured providers and model order are:
 - `codex/gpt-5.3-codex-spark`
 - `kimi/kimi-code/k3`
 - Every configured `opencode/<free-model>` concurrently
+- `openrouter/openrouter/free`, through the existing OpenCode tool harness
 - `copilot/auto`, updated to the model selected by Copilot routing
 - `claude/sonnet-5-max`
 - `ollama/minimax-m3:cloud`

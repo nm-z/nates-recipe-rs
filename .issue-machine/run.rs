@@ -1073,7 +1073,7 @@ fn opencode(config: &Config, model: &str, prompt: &str) -> std::result::Result<D
         let session = jq_lines(&stream, "[.[] | .sessionID][-1]")?;
         trace(
             config,
-            &format!("model={} repairing structured output session={session}", identity("opencode", model.strip_prefix("opencode/").unwrap_or(model))),
+            &format!("model={model} repairing structured output session={session}"),
         );
         let repair = output(
             Command::new(&config.opencode_binary)
@@ -1101,9 +1101,10 @@ fn opencode(config: &Config, model: &str, prompt: &str) -> std::result::Result<D
             .and_then(object);
     }
     let json = json.map_err(|error| format!("{}; {error}", failure(&result)))?;
+    let (provider, model) = model.split_once('/').expect("OpenCode model has no provider");
     Ok(Decision {
-        provider: "opencode",
-        model: model.strip_prefix("opencode/").unwrap_or(model).to_owned(),
+        provider: if provider == "openrouter" { "openrouter" } else { "opencode" },
+        model: model.to_owned(),
         effort: "default".to_owned(),
         json,
     })
@@ -1289,7 +1290,7 @@ fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
         for model in &config.opencode_models {
             let limit = *config.opencode_concurrency.get(model).expect("OpenCode model has no concurrency limit");
             if let Some(_provider) = model_provider(&OPENCODE, model, limit) {
-                let classifier = identity("opencode", model.strip_prefix("opencode/").unwrap_or(model));
+                let classifier = model.to_owned();
                 display_reviewing(packet, &classifier);
                 match opencode(config, model, prompt) {
                     Ok(decision) => return decision,
