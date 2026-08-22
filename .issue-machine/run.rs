@@ -50,6 +50,7 @@ struct Config {
     resolver_poll_seconds: u64,
     resolver_concurrency: usize,
     resolver_memory_mib: u64,
+    resolver_memory_budget_mib: u64,
     review_concurrency: usize,
     review_poll_milliseconds: u64,
     provider_poll_seconds: u64,
@@ -163,6 +164,9 @@ fn config(path: &Path) -> Config {
         resolver_memory_mib: value(&text, "resolver_memory_mib")
             .parse()
             .expect("resolver_memory_mib must be an unsigned integer"),
+        resolver_memory_budget_mib: value(&text, "resolver_memory_budget_mib")
+            .parse()
+            .expect("resolver_memory_budget_mib must be an unsigned integer"),
         review_concurrency: value(&text, "review_concurrency")
             .parse()
             .expect("review_concurrency must be an unsigned integer"),
@@ -1630,6 +1634,9 @@ impl Drop for ResolverClaim {
 
 fn resolver_claim(config: &Config, active: &Arc<Mutex<BTreeSet<u64>>>) -> std::result::Result<Option<ResolverClaim>, String> {
     let mut issues = active.lock().expect("resolver claim lock is poisoned");
+    let limit = config.resolver_memory_budget_mib / config.resolver_memory_mib;
+    assert!(limit != 0, "resolver_memory_budget_mib must hold at least one resolver");
+    if issues.len() >= limit as usize { return Ok(None) }
     let Some((number, url)) = resolver_issue(config, &issues)? else { return Ok(None) };
     issues.insert(number);
     drop(issues);
@@ -1711,7 +1718,8 @@ Commit and push the coherent fix, then create one pull request targeting {base}.
         if !result.status.success() {
             event(&current, &format!("RESOLVE model={model} issue=#{} failed error={}", issue.number, failure(&result)));
             display_resolved(issue.number, "FAIL", None);
-            return;
+            std::thread::sleep(Duration::from_secs(current.resolver_poll_seconds));
+            continue;
         }
         match resolver_pr(&current, issue.number) {
             Ok(Some(url)) => {
@@ -1721,12 +1729,14 @@ Commit and push the coherent fix, then create one pull request targeting {base}.
             Ok(None) => {
                 event(&current, &format!("RESOLVE model={model} issue=#{} failed error=goal completed without an open pull request", issue.number));
                 display_resolved(issue.number, "FAIL", None);
-                return;
+                std::thread::sleep(Duration::from_secs(current.resolver_poll_seconds));
+                continue;
             }
             Err(error) => {
                 event(&current, &format!("RESOLVE model={model} issue=#{} failed error={error}", issue.number));
                 display_resolved(issue.number, "FAIL", None);
-                return;
+                std::thread::sleep(Duration::from_secs(current.resolver_poll_seconds));
+                continue;
             }
         }
     }
