@@ -6,10 +6,11 @@ use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-const RED: &str = "\x1b[38;2;242;40;60m";
-const YELLOW: &str = "\x1b[38;2;255;194;0m";
-const GREEN: &str = "\x1b[38;2;0;174;107m";
-const BLUE: &str = "\x1b[38;2;39;125;255m";
+const RED: &str = "\x1b[38;2;255;92;122m";
+const YELLOW: &str = "\x1b[38;2;229;192;123m";
+const GREEN: &str = "\x1b[38;2;86;214;169m";
+const BLUE: &str = "\x1b[38;2;97;175;239m";
+const MUTED: &str = "\x1b[38;2;125;133;144m";
 const RESET: &str = "\x1b[0m";
 const SHELL_SIGNAL_OFFSET: i32 = 128;
 
@@ -223,10 +224,9 @@ fn event(config: &Config, color: &str, message: &str) {
         .arg("+%Y-%m-%d %H:%M:%S")
         .output()
         .expect("cannot read event time");
-    let line = format!(
-        "{} {message}\n",
-        String::from_utf8_lossy(&time.stdout).trim()
-    );
+    let timestamp = String::from_utf8_lossy(&time.stdout);
+    let timestamp = timestamp.trim();
+    let line = format!("{timestamp} {message}\n");
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -234,7 +234,8 @@ fn event(config: &Config, color: &str, message: &str) {
         .expect("cannot open machine log")
         .write_all(line.as_bytes())
         .expect("cannot write machine log");
-    eprint!("{color}{line}{RESET}");
+    let (event, details) = message.split_once(' ').unwrap_or((message, ""));
+    eprintln!("{MUTED}{}{RESET}  {color}{event:<8}{RESET} {details}", &timestamp[11..]);
 }
 
 fn trace(config: &Config, message: &str) {
