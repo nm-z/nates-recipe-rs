@@ -392,25 +392,25 @@ fn reproduction(case: u64, data_case: &DataCase, model_ordinal: u64, loss_ordina
 	let mut body = format!(r#"use recipe::*;
 
 fn main() {{
-	let bundle = "/tmp/recipe-composition-repro.ogdl";
+	let bundle = format!("/tmp/recipe-composition-repro-{{}}.ogdl", std::process::id());
 	let data = {data};
 	let model = {model};"#);
 	if phase == "setup" {
 		return format!("{body}\n}}\n");
 	}
-	body.push_str(&format!("\n\tlet report = {train}\n\t\t.save(bundle)\n\t\t.run(&model, &data);\n\tassert!(report.final_loss().is_finite());"));
+	body.push_str(&format!("\n\tlet report = {train}\n\t\t.save(&bundle)\n\t\t.run(&model, &data);\n\tassert!(report.final_loss().is_finite());"));
 	if phase == "training" {
 		return format!("{body}\n}}\n");
 	}
 	if lifecycle == 1 {
-		body.push_str(&format!("\n\tlet resumed = {train}\n\t\t.resume(bundle)\n\t\t.save(bundle)\n\t\t.run(&model, &data);\n\tassert!(resumed.final_loss().is_finite());"));
+		body.push_str(&format!("\n\tlet resumed = {train}\n\t\t.resume(&bundle)\n\t\t.save(&bundle)\n\t\t.run(&model, &data);\n\tassert!(resumed.final_loss().is_finite());"));
 	}
 	if phase == "resumed training" {
 		return format!("{body}\n}}\n");
 	}
 	let bundle_path = PathBuf::from(format!("/tmp/recipe-composition-{}.ogdl", std::process::id()));
 	let width = input_width(&bundle_path);
-	body.push_str(&format!("\n\tlet output = recipe.infer(bundle, &[0.0; {width}]);\n\tassert!(!output.is_empty());\n\tassert!(output.iter().all(|value| value.is_finite()));"));
+	body.push_str(&format!("\n\tlet output = recipe.infer(&bundle, &[0.0; {width}]);\n\tassert!(!output.is_empty());\n\tassert!(output.iter().all(|value| value.is_finite()));"));
 	format!("{body}\n}}\n")
 }
 
