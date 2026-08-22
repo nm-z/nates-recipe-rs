@@ -67,6 +67,10 @@ configured providers and model order are:
 - `ollama/minimax-m3:cloud`
 - `agy/<model>` in configured order
 
+The Ollama Claude launcher assigns each session a configured name and disables
+nonessential side requests so every model request uses the configured Ollama
+model.
+
 All OpenCode and OpenRouter reviews use separate sessions on one headless
 OpenCode server. The machine submits each turn through the server API, polls the
 authoritative session state, and reads the completed assistant message without

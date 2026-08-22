@@ -44,6 +44,8 @@ struct Config {
     claude_binary: PathBuf,
     ollama_binary: PathBuf,
     ollama_model: String,
+    ollama_session_name: String,
+    ollama_disable_nonessential_traffic: String,
     resolver_enabled: bool,
     resolver_model: String,
     resolver_effort: String,
@@ -154,6 +156,8 @@ fn config(path: &Path) -> Config {
         claude_binary: value(&text, "claude_binary").into(),
         ollama_binary: value(&text, "ollama_binary").into(),
         ollama_model: value(&text, "ollama_model"),
+        ollama_session_name: value(&text, "ollama_session_name"),
+        ollama_disable_nonessential_traffic: value(&text, "ollama_disable_nonessential_traffic"),
         resolver_enabled: value(&text, "resolver_enabled")
             .parse()
             .expect("resolver_enabled must be true or false"),
@@ -1309,6 +1313,7 @@ fn ollama_command(config: &Config, prompt: &str, session: Option<&str>) -> std::
     let tools = "Read,Glob,Grep,mcp__recipe_issues__search_issues,mcp__recipe_issues__read_issue";
     let mcp = config.repository.join(".mcp.json");
     let mut command = Command::new(&config.ollama_binary);
+    command.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", &config.ollama_disable_nonessential_traffic);
     command.args(["launch", "claude", "--model", &config.ollama_model, "--yes", "--"]);
     command.args([
         "-p",
@@ -1316,6 +1321,8 @@ fn ollama_command(config: &Config, prompt: &str, session: Option<&str>) -> std::
         "--output-format",
         "stream-json",
         "--verbose",
+        "--name",
+        &config.ollama_session_name,
         "--permission-mode",
         "dontAsk",
         "--disable-slash-commands",
