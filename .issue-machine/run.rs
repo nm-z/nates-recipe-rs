@@ -30,6 +30,10 @@ struct Config {
     kimi_skills: PathBuf,
     agy_binary: PathBuf,
     agy_models: Vec<String>,
+    opencode_binary: PathBuf,
+    opencode_config: PathBuf,
+    opencode_models: Vec<String>,
+    opencode_agent: String,
     provider_poll_seconds: u64,
     slow_cursor_seconds: u64,
     discovery_devices: Vec<String>,
@@ -84,6 +88,10 @@ fn config(path: &Path) -> Config {
         kimi_skills: value(&text, "kimi_skills").into(),
         agy_binary: value(&text, "agy_binary").into(),
         agy_models: values(&text, "agy_models"),
+        opencode_binary: value(&text, "opencode_binary").into(),
+        opencode_config: value(&text, "opencode_config").into(),
+        opencode_models: values(&text, "opencode_models"),
+        opencode_agent: value(&text, "opencode_agent"),
         provider_poll_seconds: value(&text, "provider_poll_seconds")
             .parse()
             .expect("provider_poll_seconds must be an unsigned integer"),
@@ -140,22 +148,19 @@ struct SlowTrial {
 }
 
 enum Discovery {
-    Start { device: String, cursor: u64, reproduction: PathBuf },
+    Start { device: String, cursor: u64 },
     Slow(SlowTrial),
     Complete(Trial),
 }
 
 enum Review {
     Done,
-    Deferred,
     Stop,
 }
 
 struct Active {
     cursor: u64,
     started: Instant,
-    reproduction: PathBuf,
-    composition: Option<String>,
 }
 
 struct ReviewNode {
@@ -163,8 +168,8 @@ struct ReviewNode {
     cursor: u64,
     elapsed: String,
     status: &'static str,
-    composition: String,
     model: Option<String>,
+    started: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -175,6 +180,11 @@ struct Display {
 }
 
 static DISPLAY: OnceLock<Mutex<Display>> = OnceLock::new();
+static SPARK: OnceLock<Mutex<()>> = OnceLock::new();
+static KIMI: OnceLock<Mutex<()>> = OnceLock::new();
+static AGY: OnceLock<Mutex<()>> = OnceLock::new();
+static OPENCODE: OnceLock<Mutex<()>> = OnceLock::new();
+static DEEPSEEK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn display() -> &'static Mutex<Display> { DISPLAY.get_or_init(|| Mutex::new(Display::default())) }
 
@@ -214,7 +224,7 @@ fn fit(value: &str, width: usize) -> String {
     format!("{}..", value.chars().take(width - 2).collect::<String>())
 }
 
-fn trial_line(device: &str, cursor: u64, elapsed: &str, status: &str, composition: &str, width: usize) -> String {
+fn trial_line(device: &str, cursor: u64, elapsed: &str, status: &str) -> String {
     let device_color = if device == "cpu" { GREEN } else { BLUE };
     let status_color = match status {
         "PASS" => GREEN,
@@ -222,9 +232,7 @@ fn trial_line(device: &str, cursor: u64, elapsed: &str, status: &str, compositio
         "SLOW" => YELLOW,
         _ => RESET,
     };
-    let prefix = format!("{device:<4}  cursor {cursor:<6}  time {elapsed}  status {status:<4}  composition ");
-    let composition = fit(composition, width.saturating_sub(prefix.chars().count()));
-    format!("{device_color}{device:<4}{RESET}  cursor {cursor:<6}  time {TIME}{elapsed}{RESET}  status {status_color}{status:<4}{RESET}  composition {composition}")
+    format!("{device_color}{device:<4}{RESET}  cursor {cursor:<6}  time {TIME}{elapsed}{RESET}  status {status_color}{status:<4}{RESET}")
 }
 
 fn pane_size() -> (usize, usize) {
@@ -241,55 +249,63 @@ fn pane_size() -> (usize, usize) {
 
 fn display_render(display: &mut Display) {
     display_clear(display);
-    let (width, height) = pane_size();
-    let review_rows = height.saturating_sub(display.active.len() + 1);
-    let visible_reviews = if display.reviews.len() * 2 <= review_rows {
-        display.reviews.len()
-    } else {
-        review_rows.saturating_sub(1) / 2
-    };
-    for review in display.reviews.values().take(visible_reviews) {
-        eprintln!("{}", trial_line(&review.device, review.cursor, &review.elapsed, review.status, &review.composition, width));
-        eprintln!("{}", fit(&format!("└─ review  {}", review.model.as_deref().unwrap_or("queued")), width));
+    let width = pane_size().0;
+    let trials = display.active.iter().map(|(device, active)| {
+        format!("{device:<4}  cursor {:<6}  time {}", active.cursor, elapsed(active.started))
+    }).collect::<Vec<_>>();
+    let reviews = display.reviews.values().filter_map(|review| {
+        Some(format!(
+            "{:<36}  cursor {:<6}  time {}",
+            review.model.as_deref()?,
+            review.cursor,
+            elapsed(review.started?),
+        ))
+    }).collect::<Vec<_>>();
+    let queued = display.reviews.values().filter(|review| review.model.is_none()).count();
+    if queued != 0 {
+        eprintln!("{YELLOW}queued{RESET}");
+        eprintln!("└─ {queued} reviews");
         display.rows += 2;
     }
-    let hidden_reviews = display.reviews.len() - visible_reviews;
-    if hidden_reviews != 0 {
-        eprintln!("... {hidden_reviews} more reviews");
+    if !trials.is_empty() || !reviews.is_empty() {
+        eprintln!("{BLUE}live{RESET}");
         display.rows += 1;
     }
-    for (device, active) in &mut display.active {
-        if active.composition.is_none() {
-            active.composition = std::fs::read_to_string(&active.reproduction).ok().and_then(|source| {
-                source.lines().find_map(|line| line.trim().strip_prefix(".seed(")?.strip_suffix(')').map(str::to_owned))
-            });
-        }
-        let composition = active.composition.as_deref().unwrap_or("staging");
-        eprintln!("{}", trial_line(device, active.cursor, &elapsed(active.started), "...", composition, width));
+    if !trials.is_empty() {
+        let branch = if reviews.is_empty() { "└─" } else { "├─" };
+        eprintln!("{branch} trial");
         display.rows += 1;
+        for (index, line) in trials.iter().enumerate() {
+            let branch = if index + 1 == trials.len() { "└─" } else { "├─" };
+            let trunk = if reviews.is_empty() { "   " } else { "│  " };
+            eprintln!("{}", fit(&format!("{trunk}{branch} {line}"), width));
+            display.rows += 1;
+        }
+    }
+    if !reviews.is_empty() {
+        eprintln!("└─ review");
+        display.rows += 1;
+        for (index, line) in reviews.iter().enumerate() {
+            let branch = if index + 1 == reviews.len() { "└─" } else { "├─" };
+            eprintln!("{}", fit(&format!("   {branch} {line}"), width));
+            display.rows += 1;
+        }
     }
     std::io::stderr().flush().expect("cannot draw machine status");
 }
 
-fn display_start(device: &str, cursor: u64, reproduction: PathBuf) {
+fn display_start(device: &str, cursor: u64) {
     let mut display = display().lock().expect("display lock is poisoned");
-    display.active.insert(device.to_owned(), Active { cursor, started: Instant::now(), reproduction, composition: None });
+    display.active.insert(device.to_owned(), Active { cursor, started: Instant::now() });
     display_render(&mut display);
 }
 
 fn display_finish(device: &str, failed: bool) {
     let mut display = display().lock().expect("display lock is poisoned");
     display_clear(&mut display);
-    let width = pane_size().0;
-    if let Some(mut active) = display.active.remove(device) {
-        if active.composition.is_none() {
-            active.composition = std::fs::read_to_string(&active.reproduction).ok().and_then(|source| {
-                source.lines().find_map(|line| line.trim().strip_prefix(".seed(")?.strip_suffix(')').map(str::to_owned))
-            });
-        }
+    if let Some(active) = display.active.remove(device) {
         let status = if failed { "FAIL" } else { "PASS" };
-        let composition = active.composition.as_deref().unwrap_or("unknown");
-        eprintln!("{}", trial_line(device, active.cursor, &elapsed(active.started), status, composition, width));
+        eprintln!("{}", trial_line(device, active.cursor, &elapsed(active.started), status));
     }
     display_render(&mut display);
 }
@@ -298,7 +314,6 @@ fn display_queue(packet: &str) {
     let key = packet_key(packet);
     let cursor = packet_cursor(packet);
     let device = packet_backend(packet).to_owned();
-    let composition = packet_composition(packet).to_owned();
     let mut display = display().lock().expect("display lock is poisoned");
     let active = display.active.get(&device).is_some_and(|active| active.cursor == cursor)
         .then(|| display.active.remove(&device).expect("matched active trial disappeared"));
@@ -315,8 +330,8 @@ fn display_queue(packet: &str) {
         cursor,
         elapsed: duration,
         status: if packet.starts_with("kind=performance\n") { "SLOW" } else { "FAIL" },
-        composition,
         model: None,
+        started: None,
     });
     display_render(&mut display);
 }
@@ -325,7 +340,13 @@ fn display_reviewing(packet: &str, model: &str) {
     let key = packet_key(packet);
     let mut display = display().lock().expect("display lock is poisoned");
     if let Some(review) = display.reviews.get_mut(&key) {
-        review.model = Some(model.to_owned());
+        if model == "queued" || model.starts_with("waiting for ") {
+            review.model = None;
+            review.started = None;
+        } else if review.model.as_deref() != Some(model) {
+            review.model = Some(model.to_owned());
+            review.started = Some(Instant::now());
+        }
     }
     display_render(&mut display);
 }
@@ -334,9 +355,8 @@ fn display_reviewed(packet: &str, model: &str, result: &str, url: Option<&str>) 
     let key = packet_key(packet);
     let mut display = display().lock().expect("display lock is poisoned");
     display_clear(&mut display);
-    let width = pane_size().0;
     if let Some(review) = display.reviews.remove(&key) {
-        eprintln!("{}", trial_line(&review.device, review.cursor, &review.elapsed, review.status, &review.composition, width));
+        eprintln!("{}", trial_line(&review.device, review.cursor, &review.elapsed, review.status));
         eprintln!("├─ review  {model}");
         if let Some(url) = url {
             eprintln!("└─ {result:<7} {url}");
@@ -852,46 +872,143 @@ fn agy(config: &Config, model: &str, prompt: &str) -> std::result::Result<Decisi
     })
 }
 
+fn opencode(config: &Config, model: &str, prompt: &str) -> std::result::Result<Decision, String> {
+    let permissions = r#"{"*":"deny","read":"allow","glob":"allow","grep":"allow","list":"allow","recipe_issues_*":"allow"}"#;
+    let directory = config.repository.to_str().expect("repository path is not UTF-8");
+    let result = output(
+        Command::new(&config.opencode_binary)
+            .args([
+                "run",
+                "--model",
+                model,
+                "--agent",
+                &config.opencode_agent,
+                "--dir",
+                directory,
+                "--format",
+                "json",
+                "--title",
+                "Recipe issue review",
+                prompt,
+            ])
+            .env("OPENCODE_PERMISSION", permissions)
+            .env("OPENCODE_CONFIG", &config.opencode_config)
+            .current_dir(&config.repository),
+        None,
+    );
+    let stream = String::from_utf8_lossy(&result.stdout);
+    let response = jq_lines(&stream, "[.[] | select(.type == \"text\") | .part.text][-1]");
+    if !result.status.success() && response.is_err() {
+        return Err(failure(&result));
+    }
+    let mut json = response.and_then(object);
+    if json.is_err() {
+        let session = jq_lines(&stream, "[.[] | .sessionID][-1]")?;
+        trace(
+            config,
+            &format!("model={model} repairing structured output session={session}"),
+        );
+        let repair = output(
+            Command::new(&config.opencode_binary)
+                .args([
+                    "run",
+                    "--session",
+                    &session,
+                    "--model",
+                    model,
+                    "--agent",
+                    &config.opencode_agent,
+                    "--dir",
+                    directory,
+                    "--format",
+                    "json",
+                    "Return only one corrected JSON object matching the required schema. Do not repeat the investigation.",
+                ])
+                .env("OPENCODE_PERMISSION", permissions)
+                .env("OPENCODE_CONFIG", &config.opencode_config)
+                .current_dir(&config.repository),
+            None,
+        );
+        let repaired = String::from_utf8_lossy(&repair.stdout);
+        json = jq_lines(&repaired, "[.[] | select(.type == \"text\") | .part.text][-1]")
+            .and_then(object);
+    }
+    let json = json.map_err(|error| format!("{}; {error}", failure(&result)))?;
+    Ok(Decision {
+        provider: "OpenCode",
+        model: model.to_owned(),
+        effort: "default".to_owned(),
+        json,
+    })
+}
+
 fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
     loop {
-        display_reviewing(packet, &config.spark_model);
-        match spark(config, prompt) {
-            Ok(decision) => return decision,
-            Err(error) => trace(
-                config,
-                &format!("model={} unavailable error={error}", config.spark_model),
-            ),
-        }
-        display_reviewing(packet, &config.kimi_k3_model);
-        match kimi(config, "Kimi managed", &config.kimi_k3_model, prompt) {
-            Ok(decision) => return decision,
-            Err(error) => trace(
-                config,
-                &format!("model={} unavailable error={error}", config.kimi_k3_model),
-            ),
-        }
-        for model in &config.agy_models {
-            display_reviewing(packet, model);
-            match agy(config, model, prompt) {
+        {
+            let _provider = SPARK.get_or_init(|| Mutex::new(())).lock().expect("OpenAI provider lock is poisoned");
+            display_reviewing(packet, &config.spark_model);
+            match spark(config, prompt) {
                 Ok(decision) => return decision,
-                Err(error) => trace(config, &format!("model={model} unavailable error={error}")),
-            }
-        }
-        display_reviewing(packet, &config.kimi_deepseek_model);
-        match kimi(
-            config,
-            "DeepSeek through Kimi",
-            &config.kimi_deepseek_model,
-            prompt,
-        ) {
-            Ok(decision) => return decision,
-            Err(error) => trace(
-                config,
-                &format!(
-                    "model={} unavailable error={error}",
-                    config.kimi_deepseek_model
+                Err(error) => trace(
+                    config,
+                    &format!("model={} unavailable error={error}", config.spark_model),
                 ),
-            ),
+            }
+            display_reviewing(packet, "queued");
+        }
+        {
+            let _provider = KIMI.get_or_init(|| Mutex::new(())).lock().expect("Kimi provider lock is poisoned");
+            display_reviewing(packet, &config.kimi_k3_model);
+            match kimi(config, "Kimi managed", &config.kimi_k3_model, prompt) {
+                Ok(decision) => return decision,
+                Err(error) => trace(
+                    config,
+                    &format!("model={} unavailable error={error}", config.kimi_k3_model),
+                ),
+            }
+            display_reviewing(packet, "queued");
+        }
+        {
+            let _provider = OPENCODE.get_or_init(|| Mutex::new(())).lock().expect("OpenCode provider lock is poisoned");
+            for model in &config.opencode_models {
+                display_reviewing(packet, model);
+                match opencode(config, model, prompt) {
+                    Ok(decision) => return decision,
+                    Err(error) => trace(config, &format!("model={model} unavailable error={error}")),
+                }
+            }
+            display_reviewing(packet, "queued");
+        }
+        {
+            let _provider = AGY.get_or_init(|| Mutex::new(())).lock().expect("Antigravity provider lock is poisoned");
+            for model in &config.agy_models {
+                display_reviewing(packet, model);
+                match agy(config, model, prompt) {
+                    Ok(decision) => return decision,
+                    Err(error) => trace(config, &format!("model={model} unavailable error={error}")),
+                }
+            }
+            display_reviewing(packet, "queued");
+        }
+        {
+            let _provider = DEEPSEEK.get_or_init(|| Mutex::new(())).lock().expect("DeepSeek provider lock is poisoned");
+            display_reviewing(packet, &config.kimi_deepseek_model);
+            match kimi(
+                config,
+                "DeepSeek through Kimi",
+                &config.kimi_deepseek_model,
+                prompt,
+            ) {
+                Ok(decision) => return decision,
+                Err(error) => trace(
+                    config,
+                    &format!(
+                        "model={} unavailable error={error}",
+                        config.kimi_deepseek_model
+                    ),
+                ),
+            }
+            display_reviewing(packet, "queued");
         }
         trace(
             config,
@@ -921,20 +1038,7 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> Review {
     let schema =
         std::fs::read_to_string(&config.decision_schema).expect("cannot read decision schema");
     let prompt = format!("{instructions}\n\n## Failure packet\n\n{packet}\n\n## Required decision schema\n\n{schema}");
-    let performance = packet.starts_with("kind=performance\n");
-    let decision = if performance {
-        display_reviewing(packet, &config.kimi_k3_model);
-        match kimi(config, "Kimi managed", &config.kimi_k3_model, &prompt) {
-            Ok(decision) => decision,
-            Err(error) => {
-                trace(config, &format!("model={} unavailable error={error}", config.kimi_k3_model));
-                display_reviewing(packet, &format!("waiting for {}", config.kimi_k3_model));
-                return Review::Deferred;
-            }
-        }
-    } else {
-        classify(config, &prompt, packet)
-    };
+    let decision = classify(config, &prompt, packet);
     event(
         config,
         &format!(
@@ -1052,7 +1156,6 @@ fn dispatch_review(
                     persist_queue(&current.queue_path, &state.packets);
                 }
             }
-            Review::Deferred => {}
             Review::Stop => work.lock().expect("failure queue lock is poisoned").halted = true,
         }
     });
@@ -1143,7 +1246,7 @@ fn main() {
                 start
             };
             let reproduction = reproduction_path(&current, &device, start);
-            if worker_send.send(Discovery::Start { device: device.clone(), cursor: start, reproduction: reproduction.clone() }).is_err() {
+            if worker_send.send(Discovery::Start { device: device.clone(), cursor: start }).is_err() {
                 break;
             }
             let (result, timed_out) = trial(&current, &device, start, &reproduction, &worker_send);
@@ -1167,8 +1270,8 @@ fn main() {
     let mut completed = BTreeMap::new();
     for discovery in receive {
         let trial = match discovery {
-            Discovery::Start { device, cursor, reproduction } => {
-                display_start(&device, cursor, reproduction);
+            Discovery::Start { device, cursor } => {
+                display_start(&device, cursor);
                 continue;
             }
             Discovery::Slow(trial) => {

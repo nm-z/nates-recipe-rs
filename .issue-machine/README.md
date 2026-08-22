@@ -17,9 +17,10 @@ pending review queue remain saved in `machine.toml` and `queue.ogdl`.
 
 This machine continuously runs Recipe's exhaustive Cartesian traversal. It
 records every cursor result immediately and appends stable failures to one
-durable queue before advancing the cursor. One independent reviewer consumes
-that queue, so traversal continues while a model inspects an earlier failure.
-The first available classifier returns one schema-validated decision: create a
+durable queue before advancing the cursor. Reviewers traverse that queue while
+cursor discovery continues. Each provider runs at most one model request at a
+time, while different providers run concurrently. The first available
+classifier returns one schema-validated decision: create a
 `bug` issue, comment on an existing issue, or reject the composition.
 
 Independent discovery workers claim disjoint cursors from one allocator. The
@@ -33,9 +34,10 @@ The provider waterfall is:
 
 1. Codex Spark with xhigh reasoning
 2. Kimi K3
-3. Gemini 3.1 Pro High
-4. Gemini 3.7 Flash High
-5. DeepSeek V4 Pro 1M
+3. OpenCode free models in configured order
+4. Gemini 3.1 Pro High
+5. Gemini 3.7 Flash High
+6. DeepSeek V4 Pro 1M
 
 The machine uses each provider until that provider is unavailable. It does not
 wait for consensus. If every route is unavailable, the reviewer retains the
@@ -52,7 +54,7 @@ Every classifier can read the Recipe repository and call only two GitHub tools:
 
 The classifiers search issues on demand and read every plausible match in full.
 The machine does not preload, cache, summarize, or truncate the issue tree.
-Codex uses the project-scoped MCP configuration. Kimi uses
+Codex and OpenCode use project-scoped MCP configurations. Kimi uses
 `/home/nate/.kimi-code/mcp.json`. Antigravity uses the imported
 `recipe-issue-reader` plugin and a pre-tool hook that rejects mutation tools.
 
