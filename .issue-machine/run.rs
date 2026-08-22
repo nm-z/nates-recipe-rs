@@ -50,6 +50,7 @@ struct Config {
     resolver_poll_seconds: u64,
     provider_poll_seconds: u64,
     slow_cursor_seconds: u64,
+    trial_memory_mib: u64,
     discovery_devices: Vec<String>,
     seed: u64,
     cursor: u64,
@@ -153,6 +154,9 @@ fn config(path: &Path) -> Config {
         slow_cursor_seconds: value(&text, "slow_cursor_seconds")
             .parse()
             .expect("slow_cursor_seconds must be an unsigned integer"),
+        trial_memory_mib: value(&text, "trial_memory_mib")
+            .parse()
+            .expect("trial_memory_mib must be an unsigned integer"),
         discovery_devices: values(&text, "discovery_devices"),
         seed: value(&text, "seed")
             .parse()
@@ -705,9 +709,22 @@ fn trial(
     reproduction: &Path,
     send: &mpsc::Sender<Discovery>,
 ) -> (std::process::Output, bool) {
-    let mut command = Command::new("cargo");
+    let memory_bytes = config
+        .trial_memory_mib
+        .checked_mul(1024 * 1024)
+        .expect("trial_memory_mib exceeds the supported address-space limit");
+    let mut command = Command::new("prlimit");
     command
-        .args(["run", "--bin", "recipe", "--", "test.rs"])
+        .args([
+            &format!("--as={memory_bytes}"),
+            "--",
+            "cargo",
+            "run",
+            "--bin",
+            "recipe",
+            "--",
+            "test.rs",
+        ])
         .env("RECIPE_COMPOSITION_SEED", config.seed.to_string())
         .env("RECIPE_COMPOSITION_CURSOR", cursor.to_string())
         .env(
@@ -725,7 +742,7 @@ fn trial(
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     command.process_group(0);
-    let mut child = command.spawn().expect("cannot start Recipe traversal");
+    let mut child = command.spawn().expect("cannot start memory-bounded Recipe traversal");
     let mut child_stdout = child.stdout.take().expect("Recipe traversal stdout is absent");
     let mut child_stderr = child.stderr.take().expect("Recipe traversal stderr is absent");
     let stdout = std::thread::spawn(move || {

@@ -38,6 +38,11 @@ advances only across the contiguous completed cursor frontier. A crash can
 repeat unfinished work but cannot skip it. Every terminal record and failure
 packet identifies the backend that executed the cursor.
 
+Each traversal process has the configured `trial_memory_mib` address-space
+limit. A composition that exceeds that limit fails through the same public
+process boundary and enters the normal review queue instead of exhausting the
+host and terminating the machine.
+
 The machine runs each model up to its configured concurrency limit. Ox Alpha,
 whose current catalog key is `opencode/x-preview-f-free`, runs up to 20
 requests concurrently. Every other OpenCode model runs one request at a time.

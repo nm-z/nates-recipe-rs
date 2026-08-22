@@ -32,6 +32,7 @@ resolver_worktree_root = "/tmp"
 resolver_poll_seconds = 60
 provider_poll_seconds = 60
 slow_cursor_seconds = 60
+trial_memory_mib = 4096
 discovery_devices = "amd0,cpu"
 seed = 0
 cursor = 108
