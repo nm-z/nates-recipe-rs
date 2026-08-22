@@ -379,13 +379,9 @@ fn classify_with(config: &Config, packet: &str, classifier: &str, run: impl FnOn
     match run() {
         Ok(decision) => Some(decision),
         Err(error) => {
-            if usage_exhausted(&error) {
-                let reset = reset_after(&error);
-                COOLDOWNS.get_or_init(|| Mutex::new(BTreeMap::new())).lock().expect("cooldown lock is poisoned").insert(classifier.to_owned(), reset.map(|duration| Instant::now() + duration));
-                trace(config, &format!("model={classifier} usage exhausted reset_seconds={}", reset.map_or_else(|| "machine-run".to_owned(), |duration| duration.as_secs().to_string())));
-            } else {
-                trace(config, &format!("model={classifier} unavailable error={error}"));
-            }
+            let reset = reset_after(&error);
+            COOLDOWNS.get_or_init(|| Mutex::new(BTreeMap::new())).lock().expect("cooldown lock is poisoned").insert(classifier.to_owned(), reset.map(|duration| Instant::now() + duration));
+            trace(config, &format!("model={classifier} unavailable reset_seconds={} error={error}", reset.map_or_else(|| "machine-run".to_owned(), |duration| duration.as_secs().to_string())));
             display_reviewing(packet, "queued");
             None
         }
