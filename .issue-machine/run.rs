@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const RED: &str = "\x1b[38;2;255;92;122m";
@@ -11,6 +11,7 @@ const YELLOW: &str = "\x1b[38;2;229;192;123m";
 const GREEN: &str = "\x1b[38;2;86;214;169m";
 const BLUE: &str = "\x1b[38;2;97;175;239m";
 const MUTED: &str = "\x1b[38;2;125;133;144m";
+const TIME: &str = "\x1b[38;2;255;194;0m";
 const RESET: &str = "\x1b[0m";
 const SHELL_SIGNAL_OFFSET: i32 = 128;
 
@@ -150,6 +151,84 @@ enum Review {
     Stop,
 }
 
+struct Active {
+    cursor: u64,
+    started: Instant,
+    reproduction: PathBuf,
+    composition: Option<String>,
+}
+
+#[derive(Default)]
+struct Display {
+    active: BTreeMap<String, Active>,
+    rows: usize,
+}
+
+static DISPLAY: OnceLock<Mutex<Display>> = OnceLock::new();
+
+fn display() -> &'static Mutex<Display> { DISPLAY.get_or_init(|| Mutex::new(Display::default())) }
+
+fn display_clear(display: &mut Display) {
+    eprint!("\x1b[s");
+    for _ in 0..display.rows {
+        eprint!("\r\x1b[2K\n")
+    }
+    eprint!("\x1b[u");
+    display.rows = 0;
+}
+
+fn elapsed(started: Instant) -> String {
+    let seconds = started.elapsed().as_secs_f64();
+    if seconds < 1.0 {
+        format!("{:>7.3} ms", seconds * 1000.0)
+    } else {
+        format!("{seconds:>8.4} s")
+    }
+}
+
+fn display_render(display: &mut Display) {
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    display_clear(display);
+    eprint!("\x1b[s");
+    for (device, active) in &mut display.active {
+        if active.composition.is_none() {
+            active.composition = std::fs::read_to_string(&active.reproduction).ok().and_then(|source| {
+                source.lines().find_map(|line| line.trim().strip_prefix(".seed(")?.strip_suffix(')').map(str::to_owned))
+            });
+        }
+        let color = if device == "cpu" { GREEN } else { BLUE };
+        let composition = active.composition.as_deref().unwrap_or("staging");
+        eprintln!("{color}{device:<8}{RESET} cursor={:<6}  {MUTED}time{RESET} {TIME}{}{RESET}  composition={composition}", active.cursor, elapsed(active.started));
+        display.rows += 1;
+    }
+    eprint!("\x1b[u");
+    std::io::stderr().flush().expect("cannot draw machine status");
+}
+
+fn display_start(device: &str, cursor: u64, reproduction: PathBuf) {
+    let mut display = display().lock().expect("display lock is poisoned");
+    display.active.insert(device.to_owned(), Active { cursor, started: Instant::now(), reproduction, composition: None });
+    display_render(&mut display);
+}
+
+fn display_stop(device: &str) {
+    let mut display = display().lock().expect("display lock is poisoned");
+    display.active.remove(device);
+    display_render(&mut display);
+}
+
+fn display_clock() {
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_secs(1));
+        display_render(&mut display().lock().expect("display lock is poisoned"));
+    });
+}
+
 fn queued(text: &str) -> VecDeque<String> {
     let mut packets = text.split("RECIPE QUEUED FAILURE BEGIN\n")
         .skip(1)
@@ -219,14 +298,13 @@ fn output(command: &mut Command, input: Option<&str>) -> std::process::Output {
         .expect("cannot read command output")
 }
 
-fn event(config: &Config, color: &str, message: &str) {
+fn event(config: &Config, _color: &str, message: &str) {
     let time = Command::new("date")
-        .arg("+%Y-%m-%d %H:%M:%S\t%I:%M:%S %p")
+        .arg("+%Y-%m-%d %H:%M:%S")
         .output()
         .expect("cannot read event time");
     let timestamp = String::from_utf8_lossy(&time.stdout);
-    let (timestamp, display_time) = timestamp.trim().split_once('\t').expect("event time has no display clock");
-    let display_time = display_time.trim_start_matches('0');
+    let timestamp = timestamp.trim();
     let line = format!("{timestamp} {message}\n");
     std::fs::OpenOptions::new()
         .create(true)
@@ -235,8 +313,6 @@ fn event(config: &Config, color: &str, message: &str) {
         .expect("cannot open machine log")
         .write_all(line.as_bytes())
         .expect("cannot write machine log");
-    let (event, details) = message.split_once(' ').unwrap_or((message, ""));
-    eprintln!("{MUTED}{display_time}{RESET}  {color}{event:<8}{RESET} {details}");
 }
 
 fn trace(config: &Config, message: &str) {
@@ -834,6 +910,7 @@ fn main() {
         .to_owned();
     let path = directory.join("machine.toml");
     let initial = config(&path);
+    display_clock();
     let pending = std::fs::read_to_string(&initial.queue_path)
         .map(|text| queued(&text))
         .unwrap_or_default();
@@ -930,6 +1007,7 @@ fn main() {
                 start
             };
             let reproduction = reproduction_path(&current, &device, start);
+            display_start(&device, start, reproduction.clone());
             let result = trial(&current, &device, start, &reproduction, &worker_send);
             if worker_send
                 .send(Discovery::Complete(Trial {
@@ -967,7 +1045,10 @@ fn main() {
                 }
                 continue;
             }
-            Discovery::Complete(trial) => trial,
+            Discovery::Complete(trial) => {
+                display_stop(&trial.device);
+                trial
+            }
         };
         let text = format!(
             "{}{}",
