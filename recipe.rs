@@ -663,7 +663,8 @@ pub struct NormalizeReverseContext<'a> {
 	pub value_type: &'a str,
 	pub pointer_type: &'a str,
 	pub alignment: usize,
-	pub zero: &'a str,
+	pub state_type: &'a str,
+	pub state_zero: &'a str,
 	pub context: &'a str,
 	pub rows: &'a str,
 	pub channels: usize,
@@ -677,6 +678,10 @@ pub struct NormalizeReverseFragment {
 	pub contribution: String,
 }
 
+/// Accumulate each group's delta sum and delta-output projection in the state
+/// format, like the loss reduction, and store them as per-item means in the
+/// model format. Batch groups span every row, so the raw counts and sums can
+/// exceed the finite range of narrow model formats; the means cannot.
 pub fn emit_normalize_reverse_stats(context: NormalizeReverseContext<'_>, delta: &str, output_value: &str) -> String {
 	let mut code = String::new();
 	let elements = context.channels * context.length;
@@ -704,8 +709,8 @@ pub fn emit_normalize_reverse_stats(context: NormalizeReverseContext<'_>, delta:
 	let _ = writeln!(code, "br i1 %{prefix}.group.more, label %{prefix}.item.loop, label %{prefix}.done");
 	let _ = writeln!(code, "{prefix}.item.loop:");
 	let _ = writeln!(code, "%{prefix}.p = phi i32 [ 0, %{prefix}.group.loop ], [ %{prefix}.p.next, %{prefix}.item.step ]");
-	let _ = writeln!(code, "%{prefix}.sum = phi {ty} [ {zero}, %{prefix}.group.loop ], [ %{prefix}.sum.next, %{prefix}.item.step ]", ty = context.value_type, zero = context.zero);
-	let _ = writeln!(code, "%{prefix}.projected = phi {ty} [ {zero}, %{prefix}.group.loop ], [ %{prefix}.projected.next, %{prefix}.item.step ]", ty = context.value_type, zero = context.zero);
+	let _ = writeln!(code, "%{prefix}.sum = phi {ty} [ {zero}, %{prefix}.group.loop ], [ %{prefix}.sum.next, %{prefix}.item.step ]", ty = context.state_type, zero = context.state_zero);
+	let _ = writeln!(code, "%{prefix}.projected = phi {ty} [ {zero}, %{prefix}.group.loop ], [ %{prefix}.projected.next, %{prefix}.item.step ]", ty = context.state_type, zero = context.state_zero);
 	let _ = writeln!(code, "%{prefix}.item.more = icmp ult i32 %{prefix}.p, {items}");
 	let _ = writeln!(code, "br i1 %{prefix}.item.more, label %{prefix}.item.step, label %{prefix}.store");
 	let _ = writeln!(code, "{prefix}.item.step:");
@@ -728,26 +733,33 @@ pub fn emit_normalize_reverse_stats(context: NormalizeReverseContext<'_>, delta:
 	let _ = writeln!(code, "%{prefix}.index = add i32 %{prefix}.row.base, %{prefix}.local");
 	let _ = writeln!(code, "%{prefix}.delta.ptr = getelementptr inbounds {ty}, {ptrty} {delta}, i32 %{prefix}.index", ty = context.value_type, ptrty = context.pointer_type);
 	let _ = writeln!(code, "%{prefix}.output.ptr = getelementptr inbounds {ty}, {ptrty} {output}, i32 %{prefix}.index", ty = context.value_type, ptrty = context.pointer_type, output = output_value);
-	let _ = writeln!(code, "%{prefix}.delta = load {ty}, {ptrty} %{prefix}.delta.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
-	let _ = writeln!(code, "%{prefix}.output = load {ty}, {ptrty} %{prefix}.output.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+	let _ = writeln!(code, "%{prefix}.delta.model = load {ty}, {ptrty} %{prefix}.delta.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+	let _ = writeln!(code, "%{prefix}.output.model = load {ty}, {ptrty} %{prefix}.output.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+	let _ = writeln!(code, "%{prefix}.delta = call {state} @recipe.state.from.model({ty} %{prefix}.delta.model)", state = context.state_type, ty = context.value_type);
+	let _ = writeln!(code, "%{prefix}.output = call {state} @recipe.state.from.model({ty} %{prefix}.output.model)", state = context.state_type, ty = context.value_type);
 	if context.mode == NormalizeMode::Rms {
-		let _ = writeln!(code, "%{prefix}.sum.next = call {ty} @recipe.add({ty} %{prefix}.sum, {ty} {zero})", ty = context.value_type, zero = context.zero);
+		let _ = writeln!(code, "%{prefix}.sum.next = call {ty} @recipe.state.add({ty} %{prefix}.sum, {ty} {zero})", ty = context.state_type, zero = context.state_zero);
 	} else {
-		let _ = writeln!(code, "%{prefix}.sum.next = call {ty} @recipe.add({ty} %{prefix}.sum, {ty} %{prefix}.delta)", ty = context.value_type);
+		let _ = writeln!(code, "%{prefix}.sum.next = call {ty} @recipe.state.add({ty} %{prefix}.sum, {ty} %{prefix}.delta)", ty = context.state_type);
 	}
-	let _ = writeln!(code, "%{prefix}.projection = call {ty} @recipe.mul({ty} %{prefix}.delta, {ty} %{prefix}.output)", ty = context.value_type);
-	let _ = writeln!(code, "%{prefix}.projected.next = call {ty} @recipe.add({ty} %{prefix}.projected, {ty} %{prefix}.projection)", ty = context.value_type);
+	let _ = writeln!(code, "%{prefix}.projection = call {ty} @recipe.state.mul({ty} %{prefix}.delta, {ty} %{prefix}.output)", ty = context.state_type);
+	let _ = writeln!(code, "%{prefix}.projected.next = call {ty} @recipe.state.add({ty} %{prefix}.projected, {ty} %{prefix}.projection)", ty = context.state_type);
 	let _ = writeln!(code, "%{prefix}.p.next = add i32 %{prefix}.p, 1");
 	let _ = writeln!(code, "br label %{prefix}.item.loop");
 	let _ = writeln!(code, "{prefix}.store:");
+	let _ = writeln!(code, "%{prefix}.items.value = call {ty} @recipe.state.from.u32(i32 {items})", ty = context.state_type);
+	let _ = writeln!(code, "%{prefix}.sum.mean = call {ty} @recipe.state.div({ty} %{prefix}.sum, {ty} %{prefix}.items.value)", ty = context.state_type);
+	let _ = writeln!(code, "%{prefix}.projected.mean = call {ty} @recipe.state.div({ty} %{prefix}.projected, {ty} %{prefix}.items.value)", ty = context.state_type);
+	let _ = writeln!(code, "%{prefix}.sum.model = call {ty} @recipe.model.from.state({state} %{prefix}.sum.mean)", ty = context.value_type, state = context.state_type);
+	let _ = writeln!(code, "%{prefix}.projected.model = call {ty} @recipe.model.from.state({state} %{prefix}.projected.mean)", ty = context.value_type, state = context.state_type);
 	let _ = writeln!(code, "%{prefix}.sum.base = mul i32 {groups}, 2");
 	let _ = writeln!(code, "%{prefix}.projected.base = mul i32 {groups}, 3");
 	let _ = writeln!(code, "%{prefix}.sum.index = add i32 %{prefix}.sum.base, {group}");
 	let _ = writeln!(code, "%{prefix}.projected.index = add i32 %{prefix}.projected.base, {group}");
 	let _ = writeln!(code, "%{prefix}.sum.ptr = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i32 %{prefix}.sum.index", ty = context.value_type, ptrty = context.pointer_type, context_ptr = context.context);
 	let _ = writeln!(code, "%{prefix}.projected.ptr = getelementptr inbounds {ty}, {ptrty} {context_ptr}, i32 %{prefix}.projected.index", ty = context.value_type, ptrty = context.pointer_type, context_ptr = context.context);
-	let _ = writeln!(code, "store {ty} %{prefix}.sum, {ptrty} %{prefix}.sum.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
-	let _ = writeln!(code, "store {ty} %{prefix}.projected, {ptrty} %{prefix}.projected.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+	let _ = writeln!(code, "store {ty} %{prefix}.sum.model, {ptrty} %{prefix}.sum.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
+	let _ = writeln!(code, "store {ty} %{prefix}.projected.model, {ptrty} %{prefix}.projected.ptr, align {align}", ty = context.value_type, ptrty = context.pointer_type, align = context.alignment);
 	let _ = writeln!(code, "%{prefix}.group.next = add i32 {group}, %threads");
 	let _ = writeln!(code, "br label %{prefix}.group.loop");
 	let _ = writeln!(code, "{prefix}.done:");
@@ -755,9 +767,11 @@ pub fn emit_normalize_reverse_stats(context: NormalizeReverseContext<'_>, delta:
 }
 
 /// Emit the fixed reverse formula for a normalized element. In training modes
-/// the stats pass must have populated `sum[group]` and `projected[group]` in
-/// the context arena. Evaluation uses stored scale directly because its stats
-/// are not differentiated.
+/// the stats pass must have populated the per-item delta mean and projection
+/// mean for each group in the context arena; keeping the group reductions as
+/// means bounds them by the item magnitudes, so no batch-sized count or sum
+/// ever has to be representable in the model arithmetic format. Evaluation
+/// uses stored scale directly because its stats are not differentiated.
 pub fn emit_normalize_reverse(context: NormalizeReverseContext<'_>, element: &str, delta: &str, output_value: &str) -> NormalizeReverseFragment {
 	let mut code = String::new();
 	let elements = context.channels * context.length;
@@ -767,7 +781,6 @@ pub fn emit_normalize_reverse(context: NormalizeReverseContext<'_>, element: &st
 	let position = format!("%{}.normalize.reverse.position", context.prefix);
 	let group = format!("%{}.normalize.reverse.group", context.prefix);
 	let groups = format!("%{}.normalize.reverse.groups", context.prefix);
-	let items = format!("%{}.normalize.reverse.items", context.prefix);
 	let scale_index = format!("%{}.normalize.reverse.scale.index", context.prefix);
 	let sum_base = format!("%{}.normalize.reverse.sum.base", context.prefix);
 	let projected_base = format!("%{}.normalize.reverse.projected.base", context.prefix);
@@ -788,14 +801,12 @@ pub fn emit_normalize_reverse(context: NormalizeReverseContext<'_>, element: &st
 			let _ = writeln!(code, "{channel} = udiv i32 {local}, {length}");
 			let _ = writeln!(code, "{group} = add i32 {channel}, 0");
 			let _ = writeln!(code, "{groups} = add i32 0, {channels}", channels = context.channels);
-			let _ = writeln!(code, "{items} = mul i32 {rows}, {length}", rows = context.rows);
 		}
 		NormalizeMode::Layer | NormalizeMode::Rms => {
 			let row_base = format!("%{}.normalize.reverse.row.base", context.prefix);
 			let _ = writeln!(code, "{row_base} = mul i32 {row}, {length}");
 			let _ = writeln!(code, "{group} = add i32 {row_base}, {position}");
 			let _ = writeln!(code, "{groups} = mul i32 {rows}, {length}", rows = context.rows);
-			let _ = writeln!(code, "{items} = add i32 0, {channels}", channels = context.channels);
 		}
 	}
 	let _ = writeln!(code, "{scale_index} = add i32 {groups}, {group}");
@@ -815,20 +826,14 @@ pub fn emit_normalize_reverse(context: NormalizeReverseContext<'_>, element: &st
 	}
 	let _ = writeln!(code, "{sum} = load {ty}, {ptrty} {sum_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
 	let _ = writeln!(code, "{projected} = load {ty}, {ptrty} {projected_pointer}, align {align}", ty = context.value_type, ptrty = context.pointer_type);
-	let items_value = format!("%{}.normalize.reverse.items.value", context.prefix);
-	let scaled_delta = format!("%{}.normalize.reverse.scaled.delta", context.prefix);
 	let output_projection = format!("%{}.normalize.reverse.output.projection", context.prefix);
 	let centered = format!("%{}.normalize.reverse.centered", context.prefix);
 	let numerator = format!("%{}.normalize.reverse.numerator", context.prefix);
-	let scaled = format!("%{}.normalize.reverse.scaled", context.prefix);
 	let contribution = format!("%{}.normalize.reverse.contribution", context.prefix);
-	let _ = writeln!(code, "{items_value} = call {ty} @recipe.from.u32(i32 {items})", ty = context.value_type);
-	let _ = writeln!(code, "{scaled_delta} = call {ty} @recipe.mul({ty} {items_value}, {ty} {delta})", ty = context.value_type);
 	let _ = writeln!(code, "{output_projection} = call {ty} @recipe.mul({ty} {output_value}, {ty} {projected})", ty = context.value_type);
-	let _ = writeln!(code, "{centered} = call {ty} @recipe.sub({ty} {scaled_delta}, {ty} {sum})", ty = context.value_type);
+	let _ = writeln!(code, "{centered} = call {ty} @recipe.sub({ty} {delta}, {ty} {sum})", ty = context.value_type);
 	let _ = writeln!(code, "{numerator} = call {ty} @recipe.sub({ty} {centered}, {ty} {output_projection})", ty = context.value_type);
-	let _ = writeln!(code, "{scaled} = call {ty} @recipe.mul({ty} {scale}, {ty} {numerator})", ty = context.value_type);
-	let _ = writeln!(code, "{contribution} = call {ty} @recipe.div({ty} {scaled}, {ty} {items_value})", ty = context.value_type);
+	let _ = writeln!(code, "{contribution} = call {ty} @recipe.mul({ty} {scale}, {ty} {numerator})", ty = context.value_type);
 	NormalizeReverseFragment { code, contribution }
 }
 
@@ -2091,8 +2096,8 @@ impl NativeModelIr {
 					let prefix = format!("n{index}.normalize.reverse");
 					if mode != program_ir::NormalizeMode::Evaluation {
 						let stats_prefix = format!("{prefix}.stats");
-						let zero = native_literal(self.precision.model, ty, 0.0);
-						ir.push_str(&program_ir::emit_normalize_reverse_stats(program_ir::NormalizeReverseContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), zero: &zero, context: &pointers.context, rows: "%rows", channels: node.output.channels, length: node.output.length, mode, prefix: &stats_prefix }, &pointers.delta, &pointers.value));
+						let state_zero = native_literal(self.precision.state, self.precision.state_type, 0.0);
+						ir.push_str(&program_ir::emit_normalize_reverse_stats(program_ir::NormalizeReverseContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), state_type: self.precision.state_type, state_zero: &state_zero, context: &pointers.context, rows: "%rows", channels: node.output.channels, length: node.output.length, mode, prefix: &stats_prefix }, &pointers.delta, &pointers.value));
 						ir.push_str(barrier(backend));
 					}
 					emit_fixed_loop(&mut ir, index, "normalize.reverse", count, |ir, p| {
@@ -2101,8 +2106,8 @@ impl NativeModelIr {
 						let output_pointer = format!("%{prefix}.output.ptr");
 						let output_value = format!("%{prefix}.output.value");
 						ir.push_str(&format!("{delta_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i32 {p}\n{delta_value} = load {ty}, {pointer} {delta_pointer}, align {align}\n{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i32 {p}\n{output_value} = load {ty}, {pointer} {output_pointer}, align {align}\n", delta = pointers.delta, value = pointers.value, align = alignment(ty)));
-						let zero = native_literal(self.precision.model, ty, 0.0);
-						let fragment = program_ir::emit_normalize_reverse(program_ir::NormalizeReverseContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), zero: &zero, context: &pointers.context, rows: "%rows", channels: node.output.channels, length: node.output.length, mode, prefix: &prefix }, p, &delta_value, &output_value);
+						let state_zero = native_literal(self.precision.state, self.precision.state_type, 0.0);
+						let fragment = program_ir::emit_normalize_reverse(program_ir::NormalizeReverseContext { value_type: ty, pointer_type: pointer, alignment: alignment(ty), state_type: self.precision.state_type, state_zero: &state_zero, context: &pointers.context, rows: "%rows", channels: node.output.channels, length: node.output.length, mode, prefix: &prefix }, p, &delta_value, &output_value);
 						ir.push_str(&fragment.code);
 						let source_pointer = format!("%{prefix}.source.adjoint.ptr");
 						ir.push_str(&format!("{source_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i32 {p}\n", source_adjoint = pointers.source_adjoint));
@@ -2115,17 +2120,24 @@ impl NativeModelIr {
 		Ok(ir)
 	}
 
+	// Group statistics are reductions over the batch, like the loss, so they
+	// accumulate in the state format and only the finished mean and scale are
+	// encoded into the model format for the context arena. Batch groups span
+	// every row, and neither their item count nor their running sums fit the
+	// finite range of narrow model formats.
 	fn emit_normalize_stats(&self, backend: Backend, index: usize, node: &Node, pointers: &ModelPointers, mode: program_ir::NormalizeMode) -> Result<String> {
 		let pointer = pointer_type(backend);
 		let ty = self.precision.model_type;
+		let state_ty = self.precision.state_type;
 		let prefix = format!("n{index}.normalize.stats");
 		let elements = i32::try_from(node.output.elements()).map_err(|_| RecipeError::new("normalization element count exceeds i32"))?;
 		let length = i32::try_from(node.output.length).map_err(|_| RecipeError::new("normalization length exceeds i32"))?;
 		let channels = i32::try_from(node.output.channels).map_err(|_| RecipeError::new("normalization channels exceed i32"))?;
 		let mut ir = String::new();
-		let zero = native_literal(self.precision.model, ty, 0.0);
-		let one = native_literal(self.precision.model, ty, 1.0);
-		let epsilon = native_literal(self.precision.model, ty, node.argument[1]);
+		let model_zero = native_literal(self.precision.model, ty, 0.0);
+		let zero = native_literal(self.precision.state, state_ty, 0.0);
+		let one = native_literal(self.precision.state, state_ty, 1.0);
+		let epsilon = native_literal(self.precision.state, state_ty, node.argument[1]);
 		let groups = format!("%{prefix}.groups");
 		let items = format!("%{prefix}.items");
 		match mode {
@@ -2160,14 +2172,14 @@ impl NativeModelIr {
 				program_ir::NormalizeMode::Evaluation => unreachable!(),
 			}
 		};
-		ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.group.loop\n{prefix}.group.loop:\n{group} = phi i32 [ %tid, %{prefix}.entry ], [ %{prefix}.group.next, %{prefix}.store ]\n%{prefix}.group.more = icmp ult i32 {group}, {group_limit}\nbr i1 %{prefix}.group.more, label %{prefix}.mean.loop, label %{prefix}.done\n{prefix}.mean.loop:\n%{prefix}.mean.p = phi i32 [ 0, %{prefix}.group.loop ], [ %{prefix}.mean.next, %{prefix}.mean.step ]\n%{prefix}.mean.sum = phi {ty} [ {zero}, %{prefix}.group.loop ], [ %{prefix}.mean.sum.next, %{prefix}.mean.step ]\n%{prefix}.mean.more = icmp ult i32 %{prefix}.mean.p, {items}\nbr i1 %{prefix}.mean.more, label %{prefix}.mean.step, label %{prefix}.variance.loop\n{prefix}.mean.step:\n", group = group, group_limit = group_limit, ty = ty, zero = zero, items = items));
+		ir.push_str(&format!("br label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.group.loop\n{prefix}.group.loop:\n{group} = phi i32 [ %tid, %{prefix}.entry ], [ %{prefix}.group.next, %{prefix}.store ]\n%{prefix}.group.more = icmp ult i32 {group}, {group_limit}\nbr i1 %{prefix}.group.more, label %{prefix}.mean.loop, label %{prefix}.done\n{prefix}.mean.loop:\n%{prefix}.mean.p = phi i32 [ 0, %{prefix}.group.loop ], [ %{prefix}.mean.next, %{prefix}.mean.step ]\n%{prefix}.mean.sum = phi {ty} [ {zero}, %{prefix}.group.loop ], [ %{prefix}.mean.sum.next, %{prefix}.mean.step ]\n%{prefix}.mean.more = icmp ult i32 %{prefix}.mean.p, {items}\nbr i1 %{prefix}.mean.more, label %{prefix}.mean.step, label %{prefix}.variance.loop\n{prefix}.mean.step:\n", group = group, group_limit = group_limit, ty = state_ty, zero = zero, items = items));
 		emit_index(&mut ir, "mean", &format!("%{prefix}.mean.p"));
-		ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i32 %{prefix}.mean.index\n%{prefix}.mean.value = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.sum.next = call {ty} @recipe.add({ty} %{prefix}.mean.sum, {ty} %{prefix}.mean.value)\n%{prefix}.mean.next = add i32 %{prefix}.mean.p, 1\nbr label %{prefix}.mean.loop\n{prefix}.variance.loop:\n%{prefix}.variance.p = phi i32 [ 0, %{prefix}.mean.loop ], [ %{prefix}.variance.next, %{prefix}.variance.step ]\n%{prefix}.variance.sum = phi {ty} [ {zero}, %{prefix}.mean.loop ], [ %{prefix}.variance.sum.next, %{prefix}.variance.step ]\n%{prefix}.items.value = call {ty} @recipe.from.u32(i32 {items})\n%{prefix}.mean = call {ty} @recipe.div({ty} %{prefix}.mean.sum, {ty} %{prefix}.items.value)\n%{prefix}.variance.more = icmp ult i32 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label %{prefix}.store\n{prefix}.variance.step:\n", pointer = pointer, source = pointers.source, ty = ty, zero = zero, items = items, align = alignment(ty)));
+		ir.push_str(&format!("%{prefix}.mean.ptr = getelementptr inbounds {ty}, {pointer} {source}, i32 %{prefix}.mean.index\n%{prefix}.mean.model = load {ty}, {pointer} %{prefix}.mean.ptr, align {align}\n%{prefix}.mean.value = call {state_ty} @recipe.state.from.model({ty} %{prefix}.mean.model)\n%{prefix}.mean.sum.next = call {state_ty} @recipe.state.add({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.mean.value)\n%{prefix}.mean.next = add i32 %{prefix}.mean.p, 1\nbr label %{prefix}.mean.loop\n{prefix}.variance.loop:\n%{prefix}.variance.p = phi i32 [ 0, %{prefix}.mean.loop ], [ %{prefix}.variance.next, %{prefix}.variance.step ]\n%{prefix}.variance.sum = phi {state_ty} [ {zero}, %{prefix}.mean.loop ], [ %{prefix}.variance.sum.next, %{prefix}.variance.step ]\n%{prefix}.items.value = call {state_ty} @recipe.state.from.u32(i32 {items})\n%{prefix}.mean = call {state_ty} @recipe.state.div({state_ty} %{prefix}.mean.sum, {state_ty} %{prefix}.items.value)\n%{prefix}.variance.more = icmp ult i32 %{prefix}.variance.p, {items}\nbr i1 %{prefix}.variance.more, label %{prefix}.variance.step, label %{prefix}.store\n{prefix}.variance.step:\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, zero = zero, items = items, align = alignment(ty)));
 		emit_index(&mut ir, "variance", &format!("%{prefix}.variance.p"));
-		ir.push_str(&format!("%{prefix}.variance.ptr = getelementptr inbounds {ty}, {pointer} {source}, i32 %{prefix}.variance.index\n%{prefix}.variance.value = load {ty}, {pointer} %{prefix}.variance.ptr, align {align}\n%{prefix}.variance.centered = call {ty} @recipe.sub({ty} %{prefix}.variance.value, {ty} %{prefix}.mean)\n", pointer = pointer, source = pointers.source, ty = ty, align = alignment(ty)));
+		ir.push_str(&format!("%{prefix}.variance.ptr = getelementptr inbounds {ty}, {pointer} {source}, i32 %{prefix}.variance.index\n%{prefix}.variance.model = load {ty}, {pointer} %{prefix}.variance.ptr, align {align}\n%{prefix}.variance.value = call {state_ty} @recipe.state.from.model({ty} %{prefix}.variance.model)\n%{prefix}.variance.centered = call {state_ty} @recipe.state.sub({state_ty} %{prefix}.variance.value, {state_ty} %{prefix}.mean)\n", pointer = pointer, source = pointers.source, ty = ty, state_ty = state_ty, align = alignment(ty)));
 		let difference = if mode == program_ir::NormalizeMode::Rms { format!("%{prefix}.variance.value") } else { format!("%{prefix}.variance.centered") };
-		ir.push_str(&format!("%{prefix}.variance.square = call {ty} @recipe.mul({ty} {difference}, {ty} {difference})\n%{prefix}.variance.sum.next = call {ty} @recipe.add({ty} %{prefix}.variance.sum, {ty} %{prefix}.variance.square)\n%{prefix}.variance.next = add i32 %{prefix}.variance.p, 1\nbr label %{prefix}.variance.loop\n{prefix}.store:\n%{prefix}.variance = call {ty} @recipe.div({ty} %{prefix}.variance.sum, {ty} %{prefix}.items.value)\n%{prefix}.adjusted = call {ty} @recipe.add({ty} %{prefix}.variance, {ty} {epsilon})\n%{prefix}.deviation = call {ty} @recipe.sqrt({ty} %{prefix}.adjusted)\n%{prefix}.scale = call {ty} @recipe.div({ty} {one}, {ty} %{prefix}.deviation)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i32 {group}\n%{prefix}.scale.index = add i32 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i32 %{prefix}.scale.index\n", pointer = pointer, context = pointers.context, ty = ty, epsilon = epsilon, one = one, group = group, group_limit = group_limit));
-		let stored_mean = if mode == program_ir::NormalizeMode::Rms { zero.clone() } else { format!("%{prefix}.mean") };
+		ir.push_str(&format!("%{prefix}.variance.square = call {state_ty} @recipe.state.mul({state_ty} {difference}, {state_ty} {difference})\n%{prefix}.variance.sum.next = call {state_ty} @recipe.state.add({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.variance.square)\n%{prefix}.variance.next = add i32 %{prefix}.variance.p, 1\nbr label %{prefix}.variance.loop\n{prefix}.store:\n%{prefix}.variance = call {state_ty} @recipe.state.div({state_ty} %{prefix}.variance.sum, {state_ty} %{prefix}.items.value)\n%{prefix}.adjusted = call {state_ty} @recipe.state.add({state_ty} %{prefix}.variance, {state_ty} {epsilon})\n%{prefix}.deviation = call {state_ty} @recipe.state.sqrt({state_ty} %{prefix}.adjusted)\n%{prefix}.scale.state = call {state_ty} @recipe.state.div({state_ty} {one}, {state_ty} %{prefix}.deviation)\n%{prefix}.mean.stored = call {ty} @recipe.model.from.state({state_ty} %{prefix}.mean)\n%{prefix}.scale = call {ty} @recipe.model.from.state({state_ty} %{prefix}.scale.state)\n%{prefix}.mean.context.ptr = getelementptr inbounds {ty}, {pointer} {context}, i32 {group}\n%{prefix}.scale.index = add i32 {group_limit}, {group}\n%{prefix}.scale.ptr = getelementptr inbounds {ty}, {pointer} {context}, i32 %{prefix}.scale.index\n", pointer = pointer, context = pointers.context, ty = ty, state_ty = state_ty, epsilon = epsilon, one = one, group = group, group_limit = group_limit));
+		let stored_mean = if mode == program_ir::NormalizeMode::Rms { model_zero.clone() } else { format!("%{prefix}.mean.stored") };
 		ir.push_str(&format!("store {ty} {stored_mean}, {pointer} %{prefix}.mean.context.ptr, align {align}\nstore {ty} %{prefix}.scale, {pointer} %{prefix}.scale.ptr, align {align}\n%{prefix}.group.next = add i32 {group}, %threads\nbr label %{prefix}.group.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, stored_mean = stored_mean, align = alignment(ty), group = group));
 		Ok(ir)
 	}
@@ -3593,7 +3605,7 @@ impl Model {
 	fn gru(width: usize) = Operation::Gru(width);
 	fn lstm(width: usize) = Operation::Lstm(width);
 	fn perc(width: usize) = Operation::Perceptron(width); }
-	pub fn residual<const N: usize>(&self, parts: [Residual; N]) -> Self { self.push(Operation::Residual(parts.into())) }
+	pub fn res<const N: usize>(&self, parts: [Residual; N]) -> Self { self.push(Operation::Residual(parts.into())) }
 	pub fn moe<const N: usize>(&self, top_k: usize, experts: [Residual; N]) -> Self { self.push(Operation::Moe(top_k, experts.into())) }
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
 		let mut model = self.clone();
@@ -4911,7 +4923,7 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 	}
 	Ok(())
 }
-fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config, initialize: bool) -> Result<Graph> {
+fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config, initialize: bool) -> Result<Graph> {
 	require(!model.blocks.is_empty(), "model must contain a block")?;
 	if let Some(format) = model.blocks.iter().map(|block| StorageFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
 		return Err(format.unavailable());
@@ -4922,7 +4934,7 @@ fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, confi
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
 		graph.block_kind = block.operation.name();
-		lower_block(&mut graph, block, model.blocks.len(), data, rows, gpu, config)?;
+		lower_block(&mut graph, block, model.blocks.len(), data, targets, rows, gpu, config)?;
 	}
 	let mut output_profile = model.blocks.last().filter(|block| block.profile).map(|block| StorageFormat(block.quantization));
 	if graph.output.elements() != 1 {
@@ -4950,7 +4962,7 @@ fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, confi
 }
 fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: &'static Gpu, config: Config) -> Result<Graph> {
 	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], rows: 1, source_rows: 1, features: saved.input.elements(), schema: DataSchema::default(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new(), fitted: saved.predictors.clone() };
-	let mut graph = compile(&saved.model, &prepared, 1, gpu, config, false)?;
+	let mut graph = compile(&saved.model, &prepared, &prepared.targets, 1, gpu, config, false)?;
 	require(graph.input == saved.input, "saved semantic input shape does not match the compiled model")?;
 	require(graph.output == saved.output, "saved semantic output shape does not match the compiled model")?;
 	require(graph.parameters.len() == saved.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "saved semantic weights do not match the compiled model")?;
@@ -4991,7 +5003,7 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	graph.source = narrow(graph.nodes.len(), "model graph nodes")? - 1;
 	Ok(graph.source)
 }
-fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let skip = graph.source;
 	let first = graph.nodes.len();
 	match &block.operation {
@@ -5006,7 +5018,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, config)?,
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
-			lower_estimator(graph, estimator, data, rows, gpu, config)?
+			lower_estimator(graph, estimator, data, targets, rows, gpu, config)?
 		}
 	}
 	if block.activation != Activation::Linear {
@@ -5341,18 +5353,18 @@ fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Conf
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
 	push_program(graph, skip, &[], program)
 }
-fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let (source, input) = (graph.source, graph.output);
 	let restored = data.fitted.get(graph.nodes.iter().filter(|node| node.op == Primitive::Predictor).count()).cloned();
 	let (predictor, surrogate) = if let Some(program) = restored {
 		let blank = Prepared { samples: vec![0.0; input.elements()], targets: vec![0.0], rows: 1, source_rows: 1, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
-		let mut surrogate = compile(&surrogate_model(config.surrogate_width), &blank, 1, gpu, config, false)?;
+		let mut surrogate = compile(&surrogate_model(config.surrogate_width), &blank, &blank.targets, 1, gpu, config, false)?;
 		surrogate.frozen.fill(1);
 		(program, surrogate)
 	} else {
 		(estimator.validate)(estimator.param, rows)?;
 		let inputs = graph_inputs(graph, &data.samples, &data.targets, rows, gpu, config.precision)?;
-		let prepared = Prepared { samples: inputs.clone(), targets: data.targets[..rows].to_vec(), rows, source_rows: rows, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: data.target_categorical, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
+		let prepared = Prepared { samples: inputs.clone(), targets: targets[..rows].to_vec(), rows, source_rows: rows, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: data.target_categorical, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
 		let teacher = estimator.fit(&prepared, rows, config, true)?;
 		let targets = inputs.chunks_exact(input.elements()).enumerate().map(|(row, query)| (teacher.predict)(row, query)).collect::<Result<Vec<_>>>()?;
 		let predictor = estimator.fit(&prepared, rows, config, false)?;
@@ -6858,7 +6870,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	require(samples.len() == sample_count, "surrogate sample batch is invalid")?;
 	let model = surrogate_model(hidden);
 	let prepared = Prepared { samples: samples.to_vec(), targets: targets.to_vec(), rows: targets.len(), source_rows: targets.len(), features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
-	let mut graph = compile(&model, &prepared, prepared.rows, gpu, config, true)?;
+	let mut graph = compile(&model, &prepared, targets, prepared.rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, mse)?;
 	for _ in 0..config.surrogate_epochs {
 		tape.advance()?;
@@ -7785,9 +7797,20 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	}
 	for path in &mut paths { *path = fs::canonicalize(&*path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))? }
 	paths.sort(); paths.dedup();
+	// A ZIP source contributes its entries, not itself: the container is not a
+	// table or a sample, and its entries take virtual paths anchored at the
+	// archive's own path, so the directory-layout rules that already interpret
+	// a real class-subfolder tree interpret an archived one identically.
 	let mut files = Vec::new();
 	for path in &paths {
-		files.push((path.clone(), fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?));
+		let bytes = fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+		if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
+			for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
+				files.push((path.join(entry), contents));
+			}
+		} else {
+			files.push((path.clone(), bytes));
+		}
 	}
 	let mut grouped = Vec::new();
 	for (path, bytes) in &files {
@@ -8481,6 +8504,7 @@ fn sample_identity(sample: &[f64], target: f64) -> u64 {
 	sample.iter().copied().chain(std::iter::once(target)).flat_map(|value| value.to_bits().to_le_bytes()).fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
 }
 fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5" | "xml") }
+fn is_archive(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "zip") }
 fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	let path = path.as_ref();
 	let mut components = path.components();
@@ -9699,7 +9723,7 @@ impl Train {
 		let probability = model.loss.0 >= 4;
 		let scale = probability.then(|| TargetScale::fit(&prepared.targets[..training_rows]));
 		let target_values = prepared.targets.iter().map(|target| scale.map_or(*target, |scale| scale.encode(*target))).collect::<Vec<_>>();
-		let (run, mut graph) = (RUN.fetch_add(1, Ordering::Relaxed) + 1, compile(model, prepared, training_rows, gpu, config, true)?);
+		let (run, mut graph) = (RUN.fetch_add(1, Ordering::Relaxed) + 1, compile(model, prepared, &target_values, training_rows, gpu, config, true)?);
 		graph.state.training_rows = training_rows;
 		if let Some(scale) = scale
 			&& let Some(offset) = output_bias_offset(&graph)

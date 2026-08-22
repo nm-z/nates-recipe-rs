@@ -106,7 +106,7 @@ fn build(case: &Case) -> Model {
 		"sigmoid" => recipe.model().layer(9).sigmoid().layer(5).sigmoid().layer(1).loss(mse),
 		"norm" => recipe.model().layer(9).relu().norm(batch).layer(5).relu().layer(1).loss(mse),
 		"conv" => recipe.model().conv(3, 3).relu().conv(2, 1).relu().layer(1).loss(mse),
-		"residual" => recipe.model().layer(9).relu().residual([layer(9), layer(9)]).relu().layer(1).loss(mse),
+		"residual" => recipe.model().layer(9).relu().res([layer(9), layer(9)]).relu().layer(1).loss(mse),
 		"attention" => recipe.model().attn(2).relu().layer(1).loss(mse),
 		"gru" => recipe.model().gru(6).relu().layer(1).loss(mse),
 		"lstm" => recipe.model().lstm(6).relu().layer(1).loss(mse),
