@@ -188,6 +188,14 @@ static DEEPSEEK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn display() -> &'static Mutex<Display> { DISPLAY.get_or_init(|| Mutex::new(Display::default())) }
 
+fn provider(slot: &'static OnceLock<Mutex<()>>) -> Option<std::sync::MutexGuard<'static, ()>> {
+    match slot.get_or_init(|| Mutex::new(())).try_lock() {
+        Ok(provider) => Some(provider),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(_)) => panic!("provider lock is poisoned"),
+    }
+}
+
 fn display_clear(display: &mut Display) {
     if display.rows == 0 {
         return;
@@ -944,8 +952,7 @@ fn opencode(config: &Config, model: &str, prompt: &str) -> std::result::Result<D
 
 fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
     loop {
-        {
-            let _provider = SPARK.get_or_init(|| Mutex::new(())).lock().expect("OpenAI provider lock is poisoned");
+        if let Some(_provider) = provider(&SPARK) {
             display_reviewing(packet, &config.spark_model);
             match spark(config, prompt) {
                 Ok(decision) => return decision,
@@ -956,8 +963,7 @@ fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
             }
             display_reviewing(packet, "queued");
         }
-        {
-            let _provider = KIMI.get_or_init(|| Mutex::new(())).lock().expect("Kimi provider lock is poisoned");
+        if let Some(_provider) = provider(&KIMI) {
             display_reviewing(packet, &config.kimi_k3_model);
             match kimi(config, "Kimi managed", &config.kimi_k3_model, prompt) {
                 Ok(decision) => return decision,
@@ -968,8 +974,7 @@ fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
             }
             display_reviewing(packet, "queued");
         }
-        {
-            let _provider = OPENCODE.get_or_init(|| Mutex::new(())).lock().expect("OpenCode provider lock is poisoned");
+        if let Some(_provider) = provider(&OPENCODE) {
             for model in &config.opencode_models {
                 display_reviewing(packet, model);
                 match opencode(config, model, prompt) {
@@ -979,8 +984,7 @@ fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
             }
             display_reviewing(packet, "queued");
         }
-        {
-            let _provider = AGY.get_or_init(|| Mutex::new(())).lock().expect("Antigravity provider lock is poisoned");
+        if let Some(_provider) = provider(&AGY) {
             for model in &config.agy_models {
                 display_reviewing(packet, model);
                 match agy(config, model, prompt) {
@@ -990,8 +994,7 @@ fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
             }
             display_reviewing(packet, "queued");
         }
-        {
-            let _provider = DEEPSEEK.get_or_init(|| Mutex::new(())).lock().expect("DeepSeek provider lock is poisoned");
+        if let Some(_provider) = provider(&DEEPSEEK) {
             display_reviewing(packet, &config.kimi_deepseek_model);
             match kimi(
                 config,

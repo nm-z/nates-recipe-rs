@@ -35,9 +35,12 @@ The provider waterfall is:
 1. Codex Spark with xhigh reasoning
 2. Kimi K3
 3. OpenCode free models in configured order
-4. Gemini 3.1 Pro High
-5. Gemini 3.7 Flash High
-6. DeepSeek V4 Pro 1M
+4. Claude Opus 4.6 Thinking
+5. Claude Sonnet 4.6 Thinking
+6. GPT-OSS 120B Medium
+7. Gemini 3.1 Pro High
+8. Gemini 3.7 Flash High
+9. DeepSeek V4 Pro 1M
 
 The machine uses each provider until that provider is unavailable. It does not
 wait for consensus. If every route is unavailable, the reviewer retains the
