@@ -504,13 +504,13 @@ fn elapsed(started: Instant) -> String {
 }
 
 fn fit(value: &str, width: usize) -> String {
-    if value.chars().count() <= width {
-        return value.to_owned();
-    }
-    if width <= 2 {
-        return value.chars().take(width).collect();
-    }
-    format!("{}..", value.chars().take(width - 2).collect::<String>())
+    if value.chars().count() <= width { return value.to_owned() }
+    if width <= 2 { value.chars().take(width).collect() } else { format!("{}..", value.chars().take(width - 2).collect::<String>()) }
+}
+
+fn review_line(prefix: &str, model: &str, cursor: u64, elapsed: &str, width: usize) -> String {
+    let suffix = format!("  cursor {cursor:<6}  time {elapsed}");
+    format!("{prefix}{}{suffix}", fit(model, width.saturating_sub(prefix.chars().count() + suffix.chars().count())))
 }
 
 fn trial_line(device: &str, cursor: u64, elapsed: &str, status: &str) -> String {
@@ -585,7 +585,7 @@ fn display_render(display: &mut Display) {
             let provider_branch = if provider_last { "└─" } else { "├─" };
             if models.len() == 1 {
                 let (model, cursor, elapsed) = &models[0];
-                eprintln!("{}", fit(&format!("{review_trunk}{provider_branch} {provider}/{model:<28}  cursor {cursor:<6}  time {elapsed}"), width));
+                eprintln!("{}", review_line(&format!("{review_trunk}{provider_branch} "), &format!("{provider}/{model}"), *cursor, elapsed, width));
                 display.rows += 1;
                 continue;
             }
@@ -594,7 +594,7 @@ fn display_render(display: &mut Display) {
             for (model_index, (model, cursor, elapsed)) in models.iter().enumerate() {
                 let branch = if model_index + 1 == models.len() { "└─" } else { "├─" };
                 let trunk = if provider_last { format!("{review_trunk}   ") } else { format!("{review_trunk}│  ") };
-                eprintln!("{}", fit(&format!("{trunk}{branch} {model:<28}  cursor {cursor:<6}  time {elapsed}"), width));
+                eprintln!("{}", review_line(&format!("{trunk}{branch} "), model, *cursor, elapsed, width));
                 display.rows += 1;
             }
         }

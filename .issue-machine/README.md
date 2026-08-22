@@ -148,6 +148,8 @@ live
 
 The terminal groups a provider under one node only while multiple models from
 that provider are active. A provider with one active model stays on one line.
+Long model identities truncate before the cursor and elapsed time, so live
+timing remains visible at the current pane width.
 
 A failed cursor then contains two classification lifecycle records:
 
