@@ -9,8 +9,10 @@ WorkingDirectory=/home/nate/Desktop/recipe-issue-machine
 Environment=HOME=/home/nate
 Environment=TERM=xterm-256color
 Environment=PATH=/home/nate/.local/bin:/home/nate/.cargo/bin:/usr/local/bin:/usr/bin:/opt/rocm/bin
+ExecStartPre=/usr/bin/rm -f /tmp/tmux-%U/default /tmp/tmux-%U/default.lock
 ExecStart=/usr/bin/tmux -S /tmp/tmux-%U/default -D -f /home/nate/Desktop/recipe-issue-machine/.issue-machine/tmux.conf
-ExecStop=/usr/bin/tmux kill-session -t recipe-issue-machine
+ExecStop=/usr/bin/tmux -S /tmp/tmux-%U/default kill-server
+ExecStopPost=/usr/bin/rm -f /tmp/tmux-%U/default /tmp/tmux-%U/default.lock
 KillMode=control-group
 Restart=always
 RestartSec=1
