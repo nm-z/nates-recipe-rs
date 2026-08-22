@@ -71,6 +71,7 @@ pub enum PredictorOpcode {
 	Greater = 10,
 	Choose = 11,
 	Nearest = 12,
+	Affine = 13,
 }
 
 impl PredictorOpcode {
@@ -89,6 +90,7 @@ impl PredictorOpcode {
 			10 => Ok(Self::Greater),
 			11 => Ok(Self::Choose),
 			12 => Ok(Self::Nearest),
+			13 => Ok(Self::Affine),
 			_ => Err(EmitError::InvalidOpcode { kind: "predictor", value }),
 		}
 	}
@@ -592,6 +594,33 @@ pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorCon
 				}
 				let _ = writeln!(output, "%{p}.result = call {ty} @recipe.div({ty} {sum}, {ty} {count})", count = (context.literal)(count as f64, ty));
 				stack.push(format!("%{p}.result"));
+			}
+			PredictorOpcode::Affine => {
+				if context.features == 0 || context.parameters != 3 * context.features {
+					return Err(EmitError::InvalidOperand { kind: "affine table width", value: context.parameters as f64 });
+				}
+				let ty = context.value_type;
+				let (ptr, align) = (context.pointer_type, context.alignment);
+				let p = format!("{}.affine.{sequence}", context.prefix);
+				sequence += 1;
+				let zero = (context.literal)(0.0, ty);
+				// Feature loop head: induction variable plus the running sum as phis.
+				let _ = writeln!(output, "br label %{p}.entry\n{p}.entry:\nbr label %{p}.head\n{p}.head:");
+				let _ = writeln!(output, "%{p}.j = phi i32 [ 0, %{p}.entry ], [ %{p}.j.next, %{p}.body ]");
+				let _ = writeln!(output, "%{p}.acc = phi {ty} [ {zero}, %{p}.entry ], [ %{p}.acc.next, %{p}.body ]");
+				let _ = writeln!(output, "%{p}.more = icmp ult i32 %{p}.j, {features}\nbr i1 %{p}.more, label %{p}.body, label %{p}.done", features = context.features);
+				// The table is three feature-length planes (means, scales, weights),
+				// accumulated per feature as (x - mean) * scale * weight. The
+				// weights pointer is already advanced to this node's parameter
+				// span, so the plane indices are node-relative.
+				let _ = writeln!(output, "{p}.body:");
+				let _ = writeln!(output, "%{p}.q.base = mul i32 {row}, {features}\n%{p}.q.index = add i32 %{p}.q.base, %{p}.j\n%{p}.q.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.q.index\n%{p}.q = load {ty}, {ptr} %{p}.q.ptr, align {align}", row = context.row, features = context.features, input = context.input);
+				let _ = writeln!(output, "%{p}.mean.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.j\n%{p}.mean = load {ty}, {ptr} %{p}.mean.ptr, align {align}", weights = context.weights);
+				let _ = writeln!(output, "%{p}.scale.index = add i32 %{p}.j, {features}\n%{p}.scale.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.scale.index\n%{p}.scale = load {ty}, {ptr} %{p}.scale.ptr, align {align}", features = context.features, weights = context.weights);
+				let _ = writeln!(output, "%{p}.weight.index = add i32 %{p}.scale.index, {features}\n%{p}.weight.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.weight.index\n%{p}.weight = load {ty}, {ptr} %{p}.weight.ptr, align {align}", features = context.features, weights = context.weights);
+				let _ = writeln!(output, "%{p}.centered = call {ty} @recipe.sub({ty} %{p}.q, {ty} %{p}.mean)\n%{p}.scaled = call {ty} @recipe.mul({ty} %{p}.centered, {ty} %{p}.scale)\n%{p}.term = call {ty} @recipe.mul({ty} %{p}.scaled, {ty} %{p}.weight)\n%{p}.acc.next = call {ty} @recipe.add({ty} %{p}.acc, {ty} %{p}.term)");
+				let _ = writeln!(output, "%{p}.j.next = add i32 %{p}.j, 1\nbr label %{p}.head\n{p}.done:");
+				stack.push(format!("%{p}.acc"));
 			}
 		}
 	}
@@ -6955,6 +6984,12 @@ impl PredictorProgram {
 					}
 					stack.push(best.iter().map(|slot| slot.1).sum::<f64>() / count as f64)
 				},
+				value if value == PredictorOpcode::Affine as i32 => {
+					require(self.table.len() == 3 * query.len() && !query.is_empty(), "affine table width is invalid")?;
+					let (means, rest) = self.table.split_at(query.len());
+					let (scales, weights) = rest.split_at(query.len());
+					stack.push(query.iter().zip(means).zip(scales).zip(weights).map(|(((value, mean), scale), weight)| (value - mean) * scale * weight).sum())
+				},
 				_ => return Err(RecipeError::new(format!("invalid predictor opcode {opcode}"))),
 			}
 		}
@@ -6975,6 +7010,10 @@ impl PredictorBuilder {
 	fn nearest(&mut self, count: usize, exclude: bool, table: Vec<f64>) {
 		self.table = table;
 		self.push(PredictorOpcode::Nearest, if exclude { -(count as f64) } else { count as f64 });
+	}
+	fn affine(&mut self, table: Vec<f64>) {
+		self.table = table;
+		self.push(PredictorOpcode::Affine, 0.0);
 	}
 	fn emit(&mut self, opcode: PredictorOpcode, argument: f64) { self.code.extend([opcode as i32 as f64, argument]) }
 	fn push(&mut self, opcode: PredictorOpcode, argument: f64) { self.emit(opcode, argument); self.depth += 1; self.stack = self.stack.max(self.depth) }
@@ -7080,8 +7119,12 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> R
 			*variance += (value - mean).powi(2) / rows as f64
 		}
 	}
+	// Regularize the variance like normalize_samples does: an exact-zero guard
+	// misses float-residue variances on numerically constant features, whose
+	// unbounded inverses cannot survive the model's storage format.
+	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
 	for value in &mut inverse {
-		*value = if *value == 0.0 { 0.0 } else { value.sqrt().recip() }
+		*value = (*value + epsilon).sqrt().recip()
 	}
 	let mut weights = vec![0.0; data.features];
 	let mut bias = data.targets[..rows].iter().sum::<f64>() / rows as f64;
@@ -7102,18 +7145,18 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> R
 			*weight -= config.svm_rate * gradient
 		}
 	}
+	// The fitted model lives in the predictor table as three feature-length
+	// planes (means, scales, weights), so the emitted program is a fixed-size
+	// feature loop instead of straight-line code that grows with the feature
+	// count, and each storage block quantizes values of one magnitude family.
+	let mut table = Vec::with_capacity(3 * data.features);
+	table.extend(means);
+	table.extend(inverse);
+	table.extend(weights);
 	let mut program = PredictorBuilder::new();
 	program.constant(bias);
-	for (feature, ((weight, mean), scale)) in weights.into_iter().zip(means).zip(inverse).enumerate() {
-		program.feature(feature);
-		program.constant(mean);
-		program.binary(PredictorOpcode::Subtract);
-		program.constant(scale);
-		program.binary(PredictorOpcode::Multiply);
-		program.constant(weight);
-		program.binary(PredictorOpcode::Multiply);
-		program.binary(PredictorOpcode::Add);
-	}
+	program.affine(table);
+	program.binary(PredictorOpcode::Add);
 	Ok(Predictor::new(program.finish()?))
 }
 fn fit_forest(trees: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
