@@ -504,12 +504,10 @@ fn opencode_turn(config: &Config, model: &str, prompt: &str, session: &str) -> s
     }
 }
 
-fn display_clear(display: &mut Display) {
-    if display.rows == 0 {
-        return;
-    }
-    eprint!("\x1b[{}A\r\x1b[J", display.rows);
-    display.rows = 0;
+fn display_line(frame: &mut String, display: &mut Display, line: &str) {
+    frame.push_str(line);
+    frame.push('\n');
+    display.rows += 1;
 }
 
 fn elapsed(started: Instant) -> String {
@@ -563,8 +561,9 @@ fn pane_size() -> (usize, usize) {
 }
 
 fn display_render(display: &mut Display) {
-    display_clear(display);
-    for line in display.history.drain(..) { eprintln!("{line}") }
+    let mut frame = if display.rows == 0 { String::new() } else { format!("\x1b[{}A\r\x1b[J", display.rows) };
+    display.rows = 0;
+    for line in display.history.drain(..) { frame.push_str(&line); frame.push('\n') }
     let width = pane_size().0;
     let trials = display.active.iter().map(|(device, active)| {
         format!("{device:<4}  cursor {:<6}  time {}", active.cursor, active_elapsed(active))
@@ -581,60 +580,52 @@ fn display_render(display: &mut Display) {
         format!("{:<28}  issue #{:<5}  time {}", resolver.model, resolver.issue, elapsed(resolver.started))
     }).collect::<Vec<_>>();
     if queued != 0 {
-        eprintln!("{YELLOW}queued{RESET}");
-        eprintln!("└─ {queued} reviews");
-        display.rows += 2;
+        display_line(&mut frame, display, &format!("{YELLOW}queued{RESET}"));
+        display_line(&mut frame, display, &format!("└─ {queued} reviews"));
     }
     if !trials.is_empty() || !reviews.is_empty() || !resolving.is_empty() {
-        eprintln!("{BLUE}live{RESET}");
-        display.rows += 1;
+        display_line(&mut frame, display, &format!("{BLUE}live{RESET}"));
     }
     if !trials.is_empty() {
         let branch = if reviews.is_empty() && resolving.is_empty() { "└─" } else { "├─" };
-        eprintln!("{branch} trial");
-        display.rows += 1;
+        display_line(&mut frame, display, &format!("{branch} trial"));
         for (index, line) in trials.iter().enumerate() {
             let branch = if index + 1 == trials.len() { "└─" } else { "├─" };
             let trunk = if reviews.is_empty() && resolving.is_empty() { "   " } else { "│  " };
-            eprintln!("{}", fit(&format!("{trunk}{branch} {line}"), width));
-            display.rows += 1;
+            display_line(&mut frame, display, &fit(&format!("{trunk}{branch} {line}"), width));
         }
     }
     if !reviews.is_empty() {
         let review_branch = if resolving.is_empty() { "└─" } else { "├─" };
         let review_trunk = if resolving.is_empty() { "   " } else { "│  " };
-        eprintln!("{review_branch} review");
-        display.rows += 1;
+        display_line(&mut frame, display, &format!("{review_branch} review"));
         let provider_count = reviews.len();
         for (provider_index, (provider, models)) in reviews.into_iter().enumerate() {
             let provider_last = provider_index + 1 == provider_count;
             let provider_branch = if provider_last { "└─" } else { "├─" };
             if models.len() == 1 {
                 let (model, cursor, elapsed) = &models[0];
-                eprintln!("{}", review_line(&format!("{review_trunk}{provider_branch} "), &format!("{provider}/{model}"), *cursor, elapsed, width));
-                display.rows += 1;
+                display_line(&mut frame, display, &review_line(&format!("{review_trunk}{provider_branch} "), &format!("{provider}/{model}"), *cursor, elapsed, width));
                 continue;
             }
-            eprintln!("{review_trunk}{provider_branch} {provider}");
-            display.rows += 1;
+            display_line(&mut frame, display, &format!("{review_trunk}{provider_branch} {provider}"));
             for (model_index, (model, cursor, elapsed)) in models.iter().enumerate() {
                 let branch = if model_index + 1 == models.len() { "└─" } else { "├─" };
                 let trunk = if provider_last { format!("{review_trunk}   ") } else { format!("{review_trunk}│  ") };
-                eprintln!("{}", review_line(&format!("{trunk}{branch} "), model, *cursor, elapsed, width));
-                display.rows += 1;
+                display_line(&mut frame, display, &review_line(&format!("{trunk}{branch} "), model, *cursor, elapsed, width));
             }
         }
     }
     if !resolving.is_empty() {
-        eprintln!("└─ resolve");
-        display.rows += 1;
+        display_line(&mut frame, display, "└─ resolve");
         for (index, resolver) in resolving.iter().enumerate() {
             let branch = if index + 1 == resolving.len() { "└─" } else { "├─" };
-            eprintln!("{}", fit(&format!("   {branch} {resolver}"), width));
-            display.rows += 1;
+            display_line(&mut frame, display, &fit(&format!("   {branch} {resolver}"), width));
         }
     }
-    std::io::stderr().flush().expect("cannot draw machine status");
+    let mut stderr = std::io::stderr().lock();
+    stderr.write_all(frame.as_bytes()).expect("cannot draw machine status");
+    stderr.flush().expect("cannot flush machine status");
 }
 
 fn display_start(device: &str, cursor: u64) {
