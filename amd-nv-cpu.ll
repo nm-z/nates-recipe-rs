@@ -2357,7 +2357,7 @@ ret void
 }
 define internal void @scan_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
 ptr addrspace(1) %context, i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %gates,
-i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #1 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
+i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #3 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
 %in.elements = mul i32 %in.channels, %length
 %out.elements = mul i32 %out.channels, %length %input.matrix = mul i32 %in.channels, %out.channels
 %state.matrix = mul i32 %out.channels, %out.channels %matrix.span = add i32 %input.matrix, %state.matrix
@@ -2756,7 +2756,7 @@ define internal void @scan_reverse_body( ptr addrspace(1) %input, ptr addrspace(
 ptr addrspace(1) %context, ptr addrspace(1) %delta, ptr addrspace(1) %previous,
 ptr addrspace(1) %gradient, i1 %write.input, i32 %rows, i32 %in.channels,
 i32 %length, i32 %out.channels, i32 %gates, i32 %parameters, i32 %offset,
-i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k, i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads ) #1 { entry:
+i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k, i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads ) #3 { entry:
 %tid = call i32 @llvm.amdgcn.workitem.id.x() %in.elements = mul i32 %in.channels, %length
 %out.elements = mul i32 %out.channels, %length %batch = mul i32 %rows, %out.elements
 %gate.stride.0 = mul i32 %in.channels, %out.channels %state.matrix = mul i32 %out.channels, %out.channels
