@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,9 @@ struct Config {
     agy_models: Vec<String>,
     opencode_binary: PathBuf,
     opencode_config: PathBuf,
+    opencode_server: String,
+    opencode_server_start_seconds: u64,
+    opencode_server_poll_milliseconds: u64,
     opencode_models: Vec<String>,
     opencode_concurrency: BTreeMap<String, usize>,
     opencode_agent: String,
@@ -129,6 +132,13 @@ fn config(path: &Path) -> Config {
         agy_models: values(&text, "agy_models"),
         opencode_binary: value(&text, "opencode_binary").into(),
         opencode_config: value(&text, "opencode_config").into(),
+        opencode_server: value(&text, "opencode_server"),
+        opencode_server_start_seconds: value(&text, "opencode_server_start_seconds")
+            .parse()
+            .expect("opencode_server_start_seconds must be an unsigned integer"),
+        opencode_server_poll_milliseconds: value(&text, "opencode_server_poll_milliseconds")
+            .parse()
+            .expect("opencode_server_poll_milliseconds must be an unsigned integer"),
         opencode_models,
         opencode_concurrency,
         opencode_agent: value(&text, "opencode_agent"),
@@ -325,6 +335,41 @@ fn model_provider(
 }
 
 fn identity(provider: &str, model: &str) -> String { format!("{provider}/{model}") }
+
+struct OpenCodeServer(Child);
+
+impl Drop for OpenCodeServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn opencode_server(config: &Config) -> OpenCodeServer {
+    let address = config.opencode_server.strip_prefix("http://").expect("opencode_server must use http://");
+    let (host, port) = address.split_once(':').expect("opencode_server must contain host:port");
+    let mut child = Command::new(&config.opencode_binary)
+        .args(["serve", "--hostname", host, "--port", port, "--log-level", "ERROR"])
+        .env("OPENCODE_CONFIG", &config.opencode_config)
+        .current_dir(&config.repository)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("cannot start OpenCode server");
+    let stderr = child.stderr.take().expect("OpenCode server stderr is absent");
+    let log_config = config.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            log(&log_config, &format!("OPENCODE {line}"));
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(config.opencode_server_start_seconds);
+    while std::net::TcpStream::connect(address).is_err() {
+        assert!(Instant::now() < deadline, "OpenCode server did not start at {}", config.opencode_server);
+        std::thread::sleep(Duration::from_millis(config.opencode_server_poll_milliseconds));
+    }
+    OpenCodeServer(child)
+}
 
 fn display_clear(display: &mut Display) {
     if display.rows == 0 {
@@ -1064,6 +1109,8 @@ fn opencode(config: &Config, model: &str, prompt: &str) -> std::result::Result<D
         Command::new(&config.opencode_binary)
             .args([
                 "run",
+                "--attach",
+                &config.opencode_server,
                 "--model",
                 model,
                 "--agent",
@@ -1097,6 +1144,8 @@ fn opencode(config: &Config, model: &str, prompt: &str) -> std::result::Result<D
             Command::new(&config.opencode_binary)
                 .args([
                     "run",
+                    "--attach",
+                    &config.opencode_server,
                     "--session",
                     &session,
                     "--model",
@@ -1678,6 +1727,7 @@ fn main() {
         .to_owned();
     let path = directory.join("machine.toml");
     let initial = config(&path);
+    let _opencode_server = opencode_server(&initial);
     display_clock();
     let pending = std::fs::read_to_string(&initial.queue_path)
         .map(|text| queued(&text))
