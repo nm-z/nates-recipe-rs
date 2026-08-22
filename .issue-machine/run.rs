@@ -325,16 +325,7 @@ fn display_clear(display: &mut Display) {
     if display.rows == 0 {
         return;
     }
-    eprint!("\x1b[{}A", display.rows);
-    for row in 0..display.rows {
-        eprint!("\r\x1b[2K");
-        if row + 1 != display.rows {
-            eprint!("\x1b[1B");
-        }
-    }
-    if display.rows != 1 {
-        eprint!("\x1b[{}A", display.rows - 1);
-    }
+    eprint!("\x1b[{}A\r\x1b[J", display.rows);
     display.rows = 0;
 }
 
