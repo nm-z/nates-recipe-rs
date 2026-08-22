@@ -35,6 +35,11 @@ the public path, and create one pull request with `Fixes #<issue>`. Each resolve
 uses the configured memory limit and keeps its issue claim until it finishes.
 A failed resolver releases its issue, waits for the configured poll interval,
 and returns to issue selection instead of terminating its worker. Resolver
+usage-limit failures enter the same model cooldown used by reviewers. A
+reported epoch reset keeps every resolver worker idle until that time, while an
+unparseable reset disables the resolver model for the rest of the machine run.
+Normal output omits the provider transcript, and the single `debug` option adds
+it to `recipe.log` when diagnostics are required. Resolver
 admission counts active `recipe-resolve-*` systemd units, so restarting the
 machine cannot duplicate an issue claim or exceed the memory budget.
 The terminal derives active resolver rows and elapsed times from those same
