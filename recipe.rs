@@ -4911,7 +4911,7 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 	}
 	Ok(())
 }
-fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config, initialize: bool) -> Result<Graph> {
+fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config, initialize: bool) -> Result<Graph> {
 	require(!model.blocks.is_empty(), "model must contain a block")?;
 	if let Some(format) = model.blocks.iter().map(|block| StorageFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
 		return Err(format.unavailable());
@@ -4922,7 +4922,7 @@ fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, confi
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
 		graph.block_kind = block.operation.name();
-		lower_block(&mut graph, block, model.blocks.len(), data, rows, gpu, config)?;
+		lower_block(&mut graph, block, model.blocks.len(), data, targets, rows, gpu, config)?;
 	}
 	let mut output_profile = model.blocks.last().filter(|block| block.profile).map(|block| StorageFormat(block.quantization));
 	if graph.output.elements() != 1 {
@@ -4950,7 +4950,7 @@ fn compile(model: &Model, data: &Prepared, rows: usize, gpu: &'static Gpu, confi
 }
 fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: &'static Gpu, config: Config) -> Result<Graph> {
 	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], rows: 1, source_rows: 1, features: saved.input.elements(), schema: DataSchema::default(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new(), fitted: saved.predictors.clone() };
-	let mut graph = compile(&saved.model, &prepared, 1, gpu, config, false)?;
+	let mut graph = compile(&saved.model, &prepared, &prepared.targets, 1, gpu, config, false)?;
 	require(graph.input == saved.input, "saved semantic input shape does not match the compiled model")?;
 	require(graph.output == saved.output, "saved semantic output shape does not match the compiled model")?;
 	require(graph.parameters.len() == saved.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "saved semantic weights do not match the compiled model")?;
@@ -4991,7 +4991,7 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	graph.source = narrow(graph.nodes.len(), "model graph nodes")? - 1;
 	Ok(graph.source)
 }
-fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let skip = graph.source;
 	let first = graph.nodes.len();
 	match &block.operation {
@@ -5006,7 +5006,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, config)?,
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
-			lower_estimator(graph, estimator, data, rows, gpu, config)?
+			lower_estimator(graph, estimator, data, targets, rows, gpu, config)?
 		}
 	}
 	if block.activation != Activation::Linear {
@@ -5341,18 +5341,18 @@ fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Conf
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
 	push_program(graph, skip, &[], program)
 }
-fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let (source, input) = (graph.source, graph.output);
 	let restored = data.fitted.get(graph.nodes.iter().filter(|node| node.op == Primitive::Predictor).count()).cloned();
 	let (predictor, surrogate) = if let Some(program) = restored {
 		let blank = Prepared { samples: vec![0.0; input.elements()], targets: vec![0.0], rows: 1, source_rows: 1, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
-		let mut surrogate = compile(&surrogate_model(config.surrogate_width), &blank, 1, gpu, config, false)?;
+		let mut surrogate = compile(&surrogate_model(config.surrogate_width), &blank, &blank.targets, 1, gpu, config, false)?;
 		surrogate.frozen.fill(1);
 		(program, surrogate)
 	} else {
 		(estimator.validate)(estimator.param, rows)?;
 		let inputs = graph_inputs(graph, &data.samples, &data.targets, rows, gpu, config.precision)?;
-		let prepared = Prepared { samples: inputs.clone(), targets: data.targets[..rows].to_vec(), rows, source_rows: rows, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: data.target_categorical, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
+		let prepared = Prepared { samples: inputs.clone(), targets: targets[..rows].to_vec(), rows, source_rows: rows, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: data.target_categorical, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
 		let teacher = estimator.fit(&prepared, rows, config, true)?;
 		let targets = inputs.chunks_exact(input.elements()).enumerate().map(|(row, query)| (teacher.predict)(row, query)).collect::<Result<Vec<_>>>()?;
 		let predictor = estimator.fit(&prepared, rows, config, false)?;
@@ -6858,7 +6858,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	require(samples.len() == sample_count, "surrogate sample batch is invalid")?;
 	let model = surrogate_model(hidden);
 	let prepared = Prepared { samples: samples.to_vec(), targets: targets.to_vec(), rows: targets.len(), source_rows: targets.len(), features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
-	let mut graph = compile(&model, &prepared, prepared.rows, gpu, config, true)?;
+	let mut graph = compile(&model, &prepared, targets, prepared.rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, mse)?;
 	for _ in 0..config.surrogate_epochs {
 		tape.advance()?;
@@ -9699,7 +9699,7 @@ impl Train {
 		let probability = model.loss.0 >= 4;
 		let scale = probability.then(|| TargetScale::fit(&prepared.targets[..training_rows]));
 		let target_values = prepared.targets.iter().map(|target| scale.map_or(*target, |scale| scale.encode(*target))).collect::<Vec<_>>();
-		let (run, mut graph) = (RUN.fetch_add(1, Ordering::Relaxed) + 1, compile(model, prepared, training_rows, gpu, config, true)?);
+		let (run, mut graph) = (RUN.fetch_add(1, Ordering::Relaxed) + 1, compile(model, prepared, &target_values, training_rows, gpu, config, true)?);
 		graph.state.training_rows = training_rows;
 		if let Some(scale) = scale
 			&& let Some(offset) = output_bias_offset(&graph)
