@@ -23,13 +23,13 @@ while different models run concurrently. The first available
 classifier returns one schema-validated decision: create a
 `bug` issue or comment on an existing issue.
 
-One resolver runs independently of discovery and review. It selects the first
-open issue that no open pull request closes, then starts
+Five resolvers run independently of discovery and review. Each claims a
+different open issue that no open pull request closes, then starts
 `claude-fable-5` at high effort with unrestricted Claude Code permissions. The
 initial `/goal` requires the session to read that issue, reproduce it, implement
 the root fix in a separate worktree based on current `origin/minimal`, validate
-the public path, and create one pull request with `Fixes #<issue>`. The resolver
-does not release its only slot until that pull request exists.
+the public path, and create one pull request with `Fixes #<issue>`. Each resolver
+uses the configured memory limit and keeps its issue claim until it finishes.
 
 Independent discovery workers claim disjoint cursors from one allocator. The
 default configuration runs one worker on `amd0` and one worker through
@@ -43,11 +43,7 @@ limit. A composition that exceeds that limit fails through the same public
 process boundary and enters the normal review queue instead of exhausting the
 host and terminating the machine.
 
-The machine runs each model up to its configured concurrency limit. Ox Alpha,
-whose current catalog key is `opencode/x-preview-f-free`, and OpenRouter's
-`openrouter/free` route each run up to 10 requests concurrently. Every other
-OpenCode model runs one request at a time.
-Each live
+The machine runs every review route twice concurrently. Each live
 reviewer uses the `provider/model` identity shown in the terminal and log. The
 configured providers and model order are:
 
@@ -56,7 +52,6 @@ configured providers and model order are:
 - Every configured `opencode/<free-model>` concurrently
 - `openrouter/openrouter/free`, through the existing OpenCode tool harness
 - `copilot/auto`, updated to the model selected by Copilot routing
-- `claude/sonnet-5-max`
 - `ollama/minimax-m3:cloud`
 - `agy/<model>` in configured order
 
@@ -123,10 +118,10 @@ live
    │  ├─ big-pickle                    cursor 561  time 51.0895 s
    │  └─ hy3-free                      cursor 568  time 42.0012 s
    ├─ copilot/claude-haiku-4.5         cursor 570  time 12.0031 s
-   ├─ claude/sonnet-5-max              cursor 573  time 10.1011 s
    └─ agy/claude-opus-4-6-thinking     cursor 536  time 51.0867 s
 └─ resolve
-   └─ claude/fable-5-high              issue #171  time 51.1012 s
+   ├─ claude/fable-5-high              issue #171  time 51.1012 s
+   └─ claude/fable-5-high              issue #172  time 49.3001 s
 ```
 
 The terminal groups a provider under one node only while multiple models from

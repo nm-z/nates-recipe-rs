@@ -37,8 +37,6 @@ struct Config {
     copilot_binary: PathBuf,
     copilot_model: String,
     claude_binary: PathBuf,
-    claude_model: String,
-    claude_effort: String,
     ollama_binary: PathBuf,
     ollama_model: String,
     resolver_enabled: bool,
@@ -47,6 +45,9 @@ struct Config {
     resolver_base: String,
     resolver_worktree_root: PathBuf,
     resolver_poll_seconds: u64,
+    resolver_concurrency: usize,
+    resolver_memory_mib: u64,
+    review_concurrency: usize,
     provider_poll_seconds: u64,
     slow_cursor_seconds: u64,
     trial_memory_mib: u64,
@@ -132,8 +133,6 @@ fn config(path: &Path) -> Config {
         copilot_binary: value(&text, "copilot_binary").into(),
         copilot_model: value(&text, "copilot_model"),
         claude_binary: value(&text, "claude_binary").into(),
-        claude_model: value(&text, "claude_model"),
-        claude_effort: value(&text, "claude_effort"),
         ollama_binary: value(&text, "ollama_binary").into(),
         ollama_model: value(&text, "ollama_model"),
         resolver_enabled: value(&text, "resolver_enabled")
@@ -146,6 +145,15 @@ fn config(path: &Path) -> Config {
         resolver_poll_seconds: value(&text, "resolver_poll_seconds")
             .parse()
             .expect("resolver_poll_seconds must be an unsigned integer"),
+        resolver_concurrency: value(&text, "resolver_concurrency")
+            .parse()
+            .expect("resolver_concurrency must be an unsigned integer"),
+        resolver_memory_mib: value(&text, "resolver_memory_mib")
+            .parse()
+            .expect("resolver_memory_mib must be an unsigned integer"),
+        review_concurrency: value(&text, "review_concurrency")
+            .parse()
+            .expect("review_concurrency must be an unsigned integer"),
         provider_poll_seconds: value(&text, "provider_poll_seconds")
             .parse()
             .expect("provider_poll_seconds must be an unsigned integer"),
@@ -239,27 +247,39 @@ struct ReviewNode {
 struct Display {
     active: BTreeMap<String, Active>,
     reviews: BTreeMap<String, ReviewNode>,
-    resolver: Option<ResolverNode>,
+    resolvers: BTreeMap<u64, ResolverNode>,
     rows: usize,
 }
 
 static DISPLAY: OnceLock<Mutex<Display>> = OnceLock::new();
-static SPARK: OnceLock<Mutex<()>> = OnceLock::new();
-static KIMI: OnceLock<Mutex<()>> = OnceLock::new();
-static AGY: OnceLock<Mutex<()>> = OnceLock::new();
+static SPARK: OnceLock<Mutex<usize>> = OnceLock::new();
+static KIMI: OnceLock<Mutex<usize>> = OnceLock::new();
+static AGY: OnceLock<Mutex<usize>> = OnceLock::new();
 static OPENCODE: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
-static COPILOT: OnceLock<Mutex<()>> = OnceLock::new();
-static CLAUDE: OnceLock<Mutex<()>> = OnceLock::new();
-static OLLAMA: OnceLock<Mutex<()>> = OnceLock::new();
+static COPILOT: OnceLock<Mutex<usize>> = OnceLock::new();
+static OLLAMA: OnceLock<Mutex<usize>> = OnceLock::new();
 
 fn display() -> &'static Mutex<Display> { DISPLAY.get_or_init(|| Mutex::new(Display::default())) }
 
-fn provider(slot: &'static OnceLock<Mutex<()>>) -> Option<std::sync::MutexGuard<'static, ()>> {
-    match slot.get_or_init(|| Mutex::new(())).try_lock() {
-        Ok(provider) => Some(provider),
-        Err(std::sync::TryLockError::WouldBlock) => None,
-        Err(std::sync::TryLockError::Poisoned(_)) => panic!("provider lock is poisoned"),
+struct Provider {
+    slots: &'static Mutex<usize>,
+}
+
+impl Drop for Provider {
+    fn drop(&mut self) {
+        *self.slots.lock().expect("provider lock is poisoned") -= 1;
     }
+}
+
+fn provider(slot: &'static OnceLock<Mutex<usize>>, limit: usize) -> Option<Provider> {
+    let slots = slot.get_or_init(|| Mutex::new(0));
+    let mut active = slots.lock().expect("provider lock is poisoned");
+    if *active >= limit {
+        return None;
+    }
+    *active += 1;
+    drop(active);
+    Some(Provider { slots })
 }
 
 struct ModelProvider {
@@ -369,32 +389,32 @@ fn display_render(display: &mut Display) {
         reviews.entry(provider.to_owned()).or_default().push((model.to_owned(), review.cursor, elapsed(started)));
     }
     let queued = display.reviews.values().filter(|review| review.model.is_none()).count();
-    let resolving = display.resolver.as_ref().map(|resolver| {
+    let resolving = display.resolvers.values().map(|resolver| {
         format!("{:<28}  issue #{:<5}  time {}", resolver.model, resolver.issue, elapsed(resolver.started))
-    });
+    }).collect::<Vec<_>>();
     if queued != 0 {
         eprintln!("{YELLOW}queued{RESET}");
         eprintln!("└─ {queued} reviews");
         display.rows += 2;
     }
-    if !trials.is_empty() || !reviews.is_empty() || resolving.is_some() {
+    if !trials.is_empty() || !reviews.is_empty() || !resolving.is_empty() {
         eprintln!("{BLUE}live{RESET}");
         display.rows += 1;
     }
     if !trials.is_empty() {
-        let branch = if reviews.is_empty() && resolving.is_none() { "└─" } else { "├─" };
+        let branch = if reviews.is_empty() && resolving.is_empty() { "└─" } else { "├─" };
         eprintln!("{branch} trial");
         display.rows += 1;
         for (index, line) in trials.iter().enumerate() {
             let branch = if index + 1 == trials.len() { "└─" } else { "├─" };
-            let trunk = if reviews.is_empty() && resolving.is_none() { "   " } else { "│  " };
+            let trunk = if reviews.is_empty() && resolving.is_empty() { "   " } else { "│  " };
             eprintln!("{}", fit(&format!("{trunk}{branch} {line}"), width));
             display.rows += 1;
         }
     }
     if !reviews.is_empty() {
-        let review_branch = if resolving.is_some() { "├─" } else { "└─" };
-        let review_trunk = if resolving.is_some() { "│  " } else { "   " };
+        let review_branch = if resolving.is_empty() { "└─" } else { "├─" };
+        let review_trunk = if resolving.is_empty() { "   " } else { "│  " };
         eprintln!("{review_branch} review");
         display.rows += 1;
         let provider_count = reviews.len();
@@ -417,10 +437,14 @@ fn display_render(display: &mut Display) {
             }
         }
     }
-    if let Some(resolver) = resolving {
+    if !resolving.is_empty() {
         eprintln!("└─ resolve");
-        eprintln!("{}", fit(&format!("   └─ {resolver}"), width));
-        display.rows += 2;
+        display.rows += 1;
+        for (index, resolver) in resolving.iter().enumerate() {
+            let branch = if index + 1 == resolving.len() { "└─" } else { "├─" };
+            eprintln!("{}", fit(&format!("   {branch} {resolver}"), width));
+            display.rows += 1;
+        }
     }
     std::io::stderr().flush().expect("cannot draw machine status");
 }
@@ -500,14 +524,14 @@ fn display_reviewed(packet: &str, model: &str, result: &str, url: Option<&str>) 
 
 fn display_resolving(issue: u64, model: &str) {
     let mut display = display().lock().expect("display lock is poisoned");
-    display.resolver = Some(ResolverNode { issue, model: model.to_owned(), started: Instant::now() });
+    display.resolvers.insert(issue, ResolverNode { issue, model: model.to_owned(), started: Instant::now() });
     display_render(&mut display);
 }
 
-fn display_resolved(result: &str, url: Option<&str>) {
+fn display_resolved(issue: u64, result: &str, url: Option<&str>) {
     let mut display = display().lock().expect("display lock is poisoned");
     display_clear(&mut display);
-    if let Some(resolver) = display.resolver.take() {
+    if let Some(resolver) = display.resolvers.remove(&issue) {
         eprintln!("resolve  issue #{:<5}  time {}  model {}", resolver.issue, elapsed(resolver.started), resolver.model);
         if let Some(url) = url {
             eprintln!("└─ {result:<7} {url}");
@@ -1189,16 +1213,11 @@ fn copilot(config: &Config, packet: &str, prompt: &str) -> std::result::Result<D
     })
 }
 
-fn claude_command(config: &Config, prompt: &str, session: Option<&str>, ollama: bool) -> std::process::Output {
+fn ollama_command(config: &Config, prompt: &str, session: Option<&str>) -> std::process::Output {
     let tools = "Read,Glob,Grep,mcp__recipe_issues__search_issues,mcp__recipe_issues__read_issue";
     let mcp = config.repository.join(".mcp.json");
-    let mut command = if ollama {
-        let mut command = Command::new(&config.ollama_binary);
-        command.args(["launch", "claude", "--model", &config.ollama_model, "--yes", "--"]);
-        command
-    } else {
-        Command::new(&config.claude_binary)
-    };
+    let mut command = Command::new(&config.ollama_binary);
+    command.args(["launch", "claude", "--model", &config.ollama_model, "--yes", "--"]);
     command.args([
         "-p",
         prompt,
@@ -1218,32 +1237,27 @@ fn claude_command(config: &Config, prompt: &str, session: Option<&str>, ollama: 
     ]);
     if let Some(session) = session {
         command.args(["--resume", session]);
-    } else if !ollama {
-        command.args(["--model", &config.claude_model, "--effort", &config.claude_effort]);
     }
     output(command.current_dir(&config.repository), None)
 }
 
-fn claude(config: &Config, prompt: &str, ollama: bool) -> std::result::Result<Decision, String> {
-    let provider = if ollama { "ollama" } else { "claude" };
-    let effort = if ollama { "thinking" } else { &config.claude_effort };
-    let result = claude_command(config, prompt, None, ollama);
+fn ollama(config: &Config, prompt: &str) -> std::result::Result<Decision, String> {
+    let result = ollama_command(config, prompt, None);
     let stream = String::from_utf8_lossy(&result.stdout);
     let response = jq_lines(&stream, "[.[] | select(.type == \"assistant\") | .message.content[]? | select(.type == \"text\") | .text][-1]");
     if !result.status.success() && response.is_err() {
         return Err(failure(&result));
     }
     let model = jq_lines(&stream, "[.[] | select(.type == \"system\" and .subtype == \"init\") | .model][-1]")
-        .unwrap_or_else(|_| config.claude_model.clone());
+        .unwrap_or_else(|_| config.ollama_model.clone());
     let mut json = response.and_then(object);
     if json.is_err() {
         let session = jq_lines(&stream, "[.[] | select(.session_id != null) | .session_id][-1]")?;
-        trace(config, &format!("model={} repairing structured output session={session}", identity(provider, &model)));
-        let repair = claude_command(
+        trace(config, &format!("model={} repairing structured output session={session}", identity("ollama", &model)));
+        let repair = ollama_command(
             config,
             "Return only one corrected JSON object matching the required schema. Do not repeat the investigation.",
             Some(&session),
-            ollama,
         );
         let repaired = String::from_utf8_lossy(&repair.stdout);
         json = jq_lines(&repaired, "[.[] | select(.type == \"assistant\") | .message.content[]? | select(.type == \"text\") | .text][-1]")
@@ -1251,16 +1265,16 @@ fn claude(config: &Config, prompt: &str, ollama: bool) -> std::result::Result<De
     }
     let json = json.map_err(|error| format!("{}; {error}", failure(&result)))?;
     Ok(Decision {
-        provider,
-        model: if ollama { model } else { format!("{}-{}", model.strip_prefix("claude-").unwrap_or(&model), effort) },
-        effort: effort.to_owned(),
+        provider: "ollama",
+        model,
+        effort: "thinking".to_owned(),
         json,
     })
 }
 
 fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
     loop {
-        if let Some(_provider) = provider(&SPARK) {
+        if let Some(_provider) = provider(&SPARK, config.review_concurrency) {
             let classifier = identity("codex", &config.spark_model);
             display_reviewing(packet, &classifier);
             match spark(config, prompt) {
@@ -1272,7 +1286,7 @@ fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
             }
             display_reviewing(packet, "queued");
         }
-        if let Some(_provider) = provider(&KIMI) {
+        if let Some(_provider) = provider(&KIMI, config.review_concurrency) {
             let classifier = identity("kimi", &config.kimi_k3_model);
             display_reviewing(packet, &classifier);
             match kimi(config, "kimi", &config.kimi_k3_model, prompt) {
@@ -1296,7 +1310,7 @@ fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
                 display_reviewing(packet, "queued");
             }
         }
-        if let Some(_provider) = provider(&COPILOT) {
+        if let Some(_provider) = provider(&COPILOT, config.review_concurrency) {
             let classifier = identity("copilot", &config.copilot_model);
             display_reviewing(packet, &classifier);
             match copilot(config, packet, prompt) {
@@ -1305,25 +1319,16 @@ fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
             }
             display_reviewing(packet, "queued");
         }
-        if let Some(_provider) = provider(&CLAUDE) {
-            let classifier = identity("claude", "sonnet-5-max");
-            display_reviewing(packet, &classifier);
-            match claude(config, prompt, false) {
-                Ok(decision) => return decision,
-                Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
-            }
-            display_reviewing(packet, "queued");
-        }
-        if let Some(_provider) = provider(&OLLAMA) {
+        if let Some(_provider) = provider(&OLLAMA, config.review_concurrency) {
             let classifier = identity("ollama", &config.ollama_model);
             display_reviewing(packet, &classifier);
-            match claude(config, prompt, true) {
+            match ollama(config, prompt) {
                 Ok(decision) => return decision,
                 Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
             }
             display_reviewing(packet, "queued");
         }
-        if let Some(_provider) = provider(&AGY) {
+        if let Some(_provider) = provider(&AGY, config.review_concurrency) {
             for model in &config.agy_models {
                 let classifier = identity("agy", model);
                 display_reviewing(packet, &classifier);
@@ -1489,7 +1494,7 @@ fn enqueue_review(
     depth
 }
 
-fn resolver_issue(config: &Config) -> std::result::Result<Option<(u64, String)>, String> {
+fn resolver_issue(config: &Config, active: &BTreeSet<u64>) -> std::result::Result<Option<(u64, String)>, String> {
     let issues = output(
         Command::new("gh")
             .args(["issue", "list", "--state", "open", "--limit", "100", "--json", "number,url", "--jq", ".[] | [.number, .url] | @tsv"])
@@ -1515,8 +1520,28 @@ fn resolver_issue(config: &Config) -> std::result::Result<Option<(u64, String)>,
     Ok(String::from_utf8_lossy(&issues.stdout).lines().find_map(|line| {
         let (number, url) = line.split_once('\t')?;
         let number = number.parse::<u64>().ok()?;
-        (!claimed.contains(&number)).then(|| (number, url.to_owned()))
+        (!claimed.contains(&number) && !active.contains(&number)).then(|| (number, url.to_owned()))
     }))
+}
+
+struct ResolverClaim {
+    active: Arc<Mutex<BTreeSet<u64>>>,
+    number: u64,
+    url: String,
+}
+
+impl Drop for ResolverClaim {
+    fn drop(&mut self) {
+        self.active.lock().expect("resolver claim lock is poisoned").remove(&self.number);
+    }
+}
+
+fn resolver_claim(config: &Config, active: &Arc<Mutex<BTreeSet<u64>>>) -> std::result::Result<Option<ResolverClaim>, String> {
+    let mut issues = active.lock().expect("resolver claim lock is poisoned");
+    let Some((number, url)) = resolver_issue(config, &issues)? else { return Ok(None) };
+    issues.insert(number);
+    drop(issues);
+    Ok(Some(ResolverClaim { active: Arc::clone(active), number, url }))
 }
 
 fn resolver_pr(config: &Config, issue: u64) -> std::result::Result<Option<String>, String> {
@@ -1535,10 +1560,10 @@ fn resolver_pr(config: &Config, issue: u64) -> std::result::Result<Option<String
     }))
 }
 
-fn resolver_loop(path: PathBuf) {
+fn resolver_loop(path: PathBuf, active: Arc<Mutex<BTreeSet<u64>>>) {
     loop {
         let current = config(&path);
-        let issue = match resolver_issue(&current) {
+        let issue = match resolver_claim(&current, &active) {
             Ok(Some(issue)) => issue,
             Ok(None) => {
                 std::thread::sleep(Duration::from_secs(current.resolver_poll_seconds));
@@ -1555,12 +1580,27 @@ fn resolver_loop(path: PathBuf) {
 
 Use unrestricted tools and make every required repository and GitHub change yourself. Never edit the current issue-machine worktree. Work in one separate Git worktree under {root}, based on the latest origin/{base}. Reuse coherent existing work for issue #{number} if it exists. Reproduce the exact public failure first, identify the earliest cause in current origin/{base}, implement the root fix without a fallback or parallel implementation, and validate the exact public Recipe path end to end. Test reachable edge cases one at a time through the same public entrypoint. Preserve unrelated user changes.
 
-Commit and push the coherent fix, then create one pull request targeting {base}. The pull request body must contain `Fixes #{number}`, the exact reproduction, the root cause, the change, and measured end-to-end evidence. Do not stop until the pull request exists and its URL is visible. Target issue: {url}"#, number = issue.0, root = current.resolver_worktree_root.display(), base = current.resolver_base, url = issue.1);
-        display_resolving(issue.0, &model);
-        event(&current, &format!("RESOLVE model={model} issue=#{} url={}", issue.0, issue.1));
+Commit and push the coherent fix, then create one pull request targeting {base}. The pull request body must contain `Fixes #{number}`, the exact reproduction, the root cause, the change, and measured end-to-end evidence. Do not stop until the pull request exists and its URL is visible. Target issue: {url}"#, number = issue.number, root = current.resolver_worktree_root.display(), base = current.resolver_base, url = issue.url);
+        display_resolving(issue.number, &model);
+        event(&current, &format!("RESOLVE model={model} issue=#{} url={}", issue.number, issue.url));
+        let memory = format!("MemoryMax={}M", current.resolver_memory_mib);
+        let unit = format!("recipe-resolve-{}", issue.number);
         let result = output(
-            Command::new(&current.claude_binary)
+            Command::new("systemd-run")
                 .args([
+                    "--user",
+                    "--wait",
+                    "--pipe",
+                    "--collect",
+                    "--quiet",
+                    "--unit",
+                    &unit,
+                    "--working-directory",
+                    current.repository.to_str().expect("repository path is not UTF-8"),
+                    "--property",
+                    &memory,
+                    "--",
+                    current.claude_binary.to_str().expect("Claude binary path is not UTF-8"),
                     "-p",
                     &goal,
                     "--model",
@@ -1571,29 +1611,29 @@ Commit and push the coherent fix, then create one pull request targeting {base}.
                     "--output-format",
                     "json",
                     "--name",
-                    &format!("Resolve Recipe issue #{}", issue.0),
+                    &format!("Resolve Recipe issue #{}", issue.number),
                 ])
                 .current_dir(&current.repository),
             None,
         );
         if !result.status.success() {
-            event(&current, &format!("RESOLVE model={model} issue=#{} failed error={}", issue.0, failure(&result)));
-            display_resolved("FAIL", None);
+            event(&current, &format!("RESOLVE model={model} issue=#{} failed error={}", issue.number, failure(&result)));
+            display_resolved(issue.number, "FAIL", None);
             return;
         }
-        match resolver_pr(&current, issue.0) {
+        match resolver_pr(&current, issue.number) {
             Ok(Some(url)) => {
-                event(&current, &format!("PR model={model} issue=#{} url={url}", issue.0));
-                display_resolved("PR", Some(&url));
+                event(&current, &format!("PR model={model} issue=#{} url={url}", issue.number));
+                display_resolved(issue.number, "PR", Some(&url));
             }
             Ok(None) => {
-                event(&current, &format!("RESOLVE model={model} issue=#{} failed error=goal completed without an open pull request", issue.0));
-                display_resolved("FAIL", None);
+                event(&current, &format!("RESOLVE model={model} issue=#{} failed error=goal completed without an open pull request", issue.number));
+                display_resolved(issue.number, "FAIL", None);
                 return;
             }
             Err(error) => {
-                event(&current, &format!("RESOLVE model={model} issue=#{} failed error={error}", issue.0));
-                display_resolved("FAIL", None);
+                event(&current, &format!("RESOLVE model={model} issue=#{} failed error={error}", issue.number));
+                display_resolved(issue.number, "FAIL", None);
                 return;
             }
         }
@@ -1624,8 +1664,12 @@ fn main() {
         .cloned()
         .for_each(|packet| dispatch_review(Arc::clone(&work), path.clone(), Arc::clone(&instructions), packet));
     if initial.resolver_enabled {
-        let resolver_path = path.clone();
-        std::thread::spawn(move || resolver_loop(resolver_path));
+        let active = Arc::new(Mutex::new(BTreeSet::new()));
+        for _ in 0..initial.resolver_concurrency {
+            let resolver_path = path.clone();
+            let resolver_active = Arc::clone(&active);
+            std::thread::spawn(move || resolver_loop(resolver_path, resolver_active));
+        }
     }
     assert!(
         !initial.discovery_devices.is_empty(),
