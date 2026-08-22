@@ -1016,8 +1016,8 @@ const NATIVE_FORWARD_SYMBOL: &str = "recipe_model_forward";
 const NATIVE_EPOCH_SYMBOL: &str = "recipe_model_epoch";
 const NATIVE_MODEL_LOAD_SYMBOL: &str = "recipe_model_load";
 const NATIVE_FORWARD_LAYOUT: &[u8] = b"888844";
-const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"8888888888884488888884";
-const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"8888888888884444444444";
+const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"88888888888884488888884";
+const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"88888888888884444444444";
 const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"884";
 macro_rules! native_precisions {
 	($($pattern:pat $(if $guard:expr)? => ($source:literal, $model_type:literal, $state:expr, $state_type:literal, $layout:expr)),+ $(,)?) => {
@@ -2397,7 +2397,7 @@ impl NativeModelIr {
 		body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"));
 		let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
 		let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
-		let epoch_args = format!("{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %step");
+		let epoch_args = format!("{pointer} %samples, {pointer} %targets, {pointer} %mask, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %step");
 		body.push_str(&format!("define {kernel}void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "entry")?);
 		body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
@@ -2422,12 +2422,26 @@ impl NativeModelIr {
 		let adjoint_offset = last.adjoint;
 		let mut ir = String::new();
 		let zero = native_literal(state_precision, state_ty, 0.0);
+		// One mask byte per target component: nonzero marks a labelled component. An
+		// unlabelled component is absent from the mean: it is dropped by selection, never by
+		// multiplying with zero, which would turn a nonfinite untaken value into NaN.
+		let count = |prefix: &str, from: &str| {
+			format!(
+				"br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ 0, %{from} ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.acc = phi i32 [ 0, %{from} ], [ %{prefix}.acc.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {items}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.ptr = getelementptr i8, {pointer} %mask, i32 %{prefix}.p\n%{prefix}.byte = load i8, {pointer} %{prefix}.ptr, align 1\n%{prefix}.on = icmp ne i8 %{prefix}.byte, 0\n%{prefix}.inc = zext i1 %{prefix}.on to i32\n%{prefix}.acc.next = add i32 %{prefix}.acc, %{prefix}.inc\n%{prefix}.next = add i32 %{prefix}.p, 1\nbr label %{prefix}.loop\n{prefix}.done:\n"
+			)
+		};
+		let mask = |prefix: &str, position: &str| {
+			format!(
+				"%{prefix}.mask.ptr = getelementptr i8, {pointer} %mask, i32 {position}\n%{prefix}.mask.byte = load i8, {pointer} %{prefix}.mask.ptr, align 1\n%{prefix}.labelled = icmp ne i8 %{prefix}.mask.byte, 0\n"
+			)
+		};
 		ir.push_str(&format!("%prediction.base = getelementptr i8, {pointer} %values, i32 {prediction_offset}\n%prediction = bitcast {pointer} %prediction.base to {pointer}\n%metric.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 0\n%loss.leader = icmp eq i32 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
-		ir.push_str(&format!("%loss.items = call {state_ty} @recipe.state.from.u32(i32 {items})\n"));
+		ir.push_str(&count("loss.count", "loss.entry"));
+		ir.push_str(&format!("%loss.items = call {state_ty} @recipe.state.from.u32(i32 %loss.count.acc)\n"));
 		if loss.0 <= 1 {
 			ir.push_str(&format!("%loss.normalizer = call {state_ty} @recipe.state.sqrt({state_ty} %loss.items)\n"));
 		}
-		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, {items}\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
+		ir.push_str(&format!("br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.count.done ], [ %loss.next, %loss.item ]\n%loss.mean = phi {state_ty} [ {zero}, %loss.count.done ], [ %loss.mean.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, {items}\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n"));
 		let prediction = "%loss.prediction";
 		let target = "%loss.target";
 		let pred_ptr = "%loss.prediction.ptr";
@@ -2441,7 +2455,9 @@ impl NativeModelIr {
 			ir.push_str(&format!("%loss.contribution = call {state_ty} @recipe.state.div({state_ty} {loss_value}, {state_ty} %loss.items)\n"));
 			"%loss.contribution".to_owned()
 		};
-		ir.push_str(&format!("%loss.mean.next = call {state_ty} @recipe.state.add({state_ty} %loss.mean, {state_ty} {contribution})\n%loss.next = add i32 %loss.p, 1\nbr label %loss.step\nloss.store:\n"));
+		ir.push_str(&mask("loss", "%loss.p"));
+		ir.push_str(&format!("%loss.selected = select i1 %loss.labelled, {state_ty} {contribution}, {state_ty} {zero}\n"));
+		ir.push_str(&format!("%loss.mean.next = call {state_ty} @recipe.state.add({state_ty} %loss.mean, {state_ty} %loss.selected)\n%loss.next = add i32 %loss.p, 1\nbr label %loss.step\nloss.store:\n"));
 		if loss.0 == 1 {
 			ir.push_str(&format!("%loss.value = call {state_ty} @recipe.state.sqrt({state_ty} %loss.mean)\n"));
 		} else {
@@ -2455,9 +2471,13 @@ impl NativeModelIr {
 		} else {
 			zero.as_str()
 		};
-		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i32 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, {items}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
-		let gradient = emit_loss_gradient(&mut ir, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, loss_value, &format!("{items}"))?;
-		ir.push_str(&format!("%seed.model = call {model_ty} @recipe.model.from.state({state_ty} {gradient})\n%seed.ptr = getelementptr {model_ty}, {pointer} %adjoint, i32 %seed.p\nstore {model_ty} %seed.model, {pointer} %seed.ptr, align {model_align}\n%seed.next = add i32 %seed.p, %threads\nbr label %seed.loop\nseed.done:\n"));
+		ir.push_str(&count("seed.count", "loss.wait"));
+		ir.push_str(&format!("%seed.labelled.total = call {state_ty} @recipe.state.from.u32(i32 %seed.count.acc)\n"));
+		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i32 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %seed.count.done ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, {items}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
+		let gradient = emit_loss_gradient(&mut ir, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, loss_value, "%seed.labelled.total")?;
+		ir.push_str(&mask("seed", "%seed.p"));
+		ir.push_str(&format!("%seed.selected = select i1 %seed.labelled, {state_ty} {gradient}, {state_ty} {zero}\n"));
+		ir.push_str(&format!("%seed.model = call {model_ty} @recipe.model.from.state({state_ty} %seed.selected)\n%seed.ptr = getelementptr {model_ty}, {pointer} %adjoint, i32 %seed.p\nstore {model_ty} %seed.model, {pointer} %seed.ptr, align {model_align}\n%seed.next = add i32 %seed.p, %threads\nbr label %seed.loop\nseed.done:\n"));
 		Ok(ir)
 	}
 
@@ -2596,7 +2616,7 @@ fn emit_loss_value(ir: &mut String, loss: LossFunction, precision: Compute, ty: 
 	}
 }
 
-fn emit_loss_gradient(ir: &mut String, loss: LossFunction, precision: Compute, ty: &str, prediction: &str, target: &str, threshold: &str, loss_value: &str, rows: &str) -> Result<String> {
+fn emit_loss_gradient(ir: &mut String, loss: LossFunction, precision: Compute, ty: &str, prediction: &str, target: &str, threshold: &str, loss_value: &str, labelled: &str) -> Result<String> {
 	let literal = |value: f64| native_literal(precision, ty, value);
 	let zero = literal(0.0);
 	let one = literal(1.0);
@@ -2605,8 +2625,8 @@ fn emit_loss_gradient(ir: &mut String, loss: LossFunction, precision: Compute, t
 	let tiny = literal(f64::EPSILON);
 	let half = literal(0.5);
 	append_binary(ir, ty, "seed.difference", "sub", prediction, target);
-	let rows_value = "%seed.rows";
-	ir.push_str(&format!("{rows_value} = call {ty} @recipe.state.from.u32(i32 {rows})\n", rows_value = rows_value, ty = ty, rows = rows));
+	// The mean spans the labelled components, so they alone carry the gradient.
+	let rows_value = labelled;
 	match loss.0 {
 		0 => {
 			append_binary(ir, ty, "seed.twice", "add", "%seed.difference", "%seed.difference");
@@ -3219,7 +3239,9 @@ mod bundle {
 			for (name, values) in [("moments", &self.state.moments), ("variances", &self.state.variances)] {
 				require(values.is_empty() || values.len() == self.frozen.len(), format!("semantic model {name} are incomplete"))?;
 			}
-			let estimators = model.blocks.iter().filter(|block| matches!(block.operation, Operation::Estimator(_))).count();
+			// An estimator block fits one predictor per target, so a model output vector of
+			// width N carries N programs per estimator block.
+			let estimators = model.blocks.iter().filter(|block| matches!(block.operation, Operation::Estimator(_))).count() * output.elements();
 			require(self.predictors.len() == estimators, "semantic model fitted estimator programs are incomplete")?;
 			Ok(SemanticGraph { model, precision: self.precision.ok_or_else(|| RecipeError::new("semantic model has no arithmetic format"))?, input, output, inputs: self.inputs, outputs: self.outputs, tensors: self.tensors, predictors: self.predictors, frozen: self.frozen, state: self.state, norm_mean: self.norm_mean, norm_scale: self.norm_scale, target_min: self.target_min, target_span: self.target_span, bn_stats: self.bn_stats, artifact: self.artifact })
 		}
@@ -5034,9 +5056,11 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		lower_block(&mut graph, block, model.blocks.len(), data, targets, rows, gpu, config)?;
 	}
 	let mut output_profile = model.blocks.last().filter(|block| block.profile).map(|block| StorageFormat(block.quantization));
-	if graph.output.elements() != 1 {
+	// The output is the target vector only when it is one position of that many channels;
+	// any other shape, sequential ones included, still needs the projection.
+	if graph.output.channels != data.target_width || graph.output.length != 1 {
 		let length = graph.output.length;
-		lower_conv(&mut graph, 1, length)?;
+		lower_conv(&mut graph, data.target_width, length)?;
 		if model.quantization != 0 {
 			graph.nodes.last_mut().unwrap().argument[8] = f64::from(model.quantization)
 		}
@@ -5050,15 +5074,16 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	if initialize {
 		initialize_graph(&mut graph, config);
 		if let Some(offset) = output_bias_offset(&graph) {
-			let mean = data.targets[..rows].iter().sum::<f64>() / rows as f64;
-			graph.parameters[offset] = mean;
+			for (index, bias) in target_means(&data.targets, data.target_width, rows).into_iter().enumerate() {
+				graph.parameters[offset + index] = bias;
+			}
 		}
 	}
 	encode_graph_storage(&mut graph, config)?;
 	Ok(graph)
 }
 fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: &'static Gpu, config: Config) -> Result<Graph> {
-	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], rows: 1, source_rows: 1, features: saved.input.elements(), schema: DataSchema::default(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new(), fitted: saved.predictors.clone() };
+	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], rows: 1, source_rows: 1, features: saved.input.elements(), target_width: saved.output.elements(), schema: DataSchema::default(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new(), fitted: saved.predictors.clone() };
 	let mut graph = compile(&saved.model, &prepared, &prepared.targets, 1, gpu, config, false)?;
 	require(graph.input == saved.input, "saved semantic input shape does not match the compiled model")?;
 	require(graph.output == saved.output, "saved semantic output shape does not match the compiled model")?;
@@ -5295,6 +5320,17 @@ fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	let output = Shape { channels: filters, length: graph.output.length - kernel + 1 };
 	push_node(graph, Primitive::Contraction, output, parameters, arguments(kernel as f64, 0.0), -2)
 }
+// An unlabelled target component is absent, not zero, so the mean that seeds its output bias
+// averages the rows that label it.
+fn target_means(targets: &[f64], width: usize, rows: usize) -> Vec<f64> {
+	(0..width)
+		.map(|index| {
+			let labelled = targets[..rows * width].iter().skip(index).step_by(width).filter(|value| value.is_finite());
+			let count = labelled.clone().count();
+			labelled.sum::<f64>() / count as f64
+		})
+		.collect()
+}
 fn output_bias_offset(graph: &Graph) -> Option<usize> { graph.nodes.iter().rev().find(|node| node.op == Primitive::Contraction).map(|node| node.offset + node.parameters - node.output.channels) }
 fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	require(size != 0, "pool window must be positive")?;
@@ -5457,29 +5493,66 @@ fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Conf
 }
 fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let (source, input) = (graph.source, graph.output);
-	let restored = data.fitted.get(graph.nodes.iter().filter(|node| node.op == Primitive::Predictor).count()).cloned();
-	let (predictor, surrogate) = if let Some(program) = restored {
-		let blank = Prepared { samples: vec![0.0; input.elements()], targets: vec![0.0], rows: 1, source_rows: 1, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
-		let mut surrogate = compile(&surrogate_model(config.surrogate_width), &blank, &blank.targets, 1, gpu, config, false)?;
-		surrogate.frozen.fill(1);
-		(program, surrogate)
-	} else {
+	let width = data.target_width;
+	let scalar = Shape { channels: 1, length: 1 };
+	let base = graph.nodes.iter().filter(|node| node.op == Primitive::Predictor).count();
+	let restored = (0..width).map(|column| data.fitted.get(base + column).cloned()).collect::<Vec<_>>();
+	// One estimator fit per target reads the activations reaching this block, so they are
+	// taken once, before any of the block's own nodes join the graph.
+	let inputs = if restored.iter().any(Option::is_none) {
 		(estimator.validate)(estimator.param, rows)?;
-		let inputs = graph_inputs(graph, &data.samples, &data.targets, rows, gpu, config.precision)?;
-		let prepared = Prepared { samples: inputs.clone(), targets: targets[..rows].to_vec(), rows, source_rows: rows, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: data.target_categorical, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
-		let teacher = estimator.fit(&prepared, rows, config, true)?;
-		let targets = inputs.chunks_exact(input.elements()).enumerate().map(|(row, query)| (teacher.predict)(row, query)).collect::<Result<Vec<_>>>()?;
-		let predictor = estimator.fit(&prepared, rows, config, false)?;
-		(predictor.program, fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?)
+		graph_inputs(graph, &data.samples, &data.targets, rows, gpu, config.precision)?
+	} else {
+		Vec::new()
 	};
-	reset(graph, source, input);
-	push_predictor(graph, predictor)?;
-	let real = graph.source;
-	reset(graph, source, input);
-	let surrogate = append_graph(graph, surrogate)?;
-	let mut rat = ScalarProgram(Vec::new());
-	rat.op(ScalarOpcode::StraightThrough, -1.0, -2.0);
-	program(graph, real, surrogate, Shape { channels: 1, length: 1 }, &[], rat).map(drop)
+	let mut accumulated = None;
+	for (column, fitted) in restored.into_iter().enumerate() {
+		let (predictor, surrogate) = if let Some(program) = fitted {
+			let blank = Prepared { samples: vec![0.0; input.elements()], targets: vec![0.0], rows: 1, source_rows: 1, features: input.elements(), target_width: 1, schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
+			let mut surrogate = compile(&surrogate_model(config.surrogate_width), &blank, &blank.targets, 1, gpu, config, false)?;
+			surrogate.frozen.fill(1);
+			(program, surrogate)
+		} else {
+			let column_targets = (0..rows).map(|row| targets[row * width + column]).collect::<Vec<_>>();
+			let prepared = Prepared { samples: inputs.clone(), targets: column_targets, rows, source_rows: rows, features: input.elements(), target_width: 1, schema: DataSchema::default(), sequence: None, target_categorical: data.target_categorical, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
+			let teacher = estimator.fit(&prepared, rows, config, true)?;
+			let teaching = inputs.chunks_exact(input.elements()).enumerate().map(|(row, query)| (teacher.predict)(row, query)).collect::<Result<Vec<_>>>()?;
+			let predictor = estimator.fit(&prepared, rows, config, false)?;
+			(predictor.program, fit_surrogate(input, &inputs, &teaching, config.surrogate_width, gpu, config)?)
+		};
+		reset(graph, source, input);
+		push_predictor(graph, predictor)?;
+		let real = graph.source;
+		reset(graph, source, input);
+		let surrogate = append_graph(graph, surrogate)?;
+		let mut rat = ScalarProgram(Vec::new());
+		rat.op(ScalarOpcode::StraightThrough, -1.0, -2.0);
+		let estimate = program(graph, real, surrogate, scalar, &[], rat)?;
+		if width == 1 {
+			return Ok(());
+		}
+		reset(graph, estimate, scalar);
+		place_channel(graph, column, width)?;
+		let branch = graph.source;
+		accumulated = Some(match accumulated {
+			None => branch,
+			Some(previous) => binary(graph, previous, branch, Shape { channels: width, length: 1 }, ScalarOpcode::Add)?,
+		});
+	}
+	let accumulated = accumulated.ok_or_else(|| RecipeError::new("estimator has no target"))?;
+	reset(graph, accumulated, Shape { channels: width, length: 1 });
+	Ok(())
+}
+// Route one scalar estimate into its own target channel, leaving the others zero, so that
+// summing the per-target branches concatenates them into one target-width vector.
+fn place_channel(graph: &mut Graph, channel: usize, width: usize) -> Result<()> {
+	lower_project(graph, width)?;
+	let node = graph.nodes.last().ok_or_else(|| RecipeError::new("estimator channel projection is absent"))?;
+	let (offset, parameters) = (node.offset, node.parameters);
+	graph.parameters[offset..offset + parameters].fill(0.0);
+	graph.parameters[offset + channel] = 1.0;
+	graph.frozen[offset..offset + parameters].fill(1);
+	Ok(())
 }
 fn initialize_graph(graph: &mut Graph, config: Config) {
 	let mut state = config.random_seed as u64;
@@ -5606,7 +5679,7 @@ fn natural(name: &str, text: &str) -> Result<usize> {
 fn count(name: &str, text: &str) -> Result<usize> { text.parse::<usize>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}"))) }
 fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetScale>, precision: Compute, target: &str) -> bundle::StoredGraph {
 	let inputs = if data.autoregressive { CHAR_IDS.iter().enumerate().flat_map(|(id, character)| (0..graph.input.length).map(move |position| format!("char{id}.u{:04X}.{position}", *character as u32))).collect() } else { (0..graph.input.elements()).map(|index| format!("input{index}")).collect() };
-	let output = if data.autoregressive { "char-id".to_owned() } else { data.target.first().cloned().unwrap_or_else(|| "target".to_owned()) };
+	let outputs = if data.autoregressive { vec!["char-id".to_owned()] } else if data.target.is_empty() { vec!["target".to_owned()] } else { data.target.clone() };
 	let (norm_mean, norm_scale) = match data.prepared.get() {
 		Some(Ok(prepared)) => (prepared.norm_mean.clone(), prepared.norm_scale.clone()),
 		_ => (Vec::new(), Vec::new()),
@@ -5614,7 +5687,7 @@ fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetS
 	let (target_min, target_span) = scale.map_or((0.0, 0.0), |s| (s.minimum, s.span));
 	let schema = data.prepared.get().and_then(|prepared| prepared.as_ref().ok()).map_or_else(DataSchema::default, |prepared| prepared.schema.clone());
 	let artifact = bundle::artifact_key(model, &schema, precision, graph, target);
-	bundle::StoredGraph { graph: graph.clone(), model: model.clone(), precision, inputs, outputs: vec![output], norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new(), artifact }
+	bundle::StoredGraph { graph: graph.clone(), model: model.clone(), precision, inputs, outputs, norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new(), artifact }
 }
 struct NativeTape {
 	program: NativeProgram,
@@ -5626,6 +5699,7 @@ struct NativeTape {
 	samples: Buffer,
 	input_adjoint: Buffer,
 	targets: Buffer,
+	mask: Buffer,
 	weights: Buffer,
 	frozen: Buffer,
 	moments: Buffer,
@@ -5662,7 +5736,9 @@ impl NativeTape {
 		let batch_normalizations = graph.nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels))).collect();
 		let best_loss = if graph.state.best_loss.is_empty() { [f64::INFINITY, f64::NAN, f64::NAN, f64::INFINITY] } else { graph.state.best_loss.as_slice().try_into().map_err(|_| RecipeError::new("saved loss state is invalid"))? };
 		let step = narrow(graph.state.epoch, "optimizer epoch")? as u32;
-		let target_buffer = if targets.is_empty() { vec![0.0] } else { targets.to_vec() };
+		// An unlabelled component uploads as zero; the mask byte, not the value, excludes it.
+		let target_buffer = if targets.is_empty() { vec![0.0] } else { targets.iter().map(|target| if target.is_finite() { *target } else { 0.0 }).collect() };
+		let mask_bytes = if targets.is_empty() { vec![0_u8] } else { targets.iter().map(|target| u8::from(target.is_finite())).collect() };
 		let parameter_values = if graph.parameters.is_empty() { vec![0.0] } else { graph.parameters.clone() };
 		let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
 		if program.model_load.is_some() {
@@ -5685,6 +5761,7 @@ impl NativeTape {
 			samples: Buffer::upload_float(gpu, samples, precision.model)?,
 			input_adjoint: Buffer::upload_float(gpu, &vec![0.0; samples.len().max(1)], precision.model)?,
 			targets: Buffer::upload_float(gpu, &target_buffer, precision.model)?,
+			mask: Buffer::upload(gpu, &mask_bytes)?,
 			weights,
 			frozen: Buffer::upload(gpu, &frozen)?,
 			moments: Buffer::upload_float(gpu, &moments, precision.state)?,
@@ -5746,6 +5823,7 @@ impl NativeTape {
 		let mut call = ptrs![
 			self.samples.pointer,
 			self.targets.pointer,
+			self.mask.pointer,
 			self.weights.pointer,
 			self.frozen.pointer,
 			self.moments.pointer,
@@ -5921,10 +5999,10 @@ struct Dispatch {
 }
 type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32);
-type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32);
-type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32);
-type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32);
-type NativeEpochF8 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i8, i8, i8, i8, i8, i8, i8, i32);
+type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32);
+type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32);
+type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32);
+type NativeEpochF8 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i8, i8, i8, i8, i8, i8, i8, i32);
 
 #[derive(Clone, Copy)]
 enum NativeCpuEpoch {
@@ -6659,23 +6737,23 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 		}
 		NativeEntry::Epoch => {
 			require(arguments.len() == NATIVE_EPOCH_LAYOUT_FP64.len(), "native CPU epoch argument count is invalid")?;
-			let pointers = (0..12).map(|index| native_cpu_pointer(arguments, index)).collect::<Vec<_>>();
+			let pointers = (0..13).map(|index| native_cpu_pointer(arguments, index)).collect::<Vec<_>>();
 			match cpu.epoch {
 				NativeCpuEpoch::F64(function) => function(
-					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11],
-					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21),
+					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11], pointers[12],
+					native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21), native_cpu_value(arguments, 22),
 				),
 				NativeCpuEpoch::F32(function) => function(
-					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11],
-					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21),
+					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11], pointers[12],
+					native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21), native_cpu_value(arguments, 22),
 				),
 				NativeCpuEpoch::F16(function) => function(
-					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11],
-					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21),
+					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11], pointers[12],
+					native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21), native_cpu_value(arguments, 22),
 				),
 				NativeCpuEpoch::F8(function) => function(
-					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11],
-					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21),
+					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11], pointers[12],
+					native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21), native_cpu_value(arguments, 22),
 				),
 			}
 		}
@@ -6972,7 +7050,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	let sample_count = checked_mul(targets.len(), input.elements(), "surrogate samples")?;
 	require(samples.len() == sample_count, "surrogate sample batch is invalid")?;
 	let model = surrogate_model(hidden);
-	let prepared = Prepared { samples: samples.to_vec(), targets: targets.to_vec(), rows: targets.len(), source_rows: targets.len(), features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
+	let prepared = Prepared { samples: samples.to_vec(), targets: targets.to_vec(), rows: targets.len(), source_rows: targets.len(), features: input.elements(), target_width: 1, schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
 	let mut graph = compile(&model, &prepared, targets, prepared.rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, mse)?;
 	for _ in 0..config.surrogate_epochs {
@@ -7907,6 +7985,7 @@ struct Prepared {
 	rows: usize,
 	source_rows: usize,
 	features: usize,
+	target_width: usize,
 	schema: DataSchema,
 	sequence: Option<Shape>,
 	target_categorical: bool,
@@ -8523,55 +8602,58 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	require(features != 0, "dataset has no training features")?;
 	let target_categories = selected.iter().map(|target| categories(&tables[target.0], target.1, source_table_rows)).collect::<Vec<_>>();
 	let target_categorical = selected.iter().any(|target| tables[target.0].rows.iter().take(source_table_rows).filter_map(|row| row.get(target.1)).any(|value| !value.is_empty() && value.parse::<f64>().is_err()));
+	// One source row is one sample; several targets widen its target vector.
+	let target_width = selected.len().max(1);
 	let mut samples = Vec::new();
 	let mut targets = Vec::new();
 	let mut source_rows = 0;
 	let mut missing = vec![0_usize; columns.len()];
 	for row in 0..row_count {
-		if row == source_table_rows { source_rows = targets.len() }
+		if row == source_table_rows { source_rows = targets.len() / target_width }
 		let mut encoded = Vec::with_capacity(features);
 		let valid = columns.iter().all(|column| tables[column.0].rows[row].get(column.1).is_some_and(|value| encode(value, &column.2, &mut encoded)));
-		if valid {
-			if let Some(shape) = sequence {
-				let mut ordered = Vec::with_capacity(features);
-				for channel in 0..shape.channels {
-					for position in 0..shape.length {
-						ordered.push(encoded[position * shape.channels + channel]);
-					}
-				}
-				encoded = ordered;
-			}
+		if !valid {
+			continue;
 		}
-		if valid && selected.is_empty() {
-			samples.extend_from_slice(&encoded);
-			targets.push(0.0);
-			for (count, column) in missing.iter_mut().zip(&columns) {
-				*count += usize::from(tables[column.0].rows[row][column.1].is_empty());
-			}
-		} else if valid {
-			for (target, categories) in selected.iter().zip(&target_categories) {
-				let value = tables[target.0].rows[row].get(target.1);
-				let target = value.and_then(|value| value.parse::<f64>().ok()).or_else(|| value.and_then(|value| categories.iter().position(|category| category == value)).map(|value| value as f64));
-				if let Some(target) = target
-					&& target.is_finite()
-				{
-					samples.extend_from_slice(&encoded);
-					targets.push(target);
-					for (count, column) in missing.iter_mut().zip(&columns) {
-						*count += usize::from(tables[column.0].rows[row][column.1].is_empty());
-					}
+		if let Some(shape) = sequence {
+			let mut ordered = Vec::with_capacity(features);
+			for channel in 0..shape.channels {
+				for position in 0..shape.length {
+					ordered.push(encoded[position * shape.channels + channel]);
 				}
 			}
+			encoded = ordered;
+		}
+		let mut vector = Vec::with_capacity(target_width);
+		for (target, categories) in selected.iter().zip(&target_categories) {
+			let value = tables[target.0].rows[row].get(target.1);
+			let value = value.and_then(|value| value.parse::<f64>().ok()).or_else(|| value.and_then(|value| categories.iter().position(|category| category == value)).map(|value| value as f64));
+			vector.push(value.filter(|value| value.is_finite()).unwrap_or(f64::NAN));
+		}
+		if selected.is_empty() {
+			vector.push(0.0);
+		}
+		// One label makes the row a sample; the rest of its target vector is imputed.
+		if !vector.iter().any(|value| value.is_finite()) {
+			continue;
+		}
+		samples.extend_from_slice(&encoded);
+		targets.append(&mut vector);
+		for (count, column) in missing.iter_mut().zip(&columns) {
+			*count += usize::from(tables[column.0].rows[row][column.1].is_empty());
 		}
 	}
-	if source_table_rows == row_count { source_rows = targets.len() }
+	if source_table_rows == row_count { source_rows = targets.len() / target_width }
+	for column in 0..target_width {
+		require(targets.iter().skip(column).step_by(target_width).any(|value| value.is_finite()), format!("target {} labels no row", column + 1))?;
+	}
 	for (column, count) in columns.iter().zip(missing).filter(|value| value.1 != 0) {
 		let percentage = count as f64 * 100.0 / row_count as f64;
 		let precision = 4_usize.max((-percentage.log10()).ceil().max(0.0) as usize);
 		eprintln!("imputed {}.{}: {percentage:.precision$}%", tables[column.0].name, tables[column.0].headers[column.1]);
 	}
 	let schema = columns.iter().map(|column| ("feature".to_owned(), format!("{} {}.{}", column.2.width(), tables[column.0].name, tables[column.0].headers[column.1]))).chain(data.target.iter().cloned().map(|target| ("target".to_owned(), target))).collect();
-	finish_prepared(data, samples, targets, source_rows, features, sequence, target_categorical, schema)
+	finish_prepared(data, samples, targets, source_rows, features, target_width, sequence, target_categorical, schema)
 }
 fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 	let mut sequences = Vec::new();
@@ -8606,27 +8688,27 @@ fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 	}
 	let schema = CHAR_IDS.iter().map(|character| ("character".to_owned(), format!("U+{:04X}", *character as u32))).collect();
 	let source_rows = targets.len();
-	finish_prepared(data, samples, targets, source_rows, features, Some(Shape { channels: CHAR_IDS.len(), length }), true, schema)
+	finish_prepared(data, samples, targets, source_rows, features, 1, Some(Shape { channels: CHAR_IDS.len(), length }), true, schema)
 }
-fn finish_prepared(data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, source_rows: usize, features: usize, sequence: Option<Shape>, target_categorical: bool, schema: DataSchema) -> Result<Prepared> {
-	let rows = targets.len();
+fn finish_prepared(data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, source_rows: usize, features: usize, target_width: usize, sequence: Option<Shape>, target_categorical: bool, schema: DataSchema) -> Result<Prepared> {
+	let rows = targets.len() / target_width;
 	require(source_rows != 0 && source_rows <= rows, "dataset has no complete training rows")?;
 	// Sources may repeat a row verbatim; each copy is its own sample, so its identity mixes
 	// in how many identical rows precede it in source order, which the seed never changes.
 	let mut occurrences = BTreeMap::new();
-	let mut identities = samples.chunks_exact(features).zip(&targets).map(|(sample, target)| {
-		let content = sample_identity(sample, *target);
+	let mut identities = samples.chunks_exact(features).zip(targets.chunks_exact(target_width)).map(|(sample, target)| {
+		let content = sample_identity(sample, target);
 		let occurrence = occurrences.entry(content).and_modify(|count| *count += 1_u64).or_insert(0);
 		occurrence.to_le_bytes().iter().fold(content, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(1099511628211))
 	}).collect();
-	shuffle(&mut samples, &mut targets, &mut identities, features, source_rows)?;
+	shuffle(&mut samples, &mut targets, &mut identities, features, target_width, source_rows)?;
 	let (norm_mean, norm_scale) = if data.normalize {
 		normalize_samples(&mut samples, features, ((source_rows as f64) * data.split).floor() as usize)?
 	} else {
 		impute_missing(&mut samples);
 		(Vec::new(), Vec::new())
 	};
-	Ok(Prepared { samples, targets, rows, source_rows, features, schema, sequence, target_categorical, norm_mean, norm_scale, identities, fitted: Vec::new() })
+	Ok(Prepared { samples, targets, rows, source_rows, features, target_width, schema, sequence, target_categorical, norm_mean, norm_scale, identities, fitted: Vec::new() })
 }
 fn normalize_samples(samples: &mut [f64], features: usize, fit: usize) -> Result<(Vec<f64>, Vec<f64>)> {
 	require(fit != 0, "split must retain normalization rows")?;
@@ -8654,12 +8736,12 @@ fn impute_missing(samples: &mut [f64]) {
 		}
 	}
 }
-fn sample_identity(sample: &[f64], target: f64) -> u64 {
+fn sample_identity(sample: &[f64], target: &[f64]) -> u64 {
 	const OFFSET: u64 = 14695981039346656037;
 	const PRIME: u64 = 1099511628211;
 	// Feed the hash bytewise: word-wide mixing leaves the low hash bits untouched by the
 	// all-zero low mantissa bits of small integer values, collapsing the identity space.
-	sample.iter().copied().chain(std::iter::once(target)).flat_map(|value| value.to_bits().to_le_bytes()).fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
+	sample.iter().chain(target).flat_map(|value| value.to_bits().to_le_bytes()).fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
 }
 fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5" | "xml") }
 fn is_archive(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "zip") }
@@ -9678,10 +9760,11 @@ fn encode(value: &str, kind: &FeatureType, output: &mut Vec<f64>) -> bool {
 		}
 	}
 }
-fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, identities: &mut Vec<u64>, features: usize, source_rows: usize) -> Result<()> {
+fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, identities: &mut Vec<u64>, features: usize, target_width: usize, source_rows: usize) -> Result<()> {
 	let mut seed = env!("RECIPE_RANDOM_SEED").parse::<u64>().map_err(|error| RecipeError::new(format!("invalid random seed: {error}")))?;
-	let mut order = Vec::with_capacity(targets.len());
-	for (start, end) in [(0, source_rows), (source_rows, targets.len())] {
+	let rows = targets.len() / target_width;
+	let mut order = Vec::with_capacity(rows);
+	for (start, end) in [(0, source_rows), (source_rows, rows)] {
 		let mut partition = (start..end).collect::<Vec<_>>();
 		for index in (1..partition.len()).rev() {
 			seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -9694,7 +9777,7 @@ fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, identities: &mut Vec<
 	let old_identities = std::mem::take(identities);
 	for row in order {
 		samples.extend_from_slice(&old_samples[row * features..(row + 1) * features]);
-		targets.push(old_targets[row]);
+		targets.extend_from_slice(&old_targets[row * target_width..(row + 1) * target_width]);
 		identities.push(old_identities[row]);
 	}
 	Ok(())
@@ -9882,26 +9965,28 @@ impl Train {
 			config.random_seed = seed;
 		}
 		let probability = model.loss.0 >= 4;
-		let scale = probability.then(|| TargetScale::fit(&prepared.targets[..training_rows]));
+		let width = prepared.target_width;
+		let scale = probability.then(|| TargetScale::fit(&prepared.targets[..training_rows * width]));
 		let target_values = prepared.targets.iter().map(|target| scale.map_or(*target, |scale| scale.encode(*target))).collect::<Vec<_>>();
 		let (run, mut graph) = (RUN.fetch_add(1, Ordering::Relaxed) + 1, compile(model, prepared, &target_values, training_rows, gpu, config, true)?);
 		graph.state.training_rows = training_rows;
 		if let Some(scale) = scale
 			&& let Some(offset) = output_bias_offset(&graph)
 		{
-			let mean = target_values[..training_rows].iter().sum::<f64>() / training_rows as f64;
-			graph.parameters[offset] = scale.logit(mean);
+			for (index, mean) in target_means(&target_values, width, training_rows).into_iter().enumerate() {
+				graph.parameters[offset + index] = scale.logit(mean);
+			}
 		}
 		graph.refresh_storage(config)?;
 		let mut stored = stored_graph(&graph, model, data, scale, precision, native_target_label(&gpu.native_target));
-		require(stored.graph.output.elements() == 1, "model output width must be one")?;
+		require(stored.graph.output.elements() == width, format!("model output expected width {width}, received {}", stored.graph.output.elements()))?;
 		if let Some(path) = &self.resume {
 			bundle::restore(path, &prepared.schema, std::slice::from_mut(&mut stored), &prepared.identities)?;
 		}
 		stored.graph.state.trained_samples.extend_from_slice(&prepared.identities[..training_rows]);
 		stored.graph.state.trained_samples.sort_unstable();
 		stored.graph.state.trained_samples.dedup();
-		let (samples, targets) = (&prepared.samples[..training_rows * prepared.features], &target_values[..training_rows]);
+		let (samples, targets) = (&prepared.samples[..training_rows * prepared.features], &target_values[..training_rows * width]);
 		let mut tape = NativeTape::new(&stored.graph, samples, targets, gpu, config.precision, model.loss)?;
 		self.finish_dispatch(if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) }, &mut stored, &prepared.schema, &tape, None)?;
 		tape.print_devices()?;
@@ -9963,11 +10048,11 @@ impl Train {
 			}
 			// Evaluation loss lives in the training representation and covers only held-out rows;
 			// decoding is for the user-facing predictions, r2, and tokens.
-			final_loss = model_loss(&raw_outputs[training_rows..], &target_values[training_rows..], model.loss, config.activation[7]);
+			final_loss = model_loss(&raw_outputs[training_rows..], &target_values[training_rows * width..], model.loss, config.activation[7]);
 		} else if training_rows < prepared.rows {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
-			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_rows..]);
+			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_rows * width..]);
 			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, model.loss)?;
 			validation.inject_bn_stats(&stored.bn_stats)?;
 			validation.forward()?;
@@ -9980,7 +10065,7 @@ impl Train {
 		} else if evaluation && data.autoregressive {
 			coefficient(&prepared.targets[training_rows..], &predictions[training_rows..])
 		} else {
-			coefficient(&prepared.targets[training_rows..], &evaluated)
+			coefficient(&prepared.targets[training_rows * width..], &evaluated)
 		};
 		if !evaluated.is_empty() { predictions = evaluated }
 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(()))?;
@@ -10071,8 +10156,8 @@ struct TargetScale {
 }
 impl TargetScale {
 	fn fit(targets: &[f64]) -> Self {
-		let minimum = targets.iter().copied().fold(f64::INFINITY, f64::min);
-		let maximum = targets.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+		let minimum = targets.iter().copied().filter(|value| value.is_finite()).fold(f64::INFINITY, f64::min);
+		let maximum = targets.iter().copied().filter(|value| value.is_finite()).fold(f64::NEG_INFINITY, f64::max);
 		// A constant target spans nothing; encode it as the minimum of a unit span so scaling stays finite.
 		Self { minimum, span: if maximum == minimum { 1.0 } else { maximum - minimum } }
 	}
@@ -10084,8 +10169,9 @@ impl TargetScale {
 	}
 }
 fn model_loss(predictions: &[f64], targets: &[f64], loss: LossFunction, threshold: f64) -> f64 {
-	let values = predictions.iter().zip(targets);
-	let mut result = values.map(|(prediction, target)| loss.value(*prediction, *target, threshold)).sum::<f64>() / targets.len() as f64;
+	let labelled = predictions.iter().zip(targets).filter(|(_, target)| target.is_finite());
+	let count = labelled.clone().count();
+	let mut result = labelled.map(|(prediction, target)| loss.value(*prediction, *target, threshold)).sum::<f64>() / count as f64;
 	if loss.0 == 1 {
 		result = result.sqrt();
 	}
@@ -10097,8 +10183,10 @@ fn predicted_char(prediction: f64) -> Result<char> {
 	Ok(CHAR_IDS[id])
 }
 fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
-	let mean = targets.iter().sum::<f64>() / targets.len() as f64;
-	let residual = targets.iter().zip(predictions).map(|(target, value)| (target - value).powi(2)).sum::<f64>();
-	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
+	let labelled = targets.iter().zip(predictions).filter(|(target, _)| target.is_finite());
+	let count = labelled.clone().count();
+	let mean = labelled.clone().map(|(target, _)| target).sum::<f64>() / count as f64;
+	let residual = labelled.clone().map(|(target, value)| (target - value).powi(2)).sum::<f64>();
+	let total = labelled.map(|(target, _)| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
 }
