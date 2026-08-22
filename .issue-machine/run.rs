@@ -1164,6 +1164,7 @@ fn agy(config: &Config, model: &str, prompt: &str) -> std::result::Result<Decisi
         None,
     );
     let text = String::from_utf8_lossy(&result.stdout);
+    if jq(&text, ".status").as_deref() == Ok("ERROR") { return Err(failure(&result)) }
     let response = jq(&text, ".structured_output | tojson").or_else(|_| jq(&text, ".response"));
     let mut json = response.and_then(object);
     if json.is_err() {
