@@ -61,7 +61,8 @@ configured providers and model order are:
 - `codex/gpt-5.3-codex-spark`
 - `kimi/kimi-code/k3`
 - Every configured `opencode/<free-model>` concurrently
-- `openrouter/openrouter/free`, through the existing OpenCode tool harness
+- Every configured explicit zero-cost `openrouter/<model>`, through the
+  existing OpenCode tool harness
 - `copilot/auto`, updated to the model selected by Copilot routing
 - `ollama/minimax-m3:cloud`
 - `agy/<model>` in configured order
