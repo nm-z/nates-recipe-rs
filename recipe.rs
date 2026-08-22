@@ -30,6 +30,7 @@ pub enum ScalarOpcode {
 	Tanh = 12,
 	Greater = 13,
 	StraightThrough = 14,
+	Select = 15,
 }
 
 impl ScalarOpcode {
@@ -49,6 +50,7 @@ impl ScalarOpcode {
 			12 => Ok(Self::Tanh),
 			13 => Ok(Self::Greater),
 			14 => Ok(Self::StraightThrough),
+			15 => Ok(Self::Select),
 			_ => Err(EmitError::InvalidOpcode { kind: "scalar", value }),
 		}
 	}
@@ -207,6 +209,14 @@ pub fn emit_scalar_forward(code: &[f64], context: ScalarContext<'_>) -> Result<S
 				name
 			},
 			ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, context.first, context.second)?,
+			ScalarOpcode::Select => {
+				let condition = scalar_operand(instruction.left, &values, context.first, context.second)?;
+				let value = scalar_operand(instruction.right, &values, context.first, context.second)?;
+				let zero = (context.literal)(0.0, context.value_type);
+				let _ = writeln!(output, "{name}.condition = call i1 @recipe.ogt({ty} {condition}, {ty} {zero})", ty = context.value_type);
+				let _ = writeln!(output, "{name} = select i1 {name}.condition, {ty} {value}, {ty} {zero}", ty = context.value_type);
+				name
+			}
 			ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater => {
 				let left = scalar_operand(instruction.left, &values, context.first, context.second)?;
 				let right = scalar_operand(instruction.right, &values, context.first, context.second)?;
@@ -274,7 +284,7 @@ pub fn emit_scalar_reverse(code: &[f64], context: ScalarContext<'_>, incoming: &
 				format!("%{}.scalar.{index}", context.prefix)
 			}
 			ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, context.first, context.second)?,
-			ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater | ScalarOpcode::Absolute | ScalarOpcode::Exp | ScalarOpcode::Log | ScalarOpcode::Sin | ScalarOpcode::Cos | ScalarOpcode::Tanh => format!("%{}.scalar.{index}", context.prefix),
+			ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater | ScalarOpcode::Select | ScalarOpcode::Absolute | ScalarOpcode::Exp | ScalarOpcode::Log | ScalarOpcode::Sin | ScalarOpcode::Cos | ScalarOpcode::Tanh => format!("%{}.scalar.{index}", context.prefix),
 		};
 		values.push(value);
 	}
@@ -304,7 +314,7 @@ pub fn emit_scalar_reverse(code: &[f64], context: ScalarContext<'_>, incoming: &
 	for (index, instruction) in instructions.iter().enumerate().rev() {
 		let adjoint = adjoints[index].clone();
 		let left = if matches!(instruction.opcode, ScalarOpcode::Constant | ScalarOpcode::Parameter) { String::new() } else { operand(instruction.left, &values)? };
-		let right = if matches!(instruction.opcode, ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater | ScalarOpcode::StraightThrough) { operand(instruction.right, &values)? } else { String::new() };
+		let right = if matches!(instruction.opcode, ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater | ScalarOpcode::Select | ScalarOpcode::StraightThrough) { operand(instruction.right, &values)? } else { String::new() };
 		match instruction.opcode {
 			ScalarOpcode::Add => {
 				add_operand(&mut output, instruction.left, &adjoint, &mut adjoints, &mut first, &mut second, &mut sequence)?;
@@ -391,6 +401,15 @@ pub fn emit_scalar_reverse(code: &[f64], context: ScalarContext<'_>, incoming: &
 				let contribution = binary(&mut output, context.value_type, &format!("%{}.tanh.{sequence}", context.prefix), "mul", &adjoint, &base);
 				sequence += 1;
 				add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
+			}
+			ScalarOpcode::Select => {
+				let condition = format!("%{}.select.condition.{sequence}", context.prefix);
+				sequence += 1;
+				let _ = writeln!(output, "{condition} = call i1 @recipe.ogt({ty} {left}, {ty} {zero})", ty = context.value_type, zero = (context.literal)(0.0, context.value_type));
+				let contribution = format!("%{}.select.contribution.{sequence}", context.prefix);
+				sequence += 1;
+				let _ = writeln!(output, "{contribution} = select i1 {condition}, {ty} {adjoint}, {ty} {zero}", ty = context.value_type, adjoint = adjoint, zero = (context.literal)(0.0, context.value_type));
+				add_operand(&mut output, instruction.right, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 			}
 			ScalarOpcode::Greater | ScalarOpcode::Constant | ScalarOpcode::Parameter => {}
 		}
@@ -4842,10 +4861,14 @@ impl ScalarProgram {
 		result
 	}
 	fn constant(&mut self, value: f64) -> f64 { self.op(ScalarOpcode::Constant, value, 0.0) }
+	// Both branches are always evaluated as straight-line SSA, so the untaken
+	// branch must be dropped by selection, never by arithmetic masking: a
+	// multiply blend turns an infinite untaken value into 0*inf = NaN.
+	fn select(&mut self, condition: f64, value: f64) -> f64 { self.op(ScalarOpcode::Select, condition, value) }
 	fn choose(&mut self, condition: f64, yes: f64, no: f64) -> f64 {
 		let one = self.constant(1.0);
 		let inv = self.op(ScalarOpcode::Subtract, one, condition);
-		let (a, b) = (self.op(ScalarOpcode::Multiply, condition, yes), self.op(ScalarOpcode::Multiply, inv, no));
+		let (a, b) = (self.select(condition, yes), self.select(inv, no));
 		self.op(ScalarOpcode::Add, a, b)
 	}
 	fn unary(&mut self, opcode: ScalarOpcode, value: f64) -> f64 { self.op(opcode, value, 0.0) }
@@ -5126,7 +5149,7 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			let cosine = program.unary(ScalarOpcode::Cos, x);
 			program.op(ScalarOpcode::Divide, sine, cosine)
 		}
-		Activation::Relu => program.op(ScalarOpcode::Multiply, positive, x),
+		Activation::Relu => program.select(positive, x),
 		Activation::Leak | Activation::Elu | Activation::Selu | Activation::Prelu => {
 			let negative = match activation {
 				Activation::Leak => {
@@ -5138,7 +5161,12 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 					program.op(ScalarOpcode::Multiply, slope, x)
 				}
 				_ => {
-					let exponential = program.unary(ScalarOpcode::Exp, x);
+					// choose only selects this branch for x <= 0, but exp still runs on
+					// the full range: mask its argument through the same predicate so a
+					// large positive x cannot overflow exp in the untaken branch.
+					let inverse = program.op(ScalarOpcode::Subtract, one, positive);
+					let masked = program.select(inverse, x);
+					let exponential = program.unary(ScalarOpcode::Exp, masked);
 					let shifted = program.op(ScalarOpcode::Subtract, exponential, one);
 					let alpha = constant(&mut program, config.activation[usize::from(activation == Activation::Selu) + 2]);
 					program.op(ScalarOpcode::Multiply, alpha, shifted)
