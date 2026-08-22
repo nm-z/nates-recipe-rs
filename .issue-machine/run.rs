@@ -455,12 +455,8 @@ fn opencode_turn(config: &Config, model: &str, prompt: &str, session: &str) -> s
             "busy" => continue,
             "retry" => {
                 let message = jq(&state, ".message").unwrap_or_else(|_| "OpenCode usage is unavailable".to_owned());
-                let reset = jq(&state, ".next").ok().and_then(|value| value.parse::<u64>().ok()).map(|next| {
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system time precedes Unix epoch").as_millis() as u64;
-                    next.saturating_sub(now).saturating_add(999) / 1000
-                });
                 opencode_request(config, "POST", &format!("/session/{session}/abort"), "")?;
-                return Err(format!("usage limit; refreshes in {}s; {message}", reset.unwrap_or(config.provider_poll_seconds)));
+                return Err(message);
             }
             "idle" => {
                 let messages = opencode_request(config, "GET", &format!("/session/{session}/message"), "")?;
@@ -470,7 +466,8 @@ fn opencode_turn(config: &Config, model: &str, prompt: &str, session: &str) -> s
                         let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system time precedes Unix epoch").as_millis() as u64;
                         next.saturating_sub(now).saturating_add(999) / 1000
                     });
-                    if reset.is_some() || usage_exhausted(&message) { return Err(format!("usage limit; refreshes in {}s; {message}", reset.unwrap_or(config.provider_poll_seconds))) }
+                    if let Some(reset) = reset { return Err(format!("usage limit; refreshes in {reset}s; {message}")) }
+                    if usage_exhausted(&message) { return Err(message) }
                     return Err(message);
                 }
                 if jq(&messages, r#"[.[] | select(.info.role == "assistant") | .info.id][-1]"#).is_ok() { return Err("OpenCode returned a completed assistant turn with no response".to_owned()) }
