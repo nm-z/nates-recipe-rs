@@ -23,13 +23,17 @@ while different models run concurrently. The first available
 classifier returns one schema-validated decision: create a
 `bug` issue or comment on an existing issue.
 
-Five resolvers run independently of discovery and review. Each claims a
-different open issue that no open pull request closes, then starts
+The resolver pool has a ceiling of 20 workers and a separate process-memory
+budget. The current 6 GiB budget admits two 3 GiB resolver process trees at a
+time. Each active resolver claims a different open issue that no open pull
+request closes, then starts
 `claude-fable-5` at high effort with unrestricted Claude Code permissions. The
 initial `/goal` requires the session to read that issue, reproduce it, implement
 the root fix in a separate worktree based on current `origin/minimal`, validate
 the public path, and create one pull request with `Fixes #<issue>`. Each resolver
 uses the configured memory limit and keeps its issue claim until it finishes.
+A failed resolver releases its issue, waits for the configured poll interval,
+and returns to issue selection instead of terminating its worker.
 
 Independent discovery workers claim disjoint cursors from one allocator. The
 default configuration runs one worker on `amd0` and one worker through
@@ -43,8 +47,10 @@ limit. A composition that exceeds that limit fails through the same public
 process boundary and enters the normal review queue instead of exhausting the
 host and terminating the machine.
 
-The machine runs every review route twice concurrently. Each live
-reviewer uses the `provider/model` identity shown in the terminal and log. The
+The machine derives one fixed review-worker pool from the configured route
+limits. Queue growth does not create additional operating-system threads. Each
+live reviewer uses the `provider/model` identity shown in the terminal and log.
+The
 configured providers and model order are:
 
 - `codex/gpt-5.3-codex-spark`
@@ -55,10 +61,15 @@ configured providers and model order are:
 - `ollama/minimax-m3:cloud`
 - `agy/<model>` in configured order
 
-The machine uses each provider until that provider is unavailable. It does not
-wait for consensus. If every route is unavailable, the reviewer retains the
-failure at the head of the queue, waits for `provider_poll_seconds`, and tries
-again while cursor discovery continues.
+All OpenCode and OpenRouter reviews attach to one headless OpenCode server and
+use separate sessions. The machine uses each provider until that provider is
+unavailable. It does not wait for consensus. When a route reports exhausted
+usage, the machine records its reported reset duration and does not dispatch
+that route again before the reset. If the diagnostic contains no parseable
+reset duration, the route remains unavailable for the current machine run. If
+every route is unavailable, the reviewer retains the failure, waits for
+`provider_poll_seconds`, and checks the available routes while cursor discovery
+continues.
 
 ## Classifier access
 
@@ -86,9 +97,12 @@ turn.
 
 ## Publication
 
-The Rust machine owns the only GitHub write boundary. For a `new` decision, it
-creates an issue with the `bug` label. For a `comment` decision, it comments on
-the selected issue. Every published issue or comment records:
+The Rust machine owns the only GitHub write boundary. It serializes publication
+and scans the configured issue history before accepting a `new` decision. If an
+existing issue has the same title, the machine comments on the earliest matching
+issue. Otherwise, it creates an issue with the `bug` label. For a `comment`
+decision, it comments on the selected issue. Every published issue or comment
+records:
 
 - The traversal failure fingerprint
 - The exact classifier provider, model, and effort
