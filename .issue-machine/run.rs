@@ -41,6 +41,12 @@ struct Config {
     claude_effort: String,
     ollama_binary: PathBuf,
     ollama_model: String,
+    resolver_enabled: bool,
+    resolver_model: String,
+    resolver_effort: String,
+    resolver_base: String,
+    resolver_worktree_root: PathBuf,
+    resolver_poll_seconds: u64,
     provider_poll_seconds: u64,
     slow_cursor_seconds: u64,
     discovery_devices: Vec<String>,
@@ -106,6 +112,16 @@ fn config(path: &Path) -> Config {
         claude_effort: value(&text, "claude_effort"),
         ollama_binary: value(&text, "ollama_binary").into(),
         ollama_model: value(&text, "ollama_model"),
+        resolver_enabled: value(&text, "resolver_enabled")
+            .parse()
+            .expect("resolver_enabled must be true or false"),
+        resolver_model: value(&text, "resolver_model"),
+        resolver_effort: value(&text, "resolver_effort"),
+        resolver_base: value(&text, "resolver_base"),
+        resolver_worktree_root: value(&text, "resolver_worktree_root").into(),
+        resolver_poll_seconds: value(&text, "resolver_poll_seconds")
+            .parse()
+            .expect("resolver_poll_seconds must be an unsigned integer"),
         provider_poll_seconds: value(&text, "provider_poll_seconds")
             .parse()
             .expect("provider_poll_seconds must be an unsigned integer"),
@@ -177,6 +193,12 @@ struct Active {
     started: Instant,
 }
 
+struct ResolverNode {
+    issue: u64,
+    model: String,
+    started: Instant,
+}
+
 struct ReviewNode {
     device: String,
     cursor: u64,
@@ -190,6 +212,7 @@ struct ReviewNode {
 struct Display {
     active: BTreeMap<String, Active>,
     reviews: BTreeMap<String, ReviewNode>,
+    resolver: Option<ResolverNode>,
     rows: usize,
 }
 
@@ -310,28 +333,33 @@ fn display_render(display: &mut Display) {
         reviews.entry(provider.to_owned()).or_default().push((model.to_owned(), review.cursor, elapsed(started)));
     }
     let queued = display.reviews.values().filter(|review| review.model.is_none()).count();
+    let resolving = display.resolver.as_ref().map(|resolver| {
+        format!("{:<28}  issue #{:<5}  time {}", resolver.model, resolver.issue, elapsed(resolver.started))
+    });
     if queued != 0 {
         eprintln!("{YELLOW}queued{RESET}");
         eprintln!("└─ {queued} reviews");
         display.rows += 2;
     }
-    if !trials.is_empty() || !reviews.is_empty() {
+    if !trials.is_empty() || !reviews.is_empty() || resolving.is_some() {
         eprintln!("{BLUE}live{RESET}");
         display.rows += 1;
     }
     if !trials.is_empty() {
-        let branch = if reviews.is_empty() { "└─" } else { "├─" };
+        let branch = if reviews.is_empty() && resolving.is_none() { "└─" } else { "├─" };
         eprintln!("{branch} trial");
         display.rows += 1;
         for (index, line) in trials.iter().enumerate() {
             let branch = if index + 1 == trials.len() { "└─" } else { "├─" };
-            let trunk = if reviews.is_empty() { "   " } else { "│  " };
+            let trunk = if reviews.is_empty() && resolving.is_none() { "   " } else { "│  " };
             eprintln!("{}", fit(&format!("{trunk}{branch} {line}"), width));
             display.rows += 1;
         }
     }
     if !reviews.is_empty() {
-        eprintln!("└─ review");
+        let review_branch = if resolving.is_some() { "├─" } else { "└─" };
+        let review_trunk = if resolving.is_some() { "│  " } else { "   " };
+        eprintln!("{review_branch} review");
         display.rows += 1;
         let provider_count = reviews.len();
         for (provider_index, (provider, models)) in reviews.into_iter().enumerate() {
@@ -339,19 +367,24 @@ fn display_render(display: &mut Display) {
             let provider_branch = if provider_last { "└─" } else { "├─" };
             if models.len() == 1 {
                 let (model, cursor, elapsed) = &models[0];
-                eprintln!("{}", fit(&format!("   {provider_branch} {provider}/{model:<28}  cursor {cursor:<6}  time {elapsed}"), width));
+                eprintln!("{}", fit(&format!("{review_trunk}{provider_branch} {provider}/{model:<28}  cursor {cursor:<6}  time {elapsed}"), width));
                 display.rows += 1;
                 continue;
             }
-            eprintln!("   {provider_branch} {provider}");
+            eprintln!("{review_trunk}{provider_branch} {provider}");
             display.rows += 1;
             for (model_index, (model, cursor, elapsed)) in models.iter().enumerate() {
                 let branch = if model_index + 1 == models.len() { "└─" } else { "├─" };
-                let trunk = if provider_last { "      " } else { "   │  " };
+                let trunk = if provider_last { format!("{review_trunk}   ") } else { format!("{review_trunk}│  ") };
                 eprintln!("{}", fit(&format!("{trunk}{branch} {model:<28}  cursor {cursor:<6}  time {elapsed}"), width));
                 display.rows += 1;
             }
         }
+    }
+    if let Some(resolver) = resolving {
+        eprintln!("└─ resolve");
+        eprintln!("{}", fit(&format!("   └─ {resolver}"), width));
+        display.rows += 2;
     }
     std::io::stderr().flush().expect("cannot draw machine status");
 }
@@ -420,6 +453,26 @@ fn display_reviewed(packet: &str, model: &str, result: &str, url: Option<&str>) 
     if let Some(review) = display.reviews.remove(&key) {
         eprintln!("{}", trial_line(&review.device, review.cursor, &review.elapsed, review.status));
         eprintln!("├─ review  {model}");
+        if let Some(url) = url {
+            eprintln!("└─ {result:<7} {url}");
+        } else {
+            eprintln!("└─ result  {result}");
+        }
+    }
+    display_render(&mut display);
+}
+
+fn display_resolving(issue: u64, model: &str) {
+    let mut display = display().lock().expect("display lock is poisoned");
+    display.resolver = Some(ResolverNode { issue, model: model.to_owned(), started: Instant::now() });
+    display_render(&mut display);
+}
+
+fn display_resolved(result: &str, url: Option<&str>) {
+    let mut display = display().lock().expect("display lock is poisoned");
+    display_clear(&mut display);
+    if let Some(resolver) = display.resolver.take() {
+        eprintln!("resolve  issue #{:<5}  time {}  model {}", resolver.issue, elapsed(resolver.started), resolver.model);
         if let Some(url) = url {
             eprintln!("└─ {result:<7} {url}");
         } else {
@@ -1402,6 +1455,117 @@ fn enqueue_review(
     depth
 }
 
+fn resolver_issue(config: &Config) -> std::result::Result<Option<(u64, String)>, String> {
+    let issues = output(
+        Command::new("gh")
+            .args(["issue", "list", "--state", "open", "--limit", "100", "--json", "number,url", "--jq", ".[] | [.number, .url] | @tsv"])
+            .current_dir(&config.repository),
+        None,
+    );
+    if !issues.status.success() {
+        return Err(failure(&issues));
+    }
+    let pull_requests = output(
+        Command::new("gh")
+            .args(["pr", "list", "--state", "open", "--limit", "100", "--json", "closingIssuesReferences", "--jq", ".[].closingIssuesReferences[].number"])
+            .current_dir(&config.repository),
+        None,
+    );
+    if !pull_requests.status.success() {
+        return Err(failure(&pull_requests));
+    }
+    let claimed = String::from_utf8_lossy(&pull_requests.stdout)
+        .lines()
+        .filter_map(|number| number.parse::<u64>().ok())
+        .collect::<BTreeSet<_>>();
+    Ok(String::from_utf8_lossy(&issues.stdout).lines().find_map(|line| {
+        let (number, url) = line.split_once('\t')?;
+        let number = number.parse::<u64>().ok()?;
+        (!claimed.contains(&number)).then(|| (number, url.to_owned()))
+    }))
+}
+
+fn resolver_pr(config: &Config, issue: u64) -> std::result::Result<Option<String>, String> {
+    let pull_requests = output(
+        Command::new("gh")
+            .args(["pr", "list", "--state", "open", "--limit", "100", "--json", "closingIssuesReferences,url", "--jq", ".[] | [.url, ([.closingIssuesReferences[].number] | map(tostring) | join(\",\"))] | @tsv"])
+            .current_dir(&config.repository),
+        None,
+    );
+    if !pull_requests.status.success() {
+        return Err(failure(&pull_requests));
+    }
+    Ok(String::from_utf8_lossy(&pull_requests.stdout).lines().find_map(|line| {
+        let (url, issues) = line.split_once('\t')?;
+        issues.split(',').any(|number| number.parse::<u64>() == Ok(issue)).then(|| url.to_owned())
+    }))
+}
+
+fn resolver_loop(path: PathBuf) {
+    loop {
+        let current = config(&path);
+        let issue = match resolver_issue(&current) {
+            Ok(Some(issue)) => issue,
+            Ok(None) => {
+                std::thread::sleep(Duration::from_secs(current.resolver_poll_seconds));
+                continue;
+            }
+            Err(error) => {
+                trace(&current, &format!("resolver issue selection failed error={error}"));
+                std::thread::sleep(Duration::from_secs(current.resolver_poll_seconds));
+                continue;
+            }
+        };
+        let model = format!("claude/{}-{}", current.resolver_model.strip_prefix("claude-").unwrap_or(&current.resolver_model), current.resolver_effort);
+        let goal = format!(r#"/goal Read GitHub issue #{number} and every comment in full, then resolve that one issue completely and create one pull request that closes it.
+
+Use unrestricted tools and make every required repository and GitHub change yourself. Never edit the current issue-machine worktree. Work in one separate Git worktree under {root}, based on the latest origin/{base}. Reuse coherent existing work for issue #{number} if it exists. Reproduce the exact public failure first, identify the earliest cause in current origin/{base}, implement the root fix without a fallback or parallel implementation, and validate the exact public Recipe path end to end. Test reachable edge cases one at a time through the same public entrypoint. Preserve unrelated user changes.
+
+Commit and push the coherent fix, then create one pull request targeting {base}. The pull request body must contain `Fixes #{number}`, the exact reproduction, the root cause, the change, and measured end-to-end evidence. Do not stop until the pull request exists and its URL is visible. Target issue: {url}"#, number = issue.0, root = current.resolver_worktree_root.display(), base = current.resolver_base, url = issue.1);
+        display_resolving(issue.0, &model);
+        event(&current, &format!("RESOLVE model={model} issue=#{} url={}", issue.0, issue.1));
+        let result = output(
+            Command::new(&current.claude_binary)
+                .args([
+                    "-p",
+                    &goal,
+                    "--model",
+                    &current.resolver_model,
+                    "--effort",
+                    &current.resolver_effort,
+                    "--dangerously-skip-permissions",
+                    "--output-format",
+                    "json",
+                    "--name",
+                    &format!("Resolve Recipe issue #{}", issue.0),
+                ])
+                .current_dir(&current.repository),
+            None,
+        );
+        if !result.status.success() {
+            event(&current, &format!("RESOLVE model={model} issue=#{} failed error={}", issue.0, failure(&result)));
+            display_resolved("FAIL", None);
+            return;
+        }
+        match resolver_pr(&current, issue.0) {
+            Ok(Some(url)) => {
+                event(&current, &format!("PR model={model} issue=#{} url={url}", issue.0));
+                display_resolved("PR", Some(&url));
+            }
+            Ok(None) => {
+                event(&current, &format!("RESOLVE model={model} issue=#{} failed error=goal completed without an open pull request", issue.0));
+                display_resolved("FAIL", None);
+                return;
+            }
+            Err(error) => {
+                event(&current, &format!("RESOLVE model={model} issue=#{} failed error={error}", issue.0));
+                display_resolved("FAIL", None);
+                return;
+            }
+        }
+    }
+}
+
 fn main() {
     let directory = std::env::current_exe()
         .expect("cannot locate machine executable")
@@ -1425,6 +1589,10 @@ fn main() {
         .iter()
         .cloned()
         .for_each(|packet| dispatch_review(Arc::clone(&work), path.clone(), Arc::clone(&instructions), packet));
+    if initial.resolver_enabled {
+        let resolver_path = path.clone();
+        std::thread::spawn(move || resolver_loop(resolver_path));
+    }
     assert!(
         !initial.discovery_devices.is_empty(),
         "discovery_devices must contain at least one device"
