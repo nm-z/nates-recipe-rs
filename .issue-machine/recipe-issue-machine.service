@@ -9,9 +9,7 @@ WorkingDirectory=/home/nate/Desktop/recipe-issue-machine
 Environment=HOME=/home/nate
 Environment=TERM=xterm-256color
 Environment=PATH=/home/nate/.local/bin:/home/nate/.cargo/bin:/usr/local/bin:/usr/bin:/opt/rocm/bin
-ExecStart=/usr/bin/tmux -D -f /home/nate/Desktop/recipe-issue-machine/.issue-machine/tmux.conf
-ExecStartPost=/usr/bin/tmux new-session -d -s recipe-issue-machine /home/nate/Desktop/recipe-issue-machine/.issue-machine/session
-ExecStartPost=/usr/bin/tmux select-pane -d -t recipe-issue-machine:0.0
+ExecStart=/usr/bin/tmux -S /tmp/tmux-%U/default -D -f /home/nate/Desktop/recipe-issue-machine/.issue-machine/tmux.conf
 ExecStop=/usr/bin/tmux kill-session -t recipe-issue-machine
 KillMode=control-group
 Restart=always
