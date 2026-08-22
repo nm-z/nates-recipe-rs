@@ -5714,13 +5714,65 @@ struct TileRatSlot {
 	lut: Vec<f64>,
 	dispatched: usize,
 }
+/// One parsed image of the lookup state file. `TileRat` keeps the image it
+/// absorbed at load time as its baseline: publishing subtracts the baseline
+/// from the live state to recover this run's contribution, then adds that
+/// contribution to whatever the file holds at publish time. Two runs that
+/// loaded the same baseline therefore both land their measurements, in
+/// either publish order, instead of the later rename discarding the earlier
+/// run.
+struct RatDisk {
+	count: u64,
+	runs: u64,
+	benchmark_head: [f64; NATIVE_RAT_HIDDEN + 1],
+	proposer_head: [f64; NATIVE_RAT_ACTION * (NATIVE_RAT_HIDDEN + 1)],
+	luts: Vec<Vec<f64>>,
+	history: Vec<(u64, f64, Vec<[f64; NATIVE_RAT_STATE + NATIVE_RAT_ACTION]>)>,
+}
+impl RatDisk {
+	/// The state of a lookup file that does not exist yet: the pretrained
+	/// heads, empty residual tables, and no measurements.
+	fn pretrained(slots: &[TileRatSlot]) -> Self {
+		Self { count: 0, runs: 0, benchmark_head: NATIVE_RAT_BENCHMARK_HEAD, proposer_head: NATIVE_RAT_PROPOSER_HEAD, luts: slots.iter().map(|slot| vec![0.0; slot.candidates.len()]).collect(), history: Vec::new() }
+	}
+	fn read(path: &Path, slots: &[TileRatSlot]) -> Result<Option<Self>> {
+		let text = match fs::read_to_string(path) {
+			Ok(text) => text,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+			Err(error) => return Err(RecipeError::new(format!("cannot read RAT lookup state {}: {error}", path.display()))),
+		};
+		let mut lines = text.lines();
+		require(lines.next() == Some("recipe-rat 1"), format!("RAT lookup state {} has an unsupported header", path.display()))?;
+		let numbers = |line: Option<&str>, label: &str, expected: usize| -> Result<Vec<f64>> {
+			let line = line.and_then(|line| line.strip_prefix(label)).ok_or_else(|| RecipeError::new(format!("RAT lookup state {} is missing {label}", path.display())))?;
+			let values = line.split_whitespace().map(|value| value.parse::<f64>().map_err(|error| RecipeError::new(format!("RAT lookup state value is invalid: {error}")))).collect::<Result<Vec<_>>>()?;
+			require(values.len() == expected && values.iter().all(|value| value.is_finite()), format!("RAT lookup state {} has a malformed {label} record", path.display())).map(|_| values)
+		};
+		let count = numbers(lines.next(), "count", 1)?[0] as u64;
+		let runs = numbers(lines.next(), "runs", 1)?[0] as u64;
+		let benchmark_head = numbers(lines.next(), "benchmark", NATIVE_RAT_HIDDEN + 1)?.try_into().map_err(|_| RecipeError::new("RAT benchmark head is malformed"))?;
+		let proposer_head = numbers(lines.next(), "proposer", NATIVE_RAT_ACTION * (NATIVE_RAT_HIDDEN + 1))?.try_into().map_err(|_| RecipeError::new("RAT proposer head is malformed"))?;
+		let luts = slots.iter().map(|slot| numbers(lines.next(), "lut", slot.candidates.len())).collect::<Result<Vec<_>>>()?;
+		let mut history = Vec::new();
+		let width = NATIVE_RAT_STATE + NATIVE_RAT_ACTION;
+		for line in lines {
+			let values = line.strip_prefix("epoch").ok_or_else(|| RecipeError::new(format!("RAT lookup state {} has an unrecognized record", path.display())))?.split_whitespace().map(|value| value.parse::<f64>().map_err(|error| RecipeError::new(format!("RAT lookup state value is invalid: {error}")))).collect::<Result<Vec<_>>>()?;
+			require(values.len() > 2 && (values.len() - 2).is_multiple_of(width) && values.iter().all(|value| value.is_finite()), format!("RAT lookup state {} has a malformed epoch record", path.display()))?;
+			let rows = values[2..].chunks_exact(width).map(|chunk| chunk.try_into().map_err(|_| RecipeError::new("RAT epoch row is malformed"))).collect::<Result<Vec<_>>>()?;
+			history.push((values[0] as u64, values[1], rows));
+		}
+		Ok(Some(Self { count, runs, benchmark_head, proposer_head, luts, history }))
+	}
+}
 /// The internal tile RAT: one proposer that chooses each contraction
 /// direction's tile from its legal candidates, and one benchmark surrogate
 /// that learns what the chosen schedule costs from the real fused epoch it
 /// ran in. Both keep their pretrained bases frozen; the readout heads adapt
-/// online and persist as lookup state next to the native artifact, so later
-/// runs on the same device and artifact continue from what earlier runs
-/// measured.
+/// online and persist as lookup state keyed by the physical GPU inside the
+/// native artifact directory, so later runs on the same device and artifact
+/// continue from what earlier runs measured, while a different device or
+/// artifact starts from its own state rather than silently reusing
+/// incompatible measurements.
 struct TileRat {
 	slots: Vec<TileRatSlot>,
 	benchmark_head: [f64; NATIVE_RAT_HIDDEN + 1],
@@ -5742,6 +5794,9 @@ struct TileRat {
 	/// rows)`, bounded by the configured measurement count. `rat_pretrain`
 	/// pools these across artifacts and devices to refit the frozen bases.
 	history: Vec<(u64, f64, Vec<[f64; NATIVE_RAT_STATE + NATIVE_RAT_ACTION]>)>,
+	/// The lookup state this run started from, kept so publishing can add
+	/// only this run's contribution to the file's current contents.
+	base: RatDisk,
 	path: PathBuf,
 }
 impl TileRat {
@@ -5763,8 +5818,15 @@ impl TileRat {
 				slots.push(TileRatSlot { node, direction, state, hidden: rat_hidden(&NATIVE_RAT_PROPOSER_BASIS, &state), candidates: candidates.clone(), benchmark_hidden, lut: vec![0.0; candidates.len()], dispatched: 0 });
 			}
 		}
-		let path = program.artifact.path.parent().ok_or_else(|| RecipeError::new("native artifact has no directory"))?.join("rat.tsv");
-		let mut rat = Self { slots, benchmark_head: NATIVE_RAT_BENCHMARK_HEAD, proposer_head: NATIVE_RAT_PROPOSER_HEAD, count: 0, observed: 0, runs: 0, history: Vec::new(), path };
+		// The artifact directory keys the model, rows, arithmetic, and target;
+		// the file name adds the physical GPU. The device name is the stable
+		// per-machine ordinal used for selection, and the memory size guards
+		// against a different card appearing at the same ordinal. Timings from
+		// one physical device therefore never steer another.
+		let directory = program.artifact.path.parent().ok_or_else(|| RecipeError::new("native artifact has no directory"))?;
+		let path = directory.join(format!("rat-{}-{}.tsv", program.gpu.name, program.gpu.memory >> 20));
+		let base = RatDisk::pretrained(&slots);
+		let mut rat = Self { slots, benchmark_head: NATIVE_RAT_BENCHMARK_HEAD, proposer_head: NATIVE_RAT_PROPOSER_HEAD, count: 0, observed: 0, runs: 0, history: Vec::new(), base, path };
 		rat.load()?;
 		rat.runs += 1;
 		Ok(rat)
@@ -5870,38 +5932,49 @@ impl TileRat {
 		let excess = self.history.len().saturating_sub(config.rat_measurements);
 		if excess != 0 { self.history.drain(..excess); }
 	}
+	/// Open the sibling lock file that serializes cross-process access to the
+	/// lookup state. The lock file is never renamed, so every process locks
+	/// the same inode for the life of the state, while the state file itself
+	/// is still published by atomic rename.
+	fn lock_file(&self) -> Result<fs::File> {
+		let path = self.path.with_extension("lock");
+		fs::File::options().read(true).append(true).create(true).open(&path).map_err(|error| RecipeError::new(format!("cannot open RAT lookup lock {}: {error}", path.display())))
+	}
 	fn load(&mut self) -> Result<()> {
-		let text = match fs::read_to_string(&self.path) {
-			Ok(text) => text,
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-			Err(error) => return Err(RecipeError::new(format!("cannot read RAT lookup state {}: {error}", self.path.display()))),
-		};
-		let mut lines = text.lines();
-		require(lines.next() == Some("recipe-rat 1"), format!("RAT lookup state {} has an unsupported header", self.path.display()))?;
-		let numbers = |line: Option<&str>, label: &str, expected: usize| -> Result<Vec<f64>> {
-			let line = line.and_then(|line| line.strip_prefix(label)).ok_or_else(|| RecipeError::new(format!("RAT lookup state {} is missing {label}", self.path.display())))?;
-			let values = line.split_whitespace().map(|value| value.parse::<f64>().map_err(|error| RecipeError::new(format!("RAT lookup state value is invalid: {error}")))).collect::<Result<Vec<_>>>()?;
-			require(values.len() == expected && values.iter().all(|value| value.is_finite()), format!("RAT lookup state {} has a malformed {label} record", self.path.display())).map(|_| values)
-		};
-		self.count = numbers(lines.next(), "count", 1)?[0] as u64;
-		self.runs = numbers(lines.next(), "runs", 1)?[0] as u64;
-		self.benchmark_head = numbers(lines.next(), "benchmark", NATIVE_RAT_HIDDEN + 1)?.try_into().map_err(|_| RecipeError::new("RAT benchmark head is malformed"))?;
-		self.proposer_head = numbers(lines.next(), "proposer", NATIVE_RAT_ACTION * (NATIVE_RAT_HIDDEN + 1))?.try_into().map_err(|_| RecipeError::new("RAT proposer head is malformed"))?;
-		for slot in &mut self.slots {
-			let lut = numbers(lines.next(), "lut", slot.candidates.len())?;
-			slot.lut = lut;
-		}
-		self.history.clear();
-		let width = NATIVE_RAT_STATE + NATIVE_RAT_ACTION;
-		for line in lines {
-			let values = line.strip_prefix("epoch").ok_or_else(|| RecipeError::new(format!("RAT lookup state {} has an unrecognized record", self.path.display())))?.split_whitespace().map(|value| value.parse::<f64>().map_err(|error| RecipeError::new(format!("RAT lookup state value is invalid: {error}")))).collect::<Result<Vec<_>>>()?;
-			require(values.len() > 2 && (values.len() - 2) % width == 0 && values.iter().all(|value| value.is_finite()), format!("RAT lookup state {} has a malformed epoch record", self.path.display()))?;
-			let rows = values[2..].chunks_exact(width).map(|chunk| chunk.try_into().map_err(|_| RecipeError::new("RAT epoch row is malformed"))).collect::<Result<Vec<_>>>()?;
-			self.history.push((values[0] as u64, values[1], rows));
-		}
+		let lock = self.lock_file()?;
+		lock.lock_shared().map_err(|error| RecipeError::new(format!("cannot lock RAT lookup state {}: {error}", self.path.display())))?;
+		let Some(mut disk) = RatDisk::read(&self.path, &self.slots)? else { return Ok(()) };
+		self.count = disk.count;
+		self.runs = disk.runs;
+		self.benchmark_head = disk.benchmark_head;
+		self.proposer_head = disk.proposer_head;
+		for (slot, lut) in self.slots.iter_mut().zip(&disk.luts) { slot.lut.clone_from(lut); }
+		self.history = std::mem::take(&mut disk.history);
+		self.base = disk;
 		Ok(())
 	}
-	fn save(&self) -> Result<()> {
+	/// Publish this run's measurements as one coherent cross-process
+	/// operation. The exclusive lock covers rereading the file, adding this
+	/// run's contribution to whatever is published there, and renaming the
+	/// merged state into place, so a concurrent run that published first
+	/// keeps its measurements and this run's land on top of them.
+	fn save(&self, config: Config) -> Result<()> {
+		let lock = self.lock_file()?;
+		lock.lock().map_err(|error| RecipeError::new(format!("cannot lock RAT lookup state {}: {error}", self.path.display())))?;
+		let disk = RatDisk::read(&self.path, &self.slots)?.unwrap_or_else(|| RatDisk::pretrained(&self.slots));
+		let count = disk.count + (self.count - self.base.count);
+		let runs = disk.runs + (self.runs - self.base.runs);
+		let benchmark_head: [f64; NATIVE_RAT_HIDDEN + 1] = std::array::from_fn(|unit| disk.benchmark_head[unit] + (self.benchmark_head[unit] - self.base.benchmark_head[unit]));
+		let proposer_head: [f64; NATIVE_RAT_ACTION * (NATIVE_RAT_HIDDEN + 1)] = std::array::from_fn(|unit| disk.proposer_head[unit] + (self.proposer_head[unit] - self.base.proposer_head[unit]));
+		let luts = self.slots.iter().enumerate().map(|(index, slot)| slot.lut.iter().zip(&self.base.luts[index]).zip(&disk.luts[index]).map(|((live, base), published)| published + (live - base)).collect::<Vec<_>>()).collect::<Vec<_>>();
+		// This run's epochs are the history entries tagged with its run
+		// number. They are retagged to follow the published run count, so the
+		// per-run tempo intercepts in rat_pretrain never conflate two
+		// processes that loaded the same baseline.
+		let mut history = disk.history;
+		history.extend(self.history.iter().filter(|(run, _, _)| *run == self.runs).map(|(_, measured, rows)| (runs, *measured, rows.clone())));
+		let excess = history.len().saturating_sub(config.rat_measurements);
+		if excess != 0 { history.drain(..excess); }
 		let mut text = String::from("recipe-rat 1
 ");
 		let mut line = |label: &str, values: &[f64]| {
@@ -5909,19 +5982,18 @@ impl TileRat {
 			for value in values { text.push_str(&format!(" {value}")); }
 			text.push('\n');
 		};
-		line("count", &[self.count as f64]);
-		line("runs", &[self.runs as f64]);
-		line("benchmark", &self.benchmark_head);
-		line("proposer", &self.proposer_head);
-		for slot in &self.slots {
-			line("lut", &slot.lut);
+		line("count", &[count as f64]);
+		line("runs", &[runs as f64]);
+		line("benchmark", &benchmark_head);
+		line("proposer", &proposer_head);
+		for lut in &luts {
+			line("lut", lut);
 		}
-		for (run, measured, rows) in &self.history {
+		for (run, measured, rows) in &history {
 			let mut values = vec![*run as f64, *measured];
 			for row in rows { values.extend_from_slice(row); }
 			line("epoch", &values);
 		}
-		drop(line);
 		let staged = self.path.with_extension("tsv.next");
 		fs::write(&staged, text).map_err(|error| RecipeError::new(format!("cannot stage RAT lookup state {}: {error}", staged.display())))?;
 		fs::rename(&staged, &self.path).map_err(|error| RecipeError::new(format!("cannot publish RAT lookup state {}: {error}", self.path.display())))
@@ -10348,10 +10420,14 @@ impl Train {
 			epoch_seconds += seconds;
 			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, saved, live, &tape.schedule_text())?; if INTERRUPTED.load(Ordering::Acquire) { std::process::exit(INTERRUPTED_EXIT) }
 		}
-		tape.rat.save()?;
+		tape.rat.save(config)?;
 		stored.bn_stats = tape.extract_bn_stats()?;
 		tape.inject_bn_stats(&stored.bn_stats)?;
 		self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
+		// The reported schedule follows the tape that produced the reported
+		// evaluation: the held-out paths below dispatch their own validation
+		// tapes and overwrite this with the schedule those tapes actually ran.
+		let mut evaluation_schedule = tape.schedule_text();
 		let raw_predictions = tape.predictions()?;
 		let mut final_loss = model_loss(&raw_predictions, targets, model.loss, config.activation[7]);
 		let mut predictions = raw_predictions.iter().map(|value| scale.map_or(*value, |scale| scale.decode(*value))).collect::<Vec<_>>();
@@ -10366,6 +10442,7 @@ impl Train {
 				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, model.loss)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
 				validation.forward()?;
+				evaluation_schedule = validation.schedule_text();
 				let raw = validation.predictions()?;
 				require(raw.len() == 1, "autoregressive forward must produce one char ID")?;
 				raw_outputs.push(raw[0]);
@@ -10389,6 +10466,7 @@ impl Train {
 			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, model.loss)?;
 			validation.inject_bn_stats(&stored.bn_stats)?;
 			validation.forward()?;
+			evaluation_schedule = validation.schedule_text();
 			let raw = validation.predictions()?;
 			final_loss = model_loss(&raw, validation_targets, model.loss, config.activation[7]);
 			evaluated = raw.into_iter().map(|value| scale.map_or(value, |scale| scale.decode(value))).collect();
@@ -10402,7 +10480,7 @@ impl Train {
 		};
 		if !evaluated.is_empty() { predictions = evaluated }
 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(()))?;
-		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), schedule: tape.schedule_text(), run, epoch: tape.step as usize, seconds: started.elapsed().as_secs_f64(), epoch_seconds })
+		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), schedule: evaluation_schedule, run, epoch: tape.step as usize, seconds: started.elapsed().as_secs_f64(), epoch_seconds })
 	}
 	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &DataSchema, tape: &NativeTape, save: Option<()>) -> Result<T> {
 		let save = if INTERRUPTED.load(Ordering::Acquire) && !INTERRUPT_CHECKPOINTED.swap(true, Ordering::AcqRel) { Some(()) } else { save.filter(|_| !INTERRUPTED.load(Ordering::Acquire)) };
@@ -10530,7 +10608,7 @@ mod rat_pretraining {
 		let Ok(entries) = fs::read_dir(directory) else { return };
 		for entry in entries.flatten() {
 			let path = entry.path();
-			if path.is_dir() { walk(&path, found) } else if path.file_name().is_some_and(|name| name == "rat.tsv") { found.push(path) }
+			if path.is_dir() { walk(&path, found) } else if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("rat-") && name.ends_with(".tsv")) { found.push(path) }
 		}
 	}
 	fn corpus(root: &Path) -> Vec<(usize, f64, Vec<[f64; NATIVE_RAT_STATE + NATIVE_RAT_ACTION]>)> {
@@ -10542,7 +10620,7 @@ mod rat_pretraining {
 			let text = fs::read_to_string(&path).unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
 			for line in text.lines().filter_map(|line| line.strip_prefix("epoch")) {
 				let values = line.split_whitespace().map(|value| value.parse::<f64>().unwrap_or_else(|error| panic!("corpus value is malformed: {error}"))).collect::<Vec<_>>();
-				assert!(values.len() > 2 && (values.len() - 2) % width == 0, "corpus epoch record is malformed");
+				assert!(values.len() > 2 && (values.len() - 2).is_multiple_of(width), "corpus epoch record is malformed");
 				let next = groups.len();
 				let group = *groups.entry((file, values[0] as u64)).or_insert(next);
 				epochs.push((group, values[1], values[2..].chunks_exact(width).map(|chunk| chunk.try_into().unwrap()).collect()));
@@ -10610,8 +10688,8 @@ mod rat_pretraining {
 	}
 	/// Offline tool: refit the tile RAT's pretrained constants from lookup
 	/// state accumulated by real training runs. Point RECIPE_RAT_CORPUS at a
-	/// directory tree holding `rat.tsv` files (a build's `recipe-native`
-	/// artifact directory), then paste the printed arrays over the
+	/// directory tree holding per-GPU `rat-*.tsv` files (a build's
+	/// `recipe-native` artifact directory), then paste the printed arrays over the
 	/// `NATIVE_RAT_*` constants. The benchmark surrogate fits the pooled real
 	/// fused-epoch timings under relative-error weighting; the proposer then
 	/// descends the frozen fitted surrogate at every observed state.
