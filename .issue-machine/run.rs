@@ -1782,7 +1782,7 @@ Use unrestricted tools and make every required repository and GitHub change your
 
 Do not read, inspect, execute, edit, create, install, or delegate Python code, files, tooling, dependencies, documentation, or artifacts. Do not create or redirect output into additional log files. The public Recipe entrypoint may write only the repository-root recipe.log. Use Google developer documentation style and never use em dashes.
 
-Commit and push the coherent fix, then create one pull request targeting {base}. The pull request body must contain `Fixes #{number}`, the exact reproduction, the root cause, the change, and measured end-to-end evidence. Do not stop until the pull request exists and its URL is visible. Target issue: {url}"#, number = issue.number, root = current.resolver_worktree_root.display(), base = current.resolver_base, url = issue.url);
+Commit and push the coherent fix, then create one pull request targeting {base}. Keep the pull request body concise and include only `Fixes #{number}`, the exact reproduction, the root cause, the change, and measured end-to-end evidence. Omit issue history, implementation tours, alternatives, tables, and exhaustive edge-case narratives. Do not stop until the pull request exists and its URL is visible. Target issue: {url}"#, number = issue.number, root = current.resolver_worktree_root.display(), base = current.resolver_base, url = issue.url);
         event(&current, &format!("RESOLVE model={model} issue=#{} url={}", issue.number, issue.url));
         let memory = format!("MemoryMax={}M", current.resolver_memory_mib);
         let environment = format!("Environment={}", current.resolver_environment);
