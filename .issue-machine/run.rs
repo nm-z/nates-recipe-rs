@@ -54,6 +54,7 @@ struct Config {
     resolver_worktree_root: PathBuf,
     resolver_poll_seconds: u64,
     resolver_concurrency: usize,
+    resolver_reset_unix: u64,
     resolver_memory_mib: u64,
     resolver_memory_budget_mib: u64,
     resolver_environment: String,
@@ -174,6 +175,9 @@ fn config(path: &Path) -> Config {
         resolver_concurrency: value(&text, "resolver_concurrency")
             .parse()
             .expect("resolver_concurrency must be an unsigned integer"),
+        resolver_reset_unix: value(&text, "resolver_reset_unix")
+            .parse()
+            .expect("resolver_reset_unix must be an unsigned integer"),
         resolver_memory_mib: value(&text, "resolver_memory_mib")
             .parse()
             .expect("resolver_memory_mib must be an unsigned integer"),
@@ -303,6 +307,7 @@ static COPILOT: OnceLock<Mutex<usize>> = OnceLock::new();
 static OLLAMA: OnceLock<Mutex<usize>> = OnceLock::new();
 static OPENCODE_SESSION: Mutex<()> = Mutex::new(());
 static PUBLICATION: Mutex<()> = Mutex::new(());
+static CONFIGURATION: Mutex<()> = Mutex::new(());
 static COOLDOWNS: OnceLock<Mutex<BTreeMap<String, Option<Instant>>>> = OnceLock::new();
 
 fn display() -> &'static Mutex<Display> { DISPLAY.get_or_init(|| Mutex::new(Display::default())) }
@@ -361,13 +366,13 @@ fn model_provider(
 }
 
 fn identity(provider: &str, model: &str) -> String { format!("{provider}/{model}") }
+fn epoch() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).expect("system time precedes Unix epoch").as_secs() }
 
 fn reset_after(error: &str) -> Option<Duration> {
     let lower = error.to_ascii_lowercase();
     if let Some(tail) = lower.split_once("\"resetsat\":").map(|(_, tail)| tail) {
-        let epoch = tail.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u64>().ok()?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system time precedes Unix epoch").as_secs();
-        return epoch.checked_sub(now).map(Duration::from_secs);
+        let reset_epoch = tail.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u64>().ok()?;
+        return reset_epoch.checked_sub(epoch()).map(Duration::from_secs);
     }
     let tail = ["resets in ", "refreshes in "].into_iter().find_map(|marker| lower.split_once(marker).map(|(_, tail)| tail))?;
     let mut seconds = 0_u64;
@@ -395,10 +400,11 @@ fn available(model: &str) -> bool {
     }
 }
 
-fn cooldown(config: &Config, model: &str, error: &str) {
+fn cooldown(config: &Config, model: &str, error: &str) -> Option<u64> {
     let reset = reset_after(error);
     COOLDOWNS.get_or_init(|| Mutex::new(BTreeMap::new())).lock().expect("cooldown lock is poisoned").insert(model.to_owned(), reset.map(|duration| Instant::now() + duration));
     trace(config, &format!("model={model} unavailable reset_seconds={} error={error}", reset.map_or_else(|| "machine-run".to_owned(), |duration| duration.as_secs().to_string())));
+    reset.map(|duration| epoch().saturating_add(duration.as_secs()))
 }
 
 fn classify_with(config: &Config, packet: &str, classifier: &str, run: impl FnOnce() -> std::result::Result<Decision, String>) -> Option<Decision> {
@@ -407,7 +413,7 @@ fn classify_with(config: &Config, packet: &str, classifier: &str, run: impl FnOn
     match run() {
         Ok(decision) => Some(decision),
         Err(error) => {
-            cooldown(config, classifier, &error);
+            let _ = cooldown(config, classifier, &error);
             display_reviewing(packet, "queued");
             None
         }
@@ -750,16 +756,17 @@ fn persist_queue(path: &Path, packets: &VecDeque<String>) {
     std::fs::rename(temporary, path).expect("cannot publish the failure queue");
 }
 
-fn cursor(path: &Path, next: u64) {
+fn setting(path: &Path, key: &str, value: u64) {
+    let _configuration = CONFIGURATION.lock().expect("configuration lock is poisoned");
     let text = std::fs::read_to_string(path).expect("cannot read machine.toml");
     let updated = text
         .lines()
         .map(|line| {
             if line
                 .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == "cursor")
+                .is_some_and(|(candidate, _)| candidate.trim() == key)
             {
-                format!("cursor = {next}")
+                format!("{key} = {value}")
             } else {
                 line.to_owned()
             }
@@ -768,9 +775,11 @@ fn cursor(path: &Path, next: u64) {
         .join("\n")
         + "\n";
     let temporary = path.with_extension("next");
-    std::fs::write(&temporary, updated).expect("cannot write the next cursor");
-    std::fs::rename(temporary, path).expect("cannot publish the next cursor");
+    std::fs::write(&temporary, updated).expect("cannot write machine configuration");
+    std::fs::rename(temporary, path).expect("cannot publish machine configuration");
 }
+
+fn cursor(path: &Path, next: u64) { setting(path, "cursor", next) }
 
 fn output(command: &mut Command, input: Option<&str>) -> std::process::Output {
     if input.is_some() {
@@ -1820,7 +1829,7 @@ Commit and push the coherent fix, then create one pull request targeting {base}.
         );
         let transcript = format!("{}{}", String::from_utf8_lossy(&result.stderr), String::from_utf8_lossy(&result.stdout));
         if usage_exhausted(&transcript) {
-            cooldown(&current, &model, &transcript);
+            if let Some(reset) = cooldown(&current, &model, &transcript) { setting(&path, "resolver_reset_unix", reset) }
             display().lock().expect("display lock is poisoned").resolvers.remove(&issue.number);
             std::thread::sleep(Duration::from_secs(current.resolver_poll_seconds));
             continue;
@@ -1865,6 +1874,10 @@ fn main() {
     let path = directory.join("machine.toml");
     let initial = config(&path);
     cleanup_reproductions(&initial);
+    if let Some(seconds) = initial.resolver_reset_unix.checked_sub(epoch()).filter(|seconds| *seconds != 0) {
+        let model = format!("claude/{}-{}", initial.resolver_model.strip_prefix("claude-").unwrap_or(&initial.resolver_model), initial.resolver_effort);
+        COOLDOWNS.get_or_init(|| Mutex::new(BTreeMap::new())).lock().expect("cooldown lock is poisoned").insert(model, Some(Instant::now() + Duration::from_secs(seconds)));
+    }
     let _opencode_server = opencode_server(&initial);
     display_clock(format!("claude/{}-{}", initial.resolver_model.strip_prefix("claude-").unwrap_or(&initial.resolver_model), initial.resolver_effort));
     let pending = std::fs::read_to_string(&initial.queue_path)
