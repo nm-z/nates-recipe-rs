@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{IsTerminal, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const RED: &str = "\x1b[38;2;255;92;122m";
@@ -114,7 +114,6 @@ fn config(path: &Path) -> Config {
 
 struct Work {
     packets: VecDeque<String>,
-    discovery_done: bool,
     halted: bool,
 }
 
@@ -157,12 +156,21 @@ struct Active {
     started: Instant,
     reproduction: PathBuf,
     composition: Option<String>,
-    slow: bool,
+}
+
+struct ReviewNode {
+    device: String,
+    cursor: u64,
+    elapsed: String,
+    status: &'static str,
+    composition: String,
+    model: Option<String>,
 }
 
 #[derive(Default)]
 struct Display {
     active: BTreeMap<String, Active>,
+    reviews: BTreeMap<String, ReviewNode>,
     rows: usize,
 }
 
@@ -171,11 +179,19 @@ static DISPLAY: OnceLock<Mutex<Display>> = OnceLock::new();
 fn display() -> &'static Mutex<Display> { DISPLAY.get_or_init(|| Mutex::new(Display::default())) }
 
 fn display_clear(display: &mut Display) {
-    eprint!("\x1b[s");
-    for _ in 0..display.rows {
-        eprint!("\r\x1b[2K\n")
+    if display.rows == 0 {
+        return;
     }
-    eprint!("\x1b[u");
+    eprint!("\x1b[{}A", display.rows);
+    for row in 0..display.rows {
+        eprint!("\r\x1b[2K");
+        if row + 1 != display.rows {
+            eprint!("\x1b[1B");
+        }
+    }
+    if display.rows != 1 {
+        eprint!("\x1b[{}A", display.rows - 1);
+    }
     display.rows = 0;
 }
 
@@ -188,63 +204,150 @@ fn elapsed(started: Instant) -> String {
     }
 }
 
-fn display_render(display: &mut Display) {
-    if !std::io::stderr().is_terminal() {
-        return;
+fn fit(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_owned();
     }
+    if width <= 2 {
+        return value.chars().take(width).collect();
+    }
+    format!("{}..", value.chars().take(width - 2).collect::<String>())
+}
+
+fn trial_line(device: &str, cursor: u64, elapsed: &str, status: &str, composition: &str, width: usize) -> String {
+    let device_color = if device == "cpu" { GREEN } else { BLUE };
+    let status_color = match status {
+        "PASS" => GREEN,
+        "FAIL" => RED,
+        "SLOW" => YELLOW,
+        _ => RESET,
+    };
+    let prefix = format!("{device:<4}  cursor {cursor:<6}  time {elapsed}  status {status:<4}  composition ");
+    let composition = fit(composition, width.saturating_sub(prefix.chars().count()));
+    format!("{device_color}{device:<4}{RESET}  cursor {cursor:<6}  time {TIME}{elapsed}{RESET}  status {status_color}{status:<4}{RESET}  composition {composition}")
+}
+
+fn pane_size() -> (usize, usize) {
+    let pane = std::env::var("TMUX_PANE").expect("machine display is not running in tmux");
+    let size = output(Command::new("tmux").args(["display-message", "-p", "-t", &pane, "#{pane_width} #{pane_height}"]), None);
+    assert!(size.status.success(), "cannot read tmux pane size");
+    let text = String::from_utf8(size.stdout).expect("tmux pane size is not UTF-8");
+    let mut values = text.split_whitespace().map(|value| value.parse::<usize>().expect("tmux pane size is invalid"));
+    (
+        values.next().expect("tmux pane width is absent").saturating_sub(1),
+        values.next().expect("tmux pane height is absent"),
+    )
+}
+
+fn display_render(display: &mut Display) {
     display_clear(display);
-    eprint!("\x1b[s");
+    let (width, height) = pane_size();
+    let review_rows = height.saturating_sub(display.active.len() + 1);
+    let visible_reviews = if display.reviews.len() * 2 <= review_rows {
+        display.reviews.len()
+    } else {
+        review_rows.saturating_sub(1) / 2
+    };
+    for review in display.reviews.values().take(visible_reviews) {
+        eprintln!("{}", trial_line(&review.device, review.cursor, &review.elapsed, review.status, &review.composition, width));
+        eprintln!("{}", fit(&format!("└─ review  {}", review.model.as_deref().unwrap_or("queued")), width));
+        display.rows += 2;
+    }
+    let hidden_reviews = display.reviews.len() - visible_reviews;
+    if hidden_reviews != 0 {
+        eprintln!("... {hidden_reviews} more reviews");
+        display.rows += 1;
+    }
     for (device, active) in &mut display.active {
         if active.composition.is_none() {
             active.composition = std::fs::read_to_string(&active.reproduction).ok().and_then(|source| {
                 source.lines().find_map(|line| line.trim().strip_prefix(".seed(")?.strip_suffix(')').map(str::to_owned))
             });
         }
-        let color = if device == "cpu" { GREEN } else { BLUE };
         let composition = active.composition.as_deref().unwrap_or("staging");
-        let (status, status_color) = if active.slow { ("SLOW", YELLOW) } else { ("...", RESET) };
-        eprintln!("{color}{device:<4}{RESET}  cursor {:<6}  time {TIME}{}{RESET}  status {status_color}{status:<4}{RESET}  composition {composition}", active.cursor, elapsed(active.started));
+        eprintln!("{}", trial_line(device, active.cursor, &elapsed(active.started), "...", composition, width));
         display.rows += 1;
     }
-    eprint!("\x1b[u");
     std::io::stderr().flush().expect("cannot draw machine status");
 }
 
 fn display_start(device: &str, cursor: u64, reproduction: PathBuf) {
     let mut display = display().lock().expect("display lock is poisoned");
-    display.active.insert(device.to_owned(), Active { cursor, started: Instant::now(), reproduction, composition: None, slow: false });
-    display_render(&mut display);
-}
-
-fn display_slow(device: &str) {
-    let mut display = display().lock().expect("display lock is poisoned");
-    if let Some(active) = display.active.get_mut(device) {
-        active.slow = true
-    }
+    display.active.insert(device.to_owned(), Active { cursor, started: Instant::now(), reproduction, composition: None });
     display_render(&mut display);
 }
 
 fn display_finish(device: &str, failed: bool) {
     let mut display = display().lock().expect("display lock is poisoned");
     display_clear(&mut display);
+    let width = pane_size().0;
     if let Some(mut active) = display.active.remove(device) {
         if active.composition.is_none() {
             active.composition = std::fs::read_to_string(&active.reproduction).ok().and_then(|source| {
                 source.lines().find_map(|line| line.trim().strip_prefix(".seed(")?.strip_suffix(')').map(str::to_owned))
             });
         }
-        let device_color = if device == "cpu" { GREEN } else { BLUE };
-        let (status, status_color) = if failed { ("FAIL", RED) } else if active.slow { ("SLOW", YELLOW) } else { ("PASS", GREEN) };
+        let status = if failed { "FAIL" } else { "PASS" };
         let composition = active.composition.as_deref().unwrap_or("unknown");
-        eprintln!("{device_color}{device:<4}{RESET}  cursor {:<6}  time {TIME}{}{RESET}  status {status_color}{status:<4}{RESET}  composition {composition}", active.cursor, elapsed(active.started));
+        eprintln!("{}", trial_line(device, active.cursor, &elapsed(active.started), status, composition, width));
+    }
+    display_render(&mut display);
+}
+
+fn display_queue(packet: &str) {
+    let key = packet_key(packet);
+    let cursor = packet_cursor(packet);
+    let device = packet_backend(packet).to_owned();
+    let composition = packet_composition(packet).to_owned();
+    let mut display = display().lock().expect("display lock is poisoned");
+    let active = display.active.get(&device).is_some_and(|active| active.cursor == cursor)
+        .then(|| display.active.remove(&device).expect("matched active trial disappeared"));
+    let duration = active.map(|active| elapsed(active.started)).unwrap_or_else(|| {
+        packet.lines().find_map(|line| {
+            line.strip_prefix("measurement=elapsed_seconds:")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|seconds| seconds.parse::<f64>().ok())
+                .map(|seconds| format!("{seconds:>8.4} s"))
+        }).unwrap_or_else(|| "     ...".to_owned())
+    });
+    display.reviews.entry(key).or_insert(ReviewNode {
+        device,
+        cursor,
+        elapsed: duration,
+        status: if packet.starts_with("kind=performance\n") { "SLOW" } else { "FAIL" },
+        composition,
+        model: None,
+    });
+    display_render(&mut display);
+}
+
+fn display_reviewing(packet: &str, model: &str) {
+    let key = packet_key(packet);
+    let mut display = display().lock().expect("display lock is poisoned");
+    if let Some(review) = display.reviews.get_mut(&key) {
+        review.model = Some(model.to_owned());
+    }
+    display_render(&mut display);
+}
+
+fn display_reviewed(packet: &str, model: &str, result: &str, url: Option<&str>) {
+    let key = packet_key(packet);
+    let mut display = display().lock().expect("display lock is poisoned");
+    display_clear(&mut display);
+    let width = pane_size().0;
+    if let Some(review) = display.reviews.remove(&key) {
+        eprintln!("{}", trial_line(&review.device, review.cursor, &review.elapsed, review.status, &review.composition, width));
+        eprintln!("├─ review  {model}");
+        if let Some(url) = url {
+            eprintln!("└─ {result:<7} {url}");
+        } else {
+            eprintln!("└─ result  {result}");
+        }
     }
     display_render(&mut display);
 }
 
 fn display_clock() {
-    if !std::io::stderr().is_terminal() {
-        return;
-    }
     std::thread::spawn(|| loop {
         std::thread::sleep(Duration::from_secs(1));
         display_render(&mut display().lock().expect("display lock is poisoned"));
@@ -320,14 +423,12 @@ fn output(command: &mut Command, input: Option<&str>) -> std::process::Output {
         .expect("cannot read command output")
 }
 
-fn event(config: &Config, _color: &str, message: &str) {
+fn log(config: &Config, message: &str) {
     let time = Command::new("date")
         .arg("+%Y-%m-%d %H:%M:%S")
         .output()
         .expect("cannot read event time");
-    let timestamp = String::from_utf8_lossy(&time.stdout);
-    let timestamp = timestamp.trim();
-    let line = format!("{timestamp} {message}\n");
+    let line = format!("{} {message}\n", String::from_utf8_lossy(&time.stdout).trim());
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -337,25 +438,10 @@ fn event(config: &Config, _color: &str, message: &str) {
         .expect("cannot write machine log");
 }
 
+fn event(config: &Config, message: &str) { log(config, message) }
+
 fn trace(config: &Config, message: &str) {
-    if !config.debug {
-        return;
-    }
-    let time = Command::new("date")
-        .arg("+%Y-%m-%d %H:%M:%S")
-        .output()
-        .expect("cannot read event time");
-    let line = format!(
-        "{} DEBUG {message}\n",
-        String::from_utf8_lossy(&time.stdout).trim()
-    );
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&config.log_path)
-        .expect("cannot open machine log")
-        .write_all(line.as_bytes())
-        .expect("cannot write machine log");
+    if config.debug { log(config, &format!("DEBUG {message}")) }
 }
 
 fn failure(result: &std::process::Output) -> String {
@@ -398,6 +484,21 @@ fn packet_cursor(packet: &str) -> u64 {
         .expect("failure packet cursor is invalid")
 }
 
+fn packet_backend(packet: &str) -> &str {
+    packet.lines().find_map(|line| line.strip_prefix("backend=")).unwrap_or("unrecorded")
+}
+
+fn packet_composition(packet: &str) -> &str {
+    field(packet, "cursor=")
+        .split_whitespace()
+        .find_map(|value| value.strip_prefix("composition:"))
+        .expect("failure cursor has no composition")
+}
+
+fn packet_key(packet: &str) -> String {
+    format!("{}:{}", field(packet, "id="), packet_backend(packet))
+}
+
 fn packet_for_device(packet: &str, device: &str) -> String {
     let selector = if device == "cpu" {
         "RECIPE_FORCE_CPU=1".to_owned()
@@ -420,8 +521,7 @@ fn packet_for_device(packet: &str, device: &str) -> String {
 
 fn same_failure(left: &str, right: &str) -> bool {
     field(left, "id=") == field(right, "id=")
-        && left.lines().find_map(|line| line.strip_prefix("backend="))
-            == right.lines().find_map(|line| line.strip_prefix("backend="))
+        && packet_backend(left) == packet_backend(right)
 }
 
 fn reproduction_path(config: &Config, device: &str, cursor: u64) -> PathBuf {
@@ -752,8 +852,9 @@ fn agy(config: &Config, model: &str, prompt: &str) -> std::result::Result<Decisi
     })
 }
 
-fn classify(config: &Config, prompt: &str) -> Decision {
+fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
     loop {
+        display_reviewing(packet, &config.spark_model);
         match spark(config, prompt) {
             Ok(decision) => return decision,
             Err(error) => trace(
@@ -761,6 +862,7 @@ fn classify(config: &Config, prompt: &str) -> Decision {
                 &format!("model={} unavailable error={error}", config.spark_model),
             ),
         }
+        display_reviewing(packet, &config.kimi_k3_model);
         match kimi(config, "Kimi managed", &config.kimi_k3_model, prompt) {
             Ok(decision) => return decision,
             Err(error) => trace(
@@ -769,11 +871,13 @@ fn classify(config: &Config, prompt: &str) -> Decision {
             ),
         }
         for model in &config.agy_models {
+            display_reviewing(packet, model);
             match agy(config, model, prompt) {
                 Ok(decision) => return decision,
                 Err(error) => trace(config, &format!("model={model} unavailable error={error}")),
             }
         }
+        display_reviewing(packet, &config.kimi_deepseek_model);
         match kimi(
             config,
             "DeepSeek through Kimi",
@@ -796,6 +900,7 @@ fn classify(config: &Config, prompt: &str) -> Decision {
                 config.provider_poll_seconds
             ),
         );
+        display_reviewing(packet, "waiting for provider");
         std::thread::sleep(std::time::Duration::from_secs(config.provider_poll_seconds));
     }
 }
@@ -804,37 +909,34 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> Review {
     if field(packet, "replay=").ends_with("stable:false") {
         event(
             config,
-            YELLOW,
             &format!(
                 "REJECT composition=unstable fingerprint={}",
                 field(packet, "id=")
             ),
         );
+        display_reviewed(packet, "none", "rejected", None);
         return Review::Done;
     }
-    let cursor = field(packet, "cursor=");
-    let composition = cursor
-        .split_whitespace()
-        .find_map(|value| value.strip_prefix("composition:"))
-        .expect("failure cursor has no composition");
+    let composition = packet_composition(packet);
     let schema =
         std::fs::read_to_string(&config.decision_schema).expect("cannot read decision schema");
     let prompt = format!("{instructions}\n\n## Failure packet\n\n{packet}\n\n## Required decision schema\n\n{schema}");
     let performance = packet.starts_with("kind=performance\n");
     let decision = if performance {
+        display_reviewing(packet, &config.kimi_k3_model);
         match kimi(config, "Kimi managed", &config.kimi_k3_model, &prompt) {
             Ok(decision) => decision,
             Err(error) => {
                 trace(config, &format!("model={} unavailable error={error}", config.kimi_k3_model));
+                display_reviewing(packet, &format!("waiting for {}", config.kimi_k3_model));
                 return Review::Deferred;
             }
         }
     } else {
-        classify(config, &prompt)
+        classify(config, &prompt, packet)
     };
     event(
         config,
-        RED,
         &format!(
             "CLASSIFY model={} composition={composition}",
             decision.model
@@ -847,20 +949,20 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> Review {
     if !config.publish {
         event(
             config,
-            YELLOW,
             &format!(
                 "DECISION model={} verdict={verdict} issue={issue} title={title}",
                 decision.model
             ),
         );
+        display_reviewed(packet, &decision.model, &verdict, None);
         return Review::Stop;
     }
     if verdict == "reject" {
         event(
             config,
-            YELLOW,
             &format!("REJECT model={} composition={composition}", decision.model),
         );
+        display_reviewed(packet, &decision.model, "rejected", None);
         return Review::Done;
     }
     assert!(
@@ -918,16 +1020,65 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> Review {
     } else {
         "commented on"
     };
-    let color = if verdict == "new" { GREEN } else { BLUE };
     event(
         config,
-        color,
         &format!(
             "ISSUE model={} {action} issue=#{published_issue} url={url}",
             decision.model
         ),
     );
+    display_reviewed(packet, &decision.model, if verdict == "new" { "issue" } else { "comment" }, Some(&url));
     Review::Done
+}
+
+fn dispatch_review(
+    work: Arc<Mutex<Work>>,
+    path: PathBuf,
+    instructions: Arc<String>,
+    packet: String,
+) {
+    display_queue(&packet);
+    std::thread::spawn(move || {
+        let current = config(&path);
+        match triage(&current, &instructions, &packet) {
+            Review::Done => {
+                let mut state = work.lock().expect("failure queue lock is poisoned");
+                let reviewed = field(&packet, "id=");
+                let backend = packet_backend(&packet);
+                if let Some(index) = state.packets.iter().position(|queued| {
+                    field(queued, "id=") == reviewed && packet_backend(queued) == backend
+                }) {
+                    state.packets.remove(index);
+                    persist_queue(&current.queue_path, &state.packets);
+                }
+            }
+            Review::Deferred => {}
+            Review::Stop => work.lock().expect("failure queue lock is poisoned").halted = true,
+        }
+    });
+}
+
+fn enqueue_review(
+    work: &Arc<Mutex<Work>>,
+    config: &Config,
+    packet: &str,
+) -> Option<usize> {
+    let depth = {
+        let mut state = work.lock().expect("failure queue lock is poisoned");
+        if state.packets.iter().any(|queued| same_failure(queued, &packet)) {
+            None
+        } else {
+            if packet.starts_with("kind=performance\n") {
+                state.packets.push_front(packet.to_owned());
+            } else {
+                state.packets.push_back(packet.to_owned());
+            }
+            persist_queue(&config.queue_path, &state.packets);
+            Some(state.packets.len())
+        }
+    };
+    if depth.is_none() { display_queue(packet) }
+    depth
 }
 
 fn main() {
@@ -942,59 +1093,17 @@ fn main() {
     let pending = std::fs::read_to_string(&initial.queue_path)
         .map(|text| queued(&text))
         .unwrap_or_default();
-    let work = Arc::new((
-        Mutex::new(Work {
-            packets: pending,
-            discovery_done: false,
-            halted: false,
-        }),
-        Condvar::new(),
-    ));
-    let reviewer_work = Arc::clone(&work);
-    let reviewer_path = path.clone();
+    let work = Arc::new(Mutex::new(Work { packets: pending, halted: false }));
     let instructions = Arc::new(
         std::fs::read_to_string(directory.join("triage.md")).expect("cannot read triage.md"),
     );
-    let reviewer_instructions = Arc::clone(&instructions);
-    let reviewer = std::thread::spawn(move || loop {
-        let packet = {
-            let (lock, ready) = &*reviewer_work;
-            let mut state = lock.lock().expect("failure queue lock is poisoned");
-            while state.packets.is_empty() && !state.discovery_done && !state.halted {
-                state = ready.wait(state).expect("failure queue lock is poisoned");
-            }
-            if state.halted || state.packets.is_empty() && state.discovery_done {
-                break;
-            }
-            state
-                .packets
-                .front()
-                .expect("notified failure queue is empty")
-                .clone()
-        };
-        let current = config(&reviewer_path);
-        match triage(&current, &reviewer_instructions, &packet) {
-            Review::Done => {}
-            Review::Deferred => break,
-            Review::Stop => {
-                let (lock, ready) = &*reviewer_work;
-                let mut state = lock.lock().expect("failure queue lock is poisoned");
-                state.halted = true;
-                ready.notify_all();
-                break;
-            }
-        }
-        let (lock, _) = &*reviewer_work;
-        let mut state = lock.lock().expect("failure queue lock is poisoned");
-        let reviewed = field(&packet, "id=");
-        let index = state
-            .packets
-            .iter()
-            .position(|queued| field(queued, "id=") == reviewed)
-            .expect("reviewed packet disappeared from the failure queue");
-        state.packets.remove(index);
-        persist_queue(&current.queue_path, &state.packets);
-    });
+    work
+        .lock()
+        .expect("failure queue lock is poisoned")
+        .packets
+        .iter()
+        .cloned()
+        .for_each(|packet| dispatch_review(Arc::clone(&work), path.clone(), Arc::clone(&instructions), packet));
     assert!(
         !initial.discovery_devices.is_empty(),
         "discovery_devices must contain at least one device"
@@ -1012,7 +1121,6 @@ fn main() {
         let worker_send = send.clone();
         discoverers.push(std::thread::spawn(move || loop {
             if worker_work
-                .0
                 .lock()
                 .expect("failure queue lock is poisoned")
                 .halted
@@ -1064,20 +1172,11 @@ fn main() {
                 continue;
             }
             Discovery::Slow(trial) => {
-                display_slow(&trial.device);
                 let packet = slow_packet(&trial);
-                let composition = field(&packet, "cursor=")
-                    .split_whitespace()
-                    .find_map(|value| value.strip_prefix("composition:"))
-                    .expect("slow cursor has no composition")
-                    .to_owned();
-                let (lock, ready) = &*work;
-                let mut state = lock.lock().expect("failure queue lock is poisoned");
-                if !state.packets.iter().any(|queued| same_failure(queued, &packet)) {
-                    state.packets.push_front(packet);
-                    persist_queue(&trial.config.queue_path, &state.packets);
-                    event(&trial.config, YELLOW, &format!("SLOW device={} cursor={} composition={composition} elapsed={}s depth={}", trial.device, trial.cursor, trial.elapsed_seconds, state.packets.len()));
-                    ready.notify_one();
+                let composition = packet_composition(&packet);
+                if let Some(depth) = enqueue_review(&work, &trial.config, &packet) {
+                    event(&trial.config, &format!("SLOW device={} cursor={} composition={composition} elapsed={}s depth={depth}", trial.device, trial.cursor, trial.elapsed_seconds));
+                    dispatch_review(Arc::clone(&work), path.clone(), Arc::clone(&instructions), packet);
                 }
                 continue;
             }
@@ -1107,7 +1206,6 @@ fn main() {
         if let Some(signal) = signal {
             failures.push(packet_for_device(&crash_packet(&trial, &text, signal), &trial.device));
         }
-        display_finish(&trial.device, !failures.is_empty());
         for (offset, composition) in text
             .lines()
             .filter_map(|line| {
@@ -1123,14 +1221,9 @@ fn main() {
             let failed = failures
                 .iter()
                 .any(|packet| packet_cursor(packet) == analyzed);
-            let (color, status) = if failed {
-                (RED, "FAIL")
-            } else {
-                (GREEN, "PASS")
-            };
+            let status = if failed { "FAIL" } else { "PASS" };
             event(
                 &trial.config,
-                color,
                 &format!(
                     "{status} device={} cursor={analyzed} composition={composition}",
                     trial.device
@@ -1139,31 +1232,13 @@ fn main() {
         }
         for packet in &failures {
             let packet_cursor = packet_cursor(packet);
-            let composition = field(packet, "cursor=")
-                .split_whitespace()
-                .find_map(|value| value.strip_prefix("composition:"))
-                .expect("failure cursor has no composition");
-            let (lock, ready) = &*work;
-            let mut state = lock.lock().expect("failure queue lock is poisoned");
-            if !state
-                .packets
-                .iter()
-                .any(|queued| same_failure(queued, packet))
-            {
-                state.packets.push_back(packet.clone());
-                persist_queue(&trial.config.queue_path, &state.packets);
-                event(
-                    &trial.config,
-                    BLUE,
-                    &format!(
-                        "QUEUE device={} cursor={packet_cursor} composition={composition} depth={}",
-                        trial.device,
-                        state.packets.len()
-                    ),
-                );
-                ready.notify_one();
+            let composition = packet_composition(packet);
+            if let Some(depth) = enqueue_review(&work, &trial.config, packet) {
+                event(&trial.config, &format!("QUEUE device={} cursor={packet_cursor} composition={composition} depth={depth}", trial.device));
+                dispatch_review(Arc::clone(&work), path.clone(), Arc::clone(&instructions), packet.clone());
             }
         }
+        display_finish(&trial.device, !failures.is_empty());
         let next = if trial.timed_out || signal.is_some() {
             trial.cursor + trial.config.compositions_per_batch
         } else {
@@ -1182,11 +1257,4 @@ fn main() {
     for discoverer in discoverers {
         discoverer.join().expect("cursor discoverer failed");
     }
-    {
-        let (lock, ready) = &*work;
-        let mut state = lock.lock().expect("failure queue lock is poisoned");
-        state.discovery_done = true;
-        ready.notify_all();
-    }
-    reviewer.join().expect("reviewer thread failed");
 }
