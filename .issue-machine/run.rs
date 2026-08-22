@@ -919,27 +919,26 @@ fn trial(
         child_stderr.read_to_end(&mut output).expect("cannot read Recipe traversal stderr");
         output
     });
-    let started = Instant::now();
-    let (status, timed_out) = loop {
-        if let Some(status) = child.try_wait().expect("cannot inspect Recipe traversal") {
-            break (status, false);
-        }
-        if started.elapsed() >= Duration::from_secs(config.slow_cursor_seconds) {
-            let terminated = Command::new("kill")
-                .args(["-KILL", &format!("-{}", child.id())])
-                .status()
-                .expect("cannot terminate slow Recipe traversal");
-            assert!(terminated.success(), "cannot terminate slow Recipe traversal process group");
-            let status = child.wait().expect("cannot collect slow Recipe traversal");
-            let _ = send.send(Discovery::Slow(SlowTrial {
+	let started = Instant::now();
+	let (status, timed_out) = loop {
+		if started.elapsed() >= Duration::from_secs(config.slow_cursor_seconds) {
+			let status = if let Some(status) = child.try_wait().expect("cannot inspect Recipe traversal") { status } else {
+				let terminated = Command::new("kill").args(["-KILL", &format!("-{}", child.id())]).status().expect("cannot terminate slow Recipe traversal");
+				assert!(terminated.success(), "cannot terminate slow Recipe traversal process group");
+				child.wait().expect("cannot collect slow Recipe traversal")
+			};
+			let _ = send.send(Discovery::Slow(SlowTrial {
                 config: config.clone(),
                 device: device.to_owned(),
                 cursor,
                 reproduction: reproduction.to_owned(),
                 elapsed_seconds: started.elapsed().as_secs(),
             }));
-            break (status, true);
-        }
+			break (status, true);
+		}
+		if let Some(status) = child.try_wait().expect("cannot inspect Recipe traversal") {
+			break (status, false);
+		}
         std::thread::sleep(Duration::from_millis(100));
     };
     (std::process::Output {
