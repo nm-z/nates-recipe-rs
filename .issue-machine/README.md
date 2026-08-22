@@ -10,11 +10,6 @@ tmux new-session -d -s recipe-issue-machine /home/nate/Desktop/recipe-issue-mach
 tmux attach -t recipe-issue-machine
 ```
 
-The current unfinished observation is CPU cursor 114. It reproducibly exits
-with SIGSEGV inside generated `artifact.so`. The concurrent coordinator must
-queue stable process-level failures instead of terminating. Cursor 108 and the
-pending review queue remain saved in `machine.toml` and `queue.ogdl`.
-
 This machine continuously runs Recipe's exhaustive Cartesian traversal. It
 records every cursor result immediately and appends stable failures to one
 durable queue before advancing the cursor. Reviewers traverse that queue while
@@ -33,7 +28,9 @@ the root fix in a separate worktree based on current `origin/minimal`, validate
 the public path, and create one pull request with `Fixes #<issue>`. Each resolver
 uses the configured memory limit and keeps its issue claim until it finishes.
 A failed resolver releases its issue, waits for the configured poll interval,
-and returns to issue selection instead of terminating its worker.
+and returns to issue selection instead of terminating its worker. Resolver
+admission counts active `recipe-resolve-*` systemd units, so restarting the
+machine cannot duplicate an issue claim or exceed the memory budget.
 
 Independent discovery workers claim disjoint cursors from one allocator. The
 default configuration runs one worker on `amd0` and one worker through
@@ -61,13 +58,15 @@ configured providers and model order are:
 - `ollama/minimax-m3:cloud`
 - `agy/<model>` in configured order
 
-All OpenCode and OpenRouter reviews attach to one headless OpenCode server and
-use separate sessions. The machine uses each provider until that provider is
-unavailable. It does not wait for consensus. When a route reports exhausted
-usage, the machine records its reported reset duration and does not dispatch
-that route again before the reset. If the diagnostic contains no parseable
-reset duration, the route remains unavailable for the current machine run. If
-every route is unavailable, the reviewer retains the failure, waits for
+All OpenCode and OpenRouter reviews use separate sessions on one headless
+OpenCode server. The machine submits each turn through the server API, polls the
+authoritative session state, and reads the completed assistant message without
+starting an OpenCode client process. The machine uses each provider until that
+provider is unavailable. It does not wait for consensus. When a route fails,
+the machine records its reported reset duration and does not dispatch that
+route again before the reset. If the diagnostic contains no parseable reset
+duration, the route remains unavailable for the current machine run. If every
+route is unavailable, the reviewer retains the failure, waits for
 `provider_poll_seconds`, and checks the available routes while cursor discovery
 continues.
 
