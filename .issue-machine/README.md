@@ -39,6 +39,7 @@ configured providers and model order are:
 - Every configured `opencode/<free-model>` concurrently
 - `copilot/auto`, updated to the model selected by Copilot routing
 - `claude/sonnet-5-max`
+- `ollama/minimax-m3:cloud`
 - `agy/<model>` in configured order
 - `deepseek/deepseek-v4-pro`
 
@@ -57,7 +58,7 @@ Every classifier can read the Recipe repository and call only two GitHub tools:
 
 The classifiers search issues on demand and read every plausible match in full.
 The machine does not preload, cache, summarize, or truncate the issue tree.
-Codex, OpenCode, Claude, and GitHub Copilot use project-scoped MCP
+Codex, OpenCode, Claude, Ollama, and GitHub Copilot use project-scoped MCP
 configurations. Kimi uses `/home/nate/.kimi-code/mcp.json`. Agy uses the imported
 `recipe-issue-reader` plugin and a pre-tool hook that rejects mutation tools.
 

@@ -39,6 +39,8 @@ struct Config {
     claude_binary: PathBuf,
     claude_model: String,
     claude_effort: String,
+    ollama_binary: PathBuf,
+    ollama_model: String,
     provider_poll_seconds: u64,
     slow_cursor_seconds: u64,
     discovery_devices: Vec<String>,
@@ -102,6 +104,8 @@ fn config(path: &Path) -> Config {
         claude_binary: value(&text, "claude_binary").into(),
         claude_model: value(&text, "claude_model"),
         claude_effort: value(&text, "claude_effort"),
+        ollama_binary: value(&text, "ollama_binary").into(),
+        ollama_model: value(&text, "ollama_model"),
         provider_poll_seconds: value(&text, "provider_poll_seconds")
             .parse()
             .expect("provider_poll_seconds must be an unsigned integer"),
@@ -196,6 +200,7 @@ static AGY: OnceLock<Mutex<()>> = OnceLock::new();
 static OPENCODE: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 static COPILOT: OnceLock<Mutex<()>> = OnceLock::new();
 static CLAUDE: OnceLock<Mutex<()>> = OnceLock::new();
+static OLLAMA: OnceLock<Mutex<()>> = OnceLock::new();
 static DEEPSEEK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn display() -> &'static Mutex<Display> { DISPLAY.get_or_init(|| Mutex::new(Display::default())) }
@@ -1081,10 +1086,16 @@ fn copilot(config: &Config, packet: &str, prompt: &str) -> std::result::Result<D
     })
 }
 
-fn claude_command(config: &Config, prompt: &str, session: Option<&str>) -> std::process::Output {
+fn claude_command(config: &Config, prompt: &str, session: Option<&str>, ollama: bool) -> std::process::Output {
     let tools = "Read,Glob,Grep,mcp__recipe_issues__search_issues,mcp__recipe_issues__read_issue";
     let mcp = config.repository.join(".mcp.json");
-    let mut command = Command::new(&config.claude_binary);
+    let mut command = if ollama {
+        let mut command = Command::new(&config.ollama_binary);
+        command.args(["launch", "claude", "--model", &config.ollama_model, "--yes", "--"]);
+        command
+    } else {
+        Command::new(&config.claude_binary)
+    };
     command.args([
         "-p",
         prompt,
@@ -1104,14 +1115,16 @@ fn claude_command(config: &Config, prompt: &str, session: Option<&str>) -> std::
     ]);
     if let Some(session) = session {
         command.args(["--resume", session]);
-    } else {
+    } else if !ollama {
         command.args(["--model", &config.claude_model, "--effort", &config.claude_effort]);
     }
     output(command.current_dir(&config.repository), None)
 }
 
-fn claude(config: &Config, prompt: &str) -> std::result::Result<Decision, String> {
-    let result = claude_command(config, prompt, None);
+fn claude(config: &Config, prompt: &str, ollama: bool) -> std::result::Result<Decision, String> {
+    let provider = if ollama { "ollama" } else { "claude" };
+    let effort = if ollama { "thinking" } else { &config.claude_effort };
+    let result = claude_command(config, prompt, None, ollama);
     let stream = String::from_utf8_lossy(&result.stdout);
     let response = jq_lines(&stream, "[.[] | select(.type == \"assistant\") | .message.content[]? | select(.type == \"text\") | .text][-1]");
     if !result.status.success() && response.is_err() {
@@ -1122,11 +1135,12 @@ fn claude(config: &Config, prompt: &str) -> std::result::Result<Decision, String
     let mut json = response.and_then(object);
     if json.is_err() {
         let session = jq_lines(&stream, "[.[] | select(.session_id != null) | .session_id][-1]")?;
-        trace(config, &format!("model={} repairing structured output session={session}", identity("claude", &model)));
+        trace(config, &format!("model={} repairing structured output session={session}", identity(provider, &model)));
         let repair = claude_command(
             config,
             "Return only one corrected JSON object matching the required schema. Do not repeat the investigation.",
             Some(&session),
+            ollama,
         );
         let repaired = String::from_utf8_lossy(&repair.stdout);
         json = jq_lines(&repaired, "[.[] | select(.type == \"assistant\") | .message.content[]? | select(.type == \"text\") | .text][-1]")
@@ -1134,9 +1148,9 @@ fn claude(config: &Config, prompt: &str) -> std::result::Result<Decision, String
     }
     let json = json.map_err(|error| format!("{}; {error}", failure(&result)))?;
     Ok(Decision {
-        provider: "claude",
-        model: format!("{}-{}", model.strip_prefix("claude-").unwrap_or(&model), config.claude_effort),
-        effort: config.claude_effort.clone(),
+        provider,
+        model: if ollama { model } else { format!("{}-{}", model.strip_prefix("claude-").unwrap_or(&model), effort) },
+        effort: effort.to_owned(),
         json,
     })
 }
@@ -1190,7 +1204,16 @@ fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
         if let Some(_provider) = provider(&CLAUDE) {
             let classifier = identity("claude", "sonnet-5-max");
             display_reviewing(packet, &classifier);
-            match claude(config, prompt) {
+            match claude(config, prompt, false) {
+                Ok(decision) => return decision,
+                Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
+            }
+            display_reviewing(packet, "queued");
+        }
+        if let Some(_provider) = provider(&OLLAMA) {
+            let classifier = identity("ollama", &config.ollama_model);
+            display_reviewing(packet, &classifier);
+            match claude(config, prompt, true) {
                 Ok(decision) => return decision,
                 Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
             }
