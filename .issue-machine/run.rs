@@ -899,6 +899,17 @@ fn reproduction_path(config: &Config, device: &str, cursor: u64) -> PathBuf {
     config.reproduction_directory.join(format!("recipe-composition-repro-{device}-{cursor}.rs"))
 }
 
+fn cleanup_reproductions(config: &Config) {
+    for entry in std::fs::read_dir(&config.reproduction_directory).expect("cannot read reproduction directory") {
+        let entry = entry.expect("cannot read reproduction entry");
+        let name = entry.file_name();
+        let Some((device, cursor)) = name.to_str().and_then(|name| name.strip_prefix("recipe-composition-repro-")).and_then(|name| name.strip_suffix(".rs")).and_then(|name| name.rsplit_once('-')) else { continue };
+        if config.discovery_devices.iter().any(|candidate| candidate == device) && cursor.parse::<u64>().is_ok() {
+            std::fs::remove_file(entry.path()).expect("cannot remove interrupted reproduction");
+        }
+    }
+}
+
 fn trial(
     config: &Config,
     device: &str,
@@ -1853,6 +1864,7 @@ fn main() {
         .to_owned();
     let path = directory.join("machine.toml");
     let initial = config(&path);
+    cleanup_reproductions(&initial);
     let _opencode_server = opencode_server(&initial);
     display_clock(format!("claude/{}-{}", initial.resolver_model.strip_prefix("claude-").unwrap_or(&initial.resolver_model), initial.resolver_effort));
     let pending = std::fs::read_to_string(&initial.queue_path)
