@@ -4,16 +4,18 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=simple
 WorkingDirectory=/home/nate/Desktop/recipe-issue-machine
 Environment=HOME=/home/nate
 Environment=TERM=xterm-256color
 Environment=PATH=/home/nate/.local/bin:/home/nate/.cargo/bin:/usr/local/bin:/usr/bin:/opt/rocm/bin
-ExecStart=/usr/bin/tmux -f /home/nate/Desktop/recipe-issue-machine/.issue-machine/tmux.conf new-session -d -s recipe-issue-machine /home/nate/Desktop/recipe-issue-machine/.issue-machine/session
+ExecStart=/usr/bin/tmux -D -f /home/nate/Desktop/recipe-issue-machine/.issue-machine/tmux.conf
+ExecStartPost=/usr/bin/tmux new-session -d -s recipe-issue-machine /home/nate/Desktop/recipe-issue-machine/.issue-machine/session
 ExecStartPost=/usr/bin/tmux select-pane -d -t recipe-issue-machine:0.0
 ExecStop=/usr/bin/tmux kill-session -t recipe-issue-machine
 KillMode=control-group
+Restart=always
+RestartSec=1
 StandardOutput=null
 StandardError=null
 
