@@ -23,6 +23,7 @@ struct Config {
     decision_schema: PathBuf,
     spark_model: String,
     spark_effort: String,
+    spark_issue_reader: PathBuf,
     kimi_binary: PathBuf,
     kimi_k3_model: String,
     kimi_agent: PathBuf,
@@ -129,6 +130,7 @@ fn config(path: &Path) -> Config {
         decision_schema: value(&text, "decision_schema").into(),
         spark_model: value(&text, "spark_model"),
         spark_effort: value(&text, "spark_effort"),
+        spark_issue_reader: value(&text, "spark_issue_reader").into(),
         kimi_binary: value(&text, "kimi_binary").into(),
         kimi_k3_model: value(&text, "kimi_k3_model"),
         kimi_agent: value(&text, "kimi_agent").into(),
@@ -1030,6 +1032,7 @@ fn object(text: String) -> std::result::Result<String, String> {
 
 fn spark(config: &Config, prompt: &str) -> std::result::Result<Decision, String> {
     let effort = format!("model_reasoning_effort=\"{}\"", config.spark_effort);
+    let issue_reader = format!("mcp_servers.recipe_issues.command=\"{}\"", config.spark_issue_reader.display());
     let result = output(
         Command::new("codex")
             .args([
@@ -1041,6 +1044,12 @@ fn spark(config: &Config, prompt: &str) -> std::result::Result<Decision, String>
                 &config.spark_model,
                 "--config",
                 &effort,
+                "--config",
+                &issue_reader,
+                "--config",
+                "mcp_servers.recipe_issues.enabled_tools=[\"search_issues\",\"read_issue\"]",
+                "--config",
+                "mcp_servers.recipe_issues.default_tools_approval_mode=\"approve\"",
                 "--output-schema",
                 config
                     .decision_schema
