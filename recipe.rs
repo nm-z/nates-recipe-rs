@@ -3840,32 +3840,77 @@ const IQ2_S: [u16; 1024] = [
 	34068, 34080, 34113, 34116, 34128, 34176, 34186, 34305, 34308, 34320, 34345, 34368, 34816, 34821, 34833, 34836, 34881, 34884, 34896, 34978, 35073, 35076, 35136, 35173, 35362, 35416, 35418, 35458, 35490, 36865, 36868, 36873, 36880, 36882, 36885, 36888, 36900, 36928, 36930, 36933, 36936, 36945, 36948, 36960, 36993, 36996, 37008, 37120, 37125, 37137, 37140, 37185, 37188, 37200, 37210, 37377, 37380, 37392, 37440, 37542, 37888, 37890, 37893, 37896, 37905, 37908, 37920, 37953, 37956, 37968, 38016, 38038, 38145, 38148, 38160, 38208, 38296, 38305, 38400, 38470, 38500, 38913, 38916, 38928, 38950, 38976, 39081, 39168, 39241, 39250, 39568, 40960, 40965, 40970, 40980, 40994, 41002, 41025, 41028, 41040, 41122, 41130, 41280, 41317, 41474, 41482, 41506, 41512, 41514, 41602, 41608, 41610, 41640, 41985, 41988, 42000, 42048, 42121, 42148, 42240, 42265, 42577, 43018, 43048, 43170, 43348, 43398, 43528, 43530, 43552, 43554, 43560, 43656, 43690,
 ];
 fn iq3_grid(grid: &[u16], index: usize, lane: usize) -> i8 { (2 * (grid[index] >> (3 * lane) & 7) + 1) as i8 }
-fn iq3_nearest(grid: &[u16], levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32) -> usize {
+/// Every 12-bit level key resolved against one IQ3 grid: either the first
+/// exact grid index, or the first two distance shells in (distance, index)
+/// order, which is the same candidate order an exhaustive sorted scan yields.
+struct Iq3Neighbours {
+	exact: Vec<i32>,
+	offsets: Vec<u32>,
+	candidates: Vec<u16>,
+}
+fn iq3_neighbours(grid: &'static [u16]) -> &'static Iq3Neighbours {
+	static XXS: OnceLock<Iq3Neighbours> = OnceLock::new();
+	static S: OnceLock<Iq3Neighbours> = OnceLock::new();
+	let cache = if std::ptr::eq(grid.as_ptr(), IQ3_XXS.as_ptr()) { &XXS } else { &S };
+	cache.get_or_init(|| {
+		let keys = 1_usize << 12;
+		let mut exact = vec![-1_i32; keys];
+		for (index, point) in grid.iter().enumerate() {
+			if exact[usize::from(*point)] < 0 {
+				exact[usize::from(*point)] = index as i32
+			}
+		}
+		let (mut offsets, mut candidates) = (Vec::with_capacity(keys + 1), Vec::new());
+		offsets.push(0_u32);
+		for key in 0..keys {
+			if exact[key] >= 0 {
+				offsets.push(candidates.len() as u32);
+				continue;
+			}
+			let distance = |point: u16| {
+				let mut total = 0_i32;
+				for lane in 0..4 {
+					let difference = i32::from(point >> (3 * lane) & 7) - (key as i32 >> (3 * lane) & 7);
+					total += difference * difference
+				}
+				total
+			};
+			let (mut first, mut second) = (i32::MAX, i32::MAX);
+			for point in grid {
+				let d = distance(*point);
+				if d < first {
+					second = first;
+					first = d
+				} else if d > first && d < second {
+					second = d
+				}
+			}
+			for shell in [first, second] {
+				for (index, point) in grid.iter().enumerate() {
+					if distance(*point) == shell {
+						candidates.push(index as u16)
+					}
+				}
+				if second == first || second == i32::MAX {
+					break;
+				}
+			}
+			offsets.push(candidates.len() as u32);
+		}
+		Iq3Neighbours { exact, offsets, candidates }
+	})
+}
+fn iq3_nearest(grid: &'static [u16], levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32) -> usize {
 	let key = levels.iter().enumerate().fold(0_u16, |key, (lane, level)| key | (*level as u16) << (3 * lane));
-	if let Some(index) = grid.iter().position(|value| *value == key) {
-		return index;
+	let neighbours = iq3_neighbours(grid);
+	let exact = neighbours.exact[usize::from(key)];
+	if exact >= 0 {
+		return exact as usize;
 	}
-	let mut candidates = grid
+	let span = neighbours.offsets[usize::from(key)] as usize..neighbours.offsets[usize::from(key) + 1] as usize;
+	let index = neighbours.candidates[span]
 		.iter()
-		.enumerate()
-		.map(|(index, point)| {
-			(
-				(0..4).map(|lane| {
-					let difference = i32::from((*point >> (3 * lane) & 7) as i8 - levels[lane]);
-					difference * difference
-				})
-				.sum::<i32>(),
-				index,
-			)
-		})
-		.collect::<Vec<_>>();
-	candidates.sort_unstable();
-	let first = candidates[0].0;
-	let second = candidates.iter().find(|item| item.0 != first).map(|item| item.0).unwrap_or(first);
-	let index = candidates
-		.into_iter()
-		.take_while(|item| item.0 <= second)
-		.map(|item| item.1)
+		.map(|index| usize::from(*index))
 		.min_by(|left, right| {
 			let error = |index| {
 				(0..4).map(|lane| {
