@@ -56,7 +56,9 @@ replay result and does not enter the review queue.
 
 Generated reproductions use a process-specific saved model path. Concurrent
 resolvers can exercise save, resume, and inference without replacing another
-reproduction's model file.
+reproduction's model file. Each failure packet embeds the complete reproduction
+source before the machine removes the completed temporary script, so continuous
+traversal does not retain one file per cursor.
 
 The machine derives one fixed review-worker pool from the configured route
 limits. Queue growth does not create additional operating-system threads. Each

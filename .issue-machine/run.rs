@@ -1990,6 +1990,7 @@ fn main() {
             }
         }
         display_finish(&trial.device, !failures.is_empty());
+        std::fs::remove_file(&trial.reproduction).expect("cannot remove completed reproduction");
         if let Some(replayed) = &trial.replay {
             let key = packet_key(replayed);
             let removed = {
