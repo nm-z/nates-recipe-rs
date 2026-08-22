@@ -1,12 +1,14 @@
 # Recipe issue machine
 
-This branch is the persistent reboot-safe machine snapshot. Create its worktree
-at the configured path and start the tmux session:
+This branch is the persistent, reboot-safe machine snapshot. Create its
+worktree, install the user service, and attach to its tmux session:
 
 ```text
 git worktree prune
 git worktree add /home/nate/Desktop/recipe-issue-machine machine
-tmux new-session -d -s recipe-issue-machine /home/nate/Desktop/recipe-issue-machine/.issue-machine/session
+install -Dm644 .issue-machine/recipe-issue-machine.service /home/nate/.config/systemd/user/recipe-issue-machine.service
+systemctl --user daemon-reload
+systemctl --user enable --now recipe-issue-machine.service
 tmux attach -t recipe-issue-machine
 ```
 
@@ -176,18 +178,19 @@ The machine writes the same lifecycle records to the repository-root
 polling, and structured-output repair details to that file. There are no other
 logs or verbosity controls.
 
-## Run the machine
+## Control the machine
 
-Build and run the machine from this directory:
+Restart the service after changing the machine source or configuration, then
+attach to the persistent tmux session:
 
 ```text
-rustc --edition 2021 run.rs -o run
-./run
+systemctl --user restart recipe-issue-machine.service
+tmux attach -t recipe-issue-machine
 ```
 
-Configuration is in `machine.toml`. The Recipe repository is a detached
-worktree, so the traversal cannot alter Nate's active checkout and does not
-create a branch. `machine.toml` stores the resumable cursor. GitHub issues and
-comments remain the authoritative deduplication state. `queue.ogdl` is the
-durable pending-review state. A packet remains there until its decision is
-published, and a restart resumes the oldest queued packet first.
+Configuration is in `machine.toml`. The Recipe repository uses a dedicated
+worktree on the `machine` branch, so traversal state cannot alter Nate's active
+checkout. `machine.toml` stores the resumable cursor. GitHub issues and comments
+remain the authoritative deduplication state. `queue.ogdl` is the durable
+pending-review state. A packet remains there until its decision is published,
+and a restart resumes the oldest queued packet first.
