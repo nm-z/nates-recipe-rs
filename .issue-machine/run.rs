@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{IsTerminal, Read, Write};
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
@@ -129,6 +129,7 @@ struct Trial {
     cursor: u64,
     reproduction: PathBuf,
     output: std::process::Output,
+    timed_out: bool,
 }
 
 struct SlowTrial {
@@ -433,7 +434,7 @@ fn trial(
     cursor: u64,
     reproduction: &Path,
     send: &mpsc::Sender<Discovery>,
-) -> std::process::Output {
+) -> (std::process::Output, bool) {
     let mut command = Command::new("cargo");
     command
         .args(["run", "--bin", "recipe", "--", "test.rs"])
@@ -453,6 +454,7 @@ fn trial(
         command.env("RECIPE_DEVICE", device);
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command.process_group(0);
     let mut child = command.spawn().expect("cannot start Recipe traversal");
     let mut child_stdout = child.stdout.take().expect("Recipe traversal stdout is absent");
     let mut child_stderr = child.stderr.take().expect("Recipe traversal stderr is absent");
@@ -467,13 +469,17 @@ fn trial(
         output
     });
     let started = Instant::now();
-    let mut reported = false;
-    let status = loop {
+    let (status, timed_out) = loop {
         if let Some(status) = child.try_wait().expect("cannot inspect Recipe traversal") {
-            break status;
+            break (status, false);
         }
-        if !reported && started.elapsed() >= Duration::from_secs(config.slow_cursor_seconds) {
-            reported = true;
+        if started.elapsed() >= Duration::from_secs(config.slow_cursor_seconds) {
+            let terminated = Command::new("kill")
+                .args(["-KILL", &format!("-{}", child.id())])
+                .status()
+                .expect("cannot terminate slow Recipe traversal");
+            assert!(terminated.success(), "cannot terminate slow Recipe traversal process group");
+            let status = child.wait().expect("cannot collect slow Recipe traversal");
             let _ = send.send(Discovery::Slow(SlowTrial {
                 config: config.clone(),
                 device: device.to_owned(),
@@ -481,14 +487,15 @@ fn trial(
                 reproduction: reproduction.to_owned(),
                 elapsed_seconds: started.elapsed().as_secs(),
             }));
+            break (status, true);
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    std::process::Output {
+    (std::process::Output {
         status,
         stdout: stdout.join().expect("Recipe traversal stdout reader failed"),
         stderr: stderr.join().expect("Recipe traversal stderr reader failed"),
-    }
+    }, timed_out)
 }
 
 fn termination_signal(status: std::process::ExitStatus) -> Option<i32> {
@@ -1031,7 +1038,7 @@ fn main() {
             if worker_send.send(Discovery::Start { device: device.clone(), cursor: start, reproduction: reproduction.clone() }).is_err() {
                 break;
             }
-            let result = trial(&current, &device, start, &reproduction, &worker_send);
+            let (result, timed_out) = trial(&current, &device, start, &reproduction, &worker_send);
             if worker_send
                 .send(Discovery::Complete(Trial {
                     config: current,
@@ -1039,6 +1046,7 @@ fn main() {
                     cursor: start,
                     reproduction,
                     output: result,
+                    timed_out,
                 }))
                 .is_err()
             {
@@ -1080,18 +1088,22 @@ fn main() {
             String::from_utf8_lossy(&trial.output.stderr),
             String::from_utf8_lossy(&trial.output.stdout)
         );
-        let signal = termination_signal(trial.output.status);
+        let signal = (!trial.timed_out).then(|| termination_signal(trial.output.status)).flatten();
         assert!(
-            trial.output.status.success() || signal.is_some(),
+            trial.timed_out || trial.output.status.success() || signal.is_some(),
             "Recipe traversal failed outside a failure packet on {} with status {:?}: {}",
             trial.device,
             trial.output.status,
             failure(&trial.output)
         );
-        let mut failures = packets(&text)
-            .into_iter()
-            .map(|packet| packet_for_device(packet, &trial.device))
-            .collect::<Vec<_>>();
+        let mut failures = if trial.timed_out {
+            Vec::new()
+        } else {
+            packets(&text)
+                .into_iter()
+                .map(|packet| packet_for_device(packet, &trial.device))
+                .collect::<Vec<_>>()
+        };
         if let Some(signal) = signal {
             failures.push(packet_for_device(&crash_packet(&trial, &text, signal), &trial.device));
         }
@@ -1099,6 +1111,9 @@ fn main() {
         for (offset, composition) in text
             .lines()
             .filter_map(|line| {
+                if trial.timed_out {
+                    return None;
+                }
                 let (composition, _) = line.strip_prefix("composition ")?.split_once(':')?;
                 composition.parse::<u64>().ok().map(|_| composition)
             })
@@ -1149,8 +1164,8 @@ fn main() {
                 ready.notify_one();
             }
         }
-        let next = if signal.is_some() {
-            trial.cursor + 1
+        let next = if trial.timed_out || signal.is_some() {
+            trial.cursor + trial.config.compositions_per_batch
         } else {
             text.lines()
                 .find_map(|line| line.strip_prefix("composition cursor="))
