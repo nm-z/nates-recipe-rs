@@ -7718,7 +7718,12 @@ fn native_contraction_partial_per_chunk(m: u32, n: u32, register_m: u32, registe
 /// The tile's local memory serves two phases in turn: the staged operands, and
 /// then the chunk partials the k lanes exchange after a barrier. Both live in
 /// the same allocation, so K is bounded by whichever phase is larger, and a tile
-/// too wide to stage a whole chunk narrows its M lanes until one fits.
+/// too wide to stage a whole chunk narrows its M lanes until one fits. A wide
+/// arithmetic selection can leave every M count too wide beside the initial N
+/// count, so when the M lanes are exhausted the search narrows the N lanes and
+/// walks the M counts again. The walk visits the same candidates in the same
+/// order as before down to one M lane, so every tile that fit before this
+/// extension still selects identically.
 fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block: u32, shared_values: u32, fragment: u32, ratio: u32, matrix: bool) -> Result<Tile> {
 	require(register_m != 0 && register_n != 0 && block != 0 && fragment != 0 && ratio != 0, "native contraction tile inputs are empty")?;
 	if matrix {
@@ -7734,7 +7739,7 @@ fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block
 		require(k != 0, "native matrix contraction tile does not fit the device")?;
 		return Ok(Tile { m, n, k })
 	}
-	let lane_n = limits.n.div_ceil(register_n).min(block.isqrt().max(1));
+	let mut lane_n = limits.n.div_ceil(register_n).min(block.isqrt().max(1));
 	let mut lane_m = limits.m.div_ceil(register_m).min(block / lane_n);
 	loop {
 		let m = lane_m.checked_mul(register_m).ok_or_else(|| RecipeError::new("native contraction M tile overflows"))?;
@@ -7754,7 +7759,12 @@ fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block
 		if room >= fragment {
 			return Ok(Tile { m, n, k: room - room % fragment });
 		}
-		lane_m = lane_m.checked_sub(1).filter(|lanes| *lanes != 0).ok_or_else(|| RecipeError::new("native contraction tile does not fit the device"))?;
+		if lane_m > 1 {
+			lane_m -= 1;
+			continue;
+		}
+		lane_n = lane_n.checked_sub(1).filter(|lanes| *lanes != 0).ok_or_else(|| RecipeError::new("native contraction tile does not fit the device"))?;
+		lane_m = limits.m.div_ceil(register_m).min(block / lane_n);
 	}
 }
 fn native_contraction_shared_values(tile: Tile, register_m: u32, register_n: u32, block: u32, fragment: u32, ratio: u32, matrix: bool) -> Result<u32> {
