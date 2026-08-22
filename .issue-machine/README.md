@@ -40,9 +40,15 @@ repeat unfinished work but cannot skip it. Every terminal record and failure
 packet identifies the backend that executed the cursor.
 
 Each traversal process has the configured `trial_memory_mib` address-space
-limit. A composition that exceeds that limit fails through the same public
-process boundary and enters the normal review queue instead of exhausting the
-host and terminating the machine.
+limit. The current 8 GiB limit leaves enough virtual address space for ROCm
+queue creation. If a traversal terminates by signal, the machine reruns the
+same cursor through the same bounded public entrypoint and queues the crash only
+when that replay also terminates by signal. A transient process death uses the
+replay result and does not enter the review queue.
+
+Generated reproductions use a process-specific saved model path. Concurrent
+resolvers can exercise save, resume, and inference without replacing another
+reproduction's model file.
 
 The machine derives one fixed review-worker pool from the configured route
 limits. Queue growth does not create additional operating-system threads. Each
