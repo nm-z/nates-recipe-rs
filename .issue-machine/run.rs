@@ -275,6 +275,7 @@ struct Display {
     active: BTreeMap<String, Active>,
     reviews: BTreeMap<String, ReviewNode>,
     resolvers: BTreeMap<u64, ResolverNode>,
+    history: Vec<String>,
     rows: usize,
 }
 
@@ -536,6 +537,7 @@ fn pane_size() -> (usize, usize) {
 
 fn display_render(display: &mut Display) {
     display_clear(display);
+    for line in display.history.drain(..) { eprintln!("{line}") }
     let width = pane_size().0;
     let trials = display.active.iter().map(|(device, active)| {
         format!("{device:<4}  cursor {:<6}  time {}", active.cursor, elapsed(active.started))
@@ -615,12 +617,10 @@ fn display_start(device: &str, cursor: u64) {
 
 fn display_finish(device: &str, failed: bool) {
     let mut display = display().lock().expect("display lock is poisoned");
-    display_clear(&mut display);
     if let Some(active) = display.active.remove(device) {
         let status = if failed { "FAIL" } else { "PASS" };
-        eprintln!("{}", trial_line(device, active.cursor, &elapsed(active.started), status));
+        display.history.push(trial_line(device, active.cursor, &elapsed(active.started), status));
     }
-    std::io::stderr().flush().expect("cannot draw completed trial");
 }
 
 fn display_queue(packet: &str) {
@@ -665,17 +665,15 @@ fn display_reviewing(packet: &str, model: &str) {
 fn display_reviewed(packet: &str, model: &str, result: &str, url: Option<&str>) {
     let key = packet_key(packet);
     let mut display = display().lock().expect("display lock is poisoned");
-    display_clear(&mut display);
     if let Some(review) = display.reviews.remove(&key) {
-        eprintln!("{}", trial_line(&review.device, review.cursor, &review.elapsed, review.status));
-        eprintln!("├─ review  {model}");
+        display.history.push(trial_line(&review.device, review.cursor, &review.elapsed, review.status));
+        display.history.push(format!("├─ review  {model}"));
         if let Some(url) = url {
-            eprintln!("└─ {result:<7} {url}");
+            display.history.push(format!("└─ {result:<7} {url}"));
         } else {
-            eprintln!("└─ result  {result}");
+            display.history.push(format!("└─ result  {result}"));
         }
     }
-    std::io::stderr().flush().expect("cannot draw completed review");
 }
 
 fn display_resolving(issue: u64, model: &str) {
@@ -685,16 +683,14 @@ fn display_resolving(issue: u64, model: &str) {
 
 fn display_resolved(issue: u64, result: &str, url: Option<&str>) {
     let mut display = display().lock().expect("display lock is poisoned");
-    display_clear(&mut display);
     if let Some(resolver) = display.resolvers.remove(&issue) {
-        eprintln!("resolve  issue #{:<5}  time {}  model {}", resolver.issue, elapsed(resolver.started), resolver.model);
+        display.history.push(format!("resolve  issue #{:<5}  time {}  model {}", resolver.issue, elapsed(resolver.started), resolver.model));
         if let Some(url) = url {
-            eprintln!("└─ {result:<7} {url}");
+            display.history.push(format!("└─ {result:<7} {url}"));
         } else {
-            eprintln!("└─ result  {result}");
+            display.history.push(format!("└─ result  {result}"));
         }
     }
-    std::io::stderr().flush().expect("cannot draw completed resolution");
 }
 
 fn display_clock() {
