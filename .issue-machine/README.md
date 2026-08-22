@@ -18,7 +18,7 @@ pending review queue remain saved in `machine.toml` and `queue.ogdl`.
 This machine continuously runs Recipe's exhaustive Cartesian traversal. It
 records every cursor result immediately and appends stable failures to one
 durable queue before advancing the cursor. Reviewers traverse that queue while
-cursor discovery continues. Each model runs at most one request at a time,
+cursor discovery continues. Each model uses its configured concurrency limit,
 while different models run concurrently. The first available
 classifier returns one schema-validated decision: create a
 `bug` issue or comment on an existing issue.
@@ -38,7 +38,10 @@ advances only across the contiguous completed cursor frontier. A crash can
 repeat unfinished work but cannot skip it. Every terminal record and failure
 packet identifies the backend that executed the cursor.
 
-The machine runs one request from each model concurrently. Each live
+The machine runs each model up to its configured concurrency limit. Ox Alpha,
+whose current catalog key is `opencode/x-preview-f-free`, runs up to 20
+requests concurrently. Every other OpenCode model runs one request at a time.
+Each live
 reviewer uses the `provider/model` identity shown in the terminal and log. The
 configured providers and model order are:
 

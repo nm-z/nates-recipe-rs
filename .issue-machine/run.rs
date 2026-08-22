@@ -33,6 +33,7 @@ struct Config {
     opencode_binary: PathBuf,
     opencode_config: PathBuf,
     opencode_models: Vec<String>,
+    opencode_concurrency: BTreeMap<String, usize>,
     opencode_agent: String,
     copilot_binary: PathBuf,
     copilot_model: String,
@@ -84,8 +85,31 @@ fn values(text: &str, name: &str) -> Vec<String> {
         .collect()
 }
 
+fn limits(text: &str, name: &str) -> BTreeMap<String, usize> {
+    values(text, name)
+        .into_iter()
+        .map(|entry| {
+            let (model, limit) = entry
+                .rsplit_once(':')
+                .unwrap_or_else(|| panic!("{name} entry has no concurrency limit: {entry}"));
+            let limit = limit
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} entry has an invalid concurrency limit: {entry}"));
+            assert!(limit > 0, "{name} entry must have a positive concurrency limit: {entry}");
+            (model.to_owned(), limit)
+        })
+        .collect()
+}
+
 fn config(path: &Path) -> Config {
     let text = std::fs::read_to_string(path).expect("cannot read machine.toml");
+    let opencode_models = values(&text, "opencode_models");
+    let opencode_concurrency = limits(&text, "opencode_concurrency");
+    assert_eq!(
+        opencode_models.iter().cloned().collect::<BTreeSet<_>>(),
+        opencode_concurrency.keys().cloned().collect(),
+        "opencode_concurrency must define every configured OpenCode model exactly once",
+    );
     Config {
         repository: value(&text, "repository").into(),
         log_path: value(&text, "log_path").into(),
@@ -103,7 +127,8 @@ fn config(path: &Path) -> Config {
         agy_models: values(&text, "agy_models"),
         opencode_binary: value(&text, "opencode_binary").into(),
         opencode_config: value(&text, "opencode_config").into(),
-        opencode_models: values(&text, "opencode_models"),
+        opencode_models,
+        opencode_concurrency,
         opencode_agent: value(&text, "opencode_agent"),
         copilot_binary: value(&text, "copilot_binary").into(),
         copilot_model: value(&text, "copilot_model"),
@@ -220,7 +245,7 @@ static DISPLAY: OnceLock<Mutex<Display>> = OnceLock::new();
 static SPARK: OnceLock<Mutex<()>> = OnceLock::new();
 static KIMI: OnceLock<Mutex<()>> = OnceLock::new();
 static AGY: OnceLock<Mutex<()>> = OnceLock::new();
-static OPENCODE: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+static OPENCODE: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
 static COPILOT: OnceLock<Mutex<()>> = OnceLock::new();
 static CLAUDE: OnceLock<Mutex<()>> = OnceLock::new();
 static OLLAMA: OnceLock<Mutex<()>> = OnceLock::new();
@@ -237,25 +262,35 @@ fn provider(slot: &'static OnceLock<Mutex<()>>) -> Option<std::sync::MutexGuard<
 }
 
 struct ModelProvider {
-    slots: &'static Mutex<BTreeSet<String>>,
+    slots: &'static Mutex<BTreeMap<String, usize>>,
     model: String,
 }
 
 impl Drop for ModelProvider {
     fn drop(&mut self) {
-        self.slots.lock().expect("model provider lock is poisoned").remove(&self.model);
+        let mut slots = self.slots.lock().expect("model provider lock is poisoned");
+        let active = slots.get_mut(&self.model).expect("active model has no provider slot");
+        *active -= 1;
+        if *active == 0 {
+            slots.remove(&self.model);
+        }
     }
 }
 
 fn model_provider(
-    slot: &'static OnceLock<Mutex<BTreeSet<String>>>,
+    slot: &'static OnceLock<Mutex<BTreeMap<String, usize>>>,
     model: &str,
+    limit: usize,
 ) -> Option<ModelProvider> {
-    let slots = slot.get_or_init(|| Mutex::new(BTreeSet::new()));
-    slots.lock().expect("model provider lock is poisoned").insert(model.to_owned()).then(|| ModelProvider {
-        slots,
-        model: model.to_owned(),
-    })
+    let slots = slot.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut active = slots.lock().expect("model provider lock is poisoned");
+    let count = active.entry(model.to_owned()).or_default();
+    if *count >= limit {
+        return None;
+    }
+    *count += 1;
+    drop(active);
+    Some(ModelProvider { slots, model: model.to_owned() })
 }
 
 fn identity(provider: &str, model: &str) -> String { format!("{provider}/{model}") }
@@ -1235,7 +1270,8 @@ fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
             display_reviewing(packet, "queued");
         }
         for model in &config.opencode_models {
-            if let Some(_provider) = model_provider(&OPENCODE, model) {
+            let limit = *config.opencode_concurrency.get(model).expect("OpenCode model has no concurrency limit");
+            if let Some(_provider) = model_provider(&OPENCODE, model, limit) {
                 let classifier = identity("opencode", model.strip_prefix("opencode/").unwrap_or(model));
                 display_reviewing(packet, &classifier);
                 match opencode(config, model, prompt) {
