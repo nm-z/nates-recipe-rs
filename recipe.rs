@@ -9590,7 +9590,10 @@ fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	let first = rows.remove(0);
 	let numeric = |value: &String| value.parse::<f64>().is_ok();
 	let headerless = first.iter().all(numeric) || rows.is_empty();
-	let headers = if headerless { (1..=first.len()).map(|column| format!("col{column}")).collect() } else { first.clone() };
+	// A headerless table carries its label in the conventional final position, so that
+	// column's authoritative name is "target" and the earlier columns take positional
+	// names. Positional colN forms still match every column through column_match.
+	let headers = if headerless { (1..=first.len()).map(|column| if column == first.len() { "target".to_owned() } else { format!("col{column}") }).collect() } else { first.clone() };
 	if headerless {
 		rows.insert(0, first);
 	}
