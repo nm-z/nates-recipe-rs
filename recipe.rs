@@ -10352,6 +10352,10 @@ impl Train {
 		stored.bn_stats = tape.extract_bn_stats()?;
 		tape.inject_bn_stats(&stored.bn_stats)?;
 		self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
+		// The reported schedule follows the tape that produced the reported
+		// evaluation: the held-out paths below dispatch their own validation
+		// tapes and overwrite this with the schedule those tapes actually ran.
+		let mut evaluation_schedule = tape.schedule_text();
 		let raw_predictions = tape.predictions()?;
 		let mut final_loss = model_loss(&raw_predictions, targets, model.loss, config.activation[7]);
 		let mut predictions = raw_predictions.iter().map(|value| scale.map_or(*value, |scale| scale.decode(*value))).collect::<Vec<_>>();
@@ -10366,6 +10370,7 @@ impl Train {
 				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, model.loss)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
 				validation.forward()?;
+				evaluation_schedule = validation.schedule_text();
 				let raw = validation.predictions()?;
 				require(raw.len() == 1, "autoregressive forward must produce one char ID")?;
 				raw_outputs.push(raw[0]);
@@ -10389,6 +10394,7 @@ impl Train {
 			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, model.loss)?;
 			validation.inject_bn_stats(&stored.bn_stats)?;
 			validation.forward()?;
+			evaluation_schedule = validation.schedule_text();
 			let raw = validation.predictions()?;
 			final_loss = model_loss(&raw, validation_targets, model.loss, config.activation[7]);
 			evaluated = raw.into_iter().map(|value| scale.map_or(value, |scale| scale.decode(value))).collect();
@@ -10402,7 +10408,7 @@ impl Train {
 		};
 		if !evaluated.is_empty() { predictions = evaluated }
 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(()))?;
-		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), schedule: tape.schedule_text(), run, epoch: tape.step as usize, seconds: started.elapsed().as_secs_f64(), epoch_seconds })
+		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), schedule: evaluation_schedule, run, epoch: tape.step as usize, seconds: started.elapsed().as_secs_f64(), epoch_seconds })
 	}
 	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &DataSchema, tape: &NativeTape, save: Option<()>) -> Result<T> {
 		let save = if INTERRUPTED.load(Ordering::Acquire) && !INTERRUPT_CHECKPOINTED.swap(true, Ordering::AcqRel) { Some(()) } else { save.filter(|_| !INTERRUPTED.load(Ordering::Acquire)) };
