@@ -26,8 +26,8 @@ machine instead of leaving an interactive shell that reports a false healthy
 state.
 
 The resolver pool has a ceiling of 20 workers and a separate process-memory
-budget. The current 60 GiB admission budget permits all 20 resolver process
-trees, and each tree has a 3 GiB memory limit. Resolver sessions share one Cargo
+budget. The current 80 GiB admission budget permits all 20 resolver process
+trees, and each tree has a 4 GiB memory limit. Resolver sessions share one Cargo
 target directory, compile one Cargo job at a time, and omit dev and test debug
 symbols. This prevents concurrent worktrees from linking duplicate debug
 artifacts while all 20 model sessions remain active. Each active resolver
