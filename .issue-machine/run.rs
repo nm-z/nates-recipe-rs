@@ -278,6 +278,7 @@ static OPENCODE: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
 static COPILOT: OnceLock<Mutex<usize>> = OnceLock::new();
 static OLLAMA: OnceLock<Mutex<usize>> = OnceLock::new();
 static PUBLICATION: Mutex<()> = Mutex::new(());
+static COOLDOWNS: OnceLock<Mutex<BTreeMap<String, Option<Instant>>>> = OnceLock::new();
 
 fn display() -> &'static Mutex<Display> { DISPLAY.get_or_init(|| Mutex::new(Display::default())) }
 
@@ -335,6 +336,53 @@ fn model_provider(
 }
 
 fn identity(provider: &str, model: &str) -> String { format!("{provider}/{model}") }
+
+fn reset_after(error: &str) -> Option<Duration> {
+    let lower = error.to_ascii_lowercase();
+    let tail = ["resets in ", "refreshes in "].into_iter().find_map(|marker| lower.split_once(marker).map(|(_, tail)| tail))?;
+    let mut seconds = 0_u64;
+    for token in tail.split_whitespace() {
+        let token = token.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+        let Some((value, unit)) = token.split_at_checked(token.len().saturating_sub(1)) else { break };
+        let Ok(value) = value.parse::<u64>() else { break };
+        seconds = seconds.saturating_add(value.saturating_mul(match unit { "d" => 86_400, "h" => 3_600, "m" => 60, "s" => 1, _ => break }));
+    }
+    (seconds != 0).then(|| Duration::from_secs(seconds))
+}
+
+fn usage_exhausted(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    ["usage limit", "quota", "out of credits", "credit balance", "rate limit", "rate-limit"].iter().any(|message| error.contains(message))
+}
+
+fn available(model: &str) -> bool {
+    let cooldowns = COOLDOWNS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut cooldowns = cooldowns.lock().expect("cooldown lock is poisoned");
+    match cooldowns.get(model).copied() {
+        Some(Some(reset)) if Instant::now() >= reset => { cooldowns.remove(model); true }
+        Some(_) => false,
+        None => true,
+    }
+}
+
+fn classify_with(config: &Config, packet: &str, classifier: &str, run: impl FnOnce() -> std::result::Result<Decision, String>) -> Option<Decision> {
+    if !available(classifier) { return None }
+    display_reviewing(packet, classifier);
+    match run() {
+        Ok(decision) => Some(decision),
+        Err(error) => {
+            if usage_exhausted(&error) {
+                let reset = reset_after(&error);
+                COOLDOWNS.get_or_init(|| Mutex::new(BTreeMap::new())).lock().expect("cooldown lock is poisoned").insert(classifier.to_owned(), reset.map(|duration| Instant::now() + duration));
+                trace(config, &format!("model={classifier} usage exhausted reset_seconds={}", reset.map_or_else(|| "machine-run".to_owned(), |duration| duration.as_secs().to_string())));
+            } else {
+                trace(config, &format!("model={classifier} unavailable error={error}"));
+            }
+            display_reviewing(packet, "queued");
+            None
+        }
+    }
+}
 
 struct OpenCodeServer(Child);
 
@@ -1322,66 +1370,31 @@ fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
     loop {
         if let Some(_provider) = provider(&SPARK, config.review_concurrency) {
             let classifier = identity("codex", &config.spark_model);
-            display_reviewing(packet, &classifier);
-            match spark(config, prompt) {
-                Ok(decision) => return decision,
-                Err(error) => trace(
-                    config,
-                    &format!("model={classifier} unavailable error={error}"),
-                ),
-            }
-            display_reviewing(packet, "queued");
+            if let Some(decision) = classify_with(config, packet, &classifier, || spark(config, prompt)) { return decision }
         }
         if let Some(_provider) = provider(&KIMI, config.review_concurrency) {
             let classifier = identity("kimi", &config.kimi_k3_model);
-            display_reviewing(packet, &classifier);
-            match kimi(config, "kimi", &config.kimi_k3_model, prompt) {
-                Ok(decision) => return decision,
-                Err(error) => trace(
-                    config,
-                    &format!("model={classifier} unavailable error={error}"),
-                ),
-            }
-            display_reviewing(packet, "queued");
+            if let Some(decision) = classify_with(config, packet, &classifier, || kimi(config, "kimi", &config.kimi_k3_model, prompt)) { return decision }
         }
         for model in &config.opencode_models {
             let limit = *config.opencode_concurrency.get(model).expect("OpenCode model has no concurrency limit");
             if let Some(_provider) = model_provider(&OPENCODE, model, limit) {
                 let classifier = model.to_owned();
-                display_reviewing(packet, &classifier);
-                match opencode(config, model, prompt) {
-                    Ok(decision) => return decision,
-                    Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
-                }
-                display_reviewing(packet, "queued");
+                if let Some(decision) = classify_with(config, packet, &classifier, || opencode(config, model, prompt)) { return decision }
             }
         }
         if let Some(_provider) = provider(&COPILOT, config.review_concurrency) {
             let classifier = identity("copilot", &config.copilot_model);
-            display_reviewing(packet, &classifier);
-            match copilot(config, packet, prompt) {
-                Ok(decision) => return decision,
-                Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
-            }
-            display_reviewing(packet, "queued");
+            if let Some(decision) = classify_with(config, packet, &classifier, || copilot(config, packet, prompt)) { return decision }
         }
         if let Some(_provider) = provider(&OLLAMA, config.review_concurrency) {
             let classifier = identity("ollama", &config.ollama_model);
-            display_reviewing(packet, &classifier);
-            match ollama(config, prompt) {
-                Ok(decision) => return decision,
-                Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
-            }
-            display_reviewing(packet, "queued");
+            if let Some(decision) = classify_with(config, packet, &classifier, || ollama(config, prompt)) { return decision }
         }
         if let Some(_provider) = provider(&AGY, config.review_concurrency) {
             for model in &config.agy_models {
                 let classifier = identity("agy", model);
-                display_reviewing(packet, &classifier);
-                match agy(config, model, prompt) {
-                    Ok(decision) => return decision,
-                    Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
-                }
+                if let Some(decision) = classify_with(config, packet, &classifier, || agy(config, model, prompt)) { return decision }
             }
             display_reviewing(packet, "queued");
         }
