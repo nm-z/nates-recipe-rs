@@ -610,6 +610,7 @@ fn main() -> BuildResult<()> {
 		("boost-iterations", "RECIPE_BOOST_ITERATIONS"),
 		("boost-learning-rate", "RECIPE_BOOST_LEARNING_RATE"),
 		("catboost-ordered-prior", "RECIPE_CATBOOST_ORDERED_PRIOR"),
+		("catboost-border-count", "RECIPE_CATBOOST_BORDER_COUNT"),
 		("xgboost-l2-regularization", "RECIPE_XGBOOST_L2_REGULARIZATION"),
 		("xgboost-minimum-gain", "RECIPE_XGBOOST_MINIMUM_GAIN"),
 		("lightgbm-histogram-bins", "RECIPE_LIGHTGBM_HISTOGRAM_BINS"),

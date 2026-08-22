@@ -5498,6 +5498,7 @@ struct Config {
 	boost_iterations: usize,
 	boost_rate: f64,
 	catboost_prior: f64,
+	catboost_borders: usize,
 	xgboost_regularization: f64,
 	xgboost_min_gain: f64,
 	lightgbm_bins: usize,
@@ -5517,7 +5518,7 @@ struct Config {
 	precision: Compute,
 }
 impl Config {
-	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
+	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, catboost_borders: natural("CatBoost border count", env!("RECIPE_CATBOOST_BORDER_COUNT"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
 }
 fn number(name: &str, text: &str) -> Result<f64> {
 	let value = text.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))?;
@@ -7370,20 +7371,44 @@ fn fit_lightgbm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool)
 	}
 	boosted_predictor(base, &trees, config.boost_rate)
 }
-fn ordered_split(samples: &[f64], residuals: &[f64], features: usize, permutation: &[usize], codes: &[usize], level: usize, prior: f64, minimum: usize) -> Option<(usize, f64)> {
-	let mut best = None;
-	for feature in 0..features {
-		let mut values = permutation.iter().map(|&row| samples[row * features + feature]).collect::<Vec<_>>();
+/// Candidate split thresholds for one feature of a CatBoost fit. CatBoost
+/// quantizes every feature into a bounded border set before growing trees, so
+/// the ordered error scan visits `count` candidates per feature instead of one
+/// per distinct value, which on a continuous feature would make the scan
+/// quadratic in the row count. A feature with at most `count` distinct
+/// midpoints keeps all of them. `bins[row]` is the number of thresholds the
+/// row's value does not fall left of, so the row sits left of threshold
+/// `index` exactly when `bins[row] <= index`.
+struct CatboostBorders {
+	thresholds: Vec<f64>,
+	bins: Vec<usize>,
+}
+fn catboost_borders(samples: &[f64], features: usize, rows: usize, count: usize) -> Vec<CatboostBorders> {
+	(0..features).map(|feature| {
+		let mut values = (0..rows).map(|row| samples[row * features + feature]).collect::<Vec<_>>();
 		values.sort_by(f64::total_cmp);
 		values.dedup_by(|left, right| left.to_bits() == right.to_bits());
-		for pair in values.windows(2) {
-			let threshold = (pair[0] + pair[1]) * 0.5;
+		let midpoints = values.len().saturating_sub(1);
+		// Rank-spaced positions keep every candidate when the feature is small
+		// and pick evenly spread interior quantiles when it is not.
+		let thresholds = (0..midpoints.min(count)).map(|index| {
+			let position = if midpoints <= count { index } else { (index + 1) * midpoints / (count + 1) };
+			(values[position] + values[position + 1]) * 0.5
+		}).collect::<Vec<f64>>();
+		let bins = (0..rows).map(|row| thresholds.partition_point(|threshold| !(samples[row * features + feature] < *threshold))).collect();
+		CatboostBorders { thresholds, bins }
+	}).collect()
+}
+fn ordered_split(borders: &[CatboostBorders], residuals: &[f64], permutation: &[usize], codes: &[usize], level: usize, prior: f64, minimum: usize) -> Option<(usize, f64)> {
+	let mut best = None;
+	for (feature, candidates) in borders.iter().enumerate() {
+		for (index, &threshold) in candidates.thresholds.iter().enumerate() {
 			let groups = 1_usize.checked_shl((level + 1) as u32)?;
 			let mut counts = vec![0_usize; groups];
 			let mut sums = vec![0.0; groups];
 			let mut error = 0.0;
 			for &row in permutation {
-				let side = usize::from(samples[row * features + feature] < threshold);
+				let side = usize::from(candidates.bins[row] <= index);
 				let group = codes[row] | side << level;
 				let estimate = sums[group] / (counts[group] as f64 + prior);
 				error += (residuals[row] - estimate).powi(2);
@@ -7403,6 +7428,7 @@ fn oblivious_tree(splits: &[(usize, f64)], leaves: &[f64], level: usize, code: u
 fn fit_catboost(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
 	require(rows >= config.tree_min_rows && data.features != 0, "CatBoost requires enough training rows and features")?;
 	require(config.tree_depth < usize::BITS as usize, "CatBoost tree depth is too large")?;
+	let borders = catboost_borders(&data.samples, data.features, rows, config.catboost_borders);
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	let mut predictions = vec![base; rows];
 	let mut state = config.random_seed as u64;
@@ -7414,7 +7440,7 @@ fn fit_catboost(_: usize, data: &Prepared, rows: usize, config: Config, _: bool)
 		let mut codes = vec![0_usize; rows];
 		let mut splits = Vec::with_capacity(config.tree_depth);
 		for level in 0..config.tree_depth {
-			let Some(split) = ordered_split(&data.samples, &residuals, data.features, &permutation, &codes, level, config.catboost_prior, config.tree_min_rows) else { break };
+			let Some(split) = ordered_split(&borders, &residuals, &permutation, &codes, level, config.catboost_prior, config.tree_min_rows) else { break };
 			for row in 0..rows { codes[row] |= usize::from(data.samples[row * data.features + split.0] < split.1) << level }
 			splits.push(split);
 		}

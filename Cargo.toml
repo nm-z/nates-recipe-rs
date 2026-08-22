@@ -65,6 +65,7 @@ bayes-variance-epsilon = 0.000001
 boost-iterations = 8
 boost-learning-rate = 0.1
 catboost-ordered-prior = 1.0
+catboost-border-count = 32
 xgboost-l2-regularization = 1.0
 xgboost-minimum-gain = 0.000001
 lightgbm-histogram-bins = 16
