@@ -457,7 +457,6 @@ fn display_render(display: &mut Display) {
 fn display_start(device: &str, cursor: u64) {
     let mut display = display().lock().expect("display lock is poisoned");
     display.active.insert(device.to_owned(), Active { cursor, started: Instant::now() });
-    display_render(&mut display);
 }
 
 fn display_finish(device: &str, failed: bool) {
@@ -467,7 +466,7 @@ fn display_finish(device: &str, failed: bool) {
         let status = if failed { "FAIL" } else { "PASS" };
         eprintln!("{}", trial_line(device, active.cursor, &elapsed(active.started), status));
     }
-    display_render(&mut display);
+    std::io::stderr().flush().expect("cannot draw completed trial");
 }
 
 fn display_queue(packet: &str) {
@@ -493,7 +492,6 @@ fn display_queue(packet: &str) {
         model: None,
         started: None,
     });
-    display_render(&mut display);
 }
 
 fn display_reviewing(packet: &str, model: &str) {
@@ -508,7 +506,6 @@ fn display_reviewing(packet: &str, model: &str) {
             review.started = Some(Instant::now());
         }
     }
-    display_render(&mut display);
 }
 
 fn display_reviewed(packet: &str, model: &str, result: &str, url: Option<&str>) {
@@ -524,13 +521,12 @@ fn display_reviewed(packet: &str, model: &str, result: &str, url: Option<&str>) 
             eprintln!("└─ result  {result}");
         }
     }
-    display_render(&mut display);
+    std::io::stderr().flush().expect("cannot draw completed review");
 }
 
 fn display_resolving(issue: u64, model: &str) {
     let mut display = display().lock().expect("display lock is poisoned");
     display.resolvers.insert(issue, ResolverNode { issue, model: model.to_owned(), started: Instant::now() });
-    display_render(&mut display);
 }
 
 fn display_resolved(issue: u64, result: &str, url: Option<&str>) {
@@ -544,7 +540,7 @@ fn display_resolved(issue: u64, result: &str, url: Option<&str>) {
             eprintln!("└─ result  {result}");
         }
     }
-    display_render(&mut display);
+    std::io::stderr().flush().expect("cannot draw completed resolution");
 }
 
 fn display_clock() {
