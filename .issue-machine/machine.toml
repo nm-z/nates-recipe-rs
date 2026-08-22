@@ -16,6 +16,7 @@ opencode_config = "/home/nate/Desktop/recipe-issue-machine/.issue-machine/openco
 opencode_server = "http://127.0.0.1:4096"
 opencode_server_start_seconds = 30
 opencode_server_poll_milliseconds = 50
+opencode_status_poll_milliseconds = 1000
 opencode_models = "opencode/big-pickle,opencode/hy3-free,opencode/mimo-v2.5-free,opencode/muse-spark-1.2-contributor-free,opencode/nemotron-3-ultra-free,opencode/nemotron-3.5-lightning-free,opencode/x-preview-f-free,openrouter/openrouter/free"
 opencode_concurrency = "opencode/big-pickle:2,opencode/hy3-free:2,opencode/mimo-v2.5-free:2,opencode/muse-spark-1.2-contributor-free:2,opencode/nemotron-3-ultra-free:2,opencode/nemotron-3.5-lightning-free:2,opencode/x-preview-f-free:2,openrouter/openrouter/free:2"
 opencode_agent = "recipe-reviewer"

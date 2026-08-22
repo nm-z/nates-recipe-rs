@@ -4,7 +4,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RED: &str = "\x1b[38;2;255;92;122m";
 const YELLOW: &str = "\x1b[38;2;229;192;123m";
@@ -34,6 +34,7 @@ struct Config {
     opencode_server: String,
     opencode_server_start_seconds: u64,
     opencode_server_poll_milliseconds: u64,
+    opencode_status_poll_milliseconds: u64,
     opencode_models: Vec<String>,
     opencode_concurrency: BTreeMap<String, usize>,
     opencode_agent: String,
@@ -140,6 +141,9 @@ fn config(path: &Path) -> Config {
         opencode_server_poll_milliseconds: value(&text, "opencode_server_poll_milliseconds")
             .parse()
             .expect("opencode_server_poll_milliseconds must be an unsigned integer"),
+        opencode_status_poll_milliseconds: value(&text, "opencode_status_poll_milliseconds")
+            .parse()
+            .expect("opencode_status_poll_milliseconds must be an unsigned integer"),
         opencode_models,
         opencode_concurrency,
         opencode_agent: value(&text, "opencode_agent"),
@@ -421,6 +425,67 @@ fn opencode_server(config: &Config) -> OpenCodeServer {
         std::thread::sleep(Duration::from_millis(config.opencode_server_poll_milliseconds));
     }
     OpenCodeServer(child)
+}
+
+fn opencode_request(config: &Config, method: &str, path: &str, body: &str) -> std::result::Result<String, String> {
+    let address = config.opencode_server.strip_prefix("http://").expect("opencode_server must use http://");
+    let mut stream = std::net::TcpStream::connect(address).map_err(|error| error.to_string())?;
+    write!(stream, "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).map_err(|error| error.to_string())?;
+    if !line.starts_with("HTTP/1.1 2") { return Err(line.trim().to_owned()) }
+    let mut length = None;
+    loop {
+        line.clear();
+        reader.read_line(&mut line).map_err(|error| error.to_string())?;
+        if line == "\r\n" { break }
+        if let Some(value) = line.strip_prefix("Content-Length:").or_else(|| line.strip_prefix("content-length:")) {
+            length = Some(value.trim().parse::<usize>().map_err(|error| error.to_string())?);
+        }
+    }
+    let mut body = vec![0; length.ok_or_else(|| "OpenCode server returned no content length".to_owned())?];
+    reader.read_exact(&mut body).map_err(|error| error.to_string())?;
+    String::from_utf8(body).map_err(|error| error.to_string())
+}
+
+fn opencode_turn(config: &Config, model: &str, prompt: &str, session: &str) -> std::result::Result<String, String> {
+    let (provider, model) = model.split_once('/').expect("OpenCode model has no provider");
+    let payload = output(Command::new("jq").args(["-cn", "--arg", "provider", provider, "--arg", "model", model, "--arg", "agent", &config.opencode_agent, "--arg", "prompt", prompt, r#"{model:{providerID:$provider,modelID:$model},agent:$agent,parts:[{type:"text",text:$prompt}]}"#]), None);
+    if !payload.status.success() { return Err(failure(&payload)) }
+    opencode_request(config, "POST", &format!("/session/{session}/prompt_async"), &String::from_utf8_lossy(&payload.stdout))?;
+    loop {
+        std::thread::sleep(Duration::from_millis(config.opencode_status_poll_milliseconds));
+        let sessions = opencode_request(config, "GET", "/session/status", "")?;
+        let filter = format!(r#".["{session}"] // {{"type":"idle"}}"#);
+        let state = jq(&sessions, &filter)?;
+        match jq(&state, ".type")?.as_str() {
+            "busy" => continue,
+            "retry" => {
+                let message = jq(&state, ".message").unwrap_or_else(|_| "OpenCode usage is unavailable".to_owned());
+                let reset = jq(&state, ".next").ok().and_then(|value| value.parse::<u64>().ok()).map(|next| {
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system time precedes Unix epoch").as_millis() as u64;
+                    next.saturating_sub(now).saturating_add(999) / 1000
+                });
+                opencode_request(config, "POST", &format!("/session/{session}/abort"), "")?;
+                return Err(format!("usage limit; refreshes in {}s; {message}", reset.unwrap_or(config.provider_poll_seconds)));
+            }
+            "idle" => {
+                let messages = opencode_request(config, "GET", &format!("/session/{session}/message"), "")?;
+                if let Ok(response) = jq(&messages, r#"[.[] | select(.info.role == "assistant") | .parts[]? | select(.type == "text") | .text][-1]"#) { return Ok(response) }
+                if let Ok(message) = jq(&messages, r#"[.[] | select(.info.role == "assistant" and .info.error != null) | .info.error.data.message][-1]"#) {
+                    let reset = jq(&messages, r#"[.[] | select(.info.role == "assistant" and .info.error != null) | .info.error.data.responseHeaders["x-ratelimit-reset"]][-1]"#).ok().and_then(|value| value.parse::<u64>().ok()).map(|next| {
+                        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system time precedes Unix epoch").as_millis() as u64;
+                        next.saturating_sub(now).saturating_add(999) / 1000
+                    });
+                    if reset.is_some() || usage_exhausted(&message) { return Err(format!("usage limit; refreshes in {}s; {message}", reset.unwrap_or(config.provider_poll_seconds))) }
+                    return Err(message);
+                }
+                if jq(&messages, r#"[.[] | select(.info.role == "assistant") | .info.id][-1]"#).is_ok() { return Err("OpenCode returned a completed assistant turn with no response".to_owned()) }
+            }
+            _ => continue,
+        }
+    }
 }
 
 fn display_clear(display: &mut Display) {
@@ -1155,71 +1220,17 @@ fn agy(config: &Config, model: &str, prompt: &str) -> std::result::Result<Decisi
 }
 
 fn opencode(config: &Config, model: &str, prompt: &str) -> std::result::Result<Decision, String> {
-    let permissions = r#"{"*":"deny","read":"allow","glob":"allow","grep":"allow","list":"allow","recipe_issues_*":"allow"}"#;
-    let directory = config.repository.to_str().expect("repository path is not UTF-8");
-    let result = output(
-        Command::new(&config.opencode_binary)
-            .args([
-                "run",
-                "--attach",
-                &config.opencode_server,
-                "--model",
-                model,
-                "--agent",
-                &config.opencode_agent,
-                "--dir",
-                directory,
-                "--format",
-                "json",
-                "--title",
-                "Recipe issue review",
-                prompt,
-            ])
-            .env("OPENCODE_PERMISSION", permissions)
-            .env("OPENCODE_CONFIG", &config.opencode_config)
-            .current_dir(&config.repository),
-        None,
-    );
-    let stream = String::from_utf8_lossy(&result.stdout);
-    let response = jq_lines(&stream, "[.[] | select(.type == \"text\") | .part.text][-1]");
-    if !result.status.success() && response.is_err() {
-        return Err(failure(&result));
-    }
-    let mut json = response.and_then(object);
+    let session = jq(&opencode_request(config, "POST", "/session", r#"{"title":"Recipe issue review"}"#)?, ".id")?;
+    let response = opencode_turn(config, model, prompt, &session)?;
+    let mut json = object(response);
     if json.is_err() {
-        let session = jq_lines(&stream, "[.[] | .sessionID][-1]")?;
         trace(
             config,
             &format!("model={model} repairing structured output session={session}"),
         );
-        let repair = output(
-            Command::new(&config.opencode_binary)
-                .args([
-                    "run",
-                    "--attach",
-                    &config.opencode_server,
-                    "--session",
-                    &session,
-                    "--model",
-                    model,
-                    "--agent",
-                    &config.opencode_agent,
-                    "--dir",
-                    directory,
-                    "--format",
-                    "json",
-                    "Return only one corrected JSON object matching the required schema. Do not repeat the investigation.",
-                ])
-                .env("OPENCODE_PERMISSION", permissions)
-                .env("OPENCODE_CONFIG", &config.opencode_config)
-                .current_dir(&config.repository),
-            None,
-        );
-        let repaired = String::from_utf8_lossy(&repair.stdout);
-        json = jq_lines(&repaired, "[.[] | select(.type == \"text\") | .part.text][-1]")
-            .and_then(object);
+        json = opencode_turn(config, model, "Return only one corrected JSON object matching the required schema. Do not repeat the investigation.", &session).and_then(object);
     }
-    let json = json.map_err(|error| format!("{}; {error}", failure(&result)))?;
+    let json = json?;
     let (provider, model) = model.split_once('/').expect("OpenCode model has no provider");
     Ok(Decision {
         provider: if provider == "openrouter" { "openrouter" } else { "opencode" },
