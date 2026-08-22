@@ -240,6 +240,7 @@ struct Trial {
     elapsed: Duration,
     timed_out: bool,
     crash: Option<(i32, i32)>,
+    replay: Option<String>,
 }
 
 struct SlowTrial {
@@ -661,6 +662,10 @@ fn display_queue(packet: &str) {
         model: None,
         started: None,
     });
+}
+
+fn display_drop(packet: &str) {
+    display().lock().expect("display lock is poisoned").reviews.remove(&packet_key(packet));
 }
 
 fn display_reviewing(packet: &str, model: &str) {
@@ -1869,20 +1874,21 @@ fn main() {
                 break;
             }
             let current = config(&worker_path);
-            let start = {
-                let mut allocation = worker_allocation
-                    .lock()
-                    .expect("cursor allocator lock is poisoned");
-                if current.batches != 0 && allocation.claimed == current.batches {
-                    break;
-                }
-                let start = allocation.next;
-                allocation.next = allocation
-                    .next
-                    .saturating_add(current.compositions_per_batch);
-                allocation.claimed += 1;
-                start
+            let replay = {
+                let mut state = worker_work.lock().expect("failure queue lock is poisoned");
+                let packet = state.packets.iter().find(|packet| packet_backend(packet) == device && !state.ready.contains(&packet_key(packet)) && !state.active.contains(&packet_key(packet))).cloned();
+                if let Some(packet) = &packet { state.active.insert(packet_key(packet)); }
+                packet
             };
+            let start = replay.as_ref().map_or_else(|| {
+                let mut allocation = worker_allocation.lock().expect("cursor allocator lock is poisoned");
+                if current.batches != 0 && allocation.claimed == current.batches { return None }
+                let start = allocation.next;
+                allocation.next = allocation.next.saturating_add(current.compositions_per_batch);
+                allocation.claimed += 1;
+                Some(start)
+            }, |packet| Some(packet_cursor(packet)));
+            let Some(start) = start else { break };
             let reproduction = reproduction_path(&current, &device, start);
             if worker_send.send(Discovery::Start { device: device.clone(), cursor: start }).is_err() {
                 break;
@@ -1897,7 +1903,7 @@ fn main() {
                     if !timed_out { crash = termination_signal(result.status).map(|replayed| (observed, replayed)) }
                 }
             }
-            let completed = Trial { config: current, device: device.clone(), cursor: start, reproduction, output: result, elapsed, timed_out, crash };
+            let completed = Trial { config: current, device: device.clone(), cursor: start, reproduction, output: result, elapsed, timed_out, crash, replay };
             if worker_send.send(Discovery::Complete(completed)).is_err() { break }
         }));
     }
@@ -1979,6 +1985,22 @@ fn main() {
             }
         }
         display_finish(&trial.device, !failures.is_empty());
+        if let Some(replayed) = &trial.replay {
+            let key = packet_key(replayed);
+            let removed = {
+                let mut state = work.lock().expect("failure queue lock is poisoned");
+                state.active.remove(&key);
+                if state.ready.contains(&key) {
+                    false
+                } else {
+                    state.packets.retain(|packet| packet_key(packet) != key);
+                    persist_queue(&trial.config.queue_path, &state.packets);
+                    true
+                }
+            };
+            if removed { display_drop(replayed) }
+            continue;
+        }
         let next = if trial.timed_out || signal.is_some() {
             trial.cursor + trial.config.compositions_per_batch
         } else {
