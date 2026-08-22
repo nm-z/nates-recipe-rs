@@ -1777,7 +1777,7 @@ fn main() {
         std::fs::read_to_string(directory.join("triage.md")).expect("cannot read triage.md"),
     );
     work.lock().expect("failure queue lock is poisoned").packets.iter().for_each(|packet| display_queue(packet));
-    let review_workers = initial.review_concurrency * (initial.opencode_models.len() + 5);
+    let review_workers = initial.opencode_concurrency.values().sum::<usize>() + initial.review_concurrency * 5;
     for _ in 0..review_workers {
         let review_work = Arc::clone(&work);
         let review_path = path.clone();
