@@ -408,7 +408,7 @@ fn main() {{
 		return format!("{body}\n}}\n");
 	}
 	let bundle_path = PathBuf::from(format!("/tmp/recipe-composition-{}.ogdl", std::process::id()));
-	let width = input_width(&bundle_path);
+	let width = bundle_path.exists().then(|| input_width(&bundle_path)).unwrap_or(0);
 	body.push_str(&format!("\n\tlet output = recipe.infer(&bundle, &[0.0; {width}]);\n\tassert!(!output.is_empty());\n\tassert!(output.iter().all(|value| value.is_finite()));"));
 	format!("{body}\n}}\n")
 }
