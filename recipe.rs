@@ -3479,7 +3479,7 @@ pub enum Residual {
 }
 pub const fn layer(width: usize) -> Residual { Residual::Layer(width) }
 pub const fn conv(filters: usize, kernel: usize) -> Residual { Residual::Conv(filters, kernel) }
-type FitFn = fn(usize, &Prepared, usize, Config, bool) -> Result<Predictor>;
+type FitFn = fn(usize, &Prepared, usize, Config, bool) -> Result<PredictorProgram>;
 type ValidateFn = fn(usize, usize) -> Result<()>;
 #[derive(Clone, Copy, Debug)]
 struct Estimator {
@@ -5366,9 +5366,9 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 		let inputs = graph_inputs(graph, &data.samples, &data.targets, rows, gpu, config.precision)?;
 		let prepared = Prepared { samples: inputs.clone(), targets: targets[..rows].to_vec(), rows, source_rows: rows, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: data.target_categorical, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
 		let teacher = estimator.fit(&prepared, rows, config, true)?;
-		let targets = inputs.chunks_exact(input.elements()).enumerate().map(|(row, query)| (teacher.predict)(row, query)).collect::<Result<Vec<_>>>()?;
+		let targets = predict_rows(&teacher, &inputs, input.elements(), rows)?;
 		let predictor = estimator.fit(&prepared, rows, config, false)?;
-		(predictor.program, fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?)
+		(predictor, fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?)
 	};
 	reset(graph, source, input);
 	push_predictor(graph, predictor)?;
@@ -6963,15 +6963,18 @@ impl PredictorBuilder {
 		Ok(PredictorProgram { code: self.code, locals: self.locals, stack: self.stack, table: self.table })
 	}
 }
-struct Predictor {
-	program: PredictorProgram,
-	predict: Box<dyn Fn(usize, &[f64]) -> Result<f64>>,
-}
-impl Predictor {
-	fn new(program: PredictorProgram) -> Self {
-		let evaluator = program.clone();
-		Self { program, predict: Box::new(move |row, query| evaluator.evaluate(row, query)) }
-	}
+fn predict_rows(program: &PredictorProgram, inputs: &[f64], features: usize, rows: usize) -> Result<Vec<f64>> {
+	let workers = std::thread::available_parallelism().map_or(1, usize::from).min(rows.max(1));
+	let stride = rows.div_ceil(workers).max(1);
+	let mut predictions = vec![0.0; rows];
+	std::thread::scope(|scope| {
+		let tasks = predictions.chunks_mut(stride).enumerate().map(|(chunk, slots)| scope.spawn(move || slots.iter_mut().enumerate().try_for_each(|(offset, slot)| {
+			let row = chunk * stride + offset;
+			program.evaluate(row, &inputs[row * features..(row + 1) * features]).map(|value| *slot = value)
+		}))).collect::<Vec<_>>();
+		tasks.into_iter().try_for_each(|task| task.join().map_err(|_| RecipeError::new("estimator prediction worker panicked"))?)
+	})?;
+	Ok(predictions)
 }
 #[derive(Clone)]
 enum TreeNode {
@@ -7037,7 +7040,7 @@ fn predictor_distance(program: &mut PredictorBuilder, sample: &[f64]) {
 		program.binary(PredictorOpcode::Add);
 	}
 }
-fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<PredictorProgram> {
 	require(rows != 0 && data.features != 0, "SVM requires training rows and features")?;
 	let mut means = vec![0.0; data.features];
 	for sample in data.samples[..rows * data.features].chunks_exact(data.features) {
@@ -7085,9 +7088,9 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> R
 		program.binary(PredictorOpcode::Multiply);
 		program.binary(PredictorOpcode::Add);
 	}
-	Ok(Predictor::new(program.finish()?))
+	program.finish()
 }
-fn fit_forest(trees: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+fn fit_forest(trees: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<PredictorProgram> {
 	require(rows >= config.tree_min_rows && data.features != 0, "forest requires enough training rows and features")?;
 	let feature_count = ((data.features as f64 * config.forest_feature_fraction).ceil() as usize).clamp(1, data.features);
 	let mut state = config.random_seed as u64;
@@ -7109,7 +7112,7 @@ fn fit_forest(trees: usize, data: &Prepared, rows: usize, config: Config, _: boo
 	}
 	program.constant(trees as f64);
 	program.binary(PredictorOpcode::Divide);
-	Ok(Predictor::new(program.finish()?))
+	program.finish()
 }
 fn solve_linear(mut matrix: Vec<f64>, mut values: Vec<f64>, epsilon: f64) -> Result<Vec<f64>> {
 	let width = values.len();
@@ -7144,7 +7147,7 @@ fn bayes_score(program: &mut PredictorBuilder, base: f64, means: &[f64], inverse
 		program.binary(PredictorOpcode::Add);
 	}
 }
-fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<PredictorProgram> {
 	require(rows != 0 && data.features != 0, "Bayes requires training rows and features")?;
 	if !data.target_categorical {
 		let mut means = vec![0.0; data.features];
@@ -7172,7 +7175,7 @@ fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) ->
 			program.binary(PredictorOpcode::Multiply);
 			program.binary(PredictorOpcode::Add);
 		}
-		return Ok(Predictor::new(program.finish()?));
+		return program.finish();
 	}
 	let mut classes = data.targets[..rows].to_vec();
 	classes.sort_by(f64::total_cmp);
@@ -7216,7 +7219,7 @@ fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) ->
 		program.store(best_class);
 	}
 	program.load(best_class);
-	Ok(Predictor::new(program.finish()?))
+	program.finish()
 }
 fn tree_predict(tree: &TreeNode, sample: &[f64]) -> f64 {
 	match tree {
@@ -7224,7 +7227,7 @@ fn tree_predict(tree: &TreeNode, sample: &[f64]) -> f64 {
 		TreeNode::Split { feature, threshold, left, right } => tree_predict(if sample[*feature] < *threshold { left } else { right }, sample),
 	}
 }
-fn boosted_predictor(base: f64, trees: &[TreeNode], rate: f64) -> Result<Predictor> {
+fn boosted_predictor(base: f64, trees: &[TreeNode], rate: f64) -> Result<PredictorProgram> {
 	let mut program = PredictorBuilder::new();
 	program.constant(base);
 	for tree in trees {
@@ -7233,7 +7236,7 @@ fn boosted_predictor(base: f64, trees: &[TreeNode], rate: f64) -> Result<Predict
 		program.binary(PredictorOpcode::Multiply);
 		program.binary(PredictorOpcode::Add);
 	}
-	Ok(Predictor::new(program.finish()?))
+	program.finish()
 }
 fn xgboost_leaf(rows: &[usize], gradients: &[f64], regularization: f64) -> f64 { -rows.iter().map(|&row| gradients[row]).sum::<f64>() / (rows.len() as f64 + regularization) }
 fn fit_xgboost_tree(samples: &[f64], gradients: &[f64], features: usize, rows: &[usize], depth: usize, minimum: usize, regularization: f64, minimum_gain: f64) -> TreeNode {
@@ -7257,7 +7260,7 @@ fn fit_xgboost_tree(samples: &[f64], gradients: &[f64], features: usize, rows: &
 	let (left, right): (Vec<_>, Vec<_>) = rows.iter().copied().partition(|row| samples[row * features + feature] < threshold);
 	TreeNode::Split { feature, threshold, left: Box::new(fit_xgboost_tree(samples, gradients, features, &left, depth - 1, minimum, regularization, minimum_gain)), right: Box::new(fit_xgboost_tree(samples, gradients, features, &right, depth - 1, minimum, regularization, minimum_gain)) }
 }
-fn fit_xgboost(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+fn fit_xgboost(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<PredictorProgram> {
 	require(rows >= config.tree_min_rows && data.features != 0, "XGBoost requires enough training rows and features")?;
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	let mut predictions = vec![base; rows];
@@ -7317,7 +7320,7 @@ fn materialize_lightgbm(nodes: &[LightNode], index: usize) -> TreeNode {
 		None => TreeNode::Leaf(nodes[index].value),
 	}
 }
-fn fit_lightgbm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+fn fit_lightgbm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<PredictorProgram> {
 	require(config.lightgbm_bins >= 2, "LightGBM histogram bins must be at least two")?;
 	require(config.lightgbm_leaves >= 2 && rows >= config.tree_min_rows && data.features != 0, "LightGBM requires at least two leaves and enough training rows and features")?;
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
@@ -7372,7 +7375,7 @@ fn oblivious_tree(splits: &[(usize, f64)], leaves: &[f64], level: usize, code: u
 	let (feature, threshold) = splits[level];
 	TreeNode::Split { feature, threshold, left: Box::new(oblivious_tree(splits, leaves, level + 1, code | 1 << level)), right: Box::new(oblivious_tree(splits, leaves, level + 1, code)) }
 }
-fn fit_catboost(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+fn fit_catboost(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<PredictorProgram> {
 	require(rows >= config.tree_min_rows && data.features != 0, "CatBoost requires enough training rows and features")?;
 	require(config.tree_depth < usize::BITS as usize, "CatBoost tree depth is too large")?;
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
@@ -7427,7 +7430,7 @@ fn cluster(data: &[f64], width: usize, clusters: usize, iterations: usize, impor
 	}
 	Ok((centers, assignments))
 }
-fn fit_kmeans(clusters: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
+fn fit_kmeans(clusters: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<PredictorProgram> {
 	let (centers, _) = cluster(&data.samples[..rows * data.features], data.features, clusters, config.kmeans_iterations, None)?;
 	let (mut program, best_distance, best_value, distance, condition) = (PredictorBuilder::new(), 0, 1, 2, 3);
 	program.locals = 4;
@@ -7454,19 +7457,19 @@ fn fit_kmeans(clusters: usize, data: &Prepared, rows: usize, config: Config, _: 
 		program.store(best_value);
 	}
 	program.load(best_value);
-	Ok(Predictor::new(program.finish()?))
+	program.finish()
 }
-fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool) -> Result<Predictor> {
+fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool) -> Result<PredictorProgram> {
 	let maximum = rows.checked_sub(usize::from(exclude)).unwrap_or(0);
 	require(count != 0 && count <= maximum, "knn neighbor count is invalid")?;
 	let mut table = data.samples[..rows * data.features].to_vec();
 	table.extend_from_slice(&data.targets[..rows]);
 	let mut program = PredictorBuilder::new();
 	program.nearest(count, exclude, table);
-	Ok(Predictor::new(program.finish()?))
+	program.finish()
 }
 impl Estimator {
-	fn fit(&self, data: &Prepared, rows: usize, config: Config, exclude: bool) -> Result<Predictor> { (self.fit)(self.param, data, rows, config, exclude) }
+	fn fit(&self, data: &Prepared, rows: usize, config: Config, exclude: bool) -> Result<PredictorProgram> { (self.fit)(self.param, data, rows, config, exclude) }
 }
 fn native_contraction_shapes(graph: &Graph, rows: usize) -> Result<Vec<Option<NativeContractionShapes>>> {
 	graph.nodes.iter().map(|node| {
