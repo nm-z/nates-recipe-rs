@@ -48,6 +48,7 @@ struct Config {
     resolver_concurrency: usize,
     resolver_memory_mib: u64,
     review_concurrency: usize,
+    review_poll_milliseconds: u64,
     provider_poll_seconds: u64,
     issue_history_limit: usize,
     slow_cursor_seconds: u64,
@@ -155,6 +156,9 @@ fn config(path: &Path) -> Config {
         review_concurrency: value(&text, "review_concurrency")
             .parse()
             .expect("review_concurrency must be an unsigned integer"),
+        review_poll_milliseconds: value(&text, "review_poll_milliseconds")
+            .parse()
+            .expect("review_poll_milliseconds must be an unsigned integer"),
         provider_poll_seconds: value(&text, "provider_poll_seconds")
             .parse()
             .expect("provider_poll_seconds must be an unsigned integer"),
@@ -191,6 +195,7 @@ fn config(path: &Path) -> Config {
 
 struct Work {
     packets: VecDeque<String>,
+    active: BTreeSet<String>,
     halted: bool,
 }
 
@@ -1455,15 +1460,24 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> Review {
     Review::Done
 }
 
-fn dispatch_review(
+fn review_loop(
     work: Arc<Mutex<Work>>,
     path: PathBuf,
     instructions: Arc<String>,
-    packet: String,
 ) {
-    display_queue(&packet);
-    std::thread::spawn(move || {
+    loop {
         let current = config(&path);
+        let packet = {
+            let mut state = work.lock().expect("failure queue lock is poisoned");
+            if state.halted { return }
+            let packet = state.packets.iter().find(|packet| !state.active.contains(&packet_key(packet))).cloned();
+            if let Some(packet) = &packet { state.active.insert(packet_key(packet)); }
+            packet
+        };
+        let Some(packet) = packet else {
+            std::thread::sleep(Duration::from_millis(current.review_poll_milliseconds));
+            continue;
+        };
         match triage(&current, &instructions, &packet) {
             Review::Done => {
                 let mut state = work.lock().expect("failure queue lock is poisoned");
@@ -1475,10 +1489,16 @@ fn dispatch_review(
                     state.packets.remove(index);
                     persist_queue(&current.queue_path, &state.packets);
                 }
+                state.active.remove(&packet_key(&packet));
             }
-            Review::Stop => work.lock().expect("failure queue lock is poisoned").halted = true,
+            Review::Stop => {
+                let mut state = work.lock().expect("failure queue lock is poisoned");
+                state.active.remove(&packet_key(&packet));
+                state.halted = true;
+                return;
+            }
         }
-    });
+    }
 }
 
 fn enqueue_review(
@@ -1662,17 +1682,18 @@ fn main() {
     let pending = std::fs::read_to_string(&initial.queue_path)
         .map(|text| queued(&text))
         .unwrap_or_default();
-    let work = Arc::new(Mutex::new(Work { packets: pending, halted: false }));
+    let work = Arc::new(Mutex::new(Work { packets: pending, active: BTreeSet::new(), halted: false }));
     let instructions = Arc::new(
         std::fs::read_to_string(directory.join("triage.md")).expect("cannot read triage.md"),
     );
-    work
-        .lock()
-        .expect("failure queue lock is poisoned")
-        .packets
-        .iter()
-        .cloned()
-        .for_each(|packet| dispatch_review(Arc::clone(&work), path.clone(), Arc::clone(&instructions), packet));
+    work.lock().expect("failure queue lock is poisoned").packets.iter().for_each(|packet| display_queue(packet));
+    let review_workers = initial.review_concurrency * (initial.opencode_models.len() + 5);
+    for _ in 0..review_workers {
+        let review_work = Arc::clone(&work);
+        let review_path = path.clone();
+        let review_instructions = Arc::clone(&instructions);
+        std::thread::spawn(move || review_loop(review_work, review_path, review_instructions));
+    }
     if initial.resolver_enabled {
         let active = Arc::new(Mutex::new(BTreeSet::new()));
         for _ in 0..initial.resolver_concurrency {
@@ -1753,7 +1774,6 @@ fn main() {
                 let composition = packet_composition(&packet);
                 if let Some(depth) = enqueue_review(&work, &trial.config, &packet) {
                     event(&trial.config, &format!("SLOW device={} cursor={} composition={composition} elapsed={}s depth={depth}", trial.device, trial.cursor, trial.elapsed_seconds));
-                    dispatch_review(Arc::clone(&work), path.clone(), Arc::clone(&instructions), packet);
                 }
                 continue;
             }
@@ -1812,7 +1832,6 @@ fn main() {
             let composition = packet_composition(packet);
             if let Some(depth) = enqueue_review(&work, &trial.config, packet) {
                 event(&trial.config, &format!("QUEUE device={} cursor={packet_cursor} composition={composition} depth={depth}", trial.device));
-                dispatch_review(Arc::clone(&work), path.clone(), Arc::clone(&instructions), packet.clone());
             }
         }
         display_finish(&trial.device, !failures.is_empty());
