@@ -49,6 +49,7 @@ struct Config {
     resolver_memory_mib: u64,
     review_concurrency: usize,
     provider_poll_seconds: u64,
+    issue_history_limit: usize,
     slow_cursor_seconds: u64,
     trial_memory_mib: u64,
     discovery_devices: Vec<String>,
@@ -157,6 +158,9 @@ fn config(path: &Path) -> Config {
         provider_poll_seconds: value(&text, "provider_poll_seconds")
             .parse()
             .expect("provider_poll_seconds must be an unsigned integer"),
+        issue_history_limit: value(&text, "issue_history_limit")
+            .parse()
+            .expect("issue_history_limit must be an unsigned integer"),
         slow_cursor_seconds: value(&text, "slow_cursor_seconds")
             .parse()
             .expect("slow_cursor_seconds must be an unsigned integer"),
@@ -258,6 +262,7 @@ static AGY: OnceLock<Mutex<usize>> = OnceLock::new();
 static OPENCODE: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
 static COPILOT: OnceLock<Mutex<usize>> = OnceLock::new();
 static OLLAMA: OnceLock<Mutex<usize>> = OnceLock::new();
+static PUBLICATION: Mutex<()> = Mutex::new(());
 
 fn display() -> &'static Mutex<Display> { DISPLAY.get_or_init(|| Mutex::new(Display::default())) }
 
@@ -1364,8 +1369,8 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> Review {
             "CLASSIFY model={classifier} composition={composition}"
         ),
     );
-    let verdict = jq(&decision.json, ".verdict").expect("validated decision lost its verdict");
-    let issue = jq(&decision.json, ".issue").expect("validated decision lost its issue");
+    let mut verdict = jq(&decision.json, ".verdict").expect("validated decision lost its verdict");
+    let mut issue = jq(&decision.json, ".issue").expect("validated decision lost its issue");
     let title = jq(&decision.json, ".title").expect("validated decision lost its title");
     let mut body = jq(&decision.json, ".body").expect("validated decision lost its body");
     if !config.publish {
@@ -1401,6 +1406,24 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> Review {
         decision.provider, decision.model, decision.effort, decision.json
     );
     body = format!("<!-- recipe-failure:{fingerprint} -->\n\n{body}\n\n{provenance}\n\n## Deterministic failure packet\n\n{packet}");
+    let _publication = PUBLICATION.lock().expect("publication lock is poisoned");
+    if verdict == "new" {
+        let limit = config.issue_history_limit.to_string();
+        let existing = output(
+            Command::new("gh")
+                .args(["issue", "list", "--state", "all", "--limit", &limit, "--json", "number,title", "--jq", ".[] | [.number, .title] | @tsv"])
+                .current_dir(&config.repository),
+            None,
+        );
+        assert!(existing.status.success(), "GitHub duplicate check failed: {}", failure(&existing));
+        if let Some(number) = String::from_utf8_lossy(&existing.stdout).lines().find_map(|line| {
+            let (number, existing_title) = line.split_once('\t')?;
+            existing_title.trim().eq_ignore_ascii_case(title.trim()).then(|| number.to_owned())
+        }) {
+            verdict = "comment".to_owned();
+            issue = number;
+        }
+    }
     let published = match verdict.as_str() {
         "new" => output(
             Command::new("gh")

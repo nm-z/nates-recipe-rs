@@ -31,6 +31,7 @@ resolver_concurrency = 5
 resolver_memory_mib = 2048
 review_concurrency = 2
 provider_poll_seconds = 60
+issue_history_limit = 1000
 slow_cursor_seconds = 60
 trial_memory_mib = 4096
 discovery_devices = "amd0,cpu"
