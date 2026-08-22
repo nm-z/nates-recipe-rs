@@ -140,6 +140,7 @@ struct SlowTrial {
 }
 
 enum Discovery {
+    Start { device: String, cursor: u64, reproduction: PathBuf },
     Slow(SlowTrial),
     Complete(Trial),
 }
@@ -155,6 +156,7 @@ struct Active {
     started: Instant,
     reproduction: PathBuf,
     composition: Option<String>,
+    slow: bool,
 }
 
 #[derive(Default)]
@@ -199,7 +201,8 @@ fn display_render(display: &mut Display) {
         }
         let color = if device == "cpu" { GREEN } else { BLUE };
         let composition = active.composition.as_deref().unwrap_or("staging");
-        eprintln!("{color}{device:<4}{RESET}  cursor {:<6}  time {TIME}{}{RESET}  composition {composition}", active.cursor, elapsed(active.started));
+        let (status, status_color) = if active.slow { ("SLOW", YELLOW) } else { ("...", RESET) };
+        eprintln!("{color}{device:<4}{RESET}  cursor {:<6}  time {TIME}{}{RESET}  status {status_color}{status:<4}{RESET}  composition {composition}", active.cursor, elapsed(active.started));
         display.rows += 1;
     }
     eprint!("\x1b[u");
@@ -208,13 +211,32 @@ fn display_render(display: &mut Display) {
 
 fn display_start(device: &str, cursor: u64, reproduction: PathBuf) {
     let mut display = display().lock().expect("display lock is poisoned");
-    display.active.insert(device.to_owned(), Active { cursor, started: Instant::now(), reproduction, composition: None });
+    display.active.insert(device.to_owned(), Active { cursor, started: Instant::now(), reproduction, composition: None, slow: false });
     display_render(&mut display);
 }
 
-fn display_stop(device: &str) {
+fn display_slow(device: &str) {
     let mut display = display().lock().expect("display lock is poisoned");
-    display.active.remove(device);
+    if let Some(active) = display.active.get_mut(device) {
+        active.slow = true
+    }
+    display_render(&mut display);
+}
+
+fn display_finish(device: &str, failed: bool) {
+    let mut display = display().lock().expect("display lock is poisoned");
+    display_clear(&mut display);
+    if let Some(mut active) = display.active.remove(device) {
+        if active.composition.is_none() {
+            active.composition = std::fs::read_to_string(&active.reproduction).ok().and_then(|source| {
+                source.lines().find_map(|line| line.trim().strip_prefix(".seed(")?.strip_suffix(')').map(str::to_owned))
+            });
+        }
+        let device_color = if device == "cpu" { GREEN } else { BLUE };
+        let (status, status_color) = if failed { ("FAIL", RED) } else if active.slow { ("SLOW", YELLOW) } else { ("PASS", GREEN) };
+        let composition = active.composition.as_deref().unwrap_or("unknown");
+        eprintln!("{device_color}{device:<4}{RESET}  cursor {:<6}  time {TIME}{}{RESET}  status {status_color}{status:<4}{RESET}  composition {composition}", active.cursor, elapsed(active.started));
+    }
     display_render(&mut display);
 }
 
@@ -1006,7 +1028,9 @@ fn main() {
                 start
             };
             let reproduction = reproduction_path(&current, &device, start);
-            display_start(&device, start, reproduction.clone());
+            if worker_send.send(Discovery::Start { device: device.clone(), cursor: start, reproduction: reproduction.clone() }).is_err() {
+                break;
+            }
             let result = trial(&current, &device, start, &reproduction, &worker_send);
             if worker_send
                 .send(Discovery::Complete(Trial {
@@ -1027,7 +1051,12 @@ fn main() {
     let mut completed = BTreeMap::new();
     for discovery in receive {
         let trial = match discovery {
+            Discovery::Start { device, cursor, reproduction } => {
+                display_start(&device, cursor, reproduction);
+                continue;
+            }
             Discovery::Slow(trial) => {
+                display_slow(&trial.device);
                 let packet = slow_packet(&trial);
                 let composition = field(&packet, "cursor=")
                     .split_whitespace()
@@ -1044,10 +1073,7 @@ fn main() {
                 }
                 continue;
             }
-            Discovery::Complete(trial) => {
-                display_stop(&trial.device);
-                trial
-            }
+            Discovery::Complete(trial) => trial,
         };
         let text = format!(
             "{}{}",
@@ -1069,6 +1095,7 @@ fn main() {
         if let Some(signal) = signal {
             failures.push(packet_for_device(&crash_packet(&trial, &text, signal), &trial.device));
         }
+        display_finish(&trial.device, !failures.is_empty());
         for (offset, composition) in text
             .lines()
             .filter_map(|line| {
