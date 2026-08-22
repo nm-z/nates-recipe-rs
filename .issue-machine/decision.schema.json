@@ -1,7 +1,7 @@
 {
   "type": "object",
   "properties": {
-    "verdict": { "type": "string", "enum": ["new", "comment", "reject"] },
+    "verdict": { "type": "string", "enum": ["new", "comment"] },
     "issue": { "type": "integer", "minimum": 0 },
     "title": { "type": "string" },
     "body": { "type": "string" },

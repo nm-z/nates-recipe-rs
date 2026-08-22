@@ -10,9 +10,9 @@ tools:
 subagents: []
 ---
 
-You classify a deterministic Recipe failure packet. Independently decide whether the
-failure is a new public bug, evidence for an existing issue, or an invalid
-composition that must be rejected.
+You classify a Recipe failure packet. Independently decide whether the failure
+requires a new public bug or a comment on an existing issue. Every packet must
+produce one of these two publication actions.
 
 Use Read, Grep, and Glob across the Recipe repository to trace the observed
 path. Use search_issues and read_issue to inspect every potentially matching

@@ -736,7 +736,7 @@ fn jq_lines(json: &str, filter: &str) -> std::result::Result<String, String> {
 
 fn valid(json: String) -> std::result::Result<String, String> {
     let verdict = jq(&json, ".verdict")?;
-    if !matches!(verdict.as_str(), "new" | "comment" | "reject") {
+    if !matches!(verdict.as_str(), "new" | "comment") {
         return Err(format!("invalid verdict {verdict}"));
     }
     for field in [".issue", ".title", ".body", ".rationale"] {
@@ -1237,17 +1237,6 @@ fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
 }
 
 fn triage(config: &Config, instructions: &str, packet: &str) -> Review {
-    if field(packet, "replay=").ends_with("stable:false") {
-        event(
-            config,
-            &format!(
-                "REJECT composition=unstable fingerprint={}",
-                field(packet, "id=")
-            ),
-        );
-        display_reviewed(packet, "none", "rejected", None);
-        return Review::Done;
-    }
     let composition = packet_composition(packet);
     let schema =
         std::fs::read_to_string(&config.decision_schema).expect("cannot read decision schema");
@@ -1274,14 +1263,6 @@ fn triage(config: &Config, instructions: &str, packet: &str) -> Review {
         );
         display_reviewed(packet, &classifier, &verdict, None);
         return Review::Stop;
-    }
-    if verdict == "reject" {
-        event(
-            config,
-            &format!("REJECT model={classifier} composition={composition}"),
-        );
-        display_reviewed(packet, &classifier, "rejected", None);
-        return Review::Done;
     }
     assert!(
         !title.is_empty() && !body.is_empty(),

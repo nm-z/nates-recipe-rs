@@ -21,7 +21,7 @@ durable queue before advancing the cursor. Reviewers traverse that queue while
 cursor discovery continues. Each model runs at most one request at a time,
 while different models run concurrently. The first available
 classifier returns one schema-validated decision: create a
-`bug` issue, comment on an existing issue, or reject the composition.
+`bug` issue or comment on an existing issue.
 
 Independent discovery workers claim disjoint cursors from one allocator. The
 default configuration runs one worker on `amd0` and one worker through
@@ -119,9 +119,8 @@ CLASSIFY model=<provider/model> composition=<composition>
 ISSUE model=<provider/model> <action> issue=#<number> url=<url>
 ```
 
-A rejected composition ends with `REJECT` instead of `ISSUE`. An unpublished
-trial ends with `DECISION`. Unavailable models and provider fallthrough do not
-print to the terminal.
+An unpublished trial ends with `DECISION`. Unavailable models and provider
+fallthrough do not print to the terminal.
 
 The machine writes the same lifecycle records to the repository-root
 `recipe.log`. Set the single `debug` option to `true` to add provider failures,
@@ -142,4 +141,4 @@ worktree, so the traversal cannot alter Nate's active checkout and does not
 create a branch. `machine.toml` stores the resumable cursor. GitHub issues and
 comments remain the authoritative deduplication state. `queue.ogdl` is the
 durable pending-review state. A packet remains there until its decision is
-published or rejected, and a restart resumes the oldest queued packet first.
+published, and a restart resumes the oldest queued packet first.

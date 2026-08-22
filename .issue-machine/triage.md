@@ -16,19 +16,14 @@ operation through the same implementation path. A new input representation
 that is ignored by the same loader and produces the same terminal check is
 additional evidence for the existing loader issue, not a new issue.
 A previously unreported input representation materially expands that issue and
-must return `comment`. Return `reject` only when that representation and failure
-are already present in the issue body or comments.
+must return `comment`.
 
-Return `reject` when the packet repeats evidence already present in an issue,
-when only irrelevant configuration differs, when the composition is invalid,
-when the expectation is unsupported, when replay is unstable, or when the
-evidence does not establish a public defect. Return `comment` only when an
-existing issue has the same cause and the packet materially expands its
-actionable scope, such as a new lifecycle phase, backend, or independently
-failing implementation path. Return `new` only when inspected source proves a
-distinct earliest cause not represented in the catalog.
-Evidence in an issue body already counts. An empty comment thread does not make
-an exact repetition new evidence and is never a reason to return `comment`.
+Return `comment` whenever an existing issue represents the same earliest cause,
+including repeated evidence, irrelevant configuration differences, an invalid
+composition, an unsupported expectation, unstable replay, or evidence that does
+not establish a different public defect. Return `new` only when no existing
+issue represents the inspected earliest cause. Every packet must produce one of
+these two publication actions.
 
 Do not propose a fix, modify the repository, run mutating commands, use a
 subagent, or infer an undocumented contract. For `new` and `comment`, name the
@@ -42,10 +37,9 @@ time is theoretically justified. Derive the loaded row count, feature count,
 model operations, tree candidates, depth, boosting iterations, arithmetic work,
 memory traffic, and relevant CPU or GPU capabilities from the exact reproduction
 and current source. State the measured runtime, a defensible expected runtime or
-throughput range, and the dominant gap. Return `new` or `comment` only when the
-measured path is materially slower than that workload and hardware justify. Do
-not reject a performance packet merely because the implementation performs more
-work than the public composition implies.
+throughput range, and the dominant gap. Return `new` or `comment` when the
+measured path is materially slower than that workload and hardware justify.
+Otherwise, comment on the closest existing performance issue.
 
 ## Recipe presentation contract
 
