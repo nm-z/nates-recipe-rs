@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -36,6 +36,9 @@ struct Config {
     opencode_agent: String,
     copilot_binary: PathBuf,
     copilot_model: String,
+    claude_binary: PathBuf,
+    claude_model: String,
+    claude_effort: String,
     provider_poll_seconds: u64,
     slow_cursor_seconds: u64,
     discovery_devices: Vec<String>,
@@ -96,6 +99,9 @@ fn config(path: &Path) -> Config {
         opencode_agent: value(&text, "opencode_agent"),
         copilot_binary: value(&text, "copilot_binary").into(),
         copilot_model: value(&text, "copilot_model"),
+        claude_binary: value(&text, "claude_binary").into(),
+        claude_model: value(&text, "claude_model"),
+        claude_effort: value(&text, "claude_effort"),
         provider_poll_seconds: value(&text, "provider_poll_seconds")
             .parse()
             .expect("provider_poll_seconds must be an unsigned integer"),
@@ -187,8 +193,9 @@ static DISPLAY: OnceLock<Mutex<Display>> = OnceLock::new();
 static SPARK: OnceLock<Mutex<()>> = OnceLock::new();
 static KIMI: OnceLock<Mutex<()>> = OnceLock::new();
 static AGY: OnceLock<Mutex<()>> = OnceLock::new();
-static OPENCODE: OnceLock<Mutex<()>> = OnceLock::new();
+static OPENCODE: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 static COPILOT: OnceLock<Mutex<()>> = OnceLock::new();
+static CLAUDE: OnceLock<Mutex<()>> = OnceLock::new();
 static DEEPSEEK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn display() -> &'static Mutex<Display> { DISPLAY.get_or_init(|| Mutex::new(Display::default())) }
@@ -199,6 +206,28 @@ fn provider(slot: &'static OnceLock<Mutex<()>>) -> Option<std::sync::MutexGuard<
         Err(std::sync::TryLockError::WouldBlock) => None,
         Err(std::sync::TryLockError::Poisoned(_)) => panic!("provider lock is poisoned"),
     }
+}
+
+struct ModelProvider {
+    slots: &'static Mutex<BTreeSet<String>>,
+    model: String,
+}
+
+impl Drop for ModelProvider {
+    fn drop(&mut self) {
+        self.slots.lock().expect("model provider lock is poisoned").remove(&self.model);
+    }
+}
+
+fn model_provider(
+    slot: &'static OnceLock<Mutex<BTreeSet<String>>>,
+    model: &str,
+) -> Option<ModelProvider> {
+    let slots = slot.get_or_init(|| Mutex::new(BTreeSet::new()));
+    slots.lock().expect("model provider lock is poisoned").insert(model.to_owned()).then(|| ModelProvider {
+        slots,
+        model: model.to_owned(),
+    })
 }
 
 fn identity(provider: &str, model: &str) -> String { format!("{provider}/{model}") }
@@ -268,14 +297,13 @@ fn display_render(display: &mut Display) {
     let trials = display.active.iter().map(|(device, active)| {
         format!("{device:<4}  cursor {:<6}  time {}", active.cursor, elapsed(active.started))
     }).collect::<Vec<_>>();
-    let reviews = display.reviews.values().filter_map(|review| {
-        Some(format!(
-            "{:<36}  cursor {:<6}  time {}",
-            review.model.as_deref()?,
-            review.cursor,
-            elapsed(review.started?),
-        ))
-    }).collect::<Vec<_>>();
+    let mut reviews = BTreeMap::<String, Vec<(String, u64, String)>>::new();
+    for review in display.reviews.values() {
+        let Some(identity) = review.model.as_deref() else { continue };
+        let Some(started) = review.started else { continue };
+        let (provider, model) = identity.split_once('/').unwrap_or((identity, identity));
+        reviews.entry(provider.to_owned()).or_default().push((model.to_owned(), review.cursor, elapsed(started)));
+    }
     let queued = display.reviews.values().filter(|review| review.model.is_none()).count();
     if queued != 0 {
         eprintln!("{YELLOW}queued{RESET}");
@@ -300,10 +328,24 @@ fn display_render(display: &mut Display) {
     if !reviews.is_empty() {
         eprintln!("└─ review");
         display.rows += 1;
-        for (index, line) in reviews.iter().enumerate() {
-            let branch = if index + 1 == reviews.len() { "└─" } else { "├─" };
-            eprintln!("{}", fit(&format!("   {branch} {line}"), width));
+        let provider_count = reviews.len();
+        for (provider_index, (provider, models)) in reviews.into_iter().enumerate() {
+            let provider_last = provider_index + 1 == provider_count;
+            let provider_branch = if provider_last { "└─" } else { "├─" };
+            if models.len() == 1 {
+                let (model, cursor, elapsed) = &models[0];
+                eprintln!("{}", fit(&format!("   {provider_branch} {provider}/{model:<28}  cursor {cursor:<6}  time {elapsed}"), width));
+                display.rows += 1;
+                continue;
+            }
+            eprintln!("   {provider_branch} {provider}");
             display.rows += 1;
+            for (model_index, (model, cursor, elapsed)) in models.iter().enumerate() {
+                let branch = if model_index + 1 == models.len() { "└─" } else { "├─" };
+                let trunk = if provider_last { "      " } else { "   │  " };
+                eprintln!("{}", fit(&format!("{trunk}{branch} {model:<28}  cursor {cursor:<6}  time {elapsed}"), width));
+                display.rows += 1;
+            }
         }
     }
     std::io::stderr().flush().expect("cannot draw machine status");
@@ -1039,6 +1081,66 @@ fn copilot(config: &Config, packet: &str, prompt: &str) -> std::result::Result<D
     })
 }
 
+fn claude_command(config: &Config, prompt: &str, session: Option<&str>) -> std::process::Output {
+    let tools = "Read,Glob,Grep,mcp__recipe_issues__search_issues,mcp__recipe_issues__read_issue";
+    let mcp = config.repository.join(".mcp.json");
+    let mut command = Command::new(&config.claude_binary);
+    command.args([
+        "-p",
+        prompt,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "dontAsk",
+        "--disable-slash-commands",
+        "--strict-mcp-config",
+        "--mcp-config",
+        mcp.to_str().expect("MCP config path is not UTF-8"),
+        "--tools",
+        tools,
+        "--allowed-tools",
+        tools,
+    ]);
+    if let Some(session) = session {
+        command.args(["--resume", session]);
+    } else {
+        command.args(["--model", &config.claude_model, "--effort", &config.claude_effort]);
+    }
+    output(command.current_dir(&config.repository), None)
+}
+
+fn claude(config: &Config, prompt: &str) -> std::result::Result<Decision, String> {
+    let result = claude_command(config, prompt, None);
+    let stream = String::from_utf8_lossy(&result.stdout);
+    let response = jq_lines(&stream, "[.[] | select(.type == \"assistant\") | .message.content[]? | select(.type == \"text\") | .text][-1]");
+    if !result.status.success() && response.is_err() {
+        return Err(failure(&result));
+    }
+    let model = jq_lines(&stream, "[.[] | select(.type == \"system\" and .subtype == \"init\") | .model][-1]")
+        .unwrap_or_else(|_| config.claude_model.clone());
+    let mut json = response.and_then(object);
+    if json.is_err() {
+        let session = jq_lines(&stream, "[.[] | select(.session_id != null) | .session_id][-1]")?;
+        trace(config, &format!("model={} repairing structured output session={session}", identity("claude", &model)));
+        let repair = claude_command(
+            config,
+            "Return only one corrected JSON object matching the required schema. Do not repeat the investigation.",
+            Some(&session),
+        );
+        let repaired = String::from_utf8_lossy(&repair.stdout);
+        json = jq_lines(&repaired, "[.[] | select(.type == \"assistant\") | .message.content[]? | select(.type == \"text\") | .text][-1]")
+            .and_then(object);
+    }
+    let json = json.map_err(|error| format!("{}; {error}", failure(&result)))?;
+    Ok(Decision {
+        provider: "claude",
+        model: format!("{}-{}", model.strip_prefix("claude-").unwrap_or(&model), config.claude_effort),
+        effort: config.claude_effort.clone(),
+        json,
+    })
+}
+
 fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
     loop {
         if let Some(_provider) = provider(&SPARK) {
@@ -1065,21 +1167,30 @@ fn classify(config: &Config, prompt: &str, packet: &str) -> Decision {
             }
             display_reviewing(packet, "queued");
         }
-        if let Some(_provider) = provider(&OPENCODE) {
-            for model in &config.opencode_models {
+        for model in &config.opencode_models {
+            if let Some(_provider) = model_provider(&OPENCODE, model) {
                 let classifier = identity("opencode", model.strip_prefix("opencode/").unwrap_or(model));
                 display_reviewing(packet, &classifier);
                 match opencode(config, model, prompt) {
                     Ok(decision) => return decision,
                     Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
                 }
+                display_reviewing(packet, "queued");
             }
-            display_reviewing(packet, "queued");
         }
         if let Some(_provider) = provider(&COPILOT) {
             let classifier = identity("copilot", &config.copilot_model);
             display_reviewing(packet, &classifier);
             match copilot(config, packet, prompt) {
+                Ok(decision) => return decision,
+                Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
+            }
+            display_reviewing(packet, "queued");
+        }
+        if let Some(_provider) = provider(&CLAUDE) {
+            let classifier = identity("claude", "sonnet-5-max");
+            display_reviewing(packet, &classifier);
+            match claude(config, prompt) {
                 Ok(decision) => return decision,
                 Err(error) => trace(config, &format!("model={classifier} unavailable error={error}")),
             }

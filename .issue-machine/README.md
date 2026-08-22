@@ -18,8 +18,8 @@ pending review queue remain saved in `machine.toml` and `queue.ogdl`.
 This machine continuously runs Recipe's exhaustive Cartesian traversal. It
 records every cursor result immediately and appends stable failures to one
 durable queue before advancing the cursor. Reviewers traverse that queue while
-cursor discovery continues. Each provider runs at most one model request at a
-time, while different providers run concurrently. The first available
+cursor discovery continues. Each model runs at most one request at a time,
+while different models run concurrently. The first available
 classifier returns one schema-validated decision: create a
 `bug` issue, comment on an existing issue, or reject the composition.
 
@@ -30,14 +30,15 @@ advances only across the contiguous completed cursor frontier. A crash can
 repeat unfinished work but cannot skip it. Every terminal record and failure
 packet identifies the backend that executed the cursor.
 
-The machine runs one request from each provider concurrently. Each live
+The machine runs one request from each model concurrently. Each live
 reviewer uses the `provider/model` identity shown in the terminal and log. The
 configured providers and model order are:
 
 - `codex/gpt-5.3-codex-spark`
 - `kimi/kimi-code/k3`
-- `opencode/<free-model>` in configured order
+- Every configured `opencode/<free-model>` concurrently
 - `copilot/auto`, updated to the model selected by Copilot routing
+- `claude/sonnet-5-max`
 - `agy/<model>` in configured order
 - `deepseek/deepseek-v4-pro`
 
@@ -56,8 +57,8 @@ Every classifier can read the Recipe repository and call only two GitHub tools:
 
 The classifiers search issues on demand and read every plausible match in full.
 The machine does not preload, cache, summarize, or truncate the issue tree.
-Codex, OpenCode, and GitHub Copilot use project-scoped MCP configurations.
-Kimi uses `/home/nate/.kimi-code/mcp.json`. Agy uses the imported
+Codex, OpenCode, Claude, and GitHub Copilot use project-scoped MCP
+configurations. Kimi uses `/home/nate/.kimi-code/mcp.json`. Agy uses the imported
 `recipe-issue-reader` plugin and a pre-tool hook that rejects mutation tools.
 
 The classifier tool surfaces contain only repository readers and the two issue
@@ -100,10 +101,16 @@ live
 │  ├─ amd0  cursor 571     time  50.8573 s
 │  └─ cpu   cursor 575     time  20.1335 s
 └─ review
-   ├─ opencode/big-pickle              cursor 561  time 51.0895 s
+   ├─ opencode
+   │  ├─ big-pickle                    cursor 561  time 51.0895 s
+   │  └─ hy3-free                      cursor 568  time 42.0012 s
    ├─ copilot/claude-haiku-4.5         cursor 570  time 12.0031 s
+   ├─ claude/sonnet-5-max              cursor 573  time 10.1011 s
    └─ agy/claude-opus-4-6-thinking     cursor 536  time 51.0867 s
 ```
+
+The terminal groups a provider under one node only while multiple models from
+that provider are active. A provider with one active model stays on one line.
 
 A failed cursor then contains two classification lifecycle records:
 
