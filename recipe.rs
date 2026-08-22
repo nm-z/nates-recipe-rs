@@ -8397,6 +8397,17 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 				}
 			}
 		}
+		// A headerless table carries only positional col1..colN names, so a requested
+		// target name cannot match any column by name. When the source resolves to one
+		// such table, the name designates the final column, the conventional label
+		// position for headerless datasets.
+		if matches.is_empty() && data.target.len() == 1 {
+			if let [table] = tables.as_slice() {
+				if headerless(table) {
+					matches.push((0, table.headers.len() - 1));
+				}
+			}
+		}
 		require(matches.len() == 1, format!("target {name:?} must identify exactly one feature"))?;
 		selected.push(matches[0]);
 	}
@@ -8582,6 +8593,7 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
 	Ok(())
 }
 fn target_column(table: &Table, name: &str) -> Option<usize> { table.headers.iter().enumerate().position(|(column, header)| column_match(name, table, header, column)) }
+fn headerless(table: &Table) -> bool { !table.headers.is_empty() && table.headers.iter().enumerate().all(|(column, header)| *header == format!("col{}", column + 1)) }
 fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<Vec<Table>> {
 	let mut groups = BTreeMap::<PathBuf, Vec<Table>>::new();
 	for (directory, table) in tables {
