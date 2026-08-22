@@ -364,6 +364,11 @@ fn identity(provider: &str, model: &str) -> String { format!("{provider}/{model}
 
 fn reset_after(error: &str) -> Option<Duration> {
     let lower = error.to_ascii_lowercase();
+    if let Some(tail) = lower.split_once("\"resetsat\":").map(|(_, tail)| tail) {
+        let epoch = tail.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u64>().ok()?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("system time precedes Unix epoch").as_secs();
+        return epoch.checked_sub(now).map(Duration::from_secs);
+    }
     let tail = ["resets in ", "refreshes in "].into_iter().find_map(|marker| lower.split_once(marker).map(|(_, tail)| tail))?;
     let mut seconds = 0_u64;
     for token in tail.split_whitespace() {
@@ -377,7 +382,7 @@ fn reset_after(error: &str) -> Option<Duration> {
 
 fn usage_exhausted(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
-    ["usage limit", "quota", "out of credits", "credit balance", "rate limit", "rate-limit"].iter().any(|message| error.contains(message))
+    ["usage limit", "session limit", "quota", "out of credits", "credit balance", "rate limit", "rate-limit", "rate_limit"].iter().any(|message| error.contains(message))
 }
 
 fn available(model: &str) -> bool {
@@ -390,15 +395,19 @@ fn available(model: &str) -> bool {
     }
 }
 
+fn cooldown(config: &Config, model: &str, error: &str) {
+    let reset = reset_after(error);
+    COOLDOWNS.get_or_init(|| Mutex::new(BTreeMap::new())).lock().expect("cooldown lock is poisoned").insert(model.to_owned(), reset.map(|duration| Instant::now() + duration));
+    trace(config, &format!("model={model} unavailable reset_seconds={} error={error}", reset.map_or_else(|| "machine-run".to_owned(), |duration| duration.as_secs().to_string())));
+}
+
 fn classify_with(config: &Config, packet: &str, classifier: &str, run: impl FnOnce() -> std::result::Result<Decision, String>) -> Option<Decision> {
     if !available(classifier) { return None }
     display_reviewing(packet, classifier);
     match run() {
         Ok(decision) => Some(decision),
         Err(error) => {
-            let reset = reset_after(&error);
-            COOLDOWNS.get_or_init(|| Mutex::new(BTreeMap::new())).lock().expect("cooldown lock is poisoned").insert(classifier.to_owned(), reset.map(|duration| Instant::now() + duration));
-            trace(config, &format!("model={classifier} unavailable reset_seconds={} error={error}", reset.map_or_else(|| "machine-run".to_owned(), |duration| duration.as_secs().to_string())));
+            cooldown(config, classifier, &error);
             display_reviewing(packet, "queued");
             None
         }
@@ -1736,6 +1745,11 @@ fn resolver_pr(config: &Config, issue: u64) -> std::result::Result<Option<String
 fn resolver_loop(path: PathBuf, active: Arc<Mutex<BTreeSet<u64>>>) {
     loop {
         let current = config(&path);
+        let model = format!("claude/{}-{}", current.resolver_model.strip_prefix("claude-").unwrap_or(&current.resolver_model), current.resolver_effort);
+        if !available(&model) {
+            std::thread::sleep(Duration::from_secs(current.resolver_poll_seconds));
+            continue;
+        }
         let issue = match resolver_claim(&current, &active) {
             Ok(Some(issue)) => issue,
             Ok(None) => {
@@ -1748,7 +1762,6 @@ fn resolver_loop(path: PathBuf, active: Arc<Mutex<BTreeSet<u64>>>) {
                 continue;
             }
         };
-        let model = format!("claude/{}-{}", current.resolver_model.strip_prefix("claude-").unwrap_or(&current.resolver_model), current.resolver_effort);
         let goal = format!(r#"/goal Read GitHub issue #{number} and every comment in full, then resolve that one issue completely and create one pull request that closes it.
 
 Use unrestricted tools and make every required repository and GitHub change yourself. Never edit the current issue-machine worktree. Work in one separate Git worktree under {root}, based on the latest origin/{base}. Reuse coherent existing work for issue #{number} if it exists. Reproduce the exact public failure first, identify the earliest cause in current origin/{base}, implement the root fix without a fallback or parallel implementation, and validate the exact public Recipe path end to end. Test reachable edge cases one at a time through the same public entrypoint. Preserve unrelated user changes.
@@ -1794,8 +1807,17 @@ Commit and push the coherent fix, then create one pull request targeting {base}.
                 .current_dir(&current.repository),
             None,
         );
+        let transcript = format!("{}{}", String::from_utf8_lossy(&result.stderr), String::from_utf8_lossy(&result.stdout));
+        if usage_exhausted(&transcript) {
+            cooldown(&current, &model, &transcript);
+            display().lock().expect("display lock is poisoned").resolvers.remove(&issue.number);
+            std::thread::sleep(Duration::from_secs(current.resolver_poll_seconds));
+            continue;
+        }
         if !result.status.success() {
-            event(&current, &format!("RESOLVE model={model} issue=#{} failed error={}", issue.number, failure(&result)));
+            let error = failure(&result);
+            event(&current, &format!("RESOLVE model={model} issue=#{} failed", issue.number));
+            trace(&current, &format!("resolver issue #{} failed error={error}", issue.number));
             display_resolved(issue.number, "FAIL", None);
             std::thread::sleep(Duration::from_secs(current.resolver_poll_seconds));
             continue;
@@ -1806,13 +1828,15 @@ Commit and push the coherent fix, then create one pull request targeting {base}.
                 display_resolved(issue.number, "PR", Some(&url));
             }
             Ok(None) => {
-                event(&current, &format!("RESOLVE model={model} issue=#{} failed error=goal completed without an open pull request", issue.number));
+                event(&current, &format!("RESOLVE model={model} issue=#{} failed", issue.number));
+                trace(&current, &format!("resolver issue #{} completed without an open pull request", issue.number));
                 display_resolved(issue.number, "FAIL", None);
                 std::thread::sleep(Duration::from_secs(current.resolver_poll_seconds));
                 continue;
             }
             Err(error) => {
-                event(&current, &format!("RESOLVE model={model} issue=#{} failed error={error}", issue.number));
+                event(&current, &format!("RESOLVE model={model} issue=#{} failed", issue.number));
+                trace(&current, &format!("resolver issue #{} pull request lookup failed error={error}", issue.number));
                 display_resolved(issue.number, "FAIL", None);
                 std::thread::sleep(Duration::from_secs(current.resolver_poll_seconds));
                 continue;
