@@ -222,6 +222,7 @@ fn config(path: &Path) -> Config {
 struct Work {
     packets: VecDeque<String>,
     active: BTreeSet<String>,
+    ready: BTreeSet<String>,
     halted: bool,
 }
 
@@ -985,6 +986,11 @@ fn repository_base(repository: &Path) -> String {
     format!("commit={} tracked_tree={}", String::from_utf8_lossy(&commit.stdout).trim(), if status.stdout.is_empty() { "clean" } else { "modified" })
 }
 
+fn packet_current(repository: &Path, packet: &str) -> bool {
+    let commit = field(packet, "base=").split_whitespace().find_map(|value| value.strip_prefix("commit=")).expect("failure packet base has no commit");
+    output(Command::new("git").args(["diff", "--quiet", commit, "HEAD", "--", "Cargo.lock", "Cargo.toml", "amd-nv-cpu.ll", "build.rs", "cli.rs", "data", "recipe.rs", "test.rs"]).current_dir(repository), None).status.success()
+}
+
 fn crash_packet(trial: &Trial, text: &str, observed: i32, replayed: i32) -> String {
     let line = text.lines().find(|line| line.starts_with("composition ") && line.contains(':')).expect("signaled traversal emitted no composition");
     let (case, configuration) = line.strip_prefix("composition ").expect("composition prefix disappeared").split_once(':').expect("composition description has no separator");
@@ -1571,7 +1577,7 @@ fn review_loop(
         let packet = {
             let mut state = work.lock().expect("failure queue lock is poisoned");
             if state.halted { return }
-            let packet = state.packets.iter().find(|packet| !state.active.contains(&packet_key(packet))).cloned();
+            let packet = state.packets.iter().find(|packet| state.ready.contains(&packet_key(packet)) && !state.active.contains(&packet_key(packet))).cloned();
             if let Some(packet) = &packet { state.active.insert(packet_key(packet)); }
             packet
         };
@@ -1590,6 +1596,7 @@ fn review_loop(
                     state.packets.remove(index);
                     persist_queue(&current.queue_path, &state.packets);
                 }
+                state.ready.remove(&packet_key(&packet));
                 state.active.remove(&packet_key(&packet));
             }
             Review::Stop => {
@@ -1609,14 +1616,22 @@ fn enqueue_review(
 ) -> Option<usize> {
     let depth = {
         let mut state = work.lock().expect("failure queue lock is poisoned");
-        if state.packets.iter().any(|queued| same_failure(queued, &packet)) {
-            None
+        if let Some(index) = state.packets.iter().position(|queued| same_failure(queued, &packet)) {
+            let key = packet_key(packet);
+            if state.ready.insert(key) {
+                state.packets[index] = packet.to_owned();
+                persist_queue(&config.queue_path, &state.packets);
+                Some(state.packets.len())
+            } else {
+                None
+            }
         } else {
             if packet.starts_with("kind=performance\n") {
                 state.packets.push_front(packet.to_owned());
             } else {
                 state.packets.push_back(packet.to_owned());
             }
+            state.ready.insert(packet_key(packet));
             persist_queue(&config.queue_path, &state.packets);
             Some(state.packets.len())
         }
@@ -1809,7 +1824,8 @@ fn main() {
     let pending = std::fs::read_to_string(&initial.queue_path)
         .map(|text| queued(&text))
         .unwrap_or_default();
-    let work = Arc::new(Mutex::new(Work { packets: pending, active: BTreeSet::new(), halted: false }));
+    let ready = pending.iter().filter(|packet| packet_current(&initial.repository, packet)).map(|packet| packet_key(packet)).collect();
+    let work = Arc::new(Mutex::new(Work { packets: pending, active: BTreeSet::new(), ready, halted: false }));
     let instructions = Arc::new(
         std::fs::read_to_string(directory.join("triage.md")).expect("cannot read triage.md"),
     );
