@@ -221,11 +221,12 @@ fn output(command: &mut Command, input: Option<&str>) -> std::process::Output {
 
 fn event(config: &Config, color: &str, message: &str) {
     let time = Command::new("date")
-        .arg("+%Y-%m-%d %H:%M:%S")
+        .arg("+%Y-%m-%d %H:%M:%S\t%I:%M:%S %p")
         .output()
         .expect("cannot read event time");
     let timestamp = String::from_utf8_lossy(&time.stdout);
-    let timestamp = timestamp.trim();
+    let (timestamp, display_time) = timestamp.trim().split_once('\t').expect("event time has no display clock");
+    let display_time = display_time.trim_start_matches('0');
     let line = format!("{timestamp} {message}\n");
     std::fs::OpenOptions::new()
         .create(true)
@@ -235,7 +236,7 @@ fn event(config: &Config, color: &str, message: &str) {
         .write_all(line.as_bytes())
         .expect("cannot write machine log");
     let (event, details) = message.split_once(' ').unwrap_or((message, ""));
-    eprintln!("{MUTED}{}{RESET}  {color}{event:<8}{RESET} {details}", &timestamp[11..]);
+    eprintln!("{MUTED}{display_time}{RESET}  {color}{event:<8}{RESET} {details}");
 }
 
 fn trace(config: &Config, message: &str) {
