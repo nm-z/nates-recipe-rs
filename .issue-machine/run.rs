@@ -229,6 +229,7 @@ struct Trial {
     reproduction: PathBuf,
     output: std::process::Output,
     timed_out: bool,
+    crash: Option<(i32, i32)>,
 }
 
 struct SlowTrial {
@@ -968,18 +969,19 @@ fn repository_base(repository: &Path) -> String {
     format!("commit={} tracked_tree={}", String::from_utf8_lossy(&commit.stdout).trim(), if status.stdout.is_empty() { "clean" } else { "modified" })
 }
 
-fn crash_packet(trial: &Trial, text: &str, signal: i32) -> String {
+fn crash_packet(trial: &Trial, text: &str, observed: i32, replayed: i32) -> String {
     let line = text.lines().find(|line| line.starts_with("composition ") && line.contains(':')).expect("signaled traversal emitted no composition");
     let (case, configuration) = line.strip_prefix("composition ").expect("composition prefix disappeared").split_once(':').expect("composition description has no separator");
     let step = text.lines().find_map(|line| line.split_whitespace().find_map(|value| value.strip_prefix("step="))).expect("signaled traversal emitted no permutation step");
     let source = std::fs::read_to_string(&trial.reproduction).expect("signaled traversal staged no reproduction");
     let mut fingerprint = 1_469_598_103_934_665_603_u64;
-    for byte in format!("{}:{signal}:{case}", trial.device).bytes().chain(source.bytes()) {
+    for byte in format!("{}:{observed}:{replayed}:{case}", trial.device).bytes().chain(source.bytes()) {
         fingerprint ^= u64::from(byte);
         fingerprint = fingerprint.wrapping_mul(1_099_511_628_211);
     }
-    let message = format!("device {} terminated by signal {signal}", trial.device);
-    format!("id={fingerprint:016x}\nbase={}\ncursor=seed:{} cursor:{} next:{} step:{step} composition:{case}\nconfiguration={}\nexpected=training, optional resume, and inference produce finite numerical results through the public Recipe API\nobserved=phase:process message:{message}\noutput=phase:process message:{message}\nreplay=phase:process message:the process terminated before in-process replay stable:unknown\ncommand=cargo run --bin recipe -- {}\nreproduction:\n```rust\n{source}```", repository_base(&trial.config.repository), trial.config.seed, trial.cursor, trial.cursor + 1, configuration.trim(), trial.reproduction.display())
+    let observed = format!("device {} terminated by signal {observed}", trial.device);
+    let replayed = format!("device {} terminated by signal {replayed}", trial.device);
+    format!("id={fingerprint:016x}\nbase={}\ncursor=seed:{} cursor:{} next:{} step:{step} composition:{case}\nconfiguration={}\nexpected=training, optional resume, and inference produce finite numerical results through the public Recipe API\nobserved=phase:process message:{observed}\noutput=phase:process message:{observed}\nreplay=phase:process message:{replayed} stable:true\ncommand=cargo run --bin recipe -- {}\nreproduction:\n```rust\n{source}```", repository_base(&trial.config.repository), trial.config.seed, trial.cursor, trial.cursor + 1, configuration.trim(), trial.reproduction.display())
 }
 
 fn slow_packet(trial: &SlowTrial) -> String {
@@ -1830,20 +1832,16 @@ fn main() {
             if worker_send.send(Discovery::Start { device: device.clone(), cursor: start }).is_err() {
                 break;
             }
-            let (result, timed_out) = trial(&current, &device, start, &reproduction, &worker_send);
-            if worker_send
-                .send(Discovery::Complete(Trial {
-                    config: current,
-                    device: device.clone(),
-                    cursor: start,
-                    reproduction,
-                    output: result,
-                    timed_out,
-                }))
-                .is_err()
-            {
-                break;
+            let (mut result, mut timed_out) = trial(&current, &device, start, &reproduction, &worker_send);
+            let mut crash = None;
+            if !timed_out {
+                if let Some(observed) = termination_signal(result.status) {
+                    (result, timed_out) = trial(&current, &device, start, &reproduction, &worker_send);
+                    if !timed_out { crash = termination_signal(result.status).map(|replayed| (observed, replayed)) }
+                }
             }
+            let completed = Trial { config: current, device: device.clone(), cursor: start, reproduction, output: result, timed_out, crash };
+            if worker_send.send(Discovery::Complete(completed)).is_err() { break }
         }));
     }
     drop(send);
@@ -1886,8 +1884,8 @@ fn main() {
                 .map(|packet| packet_for_device(packet, &trial.device))
                 .collect::<Vec<_>>()
         };
-        if let Some(signal) = signal {
-            failures.push(packet_for_device(&crash_packet(&trial, &text, signal), &trial.device));
+        if let Some((observed, replayed)) = trial.crash {
+            failures.push(packet_for_device(&crash_packet(&trial, &text, observed, replayed), &trial.device));
         }
         for (offset, composition) in text
             .lines()
