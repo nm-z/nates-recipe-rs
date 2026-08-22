@@ -3271,6 +3271,7 @@ mod bundle {
 				"shape" => {
 					let shape = values::<usize>(value, "model shape")?;
 					require(shape.len() == 4, "semantic model shape has the wrong width")?;
+					require(shape.iter().all(|value| *value != 0), "semantic model shape must be positive")?;
 					builder.input = Some(Shape { channels: shape[0], length: shape[1] });
 					builder.output = Some(Shape { channels: shape[2], length: shape[3] });
 				}
@@ -5034,9 +5035,10 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		lower_block(&mut graph, block, model.blocks.len(), data, targets, rows, gpu, config)?;
 	}
 	let mut output_profile = model.blocks.last().filter(|block| block.profile).map(|block| StorageFormat(block.quantization));
-	if graph.output.elements() != 1 {
+	let width = data.target_width;
+	if graph.output.elements() != width {
 		let length = graph.output.length;
-		lower_conv(&mut graph, 1, length)?;
+		lower_conv(&mut graph, width, length)?;
 		if model.quantization != 0 {
 			graph.nodes.last_mut().unwrap().argument[8] = f64::from(model.quantization)
 		}
@@ -5049,16 +5051,16 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	}
 	if initialize {
 		initialize_graph(&mut graph, config);
-		if let Some(offset) = output_bias_offset(&graph) {
-			let mean = data.targets[..rows].iter().sum::<f64>() / rows as f64;
-			graph.parameters[offset] = mean;
+		if let Some(bias) = output_bias_offset(&graph) {
+			let mean = data.targets[..rows * width].iter().sum::<f64>() / (rows * width) as f64;
+			graph.parameters[bias].fill(mean);
 		}
 	}
 	encode_graph_storage(&mut graph, config)?;
 	Ok(graph)
 }
 fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: &'static Gpu, config: Config) -> Result<Graph> {
-	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], rows: 1, source_rows: 1, features: saved.input.elements(), schema: DataSchema::default(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new(), fitted: saved.predictors.clone() };
+	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], rows: 1, source_rows: 1, features: saved.input.elements(), target_width: saved.output.elements(), schema: DataSchema::default(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new(), fitted: saved.predictors.clone() };
 	let mut graph = compile(&saved.model, &prepared, &prepared.targets, 1, gpu, config, false)?;
 	require(graph.input == saved.input, "saved semantic input shape does not match the compiled model")?;
 	require(graph.output == saved.output, "saved semantic output shape does not match the compiled model")?;
@@ -5295,7 +5297,7 @@ fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	let output = Shape { channels: filters, length: graph.output.length - kernel + 1 };
 	push_node(graph, Primitive::Contraction, output, parameters, arguments(kernel as f64, 0.0), -2)
 }
-fn output_bias_offset(graph: &Graph) -> Option<usize> { graph.nodes.iter().rev().find(|node| node.op == Primitive::Contraction).map(|node| node.offset + node.parameters - node.output.channels) }
+fn output_bias_offset(graph: &Graph) -> Option<std::ops::Range<usize>> { graph.nodes.iter().rev().find(|node| node.op == Primitive::Contraction).map(|node| node.offset + node.parameters - node.output.channels..node.offset + node.parameters) }
 fn lower_pool(graph: &mut Graph, size: usize) -> Result<()> {
 	require(size != 0, "pool window must be positive")?;
 	let output = Shape { channels: graph.output.channels, length: graph.output.length.div_ceil(size) };
@@ -5456,17 +5458,18 @@ fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Conf
 	push_program(graph, skip, &[], program)
 }
 fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	require(data.target_width <= 1, format!("estimator blocks require one target value per row, received {}", data.target_width))?;
 	let (source, input) = (graph.source, graph.output);
 	let restored = data.fitted.get(graph.nodes.iter().filter(|node| node.op == Primitive::Predictor).count()).cloned();
 	let (predictor, surrogate) = if let Some(program) = restored {
-		let blank = Prepared { samples: vec![0.0; input.elements()], targets: vec![0.0], rows: 1, source_rows: 1, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
+		let blank = Prepared { samples: vec![0.0; input.elements()], targets: vec![0.0], rows: 1, source_rows: 1, features: input.elements(), target_width: 1, schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
 		let mut surrogate = compile(&surrogate_model(config.surrogate_width), &blank, &blank.targets, 1, gpu, config, false)?;
 		surrogate.frozen.fill(1);
 		(program, surrogate)
 	} else {
 		(estimator.validate)(estimator.param, rows)?;
 		let inputs = graph_inputs(graph, &data.samples, &data.targets, rows, gpu, config.precision)?;
-		let prepared = Prepared { samples: inputs.clone(), targets: targets[..rows].to_vec(), rows, source_rows: rows, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: data.target_categorical, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
+		let prepared = Prepared { samples: inputs.clone(), targets: targets[..rows].to_vec(), rows, source_rows: rows, features: input.elements(), target_width: 1, schema: DataSchema::default(), sequence: None, target_categorical: data.target_categorical, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
 		let teacher = estimator.fit(&prepared, rows, config, true)?;
 		let targets = inputs.chunks_exact(input.elements()).enumerate().map(|(row, query)| (teacher.predict)(row, query)).collect::<Result<Vec<_>>>()?;
 		let predictor = estimator.fit(&prepared, rows, config, false)?;
@@ -5607,6 +5610,10 @@ fn count(name: &str, text: &str) -> Result<usize> { text.parse::<usize>().map_er
 fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetScale>, precision: Compute, target: &str) -> bundle::StoredGraph {
 	let inputs = if data.autoregressive { CHAR_IDS.iter().enumerate().flat_map(|(id, character)| (0..graph.input.length).map(move |position| format!("char{id}.u{:04X}.{position}", *character as u32))).collect() } else { (0..graph.input.elements()).map(|index| format!("input{index}")).collect() };
 	let output = if data.autoregressive { "char-id".to_owned() } else { data.target.first().cloned().unwrap_or_else(|| "target".to_owned()) };
+	let outputs = match graph.output.elements() {
+		1 => vec![output],
+		width => (1..=width).map(|index| format!("{output}.{index}")).collect(),
+	};
 	let (norm_mean, norm_scale) = match data.prepared.get() {
 		Some(Ok(prepared)) => (prepared.norm_mean.clone(), prepared.norm_scale.clone()),
 		_ => (Vec::new(), Vec::new()),
@@ -5614,7 +5621,7 @@ fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetS
 	let (target_min, target_span) = scale.map_or((0.0, 0.0), |s| (s.minimum, s.span));
 	let schema = data.prepared.get().and_then(|prepared| prepared.as_ref().ok()).map_or_else(DataSchema::default, |prepared| prepared.schema.clone());
 	let artifact = bundle::artifact_key(model, &schema, precision, graph, target);
-	bundle::StoredGraph { graph: graph.clone(), model: model.clone(), precision, inputs, outputs: vec![output], norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new(), artifact }
+	bundle::StoredGraph { graph: graph.clone(), model: model.clone(), precision, inputs, outputs, norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new(), artifact }
 }
 struct NativeTape {
 	program: NativeProgram,
@@ -6972,7 +6979,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	let sample_count = checked_mul(targets.len(), input.elements(), "surrogate samples")?;
 	require(samples.len() == sample_count, "surrogate sample batch is invalid")?;
 	let model = surrogate_model(hidden);
-	let prepared = Prepared { samples: samples.to_vec(), targets: targets.to_vec(), rows: targets.len(), source_rows: targets.len(), features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
+	let prepared = Prepared { samples: samples.to_vec(), targets: targets.to_vec(), rows: targets.len(), source_rows: targets.len(), features: input.elements(), target_width: 1, schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
 	let mut graph = compile(&model, &prepared, targets, prepared.rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, mse)?;
 	for _ in 0..config.surrogate_epochs {
@@ -7907,6 +7914,7 @@ struct Prepared {
 	rows: usize,
 	source_rows: usize,
 	features: usize,
+	target_width: usize,
 	schema: DataSchema,
 	sequence: Option<Shape>,
 	target_categorical: bool,
@@ -7932,6 +7940,25 @@ fn prepare(data: &Data) -> Result<&Prepared> {
 	}
 }
 fn column_match(name: &str, table: &Table, header: &str, column: usize) -> bool { name == header || name == format!("{}.{}", table.name, header) || name == format!("col{}", column + 1) || name == format!("{}.col{}", table.name, column + 1) || header.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.')) || header.rsplit_once('.').is_some_and(|(base, row)| row.parse::<usize>().is_ok() && (base == name || base.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.')))) }
+/// One positionally indexed column group: every match sits in one table and shares one
+/// header base carrying the indexes 1..=N, so a name such as "target" selects the whole
+/// "target.1".."target.N" expansion as one multi-column target in index order.
+fn column_group(tables: &[Table], matches: &[(usize, usize)]) -> Option<(usize, Vec<usize>)> {
+	let (first, rest) = matches.split_first()?;
+	if rest.is_empty() || matches.iter().any(|(table, _)| *table != first.0) {
+		return None;
+	}
+	let mut bases = BTreeSet::new();
+	let mut indexed = Vec::with_capacity(matches.len());
+	for &(table, column) in matches {
+		let (base, index) = tables[table].headers[column].rsplit_once('.')?;
+		bases.insert(base);
+		indexed.push((index.parse::<usize>().ok()?, column));
+	}
+	indexed.sort_unstable();
+	let ordered = bases.len() == 1 && indexed.iter().map(|(index, _)| *index).eq(1..=indexed.len());
+	ordered.then(|| (first.0, indexed.into_iter().map(|(_, column)| column).collect()))
+}
 fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathBuf>)> {
 	let mut paths = Vec::new();
 	for source in sources {
@@ -8057,7 +8084,6 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 			for (row, entries) in directories.values().enumerate() {
 				let (path, bytes) = entries.iter().find(|(path, _)| stem(path) == *column).unwrap();
 				let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
-					require(column != target, format!("per-sample target files {column:?} hold images, not values"))?;
 					image_values(path, bytes)?
 				} else {
 					vec![sample_text(path, bytes)?]
@@ -8085,7 +8111,6 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 			let mut width = None;
 			for (row, (path, bytes)) in ordered.iter().enumerate() {
 				let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
-					require(column != target, format!("paired target directory {column:?} holds images, not values"))?;
 					image_values(path, bytes)?
 				} else {
 					vec![sample_text(path, bytes)?]
@@ -8501,9 +8526,20 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 				}
 			}
 		}
+		if let Some(group) = column_group(&tables, &matches) {
+			selected.push(group);
+			continue;
+		}
 		require(matches.len() == 1, format!("target {name:?} must identify exactly one feature"))?;
-		selected.push(matches[0]);
+		selected.push((matches[0].0, vec![matches[0].1]));
 	}
+	let target_width = match selected.as_slice() {
+		[(_, group)] => group.len(),
+		targets => {
+			require(targets.iter().all(|target| target.1.len() == 1), "a multi-column target must be the only target")?;
+			1
+		}
+	};
 	let table_index = selected.first().map_or(0, |target| target.0);
 	let row_count = tables[table_index].rows.len();
 	for table in &tables { require(table.rows.len() == row_count, format!("table {:?} expected {row_count} positionally aligned rows, received {}", table.name, table.rows.len()))? }
@@ -8511,7 +8547,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	for (table, value) in tables.iter().enumerate() {
 		for (column, header) in value.headers.iter().enumerate() {
 			let excluded = data.exclusions.iter().any(|name| column_match(name, value, header, column));
-			if !selected.contains(&(table, column)) && !excluded {
+			if !selected.iter().any(|target| target.0 == table && target.1.contains(&column)) && !excluded {
 				columns.push((table, column, infer_feature(value, column, source_table_rows)));
 			}
 		}
@@ -8521,14 +8557,14 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	let repeated = columns.iter().all(|column| tables[column.0].headers[column.1].rsplit_once('.').and_then(|value| value.1.parse::<usize>().ok().map(|row| *sequence_widths.entry(row).or_insert(0) += column.2.width())).is_some());
 	let sequence = (repeated && sequence_widths.len() > 1 && sequence_widths.keys().copied().eq(1..=sequence_widths.len()) && sequence_widths.values().all(|width| *width == sequence_widths[&1])).then(|| Shape { channels: sequence_widths[&1], length: sequence_widths.len() });
 	require(features != 0, "dataset has no training features")?;
-	let target_categories = selected.iter().map(|target| categories(&tables[target.0], target.1, source_table_rows)).collect::<Vec<_>>();
-	let target_categorical = selected.iter().any(|target| tables[target.0].rows.iter().take(source_table_rows).filter_map(|row| row.get(target.1)).any(|value| !value.is_empty() && value.parse::<f64>().is_err()));
+	let target_categories = selected.iter().map(|target| if let [column] = target.1.as_slice() { categories(&tables[target.0], *column, source_table_rows) } else { Vec::new() }).collect::<Vec<_>>();
+	let target_categorical = target_width == 1 && selected.iter().any(|target| tables[target.0].rows.iter().take(source_table_rows).filter_map(|row| row.get(target.1[0])).any(|value| !value.is_empty() && value.parse::<f64>().is_err()));
 	let mut samples = Vec::new();
 	let mut targets = Vec::new();
 	let mut source_rows = 0;
 	let mut missing = vec![0_usize; columns.len()];
 	for row in 0..row_count {
-		if row == source_table_rows { source_rows = targets.len() }
+		if row == source_table_rows { source_rows = targets.len() / target_width }
 		let mut encoded = Vec::with_capacity(features);
 		let valid = columns.iter().all(|column| tables[column.0].rows[row].get(column.1).is_some_and(|value| encode(value, &column.2, &mut encoded)));
 		if valid {
@@ -8548,9 +8584,23 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 			for (count, column) in missing.iter_mut().zip(&columns) {
 				*count += usize::from(tables[column.0].rows[row][column.1].is_empty());
 			}
+		} else if valid && target_width != 1 {
+			let (table, group) = &selected[0];
+			let mut values = Vec::with_capacity(group.len());
+			for column in group {
+				let Some(value) = tables[*table].rows[row].get(*column).and_then(|value| value.parse::<f64>().ok()).filter(|value| value.is_finite()) else { values.clear(); break };
+				values.push(value);
+			}
+			if values.len() == group.len() {
+				samples.extend_from_slice(&encoded);
+				targets.append(&mut values);
+				for (count, column) in missing.iter_mut().zip(&columns) {
+					*count += usize::from(tables[column.0].rows[row][column.1].is_empty());
+				}
+			}
 		} else if valid {
 			for (target, categories) in selected.iter().zip(&target_categories) {
-				let value = tables[target.0].rows[row].get(target.1);
+				let value = tables[target.0].rows[row].get(target.1[0]);
 				let target = value.and_then(|value| value.parse::<f64>().ok()).or_else(|| value.and_then(|value| categories.iter().position(|category| category == value)).map(|value| value as f64));
 				if let Some(target) = target
 					&& target.is_finite()
@@ -8564,14 +8614,14 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 			}
 		}
 	}
-	if source_table_rows == row_count { source_rows = targets.len() }
+	if source_table_rows == row_count { source_rows = targets.len() / target_width }
 	for (column, count) in columns.iter().zip(missing).filter(|value| value.1 != 0) {
 		let percentage = count as f64 * 100.0 / row_count as f64;
 		let precision = 4_usize.max((-percentage.log10()).ceil().max(0.0) as usize);
 		eprintln!("imputed {}.{}: {percentage:.precision$}%", tables[column.0].name, tables[column.0].headers[column.1]);
 	}
 	let schema = columns.iter().map(|column| ("feature".to_owned(), format!("{} {}.{}", column.2.width(), tables[column.0].name, tables[column.0].headers[column.1]))).chain(data.target.iter().cloned().map(|target| ("target".to_owned(), target))).collect();
-	finish_prepared(data, samples, targets, source_rows, features, sequence, target_categorical, schema)
+	finish_prepared(data, samples, targets, source_rows, features, target_width, sequence, target_categorical, schema)
 }
 fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 	let mut sequences = Vec::new();
@@ -8606,27 +8656,27 @@ fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 	}
 	let schema = CHAR_IDS.iter().map(|character| ("character".to_owned(), format!("U+{:04X}", *character as u32))).collect();
 	let source_rows = targets.len();
-	finish_prepared(data, samples, targets, source_rows, features, Some(Shape { channels: CHAR_IDS.len(), length }), true, schema)
+	finish_prepared(data, samples, targets, source_rows, features, 1, Some(Shape { channels: CHAR_IDS.len(), length }), true, schema)
 }
-fn finish_prepared(data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, source_rows: usize, features: usize, sequence: Option<Shape>, target_categorical: bool, schema: DataSchema) -> Result<Prepared> {
-	let rows = targets.len();
+fn finish_prepared(data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, source_rows: usize, features: usize, target_width: usize, sequence: Option<Shape>, target_categorical: bool, schema: DataSchema) -> Result<Prepared> {
+	let rows = targets.len() / target_width;
 	require(source_rows != 0 && source_rows <= rows, "dataset has no complete training rows")?;
 	// Sources may repeat a row verbatim; each copy is its own sample, so its identity mixes
 	// in how many identical rows precede it in source order, which the seed never changes.
 	let mut occurrences = BTreeMap::new();
-	let mut identities = samples.chunks_exact(features).zip(&targets).map(|(sample, target)| {
-		let content = sample_identity(sample, *target);
+	let mut identities = samples.chunks_exact(features).zip(targets.chunks_exact(target_width)).map(|(sample, target)| {
+		let content = sample_identity(sample, target);
 		let occurrence = occurrences.entry(content).and_modify(|count| *count += 1_u64).or_insert(0);
 		occurrence.to_le_bytes().iter().fold(content, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(1099511628211))
 	}).collect();
-	shuffle(&mut samples, &mut targets, &mut identities, features, source_rows)?;
+	shuffle(&mut samples, &mut targets, &mut identities, features, target_width, source_rows)?;
 	let (norm_mean, norm_scale) = if data.normalize {
 		normalize_samples(&mut samples, features, ((source_rows as f64) * data.split).floor() as usize)?
 	} else {
 		impute_missing(&mut samples);
 		(Vec::new(), Vec::new())
 	};
-	Ok(Prepared { samples, targets, rows, source_rows, features, schema, sequence, target_categorical, norm_mean, norm_scale, identities, fitted: Vec::new() })
+	Ok(Prepared { samples, targets, rows, source_rows, features, target_width, schema, sequence, target_categorical, norm_mean, norm_scale, identities, fitted: Vec::new() })
 }
 fn normalize_samples(samples: &mut [f64], features: usize, fit: usize) -> Result<(Vec<f64>, Vec<f64>)> {
 	require(fit != 0, "split must retain normalization rows")?;
@@ -8654,12 +8704,12 @@ fn impute_missing(samples: &mut [f64]) {
 		}
 	}
 }
-fn sample_identity(sample: &[f64], target: f64) -> u64 {
+fn sample_identity(sample: &[f64], target: &[f64]) -> u64 {
 	const OFFSET: u64 = 14695981039346656037;
 	const PRIME: u64 = 1099511628211;
 	// Feed the hash bytewise: word-wide mixing leaves the low hash bits untouched by the
 	// all-zero low mantissa bits of small integer values, collapsing the identity space.
-	sample.iter().copied().chain(std::iter::once(target)).flat_map(|value| value.to_bits().to_le_bytes()).fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
+	sample.iter().chain(target).copied().flat_map(|value| value.to_bits().to_le_bytes()).fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
 }
 fn is_table(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "csv" | "tsv" | "txt" | "data" | "dat" | "all-data" | "jsonl" | "json" | "npz" | "sqlite" | "sqlite3" | "db" | "h5" | "hdf5" | "xml") }
 fn is_archive(extension: &str) -> bool { matches!(extension.to_ascii_lowercase().as_str(), "zip") }
@@ -9675,10 +9725,10 @@ fn encode(value: &str, kind: &FeatureType, output: &mut Vec<f64>) -> bool {
 		}
 	}
 }
-fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, identities: &mut Vec<u64>, features: usize, source_rows: usize) -> Result<()> {
+fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, identities: &mut Vec<u64>, features: usize, target_width: usize, source_rows: usize) -> Result<()> {
 	let mut seed = env!("RECIPE_RANDOM_SEED").parse::<u64>().map_err(|error| RecipeError::new(format!("invalid random seed: {error}")))?;
-	let mut order = Vec::with_capacity(targets.len());
-	for (start, end) in [(0, source_rows), (source_rows, targets.len())] {
+	let mut order = Vec::with_capacity(identities.len());
+	for (start, end) in [(0, source_rows), (source_rows, identities.len())] {
 		let mut partition = (start..end).collect::<Vec<_>>();
 		for index in (1..partition.len()).rev() {
 			seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -9691,7 +9741,7 @@ fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, identities: &mut Vec<
 	let old_identities = std::mem::take(identities);
 	for row in order {
 		samples.extend_from_slice(&old_samples[row * features..(row + 1) * features]);
-		targets.push(old_targets[row]);
+		targets.extend_from_slice(&old_targets[row * target_width..(row + 1) * target_width]);
 		identities.push(old_identities[row]);
 	}
 	Ok(())
@@ -9879,26 +9929,27 @@ impl Train {
 			config.random_seed = seed;
 		}
 		let probability = model.loss.0 >= 4;
-		let scale = probability.then(|| TargetScale::fit(&prepared.targets[..training_rows]));
+		let width = prepared.target_width;
+		let scale = probability.then(|| TargetScale::fit(&prepared.targets[..training_rows * width]));
 		let target_values = prepared.targets.iter().map(|target| scale.map_or(*target, |scale| scale.encode(*target))).collect::<Vec<_>>();
 		let (run, mut graph) = (RUN.fetch_add(1, Ordering::Relaxed) + 1, compile(model, prepared, &target_values, training_rows, gpu, config, true)?);
 		graph.state.training_rows = training_rows;
 		if let Some(scale) = scale
-			&& let Some(offset) = output_bias_offset(&graph)
+			&& let Some(bias) = output_bias_offset(&graph)
 		{
-			let mean = target_values[..training_rows].iter().sum::<f64>() / training_rows as f64;
-			graph.parameters[offset] = scale.logit(mean);
+			let mean = target_values[..training_rows * width].iter().sum::<f64>() / (training_rows * width) as f64;
+			graph.parameters[bias].fill(scale.logit(mean));
 		}
 		graph.refresh_storage(config)?;
 		let mut stored = stored_graph(&graph, model, data, scale, precision, native_target_label(&gpu.native_target));
-		require(stored.graph.output.elements() == 1, "model output width must be one")?;
+		require(stored.graph.output.elements() == width, "model output width must match the target width")?;
 		if let Some(path) = &self.resume {
 			bundle::restore(path, &prepared.schema, std::slice::from_mut(&mut stored), &prepared.identities)?;
 		}
 		stored.graph.state.trained_samples.extend_from_slice(&prepared.identities[..training_rows]);
 		stored.graph.state.trained_samples.sort_unstable();
 		stored.graph.state.trained_samples.dedup();
-		let (samples, targets) = (&prepared.samples[..training_rows * prepared.features], &target_values[..training_rows]);
+		let (samples, targets) = (&prepared.samples[..training_rows * prepared.features], &target_values[..training_rows * width]);
 		let mut tape = NativeTape::new(&stored.graph, samples, targets, gpu, config.precision, model.loss)?;
 		self.finish_dispatch(if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) }, &mut stored, &prepared.schema, &tape, None)?;
 		tape.print_devices()?;
@@ -9964,7 +10015,7 @@ impl Train {
 		} else if training_rows < prepared.rows {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
-			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_rows..]);
+			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_rows * width..]);
 			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, model.loss)?;
 			validation.inject_bn_stats(&stored.bn_stats)?;
 			validation.forward()?;
@@ -9977,7 +10028,7 @@ impl Train {
 		} else if evaluation && data.autoregressive {
 			coefficient(&prepared.targets[training_rows..], &predictions[training_rows..])
 		} else {
-			coefficient(&prepared.targets[training_rows..], &evaluated)
+			coefficient(&prepared.targets[training_rows * width..], &evaluated)
 		};
 		if !evaluated.is_empty() { predictions = evaluated }
 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(()))?;
