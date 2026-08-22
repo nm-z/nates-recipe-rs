@@ -45,7 +45,7 @@ host and terminating the machine.
 
 The machine runs each model up to its configured concurrency limit. Ox Alpha,
 whose current catalog key is `opencode/x-preview-f-free`, and OpenRouter's
-`openrouter/free` route each run up to 20 requests concurrently. Every other
+`openrouter/free` route each run up to 10 requests concurrently. Every other
 OpenCode model runs one request at a time.
 Each live
 reviewer uses the `provider/model` identity shown in the terminal and log. The
