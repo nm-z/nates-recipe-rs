@@ -20,6 +20,11 @@ while different models run concurrently. The first available
 classifier returns one schema-validated decision: create a
 `bug` issue or comment on an existing issue.
 
+The tmux session executes the coordinator as its final process. If the
+coordinator exits, tmux exits with it, and the user service restarts the whole
+machine instead of leaving an interactive shell that reports a false healthy
+state.
+
 The resolver pool has a ceiling of 20 workers and a separate process-memory
 budget. The current 60 GiB admission budget permits all 20 resolver process
 trees, and each tree has a 3 GiB memory limit. Resolver sessions share one Cargo
