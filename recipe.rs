@@ -3928,33 +3928,65 @@ fn iq3_nearest(grid: &'static [u16], levels: &mut [i8], values: &[f32], weights:
 	index
 }
 fn iq2_grid(grid: &[u16], index: usize, lane: usize) -> i8 { (2 * (grid[index] >> (2 * lane) & 3) + 1) as i8 }
-fn iq2_nearest(grid: &[u16], shells: usize, levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32) -> usize {
-	let key = levels.iter().enumerate().fold(0_u16, |key, (lane, level)| key | (*level as u16) << (2 * lane));
-	if let Some(index) = grid.iter().position(|value| *value == key) {
-		return index;
-	}
+/// Every 16-bit level key resolved against one IQ2 grid: either the first
+/// exact grid index, or the first two distance shells in (distance, index)
+/// order, which is the same candidate order an exhaustive sorted scan yields.
+/// The exact map is built once per grid; shell members are resolved once per
+/// key on first use, because sweeping all 65536 keys against a 1024-point
+/// grid up front costs more than the encodes it serves.
+struct Iq2Neighbours {
+	exact: Vec<i32>,
+	shells: Vec<OnceLock<(u32, Box<[u16]>)>>,
+}
+fn iq2_neighbours(grid: &'static [u16]) -> &'static Iq2Neighbours {
+	static XXS: OnceLock<Iq2Neighbours> = OnceLock::new();
+	static XS: OnceLock<Iq2Neighbours> = OnceLock::new();
+	static S: OnceLock<Iq2Neighbours> = OnceLock::new();
+	let cache = if std::ptr::eq(grid.as_ptr(), IQ2_XXS.as_ptr()) { &XXS } else if std::ptr::eq(grid.as_ptr(), IQ2_XS.as_ptr()) { &XS } else { &S };
+	cache.get_or_init(|| {
+		let keys = 1_usize << 16;
+		let mut exact = vec![-1_i32; keys];
+		for (index, point) in grid.iter().enumerate() {
+			if exact[usize::from(*point)] < 0 {
+				exact[usize::from(*point)] = index as i32
+			}
+		}
+		Iq2Neighbours { exact, shells: (0..keys).map(|_| OnceLock::new()).collect() }
+	})
+}
+fn iq2_shells(grid: &[u16], key: u16) -> (u32, Box<[u16]>) {
 	let mut candidates = grid
 		.iter()
 		.enumerate()
 		.map(|(index, point)| {
 			(
 				(0..8).map(|lane| {
-					let difference = i32::from((*point >> (2 * lane) & 3) as i8 - levels[lane]);
+					let difference = i32::from(*point >> (2 * lane) & 3) - i32::from(key >> (2 * lane) & 3);
 					difference * difference
 				})
 				.sum::<i32>(),
-				index,
+				index as u16,
 			)
 		})
 		.collect::<Vec<_>>();
 	candidates.sort_unstable();
-	let mut distances = candidates.iter().map(|item| item.0).collect::<Vec<_>>();
-	distances.dedup();
-	let limit = distances.get(shells.saturating_sub(1)).copied().unwrap_or(candidates[0].0);
-	let index = candidates
-		.into_iter()
-		.take_while(|item| item.0 <= limit)
-		.map(|item| item.1)
+	let first = candidates[0].0;
+	let limit = candidates.iter().map(|item| item.0).find(|distance| *distance > first).unwrap_or(first);
+	let inner = candidates.iter().take_while(|item| item.0 == first).count() as u32;
+	(inner, candidates.iter().take_while(|item| item.0 <= limit).map(|item| item.1).collect())
+}
+fn iq2_nearest(grid: &'static [u16], shells: usize, levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32) -> usize {
+	let key = levels.iter().enumerate().fold(0_u16, |key, (lane, level)| key | (*level as u16) << (2 * lane));
+	let neighbours = iq2_neighbours(grid);
+	let exact = neighbours.exact[usize::from(key)];
+	if exact >= 0 {
+		return exact as usize;
+	}
+	let (inner, candidates) = neighbours.shells[usize::from(key)].get_or_init(|| iq2_shells(grid, key));
+	let span = if shells <= 1 { &candidates[..*inner as usize] } else { &candidates[..] };
+	let index = span
+		.iter()
+		.map(|index| usize::from(*index))
 		.min_by(|left, right| {
 			let error = |index| {
 				(0..8).map(|lane| {
