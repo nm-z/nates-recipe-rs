@@ -5138,7 +5138,12 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 					program.op(ScalarOpcode::Multiply, slope, x)
 				}
 				_ => {
-					let exponential = program.unary(ScalarOpcode::Exp, x);
+					// The negative branch is only selected for x <= 0, but choose blends
+					// both branches arithmetically, so exp must never see a positive x:
+					// exp overflows to infinity there and the blend turns 0*inf into NaN.
+					let inverse = program.op(ScalarOpcode::Subtract, one, positive);
+					let clamped = program.op(ScalarOpcode::Multiply, inverse, x);
+					let exponential = program.unary(ScalarOpcode::Exp, clamped);
 					let shifted = program.op(ScalarOpcode::Subtract, exponential, one);
 					let alpha = constant(&mut program, config.activation[usize::from(activation == Activation::Selu) + 2]);
 					program.op(ScalarOpcode::Multiply, alpha, shifted)
