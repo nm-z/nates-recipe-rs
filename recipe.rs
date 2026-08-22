@@ -6693,6 +6693,59 @@ impl NativeProgram {
 	}
 }
 
+#[cfg(amd)]
+mod hsa_fault {
+	// ROCm 7.2.4 kills the process instead of returning a status when an
+	// allocation inside hsa_queue_create fails: GpuAgent::QueueCreate arms a
+	// scope guard over a zero-initialized ScratchInfo whose cache node is a
+	// value-initialized map iterator, and every error return - including the
+	// nested internal GWS and SDMA utility-queue creations, whose parameters
+	// the caller cannot choose - runs ReleaseQueueMainScratch, which
+	// dereferences that null iterator and raises SIGSEGV. Under system memory
+	// exhaustion the utility-queue allocation is the first to fail, so the
+	// process dies by signal 11 before any in-process error exists. Trap the
+	// fault for exactly this call on exactly this thread and surface the
+	// out-of-resources error the runtime intended to return; any other thread
+	// or code faulting during the window is re-raised under the previous
+	// disposition unchanged.
+	use super::{require, RecipeError, Result};
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	#[repr(C)]
+	struct Action { handler: usize, mask: [u64; 16], flags: i32, restorer: usize }
+	unsafe extern "C" {
+		fn sigaction(signal: i32, action: *const Action, previous: *mut Action) -> i32;
+		fn __sigsetjmp(environment: *mut u64, save_mask: i32) -> i32;
+		fn siglongjmp(environment: *mut u64, value: i32) -> !;
+		fn pthread_self() -> usize;
+	}
+	const SIGSEGV: i32 = 11;
+	static ARMED: AtomicUsize = AtomicUsize::new(0);
+	static mut RETURN: [u64; 32] = [0; 32];
+	static mut PREVIOUS: Action = Action { handler: 0, mask: [0; 16], flags: 0, restorer: 0 };
+	extern "C" fn trap(signal: i32) {
+		let this = unsafe { pthread_self() };
+		if ARMED.compare_exchange(this, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+			unsafe { siglongjmp((&raw mut RETURN).cast(), 1) }
+		}
+		unsafe { sigaction(signal, &raw const PREVIOUS, std::ptr::null_mut()) };
+	}
+	#[inline(never)]
+	pub(super) unsafe fn trapped(action: impl FnOnce() -> i32, what: &str) -> Result<i32> {
+		unsafe {
+			let installed = Action { handler: trap as *const () as usize, mask: [0; 16], flags: 0, restorer: 0 };
+			require(sigaction(SIGSEGV, &installed, &raw mut PREVIOUS) == 0, "AMD fault trap installation failed")?;
+			if __sigsetjmp((&raw mut RETURN).cast(), 1) != 0 {
+				sigaction(SIGSEGV, &raw const PREVIOUS, std::ptr::null_mut());
+				return Err(RecipeError::new(format!("AMD {what} faulted inside the HSA runtime instead of returning a status; the device queue resources are exhausted")));
+			}
+			ARMED.store(pthread_self(), Ordering::Release);
+			let status = action();
+			ARMED.store(0, Ordering::Release);
+			sigaction(SIGSEGV, &raw const PREVIOUS, std::ptr::null_mut());
+			Ok(status)
+		}
+	}
+}
 fn load_amd() -> Result<Vec<Gpu>> {
 	#[cfg(not(amd))]
 	return Err(RecipeError::new("AMD support is not compiled into this build"));
@@ -6749,7 +6802,13 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		let allocate: unsafe extern "C" fn(u64, usize, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_amd_memory_pool_allocate\0")?;
 		let allow: unsafe extern "C" fn(u32, *const u64, *const u32, *const c_void) -> i32 = runtime.function(b"hsa_amd_agents_allow_access\0")?;
 		let (mut queue, mut completion) = (ptr::null_mut(), 0);
-		driver_status(Backend::Amd, queue_create(agent, 256, 2, ptr::null_mut(), ptr::null_mut(), u32::MAX, u32::MAX, &mut queue), "queue creation")?;
+		let status = hsa_fault::trapped(|| queue_create(agent, 256, 2, ptr::null_mut(), ptr::null_mut(), u32::MAX, u32::MAX, &mut queue), "queue creation").inspect_err(|_| {
+			// The runtime is not reusable after the trapped fault and its worker
+			// threads are still executing library code, so keep it mapped instead
+			// of letting the error path dlclose it out from under them.
+			std::mem::forget(runtime.clone())
+		})?;
+		driver_status(Backend::Amd, status, "queue creation")?;
 		check(signal_create(0, 0, ptr::null(), &mut completion), "signal creation")?;
 		let hsa = Hsa { _runtime: runtime.clone(), reader_create, reader_destroy, executable_create, executable_destroy, executable_load, executable_freeze, symbol, symbol_info, allocate, allow, queue, cpu_agent, free: runtime.function(b"hsa_amd_memory_pool_free\0")?, copy: runtime.function(b"hsa_memory_copy\0")?, store: runtime.function(b"hsa_signal_store_screlease\0")?, wait: runtime.function(b"hsa_signal_wait_scacquire\0")?, write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?, signal: completion, vram_pool: vram.found, kernarg_pool: kernarg.found, agent, cus, wave, workgroup, lds };
 		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, native_target, driver: Driver::Hsa(hsa), memory: memory as u64, shared_limit: lds, dispatch: Mutex::new(()) })
