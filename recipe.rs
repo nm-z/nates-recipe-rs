@@ -5562,6 +5562,12 @@ struct NativeSchedule {
 	shared_values: u32,
 	contractions: Vec<Option<NativeContractionTiles>>,
 	attention: Vec<Option<Tile>>,
+	/// Per node, per direction: the contraction's shape limits and every tile
+	/// the live schedule may legally dispatch for it. The proposer selects only
+	/// from this set, so a proposal can never violate the local-memory,
+	/// register, chunk, or split-K constraints the enumeration enforces.
+	candidates: Vec<Vec<(Tile, Vec<Tile>)>>,
+	dominant_index: Option<usize>,
 }
 #[derive(Clone, Copy, Debug)]
 struct NativeContractionTiles {
@@ -5603,6 +5609,11 @@ struct Config {
 	surrogate_epochs: usize,
 	surrogate_width: usize,
 	surrogate_rate: f64,
+	rat_exploration: f64,
+	rat_benchmark_rate: f64,
+	rat_proposer_rate: f64,
+	rat_lut_rate: f64,
+	rat_measurements: usize,
 	initial: f64,
 	beta1: f64,
 	beta2: f64,
@@ -5614,7 +5625,7 @@ struct Config {
 	precision: Compute,
 }
 impl Config {
-	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, catboost_borders: natural("CatBoost border count", env!("RECIPE_CATBOOST_BORDER_COUNT"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
+	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, catboost_borders: natural("CatBoost border count", env!("RECIPE_CATBOOST_BORDER_COUNT"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, rat_exploration: fraction("RAT exploration", env!("RECIPE_RAT_EXPLORATION"))?, rat_benchmark_rate: number("RAT benchmark rate", env!("RECIPE_RAT_BENCHMARK_RATE"))?, rat_proposer_rate: number("RAT proposer rate", env!("RECIPE_RAT_PROPOSER_RATE"))?, rat_lut_rate: number("RAT LUT rate", env!("RECIPE_RAT_LUT_RATE"))?, rat_measurements: natural("RAT measurements", env!("RECIPE_RAT_MEASUREMENTS"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
 }
 fn number(name: &str, text: &str) -> Result<f64> {
 	let value = text.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))?;
@@ -5638,6 +5649,284 @@ fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetS
 	let artifact = bundle::artifact_key(model, &schema, precision, graph, target);
 	bundle::StoredGraph { graph: graph.clone(), model: model.clone(), precision, inputs, outputs: vec![output], norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new(), artifact }
 }
+/// One value per contraction direction axis, in units of `log2 / 8` so every
+/// shape or resource extent up to 2^16 lands inside tanh's linear range.
+fn rat_log2(value: u32) -> f64 { f64::from(value.max(1)).log2() / 8.0 }
+/// The exact arithmetic format as `(exponent bits, mantissa bits)`. This is
+/// the identity that separates formats a byte width alone conflates: FP16
+/// from BF16, TF32 from FP32, and every custom `f(exp, man)` layout.
+fn rat_dtype(precision: Compute) -> [f64; 2] {
+	match precision {
+		Compute::F(format) | Compute::Fp(format) | Compute::Bf(format) | Compute::Tf(format) => [f64::from(format.arithmetic.exp) / 8.0, f64::from(format.arithmetic.man) / 32.0],
+		Compute::Int(format) => [0.0, f64::from(format.bits) / 32.0],
+	}
+}
+const NATIVE_RAT_STATE: usize = 13;
+const NATIVE_RAT_ACTION: usize = 3;
+const NATIVE_RAT_HIDDEN: usize = 32;
+/// The tile RAT's pretrained parameters, regenerated by `rat_pretrain` from
+/// accumulated lookup state. The bases are the frozen subset: they carry the
+/// shape-to-schedule structure of pooled real fused-epoch timings. The
+/// benchmark surrogate predicts a tile's log-cost effect — its contribution
+/// to the log of the fused epoch's milliseconds relative to its model's
+/// tempo — so relative cost is the same learnable quantity at every model
+/// scale, and the epoch's absolute level is what the adaptive head tracks.
+/// The heads are the adjustable subset: a run adapts them online from its own
+/// epoch timings and persists them next to the native artifact. The head is
+/// the structured unit of adaptation because hidden units of a dense layer are
+/// permutation-symmetric: freezing the basis and adapting the readout is the
+/// smallest subset whose meaning survives that symmetry.
+const NATIVE_RAT_BENCHMARK_BASIS: [f64; (NATIVE_RAT_STATE + NATIVE_RAT_ACTION + 1) * NATIVE_RAT_HIDDEN] = [-0.22510735, -0.21201507, 0.64019972, 0.02579818, 0.65416042, -0.21306300, -0.21347344, 0.20949241, 0.09611179, 0.18441787, 0.02115847, 0.32666092, -0.16170693, -0.57617099, -0.04179446, 1.10875236, 0.32009959, 0.21535055, 0.51295611, 0.69728705, 0.41036822, 0.21415149, -2.76760102, 0.18497385, 0.03153260, -0.19283427, 0.05442528, -0.11247322, 0.01612624, -0.44708046, -1.67893514, -1.58634517, 1.44960804, -0.42470838, -0.09122058, 0.10514881, -0.11462496, 0.28898362, 0.12924126, 0.52788841, 0.50430276, -0.16318434, -0.09155108, 0.00417398, -0.26269532, -0.24582744, 0.28510323, -0.15176004, -0.32501557, 0.11994185, -0.19882462, -0.45976034, -0.12717490, 0.02467072, -0.10372673, 0.19397584, -0.11021251, -0.36741976, 0.21655642, -0.12892823, 0.03868948, -0.18089570, 0.04082230, 0.19122390, 0.47308796, 0.39210412, -0.11294927, 0.22244110, 0.21813335, 0.15785466, -0.09616289, 0.56944636, -2.24619655, 0.24156630, -0.14358309, 0.04831723, 0.33127984, -0.00849025, -0.26780895, -0.12865348, 0.11763323, -0.23175972, -0.08295876, -0.42712678, -0.28641056, -0.07087465, -1.02201583, 0.10842542, -0.02635398, -0.33748998, 0.41822497, 0.26147893, -0.29185659, 0.15181998, 0.13052659, -0.11331901, -0.50506817, 0.04120567, 1.10146689, -0.28409025, 0.57915220, 0.34549936, -0.25823838, 0.41450598, -0.32344177, -0.09957624, -0.17639616, -0.20167455, -0.23048519, 0.33258656, 0.05959498, 0.02455183, 0.50726778, -0.02980878, -0.27669577, 0.46035250, 0.35290781, 0.33259993, 0.03814946, -0.40160540, 0.26891349, 0.86934917, -0.16818891, 2.50794995, -0.21979534, -0.25197553, -0.05941345, 0.06266561, 0.17417370, 0.41621651, -0.15495268, -0.09580453, 0.25343913, -0.66179877, 0.32583785, -0.06486496, -0.03154947, 0.75726303, 0.13151203, 0.26151232, 0.02614961, 0.40364542, 0.10280898, 0.06897898, -0.03390775, 0.24616818, -0.39690430, -0.12731107, -0.21787937, -0.15745026, -0.28641763, -0.13495381, 0.07303176, 0.18567375, -2.17458656, -0.52998049, 2.88840390, 0.75461804, -0.40413963, 0.50943222, 0.63333242, 0.22701670, -0.06622259, 0.58967588, 0.13728469, 0.24515574, 0.25053368, -0.95072435, -0.15104972, 0.26046380, 0.00403089, 0.66174776, 0.71027962, 0.25610958, -0.33225562, -1.18425449, -0.05760907, -0.59020227, -0.08185412, -0.09835627, -0.27606586, -0.50044812, -0.39159016, 1.05829931, -0.45628456, 1.05719216, 0.07780593, -0.09253772, -0.19804953, -0.27574528, -0.09786887, -0.02840393, -0.33691746, 0.35508962, 0.15809999, -0.06164615, -0.14576419, -0.05080435, -0.29202673, 0.02075525, 0.37899120, -0.31361992, -0.12114756, 0.34924769, -0.45106238, -0.22857935, -0.28592237, 0.43165107, -0.13318353, -0.15217587, 0.32589123, 0.34287382, 0.02395949, -0.09827269, -0.36528539, -0.25333070, 0.12804837, -1.45595034, -0.52607396, 0.91582159, 0.32246211, -0.06856907, -0.02438413, 0.50795447, 0.40278969, 1.66918932, -0.86058857, -0.42498585, 0.12765207, -0.14708023, 0.03304382, -0.33867546, -0.30215900, -0.02125257, -0.19958003, 0.49272161, 0.30473580, 0.14285692, -0.30618879, 0.04458427, 0.03330688, 0.69476721, 1.30201460, -0.55116963, 0.36959232, 0.32006597, -0.00551492, -0.14854021, 0.58976151, 0.17871764, 0.13256851, 0.18142290, 0.45613897, -0.72085364, -0.29405374, -0.13360244, 0.70123221, -0.47425335, 0.75572562, -3.01190508, -0.22209026, -0.15129999, 0.11727791, -0.18764049, -0.48111209, -0.25188989, -0.43160557, 0.39214036, -0.29312061, -0.09555670, -0.28589002, 0.14855883, 0.38529658, -0.09049511, -0.97023059, -0.16419855, -0.07650409, -0.35783502, 0.28090104, 0.26380510, 0.13087496, 0.15212744, 0.29117143, 0.17083200, -0.25235085, 0.05640892, 0.40068532, -0.62851665, 0.13488020, 0.42766560, 0.76372337, -0.33801515, 0.08220077, 0.10440213, -0.18358819, 0.02945323, -0.28427363, -0.18651859, -0.32022870, -0.44254392, -0.19565684, 0.41298695, -0.11047265, -0.06678577, 0.25904707, -0.14993457, 0.05487624, -0.16844291, -1.35459120, 0.18984511, -3.07689949, -0.36449354, -0.03346688, -0.07722447, 0.04520082, 0.65930993, 0.72008784, 0.66274579, -0.18909355, 1.33601333, -0.05042495, -1.06725489, -0.35748812, 0.58006508, -1.40264246, -0.06916102, -0.20974900, -0.10568900, 0.33179933, 0.09367491, 0.24935717, 0.15410015, 0.03171991, 0.10326546, 0.02207518, -0.03248962, 2.02871875, -1.67587838, 0.01521501, 0.14508087, 0.32708218, 0.30300831, 0.19108107, -0.13467163, -0.23915255, 0.20319272, 0.13777997, 0.41864022, -0.07327552, -0.46302268, -0.40047790, -0.35511864, 0.08569685, 1.10461045, -0.32975801, -0.56054486, 0.53435064, 0.38005023, -0.33405426, -0.23188769, -0.67995431, -0.09106066, 0.34053214, -0.34598136, -0.03460893, -0.20290425, -0.25350313, 0.35354627, 0.20315321, -0.09362271, 0.33182676, -0.30384958, 0.20394634, -0.28399050, -0.11819702, -0.05234466, -0.26950824, 0.00104137, -0.07300589, -0.33484617, -0.19451019, -0.44322002, -0.19848690, -0.21992502, 0.53932602, 0.11350841, 0.17355522, -1.28572960, 0.01415420, 0.99524068, -0.39080631, -0.42375217, -0.40528767, -0.02586940, 0.27578483, 0.70796576, -0.02332531, -0.27792119, -0.45545711, -0.16623639, -0.04574732, 0.77576058, 0.20902786, -0.27506108, -1.11835159, 1.00259562, -0.42858886, -0.14430675, 0.19404962, -0.44273993, 0.60956928, 0.00411846, -0.07406268, -0.33910027, -0.05420010, -0.09072438, -0.21780679, -0.01295821, -0.47233670, 0.13167600, 0.12857791, 0.51236823, -0.34466888, 0.41321233, -0.26700170, 1.46573851, -0.03101956, -1.44142765, -1.31130160, 0.44816409, -0.66025671, 0.18410756, -0.01506789, -0.22366857, 0.13109471, -0.23977992, -0.12974441, 0.16840983, 3.70598352, -2.39519406, -0.04482716, 0.13825599, -0.53522257, -0.69702836, -0.67878449, 0.09707982, -0.63564655, -0.07669342, 0.06508428, 0.27535960, -0.05691540, -0.04294331, -0.01263255, 0.10803591, 0.08238622, 1.20227902, -0.08857200, 0.06369642, 0.07514755, 0.27982444, -0.90110022, -0.20123542, -0.82178252, -0.36914033, 0.46390719, 0.07196795, 0.22820928, 0.14526771, -0.16139072, -0.71690429, -0.63728535, -0.02944191, -0.25228444, -0.88833448, 0.29530892, -0.15505184, 0.64466679, 4.53412270, 0.45876911, -0.20299586, 0.28695084, 0.07170619, -0.20646331, -0.29192335, -0.16957204, -0.31233531, -0.42846916, -0.42465901, -0.58934323, -3.24043691, -2.90479740, -0.51254506, -0.08431965, 0.22695802, 0.35417242, -0.99341939, 0.13899027, -1.38478951, -0.47733862, 0.11671055, -0.11321545, 0.35680314, -0.51526056, 0.27141057, -0.48008737, -0.38808857, 0.27006020, -0.32569681, -0.16860934, 0.20198414, 0.24523052, 0.24108132, 0.31354117, -0.27430823, 0.12521783, 0.34696826, -0.14994651, 0.06280109, -0.29130235, -0.18204399, 0.14699627, -0.09773864, -0.28241150, -0.07197657, 0.41146344, -0.21262402, -0.18622483, -0.75489374, 0.23541962, -0.00180151, 0.29943241, 0.04802429, -0.18104113, 0.00953027, 0.31558608, -0.01471953, 0.29490091, -0.47070977, 0.24971146, 0.28028993, 1.55161046, -0.83483301, 0.15788278, 0.13879676];
+const NATIVE_RAT_BENCHMARK_HEAD: [f64; NATIVE_RAT_HIDDEN + 1] = [0.31475077, 0.28960739, 0.01365063, 0.09886159, -0.06372361, -0.21953466, -0.12608527, 0.29391928, 0.38585269, 0.33835855, -0.35757559, 0.12408443, -0.40317223, 0.26696792, 0.10696423, -0.20217349, 0.23806685, 0.47609682, -0.22714471, 0.36400585, 0.21911878, 0.15850838, -0.15879404, -0.20404534, -0.22900097, -0.42809947, 0.69619750, -0.12444121, 0.94809296, -0.10757617, -0.26081920, -0.47887236, 0.01807164];
+const NATIVE_RAT_PROPOSER_BASIS: [f64; (NATIVE_RAT_STATE + 1) * NATIVE_RAT_HIDDEN] = [-0.20640864, -0.10484466, -0.39430779, 0.22545050, 0.75982676, -0.65027414, -0.38900348, 0.10001931, -0.21207984, -0.00669524, 0.86537810, 0.42197594, 0.19358858, 0.05853571, 1.45558060, -4.57925664, -0.27981506, 2.72977685, -1.54134448, -0.32156504, -1.13341174, -0.61236420, -0.01783114, 1.00313943, 1.67407526, 0.98118728, 0.67841062, -0.46899161, 0.58446207, 0.74229372, 2.44256968, -1.14644381, -1.59334516, 0.15171599, -1.46055110, -0.42669386, -0.02839039, 0.39760757, 0.64306376, 0.31149456, -0.14219896, -0.32180528, 0.91210794, -0.05999316, 0.00116951, -2.15797480, 2.45525948, -0.57386728, -0.26221871, 0.09292731, 0.13662164, -0.72618454, -1.48857060, -0.43864441, -0.05726039, 0.31901772, -1.44940106, 0.05765876, 0.20574711, -0.22526495, 0.46908424, -2.31584004, -0.25624923, 0.33787999, -0.33215995, -0.40720324, 0.01089154, -0.52040613, 0.28792449, -0.13152179, -0.10519594, -3.67549124, 0.68216885, -1.47333290, -1.17503326, 2.07059537, -0.20720316, -0.05294993, 0.38182766, 0.05340218, 0.38546580, 0.22689638, -0.46678204, 0.08972815, 0.36069567, 0.45040617, -2.96357863, -0.06675495, -1.40955703, 0.26120220, -0.01515290, -0.35137216, -0.08169495, 0.35910097, -0.26946604, -0.16406469, 0.10460611, 0.16936123, -0.73777330, -1.37608492, -1.74113247, 1.45629497, 0.15001073, -0.01055038, 0.88501539, 0.34034601, -0.04262635, 0.15264935, 0.50512012, 0.53593677, -0.09750546, 0.64427803, 0.50196426, -3.02850433, 0.82278025, -1.23140280, 0.75895852, -0.28999029, 0.17298934, 0.20634650, 0.35620696, -0.23252123, -0.71797728, -0.73662502, -0.61435501, 0.04868662, 0.24224886, 1.52570083, 1.48798205, -0.23679489, 1.18560770, -1.09018572, 0.17493443, -0.35103135, 0.28854919, 0.24211759, 0.76507300, 0.38642813, -1.01297461, -0.29500658, 3.33907999, 2.52165157, 5.07410220, 0.37254719, 0.55346397, -5.19249142, -3.62744744, -1.13380219, 0.04591201, -1.28655514, 2.80200384, -1.04759424, 0.33350461, -1.52708774, -0.46996471, 0.60066408, -2.66708186, 1.35746709, 0.94921860, -0.52796786, -0.27348728, 0.38858008, 0.01200849, -0.46752659, -0.65217959, -0.78686910, 0.74400051, 0.28902587, -1.69654838, 0.23794368, 1.27915973, 0.78446813, -0.63206368, 1.11585398, 1.82239194, 0.71902135, 0.13024147, 0.35387968, -0.94969473, 0.17239622, -0.64816132, 0.29774396, -2.47844159, 5.79689606, -2.35178601, 1.39510237, 3.62110862, -0.26134579, 3.46458141, 1.36384634, -0.16913644, -0.93533150, -1.50234539, -1.61921914, -0.88119151, 1.71597741, 0.00176960, -0.67267448, -0.74591583, -0.04282786, -2.23477853, 0.22286578, 0.50596051, -0.25780552, 0.25257077, 0.35076613, -0.08137347, 0.15192198, 0.20894135, -0.23066411, -0.47172592, -2.42902592, 0.89396348, -0.68029331, -0.04180795, 0.38841838, -0.77038454, 0.31450069, 0.35116615, -0.00425034, -0.00618500, 0.07089856, 0.35812598, -0.38873714, -0.17806827, 0.84262346, 1.21474418, 0.05162012, 0.16291509, -0.86753386, -0.09834097, 0.15843764, -0.35774202, -0.24739165, 0.33304089, -0.30507958, -0.66947681, 0.09869969, 0.36444036, 1.37103652, 0.56547096, 1.12293408, 2.36196742, -0.98829210, -0.06294212, 0.32345915, 0.15530345, 0.08868907, -0.06750969, -0.67114946, -0.06651055, -0.27910960, -1.06415746, -3.92336335, 1.22190155, 1.20566210, -0.74233445, -0.14681002, -1.16415492, 0.76359877, -0.28969284, -0.53479800, -1.23491218, -0.25404881, 1.70576913, -0.26351001, -0.87228733, -1.97034420, -2.07992609, -0.53358887, -0.47803795, 1.07745840, -1.31641647, 0.64000392, -0.40382305, -0.30824657, -1.04040333, -0.36785781, 1.06485941, 0.07227341, -2.10843417, 5.20982509, -0.18907813, 0.20991366, -2.27086388, 3.30987512, -0.09434558, 0.91604480, -0.30503911, -0.58221777, -1.24920144, -0.34473951, 1.59649165, 0.63379983, -0.13177242, -1.56322663, 1.22498561, -0.68096227, -1.30873905, 1.68964313, -1.21986110, -0.56035571, 0.34517482, -0.19290421, 0.54541315, -0.29688678, 0.27990488, -0.17551617, 0.27161653, 0.97666748, -0.00563401, -0.80793555, 0.25077008, 0.39235119, -0.13255058, -0.20045072, 0.28002622, 0.19378885, 0.53304347, -0.18057772, 0.02459349, 0.07592121, -0.68441776, -0.25041318, -0.17297298, -1.10143214, 0.09110866, -0.08848459, 0.19853879, 0.31878477, -0.22222796, 0.34016822, -0.27699144, -0.40672054, -0.05249987, -0.18576970, 0.86411028, -1.02802243, 1.25015699, 0.60004647, 0.41867817, -1.22141867, 0.22764890, -0.40315280, 0.14141029, -0.32734631, 0.58190449, 0.22699649, -0.32569148, -0.52957800, -3.47348496, 1.47148878, -0.29174070, 2.48381699, -3.46032662, -0.35139638, 1.29029034, 0.12028700, -0.03371448, 0.35481121, 0.50238957, 1.06960984, -0.79375367, 0.28185954, -0.83561804, 0.32138452, -0.07471445, -0.00171637, -0.23355921, 0.26348643, -0.38510655, 0.35720694, -0.17580201, -0.33050553, -0.52008876, -0.22831250, 0.63208609, 0.25053020, 0.62820835, -0.98478446, 0.38438018, 0.56059588, 0.25028526, -2.86798529, -0.17193624, -0.39533421, -0.37625022, -0.26370739, 0.67657887, -0.10023280, -0.24295695, -0.14832941, -2.28657633, 1.46536974, 2.19104549, -0.03873624, -2.26202126, 1.04875472, -0.03697485, -0.21426987, 0.29945275, 0.54946692, 0.82987435, 0.21471157, 0.76185225, 0.29238569, -0.44375049, -0.10557503, -1.01317934, -0.01069525, 0.15346895, 0.04257109, -0.45070238, -0.14523987, -0.12135251, -0.02117414, 0.63961482, 0.41779244, 0.54614821, 0.18497172, -0.11517608, -0.06785145, 1.24054444, 0.26769634, -0.77273817, 0.51254732, -0.44840504, 0.29859687, -0.38488076, -0.30065531, -0.77011323, -0.69748927, 0.38034442, -0.26079804, 0.92662979, 0.95186878, 1.62386377, 1.29778641, -1.91431702, -0.42529274, -1.24684131, -0.79323551, 0.13364524, 0.41975778, 0.52460577, 0.56275486, -0.01209209, -0.07427684];
+const NATIVE_RAT_PROPOSER_HEAD: [f64; NATIVE_RAT_ACTION * (NATIVE_RAT_HIDDEN + 1)] = [0.17464269, 0.45802899, 0.80183111, 0.86693302, -0.26218769, -0.61591240, 0.74872386, 0.94451843, 0.84935848, -0.59220602, 1.32842342, -1.17363775, 1.73644757, -0.74431540, 0.02235288, 0.89480027, -0.31682846, -0.08980592, -1.05061183, -0.43977076, 0.76379705, -0.63897703, 0.14775942, -0.08292836, -0.61102360, 0.97515228, 0.68760421, 0.37943481, -1.85196675, 0.95474722, 0.35398711, 0.78409992, 0.02495855, 0.17447360, -0.27174712, -0.14192963, -0.38642680, -0.28825785, 0.33276853, 0.35773789, -0.04337746, 0.00951057, 0.54320693, -0.34178236, 0.06659785, 0.03790219, -0.05132138, -0.72117121, -0.03625984, -0.72402683, 0.40533353, -0.09198346, 0.37628469, -0.28025137, -0.19049692, -0.29179126, -0.14844028, 0.85415493, 0.02301605, 0.18625976, -0.85974397, 0.14301197, 0.03171899, 0.21739267, 0.15667745, 0.07825049, 0.19854720, 0.03326759, -0.02928141, -0.05308320, 0.22438410, -0.03227721, -0.16254371, -0.03460606, -0.29293612, 0.18346811, 0.07848414, -0.04868623, -0.08808313, 0.00524715, 0.11189364, 0.22095966, -0.13643519, -0.02577629, 0.02537927, -0.39466060, 0.03128173, 0.12515974, 0.08663202, -0.25880919, -0.27893986, 0.07425454, -0.05685341, 0.29012162, 0.06730432, -0.25882296, 0.34487312, -0.47287183, 0.21580371];
+/// One hidden layer of either RAT model: rows of `input weights + bias` per
+/// unit, tanh output.
+fn rat_hidden(basis: &[f64], input: &[f64]) -> [f64; NATIVE_RAT_HIDDEN] {
+	let mut hidden = [0.0; NATIVE_RAT_HIDDEN];
+	for (unit, value) in hidden.iter_mut().enumerate() {
+		let row = &basis[unit * (input.len() + 1)..(unit + 1) * (input.len() + 1)];
+		*value = (row[..input.len()].iter().zip(input).map(|(weight, x)| weight * x).sum::<f64>() + row[input.len()]).tanh();
+	}
+	hidden
+}
+struct TileRatSlot {
+	node: usize,
+	direction: usize,
+	state: [f64; NATIVE_RAT_STATE],
+	/// The proposer basis output at this slot's state. The state is fixed for
+	/// the life of the program, so the frozen half of the proposer runs once.
+	hidden: [f64; NATIVE_RAT_HIDDEN],
+	candidates: Vec<Tile>,
+	/// The benchmark basis output for `(state, action(candidate))`, one per
+	/// candidate. The basis is frozen and the input fixed, so this never
+	/// changes; the online cost of a candidate is one dot product between
+	/// this vector and the adaptive benchmark head.
+	benchmark_hidden: Vec<[f64; NATIVE_RAT_HIDDEN]>,
+	/// Per-candidate measured residual, the LUT half of the RAT/LUT basis.
+	/// The shared head can only shift the whole cost surface, so it tracks
+	/// the device's tempo; this table accumulates what each dispatched
+	/// candidate measured beyond the surrogate's prediction, which is the
+	/// per-candidate ranking signal that lets a run walk out of a schedule
+	/// the pretrained basis wrongly favors. It persists with the artifact,
+	/// so visited candidates keep sharpening across runs while unvisited
+	/// ones fall back on the pretrained prior alone.
+	lut: Vec<f64>,
+	dispatched: usize,
+}
+/// The internal tile RAT: one proposer that chooses each contraction
+/// direction's tile from its legal candidates, and one benchmark surrogate
+/// that learns what the chosen schedule costs from the real fused epoch it
+/// ran in. Both keep their pretrained bases frozen; the readout heads adapt
+/// online and persist as lookup state next to the native artifact, so later
+/// runs on the same device and artifact continue from what earlier runs
+/// measured.
+struct TileRat {
+	slots: Vec<TileRatSlot>,
+	benchmark_head: [f64; NATIVE_RAT_HIDDEN + 1],
+	proposer_head: [f64; NATIVE_RAT_ACTION * (NATIVE_RAT_HIDDEN + 1)],
+	count: u64,
+	/// Epochs this tape has measured, distinct from the persistent count: the
+	/// first observations of a process measure device warmup — clock ramp,
+	/// first-touch paging — rather than the schedule, so they get a grace
+	/// period instead of polluting the learned cost surface.
+	observed: u64,
+	/// Runs that have measured through this lookup state. Device tempo — the
+	/// clock and thermal state behind every timing — drifts between runs, so
+	/// each measurement carries its run and `rat_pretrain` fits a per-run
+	/// intercept: the bases then learn only within-run schedule contrasts,
+	/// which is the part that transfers, while the adaptive head tracks the
+	/// live tempo during a run.
+	runs: u64,
+	/// Recent epochs as `(run, measured milliseconds, per-slot state+action
+	/// rows)`, bounded by the configured measurement count. `rat_pretrain`
+	/// pools these across artifacts and devices to refit the frozen bases.
+	history: Vec<(u64, f64, Vec<[f64; NATIVE_RAT_STATE + NATIVE_RAT_ACTION]>)>,
+	path: PathBuf,
+}
+impl TileRat {
+	fn new(program: &NativeProgram) -> Result<Self> {
+		let schedule = &program.schedule;
+		let mut slots = Vec::new();
+		for (node, directions) in schedule.candidates.iter().enumerate() {
+			for (direction, (limits, candidates)) in directions.iter().enumerate() {
+				let flag = |condition: bool| if condition { 1.0 } else { 0.0 };
+				let [exponent, mantissa] = rat_dtype(program.artifact.precision.model);
+				let state = [rat_log2(limits.m), rat_log2(limits.n), rat_log2(limits.k), flag(direction == 0), flag(direction == 1), flag(direction == 2), rat_log2(schedule.block), rat_log2(schedule.shared_values), flag(schedule.matrix), exponent, mantissa, rat_log2(program.artifact.precision.model.bytes() as u32), rat_log2((program.gpu.memory >> 20).min(u64::from(u32::MAX)) as u32)];
+				require(!candidates.is_empty(), "contraction direction has no legal tile candidate")?;
+				let benchmark_hidden = candidates.iter().map(|extent| {
+					let mut input = [0.0; NATIVE_RAT_STATE + NATIVE_RAT_ACTION];
+					input[..NATIVE_RAT_STATE].copy_from_slice(&state);
+					input[NATIVE_RAT_STATE..].copy_from_slice(&Self::action(*extent));
+					rat_hidden(&NATIVE_RAT_BENCHMARK_BASIS, &input)
+				}).collect();
+				slots.push(TileRatSlot { node, direction, state, hidden: rat_hidden(&NATIVE_RAT_PROPOSER_BASIS, &state), candidates: candidates.clone(), benchmark_hidden, lut: vec![0.0; candidates.len()], dispatched: 0 });
+			}
+		}
+		let path = program.artifact.path.parent().ok_or_else(|| RecipeError::new("native artifact has no directory"))?.join("rat.tsv");
+		let mut rat = Self { slots, benchmark_head: NATIVE_RAT_BENCHMARK_HEAD, proposer_head: NATIVE_RAT_PROPOSER_HEAD, count: 0, observed: 0, runs: 0, history: Vec::new(), path };
+		rat.load()?;
+		rat.runs += 1;
+		Ok(rat)
+	}
+	fn action(extent: Tile) -> [f64; NATIVE_RAT_ACTION] { [rat_log2(extent.m), rat_log2(extent.n), rat_log2(extent.k)] }
+	/// Choose a tile for every slot and write it into the schedule buffer's
+	/// host mirror. The proposer head maps each slot's fixed hidden state to a
+	/// continuous tile; dispatch snaps it to the nearest legal candidate. A
+	/// positive exploration probability replaces individual choices with a
+	/// deterministic draw seeded by the measurement count, so exploration
+	/// depends on the learning history rather than on the user's model seed.
+	fn propose(&mut self, values: &mut [i32], exploration: f64) -> Result<bool> {
+		let mut changed = false;
+		let mut draw = self.count.wrapping_add(1).wrapping_mul(6364136223846793005).wrapping_add(0x9E3779B97F4A7C15);
+		let mut uniform = move || { draw = draw.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (draw >> 11) as f64 / (1_u64 << 53) as f64 };
+		// An explored epoch draws every slot independently. Joint independent
+		// draws make the design orthogonal, so the surrogate's additive fit
+		// recovers each slot's marginal cost without confounding — and they
+		// visit joint basins that single-slot deviations from the current
+		// policy can never reach, because coordinated tile changes interact.
+		let explored = uniform() < exploration && !self.slots.is_empty();
+		for slot in self.slots.iter_mut() {
+			let proposed: [f64; NATIVE_RAT_ACTION] = std::array::from_fn(|axis| {
+				let row = &self.proposer_head[axis * (NATIVE_RAT_HIDDEN + 1)..(axis + 1) * (NATIVE_RAT_HIDDEN + 1)];
+				row[..NATIVE_RAT_HIDDEN].iter().zip(&slot.hidden).map(|(weight, h)| weight * h).sum::<f64>() + row[NATIVE_RAT_HIDDEN]
+			});
+			slot.dispatched = if explored {
+				(uniform() * slot.candidates.len() as f64) as usize % slot.candidates.len()
+			} else {
+				let distance = |extent: &Tile| Self::action(*extent).iter().zip(&proposed).map(|(axis, target)| (axis - target) * (axis - target)).sum::<f64>();
+				(0..slot.candidates.len()).min_by(|left, right| distance(&slot.candidates[*left]).total_cmp(&distance(&slot.candidates[*right]))).unwrap_or(0)
+			};
+			let chosen = slot.candidates[slot.dispatched];
+			let base = slot.node * NATIVE_SCHEDULE_STRIDE + slot.direction * 3;
+			for (axis, extent) in [chosen.m, chosen.n, chosen.k].into_iter().enumerate() {
+				let value = narrow(extent as usize, "native schedule tile axis")?;
+				changed |= values[base + axis] != value;
+				values[base + axis] = value;
+			}
+		}
+		Ok(changed)
+	}
+	/// Feed one real fused-epoch timing back. The benchmark surrogate's head
+	/// descends the error between its predicted total and the measurement;
+	/// the proposer's head then moves each slot's proposal a bounded step
+	/// toward the legal candidate the frozen surrogate currently ranks
+	/// fastest. Ranking only real candidates keeps the policy on the region
+	/// the surrogate has measurements for, where free gradient descent
+	/// through the surrogate would wander into extrapolated fantasy.
+	fn observe(&mut self, measured: f64, config: Config) {
+		self.observed += 1;
+		if self.slots.is_empty() || self.observed <= 2 { return }
+		let inputs = self.slots.iter().map(|slot| {
+			let mut input = [0.0; NATIVE_RAT_STATE + NATIVE_RAT_ACTION];
+			input[..NATIVE_RAT_STATE].copy_from_slice(&slot.state);
+			input[NATIVE_RAT_STATE..].copy_from_slice(&Self::action(slot.candidates[slot.dispatched]));
+			input
+		}).collect::<Vec<_>>();
+		let hiddens = self.slots.iter().map(|slot| slot.benchmark_hidden[slot.dispatched]).collect::<Vec<_>>();
+		let predicted = self.slots.iter().zip(&hiddens).map(|(slot, hidden)| hidden.iter().zip(&self.benchmark_head).map(|(h, weight)| h * weight).sum::<f64>() + self.benchmark_head[NATIVE_RAT_HIDDEN] + slot.lut[slot.dispatched]).sum::<f64>();
+		let error = predicted - measured.max(f64::MIN_POSITIVE).ln();
+		let mut regressor = [0.0; NATIVE_RAT_HIDDEN + 1];
+		for hidden in &hiddens {
+			for (unit, h) in hidden.iter().enumerate() { regressor[unit] += h; }
+			regressor[NATIVE_RAT_HIDDEN] += 1.0;
+		}
+		let energy = regressor.iter().map(|value| value * value).sum::<f64>().max(1.0);
+		for (weight, value) in self.benchmark_head.iter_mut().zip(&regressor) {
+			*weight -= config.rat_benchmark_rate * error * value / energy;
+		}
+		// The LUT absorbs what remains after the head has taken this epoch's
+		// share of the level: a residual computed before that update would
+		// push every dispatched candidate's entry whenever the device tempo
+		// shifted, punishing whichever schedule happened to be running.
+		let leveled = self.slots.iter().zip(&hiddens).map(|(slot, hidden)| hidden.iter().zip(&self.benchmark_head).map(|(h, weight)| h * weight).sum::<f64>() + self.benchmark_head[NATIVE_RAT_HIDDEN] + slot.lut[slot.dispatched]).sum::<f64>() - measured.max(f64::MIN_POSITIVE).ln();
+		for slot in &mut self.slots {
+			slot.lut[slot.dispatched] -= config.rat_lut_rate * leveled;
+		}
+		for slot in &self.slots {
+			let cost = |candidate: usize| slot.benchmark_hidden[candidate].iter().zip(&self.benchmark_head).map(|(h, weight)| h * weight).sum::<f64>() + slot.lut[candidate];
+			let Some(fastest) = (0..slot.candidates.len()).min_by(|left, right| cost(*left).total_cmp(&cost(*right))) else { continue };
+			let target = &slot.candidates[fastest];
+			let mut delta: [f64; NATIVE_RAT_ACTION] = Self::action(*target);
+			for (axis, value) in delta.iter_mut().enumerate() {
+				let row = &self.proposer_head[axis * (NATIVE_RAT_HIDDEN + 1)..(axis + 1) * (NATIVE_RAT_HIDDEN + 1)];
+				*value -= row[..NATIVE_RAT_HIDDEN].iter().zip(&slot.hidden).map(|(weight, h)| weight * h).sum::<f64>() + row[NATIVE_RAT_HIDDEN];
+			}
+			let gap = delta.iter().map(|value| value * value).sum::<f64>().sqrt();
+			if gap == 0.0 { continue }
+			let support = slot.hidden.iter().map(|h| h * h).sum::<f64>() + 1.0;
+			let scale = config.rat_proposer_rate.min(gap) / gap;
+			for (axis, value) in delta.into_iter().enumerate() {
+				let step = scale * value / support;
+				let row = &mut self.proposer_head[axis * (NATIVE_RAT_HIDDEN + 1)..(axis + 1) * (NATIVE_RAT_HIDDEN + 1)];
+				for (unit, h) in slot.hidden.iter().enumerate() {
+					row[unit] += step * h;
+				}
+				row[NATIVE_RAT_HIDDEN] += step;
+			}
+		}
+		self.count += 1;
+		self.history.push((self.runs, measured, inputs));
+		let excess = self.history.len().saturating_sub(config.rat_measurements);
+		if excess != 0 { self.history.drain(..excess); }
+	}
+	fn load(&mut self) -> Result<()> {
+		let text = match fs::read_to_string(&self.path) {
+			Ok(text) => text,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+			Err(error) => return Err(RecipeError::new(format!("cannot read RAT lookup state {}: {error}", self.path.display()))),
+		};
+		let mut lines = text.lines();
+		require(lines.next() == Some("recipe-rat 1"), format!("RAT lookup state {} has an unsupported header", self.path.display()))?;
+		let numbers = |line: Option<&str>, label: &str, expected: usize| -> Result<Vec<f64>> {
+			let line = line.and_then(|line| line.strip_prefix(label)).ok_or_else(|| RecipeError::new(format!("RAT lookup state {} is missing {label}", self.path.display())))?;
+			let values = line.split_whitespace().map(|value| value.parse::<f64>().map_err(|error| RecipeError::new(format!("RAT lookup state value is invalid: {error}")))).collect::<Result<Vec<_>>>()?;
+			require(values.len() == expected && values.iter().all(|value| value.is_finite()), format!("RAT lookup state {} has a malformed {label} record", self.path.display())).map(|_| values)
+		};
+		self.count = numbers(lines.next(), "count", 1)?[0] as u64;
+		self.runs = numbers(lines.next(), "runs", 1)?[0] as u64;
+		self.benchmark_head = numbers(lines.next(), "benchmark", NATIVE_RAT_HIDDEN + 1)?.try_into().map_err(|_| RecipeError::new("RAT benchmark head is malformed"))?;
+		self.proposer_head = numbers(lines.next(), "proposer", NATIVE_RAT_ACTION * (NATIVE_RAT_HIDDEN + 1))?.try_into().map_err(|_| RecipeError::new("RAT proposer head is malformed"))?;
+		for slot in &mut self.slots {
+			let lut = numbers(lines.next(), "lut", slot.candidates.len())?;
+			slot.lut = lut;
+		}
+		self.history.clear();
+		let width = NATIVE_RAT_STATE + NATIVE_RAT_ACTION;
+		for line in lines {
+			let values = line.strip_prefix("epoch").ok_or_else(|| RecipeError::new(format!("RAT lookup state {} has an unrecognized record", self.path.display())))?.split_whitespace().map(|value| value.parse::<f64>().map_err(|error| RecipeError::new(format!("RAT lookup state value is invalid: {error}")))).collect::<Result<Vec<_>>>()?;
+			require(values.len() > 2 && (values.len() - 2) % width == 0 && values.iter().all(|value| value.is_finite()), format!("RAT lookup state {} has a malformed epoch record", self.path.display()))?;
+			let rows = values[2..].chunks_exact(width).map(|chunk| chunk.try_into().map_err(|_| RecipeError::new("RAT epoch row is malformed"))).collect::<Result<Vec<_>>>()?;
+			self.history.push((values[0] as u64, values[1], rows));
+		}
+		Ok(())
+	}
+	fn save(&self) -> Result<()> {
+		let mut text = String::from("recipe-rat 1
+");
+		let mut line = |label: &str, values: &[f64]| {
+			text.push_str(label);
+			for value in values { text.push_str(&format!(" {value}")); }
+			text.push('\n');
+		};
+		line("count", &[self.count as f64]);
+		line("runs", &[self.runs as f64]);
+		line("benchmark", &self.benchmark_head);
+		line("proposer", &self.proposer_head);
+		for slot in &self.slots {
+			line("lut", &slot.lut);
+		}
+		for (run, measured, rows) in &self.history {
+			let mut values = vec![*run as f64, *measured];
+			for row in rows { values.extend_from_slice(row); }
+			line("epoch", &values);
+		}
+		drop(line);
+		let staged = self.path.with_extension("tsv.next");
+		fs::write(&staged, text).map_err(|error| RecipeError::new(format!("cannot stage RAT lookup state {}: {error}", staged.display())))?;
+		fs::rename(&staged, &self.path).map_err(|error| RecipeError::new(format!("cannot publish RAT lookup state {}: {error}", self.path.display())))
+	}
+}
 struct NativeTape {
 	program: NativeProgram,
 	precision: NativePrecision,
@@ -5656,6 +5945,7 @@ struct NativeTape {
 	metrics: Buffer,
 	schedule: Buffer,
 	schedule_values: Vec<i32>,
+	rat: TileRat,
 	best_loss: [f64; 4],
 	rows: u32,
 	parameters: usize,
@@ -5672,7 +5962,9 @@ impl NativeTape {
 		let output = graph.output.elements();
 		require(targets.is_empty() || targets.len() == rows * output, format!("target batch expected 0 or {} values, received {}", rows * output, targets.len()))?;
 		let program = gpu.native_program(graph, rows, precision, loss)?;
-		let schedule_values = program.schedule_values()?;
+		let mut schedule_values = program.schedule_values()?;
+		let mut rat = TileRat::new(&program)?;
+		rat.propose(&mut schedule_values, 0.0)?;
 		let precision = program.artifact.precision;
 		let layout = program.artifact.layout.clone();
 		let parameters = graph.parameters.len();
@@ -5718,6 +6010,7 @@ impl NativeTape {
 			metrics: Buffer::upload_float(gpu, &[0.0], precision.state)?,
 			schedule: Buffer::upload(gpu, &schedule_values)?,
 			schedule_values,
+			rat,
 			best_loss,
 			rows: narrow(rows, "native rows")? as u32,
 			parameters,
@@ -5780,6 +6073,15 @@ impl NativeTape {
 		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision.model)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
+	/// Let the RAT choose the coming epoch's schedule. Runs before the epoch
+	/// so the logged schedule is the one the dispatch consumes.
+	fn retile(&mut self, config: Config) -> Result<()> {
+		if self.rat.propose(&mut self.schedule_values, config.rat_exploration)? {
+			let bytes = self.schedule_values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+			self.schedule.write_bytes(0, &bytes)?;
+		}
+		Ok(())
+	}
 	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
 		require(self.step != 0, "optimizer epoch is absent")?;
 		let threads = self.program.epoch.geometry.threads()?;
@@ -5819,10 +6121,13 @@ impl NativeTape {
 			step
 		];
 		debug(&format!("epoch {step} launch"))?;
+		let launched = Instant::now();
 		self.program.launch_epoch(&mut call).map_err(|error| RecipeError::new(format!("training forward/backward/optimizer update: {error}")))?;
 		debug(&format!("epoch {step} launch complete"))?;
 		let objective = self.metrics.download_float(1, self.precision.state)?[0];
-		debug(&format!("epoch {step} metric complete"))?;
+		let measured = launched.elapsed().as_secs_f64() * 1e3;
+		self.rat.observe(measured, config);
+		debug(&format!("epoch {step} metric complete: rat measured {measured:.3} ms for schedule {}", self.schedule_text()))?;
 		let saved = self.observe(objective, tolerance)?;
 		Ok((objective, saved))
 	}
@@ -5853,7 +6158,12 @@ impl NativeTape {
 		graph.state.best_loss = self.best_loss.to_vec();
 		Ok(())
 	}
-	fn tile(&self) -> Tile { self.program.tile }
+	fn tile(&self) -> Tile {
+		self.program.schedule.dominant_index.map_or(self.program.tile, |index| {
+			let base = index * NATIVE_SCHEDULE_STRIDE + 3;
+			Tile { m: self.schedule_values[base] as u32, n: self.schedule_values[base + 1] as u32, k: self.schedule_values[base + 2] as u32 }
+		})
+	}
 	fn print_devices(&self) -> Result<()> {
 		let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 		eprintln!("{}:{}.{}", host.trim(), self.program.gpu.name, self.precision.model.label());
@@ -6370,7 +6680,7 @@ impl Gpu {
 			let Some(shape) = shape else { candidates.push(Vec::new()); continue };
 			let mut node = Vec::new();
 			for limits in [shape.forward, shape.gradient, shape.previous] {
-				node.push(native_tile_candidates(limits, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?);
+				node.push((limits, native_tile_candidates(limits, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?));
 			}
 			candidates.push(node);
 		}
@@ -6384,7 +6694,8 @@ impl Gpu {
 			})
 		}).transpose()).collect::<Result<Vec<_>>>()?;
 		dominant_tile = dominant.and_then(|(index, _)| contractions[index]).map_or(dominant_tile, |contraction| contraction.gradient);
-		let contraction_shared_values = candidates.iter().flatten().flatten().map(|extent| native_contraction_shared_values(*extent, register_m, register_n, block, chunk_k, ratio, matrix)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
+		let dominant_index = dominant.and_then(|(index, _)| contractions[index].map(|_| index));
+		let contraction_shared_values = candidates.iter().flatten().flat_map(|(_, tiles)| tiles).map(|extent| native_contraction_shared_values(*extent, register_m, register_n, block, chunk_k, ratio, matrix)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
 		let attention_query_tile = narrow(natural("attention query tile", env!("RECIPE_ATTENTION_QUERY_TILE"))?, "attention query tile")? as u32;
 		let attention = native_attention_tiles(graph, shared_budget, attention_query_tile)?;
 		let attention_shared_values = attention.iter().enumerate().filter_map(|(index, entry)| entry.map(|extent| native_attention_shared_values(extent, extent.m as usize == graph.nodes[index].output.length))).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
@@ -6397,7 +6708,7 @@ impl Gpu {
 		// the output lanes and so grow the k lanes, so the full-tile lane count
 		// bounds how many chunks a lane can hold.
 		let mut owned = 1_u32;
-		for extent in candidates.iter().flatten().flatten().copied() {
+		for extent in candidates.iter().flatten().flat_map(|(_, tiles)| tiles).copied() {
 			let output_lanes = (extent.m / register_m).max(1).checked_mul((extent.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
 			let k_lanes = (block / output_lanes).max(2);
 			owned = owned.max(extent.k.div_ceil(chunk_k).div_ceil(k_lanes));
@@ -6406,7 +6717,7 @@ impl Gpu {
 		let chunk_bias_values = owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?;
 		let scratch_base = narrow(graph.parameters.len().next_multiple_of(NATIVE_SCRATCH_ROW_VALUES), "native gradient scratch base")?;
 		debug(&format!("native schedule block={block} waves={waves} registers={register_count} shared={shared_values} contractions={contractions:?} attention={attention:?}"))?;
-		let schedule = NativeSchedule { matrix, block, tile: dominant_tile, register_m, register_n, register_count, fragment_k, chunk_k, chunk_values, chunk_bias_values, scratch_base, shared_values, contractions, attention };
+		let schedule = NativeSchedule { matrix, block, tile: dominant_tile, register_m, register_n, register_count, fragment_k, chunk_k, chunk_values, chunk_bias_values, scratch_base, shared_values, contractions, attention, candidates, dominant_index };
 		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
 		let program = NativeProgram::load(self, artifact, graph, schedule, register_values, waves)?;
 		let fixed = program.forward.kernel.shared.max(program.epoch.kernel.shared).max(program.model_load.map_or(0, |dispatch| dispatch.kernel.shared));
@@ -10022,6 +10333,7 @@ impl Train {
 				break;
 			}
 			tape.advance()?;
+			tape.retile(config)?;
 			let epoch = tape.step as usize;
 			let dispatched_schedule = tape.schedule_text();
 			let ((loss, saved, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &dispatched_schedule, || {
@@ -10036,6 +10348,7 @@ impl Train {
 			epoch_seconds += seconds;
 			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, saved, live, &tape.schedule_text())?; if INTERRUPTED.load(Ordering::Acquire) { std::process::exit(INTERRUPTED_EXIT) }
 		}
+		tape.rat.save()?;
 		stored.bn_stats = tape.extract_bn_stats()?;
 		tape.inject_bn_stats(&stored.bn_stats)?;
 		self.finish_dispatch(tape.forward(), &mut stored, &prepared.schema, &tape, None)?;
@@ -10209,4 +10522,240 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let residual = targets.iter().zip(predictions).map(|(target, value)| (target - value).powi(2)).sum::<f64>();
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
+}
+#[cfg(test)]
+mod rat_pretraining {
+	use super::*;
+	fn walk(directory: &Path, found: &mut Vec<PathBuf>) {
+		let Ok(entries) = fs::read_dir(directory) else { return };
+		for entry in entries.flatten() {
+			let path = entry.path();
+			if path.is_dir() { walk(&path, found) } else if path.file_name().is_some_and(|name| name == "rat.tsv") { found.push(path) }
+		}
+	}
+	fn corpus(root: &Path) -> Vec<(usize, f64, Vec<[f64; NATIVE_RAT_STATE + NATIVE_RAT_ACTION]>)> {
+		let mut paths = Vec::new();
+		walk(root, &mut paths);
+		let width = NATIVE_RAT_STATE + NATIVE_RAT_ACTION;
+		let (mut epochs, mut groups) = (Vec::new(), BTreeMap::new());
+		for (file, path) in paths.into_iter().enumerate() {
+			let text = fs::read_to_string(&path).unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+			for line in text.lines().filter_map(|line| line.strip_prefix("epoch")) {
+				let values = line.split_whitespace().map(|value| value.parse::<f64>().unwrap_or_else(|error| panic!("corpus value is malformed: {error}"))).collect::<Vec<_>>();
+				assert!(values.len() > 2 && (values.len() - 2) % width == 0, "corpus epoch record is malformed");
+				let next = groups.len();
+				let group = *groups.entry((file, values[0] as u64)).or_insert(next);
+				epochs.push((group, values[1], values[2..].chunks_exact(width).map(|chunk| chunk.try_into().unwrap()).collect()));
+			}
+		}
+		epochs
+	}
+	struct Lcg(u64);
+	impl Lcg {
+		fn uniform(&mut self) -> f64 {
+			self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+			(self.0 >> 11) as f64 / (1_u64 << 53) as f64
+		}
+		fn basis(&mut self, inputs: usize, hidden: usize) -> Vec<f64> { (0..(inputs + 1) * hidden).map(|_| (self.uniform() * 2.0 - 1.0) * (1.5 / (inputs as f64).sqrt())).collect() }
+	}
+	fn forward(basis: &[f64], head: &[f64], input: &[f64]) -> (Vec<f64>, f64) {
+		let hidden = (0..NATIVE_RAT_HIDDEN).map(|unit| {
+			let row = &basis[unit * (input.len() + 1)..(unit + 1) * (input.len() + 1)];
+			(row[..input.len()].iter().zip(input).map(|(weight, x)| weight * x).sum::<f64>() + row[input.len()]).tanh()
+		}).collect::<Vec<_>>();
+		let value = hidden.iter().zip(head).map(|(h, weight)| h * weight).sum::<f64>() + head[NATIVE_RAT_HIDDEN];
+		(hidden, value)
+	}
+	/// Accumulate the gradient of `scale * value` into the basis and head
+	/// gradients for one input, reusing the forward hidden activations.
+	fn backward(head: &[f64], input: &[f64], hidden: &[f64], scale: f64, basis_gradient: &mut [f64], head_gradient: &mut [f64]) {
+		for (unit, h) in hidden.iter().enumerate() {
+			head_gradient[unit] += scale * h;
+			let upstream = scale * head[unit] * (1.0 - h * h);
+			let row = &mut basis_gradient[unit * (input.len() + 1)..(unit + 1) * (input.len() + 1)];
+			for (weight, x) in row[..input.len()].iter_mut().zip(input) { *weight += upstream * x; }
+			row[input.len()] += upstream;
+		}
+		head_gradient[NATIVE_RAT_HIDDEN] += scale;
+	}
+	/// Solve the symmetric positive-definite normal equations in place by
+	/// Gaussian elimination with partial pivoting.
+	fn solve(matrix: &mut [f64], vector: &mut [f64], width: usize) -> Vec<f64> {
+		for column in 0..width {
+			let pivot = (column..width).max_by(|left, right| matrix[left * width + column].abs().total_cmp(&matrix[right * width + column].abs())).unwrap();
+			if pivot != column {
+				for swap in 0..width { matrix.swap(column * width + swap, pivot * width + swap) }
+				vector.swap(column, pivot);
+			}
+			let diagonal = matrix[column * width + column];
+			assert!(diagonal.abs() > 1e-12, "normal equations are singular");
+			for row in column + 1..width {
+				let factor = matrix[row * width + column] / diagonal;
+				if factor == 0.0 { continue }
+				for swap in column..width { matrix[row * width + swap] -= factor * matrix[column * width + swap] }
+				vector[row] -= factor * vector[column];
+			}
+		}
+		let mut solution = vec![0.0; width];
+		for column in (0..width).rev() {
+			let mut value = vector[column];
+			for known in column + 1..width { value -= matrix[column * width + known] * solution[known] }
+			solution[column] = value / matrix[column * width + column];
+		}
+		solution
+	}
+	fn print_constants(name: &str, values: &[f64]) {
+		assert!(values.iter().all(|value| value.is_finite()), "{name} did not fit to finite values");
+		println!("const {name}: [f64; {}] = [{}];", values.len(), values.iter().map(|value| format!("{value:.8}")).collect::<Vec<_>>().join(", "));
+	}
+	/// Offline tool: refit the tile RAT's pretrained constants from lookup
+	/// state accumulated by real training runs. Point RECIPE_RAT_CORPUS at a
+	/// directory tree holding `rat.tsv` files (a build's `recipe-native`
+	/// artifact directory), then paste the printed arrays over the
+	/// `NATIVE_RAT_*` constants. The benchmark surrogate fits the pooled real
+	/// fused-epoch timings under relative-error weighting; the proposer then
+	/// descends the frozen fitted surrogate at every observed state.
+	#[test]
+	#[ignore = "offline: regenerates the NATIVE_RAT_* pretrained constants from a measurement corpus"]
+	fn rat_pretrain() {
+		let root = std::env::var_os("RECIPE_RAT_CORPUS").expect("set RECIPE_RAT_CORPUS to the directory holding rat.tsv lookup state");
+		let epochs = corpus(Path::new(&root));
+		assert!(!epochs.is_empty(), "the corpus holds no epoch measurements");
+		let groups = epochs.iter().map(|(group, _, _)| group + 1).max().unwrap_or(0);
+		// Stage one: closed-form fixed-effects least squares. One parameter per
+		// run absorbs that run's device tempo, and one parameter per observed
+		// (state, action) pair estimates that tile's log-cost effect, pooling
+		// every epoch it appeared in. Per-epoch timing noise is several times
+		// larger than a tile effect, so the networks are trained on these
+		// pooled estimates rather than on raw epochs they could only chase.
+		let mut pairs = BTreeMap::new();
+		for (_, _, rows) in &epochs {
+			for row in rows {
+				let key = row.map(f64::to_bits);
+				let next = groups + pairs.len();
+				pairs.entry(key).or_insert(next);
+			}
+		}
+		let width = groups + pairs.len();
+		let (mut normal, mut moment) = (vec![0.0; width * width], vec![0.0; width]);
+		for (group, measured, rows) in &epochs {
+			let mut columns = vec![*group];
+			columns.extend(rows.iter().map(|row| pairs[&row.map(f64::to_bits)]));
+			for &left in &columns {
+				for &right in &columns {
+					normal[left * width + right] += 1.0;
+				}
+				moment[left] += measured.max(f64::MIN_POSITIVE).ln();
+			}
+		}
+		for column in 0..width {
+			normal[column * width + column] += 1e-3;
+		}
+		let effects = solve(&mut normal, &mut moment, width);
+		println!("corpus: {} epochs, {} runs, {} state-action pairs", epochs.len(), groups, pairs.len());
+		// Center effects within each state so a state's average cost is tempo,
+		// not schedule: rankings are unchanged and the networks learn the part
+		// that distinguishes tiles.
+		let mut states = BTreeMap::<[u64; NATIVE_RAT_STATE], Vec<([f64; NATIVE_RAT_STATE + NATIVE_RAT_ACTION], f64)>>::new();
+		for (key, column) in &pairs {
+			let row = key.map(f64::from_bits);
+			let state: [u64; NATIVE_RAT_STATE] = key[..NATIVE_RAT_STATE].try_into().unwrap();
+			states.entry(state).or_default().push((row, effects[*column]));
+		}
+		let mut samples = Vec::new();
+		let mut targets = Vec::new();
+		for members in states.values_mut() {
+			let mean = members.iter().map(|(_, effect)| effect).sum::<f64>() / members.len() as f64;
+			for (row, effect) in members.iter() {
+				samples.push(*row);
+				targets.push(effect - mean);
+			}
+		}
+		println!("stage one: {} states, effect rms {:.4}", states.len(), (targets.iter().map(|value| value * value).sum::<f64>() / targets.len() as f64).sqrt());
+		let mut seed = Lcg(2026);
+		let (mut benchmark_basis, mut benchmark_head) = (seed.basis(NATIVE_RAT_STATE + NATIVE_RAT_ACTION, NATIVE_RAT_HIDDEN), vec![0.0; NATIVE_RAT_HIDDEN + 1]);
+		let (mut momentum_basis, mut momentum_head) = (vec![0.0; benchmark_basis.len()], vec![0.0; benchmark_head.len()]);
+		let (mut variance_basis, mut variance_head) = (vec![0.0; benchmark_basis.len()], vec![0.0; benchmark_head.len()]);
+		for iteration in 0..24000 {
+			let (mut basis_gradient, mut head_gradient, mut loss) = (vec![0.0; benchmark_basis.len()], vec![0.0; benchmark_head.len()], 0.0);
+			for (sample, target) in samples.iter().zip(&targets) {
+				let (hidden, predicted) = forward(&benchmark_basis, &benchmark_head, sample);
+				let error = predicted - target;
+				loss += error * error;
+				backward(&benchmark_head, sample, &hidden, 2.0 * error / samples.len() as f64, &mut basis_gradient, &mut head_gradient);
+			}
+			let rate = if iteration < 16000 { 0.003 } else { 0.0003 };
+			for (((weight, gradient), momentum), variance) in benchmark_basis.iter_mut().zip(&basis_gradient).chain(benchmark_head.iter_mut().zip(&head_gradient)).zip(momentum_basis.iter_mut().chain(momentum_head.iter_mut())).zip(variance_basis.iter_mut().chain(variance_head.iter_mut())) {
+				*momentum = 0.9 * *momentum + 0.1 * gradient;
+				*variance = 0.999 * *variance + 0.001 * gradient * gradient;
+				*weight -= rate * *momentum / (variance.sqrt() + 1e-8);
+			}
+			if iteration % 4000 == 0 { println!("benchmark iteration {iteration}: effect loss {:.6}", loss / samples.len() as f64) }
+		}
+		// The proposer's target comes from the fastest jointly-measured epoch
+		// of each model family, after removing that run's tempo intercept: a
+		// winning joint schedule is a coherent measurement, interactions
+		// included, where a composition of per-slot argmins is an unproven
+		// guess. A state shared by several winners keeps the action stage
+		// one ranks fastest among them.
+		let intercepts = &effects[..groups];
+		let mut winners = BTreeMap::<Vec<[u64; NATIVE_RAT_STATE]>, (f64, &Vec<[f64; NATIVE_RAT_STATE + NATIVE_RAT_ACTION]>)>::new();
+		for (group, measured, rows) in &epochs {
+			let family = rows.iter().map(|row| row.map(f64::to_bits)[..NATIVE_RAT_STATE].try_into().unwrap()).collect::<Vec<[u64; NATIVE_RAT_STATE]>>();
+			let score = measured.max(f64::MIN_POSITIVE).ln() - intercepts[*group];
+			let entry = winners.entry(family).or_insert((score, rows));
+			if score < entry.0 { *entry = (score, rows) }
+		}
+		let mut proposals = BTreeMap::<[u64; NATIVE_RAT_STATE], [f64; NATIVE_RAT_STATE + NATIVE_RAT_ACTION]>::new();
+		for (_, rows) in winners.values() {
+			for row in rows.iter() {
+				let state: [u64; NATIVE_RAT_STATE] = row.map(f64::to_bits)[..NATIVE_RAT_STATE].try_into().unwrap();
+				let effect = |candidate: &[f64; NATIVE_RAT_STATE + NATIVE_RAT_ACTION]| effects[pairs[&candidate.map(f64::to_bits)]];
+				proposals.entry(state).and_modify(|held| if effect(row) < effect(held) { *held = *row }).or_insert(*row);
+			}
+		}
+		let targets = proposals.values().map(|row| {
+			(row[..NATIVE_RAT_STATE].try_into().unwrap(), row[NATIVE_RAT_STATE..].try_into().unwrap())
+		}).collect::<Vec<([f64; NATIVE_RAT_STATE], [f64; NATIVE_RAT_ACTION])>>();
+		println!("proposer targets: {} families, {} states", winners.len(), targets.len());
+		let (mut proposer_basis, mut proposer_head) = (seed.basis(NATIVE_RAT_STATE, NATIVE_RAT_HIDDEN), vec![0.0; NATIVE_RAT_ACTION * (NATIVE_RAT_HIDDEN + 1)]);
+		let (mut momentum_basis, mut momentum_head) = (vec![0.0; proposer_basis.len()], vec![0.0; proposer_head.len()]);
+		let (mut variance_basis, mut variance_head) = (vec![0.0; proposer_basis.len()], vec![0.0; proposer_head.len()]);
+		for iteration in 0..24000 {
+			let (mut basis_gradient, mut head_gradient, mut loss) = (vec![0.0; proposer_basis.len()], vec![0.0; proposer_head.len()], 0.0);
+			for (state, target) in &targets {
+				let hidden = (0..NATIVE_RAT_HIDDEN).map(|unit| {
+					let row = &proposer_basis[unit * (NATIVE_RAT_STATE + 1)..(unit + 1) * (NATIVE_RAT_STATE + 1)];
+					(row[..NATIVE_RAT_STATE].iter().zip(state).map(|(weight, x)| weight * x).sum::<f64>() + row[NATIVE_RAT_STATE]).tanh()
+				}).collect::<Vec<_>>();
+				for axis in 0..NATIVE_RAT_ACTION {
+					let head_row = &proposer_head[axis * (NATIVE_RAT_HIDDEN + 1)..(axis + 1) * (NATIVE_RAT_HIDDEN + 1)];
+					let output = head_row[..NATIVE_RAT_HIDDEN].iter().zip(&hidden).map(|(weight, h)| weight * h).sum::<f64>() + head_row[NATIVE_RAT_HIDDEN];
+					let error = output - target[axis];
+					loss += error * error;
+					let scale = 2.0 * error / targets.len() as f64;
+					let row = &mut head_gradient[axis * (NATIVE_RAT_HIDDEN + 1)..(axis + 1) * (NATIVE_RAT_HIDDEN + 1)];
+					for (unit, h) in hidden.iter().enumerate() { row[unit] += scale * h; }
+					row[NATIVE_RAT_HIDDEN] += scale;
+					for (unit, h) in hidden.iter().enumerate() {
+						let upstream = scale * head_row[unit] * (1.0 - h * h);
+						let basis_row = &mut basis_gradient[unit * (NATIVE_RAT_STATE + 1)..(unit + 1) * (NATIVE_RAT_STATE + 1)];
+						for (weight, x) in basis_row[..NATIVE_RAT_STATE].iter_mut().zip(state) { *weight += upstream * x; }
+						basis_row[NATIVE_RAT_STATE] += upstream;
+					}
+				}
+			}
+			let rate = if iteration < 16000 { 0.003 } else { 0.0003 };
+			for (((weight, gradient), momentum), variance) in proposer_basis.iter_mut().zip(&basis_gradient).chain(proposer_head.iter_mut().zip(&head_gradient)).zip(momentum_basis.iter_mut().chain(momentum_head.iter_mut())).zip(variance_basis.iter_mut().chain(variance_head.iter_mut())) {
+				*momentum = 0.9 * *momentum + 0.1 * gradient;
+				*variance = 0.999 * *variance + 0.001 * gradient * gradient;
+				*weight -= rate * *momentum / (variance.sqrt() + 1e-8);
+			}
+			if iteration % 4000 == 0 { println!("proposer iteration {iteration}: regression loss {:.6}", loss / targets.len() as f64) }
+		}
+				print_constants("NATIVE_RAT_BENCHMARK_BASIS", &benchmark_basis);
+		print_constants("NATIVE_RAT_BENCHMARK_HEAD", &benchmark_head);
+		print_constants("NATIVE_RAT_PROPOSER_BASIS", &proposer_basis);
+		print_constants("NATIVE_RAT_PROPOSER_HEAD", &proposer_head);
+	}
 }
