@@ -677,27 +677,21 @@ fn display_reviewed(packet: &str, model: &str, result: &str, url: Option<&str>) 
     }
 }
 
-fn display_resolving(issue: u64, model: &str) {
-    let mut display = display().lock().expect("display lock is poisoned");
-    display.resolvers.insert(issue, ResolverNode { issue, model: model.to_owned(), started: Instant::now() });
-}
-
 fn display_resolved(issue: u64, result: &str, url: Option<&str>) {
     let mut display = display().lock().expect("display lock is poisoned");
-    if let Some(resolver) = display.resolvers.remove(&issue) {
-        display.history.push(format!("resolve  issue #{:<5}  time {}  model {}", resolver.issue, elapsed(resolver.started), resolver.model));
-        if let Some(url) = url {
-            display.history.push(format!("└─ {result:<7} {url}"));
-        } else {
-            display.history.push(format!("└─ result  {result}"));
-        }
-    }
+    let Some(resolver) = display.resolvers.remove(&issue) else { return };
+    display.history.push(format!("resolve  issue #{:<5}  time {}  model {}", resolver.issue, elapsed(resolver.started), resolver.model));
+    display.history.push(url.map_or_else(|| format!("└─ result  {result}"), |url| format!("└─ {result:<7} {url}")));
 }
 
-fn display_clock() {
-    std::thread::spawn(|| loop {
+fn display_clock(model: String) {
+    std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
-        display_render(&mut display().lock().expect("display lock is poisoned"));
+        let running = resolver_units().expect("cannot inspect active resolver units");
+        let mut display = display().lock().expect("display lock is poisoned");
+        display.resolvers.retain(|issue, _| running.contains_key(issue));
+        for (issue, started) in running { display.resolvers.entry(issue).or_insert_with(|| ResolverNode { issue, model: model.clone(), started }); }
+        display_render(&mut display);
     });
 }
 
@@ -1595,15 +1589,22 @@ fn enqueue_review(
     depth
 }
 
-fn resolver_units() -> std::result::Result<BTreeSet<u64>, String> {
-    let resolvers = output(Command::new("systemctl").args(["--user", "list-units", "recipe-resolve-*", "--state=running", "--plain", "--no-legend"]), None);
+fn resolver_units() -> std::result::Result<BTreeMap<u64, Instant>, String> {
+    let resolvers = output(Command::new("systemctl").args(["--user", "show", "recipe-resolve-*", "--property=Id", "--property=ActiveState", "--property=ActiveEnterTimestampMonotonic", "--value"]), None);
     if !resolvers.status.success() { return Err(failure(&resolvers)) }
-    Ok(String::from_utf8_lossy(&resolvers.stdout).lines().filter_map(|line| {
-        line.split_whitespace().next()?.strip_prefix("recipe-resolve-")?.strip_suffix(".service")?.parse::<u64>().ok()
+    let uptime = std::fs::read_to_string("/proc/uptime").map_err(|error| error.to_string())?.split_whitespace().next().expect("system uptime is absent").parse::<f64>().map_err(|error| error.to_string())?;
+    let now = Instant::now();
+    Ok(String::from_utf8_lossy(&resolvers.stdout).split("\n\n").filter_map(|unit| {
+        let mut values = unit.lines();
+        let issue = values.next()?.strip_prefix("recipe-resolve-")?.strip_suffix(".service")?.parse::<u64>().ok()?;
+        (values.next()? == "active").then_some(())?;
+        let entered = values.next()?.parse::<u64>().ok()?;
+        let elapsed = Duration::from_secs_f64(uptime).saturating_sub(Duration::from_micros(entered));
+        Some((issue, now.checked_sub(elapsed).expect("resolver start precedes process clock")))
     }).collect())
 }
 
-fn resolver_issue(config: &Config, active: &BTreeSet<u64>, running: &BTreeSet<u64>) -> std::result::Result<Option<(u64, String)>, String> {
+fn resolver_issue(config: &Config, active: &BTreeSet<u64>, running: &BTreeMap<u64, Instant>) -> std::result::Result<Option<(u64, String)>, String> {
     let issues = output(
         Command::new("gh")
             .args(["issue", "list", "--state", "open", "--limit", "100", "--json", "number,url", "--jq", ".[] | [.number, .url] | @tsv"])
@@ -1626,7 +1627,7 @@ fn resolver_issue(config: &Config, active: &BTreeSet<u64>, running: &BTreeSet<u6
         .lines()
         .filter_map(|number| number.parse::<u64>().ok())
         .collect::<BTreeSet<_>>();
-    claimed.extend(running);
+    claimed.extend(running.keys().copied());
     Ok(String::from_utf8_lossy(&issues.stdout).lines().find_map(|line| {
         let (number, url) = line.split_once('\t')?;
         let number = number.parse::<u64>().ok()?;
@@ -1651,7 +1652,7 @@ fn resolver_claim(config: &Config, active: &Arc<Mutex<BTreeSet<u64>>>) -> std::r
     let limit = config.resolver_memory_budget_mib / config.resolver_memory_mib;
     assert!(limit != 0, "resolver_memory_budget_mib must hold at least one resolver");
     let running = resolver_units()?;
-    if issues.union(&running).count() >= limit as usize { return Ok(None) }
+    if issues.len() + running.keys().filter(|issue| !issues.contains(issue)).count() >= limit as usize { return Ok(None) }
     let Some((number, url)) = resolver_issue(config, &issues, &running)? else { return Ok(None) };
     issues.insert(number);
     drop(issues);
@@ -1695,7 +1696,6 @@ fn resolver_loop(path: PathBuf, active: Arc<Mutex<BTreeSet<u64>>>) {
 Use unrestricted tools and make every required repository and GitHub change yourself. Never edit the current issue-machine worktree. Work in one separate Git worktree under {root}, based on the latest origin/{base}. Reuse coherent existing work for issue #{number} if it exists. Reproduce the exact public failure first, identify the earliest cause in current origin/{base}, implement the root fix without a fallback or parallel implementation, and validate the exact public Recipe path end to end. Test reachable edge cases one at a time through the same public entrypoint. Preserve unrelated user changes.
 
 Commit and push the coherent fix, then create one pull request targeting {base}. The pull request body must contain `Fixes #{number}`, the exact reproduction, the root cause, the change, and measured end-to-end evidence. Do not stop until the pull request exists and its URL is visible. Target issue: {url}"#, number = issue.number, root = current.resolver_worktree_root.display(), base = current.resolver_base, url = issue.url);
-        display_resolving(issue.number, &model);
         event(&current, &format!("RESOLVE model={model} issue=#{} url={}", issue.number, issue.url));
         let memory = format!("MemoryMax={}M", current.resolver_memory_mib);
         let unit = format!("recipe-resolve-{}", issue.number);
@@ -1766,7 +1766,7 @@ fn main() {
     let path = directory.join("machine.toml");
     let initial = config(&path);
     let _opencode_server = opencode_server(&initial);
-    display_clock();
+    display_clock(format!("claude/{}-{}", initial.resolver_model.strip_prefix("claude-").unwrap_or(&initial.resolver_model), initial.resolver_effort));
     let pending = std::fs::read_to_string(&initial.queue_path)
         .map(|text| queued(&text))
         .unwrap_or_default();

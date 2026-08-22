@@ -31,6 +31,8 @@ A failed resolver releases its issue, waits for the configured poll interval,
 and returns to issue selection instead of terminating its worker. Resolver
 admission counts active `recipe-resolve-*` systemd units, so restarting the
 machine cannot duplicate an issue claim or exceed the memory budget.
+The terminal derives active resolver rows and elapsed times from those same
+systemd units, so coordinator restarts do not hide work already in progress.
 
 Independent discovery workers claim disjoint cursors from one allocator. The
 default configuration runs one worker on `amd0` and one worker through
