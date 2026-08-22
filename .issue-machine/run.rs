@@ -1760,6 +1760,7 @@ Commit and push the coherent fix, then create one pull request targeting {base}.
                     "--effort",
                     &current.resolver_effort,
                     "--dangerously-skip-permissions",
+                    "--strict-mcp-config",
                     "--output-format",
                     "json",
                     "--name",
