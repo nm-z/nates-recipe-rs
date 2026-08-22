@@ -236,6 +236,7 @@ struct Trial {
     cursor: u64,
     reproduction: PathBuf,
     output: std::process::Output,
+    elapsed: Duration,
     timed_out: bool,
     crash: Option<(i32, i32)>,
 }
@@ -262,6 +263,7 @@ enum Review {
 struct Active {
     cursor: u64,
     started: Instant,
+    completed: Option<Duration>,
 }
 
 struct ResolverNode {
@@ -492,12 +494,20 @@ fn display_clear(display: &mut Display) {
 }
 
 fn elapsed(started: Instant) -> String {
-    let seconds = started.elapsed().as_secs_f64();
+    duration(started.elapsed())
+}
+
+fn duration(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f64();
     if seconds < 1.0 {
         format!("{:>7.3} ms", seconds * 1000.0)
     } else {
         format!("{seconds:>8.4} s")
     }
+}
+
+fn active_elapsed(active: &Active) -> String {
+    active.completed.map_or_else(|| elapsed(active.started), duration)
 }
 
 fn fit(value: &str, width: usize) -> String {
@@ -538,7 +548,7 @@ fn display_render(display: &mut Display) {
     for line in display.history.drain(..) { eprintln!("{line}") }
     let width = pane_size().0;
     let trials = display.active.iter().map(|(device, active)| {
-        format!("{device:<4}  cursor {:<6}  time {}", active.cursor, elapsed(active.started))
+        format!("{device:<4}  cursor {:<6}  time {}", active.cursor, active_elapsed(active))
     }).collect::<Vec<_>>();
     let mut reviews = BTreeMap::<String, Vec<(String, u64, String)>>::new();
     for review in display.reviews.values() {
@@ -610,14 +620,20 @@ fn display_render(display: &mut Display) {
 
 fn display_start(device: &str, cursor: u64) {
     let mut display = display().lock().expect("display lock is poisoned");
-    display.active.insert(device.to_owned(), Active { cursor, started: Instant::now() });
+    display.active.insert(device.to_owned(), Active { cursor, started: Instant::now(), completed: None });
+}
+
+fn display_complete(device: &str, elapsed: Duration) {
+    if let Some(active) = display().lock().expect("display lock is poisoned").active.get_mut(device) {
+        active.completed = Some(elapsed);
+    }
 }
 
 fn display_finish(device: &str, failed: bool) {
     let mut display = display().lock().expect("display lock is poisoned");
     if let Some(active) = display.active.remove(device) {
         let status = if failed { "FAIL" } else { "PASS" };
-        display.history.push(trial_line(device, active.cursor, &elapsed(active.started), status));
+        display.history.push(trial_line(device, active.cursor, &active_elapsed(&active), status));
     }
 }
 
@@ -628,7 +644,7 @@ fn display_queue(packet: &str) {
     let mut display = display().lock().expect("display lock is poisoned");
     let active = display.active.get(&device).is_some_and(|active| active.cursor == cursor)
         .then(|| display.active.remove(&device).expect("matched active trial disappeared"));
-    let duration = active.map(|active| elapsed(active.started)).unwrap_or_else(|| {
+    let duration = active.map(|active| active_elapsed(&active)).unwrap_or_else(|| {
         packet.lines().find_map(|line| {
             line.strip_prefix("measurement=elapsed_seconds:")
                 .and_then(|value| value.split_whitespace().next())
@@ -872,7 +888,8 @@ fn trial(
     cursor: u64,
     reproduction: &Path,
     send: &mpsc::Sender<Discovery>,
-) -> (std::process::Output, bool) {
+) -> (std::process::Output, bool, Duration) {
+    let started = Instant::now();
     let memory_bytes = config
         .trial_memory_mib
         .checked_mul(1024 * 1024)
@@ -919,7 +936,6 @@ fn trial(
         child_stderr.read_to_end(&mut output).expect("cannot read Recipe traversal stderr");
         output
     });
-    let started = Instant::now();
     let (status, timed_out) = loop {
         if started.elapsed() >= Duration::from_secs(config.slow_cursor_seconds) {
             let status = if let Some(status) = child.try_wait().expect("cannot inspect Recipe traversal") {
@@ -946,11 +962,15 @@ fn trial(
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    (std::process::Output {
-        status,
-        stdout: stdout.join().expect("Recipe traversal stdout reader failed"),
-        stderr: stderr.join().expect("Recipe traversal stderr reader failed"),
-    }, timed_out)
+    (
+        std::process::Output {
+            status,
+            stdout: stdout.join().expect("Recipe traversal stdout reader failed"),
+            stderr: stderr.join().expect("Recipe traversal stderr reader failed"),
+        },
+        timed_out,
+        started.elapsed(),
+    )
 }
 
 fn termination_signal(status: std::process::ExitStatus) -> Option<i32> {
@@ -1849,15 +1869,17 @@ fn main() {
             if worker_send.send(Discovery::Start { device: device.clone(), cursor: start }).is_err() {
                 break;
             }
-            let (mut result, mut timed_out) = trial(&current, &device, start, &reproduction, &worker_send);
+            let (mut result, mut timed_out, mut elapsed) = trial(&current, &device, start, &reproduction, &worker_send);
             let mut crash = None;
             if !timed_out {
                 if let Some(observed) = termination_signal(result.status) {
-                    (result, timed_out) = trial(&current, &device, start, &reproduction, &worker_send);
+                    let replayed;
+                    (result, timed_out, replayed) = trial(&current, &device, start, &reproduction, &worker_send);
+                    elapsed += replayed;
                     if !timed_out { crash = termination_signal(result.status).map(|replayed| (observed, replayed)) }
                 }
             }
-            let completed = Trial { config: current, device: device.clone(), cursor: start, reproduction, output: result, timed_out, crash };
+            let completed = Trial { config: current, device: device.clone(), cursor: start, reproduction, output: result, elapsed, timed_out, crash };
             if worker_send.send(Discovery::Complete(completed)).is_err() { break }
         }));
     }
@@ -1878,7 +1900,10 @@ fn main() {
                 }
                 continue;
             }
-            Discovery::Complete(trial) => trial,
+            Discovery::Complete(trial) => {
+                display_complete(&trial.device, trial.elapsed);
+                trial
+            }
         };
         let text = format!(
             "{}{}",
