@@ -30,6 +30,7 @@ pub enum ScalarOpcode {
 	Tanh = 12,
 	Greater = 13,
 	StraightThrough = 14,
+	Select = 15,
 }
 
 impl ScalarOpcode {
@@ -49,6 +50,7 @@ impl ScalarOpcode {
 			12 => Ok(Self::Tanh),
 			13 => Ok(Self::Greater),
 			14 => Ok(Self::StraightThrough),
+			15 => Ok(Self::Select),
 			_ => Err(EmitError::InvalidOpcode { kind: "scalar", value }),
 		}
 	}
@@ -207,6 +209,14 @@ pub fn emit_scalar_forward(code: &[f64], context: ScalarContext<'_>) -> Result<S
 				name
 			},
 			ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, context.first, context.second)?,
+			ScalarOpcode::Select => {
+				let condition = scalar_operand(instruction.left, &values, context.first, context.second)?;
+				let value = scalar_operand(instruction.right, &values, context.first, context.second)?;
+				let zero = (context.literal)(0.0, context.value_type);
+				let _ = writeln!(output, "{name}.condition = call i1 @recipe.ogt({ty} {condition}, {ty} {zero})", ty = context.value_type);
+				let _ = writeln!(output, "{name} = select i1 {name}.condition, {ty} {value}, {ty} {zero}", ty = context.value_type);
+				name
+			}
 			ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater => {
 				let left = scalar_operand(instruction.left, &values, context.first, context.second)?;
 				let right = scalar_operand(instruction.right, &values, context.first, context.second)?;
@@ -274,7 +284,7 @@ pub fn emit_scalar_reverse(code: &[f64], context: ScalarContext<'_>, incoming: &
 				format!("%{}.scalar.{index}", context.prefix)
 			}
 			ScalarOpcode::StraightThrough => scalar_operand(instruction.left, &values, context.first, context.second)?,
-			ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater | ScalarOpcode::Absolute | ScalarOpcode::Exp | ScalarOpcode::Log | ScalarOpcode::Sin | ScalarOpcode::Cos | ScalarOpcode::Tanh => format!("%{}.scalar.{index}", context.prefix),
+			ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater | ScalarOpcode::Select | ScalarOpcode::Absolute | ScalarOpcode::Exp | ScalarOpcode::Log | ScalarOpcode::Sin | ScalarOpcode::Cos | ScalarOpcode::Tanh => format!("%{}.scalar.{index}", context.prefix),
 		};
 		values.push(value);
 	}
@@ -304,7 +314,7 @@ pub fn emit_scalar_reverse(code: &[f64], context: ScalarContext<'_>, incoming: &
 	for (index, instruction) in instructions.iter().enumerate().rev() {
 		let adjoint = adjoints[index].clone();
 		let left = if matches!(instruction.opcode, ScalarOpcode::Constant | ScalarOpcode::Parameter) { String::new() } else { operand(instruction.left, &values)? };
-		let right = if matches!(instruction.opcode, ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater | ScalarOpcode::StraightThrough) { operand(instruction.right, &values)? } else { String::new() };
+		let right = if matches!(instruction.opcode, ScalarOpcode::Add | ScalarOpcode::Subtract | ScalarOpcode::Multiply | ScalarOpcode::Divide | ScalarOpcode::Greater | ScalarOpcode::Select | ScalarOpcode::StraightThrough) { operand(instruction.right, &values)? } else { String::new() };
 		match instruction.opcode {
 			ScalarOpcode::Add => {
 				add_operand(&mut output, instruction.left, &adjoint, &mut adjoints, &mut first, &mut second, &mut sequence)?;
@@ -391,6 +401,15 @@ pub fn emit_scalar_reverse(code: &[f64], context: ScalarContext<'_>, incoming: &
 				let contribution = binary(&mut output, context.value_type, &format!("%{}.tanh.{sequence}", context.prefix), "mul", &adjoint, &base);
 				sequence += 1;
 				add_operand(&mut output, instruction.left, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
+			}
+			ScalarOpcode::Select => {
+				let condition = format!("%{}.select.condition.{sequence}", context.prefix);
+				sequence += 1;
+				let _ = writeln!(output, "{condition} = call i1 @recipe.ogt({ty} {left}, {ty} {zero})", ty = context.value_type, zero = (context.literal)(0.0, context.value_type));
+				let contribution = format!("%{}.select.contribution.{sequence}", context.prefix);
+				sequence += 1;
+				let _ = writeln!(output, "{contribution} = select i1 {condition}, {ty} {adjoint}, {ty} {zero}", ty = context.value_type, adjoint = adjoint, zero = (context.literal)(0.0, context.value_type));
+				add_operand(&mut output, instruction.right, &contribution, &mut adjoints, &mut first, &mut second, &mut sequence)?;
 			}
 			ScalarOpcode::Greater | ScalarOpcode::Constant | ScalarOpcode::Parameter => {}
 		}
@@ -4842,10 +4861,14 @@ impl ScalarProgram {
 		result
 	}
 	fn constant(&mut self, value: f64) -> f64 { self.op(ScalarOpcode::Constant, value, 0.0) }
+	// Both branches are always evaluated as straight-line SSA, so the untaken
+	// branch must be dropped by selection, never by arithmetic masking: a
+	// multiply blend turns an infinite untaken value into 0*inf = NaN.
+	fn select(&mut self, condition: f64, value: f64) -> f64 { self.op(ScalarOpcode::Select, condition, value) }
 	fn choose(&mut self, condition: f64, yes: f64, no: f64) -> f64 {
 		let one = self.constant(1.0);
 		let inv = self.op(ScalarOpcode::Subtract, one, condition);
-		let (a, b) = (self.op(ScalarOpcode::Multiply, condition, yes), self.op(ScalarOpcode::Multiply, inv, no));
+		let (a, b) = (self.select(condition, yes), self.select(inv, no));
 		self.op(ScalarOpcode::Add, a, b)
 	}
 	fn unary(&mut self, opcode: ScalarOpcode, value: f64) -> f64 { self.op(opcode, value, 0.0) }
@@ -5126,7 +5149,7 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 			let cosine = program.unary(ScalarOpcode::Cos, x);
 			program.op(ScalarOpcode::Divide, sine, cosine)
 		}
-		Activation::Relu => program.op(ScalarOpcode::Multiply, positive, x),
+		Activation::Relu => program.select(positive, x),
 		Activation::Leak | Activation::Elu | Activation::Selu | Activation::Prelu => {
 			let negative = match activation {
 				Activation::Leak => {
@@ -5138,7 +5161,12 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 					program.op(ScalarOpcode::Multiply, slope, x)
 				}
 				_ => {
-					let exponential = program.unary(ScalarOpcode::Exp, x);
+					// choose only selects this branch for x <= 0, but exp still runs on
+					// the full range: mask its argument through the same predicate so a
+					// large positive x cannot overflow exp in the untaken branch.
+					let inverse = program.op(ScalarOpcode::Subtract, one, positive);
+					let masked = program.select(inverse, x);
+					let exponential = program.unary(ScalarOpcode::Exp, masked);
 					let shifted = program.op(ScalarOpcode::Subtract, exponential, one);
 					let alpha = constant(&mut program, config.activation[usize::from(activation == Activation::Selu) + 2]);
 					program.op(ScalarOpcode::Multiply, alpha, shifted)
@@ -5470,6 +5498,7 @@ struct Config {
 	boost_iterations: usize,
 	boost_rate: f64,
 	catboost_prior: f64,
+	catboost_borders: usize,
 	xgboost_regularization: f64,
 	xgboost_min_gain: f64,
 	lightgbm_bins: usize,
@@ -5489,7 +5518,7 @@ struct Config {
 	precision: Compute,
 }
 impl Config {
-	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
+	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, catboost_borders: natural("CatBoost border count", env!("RECIPE_CATBOOST_BORDER_COUNT"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
 }
 fn number(name: &str, text: &str) -> Result<f64> {
 	let value = text.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))?;
@@ -7342,20 +7371,44 @@ fn fit_lightgbm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool)
 	}
 	boosted_predictor(base, &trees, config.boost_rate)
 }
-fn ordered_split(samples: &[f64], residuals: &[f64], features: usize, permutation: &[usize], codes: &[usize], level: usize, prior: f64, minimum: usize) -> Option<(usize, f64)> {
-	let mut best = None;
-	for feature in 0..features {
-		let mut values = permutation.iter().map(|&row| samples[row * features + feature]).collect::<Vec<_>>();
+/// Candidate split thresholds for one feature of a CatBoost fit. CatBoost
+/// quantizes every feature into a bounded border set before growing trees, so
+/// the ordered error scan visits `count` candidates per feature instead of one
+/// per distinct value, which on a continuous feature would make the scan
+/// quadratic in the row count. A feature with at most `count` distinct
+/// midpoints keeps all of them. `bins[row]` is the number of thresholds the
+/// row's value does not fall left of, so the row sits left of threshold
+/// `index` exactly when `bins[row] <= index`.
+struct CatboostBorders {
+	thresholds: Vec<f64>,
+	bins: Vec<usize>,
+}
+fn catboost_borders(samples: &[f64], features: usize, rows: usize, count: usize) -> Vec<CatboostBorders> {
+	(0..features).map(|feature| {
+		let mut values = (0..rows).map(|row| samples[row * features + feature]).collect::<Vec<_>>();
 		values.sort_by(f64::total_cmp);
 		values.dedup_by(|left, right| left.to_bits() == right.to_bits());
-		for pair in values.windows(2) {
-			let threshold = (pair[0] + pair[1]) * 0.5;
+		let midpoints = values.len().saturating_sub(1);
+		// Rank-spaced positions keep every candidate when the feature is small
+		// and pick evenly spread interior quantiles when it is not.
+		let thresholds = (0..midpoints.min(count)).map(|index| {
+			let position = if midpoints <= count { index } else { (index + 1) * midpoints / (count + 1) };
+			(values[position] + values[position + 1]) * 0.5
+		}).collect::<Vec<f64>>();
+		let bins = (0..rows).map(|row| thresholds.partition_point(|threshold| !(samples[row * features + feature] < *threshold))).collect();
+		CatboostBorders { thresholds, bins }
+	}).collect()
+}
+fn ordered_split(borders: &[CatboostBorders], residuals: &[f64], permutation: &[usize], codes: &[usize], level: usize, prior: f64, minimum: usize) -> Option<(usize, f64)> {
+	let mut best = None;
+	for (feature, candidates) in borders.iter().enumerate() {
+		for (index, &threshold) in candidates.thresholds.iter().enumerate() {
 			let groups = 1_usize.checked_shl((level + 1) as u32)?;
 			let mut counts = vec![0_usize; groups];
 			let mut sums = vec![0.0; groups];
 			let mut error = 0.0;
 			for &row in permutation {
-				let side = usize::from(samples[row * features + feature] < threshold);
+				let side = usize::from(candidates.bins[row] <= index);
 				let group = codes[row] | side << level;
 				let estimate = sums[group] / (counts[group] as f64 + prior);
 				error += (residuals[row] - estimate).powi(2);
@@ -7375,6 +7428,7 @@ fn oblivious_tree(splits: &[(usize, f64)], leaves: &[f64], level: usize, code: u
 fn fit_catboost(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
 	require(rows >= config.tree_min_rows && data.features != 0, "CatBoost requires enough training rows and features")?;
 	require(config.tree_depth < usize::BITS as usize, "CatBoost tree depth is too large")?;
+	let borders = catboost_borders(&data.samples, data.features, rows, config.catboost_borders);
 	let base = data.targets[..rows].iter().sum::<f64>() / rows as f64;
 	let mut predictions = vec![base; rows];
 	let mut state = config.random_seed as u64;
@@ -7386,7 +7440,7 @@ fn fit_catboost(_: usize, data: &Prepared, rows: usize, config: Config, _: bool)
 		let mut codes = vec![0_usize; rows];
 		let mut splits = Vec::with_capacity(config.tree_depth);
 		for level in 0..config.tree_depth {
-			let Some(split) = ordered_split(&data.samples, &residuals, data.features, &permutation, &codes, level, config.catboost_prior, config.tree_min_rows) else { break };
+			let Some(split) = ordered_split(&borders, &residuals, &permutation, &codes, level, config.catboost_prior, config.tree_min_rows) else { break };
 			for row in 0..rows { codes[row] |= usize::from(data.samples[row * data.features + split.0] < split.1) << level }
 			splits.push(split);
 		}
