@@ -10,7 +10,6 @@ const RED: &str = "\x1b[38;2;255;92;122m";
 const YELLOW: &str = "\x1b[38;2;229;192;123m";
 const GREEN: &str = "\x1b[38;2;86;214;169m";
 const BLUE: &str = "\x1b[38;2;97;175;239m";
-const MUTED: &str = "\x1b[38;2;125;133;144m";
 const TIME: &str = "\x1b[38;2;255;194;0m";
 const RESET: &str = "\x1b[0m";
 const SHELL_SIGNAL_OFFSET: i32 = 128;
@@ -200,7 +199,7 @@ fn display_render(display: &mut Display) {
         }
         let color = if device == "cpu" { GREEN } else { BLUE };
         let composition = active.composition.as_deref().unwrap_or("staging");
-        eprintln!("{color}{device:<8}{RESET} cursor={:<6}  {MUTED}time{RESET} {TIME}{}{RESET}  composition={composition}", active.cursor, elapsed(active.started));
+        eprintln!("{color}{device:<4}{RESET}  cursor {:<6}  time {TIME}{}{RESET}  composition {composition}", active.cursor, elapsed(active.started));
         display.rows += 1;
     }
     eprint!("\x1b[u");
