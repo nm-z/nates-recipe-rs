@@ -1946,9 +1946,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Attention) => {
-					let tile = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
-					let attention = if matrix && tile.m as usize == node.output.length { "attention_forward_matrix_body" } else { "attention_forward_body" };
-					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = tile.m, tile_n = tile.n, tile_k = tile.k));
+					let attention_tile = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
+					let attention = if matrix && attention_tile.m as usize == node.output.length { "attention_forward_matrix_body" } else { "attention_forward_body" };
+					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = attention_tile.m, tile_n = attention_tile.n, tile_k = attention_tile.k));
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Scan) => {
@@ -2036,9 +2036,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Attention) => {
-					let tile = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
-					let attention = if matrix && tile.m as usize == node.output.length { "attention_reverse_matrix_body" } else { "attention_reverse_body" };
-						ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = tile.m, tile_n = tile.n, tile_k = tile.k));
+					let attention_tile = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
+					let attention = if matrix && attention_tile.m as usize == node.output.length { "attention_reverse_matrix_body" } else { "attention_reverse_body" };
+						ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, from = node.output.elements(), heads = integer_argument(node.argument[0], "attention heads")?, channels = node.output.channels, tile_m = attention_tile.m, tile_n = attention_tile.n, tile_k = attention_tile.k));
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Scan) => {
@@ -4799,7 +4799,8 @@ pub const atvn: Metric = Metric(6);
 pub const norm: Metric = Metric(7);
 pub const tok: Metric = Metric(8);
 pub const quant: Metric = Metric(9);
-pub const all: [Metric; 9] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant];
+pub const tile: Metric = Metric(10);
+pub const all: [Metric; 10] = [Run, Time, Epoch, R2, Loss, blck, atvn, norm, quant, tile];
 pub const z_score: ZScore = ZScore;
 pub const batch: Batch = Batch;
 #[derive(Clone, Copy, Debug)]
@@ -5580,6 +5581,7 @@ struct NativeTape {
 	gradient: Buffer,
 	metrics: Buffer,
 	schedule: Buffer,
+	schedule_values: Vec<i32>,
 	best_loss: [f64; 4],
 	rows: u32,
 	parameters: usize,
@@ -5641,6 +5643,7 @@ impl NativeTape {
 			gradient: Buffer::upload(gpu, &vec![0_u8; gradient_bytes])?,
 			metrics: Buffer::upload_float(gpu, &[0.0], precision.state)?,
 			schedule: Buffer::upload(gpu, &schedule_values)?,
+			schedule_values,
 			best_loss,
 			rows: narrow(rows, "native rows")? as u32,
 			parameters,
@@ -5674,6 +5677,29 @@ impl NativeTape {
 			stats.extend(self.contexts.download_float_bytes(self.program.artifact.layout.contexts[node], 2 * channels, self.precision.model)?);
 		}
 		Ok(stats)
+	}
+	/// The contraction schedule this tape dispatches, in model execution order.
+	/// The text comes from the values uploaded to the schedule buffer, not from
+	/// a candidate or a recomputed derivation, so it names the tiles the device
+	/// actually ran. One schedule shared by every node and direction collapses
+	/// to a single `MxNxK`; distinct schedules are all listed.
+	fn schedule_text(&self) -> String {
+		let mut nodes = Vec::new();
+		for (index, contraction) in self.program.schedule.contractions.iter().enumerate() {
+			if contraction.is_none() { continue }
+			let base = index * NATIVE_SCHEDULE_STRIDE;
+			let directions = (0..3).map(|direction| {
+				let axes = &self.schedule_values[base + direction * 3..base + direction * 3 + 3];
+				format!("{}x{}x{}", axes[0], axes[1], axes[2])
+			}).collect::<Vec<_>>();
+			nodes.push(directions);
+		}
+		let distinct = nodes.iter().flatten().collect::<BTreeSet<_>>();
+		match distinct.len() {
+			0 => String::new(),
+			1 => nodes[0][0].clone(),
+			_ => nodes.iter().map(|directions| directions.join(":")).collect::<Vec<_>>().join("/"),
+		}
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
 		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
@@ -6264,7 +6290,16 @@ impl Gpu {
 		// counted in model elements, so a narrow model needs proportionally more
 		// elements per partial value.
 		let ratio = narrow(NativePrecision::new(precision)?.state.bytes().div_ceil(precision.bytes()), "native contraction state ratio")? as u32;
-		let mut tile = native_contraction_tile(dominant_shape, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?;
+		let mut dominant_tile = native_contraction_tile(dominant_shape, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?;
+		let mut candidates = Vec::new();
+		for shape in &shapes {
+			let Some(shape) = shape else { candidates.push(Vec::new()); continue };
+			let mut node = Vec::new();
+			for limits in [shape.forward, shape.gradient, shape.previous] {
+				node.push(native_tile_candidates(limits, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?);
+			}
+			candidates.push(node);
+		}
 		let contractions = shapes.iter().map(|shape| shape.map(|shape| {
 			Ok(NativeContractionTiles {
 				forward: native_contraction_tile(shape.forward, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
@@ -6274,11 +6309,11 @@ impl Gpu {
 				parameters: shape.parameters,
 			})
 		}).transpose()).collect::<Result<Vec<_>>>()?;
-		tile = dominant.and_then(|(index, _)| contractions[index]).map_or(tile, |contraction| contraction.gradient);
-		let contraction_shared_values = contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]).map(|tile| native_contraction_shared_values(tile, register_m, register_n, block, chunk_k, ratio, matrix)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
+		dominant_tile = dominant.and_then(|(index, _)| contractions[index]).map_or(dominant_tile, |contraction| contraction.gradient);
+		let contraction_shared_values = candidates.iter().flatten().flatten().map(|extent| native_contraction_shared_values(*extent, register_m, register_n, block, chunk_k, ratio, matrix)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
 		let attention_query_tile = narrow(natural("attention query tile", env!("RECIPE_ATTENTION_QUERY_TILE"))?, "attention query tile")? as u32;
 		let attention = native_attention_tiles(graph, shared_budget, attention_query_tile)?;
-		let attention_shared_values = attention.iter().enumerate().filter_map(|(index, tile)| tile.map(|tile| native_attention_shared_values(tile, tile.m as usize == graph.nodes[index].output.length))).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
+		let attention_shared_values = attention.iter().enumerate().filter_map(|(index, entry)| entry.map(|extent| native_attention_shared_values(extent, extent.m as usize == graph.nodes[index].output.length))).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
 		let shared_values = contraction_shared_values.max(attention_shared_values);
 		let register_count = register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
 		let register_values = register_count.checked_add(register_n).and_then(|values| values.checked_mul(ratio)).ok_or_else(|| RecipeError::new("native contraction register reduction overflows"))?;
@@ -6288,16 +6323,16 @@ impl Gpu {
 		// the output lanes and so grow the k lanes, so the full-tile lane count
 		// bounds how many chunks a lane can hold.
 		let mut owned = 1_u32;
-		for tile in contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]) {
-			let output_lanes = (tile.m / register_m).max(1).checked_mul((tile.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
+		for extent in candidates.iter().flatten().flatten().copied() {
+			let output_lanes = (extent.m / register_m).max(1).checked_mul((extent.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
 			let k_lanes = (block / output_lanes).max(2);
-			owned = owned.max(tile.k.div_ceil(chunk_k).div_ceil(k_lanes));
+			owned = owned.max(extent.k.div_ceil(chunk_k).div_ceil(k_lanes));
 		}
 		let chunk_values = owned.checked_mul(register_count).ok_or_else(|| RecipeError::new("native contraction chunk buffer overflows"))?;
 		let chunk_bias_values = owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?;
 		let scratch_base = narrow(graph.parameters.len().next_multiple_of(NATIVE_SCRATCH_ROW_VALUES), "native gradient scratch base")?;
 		debug(&format!("native schedule block={block} waves={waves} registers={register_count} shared={shared_values} contractions={contractions:?} attention={attention:?}"))?;
-		let schedule = NativeSchedule { matrix, block, tile, register_m, register_n, register_count, fragment_k, chunk_k, chunk_values, chunk_bias_values, scratch_base, shared_values, contractions, attention };
+		let schedule = NativeSchedule { matrix, block, tile: dominant_tile, register_m, register_n, register_count, fragment_k, chunk_k, chunk_values, chunk_bias_values, scratch_base, shared_values, contractions, attention };
 		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
 		let program = NativeProgram::load(self, artifact, graph, schedule, register_values, waves)?;
 		let fixed = program.forward.kernel.shared.max(program.epoch.kernel.shared).max(program.model_load.map_or(0, |dispatch| dispatch.kernel.shared));
@@ -6684,8 +6719,8 @@ impl NativeProgram {
 		let mut values = Vec::with_capacity(self.schedule.contractions.len() * NATIVE_SCHEDULE_STRIDE);
 		for contraction in &self.schedule.contractions {
 			let tiles = contraction.unwrap_or(NativeContractionTiles { forward: Tile { m: 1, n: 1, k: 1 }, gradient: Tile { m: 1, n: 1, k: 1 }, previous: Tile { m: 1, n: 1, k: 1 }, gradient_shape: Tile { m: 1, n: 1, k: 1 }, parameters: 0 });
-			for tile in [tiles.forward, tiles.gradient, tiles.previous] {
-				for axis in [tile.m, tile.n, tile.k] {
+			for extent in [tiles.forward, tiles.gradient, tiles.previous] {
+				for axis in [extent.m, extent.n, extent.k] {
 					values.push(narrow(axis as usize, "native schedule tile axis")?);
 				}
 			}
@@ -7585,31 +7620,31 @@ fn native_contraction_shapes(graph: &Graph, rows: usize) -> Result<Vec<Option<Na
 			_ => None,
 		};
 		dimensions.map(|(forward, gradient, previous, parameters)| {
-			let tile = |(m, n, k), role| Ok(Tile { m: narrow(m, &format!("{role} M"))? as u32, n: narrow(n, &format!("{role} N"))? as u32, k: narrow(k, &format!("{role} K"))? as u32 });
-			Ok(NativeContractionShapes { forward: tile(forward, "native forward contraction")?, gradient: tile(gradient, "native gradient contraction")?, previous: tile(previous, "native previous contraction")?, parameters })
+			let axes = |(m, n, k), role| Ok(Tile { m: narrow(m, &format!("{role} M"))? as u32, n: narrow(n, &format!("{role} N"))? as u32, k: narrow(k, &format!("{role} K"))? as u32 });
+			Ok(NativeContractionShapes { forward: axes(forward, "native forward contraction")?, gradient: axes(gradient, "native gradient contraction")?, previous: axes(previous, "native previous contraction")?, parameters })
 		}).transpose()
 	}).collect()
 }
-fn native_attention_shared_values(tile: Tile, full: bool) -> Result<u32> {
-	let queries = tile.m.checked_mul(tile.k).ok_or_else(|| RecipeError::new("native attention query tile overflows"))?;
-	let keys = tile.n.checked_mul(tile.k).ok_or_else(|| RecipeError::new("native attention key tile overflows"))?;
-	let pairs = tile.m.checked_mul(tile.n).ok_or_else(|| RecipeError::new("native attention pair tile overflows"))?;
+fn native_attention_shared_values(extent: Tile, full: bool) -> Result<u32> {
+	let queries = extent.m.checked_mul(extent.k).ok_or_else(|| RecipeError::new("native attention query tile overflows"))?;
+	let keys = extent.n.checked_mul(extent.k).ok_or_else(|| RecipeError::new("native attention key tile overflows"))?;
+	let pairs = extent.m.checked_mul(extent.n).ok_or_else(|| RecipeError::new("native attention pair tile overflows"))?;
 	let forward = queries.checked_mul(2)
 		.and_then(|values| keys.checked_mul(2).and_then(|keys| values.checked_add(keys)))
 		.and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs)))
-		.and_then(|values| tile.m.checked_mul(3).and_then(|statistics| values.checked_add(statistics)));
+		.and_then(|values| extent.m.checked_mul(3).and_then(|statistics| values.checked_add(statistics)));
 	let query_gradient = queries.checked_mul(3)
 		.and_then(|values| keys.checked_mul(2).and_then(|keys| values.checked_add(keys)))
 		.and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs)))
-		.and_then(|values| values.checked_add(tile.m));
+		.and_then(|values| values.checked_add(extent.m));
 	let key_value_gradient = queries.checked_mul(2)
 		.and_then(|values| keys.checked_mul(4).and_then(|keys| values.checked_add(keys)))
 		.and_then(|values| pairs.checked_mul(2).and_then(|pairs| values.checked_add(pairs)))
-		.and_then(|values| values.checked_add(tile.m));
-	let matrix_pairs = tile.m.checked_mul(tile.m);
+		.and_then(|values| values.checked_add(extent.m));
+	let matrix_pairs = extent.m.checked_mul(extent.m);
 	let matrix = queries.checked_mul(4)
 		.and_then(|values| matrix_pairs.and_then(|pairs| pairs.checked_mul(2)).and_then(|pairs| values.checked_add(pairs)))
-		.and_then(|values| values.checked_add(tile.m));
+		.and_then(|values| values.checked_add(extent.m));
 	forward.zip(query_gradient).zip(key_value_gradient).zip(matrix)
 		.map(|(((forward, query_gradient), key_value_gradient), matrix)| forward.max(query_gradient).max(key_value_gradient).max(if full { matrix } else { 0 }))
 		.ok_or_else(|| RecipeError::new("native attention shared values overflow"))
@@ -7695,30 +7730,58 @@ fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block
 	loop {
 		let m = lane_m.checked_mul(register_m).ok_or_else(|| RecipeError::new("native contraction M tile overflows"))?;
 		let n = lane_n.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction N tile overflows"))?;
-		let width = m.checked_add(n).ok_or_else(|| RecipeError::new("native contraction tile width overflows"))?;
-		let staging_k = shared_values / width;
-		let partial_per_chunk = native_contraction_partial_per_chunk(m, n, register_m, register_n, block, ratio)?;
-		let partial_k = (shared_values / partial_per_chunk).checked_mul(fragment).ok_or_else(|| RecipeError::new("native contraction partial K overflows"))?;
-		let room = staging_k.min(partial_k);
-		// Reduction chunks are RECIPE_FRAGMENT_K elements of K, aligned to the
-		// start of the walk. A multi-tile walk must therefore stage whole chunks,
-		// so the tile is rounded down to a chunk multiple; a walk that fits in one
-		// staged tile has no interior tile boundary and may keep its exact length.
-		if room >= limits.k {
-			return Ok(Tile { m, n, k: limits.k });
-		}
-		if room >= fragment {
-			return Ok(Tile { m, n, k: room - room % fragment });
+		if let Some(k) = native_contraction_extent(m, n, limits.k, register_m, register_n, block, shared_values, fragment, ratio)? {
+			return Ok(Tile { m, n, k });
 		}
 		lane_m = lane_m.checked_sub(1).filter(|lanes| *lanes != 0).ok_or_else(|| RecipeError::new("native contraction tile does not fit the device"))?;
 	}
 }
-fn native_contraction_shared_values(tile: Tile, register_m: u32, register_n: u32, block: u32, fragment: u32, ratio: u32, matrix: bool) -> Result<u32> {
-	let staging = tile.m.checked_add(tile.n).and_then(|width| width.checked_mul(tile.k)).ok_or_else(|| RecipeError::new("native contraction shared values overflow"))?;
+/// The longest K one tile width can stage, or nothing when a single reduction
+/// chunk already exceeds local memory. Reduction chunks are RECIPE_FRAGMENT_K
+/// elements aligned to the start of the walk, so a multi-tile walk stages whole
+/// chunks; a walk that fits one staged tile keeps its exact length.
+fn native_contraction_extent(m: u32, n: u32, extent: u32, register_m: u32, register_n: u32, block: u32, shared_values: u32, fragment: u32, ratio: u32) -> Result<Option<u32>> {
+	let width = m.checked_add(n).ok_or_else(|| RecipeError::new("native contraction tile width overflows"))?;
+	let staging_k = shared_values / width;
+	let partial_per_chunk = native_contraction_partial_per_chunk(m, n, register_m, register_n, block, ratio)?;
+	let partial_k = (shared_values / partial_per_chunk).checked_mul(fragment).ok_or_else(|| RecipeError::new("native contraction partial K overflows"))?;
+	let room = staging_k.min(partial_k);
+	Ok(if room >= extent { Some(extent) } else if room >= fragment { Some(room - room % fragment) } else { None })
+}
+/// Every tile the live schedule may dispatch for one contraction direction, as
+/// power-of-two lane splits of the workgroup. The schedule switches between
+/// these at dispatch, so each allocation the model makes is sized for the
+/// widest member rather than for whichever tile happens to run first.
+fn native_tile_candidates(limits: Tile, register_m: u32, register_n: u32, block: u32, shared_values: u32, fragment: u32, ratio: u32, matrix: bool) -> Result<Vec<Tile>> {
+	let analytic = native_contraction_tile(limits, register_m, register_n, block, shared_values, fragment, ratio, matrix)?;
+	if matrix {
+		return Ok(vec![analytic]);
+	}
+	let mut candidates = vec![analytic];
+	let mut lane_m = 1_u32;
+	while lane_m <= block {
+		let mut lane_n = 1_u32;
+		while lane_m * lane_n <= block {
+			let (m, n) = (lane_m * register_m, lane_n * register_n);
+			if m <= limits.m + register_m && n <= limits.n + register_n
+				&& let Some(k) = native_contraction_extent(m, n, limits.k, register_m, register_n, block, shared_values, fragment, ratio)?
+			{
+				candidates.push(Tile { m, n, k });
+			}
+			lane_n = lane_n.saturating_mul(2);
+		}
+		lane_m = lane_m.saturating_mul(2);
+	}
+	candidates.sort_unstable_by_key(|extent| (extent.m, extent.n, extent.k));
+	candidates.dedup();
+	Ok(candidates)
+}
+fn native_contraction_shared_values(extent: Tile, register_m: u32, register_n: u32, block: u32, fragment: u32, ratio: u32, matrix: bool) -> Result<u32> {
+	let staging = extent.m.checked_add(extent.n).and_then(|width| width.checked_mul(extent.k)).ok_or_else(|| RecipeError::new("native contraction shared values overflow"))?;
 	if matrix {
 		return Ok(staging)
 	}
-	let partials = tile.k.div_ceil(fragment).checked_mul(native_contraction_partial_per_chunk(tile.m, tile.n, register_m, register_n, block, ratio)?).ok_or_else(|| RecipeError::new("native contraction partial region overflows"))?;
+	let partials = extent.k.div_ceil(fragment).checked_mul(native_contraction_partial_per_chunk(extent.m, extent.n, register_m, register_n, block, ratio)?).ok_or_else(|| RecipeError::new("native contraction partial region overflows"))?;
 	Ok(staging.max(partials))
 }
 /// Values per split-K scratch row. Rows are written by separate workgroups, so
@@ -9856,7 +9919,8 @@ impl Train {
 			}
 			tape.advance()?;
 			let epoch = tape.step as usize;
-			let ((loss, saved, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, || {
+			let dispatched_schedule = tape.schedule_text();
+			let ((loss, saved, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &dispatched_schedule, || {
 				let dispatched = tape.epoch(self.learning_rate, tolerance, config);
 				let (loss, saved) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
 				if saved { stored.bn_stats = tape.extract_bn_stats()? }
@@ -9866,7 +9930,7 @@ impl Train {
 				Ok((loss, saved, predictions))
 			})?;
 			epoch_seconds += seconds;
-			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, saved, live)?; if INTERRUPTED.load(Ordering::Acquire) { std::process::exit(INTERRUPTED_EXIT) }
+			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, saved, live, &tape.schedule_text())?; if INTERRUPTED.load(Ordering::Acquire) { std::process::exit(INTERRUPTED_EXIT) }
 		}
 		stored.bn_stats = tape.extract_bn_stats()?;
 		tape.inject_bn_stats(&stored.bn_stats)?;
@@ -9921,7 +9985,7 @@ impl Train {
 		};
 		if !evaluated.is_empty() { predictions = evaluated }
 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(()))?;
-		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), run, epoch: tape.step as usize, seconds: started.elapsed().as_secs_f64(), epoch_seconds })
+		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), schedule: tape.schedule_text(), run, epoch: tape.step as usize, seconds: started.elapsed().as_secs_f64(), epoch_seconds })
 	}
 	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &DataSchema, tape: &NativeTape, save: Option<()>) -> Result<T> {
 		let save = if INTERRUPTED.load(Ordering::Acquire) && !INTERRUPT_CHECKPOINTED.swap(true, Ordering::AcqRel) { Some(()) } else { save.filter(|_| !INTERRUPTED.load(Ordering::Acquire)) };
@@ -9932,13 +9996,13 @@ impl Train {
 		}
 		result
 	}
-	fn print(&self, model: &Model, run: u64, epoch: usize, epochs: usize, loss: f64, targets: &[f64], predictions: &[f64], seconds: f64, checkpoint: bool, live: bool) -> Result<()> {
+	fn print(&self, model: &Model, run: u64, epoch: usize, epochs: usize, loss: f64, targets: &[f64], predictions: &[f64], seconds: f64, checkpoint: bool, live: bool, schedule: &str) -> Result<()> {
 		if self.log_metrics.is_empty() { return Ok(()) }
 		let r2 = self.log_metrics.iter().any(|metric| metric.0 == R2.0).then(|| coefficient(targets, predictions));
-		Self::write_progress(&Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), &self.log_metrics, epochs, Metrics { run, epoch, loss: Some(loss), r2, seconds, checkpoint, evaluation: false }), live, true)
+		Self::write_progress(&Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), schedule, &self.log_metrics, epochs, Metrics { run, epoch, loss: Some(loss), r2, seconds, checkpoint, evaluation: false }), live, true)
 	}
-	fn print_evaluation(&self, model: &Model, report: &TrainingReport) { let defaults = [Loss, R2]; let metrics = if self.log_metrics.is_empty() { &defaults[..] } else { &self.log_metrics }; Self::write_progress(&Self::metric_line(model.loss.name(), &model.description(metrics), metrics, self.epochs, Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: false, evaluation: true }), false, true).unwrap_or_else(|error| panic!("{error}")) }
-	fn metric_line(loss: &str, topology: &str, metrics: &[Metric], epochs: usize, measurement: Metrics) -> String {
+	fn print_evaluation(&self, model: &Model, report: &TrainingReport) { let defaults = [Loss, R2]; let metrics = if self.log_metrics.is_empty() { &defaults[..] } else { &self.log_metrics }; Self::write_progress(&Self::metric_line(model.loss.name(), &model.description(metrics), &report.schedule, metrics, self.epochs, Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: false, evaluation: true }), false, true).unwrap_or_else(|error| panic!("{error}")) }
+	fn metric_line(loss: &str, topology: &str, schedule: &str, metrics: &[Metric], epochs: usize, measurement: Metrics) -> String {
 		let time = measurement.seconds * 1000.0; let mut values = Vec::new(); let mut topology_printed = false;
 		for metric in metrics {
 			let value = match metric.0 {
@@ -9950,6 +10014,8 @@ impl Train {
 				5..=7 | 9 if !topology_printed && !topology.is_empty() => { topology_printed = true; topology.to_owned() }
 				5..=7 | 9 => continue,
 				8 => continue,
+				10 if schedule.is_empty() => continue,
+				10 => format!("tile \x1b[38\x3b2\x3b135\x3b90\x3b251m{schedule}\x1b[0m"),
 				_ => unreachable!(),
 			}; values.push(value);
 		}
@@ -9963,16 +10029,16 @@ impl Train {
 		let mut output = std::io::stderr().lock();
 		output.write_all(frame.as_bytes()).and_then(|_| output.flush()).map_err(|error| RecipeError::new(format!("cannot write epoch progress: {error}")))
 	}
-	fn live_epoch<T>(&self, model: &Model, run: u64, epoch: usize, epochs: usize, config: Config, action: impl FnOnce() -> Result<T>) -> Result<(T, f64, bool)> {
+	fn live_epoch<T>(&self, model: &Model, run: u64, epoch: usize, epochs: usize, config: Config, schedule: &str, action: impl FnOnce() -> Result<T>) -> Result<(T, f64, bool)> {
 		let started = Instant::now(); let partial = Metrics { run, epoch, loss: None, r2: None, seconds: 0.0, checkpoint: false, evaluation: false };
-		let line = Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), &self.log_metrics, epochs, partial);
+		let line = Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), schedule, &self.log_metrics, epochs, partial);
 		let live = !line.is_empty() && std::io::stderr().is_terminal();
 		if !live { return action().map(|value| (value, started.elapsed().as_secs_f64(), false)) }
 		Self::write_progress(&line, false, false)?;
-		let (stop, wait) = std::sync::mpsc::channel(); let (metrics, loss, topology) = (self.log_metrics.clone(), model.loss.name(), model.description(&self.log_metrics));
+		let (stop, wait) = std::sync::mpsc::channel(); let (metrics, loss, topology, dispatched) = (self.log_metrics.clone(), model.loss.name(), model.description(&self.log_metrics), schedule.to_owned());
 		let updates = std::thread::spawn(move || -> Result<bool> { let mut row = false; loop { match wait.recv_timeout(Duration::from_secs(1).div_f64(config.progress_refresh_hz as f64)) {
-			Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { if INTERRUPTED.load(Ordering::Acquire) && !row { Self::write_progress(&Self::metric_line(loss, &topology, &metrics, epochs, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), false, false)? }; return Ok(row || INTERRUPTED.load(Ordering::Acquire)) },
-			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { let interrupted = INTERRUPTED.load(Ordering::Acquire); Self::write_progress(&Self::metric_line(loss, &topology, &metrics, epochs, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), row || !interrupted, false)?; row |= interrupted },
+			Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { if INTERRUPTED.load(Ordering::Acquire) && !row { Self::write_progress(&Self::metric_line(loss, &topology, &dispatched, &metrics, epochs, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), false, false)? }; return Ok(row || INTERRUPTED.load(Ordering::Acquire)) },
+			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { let interrupted = INTERRUPTED.load(Ordering::Acquire); Self::write_progress(&Self::metric_line(loss, &topology, &dispatched, &metrics, epochs, Metrics { seconds: started.elapsed().as_secs_f64(), ..partial }), row || !interrupted, false)?; row |= interrupted },
 		} } });
 		let result = action(); let _ = stop.send(()); updates.join().map_err(|_| RecipeError::new("epoch progress panicked"))??;
 		let value = match result { Ok(value) => value, Err(error) => { let _ = Self::write_progress("", true, false); return Err(error) } };
@@ -9987,6 +10053,7 @@ pub struct TrainingReport {
 	predictions: Vec<f64>,
 	r2: f64,
 	tile: Tile,
+	schedule: String,
 	run: u64,
 	epoch: usize,
 	seconds: f64,
