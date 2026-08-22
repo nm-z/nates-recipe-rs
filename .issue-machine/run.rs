@@ -56,6 +56,7 @@ struct Config {
     resolver_concurrency: usize,
     resolver_memory_mib: u64,
     resolver_memory_budget_mib: u64,
+    resolver_environment: String,
     review_concurrency: usize,
     review_poll_milliseconds: u64,
     provider_poll_seconds: u64,
@@ -179,6 +180,7 @@ fn config(path: &Path) -> Config {
         resolver_memory_budget_mib: value(&text, "resolver_memory_budget_mib")
             .parse()
             .expect("resolver_memory_budget_mib must be an unsigned integer"),
+        resolver_environment: value(&text, "resolver_environment"),
         review_concurrency: value(&text, "review_concurrency")
             .parse()
             .expect("review_concurrency must be an unsigned integer"),
@@ -1756,6 +1758,7 @@ Do not read, inspect, execute, edit, create, install, or delegate Python code, f
 Commit and push the coherent fix, then create one pull request targeting {base}. The pull request body must contain `Fixes #{number}`, the exact reproduction, the root cause, the change, and measured end-to-end evidence. Do not stop until the pull request exists and its URL is visible. Target issue: {url}"#, number = issue.number, root = current.resolver_worktree_root.display(), base = current.resolver_base, url = issue.url);
         event(&current, &format!("RESOLVE model={model} issue=#{} url={}", issue.number, issue.url));
         let memory = format!("MemoryMax={}M", current.resolver_memory_mib);
+        let environment = format!("Environment={}", current.resolver_environment);
         let unit = format!("recipe-resolve-{}", issue.number);
         let result = output(
             Command::new("systemd-run")
@@ -1771,6 +1774,8 @@ Commit and push the coherent fix, then create one pull request targeting {base}.
                     current.repository.to_str().expect("repository path is not UTF-8"),
                     "--property",
                     &memory,
+                    "--property",
+                    &environment,
                     "--",
                     current.claude_binary.to_str().expect("Claude binary path is not UTF-8"),
                     "-p",

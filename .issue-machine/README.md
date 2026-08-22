@@ -21,8 +21,12 @@ classifier returns one schema-validated decision: create a
 `bug` issue or comment on an existing issue.
 
 The resolver pool has a ceiling of 20 workers and a separate process-memory
-budget. The current 6 GiB budget admits two 3 GiB resolver process trees at a
-time. Each active resolver claims a different open issue that no open pull
+budget. The current 60 GiB admission budget permits all 20 resolver process
+trees, and each tree has a 3 GiB memory limit. Resolver sessions share one Cargo
+target directory, compile one Cargo job at a time, and omit dev and test debug
+symbols. This prevents concurrent worktrees from linking duplicate debug
+artifacts while all 20 model sessions remain active. Each active resolver
+claims a different open issue that no open pull
 request closes, then starts
 `claude-fable-5` at high effort with unrestricted Claude Code permissions. The
 initial `/goal` requires the session to read that issue, reproduce it, implement
