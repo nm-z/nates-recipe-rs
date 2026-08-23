@@ -1,0 +1,219 @@
+summary	note	target
+the sensor passes inspection	cleared by audit	1
+the valve vibrates hard	logged at shift end	0
+the housing leaks at the seam	cleared by audit	0
+the housing vibrates hard	checked on site	0
+the rotor works under load	flagged for review	1
+the sensor vibrates hard	flagged for review	0
+the housing vibrates hard	flagged for review	0
+the sensor vibrates hard	logged at shift end	0
+the sensor fails under load	logged at shift end	0
+the bearing works under load	cleared by audit	1
+the intake works under load	checked on site	1
+the sensor fails under load	checked on site	0
+the intake leaks at the seam	checked on site	0
+the intake runs quiet	logged at shift end	1
+the gasket runs quiet	logged at shift end	1
+the rotor fails under load	checked on site	0
+the bearing leaks at the seam	logged at shift end	0
+the bearing leaks at the seam	flagged for review	0
+the sensor runs quiet	logged at shift end	1
+the bearing passes inspection	flagged for review	1
+the filter runs quiet	cleared by audit	1
+the intake fails under load	cleared by audit	0
+the bearing leaks at the seam	cleared by audit	0
+the valve vibrates hard	checked on site	0
+the intake fails under load	logged at shift end	0
+the gasket passes inspection	flagged for review	1
+the intake runs quiet	logged at shift end	1
+the rotor vibrates hard	flagged for review	0
+the filter fails under load	checked on site	0
+the bearing passes inspection	cleared by audit	1
+the valve vibrates hard	logged at shift end	0
+the filter passes inspection	cleared by audit	1
+the valve leaks at the seam	cleared by audit	0
+the housing passes inspection	checked on site	1
+the bearing fails under load	checked on site	0
+the rotor leaks at the seam	flagged for review	0
+the gasket runs quiet	cleared by audit	1
+the housing vibrates hard	logged at shift end	0
+the rotor vibrates hard	checked on site	0
+the housing passes inspection	flagged for review	1
+the bearing fails under load	logged at shift end	0
+the bearing passes inspection	logged at shift end	1
+the sensor runs quiet	logged at shift end	1
+the bearing runs quiet	cleared by audit	1
+the housing works under load	logged at shift end	1
+the intake works under load	checked on site	1
+the housing passes inspection	logged at shift end	1
+the filter works under load	checked on site	1
+the filter works under load	cleared by audit	1
+the valve passes inspection	logged at shift end	1
+the intake passes inspection	cleared by audit	1
+the rotor leaks at the seam	cleared by audit	0
+the intake passes inspection	cleared by audit	1
+the valve leaks at the seam	cleared by audit	0
+the filter passes inspection	cleared by audit	1
+the rotor runs quiet	checked on site	1
+the valve vibrates hard	checked on site	0
+the housing leaks at the seam	checked on site	0
+the filter fails under load	logged at shift end	0
+the valve runs quiet	checked on site	1
+the intake runs quiet	flagged for review	1
+the housing fails under load	checked on site	0
+the sensor leaks at the seam	flagged for review	0
+the filter passes inspection	flagged for review	1
+the intake leaks at the seam	flagged for review	0
+the bearing runs quiet	checked on site	1
+the filter works under load	flagged for review	1
+the gasket works under load	flagged for review	1
+the sensor runs quiet	logged at shift end	1
+the bearing works under load	flagged for review	1
+the rotor leaks at the seam	checked on site	0
+the valve passes inspection	flagged for review	1
+the filter vibrates hard	flagged for review	0
+the housing vibrates hard	flagged for review	0
+the valve leaks at the seam	logged at shift end	0
+the valve vibrates hard	flagged for review	0
+the filter leaks at the seam	flagged for review	0
+the gasket vibrates hard	flagged for review	0
+the bearing runs quiet	checked on site	1
+the bearing vibrates hard	cleared by audit	0
+the filter works under load	logged at shift end	1
+the rotor vibrates hard	cleared by audit	0
+the gasket leaks at the seam	checked on site	0
+the housing vibrates hard	checked on site	0
+the gasket runs quiet	cleared by audit	1
+the bearing runs quiet	flagged for review	1
+the valve vibrates hard	flagged for review	0
+the bearing works under load	cleared by audit	1
+the sensor vibrates hard	cleared by audit	0
+the valve runs quiet	flagged for review	1
+the rotor leaks at the seam	logged at shift end	0
+the rotor vibrates hard	flagged for review	0
+the sensor passes inspection	cleared by audit	1
+the filter runs quiet	logged at shift end	1
+the intake runs quiet	cleared by audit	1
+the gasket fails under load	checked on site	0
+the filter passes inspection	flagged for review	1
+the gasket vibrates hard	flagged for review	0
+the intake vibrates hard	logged at shift end	0
+the rotor leaks at the seam	logged at shift end	0
+the rotor fails under load	cleared by audit	0
+the intake passes inspection	flagged for review	1
+the filter fails under load	flagged for review	0
+the bearing works under load	logged at shift end	1
+the housing works under load	logged at shift end	1
+the housing works under load	cleared by audit	1
+the bearing vibrates hard	logged at shift end	0
+the rotor passes inspection	cleared by audit	1
+the housing leaks at the seam	checked on site	0
+the sensor runs quiet	checked on site	1
+the intake fails under load	logged at shift end	0
+the gasket vibrates hard	logged at shift end	0
+the filter runs quiet	logged at shift end	1
+the rotor passes inspection	logged at shift end	1
+the valve vibrates hard	logged at shift end	0
+the gasket works under load	flagged for review	1
+the intake fails under load	checked on site	0
+the valve fails under load	checked on site	0
+the intake works under load	cleared by audit	1
+the sensor leaks at the seam	cleared by audit	0
+the rotor vibrates hard	logged at shift end	0
+the housing passes inspection	checked on site	1
+the gasket leaks at the seam	checked on site	0
+the valve leaks at the seam	logged at shift end	0
+the gasket runs quiet	cleared by audit	1
+the intake leaks at the seam	cleared by audit	0
+the housing passes inspection	cleared by audit	1
+the filter fails under load	flagged for review	0
+the filter vibrates hard	checked on site	0
+the filter passes inspection	checked on site	1
+the filter fails under load	logged at shift end	0
+the bearing vibrates hard	logged at shift end	0
+the intake leaks at the seam	cleared by audit	0
+the gasket fails under load	flagged for review	0
+the sensor works under load	checked on site	1
+the valve passes inspection	logged at shift end	1
+the intake runs quiet	flagged for review	1
+the filter passes inspection	cleared by audit	1
+the gasket leaks at the seam	cleared by audit	0
+the rotor passes inspection	logged at shift end	1
+the filter runs quiet	logged at shift end	1
+the housing works under load	flagged for review	1
+the gasket leaks at the seam	logged at shift end	0
+the sensor leaks at the seam	checked on site	0
+the intake passes inspection	logged at shift end	1
+the housing vibrates hard	logged at shift end	0
+the intake works under load	checked on site	1
+the bearing passes inspection	checked on site	1
+the intake leaks at the seam	flagged for review	0
+the gasket passes inspection	cleared by audit	1
+the gasket passes inspection	checked on site	1
+the valve leaks at the seam	cleared by audit	0
+the sensor leaks at the seam	logged at shift end	0
+the sensor vibrates hard	flagged for review	0
+the sensor runs quiet	checked on site	1
+the housing fails under load	checked on site	0
+the bearing passes inspection	checked on site	1
+the intake works under load	cleared by audit	1
+the intake works under load	checked on site	1
+the filter runs quiet	checked on site	1
+the gasket leaks at the seam	checked on site	0
+the bearing fails under load	logged at shift end	0
+the rotor leaks at the seam	flagged for review	0
+the intake vibrates hard	cleared by audit	0
+the sensor passes inspection	cleared by audit	1
+the sensor runs quiet	cleared by audit	1
+the valve fails under load	checked on site	0
+the gasket vibrates hard	checked on site	0
+the housing leaks at the seam	cleared by audit	0
+the gasket runs quiet	logged at shift end	1
+the housing leaks at the seam	cleared by audit	0
+the sensor runs quiet	checked on site	1
+the bearing vibrates hard	logged at shift end	0
+the valve passes inspection	flagged for review	1
+the housing works under load	checked on site	1
+the bearing runs quiet	cleared by audit	1
+the valve fails under load	checked on site	0
+the intake leaks at the seam	logged at shift end	0
+the gasket fails under load	logged at shift end	0
+the housing fails under load	cleared by audit	0
+the rotor leaks at the seam	cleared by audit	0
+the rotor passes inspection	logged at shift end	1
+the filter works under load	cleared by audit	1
+the bearing fails under load	cleared by audit	0
+the rotor fails under load	flagged for review	0
+the rotor runs quiet	logged at shift end	1
+the gasket vibrates hard	cleared by audit	0
+the filter leaks at the seam	checked on site	0
+the valve runs quiet	flagged for review	1
+the intake leaks at the seam	cleared by audit	0
+the bearing passes inspection	checked on site	1
+the gasket works under load	logged at shift end	1
+the rotor leaks at the seam	logged at shift end	0
+the gasket works under load	logged at shift end	1
+the gasket runs quiet	logged at shift end	1
+the valve runs quiet	logged at shift end	1
+the sensor passes inspection	flagged for review	1
+the filter works under load	cleared by audit	1
+the filter fails under load	flagged for review	0
+the sensor fails under load	logged at shift end	0
+the intake leaks at the seam	flagged for review	0
+the filter works under load	checked on site	1
+the rotor vibrates hard	checked on site	0
+the rotor works under load	checked on site	1
+the valve leaks at the seam	cleared by audit	0
+the filter works under load	flagged for review	1
+the bearing works under load	cleared by audit	1
+the gasket leaks at the seam	flagged for review	0
+the bearing works under load	checked on site	1
+the bearing passes inspection	flagged for review	1
+the rotor works under load	flagged for review	1
+the bearing runs quiet	logged at shift end	1
+the bearing passes inspection	logged at shift end	1
+the valve runs quiet	flagged for review	1
+the sensor runs quiet	cleared by audit	1
+the bearing works under load	flagged for review	1
+the bearing leaks at the seam	cleared by audit	0
+the sensor fails under load	flagged for review	0

@@ -1,0 +1,20 @@
+{"summary": "the gasket leaks at the seam", "note": "checked on site", "target": 0}
+{"summary": "the housing runs quiet", "note": "cleared by audit", "target": 1}
+{"summary": "the filter passes inspection", "note": "cleared by audit", "target": 1}
+{"summary": "the housing leaks at the seam", "note": "cleared by audit", "target": 0}
+{"summary": "the gasket leaks at the seam", "note": "checked on site", "target": 0}
+{"summary": "the gasket vibrates hard", "note": "cleared by audit", "target": 0}
+{"summary": "the rotor vibrates hard", "note": "flagged for review", "target": 0}
+{"summary": "the gasket leaks at the seam", "note": "cleared by audit", "target": 0}
+{"summary": "the sensor leaks at the seam", "note": "cleared by audit", "target": 0}
+{"summary": "the valve passes inspection", "note": "logged at shift end", "target": 1}
+{"summary": "the housing leaks at the seam", "note": "cleared by audit", "target": 0}
+{"summary": "the filter passes inspection", "note": "cleared by audit", "target": 1}
+{"summary": "the valve works under load", "note": "cleared by audit", "target": 1}
+{"summary": "the valve works under load", "note": "logged at shift end", "target": 1}
+{"summary": "the housing works under load", "note": "flagged for review", "target": 1}
+{"summary": "the gasket leaks at the seam", "note": "checked on site", "target": 0}
+{"summary": "the valve vibrates hard", "note": "logged at shift end", "target": 0}
+{"summary": "the housing leaks at the seam", "note": "checked on site", "target": 0}
+{"summary": "the intake leaks at the seam", "note": "cleared by audit", "target": 0}
+{"summary": "the rotor runs quiet", "note": "checked on site", "target": 1}

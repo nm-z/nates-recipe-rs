@@ -1,0 +1,20 @@
+{"summary": "the filter runs quiet", "note": "checked on site", "target": 1}
+{"summary": "the housing runs quiet", "note": "flagged for review", "target": 1}
+{"summary": "the rotor runs quiet", "note": "flagged for review", "target": 1}
+{"summary": "the housing leaks at the seam", "note": "checked on site", "target": 0}
+{"summary": "the housing leaks at the seam", "note": "cleared by audit", "target": 0}
+{"summary": "the intake leaks at the seam", "note": "cleared by audit", "target": 0}
+{"summary": "the sensor vibrates hard", "note": "checked on site", "target": 0}
+{"summary": "the bearing vibrates hard", "note": "logged at shift end", "target": 0}
+{"summary": "the valve fails under load", "note": "checked on site", "target": 0}
+{"summary": "the housing vibrates hard", "note": "checked on site", "target": 0}
+{"summary": "the gasket works under load", "note": "cleared by audit", "target": 1}
+{"summary": "the valve vibrates hard", "note": "checked on site", "target": 0}
+{"summary": "the gasket runs quiet", "note": "flagged for review", "target": 1}
+{"summary": "the intake fails under load", "note": "checked on site", "target": 0}
+{"summary": "the bearing vibrates hard", "note": "checked on site", "target": 0}
+{"summary": "the sensor fails under load", "note": "cleared by audit", "target": 0}
+{"summary": "the intake works under load", "note": "cleared by audit", "target": 1}
+{"summary": "the rotor works under load", "note": "flagged for review", "target": 1}
+{"summary": "the sensor fails under load", "note": "flagged for review", "target": 0}
+{"summary": "the rotor fails under load", "note": "logged at shift end", "target": 0}

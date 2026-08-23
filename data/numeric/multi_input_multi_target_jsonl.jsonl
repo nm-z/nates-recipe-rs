@@ -1,0 +1,88 @@
+{"pressure_kpa": 89.6391, "humidity_pct": 65.1081, "airflow_cmh": 8.3173, "target": 34.9076, "energy_index": 21.455}
+{"pressure_kpa": 90.7738, "humidity_pct": 64.9801, "airflow_cmh": 8.2954, "target": 35.4062, "energy_index": 21.4867}
+{"pressure_kpa": 91.9648, "humidity_pct": 64.8584, "airflow_cmh": 8.3307, "target": 35.4614, "energy_index": 21.526}
+{"pressure_kpa": 92.6103, "humidity_pct": 64.6656, "airflow_cmh": 8.3499, "target": 35.1269, "energy_index": 21.8485}
+{"pressure_kpa": 93.986, "humidity_pct": 65.107, "airflow_cmh": 8.3293, "target": 36.3833}
+{"pressure_kpa": 94.8233, "humidity_pct": 64.8066, "airflow_cmh": 8.3354, "target": 36.2477, "energy_index": 22.4306}
+{"pressure_kpa": 95.0367, "humidity_pct": 64.8233, "airflow_cmh": 8.3658, "target": 36.4974, "energy_index": 22.1215}
+{"pressure_kpa": 96.477, "humidity_pct": 64.5656, "airflow_cmh": 8.3897, "target": 36.4339, "energy_index": 22.7907}
+{"pressure_kpa": 96.8387, "humidity_pct": 64.817, "airflow_cmh": 8.3804, "target": 37.1874, "energy_index": 22.2164}
+{"pressure_kpa": 98.0406, "humidity_pct": 65.0422, "airflow_cmh": 8.3998, "target": 37.6301, "energy_index": 22.4028}
+{"pressure_kpa": 99.1231, "humidity_pct": 64.8252, "airflow_cmh": 8.3847, "target": 38.4419, "energy_index": 22.8267}
+{"pressure_kpa": 100.1403, "humidity_pct": 64.6547, "airflow_cmh": 8.4106, "target": 37.8647, "energy_index": 23.2747}
+{"pressure_kpa": 100.6536, "humidity_pct": 64.8155, "airflow_cmh": 8.3819, "target": 38.0379, "energy_index": 23.158}
+{"pressure_kpa": 101.7007, "humidity_pct": 64.7992, "airflow_cmh": 8.4146, "target": 38.6796, "energy_index": 23.5254}
+{"pressure_kpa": 102.8472, "humidity_pct": 64.8882, "airflow_cmh": 8.3882, "target": 38.8879, "energy_index": 23.366}
+{"pressure_kpa": 103.171, "humidity_pct": 64.623, "airflow_cmh": 8.4185, "target": 38.9265}
+{"pressure_kpa": 104.2324, "humidity_pct": 64.4338, "airflow_cmh": 8.3905, "target": 39.619, "energy_index": 23.9503}
+{"pressure_kpa": 104.9777, "humidity_pct": 64.5257, "airflow_cmh": 8.3852, "target": 40.2303, "energy_index": 24.0133}
+{"pressure_kpa": 106.1652, "humidity_pct": 64.7988, "airflow_cmh": 8.3928, "target": 39.8774, "energy_index": 24.0494}
+{"pressure_kpa": 107.3058, "humidity_pct": 64.5522, "airflow_cmh": 8.3945, "target": 40.6656, "energy_index": 24.0264}
+{"pressure_kpa": 107.9363, "humidity_pct": 64.8006, "airflow_cmh": 8.3954, "target": 40.4259, "energy_index": 24.8576}
+{"pressure_kpa": 108.5986, "humidity_pct": 64.759, "airflow_cmh": 8.3553, "target": 40.853, "energy_index": 24.3009}
+{"pressure_kpa": 109.6753, "humidity_pct": 64.8162, "airflow_cmh": 8.3819, "target": 41.4825, "energy_index": 24.6482}
+{"pressure_kpa": 111.0021, "humidity_pct": 64.7881, "airflow_cmh": 8.3474, "target": 42.3015, "energy_index": 24.6902}
+{"pressure_kpa": 111.7023, "humidity_pct": 64.7635, "airflow_cmh": 8.3401, "target": 42.1373, "energy_index": 25.2038}
+{"pressure_kpa": 112.1218, "humidity_pct": 64.3049, "airflow_cmh": 8.3161, "target": 42.6695, "energy_index": 25.5449}
+{"pressure_kpa": 113.0816, "humidity_pct": 64.3992, "airflow_cmh": 8.339, "target": 43.2392}
+{"pressure_kpa": 114.5304, "humidity_pct": 64.5506, "airflow_cmh": 8.321, "target": 43.0213, "energy_index": 25.4753}
+{"pressure_kpa": 115.4716, "humidity_pct": 64.6911, "airflow_cmh": 8.3043, "target": 44.081, "energy_index": 25.5958}
+{"pressure_kpa": 116.058, "humidity_pct": 64.5504, "airflow_cmh": 8.2776, "target": 43.6869, "energy_index": 25.9233}
+{"pressure_kpa": 117.2903, "humidity_pct": 64.6505, "airflow_cmh": 8.3009, "target": 44.2775, "energy_index": 26.167}
+{"pressure_kpa": 117.9171, "humidity_pct": 64.2942, "airflow_cmh": 8.2779, "target": 44.1777, "energy_index": 26.3017}
+{"pressure_kpa": 118.952, "humidity_pct": 64.1474, "airflow_cmh": 8.248, "target": 45.0789, "energy_index": 26.7378}
+{"pressure_kpa": 119.8285, "humidity_pct": 64.5467, "airflow_cmh": 8.249, "target": 45.7177, "energy_index": 26.5131}
+{"pressure_kpa": 90.3075, "humidity_pct": 64.2208, "airflow_cmh": 8.2284, "target": 35.1255, "energy_index": 20.8019}
+{"pressure_kpa": 91.8988, "humidity_pct": 64.5067, "airflow_cmh": 8.2444, "target": 34.9084, "energy_index": 21.1832}
+{"pressure_kpa": 92.4458, "humidity_pct": 64.4666, "airflow_cmh": 8.2227, "target": 35.9143, "energy_index": 21.9322}
+{"pressure_kpa": 93.1491, "humidity_pct": 63.9757, "airflow_cmh": 8.215, "target": 35.6113}
+{"pressure_kpa": 94.1807, "humidity_pct": 64.4239, "airflow_cmh": 8.23, "target": 36.4023, "energy_index": 21.6808}
+{"pressure_kpa": 95.0193, "humidity_pct": 64.4976, "airflow_cmh": 8.2096, "target": 37.0654, "energy_index": 21.9874}
+{"pressure_kpa": 96.1613, "humidity_pct": 63.9074, "airflow_cmh": 8.2013, "target": 36.7165, "energy_index": 22.476}
+{"pressure_kpa": 96.9538, "humidity_pct": 64.305, "airflow_cmh": 8.2082, "target": 36.6032, "energy_index": 22.5223}
+{"pressure_kpa": 97.4074, "humidity_pct": 64.2102, "airflow_cmh": 8.2058, "target": 37.8008, "energy_index": 22.6839}
+{"pressure_kpa": 98.6418, "humidity_pct": 64.3257, "airflow_cmh": 8.2012, "target": 37.3216, "energy_index": 22.6222}
+{"pressure_kpa": 99.9797, "humidity_pct": 64.0812, "airflow_cmh": 8.1906, "target": 37.6381, "energy_index": 23.2802}
+{"pressure_kpa": 100.5718, "humidity_pct": 64.137, "airflow_cmh": 8.1888, "target": 38.4575, "energy_index": 23.2918}
+{"pressure_kpa": 101.3549, "humidity_pct": 64.0322, "airflow_cmh": 8.2195, "target": 38.4663, "energy_index": 23.0363}
+{"pressure_kpa": 101.9171, "humidity_pct": 64.3099, "airflow_cmh": 8.211, "target": 38.4738, "energy_index": 23.3892}
+{"pressure_kpa": 103.4027, "humidity_pct": 63.8114, "airflow_cmh": 8.2174, "target": 39.7409}
+{"pressure_kpa": 103.9801, "humidity_pct": 63.9222, "airflow_cmh": 8.2329, "target": 39.0766, "energy_index": 23.6746}
+{"pressure_kpa": 104.6896, "humidity_pct": 64.2485, "airflow_cmh": 8.2411, "target": 40.2729, "energy_index": 24.0869}
+{"pressure_kpa": 105.759, "humidity_pct": 63.7081, "airflow_cmh": 8.2508, "target": 40.0849, "energy_index": 24.2666}
+{"pressure_kpa": 106.7282, "humidity_pct": 64.244, "airflow_cmh": 8.2425, "target": 40.4833, "energy_index": 24.3851}
+{"pressure_kpa": 108.0126, "humidity_pct": 64.1246, "airflow_cmh": 8.2587, "target": 40.5339, "energy_index": 24.5375}
+{"pressure_kpa": 108.384, "humidity_pct": 64.1646, "airflow_cmh": 8.286, "target": 41.5829, "energy_index": 24.3489}
+{"pressure_kpa": 109.8257, "humidity_pct": 63.6427, "airflow_cmh": 8.2993, "target": 41.1344, "energy_index": 24.9028}
+{"pressure_kpa": 110.6484, "humidity_pct": 63.7611, "airflow_cmh": 8.287, "target": 41.9137, "energy_index": 24.5941}
+{"pressure_kpa": 110.9712, "humidity_pct": 64.0809, "airflow_cmh": 8.2978, "target": 42.5534, "energy_index": 24.6622}
+{"pressure_kpa": 111.8458, "humidity_pct": 63.6351, "airflow_cmh": 8.3279, "target": 42.2026, "energy_index": 24.8621}
+{"pressure_kpa": 112.983, "humidity_pct": 63.7129, "airflow_cmh": 8.338, "target": 42.1845}
+{"pressure_kpa": 114.1218, "humidity_pct": 63.831, "airflow_cmh": 8.3374, "target": 43.368, "energy_index": 25.2976}
+{"pressure_kpa": 115.0545, "humidity_pct": 63.934, "airflow_cmh": 8.339, "target": 43.374, "energy_index": 25.5412}
+{"pressure_kpa": 115.4733, "humidity_pct": 63.6293, "airflow_cmh": 8.3756, "target": 43.0551, "energy_index": 25.5307}
+{"pressure_kpa": 116.9551, "humidity_pct": 63.9322, "airflow_cmh": 8.3699, "target": 43.828, "energy_index": 26.214}
+{"pressure_kpa": 117.2102, "humidity_pct": 63.9737, "airflow_cmh": 8.3834, "target": 44.3016, "energy_index": 26.4395}
+{"pressure_kpa": 118.3411, "humidity_pct": 63.4747, "airflow_cmh": 8.3646, "target": 44.4546, "energy_index": 26.5959}
+{"pressure_kpa": 119.4049, "humidity_pct": 63.745, "airflow_cmh": 8.3888, "target": 45.2875, "energy_index": 26.1957}
+{"pressure_kpa": 90.6585, "humidity_pct": 63.3714, "airflow_cmh": 8.4005, "target": 34.3956, "energy_index": 21.1098}
+{"pressure_kpa": 91.0736, "humidity_pct": 63.5184, "airflow_cmh": 8.3873, "target": 35.4997, "energy_index": 21.2245}
+{"pressure_kpa": 92.0667, "humidity_pct": 63.633, "airflow_cmh": 8.4092, "target": 35.4809, "energy_index": 21.2381}
+{"pressure_kpa": 93.245, "humidity_pct": 63.4631, "airflow_cmh": 8.4056, "target": 36.4064}
+{"pressure_kpa": 93.6817, "humidity_pct": 63.8173, "airflow_cmh": 8.4093, "target": 35.6398, "energy_index": 21.6964}
+{"pressure_kpa": 94.8307, "humidity_pct": 63.4542, "airflow_cmh": 8.4109, "target": 36.2742, "energy_index": 22.4865}
+{"pressure_kpa": 95.5408, "humidity_pct": 63.5813, "airflow_cmh": 8.3969, "target": 36.289, "energy_index": 21.9542}
+{"pressure_kpa": 96.4928, "humidity_pct": 63.7207, "airflow_cmh": 8.3839, "target": 36.9615, "energy_index": 22.0988}
+{"pressure_kpa": 97.4149, "humidity_pct": 63.2585, "airflow_cmh": 8.3889, "target": 36.745, "energy_index": 22.9404}
+{"pressure_kpa": 98.3596, "humidity_pct": 63.6569, "airflow_cmh": 8.397, "target": 37.5976, "energy_index": 22.3893}
+{"pressure_kpa": 99.1677, "humidity_pct": 63.3525, "airflow_cmh": 8.3601, "target": 37.9446, "energy_index": 22.4776}
+{"pressure_kpa": 99.8126, "humidity_pct": 63.1559, "airflow_cmh": 8.3698, "target": 38.3252, "energy_index": 22.6558}
+{"pressure_kpa": 101.3107, "humidity_pct": 63.6628, "airflow_cmh": 8.3471, "target": 38.632, "energy_index": 23.176}
+{"pressure_kpa": 102.0305, "humidity_pct": 63.4449, "airflow_cmh": 8.3414, "target": 38.569, "energy_index": 23.7663}
+{"pressure_kpa": 102.9172, "humidity_pct": 63.5722, "airflow_cmh": 8.3502, "target": 38.7264}
+{"pressure_kpa": 104.0363, "humidity_pct": 63.5726, "airflow_cmh": 8.3428, "target": 40.1001, "energy_index": 23.9451}
+{"pressure_kpa": 105.0183, "humidity_pct": 63.1453, "airflow_cmh": 8.324, "target": 40.245, "energy_index": 23.6035}
+{"pressure_kpa": 105.4652, "humidity_pct": 63.5036, "airflow_cmh": 8.2965, "target": 40.0277, "energy_index": 23.9319}
+{"pressure_kpa": 106.5701, "humidity_pct": 63.5867, "airflow_cmh": 8.2839, "target": 40.9174, "energy_index": 24.3331}
+{"pressure_kpa": 107.2344, "humidity_pct": 63.367, "airflow_cmh": 8.2846, "target": 40.809, "energy_index": 24.2977}
+{"pressure_kpa": 108.2467, "humidity_pct": 63.5549, "airflow_cmh": 8.2561, "target": 40.6722, "energy_index": 24.7766}

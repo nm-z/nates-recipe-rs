@@ -1,0 +1,1 @@
+the sensor works under load
