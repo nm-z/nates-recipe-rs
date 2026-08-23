@@ -5468,7 +5468,7 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 		let inputs = graph_inputs(graph, &data.samples, &data.targets, rows, gpu, config.precision)?;
 		let prepared = Prepared { samples: inputs.clone(), targets: targets[..rows].to_vec(), rows, source_rows: rows, features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: data.target_categorical, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
 		let teacher = estimator.fit(&prepared, rows, config, true)?;
-		let targets = inputs.chunks_exact(input.elements()).enumerate().map(|(row, query)| (teacher.predict)(row, query)).collect::<Result<Vec<_>>>()?;
+		let targets = predict_rows(&teacher, &inputs, input.elements())?;
 		let predictor = estimator.fit(&prepared, rows, config, false)?;
 		(predictor.program, fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?)
 	};
@@ -7078,7 +7078,7 @@ impl PredictorBuilder {
 }
 struct Predictor {
 	program: PredictorProgram,
-	predict: Box<dyn Fn(usize, &[f64]) -> Result<f64>>,
+	predict: Box<dyn Fn(usize, &[f64]) -> Result<f64> + Send + Sync>,
 }
 impl Predictor {
 	fn new(program: PredictorProgram) -> Self {
@@ -7597,6 +7597,26 @@ fn fit_kmeans(clusters: usize, data: &Prepared, rows: usize, config: Config, _: 
 	}
 	program.load(best_value);
 	Ok(Predictor::new(program.finish()?))
+}
+/// Teacher prediction is one independent query per row, so the rows are split across the
+/// machine's cores. Each chunk owns a distinct output slice and chunks are joined in row
+/// order, so neither the values nor the reported error depend on the split.
+fn predict_rows(teacher: &Predictor, inputs: &[f64], features: usize) -> Result<Vec<f64>> {
+	require(features != 0, "teacher prediction has no features")?;
+	let rows = inputs.len() / features;
+	let mut targets = vec![0.0; rows];
+	let span = rows.div_ceil(std::thread::available_parallelism().map_or(1, |value| value.get())).max(1);
+	std::thread::scope(|scope| {
+		let handles = targets.chunks_mut(span).enumerate().map(|(chunk, slice)| scope.spawn(move || {
+			for (offset, value) in slice.iter_mut().enumerate() {
+				let row = chunk * span + offset;
+				*value = (teacher.predict)(row, &inputs[row * features..row * features + features])?;
+			}
+			Ok(())
+		})).collect::<Vec<_>>();
+		handles.into_iter().try_for_each(|handle| handle.join().map_err(|_| RecipeError::new("teacher prediction panicked"))?)
+	})?;
+	Ok(targets)
 }
 fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool) -> Result<Predictor> {
 	let maximum = rows.checked_sub(usize::from(exclude)).unwrap_or(0);
