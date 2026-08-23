@@ -9583,9 +9583,8 @@ fn json_records_table(name: String, records: &[JsonValue]) -> Result<Table> {
 	Ok(Table { name, headers, rows })
 }
 fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
-	let first = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
-	let delimiter = [b',', b';', b'\t'].into_iter().max_by_key(|delimiter| first.iter().filter(|byte| *byte == delimiter).count()).unwrap_or(b',');
-	let (mut rows, blank) = records(bytes, delimiter)?;
+	// The delimiter splits every record into the same number of fields. First-line frequency does not identify it: one incidental comma in a line of prose is not a second column.
+	let (_, mut rows, blank) = [b'\t', b';', b','].into_iter().try_fold((0, Vec::new(), 0), |widest, delimiter| { let (rows, blank) = records(bytes, delimiter)?; let width = rows.first().map_or(0, Vec::len); let rectangle = if rows.iter().all(|row| row.len() == width) { width } else { 0 }; Ok(if rectangle >= widest.0 { (rectangle, rows, blank) } else { widest }) })?;
 	require(!rows.is_empty(), format!("dataset {} is empty", path.display()))?;
 	let first = rows.remove(0);
 	let numeric = |value: &String| value.parse::<f64>().is_ok();
