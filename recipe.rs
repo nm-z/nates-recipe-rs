@@ -7734,8 +7734,9 @@ fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block
 		require(k != 0, "native matrix contraction tile does not fit the device")?;
 		return Ok(Tile { m, n, k })
 	}
-	let lane_n = limits.n.div_ceil(register_n).min(block.isqrt().max(1));
-	let mut lane_m = limits.m.div_ceil(register_m).min(block / lane_n);
+	let mut lane_n = limits.n.div_ceil(register_n).min(block.isqrt().max(1));
+	let widest_m = limits.m.div_ceil(register_m);
+	let mut lane_m = widest_m.min(block / lane_n);
 	loop {
 		let m = lane_m.checked_mul(register_m).ok_or_else(|| RecipeError::new("native contraction M tile overflows"))?;
 		let n = lane_n.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction N tile overflows"))?;
@@ -7754,7 +7755,12 @@ fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block
 		if room >= fragment {
 			return Ok(Tile { m, n, k: room - room % fragment });
 		}
-		lane_m = lane_m.checked_sub(1).filter(|lanes| *lanes != 0).ok_or_else(|| RecipeError::new("native contraction tile does not fit the device"))?;
+		// The staged width is M plus N, so narrowing M alone never fits a chunk once N
+		// fills the budget by itself. The N lanes narrow once the M lanes are spent.
+		match lane_m.checked_sub(1).filter(|lanes| *lanes != 0) {
+			Some(lanes) => lane_m = lanes,
+			None => { lane_n = lane_n.checked_sub(1).filter(|lanes| *lanes != 0).ok_or_else(|| RecipeError::new("native contraction tile does not fit the device"))?; lane_m = widest_m.min(block / lane_n) }
+		}
 	}
 }
 fn native_contraction_shared_values(tile: Tile, register_m: u32, register_n: u32, block: u32, fragment: u32, ratio: u32, matrix: bool) -> Result<u32> {
