@@ -2494,11 +2494,11 @@ impl NativeModelIr {
 		Ok(ir)
 	}
 	fn emit_clear_bytes(&self, backend: Backend, base: &str, bytes: usize, label: &str, from: &str) -> Result<String> {
-		let count = i32::try_from(bytes).map_err(|_| RecipeError::new(format!("native {label} clear count exceeds i32")))?;
+		let count = i64::try_from(bytes).map_err(|_| RecipeError::new(format!("native {label} clear count exceeds i64")))?;
 		let pointer = pointer_type(backend);
 		let prefix = format!("clear.{label}");
 		let mut ir = String::new();
-		ir.push_str(&format!("br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %{from} ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.ptr = getelementptr i8, {pointer} %{base}, i32 %{prefix}.p\nstore i8 0, {pointer} %{prefix}.ptr, align 1\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", base = base, from = from));
+		ir.push_str(&format!("%{prefix}.start = zext i32 %tid to i64\n%{prefix}.stride = zext i32 %threads to i64\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i64 [ %{prefix}.start, %{from} ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i64 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.ptr = getelementptr i8, {pointer} %{base}, i64 %{prefix}.p\nstore i8 0, {pointer} %{prefix}.ptr, align 1\n%{prefix}.next = add i64 %{prefix}.p, %{prefix}.stride\nbr label %{prefix}.loop\n{prefix}.done:\n", base = base, from = from));
 		Ok(ir)
 	}
 }
