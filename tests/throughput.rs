@@ -94,12 +94,12 @@ fn training_throughput() {
 		results.push((precision.to_owned(), tflops, per_epoch, second.tile()));
 	}
 	let mut table = format!("\n{:<9} {:>10} {:>10} {:>12} {:>10}  {}\n", "precision", "tflops", "s/epoch", "peak", "of peak", "tile");
-	for (precision, tflops, per_epoch, tile) in &results {
+	for (precision, tflops, per_epoch, extent) in &results {
 		let (peak_text, share) = match peak(precision) {
 			Some(peak) => (format!("{peak:.2}"), format!("{:.4}%", tflops / peak * 100.0)),
 			None => ("-".to_owned(), "-".to_owned()),
 		};
-		let _ = writeln!(table, "{precision:<9} {tflops:>10.3} {per_epoch:>10.3} {peak_text:>12} {share:>10}  {tile:?}");
+		let _ = writeln!(table, "{precision:<9} {tflops:>10.3} {per_epoch:>10.3} {peak_text:>12} {share:>10}  {extent:?}");
 	}
 	report(table);
 }
