@@ -6083,7 +6083,7 @@ struct Cuda {
 	upload: unsafe extern "C" fn(u64, *const c_void, usize) -> i32,
 	download: unsafe extern "C" fn(Ptr, u64, usize) -> i32,
 	synchronize: unsafe extern "C" fn() -> i32,
-	launch: unsafe extern "C" fn(usize, u32, u32, u32, u32, u32, u32, u32, Ptr, *mut Ptr) -> i32,
+	launch: unsafe extern "C" fn(usize, u32, u32, u32, u32, u32, u32, u32, Ptr, *mut Ptr, *mut Ptr) -> i32,
 	load: unsafe extern "C" fn(*mut Ptr, *const c_void) -> i32,
 	unload: unsafe extern "C" fn(Ptr) -> i32,
 	function: unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32,
@@ -6800,7 +6800,7 @@ impl NativeProgram {
 				(NativeBackend::Nvidia(program), Driver::Cuda(driver)) => {
 					require(program.module != 0, "native NVIDIA module is absent")?;
 					let stream = ptr::null_mut();
-					driver_status(Backend::Nvidia, (driver.launch)(dispatch.kernel.object as usize, threads / block, 1, 1, block, 1, 1, dynamic, stream, arguments.as_mut_ptr()), "native dispatch")
+					driver_status(Backend::Nvidia, (driver.launch)(dispatch.kernel.object as usize, threads / block, 1, 1, block, 1, 1, dynamic, stream, arguments.as_mut_ptr(), ptr::null_mut()), "native dispatch")
 				}
 				_ => Err(RecipeError::new("native program backend changed after loading")),
 			}
@@ -6883,7 +6883,6 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		const THREADS_PER_SM: i32 = 39;
 		const SM_LDS: i32 = 81;
 		const REGISTERS_PER_SM: i32 = 82;
-		const COOPERATIVE: i32 = 95;
 		const COMPUTE_MAJOR: i32 = 75;
 		const COMPUTE_MINOR: i32 = 76;
 		let runtime = std::sync::Arc::new(Library::open(if cfg!(windows) { "nvcuda.dll" } else { env!("RECIPE_NV_RUNTIME") })?);
@@ -6905,17 +6904,16 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		let load_device = |device, index| -> Result<Gpu> {
 			let check = |s, a| driver_status(Backend::Nvidia, s, a);
 			let mut context = ptr::null_mut();
-			let (mut cus, mut wave, mut workgroup, mut block_lds, mut sm_lds, mut registers, mut threads, mut cooperative, mut compute_major, mut compute_minor) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+			let (mut cus, mut wave, mut workgroup, mut block_lds, mut sm_lds, mut registers, mut threads, mut compute_major, mut compute_minor) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
 			let mut memory = 0;
 			check(total(&mut memory, device), "VRAM size")?;
-			for (kind, output, action) in [(CUS, &mut cus, "SM query"), (WAVE, &mut wave, "warp query"), (MAX_BLOCK, &mut workgroup, "workgroup query"), (BLOCK_LDS, &mut block_lds, "workgroup LDS query"), (SM_LDS, &mut sm_lds, "SM LDS query"), (REGISTERS_PER_SM, &mut registers, "register query"), (THREADS_PER_SM, &mut threads, "resident thread query"), (COOPERATIVE, &mut cooperative, "cooperative launch query"), (COMPUTE_MAJOR, &mut compute_major, "compute capability major query"), (COMPUTE_MINOR, &mut compute_minor, "compute capability minor query")] {
+			for (kind, output, action) in [(CUS, &mut cus, "SM query"), (WAVE, &mut wave, "warp query"), (MAX_BLOCK, &mut workgroup, "workgroup query"), (BLOCK_LDS, &mut block_lds, "workgroup LDS query"), (SM_LDS, &mut sm_lds, "SM LDS query"), (REGISTERS_PER_SM, &mut registers, "register query"), (THREADS_PER_SM, &mut threads, "resident thread query"), (COMPUTE_MAJOR, &mut compute_major, "compute capability major query"), (COMPUTE_MINOR, &mut compute_minor, "compute capability minor query")] {
 				check(attribute(output, kind, device), action)?;
 			}
-			require(cooperative != 0, "Nvidia device does not support cooperative launch")?;
 			require(compute_major > 0 && compute_minor >= 0, "Nvidia compute capability is invalid")?;
 			let native_target = BackendTarget::Nvidia { architecture: format!("sm_{compute_major}{compute_minor}") };
 			check(create(&mut context, 0, device), "context creation")?;
-			let cuda = Cuda { _runtime: runtime.clone(), context, set: runtime.function(b"cuCtxSetCurrent\0")?, allocate: runtime.function(b"cuMemAlloc_v2\0")?, free: runtime.function(b"cuMemFree_v2\0")?, upload: runtime.function(b"cuMemcpyHtoD_v2\0")?, download: runtime.function(b"cuMemcpyDtoH_v2\0")?, synchronize: runtime.function(b"cuCtxSynchronize\0")?, launch: runtime.function(b"cuLaunchCooperativeKernel\0")?, load, unload, function, function_attribute, occupancy, cus: cus as u32, wave: wave as u32, workgroup: workgroup as u32, block_lds: block_lds as u32, sm_lds: sm_lds as u32, registers: registers as u32, threads: threads as u32 };
+			let cuda = Cuda { _runtime: runtime.clone(), context, set: runtime.function(b"cuCtxSetCurrent\0")?, allocate: runtime.function(b"cuMemAlloc_v2\0")?, free: runtime.function(b"cuMemFree_v2\0")?, upload: runtime.function(b"cuMemcpyHtoD_v2\0")?, download: runtime.function(b"cuMemcpyDtoH_v2\0")?, synchronize: runtime.function(b"cuCtxSynchronize\0")?, launch: runtime.function(b"cuLaunchKernel\0")?, load, unload, function, function_attribute, occupancy, cus: cus as u32, wave: wave as u32, workgroup: workgroup as u32, block_lds: block_lds as u32, sm_lds: sm_lds as u32, registers: registers as u32, threads: threads as u32 };
 			Ok(Gpu { name: format!("nv{index}"), backend: Backend::Nvidia, native_target, driver: Driver::Cuda(cuda), memory: memory as u64, shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()) })
 		};
 		let mut found = Vec::new();
