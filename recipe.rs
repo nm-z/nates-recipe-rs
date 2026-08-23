@@ -7139,17 +7139,6 @@ fn valid_estimator(_: usize, _: usize) -> Result<()> { Ok(()) }
 fn positive_estimator(value: usize, _: usize) -> Result<()> { require(value != 0, format!("estimator count {value} is invalid")) }
 fn cluster_estimator(value: usize, rows: usize) -> Result<()> { require(value != 0 && value <= rows, format!("kmeans cluster count {value} is invalid for {rows} training rows")) }
 fn neighbor_estimator(value: usize, rows: usize) -> Result<()> { require(value != 0 && value < rows, format!("knn neighbor count {value} is invalid for {rows} training rows")) }
-fn predictor_distance(program: &mut PredictorBuilder, sample: &[f64]) {
-	program.constant(0.0);
-	for (feature, &value) in sample.iter().enumerate() {
-		program.feature(feature);
-		program.constant(value);
-		program.binary(PredictorOpcode::Subtract);
-		program.duplicate();
-		program.binary(PredictorOpcode::Multiply);
-		program.binary(PredictorOpcode::Add);
-	}
-}
 fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
 	require(rows != 0 && data.features != 0, "SVM requires training rows and features")?;
 	let mut means = vec![0.0; data.features];
@@ -7570,32 +7559,14 @@ fn cluster(data: &[f64], width: usize, clusters: usize, iterations: usize, impor
 	Ok((centers, assignments))
 }
 fn fit_kmeans(clusters: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
-	let (centers, _) = cluster(&data.samples[..rows * data.features], data.features, clusters, config.kmeans_iterations, None)?;
-	let (mut program, best_distance, best_value, distance, condition) = (PredictorBuilder::new(), 0, 1, 2, 3);
-	program.locals = 4;
-	program.constant(f64::MAX);
-	program.store(best_distance);
-	program.constant(0.0);
-	program.store(best_value);
-	for (group, center) in centers.chunks_exact(data.features).enumerate() {
-		predictor_distance(&mut program, center);
-		program.store(distance);
-		program.load(best_distance);
-		program.load(distance);
-		program.binary(PredictorOpcode::Greater);
-		program.store(condition);
-		program.load(condition);
-		program.load(distance);
-		program.load(best_distance);
-		program.choose();
-		program.store(best_distance);
-		program.load(condition);
-		program.constant(group as f64);
-		program.load(best_value);
-		program.choose();
-		program.store(best_value);
-	}
-	program.load(best_value);
+	// Assigning a row to its closest centre is the one-neighbour case of the nearest
+	// table, whose lowering is a loop. Emitting the distance per centre per feature
+	// instead unrolls the whole comparison into the kernel.
+	let (mut table, _) = cluster(&data.samples[..rows * data.features], data.features, clusters, config.kmeans_iterations, None)?;
+	let groups = table.len() / data.features.max(1);
+	table.extend((0..groups).map(|group| group as f64));
+	let mut program = PredictorBuilder::new();
+	program.nearest(1, false, table);
 	Ok(Predictor::new(program.finish()?))
 }
 fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool) -> Result<Predictor> {
