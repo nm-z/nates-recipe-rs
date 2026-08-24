@@ -118,19 +118,28 @@ define internal i32 @global_id() #1 { entry:
 @RECIPE_GRID_BARRIER@"#;
 const AMD_GRID_BARRIER: &str = r#"declare void @__ockl_grid_sync()
 define internal void @grid_barrier(i32 %threads) #1 { entry: call void @__ockl_grid_sync() ret void }"#;
+// PTX only accepts ordered atomics on sm_70 and newer, so the counting barrier uses
+// relaxed atomics with explicit fences. A release fence before each arrival publishes the
+// block's writes; the last arriver acquires them, republishes with a release fence, and
+// flips the phase; each waiter acquires after it observes the flip. The fences lower to
+// membar, which every NVIDIA architecture supports, so one barrier serves them all.
 const NVIDIA_GRID_BARRIER: &str = r#"@grid.count = internal addrspace(1) global i32 0, align 4
 @grid.phase = internal addrspace(1) global i32 0, align 4
 define internal void @grid_barrier(i32 %threads) #1 { entry:
 call void @llvm.amdgcn.s.barrier() %lane = call i32 @llvm.amdgcn.workitem.id.x()
 %leader = icmp eq i32 %lane, 0 br i1 %leader, label %arrive, label %joined arrive:
 %width = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %width
-%phase = load atomic i32, ptr addrspace(1) @grid.phase acquire, align 4
-%prior = atomicrmw add ptr addrspace(1) @grid.count, i32 1 acq_rel %limit = sub i32 %groups, 1
+%phase = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4
+fence release
+%prior = atomicrmw add ptr addrspace(1) @grid.count, i32 1 monotonic %limit = sub i32 %groups, 1
 %last = icmp eq i32 %prior, %limit br i1 %last, label %release, label %wait release:
-store atomic i32 0, ptr addrspace(1) @grid.count release, align 4 %next = xor i32 %phase, 1
-store atomic i32 %next, ptr addrspace(1) @grid.phase release, align 4 br label %joined wait:
-%seen = load atomic i32, ptr addrspace(1) @grid.phase acquire, align 4 %ready = icmp ne i32 %seen, %phase
-br i1 %ready, label %joined, label %wait joined: call void @llvm.amdgcn.s.barrier() ret void }"#;
+fence acquire
+store atomic i32 0, ptr addrspace(1) @grid.count monotonic, align 4 %next = xor i32 %phase, 1
+fence release
+store atomic i32 %next, ptr addrspace(1) @grid.phase monotonic, align 4 br label %joined wait:
+%seen = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4 %ready = icmp ne i32 %seen, %phase
+br i1 %ready, label %waited, label %wait waited:
+fence acquire br label %joined joined: call void @llvm.amdgcn.s.barrier() ret void }"#;
 const AMD_WIDTH: &str = r#"declare ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
 define internal i32 @recipe.workgroup.size.x() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
 %address = getelementptr i8, ptr addrspace(4) %args, i32 4 %value = load i16, ptr addrspace(4) %address, align 2
@@ -548,7 +557,7 @@ fn compile_amd(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 }
 fn compile_nvidia(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
 	let ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?);
-	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER).replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda").replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x").replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x").replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x").replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0").replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }");
+	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER).replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda").replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x").replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x").replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x").replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0").replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }").replace(", addrspace(5)", "").replace(" addrspace(5)", "");
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let path = out.join(format!("recipe-nvidia{suffix}.ll"));
@@ -559,7 +568,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildRes
 	println!("cargo:rustc-env=RECIPE_NV_COMPILER={}", text(manifest, "nvidia-compiler")?);
 	println!("cargo:rustc-env=RECIPE_NV_DEVICE_LIBRARY={}", text(manifest, "nvidia-device-library")?);
 	println!("cargo:rustc-env=RECIPE_NV_PTX_VERSION=+{}", text(manifest, "nvidia-ptx")?);
-	println!("cargo:rustc-env=RECIPE_NV_PTX_ASSEMBLER={}", text(manifest, "nvidia-ptx-assembler")?);
+	println!("cargo:rustc-env=RECIPE_NV_PTX_GENERATOR={}", text(manifest, "nvidia-ptx-generator")?);
 	Ok(())
 }
 fn compile_cpu(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
@@ -659,7 +668,7 @@ fn main() -> BuildResult<()> {
 	// GPU driver stubs and library search paths are host-arch: cross-compiled builds are CPU-only.
 	let native = env::var("TARGET")? == env::var("HOST")?;
 	let amd = native && toolchain("hsa-compiler", "hsa-device-library")?;
-	let nvidia = native && toolchain("nvidia-compiler", "nvidia-device-library")? && Path::new(text(&manifest, "nvidia-ptx-assembler")?).exists();
+	let nvidia = native && toolchain("nvidia-compiler", "nvidia-device-library")? && Path::new(text(&manifest, "nvidia-ptx-generator")?).exists();
 	if amd {
 		println!("cargo:rustc-cfg=amd");
 		compile_amd(&manifest, &out, schedule)?;
