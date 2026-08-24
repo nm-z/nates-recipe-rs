@@ -8695,12 +8695,12 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 	if targets.is_empty() || groups.values().all(|group| !valid(group)) {
 		let mut tables = Vec::new();
 		for mut group in groups.into_values() {
-			let rows = group.iter().map(|table| table.rows.len()).max().unwrap_or(0);
-			for table in &mut group {
-				let count = table.rows.len();
-				require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
-				if count != rows {
-					table.rows = table.rows.iter().cloned().cycle().take(rows).collect();
+			// Tables in one directory align onto each other only when they contribute different columns. Same columns means more rows of one table, and broadcasting those duplicates records instead of widening them.
+			if group.iter().any(|table| table.headers != group[0].headers) {
+				let rows = group.iter().map(|table| table.rows.len()).max().unwrap_or(0);
+				for table in &mut group { let count = table.rows.len();
+					require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
+					if count != rows { table.rows = table.rows.iter().cloned().cycle().take(rows).collect() }
 				}
 			}
 			tables.extend(group);
