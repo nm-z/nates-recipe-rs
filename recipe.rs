@@ -10063,6 +10063,7 @@ impl TrainingReport {
 	pub const fn r2(&self) -> f64 { self.r2 }
 	pub const fn tile(&self) -> [u32; 3] { [self.tile.m, self.tile.n, self.tile.k] }
 	pub const fn epoch_seconds(&self) -> f64 { self.epoch_seconds }
+	pub const fn seconds(&self) -> f64 { self.seconds }
 }
 #[derive(Clone, Copy)]
 struct TargetScale {
