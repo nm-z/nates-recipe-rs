@@ -6508,8 +6508,10 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	if let Some(name) = name {
 		return found.iter().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
 	}
-	require(found.len() == 1, "multiple GPUs require named selection")?;
-	Ok(&found[0])
+	if found.len() == 1 { return Ok(&found[0]) }
+	// Lease the first unlocked device via advisory flock so concurrent processes spread across GPUs.
+	#[cfg(unix)] { use std::os::unix::io::AsRawFd; let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned()); for gpu in found { let Ok(file) = fs::File::create(format!("{dir}/recipe-{}.lock", gpu.name)) else { continue }; if unsafe { flock(file.as_raw_fd(), 6) } == 0 { std::mem::forget(file); return Ok(gpu) } } }
+	Err(RecipeError::new(format!("all {} devices are occupied; set RECIPE_DEVICE to select one", found.len())))
 }
 fn selected_gpu() -> Result<&'static Gpu> {
 	let Some(name) = std::env::var("RECIPE_DEVICE").ok() else { return device(None) };
@@ -6983,6 +6985,8 @@ unsafe extern "C" {
 	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
 	#[cfg_attr(windows, link_name = "_write")]
 	fn write(file: i32, bytes: *const c_void, length: usize) -> isize;
+	#[cfg(unix)]
+	fn flock(fd: i32, operation: i32) -> i32;
 }
 fn distance(left: &[f64], right: &[f64]) -> f64 { left.iter().zip(right).map(|(a, b)| (a - b).powi(2)).sum() }
 fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) { state.chunks_exact(features).enumerate().map(|(index, row)| (index, distance(query, row))).min_by(|left, right| left.1.total_cmp(&right.1)).unwrap_or((0, f64::INFINITY)) }
