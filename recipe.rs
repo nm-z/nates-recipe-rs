@@ -920,7 +920,7 @@ impl BackendTarget {
 		match self {
 			Self::Cpu { .. } => "so",
 			Self::Amd { .. } => "hsaco",
-			Self::Nvidia { .. } => "cubin",
+			Self::Nvidia { .. } => "ptx",
 		}
 	}
 
@@ -2821,7 +2821,7 @@ fn native_amd_library(name: &'static str) -> Result<&'static str> {
 	option_env!("RECIPE_HSA_DEVICE_LIBRARY").filter(|_| name == "device").or(option_env!("RECIPE_HSA_CLOCK_LIBRARY").filter(|_| name == "clock")).or(option_env!("RECIPE_HSA_ABI_LIBRARY").filter(|_| name == "abi")).or(option_env!("RECIPE_HSA_FINITE_LIBRARY").filter(|_| name == "finite")).or(option_env!("RECIPE_HSA_MATH_LIBRARY").filter(|_| name == "math")).ok_or_else(|| RecipeError::new(format!("AMD native {name} library is unavailable")))
 }
 
-fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, ptx: Option<&Path>, key: &str) -> Result<Vec<KernelResources>> {
+fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, bitcode: Option<&Path>, key: &str) -> Result<Vec<KernelResources>> {
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
@@ -2848,15 +2848,18 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 		BackendTarget::Nvidia { architecture } => {
 			let compiler = native_nvidia_compiler()?;
 			let device = option_env!("RECIPE_NV_DEVICE_LIBRARY").ok_or_else(|| RecipeError::new("NVIDIA native device library is unavailable"))?;
-			let ptx = ptx.ok_or_else(|| RecipeError::new("NVIDIA PTX output path is absent"))?;
+			let bitcode = bitcode.ok_or_else(|| RecipeError::new("NVIDIA bitcode path is absent"))?;
 			let ptx_version = option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))?;
 			let mut llvm = Command::new(compiler);
-			llvm.args(["-target", "nvptx64-nvidia-cuda"]).arg(format!("-march={architecture}")).args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-S", "-x", "ir"]).arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(ptx);
+			llvm.args(["-target", "nvptx64-nvidia-cuda"]).arg(format!("-march={architecture}")).args(["-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(bitcode);
 			native_command(llvm, "NVIDIA LLVM IR compiler", key)?;
-			let assembler = option_env!("RECIPE_NV_PTX_ASSEMBLER").ok_or_else(|| RecipeError::new("NVIDIA PTX assembler is unavailable"))?;
-			let mut ptxas = Command::new(assembler);
-			ptxas.arg(format!("-arch={architecture}")).args(["-o"]).arg(output).arg(ptx);
-			native_command(ptxas, "NVIDIA PTX assembler", key).map(|_| Vec::new())
+			// Clang stamps its own newest PTX ISA and ignores the requested one, so the generator pins it instead, and the driver JIT then loads the artifact on every driver at or above that version.
+			// The verifier rejects address spaces that the generator's own NVPTX passes introduce downstream of it, so it stays off, as it is on the single-command path.
+			let generator = option_env!("RECIPE_NV_PTX_GENERATOR").ok_or_else(|| RecipeError::new("NVIDIA PTX generator is unavailable"))?;
+			let mut llc = Command::new(generator);
+			llc.args(["-march=nvptx64", &format!("-mcpu={architecture}"), &format!("-mattr={ptx_version}"), "-O2", "-disable-verify"]).arg(bitcode).args(["-o"]).arg(output);
+			native_command(llc, "NVIDIA PTX generator", key)?;
+			fs::read(output).and_then(|mut image| { image.push(0); fs::write(output, &image) }).map(|_| Vec::new()).map_err(|error| RecipeError::new(format!("cannot terminate native PTX artifact: {error}")))
 		}
 	}
 }
@@ -2877,8 +2880,8 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		let stem = format!(".recipe-native-{}-{serial}", std::process::id());
 		let source = directory.join(format!("{stem}.ll"));
 		let output = directory.join(format!("{stem}.{}", target.artifact_extension()));
-		let ptx = (target.backend() == Backend::Nvidia).then(|| directory.join(format!("{stem}.ptx")));
-		let temporary = NativeTemporaryFiles { paths: std::iter::once(source.clone()).chain(std::iter::once(output.clone())).chain(ptx.iter().cloned()).collect() };
+		let bitcode = (target.backend() == Backend::Nvidia).then(|| directory.join(format!("{stem}.bc")));
+		let temporary = NativeTemporaryFiles { paths: std::iter::once(source.clone()).chain(std::iter::once(output.clone())).chain(bitcode.iter().cloned()).collect() };
 		fs::write(&source, ir).map_err(|error| RecipeError::new(format!("cannot write native LLVM IR: {error}")))?; debug(&format!("native source key={key} path={}", source.display()))?;
 		// The artifact is cached on disk, so this is the one moment the compiler's
 		// view of the kernel exists. A cooperative grid requires every workgroup to
@@ -2887,7 +2890,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		// nonzero occupancy here holds for every workgroup width the schedule can
 		// pick. It does not bound the tile: local memory is checked separately, and
 		// the schedule still does not resize itself from these numbers.
-		for kernel in compile_native_artifact(target, &source, &output, ptx.as_deref(), &key)? {
+		for kernel in compile_native_artifact(target, &source, &output, bitcode.as_deref(), &key)? {
 			debug(&format!("native kernel {} registers={} scalars={} occupancy={} waves per SIMD", kernel.name, kernel.registers, kernel.scalars, kernel.occupancy))?;
 			require(kernel.occupancy != 0, format!("native kernel {} cannot be resident at any workgroup width", kernel.name))?;
 		}
