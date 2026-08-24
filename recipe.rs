@@ -6307,7 +6307,7 @@ impl Gpu {
 		// wave count because that is the multiple by which the workgroup was
 		// widened. Claiming the whole local store deadlocks even at one wave,
 		// because the kernel's own fixed allocation shares the same store.
-		let shared_budget = shared_values / waves_per_workgroup;
+		let shared_budget = shared_values / waves;
 		// Chunk partials keep the arithmetic width while the tile allocation is
 		// counted in model elements, so a narrow model needs proportionally more
 		// elements per partial value.
@@ -6597,7 +6597,7 @@ impl Hsa {
 }
 #[cfg(nvidia)]
 impl Cuda {
-	unsafe fn native_dispatch(&self, module: Ptr, name: &str, element: u8, layout: &'static [u8]) -> Result<Dispatch> {
+	unsafe fn native_dispatch(&self, module: Ptr, name: &str, element: u8, layout: &'static [u8], waves: u32) -> Result<Dispatch> {
 		unsafe {
 		let name = std::ffi::CString::new(name).map_err(|error| RecipeError::new(format!("NVIDIA native symbol is invalid: {error}")))?;
 		let mut object = 0;
@@ -6608,9 +6608,10 @@ impl Cuda {
 		}
 		require(max_block > 0 && shared >= 0 && used_registers > 0, "NVIDIA native symbol resources are invalid")?;
 		let register_wave = (used_registers as u32).checked_mul(self.wave).ok_or_else(|| RecipeError::new("NVIDIA native register count overflows"))?;
-		let observed = (self.registers / register_wave).min(self.threads / self.wave);
+		require((self.registers / register_wave).min(self.threads / self.wave) != 0, "NVIDIA native symbol has no resident wave")?;
 		let resources = Resources { shared: shared as u32, max_block: max_block as u32 };
-		let geometry = nvidia(self.cus, self.wave, self.workgroup, self.block_lds, self.sm_lds, observed, resources)?;
+		// The schedule sized every tile and the reduction buffer for its own workgroup, so the dispatch must use that width and not the wider one the register budget would allow.
+		let geometry = nvidia(self.cus, self.wave, self.workgroup, self.block_lds, self.sm_lds, waves, resources)?;
 		let mut active = 0;
 		driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, geometry.block as i32, 0), "native occupancy query")?;
 		require(active > 0, "NVIDIA native symbol has no resident workgroup")?;
@@ -6618,16 +6619,16 @@ impl Cuda {
 		}
 	}
 
-	unsafe fn load_native(&self, artifact: &NativeArtifact) -> Result<(NativeCudaProgram, Dispatch, Dispatch, Option<Dispatch>)> {
+	unsafe fn load_native(&self, artifact: &NativeArtifact, waves: u32) -> Result<(NativeCudaProgram, Dispatch, Dispatch, Option<Dispatch>)> {
 		unsafe {
 		driver_status(Backend::Nvidia, (self.set)(self.context), "native context")?;
 		let mut module = ptr::null_mut();
 		driver_status(Backend::Nvidia, (self.load)(&mut module, artifact.artifact.as_ptr().cast()), "native cubin load")?;
 		let program = NativeCudaProgram { module: module as usize, unload: self.unload };
 		let element = u8::try_from(artifact.precision.model.bytes()).map_err(|_| RecipeError::new("native NVIDIA precision width is invalid"))?;
-		let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT)?;
-		let epoch = self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, artifact.precision.epoch_layout)?;
-		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
+		let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves)?;
+		let epoch = self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, artifact.precision.epoch_layout, waves)?;
+		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves)).transpose()?;
 		Ok((program, forward, epoch, model_load))
 		}
 	}
@@ -6713,7 +6714,7 @@ impl NativeProgram {
 			}
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => {
-				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact)? };
+				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact, waves)? };
 				(NativeBackend::Nvidia(program), forward, epoch, model_load)
 			}
 		};
