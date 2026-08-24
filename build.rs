@@ -654,6 +654,9 @@ fn main() -> BuildResult<()> {
 		("contraction-resident-waves-per-workgroup", "RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"),
 		("contraction-matrix-max-waves-per-workgroup", "RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"),
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
+		("tuning-budget-ms", "RECIPE_TUNING_BUDGET_MS"),
+		("tuning-candidates", "RECIPE_TUNING_CANDIDATES"),
+		("tuning-measurements", "RECIPE_TUNING_MEASUREMENTS"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
