@@ -2745,9 +2745,10 @@ impl Drop for NativeTemporaryFiles {
 
 fn native_artifact_directory(key: &str) -> Result<PathBuf> {
 	require(!key.is_empty() && key != "." && key != ".." && !key.contains('/') && !key.contains('\\'), "native artifact key is not a single path component")?;
-	let executable = std::env::current_exe().map_err(|error| RecipeError::new(format!("cannot locate Recipe executable for native artifacts: {error}")))?;
-	let parent = executable.parent().ok_or_else(|| RecipeError::new("Recipe executable has no artifact directory"))?;
-	Ok(parent.join("recipe-native").join(key))
+	// A published artifact outlives the transient script that compiled it, so the
+	// cache is rooted in the user cache directory instead of beside the executable.
+	let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache"))).ok_or_else(|| RecipeError::new("cannot locate a cache directory for native artifacts"))?;
+	Ok(cache.join("recipe-native").join(key))
 }
 
 fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
