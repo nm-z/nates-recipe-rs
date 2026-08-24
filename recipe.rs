@@ -6370,7 +6370,7 @@ impl Gpu {
 		let chunk_values = owned.checked_mul(register_count).ok_or_else(|| RecipeError::new("native contraction chunk buffer overflows"))?;
 		let chunk_bias_values = owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?;
 		let scratch_base = narrow(graph.parameters.len().next_multiple_of(NATIVE_SCRATCH_ROW_VALUES), "native gradient scratch base")?;
-		debug(&format!("native schedule block={block} waves={waves} registers={register_count} shared={shared_values} contractions={contractions:?} attention={attention:?}"))?;
+		debug(&format!("native schedule block={block} waves={waves} registers={register_count} shared={shared_values} matrix={matrix} contractions={contractions:?} attention={attention:?}"))?;
 		let schedule = NativeSchedule { matrix, block, tile: extent, register_m, register_n, register_count, fragment_k, chunk_k, chunk_values, chunk_bias_values, scratch_base, shared_values, contractions, attention };
 		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
 		let program = NativeProgram::load(self, artifact, graph, schedule, register_values, waves)?;
