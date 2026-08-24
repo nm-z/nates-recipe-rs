@@ -6503,18 +6503,49 @@ fn devices() -> Result<&'static [Gpu]> {
 		.map(Vec::as_slice)
 		.map_err(Clone::clone)
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placement { Single, Auto, Multi }
+fn placement() -> Result<Placement> {
+	match std::env::var("RECIPE_MULTI_DEVICE").as_deref() {
+		Err(_) | Ok("false") => Ok(Placement::Single),
+		Ok("auto") => Ok(Placement::Auto),
+		Ok("true") => Ok(Placement::Multi),
+		Ok(value) => Err(RecipeError::new(format!("RECIPE_MULTI_DEVICE must be false, true, or auto, received {value:?}"))),
+	}
+}
 fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	let found = devices()?;
 	if let Some(name) = name {
 		return found.iter().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
 	}
-	require(found.len() == 1, "multiple GPUs require named selection")?;
-	Ok(&found[0])
+	if found.len() == 1 { return Ok(&found[0]) }
+	match placement()? {
+		Placement::Auto => Ok(&found[0]),
+		Placement::Multi => Err(RecipeError::new("multi-device parallelism requires RECIPE_DEVICE")),
+		Placement::Single => Err(RecipeError::new("multiple GPUs require named selection")),
+	}
 }
 fn selected_gpu() -> Result<&'static Gpu> {
 	let Some(name) = std::env::var("RECIPE_DEVICE").ok() else { return device(None) };
 	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	devices()?.iter().find(|gpu| gpu.name == name || format!("{}:{}", host.trim(), gpu.name) == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")))
+}
+/// Select the device with the lowest complete measured epoch cost.
+fn select_by_epoch(model: &Model, prepared: &Prepared, targets: &[f64], rows: usize, config: Config) -> Result<&'static Gpu> {
+	let candidates = devices()?;
+	if candidates.len() == 1 { return Ok(&candidates[0]) }
+	let samples = &prepared.samples[..rows * prepared.features];
+	let target_slice = &targets[..rows * prepared.target_width];
+	let mut best: Option<(&Gpu, f64)> = None;
+	for gpu in candidates {
+		let start = Instant::now();
+		let Ok(graph) = compile(model, prepared, targets, rows, gpu, config, true) else { continue };
+		let Ok(mut tape) = NativeTape::new(&graph, samples, target_slice, gpu, config.precision, model.loss) else { continue };
+		if tape.forward().and_then(|_| gpu.synchronize()).is_err() { continue }
+		let cost = start.elapsed().as_secs_f64();
+		if best.is_none_or(|(_, b)| cost < b) { best = Some((gpu, cost)) }
+	}
+	best.map(|(gpu, _)| gpu).ok_or_else(|| RecipeError::new("no device can run this model"))
 }
 #[cfg(amd)]
 type HsaInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32;
@@ -9905,12 +9936,15 @@ impl Train {
 		let prepared = prepare(data)?;
 		let training_rows = ((prepared.source_rows as f64) * data.split).floor() as usize;
 		require(training_rows != 0 && training_rows <= prepared.source_rows, "split must select training rows")?;
-		let (gpu, mut config) = (selected_gpu()?, Config::load()?);
+		let mut config = Config::load()?;
 		let precision = self.precision;
 		config.precision = precision;
-		if let Some(seed) = self.seed {
-			config.random_seed = seed;
-		}
+		if let Some(seed) = self.seed { config.random_seed = seed; }
+		let gpu = if std::env::var("RECIPE_DEVICE").is_err() && placement()? == Placement::Auto && devices()?.len() > 1 {
+			select_by_epoch(model, prepared, &prepared.targets, training_rows, config)?
+		} else {
+			selected_gpu()?
+		};
 		let probability = model.loss.0 >= 4;
 		let training_values = training_rows * prepared.target_width;
 		let scale = probability.then(|| TargetScale::fit(&prepared.targets[..training_values]));
