@@ -1,39 +1,39 @@
 target triple = "amdgcn-amd-amdhsa"
 ; NUMERIC BEGIN
 declare double @llvm.sqrt.f64(double) declare double @llvm.fabs.f64(double) declare double @llvm.floor.f64(double)
-define internal double @recipe.add(double %left, double %right) #1 { entry: %result = fadd double %left, %right ret double %result }
-define internal double @recipe.sub(double %left, double %right) #1 { entry: %result = fsub double %left, %right ret double %result }
-define internal double @recipe.mul(double %left, double %right) #1 { entry: %result = fmul double %left, %right ret double %result }
-define internal double @recipe.div(double %left, double %right) #1 { entry: %result = fdiv double %left, %right ret double %result }
-define internal double @recipe.neg(double %value) #1 { entry: %result = fneg double %value ret double %result }
-define internal i1 @recipe.oeq(double %left, double %right) #1 { entry: %result = fcmp oeq double %left, %right ret i1 %result }
-define internal i1 @recipe.oge(double %left, double %right) #1 { entry: %result = fcmp oge double %left, %right ret i1 %result }
-define internal i1 @recipe.ogt(double %left, double %right) #1 { entry: %result = fcmp ogt double %left, %right ret i1 %result }
-define internal i1 @recipe.ole(double %left, double %right) #1 { entry: %result = fcmp ole double %left, %right ret i1 %result }
-define internal i1 @recipe.olt(double %left, double %right) #1 { entry: %result = fcmp olt double %left, %right ret i1 %result }
-define internal i1 @recipe.one(double %left, double %right) #1 { entry: %result = fcmp one double %left, %right ret i1 %result }
-define internal i1 @recipe.ord(double %left, double %right) #1 { entry: %result = fcmp ord double %left, %right ret i1 %result }
-define internal double @recipe.from.u1(i1 %value) #1 { entry: %result = uitofp i1 %value to double ret double %result }
-define internal double @recipe.from.u32(i32 %value) #1 { entry: %result = uitofp i32 %value to double ret double %result }
-define internal double @recipe.from.s32(i32 %value) #1 { entry: %result = sitofp i32 %value to double ret double %result }
-define internal i32 @recipe.to.u32(double %value) #1 { entry: %result = fptoui double %value to i32 ret i32 %result }
-define internal i32 @recipe.to.s32(double %value) #1 { entry: %result = fptosi double %value to i32 ret i32 %result }
-define internal double @recipe.from.f32(float %value) #1 { entry: %result = fpext float %value to double ret double %result }
-define internal double @recipe.from.f16(half %value) #1 { entry: %result = fpext half %value to double ret double %result }
-define internal half @recipe.to.f16(double %value) #1 { entry: %result = fptrunc double %value to half ret half %result }
-define internal double @recipe.abs(double %value) #1 { entry: %result = call double @llvm.fabs.f64(double %value) ret double %result }
-define internal double @recipe.floor(double %value) #1 { entry: %result = call double @llvm.floor.f64(double %value) ret double %result }
-define internal double @recipe.sqrt(double %value) #1 { entry: %result = call double @llvm.sqrt.f64(double %value) ret double %result }
+define internal double @recipe.add(double %left, double %right) #3 { entry: %result = fadd double %left, %right ret double %result }
+define internal double @recipe.sub(double %left, double %right) #3 { entry: %result = fsub double %left, %right ret double %result }
+define internal double @recipe.mul(double %left, double %right) #3 { entry: %result = fmul double %left, %right ret double %result }
+define internal double @recipe.div(double %left, double %right) #3 { entry: %result = fdiv double %left, %right ret double %result }
+define internal double @recipe.neg(double %value) #3 { entry: %result = fneg double %value ret double %result }
+define internal i1 @recipe.oeq(double %left, double %right) #3 { entry: %result = fcmp oeq double %left, %right ret i1 %result }
+define internal i1 @recipe.oge(double %left, double %right) #3 { entry: %result = fcmp oge double %left, %right ret i1 %result }
+define internal i1 @recipe.ogt(double %left, double %right) #3 { entry: %result = fcmp ogt double %left, %right ret i1 %result }
+define internal i1 @recipe.ole(double %left, double %right) #3 { entry: %result = fcmp ole double %left, %right ret i1 %result }
+define internal i1 @recipe.olt(double %left, double %right) #3 { entry: %result = fcmp olt double %left, %right ret i1 %result }
+define internal i1 @recipe.one(double %left, double %right) #3 { entry: %result = fcmp one double %left, %right ret i1 %result }
+define internal i1 @recipe.ord(double %left, double %right) #3 { entry: %result = fcmp ord double %left, %right ret i1 %result }
+define internal double @recipe.from.u1(i1 %value) #3 { entry: %result = uitofp i1 %value to double ret double %result }
+define internal double @recipe.from.u32(i32 %value) #3 { entry: %result = uitofp i32 %value to double ret double %result }
+define internal double @recipe.from.s32(i32 %value) #3 { entry: %result = sitofp i32 %value to double ret double %result }
+define internal i32 @recipe.to.u32(double %value) #3 { entry: %result = fptoui double %value to i32 ret i32 %result }
+define internal i32 @recipe.to.s32(double %value) #3 { entry: %result = fptosi double %value to i32 ret i32 %result }
+define internal double @recipe.from.f32(float %value) #3 { entry: %result = fpext float %value to double ret double %result }
+define internal double @recipe.from.f16(half %value) #3 { entry: %result = fpext half %value to double ret double %result }
+define internal half @recipe.to.f16(double %value) #3 { entry: %result = fptrunc double %value to half ret half %result }
+define internal double @recipe.abs(double %value) #3 { entry: %result = call double @llvm.fabs.f64(double %value) ret double %result }
+define internal double @recipe.floor(double %value) #3 { entry: %result = call double @llvm.floor.f64(double %value) ret double %result }
+define internal double @recipe.sqrt(double %value) #3 { entry: %result = call double @llvm.sqrt.f64(double %value) ret double %result }
 ; This whole region is a placeholder that the build replaces per precision. The
 ; transcendentals resolve to definitions the build emits, never to a backend
 ; library, so every device evaluates the same coefficients in its declared
 ; arithmetic type and in the same order.
-define internal double @recipe.exp(double %value) #1 { entry: %result = call double @recipe.math.exp(double %value) ret double %result }
-define internal double @recipe.tanh(double %value) #1 { entry: %result = call double @recipe.math.tanh(double %value) ret double %result }
-define internal double @recipe.cos(double %value) #1 { entry: %result = call double @recipe.math.cos(double %value) ret double %result }
-define internal double @recipe.sin(double %value) #1 { entry: %result = call double @recipe.math.sin(double %value) ret double %result }
-define internal double @recipe.log(double %value) #1 { entry: %result = call double @recipe.math.log(double %value) ret double %result }
-define internal void @recipe.set.format(i32 %exp, i32 %man) #1 { entry: ret void }
+define internal double @recipe.exp(double %value) #3 { entry: %result = call double @recipe.math.exp(double %value) ret double %result }
+define internal double @recipe.tanh(double %value) #3 { entry: %result = call double @recipe.math.tanh(double %value) ret double %result }
+define internal double @recipe.cos(double %value) #3 { entry: %result = call double @recipe.math.cos(double %value) ret double %result }
+define internal double @recipe.sin(double %value) #3 { entry: %result = call double @recipe.math.sin(double %value) ret double %result }
+define internal double @recipe.log(double %value) #3 { entry: %result = call double @recipe.math.log(double %value) ret double %result }
+define internal void @recipe.set.format(i32 %exp, i32 %man) #3 { entry: ret void }
 ; NUMERIC END
 declare i32 @llvm.amdgcn.workitem.id.x()
 declare void @llvm.amdgcn.s.barrier() declare i64 @__ockl_steadyctr_u64()
