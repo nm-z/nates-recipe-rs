@@ -6318,66 +6318,81 @@ impl Gpu {
 		let matrix = matches!(&self.native_target, BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") || architecture.starts_with("gfx12")) && [Compute::FP16, Compute::BF16, Compute::INT8, Compute::INT4].contains(&precision) && dominant_shape.m >= fragment_k && dominant_shape.n >= fragment_k && dominant_shape.k >= fragment_k && aligned_attention;
 		let matrix_waves = narrow(natural("contraction matrix maximum waves per workgroup", env!("RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"))?, "contraction matrix maximum waves per workgroup")? as u32;
 		let waves_per_workgroup = if matrix { matrix_waves.min(dominant_shape.m.div_ceil(fragment_k)).max(1) } else { vector_waves };
-		// The reduction chunk is a multiple of the staging fragment so a chunk
-		// boundary never falls inside a vector staging load.
 		let chunk_k = narrow(natural("contraction chunk K", env!("RECIPE_CONTRACTION_CHUNK_K"))?, "contraction chunk K")? as u32;
 		require(chunk_k % fragment_k == 0, "contraction chunk K must be a multiple of the staging fragment")?;
 		let register_m = (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(limits.m);
 		let waves = if self.backend == Backend::Amd { waves_per_workgroup } else { 1 };
 		let block = wave.checked_mul(waves).ok_or_else(|| RecipeError::new("native contraction workgroup overflows"))?;
 		let register_n = (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(limits.n).min((self.shared_limit / precision.bytes() as u32 / block / register_m.checked_add(1).ok_or_else(|| RecipeError::new("native contraction register width overflows"))?).max(1));
-		// A cooperative grid deadlocks unless every workgroup is resident, so the
-		// tile must leave local memory unclaimed for the waves that share a compute
-		// unit. Local memory is allocated per workgroup rather than per wave, so
-		// this divisor is a margin and not the exact resource equation: it is the
-		// wave count because that is the multiple by which the workgroup was
-		// widened. Claiming the whole local store deadlocks even at one wave,
-		// because the kernel's own fixed allocation shares the same store.
 		let shared_budget = shared_values / waves;
-		// Chunk partials keep the arithmetic width while the tile allocation is
-		// counted in model elements, so a narrow model needs proportionally more
-		// elements per partial value.
 		let ratio = narrow(NativePrecision::new(precision)?.state.bytes().div_ceil(precision.bytes()), "native contraction state ratio")? as u32;
-		let mut extent = native_contraction_tile(dominant_shape, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?;
-		let contractions = shapes.iter().map(|shape| shape.map(|shape| {
-			Ok(NativeContractionTiles {
-				forward: native_contraction_tile(shape.forward, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
-				gradient: native_contraction_tile(shape.gradient, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
-				previous: native_contraction_tile(shape.previous, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
-				gradient_shape: shape.gradient,
-				parameters: shape.parameters,
-			})
-		}).transpose()).collect::<Result<Vec<_>>>()?;
-		extent = dominant.and_then(|(index, _)| contractions[index]).map_or(extent, |contraction| contraction.gradient);
-		let contraction_shared_values = contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]).map(|extent| native_contraction_shared_values(extent, register_m, register_n, block, chunk_k, ratio, matrix)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
 		let attention_query_tile = narrow(natural("attention query tile", env!("RECIPE_ATTENTION_QUERY_TILE"))?, "attention query tile")? as u32;
 		let attention = native_attention_tiles(graph, shared_budget, attention_query_tile)?;
 		let attention_shared_values = attention.iter().enumerate().filter_map(|(index, extent)| extent.map(|extent| native_attention_shared_values(extent, extent.m as usize == graph.nodes[index].output.length))).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1);
-		let shared_values = contraction_shared_values.max(attention_shared_values);
+		let scratch_base = narrow(graph.parameters.len().next_multiple_of(NATIVE_SCRATCH_ROW_VALUES), "native gradient scratch base")?;
 		let register_count = register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
 		let register_values = register_count.checked_add(register_n).and_then(|values| values.checked_mul(ratio)).ok_or_else(|| RecipeError::new("native contraction register reduction overflows"))?;
-		// The private chunk buffer holds every partial a single lane can own at
-		// once. A full tile with one k lane folds locally and reuses one slot; the
-		// exchange only ever runs with at least two k lanes, and tails only shrink
-		// the output lanes and so grow the k lanes, so the full-tile lane count
-		// bounds how many chunks a lane can hold.
-		let mut owned = 1_u32;
-		for extent in contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]) {
-			let output_lanes = (extent.m / register_m).max(1).checked_mul((extent.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
-			let k_lanes = (block / output_lanes).max(2);
-			owned = owned.max(extent.k.div_ceil(chunk_k).div_ceil(k_lanes));
+		let build = |contractions: Vec<Option<NativeContractionTiles>>| -> Result<NativeProgram> {
+			let extent = dominant.and_then(|(i, _)| contractions[i]).map_or_else(|| native_contraction_tile(dominant_shape, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix), |c| Ok(c.gradient))?;
+			let shared_values = contractions.iter().flatten().flat_map(|c| [c.forward, c.gradient, c.previous]).map(|e| native_contraction_shared_values(e, register_m, register_n, block, chunk_k, ratio, matrix)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(1).max(attention_shared_values);
+			let mut owned = 1_u32;
+			for e in contractions.iter().flatten().flat_map(|c| [c.forward, c.gradient, c.previous]) {
+				owned = owned.max(e.k.div_ceil(chunk_k).div_ceil((block / (e.m / register_m).max(1).checked_mul((e.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?).max(2)));
+			}
+			let (chunk_values, chunk_bias_values) = (owned.checked_mul(register_count).ok_or_else(|| RecipeError::new("native contraction chunk buffer overflows"))?, owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?);
+			debug(&format!("native schedule block={block} waves={waves} registers={register_count} shared={shared_values} contractions={contractions:?} attention={attention:?}"))?;
+			let schedule = NativeSchedule { matrix, block, tile: extent, register_m, register_n, register_count, fragment_k, chunk_k, chunk_values, chunk_bias_values, scratch_base, shared_values, contractions, attention: attention.clone() };
+			let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
+			let program = NativeProgram::load(self, artifact, graph, schedule, register_values, waves)?;
+			let fixed = program.forward.kernel.shared.max(program.epoch.kernel.shared).max(program.model_load.map_or(0, |d| d.kernel.shared));
+			let required = fixed.checked_add(shared_values.max(program.reduction_values).checked_mul(precision.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
+			require(required <= self.shared_limit, "native model exceeds resident device shared memory")?;
+			Ok(program)
+		};
+		let candidates = |md: u32, nd: u32| -> Result<Vec<Option<NativeContractionTiles>>> {
+			shapes.iter().map(|shape| shape.map(|shape| {
+				let cap = |e: Tile| Tile { m: (e.m / md).max(register_m), n: (e.n / nd).max(register_n), k: e.k };
+				Ok(NativeContractionTiles {
+					forward: native_contraction_tile(cap(shape.forward), register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
+					gradient: native_contraction_tile(cap(shape.gradient), register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
+					previous: native_contraction_tile(cap(shape.previous), register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
+					gradient_shape: shape.gradient,
+					parameters: shape.parameters,
+				})
+			}).transpose()).collect()
+		};
+		let analytic = candidates(1, 1)?;
+		if matches!(&self.driver, Driver::Cpu) || analytic.iter().all(Option::is_none) {
+			return build(analytic);
 		}
-		let chunk_values = owned.checked_mul(register_count).ok_or_else(|| RecipeError::new("native contraction chunk buffer overflows"))?;
-		let chunk_bias_values = owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?;
-		let scratch_base = narrow(graph.parameters.len().next_multiple_of(NATIVE_SCRATCH_ROW_VALUES), "native gradient scratch base")?;
-		debug(&format!("native schedule block={block} waves={waves} registers={register_count} shared={shared_values} contractions={contractions:?} attention={attention:?}"))?;
-		let schedule = NativeSchedule { matrix, block, tile: extent, register_m, register_n, register_count, fragment_k, chunk_k, chunk_values, chunk_bias_values, scratch_base, shared_values, contractions, attention };
-		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
-		let program = NativeProgram::load(self, artifact, graph, schedule, register_values, waves)?;
-		let fixed = program.forward.kernel.shared.max(program.epoch.kernel.shared).max(program.model_load.map_or(0, |dispatch| dispatch.kernel.shared));
-		let required = fixed.checked_add(shared_values.max(program.reduction_values).checked_mul(precision.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
-		require(required <= self.shared_limit, "native model exceeds resident device shared memory")?;
-		Ok(program)
+		let measure = |prog: &NativeProgram| -> Result<Duration> {
+			let sb = checked_mul(rows, graph.input.elements(), "measurement")?.checked_mul(precision.bytes()).ok_or_else(|| RecipeError::new("measurement overflow"))?;
+			let wb = graph.parameters.len().max(1).checked_mul(precision.bytes()).ok_or_else(|| RecipeError::new("measurement overflow"))?;
+			let (s, w) = (self.allocate(sb.max(1))?, self.allocate(wb)?);
+			let (v, c) = (self.allocate(prog.artifact.layout.values_bytes.max(1))?, self.allocate(prog.artifact.layout.contexts_bytes.max(1))?);
+			let (threads, r) = (prog.forward.geometry.threads()?, narrow(rows, "measurement rows")? as u32);
+			let mut call = ptrs![s, w, v, c, r, threads];
+			prog.launch_forward(&mut call)?; self.synchronize()?;
+			let started = Instant::now();
+			let mut call = ptrs![s, w, v, c, r, threads];
+			prog.launch_forward(&mut call)?; self.synchronize()?;
+			let elapsed = started.elapsed();
+			self.free(s); self.free(w); self.free(v); self.free(c);
+			Ok(elapsed)
+		};
+		let mut best = build(analytic)?;
+		let mut best_time = measure(&best)?;
+		debug(&format!("native measured analytic={best_time:?}"))?;
+		// Try halved-M and halved-N tiles for potentially better occupancy.
+		for (md, nd) in [(2, 1), (1, 2)] {
+			let Ok(tiles) = candidates(md, nd) else { continue };
+			if tiles.iter().flatten().flat_map(|c| [c.forward, c.gradient, c.previous]).eq(best.contractions.iter().flatten().flat_map(|c| [c.forward, c.gradient, c.previous])) { continue }
+			let Ok(prog) = build(tiles) else { continue };
+			let Ok(t) = measure(&prog) else { continue };
+			debug(&format!("native measured md={md} nd={nd} time={t:?}"))?;
+			if t < best_time { best_time = t; best = prog; }
+		}
+		Ok(best)
 	}
 	fn allocate(&self, bytes: usize) -> Result<u64> {
 		self.activate()?;
