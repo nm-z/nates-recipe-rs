@@ -427,7 +427,7 @@ define internal void @contraction_vector_accumulate(
 ptr addrspace(5) %sums, i1 %lane.active, i1 %lane.store, i32 %lid,
 i32 %lane.k, i32 %k.lanes, i32 %output.lane, i32 %output.lanes,
 i32 %output.m.base, i32 %output.n.base, i32 %m.count, i32 %n.count,
-i32 %k.count, i32 %tile.m, i32 %tile.n, i32 %tile.k ) #1 {
+i32 %k.count, i32 %tile.m, i32 %tile.n, i32 %tile.k ) #3 {
 entry:
 %chunk.sums = alloca [RECIPE_CHUNK_VALUES x RECIPE_STATE], align RECIPE_STATE_ALIGN, addrspace(5)
 %state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
@@ -673,7 +673,7 @@ define internal void @contraction_matrix_accumulate(
 ptr addrspace(5) %sums, i1 %lane.active, i1 %lane.store, i32 %lid,
 i32 %lane.k, i32 %k.lanes, i32 %output.lane, i32 %output.lanes,
 i32 %output.m.base, i32 %output.n.base, i32 %m.count, i32 %n.count,
-i32 %k.count, i32 %tile.m, i32 %tile.n, i32 %tile.k ) #1 { entry:
+i32 %k.count, i32 %tile.m, i32 %tile.n, i32 %tile.k ) #3 { entry:
 %wave = udiv i32 %lid, 32
 %lane = urem i32 %lid, 32
 %lane.local = urem i32 %lane, 16
@@ -773,7 +773,7 @@ ret void
 }
 define internal void @contraction_forward_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %activation, i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %kernel,
-i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #1 { entry:
+i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #3 { entry:
 ; The running sums live in the arithmetic type for the whole K extent and are
 ; rounded to the model type once, at the store. Staging the operands in tiles
 ; therefore cannot move a rounding point.
@@ -1582,7 +1582,7 @@ ret void
 define internal void @attention_matrix_product(
 ptr addrspace(1) %previous, i32 %mode, i32 %left.base, i32 %right.base,
 i32 %row.base, i32 %from, i32 %head.start, i32 %length, i32 %head.width,
-double %scale, i32 %lid, i32 %block ) #1 { entry:
+double %scale, i32 %lid, i32 %block ) #3 { entry:
 %dq = icmp eq i32 %mode, 0
 %forward = icmp eq i32 %mode, 3
 %direct = or i1 %dq, %forward
@@ -2469,7 +2469,7 @@ br label %output.loop output.done: %time.next = add nuw i32 %time, 1 br label %t
 define internal void @contraction_reverse_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.input, i1 %has.bias, i1 %relu, i1 %matrix.gradient,
 i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %kernel, i32 %offset,
-i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k, i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads ) #1 { entry:
+i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k, i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads ) #3 { entry:
 %sums = alloca [RECIPE_REGISTER_COUNT x RECIPE_STATE], align RECIPE_STATE_ALIGN, addrspace(5)
 %bias.sums = alloca [RECIPE_REGISTER_N x RECIPE_STATE], align RECIPE_STATE_ALIGN, addrspace(5)
 %state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) %lid = call i32 @recipe.local.id.x() %group = call i32 @recipe.group.id.x() %block = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %block
