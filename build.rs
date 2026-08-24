@@ -660,6 +660,8 @@ fn main() -> BuildResult<()> {
 	for (key, environment) in [("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME")] {
 		println!("cargo:rustc-env={environment}={}", text(&manifest, key)?);
 	}
+	println!("cargo:rustc-env=RECIPE_MULTI_DEVICE={}", setting(&manifest, "multi-device")?);
+
 	let out = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR must be configured"))?);
 	println!("cargo::rustc-check-cfg=cfg(amd)");
 	println!("cargo::rustc-check-cfg=cfg(nvidia)");
