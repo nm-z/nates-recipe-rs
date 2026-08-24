@@ -6597,7 +6597,7 @@ impl Hsa {
 }
 #[cfg(nvidia)]
 impl Cuda {
-	unsafe fn native_dispatch(&self, module: Ptr, name: &str, element: u8, layout: &'static [u8], waves: u32) -> Result<Dispatch> {
+	unsafe fn native_dispatch(&self, module: Ptr, name: &str, element: u8, layout: &'static [u8], waves: u32, shared_values: u32, register_values: u32) -> Result<Dispatch> {
 		unsafe {
 		let name = std::ffi::CString::new(name).map_err(|error| RecipeError::new(format!("NVIDIA native symbol is invalid: {error}")))?;
 		let mut object = 0;
@@ -6613,22 +6613,27 @@ impl Cuda {
 		// The schedule sized every tile and the reduction buffer for its own workgroup, so the dispatch must use that width and not the wider one the register budget would allow.
 		let geometry = nvidia(self.cus, self.wave, self.workgroup, self.block_lds, self.sm_lds, waves, resources)?;
 		let mut active = 0;
-		driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, geometry.block as i32, 0), "native occupancy query")?;
+		// The grid is one workgroup per SM and the barrier only completes once every one of them
+		// is resident, so the occupancy question has to be asked about the launch this dispatch
+		// really makes. With no dynamic shared memory it answers a question nobody goes on to ask.
+		let values = shared_values.max(geometry.block.checked_mul(register_values).ok_or_else(|| RecipeError::new("NVIDIA native reduction buffer overflows"))?);
+		let dynamic = values.checked_mul(u32::from(element)).ok_or_else(|| RecipeError::new("NVIDIA native shared memory overflows"))?;
+		driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, geometry.block as i32, dynamic as usize), "native occupancy query")?;
 		require(active > 0, "NVIDIA native symbol has no resident workgroup")?;
 		Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry })
 		}
 	}
 
-	unsafe fn load_native(&self, artifact: &NativeArtifact, waves: u32) -> Result<(NativeCudaProgram, Dispatch, Dispatch, Option<Dispatch>)> {
+	unsafe fn load_native(&self, artifact: &NativeArtifact, waves: u32, shared_values: u32, register_values: u32) -> Result<(NativeCudaProgram, Dispatch, Dispatch, Option<Dispatch>)> {
 		unsafe {
 		driver_status(Backend::Nvidia, (self.set)(self.context), "native context")?;
 		let mut module = ptr::null_mut();
 		driver_status(Backend::Nvidia, (self.load)(&mut module, artifact.artifact.as_ptr().cast()), "native cubin load")?;
 		let program = NativeCudaProgram { module: module as usize, unload: self.unload };
 		let element = u8::try_from(artifact.precision.model.bytes()).map_err(|_| RecipeError::new("native NVIDIA precision width is invalid"))?;
-		let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves)?;
-		let epoch = self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, artifact.precision.epoch_layout, waves)?;
-		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves)).transpose()?;
+		let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves, shared_values, register_values)?;
+		let epoch = self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, artifact.precision.epoch_layout, waves, shared_values, register_values)?;
+		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves, 0, 0)).transpose()?;
 		Ok((program, forward, epoch, model_load))
 		}
 	}
@@ -6714,7 +6719,7 @@ impl NativeProgram {
 			}
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => {
-				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact, waves)? };
+				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact, waves, schedule.shared_values, register_values)? };
 				(NativeBackend::Nvidia(program), forward, epoch, model_load)
 			}
 		};
