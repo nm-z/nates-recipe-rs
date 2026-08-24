@@ -7738,7 +7738,8 @@ fn native_contraction_partial_per_chunk(m: u32, n: u32, register_m: u32, registe
 /// The tile's local memory serves two phases in turn: the staged operands, and
 /// then the chunk partials the k lanes exchange after a barrier. Both live in
 /// the same allocation, so K is bounded by whichever phase is larger, and a tile
-/// too wide to stage a whole chunk narrows its M lanes until one fits.
+/// too wide to stage a whole chunk narrows its M lanes, then its N lanes, until
+/// one fits.
 fn native_contraction_tile(limits: Tile, register_m: u32, register_n: u32, block: u32, shared_values: u32, fragment: u32, ratio: u32, matrix: bool) -> Result<Tile> {
 	require(register_m != 0 && register_n != 0 && block != 0 && fragment != 0 && ratio != 0, "native contraction tile inputs are empty")?;
 	if matrix {
