@@ -2854,10 +2854,9 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			llvm.args(["-target", "nvptx64-nvidia-cuda"]).arg(format!("-march={architecture}")).args(["-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(bitcode);
 			native_command(llvm, "NVIDIA LLVM IR compiler", key)?;
 			// Clang stamps its own newest PTX ISA and ignores the requested one, so the generator pins it instead, and the driver JIT then loads the artifact on every driver at or above that version.
-			// The verifier rejects address spaces that the generator's own NVPTX passes introduce downstream of it, so it stays off, as it is on the single-command path.
 			let generator = option_env!("RECIPE_NV_PTX_GENERATOR").ok_or_else(|| RecipeError::new("NVIDIA PTX generator is unavailable"))?;
 			let mut llc = Command::new(generator);
-			llc.args(["-march=nvptx64", &format!("-mcpu={architecture}"), &format!("-mattr={ptx_version}"), "-O2", "-disable-verify"]).arg(bitcode).args(["-o"]).arg(output);
+			llc.args(["-march=nvptx64", &format!("-mcpu={architecture}"), &format!("-mattr={ptx_version}"), "-O2"]).arg(bitcode).args(["-o"]).arg(output);
 			native_command(llc, "NVIDIA PTX generator", key)?;
 			fs::read(output).and_then(|mut image| { image.push(0); fs::write(output, &image) }).map(|_| Vec::new()).map_err(|error| RecipeError::new(format!("cannot terminate native PTX artifact: {error}")))
 		}
