@@ -2889,10 +2889,12 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		// nonzero occupancy here holds for every workgroup width the schedule can
 		// pick. It does not bound the tile: local memory is checked separately, and
 		// the schedule still does not resize itself from these numbers.
+		let compile_start = Instant::now();
 		for kernel in compile_native_artifact(target, &source, &output, bitcode.as_deref(), &key)? {
 			debug(&format!("native kernel {} registers={} scalars={} occupancy={} waves per SIMD", kernel.name, kernel.registers, kernel.scalars, kernel.occupancy))?;
 			require(kernel.occupancy != 0, format!("native kernel {} cannot be resident at any workgroup width", kernel.name))?;
 		}
+		debug(&format!("native compile key={key} elapsed={:.3}s", compile_start.elapsed().as_secs_f64()))?;
 		fs::rename(&output, &path).map_err(|error| RecipeError::new(format!("cannot publish native artifact {}: {error}", path.display())))?;
 		drop(temporary);
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
