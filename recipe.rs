@@ -920,7 +920,7 @@ impl BackendTarget {
 		match self {
 			Self::Cpu { .. } => "so",
 			Self::Amd { .. } => "hsaco",
-			Self::Nvidia { .. } => "cubin",
+			Self::Nvidia { .. } => "ptx",
 		}
 	}
 
@@ -2821,7 +2821,7 @@ fn native_amd_library(name: &'static str) -> Result<&'static str> {
 	option_env!("RECIPE_HSA_DEVICE_LIBRARY").filter(|_| name == "device").or(option_env!("RECIPE_HSA_CLOCK_LIBRARY").filter(|_| name == "clock")).or(option_env!("RECIPE_HSA_ABI_LIBRARY").filter(|_| name == "abi")).or(option_env!("RECIPE_HSA_FINITE_LIBRARY").filter(|_| name == "finite")).or(option_env!("RECIPE_HSA_MATH_LIBRARY").filter(|_| name == "math")).ok_or_else(|| RecipeError::new(format!("AMD native {name} library is unavailable")))
 }
 
-fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, ptx: Option<&Path>, key: &str) -> Result<Vec<KernelResources>> {
+fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, bitcode: Option<&Path>, key: &str) -> Result<Vec<KernelResources>> {
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
@@ -2848,15 +2848,17 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 		BackendTarget::Nvidia { architecture } => {
 			let compiler = native_nvidia_compiler()?;
 			let device = option_env!("RECIPE_NV_DEVICE_LIBRARY").ok_or_else(|| RecipeError::new("NVIDIA native device library is unavailable"))?;
-			let ptx = ptx.ok_or_else(|| RecipeError::new("NVIDIA PTX output path is absent"))?;
+			let bitcode = bitcode.ok_or_else(|| RecipeError::new("NVIDIA bitcode path is absent"))?;
 			let ptx_version = option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))?;
 			let mut llvm = Command::new(compiler);
-			llvm.args(["-target", "nvptx64-nvidia-cuda"]).arg(format!("-march={architecture}")).args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-S", "-x", "ir"]).arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(ptx);
+			llvm.args(["-target", "nvptx64-nvidia-cuda"]).arg(format!("-march={architecture}")).args(["-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(bitcode);
 			native_command(llvm, "NVIDIA LLVM IR compiler", key)?;
-			let assembler = option_env!("RECIPE_NV_PTX_ASSEMBLER").ok_or_else(|| RecipeError::new("NVIDIA PTX assembler is unavailable"))?;
-			let mut ptxas = Command::new(assembler);
-			ptxas.arg(format!("-arch={architecture}")).args(["-o"]).arg(output).arg(ptx);
-			native_command(ptxas, "NVIDIA PTX assembler", key).map(|_| Vec::new())
+			// Clang stamps its own newest PTX ISA and ignores the requested one, so the generator pins it instead, and the driver JIT then loads the artifact on every driver at or above that version.
+			let generator = option_env!("RECIPE_NV_PTX_GENERATOR").ok_or_else(|| RecipeError::new("NVIDIA PTX generator is unavailable"))?;
+			let mut llc = Command::new(generator);
+			llc.args(["-march=nvptx64", &format!("-mcpu={architecture}"), &format!("-mattr={ptx_version}"), "-O2"]).arg(bitcode).args(["-o"]).arg(output);
+			native_command(llc, "NVIDIA PTX generator", key)?;
+			fs::read(output).and_then(|mut image| { image.push(0); fs::write(output, &image) }).map(|_| Vec::new()).map_err(|error| RecipeError::new(format!("cannot terminate native PTX artifact: {error}")))
 		}
 	}
 }
@@ -2877,8 +2879,8 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		let stem = format!(".recipe-native-{}-{serial}", std::process::id());
 		let source = directory.join(format!("{stem}.ll"));
 		let output = directory.join(format!("{stem}.{}", target.artifact_extension()));
-		let ptx = (target.backend() == Backend::Nvidia).then(|| directory.join(format!("{stem}.ptx")));
-		let temporary = NativeTemporaryFiles { paths: std::iter::once(source.clone()).chain(std::iter::once(output.clone())).chain(ptx.iter().cloned()).collect() };
+		let bitcode = (target.backend() == Backend::Nvidia).then(|| directory.join(format!("{stem}.bc")));
+		let temporary = NativeTemporaryFiles { paths: std::iter::once(source.clone()).chain(std::iter::once(output.clone())).chain(bitcode.iter().cloned()).collect() };
 		fs::write(&source, ir).map_err(|error| RecipeError::new(format!("cannot write native LLVM IR: {error}")))?; debug(&format!("native source key={key} path={}", source.display()))?;
 		// The artifact is cached on disk, so this is the one moment the compiler's
 		// view of the kernel exists. A cooperative grid requires every workgroup to
@@ -2887,7 +2889,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		// nonzero occupancy here holds for every workgroup width the schedule can
 		// pick. It does not bound the tile: local memory is checked separately, and
 		// the schedule still does not resize itself from these numbers.
-		for kernel in compile_native_artifact(target, &source, &output, ptx.as_deref(), &key)? {
+		for kernel in compile_native_artifact(target, &source, &output, bitcode.as_deref(), &key)? {
 			debug(&format!("native kernel {} registers={} scalars={} occupancy={} waves per SIMD", kernel.name, kernel.registers, kernel.scalars, kernel.occupancy))?;
 			require(kernel.occupancy != 0, format!("native kernel {} cannot be resident at any workgroup width", kernel.name))?;
 		}
@@ -6107,7 +6109,7 @@ struct Cuda {
 	upload: unsafe extern "C" fn(u64, *const c_void, usize) -> i32,
 	download: unsafe extern "C" fn(Ptr, u64, usize) -> i32,
 	synchronize: unsafe extern "C" fn() -> i32,
-	launch: unsafe extern "C" fn(usize, u32, u32, u32, u32, u32, u32, u32, Ptr, *mut Ptr) -> i32,
+	launch: unsafe extern "C" fn(usize, u32, u32, u32, u32, u32, u32, u32, Ptr, *mut Ptr, *mut Ptr) -> i32,
 	load: unsafe extern "C" fn(*mut Ptr, *const c_void) -> i32,
 	unload: unsafe extern "C" fn(Ptr) -> i32,
 	function: unsafe extern "C" fn(*mut usize, Ptr, *const u8) -> i32,
@@ -6331,7 +6333,7 @@ impl Gpu {
 		// wave count because that is the multiple by which the workgroup was
 		// widened. Claiming the whole local store deadlocks even at one wave,
 		// because the kernel's own fixed allocation shares the same store.
-		let shared_budget = shared_values / waves_per_workgroup;
+		let shared_budget = shared_values / waves;
 		// Chunk partials keep the arithmetic width while the tile allocation is
 		// counted in model elements, so a narrow model needs proportionally more
 		// elements per partial value.
@@ -6621,7 +6623,7 @@ impl Hsa {
 }
 #[cfg(nvidia)]
 impl Cuda {
-	unsafe fn native_dispatch(&self, module: Ptr, name: &str, element: u8, layout: &'static [u8]) -> Result<Dispatch> {
+	unsafe fn native_dispatch(&self, module: Ptr, name: &str, element: u8, layout: &'static [u8], waves: u32, shared_values: u32, register_values: u32) -> Result<Dispatch> {
 		unsafe {
 		let name = std::ffi::CString::new(name).map_err(|error| RecipeError::new(format!("NVIDIA native symbol is invalid: {error}")))?;
 		let mut object = 0;
@@ -6632,26 +6634,32 @@ impl Cuda {
 		}
 		require(max_block > 0 && shared >= 0 && used_registers > 0, "NVIDIA native symbol resources are invalid")?;
 		let register_wave = (used_registers as u32).checked_mul(self.wave).ok_or_else(|| RecipeError::new("NVIDIA native register count overflows"))?;
-		let observed = (self.registers / register_wave).min(self.threads / self.wave);
+		require((self.registers / register_wave).min(self.threads / self.wave) != 0, "NVIDIA native symbol has no resident wave")?;
 		let resources = Resources { shared: shared as u32, max_block: max_block as u32 };
-		let geometry = nvidia(self.cus, self.wave, self.workgroup, self.block_lds, self.sm_lds, observed, resources)?;
+		// The schedule sized every tile and the reduction buffer for its own workgroup, so the dispatch must use that width and not the wider one the register budget would allow.
+		let geometry = nvidia(self.cus, self.wave, self.workgroup, self.block_lds, self.sm_lds, waves, resources)?;
 		let mut active = 0;
-		driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, geometry.block as i32, 0), "native occupancy query")?;
+		// The grid is one workgroup per SM and the barrier only completes once every one of them
+		// is resident, so the occupancy question has to be asked about the launch this dispatch
+		// really makes. With no dynamic shared memory it answers a question nobody goes on to ask.
+		let values = shared_values.max(geometry.block.checked_mul(register_values).ok_or_else(|| RecipeError::new("NVIDIA native reduction buffer overflows"))?);
+		let dynamic = values.checked_mul(u32::from(element)).ok_or_else(|| RecipeError::new("NVIDIA native shared memory overflows"))?;
+		driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, geometry.block as i32, dynamic as usize), "native occupancy query")?;
 		require(active > 0, "NVIDIA native symbol has no resident workgroup")?;
 		Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry })
 		}
 	}
 
-	unsafe fn load_native(&self, artifact: &NativeArtifact) -> Result<(NativeCudaProgram, Dispatch, Dispatch, Option<Dispatch>)> {
+	unsafe fn load_native(&self, artifact: &NativeArtifact, waves: u32, shared_values: u32, register_values: u32) -> Result<(NativeCudaProgram, Dispatch, Dispatch, Option<Dispatch>)> {
 		unsafe {
 		driver_status(Backend::Nvidia, (self.set)(self.context), "native context")?;
 		let mut module = ptr::null_mut();
 		driver_status(Backend::Nvidia, (self.load)(&mut module, artifact.artifact.as_ptr().cast()), "native cubin load")?;
 		let program = NativeCudaProgram { module: module as usize, unload: self.unload };
 		let element = u8::try_from(artifact.precision.model.bytes()).map_err(|_| RecipeError::new("native NVIDIA precision width is invalid"))?;
-		let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT)?;
-		let epoch = self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, artifact.precision.epoch_layout)?;
-		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
+		let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves, shared_values, register_values)?;
+		let epoch = self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, artifact.precision.epoch_layout, waves, shared_values, register_values)?;
+		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves, 0, 0)).transpose()?;
 		Ok((program, forward, epoch, model_load))
 		}
 	}
@@ -6737,7 +6745,7 @@ impl NativeProgram {
 			}
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => {
-				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact)? };
+				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact, waves, schedule.shared_values, register_values)? };
 				(NativeBackend::Nvidia(program), forward, epoch, model_load)
 			}
 		};
@@ -6824,7 +6832,7 @@ impl NativeProgram {
 				(NativeBackend::Nvidia(program), Driver::Cuda(driver)) => {
 					require(program.module != 0, "native NVIDIA module is absent")?;
 					let stream = ptr::null_mut();
-					driver_status(Backend::Nvidia, (driver.launch)(dispatch.kernel.object as usize, threads / block, 1, 1, block, 1, 1, dynamic, stream, arguments.as_mut_ptr()), "native dispatch")
+					driver_status(Backend::Nvidia, (driver.launch)(dispatch.kernel.object as usize, threads / block, 1, 1, block, 1, 1, dynamic, stream, arguments.as_mut_ptr(), ptr::null_mut()), "native dispatch")
 				}
 				_ => Err(RecipeError::new("native program backend changed after loading")),
 			}
@@ -6907,7 +6915,6 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		const THREADS_PER_SM: i32 = 39;
 		const SM_LDS: i32 = 81;
 		const REGISTERS_PER_SM: i32 = 82;
-		const COOPERATIVE: i32 = 95;
 		const COMPUTE_MAJOR: i32 = 75;
 		const COMPUTE_MINOR: i32 = 76;
 		let runtime = std::sync::Arc::new(Library::open(if cfg!(windows) { "nvcuda.dll" } else { env!("RECIPE_NV_RUNTIME") })?);
@@ -6929,17 +6936,16 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		let load_device = |device, index| -> Result<Gpu> {
 			let check = |s, a| driver_status(Backend::Nvidia, s, a);
 			let mut context = ptr::null_mut();
-			let (mut cus, mut wave, mut workgroup, mut block_lds, mut sm_lds, mut registers, mut threads, mut cooperative, mut compute_major, mut compute_minor) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+			let (mut cus, mut wave, mut workgroup, mut block_lds, mut sm_lds, mut registers, mut threads, mut compute_major, mut compute_minor) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
 			let mut memory = 0;
 			check(total(&mut memory, device), "VRAM size")?;
-			for (kind, output, action) in [(CUS, &mut cus, "SM query"), (WAVE, &mut wave, "warp query"), (MAX_BLOCK, &mut workgroup, "workgroup query"), (BLOCK_LDS, &mut block_lds, "workgroup LDS query"), (SM_LDS, &mut sm_lds, "SM LDS query"), (REGISTERS_PER_SM, &mut registers, "register query"), (THREADS_PER_SM, &mut threads, "resident thread query"), (COOPERATIVE, &mut cooperative, "cooperative launch query"), (COMPUTE_MAJOR, &mut compute_major, "compute capability major query"), (COMPUTE_MINOR, &mut compute_minor, "compute capability minor query")] {
+			for (kind, output, action) in [(CUS, &mut cus, "SM query"), (WAVE, &mut wave, "warp query"), (MAX_BLOCK, &mut workgroup, "workgroup query"), (BLOCK_LDS, &mut block_lds, "workgroup LDS query"), (SM_LDS, &mut sm_lds, "SM LDS query"), (REGISTERS_PER_SM, &mut registers, "register query"), (THREADS_PER_SM, &mut threads, "resident thread query"), (COMPUTE_MAJOR, &mut compute_major, "compute capability major query"), (COMPUTE_MINOR, &mut compute_minor, "compute capability minor query")] {
 				check(attribute(output, kind, device), action)?;
 			}
-			require(cooperative != 0, "Nvidia device does not support cooperative launch")?;
 			require(compute_major > 0 && compute_minor >= 0, "Nvidia compute capability is invalid")?;
 			let native_target = BackendTarget::Nvidia { architecture: format!("sm_{compute_major}{compute_minor}") };
 			check(create(&mut context, 0, device), "context creation")?;
-			let cuda = Cuda { _runtime: runtime.clone(), context, set: runtime.function(b"cuCtxSetCurrent\0")?, allocate: runtime.function(b"cuMemAlloc_v2\0")?, free: runtime.function(b"cuMemFree_v2\0")?, upload: runtime.function(b"cuMemcpyHtoD_v2\0")?, download: runtime.function(b"cuMemcpyDtoH_v2\0")?, synchronize: runtime.function(b"cuCtxSynchronize\0")?, launch: runtime.function(b"cuLaunchCooperativeKernel\0")?, load, unload, function, function_attribute, occupancy, cus: cus as u32, wave: wave as u32, workgroup: workgroup as u32, block_lds: block_lds as u32, sm_lds: sm_lds as u32, registers: registers as u32, threads: threads as u32 };
+			let cuda = Cuda { _runtime: runtime.clone(), context, set: runtime.function(b"cuCtxSetCurrent\0")?, allocate: runtime.function(b"cuMemAlloc_v2\0")?, free: runtime.function(b"cuMemFree_v2\0")?, upload: runtime.function(b"cuMemcpyHtoD_v2\0")?, download: runtime.function(b"cuMemcpyDtoH_v2\0")?, synchronize: runtime.function(b"cuCtxSynchronize\0")?, launch: runtime.function(b"cuLaunchKernel\0")?, load, unload, function, function_attribute, occupancy, cus: cus as u32, wave: wave as u32, workgroup: workgroup as u32, block_lds: block_lds as u32, sm_lds: sm_lds as u32, registers: registers as u32, threads: threads as u32 };
 			Ok(Gpu { name: format!("nv{index}"), backend: Backend::Nvidia, native_target, driver: Driver::Cuda(cuda), memory: memory as u64, shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()) })
 		};
 		let mut found = Vec::new();

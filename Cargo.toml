@@ -41,7 +41,7 @@ nvidia-ptx = "ptx71"
 nvidia-compiler = "/usr/bin/clang"
 nvidia-runtime = "libcuda.so.1"
 nvidia-device-library = "/opt/cuda/nvvm/libdevice/libdevice.10.bc"
-nvidia-ptx-assembler = "/opt/cuda/bin/ptxas"
+nvidia-ptx-generator = "/usr/bin/llc"
 
 [package.metadata.train]
 epochs = 210
