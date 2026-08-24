@@ -649,10 +649,11 @@ fn main() -> BuildResult<()> {
 		("contraction-resident-waves-per-workgroup", "RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"),
 		("contraction-matrix-max-waves-per-workgroup", "RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"),
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
+		("host-memory-fraction", "RECIPE_HOST_MEMORY_FRACTION"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
-	for (key, environment) in [("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME"), ("hosts", "RECIPE_HOSTS")] {
+	for (key, environment) in [("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME"), ("hosts", "RECIPE_HOSTS"), ("scheduler", "RECIPE_SCHEDULER")] {
 		println!("cargo:rustc-env={environment}={}", text(&manifest, key)?);
 	}
 	println!("cargo:rustc-env=RECIPE_MULTI_DEVICE={}", policy(&manifest, "multi-device")?);

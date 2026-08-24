@@ -5658,6 +5658,7 @@ macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 /// The permitted placement policy. One TOML value defines it and there is no
 /// second placement setting.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u64)]
 enum Placement {
 	Local,
 	Every,
@@ -5766,6 +5767,335 @@ fn route(placement: Placement, graph: &Graph, rows: usize, precision: NativePrec
 /// Seconds the route spends moving parameters each epoch, priced from the
 /// measured links. A route of one device has no edge and costs nothing, so the
 /// topology is never measured for it.
+/// The authoritative runtime. One process owns the jobs, the devices, the hosts,
+/// the links, the planned host and device memory, and the active allocations, so
+/// independent Recipe runs are scheduled against one resource state rather than
+/// against a registry private to each process.
+const RUNTIME_SUBMIT: u8 = 0;
+const RUNTIME_RELEASE: u8 = 1;
+const RUNTIME_QUEUED: u64 = 0;
+const RUNTIME_GRANTED: u64 = 1;
+/// What a submitted declaration plans to occupy. Every field is an exactly
+/// planned size, not an estimate of one.
+struct Plan {
+	rows: usize,
+	host: u64,
+	parameters: u64,
+	statistics: u64,
+	/// Planned device bytes for one shard at each route width.
+	epoch: Vec<u64>,
+	/// The route a selector named, empty when the policy chooses.
+	named: Vec<usize>,
+}
+impl Plan {
+	fn encode(&self) -> Vec<u8> {
+		let mut body = Vec::new();
+		for value in [self.rows as u64, self.host, self.parameters, self.statistics, self.epoch.len() as u64] {
+			put(&mut body, value)
+		}
+		for value in &self.epoch {
+			put(&mut body, *value)
+		}
+		put(&mut body, self.named.len() as u64);
+		for device in &self.named {
+			put(&mut body, *device as u64)
+		}
+		body
+	}
+	fn decode(bytes: &[u8]) -> Result<Self> {
+		let mut wire = Wire::new(bytes);
+		let (rows, host, parameters, statistics, widths) = (wire.value()?, wire.value()?, wire.value()?, wire.value()?, wire.value()?);
+		let epoch = (0..widths).map(|_| wire.value()).collect::<Result<Vec<_>>>()?;
+		require(!epoch.is_empty(), "a plan covers at least one route width")?;
+		let count = wire.value()?;
+		let named = (0..count).map(|_| wire.value().map(|device| device as usize)).collect::<Result<Vec<_>>>()?;
+		Ok(Self { rows: rows as usize, host, parameters, statistics, epoch, named })
+	}
+	/// The plan a declaration makes once its graph and precision are known.
+	fn of(graph: &Graph, rows: usize, precision: NativePrecision, devices: usize, host: u64, named: Vec<usize>) -> Result<Self> {
+		let epoch = (1..=devices)
+			.map(|width| planned_epoch_bytes(graph, shard_rows(rows, width)[0], precision).map(|bytes| bytes as u64))
+			.collect::<Result<Vec<_>>>()?;
+		Ok(Self { rows, host, parameters: persistent_bytes(graph.parameters.len(), precision)? as u64, statistics: statistic_bytes(graph, precision)? as u64, epoch, named })
+	}
+}
+/// One admitted job's exact reservation. It is released whole when the job
+/// reaches a terminal state.
+struct Reservation {
+	job: u64,
+	route: Vec<usize>,
+	host: u64,
+	device: u64,
+}
+struct Runtime {
+	topology: &'static Topology,
+	host_total: u64,
+	host_used: u64,
+	device_used: Vec<u64>,
+	active: Vec<Reservation>,
+	next: u64,
+}
+fn host_memory() -> Result<u64> {
+	let meminfo = fs::read_to_string("/proc/meminfo").map_err(|error| RecipeError::new(format!("cannot read host memory: {error}")))?;
+	let kilobytes = meminfo
+		.lines()
+		.find_map(|line| line.strip_prefix("MemTotal:"))
+		.and_then(|value| value.split_whitespace().next())
+		.and_then(|value| value.parse::<u64>().ok())
+		.ok_or_else(|| RecipeError::new("host memory total is absent"))?;
+	let fraction = fraction("host memory fraction", env!("RECIPE_HOST_MEMORY_FRACTION"))?;
+	Ok((kilobytes as f64 * 1024.0 * fraction) as u64)
+}
+impl Runtime {
+	fn new() -> Result<Self> {
+		let topology = topology()?;
+		Ok(Self { topology, host_total: host_memory()?, host_used: 0, device_used: vec![0; topology.devices.len()], active: Vec::new(), next: 0 })
+	}
+	/// Devices no admitted job holds. A device carries one job at a time, so
+	/// concurrent jobs never overlap on a device unless a route plans it.
+	fn free(&self) -> Vec<usize> {
+		let held = self.active.iter().flat_map(|reservation| reservation.route.iter().copied()).collect::<Vec<_>>();
+		(0..self.topology.devices.len()).filter(|device| !held.contains(device)).collect()
+	}
+	/// The route this plan may take right now: the fastest free devices whose
+	/// planned host and device bytes both fit what is unreserved. `None` means the
+	/// plan waits.
+	fn admit(&self, plan: &Plan, placement: Placement) -> Result<Option<Vec<usize>>> {
+		if checked_add(self.host_used as usize, plan.host as usize, "planned host memory")? as u64 > self.host_total {
+			return Ok(None);
+		}
+		let free = self.free();
+		// A named route is still the runtime's to grant: it waits until every device
+		// it names is unheld, so two named runs never overlap on one device.
+		if !plan.named.is_empty() {
+			let shard = *plan.epoch.get(plan.named.len() - 1).ok_or_else(|| RecipeError::new("a named route exceeds the planned widths"))?;
+			let ready = plan.named.iter().all(|device| free.contains(device) && self.device_used[*device].saturating_add(shard) <= self.topology.devices[*device].memory);
+			return Ok(ready.then(|| plan.named.clone()));
+		}
+		let host = hostname()?;
+		let mut order = free;
+		if placement == Placement::Local {
+			order.retain(|device| self.topology.devices[*device].host == host);
+			order.truncate(1);
+		}
+		let mut rates = Vec::with_capacity(order.len());
+		for device in &order {
+			rates.push(self.topology.rate(*device)?)
+		}
+		let ranked = {
+			let mut ranked = order.clone();
+			ranked.sort_by(|left, right| {
+				let (left_rate, right_rate) = (rates[order.iter().position(|device| device == left).unwrap()], rates[order.iter().position(|device| device == right).unwrap()]);
+				right_rate.total_cmp(&left_rate).then_with(|| self.topology.devices[*left].canonical().cmp(&self.topology.devices[*right].canonical()))
+			});
+			ranked
+		};
+		let widths = match placement {
+			Placement::Local => 1..=ranked.len().min(1),
+			Placement::Every => ranked.len()..=ranked.len(),
+			Placement::Auto => 1..=ranked.len().min(plan.rows.max(1)).min(plan.epoch.len()),
+		};
+		let mut best: Option<(Vec<usize>, f64)> = None;
+		for width in widths {
+			if width == 0 {
+				continue;
+			}
+			let candidate = ranked[..width].to_vec();
+			let shard = plan.epoch[width - 1];
+			if candidate.iter().any(|device| self.device_used[*device].saturating_add(shard) > self.topology.devices[*device].memory) {
+				continue;
+			}
+			let cost = self.cost(&candidate, plan, shard)?;
+			if best.as_ref().is_none_or(|(_, previous)| cost < *previous) {
+				best = Some((candidate, cost))
+			}
+		}
+		Ok(best.map(|(route, _)| route))
+	}
+	/// The same complete-epoch prediction the placement policy uses, priced from
+	/// the plan's sizes instead of from a graph the runtime does not hold.
+	fn cost(&self, route: &[usize], plan: &Plan, shard: u64) -> Result<f64> {
+		let primary = route[0];
+		let mut computation = 0.0_f64;
+		let mut crossings = 0.0;
+		for device in route.iter().copied() {
+			computation = computation.max(shard as f64 / self.topology.rate(device)?);
+			if device == primary {
+				continue;
+			}
+			crossings += self.topology.stream(device, primary, plan.parameters as usize)? + self.topology.stream(primary, device, plan.parameters as usize)?;
+			crossings += self.topology.stream(device, primary, plan.statistics as usize)? + self.topology.stream(primary, device, plan.statistics as usize)?;
+			crossings += 2.0 * (self.topology.latency(device, primary)? + self.topology.latency(primary, device)?);
+		}
+		Ok(computation + crossings)
+	}
+	fn reserve(&mut self, plan: &Plan, route: Vec<usize>) -> u64 {
+		let shard = plan.epoch[route.len() - 1];
+		self.next += 1;
+		self.host_used += plan.host;
+		for device in &route {
+			self.device_used[*device] += shard
+		}
+		self.active.push(Reservation { job: self.next, route, host: plan.host, device: shard });
+		self.next
+	}
+    fn release(&mut self, job: u64) {
+		let Some(index) = self.active.iter().position(|reservation| reservation.job == job) else { return };
+		let reservation = self.active.remove(index);
+		self.host_used -= reservation.host.min(self.host_used);
+		for device in reservation.route {
+			self.device_used[device] -= reservation.device.min(self.device_used[device])
+		}
+	}
+	fn report(&self) -> String { format!("jobs {} host {}/{} held {}", self.active.len(), self.host_used, self.host_total, self.active.iter().map(|reservation| reservation.route.iter().map(|device| self.topology.devices[*device].canonical()).collect::<Vec<_>>().join("+")).collect::<Vec<_>>().join(" ")) }
+}
+static RUNTIME: OnceLock<(Mutex<Runtime>, std::sync::Condvar)> = OnceLock::new();
+fn runtime_state() -> Result<&'static (Mutex<Runtime>, std::sync::Condvar)> {
+	static ERROR: OnceLock<RecipeError> = OnceLock::new();
+	if let Some(state) = RUNTIME.get() {
+		return Ok(state);
+	}
+	match Runtime::new() {
+		Ok(runtime) => Ok(RUNTIME.get_or_init(|| (Mutex::new(runtime), std::sync::Condvar::new()))),
+		Err(error) => Err(ERROR.get_or_init(|| error).clone()),
+	}
+}
+/// Serves the authoritative runtime. Every submitted declaration waits here
+/// until its exact reservation is available, and every release immediately
+/// re-evaluates the waiting declarations.
+pub fn scheduler(bind: &str) -> ! {
+	let listener = TcpListener::bind(bind).unwrap_or_else(|error| panic!("cannot serve the Recipe runtime on {bind}: {error}"));
+	// Measuring the topology once here keeps it off the first declaration's path.
+	let runtime = runtime_state().and_then(|state| state.0.lock().map_err(|_| RecipeError::new("the Recipe runtime lock is poisoned")).map(|runtime| runtime.report())).unwrap_or_else(|error| panic!("{error}"));
+	eprintln!("recipe runtime {bind} {runtime} devices {}", devices().map_or_else(|error| error.to_string(), |found| found.iter().map(Gpu::canonical).collect::<Vec<_>>().join(" ")));
+	for stream in listener.incoming() {
+		let stream = stream.unwrap_or_else(|error| panic!("cannot accept a Recipe client: {error}"));
+		std::thread::spawn(move || schedule(stream));
+	}
+	std::process::exit(0)
+}
+fn schedule(mut stream: TcpStream) {
+	let mut held = None;
+	loop {
+		let Ok((header, payload)) = read_frame(&mut stream, 1 + 8 * (1 + REMOTE_REQUEST_FIELDS)) else { break };
+		let mut wire = Wire::new(&header[1..]);
+		let fields = (0..1 + REMOTE_REQUEST_FIELDS).map(|_| wire.value()).collect::<Result<Vec<_>>>();
+		let reply = fields.and_then(|fields| dispatch_job(header[0], &fields, &payload, &mut held, &mut stream));
+		let (status, result, body) = match reply {
+			Ok((result, body)) => (0_u8, result, body),
+			Err(error) => (1, 0, error.to_string().into_bytes()),
+		};
+		let mut head = vec![status];
+		put(&mut head, result);
+		if write_frame(&mut stream, &head, &body).is_err() {
+			break;
+		}
+	}
+	// A client that disappears releases whatever it held.
+	if let Some(job) = held
+		&& let Ok(state) = runtime_state()
+		&& let Ok(mut runtime) = state.0.lock()
+	{
+		runtime.release(job);
+		state.1.notify_all();
+	}
+}
+fn dispatch_job(verb: u8, fields: &[u64], payload: &[u8], held: &mut Option<u64>, stream: &mut TcpStream) -> Result<(u64, Vec<u8>)> {
+	let state = runtime_state()?;
+	match verb {
+		RUNTIME_SUBMIT => {
+			let plan = Plan::decode(payload)?;
+			let placement = match fields[1] {
+				0 => Placement::Local,
+				1 => Placement::Every,
+				_ => Placement::Auto,
+			};
+			let mut runtime = state.0.lock().map_err(|_| RecipeError::new("the Recipe runtime lock is poisoned"))?;
+			let mut announced = false;
+			loop {
+				if let Some(route) = runtime.admit(&plan, placement)? {
+					let job = runtime.reserve(&plan, route.clone());
+					*held = Some(job);
+					debug(&format!("runtime granted job {job} route {} :: {}", route.iter().map(|device| runtime.topology.devices[*device].canonical()).collect::<Vec<_>>().join(","), runtime.report()))?;
+					let mut body = Vec::new();
+					put(&mut body, route.len() as u64);
+					for device in route {
+						put(&mut body, device as u64)
+					}
+					return Ok((RUNTIME_GRANTED, body));
+				}
+				if !announced {
+					// The waiting declaration holds no host or device memory.
+					debug(&format!("runtime queued a declaration :: {}", runtime.report()))?;
+					let mut head = vec![0_u8];
+					put(&mut head, RUNTIME_QUEUED);
+					write_frame(stream, &head, &[])?;
+					announced = true;
+				}
+				runtime = state.1.wait(runtime).map_err(|_| RecipeError::new("the Recipe runtime lock is poisoned"))?;
+			}
+		}
+		RUNTIME_RELEASE => {
+			let mut runtime = state.0.lock().map_err(|_| RecipeError::new("the Recipe runtime lock is poisoned"))?;
+			let job = held.take().unwrap_or_default();
+			runtime.release(job);
+			debug(&format!("runtime released job {job} :: {}", runtime.report()))?;
+			drop(runtime);
+			state.1.notify_all();
+			Ok((0, Vec::new()))
+		}
+		_ => Err(RecipeError::new(format!("runtime verb {verb} is unknown"))),
+	}
+}
+/// A granted reservation. Dropping it releases the exact reservation, so a run
+/// that panics frees its devices as surely as one that completes.
+struct Lease {
+	stream: TcpStream,
+}
+impl Drop for Lease {
+	fn drop(&mut self) {
+		let mut head = vec![RUNTIME_RELEASE];
+		for field in [0_u64; 1 + REMOTE_REQUEST_FIELDS] {
+			put(&mut head, field)
+		}
+		if write_frame(&mut self.stream, &head, &[]).is_ok() {
+			read_frame(&mut self.stream, 1 + 8).ok();
+		}
+	}
+}
+/// Submits one declaration to the authoritative runtime and waits for its route.
+/// With no configured runtime the declaration is not scheduled and the route
+/// comes from the placement policy alone.
+fn submit(placement: Placement, graph: &Graph, rows: usize, precision: NativePrecision, host: u64) -> Result<(Vec<&'static Gpu>, Option<Lease>)> {
+	let address = env!("RECIPE_SCHEDULER");
+	if address.is_empty() {
+		return route(placement, graph, rows, precision).map(|route| (route, None));
+	}
+	let registry = devices()?;
+	// A selector names the route; the runtime still decides when it may run.
+	let named = explicit_route()?.map_or_else(|| Ok(Vec::new()), |route| route.iter().map(|gpu| registry.iter().position(|device| device.canonical() == gpu.canonical()).ok_or_else(|| RecipeError::new(format!("device {} is absent from the registry", gpu.canonical())))).collect())?;
+	let plan = Plan::of(graph, rows, precision, registry.len(), host, named)?;
+	let mut stream = TcpStream::connect(address).map_err(|error| RecipeError::new(format!("cannot reach the Recipe runtime at {address}: {error}")))?;
+	let mut head = vec![RUNTIME_SUBMIT];
+	for field in [0, placement as u64, 0, 0] {
+		put(&mut head, field)
+	}
+	write_frame(&mut stream, &head, &plan.encode())?;
+	loop {
+		let (header, body) = read_frame(&mut stream, 1 + 8)?;
+		let result = u64::from_le_bytes(header[1..].try_into().unwrap());
+		require(header[0] == 0, String::from_utf8_lossy(&body).into_owned())?;
+		if result == RUNTIME_QUEUED {
+			eprintln!("queued");
+			continue;
+		}
+		let mut wire = Wire::new(&body);
+		let count = wire.value()?;
+		let route = (0..count).map(|_| wire.value().and_then(|device| registry.get(device as usize).ok_or_else(|| RecipeError::new(format!("the runtime granted absent device {device}"))))).collect::<Result<Vec<_>>>()?;
+		eprintln!("running");
+		return Ok((route, Some(Lease { stream })));
+	}
+}
 fn route_transfer(gpus: &[&'static Gpu], parameters: usize, precision: NativePrecision) -> Result<f64> {
 	if gpus.len() < 2 {
 		return Ok(0.0);
@@ -10534,7 +10864,9 @@ impl Train {
 		stored.graph.state.trained_samples.sort_unstable();
 		stored.graph.state.trained_samples.dedup();
 		let (samples, targets) = (&prepared.samples[..training_rows * prepared.features], &target_values[..training_rows]);
-		let route = route(config.placement, &stored.graph, training_rows, NativePrecision::new(config.precision)?)?;
+		// The planned host memory this declaration occupies for its own batch.
+		let host = checked_mul(checked_add(prepared.samples.len(), 2 * target_values.len(), "planned host batch")?, size_of::<f64>(), "planned host memory")? as u64;
+		let (route, _lease) = submit(config.placement, &stored.graph, training_rows, NativePrecision::new(config.precision)?, host)?;
 		let mut tape = NativeTape::new(&stored.graph, samples, targets, &route, config.precision, model.loss)?;
 		self.finish_dispatch(if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) }, &mut stored, &prepared.schema, &tape, None)?;
 		tape.print_devices()?;
