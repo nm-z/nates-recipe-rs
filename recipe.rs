@@ -1197,8 +1197,11 @@ fn prune_internal_definitions(mut ir: String) -> String {
 			let name = signature.rsplit_once('@')?.1.split_once('(')?.0;
 			Some(name.to_owned())
 		}).collect::<Vec<_>>();
-		let Some(name) = names.into_iter().find(|name| ir.match_indices(&format!("@{name}(")).count() == 1) else { return ir };
-		ir = strip_definition(ir, &name);
+		let dead: Vec<_> = names.iter().filter(|name| ir.match_indices(&format!("@{name}(")).count() == 1).cloned().collect();
+		if dead.is_empty() { return ir }
+		let mut spans: Vec<_> = dead.iter().filter_map(|name| definition_span(&ir, name)).collect();
+		spans.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+		for (start, end) in spans { ir.replace_range(start..end, "") }
 	}
 }
 
