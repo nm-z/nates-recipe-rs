@@ -6477,18 +6477,20 @@ fn devices() -> Result<&'static [Gpu]> {
 		.map(Vec::as_slice)
 		.map_err(Clone::clone)
 }
+fn device_names(found: &[Gpu]) -> String { found.iter().map(|gpu| gpu.name.as_str()).collect::<Vec<_>>().join(", ") }
 fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	let found = devices()?;
 	if let Some(name) = name {
-		return found.iter().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
+		return found.iter().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent, this host has {}", device_names(found))));
 	}
-	require(found.len() == 1, "multiple GPUs require named selection")?;
+	require(found.len() == 1, format!("multiple GPUs require named selection from {}", device_names(found)))?;
 	Ok(&found[0])
 }
 fn selected_gpu() -> Result<&'static Gpu> {
 	let Some(name) = std::env::var("RECIPE_DEVICE").ok() else { return device(None) };
 	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-	devices()?.iter().find(|gpu| gpu.name == name || format!("{}:{}", host.trim(), gpu.name) == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")))
+	let found = devices()?;
+	found.iter().find(|gpu| gpu.name == name || format!("{}:{}", host.trim(), gpu.name) == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent, this host has {}", device_names(found))))
 }
 #[cfg(amd)]
 type HsaInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32;
