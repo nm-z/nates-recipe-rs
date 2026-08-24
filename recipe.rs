@@ -2745,9 +2745,8 @@ impl Drop for NativeTemporaryFiles {
 
 fn native_artifact_directory(key: &str) -> Result<PathBuf> {
 	require(!key.is_empty() && key != "." && key != ".." && !key.contains('/') && !key.contains('\\'), "native artifact key is not a single path component")?;
-	let executable = std::env::current_exe().map_err(|error| RecipeError::new(format!("cannot locate Recipe executable for native artifacts: {error}")))?;
-	let parent = executable.parent().ok_or_else(|| RecipeError::new("Recipe executable has no artifact directory"))?;
-	Ok(parent.join("recipe-native").join(key))
+	let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| RecipeError::new("home directory is absent"))?;
+	Ok(PathBuf::from(home).join(".cache").join("recipe").join("native").join(key))
 }
 
 fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
