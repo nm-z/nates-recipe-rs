@@ -1,0 +1,118 @@
+input_a,input_b,target
+"the engine runs smoothly","check output values now",0
+"check output values now","sensor data looks normal",1
+"sensor data looks normal","calibrate the instrument",0
+"calibrate the instrument","readings within range ok",1
+"readings within range ok","device reports an error",0
+"device reports an error","signal strength stable",1
+"signal strength stable","temperature is elevated",0
+"temperature is elevated","pressure remains steady",1
+"pressure remains steady","flow rate is decreasing",0
+"flow rate is decreasing","the engine runs smoothly",1
+"the engine runs smoothly","check output values now",0
+"check output values now","sensor data looks normal",1
+"sensor data looks normal","calibrate the instrument",0
+"calibrate the instrument","readings within range ok",1
+"readings within range ok","device reports an error",0
+"device reports an error","signal strength stable",1
+"signal strength stable","temperature is elevated",0
+"temperature is elevated","pressure remains steady",1
+"pressure remains steady","flow rate is decreasing",0
+"flow rate is decreasing","the engine runs smoothly",1
+"the engine runs smoothly","check output values now",0
+"check output values now","sensor data looks normal",1
+"sensor data looks normal","calibrate the instrument",0
+"calibrate the instrument","readings within range ok",1
+"readings within range ok","device reports an error",0
+"device reports an error","signal strength stable",1
+"signal strength stable","temperature is elevated",0
+"temperature is elevated","pressure remains steady",1
+"pressure remains steady","flow rate is decreasing",0
+"flow rate is decreasing","the engine runs smoothly",1
+"the engine runs smoothly","check output values now",0
+"check output values now","sensor data looks normal",1
+"sensor data looks normal","calibrate the instrument",0
+"calibrate the instrument","readings within range ok",1
+"readings within range ok","device reports an error",0
+"device reports an error","signal strength stable",1
+"signal strength stable","temperature is elevated",0
+"temperature is elevated","pressure remains steady",1
+"pressure remains steady","flow rate is decreasing",0
+"flow rate is decreasing","the engine runs smoothly",1
+"the engine runs smoothly","check output values now",0
+"check output values now","sensor data looks normal",1
+"sensor data looks normal","calibrate the instrument",0
+"calibrate the instrument","readings within range ok",1
+"readings within range ok","device reports an error",0
+"device reports an error","signal strength stable",1
+"signal strength stable","temperature is elevated",0
+"temperature is elevated","pressure remains steady",1
+"pressure remains steady","flow rate is decreasing",0
+"flow rate is decreasing","the engine runs smoothly",1
+"the engine runs smoothly","check output values now",0
+"check output values now","sensor data looks normal",1
+"sensor data looks normal","calibrate the instrument",0
+"calibrate the instrument","readings within range ok",1
+"readings within range ok","device reports an error",0
+"device reports an error","signal strength stable",1
+"signal strength stable","temperature is elevated",0
+"temperature is elevated","pressure remains steady",1
+"pressure remains steady","flow rate is decreasing",0
+"flow rate is decreasing","the engine runs smoothly",1
+"the engine runs smoothly","check output values now",0
+"check output values now","sensor data looks normal",1
+"sensor data looks normal","calibrate the instrument",0
+"calibrate the instrument","readings within range ok",1
+"readings within range ok","device reports an error",0
+"device reports an error","signal strength stable",1
+"signal strength stable","temperature is elevated",0
+"temperature is elevated","pressure remains steady",1
+"pressure remains steady","flow rate is decreasing",0
+"flow rate is decreasing","the engine runs smoothly",1
+"the engine runs smoothly","check output values now",0
+"check output values now","sensor data looks normal",1
+"sensor data looks normal","calibrate the instrument",0
+"calibrate the instrument","readings within range ok",1
+"readings within range ok","device reports an error",0
+"device reports an error","signal strength stable",1
+"signal strength stable","temperature is elevated",0
+"temperature is elevated","pressure remains steady",1
+"pressure remains steady","flow rate is decreasing",0
+"flow rate is decreasing","the engine runs smoothly",1
+"the engine runs smoothly","check output values now",0
+"check output values now","sensor data looks normal",1
+"sensor data looks normal","calibrate the instrument",0
+"calibrate the instrument","readings within range ok",1
+"readings within range ok","device reports an error",0
+"device reports an error","signal strength stable",1
+"signal strength stable","temperature is elevated",0
+"temperature is elevated","pressure remains steady",1
+"pressure remains steady","flow rate is decreasing",0
+"flow rate is decreasing","the engine runs smoothly",1
+"the engine runs smoothly","check output values now",0
+"check output values now","sensor data looks normal",1
+"sensor data looks normal","calibrate the instrument",0
+"calibrate the instrument","readings within range ok",1
+"readings within range ok","device reports an error",0
+"device reports an error","signal strength stable",1
+"signal strength stable","temperature is elevated",0
+"temperature is elevated","pressure remains steady",1
+"pressure remains steady","flow rate is decreasing",0
+"flow rate is decreasing","the engine runs smoothly",1
+"the engine runs smoothly","check output values now",0
+"check output values now","sensor data looks normal",1
+"sensor data looks normal","calibrate the instrument",0
+"calibrate the instrument","readings within range ok",1
+"readings within range ok","device reports an error",0
+"device reports an error","signal strength stable",1
+"signal strength stable","temperature is elevated",0
+"temperature is elevated","pressure remains steady",1
+"pressure remains steady","flow rate is decreasing",0
+"flow rate is decreasing","the engine runs smoothly",1
+"the engine runs smoothly","check output values now",0
+"check output values now","sensor data looks normal",1
+"sensor data looks normal","calibrate the instrument",0
+"calibrate the instrument","readings within range ok",1
+"readings within range ok","device reports an error",0
+"device reports an error","signal strength stable",1
+"signal strength stable","temperature is elevated",0
