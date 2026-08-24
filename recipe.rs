@@ -8085,7 +8085,6 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 			for (row, entries) in directories.values().enumerate() {
 				let (path, bytes) = entries.iter().find(|(path, _)| stem(path) == *column).unwrap();
 				let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
-					require(column != target, format!("per-sample target files {column:?} hold images, not values"))?;
 					image_values(path, bytes)?
 				} else {
 					vec![sample_text(path, bytes)?]
@@ -8113,7 +8112,6 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 			let mut width = None;
 			for (row, (path, bytes)) in ordered.iter().enumerate() {
 				let values = if path.extension().and_then(|value| value.to_str()).is_some_and(is_image) {
-					require(column != target, format!("paired target directory {column:?} holds images, not values"))?;
 					image_values(path, bytes)?
 				} else {
 					vec![sample_text(path, bytes)?]
@@ -8529,8 +8527,8 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 				}
 			}
 		}
-		require(matches.len() == 1, format!("target {name:?} must identify exactly one feature"))?;
-		selected.push(matches[0]);
+		require(!matches.is_empty(), format!("target {name:?} must identify exactly one feature"))?;
+		selected.extend(matches);
 	}
 	let table_index = selected.first().map_or(0, |target| target.0);
 	let row_count = tables[table_index].rows.len();
