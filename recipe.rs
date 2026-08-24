@@ -7599,9 +7599,8 @@ fn fit_kmeans(clusters: usize, data: &Prepared, rows: usize, config: Config, _: 
 	program.nearest(1, false, table);
 	Ok(Predictor::new(program.finish()?))
 }
-/// Teacher prediction is one independent query per row, so the rows are split across the
-/// machine's cores. Each chunk owns a distinct output slice and chunks are joined in row
-/// order, so neither the values nor the reported error depend on the split.
+/// Evaluates the immutable teacher once for each prepared sample. Worker threads process
+/// disjoint sample ranges and preserve input order.
 fn predict_rows(teacher: &Predictor, inputs: &[f64], features: usize) -> Result<Vec<f64>> {
 	require(features != 0, "teacher prediction has no features")?;
 	let rows = inputs.len() / features;
