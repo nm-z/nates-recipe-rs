@@ -3451,8 +3451,9 @@ use std::{
 	error::Error,
 	ffi::c_void,
 	fmt, fs,
-	io::{IsTerminal, Write},
+	io::{IsTerminal, Read, Write},
 	mem::{size_of, size_of_val},
+	net::{TcpListener, TcpStream},
 	path::{Path, PathBuf},
 	process::Command,
 	ptr,
@@ -4896,11 +4897,11 @@ impl Recipe {
 impl Recipe {
 	pub fn infer(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
 		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
-		let device = selected_gpu().unwrap_or_else(|error| panic!("{error}"));
+		let devices = selected_gpus().unwrap_or_else(|error| panic!("{error}"));
 		let result = bundle::run_infer(&path, input, |stored, samples| {
 			let config = Config::load()?;
-			let graph = materialize_saved_graph(stored, samples, device, config)?;
-			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, stored.model.loss)?;
+			let graph = materialize_saved_graph(stored, samples, devices[0], config)?;
+			let mut tape = NativeTape::new(&graph, samples, &[], &devices, stored.precision, stored.model.loss)?;
 			tape.inject_bn_stats(&stored.bn_stats)?;
 			tape.forward()?;
 			tape.predictions()
@@ -5616,13 +5617,13 @@ fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetS
 	let artifact = bundle::artifact_key(model, &schema, precision, graph, target);
 	bundle::StoredGraph { graph: graph.clone(), model: model.clone(), precision, inputs, outputs: vec![output], norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new(), artifact }
 }
-struct NativeTape {
+/// One device's placement of the model. A shard owns every buffer the graph
+/// needs on its device and the contiguous rows that device trains on.
+struct Shard {
 	program: NativeProgram,
-	precision: NativePrecision,
 	values: Buffer,
 	contexts: Buffer,
 	adjoints: Buffer,
-	batch_normalizations: Vec<(usize, usize)>,
 	samples: Buffer,
 	input_adjoint: Buffer,
 	targets: Buffer,
@@ -5632,15 +5633,45 @@ struct NativeTape {
 	variances: Buffer,
 	gradient: Buffer,
 	metrics: Buffer,
-	best_loss: [f64; 4],
 	rows: u32,
+}
+unsafe impl Send for Shard {}
+/// The model placed across a route. A route of one device holds one shard and
+/// moves nothing; every added device adds a shard and the transfers that keep
+/// the parameters one model.
+struct NativeTape {
+	shards: Vec<Shard>,
+	precision: NativePrecision,
+	batch_normalizations: Vec<(usize, usize)>,
+	best_loss: [f64; 4],
 	parameters: usize,
 	step: u32,
 	output: usize,
 	capacity: usize,
+	transfer: f64,
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
-impl NativeTape {
+/// Contiguous row blocks, largest first, so predictions stay in row order and
+/// every device in the route trains on at least one row.
+/// Seconds the route spends moving parameters each epoch, priced from the
+/// measured links. A route of one device has no edge and costs nothing, so the
+/// topology is never measured for it.
+fn route_transfer(gpus: &[&'static Gpu], parameters: usize, precision: NativePrecision) -> Result<f64> {
+	if gpus.len() < 2 {
+		return Ok(0.0);
+	}
+	let topology = topology()?;
+	let index = |gpu: &Gpu| topology.devices.iter().position(|device| device.canonical() == gpu.canonical()).ok_or_else(|| RecipeError::new(format!("device {} is absent from the topology", gpu.canonical())));
+	let primary = index(gpus[0])?;
+	// One epoch moves weights, moments, and variances off every other device and back.
+	let bytes = checked_mul(parameters, precision.model.bytes() + 2 * precision.state.bytes(), "route parameter transfer")?;
+	gpus[1..].iter().try_fold(0.0, |total, gpu| {
+		let device = index(gpu)?;
+		Ok(total + topology.transfer(device, primary, bytes)? + topology.transfer(primary, device, bytes)?)
+	})
+}
+fn shard_rows(rows: usize, devices: usize) -> Vec<usize> { (0..devices).map(|index| rows / devices + usize::from(index < rows % devices)).collect() }
+impl Shard {
 	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: LossFunction) -> Result<Self> {
 		let input = graph.input.elements();
 		require(input != 0 && !samples.is_empty() && samples.len() % input == 0, format!("model input batch expected a nonempty multiple of {input} values, received {}", samples.len()))?;
@@ -5659,9 +5690,6 @@ impl NativeTape {
 		let moments = if graph.state.moments.is_empty() { zeros.clone() } else { graph.state.moments.clone() };
 		let variances = if graph.state.variances.is_empty() { zeros.clone() } else { graph.state.variances.clone() };
 		let frozen = if graph.frozen.is_empty() { vec![0_u8; parameters.max(1)] } else { graph.frozen.clone() };
-		let batch_normalizations = graph.nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels))).collect();
-		let best_loss = if graph.state.best_loss.is_empty() { [f64::INFINITY, f64::NAN, f64::NAN, f64::INFINITY] } else { graph.state.best_loss.as_slice().try_into().map_err(|_| RecipeError::new("saved loss state is invalid"))? };
-		let step = narrow(graph.state.epoch, "optimizer epoch")? as u32;
 		let target_buffer = if targets.is_empty() { vec![0.0] } else { targets.to_vec() };
 		let parameter_values = if graph.parameters.is_empty() { vec![0.0] } else { graph.parameters.clone() };
 		let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
@@ -5677,11 +5705,9 @@ impl NativeTape {
 		}
 		Ok(Self {
 			program,
-			precision,
 			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
 			contexts: Buffer::upload(gpu, &vec![0_u8; layout.contexts_bytes.max(1)])?,
 			adjoints: Buffer::upload(gpu, &vec![0_u8; layout.adjoints_bytes.max(1)])?,
-			batch_normalizations,
 			samples: Buffer::upload_float(gpu, samples, precision.model)?,
 			input_adjoint: Buffer::upload_float(gpu, &vec![0.0; samples.len().max(1)], precision.model)?,
 			targets: Buffer::upload_float(gpu, &target_buffer, precision.model)?,
@@ -5691,12 +5717,7 @@ impl NativeTape {
 			variances: Buffer::upload_float(gpu, &variances, precision.state)?,
 			gradient: Buffer::upload(gpu, &vec![0_u8; gradient_bytes])?,
 			metrics: Buffer::upload_float(gpu, &[0.0], precision.state)?,
-			best_loss,
 			rows: narrow(rows, "native rows")? as u32,
-			parameters,
-			step,
-			output,
-			capacity: rows,
 		})
 	}
 	fn forward(&mut self) -> Result<()> {
@@ -5704,45 +5725,20 @@ impl NativeTape {
 		let rows = self.rows;
 		let thread_count = threads;
 		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count];
-		self.program.launch_forward(&mut call).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
-		Ok(())
+		self.program.launch_forward(&mut call).map_err(|error| RecipeError::new(format!("forward: {error}")))
 	}
-	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
-		let expected = self.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
-		require(stats.len() == expected, format!("batch normalization expected {expected} saved statistics, received {}", stats.len()))?;
-		let mut offset = 0;
-		for &(node, channels) in &self.batch_normalizations {
-			let end = offset + 2 * channels;
-			self.contexts.write_float_bytes(self.program.artifact.layout.contexts[node], &stats[offset..end], self.precision.model)?;
-			offset = end;
-		}
-		Ok(())
-	}
-	fn extract_bn_stats(&self) -> Result<Vec<f64>> {
-		let mut stats = Vec::new();
-		for &(node, channels) in &self.batch_normalizations {
-			stats.extend(self.contexts.download_float_bytes(self.program.artifact.layout.contexts[node], 2 * channels, self.precision.model)?);
-		}
-		Ok(stats)
-	}
-	fn predictions(&self) -> Result<Vec<f64>> {
-		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
-		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision.model)?;
-		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
-	}
-	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
-		require(self.step != 0, "optimizer epoch is absent")?;
+	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config, precision: NativePrecision, step: u32) -> Result<f64> {
+		let _ = tolerance;
 		let threads = self.program.epoch.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
-		let beta1 = self.precision.state.below_one(config.beta1);
-		let beta2 = self.precision.state.below_one(config.beta2);
-		let epsilon = self.precision.state.optimizer_epsilon(config.epsilon);
-		let beta1_power = beta1.powi(self.step as i32);
-		let beta2_power = beta2.powi(self.step as i32);
+		let beta1 = precision.state.below_one(config.beta1);
+		let beta2 = precision.state.below_one(config.beta2);
+		let epsilon = precision.state.optimizer_epsilon(config.epsilon);
+		let beta1_power = beta1.powi(step as i32);
+		let beta2_power = beta2.powi(step as i32);
 		let decay = config.decay;
-		let step = self.step;
-		let encoded = [rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay].map(|value| self.precision.state.pack(value));
+		let encoded = [rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay].map(|value| precision.state.pack(value));
 		let mut call = ptrs![
 			self.samples.pointer,
 			self.targets.pointer,
@@ -5770,7 +5766,116 @@ impl NativeTape {
 		debug(&format!("epoch {step} launch"))?;
 		self.program.launch_epoch(&mut call).map_err(|error| RecipeError::new(format!("training forward/backward/optimizer update: {error}")))?;
 		debug(&format!("epoch {step} launch complete"))?;
-		let objective = self.metrics.download_float(1, self.precision.state)?[0];
+		self.metrics.download_float(1, precision.state).map(|values| values[0])
+	}
+	fn predictions(&self, output: usize, precision: NativePrecision) -> Result<Vec<f64>> {
+		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+		let values = self.values.download_float_bytes(offset, self.rows as usize * output, precision.model)?;
+		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.canonical())).map(|_| values)
+	}
+}
+impl NativeTape {
+	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpus: &[&'static Gpu], precision: Compute, loss: LossFunction) -> Result<Self> {
+		require(!gpus.is_empty(), "a route selects at least one device")?;
+		let input = graph.input.elements();
+		require(input != 0 && !samples.is_empty() && samples.len() % input == 0, format!("model input batch expected a nonempty multiple of {input} values, received {}", samples.len()))?;
+		let capacity = samples.len() / input;
+		let output = graph.output.elements();
+		require(targets.is_empty() || targets.len() == capacity * output, format!("target batch expected 0 or {} values, received {}", capacity * output, targets.len()))?;
+		require(capacity >= gpus.len(), format!("route of {} devices needs at least {} rows, received {capacity}", gpus.len(), gpus.len()))?;
+		let mut shards = Vec::with_capacity(gpus.len());
+		let mut row = 0;
+		for (gpu, rows) in gpus.iter().zip(shard_rows(capacity, gpus.len())) {
+			let (start, end) = (row, row + rows);
+			let slice = &samples[start * input..end * input];
+			let target = if targets.is_empty() { &[][..] } else { &targets[start * output..end * output] };
+			shards.push(Shard::new(graph, slice, target, gpu, precision, loss)?);
+			row = end;
+		}
+		let precision = shards[0].program.artifact.precision;
+		let batch_normalizations = graph.nodes.iter().enumerate().filter_map(|(index, node)| (node.op == Primitive::Normalize && node.argument[0] == 0.0).then_some((index, node.output.channels))).collect();
+		let best_loss = if graph.state.best_loss.is_empty() { [f64::INFINITY, f64::NAN, f64::NAN, f64::INFINITY] } else { graph.state.best_loss.as_slice().try_into().map_err(|_| RecipeError::new("saved loss state is invalid"))? };
+		let parameters = graph.parameters.len();
+		Ok(Self { shards, precision, batch_normalizations, best_loss, parameters, step: narrow(graph.state.epoch, "optimizer epoch")? as u32, output, capacity, transfer: route_transfer(gpus, parameters, precision)? })
+	}
+	/// Runs one operation on every device of the route at once and keeps the
+	/// first failure. A route of one device runs it in place.
+	fn map<T: Send>(&mut self, operation: impl Fn(&mut Shard) -> Result<T> + Sync) -> Result<Vec<T>> {
+		if let [shard] = &mut self.shards[..] {
+			return operation(shard).map(|value| vec![value]);
+		}
+		std::thread::scope(|scope| {
+			let handles = self.shards.iter_mut().map(|shard| scope.spawn(|| operation(shard))).collect::<Vec<_>>();
+			handles.into_iter().map(|handle| handle.join().map_err(|_| RecipeError::new("a device in the route panicked"))?).collect()
+		})
+	}
+	fn forward(&mut self) -> Result<()> { self.map(Shard::forward).map(|_| ()) }
+	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
+		let expected = self.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
+		require(stats.len() == expected, format!("batch normalization expected {expected} saved statistics, received {}", stats.len()))?;
+		for shard in &self.shards {
+			let mut offset = 0;
+			for &(node, channels) in &self.batch_normalizations {
+				let end = offset + 2 * channels;
+				shard.contexts.write_float_bytes(shard.program.artifact.layout.contexts[node], &stats[offset..end], self.precision.model)?;
+				offset = end;
+			}
+		}
+		Ok(())
+	}
+	/// Batch statistics are per-device batch statistics, so the route's statistic
+	/// is the row-weighted mean of what each device measured.
+	fn extract_bn_stats(&self) -> Result<Vec<f64>> {
+		let expected = self.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
+		let mut merged = vec![0.0; expected];
+		for shard in &self.shards {
+			let share = f64::from(shard.rows) / self.capacity as f64;
+			let mut offset = 0;
+			for &(node, channels) in &self.batch_normalizations {
+				let end = offset + 2 * channels;
+				for (slot, value) in merged[offset..end].iter_mut().zip(shard.contexts.download_float_bytes(shard.program.artifact.layout.contexts[node], 2 * channels, self.precision.model)?) {
+					*slot += share * value
+				}
+				offset = end;
+			}
+		}
+		Ok(merged)
+	}
+	fn predictions(&self) -> Result<Vec<f64>> {
+		let (output, precision) = (self.output, self.precision);
+		Ok(self.shards.iter().map(|shard| shard.predictions(output, precision)).collect::<Result<Vec<_>>>()?.concat())
+	}
+	/// Each device advanced its own rows, so the route's parameters are the
+	/// row-weighted mean of the updated parameters and are returned to every
+	/// device. This is the route's only cross-device transfer per epoch.
+	fn gather(&mut self) -> Result<()> {
+		if self.shards.len() < 2 {
+			return Ok(());
+		}
+		let (parameters, capacity, precision) = (self.parameters, self.capacity as f64, self.precision);
+		let mut merged = [vec![0.0; parameters], vec![0.0; parameters], vec![0.0; parameters]];
+		for shard in &self.shards {
+			let share = f64::from(shard.rows) / capacity;
+			let state = [shard.weights.download_float(parameters, precision.model)?, shard.moments.download_float(parameters, precision.state)?, shard.variances.download_float(parameters, precision.state)?];
+			for (sum, values) in merged.iter_mut().zip(state) {
+				for (slot, value) in sum.iter_mut().zip(values) {
+					*slot += share * value
+				}
+			}
+		}
+		for shard in &self.shards {
+			shard.weights.write_float_bytes(0, &merged[0], precision.model)?;
+			shard.moments.write_float_bytes(0, &merged[1], precision.state)?;
+			shard.variances.write_float_bytes(0, &merged[2], precision.state)?;
+		}
+		Ok(())
+	}
+	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
+		require(self.step != 0, "optimizer epoch is absent")?;
+		let (precision, step, capacity) = (self.precision, self.step, self.capacity as f64);
+		let objectives = self.map(|shard| shard.epoch(rate, tolerance, config, precision, step).map(|objective| (objective, f64::from(shard.rows))))?;
+		self.gather()?;
+		let objective = objectives.iter().map(|(objective, rows)| objective * rows / capacity).sum();
 		debug(&format!("epoch {step} metric complete"))?;
 		let saved = self.observe(objective, tolerance)?;
 		Ok((objective, saved))
@@ -5789,9 +5894,9 @@ impl NativeTape {
 		self.step = self.step.checked_add(1).ok_or_else(|| RecipeError::new("optimizer epoch overflows"))?;
 		Ok(())
 	}
-	fn weights(&self) -> Result<Vec<f64>> { self.weights.download_float(self.parameters, self.precision.model) }
+	fn weights(&self) -> Result<Vec<f64>> { self.shards[0].weights.download_float(self.parameters, self.precision.model) }
 	fn optimizer_state(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
-		Ok((self.weights()?, self.moments.download_float(self.parameters, self.precision.state)?, self.variances.download_float(self.parameters, self.precision.state)?))
+		Ok((self.weights()?, self.shards[0].moments.download_float(self.parameters, self.precision.state)?, self.shards[0].variances.download_float(self.parameters, self.precision.state)?))
 	}
 	fn capture(&self, graph: &mut Graph) -> Result<()> {
 		let (weights, moments, variances) = self.optimizer_state()?;
@@ -5802,10 +5907,11 @@ impl NativeTape {
 		graph.state.best_loss = self.best_loss.to_vec();
 		Ok(())
 	}
-	fn tile(&self) -> Tile { self.program.tile }
+	fn tile(&self) -> Tile { self.shards[0].program.tile }
 	fn print_devices(&self) -> Result<()> {
-		let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-		eprintln!("{}:{}.{}", host.trim(), self.program.gpu.name, self.precision.model.label());
+		let route = self.shards.iter().map(|shard| format!("{}#{}", shard.program.gpu.canonical(), shard.rows)).collect::<Vec<_>>().join(",");
+		let transfer = if self.shards.len() > 1 { format!(" transfer {:.6}s/epoch", self.transfer) } else { String::new() };
+		eprintln!("{route}.{}{transfer}", self.precision.model.label());
 		Ok(())
 	}
 }
@@ -5843,6 +5949,7 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 	};
 	checked_mul(elements.max(1), element, "context bytes")
 }
+fn word(value: u64, role: &str) -> Result<u32> { u32::try_from(value).map_err(|_| RecipeError::new(format!("{role} exceeds u32"))) }
 fn narrow(value: usize, role: &str) -> Result<i32> { i32::try_from(value).map_err(|_| RecipeError::new(format!("{role} exceeds i32"))) }
 struct Buffer {
 	runtime: &'static Gpu,
@@ -6016,6 +6123,7 @@ enum NativeBackend {
 	Amd(NativeHsaProgram),
 	#[cfg(nvidia)]
 	Nvidia(NativeCudaProgram),
+	Remote(u64),
 }
 
 struct NativeProgram {
@@ -6041,6 +6149,7 @@ impl Drop for NativeHsaProgram {
 }
 
 #[derive(Clone, Copy)]
+#[repr(u64)]
 enum NativeEntry {
 	Forward,
 	Epoch,
@@ -6148,19 +6257,346 @@ enum Driver {
 	Hsa(Hsa),
 	#[cfg(nvidia)]
 	Cuda(Cuda),
+	Remote(Remote),
 }
 #[allow(dead_code)]
 struct Gpu {
+	host: String,
 	name: String,
 	backend: Backend,
 	native_target: BackendTarget,
 	driver: Driver,
 	memory: u64,
+	wave: u32,
 	shared_limit: u32,
 	dispatch: Mutex<()>,
 }
 unsafe impl Send for Gpu {}
 unsafe impl Sync for Gpu {}
+/// Canonical device identity. A device is named by the host that owns it, so a
+/// local and a remote name are the same shape and one registry holds both.
+fn canonical(host: &str, name: &str) -> String { format!("{host}:{name}") }
+fn hostname() -> Result<String> {
+	let mut name = [0_u8; 256];
+	require(unsafe { gethostname(name.as_mut_ptr().cast(), name.len()) } == 0, "cannot read hostname")?;
+	let end = name.iter().position(|byte| *byte == 0).unwrap_or(name.len());
+	String::from_utf8(name[..end].to_vec()).map_err(|error| RecipeError::new(format!("hostname is not UTF-8: {error}")))
+}
+impl Gpu {
+	fn canonical(&self) -> String { canonical(&self.host, &self.name) }
+}
+/// Remote device transport. A request carries a verb, three fields, and a
+/// payload; the reply carries a status, one result, and a payload. The verbs are
+/// the driver operations, so one implementation drives local and remote devices.
+struct Remote {
+	stream: Mutex<TcpStream>,
+	device: u64,
+}
+const REMOTE_DEVICES: u8 = 0;
+const REMOTE_ALLOCATE: u8 = 1;
+const REMOTE_FREE: u8 = 2;
+const REMOTE_UPLOAD: u8 = 3;
+const REMOTE_DOWNLOAD: u8 = 4;
+const REMOTE_SYNCHRONIZE: u8 = 5;
+const REMOTE_PROGRAM: u8 = 6;
+const REMOTE_LAUNCH: u8 = 7;
+const REMOTE_REQUEST_FIELDS: usize = 3;
+fn put(buffer: &mut Vec<u8>, value: u64) { buffer.extend_from_slice(&value.to_le_bytes()) }
+fn put_bytes(buffer: &mut Vec<u8>, value: &[u8]) {
+	put(buffer, value.len() as u64);
+	buffer.extend_from_slice(value);
+}
+struct Wire<'a> {
+	bytes: &'a [u8],
+	at: usize,
+}
+impl<'a> Wire<'a> {
+	fn new(bytes: &'a [u8]) -> Self { Self { bytes, at: 0 } }
+	fn take(&mut self, count: usize) -> Result<&'a [u8]> {
+		let end = checked_add(self.at, count, "remote frame field")?;
+		require(end <= self.bytes.len(), "remote frame is truncated")?;
+		let slice = &self.bytes[self.at..end];
+		self.at = end;
+		Ok(slice)
+	}
+	fn value(&mut self) -> Result<u64> { self.take(8).map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap())) }
+	fn slice(&mut self) -> Result<&'a [u8]> {
+		let count = self.value()? as usize;
+		self.take(count)
+	}
+	fn text(&mut self) -> Result<String> { self.slice().and_then(|bytes| String::from_utf8(bytes.to_vec()).map_err(|error| RecipeError::new(format!("remote frame text is invalid: {error}")))) }
+}
+fn transport(action: &str, error: std::io::Error) -> RecipeError { RecipeError::new(format!("remote {action}: {error}")) }
+fn write_frame(stream: &mut TcpStream, head: &[u8], payload: &[u8]) -> Result<()> {
+	let mut frame = Vec::with_capacity(head.len() + 8 + payload.len());
+	frame.extend_from_slice(head);
+	put(&mut frame, payload.len() as u64);
+	frame.extend_from_slice(payload);
+	stream.write_all(&frame).map_err(|error| transport("write", error))?;
+	stream.flush().map_err(|error| transport("flush", error))
+}
+fn read_frame(stream: &mut TcpStream, head: usize) -> Result<(Vec<u8>, Vec<u8>)> {
+	let mut header = vec![0_u8; head + 8];
+	stream.read_exact(&mut header).map_err(|error| transport("read", error))?;
+	let length = u64::from_le_bytes(header[head..].try_into().unwrap()) as usize;
+	let mut payload = vec![0_u8; length];
+	stream.read_exact(&mut payload).map_err(|error| transport("read", error))?;
+	header.truncate(head);
+	Ok((header, payload))
+}
+impl Remote {
+	fn call(&self, verb: u8, fields: [u64; REMOTE_REQUEST_FIELDS], payload: &[u8]) -> Result<(u64, Vec<u8>)> {
+		let mut stream = self.stream.lock().map_err(|_| RecipeError::new("remote transport lock is poisoned"))?;
+		let mut head = vec![verb];
+		put(&mut head, self.device);
+		for field in fields {
+			put(&mut head, field)
+		}
+		write_frame(&mut stream, &head, payload)?;
+		let (header, payload) = read_frame(&mut stream, 1 + 8)?;
+		let result = u64::from_le_bytes(header[1..].try_into().unwrap());
+		require(header[0] == 0, String::from_utf8_lossy(&payload).into_owned())?;
+		Ok((result, payload))
+	}
+}
+/// Every `Compute` is described by its variant and its two float layouts, so a
+/// device on another host rebuilds the identical native precision composition.
+impl Compute {
+	fn encode(self) -> [u8; 8] {
+		let (tag, arithmetic, storage, bits) = match self {
+			Self::F(format) => (0, format.arithmetic, format.storage, 0),
+			Self::Fp(format) => (1, format.arithmetic, format.storage, 0),
+			Self::Int(format) => (2, FloatLayout::new(0, 0, 0), FloatLayout::new(0, 0, 0), format.bits),
+			Self::Bf(format) => (3, format.arithmetic, format.storage, 0),
+			Self::Tf(format) => (4, format.arithmetic, format.storage, 0),
+		};
+		[tag, arithmetic.sign, arithmetic.exp, arithmetic.man, storage.sign, storage.exp, storage.man, bits]
+	}
+	fn decode(bytes: &[u8]) -> Result<Self> {
+		require(bytes.len() == 8, "remote compute encoding has the wrong width")?;
+		let format = FloatFormat { arithmetic: FloatLayout::new(bytes[1], bytes[2], bytes[3]), storage: FloatLayout::new(bytes[4], bytes[5], bytes[6]) };
+		match bytes[0] {
+			0 => Ok(Self::F(format)),
+			1 => Ok(Self::Fp(format)),
+			2 => Ok(Self::Int(IntFormat { bits: bytes[7] })),
+			3 => Ok(Self::Bf(format)),
+			4 => Ok(Self::Tf(format)),
+			tag => Err(RecipeError::new(format!("remote compute tag {tag} is unknown"))),
+		}
+	}
+}
+fn encode_dispatch(buffer: &mut Vec<u8>, dispatch: Option<Dispatch>) {
+	put(buffer, u64::from(dispatch.is_some()));
+	let dispatch = dispatch.unwrap_or(Dispatch { kernel: Kernel::remote(0, 1, NATIVE_FORWARD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } });
+	put(buffer, u64::from(dispatch.kernel.shared));
+	put(buffer, u64::from(dispatch.kernel.element));
+	put(buffer, u64::from(dispatch.geometry.groups));
+	put(buffer, u64::from(dispatch.geometry.block));
+}
+fn decode_dispatch(wire: &mut Wire<'_>, layout: &'static [u8]) -> Result<Option<Dispatch>> {
+	let present = wire.value()? != 0;
+	let shared = word(wire.value()?, "remote dispatch shared memory")?;
+	let element = u8::try_from(wire.value()?).map_err(|_| RecipeError::new("remote dispatch element width is invalid"))?;
+	let groups = word(wire.value()?, "remote dispatch groups")?;
+	let block = word(wire.value()?, "remote dispatch block")?;
+	Ok(present.then_some(Dispatch { kernel: Kernel::remote(shared, element, layout), geometry: Geometry { groups, block } }))
+}
+/// Serves this host's own devices over the transport. A worker never publishes
+/// another host's devices, so a topology has exactly one owner per device.
+pub fn worker(bind: &str) -> ! {
+	unsafe { std::env::set_var("RECIPE_WORKER", bind) };
+	let listener = TcpListener::bind(bind).unwrap_or_else(|error| panic!("cannot serve Recipe devices on {bind}: {error}"));
+	let devices = devices().unwrap_or_else(|error| panic!("{error}"));
+	eprintln!("recipe worker {bind} devices {}", devices.iter().map(Gpu::canonical).collect::<Vec<_>>().join(" "));
+	for stream in listener.incoming() {
+		let stream = stream.unwrap_or_else(|error| panic!("cannot accept a Recipe client: {error}"));
+		std::thread::spawn(move || serve(stream));
+	}
+	std::process::exit(0)
+}
+fn serve(mut stream: TcpStream) {
+	let mut programs: Vec<(NativeBackend, Dispatch, Dispatch, Option<Dispatch>)> = Vec::new();
+	loop {
+		let Ok((header, payload)) = read_frame(&mut stream, 1 + 8 * (1 + REMOTE_REQUEST_FIELDS)) else { return };
+		let mut wire = Wire::new(&header[1..]);
+		let request = (0..1 + REMOTE_REQUEST_FIELDS).map(|_| wire.value()).collect::<Result<Vec<_>>>();
+		let reply = request.and_then(|fields| answer(header[0], &fields, &payload, &mut programs));
+		let (status, result, body) = match reply {
+			Ok((result, body)) => (0_u8, result, body),
+			Err(error) => (1, 0, error.to_string().into_bytes()),
+		};
+		let mut head = vec![status];
+		put(&mut head, result);
+		if write_frame(&mut stream, &head, &body).is_err() {
+			return;
+		}
+	}
+}
+fn answer(verb: u8, fields: &[u64], payload: &[u8], programs: &mut Vec<(NativeBackend, Dispatch, Dispatch, Option<Dispatch>)>) -> Result<(u64, Vec<u8>)> {
+	let devices = devices()?;
+	if verb == REMOTE_DEVICES {
+		let mut body = Vec::new();
+		put_bytes(&mut body, hostname()?.as_bytes());
+		put(&mut body, devices.len() as u64);
+		for gpu in devices {
+			put_bytes(&mut body, gpu.name.as_bytes());
+			put_bytes(&mut body, native_target_label(&gpu.native_target).as_bytes());
+			put(&mut body, gpu.backend as u64);
+			put(&mut body, gpu.memory);
+			put(&mut body, u64::from(gpu.wave));
+			put(&mut body, u64::from(gpu.shared_limit));
+		}
+		return Ok((devices.len() as u64, body));
+	}
+	let gpu = devices.get(fields[0] as usize).ok_or_else(|| RecipeError::new(format!("remote device {} is absent", fields[0])))?;
+	match verb {
+		REMOTE_ALLOCATE => gpu.allocate(fields[1] as usize).map(|pointer| (pointer, Vec::new())),
+		REMOTE_FREE => {
+			gpu.free(fields[1]);
+			Ok((0, Vec::new()))
+		}
+		REMOTE_UPLOAD => gpu.upload(fields[1], payload.as_ptr().cast(), payload.len()).map(|pointer| (pointer, Vec::new())),
+		REMOTE_DOWNLOAD => {
+			let mut body = vec![0_u8; fields[2] as usize];
+			gpu.download(body.as_mut_ptr().cast(), fields[1], body.len()).map(|()| (0, body))
+		}
+		REMOTE_SYNCHRONIZE => gpu.synchronize().map(|()| (0, Vec::new())),
+		REMOTE_PROGRAM => {
+			let mut wire = Wire::new(payload);
+			let precision = NativePrecision::new(Compute::decode(wire.take(8)?)?)?;
+			let target = wire.text()?;
+			require(target == native_target_label(&gpu.native_target), format!("remote artifact targets {target:?}, device {} is {:?}", gpu.name, native_target_label(&gpu.native_target)))?;
+			let storage = wire.slice()?.to_vec();
+			let artifact = wire.slice()?.to_vec();
+			let path = std::env::temp_dir().join(format!("recipe-remote-{}-{}.{}", std::process::id(), programs.len(), gpu.native_target.artifact_extension()));
+			fs::write(&path, &artifact).map_err(|error| RecipeError::new(format!("cannot stage remote artifact {}: {error}", path.display())))?;
+			let artifact = NativeArtifact { backend: gpu.native_target.clone(), layout: NativeLayout { values: Vec::new(), contexts: Vec::new(), adjoints: Vec::new(), values_bytes: 0, contexts_bytes: 0, adjoints_bytes: 0 }, precision, artifact, path, storage };
+			let loaded = gpu.load_native(&artifact, word(fields[2], "remote waves")?)?;
+			let mut body = Vec::new();
+			for dispatch in [Some(loaded.1), Some(loaded.2), loaded.3] {
+				encode_dispatch(&mut body, dispatch)
+			}
+			programs.push(loaded);
+			Ok((programs.len() as u64 - 1, body))
+		}
+		REMOTE_LAUNCH => {
+			let program = programs.get(fields[1] as usize).ok_or_else(|| RecipeError::new(format!("remote program {} is absent", fields[1])))?;
+			let mut wire = Wire::new(payload);
+			let entry = match wire.value()? {
+				0 => NativeEntry::Forward,
+				1 => NativeEntry::Epoch,
+				_ => NativeEntry::ModelLoad,
+			};
+			let values = word(wire.value()?, "remote shared values")?;
+			let dispatch = match entry {
+				NativeEntry::Forward => program.1,
+				NativeEntry::Epoch => program.2,
+				NativeEntry::ModelLoad => program.3.ok_or_else(|| RecipeError::new("remote model-load symbol is absent"))?,
+			};
+			let mut slots = vec![[0_u8; 8]; dispatch.kernel.layout.len()];
+			for slot in &mut slots {
+				slot.copy_from_slice(wire.take(8)?)
+			}
+			let mut arguments = slots.iter().map(|slot| slot.as_ptr() as Ptr).collect::<Vec<_>>();
+			gpu.launch_native(&program.0, dispatch, entry, &mut arguments, word(fields[2], "remote thread count")?, values).map(|()| (0, Vec::new()))
+		}
+		_ => Err(RecipeError::new(format!("remote verb {verb} is unknown"))),
+	}
+}
+/// Configured hosts, each serving its own devices. One authoritative list.
+fn remote_devices() -> Result<Vec<Gpu>> {
+	let mut found = Vec::new();
+	for address in env!("RECIPE_HOSTS").split(';').filter(|value| !value.is_empty()) {
+		let connect = || TcpStream::connect(address).map_err(|error| RecipeError::new(format!("cannot reach host {address}: {error}")));
+		let probe = Remote { stream: Mutex::new(connect()?), device: 0 };
+		let (count, body) = probe.call(REMOTE_DEVICES, [0; REMOTE_REQUEST_FIELDS], &[])?;
+		let mut wire = Wire::new(&body);
+		// The host that owns a device is the authority on its own name.
+		let host = wire.text()?;
+		require(wire.value()? == count, "remote device count disagrees with the device list")?;
+		for device in 0..count {
+			let name = wire.text()?;
+			let label = wire.text()?;
+			let backend = match wire.value()? {
+				value if value == Backend::Cpu as u64 => Backend::Cpu,
+				value if value == Backend::Amd as u64 => Backend::Amd,
+				value if value == Backend::Nvidia as u64 => Backend::Nvidia,
+				value => return Err(RecipeError::new(format!("remote backend {value} is unknown"))),
+			};
+			let native_target = match backend {
+				Backend::Cpu => BackendTarget::Cpu { target: label },
+				Backend::Amd => BackendTarget::Amd { architecture: label },
+				Backend::Nvidia => BackendTarget::Nvidia { architecture: label },
+			};
+			let (memory, wave, shared_limit) = (wire.value()?, wire.value()?, wire.value()?);
+			let remote = Remote { stream: Mutex::new(connect()?), device };
+			found.push(Gpu { host: host.clone(), name, backend, native_target, driver: Driver::Remote(remote), memory, wave: word(wave, "remote wave")?, shared_limit: word(shared_limit, "remote shared limit")?, dispatch: Mutex::new(()) });
+		}
+	}
+	Ok(found)
+}
+/// A measured edge between two devices. Costs are discovered by transferring a
+/// small and a large payload, so the route cost is behaviour and not a constant.
+struct Link {
+	from: usize,
+	to: usize,
+	latency: f64,
+	bandwidth: f64,
+}
+struct Topology {
+	devices: &'static [Gpu],
+	links: Vec<Link>,
+}
+const LINK_SMALL_BYTES: usize = 1 << 12;
+const LINK_LARGE_BYTES: usize = 1 << 20;
+impl Topology {
+	fn link(&self, from: usize, to: usize) -> Option<&Link> { self.links.iter().find(|link| link.from == from && link.to == to) }
+	/// Seconds to move `bytes` from one device to another along the measured edge.
+	fn transfer(&self, from: usize, to: usize, bytes: usize) -> Result<f64> {
+		if from == to {
+			return Ok(0.0);
+		}
+		let link = self.link(from, to).ok_or_else(|| RecipeError::new(format!("the topology has no edge from {} to {}", self.devices[from].canonical(), self.devices[to].canonical())))?;
+		Ok(link.latency + bytes as f64 / link.bandwidth)
+	}
+}
+fn measure_link(from: usize, to: usize, source: &Gpu, sink: &Gpu) -> Result<Link> {
+	let mut cost = [0.0_f64; 2];
+	for (index, bytes) in [LINK_SMALL_BYTES, LINK_LARGE_BYTES].into_iter().enumerate() {
+		let mut staging = vec![0_u8; bytes];
+		let origin = source.upload(0, staging.as_ptr().cast(), bytes)?;
+		let target = sink.allocate(bytes)?;
+		let started = Instant::now();
+		source.download(staging.as_mut_ptr().cast(), origin, bytes)?;
+		sink.upload(target, staging.as_ptr().cast(), bytes)?;
+		sink.synchronize()?;
+		cost[index] = started.elapsed().as_secs_f64();
+		source.free(origin);
+		sink.free(target);
+	}
+	// Two payloads determine the edge: the slope is bandwidth, the intercept is latency.
+	let span = (cost[1] - cost[0]).max(f64::MIN_POSITIVE);
+	let bandwidth = (LINK_LARGE_BYTES - LINK_SMALL_BYTES) as f64 / span;
+	Ok(Link { from, to, latency: (cost[0] - LINK_SMALL_BYTES as f64 / bandwidth).max(0.0), bandwidth })
+}
+static TOPOLOGY: OnceLock<Result<Topology>> = OnceLock::new();
+fn topology() -> Result<&'static Topology> {
+	TOPOLOGY
+		.get_or_init(|| {
+			let devices = devices()?;
+			let mut links = Vec::new();
+			for from in 0..devices.len() {
+				for to in 0..devices.len() {
+					if from != to {
+						links.push(measure_link(from, to, &devices[from], &devices[to])?)
+					}
+				}
+			}
+			Ok(Topology { devices, links })
+		})
+		.as_ref()
+		.map_err(Clone::clone)
+}
 fn native_target_label(target: &BackendTarget) -> &str {
 	match target {
 		BackendTarget::Cpu { target } => target.as_str(),
@@ -6253,7 +6689,7 @@ impl Gpu {
 	fn status(&self, status: i32, action: &str) -> Result<()> { driver_status(self.backend, status, action).map_err(|error| RecipeError::new(format!("device {} {:?}: {error}", self.name, self.backend))) }
 	fn activate(&self) -> Result<()> {
 		match &self.driver {
-			Driver::Cpu => Ok(()),
+			Driver::Cpu | Driver::Remote(_) => Ok(()),
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => self.status(unsafe { (driver.set)(driver.context) }, "context"),
 			#[cfg(amd)]
@@ -6261,8 +6697,8 @@ impl Gpu {
 		}
 	}
 	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: LossFunction) -> Result<NativeProgram> {
-		let vector_waves = if matches!(&self.driver, Driver::Cpu) { 1 } else { narrow(natural("contraction resident waves per workgroup", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"))?, "contraction resident waves per workgroup")? as u32 };
-		let shared_values = if matches!(&self.driver, Driver::Cpu) { narrow(natural("CPU contraction shared values", env!("RECIPE_CONTRACTION_CPU_SHARED_VALUES"))?, "CPU contraction shared values")? as u32 } else { self.shared_limit / precision.bytes() as u32 };
+		let vector_waves = if self.backend == Backend::Cpu { 1 } else { narrow(natural("contraction resident waves per workgroup", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"))?, "contraction resident waves per workgroup")? as u32 };
+		let shared_values = if self.backend == Backend::Cpu { narrow(natural("CPU contraction shared values", env!("RECIPE_CONTRACTION_CPU_SHARED_VALUES"))?, "CPU contraction shared values")? as u32 } else { self.shared_limit / precision.bytes() as u32 };
 		let shapes = native_contraction_shapes(graph, rows)?;
 		let mut limits = Tile { m: 1, n: 1, k: 1 };
 		let mut dominant = None;
@@ -6275,13 +6711,7 @@ impl Gpu {
 			let work = checked_mul(checked_mul(shape.gradient.m as usize, shape.gradient.n as usize, "native contraction output work")?, shape.gradient.k as usize, "native contraction work")?;
 			if dominant.is_none_or(|(_, best)| work > best) { dominant = Some((index, work)) }
 		}
-		let wave = match &self.driver {
-			Driver::Cpu => 1,
-			#[cfg(amd)]
-			Driver::Hsa(driver) => driver.wave,
-			#[cfg(nvidia)]
-			Driver::Cuda(driver) => driver.wave,
-		};
+		let wave = self.wave;
 		let dominant_shape = dominant.and_then(|(index, _)| shapes[index]).map_or(limits, |shape| shape.gradient);
 		let fragment_k = narrow(natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?, "contraction fragment K")? as u32;
 		let aligned_attention = graph.nodes.iter().filter(|node| node.op == Primitive::Attention).try_fold(true, |aligned, node| {
@@ -6378,6 +6808,7 @@ impl Gpu {
 					self.status((driver.allow)(1, &driver.cpu_agent, ptr::null(), pointer), "CPU allocation access")?;
 					Ok(pointer as u64)
 				}
+				Driver::Remote(remote) => remote.call(REMOTE_ALLOCATE, [bytes as u64, 0, 0], &[]).map(|(pointer, _)| pointer),
 			}
 		}
 	}
@@ -6399,6 +6830,9 @@ impl Gpu {
 				Driver::Hsa(driver) => {
 					(driver.free)(pointer as Ptr);
 				}
+				Driver::Remote(remote) => {
+					remote.call(REMOTE_FREE, [pointer, 0, 0], &[]).unwrap_or_else(|error| panic!("{error}"));
+				}
 			}
 		}
 	}
@@ -6416,6 +6850,7 @@ impl Gpu {
 				Driver::Cuda(driver) => self.status((driver.upload)(dst, src, bytes), "upload").map(|_| dst),
 				#[cfg(amd)]
 				Driver::Hsa(driver) => self.status((driver.copy)(dst as Ptr, src, bytes), "upload").map(|_| dst),
+				Driver::Remote(remote) => remote.call(REMOTE_UPLOAD, [dst, 0, 0], std::slice::from_raw_parts(src.cast::<u8>(), bytes)).map(|(pointer, _)| pointer),
 			}
 		}
 	}
@@ -6432,6 +6867,11 @@ impl Gpu {
 				Driver::Cuda(cuda) => self.status((cuda.download)(dst, src, bytes), "download"),
 				#[cfg(amd)]
 				Driver::Hsa(driver) => self.status((driver.copy)(dst, src as *const c_void, bytes), "download"),
+				Driver::Remote(remote) => remote.call(REMOTE_DOWNLOAD, [src, bytes as u64, 0], &[]).and_then(|(_, body)| {
+					require(body.len() == bytes, "remote download returned the wrong width")?;
+					ptr::copy_nonoverlapping(body.as_ptr(), dst.cast::<u8>(), bytes);
+					Ok(())
+				}),
 			}
 		}
 	}
@@ -6445,50 +6885,87 @@ impl Gpu {
 				Driver::Cuda(driver) => self.status((driver.synchronize)(), "synchronization"),
 				#[cfg(amd)]
 				Driver::Hsa(driver) => require((driver.wait)(driver.signal, 0, 0, u64::MAX, 1) == 0, "AMD synchronization failed"),
+				Driver::Remote(remote) => remote.call(REMOTE_SYNCHRONIZE, [0; REMOTE_REQUEST_FIELDS], &[]).map(|_| ()),
 			}
 		}
 	}
 }
 static DEVICES: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
-fn cpu_device() -> Result<Gpu> { Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) }) }
+fn cpu_device() -> Result<Gpu> { Ok(Gpu { host: String::new(), name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, wave: 1, shared_limit: u32::MAX, dispatch: Mutex::new(()) }) }
+fn local_devices() -> Result<Vec<Gpu>> {
+	if std::env::var_os("RECIPE_FORCE_CPU").is_some() {
+		return cpu_device().map(|gpu| vec![gpu]);
+	}
+	let mut found = Vec::new();
+	let mut errors = Vec::new();
+	for load in [load_amd as fn() -> Result<Vec<Gpu>>, load_nvidia] {
+		match load() {
+			Ok(mut devices) => found.append(&mut devices),
+			Err(error) => errors.push(error.to_string()),
+		}
+	}
+	if found.is_empty() {
+		if cfg!(any(amd, nvidia)) {
+			return Err(RecipeError::new(errors.join("; ")));
+		}
+		found.push(cpu_device()?);
+	}
+	Ok(found)
+}
+/// The registry holds every device this process can reach, local and remote,
+/// each stamped with the host that owns it. A worker publishes only the devices
+/// it owns, so exactly one host owns each device in a topology.
 fn devices() -> Result<&'static [Gpu]> {
 	DEVICES
 		.get_or_init(|| {
-			if std::env::var_os("RECIPE_FORCE_CPU").is_some() {
-				return cpu_device().map(|gpu| vec![gpu]);
+			let host = hostname()?;
+			let (mut found, mut errors) = (Vec::new(), Vec::new());
+			match local_devices() {
+				Ok(mut local) => {
+					for gpu in &mut local {
+						gpu.host = host.clone()
+					}
+					found.append(&mut local)
+				}
+				Err(error) => errors.push(error.to_string()),
 			}
-			let mut found = Vec::new();
-			let mut errors = Vec::new();
-			for load in [load_amd as fn() -> Result<Vec<Gpu>>, load_nvidia] {
-				match load() {
-					Ok(mut devices) => found.append(&mut devices),
+			if std::env::var_os("RECIPE_WORKER").is_none() {
+				match remote_devices() {
+					Ok(mut remote) => found.append(&mut remote),
 					Err(error) => errors.push(error.to_string()),
 				}
 			}
-			if found.is_empty() {
-				if cfg!(any(amd, nvidia)) {
-					return Err(RecipeError::new(errors.join("; ")));
-				}
-				found.push(cpu_device()?);
-			}
+			require(!found.is_empty(), errors.join("; "))?;
+			let mut names = found.iter().map(Gpu::canonical).collect::<Vec<_>>();
+			names.sort_unstable();
+			let duplicate = names.windows(2).find(|pair| pair[0] == pair[1]);
+			require(duplicate.is_none(), format!("two hosts publish the device {:?}", duplicate.map_or("", |pair| pair[0].as_str())))?;
 			Ok(found)
 		})
 		.as_ref()
 		.map(Vec::as_slice)
 		.map_err(Clone::clone)
 }
-fn device(name: Option<&str>) -> Result<&'static Gpu> {
+/// A device is selectable by its canonical `host:name` and, when it is local, by
+/// its bare name.
+fn device(name: &str) -> Result<&'static Gpu> {
 	let found = devices()?;
-	if let Some(name) = name {
-		return found.iter().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
-	}
-	require(found.len() == 1, "multiple GPUs require named selection")?;
-	Ok(&found[0])
+	let host = hostname()?;
+	found.iter().find(|gpu| gpu.canonical() == name || (gpu.host == host && gpu.name == name)).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")))
 }
-fn selected_gpu() -> Result<&'static Gpu> {
-	let Some(name) = std::env::var("RECIPE_DEVICE").ok() else { return device(None) };
-	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-	devices()?.iter().find(|gpu| gpu.name == name || format!("{}:{}", host.trim(), gpu.name) == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")))
+/// Devices selected for one run. A comma separates the devices of one route.
+fn selected_gpus() -> Result<Vec<&'static Gpu>> {
+	let Some(names) = std::env::var("RECIPE_DEVICE").ok() else {
+		let found = devices()?;
+		require(found.len() == 1, "multiple GPUs require named selection")?;
+		return Ok(vec![&found[0]]);
+	};
+	let route = names.split(',').filter(|name| !name.is_empty()).map(device).collect::<Result<Vec<_>>>()?;
+	let mut canonical = route.iter().map(|gpu| gpu.canonical()).collect::<Vec<_>>();
+	canonical.sort_unstable();
+	canonical.dedup();
+	require(canonical.len() == route.len(), "a route selects each device once")?;
+	Ok(route)
 }
 #[cfg(amd)]
 type HsaInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32;
@@ -6689,34 +7166,56 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 	}
 }
 
-impl NativeProgram {
-	fn load(gpu: &'static Gpu, artifact: NativeArtifact, graph: &Graph, schedule: NativeSchedule, register_values: u32, waves: u32) -> Result<Self> {
-		native_artifact_contract(&artifact)?;
-		require(artifact.backend.backend() == gpu.backend, format!("native artifact backend {:?} does not match device {:?}", artifact.backend.backend(), gpu.backend))?;
-		let (backend, forward, epoch, model_load) = match &gpu.driver {
+impl Gpu {
+	/// Loads one compiled artifact onto this device and reports the dispatch of
+	/// each entrypoint. A worker runs this for the host that owns the run, so a
+	/// remote device is loaded by exactly the code that loads a local one.
+	fn load_native(&self, artifact: &NativeArtifact, waves: u32) -> Result<(NativeBackend, Dispatch, Dispatch, Option<Dispatch>)> {
+		native_artifact_contract(artifact)?;
+		require(artifact.backend.backend() == self.backend, format!("native artifact backend {:?} does not match device {:?}", artifact.backend.backend(), self.backend))?;
+		match &self.driver {
 			Driver::Cpu => {
 				#[cfg(unix)]
 				{
-					let cpu = load_native_cpu(&artifact)?;
-					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } };
-					let epoch = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry: Geometry { groups: 1, block: 1 } };
-					let model_load = (!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } });
-					(NativeBackend::Cpu(cpu), forward, epoch, model_load)
+					let cpu = load_native_cpu(artifact)?;
+					let element = artifact.precision.model.bytes() as u8;
+					let forward = Dispatch { kernel: Kernel::remote(0, element, NATIVE_FORWARD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } };
+					let epoch = Dispatch { kernel: Kernel::remote(0, element, artifact.precision.epoch_layout), geometry: Geometry { groups: 1, block: 1 } };
+					let model_load = (!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, element, NATIVE_MODEL_LOAD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } });
+					Ok((NativeBackend::Cpu(cpu), forward, epoch, model_load))
 				}
 				#[cfg(not(unix))]
-				return Err(RecipeError::new("CPU native artifact loading requires POSIX dynamic loading"));
+				Err(RecipeError::new("CPU native artifact loading requires POSIX dynamic loading"))
 			}
 			#[cfg(amd)]
 			Driver::Hsa(driver) => {
-				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact, waves)? };
-				(NativeBackend::Amd(program), forward, epoch, model_load)
+				let (program, forward, epoch, model_load) = unsafe { driver.load_native(artifact, waves)? };
+				Ok((NativeBackend::Amd(program), forward, epoch, model_load))
 			}
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => {
-				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact)? };
-				(NativeBackend::Nvidia(program), forward, epoch, model_load)
+				let (program, forward, epoch, model_load) = unsafe { driver.load_native(artifact)? };
+				Ok((NativeBackend::Nvidia(program), forward, epoch, model_load))
 			}
-		};
+			Driver::Remote(remote) => {
+				let mut request = Vec::new();
+				request.extend_from_slice(&artifact.precision.model.encode());
+				put_bytes(&mut request, native_target_label(&artifact.backend).as_bytes());
+				put_bytes(&mut request, &artifact.storage);
+				put_bytes(&mut request, &artifact.artifact);
+				let (handle, body) = remote.call(REMOTE_PROGRAM, [0, u64::from(waves), 0], &request)?;
+				let mut wire = Wire::new(&body);
+				let forward = decode_dispatch(&mut wire, NATIVE_FORWARD_LAYOUT)?.ok_or_else(|| RecipeError::new("remote forward entrypoint is absent"))?;
+				let epoch = decode_dispatch(&mut wire, artifact.precision.epoch_layout)?.ok_or_else(|| RecipeError::new("remote epoch entrypoint is absent"))?;
+				let model_load = decode_dispatch(&mut wire, NATIVE_MODEL_LOAD_LAYOUT)?;
+				Ok((NativeBackend::Remote(handle), forward, epoch, model_load))
+			}
+		}
+	}
+}
+impl NativeProgram {
+	fn load(gpu: &'static Gpu, artifact: NativeArtifact, graph: &Graph, schedule: NativeSchedule, register_values: u32, waves: u32) -> Result<Self> {
+		let (backend, forward, epoch, model_load) = gpu.load_native(&artifact, waves)?;
 		debug(&format!("native load key={} path={} entrypoints={}", artifact.path.parent().and_then(Path::file_name).and_then(|key| key.to_str()).unwrap_or("unknown"), artifact.path.display(), if model_load.is_some() { "recipe_model_forward,recipe_model_epoch,recipe_model_load" } else { "recipe_model_forward,recipe_model_epoch" }))?; let block = forward.geometry.block.max(epoch.geometry.block);
 		let reduction_values = block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native contraction lane reduction overflows"))?;
 		let gradient_values = native_gradient_values(graph.parameters.len(), &schedule.contractions)?;
@@ -6743,21 +7242,26 @@ impl NativeProgram {
 		let dispatch = self.dispatch(NativeEntry::ModelLoad)?;
 		self.launch(NativeEntry::ModelLoad, arguments, dispatch.geometry.threads()?)
 	}
-
 	fn launch(&self, entry: NativeEntry, arguments: &mut [Ptr], threads: u32) -> Result<()> {
-		let gpu = self.gpu;
+		let values = if matches!(entry, NativeEntry::ModelLoad) { 0 } else { self.shared_values.max(self.reduction_values) };
+		self.gpu.launch_native(&self.backend, self.dispatch(entry)?, entry, arguments, threads, values)
+	}
+}
+impl Gpu {
+	/// Dispatches one loaded entrypoint. `values` is the dynamic shared-memory
+	/// element count the schedule reserved for this entry.
+	fn launch_native(&self, backend: &NativeBackend, dispatch: Dispatch, entry: NativeEntry, arguments: &mut [Ptr], threads: u32, values: u32) -> Result<()> {
+		let gpu = self;
 		require(!INTERRUPTED.load(Ordering::Acquire), "interrupted before native dispatch")?;
-		let dispatch = self.dispatch(entry)?;
 		require(arguments.len() == dispatch.kernel.layout.len(), "native argument count is invalid")?;
 		gpu.activate()?;
 		let block = dispatch.geometry.block;
-		let values = if matches!(entry, NativeEntry::ModelLoad) { 0 } else { self.shared_values.max(self.reduction_values) };
 		let dynamic = values.checked_mul(u32::from(dispatch.kernel.element)).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
 		let shared = dispatch.kernel.shared.checked_add(dynamic).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
 		require(shared <= gpu.shared_limit, "native shared memory exceeds device limit")?;
 		let _guard = gpu.dispatch.lock().map_err(|_| RecipeError::new("GPU dispatch lock is poisoned"))?;
 		unsafe {
-			match (&self.backend, &gpu.driver) {
+			match (backend, &gpu.driver) {
 				#[cfg(unix)]
 				(NativeBackend::Cpu(cpu), Driver::Cpu) => launch_native_cpu(cpu, entry, arguments),
 				#[cfg(amd)]
@@ -6801,6 +7305,17 @@ impl NativeProgram {
 					require(program.module != 0, "native NVIDIA module is absent")?;
 					let stream = ptr::null_mut();
 					driver_status(Backend::Nvidia, (driver.launch)(dispatch.kernel.object as usize, threads / block, 1, 1, block, 1, 1, dynamic, stream, arguments.as_mut_ptr()), "native dispatch")
+				}
+				(NativeBackend::Remote(handle), Driver::Remote(remote)) => {
+					let mut request = Vec::new();
+					put(&mut request, entry as u64);
+					put(&mut request, u64::from(values));
+					for (argument, kind) in arguments.iter().zip(dispatch.kernel.layout) {
+						let mut slot = [0_u8; 8];
+						ptr::copy_nonoverlapping((*argument).cast::<u8>(), slot.as_mut_ptr(), usize::from(*kind - b'0'));
+						request.extend_from_slice(&slot);
+					}
+					remote.call(REMOTE_LAUNCH, [*handle, u64::from(threads), 0], &request).map(|_| ())
 				}
 				_ => Err(RecipeError::new("native program backend changed after loading")),
 			}
@@ -6867,7 +7382,7 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		driver_status(Backend::Amd, queue_create(agent, 256, 2, ptr::null_mut(), ptr::null_mut(), u32::MAX, u32::MAX, &mut queue), "queue creation")?;
 		check(signal_create(0, 0, ptr::null(), &mut completion), "signal creation")?;
 		let hsa = Hsa { _runtime: runtime.clone(), reader_create, reader_destroy, executable_create, executable_destroy, executable_load, executable_freeze, symbol, symbol_info, allocate, allow, queue, cpu_agent, free: runtime.function(b"hsa_amd_memory_pool_free\0")?, copy: runtime.function(b"hsa_memory_copy\0")?, store: runtime.function(b"hsa_signal_store_screlease\0")?, wait: runtime.function(b"hsa_signal_wait_scacquire\0")?, write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?, signal: completion, vram_pool: vram.found, kernarg_pool: kernarg.found, agent, cus, wave, workgroup, lds };
-		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, native_target, driver: Driver::Hsa(hsa), memory: memory as u64, shared_limit: lds, dispatch: Mutex::new(()) })
+		Ok(Gpu { host: String::new(), name: format!("amd{index}"), backend: Backend::Amd, native_target, driver: Driver::Hsa(hsa), memory: memory as u64, wave, shared_limit: lds, dispatch: Mutex::new(()) })
 	}
 }
 fn load_nvidia() -> Result<Vec<Gpu>> {
@@ -6916,7 +7431,7 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 			let native_target = BackendTarget::Nvidia { architecture: format!("sm_{compute_major}{compute_minor}") };
 			check(create(&mut context, 0, device), "context creation")?;
 			let cuda = Cuda { _runtime: runtime.clone(), context, set: runtime.function(b"cuCtxSetCurrent\0")?, allocate: runtime.function(b"cuMemAlloc_v2\0")?, free: runtime.function(b"cuMemFree_v2\0")?, upload: runtime.function(b"cuMemcpyHtoD_v2\0")?, download: runtime.function(b"cuMemcpyDtoH_v2\0")?, synchronize: runtime.function(b"cuCtxSynchronize\0")?, launch: runtime.function(b"cuLaunchCooperativeKernel\0")?, load, unload, function, function_attribute, occupancy, cus: cus as u32, wave: wave as u32, workgroup: workgroup as u32, block_lds: block_lds as u32, sm_lds: sm_lds as u32, registers: registers as u32, threads: threads as u32 };
-			Ok(Gpu { name: format!("nv{index}"), backend: Backend::Nvidia, native_target, driver: Driver::Cuda(cuda), memory: memory as u64, shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()) })
+			Ok(Gpu { host: String::new(), name: format!("nv{index}"), backend: Backend::Nvidia, native_target, driver: Driver::Cuda(cuda), memory: memory as u64, wave: wave as u32, shared_limit: (block_lds as u32).min(sm_lds as u32), dispatch: Mutex::new(()) })
 		};
 		let mut found = Vec::new();
 		for ordinal in 0..count {
@@ -6953,6 +7468,7 @@ unsafe extern "C" {
 	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
 	#[cfg_attr(windows, link_name = "_write")]
 	fn write(file: i32, bytes: *const c_void, length: usize) -> isize;
+	fn gethostname(name: *mut std::ffi::c_char, length: usize) -> i32;
 }
 fn distance(left: &[f64], right: &[f64]) -> f64 { left.iter().zip(right).map(|(a, b)| (a - b).powi(2)).sum() }
 fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) { state.chunks_exact(features).enumerate().map(|(index, row)| (index, distance(query, row))).min_by(|left, right| left.1.total_cmp(&right.1)).unwrap_or((0, f64::INFINITY)) }
@@ -6962,7 +7478,7 @@ fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gp
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
 	let _ = targets;
-	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, mse)?;
+	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], &[gpu], precision, mse)?;
 	tape.forward()?;
 	tape.predictions()
 }
@@ -6974,7 +7490,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	let model = surrogate_model(hidden);
 	let prepared = Prepared { samples: samples.to_vec(), targets: targets.to_vec(), rows: targets.len(), source_rows: targets.len(), features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
 	let mut graph = compile(&model, &prepared, targets, prepared.rows, gpu, config, true)?;
-	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, mse)?;
+	let mut tape = NativeTape::new(&graph, samples, targets, &[gpu], config.precision, mse)?;
 	for _ in 0..config.surrogate_epochs {
 		tape.advance()?;
 		tape.epoch(config.surrogate_rate, 0.0, config)?;
@@ -9874,7 +10390,8 @@ impl Train {
 		let prepared = prepare(data)?;
 		let training_rows = ((prepared.source_rows as f64) * data.split).floor() as usize;
 		require(training_rows != 0 && training_rows <= prepared.source_rows, "split must select training rows")?;
-		let (gpu, mut config) = (selected_gpu()?, Config::load()?);
+		let (route, mut config) = (selected_gpus()?, Config::load()?);
+		let gpu = route[0];
 		let precision = self.precision;
 		config.precision = precision;
 		if let Some(seed) = self.seed {
@@ -9901,7 +10418,7 @@ impl Train {
 		stored.graph.state.trained_samples.sort_unstable();
 		stored.graph.state.trained_samples.dedup();
 		let (samples, targets) = (&prepared.samples[..training_rows * prepared.features], &target_values[..training_rows]);
-		let mut tape = NativeTape::new(&stored.graph, samples, targets, gpu, config.precision, model.loss)?;
+		let mut tape = NativeTape::new(&stored.graph, samples, targets, &route, config.precision, model.loss)?;
 		self.finish_dispatch(if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) }, &mut stored, &prepared.schema, &tape, None)?;
 		tape.print_devices()?;
 		stored.bn_stats = tape.extract_bn_stats()?;
@@ -9944,7 +10461,7 @@ impl Train {
 			let mut raw_outputs = Vec::new();
 			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
 			for sample in prepared.samples.chunks_exact(prepared.features) {
-				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, model.loss)?;
+				let mut validation = NativeTape::new(&graph, sample, &[], &[gpu], config.precision, model.loss)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
 				validation.forward()?;
 				let raw = validation.predictions()?;
@@ -9967,7 +10484,7 @@ impl Train {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
 			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_rows..]);
-			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, model.loss)?;
+			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, &route, config.precision, model.loss)?;
 			validation.inject_bn_stats(&stored.bn_stats)?;
 			validation.forward()?;
 			let raw = validation.predictions()?;
