@@ -3453,7 +3453,7 @@ use std::{
 	error::Error,
 	ffi::c_void,
 	fmt, fs,
-	io::{IsTerminal, Write},
+	io::{IsTerminal, Read, Write},
 	mem::{size_of, size_of_val},
 	path::{Path, PathBuf},
 	process::Command,
@@ -5829,8 +5829,13 @@ impl NativeTape {
 		self.program.contractions.iter().flatten().map(|node| [node.forward, node.gradient, node.previous].map(|extent| format!("{}x{}x{}", extent.m, extent.n, extent.k)).join("/")).collect::<Vec<_>>().join(" ")
 	}
 	fn print_devices(&self) -> Result<()> {
-		let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-		eprintln!("{}:{}.{}", host.trim(), self.program.gpu.name, self.precision.model.label());
+		let name = &self.program.gpu.name;
+		if name.contains(':') {
+			eprintln!("{name}.{}", self.precision.model.label());
+		} else {
+			let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
+			eprintln!("{}:{name}.{}", host.trim(), self.precision.model.label());
+		}
 		Ok(())
 	}
 }
@@ -6041,6 +6046,7 @@ enum NativeBackend {
 	Amd(NativeHsaProgram),
 	#[cfg(nvidia)]
 	Nvidia(NativeCudaProgram),
+	Remote,
 }
 
 struct NativeProgram {
@@ -6168,12 +6174,48 @@ struct Hsa {
 	workgroup: u32,
 	lds: u32,
 }
+struct RemoteChannel {
+	input: std::io::BufWriter<std::process::ChildStdin>,
+	output: std::io::BufReader<std::process::ChildStdout>,
+}
+impl RemoteChannel {
+	fn write_u8(&mut self, v: u8) -> Result<()> { self.input.write_all(&[v]).map_err(|e| RecipeError::new(format!("remote: {e}"))) }
+	fn write_u32(&mut self, v: u32) -> Result<()> { self.input.write_all(&v.to_le_bytes()).map_err(|e| RecipeError::new(format!("remote: {e}"))) }
+	fn write_u64(&mut self, v: u64) -> Result<()> { self.input.write_all(&v.to_le_bytes()).map_err(|e| RecipeError::new(format!("remote: {e}"))) }
+	fn write_bytes(&mut self, data: &[u8]) -> Result<()> { self.input.write_all(data).map_err(|e| RecipeError::new(format!("remote: {e}"))) }
+	fn flush(&mut self) -> Result<()> { self.input.flush().map_err(|e| RecipeError::new(format!("remote: {e}"))) }
+	fn read_u8(&mut self) -> Result<u8> { let mut b = [0]; self.output.read_exact(&mut b).map_err(|e| RecipeError::new(format!("remote: {e}")))?; Ok(b[0]) }
+	fn read_u32(&mut self) -> Result<u32> { let mut b = [0; 4]; self.output.read_exact(&mut b).map_err(|e| RecipeError::new(format!("remote: {e}")))?; Ok(u32::from_le_bytes(b)) }
+	fn read_u64(&mut self) -> Result<u64> { let mut b = [0; 8]; self.output.read_exact(&mut b).map_err(|e| RecipeError::new(format!("remote: {e}")))?; Ok(u64::from_le_bytes(b)) }
+	fn read_into(&mut self, buf: &mut [u8]) -> Result<()> { self.output.read_exact(buf).map_err(|e| RecipeError::new(format!("remote: {e}"))) }
+}
+#[allow(dead_code)]
+struct Remote {
+	channel: Mutex<RemoteChannel>,
+	wave: u32,
+	cus: u32,
+	workgroup: u32,
+	block_lds: u32,
+	sm_lds: u32,
+	registers: u32,
+	threads: u32,
+}
+unsafe impl Send for Remote {}
+unsafe impl Sync for Remote {}
+const REMOTE_ALLOCATE: u8 = 1;
+const REMOTE_FREE: u8 = 2;
+const REMOTE_UPLOAD: u8 = 3;
+const REMOTE_DOWNLOAD: u8 = 4;
+const REMOTE_SYNCHRONIZE: u8 = 5;
+const REMOTE_LOAD: u8 = 6;
+const REMOTE_LAUNCH: u8 = 7;
 enum Driver {
 	Cpu,
 	#[cfg(amd)]
 	Hsa(Hsa),
 	#[cfg(nvidia)]
 	Cuda(Cuda),
+	Remote(Remote),
 }
 #[allow(dead_code)]
 struct Gpu {
@@ -6279,7 +6321,7 @@ impl Gpu {
 	fn status(&self, status: i32, action: &str) -> Result<()> { driver_status(self.backend, status, action).map_err(|error| RecipeError::new(format!("device {} {:?}: {error}", self.name, self.backend))) }
 	fn activate(&self) -> Result<()> {
 		match &self.driver {
-			Driver::Cpu => Ok(()),
+			Driver::Cpu | Driver::Remote(_) => Ok(()),
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => self.status(unsafe { (driver.set)(driver.context) }, "context"),
 			#[cfg(amd)]
@@ -6307,6 +6349,7 @@ impl Gpu {
 			Driver::Hsa(driver) => driver.wave,
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => driver.wave,
+			Driver::Remote(remote) => remote.wave,
 		};
 		let dominant_shape = dominant.and_then(|(index, _)| shapes[index]).map_or(limits, |shape| shape.gradient);
 		let fragment_k = narrow(natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?, "contraction fragment K")? as u32;
@@ -6404,6 +6447,12 @@ impl Gpu {
 					self.status((driver.allow)(1, &driver.cpu_agent, ptr::null(), pointer), "CPU allocation access")?;
 					Ok(pointer as u64)
 				}
+				Driver::Remote(remote) => {
+					let mut ch = remote.channel.lock().map_err(|_| RecipeError::new("remote channel poisoned"))?;
+					ch.write_u8(REMOTE_ALLOCATE)?; ch.write_u64(bytes as u64)?; ch.flush()?;
+					let status = ch.read_u8()?; require(status == 0, format!("remote allocate failed: {status}"))?;
+					ch.read_u64()
+				}
 			}
 		}
 	}
@@ -6425,6 +6474,11 @@ impl Gpu {
 				Driver::Hsa(driver) => {
 					(driver.free)(pointer as Ptr);
 				}
+				Driver::Remote(remote) => {
+					if let Ok(mut ch) = remote.channel.lock() {
+						let _ = ch.write_u8(REMOTE_FREE).and_then(|_| ch.write_u64(pointer)).and_then(|_| ch.flush());
+					}
+				}
 			}
 		}
 	}
@@ -6442,6 +6496,13 @@ impl Gpu {
 				Driver::Cuda(driver) => self.status((driver.upload)(dst, src, bytes), "upload").map(|_| dst),
 				#[cfg(amd)]
 				Driver::Hsa(driver) => self.status((driver.copy)(dst as Ptr, src, bytes), "upload").map(|_| dst),
+				Driver::Remote(remote) => {
+					let mut ch = remote.channel.lock().map_err(|_| RecipeError::new("remote channel poisoned"))?;
+					ch.write_u8(REMOTE_UPLOAD)?; ch.write_u64(dst)?; ch.write_u64(bytes as u64)?;
+					ch.write_bytes(std::slice::from_raw_parts(src.cast::<u8>(), bytes))?; ch.flush()?;
+					let status = ch.read_u8()?; require(status == 0, format!("remote upload failed: {status}"))?;
+					Ok(dst)
+				}
 			}
 		}
 	}
@@ -6458,6 +6519,12 @@ impl Gpu {
 				Driver::Cuda(cuda) => self.status((cuda.download)(dst, src, bytes), "download"),
 				#[cfg(amd)]
 				Driver::Hsa(driver) => self.status((driver.copy)(dst, src as *const c_void, bytes), "download"),
+				Driver::Remote(remote) => {
+					let mut ch = remote.channel.lock().map_err(|_| RecipeError::new("remote channel poisoned"))?;
+					ch.write_u8(REMOTE_DOWNLOAD)?; ch.write_u64(src)?; ch.write_u64(bytes as u64)?; ch.flush()?;
+					let status = ch.read_u8()?; require(status == 0, format!("remote download failed: {status}"))?;
+					ch.read_into(std::slice::from_raw_parts_mut(dst.cast::<u8>(), bytes))
+				}
 			}
 		}
 	}
@@ -6471,6 +6538,11 @@ impl Gpu {
 				Driver::Cuda(driver) => self.status((driver.synchronize)(), "synchronization"),
 				#[cfg(amd)]
 				Driver::Hsa(driver) => require((driver.wait)(driver.signal, 0, 0, u64::MAX, 1) == 0, "AMD synchronization failed"),
+				Driver::Remote(remote) => {
+					let mut ch = remote.channel.lock().map_err(|_| RecipeError::new("remote channel poisoned"))?;
+					ch.write_u8(REMOTE_SYNCHRONIZE)?; ch.flush()?;
+					let status = ch.read_u8()?; require(status == 0, format!("remote synchronize failed: {status}"))
+				}
 			}
 		}
 	}
@@ -6511,10 +6583,54 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	require(found.len() == 1, "multiple GPUs require named selection")?;
 	Ok(&found[0])
 }
+static REMOTE_GPU: OnceLock<Result<Gpu>> = OnceLock::new();
 fn selected_gpu() -> Result<&'static Gpu> {
 	let Some(name) = std::env::var("RECIPE_DEVICE").ok() else { return device(None) };
 	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-	devices()?.iter().find(|gpu| gpu.name == name || format!("{}:{}", host.trim(), gpu.name) == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")))
+	let host = host.trim();
+	if let Some(gpu) = devices()?.iter().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
+		return Ok(gpu);
+	}
+	if let Some((remote_host, device_name)) = name.split_once(':') {
+		if remote_host != host {
+			return REMOTE_GPU.get_or_init(|| connect_remote(remote_host, device_name, &name)).as_ref().map_err(Clone::clone);
+		}
+	}
+	Err(RecipeError::new(format!("GPU {name:?} is absent")))
+}
+fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<Gpu> {
+	let binary = std::env::var_os("RECIPE_BINARY").map(PathBuf::from).unwrap_or_else(|| {
+		let exe = std::env::current_exe().unwrap_or_default();
+		exe.parent().map(|d| d.join("recipe")).unwrap_or(exe)
+	});
+	require(binary.is_file(), format!("recipe binary not found at {}", binary.display()))?;
+	let remote_path = format!("/tmp/recipe-worker-{}", std::process::id());
+	let scp = Command::new("scp").arg("-q").arg(&binary).arg(format!("{host}:{remote_path}")).status().map_err(|e| RecipeError::new(format!("scp to {host} failed: {e}")))?;
+	require(scp.success(), format!("scp to {host} failed with status {scp}"))?;
+	let mut child = Command::new("ssh").arg(host).arg(&remote_path).arg("--worker").arg(device_name)
+		.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit())
+		.spawn().map_err(|e| RecipeError::new(format!("ssh to {host} failed: {e}")))?;
+	let stdin = child.stdin.take().ok_or_else(|| RecipeError::new("remote worker stdin unavailable"))?;
+	let stdout = child.stdout.take().ok_or_else(|| RecipeError::new("remote worker stdout unavailable"))?;
+	let mut ch = RemoteChannel { input: std::io::BufWriter::new(stdin), output: std::io::BufReader::new(stdout) };
+	let backend_byte = ch.read_u8()?;
+	let backend = match backend_byte { 1 => Backend::Amd, 2 => Backend::Nvidia, _ => return Err(RecipeError::new(format!("remote worker reported unknown backend {backend_byte}"))) };
+	let arch_len = ch.read_u8()? as usize;
+	let mut arch_buf = vec![0u8; arch_len];
+	ch.read_into(&mut arch_buf)?;
+	let architecture = String::from_utf8(arch_buf).map_err(|e| RecipeError::new(format!("remote architecture is invalid: {e}")))?;
+	let memory = ch.read_u64()?;
+	let shared_limit = ch.read_u32()?;
+	let wave = ch.read_u32()?;
+	let cus = ch.read_u32()?;
+	let workgroup = ch.read_u32()?;
+	let block_lds = ch.read_u32()?;
+	let sm_lds = ch.read_u32()?;
+	let registers = ch.read_u32()?;
+	let threads = ch.read_u32()?;
+	let native_target = match backend { Backend::Amd => BackendTarget::Amd { architecture }, _ => BackendTarget::Nvidia { architecture } };
+	eprintln!("{canonical}");
+	Ok(Gpu { name: canonical.to_owned(), backend, native_target, driver: Driver::Remote(Remote { channel: Mutex::new(ch), wave, cus, workgroup, block_lds, sm_lds, registers, threads }), memory, shared_limit, dispatch: Mutex::new(()) })
 }
 #[cfg(amd)]
 type HsaInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32;
@@ -6748,6 +6864,32 @@ impl NativeProgram {
 				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact, waves, schedule.shared_values, register_values)? };
 				(NativeBackend::Nvidia(program), forward, epoch, model_load)
 			}
+			Driver::Remote(remote) => {
+				let mut ch = remote.channel.lock().map_err(|_| RecipeError::new("remote channel poisoned"))?;
+				ch.write_u8(REMOTE_LOAD)?;
+				ch.write_u64(artifact.artifact.len() as u64)?;
+				ch.write_bytes(&artifact.artifact)?;
+				ch.write_u32(waves)?;
+				ch.write_u32(schedule.shared_values)?;
+				ch.write_u32(register_values)?;
+				ch.write_u8(if artifact.storage.is_empty() { 0 } else { 1 })?;
+				ch.write_u8(artifact.precision.model.bytes() as u8)?;
+				ch.flush()?;
+				let status = ch.read_u8()?;
+				require(status == 0, format!("remote load failed: {status}"))?;
+				let read_dispatch = |ch: &mut RemoteChannel, element: u8, layout: &'static [u8]| -> Result<Dispatch> {
+					let _object = ch.read_u64()?;
+					let shared = ch.read_u32()?;
+					let groups = ch.read_u32()?;
+					let block = ch.read_u32()?;
+					Ok(Dispatch { kernel: Kernel::remote(shared, element, layout), geometry: Geometry { groups, block } })
+				};
+				let element = artifact.precision.model.bytes() as u8;
+				let forward = read_dispatch(&mut ch, element, NATIVE_FORWARD_LAYOUT)?;
+				let epoch = read_dispatch(&mut ch, element, artifact.precision.epoch_layout)?;
+				let model_load = if !artifact.storage.is_empty() { Some(read_dispatch(&mut ch, element, NATIVE_MODEL_LOAD_LAYOUT)?) } else { None };
+				(NativeBackend::Remote, forward, epoch, model_load)
+			}
 		};
 		debug(&format!("native load key={} path={} entrypoints={}", artifact.path.parent().and_then(Path::file_name).and_then(|key| key.to_str()).unwrap_or("unknown"), artifact.path.display(), if model_load.is_some() { "recipe_model_forward,recipe_model_epoch,recipe_model_load" } else { "recipe_model_forward,recipe_model_epoch" }))?; let block = forward.geometry.block.max(epoch.geometry.block);
 		let reduction_values = block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native contraction lane reduction overflows"))?;
@@ -6833,6 +6975,25 @@ impl NativeProgram {
 					require(program.module != 0, "native NVIDIA module is absent")?;
 					let stream = ptr::null_mut();
 					driver_status(Backend::Nvidia, (driver.launch)(dispatch.kernel.object as usize, threads / block, 1, 1, block, 1, 1, dynamic, stream, arguments.as_mut_ptr(), ptr::null_mut()), "native dispatch")
+				}
+				(NativeBackend::Remote, Driver::Remote(remote)) => {
+					let entry_id = match entry { NativeEntry::Forward => 0u8, NativeEntry::Epoch => 1, NativeEntry::ModelLoad => 2 };
+					let mut ch = remote.channel.lock().map_err(|_| RecipeError::new("remote channel poisoned"))?;
+					ch.write_u8(REMOTE_LAUNCH)?;
+					ch.write_u8(entry_id)?;
+					ch.write_u32(threads)?;
+					ch.write_u32(block)?;
+					ch.write_u32(dynamic)?;
+					ch.write_u8(arguments.len() as u8)?;
+					for (argument, kind) in arguments.iter().zip(dispatch.kernel.layout) {
+						let bytes = usize::from(*kind - b'0');
+						let mut data = [0u8; 8];
+						ptr::copy_nonoverlapping((*argument).cast::<u8>(), data.as_mut_ptr(), bytes);
+						ch.write_bytes(&data[..bytes])?;
+					}
+					ch.flush()?;
+					let status = ch.read_u8()?;
+					require(status == 0, format!("remote dispatch failed: {status}"))
 				}
 				_ => Err(RecipeError::new("native program backend changed after loading")),
 			}
@@ -10139,4 +10300,151 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let residual = targets.iter().zip(predictions).map(|(target, value)| (target - value).powi(2)).sum::<f64>();
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
+}
+pub fn worker_serve(device_name: &str) -> Result<()> {
+	let gpu = device(Some(device_name))?;
+	let mut out = std::io::BufWriter::new(std::io::stdout());
+	let mut input = std::io::BufReader::new(std::io::stdin());
+	let (backend_byte, arch, wave, cus, workgroup, block_lds, sm_lds, registers, threads) = match &gpu.driver {
+		#[cfg(nvidia)] Driver::Cuda(d) => (2u8, native_target_label(&gpu.native_target), d.wave, d.cus, d.workgroup, d.block_lds, d.sm_lds, d.registers, d.threads),
+		#[cfg(amd)] Driver::Hsa(d) => (1u8, native_target_label(&gpu.native_target), d.wave, d.cus, d.workgroup, d.lds, d.lds, 0, 0),
+		_ => return Err(RecipeError::new("worker requires a GPU device")),
+	};
+	out.write_all(&[backend_byte]).map_err(|e| RecipeError::new(format!("worker probe: {e}")))?;
+	let arch_bytes = arch.as_bytes();
+	out.write_all(&[arch_bytes.len() as u8]).map_err(|e| RecipeError::new(format!("worker probe: {e}")))?;
+	out.write_all(arch_bytes).map_err(|e| RecipeError::new(format!("worker probe: {e}")))?;
+	out.write_all(&gpu.memory.to_le_bytes()).map_err(|e| RecipeError::new(format!("worker probe: {e}")))?;
+	for v in [gpu.shared_limit, wave, cus, workgroup, block_lds, sm_lds, registers, threads] {
+		out.write_all(&v.to_le_bytes()).map_err(|e| RecipeError::new(format!("worker probe: {e}")))?;
+	}
+	out.flush().map_err(|e| RecipeError::new(format!("worker flush: {e}")))?;
+	struct WorkerState { dispatches: [Option<Dispatch>; 3], layouts: [&'static [u8]; 3] }
+	let mut state = WorkerState { dispatches: [None; 3], layouts: [NATIVE_FORWARD_LAYOUT, NATIVE_FORWARD_LAYOUT, NATIVE_MODEL_LOAD_LAYOUT] };
+	loop {
+		let mut cmd = [0u8; 1];
+		match input.read_exact(&mut cmd) { Ok(()) => {} Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break, Err(e) => return Err(RecipeError::new(format!("worker read: {e}"))) }
+		let reply = |out: &mut std::io::BufWriter<_>, status: u8| -> Result<()> { out.write_all(&[status]).map_err(|e| RecipeError::new(format!("worker reply: {e}")))?; out.flush().map_err(|e| RecipeError::new(format!("worker flush: {e}"))) };
+		match cmd[0] {
+			REMOTE_ALLOCATE => {
+				let mut b = [0u8; 8]; input.read_exact(&mut b).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+				let size = u64::from_le_bytes(b) as usize;
+				match gpu.allocate(size) {
+					Ok(ptr) => { reply(&mut out, 0)?; out.write_all(&ptr.to_le_bytes()).map_err(|e| RecipeError::new(format!("worker: {e}")))?; out.flush().map_err(|e| RecipeError::new(format!("worker: {e}")))?; }
+					Err(_) => { reply(&mut out, 1)?; }
+				}
+			}
+			REMOTE_FREE => {
+				let mut b = [0u8; 8]; input.read_exact(&mut b).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+				gpu.free(u64::from_le_bytes(b));
+			}
+			REMOTE_UPLOAD => {
+				let mut b = [0u8; 8]; input.read_exact(&mut b).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+				let ptr = u64::from_le_bytes(b);
+				input.read_exact(&mut b).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+				let size = u64::from_le_bytes(b) as usize;
+				let mut data = vec![0u8; size];
+				input.read_exact(&mut data).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+				match gpu.upload(ptr, data.as_ptr().cast(), size) {
+					Ok(_) => reply(&mut out, 0)?,
+					Err(_) => reply(&mut out, 1)?,
+				}
+			}
+			REMOTE_DOWNLOAD => {
+				let mut b = [0u8; 8]; input.read_exact(&mut b).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+				let ptr = u64::from_le_bytes(b);
+				input.read_exact(&mut b).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+				let size = u64::from_le_bytes(b) as usize;
+				let mut data = vec![0u8; size];
+				match gpu.download(data.as_mut_ptr().cast(), ptr, size) {
+					Ok(()) => { reply(&mut out, 0)?; out.write_all(&data).map_err(|e| RecipeError::new(format!("worker: {e}")))?; out.flush().map_err(|e| RecipeError::new(format!("worker: {e}")))?; }
+					Err(_) => reply(&mut out, 1)?,
+				}
+			}
+			REMOTE_SYNCHRONIZE => {
+				match gpu.synchronize() {
+					Ok(()) => reply(&mut out, 0)?,
+					Err(_) => reply(&mut out, 1)?,
+				}
+			}
+			REMOTE_LOAD => {
+				let mut b = [0u8; 8]; input.read_exact(&mut b).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+				let artifact_size = u64::from_le_bytes(b) as usize;
+				let mut artifact_data = vec![0u8; artifact_size];
+				input.read_exact(&mut artifact_data).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+				let mut params = [0u8; 14]; input.read_exact(&mut params).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+				let waves = u32::from_le_bytes(params[0..4].try_into().unwrap());
+				let shared_values = u32::from_le_bytes(params[4..8].try_into().unwrap());
+				let register_values = u32::from_le_bytes(params[8..12].try_into().unwrap());
+				let has_storage = params[12] != 0;
+				let element = params[13];
+				let epoch_layout = if element <= 4 { NATIVE_EPOCH_LAYOUT_FP32 } else { NATIVE_EPOCH_LAYOUT_FP64 };
+				let load_result: Result<_> = unsafe { match &gpu.driver {
+					#[cfg(nvidia)] Driver::Cuda(driver) => {
+						driver_status(Backend::Nvidia, (driver.set)(driver.context), "context")?;
+						let mut module = ptr::null_mut();
+						driver_status(Backend::Nvidia, (driver.load)(&mut module, artifact_data.as_ptr().cast()), "cubin load")?;
+						let forward = driver.native_dispatch(module, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves, shared_values, register_values)?;
+						let epoch = driver.native_dispatch(module, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves, shared_values, register_values)?;
+						let model_load = has_storage.then(|| driver.native_dispatch(module, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves, 0, 0)).transpose()?;
+						Ok((forward, epoch, model_load))
+					}
+					_ => Err(RecipeError::new("worker load requires NVIDIA GPU")),
+				} };
+				match load_result {
+					Ok((forward, epoch, model_load)) => {
+						reply(&mut out, 0)?;
+						let write_dispatch = |out: &mut std::io::BufWriter<_>, d: &Dispatch| -> Result<()> {
+							out.write_all(&d.kernel.object.to_le_bytes()).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+							out.write_all(&d.kernel.shared.to_le_bytes()).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+							out.write_all(&d.geometry.groups.to_le_bytes()).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+							out.write_all(&d.geometry.block.to_le_bytes()).map_err(|e| RecipeError::new(format!("worker: {e}")))
+						};
+						write_dispatch(&mut out, &forward)?;
+						write_dispatch(&mut out, &epoch)?;
+						state.dispatches = [Some(forward), Some(epoch), None];
+						if let Some(ref ml) = model_load { write_dispatch(&mut out, ml)?; state.dispatches[2] = model_load; }
+						state.layouts[1] = epoch_layout;
+						out.flush().map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+					}
+					Err(_) => reply(&mut out, 1)?,
+				}
+			}
+			REMOTE_LAUNCH => {
+				let mut header = [0u8; 14]; input.read_exact(&mut header).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+				let entry_id = header[0] as usize;
+				let threads = u32::from_le_bytes(header[1..5].try_into().unwrap());
+				let block = u32::from_le_bytes(header[5..9].try_into().unwrap());
+				let dynamic = u32::from_le_bytes(header[9..13].try_into().unwrap());
+				let arg_count = header[13] as usize;
+				let layout = state.layouts[entry_id.min(2)];
+				let mut arg_storage = vec![0u64; arg_count];
+				for (index, kind) in layout.iter().take(arg_count).enumerate() {
+					let bytes = usize::from(*kind - b'0');
+					let mut data = [0u8; 8];
+					input.read_exact(&mut data[..bytes]).map_err(|e| RecipeError::new(format!("worker: {e}")))?;
+					arg_storage[index] = u64::from_le_bytes(data);
+				}
+				let mut arg_ptrs: Vec<Ptr> = arg_storage.iter().map(|v| v as *const u64 as Ptr).collect();
+				let dispatch = state.dispatches[entry_id.min(2)].ok_or_else(|| RecipeError::new("worker: kernel not loaded"))?;
+				let _guard = gpu.dispatch.lock().map_err(|_| RecipeError::new("worker: dispatch lock poisoned"))?;
+				let result = unsafe {
+					match &gpu.driver {
+						#[cfg(nvidia)] Driver::Cuda(driver) => {
+							driver_status(Backend::Nvidia, (driver.set)(driver.context), "context")?;
+							let stream = ptr::null_mut();
+							driver_status(Backend::Nvidia, (driver.launch)(dispatch.kernel.object as usize, threads / block, 1, 1, block, 1, 1, dynamic, stream, arg_ptrs.as_mut_ptr(), ptr::null_mut()), "dispatch")?;
+							driver_status(Backend::Nvidia, (driver.synchronize)(), "synchronization")
+						}
+						#[cfg(amd)] Driver::Hsa(_) => Err(RecipeError::new("worker AMD launch not implemented")),
+						_ => Err(RecipeError::new("worker launch requires GPU")),
+					}
+				};
+				drop(_guard);
+				match result { Ok(()) => reply(&mut out, 0)?, Err(_) => reply(&mut out, 1)? }
+			}
+			_ => return Err(RecipeError::new(format!("worker: unknown command {}", cmd[0]))),
+		}
+	}
+	Ok(())
 }
