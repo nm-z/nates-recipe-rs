@@ -4897,7 +4897,8 @@ impl Recipe {
 impl Recipe {
 	pub fn infer(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
 		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
-		let devices = selected_gpus().unwrap_or_else(|error| panic!("{error}"));
+		let config = Config::load().unwrap_or_else(|error| panic!("{error}"));
+		let devices = explicit_route().and_then(|route| route.map_or_else(|| primary_device(config.placement).map(|gpu| vec![gpu]), Ok)).unwrap_or_else(|error| panic!("{error}"));
 		let result = bundle::run_infer(&path, input, |stored, samples| {
 			let config = Config::load()?;
 			let graph = materialize_saved_graph(stored, samples, devices[0], config)?;
@@ -5591,9 +5592,10 @@ struct Config {
 	random_seed: usize,
 	activation: [f64; 8],
 	precision: Compute,
+	placement: Placement,
 }
 impl Config {
-	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, catboost_borders: natural("CatBoost border count", env!("RECIPE_CATBOOST_BORDER_COUNT"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
+	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, catboost_borders: natural("CatBoost border count", env!("RECIPE_CATBOOST_BORDER_COUNT"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64, placement: Placement::load()? }) }
 }
 fn number(name: &str, text: &str) -> Result<f64> {
 	let value = text.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))?;
@@ -5653,6 +5655,114 @@ struct NativeTape {
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 /// Contiguous row blocks, largest first, so predictions stay in row order and
 /// every device in the route trains on at least one row.
+/// The permitted placement policy. One TOML value defines it and there is no
+/// second placement setting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Placement {
+	Local,
+	Every,
+	Auto,
+}
+impl Placement {
+	fn load() -> Result<Self> {
+		match env!("RECIPE_MULTI_DEVICE") {
+			"false" => Ok(Self::Local),
+			"true" => Ok(Self::Every),
+			"auto" => Ok(Self::Auto),
+			value => Err(RecipeError::new(format!("multi-device {value:?} is not false, true, or \"auto\""))),
+		}
+	}
+}
+/// Bytes of persistent optimizer state one device holds for this graph.
+fn persistent_bytes(parameters: usize, precision: NativePrecision) -> Result<usize> { checked_mul(parameters, precision.model.bytes() + 2 * precision.state.bytes(), "planned persistent state") }
+/// Bytes of batch statistics the route merges each epoch.
+fn statistic_bytes(graph: &Graph, precision: NativePrecision) -> Result<usize> {
+	let values = graph.nodes.iter().filter(|node| node.op == Primitive::Normalize && node.argument[0] == 0.0).try_fold(0, |total, node| checked_add(total, 2 * node.output.channels, "planned statistics"))?;
+	checked_mul(values, precision.model.bytes(), "planned statistic bytes")
+}
+/// The exact working set one fused epoch streams through a device's memory for
+/// `rows` rows: every node's values, contexts and adjoints, plus the samples,
+/// targets and persistent state the epoch reads and writes.
+fn planned_epoch_bytes(graph: &Graph, rows: usize, precision: NativePrecision) -> Result<usize> {
+	let element = precision.model.bytes();
+	let mut bytes = 0;
+	for node in &graph.nodes {
+		bytes = checked_add(bytes, checked_mul(2, graph_rows_buffer(node.output, rows, element)?, "planned arena")?, "planned values")?;
+		bytes = checked_add(bytes, node_context(node, rows, element)?, "planned contexts")?;
+	}
+	let samples = checked_mul(checked_mul(rows, graph.input.elements(), "planned sample elements")?, element, "planned samples")?;
+	let targets = checked_mul(checked_mul(rows, graph.output.elements(), "planned target elements")?, element, "planned targets")?;
+	bytes = checked_add(bytes, checked_add(samples, targets, "planned batch")?, "planned epoch batch")?;
+	checked_add(bytes, persistent_bytes(graph.parameters.len(), precision)?, "planned epoch")
+}
+/// Predicted seconds for one complete fused epoch on a route. Every term is a
+/// measured edge times an exactly planned size: the shards compute at once, then
+/// the route merges statistics and persistent state across its edges. Nothing is
+/// allocated, forwarded, trained, or dispatched to reach this number.
+fn route_cost(topology: &Topology, route: &[usize], graph: &Graph, rows: usize, precision: NativePrecision) -> Result<f64> {
+	let primary = *route.first().ok_or_else(|| RecipeError::new("a route selects at least one device"))?;
+	let (persistent, statistics) = (persistent_bytes(graph.parameters.len(), precision)?, statistic_bytes(graph, precision)?);
+	let shards = shard_rows(rows, route.len());
+	let mut computation = 0.0_f64;
+	let (mut transfers, mut synchronization, mut movement) = (0.0, 0.0, 0.0);
+	for (index, device) in route.iter().copied().enumerate() {
+		computation = computation.max(planned_epoch_bytes(graph, shards[index], precision)? as f64 / topology.rate(device)?);
+		if device == primary {
+			continue;
+		}
+		movement += topology.stream(device, primary, persistent)? + topology.stream(primary, device, persistent)?;
+		transfers += topology.stream(device, primary, statistics)? + topology.stream(primary, device, statistics)?;
+		// Each crossing pays the edge's measured latency once.
+		synchronization += 2.0 * (topology.latency(device, primary)? + topology.latency(primary, device)?);
+	}
+	Ok(computation + transfers + synchronization + movement)
+}
+/// Devices this policy may use, ordered by measured rate, fastest first.
+fn permitted(placement: Placement) -> Result<Vec<usize>> {
+	let topology = topology()?;
+	let mut order = (0..topology.devices.len()).collect::<Vec<_>>();
+	let mut rates = Vec::with_capacity(order.len());
+	for device in &order {
+		rates.push(topology.rate(*device)?)
+	}
+	// Equal measured rates order by canonical name, so a route is reproducible.
+	order.sort_by(|left, right| rates[*right].total_cmp(&rates[*left]).then_with(|| topology.devices[*left].canonical().cmp(&topology.devices[*right].canonical())));
+	if placement == Placement::Local {
+		let host = hostname()?;
+		order.retain(|device| topology.devices[*device].host == host);
+		order.truncate(1);
+	}
+	require(!order.is_empty(), "the topology has no device this placement permits")?;
+	Ok(order)
+}
+/// The route one run executes on. An explicit selector names the route; otherwise
+/// the policy does. Under `"auto"` the candidates are the fastest device, the
+/// fastest two, and so on, so a device joins the route only when the complete
+/// predicted epoch is shorter with it than without it.
+fn route(placement: Placement, graph: &Graph, rows: usize, precision: NativePrecision) -> Result<Vec<&'static Gpu>> {
+	if let Some(explicit) = explicit_route()? {
+		return Ok(explicit);
+	}
+	let topology = topology()?;
+	let order = permitted(placement)?;
+	let widths = match placement {
+		Placement::Local => 1..=1,
+		Placement::Every => order.len()..=order.len(),
+		Placement::Auto => 1..=order.len().min(rows.max(1)),
+	};
+	let mut best: Option<(Vec<usize>, f64)> = None;
+	for width in widths {
+		let candidate = order[..width].to_vec();
+		let cost = route_cost(topology, &candidate, graph, rows, precision)?;
+		debug(&format!("route {} predicted epoch {cost:.9}s", candidate.iter().map(|device| topology.devices[*device].canonical()).collect::<Vec<_>>().join(",")))?;
+		if best.as_ref().is_none_or(|(_, previous)| cost < *previous) {
+			best = Some((candidate, cost))
+		}
+	}
+	let (selected, cost) = best.ok_or_else(|| RecipeError::new("the topology has no device this placement permits"))?;
+	debug(&format!("selected route predicted epoch {cost:.9}s"))?;
+	Ok(selected.into_iter().map(|device| &topology.devices[device]).collect())
+}
 /// Seconds the route spends moving parameters each epoch, priced from the
 /// measured links. A route of one device has no edge and costs nothing, so the
 /// topology is never measured for it.
@@ -6550,15 +6660,15 @@ struct Topology {
 const LINK_SMALL_BYTES: usize = 1 << 12;
 const LINK_LARGE_BYTES: usize = 1 << 20;
 impl Topology {
-	fn link(&self, from: usize, to: usize) -> Option<&Link> { self.links.iter().find(|link| link.from == from && link.to == to) }
+	fn edge(&self, from: usize, to: usize) -> Result<&Link> { self.links.iter().find(|link| link.from == from && link.to == to).ok_or_else(|| RecipeError::new(format!("the topology has no edge from {} to {}", self.devices[from].canonical(), self.devices[to].canonical()))) }
+	/// The device's own measured byte rate, taken from its self edge.
+	fn rate(&self, device: usize) -> Result<f64> { self.edge(device, device).map(|link| link.bandwidth) }
+	/// The measured latency of one crossing.
+	fn latency(&self, from: usize, to: usize) -> Result<f64> { if from == to { Ok(0.0) } else { self.edge(from, to).map(|link| link.latency) } }
+	/// Seconds `bytes` occupy the measured edge, latency excluded.
+	fn stream(&self, from: usize, to: usize, bytes: usize) -> Result<f64> { if from == to { Ok(0.0) } else { self.edge(from, to).map(|link| bytes as f64 / link.bandwidth) } }
 	/// Seconds to move `bytes` from one device to another along the measured edge.
-	fn transfer(&self, from: usize, to: usize, bytes: usize) -> Result<f64> {
-		if from == to {
-			return Ok(0.0);
-		}
-		let link = self.link(from, to).ok_or_else(|| RecipeError::new(format!("the topology has no edge from {} to {}", self.devices[from].canonical(), self.devices[to].canonical())))?;
-		Ok(link.latency + bytes as f64 / link.bandwidth)
-	}
+	fn transfer(&self, from: usize, to: usize, bytes: usize) -> Result<f64> { Ok(self.latency(from, to)? + self.stream(from, to, bytes)?) }
 }
 fn measure_link(from: usize, to: usize, source: &Gpu, sink: &Gpu) -> Result<Link> {
 	let mut cost = [0.0_f64; 2];
@@ -6585,11 +6695,10 @@ fn topology() -> Result<&'static Topology> {
 		.get_or_init(|| {
 			let devices = devices()?;
 			let mut links = Vec::new();
+			// A self edge is the device's own measured rate; a cross edge is the route's transfer cost.
 			for from in 0..devices.len() {
 				for to in 0..devices.len() {
-					if from != to {
-						links.push(measure_link(from, to, &devices[from], &devices[to])?)
-					}
+					links.push(measure_link(from, to, &devices[from], &devices[to])?)
 				}
 			}
 			Ok(Topology { devices, links })
@@ -6953,19 +7062,26 @@ fn device(name: &str) -> Result<&'static Gpu> {
 	let host = hostname()?;
 	found.iter().find(|gpu| gpu.canonical() == name || (gpu.host == host && gpu.name == name)).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")))
 }
-/// Devices selected for one run. A comma separates the devices of one route.
-fn selected_gpus() -> Result<Vec<&'static Gpu>> {
-	let Some(names) = std::env::var("RECIPE_DEVICE").ok() else {
-		let found = devices()?;
-		require(found.len() == 1, "multiple GPUs require named selection")?;
-		return Ok(vec![&found[0]]);
-	};
+/// The route an explicit selector names. A comma separates the devices of one
+/// route; without a selector the placement policy chooses.
+fn explicit_route() -> Result<Option<Vec<&'static Gpu>>> {
+	let Some(names) = std::env::var("RECIPE_DEVICE").ok() else { return Ok(None) };
 	let route = names.split(',').filter(|name| !name.is_empty()).map(device).collect::<Result<Vec<_>>>()?;
 	let mut canonical = route.iter().map(|gpu| gpu.canonical()).collect::<Vec<_>>();
 	canonical.sort_unstable();
 	canonical.dedup();
 	require(canonical.len() == route.len(), "a route selects each device once")?;
-	Ok(route)
+	require(!route.is_empty(), "a route selects at least one device")?;
+	Ok(Some(route))
+}
+/// The device a run compiles and evaluates on: the head of the explicit route,
+/// or the fastest device the placement policy permits.
+fn primary_device(placement: Placement) -> Result<&'static Gpu> {
+	if let Some(explicit) = explicit_route()? {
+		return Ok(explicit[0]);
+	}
+	let topology = topology()?;
+	Ok(&topology.devices[permitted(placement)?[0]])
 }
 #[cfg(amd)]
 type HsaInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32;
@@ -10390,8 +10506,8 @@ impl Train {
 		let prepared = prepare(data)?;
 		let training_rows = ((prepared.source_rows as f64) * data.split).floor() as usize;
 		require(training_rows != 0 && training_rows <= prepared.source_rows, "split must select training rows")?;
-		let (route, mut config) = (selected_gpus()?, Config::load()?);
-		let gpu = route[0];
+		let mut config = Config::load()?;
+		let gpu = primary_device(config.placement)?;
 		let precision = self.precision;
 		config.precision = precision;
 		if let Some(seed) = self.seed {
@@ -10418,6 +10534,7 @@ impl Train {
 		stored.graph.state.trained_samples.sort_unstable();
 		stored.graph.state.trained_samples.dedup();
 		let (samples, targets) = (&prepared.samples[..training_rows * prepared.features], &target_values[..training_rows]);
+		let route = route(config.placement, &stored.graph, training_rows, NativePrecision::new(config.precision)?)?;
 		let mut tape = NativeTape::new(&stored.graph, samples, targets, &route, config.precision, model.loss)?;
 		self.finish_dispatch(if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) }, &mut stored, &prepared.schema, &tape, None)?;
 		tape.print_devices()?;

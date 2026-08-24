@@ -489,6 +489,10 @@ fn number<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	value.parse::<f64>().map_err(|error| io::Error::other(format!("{key} must be numeric: {error}")))?;
 	Ok(value)
 }
+fn policy<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
+	let value = setting(manifest, key)?;
+	match value { "false" | "true" => Ok(value), "\"auto\"" => Ok("auto"), _ => Err(io::Error::other(format!("{key} must be false, true, or \"auto\"")).into()) }
+}
 fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> { setting(manifest, key)?.strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| io::Error::other(format!("{key} must be quoted")).into()) }
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[("@contraction_tile = external addrspace(3) global [0 x double], align 16", "@contraction_tile = internal global [RECIPE_CONTRACTION_CPU_SHARED_VALUES x double] zeroinitializer, align 16"), (" addrspace(3)", ""), ("call i32 @llvm.amdgcn.workitem.id.x()", "add i32 0, 0"), ("call i32 @recipe.local.id.x()", "add i32 0, 0"), ("call i32 @recipe.group.id.x()", "add i32 0, 0"), ("call i32 @recipe.workgroup.size.x()", "add i32 1, 0"), ("call void @llvm.amdgcn.s.barrier()", ""), ("call void @recipe.local.barrier()", ""), ("call void @grid_barrier(i32 %threads)", ""), ("declare i32 @llvm.amdgcn.workitem.id.x()", ""), ("declare void @llvm.amdgcn.s.barrier()", ""), ("declare i64 @__ockl_steadyctr_u64()", ""), ("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }")];
 /// Compile-time contraction shape. A reverse K extent is cut into one contiguous
@@ -651,6 +655,7 @@ fn main() -> BuildResult<()> {
 	for (key, environment) in [("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME"), ("hosts", "RECIPE_HOSTS")] {
 		println!("cargo:rustc-env={environment}={}", text(&manifest, key)?);
 	}
+	println!("cargo:rustc-env=RECIPE_MULTI_DEVICE={}", policy(&manifest, "multi-device")?);
 	let out = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR must be configured"))?);
 	println!("cargo::rustc-check-cfg=cfg(amd)");
 	println!("cargo::rustc-check-cfg=cfg(nvidia)");

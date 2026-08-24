@@ -15,6 +15,7 @@ path = "cli.rs"
 
 [package.metadata.recipe]
 hosts = ""
+multi-device = "auto"
 dependency-allowlist = []
 contraction-cpu-shared-values = 65536
 contraction-register-m = 8
