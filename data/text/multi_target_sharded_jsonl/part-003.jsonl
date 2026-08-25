@@ -1,0 +1,25 @@
+{"summary": "the intake runs quiet", "target": 1, "sentiment": 0}
+{"summary": "the sensor vibrates hard", "target": 0, "sentiment": 0}
+{"summary": "the rotor vibrates hard", "target": 0}
+{"summary": "the intake vibrates hard", "target": 0, "sentiment": 1}
+{"summary": "the rotor works under load", "target": 1, "sentiment": 0}
+{"summary": "the filter runs quiet", "target": 1, "sentiment": 1}
+{"summary": "the sensor runs quiet", "target": 1, "sentiment": 1}
+{"summary": "the bearing passes inspection", "target": 1, "sentiment": 1}
+{"summary": "the housing leaks at the seam", "target": 0, "sentiment": 0}
+{"summary": "the filter runs quiet", "target": 1, "sentiment": 0}
+{"summary": "the gasket vibrates hard", "target": 0, "sentiment": 0}
+{"summary": "the gasket fails under load", "target": 0, "sentiment": 1}
+{"summary": "the bearing fails under load", "target": 0, "sentiment": 0}
+{"summary": "the bearing leaks at the seam", "target": 0}
+{"summary": "the rotor fails under load", "target": 0, "sentiment": 0}
+{"summary": "the sensor runs quiet", "target": 1, "sentiment": 0}
+{"summary": "the housing works under load", "target": 1, "sentiment": 0}
+{"summary": "the housing works under load", "target": 1, "sentiment": 1}
+{"summary": "the rotor runs quiet", "target": 1, "sentiment": 1}
+{"summary": "the filter leaks at the seam", "target": 0, "sentiment": 0}
+{"summary": "the gasket fails under load", "target": 0, "sentiment": 1}
+{"summary": "the housing runs quiet", "target": 1, "sentiment": 0}
+{"summary": "the sensor vibrates hard", "target": 0, "sentiment": 1}
+{"summary": "the filter passes inspection", "target": 1, "sentiment": 0}
+{"summary": "the housing fails under load", "target": 0}

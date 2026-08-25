@@ -1,0 +1,11 @@
+view_front,view_side,target
+images/image-0000-front.png,images/image-0000-side.png,0
+images/image-0001-front.jpg,images/image-0001-side.jpg,1
+images/image-0002-front.bmp,images/image-0002-side.bmp,2
+images/image-0003-front.webp,images/image-0003-side.webp,3
+images/image-0004-front.png,images/image-0004-side.png,0
+images/image-0005-front.jpg,images/image-0005-side.jpg,1
+images/image-0006-front.bmp,images/image-0006-side.bmp,2
+images/image-0007-front.webp,images/image-0007-side.webp,3
+images/image-0008-front.png,images/image-0008-side.png,0
+images/image-0009-front.jpg,images/image-0009-side.jpg,1

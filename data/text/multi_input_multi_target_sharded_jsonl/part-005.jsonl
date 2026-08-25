@@ -1,0 +1,17 @@
+{"summary": "the valve works under load", "note": "checked on site", "target": 1, "sentiment": 1}
+{"summary": "the sensor fails under load", "note": "flagged for review", "target": 0, "sentiment": 0}
+{"summary": "the gasket works under load", "note": "cleared by audit", "target": 1, "sentiment": 1}
+{"summary": "the gasket leaks at the seam", "note": "checked on site", "target": 0, "sentiment": 1}
+{"summary": "the rotor passes inspection", "note": "checked on site", "target": 1, "sentiment": 1}
+{"summary": "the sensor leaks at the seam", "note": "cleared by audit", "target": 0, "sentiment": 1}
+{"summary": "the gasket leaks at the seam", "note": "logged at shift end", "target": 0, "sentiment": 0}
+{"summary": "the rotor passes inspection", "note": "flagged for review", "target": 1, "sentiment": 0}
+{"summary": "the valve works under load", "note": "checked on site", "target": 1, "sentiment": 1}
+{"summary": "the bearing fails under load", "note": "logged at shift end", "target": 0}
+{"summary": "the rotor vibrates hard", "note": "checked on site", "target": 0, "sentiment": 1}
+{"summary": "the gasket works under load", "note": "flagged for review", "target": 1, "sentiment": 0}
+{"summary": "the housing vibrates hard", "note": "logged at shift end", "target": 0, "sentiment": 0}
+{"summary": "the bearing runs quiet", "note": "logged at shift end", "target": 1, "sentiment": 0}
+{"summary": "the valve vibrates hard", "note": "logged at shift end", "target": 0, "sentiment": 0}
+{"summary": "the valve vibrates hard", "note": "logged at shift end", "target": 0, "sentiment": 0}
+{"summary": "the filter runs quiet", "note": "checked on site", "target": 1, "sentiment": 1}
