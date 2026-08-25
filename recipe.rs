@@ -3468,7 +3468,7 @@ use std::{
 	error::Error,
 	ffi::c_void,
 	fmt, fs,
-	io::{IsTerminal, Write},
+	io::{IsTerminal, Read, Write},
 	mem::{size_of, size_of_val},
 	path::{Path, PathBuf},
 	process::Command,
@@ -5763,6 +5763,13 @@ impl NativeTape {
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
 	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
+		let objective = self.epoch_launch(rate, config)?;
+		let saved = observe_loss(&mut self.best_loss, objective, tolerance);
+		Ok((objective, saved))
+	}
+	/// Runs one epoch dispatch and returns the loss it measured, leaving the
+	/// checkpoint bookkeeping to the caller.
+	fn epoch_launch(&mut self, rate: f64, config: Config) -> Result<f64> {
 		require(self.step != 0, "optimizer epoch is absent")?;
 		let threads = self.program.dispatch(NativeEntry::Epoch)?.geometry.threads()?;
 		let rows = self.rows;
@@ -5804,24 +5811,20 @@ impl NativeTape {
 		debug(&format!("epoch {step} launch complete"))?;
 		let objective = self.metrics.download_float(1, self.precision.state)?[0];
 		debug(&format!("epoch {step} metric complete"))?;
-		let saved = self.observe(objective, tolerance)?;
-		Ok((objective, saved))
-	}
-	fn observe(&mut self, loss: f64, tolerance: f64) -> Result<bool> {
-		let (old_best, last, armed, saved) = (self.best_loss[0], self.best_loss[1], self.best_loss[2].is_finite(), self.best_loss[3]);
-		let best = if loss < old_best { loss } else { old_best };
-		let trigger = armed && loss > last * (2.0 - tolerance) && tolerance > 0.0;
-		self.best_loss[0] = best;
-		self.best_loss[1] = loss;
-		self.best_loss[2] = if trigger { f64::NAN } else if last.is_finite() && last < saved && loss < saved { best } else { self.best_loss[2] };
-		if trigger { self.best_loss[3] = best; }
-		Ok(trigger)
+		Ok(objective)
 	}
 	fn advance(&mut self) -> Result<()> {
 		self.step = self.step.checked_add(1).ok_or_else(|| RecipeError::new("optimizer epoch overflows"))?;
 		Ok(())
 	}
 	fn weights(&self) -> Result<Vec<f64>> { self.weights.download_float(self.parameters, self.precision.model) }
+	/// The reduced full-shard parameter gradient the last epoch dispatch left
+	/// on the device.
+	fn download_gradient(&self) -> Result<Vec<f64>> { self.gradient.download_float(self.parameters, self.precision.model) }
+	fn upload_weights(&self, weights: &[f64]) -> Result<()> { self.weights.write_float_bytes(0, weights, self.precision.model) }
+	/// Marks every parameter frozen so epoch dispatches compute the gradient
+	/// and loss without touching weights or optimizer state.
+	fn freeze_all(&self) -> Result<()> { self.frozen.write_bytes(0, &vec![1_u8; self.parameters.max(1)]) }
 	fn optimizer_state(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
 		Ok((self.weights()?, self.moments.download_float(self.parameters, self.precision.state)?, self.variances.download_float(self.parameters, self.precision.state)?))
 	}
@@ -5843,15 +5846,247 @@ impl NativeTape {
 		if extents.windows(2).all(|pair| pair[0] == pair[1]) { return extents.first().cloned().unwrap_or_default() }
 		self.program.contractions.iter().flatten().map(|node| [node.forward, node.gradient, node.previous].map(|extent| format!("{}x{}x{}", extent.m, extent.n, extent.k)).join("/")).collect::<Vec<_>>().join(" ")
 	}
+	fn device_label(&self) -> Result<String> {
+		let name = &self.program.gpu.name;
+		if name.contains(':') {
+			return Ok(name.clone());
+		}
+		Ok(format!("{}:{name}", local_host()?))
+	}
+}
+/// Tracks the running best loss and decides whether this epoch triggers a
+/// checkpoint, updating the four-slot loss state in place.
+fn observe_loss(best_loss: &mut [f64; 4], loss: f64, tolerance: f64) -> bool {
+	let (old_best, last, armed, saved) = (best_loss[0], best_loss[1], best_loss[2].is_finite(), best_loss[3]);
+	let best = if loss < old_best { loss } else { old_best };
+	let trigger = armed && loss > last * (2.0 - tolerance) && tolerance > 0.0;
+	best_loss[0] = best;
+	best_loss[1] = loss;
+	best_loss[2] = if trigger { f64::NAN } else if last.is_finite() && last < saved && loss < saved { best } else { best_loss[2] };
+	if trigger {
+		best_loss[3] = best;
+	}
+	trigger
+}
+/// One measured edge of the device topology: the transfer path between this
+/// process and a device, benchmarked rather than declared.
+struct Link {
+	latency: Duration,
+	bandwidth: f64,
+}
+fn measure_link(gpu: &'static Gpu) -> Result<Link> {
+	const PROBE_BYTES: usize = 1 << 22;
+	const ROUNDS: u32 = 8;
+	let mut scratch = vec![0_u8; PROBE_BYTES];
+	let pointer = gpu.upload(0, scratch.as_ptr().cast(), PROBE_BYTES)?;
+	let probe = (|| {
+		gpu.synchronize()?;
+		let started = Instant::now();
+		for _ in 0..ROUNDS {
+			gpu.upload(pointer, scratch.as_ptr().cast(), 8)?;
+			gpu.download(scratch.as_mut_ptr().cast(), pointer, 8)?;
+			gpu.synchronize()?;
+		}
+		let latency = started.elapsed() / (ROUNDS * 2);
+		let started = Instant::now();
+		gpu.upload(pointer, scratch.as_ptr().cast(), PROBE_BYTES)?;
+		gpu.download(scratch.as_mut_ptr().cast(), pointer, PROBE_BYTES)?;
+		gpu.synchronize()?;
+		let elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
+		Ok(Link { latency, bandwidth: (2 * PROBE_BYTES) as f64 / elapsed })
+	})();
+	gpu.free(pointer);
+	probe
+}
+/// The optimizer state a multi-device tape keeps on the host, where the
+/// gathered shard gradients meet for the single AdamW update.
+struct HostOptimizer {
+	weights: Vec<f64>,
+	moments: Vec<f64>,
+	variances: Vec<f64>,
+	frozen: Vec<u8>,
+	shares: Vec<f64>,
+	links: Vec<Link>,
+	best_loss: [f64; 4],
+	loss: LossFunction,
+}
+/// A training tape placed across the selected device topology. One device
+/// trains exactly as before with the fused on-device optimizer. Across several
+/// devices the rows shard contiguously, every device runs the epoch dispatch
+/// gradient-only in parallel, the gradients travel the measured links to the
+/// host for one AdamW update, and the weights broadcast back.
+struct DeviceTape {
+	shards: Vec<NativeTape>,
+	host: Option<HostOptimizer>,
+}
+impl DeviceTape {
+	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpus: &'static [&'static Gpu], precision: Compute, loss: LossFunction) -> Result<Self> {
+		if gpus.len() == 1 {
+			return Ok(Self { shards: vec![NativeTape::new(graph, samples, targets, gpus[0], precision, Some(loss))?], host: None });
+		}
+		let input = graph.input.elements();
+		require(input != 0 && samples.len() % input == 0, "model input batch is not a whole number of rows")?;
+		let rows = samples.len() / input;
+		let output = graph.output.elements();
+		require(rows >= gpus.len(), format!("{rows} training rows cannot shard across {} devices", gpus.len()))?;
+		require(!targets.is_empty(), "multi-device training requires targets")?;
+		require(
+			!graph.nodes.iter().any(|node| node.op == Primitive::Normalize && node.argument[0] == 0.0),
+			"batch normalization computes whole-batch statistics, so this model trains on one device",
+		)?;
+		let links = gpus.iter().map(|gpu| measure_link(gpu)).collect::<Result<Vec<_>>>()?;
+		let parameters = graph.parameters.len();
+		let (mut shards, mut shares, mut start) = (Vec::new(), Vec::new(), 0);
+		for (index, gpu) in gpus.iter().enumerate() {
+			let count = rows / gpus.len() + usize::from(index < rows % gpus.len());
+			let end = start + count;
+			let shard = NativeTape::new(graph, &samples[start * input..end * input], &targets[start * output..end * output], gpu, precision, Some(loss))?;
+			shard.freeze_all()?;
+			shards.push(shard);
+			shares.push(count as f64 / rows as f64);
+			start = end;
+		}
+		let zeros = vec![0.0; parameters];
+		let host = HostOptimizer {
+			weights: graph.parameters.clone(),
+			moments: if graph.state.moments.is_empty() { zeros.clone() } else { graph.state.moments.clone() },
+			variances: if graph.state.variances.is_empty() { zeros } else { graph.state.variances.clone() },
+			frozen: if graph.frozen.is_empty() { vec![0_u8; parameters] } else { graph.frozen.clone() },
+			shares,
+			links,
+			best_loss: shards[0].best_loss,
+			loss,
+		};
+		Ok(Self { shards, host: Some(host) })
+	}
+	fn forward(&mut self) -> Result<()> {
+		self.shards.iter_mut().try_for_each(NativeTape::forward)
+	}
+	fn predictions(&self) -> Result<Vec<f64>> {
+		let mut predictions = Vec::new();
+		for shard in &self.shards {
+			predictions.extend(shard.predictions()?);
+		}
+		Ok(predictions)
+	}
+	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
+		if self.host.is_some() {
+			return require(stats.is_empty(), "batch normalization statistics cannot place across devices");
+		}
+		self.shards[0].inject_bn_stats(stats)
+	}
+	fn extract_bn_stats(&self) -> Result<Vec<f64>> {
+		if self.host.is_some() {
+			return Ok(Vec::new());
+		}
+		self.shards[0].extract_bn_stats()
+	}
+	fn advance(&mut self) -> Result<()> {
+		self.shards.iter_mut().try_for_each(NativeTape::advance)
+	}
+	fn step(&self) -> u32 { self.shards[0].step }
+	fn best_loss(&self) -> [f64; 4] { self.host.as_ref().map_or(self.shards[0].best_loss, |host| host.best_loss) }
+	fn tile(&self) -> Tile { self.shards[0].tile() }
+	fn schedule(&self) -> String { self.shards[0].schedule() }
+	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
+		let Some(host) = &mut self.host else { return self.shards[0].epoch(rate, tolerance, config) };
+		let shards = &mut self.shards;
+		let measured = std::thread::scope(|scope| {
+			let dispatched = shards
+				.iter_mut()
+				.map(|shard| {
+					scope.spawn(move || -> Result<(f64, Vec<f64>)> {
+						let objective = shard.epoch_launch(rate, config)?;
+						Ok((objective, shard.download_gradient()?))
+					})
+				})
+				.collect::<Vec<_>>();
+			dispatched
+				.into_iter()
+				.map(|shard| shard.join().map_err(|_| RecipeError::new("device epoch panicked"))?)
+				.collect::<Result<Vec<_>>>()
+		})?;
+		let root_metric = host.loss.0 == 1;
+		let loss = if root_metric {
+			measured.iter().zip(&host.shares).map(|((objective, _), share)| share * objective * objective).sum::<f64>().sqrt()
+		} else {
+			measured.iter().zip(&host.shares).map(|((objective, _), share)| share * objective).sum()
+		};
+		let parameters = host.weights.len();
+		let mut gradient = vec![0.0; parameters];
+		for ((objective, shard_gradient), share) in measured.iter().zip(&host.shares) {
+			// The RMSE seed divides by the shard-local loss, so restoring the
+			// whole-batch gradient rescales each shard by its loss ratio.
+			let scale = share * if root_metric { if loss == 0.0 { 0.0 } else { objective / loss } } else { 1.0 };
+			for (total, partial) in gradient.iter_mut().zip(shard_gradient) {
+				*total += scale * partial;
+			}
+		}
+		let precision = self.shards[0].precision;
+		let step = self.shards[0].step;
+		let beta1 = precision.state.below_one(config.beta1);
+		let beta2 = precision.state.below_one(config.beta2);
+		let epsilon = precision.state.optimizer_epsilon(config.epsilon);
+		let (beta1_power, beta2_power) = (beta1.powi(step as i32), beta2.powi(step as i32));
+		for index in 0..parameters {
+			if host.frozen[index] != 0 {
+				continue;
+			}
+			let value = gradient[index];
+			let moment = beta1 * host.moments[index] + (1.0 - beta1) * value;
+			let variance = beta2 * host.variances[index] + (1.0 - beta2) * value * value;
+			host.moments[index] = moment;
+			host.variances[index] = variance;
+			let direction = (moment / (1.0 - beta1_power)) / ((variance / (1.0 - beta2_power)).sqrt() + epsilon);
+			host.weights[index] -= rate * (direction + config.decay * host.weights[index]);
+		}
+		for shard in self.shards.iter() {
+			shard.upload_weights(&host.weights)?;
+		}
+		let saved = observe_loss(&mut host.best_loss, loss, tolerance);
+		Ok((loss, saved))
+	}
+	fn weights(&self) -> Result<Vec<f64>> {
+		match &self.host {
+			Some(host) => Ok(host.weights.clone()),
+			None => self.shards[0].weights(),
+		}
+	}
+	fn capture(&self, graph: &mut Graph) -> Result<()> {
+		let Some(host) = &self.host else { return self.shards[0].capture(graph) };
+		graph.parameters = host.weights.clone();
+		graph.state.moments = host.moments.clone();
+		graph.state.variances = host.variances.clone();
+		graph.state.epoch = self.step() as usize;
+		graph.state.best_loss = host.best_loss.to_vec();
+		Ok(())
+	}
 	fn print_devices(&self) -> Result<()> {
-		let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-		eprintln!("{}:{}.{}", host.trim(), self.program.gpu.name, self.precision.model.label());
+		let Some(host) = &self.host else {
+			eprintln!("{}.{}", self.shards[0].device_label()?, self.shards[0].precision.model.label());
+			return Ok(());
+		};
+		for (shard, link) in self.shards.iter().zip(&host.links) {
+			// The per-epoch exchange moves the gradient to the host and the
+			// updated weights back over this measured link.
+			let bytes = 2 * shard.parameters * shard.precision.model.bytes();
+			let exchange = 2.0 * link.latency.as_secs_f64() + bytes as f64 / link.bandwidth;
+			eprintln!(
+				"{}.{} rows {} link latency {:.0?} bandwidth {:.1} MB/s exchange {:.2} ms/epoch",
+				shard.device_label()?,
+				shard.precision.model.label(),
+				shard.rows,
+				link.latency,
+				link.bandwidth / 1e6,
+				exchange * 1e3,
+			);
+		}
 		Ok(())
 	}
 }
-fn checkpoint(path: &Path, schema: &DataSchema, stored: &mut bundle::StoredGraph, tape: &NativeTape) -> Result<()> {
+fn checkpoint(path: &Path, schema: &DataSchema, stored: &mut bundle::StoredGraph, tape: &DeviceTape) -> Result<()> {
 	if let Ok((_, saved)) = bundle::load_semantic(path) {
-		if saved.first().and_then(|g| g.state.best_loss.first().copied()).is_some_and(|v| v <= tape.best_loss[0]) {
+		if saved.first().and_then(|g| g.state.best_loss.first().copied()).is_some_and(|v| v <= tape.best_loss()[0]) {
 			return Ok(());
 		}
 	}
@@ -6056,6 +6291,7 @@ enum NativeBackend {
 	Amd(NativeHsaProgram),
 	#[cfg(nvidia)]
 	Nvidia(NativeCudaProgram),
+	Remote,
 }
 
 struct NativeProgram {
@@ -6183,12 +6419,65 @@ struct Hsa {
 	workgroup: u32,
 	lds: u32,
 }
+const REMOTE_ALLOCATE: u8 = 1;
+const REMOTE_FREE: u8 = 2;
+const REMOTE_UPLOAD: u8 = 3;
+const REMOTE_DOWNLOAD: u8 = 4;
+const REMOTE_SYNCHRONIZE: u8 = 5;
+const REMOTE_LOAD: u8 = 6;
+const REMOTE_LAUNCH: u8 = 7;
+struct RemoteChannel {
+	input: std::io::BufWriter<std::process::ChildStdin>,
+	output: std::io::BufReader<std::process::ChildStdout>,
+}
+impl RemoteChannel {
+	fn fail<T>(error: std::io::Error) -> Result<T> { Err(RecipeError::new(format!("remote channel: {error}"))) }
+	fn write_u8(&mut self, value: u8) -> Result<()> { self.input.write_all(&[value]).or_else(Self::fail) }
+	fn write_u32(&mut self, value: u32) -> Result<()> { self.input.write_all(&value.to_le_bytes()).or_else(Self::fail) }
+	fn write_u64(&mut self, value: u64) -> Result<()> { self.input.write_all(&value.to_le_bytes()).or_else(Self::fail) }
+	fn write_bytes(&mut self, data: &[u8]) -> Result<()> { self.input.write_all(data).or_else(Self::fail) }
+	fn flush(&mut self) -> Result<()> { self.input.flush().or_else(Self::fail) }
+	fn read_u8(&mut self) -> Result<u8> {
+		let mut bytes = [0; 1];
+		self.output.read_exact(&mut bytes).or_else(Self::fail)?;
+		Ok(bytes[0])
+	}
+	fn read_u32(&mut self) -> Result<u32> {
+		let mut bytes = [0; 4];
+		self.output.read_exact(&mut bytes).or_else(Self::fail)?;
+		Ok(u32::from_le_bytes(bytes))
+	}
+	fn read_u64(&mut self) -> Result<u64> {
+		let mut bytes = [0; 8];
+		self.output.read_exact(&mut bytes).or_else(Self::fail)?;
+		Ok(u64::from_le_bytes(bytes))
+	}
+	fn read_into(&mut self, buffer: &mut [u8]) -> Result<()> { self.output.read_exact(buffer).or_else(Self::fail) }
+	/// Reads a status byte; a nonzero status carries the worker's error message.
+	fn read_status(&mut self, action: &str) -> Result<()> {
+		if self.read_u8()? == 0 {
+			return Ok(());
+		}
+		let length = self.read_u32()? as usize;
+		let mut message = vec![0_u8; length.min(4096)];
+		self.read_into(&mut message)?;
+		for _ in message.len()..length {
+			self.read_u8()?;
+		}
+		Err(RecipeError::new(format!("remote {action}: {}", String::from_utf8_lossy(&message))))
+	}
+}
+struct Remote {
+	channel: Mutex<RemoteChannel>,
+	wave: u32,
+}
 enum Driver {
 	Cpu,
 	#[cfg(amd)]
 	Hsa(Hsa),
 	#[cfg(nvidia)]
 	Cuda(Cuda),
+	Remote(Remote),
 }
 #[allow(dead_code)]
 struct Gpu {
@@ -6294,7 +6583,7 @@ impl Gpu {
 	fn status(&self, status: i32, action: &str) -> Result<()> { driver_status(self.backend, status, action).map_err(|error| RecipeError::new(format!("device {} {:?}: {error}", self.name, self.backend))) }
 	fn activate(&self) -> Result<()> {
 		match &self.driver {
-			Driver::Cpu => Ok(()),
+			Driver::Cpu | Driver::Remote(_) => Ok(()),
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => self.status(unsafe { (driver.set)(driver.context) }, "context"),
 			#[cfg(amd)]
@@ -6322,6 +6611,7 @@ impl Gpu {
 			Driver::Hsa(driver) => driver.wave,
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => driver.wave,
+			Driver::Remote(remote) => remote.wave,
 		};
 		let dominant_shape = dominant.and_then(|(index, _)| shapes[index]).map_or(limits, |shape| shape.gradient);
 		let fragment_k = narrow(natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?, "contraction fragment K")? as u32;
@@ -6419,6 +6709,14 @@ impl Gpu {
 					self.status((driver.allow)(1, &driver.cpu_agent, ptr::null(), pointer), "CPU allocation access")?;
 					Ok(pointer as u64)
 				}
+				Driver::Remote(remote) => {
+					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
+					channel.write_u8(REMOTE_ALLOCATE)?;
+					channel.write_u64(bytes as u64)?;
+					channel.flush()?;
+					channel.read_status("allocation")?;
+					channel.read_u64()
+				}
 			}
 		}
 	}
@@ -6440,6 +6738,11 @@ impl Gpu {
 				Driver::Hsa(driver) => {
 					(driver.free)(pointer as Ptr);
 				}
+				Driver::Remote(remote) => {
+					if let Ok(mut channel) = remote.channel.lock() {
+						channel.write_u8(REMOTE_FREE).and_then(|_| channel.write_u64(pointer)).and_then(|_| channel.flush()).ok();
+					}
+				}
 			}
 		}
 	}
@@ -6457,6 +6760,15 @@ impl Gpu {
 				Driver::Cuda(driver) => self.status((driver.upload)(dst, src, bytes), "upload").map(|_| dst),
 				#[cfg(amd)]
 				Driver::Hsa(driver) => self.status((driver.copy)(dst as Ptr, src, bytes), "upload").map(|_| dst),
+				Driver::Remote(remote) => {
+					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
+					channel.write_u8(REMOTE_UPLOAD)?;
+					channel.write_u64(dst)?;
+					channel.write_u64(bytes as u64)?;
+					channel.write_bytes(std::slice::from_raw_parts(src.cast::<u8>(), bytes))?;
+					channel.flush()?;
+					channel.read_status("upload").map(|_| dst)
+				}
 			}
 		}
 	}
@@ -6473,6 +6785,15 @@ impl Gpu {
 				Driver::Cuda(cuda) => self.status((cuda.download)(dst, src, bytes), "download"),
 				#[cfg(amd)]
 				Driver::Hsa(driver) => self.status((driver.copy)(dst, src as *const c_void, bytes), "download"),
+				Driver::Remote(remote) => {
+					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
+					channel.write_u8(REMOTE_DOWNLOAD)?;
+					channel.write_u64(src)?;
+					channel.write_u64(bytes as u64)?;
+					channel.flush()?;
+					channel.read_status("download")?;
+					channel.read_into(std::slice::from_raw_parts_mut(dst.cast::<u8>(), bytes))
+				}
 			}
 		}
 	}
@@ -6486,6 +6807,12 @@ impl Gpu {
 				Driver::Cuda(driver) => self.status((driver.synchronize)(), "synchronization"),
 				#[cfg(amd)]
 				Driver::Hsa(driver) => require((driver.wait)(driver.signal, 0, 0, u64::MAX, 1) == 0, "AMD synchronization failed"),
+				Driver::Remote(remote) => {
+					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
+					channel.write_u8(REMOTE_SYNCHRONIZE)?;
+					channel.flush()?;
+					channel.read_status("synchronization")
+				}
 			}
 		}
 	}
@@ -6526,10 +6853,90 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	require(found.len() == 1, "multiple GPUs require named selection")?;
 	Ok(&found[0])
 }
-fn selected_gpu() -> Result<&'static Gpu> {
-	let Some(name) = std::env::var("RECIPE_DEVICE").ok() else { return device(None) };
+fn local_host() -> Result<String> {
 	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-	devices()?.iter().find(|gpu| gpu.name == name || format!("{}:{}", host.trim(), gpu.name) == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")))
+	Ok(host.trim().to_owned())
+}
+static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
+/// Resolves the `RECIPE_DEVICE` selection to the ordered device list. Each
+/// comma-separated name is a local device (`amd0`, `engi:amd0`) or a device on
+/// a reachable host (`benji:nv0`); the first name is the primary device.
+fn selected_gpus() -> Result<&'static [&'static Gpu]> {
+	SELECTED
+		.get_or_init(|| {
+			let Some(selection) = std::env::var("RECIPE_DEVICE").ok() else { return device(None).map(|gpu| vec![gpu]) };
+			let host = local_host()?;
+			let mut selected = Vec::new();
+			for name in selection.split(',') {
+				let gpu = match devices()?.iter().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
+					Some(gpu) => gpu,
+					None => match name.split_once(':') {
+						Some((remote, device)) if remote != host => connect_remote(remote, device, name)?,
+						_ => return Err(RecipeError::new(format!("GPU {name:?} is absent"))),
+					},
+				};
+				require(!selected.iter().any(|previous: &&Gpu| ptr::eq(*previous, gpu)), format!("GPU {name:?} is selected twice"))?;
+				selected.push(gpu);
+			}
+			require(!selected.is_empty(), "RECIPE_DEVICE selects no device")?;
+			Ok(selected)
+		})
+		.as_ref()
+		.map(Vec::as_slice)
+		.map_err(Clone::clone)
+}
+fn selected_gpu() -> Result<&'static Gpu> { selected_gpus().map(|gpus| gpus[0]) }
+/// Uploads this build's `recipe` binary to the remote host, starts it as a
+/// device worker over SSH, and wraps the probed device as a local `Gpu` whose
+/// driver speaks the worker protocol. The worker removes the uploaded binary
+/// once it is running, so nothing is left behind on the remote host.
+fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'static Gpu> {
+	static REMOTES: Mutex<Vec<&'static Gpu>> = Mutex::new(Vec::new());
+	let mut remotes = REMOTES.lock().map_err(|_| RecipeError::new("remote registry is poisoned"))?;
+	if let Some(gpu) = remotes.iter().find(|gpu| gpu.name == canonical) {
+		return Ok(gpu);
+	}
+	let binary = std::env::var_os("RECIPE_BINARY").map(PathBuf::from).ok_or_else(|| RecipeError::new(format!("GPU {canonical:?} requires the recipe launcher to reach host {host:?}")))?;
+	require(binary.is_file(), format!("recipe binary is absent at {}", binary.display()))?;
+	let remote_path = format!("/tmp/recipe-worker-{}", std::process::id());
+	let copy = Command::new("scp").args(["-q", "-o", "BatchMode=yes"]).arg(&binary).arg(format!("{host}:{remote_path}")).status().map_err(|error| RecipeError::new(format!("cannot copy the worker to {host}: {error}")))?;
+	require(copy.success(), format!("cannot copy the worker to {host}: {copy}"))?;
+	let mut child = Command::new("ssh")
+		.args(["-o", "BatchMode=yes", host, &format!("RECIPE_WORKER_REMOVE=1 {remote_path} --worker {device_name}")])
+		.stdin(std::process::Stdio::piped())
+		.stdout(std::process::Stdio::piped())
+		.spawn()
+		.map_err(|error| RecipeError::new(format!("cannot start the worker on {host}: {error}")))?;
+	let input = child.stdin.take().ok_or_else(|| RecipeError::new("remote worker stdin is absent"))?;
+	let output = child.stdout.take().ok_or_else(|| RecipeError::new("remote worker stdout is absent"))?;
+	let mut channel = RemoteChannel { input: std::io::BufWriter::new(input), output: std::io::BufReader::new(output) };
+	channel.read_status(&format!("worker on {host}"))?;
+	let backend = match channel.read_u8()? {
+		1 => Backend::Amd,
+		2 => Backend::Nvidia,
+		byte => return Err(RecipeError::new(format!("remote worker reported unknown backend {byte}"))),
+	};
+	let mut architecture = vec![0_u8; channel.read_u8()? as usize];
+	channel.read_into(&mut architecture)?;
+	let architecture = String::from_utf8(architecture).map_err(|error| RecipeError::new(format!("remote architecture is invalid: {error}")))?;
+	let memory = channel.read_u64()?;
+	let shared_limit = channel.read_u32()?;
+	let wave = channel.read_u32()?;
+	let native_target = match backend {
+		Backend::Amd => BackendTarget::Amd { architecture },
+		_ => BackendTarget::Nvidia { architecture },
+	};
+	let gpu = Box::leak(Box::new(Gpu {
+		name: canonical.to_owned(),
+		backend,
+		native_target,
+		driver: Driver::Remote(Remote { channel: Mutex::new(channel), wave }),
+		memory,
+		shared_limit,
+		dispatch: Mutex::new(()),
+	}));
+	remotes.push(gpu);
+	Ok(gpu)
 }
 #[cfg(amd)]
 type HsaInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32;
@@ -6604,27 +7011,27 @@ unsafe fn hsa_kernel(symbol: HsaSymbol, info: HsaSymbolInfo, executable: u64, ag
 fn kfd_property(text: &str, name: &str) -> Result<u32> { text.lines().find_map(|line| line.split_once(' ').filter(|value| value.0 == name)).ok_or_else(|| RecipeError::new(format!("KFD property {name:?} is absent")))?.1.parse::<u32>().map_err(|error| RecipeError::new(format!("KFD property {name:?} is invalid: {error}"))) }
 #[cfg(amd)]
 impl Hsa {
-	unsafe fn native_dispatch(&self, executable: u64, artifact: &NativeArtifact, waves: u32, name: &str, layout: &'static [u8]) -> Result<Dispatch> {
+	unsafe fn native_dispatch(&self, executable: u64, element: u8, waves: u32, name: &str, layout: &'static [u8]) -> Result<Dispatch> {
 		unsafe {
 		let name = std::ffi::CString::new(format!("{name}.kd")).map_err(|error| RecipeError::new(format!("AMD native symbol is invalid: {error}")))?;
-		let kernel = hsa_kernel(self.symbol, self.symbol_info, executable, self.agent, &name, artifact.precision.model.bytes() as u8, layout)?;
+		let kernel = hsa_kernel(self.symbol, self.symbol_info, executable, self.agent, &name, element, layout)?;
 		let geometry = amd(self.cus, self.wave, self.workgroup, self.lds, waves, Resources { shared: kernel.shared, max_block: self.workgroup })?;
 		Ok(Dispatch { kernel, geometry })
 		}
 	}
 
-	unsafe fn load_native(&self, artifact: &NativeArtifact, waves: u32) -> Result<(NativeHsaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
+	unsafe fn load_native(&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], training: bool, has_storage: bool, waves: u32) -> Result<(NativeHsaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
 		unsafe {
-		require(artifact.artifact.len() != 0, "native AMD artifact is empty")?;
+		require(!bytes.is_empty(), "native AMD artifact is empty")?;
 		let mut reader = HsaReader { handle: 0, destroy: self.reader_destroy };
 		let mut executable = HsaExecutable { handle: 0, destroy: self.executable_destroy };
-		driver_status(Backend::Amd, (self.reader_create)(artifact.artifact.as_ptr().cast(), artifact.artifact.len(), &mut reader.handle), "native code-object reader")?;
+		driver_status(Backend::Amd, (self.reader_create)(bytes.as_ptr().cast(), bytes.len(), &mut reader.handle), "native code-object reader")?;
 		driver_status(Backend::Amd, (self.executable_create)(1, 0, ptr::null_mut(), &mut executable.handle), "native executable creation")?;
 		driver_status(Backend::Amd, (self.executable_load)(executable.handle, self.agent, reader.handle, ptr::null_mut(), ptr::null_mut()), "native code-object load")?;
 		driver_status(Backend::Amd, (self.executable_freeze)(executable.handle, ptr::null_mut()), "native executable freeze")?;
-		let forward = self.native_dispatch(executable.handle, artifact, waves, NATIVE_FORWARD_SYMBOL, NATIVE_FORWARD_LAYOUT)?;
-		let epoch = artifact.training.then(|| self.native_dispatch(executable.handle, artifact, waves, NATIVE_EPOCH_SYMBOL, artifact.precision.epoch_layout)).transpose()?;
-		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(executable.handle, artifact, waves, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
+		let forward = self.native_dispatch(executable.handle, element, waves, NATIVE_FORWARD_SYMBOL, NATIVE_FORWARD_LAYOUT)?;
+		let epoch = training.then(|| self.native_dispatch(executable.handle, element, waves, NATIVE_EPOCH_SYMBOL, epoch_layout)).transpose()?;
+		let model_load = has_storage.then(|| self.native_dispatch(executable.handle, element, waves, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
 		let kernarg_size = forward.kernel.kernarg.max(epoch.map_or(0, |dispatch| dispatch.kernel.kernarg)).max(model_load.map_or(0, |dispatch| dispatch.kernel.kernarg));
 		let grid_sync = kernarg_size.next_multiple_of(HSA_GRID_SYNC_ALIGNMENT);
 		let allocation_size = grid_sync.checked_add(HSA_GRID_SYNC_BYTES).ok_or_else(|| RecipeError::new("native AMD KERNARG allocation overflows"))?;
@@ -6665,16 +7072,15 @@ impl Cuda {
 		}
 	}
 
-	unsafe fn load_native(&self, artifact: &NativeArtifact, waves: u32, shared_values: u32, register_values: u32) -> Result<(NativeCudaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
+	unsafe fn load_native(&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], training: bool, has_storage: bool, waves: u32, shared_values: u32, register_values: u32) -> Result<(NativeCudaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
 		unsafe {
 		driver_status(Backend::Nvidia, (self.set)(self.context), "native context")?;
 		let mut module = ptr::null_mut();
-		driver_status(Backend::Nvidia, (self.load)(&mut module, artifact.artifact.as_ptr().cast()), "native cubin load")?;
+		driver_status(Backend::Nvidia, (self.load)(&mut module, bytes.as_ptr().cast()), "native cubin load")?;
 		let program = NativeCudaProgram { module: module as usize, unload: self.unload };
-		let element = u8::try_from(artifact.precision.model.bytes()).map_err(|_| RecipeError::new("native NVIDIA precision width is invalid"))?;
 		let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves, shared_values, register_values)?;
-		let epoch = artifact.training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, artifact.precision.epoch_layout, waves, shared_values, register_values)).transpose()?;
-		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves, 0, 0)).transpose()?;
+		let epoch = training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves, shared_values, register_values)).transpose()?;
+		let model_load = has_storage.then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves, 0, 0)).transpose()?;
 		Ok((program, forward, epoch, model_load))
 		}
 	}
@@ -6740,6 +7146,7 @@ impl NativeProgram {
 	fn load(gpu: &'static Gpu, artifact: NativeArtifact, graph: &Graph, schedule: NativeSchedule, register_values: u32, waves: u32) -> Result<Self> {
 		native_artifact_contract(&artifact)?;
 		require(artifact.backend.backend() == gpu.backend, format!("native artifact backend {:?} does not match device {:?}", artifact.backend.backend(), gpu.backend))?;
+		let element = u8::try_from(artifact.precision.model.bytes()).map_err(|_| RecipeError::new("native precision width is invalid"))?;
 		let (backend, forward, epoch, model_load) = match &gpu.driver {
 			Driver::Cpu => {
 				#[cfg(unix)]
@@ -6755,13 +7162,38 @@ impl NativeProgram {
 			}
 			#[cfg(amd)]
 			Driver::Hsa(driver) => {
-				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact, waves)? };
+				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact.artifact, element, artifact.precision.epoch_layout, artifact.training, !artifact.storage.is_empty(), waves)? };
 				(NativeBackend::Amd(program), forward, epoch, model_load)
 			}
 			#[cfg(nvidia)]
 			Driver::Cuda(driver) => {
-				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact, waves, schedule.shared_values, register_values)? };
+				let (program, forward, epoch, model_load) = unsafe { driver.load_native(&artifact.artifact, element, artifact.precision.epoch_layout, artifact.training, !artifact.storage.is_empty(), waves, schedule.shared_values, register_values)? };
 				(NativeBackend::Nvidia(program), forward, epoch, model_load)
+			}
+			Driver::Remote(remote) => {
+				let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
+				channel.write_u8(REMOTE_LOAD)?;
+				channel.write_u64(artifact.artifact.len() as u64)?;
+				channel.write_bytes(&artifact.artifact)?;
+				channel.write_u32(waves)?;
+				channel.write_u32(schedule.shared_values)?;
+				channel.write_u32(register_values)?;
+				channel.write_u8(element)?;
+				channel.write_u8(u8::from(artifact.training))?;
+				channel.write_u8(u8::from(artifact.precision.epoch_layout == NATIVE_EPOCH_LAYOUT_FP64))?;
+				channel.write_u8(u8::from(!artifact.storage.is_empty()))?;
+				channel.flush()?;
+				channel.read_status("artifact load")?;
+				let mut read_dispatch = |layout: &'static [u8]| -> Result<Dispatch> {
+					let shared = channel.read_u32()?;
+					let groups = channel.read_u32()?;
+					let block = channel.read_u32()?;
+					Ok(Dispatch { kernel: Kernel::remote(shared, element, layout), geometry: Geometry { groups, block } })
+				};
+				let forward = read_dispatch(NATIVE_FORWARD_LAYOUT)?;
+				let epoch = artifact.training.then(|| read_dispatch(artifact.precision.epoch_layout)).transpose()?;
+				let model_load = (!artifact.storage.is_empty()).then(|| read_dispatch(NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
+				(NativeBackend::Remote, forward, epoch, model_load)
 			}
 		};
 		let entrypoints = [Some(NATIVE_FORWARD_SYMBOL), epoch.map(|_| NATIVE_EPOCH_SYMBOL), model_load.map(|_| NATIVE_MODEL_LOAD_SYMBOL)].into_iter().flatten().collect::<Vec<_>>().join(",");
@@ -6799,60 +7231,85 @@ impl NativeProgram {
 		let dispatch = self.dispatch(entry)?;
 		require(arguments.len() == dispatch.kernel.layout.len(), "native argument count is invalid")?;
 		gpu.activate()?;
-		let block = dispatch.geometry.block;
 		let values = if matches!(entry, NativeEntry::ModelLoad) { 0 } else { self.shared_values.max(self.reduction_values) };
 		let dynamic = values.checked_mul(u32::from(dispatch.kernel.element)).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
 		let shared = dispatch.kernel.shared.checked_add(dynamic).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
 		require(shared <= gpu.shared_limit, "native shared memory exceeds device limit")?;
 		let _guard = gpu.dispatch.lock().map_err(|_| RecipeError::new("GPU dispatch lock is poisoned"))?;
-		unsafe {
-			match (&self.backend, &gpu.driver) {
-				#[cfg(unix)]
-				(NativeBackend::Cpu(cpu), Driver::Cpu) => launch_native_cpu(cpu, entry, arguments),
-				#[cfg(amd)]
-				(NativeBackend::Amd(program), Driver::Hsa(driver)) => {
-					require(program.executable.handle != 0, "native AMD executable is absent")?;
-					let kernarg = program.kernarg as Ptr;
-					ptr::write_bytes(kernarg.cast::<u8>(), 0, program.kernarg_size);
-					let mut offset = 0_usize;
-					for (argument, kind) in arguments.iter().zip(dispatch.kernel.layout) {
-						let bytes = usize::from(*kind - b'0');
-						offset = offset.next_multiple_of(bytes);
-						ptr::copy_nonoverlapping((*argument).cast::<u8>(), kernarg.cast::<u8>().add(offset), bytes);
-						offset += bytes;
-					}
-					let implicit = offset.next_multiple_of(HSA_IMPLICIT_ARGUMENT_ALIGNMENT);
-					require(dispatch.kernel.kernarg == implicit + HSA_IMPLICIT_ARGUMENT_BYTES && dispatch.kernel.kernarg <= program.kernarg_size, "native HSA KERNARG layout is invalid")?;
-					let groups = threads.checked_div(block).filter(|groups| groups.saturating_mul(block) == threads && *groups <= u32::from(u16::MAX)).ok_or_else(|| RecipeError::new("native AMD grid size is invalid"))?;
-					let grid_sync = program.grid_sync as Ptr;
-					if std::env::var_os("RECIPE_DEBUG").is_some() {
-						debug(&format!("AMD grid sync before reset {:?}", std::slice::from_raw_parts(grid_sync.cast::<u32>(), HSA_GRID_SYNC_BYTES / size_of::<u32>())))?;
-					}
-					ptr::write_bytes(grid_sync.cast::<u8>(), 0, HSA_GRID_SYNC_BYTES);
-					grid_sync.cast::<u8>().add(HSA_GRID_SYNC_GROUPS_OFFSET).cast::<u32>().write(groups);
-					kernarg.cast::<u8>().add(implicit + HSA_MULTIGRID_SYNC_POINTER_OFFSET).cast::<u64>().write(program.grid_sync as u64);
-					(driver.store)(driver.signal, 1);
-					let queue = &mut *(driver.queue as *mut HsaQueue);
-					let index = (driver.write)(queue, 1);
-					let packet = queue.base.cast::<HsaPacket>().add(index as usize & (queue.size as usize - 1));
-					packet.write(HsaPacket { header: 1, setup: 1, workgroup_x: block as u16, workgroup_y: 1, workgroup_z: 1, reserved0: 0, grid_x: threads, grid_y: 1, grid_z: 1, private: dispatch.kernel.private, group: shared, object: dispatch.kernel.object, kernarg, reserved1: 0, completion: driver.signal });
-					std::sync::atomic::fence(Ordering::Release);
-					let header = &*(&mut (*packet).header as *mut u16 as *mut std::sync::atomic::AtomicU16);
-					header.store(2 | 2 << 9 | 2 << 11, Ordering::Release);
-					(driver.store)(queue.doorbell, index as i64);
-					debug("AMD dispatch submitted")?;
-					let completed = (driver.wait)(driver.signal, 0, 0, u64::MAX, 1);
-					debug(&format!("AMD dispatch completed with signal {completed}"))?;
-					require(completed == 0, "native AMD dispatch failed")
+		unsafe { launch_backend(gpu, &self.backend, &dispatch, entry, arguments, threads, dynamic, shared) }
+	}
+}
+
+/// Dispatches one loaded entrypoint on the device that loaded it. The caller
+/// holds the device dispatch lock and has already validated the argument list
+/// and shared-memory budget.
+unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch, entry: NativeEntry, arguments: &mut [Ptr], threads: u32, dynamic: u32, shared: u32) -> Result<()> {
+	let block = dispatch.geometry.block;
+	unsafe {
+		match (backend, &gpu.driver) {
+			#[cfg(unix)]
+			(NativeBackend::Cpu(cpu), Driver::Cpu) => launch_native_cpu(cpu, entry, arguments),
+			#[cfg(amd)]
+			(NativeBackend::Amd(program), Driver::Hsa(driver)) => {
+				require(program.executable.handle != 0, "native AMD executable is absent")?;
+				let kernarg = program.kernarg as Ptr;
+				ptr::write_bytes(kernarg.cast::<u8>(), 0, program.kernarg_size);
+				let mut offset = 0_usize;
+				for (argument, kind) in arguments.iter().zip(dispatch.kernel.layout) {
+					let bytes = usize::from(*kind - b'0');
+					offset = offset.next_multiple_of(bytes);
+					ptr::copy_nonoverlapping((*argument).cast::<u8>(), kernarg.cast::<u8>().add(offset), bytes);
+					offset += bytes;
 				}
-				#[cfg(nvidia)]
-				(NativeBackend::Nvidia(program), Driver::Cuda(driver)) => {
-					require(program.module != 0, "native NVIDIA module is absent")?;
-					let stream = ptr::null_mut();
-					driver_status(Backend::Nvidia, (driver.launch)(dispatch.kernel.object as usize, threads / block, 1, 1, block, 1, 1, dynamic, stream, arguments.as_mut_ptr(), ptr::null_mut()), "native dispatch")
+				let implicit = offset.next_multiple_of(HSA_IMPLICIT_ARGUMENT_ALIGNMENT);
+				require(dispatch.kernel.kernarg == implicit + HSA_IMPLICIT_ARGUMENT_BYTES && dispatch.kernel.kernarg <= program.kernarg_size, "native HSA KERNARG layout is invalid")?;
+				let groups = threads.checked_div(block).filter(|groups| groups.saturating_mul(block) == threads && *groups <= u32::from(u16::MAX)).ok_or_else(|| RecipeError::new("native AMD grid size is invalid"))?;
+				let grid_sync = program.grid_sync as Ptr;
+				if std::env::var_os("RECIPE_DEBUG").is_some() {
+					debug(&format!("AMD grid sync before reset {:?}", std::slice::from_raw_parts(grid_sync.cast::<u32>(), HSA_GRID_SYNC_BYTES / size_of::<u32>())))?;
 				}
-				_ => Err(RecipeError::new("native program backend changed after loading")),
+				ptr::write_bytes(grid_sync.cast::<u8>(), 0, HSA_GRID_SYNC_BYTES);
+				grid_sync.cast::<u8>().add(HSA_GRID_SYNC_GROUPS_OFFSET).cast::<u32>().write(groups);
+				kernarg.cast::<u8>().add(implicit + HSA_MULTIGRID_SYNC_POINTER_OFFSET).cast::<u64>().write(program.grid_sync as u64);
+				(driver.store)(driver.signal, 1);
+				let queue = &mut *(driver.queue as *mut HsaQueue);
+				let index = (driver.write)(queue, 1);
+				let packet = queue.base.cast::<HsaPacket>().add(index as usize & (queue.size as usize - 1));
+				packet.write(HsaPacket { header: 1, setup: 1, workgroup_x: block as u16, workgroup_y: 1, workgroup_z: 1, reserved0: 0, grid_x: threads, grid_y: 1, grid_z: 1, private: dispatch.kernel.private, group: shared, object: dispatch.kernel.object, kernarg, reserved1: 0, completion: driver.signal });
+				std::sync::atomic::fence(Ordering::Release);
+				let header = &*(&mut (*packet).header as *mut u16 as *mut std::sync::atomic::AtomicU16);
+				header.store(2 | 2 << 9 | 2 << 11, Ordering::Release);
+				(driver.store)(queue.doorbell, index as i64);
+				debug("AMD dispatch submitted")?;
+				let completed = (driver.wait)(driver.signal, 0, 0, u64::MAX, 1);
+				debug(&format!("AMD dispatch completed with signal {completed}"))?;
+				require(completed == 0, "native AMD dispatch failed")
 			}
+			#[cfg(nvidia)]
+			(NativeBackend::Nvidia(program), Driver::Cuda(driver)) => {
+				require(program.module != 0, "native NVIDIA module is absent")?;
+				let stream = ptr::null_mut();
+				driver_status(Backend::Nvidia, (driver.launch)(dispatch.kernel.object as usize, threads / block, 1, 1, block, 1, 1, dynamic, stream, arguments.as_mut_ptr(), ptr::null_mut()), "native dispatch")
+			}
+			(NativeBackend::Remote, Driver::Remote(remote)) => {
+				let entry = match entry {
+					NativeEntry::Forward => 0_u8,
+					NativeEntry::Epoch => 1,
+					NativeEntry::ModelLoad => 2,
+				};
+				let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
+				channel.write_u8(REMOTE_LAUNCH)?;
+				channel.write_u8(entry)?;
+				for (argument, kind) in arguments.iter().zip(dispatch.kernel.layout) {
+					let bytes = usize::from(*kind - b'0');
+					let mut data = [0_u8; 8];
+					ptr::copy_nonoverlapping((*argument).cast::<u8>(), data.as_mut_ptr(), bytes);
+					channel.write_bytes(&data[..bytes])?;
+				}
+				channel.flush()?;
+				channel.read_status("dispatch")
+			}
+			_ => Err(RecipeError::new("native program backend changed after loading")),
 		}
 	}
 }
@@ -6976,6 +7433,192 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		}
 		require(!found.is_empty(), "Nvidia has no discrete GPU")?;
 		Ok(found)
+	}
+}
+struct WorkerWire {
+	input: std::io::BufReader<std::io::Stdin>,
+	output: std::io::BufWriter<std::io::Stdout>,
+}
+impl WorkerWire {
+	fn fail<T>(error: std::io::Error) -> Result<T> { Err(RecipeError::new(format!("worker channel: {error}"))) }
+	fn read_u8(&mut self) -> Result<u8> {
+		let mut bytes = [0; 1];
+		self.input.read_exact(&mut bytes).or_else(Self::fail)?;
+		Ok(bytes[0])
+	}
+	fn read_u32(&mut self) -> Result<u32> {
+		let mut bytes = [0; 4];
+		self.input.read_exact(&mut bytes).or_else(Self::fail)?;
+		Ok(u32::from_le_bytes(bytes))
+	}
+	fn read_u64(&mut self) -> Result<u64> {
+		let mut bytes = [0; 8];
+		self.input.read_exact(&mut bytes).or_else(Self::fail)?;
+		Ok(u64::from_le_bytes(bytes))
+	}
+	fn read_into(&mut self, buffer: &mut [u8]) -> Result<()> { self.input.read_exact(buffer).or_else(Self::fail) }
+	fn write_bytes(&mut self, data: &[u8]) -> Result<()> { self.output.write_all(data).or_else(Self::fail) }
+	fn write_u32(&mut self, value: u32) -> Result<()> { self.write_bytes(&value.to_le_bytes()) }
+	fn flush(&mut self) -> Result<()> { self.output.flush().or_else(Self::fail) }
+	/// Reports one command's outcome: a zero status, or a nonzero status
+	/// carrying the error message.
+	fn status(&mut self, result: &Result<()>) -> Result<()> {
+		match result {
+			Ok(()) => self.write_bytes(&[0]),
+			Err(error) => {
+				let message = error.to_string();
+				self.write_bytes(&[1])?;
+				self.write_u32(message.len() as u32)?;
+				self.write_bytes(message.as_bytes())
+			}
+		}
+	}
+}
+struct WorkerProgram {
+	backend: NativeBackend,
+	dispatches: [Option<Dispatch>; 3],
+	shared_values: u32,
+	reduction_values: u32,
+}
+/// Serves one local device to a remote Recipe process over stdin/stdout: the
+/// transport half of a cross-host topology link. Commands mirror the `Gpu`
+/// verbs plus artifact load and entrypoint dispatch, so a driving process can
+/// place work on this host's device exactly as on a local one.
+pub fn worker_serve(name: &str) -> Result<()> {
+	if std::env::var_os("RECIPE_WORKER_REMOVE").is_some()
+		&& let Ok(binary) = std::env::current_exe()
+	{
+		fs::remove_file(binary).ok();
+	}
+	let mut wire = WorkerWire { input: std::io::BufReader::new(std::io::stdin()), output: std::io::BufWriter::new(std::io::stdout()) };
+	let probe = device(Some(name)).and_then(|gpu| {
+		let (backend, wave) = match &gpu.driver {
+			#[cfg(amd)]
+			Driver::Hsa(driver) => (1_u8, driver.wave),
+			#[cfg(nvidia)]
+			Driver::Cuda(driver) => (2_u8, driver.wave),
+			_ => return Err(RecipeError::new(format!("device {name:?} is not a local GPU"))),
+		};
+		Ok((gpu, backend, wave))
+	});
+	let (gpu, backend, wave) = match probe {
+		Ok(probe) => probe,
+		Err(error) => {
+			wire.status(&Err(error.clone()))?;
+			wire.flush()?;
+			return Err(error);
+		}
+	};
+	wire.status(&Ok(()))?;
+	let architecture = native_target_label(&gpu.native_target);
+	wire.write_bytes(&[backend, architecture.len() as u8])?;
+	wire.write_bytes(architecture.as_bytes())?;
+	wire.write_bytes(&gpu.memory.to_le_bytes())?;
+	wire.write_u32(gpu.shared_limit)?;
+	wire.write_u32(wave)?;
+	wire.flush()?;
+	let mut program: Option<WorkerProgram> = None;
+	loop {
+		let mut command = [0_u8; 1];
+		match wire.input.read_exact(&mut command) {
+			Ok(()) => {}
+			Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+			Err(error) => return WorkerWire::fail(error),
+		}
+		match command[0] {
+			REMOTE_ALLOCATE => {
+				let bytes = wire.read_u64()? as usize;
+				let allocated = gpu.allocate(bytes);
+				wire.status(&allocated.as_ref().map(|_| ()).map_err(Clone::clone))?;
+				if let Ok(pointer) = allocated {
+					wire.write_bytes(&pointer.to_le_bytes())?;
+				}
+			}
+			REMOTE_FREE => {
+				let pointer = wire.read_u64()?;
+				gpu.free(pointer);
+			}
+			REMOTE_UPLOAD => {
+				let pointer = wire.read_u64()?;
+				let bytes = wire.read_u64()? as usize;
+				let mut data = vec![0_u8; bytes];
+				wire.read_into(&mut data)?;
+				wire.status(&gpu.upload(pointer, data.as_ptr().cast(), bytes).map(|_| ()))?;
+			}
+			REMOTE_DOWNLOAD => {
+				let pointer = wire.read_u64()?;
+				let bytes = wire.read_u64()? as usize;
+				let mut data = vec![0_u8; bytes];
+				let downloaded = gpu.download(data.as_mut_ptr().cast(), pointer, bytes);
+				wire.status(&downloaded)?;
+				if downloaded.is_ok() {
+					wire.write_bytes(&data)?;
+				}
+			}
+			REMOTE_SYNCHRONIZE => wire.status(&gpu.synchronize())?,
+			REMOTE_LOAD => {
+				let bytes = wire.read_u64()? as usize;
+				let mut artifact = vec![0_u8; bytes];
+				wire.read_into(&mut artifact)?;
+				let waves = wire.read_u32()?;
+				let shared_values = wire.read_u32()?;
+				let register_values = wire.read_u32()?;
+				let element = wire.read_u8()?;
+				let training = wire.read_u8()? != 0;
+				let epoch_layout: &'static [u8] = if wire.read_u8()? != 0 { NATIVE_EPOCH_LAYOUT_FP64 } else { NATIVE_EPOCH_LAYOUT_FP32 };
+				let has_storage = wire.read_u8()? != 0;
+				let loaded = match &gpu.driver {
+					#[cfg(amd)]
+					Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves) }.map(|(program, forward, epoch, model_load)| (NativeBackend::Amd(program), forward, epoch, model_load)),
+					#[cfg(nvidia)]
+					Driver::Cuda(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves, shared_values, register_values) }.map(|(program, forward, epoch, model_load)| (NativeBackend::Nvidia(program), forward, epoch, model_load)),
+					_ => Err(RecipeError::new("worker device driver is not native")),
+				};
+				wire.status(&loaded.as_ref().map(|_| ()).map_err(Clone::clone))?;
+				if let Ok((backend, forward, epoch, model_load)) = loaded {
+					let block = forward.geometry.block.max(epoch.map_or(0, |dispatch| dispatch.geometry.block));
+					let reduction_values = block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native contraction lane reduction overflows"))?;
+					for dispatch in [Some(forward), epoch, model_load].into_iter().flatten() {
+						wire.write_u32(dispatch.kernel.shared)?;
+						wire.write_u32(dispatch.geometry.groups)?;
+						wire.write_u32(dispatch.geometry.block)?;
+					}
+					program = Some(WorkerProgram { backend, dispatches: [Some(forward), epoch, model_load], shared_values, reduction_values });
+				}
+			}
+			REMOTE_LAUNCH => {
+				let entry = match wire.read_u8()? {
+					0 => NativeEntry::Forward,
+					1 => NativeEntry::Epoch,
+					2 => NativeEntry::ModelLoad,
+					byte => return Err(RecipeError::new(format!("worker received unknown entrypoint {byte}"))),
+				};
+				let launched = program
+					.as_ref()
+					.ok_or_else(|| RecipeError::new("worker has no loaded program"))
+					.and_then(|program| {
+						let dispatch = program.dispatches[entry as usize].ok_or_else(|| RecipeError::new("worker entrypoint is absent"))?;
+						let mut slots = [0_u64; 32];
+						for (slot, kind) in slots.iter_mut().zip(dispatch.kernel.layout) {
+							let bytes = usize::from(*kind - b'0');
+							let mut data = [0_u8; 8];
+							wire.read_into(&mut data[..bytes])?;
+							*slot = u64::from_le_bytes(data);
+						}
+						let mut arguments = slots[..dispatch.kernel.layout.len()].iter().map(|slot| slot as *const u64 as Ptr).collect::<Vec<_>>();
+						let values = if matches!(entry, NativeEntry::ModelLoad) { 0 } else { program.shared_values.max(program.reduction_values) };
+						let dynamic = values.checked_mul(u32::from(dispatch.kernel.element)).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
+						let shared = dispatch.kernel.shared.checked_add(dynamic).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
+						require(shared <= gpu.shared_limit, "native shared memory exceeds device limit")?;
+						gpu.activate()?;
+						let _guard = gpu.dispatch.lock().map_err(|_| RecipeError::new("GPU dispatch lock is poisoned"))?;
+						unsafe { launch_backend(gpu, &program.backend, &dispatch, entry, &mut arguments, dispatch.geometry.threads()?, dynamic, shared) }
+					});
+				wire.status(&launched)?;
+			}
+			byte => return Err(RecipeError::new(format!("worker received unknown command {byte}"))),
+		}
+		wire.flush()?;
 	}
 }
 #[cfg(all(unix, not(windows)))]
@@ -9999,7 +10642,8 @@ impl Train {
 		let prepared = prepare(data)?;
 		let training_rows = ((prepared.source_rows as f64) * data.split).floor() as usize;
 		require(training_rows != 0 && training_rows <= prepared.source_rows, "split must select training rows")?;
-		let (gpu, mut config) = (selected_gpu()?, Config::load()?);
+		let (gpus, mut config) = (selected_gpus()?, Config::load()?);
+		let gpu = gpus[0];
 		let precision = self.precision;
 		config.precision = precision;
 		if let Some(seed) = self.seed {
@@ -10029,7 +10673,7 @@ impl Train {
 		stored.graph.state.trained_samples.sort_unstable();
 		stored.graph.state.trained_samples.dedup();
 		let (samples, targets) = (&prepared.samples[..training_rows * prepared.features], &target_values[..training_values]);
-		let mut tape = NativeTape::new(&stored.graph, samples, targets, gpu, config.precision, Some(model.loss))?;
+		let mut tape = DeviceTape::new(&stored.graph, samples, targets, gpus, config.precision, model.loss)?;
 		self.finish_dispatch(if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) }, &mut stored, &prepared.schema, &tape, None)?;
 		tape.print_devices()?;
 		stored.bn_stats = tape.extract_bn_stats()?;
@@ -10045,7 +10689,7 @@ impl Train {
 				break;
 			}
 			tape.advance()?;
-			let epoch = tape.step as usize;
+			let epoch = tape.step() as usize;
 			// Read once per epoch from the dispatched schedule, so a schedule change appears on the next line.
 			let schedule = tape.schedule();
 			let ((loss, saved, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &schedule, || {
@@ -10113,9 +10757,9 @@ impl Train {
 		};
 		if !evaluated.is_empty() { predictions = evaluated }
 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(()))?;
-		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), schedule: tape.schedule(), run, epoch: tape.step as usize, seconds: started.elapsed().as_secs_f64(), epoch_seconds })
+		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), schedule: tape.schedule(), run, epoch: tape.step() as usize, seconds: started.elapsed().as_secs_f64(), epoch_seconds })
 	}
-	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &DataSchema, tape: &NativeTape, save: Option<()>) -> Result<T> {
+	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &DataSchema, tape: &DeviceTape, save: Option<()>) -> Result<T> {
 		let save = if INTERRUPTED.load(Ordering::Acquire) && !INTERRUPT_CHECKPOINTED.swap(true, Ordering::AcqRel) { Some(()) } else { save.filter(|_| !INTERRUPTED.load(Ordering::Acquire)) };
 		if save.is_some()
 			&& let Some(path) = &self.save
