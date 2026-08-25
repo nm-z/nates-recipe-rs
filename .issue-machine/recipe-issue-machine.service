@@ -8,7 +8,10 @@ Type=simple
 WorkingDirectory=/home/nate
 Environment=HOME=/home/nate
 Environment=PATH=/home/nate/.local/bin:/home/nate/.cargo/bin:/usr/local/bin:/usr/bin:/opt/rocm/bin
+ExecStartPre=/usr/bin/install -d -m 0700 /tmp/tmux-1000
 ExecStart=/home/nate/.local/bin/recipe-machine /home/nate/.config/recipe-machine.toml
+ExecStartPost=-/usr/bin/tmux -S /tmp/tmux-1000/default -f /home/nate/Desktop/recipe-issue-machine/.issue-machine/tmux.conf new-session -d -s recipe-issue-machine /usr/bin/tail -n 200 -F /home/nate/Desktop/recipe-issue-machine/recipe.log
+ExecStopPost=-/usr/bin/tmux -S /tmp/tmux-1000/default kill-session -t recipe-issue-machine
 KillMode=control-group
 Restart=always
 RestartSec=1
