@@ -1,5 +1,0 @@
-[mcp_servers.recipe_issues]
-command = "/home/nate/Desktop/recipe-issue-machine/.issue-machine/issue-reader"
-required = true
-enabled_tools = ["search_issues", "read_issue"]
-default_tools_approval_mode = "approve"

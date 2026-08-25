@@ -6,6 +6,10 @@ worktree, install the user service, and attach to its tmux session:
 ```text
 git worktree prune
 git worktree add /home/nate/Desktop/recipe-issue-machine machine
+paru -S deepseek-harness-bin
+rustc --edition 2024 /home/nate/Desktop/recipe-issue-machine/.issue-machine/issue-reader.rs -o /home/nate/Desktop/recipe-issue-machine/.issue-machine/issue-reader
+rustc --edition 2024 /home/nate/Desktop/recipe-issue-machine/.issue-machine/run.rs -o /home/nate/.local/bin/recipe-machine
+dsh plugin --profile recipe-machine add file:/home/nate/Desktop/recipe-issue-machine/.issue-machine/dsh
 install -Dm644 .issue-machine/recipe-issue-machine.service /home/nate/.config/systemd/user/recipe-issue-machine.service
 systemctl --user daemon-reload
 systemctl --user enable --now recipe-issue-machine.service
@@ -73,37 +77,28 @@ traversal does not retain one file per cursor.
 The machine derives one fixed review-worker pool from the configured route
 limits. Queue growth does not create additional operating-system threads. Each
 live reviewer uses the `provider/model` identity shown in the terminal and log.
-The
-configured providers and model order are:
+The configured providers are every `opencode/<free-model>` route and every
+explicit zero-cost `openrouter/<model>` route listed in `dsh_models`.
 
-- `codex/gpt-5.3-codex-spark`
-- `kimi/kimi-code/k3`
-- Every configured `opencode/<free-model>` concurrently
-- Every configured explicit zero-cost `openrouter/<model>`, through the
-  existing OpenCode tool harness
-- `copilot/auto`, updated to the model selected by Copilot routing
-- `ollama/minimax-m3:cloud`
-- `agy/<model>` in configured order
+All OpenCode and OpenRouter reviews use transient agents inside one headless DSH
+process. Recipe Machine sends prompts over an owner-only Unix socket. DSH routes
+each agent directly through its configured `opencode` or `openrouter` adapter,
+keeps one agent only for the initial decision and optional schema-repair turn,
+then disposes it. No Web UI, OpenCode server, or per-review client process runs.
+The controller remains the single admission boundary, so queue depth never
+materializes thousands of idle agents. Model turns run concurrently only while
+the controller grants review leases. Every turn uses the configured deadline,
+and retiring a lease cancels the live DSH agent immediately.
 
-The Ollama Claude launcher assigns each session a configured name and disables
-nonessential side requests so every model request uses the configured Ollama
-model.
-
-All OpenCode and OpenRouter reviews use separate sessions on one headless
-OpenCode server. The machine submits each turn through the server API, polls the
-authoritative session state, and reads the completed assistant message without
-starting an OpenCode client process. Session creation is serialized because the
-server blocks simultaneous project-scoped creation requests. Model turns run
-concurrently after their sessions exist. Every local API request uses the
-configured deadline, so a blocked request cannot remain visible as live model
-work. The machine uses each provider until that provider is unavailable. It
-does not wait for consensus. When a route fails, the machine records its
-reported reset duration and does not dispatch that route again before the
-reset. If the diagnostic contains no parseable reset duration, the route
-remains unavailable for the current machine run. If every route is unavailable,
-the reviewer retains the failure, waits for
-`provider_poll_seconds`, and checks the available routes while cursor discovery
-continues.
+The OpenRouter adapter resolves its API key from OpenCode's existing
+`auth.json` on every request. Recipe Machine neither copies the key into DSH
+configuration nor creates a second authorization flow. OpenCode Zen remains a
+keyless route. The machine uses each provider until that provider is
+unavailable. It does not wait for consensus. When a route fails, the machine
+records its reported reset duration and does not dispatch that route again
+before the reset. A diagnostic without a reset duration uses the configured
+bounded cooldown, then measures the route again. If every route is unavailable,
+the reviewer retains the failure while cursor discovery continues.
 
 ## Classifier access
 
@@ -115,9 +110,8 @@ Every classifier can read the Recipe repository and call only two GitHub tools:
 
 The classifiers search issues on demand and read every plausible match in full.
 The machine does not preload, cache, summarize, or truncate the issue tree.
-Codex, OpenCode, Claude, Ollama, and GitHub Copilot use project-scoped MCP
-configurations. Kimi uses `/home/nate/.kimi-code/mcp.json`. Agy uses the imported
-`recipe-issue-reader` plugin and a pre-tool hook that rejects mutation tools.
+DSH exposes the issue reader to classifiers through its project-scoped MCP
+configuration.
 
 The classifier tool surfaces contain only repository readers and the two issue
 readers. A classifier cannot edit files, run shell commands, delegate work,
@@ -165,8 +159,8 @@ live
    ├─ opencode
    │  ├─ big-pickle                    cursor 561  time 51.0895 s
    │  └─ hy3-free                      cursor 568  time 42.0012 s
-   ├─ copilot/claude-haiku-4.5         cursor 570  time 12.0031 s
-   └─ agy/claude-opus-4-6-thinking     cursor 536  time 51.0867 s
+   ├─ openrouter/north-mini-code       cursor 570  time 12.0031 s
+   └─ opencode/mimo-v2.5-free          cursor 536  time 51.0867 s
 └─ resolve
    ├─ claude/fable-5-high              issue #171  time 51.1012 s
    └─ claude/fable-5-high              issue #172  time 49.3001 s

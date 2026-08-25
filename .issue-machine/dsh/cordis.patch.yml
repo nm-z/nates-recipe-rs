@@ -1,0 +1,196 @@
+- id: hmr
+  disabled: true
+- id: timer
+  disabled: true
+- id: typert
+  disabled: true
+- id: typert-loader
+  disabled: true
+- id: typert-gateway
+  disabled: true
+- id: session-title
+  disabled: true
+- id: session-title-llm
+  disabled: true
+- id: user-questions
+  disabled: true
+- id: agent-default-model
+  disabled: true
+- id: jobs
+  disabled: true
+- id: llm-retry
+  disabled: true
+- id: settings
+  disabled: true
+- id: credentials
+  disabled: true
+- id: session-persistence-jsonl
+  disabled: true
+- id: attachment-local
+  disabled: true
+- id: session-query-sqlite
+  disabled: true
+- id: session-projection
+  disabled: true
+- id: session-telemetry-otel
+  disabled: true
+- id: bash-sandbox
+  disabled: true
+- id: pwsh-sandbox
+  disabled: true
+- id: approval
+  disabled: true
+- id: permission
+  disabled: true
+- id: shell-env
+  disabled: true
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: tool-jobs
+  disabled: true
+- id: agent-instructions
+  disabled: true
+- id: skill
+  disabled: true
+- id: skill-filesystem
+  disabled: true
+- id: skill-badge
+  disabled: true
+- id: tool-skill
+  disabled: true
+- id: commands
+  disabled: true
+- id: command-feedback
+  disabled: true
+- id: goal
+  disabled: true
+- id: goal-round-driver
+  disabled: true
+- id: command-goal
+  disabled: true
+- id: plan-mode
+  disabled: true
+- id: token-meter
+  disabled: true
+- id: compaction-basic
+  disabled: true
+- id: command-compact
+  disabled: true
+- id: subagent
+  disabled: true
+- id: subagent-spawn-in-process
+  disabled: true
+- id: subagent-fork-in-process
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-subagent-report
+  disabled: true
+- id: workflow-worker-thread
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: timeout-policy
+  disabled: true
+- id: spill-local
+  disabled: true
+- id: spill-policy
+  disabled: true
+- id: session-checkpoint-policy
+  disabled: true
+- id: tool-result-pruner
+  disabled: true
+- id: tool-todo
+  disabled: true
+- id: tool-goal
+  disabled: true
+- id: tool-ralph
+  disabled: true
+- id: tool-str-replace-editor
+  disabled: true
+- id: repeat-tool-reminder
+  disabled: true
+- id: web
+  disabled: true
+- id: web-search-deepseek
+  disabled: true
+- id: tool-web
+  disabled: true
+- id: llm-deepseek
+  disabled: true
+- id: tools
+  config:
+    mode: native
+- id: system-prompt
+  config:
+    persona: You classify Recipe traversal failures using repository evidence and complete GitHub issue history.
+- id: agent-loop
+  config:
+    agents: []
+    maxParallelToolCalls: !!js Number(process.env.RECIPE_MACHINE_DSH_PARALLEL_TOOL_CALLS)
+- id: sandbox-policy
+  config:
+    mode: read-only
+    workspaceRoot: !!js process.env.RECIPE_MACHINE_REPOSITORY
+- id: fs-sandbox
+  config:
+    cwd: !!js process.env.RECIPE_MACHINE_REPOSITORY
+- id: llm-pi-ai
+  config:
+    providers: !!js >-
+      Object.fromEntries([
+        ['recipe-opencode', {
+          displayName: 'OpenCode Zen',
+          apiKeyEnv: 'RECIPE_MACHINE_OPENCODE_API_KEY',
+          api: 'openai-completions',
+          baseURL: process.env.RECIPE_MACHINE_DSH_OPENCODE_BASE_URL,
+          defaultContextWindow: Number(process.env.RECIPE_MACHINE_DSH_CONTEXT_WINDOW),
+          defaultMaxTokens: Number(process.env.RECIPE_MACHINE_DSH_MAX_TOKENS),
+          compat: { supportsDeveloperRole: false, maxTokensField: 'max_tokens' },
+          headers: { Authorization: '' },
+          models: process.env.RECIPE_MACHINE_DSH_OPENCODE_MODELS.split(',').filter(Boolean).map((id) => ({ id })),
+        }],
+        ['openrouter', {
+          apiKeyEnv: 'RECIPE_MACHINE_OPENROUTER_API_KEY',
+          api: 'openai-completions',
+          baseURL: process.env.RECIPE_MACHINE_DSH_OPENROUTER_BASE_URL,
+          defaultContextWindow: Number(process.env.RECIPE_MACHINE_DSH_CONTEXT_WINDOW),
+          defaultMaxTokens: Number(process.env.RECIPE_MACHINE_DSH_MAX_TOKENS),
+          models: process.env.RECIPE_MACHINE_DSH_OPENROUTER_MODELS.split(',').filter(Boolean).map((id) => ({ id })),
+        }],
+      ].filter(([, provider]) => provider.models.length > 0))
+- insert:
+    - id: recipe-machine-credentials
+      name: recipe-machine-dsh/credentials
+      config:
+        openCodeAuthPath: !!js process.env.RECIPE_MACHINE_OPENCODE_AUTH_PATH
+        openCodeRef: RECIPE_MACHINE_OPENCODE_API_KEY
+        openCodeValue: !!js process.env.RECIPE_MACHINE_DSH_OPENCODE_CREDENTIAL
+        openRouterRef: RECIPE_MACHINE_OPENROUTER_API_KEY
+        openRouterProvider: !!js process.env.RECIPE_MACHINE_DSH_OPENROUTER_AUTH_PROVIDER
+    - id: recipe-issues-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: recipe_issues
+        transport: stdio
+        command: !!js process.env.RECIPE_MACHINE_ISSUE_READER
+        args: []
+        cwd: !!js process.env.RECIPE_MACHINE_REPOSITORY
+        failOnStartupError: true
+    - id: recipe-machine-dsh
+      name: recipe-machine-dsh
+      inject: [agents, tools]
+      config:
+        socketPath: !!js process.env.RECIPE_MACHINE_DSH_SOCKET
+        repository: !!js process.env.RECIPE_MACHINE_REPOSITORY
+        openCodeProvider: recipe-opencode
+        maxPromptBytes: !!js Number(process.env.RECIPE_MACHINE_DSH_MAX_PROMPT_BYTES)
+        maxTurns: !!js Number(process.env.RECIPE_MACHINE_DSH_MAX_TURNS)
