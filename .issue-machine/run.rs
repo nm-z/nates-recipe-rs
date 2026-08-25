@@ -88,7 +88,6 @@ struct Config {
     ollama_model: String,
     ollama_session_name: String,
     ollama_disable_nonessential_traffic: String,
-    resolver_enabled: bool,
     resolver_model: String,
     resolver_effort: String,
     resolver_base: String,
@@ -288,7 +287,6 @@ fn config(path: &Path) -> Config {
         ollama_model: value(&text, "ollama_model"),
         ollama_session_name: value(&text, "ollama_session_name"),
         ollama_disable_nonessential_traffic: value(&text, "ollama_disable_nonessential_traffic"),
-        resolver_enabled: number(&text, "resolver_enabled"),
         resolver_model: value(&text, "resolver_model"),
         resolver_effort: value(&text, "resolver_effort"),
         resolver_base: value(&text, "resolver_base"),
@@ -2813,14 +2811,12 @@ fn main() {
         let instructions = Arc::new(std::fs::read_to_string(&initial.triage_path).expect("cannot read triage.md"));
         let endpoint = Arc::new(ReviewEndpoint::new(&initial));
         manage_reviews(Arc::clone(&initial), Arc::clone(&work), Arc::clone(&admission), endpoint, Arc::clone(&instructions));
-        if initial.resolver_enabled {
-            let active = Arc::new(Mutex::new(BTreeSet::new()));
-            for _ in 0..initial.resolver_concurrency {
-                let resolver_config = Arc::clone(&initial);
-                let resolver_path = path.clone();
-                let resolver_active = Arc::clone(&active);
-                std::thread::spawn(move || resolver_loop(resolver_config, resolver_path, resolver_active));
-            }
+        let active = Arc::new(Mutex::new(BTreeSet::new()));
+        for _ in 0..initial.resolver_concurrency {
+            let resolver_config = Arc::clone(&initial);
+            let resolver_path = path.clone();
+            let resolver_active = Arc::clone(&active);
+            std::thread::spawn(move || resolver_loop(resolver_config, resolver_path, resolver_active));
         }
     }
     regulate(Arc::clone(&initial), Arc::clone(&work), Arc::clone(&admission));
