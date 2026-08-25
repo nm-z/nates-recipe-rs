@@ -1013,6 +1013,7 @@ pub(crate) struct NativePrecision {
 }
 
 const NATIVE_FORWARD_SYMBOL: &str = "recipe_model_forward";
+const NATIVE_CPU_LANE_SYMBOL: &str = "recipe_cpu_thread";
 const NATIVE_EPOCH_SYMBOL: &str = "recipe_model_epoch";
 const NATIVE_MODEL_LOAD_SYMBOL: &str = "recipe_model_load";
 const NATIVE_FORWARD_LAYOUT: &[u8] = b"888844";
@@ -1207,7 +1208,7 @@ fn prune_internal_definitions(mut ir: String) -> String {
 
 fn barrier(backend: Backend) -> &'static str {
 	match backend {
-		Backend::Cpu => "",
+		Backend::Cpu => "call void @recipe.cpu.barrier()\n",
 		Backend::Amd | Backend::Nvidia => "call void @grid_barrier(i32 %threads)",
 	}
 }
@@ -2323,7 +2324,7 @@ impl NativeModelIr {
 		let pointer = pointer_type(backend);
 		let ty = self.precision.model_type;
 		let thread = match backend {
-			Backend::Cpu => "add i32 0, 0".to_owned(),
+			Backend::Cpu => "call i32 @recipe.cpu.lane.id()".to_owned(),
 			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
 		};
 		let kernel = match backend {
@@ -2383,7 +2384,7 @@ impl NativeModelIr {
 			Backend::Nvidia => "protected ptx_kernel ",
 		};
 		let thread = match backend {
-			Backend::Cpu => "add i32 0, 0".to_owned(),
+			Backend::Cpu => "call i32 @recipe.cpu.lane.id()".to_owned(),
 			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
 		};
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
@@ -5948,6 +5949,7 @@ struct Dispatch {
 }
 type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32);
+type NativeCpuLane = unsafe extern "C" fn(i32);
 type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32);
 type NativeEpochF32 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f32, f32, f32, f32, f32, f32, f32, i32);
 type NativeEpochF16 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, i16, i16, i16, i16, i16, i16, i16, i32);
@@ -5967,6 +5969,7 @@ struct NativeCpuProgram {
 	forward: NativeForward,
 	epoch: NativeCpuEpoch,
 	model_load: Option<NativeModelLoad>,
+	lane: NativeCpuLane,
 }
 
 #[cfg(amd)]
@@ -6271,7 +6274,8 @@ fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
 	} };
 	let epoch = epoch(NATIVE_EPOCH_SYMBOL)?;
 	let model_load = (!artifact.storage.is_empty()).then(|| library.function::<NativeModelLoad>(&native_symbol(NATIVE_MODEL_LOAD_SYMBOL))).transpose()?;
-	Ok(NativeCpuProgram { _library: library, forward, epoch, model_load })
+	let lane = library.function::<NativeCpuLane>(&native_symbol(NATIVE_CPU_LANE_SYMBOL))?;
+	Ok(NativeCpuProgram { _library: library, forward, epoch, model_load, lane })
 }
 
 #[cfg(any(amd, nvidia))]
@@ -6304,7 +6308,7 @@ impl Gpu {
 			if dominant.is_none_or(|(_, best)| work > best) { dominant = Some((index, work)) }
 		}
 		let wave = match &self.driver {
-			Driver::Cpu => 1,
+			Driver::Cpu => cpu_dispatch_width(),
 			#[cfg(amd)]
 			Driver::Hsa(driver) => driver.wave,
 			#[cfg(nvidia)]
@@ -6479,6 +6483,13 @@ impl Gpu {
 }
 static DEVICES: OnceLock<Result<Vec<Gpu>>> = OnceLock::new();
 fn cpu_device() -> Result<Gpu> { Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) }) }
+/// Width of the single CPU workgroup. Kept a power of two like every GPU workgroup,
+/// and capped at 64 so the lane-count-scaled reduction region of the contraction
+/// exchange always fits inside the fixed contraction tile the CPU template allocates.
+fn cpu_dispatch_width() -> u32 {
+	let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get).clamp(1, 64) as u32;
+	if cores.is_power_of_two() { cores } else { cores.next_power_of_two() / 2 }
+}
 fn devices() -> Result<&'static [Gpu]> {
 	DEVICES
 		.get_or_init(|| {
@@ -6677,11 +6688,10 @@ unsafe fn native_cpu_value<T: Copy>(arguments: &[Ptr], index: usize) -> T {
 }
 
 #[cfg(unix)]
-unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, arguments: &[Ptr]) -> Result<()> {
+unsafe fn native_cpu_invoke(cpu: &NativeCpuProgram, entry: NativeEntry, arguments: &[Ptr]) {
 	unsafe {
 	match entry {
 		NativeEntry::Forward => {
-			require(arguments.len() == NATIVE_FORWARD_LAYOUT.len(), "native CPU forward argument count is invalid")?;
 			(cpu.forward)(
 				native_cpu_pointer(arguments, 0),
 				native_cpu_pointer(arguments, 1),
@@ -6692,7 +6702,6 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 			);
 		}
 		NativeEntry::Epoch => {
-			require(arguments.len() == NATIVE_EPOCH_LAYOUT_FP64.len(), "native CPU epoch argument count is invalid")?;
 			let pointers = (0..12).map(|index| native_cpu_pointer(arguments, index)).collect::<Vec<_>>();
 			match cpu.epoch {
 				NativeCpuEpoch::F64(function) => function(
@@ -6714,13 +6723,53 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 			}
 		}
 		NativeEntry::ModelLoad => {
-			require(arguments.len() == NATIVE_MODEL_LOAD_LAYOUT.len(), "native CPU model-load argument count is invalid")?;
-			let function = cpu.model_load.ok_or_else(|| RecipeError::new("native model-load symbol is absent"))?;
+			let function = cpu.model_load.expect("native model-load symbol was checked before dispatch");
 			function(native_cpu_pointer(arguments, 0), native_cpu_pointer(arguments, 1), native_cpu_value(arguments, 2));
 		}
 	}
-	Ok(())
 	}
+}
+
+#[cfg(unix)]
+unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, arguments: &[Ptr], threads: u32) -> Result<()> {
+	let expected = match entry {
+		NativeEntry::Forward => NATIVE_FORWARD_LAYOUT.len(),
+		NativeEntry::Epoch => NATIVE_EPOCH_LAYOUT_FP64.len(),
+		NativeEntry::ModelLoad => NATIVE_MODEL_LOAD_LAYOUT.len(),
+	};
+	require(arguments.len() == expected, "native CPU argument count is invalid")?;
+	if matches!(entry, NativeEntry::ModelLoad) {
+		cpu.model_load.ok_or_else(|| RecipeError::new("native model-load symbol is absent"))?;
+	}
+	// Every lane runs the whole kernel entry and meets the others at the artifact's
+	// counting barrier, so each OS thread must stay alive for the entire launch and
+	// must publish its lane identity into the artifact before entering.
+	let lanes = threads.max(1);
+	if lanes == 1 {
+		unsafe {
+			(cpu.lane)(0);
+			native_cpu_invoke(cpu, entry, arguments);
+		}
+		return Ok(());
+	}
+	let raw = arguments.iter().map(|argument| *argument as usize).collect::<Vec<_>>();
+	std::thread::scope(|scope| {
+		for lane in 1..lanes {
+			let raw = raw.clone();
+			scope.spawn(move || {
+				let arguments = raw.iter().map(|argument| *argument as Ptr).collect::<Vec<_>>();
+				unsafe {
+					(cpu.lane)(lane as i32);
+					native_cpu_invoke(cpu, entry, &arguments);
+				}
+			});
+		}
+		unsafe {
+			(cpu.lane)(0);
+			native_cpu_invoke(cpu, entry, arguments);
+		}
+	});
+	Ok(())
 }
 
 impl NativeProgram {
@@ -6732,9 +6781,12 @@ impl NativeProgram {
 				#[cfg(unix)]
 				{
 					let cpu = load_native_cpu(&artifact)?;
-					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } };
-					let epoch = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry: Geometry { groups: 1, block: 1 } };
-					let model_load = (!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } });
+					// The artifact was emitted for one workgroup of schedule.block lanes,
+					// so the dispatch geometry must present exactly that grid.
+					let geometry = Geometry { groups: 1, block: schedule.block };
+					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry };
+					let epoch = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry };
+					let model_load = (!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry });
 					(NativeBackend::Cpu(cpu), forward, epoch, model_load)
 				}
 				#[cfg(not(unix))]
@@ -6793,7 +6845,7 @@ impl NativeProgram {
 		unsafe {
 			match (&self.backend, &gpu.driver) {
 				#[cfg(unix)]
-				(NativeBackend::Cpu(cpu), Driver::Cpu) => launch_native_cpu(cpu, entry, arguments),
+				(NativeBackend::Cpu(cpu), Driver::Cpu) => launch_native_cpu(cpu, entry, arguments, threads),
 				#[cfg(amd)]
 				(NativeBackend::Amd(program), Driver::Hsa(driver)) => {
 					require(program.executable.handle != 0, "native AMD executable is absent")?;

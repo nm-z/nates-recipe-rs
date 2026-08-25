@@ -499,7 +499,31 @@ fn number<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	Ok(value)
 }
 fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> { setting(manifest, key)?.strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| io::Error::other(format!("{key} must be quoted")).into()) }
-const CPU_REPLACEMENTS: &[(&str, &str)] = &[("@contraction_tile = external addrspace(3) global [0 x double], align 16", "@contraction_tile = internal global [RECIPE_CONTRACTION_CPU_SHARED_VALUES x double] zeroinitializer, align 16"), (" addrspace(3)", ""), ("call i32 @llvm.amdgcn.workitem.id.x()", "add i32 0, 0"), ("call i32 @recipe.local.id.x()", "add i32 0, 0"), ("call i32 @recipe.group.id.x()", "add i32 0, 0"), ("call i32 @recipe.workgroup.size.x()", "add i32 1, 0"), ("call void @llvm.amdgcn.s.barrier()", ""), ("call void @recipe.local.barrier()", ""), ("call void @grid_barrier(i32 %threads)", ""), ("declare i32 @llvm.amdgcn.workitem.id.x()", ""), ("declare void @llvm.amdgcn.s.barrier()", ""), ("declare i64 @__ockl_steadyctr_u64()", ""), ("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }")];
+const CPU_REPLACEMENTS: &[(&str, &str)] = &[("@contraction_tile = external addrspace(3) global [0 x double], align 16", "@contraction_tile = internal global [RECIPE_CONTRACTION_CPU_SHARED_VALUES x double] zeroinitializer, align 16"), (" addrspace(3)", ""), ("call i32 @llvm.amdgcn.workitem.id.x()", "call i32 @recipe.cpu.lane.id()"), ("call i32 @recipe.local.id.x()", "call i32 @recipe.cpu.lane.id()"), ("call i32 @recipe.group.id.x()", "add i32 0, 0"), ("call i32 @recipe.workgroup.size.x()", "add i32 RECIPE_WORKGROUP_SIZE, 0"), ("call void @llvm.amdgcn.s.barrier()", "call void @recipe.cpu.barrier()"), ("call void @recipe.local.barrier()", "call void @recipe.cpu.barrier()"), ("call void @grid_barrier(i32 %threads)", "call void @recipe.cpu.barrier()"), ("declare i32 @llvm.amdgcn.workitem.id.x()", ""), ("declare void @llvm.amdgcn.s.barrier()", ""), ("declare i64 @__ockl_steadyctr_u64()", ""), ("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }")];
+// The CPU dispatch is one workgroup of RECIPE_WORKGROUP_SIZE OS threads: the lane
+// identity lives in a thread-local set by the host through recipe_cpu_thread before
+// each kernel entry, and both barrier flavors collapse to one counting barrier
+// because the single workgroup is the whole grid. The barrier mirrors the NVIDIA
+// counting barrier: relaxed atomics with explicit fences so a release publishes
+// each lane's writes and the acquire after the phase flip observes all of them.
+const CPU_PARALLEL: &str = r#"@recipe.cpu.lane = internal thread_local global i32 0, align 4
+@recipe.cpu.barrier.count = internal global i32 0, align 4
+@recipe.cpu.barrier.phase = internal global i32 0, align 4
+define void @recipe_cpu_thread(i32 %lane) #0 { entry: store i32 %lane, ptr @recipe.cpu.lane, align 4 ret void }
+define internal i32 @recipe.cpu.lane.id() #1 { entry: %lane = load i32, ptr @recipe.cpu.lane, align 4 ret i32 %lane }
+define internal void @recipe.cpu.barrier() #1 { entry:
+%single = icmp ult i32 RECIPE_WORKGROUP_SIZE, 2 br i1 %single, label %joined, label %arrive arrive:
+%phase = load atomic i32, ptr @recipe.cpu.barrier.phase monotonic, align 4
+fence release
+%prior = atomicrmw add ptr @recipe.cpu.barrier.count, i32 1 monotonic %limit = sub i32 RECIPE_WORKGROUP_SIZE, 1
+%last = icmp eq i32 %prior, %limit br i1 %last, label %release, label %wait release:
+fence acquire
+store atomic i32 0, ptr @recipe.cpu.barrier.count monotonic, align 4 %next = xor i32 %phase, 1
+fence release
+store atomic i32 %next, ptr @recipe.cpu.barrier.phase monotonic, align 4 br label %joined wait:
+%seen = load atomic i32, ptr @recipe.cpu.barrier.phase monotonic, align 4 %ready = icmp ne i32 %seen, %phase
+br i1 %ready, label %waited, label %wait waited:
+fence acquire br label %joined joined: ret void }"#;
 /// Compile-time contraction shape. A reverse K extent is cut into one contiguous
 /// partition per `split_span` elements, capped at `partitions`, so the summation
 /// order is a property of the program rather than of the device it runs on.
@@ -577,6 +601,8 @@ fn compile_cpu(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
+	let insert = ir.find("target triple").and_then(|start| ir[start..].find('\n').map(|end| start + end + 1)).ok_or_else(|| io::Error::other("kernel target triple is absent"))?;
+	ir.insert_str(insert, &format!("{CPU_PARALLEL}\n"));
 	let clang = text(manifest, "cpu-compiler")?;
 	if !Path::new(clang).exists() {
 		return Err(io::Error::other(format!("cpu-compiler {clang:?} is absent")).into())
