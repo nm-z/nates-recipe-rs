@@ -107,6 +107,8 @@ struct Config {
     discovery_devices: Vec<String>,
     filesystem_stat_binary: PathBuf,
     nvidia_smi_binary: PathBuf,
+    timeout_binary: PathBuf,
+    hardware_query_seconds: u64,
     amd_drm_root: PathBuf,
     cluster_coordinator: bool,
     cluster_address: std::net::SocketAddr,
@@ -120,6 +122,8 @@ struct Config {
     cursor_renew_milliseconds: u64,
     cluster_request_seconds: u64,
     sha256_binary: PathBuf,
+    git_binary: PathBuf,
+    cluster_workload_paths: Vec<String>,
     memory_setpoint: f64,
     memory_maximum: f64,
     vram_setpoint: f64,
@@ -209,7 +213,7 @@ fn values(text: &str, name: &str) -> Vec<String> {
         .collect()
 }
 
-fn discovered_devices(nvidia_smi_binary: &Path, amd_topology_root: &Path) -> Vec<String> {
+fn discovered_devices(nvidia_topology_root: &Path, amd_topology_root: &Path) -> Vec<String> {
     let mut devices = vec!["cpu".to_owned()];
     if amd_topology_root.is_dir() {
         let mut nodes = std::fs::read_dir(amd_topology_root)
@@ -223,17 +227,22 @@ fn discovered_devices(nvidia_smi_binary: &Path, amd_topology_root: &Path) -> Vec
             .count();
         devices.extend((0..count).map(|index| format!("amd{index}")));
     }
-    if nvidia_smi_binary.is_file() {
-        let result = Command::new(nvidia_smi_binary)
-            .args(["--query-gpu=index", "--format=csv,noheader,nounits"])
-            .output()
-            .expect("cannot start NVIDIA discovery");
-        assert!(result.status.success(), "cannot discover NVIDIA devices: {}", failure(&result));
-        let text = String::from_utf8(result.stdout).expect("NVIDIA discovery output is not UTF-8");
-        devices.extend(text.lines().filter(|line| !line.trim().is_empty()).map(|index| {
-            let index: usize = index.trim().parse().expect("NVIDIA device index is invalid");
-            format!("nv{index}")
-        }));
+    if nvidia_topology_root.is_dir() {
+        let mut nvidia = std::fs::read_dir(nvidia_topology_root)
+            .expect("cannot read NVIDIA topology")
+            .map(|entry| entry.expect("cannot read NVIDIA topology entry").path())
+            .map(|device| {
+                let information = std::fs::read_to_string(device.join("information")).expect("cannot read NVIDIA device information");
+                information
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Device Minor:").map(str::trim))
+                    .expect("NVIDIA device has no minor")
+                    .parse::<usize>()
+                    .expect("NVIDIA device minor is invalid")
+            })
+            .collect::<Vec<_>>();
+        nvidia.sort_unstable();
+        devices.extend(nvidia.into_iter().map(|index| format!("nv{index}")));
     }
     assert_eq!(devices.iter().collect::<BTreeSet<_>>().len(), devices.len(), "hardware discovery returned a duplicate device");
     devices
@@ -243,8 +252,9 @@ fn config(path: &Path) -> Config {
     let text = std::fs::read_to_string(path).expect("cannot read machine.toml");
     let opencode_models = values(&text, "opencode_models");
     let nvidia_smi_binary = PathBuf::from(value(&text, "nvidia_smi_binary"));
+    let nvidia_topology_root = PathBuf::from(value(&text, "nvidia_topology_root"));
     let amd_topology_root = PathBuf::from(value(&text, "amd_topology_root"));
-    let discovery_devices = discovered_devices(&nvidia_smi_binary, &amd_topology_root);
+    let discovery_devices = discovered_devices(&nvidia_topology_root, &amd_topology_root);
     let configuration = Config {
         repository: value(&text, "repository").into(),
         log_path: value(&text, "log_path").into(),
@@ -297,6 +307,8 @@ fn config(path: &Path) -> Config {
         discovery_devices,
         filesystem_stat_binary: value(&text, "filesystem_stat_binary").into(),
         nvidia_smi_binary,
+        timeout_binary: value(&text, "timeout_binary").into(),
+        hardware_query_seconds: positive(&text, "hardware_query_seconds"),
         amd_drm_root: value(&text, "amd_drm_root").into(),
         cluster_coordinator: number(&text, "cluster_coordinator"),
         cluster_address: value(&text, "cluster_address").parse().expect("cluster_address is invalid"),
@@ -310,6 +322,8 @@ fn config(path: &Path) -> Config {
         cursor_renew_milliseconds: positive(&text, "cursor_renew_milliseconds"),
         cluster_request_seconds: positive(&text, "cluster_request_seconds"),
         sha256_binary: value(&text, "sha256_binary").into(),
+        git_binary: value(&text, "git_binary").into(),
+        cluster_workload_paths: values(&text, "cluster_workload_paths"),
         memory_setpoint: ratio(&text, "memory_setpoint"),
         memory_maximum: ratio(&text, "memory_maximum"),
         vram_setpoint: ratio(&text, "vram_setpoint"),
@@ -1019,19 +1033,19 @@ fn cpu_time() -> (u64, u64) {
 fn accelerator_used(config: &Config) -> (f64, f64) {
     let mut gpu = 0.0_f64;
     let mut vram = 0.0_f64;
-    if config.discovery_devices.iter().any(|device| device.starts_with("nv")) {
-        let result = output(Command::new(&config.nvidia_smi_binary).args([
+    for device in config.discovery_devices.iter().filter_map(|device| device.strip_prefix("nv")) {
+        let result = output(Command::new(&config.timeout_binary).arg(config.hardware_query_seconds.to_string()).arg(&config.nvidia_smi_binary).args([
+            "-i",
+            device,
             "--query-gpu=utilization.gpu,memory.used,memory.total",
             "--format=csv,noheader,nounits",
         ]), None);
-        assert!(result.status.success(), "cannot inspect NVIDIA resources: {}", failure(&result));
+        assert!(result.status.success(), "cannot inspect NVIDIA device nv{device}: {}", failure(&result));
         let text = String::from_utf8(result.stdout).expect("NVIDIA resource output is not UTF-8");
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let values = line.split(',').map(|value| value.trim().parse::<f64>().expect("NVIDIA resource value is invalid")).collect::<Vec<_>>();
-            assert_eq!(values.len(), 3, "NVIDIA resource output has the wrong width");
-            gpu = gpu.max(values[0] / 100.0);
-            vram = vram.max(values[1] / values[2]);
-        }
+        let values = text.trim().split(',').map(|value| value.trim().parse::<f64>().expect("NVIDIA resource value is invalid")).collect::<Vec<_>>();
+        assert_eq!(values.len(), 3, "NVIDIA resource output has the wrong width");
+        gpu = gpu.max(values[0] / 100.0);
+        vram = vram.max(values[1] / values[2]);
     }
     if config.discovery_devices.iter().any(|device| device.starts_with("amd")) {
         let mut measured = 0_usize;
@@ -2746,7 +2760,11 @@ fn main() {
     assert!(initial.discovery_devices.iter().any(|device| device == "cpu"), "discovery_devices must contain cpu");
     assert_eq!(initial.discovery_devices.iter().collect::<BTreeSet<_>>().len(), initial.discovery_devices.len(), "discovery_devices contains a duplicate device");
     assert!(!initial.opencode_models.is_empty(), "opencode_models must contain at least one model");
-    let digest = cluster::binary_digest(&executable, &initial.sha256_binary);
+    let digest = format!(
+        "{}{}",
+        cluster::binary_digest(&executable, &initial.sha256_binary),
+        cluster::repository_digest(&initial.repository, &initial.cluster_workload_paths, &initial.git_binary, &initial.sha256_binary),
+    );
     let (cluster_send, cluster_receive) = mpsc::channel();
     if initial.cluster_coordinator {
         cluster::start_server(cluster::ServerConfig {

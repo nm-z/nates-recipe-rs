@@ -142,6 +142,54 @@ pub fn binary_digest(binary: &Path, sha256_binary: &Path) -> String {
     digest
 }
 
+fn content_digest(content: &[u8], sha256_binary: &Path) -> String {
+    let mut child = Command::new(sha256_binary)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("cannot start the configured SHA-256 command");
+    child.stdin.take().expect("SHA-256 stdin is absent").write_all(content).expect("cannot write SHA-256 content");
+    let output = child.wait_with_output().expect("cannot collect the SHA-256 command");
+    assert!(output.status.success(), "cannot hash cluster content");
+    let digest = String::from_utf8(output.stdout)
+        .expect("SHA-256 output is not UTF-8")
+        .split_whitespace()
+        .next()
+        .expect("SHA-256 output is empty")
+        .to_owned();
+    assert!(digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()), "SHA-256 output is invalid");
+    digest
+}
+
+pub fn repository_digest(repository: &Path, paths: &[String], git_binary: &Path, sha256_binary: &Path) -> String {
+    assert!(!paths.is_empty(), "cluster workload paths are empty");
+    let listed = Command::new(git_binary)
+        .args(["ls-files", "-z", "--"])
+        .args(paths)
+        .current_dir(repository)
+        .output()
+        .expect("cannot start workload file discovery");
+    assert!(listed.status.success(), "cannot discover cluster workload files");
+    let mut files = listed.stdout.split(|byte| *byte == 0).filter(|path| !path.is_empty()).collect::<Vec<_>>();
+    files.sort_unstable();
+    assert!(!files.is_empty(), "cluster workload contains no tracked files");
+    let mut manifest = Vec::new();
+    for path in files {
+        let path = std::str::from_utf8(path).expect("cluster workload path is not UTF-8");
+        let hashed = Command::new(git_binary)
+            .args(["hash-object", "--", path])
+            .current_dir(repository)
+            .output()
+            .expect("cannot start workload hashing");
+        assert!(hashed.status.success(), "cannot hash cluster workload path {path}");
+        manifest.extend_from_slice(path.as_bytes());
+        manifest.push(b'\t');
+        manifest.extend_from_slice(hashed.stdout.strip_suffix(b"\n").expect("workload hash has no newline"));
+        manifest.push(b'\n');
+    }
+    content_digest(&manifest, sha256_binary)
+}
+
 fn map(values: &BTreeMap<u64, u64>) -> String {
     values
         .iter()
