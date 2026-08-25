@@ -92,6 +92,7 @@ const CASES: &[Case] = &[
 	Case { name: "scan-lstm", shape: "lstm", precision: "fp32", rows: 131, columns: 18 },
 	Case { name: "pool", shape: "pool", precision: "fp32", rows: 131, columns: 18 },
 	Case { name: "moe", shape: "moe", precision: "fp32", rows: 131, columns: 17 },
+	Case { name: "moe-quantized", shape: "moe-q8", precision: "int8", rows: 131, columns: 17 },
 	Case { name: "persistence", shape: "deep", precision: "fp32", rows: 131, columns: 17 },
 ];
 
@@ -112,6 +113,7 @@ fn build(case: &Case) -> Model {
 		"lstm" => recipe.model().lstm(6).relu().layer(1).loss(mse),
 		"pool" => recipe.model().conv(4, 3).relu().pool(2).relu().layer(1).loss(mse),
 		"moe" => recipe.model().layer(9).relu().moe(1, [layer(9), layer(9)]).relu().layer(1).loss(mse),
+		"moe-q8" => recipe.model().layer(8).moe(1, [layer(8), layer(8)]).ln().qi(8).0.layer(1).loss(mae),
 		other => panic!("unknown topology {other:?}"),
 	}
 }
