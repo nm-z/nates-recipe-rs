@@ -58,6 +58,7 @@ fn run(source: &Path, device: Option<&str>) {
 		std::process::exit(status.code().unwrap_or(1));
 	}
 	let mut command = Command::new(&output);
+	command.env("RECIPE_BINARY", std::env::current_exe().expect("cannot locate recipe"));
 	if let Some(device) = device {
 		command.env("RECIPE_DEVICE", device);
 	}
@@ -72,6 +73,14 @@ fn main() {
 	let mut arguments = std::env::args().skip(1);
 	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
 	while let Some(argument) = arguments.next() {
+		if argument == "--worker" {
+			let name = arguments.next().unwrap_or_else(|| invalid("--worker requires a device name"));
+			recipe::worker_serve(&name).unwrap_or_else(|error| {
+				eprintln!("{error}");
+				std::process::exit(1)
+			});
+			return;
+		}
 		if argument == "--device" {
 			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
 			if device.is_some() {
