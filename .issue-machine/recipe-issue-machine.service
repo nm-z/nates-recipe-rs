@@ -4,20 +4,16 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=forking
-PIDFile=%t/recipe-issue-machine.pid
+Type=simple
 WorkingDirectory=/home/nate/Desktop/recipe-issue-machine
 Environment=HOME=/home/nate
-Environment=TERM=xterm-256color
 Environment=PATH=/home/nate/.local/bin:/home/nate/.cargo/bin:/usr/local/bin:/usr/bin:/opt/rocm/bin
-ExecStartPre=/usr/bin/rm -f /tmp/tmux-%U/default /tmp/tmux-%U/default.lock %t/recipe-issue-machine.pid
-ExecStart=/usr/bin/tmux -S /tmp/tmux-%U/default -f /home/nate/Desktop/recipe-issue-machine/.issue-machine/tmux.conf new-session -d -P -F #{pid} -s recipe-issue-machine /home/nate/Desktop/recipe-issue-machine/.issue-machine/session
-ExecStop=/usr/bin/tmux -S /tmp/tmux-%U/default kill-server
-ExecStopPost=/usr/bin/rm -f /tmp/tmux-%U/default /tmp/tmux-%U/default.lock %t/recipe-issue-machine.pid
+ExecStart=/home/nate/.local/bin/recipe-machine /home/nate/.config/recipe-machine.toml
 KillMode=control-group
 Restart=always
 RestartSec=1
-StandardOutput=file:%t/recipe-issue-machine.pid
+LimitNOFILE=infinity
+StandardOutput=null
 StandardError=append:/home/nate/Desktop/recipe-issue-machine/recipe.log
 
 [Install]

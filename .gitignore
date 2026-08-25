@@ -1,3 +1,6 @@
 /recipe.log
 /.issue-machine/issue-reader
 /.issue-machine/run
+/.issue-machine/cluster.state*
+/.issue-machine/cluster.state
+/.issue-machine/cluster.next

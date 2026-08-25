@@ -1,5 +1,0 @@
-#!/bin/bash
-cd /home/nate/Desktop/recipe-issue-machine || exit 1
-rustc --edition 2021 .issue-machine/issue-reader.rs -o .issue-machine/issue-reader || exit 1
-rustc --edition 2021 .issue-machine/run.rs -o .issue-machine/run || exit 1
-exec .issue-machine/run

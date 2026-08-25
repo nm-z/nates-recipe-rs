@@ -50,7 +50,7 @@ fn run(source: &Path, device: Option<&str>) {
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
 	// Each invocation compiles to its own output, so concurrent invocations never share one.
-	let output = directory.join(format!("recipe-script-{}", std::process::id()));
+	let output = std::env::var_os("RECIPE_TRIAL_DIRECTORY").map(PathBuf::from).unwrap_or_else(|| directory.clone()).join(format!("recipe-script-{}", std::process::id()));
 	fs::metadata(&library).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", library.display()));
 	let status = Command::new("rustc").arg("--edition=2024").arg(source).arg("--extern").arg(format!("recipe={}", library.display())).arg("-L").arg(format!("dependency={}", dependencies.display())).arg("-o").arg(&output).status().expect("cannot execute rustc");
 	if !status.success() {
