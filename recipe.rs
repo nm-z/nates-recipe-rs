@@ -72,6 +72,7 @@ pub enum PredictorOpcode {
 	Choose = 11,
 	Nearest = 12,
 	Affine = 13,
+	Gauss = 14,
 }
 
 impl PredictorOpcode {
@@ -91,6 +92,7 @@ impl PredictorOpcode {
 			11 => Ok(Self::Choose),
 			12 => Ok(Self::Nearest),
 			13 => Ok(Self::Affine),
+			14 => Ok(Self::Gauss),
 			_ => Err(EmitError::InvalidOpcode { kind: "predictor", value }),
 		}
 	}
@@ -619,6 +621,38 @@ pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorCon
 				let _ = writeln!(output, "%{p}.scale.index = add i32 %{p}.j, {features}\n%{p}.scale.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.scale.index\n%{p}.scale = load {ty}, {ptr} %{p}.scale.ptr, align {align}", features = context.features, weights = context.weights);
 				let _ = writeln!(output, "%{p}.weight.index = add i32 %{p}.scale.index, {features}\n%{p}.weight.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.weight.index\n%{p}.weight = load {ty}, {ptr} %{p}.weight.ptr, align {align}", features = context.features, weights = context.weights);
 				let _ = writeln!(output, "%{p}.centered = call {ty} @recipe.sub({ty} %{p}.q, {ty} %{p}.mean)\n%{p}.scaled = call {ty} @recipe.mul({ty} %{p}.centered, {ty} %{p}.scale)\n%{p}.term = call {ty} @recipe.mul({ty} %{p}.scaled, {ty} %{p}.weight)\n%{p}.acc.next = call {ty} @recipe.add({ty} %{p}.acc, {ty} %{p}.term)");
+				let _ = writeln!(output, "%{p}.j.next = add i32 %{p}.j, 1\nbr label %{p}.head\n{p}.done:");
+				stack.push(format!("%{p}.acc"));
+			}
+			PredictorOpcode::Gauss => {
+				let class = integer(argument, "gauss class")?;
+				let planes = 2 * context.features;
+				let classes = if planes == 0 { 0 } else { context.parameters / planes };
+				if class < 0 || classes == 0 || context.parameters != classes * planes || class as usize >= classes {
+					return Err(EmitError::InvalidOperand { kind: "gauss table width", value: context.parameters as f64 });
+				}
+				let seed = pop(&mut stack)?;
+				let ty = context.value_type;
+				let (ptr, align) = (context.pointer_type, context.alignment);
+				let p = format!("{}.gauss.{sequence}", context.prefix);
+				sequence += 1;
+				let mean_base = class as usize * context.features;
+				let scale_base = (classes + class as usize) * context.features;
+				// Feature loop head: induction variable plus the running score as
+				// phis, seeded with the operand popped from the stack.
+				let _ = writeln!(output, "br label %{p}.entry\n{p}.entry:\nbr label %{p}.head\n{p}.head:");
+				let _ = writeln!(output, "%{p}.j = phi i32 [ 0, %{p}.entry ], [ %{p}.j.next, %{p}.body ]");
+				let _ = writeln!(output, "%{p}.acc = phi {ty} [ {seed}, %{p}.entry ], [ %{p}.acc.next, %{p}.body ]");
+				let _ = writeln!(output, "%{p}.more = icmp ult i32 %{p}.j, {features}\nbr i1 %{p}.more, label %{p}.body, label %{p}.done", features = context.features);
+				// The table is class-count mean planes followed by class-count scale
+				// planes, accumulated per feature as (x - mean)^2 * scale. The
+				// weights pointer is already advanced to this node's parameter
+				// span, so the plane indices are node-relative.
+				let _ = writeln!(output, "{p}.body:");
+				let _ = writeln!(output, "%{p}.q.base = mul i32 {row}, {features}\n%{p}.q.index = add i32 %{p}.q.base, %{p}.j\n%{p}.q.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.q.index\n%{p}.q = load {ty}, {ptr} %{p}.q.ptr, align {align}", row = context.row, features = context.features, input = context.input);
+				let _ = writeln!(output, "%{p}.mean.index = add i32 %{p}.j, {mean_base}\n%{p}.mean.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.mean.index\n%{p}.mean = load {ty}, {ptr} %{p}.mean.ptr, align {align}", weights = context.weights);
+				let _ = writeln!(output, "%{p}.scale.index = add i32 %{p}.j, {scale_base}\n%{p}.scale.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.scale.index\n%{p}.scale = load {ty}, {ptr} %{p}.scale.ptr, align {align}", weights = context.weights);
+				let _ = writeln!(output, "%{p}.centered = call {ty} @recipe.sub({ty} %{p}.q, {ty} %{p}.mean)\n%{p}.square = call {ty} @recipe.mul({ty} %{p}.centered, {ty} %{p}.centered)\n%{p}.term = call {ty} @recipe.mul({ty} %{p}.square, {ty} %{p}.scale)\n%{p}.acc.next = call {ty} @recipe.add({ty} %{p}.acc, {ty} %{p}.term)");
 				let _ = writeln!(output, "%{p}.j.next = add i32 %{p}.j, 1\nbr label %{p}.head\n{p}.done:");
 				stack.push(format!("%{p}.acc"));
 			}
@@ -7067,6 +7101,20 @@ impl PredictorProgram {
 					let (scales, weights) = rest.split_at(query.len());
 					stack.push(query.iter().zip(means).zip(scales).zip(weights).map(|(((value, mean), scale), weight)| (value - mean) * scale * weight).sum())
 				},
+				value if value == PredictorOpcode::Gauss as i32 => {
+					let class = slot()?;
+					let features = query.len();
+					let classes = self.table.len().checked_div(2 * features).filter(|classes| *classes != 0 && classes * 2 * features == self.table.len()).ok_or_else(|| RecipeError::new("gauss table width is invalid"))?;
+					require(class < classes, "gauss class is absent")?;
+					let means = &self.table[class * features..(class + 1) * features];
+					let scales = &self.table[(classes + class) * features..(classes + class + 1) * features];
+					let mut score = pop(&mut stack)?;
+					for ((value, mean), scale) in query.iter().zip(means).zip(scales) {
+						let centered = value - mean;
+						score += centered * centered * scale;
+					}
+					stack.push(score)
+				},
 				_ => return Err(RecipeError::new(format!("invalid predictor opcode {opcode}"))),
 			}
 		}
@@ -7092,13 +7140,13 @@ impl PredictorBuilder {
 		self.table = table;
 		self.push(PredictorOpcode::Affine, 0.0);
 	}
+	fn gauss(&mut self, class: usize) { self.emit(PredictorOpcode::Gauss, class as f64) }
 	fn emit(&mut self, opcode: PredictorOpcode, argument: f64) { self.code.extend([opcode as i32 as f64, argument]) }
 	fn push(&mut self, opcode: PredictorOpcode, argument: f64) { self.emit(opcode, argument); self.depth += 1; self.stack = self.stack.max(self.depth) }
 	fn feature(&mut self, index: usize) { self.push(PredictorOpcode::Feature, index as f64) }
 	fn constant(&mut self, value: f64) { self.push(PredictorOpcode::Constant, value) }
 	fn load(&mut self, slot: usize) { self.push(PredictorOpcode::Load, slot as f64) }
 	fn store(&mut self, slot: usize) { self.emit(PredictorOpcode::Store, slot as f64); self.depth -= 1 }
-	fn duplicate(&mut self) { self.push(PredictorOpcode::Duplicate, 0.0) }
 	fn binary(&mut self, opcode: PredictorOpcode) { self.emit(opcode, 0.0); self.depth -= 1 }
 	fn choose(&mut self) { self.emit(PredictorOpcode::Choose, 0.0); self.depth -= 2 }
 	fn local(&mut self) -> usize { let slot = self.locals; self.locals += 1; slot }
@@ -7269,19 +7317,6 @@ fn solve_linear(mut matrix: Vec<f64>, mut values: Vec<f64>, epsilon: f64) -> Res
 	}
 	require(values.iter().all(|value| value.is_finite()), "linear system produced a nonfinite solution").map(|_| values)
 }
-fn bayes_score(program: &mut PredictorBuilder, base: f64, means: &[f64], inverse: &[f64]) {
-	program.constant(base);
-	for (feature, (&mean, &scale)) in means.iter().zip(inverse).enumerate() {
-		program.feature(feature);
-		program.constant(mean);
-		program.binary(PredictorOpcode::Subtract);
-		program.duplicate();
-		program.binary(PredictorOpcode::Multiply);
-		program.constant(-0.5 * scale);
-		program.binary(PredictorOpcode::Multiply);
-		program.binary(PredictorOpcode::Add);
-	}
-}
 fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) -> Result<Predictor> {
 	require(rows != 0 && data.features != 0, "Bayes requires training rows and features")?;
 	if !data.target_categorical {
@@ -7301,15 +7336,18 @@ fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) ->
 		}
 		for feature in 0..data.features { matrix[feature * data.features + feature] += config.bayes_prior_precision }
 		let weights = solve_linear(matrix, values, config.bayes_variance_epsilon)?;
-		let bias = target_mean - weights.iter().zip(&means).map(|(weight, mean)| weight * mean).sum::<f64>();
+		// The fitted model lives in the predictor table as three feature-length
+		// planes (means, scales, weights) like fit_svm, so the emitted program
+		// is a fixed-size feature loop instead of straight-line code that grows
+		// with the feature count.
+		let mut table = Vec::with_capacity(3 * data.features);
+		table.extend_from_slice(&means);
+		table.resize(2 * data.features, 1.0);
+		table.extend(weights);
 		let mut program = PredictorBuilder::new();
-		program.constant(bias);
-		for (feature, weight) in weights.into_iter().enumerate() {
-			program.feature(feature);
-			program.constant(weight);
-			program.binary(PredictorOpcode::Multiply);
-			program.binary(PredictorOpcode::Add);
-		}
+		program.constant(target_mean);
+		program.affine(table);
+		program.binary(PredictorOpcode::Add);
 		return Ok(Predictor::new(program.finish()?));
 	}
 	let mut classes = data.targets[..rows].to_vec();
@@ -7326,10 +7364,23 @@ fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) ->
 		let base = (members.len() as f64 / rows as f64).ln() - 0.5 * variance.iter().map(|value| value.ln()).sum::<f64>();
 		statistics.push((class, base, means, variance.into_iter().map(f64::recip).collect::<Vec<_>>()));
 	}
+	// The class statistics live in the predictor table as class-count mean
+	// planes followed by class-count scale planes, so each class score is a
+	// fixed-size feature loop instead of straight-line code that grows with
+	// the feature count.
+	let mut table = Vec::with_capacity(2 * statistics.len() * data.features);
+	for (_, _, means, _) in &statistics {
+		table.extend_from_slice(means)
+	}
+	for (_, _, _, inverse) in &statistics {
+		table.extend(inverse.iter().map(|inverse| -0.5 * inverse))
+	}
 	let mut program = PredictorBuilder::new();
+	program.table = table;
 	let (best_score, best_class, score, condition) = (program.local(), program.local(), program.local(), program.local());
-	for (index, (class, base, means, inverse)) in statistics.iter().enumerate() {
-		bayes_score(&mut program, *base, means, inverse);
+	for (index, (class, base, _, _)) in statistics.iter().enumerate() {
+		program.constant(*base);
+		program.gauss(index);
 		program.store(score);
 		if index == 0 {
 			program.load(score);
