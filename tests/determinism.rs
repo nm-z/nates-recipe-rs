@@ -92,7 +92,7 @@ const CASES: &[Case] = &[
 	Case { name: "scan-lstm", shape: "lstm", precision: "fp32", rows: 131, columns: 18 },
 	Case { name: "pool", shape: "pool", precision: "fp32", rows: 131, columns: 18 },
 	Case { name: "moe", shape: "moe", precision: "fp32", rows: 131, columns: 17 },
-	Case { name: "moe-quantized", shape: "moe-q8", precision: "int8", rows: 131, columns: 17 },
+	Case { name: "moe-quantized", shape: "moe-q8", precision: "fp32", rows: 131, columns: 17 },
 	Case { name: "persistence", shape: "deep", precision: "fp32", rows: 131, columns: 17 },
 ];
 
@@ -210,6 +210,10 @@ fn run(case: &Case) -> Evidence {
 	// prediction to the wrong row would fail even if the multiset matched.
 	let predictions = report.predictions().iter().map(|value| value.to_bits()).collect::<Vec<_>>();
 	let evidence = Evidence { initial: report.initial_loss().to_bits(), final_loss: report.final_loss().to_bits(), predictions, bundle: stable_bundle(&bundle) };
+	if case.name == "moe-quantized" {
+		assert_ne!(evidence.initial, evidence.final_loss, "the quantized MoE case must update its loss");
+		assert!(evidence.predictions.iter().any(|value| *value != 0), "the quantized MoE case must produce a nonzero prediction");
+	}
 	let _ = std::fs::remove_file(&bundle);
 	evidence
 }
