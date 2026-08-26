@@ -7509,25 +7509,26 @@ fn catboost_borders(samples: &[f64], features: usize, rows: usize, count: usize)
 	}).collect()
 }
 fn ordered_split(borders: &[CatboostBorders], residuals: &[f64], permutation: &[usize], codes: &[usize], level: usize, prior: f64, minimum: usize) -> Option<(usize, f64)> {
-	let mut best = None;
-	for (feature, candidates) in borders.iter().enumerate() {
+	let groups = 1_usize.checked_shl((level + 1) as u32)?;
+	// Each feature's candidate scan is independent; the reduction keeps the first
+	// strict minimum in feature order, matching the sequential scan.
+	parallel_map(borders.len(), |feature| {
+		let candidates = &borders[feature];
+		let (mut counts, mut sums, mut best) = (vec![0_usize; groups], vec![0.0; groups], None);
 		for (index, &threshold) in candidates.thresholds.iter().enumerate() {
-			let groups = 1_usize.checked_shl((level + 1) as u32)?;
-			let mut counts = vec![0_usize; groups];
-			let mut sums = vec![0.0; groups];
+			counts.fill(0);
+			sums.fill(0.0);
 			let mut error = 0.0;
 			for &row in permutation {
-				let side = usize::from(candidates.bins[row] <= index);
-				let group = codes[row] | side << level;
-				let estimate = sums[group] / (counts[group] as f64 + prior);
-				error += (residuals[row] - estimate).powi(2);
+				let group = codes[row] | usize::from(candidates.bins[row] <= index) << level;
+				error += (residuals[row] - sums[group] / (counts[group] as f64 + prior)).powi(2);
 				sums[group] += residuals[row];
 				counts[group] += 1;
 			}
-			if counts.iter().filter(|count| **count != 0).all(|count| *count >= minimum) && best.as_ref().is_none_or(|value: &(f64, usize, f64)| error < value.0) { best = Some((error, feature, threshold)) }
+			if counts.iter().filter(|count| **count != 0).all(|count| *count >= minimum) && best.as_ref().is_none_or(|value: &(f64, f64)| error < value.0) { best = Some((error, threshold)) }
 		}
-	}
-	best.map(|(_, feature, threshold)| (feature, threshold))
+		best
+	}).into_iter().enumerate().filter_map(|(feature, best)| best.map(|(error, threshold)| (error, feature, threshold))).reduce(|best, candidate| if candidate.0 < best.0 { candidate } else { best }).map(|(_, feature, threshold)| (feature, threshold))
 }
 fn oblivious_tree(splits: &[(usize, f64)], leaves: &[f64], level: usize, code: usize) -> TreeNode {
 	if level == splits.len() { return TreeNode::Leaf(leaves[code]) }
@@ -7601,24 +7602,21 @@ fn fit_kmeans(clusters: usize, data: &Prepared, rows: usize, config: Config, _: 
 	program.nearest(1, false, table);
 	Ok(Predictor::new(program.finish()?))
 }
-/// Evaluates the immutable teacher once for each prepared sample. Worker threads process
-/// disjoint sample ranges and preserve input order.
+/// Runs the work over disjoint index ranges, one worker per available core, and
+/// returns the results in index order. A worker panic resumes on the caller.
+fn parallel_map<R: Send>(count: usize, work: impl Fn(usize) -> R + Sync) -> Vec<R> {
+	let span = count.div_ceil(std::thread::available_parallelism().map_or(1, |value| value.get())).max(1);
+	let mut results = Vec::with_capacity(count);
+	std::thread::scope(|scope| {
+		let handles = (0..count).step_by(span).map(|start| { let work = &work; scope.spawn(move || (start..(start + span).min(count)).map(work).collect::<Vec<_>>()) }).collect::<Vec<_>>();
+		for handle in handles { results.extend(handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))) }
+	});
+	results
+}
+/// Evaluates the immutable teacher once for each prepared sample.
 fn predict_rows(teacher: &Predictor, inputs: &[f64], features: usize) -> Result<Vec<f64>> {
 	require(features != 0, "teacher prediction has no features")?;
-	let rows = inputs.len() / features;
-	let mut targets = vec![0.0; rows];
-	let span = rows.div_ceil(std::thread::available_parallelism().map_or(1, |value| value.get())).max(1);
-	std::thread::scope(|scope| {
-		let handles = targets.chunks_mut(span).enumerate().map(|(chunk, slice)| scope.spawn(move || {
-			for (offset, value) in slice.iter_mut().enumerate() {
-				let row = chunk * span + offset;
-				*value = (teacher.predict)(row, &inputs[row * features..row * features + features])?;
-			}
-			Ok(())
-		})).collect::<Vec<_>>();
-		handles.into_iter().try_for_each(|handle| handle.join().map_err(|_| RecipeError::new("teacher prediction panicked"))?)
-	})?;
-	Ok(targets)
+	parallel_map(inputs.len() / features, |row| (teacher.predict)(row, &inputs[row * features..row * features + features])).into_iter().collect()
 }
 fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool) -> Result<Predictor> {
 	let maximum = rows.checked_sub(usize::from(exclude)).unwrap_or(0);
