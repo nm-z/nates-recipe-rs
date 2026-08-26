@@ -574,16 +574,23 @@ pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorCon
 					format!("%{p}.acc")
 				};
 				let _ = writeln!(output, "%{p}.target.relative = add i32 {base}, %{p}.i\n%{p}.target.index = add i32 %{p}.target.relative, {offset}\n%{p}.target.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.target.index\n%{p}.target = load {ty}, {ptr} %{p}.target.ptr, align {align}", base = rows * context.features, offset = context.offset, weights = context.weights);
-				// Bubble the candidate through the k slots, keeping each slot's strictly nearer entry.
+				// Bubble the candidate through the k slots. A displaced entry precedes every later
+				// equal-distance slot because rows are visited in ascending index order.
 				let (mut carry_distance, mut carry_target) = (candidate_distance, format!("%{p}.target"));
+				let mut carry_precedes = "false".to_owned();
 				for slot in 0..count {
-					let _ = writeln!(output, "%{p}.swap{slot} = call i1 @recipe.ogt({ty} %{p}.d{slot}, {ty} {carry_distance})");
+					let _ = writeln!(output, "%{p}.nearer{slot} = call i1 @recipe.ogt({ty} %{p}.d{slot}, {ty} {carry_distance})");
+					let _ = writeln!(output, "%{p}.equal{slot} = call i1 @recipe.oeq({ty} %{p}.d{slot}, {ty} {carry_distance})");
+					let _ = writeln!(output, "%{p}.tie{slot} = and i1 %{p}.equal{slot}, {carry_precedes}");
+					let _ = writeln!(output, "%{p}.swap{slot} = or i1 %{p}.nearer{slot}, %{p}.tie{slot}");
 					let _ = writeln!(output, "%{p}.d{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_distance}, {ty} %{p}.d{slot}");
 					let _ = writeln!(output, "%{p}.t{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_target}, {ty} %{p}.t{slot}");
 					let _ = writeln!(output, "%{p}.carry.d{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.d{slot}, {ty} {carry_distance}");
 					let _ = writeln!(output, "%{p}.carry.t{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.t{slot}, {ty} {carry_target}");
+					let _ = writeln!(output, "%{p}.carry.precedes{slot} = or i1 {carry_precedes}, %{p}.swap{slot}");
 					carry_distance = format!("%{p}.carry.d{slot}");
 					carry_target = format!("%{p}.carry.t{slot}");
+					carry_precedes = format!("%{p}.carry.precedes{slot}");
 				}
 				let _ = writeln!(output, "br label %{p}.latch\n{p}.latch:\n%{p}.i.next = add i32 %{p}.i, 1\nbr label %{p}.head\n{p}.done:");
 				let mut sum = zero;
