@@ -2853,7 +2853,8 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			let bitcode = bitcode.ok_or_else(|| RecipeError::new("NVIDIA bitcode path is absent"))?;
 			let ptx_version = option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))?;
 			let mut llvm = Command::new(compiler);
-			llvm.args(["-target", "nvptx64-nvidia-cuda"]).arg(format!("-march={architecture}")).args(["-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(bitcode);
+			// Clang defaults to its minimum PTX ISA, which rejects modern -march targets outright, so the configured version is pinned here as well as in the generator.
+			llvm.args(["-target", "nvptx64-nvidia-cuda"]).arg(format!("-march={architecture}")).args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(bitcode);
 			native_command(llvm, "NVIDIA LLVM IR compiler", key)?;
 			// Clang stamps its own newest PTX ISA and ignores the requested one, so the generator pins it instead, and the driver JIT then loads the artifact on every driver at or above that version.
 			let generator = option_env!("RECIPE_NV_PTX_GENERATOR").ok_or_else(|| RecipeError::new("NVIDIA PTX generator is unavailable"))?;
@@ -3455,13 +3456,14 @@ use std::{
 	error::Error,
 	ffi::c_void,
 	fmt, fs,
-	io::{IsTerminal, Write},
+	io::{IsTerminal, Read, Write},
 	mem::{size_of, size_of_val},
+	net::{Shutdown, TcpListener, TcpStream},
 	path::{Path, PathBuf},
 	process::Command,
 	ptr,
 	sync::{
-		Mutex, OnceLock,
+		Arc, Condvar, Mutex, OnceLock,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time::{Duration, Instant},
@@ -4911,7 +4913,7 @@ impl Recipe {
 impl Recipe {
 	pub fn infer(&self, path: impl AsRef<Path>, input: &[f64]) -> Vec<f64> {
 		let path = resolve_path(path).unwrap_or_else(|error| panic!("{error}"));
-		let device = selected_gpu().unwrap_or_else(|error| panic!("{error}"));
+		let device = runtime_session().map(|session| session.gpu).unwrap_or_else(|error| panic!("{error}"));
 		let result = bundle::run_infer(&path, input, |stored, samples| {
 			let config = Config::load()?;
 			let graph = materialize_saved_graph(stored, samples, device, config)?;
@@ -5657,6 +5659,8 @@ struct NativeTape {
 	step: u32,
 	output: usize,
 	capacity: usize,
+	/// The tape's exact device reservation, released whole when it drops.
+	reserved: u64,
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 impl NativeTape {
@@ -5683,40 +5687,77 @@ impl NativeTape {
 		let step = narrow(graph.state.epoch, "optimizer epoch")? as u32;
 		let target_buffer = if targets.is_empty() { vec![0.0] } else { targets.to_vec() };
 		let parameter_values = if graph.parameters.is_empty() { vec![0.0] } else { graph.parameters.clone() };
-		let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
-		if program.model_load.is_some() {
-			require(!program.artifact.storage.is_empty(), "native model-load storage is empty")?;
-			let storage = Buffer::upload(gpu, &program.artifact.storage)?;
-			let threads = program.dispatch(NativeEntry::ModelLoad)?.geometry.threads()?;
-			let mut call = ptrs![weights.pointer, storage.pointer, threads];
-			program.launch_model_load(&mut call)?;
-			gpu.synchronize()?;
-		} else {
-			require(program.artifact.storage.is_empty(), "native artifact storage has no model-load entrypoint")?;
+		let session = runtime_session()?;
+		require(std::ptr::eq(gpu, session.gpu), "native tape device must be the runtime's granted device")?;
+		// Every device byte the tape allocates, summed from the same sizes the
+		// uploads below use and reserved with the runtime before the first allocation.
+		let planned = [
+			layout.values_bytes.max(1),
+			layout.contexts_bytes.max(1),
+			layout.adjoints_bytes.max(1),
+			checked_mul(samples.len(), precision.model.bytes(), "native sample reservation")?,
+			checked_mul(samples.len().max(1), precision.model.bytes(), "native adjoint reservation")?,
+			checked_mul(target_buffer.len(), precision.model.bytes(), "native target reservation")?,
+			checked_mul(parameter_values.len(), precision.model.bytes(), "native weight reservation")?,
+			frozen.len(),
+			checked_mul(moments.len(), precision.state.bytes(), "native moment reservation")?,
+			checked_mul(variances.len(), precision.state.bytes(), "native variance reservation")?,
+			gradient_bytes,
+			precision.state.bytes(),
+			program.artifact.storage.len(),
+		]
+		.into_iter()
+		.try_fold(0_usize, |total, bytes| checked_add(total, bytes, "native tape reservation"))?;
+		session.hold(planned as u64)?;
+		let build = move || -> Result<Self> {
+			let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
+			let mut staged = 0;
+			if program.model_load.is_some() {
+				require(!program.artifact.storage.is_empty(), "native model-load storage is empty")?;
+				let storage = Buffer::upload(gpu, &program.artifact.storage)?;
+				staged = storage.bytes;
+				let threads = program.dispatch(NativeEntry::ModelLoad)?.geometry.threads()?;
+				let mut call = ptrs![weights.pointer, storage.pointer, threads];
+				program.launch_model_load(&mut call)?;
+				gpu.synchronize()?;
+			} else {
+				require(program.artifact.storage.is_empty(), "native artifact storage has no model-load entrypoint")?;
+			}
+			let tape = Self {
+				program,
+				precision,
+				values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
+				contexts: Buffer::upload(gpu, &vec![0_u8; layout.contexts_bytes.max(1)])?,
+				adjoints: Buffer::upload(gpu, &vec![0_u8; layout.adjoints_bytes.max(1)])?,
+				batch_normalizations,
+				samples: Buffer::upload_float(gpu, samples, precision.model)?,
+				input_adjoint: Buffer::upload_float(gpu, &vec![0.0; samples.len().max(1)], precision.model)?,
+				targets: Buffer::upload_float(gpu, &target_buffer, precision.model)?,
+				weights,
+				frozen: Buffer::upload(gpu, &frozen)?,
+				moments: Buffer::upload_float(gpu, &moments, precision.state)?,
+				variances: Buffer::upload_float(gpu, &variances, precision.state)?,
+				gradient: Buffer::upload(gpu, &vec![0_u8; gradient_bytes])?,
+				metrics: Buffer::upload_float(gpu, &[0.0], precision.state)?,
+				best_loss,
+				rows: narrow(rows, "native rows")? as u32,
+				parameters,
+				step,
+				output,
+				capacity: rows,
+				reserved: planned as u64,
+			};
+			let allocated = staged + tape.values.bytes + tape.contexts.bytes + tape.adjoints.bytes + tape.samples.bytes + tape.input_adjoint.bytes + tape.targets.bytes + tape.weights.bytes + tape.frozen.bytes + tape.moments.bytes + tape.variances.bytes + tape.gradient.bytes + tape.metrics.bytes;
+			require(allocated == planned, "native tape allocation differs from its exact reservation")?;
+			Ok(tape)
+		};
+		match build() {
+			Ok(tape) => Ok(tape),
+			Err(error) => {
+				session.release(planned as u64);
+				Err(error)
+			}
 		}
-		Ok(Self {
-			program,
-			precision,
-			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
-			contexts: Buffer::upload(gpu, &vec![0_u8; layout.contexts_bytes.max(1)])?,
-			adjoints: Buffer::upload(gpu, &vec![0_u8; layout.adjoints_bytes.max(1)])?,
-			batch_normalizations,
-			samples: Buffer::upload_float(gpu, samples, precision.model)?,
-			input_adjoint: Buffer::upload_float(gpu, &vec![0.0; samples.len().max(1)], precision.model)?,
-			targets: Buffer::upload_float(gpu, &target_buffer, precision.model)?,
-			weights,
-			frozen: Buffer::upload(gpu, &frozen)?,
-			moments: Buffer::upload_float(gpu, &moments, precision.state)?,
-			variances: Buffer::upload_float(gpu, &variances, precision.state)?,
-			gradient: Buffer::upload(gpu, &vec![0_u8; gradient_bytes])?,
-			metrics: Buffer::upload_float(gpu, &[0.0], precision.state)?,
-			best_loss,
-			rows: narrow(rows, "native rows")? as u32,
-			parameters,
-			step,
-			output,
-			capacity: rows,
-		})
 	}
 	fn forward(&mut self) -> Result<()> {
 		let threads = self.program.forward.geometry.threads()?;
@@ -5831,8 +5872,7 @@ impl NativeTape {
 		self.program.contractions.iter().flatten().map(|node| [node.forward, node.gradient, node.previous].map(|extent| format!("{}x{}x{}", extent.m, extent.n, extent.k)).join("/")).collect::<Vec<_>>().join(" ")
 	}
 	fn print_devices(&self) -> Result<()> {
-		let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-		eprintln!("{}:{}.{}", host.trim(), self.program.gpu.name, self.precision.model.label());
+		eprintln!("{}:{}.{}", hostname()?, self.program.gpu.name, self.precision.model.label());
 		Ok(())
 	}
 }
@@ -5871,6 +5911,13 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 	checked_mul(elements.max(1), element, "context bytes")
 }
 fn narrow(value: usize, role: &str) -> Result<i32> { i32::try_from(value).map_err(|_| RecipeError::new(format!("{role} exceeds i32"))) }
+impl Drop for NativeTape {
+	fn drop(&mut self) {
+		if let Ok(session) = runtime_session() {
+			session.release(self.reserved);
+		}
+	}
+}
 struct Buffer {
 	runtime: &'static Gpu,
 	pointer: u64,
@@ -6505,18 +6552,802 @@ fn devices() -> Result<&'static [Gpu]> {
 		.map(Vec::as_slice)
 		.map_err(Clone::clone)
 }
-fn device(name: Option<&str>) -> Result<&'static Gpu> {
-	let found = devices()?;
-	if let Some(name) = name {
-		return found.iter().find(|gpu| gpu.name == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")));
-	}
-	require(found.len() == 1, "multiple GPUs require named selection")?;
-	Ok(&found[0])
+fn hostname() -> Result<String> { Ok(fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?.trim().to_owned()) }
+fn granted_device(canonical: &str) -> Result<&'static Gpu> {
+	let host = hostname()?;
+	devices()?.iter().find(|gpu| gpu.name == canonical || format!("{host}:{}", gpu.name) == canonical).ok_or_else(|| RecipeError::new(format!("granted device {canonical:?} is absent from this process")))
 }
-fn selected_gpu() -> Result<&'static Gpu> {
-	let Some(name) = std::env::var("RECIPE_DEVICE").ok() else { return device(None) };
-	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
-	devices()?.iter().find(|gpu| gpu.name == name || format!("{}:{}", host.trim(), gpu.name) == name).ok_or_else(|| RecipeError::new(format!("GPU {name:?} is absent")))
+/// The authoritative Recipe runtime. One backend process owns the typed job,
+/// device, host, link, reservation, and terminal-result state; every run reaches
+/// it through one framed verb; and one scheduling and execution implementation
+/// dispatches each granted job on its device's host, local or remote.
+const RT_JOB: u8 = 1;
+const RT_HOLD: u8 = 2;
+const RT_FREE: u8 = 3;
+const RT_DONE: u8 = 4;
+const RT_STATE: u8 = 5;
+const RT_GRANT: u8 = 6;
+const RT_OUT: u8 = 7;
+const RT_ERR: u8 = 8;
+const RT_EXIT: u8 = 9;
+const RT_OK: u8 = 10;
+const RT_FAIL: u8 = 11;
+const RUNTIME_FRAME_LIMIT: usize = 1 << 26;
+const BUILD_ID: u64 = parse_natural(env!("RECIPE_BUILD_ID"), "build fingerprint must be numeric") as u64;
+fn runtime_address() -> String { std::env::var("RECIPE_RUNTIME").unwrap_or_else(|_| env!("RECIPE_RUNTIME").to_owned()) }
+/// The `recipe` binary this process belongs to, resolved while running rather
+/// than recorded at build time, so a moved, copied, or installed build still
+/// starts and dispatches itself: the boundary is itself, an executor inherits
+/// it, and a linked binary finds it beside or above its own directory.
+fn runtime_binary() -> Option<String> {
+	let exe = std::env::var("RECIPE_BIN").ok().map(PathBuf::from).or_else(|| std::env::current_exe().ok())?;
+	std::iter::once(exe.clone()).chain(exe.ancestors().skip(1).map(|directory| directory.join("recipe"))).find(|path| path.file_name().is_some_and(|name| name == "recipe") && path.is_file()).and_then(|path| path.to_str().map(str::to_owned))
+}
+fn put_value(body: &mut Vec<u8>, value: u64) { body.extend_from_slice(&value.to_le_bytes()) }
+fn put_blob(body: &mut Vec<u8>, blob: &[u8]) {
+	put_value(body, blob.len() as u64);
+	body.extend_from_slice(blob);
+}
+struct Wire<'a> {
+	bytes: &'a [u8],
+	at: usize,
+}
+impl<'a> Wire<'a> {
+	fn new(bytes: &'a [u8]) -> Self { Self { bytes, at: 0 } }
+	fn take(&mut self, length: usize) -> Result<&'a [u8]> {
+		let end = checked_add(self.at, length, "runtime frame offset")?;
+		let bytes = self.bytes.get(self.at..end).ok_or_else(|| RecipeError::new("runtime frame is truncated"))?;
+		self.at = end;
+		Ok(bytes)
+	}
+	fn value(&mut self) -> Result<u64> { Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap_or_default())) }
+	fn blob(&mut self) -> Result<&'a [u8]> {
+		let length = self.value()? as usize;
+		self.take(length)
+	}
+	fn text(&mut self) -> Result<String> { String::from_utf8(self.blob()?.to_vec()).map_err(|_| RecipeError::new("runtime frame text is not UTF-8")) }
+}
+fn send_frame(stream: &mut TcpStream, verb: u8, body: &[u8]) -> Result<()> {
+	let mut frame = Vec::with_capacity(5 + body.len());
+	frame.extend_from_slice(&(body.len() as u32 + 1).to_le_bytes());
+	frame.push(verb);
+	frame.extend_from_slice(body);
+	stream.write_all(&frame).map_err(|error| RecipeError::new(format!("cannot write to the Recipe runtime: {error}")))
+}
+fn read_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
+	let mut length = [0_u8; 4];
+	stream.read_exact(&mut length).map_err(|error| RecipeError::new(format!("cannot read from the Recipe runtime: {error}")))?;
+	let length = u32::from_le_bytes(length) as usize;
+	require((1..=RUNTIME_FRAME_LIMIT).contains(&length), "runtime frame length is invalid")?;
+	let mut body = vec![0; length];
+	stream.read_exact(&mut body).map_err(|error| RecipeError::new(format!("cannot read from the Recipe runtime: {error}")))?;
+	Ok((body.remove(0), body))
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JobState {
+	Queued,
+	Preparing,
+	Running,
+	Completed,
+	Failed,
+}
+impl JobState {
+	const ALL: [Self; 5] = [Self::Queued, Self::Preparing, Self::Running, Self::Completed, Self::Failed];
+	const LABELS: [&'static str; 5] = ["queued", "preparing", "running", "completed", "failed"];
+	const fn label(self) -> &'static str { Self::LABELS[self as usize] }
+	fn decode(code: u64) -> Self { Self::ALL[(code as usize).min(Self::ALL.len() - 1)] }
+	const fn terminal(self) -> bool { matches!(self, Self::Completed | Self::Failed) }
+}
+/// The compatible job transitions. Every state move is checked here, so an
+/// incompatible transition is a reported runtime defect instead of state drift.
+fn compatible_transition(from: JobState, to: JobState) -> bool {
+	use JobState::*;
+	matches!((from, to), (Queued, Preparing) | (Preparing, Running) | (Preparing, Completed) | (Running, Completed) | (Queued, Failed) | (Preparing, Failed) | (Running, Failed))
+}
+/// One reachable host. Its transport argv prefix is empty on the runtime's own
+/// host, and `binary` is the `recipe` that host runs.
+struct HostRec {
+	name: String,
+	command: Vec<String>,
+	binary: String,
+	memory: u64,
+	limit: u64,
+	reserved: u64,
+}
+/// One device in the topology. An exclusive device carries one job at a time; a
+/// shared device is bounded by its host ledger instead of a device capacity.
+struct DeviceRec {
+	host: usize,
+	name: String,
+	canonical: String,
+	backend: String,
+	memory: u64,
+	exclusive: bool,
+	job: Option<u64>,
+	reserved: u64,
+	/// Measured epoch throughput from terminal results, rows times epochs per second.
+	measured: Option<f64>,
+}
+/// Measured transport cost from the runtime's host, indexed like `hosts`.
+struct Link {
+	latency: f64,
+	rate: f64,
+}
+/// One submitted declaration. An empty `source` marks a client process that is
+/// its own executor; a shipped source is staged and dispatched on the granted
+/// device's host.
+struct JobRec {
+	id: u64,
+	token: u64,
+	name: String,
+	source: Vec<u8>,
+	cwd: String,
+	home: Option<usize>,
+	request: String,
+	cpu: bool,
+	state: JobState,
+	device: Option<usize>,
+	device_bytes: u64,
+	runs: u64,
+	summary: String,
+	pid: Option<i32>,
+}
+struct RuntimeState {
+	hosts: Vec<HostRec>,
+	devices: Vec<DeviceRec>,
+	links: Vec<Link>,
+	jobs: Vec<JobRec>,
+	conns: BTreeMap<u64, Arc<Mutex<TcpStream>>>,
+	/// Claimed executor sessions; closing one cancels its job's next operation.
+	sessions: BTreeMap<u64, TcpStream>,
+	next: u64,
+	address: String,
+}
+static RUNTIME_STATE: OnceLock<(Mutex<RuntimeState>, Condvar)> = OnceLock::new();
+fn runtime_state() -> Result<&'static (Mutex<RuntimeState>, Condvar)> { RUNTIME_STATE.get().ok_or_else(|| RecipeError::new("the Recipe runtime is not serving")) }
+fn locked() -> Result<std::sync::MutexGuard<'static, RuntimeState>> { runtime_state()?.0.lock().map_err(|_| RecipeError::new("the Recipe runtime lock is poisoned")) }
+fn position(rt: &RuntimeState, id: u64) -> Option<usize> { rt.jobs.iter().position(|job| job.id == id) }
+fn shell_quote(text: &str) -> String { format!("'{}'", text.replace('\'', "'\\''")) }
+fn exit_with(outcome: Result<()>) -> ! {
+	match outcome {
+		Ok(()) => std::process::exit(0),
+		Err(error) => {
+			eprintln!("{error}");
+			std::process::exit(1)
+		}
+	}
+}
+/// Runs one command line on a host: the single execution implementation the
+/// runtime uses to probe, measure, stage, dispatch, and clean up on the local
+/// host and on every remote host alike. The transport prefix is host data, not
+/// a code path.
+fn host_argv(command: &[String], line: &str) -> Vec<String> {
+	let mut argv = if command.is_empty() { vec!["sh".to_owned(), "-c".to_owned()] } else { command.to_vec() };
+	argv.push(line.to_owned());
+	argv
+}
+fn host_run(command: &[String], line: &str, stdin: Option<&[u8]>) -> Result<std::process::Output> {
+	let argv = host_argv(command, line);
+	let mut child = Command::new(&argv[0]).args(&argv[1..]).stdin(if stdin.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() }).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().map_err(|error| RecipeError::new(format!("cannot run {:?}: {error}", argv[0])))?;
+	if let Some(bytes) = stdin {
+		let mut pipe = child.stdin.take().ok_or_else(|| RecipeError::new("host command has no input pipe"))?;
+		pipe.write_all(bytes).map_err(|error| RecipeError::new(format!("cannot feed {:?}: {error}", argv[0])))?;
+	}
+	child.wait_with_output().map_err(|error| RecipeError::new(format!("cannot finish {:?}: {error}", argv[0])))
+}
+fn host_memory() -> Result<u64> {
+	let meminfo = fs::read_to_string("/proc/meminfo").map_err(|error| RecipeError::new(format!("cannot read host memory: {error}")))?;
+	meminfo.lines().find_map(|line| line.strip_prefix("MemTotal:")).and_then(|line| line.split_whitespace().next()).and_then(|value| value.parse::<u64>().ok()).map(|kilobytes| kilobytes * 1024).ok_or_else(|| RecipeError::new("host memory total is absent"))
+}
+/// Prints this host's typed inventory for the runtime: its memory, its native
+/// devices, and its shared CPU device, whose native buffers live in host memory
+/// and are therefore bounded by the host ledger.
+pub fn probe() -> ! {
+	exit_with((|| -> Result<()> {
+		println!("host {} {}", hostname()?, host_memory()?);
+		match devices() {
+			Ok(found) => found.iter().filter(|gpu| !matches!(gpu.driver, Driver::Cpu)).for_each(|gpu| println!("device {} {:?} {} 1", gpu.name, gpu.backend, gpu.memory)),
+			Err(error) => println!("note {error}"),
+		}
+		println!("device cpu Cpu {} 0", u64::MAX);
+		Ok(())
+	})())
+}
+/// Measures one host's transport cost with the same execution implementation
+/// every other host operation uses.
+fn measure_link(host: &HostRec) -> Result<Link> {
+	if host.command.is_empty() {
+		return Ok(Link { latency: 0.0, rate: f64::INFINITY });
+	}
+	let started = Instant::now();
+	require(host_run(&host.command, "true", None)?.status.success(), format!("cannot reach host {}", host.name))?;
+	let latency = started.elapsed().as_secs_f64();
+	let payload = vec![0_u8; 1 << 22];
+	let started = Instant::now();
+	let counted = host_run(&host.command, "wc -c", Some(&payload))?;
+	require(String::from_utf8_lossy(&counted.stdout).trim() == payload.len().to_string(), format!("host {} transport corrupts data", host.name))?;
+	Ok(Link { latency, rate: payload.len() as f64 / (started.elapsed().as_secs_f64() - latency).max(0.001) })
+}
+fn inventory(address: &str) -> Result<RuntimeState> {
+	let limit = fraction("host memory limit", env!("RECIPE_HOST_MEMORY_LIMIT"))?;
+	let mut hosts = vec![HostRec { name: hostname()?, command: Vec::new(), binary: runtime_binary().ok_or_else(|| RecipeError::new("the Recipe runtime must run as the recipe binary"))?, memory: 0, limit: 0, reserved: 0 }];
+	for entry in env!("RECIPE_HOSTS").split(';').filter(|entry| !entry.is_empty()) {
+		let mut fields = entry.splitn(3, '=');
+		let name = fields.next().unwrap_or_default().to_owned();
+		let command = fields.next().unwrap_or_default().split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+		let binary = fields.next().unwrap_or_default().to_owned();
+		require(!name.is_empty() && !command.is_empty() && binary.starts_with('/'), format!("host entry {entry:?} is malformed"))?;
+		require(hosts.iter().all(|host| host.name != name), format!("host {name:?} is configured twice"))?;
+		hosts.push(HostRec { name, command, binary, memory: 0, limit: 0, reserved: 0 });
+	}
+	let (mut devices, mut links) = (Vec::new(), Vec::new());
+	for index in 0..hosts.len() {
+		links.push(measure_link(&hosts[index])?);
+		let probe = host_run(&hosts[index].command, &format!("{} --probe", shell_quote(&hosts[index].binary)), None)?;
+		require(probe.status.success(), format!("cannot probe host {}: {}", hosts[index].name, String::from_utf8_lossy(&probe.stderr)))?;
+		for line in String::from_utf8_lossy(&probe.stdout).lines() {
+			let mut fields = line.split_whitespace();
+			match fields.next() {
+				Some("host") => {
+					let name = fields.next().unwrap_or_default();
+					require(name == hosts[index].name, format!("host {} reports hostname {name:?}; the topology must use real hostnames", hosts[index].name))?;
+					hosts[index].memory = fields.next().and_then(|value| value.parse().ok()).ok_or_else(|| RecipeError::new("host probe memory is malformed"))?;
+					hosts[index].limit = (hosts[index].memory as f64 * limit) as u64;
+				}
+				Some("device") => {
+					let name = fields.next().unwrap_or_default().to_owned();
+					let backend = fields.next().unwrap_or_default().to_owned();
+					let memory = fields.next().and_then(|value| value.parse().ok()).ok_or_else(|| RecipeError::new("device probe memory is malformed"))?;
+					devices.push(DeviceRec { host: index, canonical: format!("{}:{name}", hosts[index].name), name, backend, memory, exclusive: fields.next() == Some("1"), job: None, reserved: 0, measured: None });
+				}
+				Some("note") => eprintln!("recipe runtime: host {}: {}", hosts[index].name, line.trim_start_matches("note ")),
+				_ => {}
+			}
+		}
+		require(hosts[index].memory != 0, format!("host {} reported no memory", hosts[index].name))?;
+	}
+	Ok(RuntimeState { hosts, devices, links, jobs: Vec::new(), conns: BTreeMap::new(), sessions: BTreeMap::new(), next: 0, address: address.to_owned() })
+}
+fn ledger_line(rt: &RuntimeState) -> String {
+	let hosts = rt.hosts.iter().map(|host| format!("{} {}/{}", host.name, host.reserved, host.limit)).collect::<Vec<_>>().join(" ");
+	let devices = rt.devices.iter().map(|device| format!("{} job {} bytes {}", device.canonical, device.job.map_or_else(|| "none".to_owned(), |job| job.to_string()), device.reserved)).collect::<Vec<_>>().join(" ");
+	format!("hosts [{hosts}] devices [{devices}]")
+}
+fn publish(rt: &RuntimeState, index: usize) {
+	let job = &rt.jobs[index];
+	let Some(conn) = rt.conns.get(&job.id) else { return };
+	let mut body = Vec::new();
+	put_value(&mut body, job.state as u64);
+	put_blob(&mut body, job.summary.as_bytes());
+	if let Ok(mut stream) = conn.lock() {
+		let _ = send_frame(&mut stream, RT_STATE, &body);
+	}
+}
+fn set_state(rt: &mut RuntimeState, index: usize, to: JobState, detail: String) -> Result<()> {
+	let from = rt.jobs[index].state;
+	require(compatible_transition(from, to), format!("job {} transition {} to {} is incompatible", rt.jobs[index].id, from.label(), to.label()))?;
+	rt.jobs[index].state = to;
+	rt.jobs[index].summary = detail;
+	debug(&format!("runtime job {} {} {} :: {}", rt.jobs[index].id, to.label(), rt.jobs[index].summary, ledger_line(rt))).ok();
+	publish(rt, index);
+	Ok(())
+}
+/// Releases a job's exact reservations and records its terminal state, which
+/// immediately re-evaluates every queued job.
+fn finish_job(rt: &mut RuntimeState, index: usize, to: JobState, detail: String) -> Result<()> {
+	if rt.jobs[index].state.terminal() {
+		return Ok(());
+	}
+	let id = rt.jobs[index].id;
+	if let Some(at) = rt.jobs[index].device {
+		let (host, planned) = (rt.devices[at].host, rt.jobs[index].device_bytes);
+		if rt.devices[at].exclusive {
+			rt.devices[at].reserved = rt.devices[at].reserved.saturating_sub(planned);
+		} else {
+			rt.hosts[host].reserved = rt.hosts[host].reserved.saturating_sub(planned);
+		}
+		if rt.devices[at].job == Some(id) {
+			rt.devices[at].job = None;
+		}
+	}
+	rt.jobs[index].device_bytes = 0;
+	rt.jobs[index].source = Vec::new();
+	set_state(rt, index, to, detail)?;
+	if let Some(session) = rt.sessions.remove(&id) {
+		let _ = session.shutdown(Shutdown::Both);
+	}
+	Ok(())
+}
+/// The measured scheduling policy: an unmeasured device is tried first so every
+/// device earns a measurement, native devices precede shared devices on a tie,
+/// then the highest measured epoch throughput, link latency, and canonical name.
+fn policy_order(rt: &RuntimeState, left: usize, right: usize) -> std::cmp::Ordering {
+	let (a, b) = (&rt.devices[left], &rt.devices[right]);
+	a.measured.is_some().cmp(&b.measured.is_some()).then(b.measured.unwrap_or(0.0).total_cmp(&a.measured.unwrap_or(0.0))).then(b.exclusive.cmp(&a.exclusive)).then(rt.links[a.host].latency.total_cmp(&rt.links[b.host].latency)).then(a.canonical.cmp(&b.canonical))
+}
+/// The best idle device compatible with one job. A client that is its own
+/// executor already lives on its host, so only that host's devices are
+/// compatible with it. A submitted declaration can use any compatible idle
+/// device; a self-executing process uses its native device unless it started
+/// CPU-only.
+fn eligible_device(rt: &RuntimeState, index: usize) -> Option<usize> {
+	let job = &rt.jobs[index];
+	let scope = if job.source.is_empty() { job.home } else { None };
+	let compatible = |(_, device): &(usize, &DeviceRec)| scope.is_none_or(|host| device.host == host) && (!device.exclusive || device.job.is_none());
+	let requested = |(_, device): &(usize, &DeviceRec)| if job.request.is_empty() { if job.cpu { !device.exclusive } else { !job.source.is_empty() || device.exclusive } } else { device.canonical == job.request || (job.home == Some(device.host) && device.name == job.request) };
+	rt.devices.iter().enumerate().filter(compatible).filter(requested).map(|(at, _)| at).min_by(|a, b| policy_order(rt, *a, *b))
+}
+struct JobOrder {
+	job: u64,
+	token: u64,
+	command: Vec<String>,
+	binary: String,
+	device: String,
+	cpu: bool,
+	source: Vec<u8>,
+	cwd: String,
+	address: String,
+	client: Option<Arc<Mutex<TcpStream>>>,
+}
+/// Dispatches every independent ready job whose device and resources are
+/// available, in submission order.
+fn schedule_pass(rt: &mut RuntimeState) -> Vec<JobOrder> {
+	let mut orders = Vec::new();
+	for index in 0..rt.jobs.len() {
+		if rt.jobs[index].state != JobState::Queued {
+			continue;
+		}
+		let Some(at) = eligible_device(rt, index) else { continue };
+		let id = rt.jobs[index].id;
+		rt.jobs[index].device = Some(at);
+		if rt.devices[at].exclusive {
+			rt.devices[at].job = Some(id);
+		}
+		let canonical = rt.devices[at].canonical.clone();
+		set_state(rt, index, JobState::Preparing, canonical).ok();
+		if !rt.jobs[index].source.is_empty() {
+			let host = &rt.hosts[rt.devices[at].host];
+			orders.push(JobOrder { job: id, token: rt.jobs[index].token, command: host.command.clone(), binary: host.binary.clone(), device: rt.devices[at].name.clone(), cpu: !rt.devices[at].exclusive, source: rt.jobs[index].source.clone(), cwd: rt.jobs[index].cwd.clone(), address: rt.address.clone(), client: rt.conns.get(&id).cloned() });
+		}
+	}
+	orders
+}
+fn reschedule(rt: &mut RuntimeState) {
+	for order in schedule_pass(rt) {
+		std::thread::spawn(move || dispatch_job(order));
+	}
+	if let Some(state) = RUNTIME_STATE.get() {
+		state.1.notify_all();
+	}
+}
+fn pump(mut source: impl Read + Send + 'static, verb: u8, client: Option<Arc<Mutex<TcpStream>>>) -> std::thread::JoinHandle<()> {
+	std::thread::spawn(move || {
+		let mut chunk = [0_u8; 8192];
+		loop {
+			match source.read(&mut chunk) {
+				Ok(0) | Err(_) => return,
+				Ok(count) => {
+					if let Some(conn) = &client
+						&& let Ok(mut stream) = conn.lock()
+						&& send_frame(&mut stream, verb, &chunk[..count]).is_err()
+					{
+						return;
+					}
+				}
+			}
+		}
+	})
+}
+fn dispatch_process(order: &JobOrder) -> Result<i32> {
+	let script = format!("/tmp/recipe-job-{}.rs", order.job);
+	let staged = host_run(&order.command, &format!("cat > {}", shell_quote(&script)), Some(&order.source))?;
+	require(staged.status.success(), format!("cannot stage job {}: {}", order.job, String::from_utf8_lossy(&staged.stderr)))?;
+	let line = format!("cd {} && RECIPE_JOB={}:{} RECIPE_RUNTIME={} RECIPE_DEVICE={} {}exec {} {}", shell_quote(&order.cwd), order.job, order.token, shell_quote(&order.address), shell_quote(&order.device), if order.cpu { "RECIPE_FORCE_CPU=1 " } else { "" }, shell_quote(&order.binary), shell_quote(&script));
+	let argv = host_argv(&order.command, &line);
+	// The runtime's own debug log owns the root recipe.log; a dispatched local
+	// process must not truncate it.
+	let mut child = Command::new(&argv[0]).args(&argv[1..]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).env_remove("RECIPE_DEBUG").spawn().map_err(|error| RecipeError::new(format!("cannot dispatch job {}: {error}", order.job)))?;
+	if let Ok(mut rt) = locked()
+		&& let Some(index) = position(&rt, order.job)
+	{
+		rt.jobs[index].pid = Some(child.id() as i32);
+	}
+	let relays = [child.stdout.take().map(|stream| pump(stream, RT_OUT, order.client.clone())), child.stderr.take().map(|stream| pump(stream, RT_ERR, order.client.clone()))];
+	let status = child.wait().map_err(|error| RecipeError::new(format!("cannot reap job {}: {error}", order.job)))?;
+	for handle in relays.into_iter().flatten() {
+		handle.join().ok();
+	}
+	host_run(&order.command, &format!("rm -f {} {}", shell_quote(&script), shell_quote(&format!("/tmp/recipe-job-{}.job", order.job))), None).ok();
+	Ok(status.code().unwrap_or_else(|| 128 + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0)))
+}
+fn dispatch_job(order: JobOrder) {
+	let outcome = dispatch_process(&order);
+	let Ok(mut rt) = locked() else { return };
+	if let Some(index) = position(&rt, order.job)
+		&& !rt.jobs[index].state.terminal()
+	{
+		let summary = rt.jobs[index].summary.clone();
+		match &outcome {
+			Ok(0) => finish_job(&mut rt, index, JobState::Completed, summary),
+			Ok(code) => finish_job(&mut rt, index, JobState::Failed, format!("exit status {code}")),
+			Err(error) => finish_job(&mut rt, index, JobState::Failed, error.to_string()),
+		}
+		.ok();
+	}
+	if let Some(conn) = &order.client
+		&& let Ok(mut stream) = conn.lock()
+	{
+		let mut body = Vec::new();
+		put_value(&mut body, outcome.unwrap_or(1) as u64);
+		let _ = send_frame(&mut stream, RT_EXIT, &body);
+	}
+	reschedule(&mut rt);
+}
+fn register_job(rt: &mut RuntimeState, name: String, source: Vec<u8>, cwd: String, host: &str, device: &str, cpu: bool, conn: Option<Arc<Mutex<TcpStream>>>) -> Result<u64> {
+	let home = rt.hosts.iter().position(|record| record.name == host);
+	// A client that is its own executor can only use a device on its own host.
+	let local = source.is_empty();
+	require(!local || home.is_some(), "this host is not in the runtime topology")?;
+	require(device.is_empty() || rt.devices.iter().any(|record| (record.canonical == device || (home == Some(record.host) && record.name == device)) && (!local || home == Some(record.host))), format!("device {device:?} is absent from the runtime topology"))?;
+	rt.next += 1;
+	let id = rt.next;
+	rt.jobs.push(JobRec { id, token: id.wrapping_mul(0x9e37_79b9_7f4a_7c15), name, source, cwd, home, request: device.to_owned(), cpu, state: JobState::Queued, device: None, device_bytes: 0, runs: 0, summary: String::new(), pid: None });
+	if let Some(conn) = conn {
+		rt.conns.insert(id, conn);
+	}
+	let index = rt.jobs.len() - 1;
+	debug(&format!("runtime job {id} submitted {} :: {}", rt.jobs[index].name, ledger_line(rt))).ok();
+	publish(rt, index);
+	Ok(id)
+}
+fn interrupt_job(rt: &mut RuntimeState, id: u64) {
+	let Some(index) = position(rt, id) else { return };
+	if rt.jobs[index].state.terminal() {
+		return;
+	}
+	if rt.jobs[index].state == JobState::Queued {
+		finish_job(rt, index, JobState::Failed, "interrupted while queued".to_owned()).ok();
+		reschedule(rt);
+		return;
+	}
+	// A local job receives the interrupt and checkpoints; a remote job is
+	// cancelled by closing its executor session.
+	let local = rt.jobs[index].device.is_none_or(|at| rt.hosts[rt.devices[at].host].command.is_empty());
+	match (local, rt.jobs[index].pid) {
+		(true, Some(pid)) => unsafe {
+			kill(pid, SIGINT);
+		},
+		_ => {
+			if let Some(session) = rt.sessions.remove(&id) {
+				let _ = session.shutdown(Shutdown::Both);
+			}
+		}
+	}
+}
+fn job_device(rt: &RuntimeState, id: u64) -> Result<(usize, usize)> {
+	let index = position(rt, id).ok_or_else(|| RecipeError::new("job is unknown"))?;
+	require(!rt.jobs[index].state.terminal(), "job was cancelled")?;
+	Ok((index, rt.jobs[index].device.ok_or_else(|| RecipeError::new("job has no device"))?))
+}
+/// Reserves a tape's exact planned native bytes on its exclusive device or,
+/// for a shared CPU device, on its host before allocation. The first native
+/// reservation of a prepared job is the moment it starts running.
+fn hold(id: u64, bytes: u64) -> Result<()> {
+	let state = runtime_state()?;
+	let mut rt = state.0.lock().map_err(|_| RecipeError::new("the Recipe runtime lock is poisoned"))?;
+	loop {
+		let (index, at) = job_device(&rt, id)?;
+		let host = rt.devices[at].host;
+		let (scope, used, limit) = if rt.devices[at].exclusive { (rt.devices[at].canonical.clone(), rt.devices[at].reserved, rt.devices[at].memory) } else { (rt.hosts[host].name.clone(), rt.hosts[host].reserved, rt.hosts[host].limit) };
+		require(bytes <= limit, format!("declaration plans {bytes} bytes on {scope} whose reservable memory is {limit}"))?;
+		if used.saturating_add(bytes) <= limit {
+			if rt.devices[at].exclusive {
+				rt.devices[at].reserved += bytes;
+			} else {
+				rt.hosts[host].reserved += bytes;
+			}
+			rt.jobs[index].device_bytes += bytes;
+			if rt.jobs[index].state == JobState::Preparing {
+				let canonical = rt.devices[at].canonical.clone();
+				set_state(&mut rt, index, JobState::Running, canonical)?;
+			}
+			debug(&format!("runtime job {id} reserved {bytes} bytes on {scope} :: {}", ledger_line(&rt))).ok();
+			return Ok(());
+		}
+		debug(&format!("runtime job {id} waits for {bytes} bytes on {scope} :: {}", ledger_line(&rt))).ok();
+		rt = state.1.wait(rt).map_err(|_| RecipeError::new("the Recipe runtime lock is poisoned"))?;
+	}
+}
+fn release(id: u64, bytes: u64) {
+	let Ok(mut rt) = locked() else { return };
+	let Ok((index, at)) = job_device(&rt, id) else { return };
+	if rt.devices[at].exclusive {
+		rt.devices[at].reserved = rt.devices[at].reserved.saturating_sub(bytes);
+	} else {
+		let host = rt.devices[at].host;
+		rt.hosts[host].reserved = rt.hosts[host].reserved.saturating_sub(bytes);
+	}
+	rt.jobs[index].device_bytes = rt.jobs[index].device_bytes.saturating_sub(bytes);
+	debug(&format!("runtime job {id} released {bytes} bytes :: {}", ledger_line(&rt))).ok();
+	if let Some(state) = RUNTIME_STATE.get() {
+		state.1.notify_all();
+	}
+}
+/// Records one run's terminal result and feeds the measured policy.
+fn record_done(id: u64, wire: &mut Wire) -> Result<()> {
+	let (loss, r2, seconds, rows, epochs) = (f64::from_bits(wire.value()?), f64::from_bits(wire.value()?), f64::from_bits(wire.value()?), wire.value()?, wire.value()?);
+	let state = runtime_state()?;
+	let mut rt = state.0.lock().map_err(|_| RecipeError::new("the Recipe runtime lock is poisoned"))?;
+	let (index, at) = job_device(&rt, id)?;
+	let rate = rows.saturating_mul(epochs) as f64 / seconds.max(1e-9);
+	rt.devices[at].measured = Some(rt.devices[at].measured.map_or(rate, |previous| 0.5 * (previous + rate)));
+	rt.jobs[index].runs += 1;
+	rt.jobs[index].summary = format!("loss {loss} r2 {r2}");
+	debug(&format!("runtime job {id} finished a run :: {}", ledger_line(&rt))).ok();
+	state.1.notify_all();
+	Ok(())
+}
+fn session_serve(mut stream: TcpStream, id: u64) -> Result<()> {
+	loop {
+		let Ok((verb, body)) = read_frame(&mut stream) else { return Ok(()) };
+		let mut wire = Wire::new(&body);
+		let reply = (|| -> Result<()> {
+			match verb {
+				RT_HOLD => hold(id, wire.value()?),
+				RT_FREE => Ok(release(id, wire.value()?)),
+				RT_DONE => record_done(id, &mut wire),
+				_ => Err(RecipeError::new("runtime session verb is unknown")),
+			}
+		})();
+		match reply {
+			Ok(()) => send_frame(&mut stream, RT_OK, &[])?,
+			Err(error) => send_frame(&mut stream, RT_FAIL, error.to_string().as_bytes())?,
+		}
+	}
+}
+fn grant(stream: &mut TcpStream, canonical: &str) -> Result<()> {
+	let mut body = Vec::new();
+	put_blob(&mut body, canonical.as_bytes());
+	send_frame(stream, RT_GRANT, &body)
+}
+/// One verb serves every client: a dispatched executor claims the job it was
+/// granted, a client that is its own executor waits here for a device on its
+/// host, and a shipped declaration waits for the process the runtime dispatches
+/// for it.
+fn serve_job(mut stream: TcpStream, wire: &mut Wire) -> Result<()> {
+	let (job, token, host, device) = (wire.value()?, wire.value()?, wire.text()?, wire.text()?);
+	let (cpu, cwd, name, source) = (wire.value()? != 0, wire.text()?, wire.text()?, wire.blob()?.to_vec());
+	let state = runtime_state()?;
+	if job != 0 {
+		let mut rt = state.0.lock().map_err(|_| RecipeError::new("the Recipe runtime lock is poisoned"))?;
+		let claimed = (|| -> Result<String> {
+			let index = position(&rt, job).ok_or_else(|| RecipeError::new("job is unknown"))?;
+			require(rt.jobs[index].token == token, "job token mismatch")?;
+			require(rt.jobs[index].state == JobState::Preparing, "job is not awaiting its executor")?;
+			rt.jobs[index].device.map(|at| rt.devices[at].canonical.clone()).ok_or_else(|| RecipeError::new("job has no device"))
+		})();
+		let canonical = match claimed {
+			Ok(canonical) => canonical,
+			Err(error) => {
+				drop(rt);
+				return send_frame(&mut stream, RT_FAIL, error.to_string().as_bytes());
+			}
+		};
+		rt.sessions.insert(job, stream.try_clone().map_err(|error| RecipeError::new(format!("cannot clone a runtime connection: {error}")))?);
+		drop(rt);
+		grant(&mut stream, &canonical)?;
+		return session_serve(stream, job);
+	}
+	let local = source.is_empty();
+	let conn = if local { None } else { Some(Arc::new(Mutex::new(stream.try_clone().map_err(|error| RecipeError::new(format!("cannot clone a runtime connection: {error}")))?))) };
+	let id = {
+		let mut rt = state.0.lock().map_err(|_| RecipeError::new("the Recipe runtime lock is poisoned"))?;
+		match register_job(&mut rt, name, source, cwd, &host, &device, cpu, conn) {
+			Ok(id) => {
+				reschedule(&mut rt);
+				id
+			}
+			Err(error) => {
+				drop(rt);
+				return send_frame(&mut stream, RT_FAIL, error.to_string().as_bytes());
+			}
+		}
+	};
+	if !local {
+		// The shipped declaration runs as the process the runtime dispatched; this
+		// connection carries its published state, its output, and its exit. A
+		// client that vanishes or interrupts takes its job with it, so its device
+		// frees.
+		while read_frame(&mut stream).is_ok() {}
+		let mut rt = state.0.lock().map_err(|_| RecipeError::new("the Recipe runtime lock is poisoned"))?;
+		rt.conns.remove(&id);
+		interrupt_job(&mut rt, id);
+		return Ok(());
+	}
+	let canonical = {
+		let mut rt = state.0.lock().map_err(|_| RecipeError::new("the Recipe runtime lock is poisoned"))?;
+		loop {
+			let index = position(&rt, id).ok_or_else(|| RecipeError::new("job is unknown"))?;
+			if rt.jobs[index].state.terminal() {
+				let detail = rt.jobs[index].summary.clone();
+				drop(rt);
+				return send_frame(&mut stream, RT_FAIL, detail.as_bytes());
+			}
+			if let Some(at) = rt.jobs[index].device.filter(|_| rt.jobs[index].state == JobState::Preparing) {
+				break rt.devices[at].canonical.clone();
+			}
+			rt = state.1.wait(rt).map_err(|_| RecipeError::new("the Recipe runtime lock is poisoned"))?;
+		}
+	};
+	grant(&mut stream, &canonical)?;
+	let outcome = session_serve(stream, id);
+	// A client that is its own executor lives exactly as long as its connection:
+	// it completes when the process ends with every run released and fails when
+	// it dies holding a reservation or without any result.
+	let mut rt = state.0.lock().map_err(|_| RecipeError::new("the Recipe runtime lock is poisoned"))?;
+	rt.conns.remove(&id);
+	if let Some(index) = position(&rt, id)
+		&& !rt.jobs[index].state.terminal()
+	{
+		let job = &rt.jobs[index];
+		let (to, detail) = if job.device_bytes > 0 || job.runs == 0 { (JobState::Failed, "client closed without a completed run".to_owned()) } else { (JobState::Completed, job.summary.clone()) };
+		finish_job(&mut rt, index, to, detail).ok();
+		reschedule(&mut rt);
+	}
+	drop(rt);
+	outcome
+}
+fn serve_conn(mut stream: TcpStream) {
+	let Ok((verb, body)) = read_frame(&mut stream) else { return };
+	let mut wire = Wire::new(&body);
+	let served = match (verb, wire.value()) {
+		(RT_JOB, Ok(BUILD_ID)) => serve_job(stream, &mut wire),
+		(RT_JOB, Ok(_)) => send_frame(&mut stream, RT_FAIL, format!("a Recipe runtime from another build holds {}; stop it and retry", runtime_address()).as_bytes()),
+		_ => Err(RecipeError::new(format!("runtime verb {verb} is unknown"))),
+	};
+	if let Err(error) = served {
+		debug(&format!("runtime connection: {error}")).ok();
+	}
+}
+/// Serves the authoritative runtime on the configured socket.
+pub fn runtime() -> ! {
+	let address = runtime_address();
+	exit_with((|| -> Result<()> {
+		// The inventory is measured before the bind, so a client never reaches a
+		// backend that cannot serve; a concurrent election loser exits quietly.
+		let state = inventory(&address)?;
+		let listener = match TcpListener::bind(&address) {
+			Ok(listener) => listener,
+			Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => std::process::exit(0),
+			Err(error) => return Err(RecipeError::new(format!("cannot serve the Recipe runtime on {address}: {error}"))),
+		};
+		let devices = state.devices.iter().map(|device| format!("{}({})", device.canonical, device.backend)).collect::<Vec<_>>().join(" ");
+		let links = state.hosts.iter().zip(&state.links).map(|(host, link)| format!("{} {:.1}ms {:.0}MB/s", host.name, link.latency * 1e3, link.rate / 1e6)).collect::<Vec<_>>().join(" ");
+		eprintln!("recipe runtime {address} hosts {} devices {devices} links [{links}]", state.hosts.len());
+		debug(&format!("runtime serving {address} :: {}", ledger_line(&state))).ok();
+		require(RUNTIME_STATE.set((Mutex::new(state), Condvar::new())).is_ok(), "the runtime state is already initialized")?;
+		for stream in listener.incoming().flatten() {
+			std::thread::spawn(move || serve_conn(stream));
+		}
+		Err(RecipeError::new("the Recipe runtime listener closed"))
+	})())
+}
+fn connect_runtime(address: &str) -> Result<TcpStream> {
+	let deadline = Instant::now() + Duration::from_secs(30);
+	let mut spawned = false;
+	loop {
+		if let Ok(stream) = TcpStream::connect(address) {
+			return Ok(stream);
+		}
+		// This side of the address is unserved: this process elects a backend by
+		// checking the bind and starting one; a concurrent loser simply connects.
+		if !spawned
+			&& TcpListener::bind(address).is_ok()
+			&& let Some(binary) = runtime_binary()
+		{
+			Command::new(&binary).arg("--runtime").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().map_err(|error| RecipeError::new(format!("cannot start the Recipe runtime {binary}: {error}")))?;
+			spawned = true;
+		}
+		require(Instant::now() < deadline, format!("cannot reach the Recipe runtime at {address}"))?;
+		std::thread::sleep(Duration::from_millis(100));
+	}
+}
+fn job_frame(job: u64, token: u64, name: &str, source: &[u8], cwd: &str, device: &str) -> Result<Vec<u8>> {
+	let mut body = Vec::new();
+	for value in [BUILD_ID, job, token] {
+		put_value(&mut body, value);
+	}
+	put_blob(&mut body, hostname()?.as_bytes());
+	put_blob(&mut body, device.as_bytes());
+	put_value(&mut body, u64::from(std::env::var_os("RECIPE_FORCE_CPU").is_some()));
+	put_blob(&mut body, cwd.as_bytes());
+	put_blob(&mut body, name.as_bytes());
+	put_blob(&mut body, source);
+	Ok(body)
+}
+/// Submits one declaration from the public `recipe file.rs` boundary to the
+/// authoritative runtime and relays its published state, output, and exit.
+pub fn submit(source: &Path, device: Option<&str>) -> ! {
+	match submit_run(source, device) {
+		Ok(code) => std::process::exit(code),
+		Err(error) => {
+			eprintln!("{error}");
+			std::process::exit(1)
+		}
+	}
+}
+fn submit_run(source: &Path, device: Option<&str>) -> Result<i32> {
+	let bytes = fs::read(source).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", source.display())))?;
+	let name = source.file_name().and_then(|name| name.to_str()).unwrap_or("declaration").to_owned();
+	let cwd = std::env::current_dir().map_err(|error| RecipeError::new(format!("cannot resolve the working directory: {error}")))?;
+	let cwd = cwd.to_str().ok_or_else(|| RecipeError::new("working directory path is not UTF-8"))?.to_owned();
+	let request = device.map(str::to_owned).or_else(|| std::env::var("RECIPE_DEVICE").ok()).unwrap_or_default();
+	let mut stream = connect_runtime(&runtime_address())?;
+	send_frame(&mut stream, RT_JOB, &job_frame(0, 0, &name, &bytes, &cwd, &request)?)?;
+	loop {
+		let (verb, body) = read_frame(&mut stream)?;
+		let mut wire = Wire::new(&body);
+		match verb {
+			RT_STATE => {
+				let (state, detail) = (JobState::decode(wire.value()?), wire.text()?);
+				eprintln!("recipe: {}{}{detail}", state.label(), if detail.is_empty() { "" } else { " " });
+			}
+			RT_OUT => relay(&mut std::io::stdout().lock(), &body)?,
+			RT_ERR => relay(&mut std::io::stderr().lock(), &body)?,
+			RT_EXIT => return Ok(wire.value()? as i32),
+			RT_FAIL => return Err(RecipeError::new(String::from_utf8_lossy(&body).into_owned())),
+			_ => {}
+		}
+	}
+}
+fn relay(sink: &mut impl Write, bytes: &[u8]) -> Result<()> { sink.write_all(bytes).and_then(|_| sink.flush()).map_err(|error| RecipeError::new(format!("cannot relay output: {error}"))) }
+struct RuntimeSession {
+	stream: Mutex<TcpStream>,
+	gpu: &'static Gpu,
+}
+static SESSION: OnceLock<Result<RuntimeSession>> = OnceLock::new();
+/// The process's runtime session. A dispatched executor claims the job the
+/// runtime granted it; any other process, like a test or a linked binary,
+/// submits itself and waits for a device on its own host. Submission precedes
+/// every allocation: a queued declaration holds nothing.
+fn runtime_session() -> Result<&'static RuntimeSession> { SESSION.get_or_init(open_session).as_ref().map_err(Clone::clone) }
+fn open_session() -> Result<RuntimeSession> {
+	let claim = std::env::var("RECIPE_JOB").unwrap_or_default();
+	let claim = claim.split_once(':').map(|(job, token)| (job.parse::<u64>(), token.parse::<u64>()));
+	let (job, token) = match claim {
+		Some((Ok(job), Ok(token))) => (job, token),
+		Some(_) => return Err(RecipeError::new("RECIPE_JOB must be job:token")),
+		None => (0, 0),
+	};
+	let address = runtime_address();
+	let mut stream = if job == 0 { connect_runtime(&address)? } else { TcpStream::connect(&address).map_err(|error| RecipeError::new(format!("cannot reach the Recipe runtime at {address}: {error}")))? };
+	send_frame(&mut stream, RT_JOB, &job_frame(job, token, "declaration", &[], "", &std::env::var("RECIPE_DEVICE").unwrap_or_default())?)?;
+	loop {
+		let (verb, reply) = read_frame(&mut stream)?;
+		match verb {
+			RT_GRANT => return Ok(RuntimeSession { gpu: granted_device(&Wire::new(&reply).text()?)?, stream: Mutex::new(stream) }),
+			RT_FAIL => return Err(RecipeError::new(String::from_utf8_lossy(&reply).into_owned())),
+			_ => {}
+		}
+	}
+}
+impl RuntimeSession {
+	fn values(&self, verb: u8, values: &[u64]) -> Result<()> {
+		let mut body = Vec::new();
+		for value in values {
+			put_value(&mut body, *value);
+		}
+		let mut stream = self.stream.lock().map_err(|_| RecipeError::new("the runtime session lock is poisoned"))?;
+		send_frame(&mut stream, verb, &body)?;
+		match read_frame(&mut stream)? {
+			(RT_OK, _) => Ok(()),
+			(RT_FAIL, payload) => Err(RecipeError::new(String::from_utf8_lossy(&payload).into_owned())),
+			_ => Err(RecipeError::new("unexpected runtime session reply")),
+		}
+	}
+	fn hold(&self, bytes: u64) -> Result<()> { self.values(RT_HOLD, &[bytes]) }
+	fn release(&self, bytes: u64) { self.values(RT_FREE, &[bytes]).ok(); }
+	fn done(&self, loss: f64, r2: f64, seconds: f64, rows: u64, epochs: u64) -> Result<()> { self.values(RT_DONE, &[loss.to_bits(), r2.to_bits(), seconds.to_bits(), rows, epochs]) }
 }
 #[cfg(amd)]
 type HsaInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32;
@@ -6983,6 +7814,7 @@ unsafe extern "system" {
 }
 unsafe extern "C" {
 	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
+	fn kill(pid: i32, number: i32) -> i32;
 	#[cfg_attr(windows, link_name = "_write")]
 	fn write(file: i32, bytes: *const c_void, length: usize) -> isize;
 }
@@ -9905,11 +10737,14 @@ impl Train {
 		report
 	}
 	fn try_run(&self, model: &Model, data: &Data, evaluation: bool) -> Result<TrainingReport> {
+		// Submission precedes every allocation: this declaration is queued with the
+		// authoritative runtime and holds nothing until a device is granted.
+		let session = runtime_session()?;
 		let started = Instant::now();
 		let prepared = prepare(data)?;
 		let training_rows = ((prepared.source_rows as f64) * data.split).floor() as usize;
 		require(training_rows != 0 && training_rows <= prepared.source_rows, "split must select training rows")?;
-		let (gpu, mut config) = (selected_gpu()?, Config::load()?);
+		let (gpu, mut config) = (session.gpu, Config::load()?);
 		let precision = self.precision;
 		config.precision = precision;
 		if let Some(seed) = self.seed {
@@ -10023,6 +10858,7 @@ impl Train {
 		};
 		if !evaluated.is_empty() { predictions = evaluated }
 		self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, Some(()))?;
+		session.done(final_loss, r2, started.elapsed().as_secs_f64(), training_rows as u64, self.epochs as u64)?;
 		Ok(TrainingReport { initial_loss, final_loss, initial_predictions, predictions, r2, tile: tape.tile(), schedule: tape.schedule(), run, epoch: tape.step as usize, seconds: started.elapsed().as_secs_f64(), epoch_seconds })
 	}
 	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &DataSchema, tape: &NativeTape, save: Option<()>) -> Result<T> {

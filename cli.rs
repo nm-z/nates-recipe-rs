@@ -1,6 +1,6 @@
-use std::{fs, os::unix::process::ExitStatusExt, path::Path, path::PathBuf, process::Command};
+use std::{fs, os::unix::process::CommandExt, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [--device <name>] <source.rs> [export]";
+const USAGE: &str = "usage: recipe [--device <name>] <source.rs> [export] | recipe --runtime | recipe --probe";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -23,55 +23,51 @@ fn export(source: &Path, selected: Option<&str>) {
 	}
 }
 
+/// The newest Recipe library beside this binary, with the direct one winning ties.
 fn library_path(directory: &Path) -> PathBuf {
+	let named = |path: &Path| path.file_name().map(|value| value.to_string_lossy().into_owned()).unwrap_or_default();
 	let direct = directory.join("librecipe.rlib");
-	let dependencies = directory.join("deps");
-	let mut selected = direct.clone();
-	let mut selected_time = direct.metadata().and_then(|metadata| metadata.modified()).ok();
-	if let Ok(entries) = fs::read_dir(&dependencies) {
-		for candidate in entries.flatten() {
-			let path = candidate.path();
-			let name = path.file_name().map(|value| value.to_string_lossy()).unwrap_or_default();
-			if !name.starts_with("librecipe-") || !name.ends_with(".rlib") {
-				continue;
-			}
-			let Ok(modified) = path.metadata().and_then(|metadata| metadata.modified()) else { continue };
-			if selected_time.is_none_or(|time| modified > time) {
-				selected_time = Some(modified);
-				selected = path;
-			}
-		}
-	}
-	selected
+	fs::read_dir(directory.join("deps")).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| named(path).starts_with("librecipe-") && named(path).ends_with(".rlib")).chain([direct.clone()]).max_by_key(|path| path.metadata().and_then(|metadata| metadata.modified()).ok()).unwrap_or(direct)
 }
 
 fn run(source: &Path, device: Option<&str>) {
-	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
+	// The public boundary submits every declaration to the authoritative runtime;
+	// only an executor the runtime dispatched, marked by the RECIPE_JOB it was
+	// granted, compiles and becomes one here.
+	if std::env::var_os("RECIPE_JOB").is_none() {
+		recipe::submit(source, device)
+	}
+	let binary = std::env::current_exe().expect("cannot locate recipe");
+	let directory = binary.parent().expect("recipe has no parent directory").to_owned();
 	let library = library_path(&directory);
-	let dependencies = directory.join("deps");
-	// Each invocation compiles to its own output, so concurrent invocations never share one.
-	let output = directory.join(format!("recipe-script-{}", std::process::id()));
-	fs::metadata(&library).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", library.display()));
-	let status = Command::new("rustc").arg("--edition=2024").arg(source).arg("--extern").arg(format!("recipe={}", library.display())).arg("-L").arg(format!("dependency={}", dependencies.display())).arg("-o").arg(&output).status().expect("cannot execute rustc");
+	// The runtime staged this declaration and removes it and this executable when
+	// the job reaches a terminal state, so neither outlives the job.
+	let output = source.with_extension("job");
+	let status = Command::new("rustc").arg("--edition=2024").arg(source).arg("--extern").arg(format!("recipe={}", library.display())).arg("-L").arg(format!("dependency={}", directory.join("deps").display())).arg("-o").arg(&output).status().expect("cannot execute rustc");
 	if !status.success() {
 		fs::remove_file(&output).ok();
 		std::process::exit(status.code().unwrap_or(1));
 	}
+	// The executor becomes the declaration, so one process holds the granted
+	// device, takes the runtime's interrupt directly, and reports its own exit.
 	let mut command = Command::new(&output);
+	command.env("RECIPE_BIN", &binary);
 	if let Some(device) = device {
 		command.env("RECIPE_DEVICE", device);
 	}
-	// The running child holds the inode, so unlinking now leaves nothing behind
-	// when this process is killed before it could otherwise clean up.
-	let status = command.spawn().and_then(|mut child| { fs::remove_file(&output).ok(); child.wait() });
-	let status = status.unwrap_or_else(|error| panic!("cannot execute Recipe script: {error}"));
-	std::process::exit(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)));
+	panic!("cannot execute Recipe script: {}", command.exec());
 }
 
 fn main() {
 	let mut arguments = std::env::args().skip(1);
 	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
 	while let Some(argument) = arguments.next() {
+		if argument == "--runtime" {
+			recipe::runtime()
+		}
+		if argument == "--probe" {
+			recipe::probe()
+		}
 		if argument == "--device" {
 			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
 			if device.is_some() {
