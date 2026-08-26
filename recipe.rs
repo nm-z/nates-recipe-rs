@@ -1194,14 +1194,14 @@ fn prune_internal_definitions(mut ir: String) -> String {
 	loop {
 		let names = ir.match_indices("define internal ").filter_map(|(start, _)| {
 			let signature = &ir[start..ir[start..].find('{').map(|offset| start + offset)?];
-			let name = signature.rsplit_once('@')?.1.split_once('(')?.0;
-			Some(name.to_owned())
+			Some(signature.rsplit_once('@')?.1.split_once('(')?.0.to_owned())
 		}).collect::<Vec<_>>();
-		let dead: Vec<_> = names.iter().filter(|name| ir.match_indices(&format!("@{name}(")).count() == 1).cloned().collect();
-		if dead.is_empty() { return ir }
-		let mut spans: Vec<_> = dead.iter().filter_map(|name| definition_span(&ir, name)).collect();
-		spans.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-		for (start, end) in spans { ir.replace_range(start..end, "") }
+		// A reference reads "@name(", so one pass over the module's '@' positions counts every name at once instead of searching the whole module again once per name, and no name outruns the window so a later '(' names nothing. The definitions arrive in ascending order, so removing their spans in reverse leaves the earlier spans valid.
+		let (bytes, window, mut counts) = (ir.as_bytes(), names.iter().map(|name| name.len() + 1).max().unwrap_or(0), HashMap::new());
+		ir.match_indices('@').filter_map(|(at, _)| bytes[at + 1..(at + 1 + window).min(bytes.len())].iter().position(|&byte| byte == b'(').map(|stop| &bytes[at + 1..at + 1 + stop])).for_each(|name| *counts.entry(name).or_insert(0usize) += 1);
+		let spans: Vec<_> = names.iter().filter(|name| counts[name.as_bytes()] == 1).filter_map(|name| definition_span(&ir, name)).collect();
+		if spans.is_empty() { return ir }
+		for (start, end) in spans.into_iter().rev() { ir.replace_range(start..end, "") }
 	}
 }
 
@@ -3451,7 +3451,7 @@ mod bundle {
 	}
 }
 use std::{
-	collections::{BTreeMap, BTreeSet},
+	collections::{BTreeMap, BTreeSet, HashMap},
 	error::Error,
 	ffi::c_void,
 	fmt, fs,
