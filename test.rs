@@ -31,6 +31,7 @@ const LIFECYCLES: usize = 2;
 struct DataCase {
 	path: String,
 	test: Option<String>,
+	targets: &'static [&'static str],
 	mode: usize,
 	autoregressive: bool,
 }
@@ -148,6 +149,22 @@ fn end_cursor(start: u64, total: u64) -> u64 {
 		.map_or(total, |count| start.saturating_add(count).min(total))
 }
 
+fn targets(family: &str, path: &str) -> &'static [&'static str] {
+	if !path.contains("multi_target") {
+		return &["target"];
+	}
+	match family {
+		"categoric" => &["target", "defect_flag"],
+		"image" => &["target", "mask_area"],
+		"numeric" if path.contains("multi_input_multi_target") => &["target", "energy_index"],
+		"numeric" => &["target", "secondary_target"],
+		"ordinal" => &["target", "priority_level"],
+		"temporal" => &["target", "dew_point_c"],
+		"text" => &["target", "sentiment"],
+		_ => panic!("multi-target data family is unknown: {family}"),
+	}
+}
+
 fn datasets() -> Vec<DataCase> {
 	let mut families = std::fs::read_dir("data")
 		.expect("cannot read data")
@@ -157,6 +174,7 @@ fn datasets() -> Vec<DataCase> {
 	families.sort();
 	let mut cases = Vec::new();
 	for family in families {
+		let family_name = family.file_name().and_then(|name| name.to_str()).expect("data family name is not UTF-8");
 		let mut representations = std::fs::read_dir(&family)
 			.unwrap_or_else(|error| panic!("cannot read {}: {error}", family.display()))
 			.map(|entry| entry.expect("cannot read a data representation").path())
@@ -169,13 +187,34 @@ fn datasets() -> Vec<DataCase> {
 			let autoregressive = path.ends_with("autoregressive_lines.txt");
 			let modes = if autoregressive { AUTOREGRESSIVE_DATA_MODES } else { DATA_MODES };
 			let path = path.to_string_lossy().into_owned();
-			cases.extend((0..modes).map(|mode| DataCase { path: path.clone(), test: None, mode, autoregressive }));
+			let targets = targets(family_name, &path);
+			cases.extend((0..modes).map(|mode| DataCase { path: path.clone(), test: None, targets, mode, autoregressive }));
 		}
 	}
-	for family in ["numeric", "temporal"] {
-		let directory = format!("data/{family}/{}", if family == "numeric" { "split_files" } else { "chronological_splits" });
-		let (path, test) = (format!("{directory}/train.csv"), format!("{directory}/test.csv"));
-		cases.extend((4..7).map(|mode| DataCase { path: path.clone(), test: Some(test.clone()), mode, autoregressive: false }));
+	for (family, situations) in [
+		("numeric", ["split_files", "multi_input_split_files", "multi_target_split_files", "multi_input_multi_target_split_files"]),
+		(
+			"temporal",
+			[
+				"chronological_splits",
+				"multi_input_chronological_splits",
+				"multi_target_chronological_splits",
+				"multi_input_multi_target_chronological_splits",
+			],
+		),
+	] {
+		for situation in situations {
+			let directory = format!("data/{family}/{situation}");
+			let (path, test) = (format!("{directory}/train.csv"), format!("{directory}/test.csv"));
+			let targets = targets(family, &path);
+			cases.extend((4..7).map(|mode| DataCase {
+				path: path.clone(),
+				test: Some(test.clone()),
+				targets,
+				mode,
+				autoregressive: false,
+			}));
+		}
 	}
 	assert!(!cases.is_empty(), "data defines no composition cases");
 	cases
@@ -185,7 +224,7 @@ fn data(case: &DataCase) -> (Data, String) {
 	let (mut data, mut source) = if case.autoregressive {
 		(recipe.data(auto).set(case.path.clone()), format!("recipe.data(auto).set({:?})", case.path))
 	} else {
-		(recipe.data(case.path.clone()).target("target"), format!("recipe.data({:?}).target(\"target\")", case.path))
+		(recipe.data(case.path.clone()).target(case.targets), format!("recipe.data({:?}).target({:?})", case.path, case.targets))
 	};
 	match case.mode {
 		0 => {}
