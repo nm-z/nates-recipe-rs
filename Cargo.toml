@@ -15,6 +15,9 @@ path = "cli.rs"
 
 [package.metadata.recipe]
 runtime = "127.0.0.1:9462"
+runtime-connect-seconds = 30
+runtime-poll-milliseconds = 100
+runtime-idle-seconds = 30
 hosts = []
 host-memory-limit = 0.8
 dependency-allowlist = []

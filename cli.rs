@@ -43,7 +43,12 @@ fn run(source: &Path, device: Option<&str>) {
 	// The runtime staged this declaration and removes it and this executable when
 	// the job reaches a terminal state, so neither outlives the job.
 	let output = source.with_extension("job");
-	let status = Command::new("rustc").arg("--edition=2024").arg(source).arg("--extern").arg(format!("recipe={}", library.display())).arg("-L").arg(format!("dependency={}", directory.join("deps").display())).arg("-o").arg(&output).status().expect("cannot execute rustc");
+	let mut compiler = Command::new("rustc");
+	compiler.arg("--edition=2024").arg(source).arg("--extern").arg(format!("recipe={}", library.display())).arg("-L").arg(format!("dependency={}", directory.join("deps").display())).arg("-o").arg(&output);
+	if let Some(original) = std::env::var_os("RECIPE_SOURCE") {
+		compiler.arg("--remap-path-prefix").arg(format!("{}={}", source.display(), PathBuf::from(original).display()));
+	}
+	let status = compiler.status().expect("cannot execute rustc");
 	if !status.success() {
 		fs::remove_file(&output).ok();
 		std::process::exit(status.code().unwrap_or(1));

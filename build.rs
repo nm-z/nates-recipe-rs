@@ -696,7 +696,7 @@ fn main() -> BuildResult<()> {
 }
 
 /// The authoritative runtime configuration: one typed TOML definition names the
-/// runtime socket, the reachable hosts, and the reservable host-memory limit.
+/// runtime socket, timing, reachable hosts, and reservable host-memory limit.
 fn runtime_configuration(manifest: &str) -> BuildResult<()> {
 	let runtime = text(manifest, "runtime")?;
 	let (address, port) = runtime.rsplit_once(':').ok_or_else(|| io::Error::other("runtime must be an address:port"))?;
@@ -719,6 +719,14 @@ fn runtime_configuration(manifest: &str) -> BuildResult<()> {
 	let limit = number(manifest, "host-memory-limit")?;
 	if limit.parse::<f64>().ok().filter(|value| *value > 0.0 && *value <= 1.0).is_none() {
 		return Err(io::Error::other("host-memory-limit must be a fraction above zero and at most one").into());
+	}
+	let timing = [("runtime-connect-seconds", "RECIPE_RUNTIME_CONNECT_SECONDS"), ("runtime-poll-milliseconds", "RECIPE_RUNTIME_POLL_MILLISECONDS"), ("runtime-idle-seconds", "RECIPE_RUNTIME_IDLE_SECONDS")];
+	for (key, environment) in timing {
+		let value = setting(manifest, key)?;
+		if value.parse::<u64>().ok().filter(|value| *value != 0).is_none() {
+			return Err(io::Error::other(format!("{key} must be a positive integer")).into());
+		}
+		println!("cargo:rustc-env={environment}={value}");
 	}
 	println!("cargo:rustc-env=RECIPE_RUNTIME={runtime}");
 	println!("cargo:rustc-env=RECIPE_HOSTS={}", hosts.join(";"));

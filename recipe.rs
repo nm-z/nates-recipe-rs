@@ -6350,7 +6350,7 @@ impl Gpu {
 			let work = checked_mul(checked_mul(shape.gradient.m as usize, shape.gradient.n as usize, "native contraction output work")?, shape.gradient.k as usize, "native contraction work")?;
 			if dominant.is_none_or(|(_, best)| work > best) { dominant = Some((index, work)) }
 		}
-		let wave = match &self.driver {
+		let wave: u32 = match &self.driver {
 			Driver::Cpu => 1,
 			#[cfg(amd)]
 			Driver::Hsa(driver) => driver.wave,
@@ -6572,8 +6572,24 @@ const RT_ERR: u8 = 8;
 const RT_EXIT: u8 = 9;
 const RT_OK: u8 = 10;
 const RT_FAIL: u8 = 11;
+const RT_RESTART: u8 = 12;
 const RUNTIME_FRAME_LIMIT: usize = 1 << 26;
 const BUILD_ID: u64 = parse_natural(env!("RECIPE_BUILD_ID"), "build fingerprint must be numeric") as u64;
+const RUNTIME_CONNECT_TIMEOUT: Duration = Duration::from_secs(runtime_natural(env!("RECIPE_RUNTIME_CONNECT_SECONDS"), "runtime connect seconds must be a positive integer"));
+const RUNTIME_POLL_INTERVAL: Duration = Duration::from_millis(runtime_natural(env!("RECIPE_RUNTIME_POLL_MILLISECONDS"), "runtime poll milliseconds must be a positive integer"));
+const RUNTIME_IDLE_TIMEOUT: Duration = Duration::from_secs(runtime_natural(env!("RECIPE_RUNTIME_IDLE_SECONDS"), "runtime idle seconds must be a positive integer"));
+const RUNTIME_CLIENT_ENV: [&str; 4] = ["RECIPE_FORCE_CPU", "RECIPE_DEVICE", "RECIPE_JOB", "RECIPE_SOURCE"];
+const fn runtime_natural(text: &str, role: &'static str) -> u64 {
+	let text = text.as_bytes();
+	let (mut value, mut index) = (0_u64, 0);
+	while index < text.len() {
+		assert!(text[index].is_ascii_digit(), "{}", role);
+		value = value * 10 + (text[index] - b'0') as u64;
+		index += 1;
+	}
+	assert!(value != 0, "{}", role);
+	value
+}
 fn runtime_address() -> String { std::env::var("RECIPE_RUNTIME").unwrap_or_else(|_| env!("RECIPE_RUNTIME").to_owned()) }
 /// The `recipe` binary this process belongs to, resolved while running rather
 /// than recorded at build time, so a moved, copied, or installed build still
@@ -6700,6 +6716,7 @@ struct RuntimeState {
 	conns: BTreeMap<u64, Arc<Mutex<TcpStream>>>,
 	/// Claimed executor sessions; closing one cancels its job's next operation.
 	sessions: BTreeMap<u64, TcpStream>,
+	connections: u64,
 	next: u64,
 	address: String,
 }
@@ -6806,7 +6823,7 @@ fn inventory(address: &str) -> Result<RuntimeState> {
 		}
 		require(hosts[index].memory != 0, format!("host {} reported no memory", hosts[index].name))?;
 	}
-	Ok(RuntimeState { hosts, devices, links, jobs: Vec::new(), conns: BTreeMap::new(), sessions: BTreeMap::new(), next: 0, address: address.to_owned() })
+	Ok(RuntimeState { hosts, devices, links, jobs: Vec::new(), conns: BTreeMap::new(), sessions: BTreeMap::new(), connections: 0, next: 0, address: address.to_owned() })
 }
 fn ledger_line(rt: &RuntimeState) -> String {
 	let hosts = rt.hosts.iter().map(|host| format!("{} {}/{}", host.name, host.reserved, host.limit)).collect::<Vec<_>>().join(" ");
@@ -6873,13 +6890,15 @@ fn policy_order(rt: &RuntimeState, left: usize, right: usize) -> std::cmp::Order
 fn eligible_device(rt: &RuntimeState, index: usize) -> Option<usize> {
 	let job = &rt.jobs[index];
 	let scope = if job.source.is_empty() { job.home } else { None };
+	let native = rt.devices.iter().any(|device| scope.is_none_or(|host| device.host == host) && device.exclusive);
 	let compatible = |(_, device): &(usize, &DeviceRec)| scope.is_none_or(|host| device.host == host) && (!device.exclusive || device.job.is_none());
-	let requested = |(_, device): &(usize, &DeviceRec)| if job.request.is_empty() { if job.cpu { !device.exclusive } else { !job.source.is_empty() || device.exclusive } } else { device.canonical == job.request || (job.home == Some(device.host) && device.name == job.request) };
+	let requested = |(_, device): &(usize, &DeviceRec)| if job.request.is_empty() { if job.cpu { !device.exclusive } else { !job.source.is_empty() || !native || device.exclusive } } else { device.canonical == job.request || (job.home == Some(device.host) && device.name == job.request) };
 	rt.devices.iter().enumerate().filter(compatible).filter(requested).map(|(at, _)| at).min_by(|a, b| policy_order(rt, *a, *b))
 }
 struct JobOrder {
 	job: u64,
 	token: u64,
+	name: String,
 	command: Vec<String>,
 	binary: String,
 	device: String,
@@ -6907,7 +6926,7 @@ fn schedule_pass(rt: &mut RuntimeState) -> Vec<JobOrder> {
 		set_state(rt, index, JobState::Preparing, canonical).ok();
 		if !rt.jobs[index].source.is_empty() {
 			let host = &rt.hosts[rt.devices[at].host];
-			orders.push(JobOrder { job: id, token: rt.jobs[index].token, command: host.command.clone(), binary: host.binary.clone(), device: rt.devices[at].name.clone(), cpu: !rt.devices[at].exclusive, source: rt.jobs[index].source.clone(), cwd: rt.jobs[index].cwd.clone(), address: rt.address.clone(), client: rt.conns.get(&id).cloned() });
+			orders.push(JobOrder { job: id, token: rt.jobs[index].token, name: rt.jobs[index].name.clone(), command: host.command.clone(), binary: host.binary.clone(), device: rt.devices[at].name.clone(), cpu: !rt.devices[at].exclusive, source: rt.jobs[index].source.clone(), cwd: rt.jobs[index].cwd.clone(), address: rt.address.clone(), client: rt.conns.get(&id).cloned() });
 		}
 	}
 	orders
@@ -6942,7 +6961,8 @@ fn dispatch_process(order: &JobOrder) -> Result<i32> {
 	let script = format!("/tmp/recipe-job-{}.rs", order.job);
 	let staged = host_run(&order.command, &format!("cat > {}", shell_quote(&script)), Some(&order.source))?;
 	require(staged.status.success(), format!("cannot stage job {}: {}", order.job, String::from_utf8_lossy(&staged.stderr)))?;
-	let line = format!("cd {} && RECIPE_JOB={}:{} RECIPE_RUNTIME={} RECIPE_DEVICE={} {}exec {} {}", shell_quote(&order.cwd), order.job, order.token, shell_quote(&order.address), shell_quote(&order.device), if order.cpu { "RECIPE_FORCE_CPU=1 " } else { "" }, shell_quote(&order.binary), shell_quote(&script));
+	let source = Path::new(&order.cwd).join(&order.name);
+	let line = format!("cd {} && RECIPE_SOURCE={} RECIPE_JOB={}:{} RECIPE_RUNTIME={} RECIPE_DEVICE={} {}exec {} {}", shell_quote(&order.cwd), shell_quote(&source.to_string_lossy()), order.job, order.token, shell_quote(&order.address), shell_quote(&order.device), if order.cpu { "RECIPE_FORCE_CPU=1 " } else { "" }, shell_quote(&order.binary), shell_quote(&script));
 	let argv = host_argv(&order.command, &line);
 	// The runtime's own debug log owns the root recipe.log; a dispatched local
 	// process must not truncate it.
@@ -7202,11 +7222,38 @@ fn serve_conn(mut stream: TcpStream) {
 	let mut wire = Wire::new(&body);
 	let served = match (verb, wire.value()) {
 		(RT_JOB, Ok(BUILD_ID)) => serve_job(stream, &mut wire),
-		(RT_JOB, Ok(_)) => send_frame(&mut stream, RT_FAIL, format!("a Recipe runtime from another build holds {}; stop it and retry", runtime_address()).as_bytes()),
+		(RT_JOB, Ok(_)) => restart_runtime(&mut stream),
 		_ => Err(RecipeError::new(format!("runtime verb {verb} is unknown"))),
 	};
 	if let Err(error) = served {
 		debug(&format!("runtime connection: {error}")).ok();
+	}
+}
+fn restart_runtime(stream: &mut TcpStream) -> Result<()> {
+	let idle = {
+		let rt = locked()?;
+		rt.connections == 1 && rt.jobs.iter().all(|job| job.state.terminal())
+	};
+	if !idle {
+		return send_frame(stream, RT_FAIL, b"a Recipe runtime from another build has active jobs; retry when they finish");
+	}
+	send_frame(stream, RT_RESTART, &[])?;
+	let (verb, body) = read_frame(stream)?;
+	require(verb == RT_OK && body.is_empty(), "runtime restart was not acknowledged")?;
+	std::process::exit(0)
+}
+fn exit_when_idle(state: &'static (Mutex<RuntimeState>, Condvar)) {
+	let Ok(mut rt) = state.0.lock() else { return };
+	loop {
+		while rt.connections != 0 || rt.jobs.iter().any(|job| !job.state.terminal()) {
+			let Ok(next) = state.1.wait(rt) else { return };
+			rt = next;
+		}
+		let Ok((next, waited)) = state.1.wait_timeout(rt, RUNTIME_IDLE_TIMEOUT) else { return };
+		rt = next;
+		if waited.timed_out() && rt.connections == 0 && rt.jobs.iter().all(|job| job.state.terminal()) {
+			std::process::exit(0)
+		}
 	}
 }
 /// Serves the authoritative runtime on the configured socket.
@@ -7226,14 +7273,26 @@ pub fn runtime() -> ! {
 		eprintln!("recipe runtime {address} hosts {} devices {devices} links [{links}]", state.hosts.len());
 		debug(&format!("runtime serving {address} :: {}", ledger_line(&state))).ok();
 		require(RUNTIME_STATE.set((Mutex::new(state), Condvar::new())).is_ok(), "the runtime state is already initialized")?;
+		let state = runtime_state()?;
+		std::thread::spawn(move || exit_when_idle(state));
 		for stream in listener.incoming().flatten() {
-			std::thread::spawn(move || serve_conn(stream));
+			if let Ok(mut rt) = state.0.lock() {
+				rt.connections = rt.connections.saturating_add(1);
+				state.1.notify_all();
+			}
+			std::thread::spawn(move || {
+				serve_conn(stream);
+				if let Ok(mut rt) = state.0.lock() {
+					rt.connections = rt.connections.saturating_sub(1);
+					state.1.notify_all();
+				}
+			});
 		}
 		Err(RecipeError::new("the Recipe runtime listener closed"))
 	})())
 }
 fn connect_runtime(address: &str) -> Result<TcpStream> {
-	let deadline = Instant::now() + Duration::from_secs(30);
+	let deadline = Instant::now() + RUNTIME_CONNECT_TIMEOUT;
 	let mut spawned = false;
 	loop {
 		if let Ok(stream) = TcpStream::connect(address) {
@@ -7245,11 +7304,32 @@ fn connect_runtime(address: &str) -> Result<TcpStream> {
 			&& TcpListener::bind(address).is_ok()
 			&& let Some(binary) = runtime_binary()
 		{
-			Command::new(&binary).arg("--runtime").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().map_err(|error| RecipeError::new(format!("cannot start the Recipe runtime {binary}: {error}")))?;
+			let mut command = Command::new(&binary);
+			command.arg("--runtime").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+			for variable in RUNTIME_CLIENT_ENV {
+				command.env_remove(variable);
+			}
+			command.spawn().map_err(|error| RecipeError::new(format!("cannot start the Recipe runtime {binary}: {error}")))?;
 			spawned = true;
 		}
 		require(Instant::now() < deadline, format!("cannot reach the Recipe runtime at {address}"))?;
-		std::thread::sleep(Duration::from_millis(100));
+		std::thread::sleep(RUNTIME_POLL_INTERVAL);
+	}
+}
+fn start_job(address: &str, frame: &[u8]) -> Result<(TcpStream, (u8, Vec<u8>))> {
+	loop {
+		let mut stream = connect_runtime(address)?;
+		send_frame(&mut stream, RT_JOB, frame)?;
+		let reply = read_frame(&mut stream)?;
+		// The old daemon stays alive until this client acknowledges the restart,
+		// then this client waits for the socket to close before electing the new build.
+		if reply.0 == RT_RESTART {
+			send_frame(&mut stream, RT_OK, &[])?;
+			let mut closed = [0_u8; 1];
+			let _ = stream.read(&mut closed);
+		} else {
+			return Ok((stream, reply));
+		}
 	}
 }
 fn job_frame(job: u64, token: u64, name: &str, source: &[u8], cwd: &str, device: &str) -> Result<Vec<u8>> {
@@ -7278,14 +7358,19 @@ pub fn submit(source: &Path, device: Option<&str>) -> ! {
 }
 fn submit_run(source: &Path, device: Option<&str>) -> Result<i32> {
 	let bytes = fs::read(source).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", source.display())))?;
-	let name = source.file_name().and_then(|name| name.to_str()).unwrap_or("declaration").to_owned();
+	let name = source.to_str().ok_or_else(|| RecipeError::new("source path is not UTF-8"))?.to_owned();
 	let cwd = std::env::current_dir().map_err(|error| RecipeError::new(format!("cannot resolve the working directory: {error}")))?;
 	let cwd = cwd.to_str().ok_or_else(|| RecipeError::new("working directory path is not UTF-8"))?.to_owned();
 	let request = device.map(str::to_owned).or_else(|| std::env::var("RECIPE_DEVICE").ok()).unwrap_or_default();
-	let mut stream = connect_runtime(&runtime_address())?;
-	send_frame(&mut stream, RT_JOB, &job_frame(0, 0, &name, &bytes, &cwd, &request)?)?;
+	let address = runtime_address();
+	let frame = job_frame(0, 0, &name, &bytes, &cwd, &request)?;
+	let (mut stream, first) = start_job(&address, &frame)?;
+	let mut first = Some(first);
 	loop {
-		let (verb, body) = read_frame(&mut stream)?;
+		let (verb, body) = match first.take() {
+			Some(reply) => reply,
+			None => read_frame(&mut stream)?,
+		};
 		let mut wire = Wire::new(&body);
 		match verb {
 			RT_STATE => {
@@ -7320,10 +7405,21 @@ fn open_session() -> Result<RuntimeSession> {
 		None => (0, 0),
 	};
 	let address = runtime_address();
-	let mut stream = if job == 0 { connect_runtime(&address)? } else { TcpStream::connect(&address).map_err(|error| RecipeError::new(format!("cannot reach the Recipe runtime at {address}: {error}")))? };
-	send_frame(&mut stream, RT_JOB, &job_frame(job, token, "declaration", &[], "", &std::env::var("RECIPE_DEVICE").unwrap_or_default())?)?;
+	let frame = job_frame(job, token, "declaration", &[], "", &std::env::var("RECIPE_DEVICE").unwrap_or_default())?;
+	let (mut stream, first) = if job == 0 {
+		start_job(&address, &frame)?
+	} else {
+		let mut stream = TcpStream::connect(&address).map_err(|error| RecipeError::new(format!("cannot reach the Recipe runtime at {address}: {error}")))?;
+		send_frame(&mut stream, RT_JOB, &frame)?;
+		let first = read_frame(&mut stream)?;
+		(stream, first)
+	};
+	let mut first = Some(first);
 	loop {
-		let (verb, reply) = read_frame(&mut stream)?;
+		let (verb, reply) = match first.take() {
+			Some(reply) => reply,
+			None => read_frame(&mut stream)?,
+		};
 		match verb {
 			RT_GRANT => return Ok(RuntimeSession { gpu: granted_device(&Wire::new(&reply).text()?)?, stream: Mutex::new(stream) }),
 			RT_FAIL => return Err(RecipeError::new(String::from_utf8_lossy(&reply).into_owned())),
