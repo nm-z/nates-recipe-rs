@@ -598,7 +598,8 @@ pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorCon
 				stack.push(format!("%{p}.result"));
 			}
 			PredictorOpcode::Affine => {
-				if context.features == 0 || context.parameters != 3 * context.features {
+				let direct = context.parameters == context.features;
+				if context.features == 0 || (!direct && context.parameters != 3 * context.features) {
 					return Err(EmitError::InvalidOperand { kind: "affine table width", value: context.parameters as f64 });
 				}
 				let ty = context.value_type;
@@ -611,16 +612,21 @@ pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorCon
 				let _ = writeln!(output, "%{p}.j = phi i32 [ 0, %{p}.entry ], [ %{p}.j.next, %{p}.body ]");
 				let _ = writeln!(output, "%{p}.acc = phi {ty} [ {zero}, %{p}.entry ], [ %{p}.acc.next, %{p}.body ]");
 				let _ = writeln!(output, "%{p}.more = icmp ult i32 %{p}.j, {features}\nbr i1 %{p}.more, label %{p}.body, label %{p}.done", features = context.features);
-				// The table is three feature-length planes (means, scales, weights),
-				// accumulated per feature as (x - mean) * scale * weight. The
-				// weights pointer is already advanced to this node's parameter
-				// span, so the plane indices are node-relative.
+				// A direct table stores one weight plane and accumulates x * weight.
+				// A standardized table stores means, scales, and weights and accumulates
+				// (x - mean) * scale * weight. Indices are node-relative because the
+				// weights pointer is already advanced to this node's parameter span.
 				let _ = writeln!(output, "{p}.body:");
 				let _ = writeln!(output, "%{p}.q.base = mul i32 {row}, {features}\n%{p}.q.index = add i32 %{p}.q.base, %{p}.j\n%{p}.q.ptr = getelementptr inbounds {ty}, {ptr} {input}, i32 %{p}.q.index\n%{p}.q = load {ty}, {ptr} %{p}.q.ptr, align {align}", row = context.row, features = context.features, input = context.input);
-				let _ = writeln!(output, "%{p}.mean.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.j\n%{p}.mean = load {ty}, {ptr} %{p}.mean.ptr, align {align}", weights = context.weights);
-				let _ = writeln!(output, "%{p}.scale.index = add i32 %{p}.j, {features}\n%{p}.scale.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.scale.index\n%{p}.scale = load {ty}, {ptr} %{p}.scale.ptr, align {align}", features = context.features, weights = context.weights);
-				let _ = writeln!(output, "%{p}.weight.index = add i32 %{p}.scale.index, {features}\n%{p}.weight.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.weight.index\n%{p}.weight = load {ty}, {ptr} %{p}.weight.ptr, align {align}", features = context.features, weights = context.weights);
-				let _ = writeln!(output, "%{p}.centered = call {ty} @recipe.sub({ty} %{p}.q, {ty} %{p}.mean)\n%{p}.scaled = call {ty} @recipe.mul({ty} %{p}.centered, {ty} %{p}.scale)\n%{p}.term = call {ty} @recipe.mul({ty} %{p}.scaled, {ty} %{p}.weight)\n%{p}.acc.next = call {ty} @recipe.add({ty} %{p}.acc, {ty} %{p}.term)");
+				if direct {
+					let _ = writeln!(output, "%{p}.weight.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.j\n%{p}.weight = load {ty}, {ptr} %{p}.weight.ptr, align {align}", weights = context.weights);
+					let _ = writeln!(output, "%{p}.term = call {ty} @recipe.mul({ty} %{p}.q, {ty} %{p}.weight)\n%{p}.acc.next = call {ty} @recipe.add({ty} %{p}.acc, {ty} %{p}.term)");
+				} else {
+					let _ = writeln!(output, "%{p}.mean.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.j\n%{p}.mean = load {ty}, {ptr} %{p}.mean.ptr, align {align}", weights = context.weights);
+					let _ = writeln!(output, "%{p}.scale.index = add i32 %{p}.j, {features}\n%{p}.scale.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.scale.index\n%{p}.scale = load {ty}, {ptr} %{p}.scale.ptr, align {align}", features = context.features, weights = context.weights);
+					let _ = writeln!(output, "%{p}.weight.index = add i32 %{p}.scale.index, {features}\n%{p}.weight.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.weight.index\n%{p}.weight = load {ty}, {ptr} %{p}.weight.ptr, align {align}", features = context.features, weights = context.weights);
+					let _ = writeln!(output, "%{p}.centered = call {ty} @recipe.sub({ty} %{p}.q, {ty} %{p}.mean)\n%{p}.scaled = call {ty} @recipe.mul({ty} %{p}.centered, {ty} %{p}.scale)\n%{p}.term = call {ty} @recipe.mul({ty} %{p}.scaled, {ty} %{p}.weight)\n%{p}.acc.next = call {ty} @recipe.add({ty} %{p}.acc, {ty} %{p}.term)");
+				}
 				let _ = writeln!(output, "%{p}.j.next = add i32 %{p}.j, 1\nbr label %{p}.head\n{p}.done:");
 				stack.push(format!("%{p}.acc"));
 			}
@@ -5095,7 +5101,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		output_profile = StorageFormat(model.quantization).selection().map(|_| StorageFormat(model.quantization));
 	}
 	if let Some(format) = output_profile
-		&& let Some(node) = graph.nodes.iter_mut().rev().find(|node| node.parameters != 0 && node.block_index + 1 == model.blocks.len())
+		&& let Some(node) = graph.nodes.iter_mut().rev().find(|node| node.op != Primitive::Predictor && node.parameters != 0 && node.block_index + 1 == model.blocks.len())
 	{
 		node.argument[8] = f64::from(format.tensor(0, false, true))
 	}
@@ -5181,7 +5187,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		let more = graph.block_index < total / 8 || graph.block_index >= 7 * total / 8 || (graph.block_index - total / 8) % 3 == 2;
 		let mut parameter = 0;
 		for node in &mut graph.nodes[first..] {
-			if node.parameters != 0 {
+			if node.op != Primitive::Predictor && node.parameters != 0 {
 				let role = if block.operation.name() == "attn" { parameter } else { 0 };
 				node.argument[8] = f64::from(if block.profile { StorageFormat(block.quantization).tensor(role, more, false) } else { block.quantization });
 				parameter += 1
@@ -7096,10 +7102,15 @@ impl PredictorProgram {
 					stack.push(best.iter().map(|slot| slot.1).sum::<f64>() / count as f64)
 				},
 				value if value == PredictorOpcode::Affine as i32 => {
-					require(self.table.len() == 3 * query.len() && !query.is_empty(), "affine table width is invalid")?;
-					let (means, rest) = self.table.split_at(query.len());
-					let (scales, weights) = rest.split_at(query.len());
-					stack.push(query.iter().zip(means).zip(scales).zip(weights).map(|(((value, mean), scale), weight)| (value - mean) * scale * weight).sum())
+					require(!query.is_empty() && (self.table.len() == query.len() || self.table.len() == 3 * query.len()), "affine table width is invalid")?;
+					let value = if self.table.len() == query.len() {
+						query.iter().zip(&self.table).map(|(value, weight)| value * weight).sum()
+					} else {
+						let (means, rest) = self.table.split_at(query.len());
+						let (scales, weights) = rest.split_at(query.len());
+						query.iter().zip(means).zip(scales).zip(weights).map(|(((value, mean), scale), weight)| (value - mean) * scale * weight).sum()
+					};
+					stack.push(value)
 				},
 				value if value == PredictorOpcode::Gauss as i32 => {
 					let class = slot()?;
@@ -7336,17 +7347,13 @@ fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) ->
 		}
 		for feature in 0..data.features { matrix[feature * data.features + feature] += config.bayes_prior_precision }
 		let weights = solve_linear(matrix, values, config.bayes_variance_epsilon)?;
-		// The fitted model lives in the predictor table as three feature-length
-		// planes (means, scales, weights) like fit_svm, so the emitted program
-		// is a fixed-size feature loop instead of straight-line code that grows
-		// with the feature count.
-		let mut table = Vec::with_capacity(3 * data.features);
-		table.extend_from_slice(&means);
-		table.resize(2 * data.features, 1.0);
-		table.extend(weights);
+		let bias = target_mean - weights.iter().zip(&means).map(|(weight, mean)| weight * mean).sum::<f64>();
+		// The fitted weights live in one predictor table plane, so the emitted
+		// program keeps the original bias plus dot-product association while
+		// replacing per-feature straight-line code with one fixed-size loop.
 		let mut program = PredictorBuilder::new();
-		program.constant(target_mean);
-		program.affine(table);
+		program.constant(bias);
+		program.affine(weights);
 		program.binary(PredictorOpcode::Add);
 		return Ok(Predictor::new(program.finish()?));
 	}
