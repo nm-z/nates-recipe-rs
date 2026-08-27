@@ -6899,10 +6899,31 @@ fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 		.map_err(Clone::clone)
 }
 fn selected_gpu() -> Result<&'static Gpu> { selected_gpus().map(|gpus| gpus[0]) }
+struct RemoteDirectory {
+	host: String,
+	path: String,
+}
+impl Drop for RemoteDirectory {
+	fn drop(&mut self) {
+		Command::new("ssh").args(["-o", "BatchMode=yes", &self.host, &format!("rm -rf -- {}", self.path)]).status().ok();
+	}
+}
+fn command_output(command: &mut Command, action: &str) -> Result<Vec<u8>> {
+	let output = command.output().map_err(|error| RecipeError::new(format!("cannot {action}: {error}")))?;
+	require(output.status.success(), format!("cannot {action}: {}", String::from_utf8_lossy(&output.stderr)))?;
+	Ok(output.stdout)
+}
+fn remote_directory(host: &str) -> Result<RemoteDirectory> {
+	let mut command = Command::new("ssh");
+	command.args(["-o", "BatchMode=yes", host, "umask 077; mktemp -d /tmp/recipe.XXXXXXXX"]);
+	let output = command_output(&mut command, &format!("create a private worker directory on {host}"))?;
+	let path = String::from_utf8(output).map_err(|error| RecipeError::new(format!("worker directory from {host} is invalid: {error}")))?.trim().to_owned();
+	require(path.starts_with("/tmp/recipe.") && path.len() == "/tmp/recipe.".len() + 8 && path.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte)), format!("worker directory from {host} is unsafe: {path:?}"))?;
+	Ok(RemoteDirectory { host: host.to_owned(), path })
+}
 /// Uploads this build's `recipe` binary to the remote host, starts it as a
 /// device worker over SSH, and wraps the probed device as a local `Gpu` whose
-/// driver speaks the worker protocol. The worker removes the uploaded binary
-/// once it is running, so nothing is left behind on the remote host.
+/// driver speaks the worker protocol.
 fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'static Gpu> {
 	static REMOTES: Mutex<Vec<&'static Gpu>> = Mutex::new(Vec::new());
 	let mut remotes = REMOTES.lock().map_err(|_| RecipeError::new("remote registry is poisoned"))?;
@@ -6911,17 +6932,26 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 	}
 	let binary = std::env::var_os("RECIPE_BINARY").map(PathBuf::from).ok_or_else(|| RecipeError::new(format!("GPU {canonical:?} requires the recipe launcher to reach host {host:?}")))?;
 	require(binary.is_file(), format!("recipe binary is absent at {}", binary.display()))?;
-	let remote_path = format!("/tmp/recipe-worker-{}", std::process::id());
+	let directory = remote_directory(host)?;
+	let remote_path = format!("{}/recipe", directory.path);
 	let copy = Command::new("scp").args(["-q", "-o", "BatchMode=yes"]).arg(&binary).arg(format!("{host}:{remote_path}")).status().map_err(|error| RecipeError::new(format!("cannot copy the worker to {host}: {error}")))?;
 	require(copy.success(), format!("cannot copy the worker to {host}: {copy}"))?;
+	let mut local_hash = Command::new("sha256sum");
+	local_hash.arg(&binary);
+	let local_hash = command_output(&mut local_hash, "hash the local worker")?;
+	let mut remote_hash = Command::new("ssh");
+	remote_hash.args(["-o", "BatchMode=yes", host, &format!("sha256sum {remote_path}")]);
+	let remote_hash = command_output(&mut remote_hash, &format!("hash the copied worker on {host}"))?;
+	require(local_hash.split(|byte| byte.is_ascii_whitespace()).next() == remote_hash.split(|byte| byte.is_ascii_whitespace()).next(), format!("copied worker hash differs on {host}"))?;
 	let mut child = Command::new("ssh")
-		.args(["-o", "BatchMode=yes", host, &format!("RECIPE_WORKER_REMOVE=1 {remote_path} --worker {device_name}")])
+		.args(["-o", "BatchMode=yes", host, &format!("{remote_path} --worker {device_name}")])
 		.stdin(std::process::Stdio::piped())
 		.stdout(std::process::Stdio::piped())
 		.spawn()
 		.map_err(|error| RecipeError::new(format!("cannot start the worker on {host}: {error}")))?;
 	let input = child.stdin.take().ok_or_else(|| RecipeError::new("remote worker stdin is absent"))?;
 	let output = child.stdout.take().ok_or_else(|| RecipeError::new("remote worker stdout is absent"))?;
+	std::thread::spawn(move || child.wait());
 	let mut channel = RemoteChannel { input: std::io::BufReader::new(output), output: std::io::BufWriter::new(input), role: "remote" };
 	channel.read_status(&format!("worker on {host}"))?;
 	let backend = match channel.read_u8()? {
@@ -6935,6 +6965,7 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 	let memory = channel.read_u64()?;
 	let shared_limit = channel.read_u32()?;
 	let wave = channel.read_u32()?;
+	drop(directory);
 	let native_target = match backend {
 		Backend::Amd => BackendTarget::Amd { architecture },
 		_ => BackendTarget::Nvidia { architecture },
@@ -7460,11 +7491,6 @@ struct WorkerProgram {
 /// verbs plus artifact load and entrypoint dispatch, so a driving process can
 /// place work on this host's device exactly as on a local one.
 pub fn worker_serve(name: &str) -> Result<()> {
-	if std::env::var_os("RECIPE_WORKER_REMOVE").is_some()
-		&& let Ok(binary) = std::env::current_exe()
-	{
-		fs::remove_file(binary).ok();
-	}
 	let mut wire = WorkerWire { input: std::io::BufReader::new(std::io::stdin()), output: std::io::BufWriter::new(std::io::stdout()), role: "worker" };
 	let probe = device(Some(name)).and_then(|gpu| {
 		let (backend, wave) = match &gpu.driver {
