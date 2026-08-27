@@ -111,7 +111,7 @@ importance quantized:
 	.iq(2|3).(xxs|xs|s|m)
 	.iq(4).(xs|nl)
 ```
-###### reporting:
+##### **reporting:**
 
 ```rust
 let report = recipe.train()
