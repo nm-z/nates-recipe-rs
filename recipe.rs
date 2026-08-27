@@ -10437,9 +10437,8 @@ fn records(bytes: &[u8], delimiter: u8) -> Result<(Vec<Vec<String>>, usize)> {
 			let value = String::from_utf8(field).map_err(|_| RecipeError::new("feature is not UTF-8"))?;
 			row.push(value.trim_end_matches('\r').to_owned());
 			field = Vec::new();
-			if row.iter().any(|value| !value.is_empty()) {
-				rows.push(row);
-			} else { blank += 1 }
+			// One rule decides whether an assembled record carries data, so a record of blank fields is padding wherever it ends.
+			if row.iter().any(|value| !value.trim().is_empty()) { rows.push(row) } else { blank += 1 }
 			row = Vec::new();
 		} else {
 			field.push(byte);
@@ -10449,7 +10448,7 @@ fn records(bytes: &[u8], delimiter: u8) -> Result<(Vec<Vec<String>>, usize)> {
 	require(!quoted, "unterminated quoted feature")?;
 	if !field.is_empty() || !row.is_empty() {
 		row.push(String::from_utf8(field).map_err(|_| RecipeError::new("feature is not UTF-8"))?);
-		rows.push(row);
+		if row.iter().any(|value| !value.trim().is_empty()) { rows.push(row) } else { blank += 1 }
 	}
 	Ok((rows, blank))
 }
