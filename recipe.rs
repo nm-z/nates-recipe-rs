@@ -5959,9 +5959,9 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 /// Plans one candidate route from the workload and storage plan already established for this run: the row share of
 /// every shard, the movement list its fused epoch performs, and the complete epoch that movement and each device's
 /// measured behavior predict.
-fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes: usize, loss: LossFunction) -> Result<(Vec<usize>, Placement)> {
-	let total = route.iter().map(|device| links[*device].work).sum::<f64>();
-	let mut counts = route.iter().map(|device| ((rows as f64 * links[*device].work / total) as usize).max(1)).collect::<Vec<_>>();
+fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes: usize, loss: LossFunction, policy: MultiDevice) -> Result<(Vec<usize>, Placement)> {
+	let total = route.iter().map(|device| if policy == MultiDevice::Auto { 1.0 } else { links[*device].work }).sum::<f64>();
+	let mut counts = route.iter().map(|device| ((rows as f64 * if policy == MultiDevice::Auto { 1.0 } else { links[*device].work } / total) as usize).max(1)).collect::<Vec<_>>();
 	counts[0] += rows - counts.iter().sum::<usize>();
 	let (gradient_to_host, weights_from_host) = (route.iter().enumerate().map(|(shard, device)| Transfer { from: shard + 1, to: 0, bytes, cost: links[*device].to_host }).collect::<Vec<_>>(), route.iter().enumerate().skip(1).map(|(shard, device)| Transfer { from: 0, to: shard + 1, bytes, cost: links[*device].from_host }).collect::<Vec<_>>());
 	let placement = Placement { shares: counts.iter().map(|count| *count as f64 / rows as f64).collect(), gradient_to_host, gradient_to_primary: Transfer { from: 0, to: 1, bytes, cost: links[route[0]].from_host }, weights_to_host: Transfer { from: 1, to: 0, bytes, cost: links[route[0]].to_host }, weights_from_host, loss, predicted: [0.0; 4] };
@@ -5990,7 +5990,7 @@ fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, preci
 	for mut route in candidates.into_iter().filter(|route| route.len() <= rows) {
 		// The fastest device leads the route and applies the one update.
 		route.sort_by(|left, right| links[*right].work.total_cmp(&links[*left].work).then(left.cmp(right)));
-		let (counts, placement) = plan_route(&route, &links, graph, rows, bytes, loss)?;
+		let (counts, placement) = plan_route(&route, &links, graph, rows, bytes, loss, config.multi_device)?;
 		let [computation, transfers, synchronization, movement] = placement.predicted;
 		eprintln!("route {} rows {} predicted epoch {:.9}s = computation {computation:.9} + transfers {transfers:.9} + synchronization {synchronization:.9} + persistent-state {movement:.9}", route.iter().map(|device| device_label(gpus[*device])).collect::<Result<Vec<_>>>()?.join(","), counts.iter().map(usize::to_string).collect::<Vec<_>>().join(","), placement.seconds());
 		best = if best.as_ref().is_none_or(|previous| placement.seconds() < previous.2.seconds()) { Some((route, counts, placement)) } else { best };
