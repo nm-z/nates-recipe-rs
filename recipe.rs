@@ -5859,41 +5859,68 @@ fn observe_loss(best_loss: &mut [f64; 4], loss: f64, tolerance: f64) -> bool {
 	}
 	trigger
 }
-/// One measured edge of the device topology: the transfer path between this
-/// process and a device, benchmarked rather than declared.
-struct Link {
+/// One measured direction of a topology link.
+#[derive(Clone, Copy)]
+struct TransferCost {
 	latency: Duration,
 	bandwidth: f64,
 }
-fn measure_link(gpu: &'static Gpu) -> Result<Link> {
-	const PROBE_BYTES: usize = 1 << 22;
-	const ROUNDS: u32 = 8;
-	let mut scratch = vec![0_u8; PROBE_BYTES];
-	let pointer = gpu.upload(0, scratch.as_ptr().cast(), PROBE_BYTES)?;
-	let probe = (|| {
+impl TransferCost {
+	fn seconds(self, bytes: usize) -> f64 { self.latency.as_secs_f64() + bytes as f64 / self.bandwidth }
+}
+/// The two measured directions between the coordinating host and one device.
+#[derive(Clone, Copy)]
+struct Link {
+	to_host: TransferCost,
+	from_host: TransferCost,
+}
+fn measure_link(gpu: &'static Gpu, bytes: usize) -> Result<Link> {
+	let bytes = bytes.max(1);
+	let mut scratch = vec![0_u8; bytes];
+	let pointer = gpu.upload(0, scratch.as_ptr().cast(), bytes)?;
+	let measured = (|| {
 		gpu.synchronize()?;
 		let started = Instant::now();
-		for _ in 0..ROUNDS {
-			gpu.upload(pointer, scratch.as_ptr().cast(), 8)?;
-			gpu.download(scratch.as_mut_ptr().cast(), pointer, 8)?;
-			gpu.synchronize()?;
-		}
-		let latency = started.elapsed() / (ROUNDS * 2);
-		let started = Instant::now();
-		gpu.upload(pointer, scratch.as_ptr().cast(), PROBE_BYTES)?;
-		gpu.download(scratch.as_mut_ptr().cast(), pointer, PROBE_BYTES)?;
+		gpu.download(scratch.as_mut_ptr().cast(), pointer, 1)?;
 		gpu.synchronize()?;
-		let elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
-		Ok(Link { latency, bandwidth: (2 * PROBE_BYTES) as f64 / elapsed })
+		let to_host_latency = started.elapsed();
+		let started = Instant::now();
+		gpu.download(scratch.as_mut_ptr().cast(), pointer, bytes)?;
+		gpu.synchronize()?;
+		let to_host_bandwidth = bytes as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON);
+		let started = Instant::now();
+		gpu.upload(pointer, scratch.as_ptr().cast(), 1)?;
+		gpu.synchronize()?;
+		let from_host_latency = started.elapsed();
+		let started = Instant::now();
+		gpu.upload(pointer, scratch.as_ptr().cast(), bytes)?;
+		gpu.synchronize()?;
+		let from_host_bandwidth = bytes as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON);
+		Ok(Link { to_host: TransferCost { latency: to_host_latency, bandwidth: to_host_bandwidth }, from_host: TransferCost { latency: from_host_latency, bandwidth: from_host_bandwidth } })
 	})();
 	gpu.free(pointer);
-	probe
+	measured
+}
+#[derive(Clone, Copy)]
+struct Transfer {
+	from: usize,
+	to: usize,
+	bytes: usize,
+	cost: TransferCost,
+}
+impl Transfer {
+	fn seconds(self) -> f64 { self.cost.seconds(self.bytes) }
 }
 /// The measured placement selected for a tape that spans several devices.
 struct Placement {
 	shares: Vec<f64>,
-	links: Vec<Link>,
+	gradient_to_host: Vec<Transfer>,
+	gradient_to_primary: Transfer,
+	weights_to_host: Transfer,
+	weights_from_host: Vec<Transfer>,
 	loss: LossFunction,
+	predicted_local: f64,
+	predicted_placed: f64,
 }
 /// A training tape placed across the selected device topology. One device
 /// trains through the same gradient and optimizer entrypoints. Across several
@@ -7260,8 +7287,9 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 					offset += bytes;
 				}
 				let implicit = offset.next_multiple_of(HSA_IMPLICIT_ARGUMENT_ALIGNMENT);
+				let implicit_bytes = dispatch.kernel.kernarg.checked_sub(implicit).ok_or_else(|| RecipeError::new(format!("native HSA KERNARG metadata {} is shorter than its {implicit}-byte explicit layout", dispatch.kernel.kernarg)))?;
 				require(
-					dispatch.kernel.kernarg == implicit + HSA_IMPLICIT_ARGUMENT_BYTES && dispatch.kernel.kernarg <= program.kernarg_size,
+					matches!(implicit_bytes, 0 | HSA_IMPLICIT_ARGUMENT_BYTES) && dispatch.kernel.kernarg <= program.kernarg_size,
 					format!("native HSA KERNARG layout is invalid: entry={entry:?} metadata={} explicit={offset} implicit={implicit} allocation={} layout={:?}", dispatch.kernel.kernarg, program.kernarg_size, dispatch.kernel.layout),
 				)?;
 				let groups = threads.checked_div(block).filter(|groups| groups.saturating_mul(block) == threads && *groups <= u32::from(u16::MAX)).ok_or_else(|| RecipeError::new("native AMD grid size is invalid"))?;
@@ -7271,7 +7299,9 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 				}
 				ptr::write_bytes(grid_sync.cast::<u8>(), 0, HSA_GRID_SYNC_BYTES);
 				grid_sync.cast::<u8>().add(HSA_GRID_SYNC_GROUPS_OFFSET).cast::<u32>().write(groups);
-				kernarg.cast::<u8>().add(implicit + HSA_MULTIGRID_SYNC_POINTER_OFFSET).cast::<u64>().write(program.grid_sync as u64);
+				if implicit_bytes != 0 {
+					kernarg.cast::<u8>().add(implicit + HSA_MULTIGRID_SYNC_POINTER_OFFSET).cast::<u64>().write(program.grid_sync as u64);
+				}
 				(driver.store)(driver.signal, 1);
 				let queue = &mut *(driver.queue as *mut HsaQueue);
 				let index = (driver.write)(queue, 1);
