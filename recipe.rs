@@ -5599,7 +5599,6 @@ enum MultiDevice { Local, Forced, Auto }
 #[derive(Clone, Copy)]
 struct Config {
 	multi_device: MultiDevice,
-	topology_calibration_rows: usize,
 	kmeans_iterations: usize,
 	svm_iterations: usize,
 	svm_rate: f64,
@@ -5634,7 +5633,7 @@ struct Config {
 	precision: Compute,
 }
 impl Config {
-	fn load() -> Result<Self> { Ok(Self { multi_device: match env!("RECIPE_MULTI_DEVICE") { "false" => MultiDevice::Local, "true" => MultiDevice::Forced, "auto" => MultiDevice::Auto, value => return Err(RecipeError::new(format!("multi-device must be false, true, or \"auto\", not {value:?}"))) }, topology_calibration_rows: natural("topology calibration rows", env!("RECIPE_TOPOLOGY_CALIBRATION_ROWS"))?, kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, catboost_borders: natural("CatBoost border count", env!("RECIPE_CATBOOST_BORDER_COUNT"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
+	fn load() -> Result<Self> { Ok(Self { multi_device: match env!("RECIPE_MULTI_DEVICE") { "false" => MultiDevice::Local, "true" => MultiDevice::Forced, "auto" => MultiDevice::Auto, value => return Err(RecipeError::new(format!("multi-device must be false, true, or \"auto\", not {value:?}"))) }, kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, catboost_borders: natural("CatBoost border count", env!("RECIPE_CATBOOST_BORDER_COUNT"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
 }
 fn number(name: &str, text: &str) -> Result<f64> {
 	let value = text.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))?;
@@ -5875,7 +5874,7 @@ struct Link {
 	work: f64,
 	overhead: f64,
 }
-fn measure_link(gpu: &'static Gpu, bytes: usize, graph: &Graph, rows: usize, config: Config) -> Result<Link> {
+fn measure_link(gpu: &'static Gpu, bytes: usize, config: Config) -> Result<Link> {
 	let probe_bytes = bytes.max(parse_natural(env!("RECIPE_TOPOLOGY_PROBE_BYTES"), "topology probe bytes must be a positive integer"));
 	let mut scratch = vec![0_u8; probe_bytes];
 	let pointer = gpu.upload(0, scratch.as_ptr().cast(), probe_bytes)?;
@@ -5897,7 +5896,7 @@ fn measure_link(gpu: &'static Gpu, bytes: usize, graph: &Graph, rows: usize, con
 		gpu.upload(pointer, scratch.as_ptr().cast(), probe_bytes)?;
 		gpu.synchronize()?;
 		let from_host_bandwidth = probe_bytes as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON);
-		let (work, overhead) = calibrate(gpu, graph, rows, config)?;
+		let (work, overhead) = calibrate(gpu, config)?;
 		Ok(Link { to_host: TransferCost { latency: to_host_latency, bandwidth: to_host_bandwidth }, from_host: TransferCost { latency: from_host_latency, bandwidth: from_host_bandwidth }, work, overhead })
 	})();
 	gpu.free(pointer);
@@ -5938,15 +5937,16 @@ fn gradient_work(graph: &Graph, rows: usize) -> Result<f64> {
 	Ok(8.0 * checked_mul(rows, graph.output.elements(), "predicted loss reduction")? as f64 + tiles + elementwise)
 }
 fn optimizer_work(graph: &Graph) -> f64 { 16.0 * graph.parameters.len() as f64 }
-/// Measures one device with a calibration graph that has the planned graph's exact operations and shapes but no
-/// user weights or optimizer state. The configured row count fixes the measured workload across devices.
-fn calibrate(gpu: &'static Gpu, graph: &Graph, rows: usize, config: Config) -> Result<(f64, f64)> {
-	let rows = rows.min(config.topology_calibration_rows);
-	let indexed = graph.input_values != graph.input.elements();
-	let samples = (0..rows * graph.input_values).map(|value| if indexed { (value % graph.input.channels) as f64 } else { ((value % 17) as f64 - 8.0) / 8.0 }).collect::<Vec<_>>();
-	let targets = (0..rows * graph.output.elements()).map(|value| ((value % 5) as f64 - 2.0) / 2.0).collect::<Vec<_>>();
-	let mut calibration = graph.clone(); calibration.parameters.fill(config.initial); calibration.stored.fill(None); calibration.frozen.clear(); calibration.state = TrainingState::default();
-	let mut tape = NativeTape::new(&calibration, &samples, &targets, gpu, config.precision, Some(mse))?;
+/// Measures one device through the configured surrogate workload. The optimizer
+/// dispatch isolates fixed cost, and the gradient dispatch measures planned work
+/// without allocating, forwarding, training, or dispatching the placed model.
+fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
+	let (rows, features) = (config.surrogate_epochs * config.surrogate_width, config.surrogate_width);
+	let samples = (0..rows * features).map(|value| ((value % 17) as f64 - 8.0) / 8.0).collect::<Vec<_>>();
+	let targets = (0..rows).map(|value| ((value % 5) as f64 - 2.0) / 2.0).collect::<Vec<_>>();
+	let prepared = Prepared { samples: samples.clone(), targets: targets.clone(), target_width: 1, rows, source_rows: rows, features, schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
+	let graph = compile(&surrogate_model(config.surrogate_width), &prepared, &targets, rows, gpu, config, true)?;
+	let mut tape = NativeTape::new(&graph, &samples, &targets, gpu, config.precision, Some(mse))?;
 	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<f64> {
 		tape.advance()?; let started = Instant::now(); gradient.then(|| tape.gradient_launch()).transpose()?;
 		tape.optimizer_launch(config.surrogate_rate, config)?; gpu.synchronize()?; Ok(started.elapsed().as_secs_f64())
@@ -5954,7 +5954,7 @@ fn calibrate(gpu: &'static Gpu, graph: &Graph, rows: usize, config: Config) -> R
 	timed(&mut tape, true)?;
 	let overhead = timed(&mut tape, false)?;
 	let epoch = timed(&mut tape, true)?;
-	Ok((((gradient_work(&calibration, rows)?) / (epoch - overhead).max(f64::MIN_POSITIVE)).max(1.0), overhead))
+	Ok((((gradient_work(&graph, rows)?) / (epoch - overhead).max(f64::MIN_POSITIVE)).max(1.0), overhead))
 }
 /// Plans one candidate route from the workload and storage plan already established for this run: the row share of
 /// every shard, the movement list its fused epoch performs, and the complete epoch that movement and each device's
@@ -5979,7 +5979,7 @@ fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes
 /// policy allocates or dispatches the model being placed to decide.
 fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, precision: Compute, loss: LossFunction, config: Config) -> Result<(Vec<usize>, Vec<usize>, Placement)> {
 	let bytes = checked_mul(graph.parameters.len().max(1), precision.bytes(), "topology transfer bytes")?;
-	let links = gpus.iter().map(|gpu| measure_link(gpu, bytes, graph, rows, config)).collect::<Result<Vec<_>>>()?;
+	let links = gpus.iter().map(|gpu| measure_link(gpu, bytes, config)).collect::<Result<Vec<_>>>()?;
 	for (gpu, link) in gpus.iter().zip(&links) {
 		eprintln!("measured {} {:.6e} work/s {:.9}s/dispatch to-host {:.1} MB/s {:.0?} from-host {:.1} MB/s {:.0?}", device_label(gpu)?, link.work, link.overhead, link.to_host.bandwidth / 1e6, link.to_host.latency, link.from_host.bandwidth / 1e6, link.from_host.latency);
 	}
