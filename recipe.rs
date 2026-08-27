@@ -6426,33 +6426,34 @@ const REMOTE_DOWNLOAD: u8 = 4;
 const REMOTE_SYNCHRONIZE: u8 = 5;
 const REMOTE_LOAD: u8 = 6;
 const REMOTE_LAUNCH: u8 = 7;
-struct RemoteChannel {
-	input: std::io::BufWriter<std::process::ChildStdin>,
-	output: std::io::BufReader<std::process::ChildStdout>,
+struct Wire<R: Read, W: Write> {
+	input: std::io::BufReader<R>,
+	output: std::io::BufWriter<W>,
+	role: &'static str,
 }
-impl RemoteChannel {
-	fn fail<T>(error: std::io::Error) -> Result<T> { Err(RecipeError::new(format!("remote channel: {error}"))) }
-	fn write_u8(&mut self, value: u8) -> Result<()> { self.input.write_all(&[value]).or_else(Self::fail) }
-	fn write_u32(&mut self, value: u32) -> Result<()> { self.input.write_all(&value.to_le_bytes()).or_else(Self::fail) }
-	fn write_u64(&mut self, value: u64) -> Result<()> { self.input.write_all(&value.to_le_bytes()).or_else(Self::fail) }
-	fn write_bytes(&mut self, data: &[u8]) -> Result<()> { self.input.write_all(data).or_else(Self::fail) }
-	fn flush(&mut self) -> Result<()> { self.input.flush().or_else(Self::fail) }
+impl<R: Read, W: Write> Wire<R, W> {
+	fn read_error<T>(role: &str, error: std::io::Error) -> Result<T> { Err(RecipeError::new(format!("{role} channel: {error}"))) }
+	fn write_u8(&mut self, value: u8) -> Result<()> { self.output.write_all(&[value]).map_err(|error| RecipeError::new(format!("{} channel: {error}", self.role))) }
+	fn write_u32(&mut self, value: u32) -> Result<()> { self.output.write_all(&value.to_le_bytes()).map_err(|error| RecipeError::new(format!("{} channel: {error}", self.role))) }
+	fn write_u64(&mut self, value: u64) -> Result<()> { self.output.write_all(&value.to_le_bytes()).map_err(|error| RecipeError::new(format!("{} channel: {error}", self.role))) }
+	fn write_bytes(&mut self, data: &[u8]) -> Result<()> { self.output.write_all(data).map_err(|error| RecipeError::new(format!("{} channel: {error}", self.role))) }
+	fn flush(&mut self) -> Result<()> { self.output.flush().map_err(|error| RecipeError::new(format!("{} channel: {error}", self.role))) }
 	fn read_u8(&mut self) -> Result<u8> {
 		let mut bytes = [0; 1];
-		self.output.read_exact(&mut bytes).or_else(Self::fail)?;
+		self.input.read_exact(&mut bytes).or_else(|error| Self::read_error(self.role, error))?;
 		Ok(bytes[0])
 	}
 	fn read_u32(&mut self) -> Result<u32> {
 		let mut bytes = [0; 4];
-		self.output.read_exact(&mut bytes).or_else(Self::fail)?;
+		self.input.read_exact(&mut bytes).or_else(|error| Self::read_error(self.role, error))?;
 		Ok(u32::from_le_bytes(bytes))
 	}
 	fn read_u64(&mut self) -> Result<u64> {
 		let mut bytes = [0; 8];
-		self.output.read_exact(&mut bytes).or_else(Self::fail)?;
+		self.input.read_exact(&mut bytes).or_else(|error| Self::read_error(self.role, error))?;
 		Ok(u64::from_le_bytes(bytes))
 	}
-	fn read_into(&mut self, buffer: &mut [u8]) -> Result<()> { self.output.read_exact(buffer).or_else(Self::fail) }
+	fn read_into(&mut self, buffer: &mut [u8]) -> Result<()> { self.input.read_exact(buffer).or_else(|error| Self::read_error(self.role, error)) }
 	/// Reads a status byte; a nonzero status carries the worker's error message.
 	fn read_status(&mut self, action: &str) -> Result<()> {
 		if self.read_u8()? == 0 {
@@ -6466,7 +6467,19 @@ impl RemoteChannel {
 		}
 		Err(RecipeError::new(format!("remote {action}: {}", String::from_utf8_lossy(&message))))
 	}
+	fn status(&mut self, result: &Result<()>) -> Result<()> {
+		match result {
+			Ok(()) => self.write_u8(0),
+			Err(error) => {
+				let message = error.to_string();
+				self.write_u8(1)?;
+				self.write_u32(message.len() as u32)?;
+				self.write_bytes(message.as_bytes())
+			}
+		}
+	}
 }
+type RemoteChannel = Wire<std::process::ChildStdout, std::process::ChildStdin>;
 struct Remote {
 	channel: Mutex<RemoteChannel>,
 	wave: u32,
@@ -6909,7 +6922,7 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 		.map_err(|error| RecipeError::new(format!("cannot start the worker on {host}: {error}")))?;
 	let input = child.stdin.take().ok_or_else(|| RecipeError::new("remote worker stdin is absent"))?;
 	let output = child.stdout.take().ok_or_else(|| RecipeError::new("remote worker stdout is absent"))?;
-	let mut channel = RemoteChannel { input: std::io::BufWriter::new(input), output: std::io::BufReader::new(output) };
+	let mut channel = RemoteChannel { input: std::io::BufReader::new(output), output: std::io::BufWriter::new(input), role: "remote" };
 	channel.read_status(&format!("worker on {host}"))?;
 	let backend = match channel.read_u8()? {
 		1 => Backend::Amd,
@@ -7435,45 +7448,7 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		Ok(found)
 	}
 }
-struct WorkerWire {
-	input: std::io::BufReader<std::io::Stdin>,
-	output: std::io::BufWriter<std::io::Stdout>,
-}
-impl WorkerWire {
-	fn fail<T>(error: std::io::Error) -> Result<T> { Err(RecipeError::new(format!("worker channel: {error}"))) }
-	fn read_u8(&mut self) -> Result<u8> {
-		let mut bytes = [0; 1];
-		self.input.read_exact(&mut bytes).or_else(Self::fail)?;
-		Ok(bytes[0])
-	}
-	fn read_u32(&mut self) -> Result<u32> {
-		let mut bytes = [0; 4];
-		self.input.read_exact(&mut bytes).or_else(Self::fail)?;
-		Ok(u32::from_le_bytes(bytes))
-	}
-	fn read_u64(&mut self) -> Result<u64> {
-		let mut bytes = [0; 8];
-		self.input.read_exact(&mut bytes).or_else(Self::fail)?;
-		Ok(u64::from_le_bytes(bytes))
-	}
-	fn read_into(&mut self, buffer: &mut [u8]) -> Result<()> { self.input.read_exact(buffer).or_else(Self::fail) }
-	fn write_bytes(&mut self, data: &[u8]) -> Result<()> { self.output.write_all(data).or_else(Self::fail) }
-	fn write_u32(&mut self, value: u32) -> Result<()> { self.write_bytes(&value.to_le_bytes()) }
-	fn flush(&mut self) -> Result<()> { self.output.flush().or_else(Self::fail) }
-	/// Reports one command's outcome: a zero status, or a nonzero status
-	/// carrying the error message.
-	fn status(&mut self, result: &Result<()>) -> Result<()> {
-		match result {
-			Ok(()) => self.write_bytes(&[0]),
-			Err(error) => {
-				let message = error.to_string();
-				self.write_bytes(&[1])?;
-				self.write_u32(message.len() as u32)?;
-				self.write_bytes(message.as_bytes())
-			}
-		}
-	}
-}
+type WorkerWire = Wire<std::io::Stdin, std::io::Stdout>;
 struct WorkerProgram {
 	backend: NativeBackend,
 	dispatches: [Option<Dispatch>; 3],
@@ -7490,7 +7465,7 @@ pub fn worker_serve(name: &str) -> Result<()> {
 	{
 		fs::remove_file(binary).ok();
 	}
-	let mut wire = WorkerWire { input: std::io::BufReader::new(std::io::stdin()), output: std::io::BufWriter::new(std::io::stdout()) };
+	let mut wire = WorkerWire { input: std::io::BufReader::new(std::io::stdin()), output: std::io::BufWriter::new(std::io::stdout()), role: "worker" };
 	let probe = device(Some(name)).and_then(|gpu| {
 		let (backend, wave) = match &gpu.driver {
 			#[cfg(amd)]
@@ -7523,7 +7498,7 @@ pub fn worker_serve(name: &str) -> Result<()> {
 		match wire.input.read_exact(&mut command) {
 			Ok(()) => {}
 			Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-			Err(error) => return WorkerWire::fail(error),
+			Err(error) => return WorkerWire::read_error("worker", error),
 		}
 		match command[0] {
 			REMOTE_ALLOCATE => {
