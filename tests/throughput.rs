@@ -76,26 +76,21 @@ fn training_throughput() {
 	let peaks = std::env::var("BENCH_PEAKS").unwrap_or_else(|_| "fp16=70.34,bf16=70.34,int8=70.34,int4=140.7,fp32=35.17,fp64=1.1".to_owned());
 	let peak = |precision: &str| peaks.split(',').filter_map(|entry| entry.trim().split_once('=')).find(|(name, _)| *name == precision).and_then(|(_, value)| value.parse::<f64>().ok());
 	let data = recipe.data(dataset(rows, width).to_string_lossy().as_ref()).target("y");
-	let model = stack(width, layers);
+		let model = stack(width, layers);
 	let flops_per_epoch = (rows * layers * 6 * width * width) as f64;
-	let mut results = Vec::new();
-	for precision in precisions.split(',').map(str::trim).filter(|value| !value.is_empty()) {
-		let first = train(precision, epochs_a).run(&model, &data);
-		let second = train(precision, epochs_b).run(&model, &data);
-		let seconds_a = first.epoch_seconds();
-		let seconds_b = second.epoch_seconds();
-		let per_epoch = seconds_b / epochs_b as f64;
-		if per_epoch <= 0.0 {
-			report(format!("throughput {precision}: measured epoch time {per_epoch:.3}s is invalid\n"));
-			continue;
-		}
-		let tflops = flops_per_epoch / per_epoch / 1e12;
-		report(format!(
-			"throughput {precision}: {tflops:.3} tflops ({per_epoch:.3}s/epoch, epoch totals {seconds_a:.2}s/{seconds_b:.2}s, tiles {:?}/{:?}, loss {:.5})\n",
-			first.tile(),
-			second.tile(),
-			second.final_loss()
-		));
+		let mut results = Vec::new();
+		for precision in precisions.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+			let first = train(precision, epochs_a).run(&model, &data);
+			let second = train(precision, epochs_b).run(&model, &data);
+			let seconds_a = first.epoch_seconds();
+			let seconds_b = second.epoch_seconds();
+			let per_epoch = seconds_b / epochs_b as f64;
+			if per_epoch <= 0.0 {
+				report(format!("throughput {precision}: measured epoch time {per_epoch:.3}s is invalid\n"));
+				continue;
+			}
+			let tflops = flops_per_epoch / per_epoch / 1e12;
+			report(format!("throughput {precision}: {tflops:.3} tflops ({per_epoch:.3}s/epoch, epoch totals {seconds_a:.2}s/{seconds_b:.2}s, tiles {:?}/{:?}, loss {:.5})\n", first.tile(), second.tile(), second.final_loss()));
 		results.push((precision.to_owned(), tflops, per_epoch, second.tile()));
 	}
 	let mut table = format!("\n{:<9} {:>10} {:>10} {:>12} {:>10}  {}\n", "precision", "tflops", "s/epoch", "peak", "of peak", "tile");
