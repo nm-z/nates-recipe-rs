@@ -7,14 +7,27 @@ fn invalid(message: &str) -> ! {
 	std::process::exit(2)
 }
 
-fn mapped(mapping: Option<&'static str>, suffix: &str) -> Vec<(String, &'static str)> { mapping.into_iter().flat_map(|values| values.split(';')).filter_map(|value| value.split_once('=')).map(|(target, path)| (format!("{target}.{suffix}"), path)).collect() }
+fn mapped(mapping: Option<&'static str>, suffix: &str) -> Vec<(String, &'static str)> {
+	mapping.into_iter().flat_map(|values| values.split(';')).filter_map(|value| value.split_once('=')).map(|(target, path)| (format!("{target}.{suffix}"), path)).collect()
+}
 
 fn export(source: &Path, selected: Option<&str>) {
-	fs::metadata(source).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", source.display())); let device = selected.map(|name| name.rsplit(':').next().unwrap_or(name));
-	if device.is_some_and(|name| name != "cpu" && !name.starts_with("amd") && !name.starts_with("nv")) { invalid("export device must be cpu, an amd device, or an nv device") }
-	let mut artifacts = mapped(option_env!("RECIPE_HSA_CODE_OBJECTS"), "hsaco"); artifacts.push(("cpu.a".to_owned(), concat!(env!("OUT_DIR"), "/librecipe_cpu.a")));
-	artifacts.extend(mapped(option_env!("RECIPE_HSA_ASSEMBLIES"), "amd.s")); artifacts.extend(option_env!("RECIPE_NV_PTX").map(|path| ("ptx".to_owned(), path)));
-	artifacts.retain(|(extension, _)| device.is_none_or(|name| match name { "cpu" => extension == "cpu.a", name if name.starts_with("amd") => extension.ends_with(".hsaco") || extension.ends_with(".amd.s"), _ => extension == "ptx" }));
+	fs::metadata(source).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", source.display()));
+	let device = selected.map(|name| name.rsplit(':').next().unwrap_or(name));
+	if device.is_some_and(|name| name != "cpu" && !name.starts_with("amd") && !name.starts_with("nv")) {
+		invalid("export device must be cpu, an amd device, or an nv device")
+	}
+	let mut artifacts = mapped(option_env!("RECIPE_HSA_CODE_OBJECTS"), "hsaco");
+	artifacts.push(("cpu.a".to_owned(), concat!(env!("OUT_DIR"), "/librecipe_cpu.a")));
+	artifacts.extend(mapped(option_env!("RECIPE_HSA_ASSEMBLIES"), "amd.s"));
+	artifacts.extend(option_env!("RECIPE_NV_PTX").map(|path| ("ptx".to_owned(), path)));
+	artifacts.retain(|(extension, _)| {
+		device.is_none_or(|name| match name {
+			"cpu" => extension == "cpu.a",
+			name if name.starts_with("amd") => extension.ends_with(".hsaco") || extension.ends_with(".amd.s"),
+			_ => extension == "ptx",
+		})
+	});
 	assert!(!artifacts.is_empty(), "Recipe artifacts for {} were not compiled", selected.unwrap_or("this build"));
 	for (extension, compiled) in artifacts {
 		let output = source.with_file_name(format!("recipe.{extension}"));
@@ -52,7 +65,17 @@ fn run(source: &Path, device: Option<&str>) {
 	// Each invocation compiles to its own output, so concurrent invocations never share one.
 	let output = directory.join(format!("recipe-script-{}", std::process::id()));
 	fs::metadata(&library).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", library.display()));
-	let status = Command::new("rustc").arg("--edition=2024").arg(source).arg("--extern").arg(format!("recipe={}", library.display())).arg("-L").arg(format!("dependency={}", dependencies.display())).arg("-o").arg(&output).status().expect("cannot execute rustc");
+	let status = Command::new("rustc")
+		.arg("--edition=2024")
+		.arg(source)
+		.arg("--extern")
+		.arg(format!("recipe={}", library.display()))
+		.arg("-L")
+		.arg(format!("dependency={}", dependencies.display()))
+		.arg("-o")
+		.arg(&output)
+		.status()
+		.expect("cannot execute rustc");
 	if !status.success() {
 		fs::remove_file(&output).ok();
 		std::process::exit(status.code().unwrap_or(1));
@@ -64,7 +87,10 @@ fn run(source: &Path, device: Option<&str>) {
 	}
 	// The running child holds the inode, so unlinking now leaves nothing behind
 	// when this process is killed before it could otherwise clean up.
-	let status = command.spawn().and_then(|mut child| { fs::remove_file(&output).ok(); child.wait() });
+	let status = command.spawn().and_then(|mut child| {
+		fs::remove_file(&output).ok();
+		child.wait()
+	});
 	let status = status.unwrap_or_else(|error| panic!("cannot execute Recipe script: {error}"));
 	std::process::exit(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)));
 }

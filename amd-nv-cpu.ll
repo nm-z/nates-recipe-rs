@@ -2356,13 +2356,13 @@ exit:
 ret void
 }
 define internal void @scan_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
-ptr addrspace(1) %context, i1 %indexed, i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %gates,
+ptr addrspace(1) %context, i32 %rows, i32 %in.channels, i32 %length, i32 %out.channels, i32 %gates,
 i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %threads ) #3 { entry: %tid = call i32 @llvm.amdgcn.workitem.id.x()
 %in.elements = mul i32 %in.channels, %length
 %out.elements = mul i32 %out.channels, %length %input.matrix = mul i32 %in.channels, %out.channels
 %state.matrix = mul i32 %out.channels, %out.channels %matrix.span = add i32 %input.matrix, %state.matrix
 %gate.stride = add i32 %matrix.span, %out.channels %gate.batch = mul i32 %rows, %out.elements
-%indexed.count = mul i32 %gates, %gate.batch br i1 %indexed, label %indexed.loop, label %precompute.loop indexed.loop: %indexed.p = phi i32 [ %tid, %entry ], [ %indexed.next, %indexed.step ] %indexed.more = icmp ult i32 %indexed.p, %indexed.count br i1 %indexed.more, label %indexed.step, label %precompute.done indexed.step: %indexed.gate = udiv i32 %indexed.p, %gate.batch %indexed.local = urem i32 %indexed.p, %gate.batch %indexed.row = udiv i32 %indexed.local, %out.elements %indexed.within = urem i32 %indexed.local, %out.elements %indexed.hidden = udiv i32 %indexed.within, %length %indexed.time = urem i32 %indexed.within, %length %indexed.input.row = mul i32 %indexed.row, %length %indexed.input.index = add i32 %indexed.input.row, %indexed.time %indexed.input.ptr = getelementptr inbounds i8, ptr addrspace(1) %input, i32 %indexed.input.index %indexed.token.byte = load i8, ptr addrspace(1) %indexed.input.ptr, align 1 %indexed.token = zext i8 %indexed.token.byte to i32 %indexed.valid = icmp ult i32 %indexed.token, %in.channels %indexed.safe = select i1 %indexed.valid, i32 %indexed.token, i32 0 %indexed.weight.gate = mul i32 %indexed.gate, %gate.stride %indexed.weight.row = mul i32 %indexed.safe, %out.channels %indexed.weight.local = add i32 %indexed.weight.row, %indexed.hidden %indexed.weight.index = add i32 %indexed.weight.gate, %indexed.weight.local %indexed.weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %indexed.weight.index %indexed.weight = load double, ptr addrspace(1) %indexed.weight.ptr, align 8 %indexed.value = select i1 %indexed.valid, double %indexed.weight, double 0.0 %indexed.context.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %indexed.p store double %indexed.value, ptr addrspace(1) %indexed.context.ptr, align 8 %indexed.next = add i32 %indexed.p, %threads br label %indexed.loop precompute.loop:
+br label %precompute.loop precompute.loop:
 %precompute.gate = phi i32 [ 0, %entry ], [ %precompute.next, %precompute.step ]
 %precompute.more = icmp ult i32 %precompute.gate, %gates
 br i1 %precompute.more, label %precompute.step, label %precompute.done precompute.step:
@@ -2754,7 +2754,7 @@ previous.store: %previous.store.m.global = add i32 %previous.m.base, %previous.s
 previous.store.next: %previous.store.register.next = add i32 %previous.store.register, 1 br label %previous.store.loop previous.job.done: %previous.job.next = add i32 %previous.job, %groups br label %previous.job.loop exit: ret void }
 define internal void @scan_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
 ptr addrspace(1) %context, ptr addrspace(1) %delta, ptr addrspace(1) %previous,
-ptr addrspace(1) %gradient, i1 %indexed, i1 %write.input, i32 %rows, i32 %in.channels,
+ptr addrspace(1) %gradient, i1 %write.input, i32 %rows, i32 %in.channels,
 i32 %length, i32 %out.channels, i32 %gates, i32 %parameters, i32 %offset,
 i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k, i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads ) #3 { entry:
 %tid = call i32 @llvm.amdgcn.workitem.id.x() %in.elements = mul i32 %in.channels, %length
@@ -2787,7 +2787,7 @@ br i1 %clear.h.more, label %clear.state.step, label %time.loop clear.state.step:
 store double 0.0, ptr addrspace(1) %clear.dh.ptr, align 8 store double 0.0, ptr addrspace(1) %clear.dc.ptr, align 8
 %clear.h.next = add nuw i32 %clear.h, 1 br label %clear.state.loop time.loop:
 %time = phi i32 [ %length, %clear.state.loop ], [ %time.current, %time.done ] %time.current = sub i32 %time, 1
-%row.output.base = mul i32 %row, %out.elements %input.row.dense = mul i32 %row, %in.elements %input.row.compact = mul i32 %row, %length %input.row.base = select i1 %indexed, i32 %input.row.compact, i32 %input.row.dense
+%row.output.base = mul i32 %row, %out.elements %input.row.base = mul i32 %row, %in.elements
 %previous.time = sub i32 %time.current, 1 %previous.exists = icmp sge i32 %previous.time, 0
 %previous.safe = select i1 %previous.exists, i32 %previous.time, i32 0 %time.more = icmp sge i32 %time.current, 0
 br i1 %time.more, label %scan.mode, label %row.done scan.mode:
@@ -2913,9 +2913,8 @@ store double %dc.previous, ptr addrspace(1) %dc.ptr, align 8 %delta0.index = add
 %delta3.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %delta3.index
 store double %di, ptr addrspace(1) %delta0.ptr, align 8 store double %df, ptr addrspace(1) %delta1.ptr, align 8
 store double %do, ptr addrspace(1) %delta2.ptr, align 8 store double %dg, ptr addrspace(1) %delta3.ptr, align 8
-%hidden.next = add nuw i32 %hidden, 1 br label %gate.delta.loop delta.done: br i1 %indexed, label %indexed.gradient.loop, label %parameter.entry indexed.gradient.loop:
-%indexed.p = phi i32 [ 0, %delta.done ], [ %indexed.next, %indexed.gradient.step ] %indexed.count = mul i32 %gates, %out.channels %indexed.more = icmp ult i32 %indexed.p, %indexed.count br i1 %indexed.more, label %indexed.gradient.step, label %parameter.entry indexed.gradient.step: %indexed.gate = udiv i32 %indexed.p, %out.channels %indexed.hidden = urem i32 %indexed.p, %out.channels %indexed.input.index = add i32 %input.row.base, %time.current %indexed.input.ptr = getelementptr inbounds i8, ptr addrspace(1) %input, i32 %indexed.input.index %indexed.token.byte = load i8, ptr addrspace(1) %indexed.input.ptr, align 1 %indexed.token = zext i8 %indexed.token.byte to i32 %indexed.valid = icmp ult i32 %indexed.token, %in.channels %indexed.safe = select i1 %indexed.valid, i32 %indexed.token, i32 0 %indexed.weight.gate = mul i32 %indexed.gate, %gate.stride %indexed.weight.row = mul i32 %indexed.safe, %out.channels %indexed.weight.local = add i32 %indexed.weight.row, %indexed.hidden %indexed.weight.index = add i32 %indexed.weight.gate, %indexed.weight.local %indexed.delta.hidden.base = mul i32 %indexed.hidden, %length %indexed.delta.local = add i32 %indexed.delta.hidden.base, %time.current %indexed.delta.row = add i32 %row.output.base, %indexed.delta.local %indexed.delta.gate = mul i32 %indexed.gate, %batch %indexed.delta.base = add i32 %delta.base, %indexed.delta.gate %indexed.delta.index = add i32 %indexed.delta.base, %indexed.delta.row %indexed.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %indexed.delta.index %indexed.delta = load double, ptr addrspace(1) %indexed.delta.ptr, align 8 %indexed.contribution = select i1 %indexed.valid, double %indexed.delta, double 0.0 %indexed.row.gradient.index = add i32 %row.gradient.start, %indexed.weight.index %indexed.row.gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %indexed.row.gradient.index %indexed.row.gradient.old = load double, ptr addrspace(1) %indexed.row.gradient.ptr, align 8 %indexed.row.gradient.new = call double @recipe.add(double %indexed.row.gradient.old, double %indexed.contribution) store double %indexed.row.gradient.new, ptr addrspace(1) %indexed.row.gradient.ptr, align 8 %indexed.next = add nuw i32 %indexed.p, 1 br label %indexed.gradient.loop parameter.entry: %parameter.start = select i1 %indexed, i32 %gate.stride.0, i32 0 br label %parameter.loop parameter.loop:
-%p = phi i32 [ %parameter.start, %parameter.entry ], [ %p.next, %parameter.advance ] %p.more = icmp ult i32 %p, %parameters
+%hidden.next = add nuw i32 %hidden, 1 br label %gate.delta.loop delta.done: br label %parameter.loop parameter.loop:
+%p = phi i32 [ 0, %delta.done ], [ %p.next, %parameter.advance ] %p.more = icmp ult i32 %p, %parameters
 br i1 %p.more, label %parameter.step, label %hidden.gradient.loop parameter.step:
 %gate = udiv i32 %p, %gate.stride %within = urem i32 %p, %gate.stride
 %input.weight = icmp ult i32 %within, %gate.stride.0
@@ -2950,7 +2949,7 @@ br i1 %input.weight, label %parameter.advance, label %parameter.value parameter.
 %row.gradient.new = call double @recipe.add(double %row.gradient.old, double %contribution)
 store double %row.gradient.new, ptr addrspace(1) %row.gradient.ptr, align 8
 br label %parameter.advance parameter.advance:
-%p.raw = add nuw i32 %p, 1 %p.within = urem i32 %p.raw, %gate.stride %p.gate = icmp eq i32 %p.within, 0 %p.skip = and i1 %indexed, %p.gate %p.after.input = add i32 %p.raw, %gate.stride.0 %p.next = select i1 %p.skip, i32 %p.after.input, i32 %p.raw br label %parameter.loop hidden.gradient.loop:
+%p.next = add nuw i32 %p, 1 br label %parameter.loop hidden.gradient.loop:
 %state.channel = phi i32 [ 0, %parameter.loop ], [ %state.channel.next, %hidden.gradient.store ]
 %state.channel.more = icmp ult i32 %state.channel, %out.channels
 br i1 %state.channel.more, label %hidden.gradient.sum.loop, label %time.done hidden.gradient.sum.loop:
