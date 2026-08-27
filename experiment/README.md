@@ -47,15 +47,21 @@ Each measured row reports:
 
 ```
 step     position in the budget
-node     contraction node index, the same one the schedule cache lines carry
-dir      0 forward, 1 weight gradient, 2 input gradient
+node     index into the lowered graph's node list, so the numbers have gaps
+         where a node holds no contraction
+dir      which of the node's three contractions: 0 forward, 1 weight
+         gradient, 2 input gradient
 m n k    the LUT cell being tried in that slot
-P        seconds B predicted before anything ran
-M        seconds measured, NaN when the extent never dispatched
-verdict  rejected    the compiled resource bounds refused the extent, nothing was timed
-         slower      dispatched and timed, but no faster than the running best
-         accepted    faster, and the trained model is unchanged, so it is adopted
-         changes the trained model    the saved model differs from the reference, so it is refused whatever it timed
+P        seconds B predicted before the run
+M        seconds measured, NaN when nothing dispatched
+verdict  rejected    a compiled resource bound refused the extent, so
+                     nothing ran
+         slower      ran, but no faster than the running best
+         accepted    faster, and the saved model is unchanged, so it
+                     becomes the running best
+         changes the trained model
+                     the saved model differs from the reference, so it
+                     is refused whatever it timed
 ```
 
 ## First result
