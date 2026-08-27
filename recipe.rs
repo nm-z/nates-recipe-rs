@@ -5874,7 +5874,7 @@ struct Link {
 	work: f64,
 	overhead: f64,
 }
-fn measure_link(gpu: &'static Gpu, bytes: usize, config: Config) -> Result<Link> {
+fn measure_link(gpu: &'static Gpu, bytes: usize, graph: &Graph, config: Config) -> Result<Link> {
 	let probe_bytes = bytes.max(parse_natural(env!("RECIPE_TOPOLOGY_PROBE_BYTES"), "topology probe bytes must be a positive integer"));
 	let mut scratch = vec![0_u8; probe_bytes];
 	let pointer = gpu.upload(0, scratch.as_ptr().cast(), probe_bytes)?;
@@ -5896,7 +5896,7 @@ fn measure_link(gpu: &'static Gpu, bytes: usize, config: Config) -> Result<Link>
 		gpu.upload(pointer, scratch.as_ptr().cast(), probe_bytes)?;
 		gpu.synchronize()?;
 		let from_host_bandwidth = probe_bytes as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON);
-		let (work, overhead) = calibrate(gpu, config)?;
+		let (work, overhead) = calibrate(gpu, graph, config)?;
 		Ok(Link { to_host: TransferCost { latency: to_host_latency, bandwidth: to_host_bandwidth }, from_host: TransferCost { latency: from_host_latency, bandwidth: from_host_bandwidth }, work, overhead })
 	})();
 	gpu.free(pointer);
@@ -5937,17 +5937,15 @@ fn gradient_work(graph: &Graph, rows: usize) -> Result<f64> {
 	Ok(8.0 * checked_mul(rows, graph.output.elements(), "predicted loss reduction")? as f64 + tiles + elementwise)
 }
 fn optimizer_work(graph: &Graph) -> f64 { 16.0 * graph.parameters.len() as f64 }
-/// Measures one device through the configured surrogate workload: the
-/// optimizer dispatch alone times the fixed cost every launch pays, and the
-/// gradient dispatch times the rate at which the device retires planned work.
-/// Measuring never allocates, forwards, trains, or dispatches the placed model.
-fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
-	let (rows, features) = (config.surrogate_epochs * config.surrogate_width, config.surrogate_width);
-	let samples = (0..rows * features).map(|value| ((value % 17) as f64 - 8.0) / 8.0).collect::<Vec<_>>();
-	let targets = (0..rows).map(|value| ((value % 5) as f64 - 2.0) / 2.0).collect::<Vec<_>>();
-	let prepared = Prepared { samples: samples.clone(), targets: targets.clone(), target_width: 1, rows, source_rows: rows, features, schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
-	let graph = compile(&surrogate_model(config.surrogate_width), &prepared, &targets, rows, gpu, config, true)?;
-	let mut tape = NativeTape::new(&graph, &samples, &targets, gpu, config.precision, Some(mse))?;
+/// Measures one device with a calibration graph that has the planned graph's exact operations and shapes but no
+/// user weights or optimizer state. The configured row count fixes the measured workload across devices.
+fn calibrate(gpu: &'static Gpu, graph: &Graph, config: Config) -> Result<(f64, f64)> {
+	let rows = config.surrogate_epochs * config.surrogate_width;
+	let indexed = graph.input_values != graph.input.elements();
+	let samples = (0..rows * graph.input_values).map(|value| if indexed { (value % graph.input.channels) as f64 } else { ((value % 17) as f64 - 8.0) / 8.0 }).collect::<Vec<_>>();
+	let targets = (0..rows * graph.output.elements()).map(|value| ((value % 5) as f64 - 2.0) / 2.0).collect::<Vec<_>>();
+	let mut calibration = graph.clone(); calibration.parameters.fill(config.initial); calibration.stored.fill(None); calibration.frozen.clear(); calibration.state = TrainingState::default();
+	let mut tape = NativeTape::new(&calibration, &samples, &targets, gpu, config.precision, Some(mse))?;
 	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<f64> {
 		tape.advance()?; let started = Instant::now(); gradient.then(|| tape.gradient_launch()).transpose()?;
 		tape.optimizer_launch(config.surrogate_rate, config)?; gpu.synchronize()?; Ok(started.elapsed().as_secs_f64())
@@ -5955,7 +5953,7 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 	timed(&mut tape, true)?;
 	let overhead = timed(&mut tape, false)?;
 	let epoch = timed(&mut tape, true)?;
-	Ok((((gradient_work(&graph, rows)?) / (epoch - overhead).max(f64::MIN_POSITIVE)).max(1.0), overhead))
+	Ok((((gradient_work(&calibration, rows)?) / (epoch - overhead).max(f64::MIN_POSITIVE)).max(1.0), overhead))
 }
 /// Plans one candidate route from the workload and storage plan already established for this run: the row share of
 /// every shard, the movement list its fused epoch performs, and the complete epoch that movement and each device's
@@ -5983,7 +5981,7 @@ fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes
 /// policy allocates or dispatches the model being placed to decide.
 fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, precision: Compute, loss: LossFunction, config: Config) -> Result<(Vec<usize>, Vec<usize>, Placement)> {
 	let bytes = checked_mul(graph.parameters.len().max(1), precision.bytes(), "topology transfer bytes")?;
-	let links = gpus.iter().map(|gpu| measure_link(gpu, bytes, config)).collect::<Result<Vec<_>>>()?;
+	let links = gpus.iter().map(|gpu| measure_link(gpu, bytes, graph, config)).collect::<Result<Vec<_>>>()?;
 	for (gpu, link) in gpus.iter().zip(&links) {
 		eprintln!("measured {} {:.6e} work/s {:.9}s/dispatch to-host {:.1} MB/s {:.0?} from-host {:.1} MB/s {:.0?}", device_label(gpu)?, link.work, link.overhead, link.to_host.bandwidth / 1e6, link.to_host.latency, link.from_host.bandwidth / 1e6, link.from_host.latency);
 	}
