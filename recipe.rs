@@ -6961,6 +6961,9 @@ fn remote_directory(host: &str) -> Result<RemoteDirectory> {
 /// driver speaks the worker protocol.
 fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'static Gpu> {
 	static REMOTES: Mutex<Vec<&'static Gpu>> = Mutex::new(Vec::new());
+	for (kind, value) in [("host", host), ("device", device_name)] {
+		require(!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)), format!("remote {kind} name is unsafe: {value:?}"))?;
+	}
 	let mut remotes = REMOTES.lock().map_err(|_| RecipeError::new("remote registry is poisoned"))?;
 	if let Some(gpu) = remotes.iter().find(|gpu| gpu.name == canonical) {
 		return Ok(gpu);

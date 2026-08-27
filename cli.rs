@@ -1,6 +1,6 @@
 use std::{fs, os::unix::process::ExitStatusExt, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [--device <name>]... <source.rs> [export]";
+const USAGE: &str = "usage: recipe [--device <name>]... <source.rs> [export]\n       recipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
