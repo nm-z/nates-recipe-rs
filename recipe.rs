@@ -5960,7 +5960,9 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 /// every shard, the movement list its fused epoch performs, and the complete epoch that movement and each device's
 /// measured behavior predict.
 fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes: usize, loss: LossFunction) -> Result<(Vec<usize>, Placement)> {
-	let counts = route.iter().enumerate().map(|(index, _)| rows / route.len() + usize::from(index < rows % route.len())).collect::<Vec<_>>();
+	let total = route.iter().map(|device| links[*device].work).sum::<f64>();
+	let mut counts = route.iter().map(|device| ((rows as f64 * links[*device].work / total) as usize).max(1)).collect::<Vec<_>>();
+	counts[0] += rows - counts.iter().sum::<usize>();
 	let (gradient_to_host, weights_from_host) = (route.iter().enumerate().map(|(shard, device)| Transfer { from: shard + 1, to: 0, bytes, cost: links[*device].to_host }).collect::<Vec<_>>(), route.iter().enumerate().skip(1).map(|(shard, device)| Transfer { from: 0, to: shard + 1, bytes, cost: links[*device].from_host }).collect::<Vec<_>>());
 	let placement = Placement { shares: counts.iter().map(|count| *count as f64 / rows as f64).collect(), gradient_to_host, gradient_to_primary: Transfer { from: 0, to: 1, bytes, cost: links[route[0]].from_host }, weights_to_host: Transfer { from: 1, to: 0, bytes, cost: links[route[0]].to_host }, weights_from_host, loss, predicted: [0.0; 4] };
 	let bandwidth = |transfer: &Transfer| transfer.bytes as f64 / transfer.cost.bandwidth;
