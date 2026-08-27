@@ -5875,9 +5875,9 @@ struct Link {
 	from_host: TransferCost,
 }
 fn measure_link(gpu: &'static Gpu, bytes: usize) -> Result<Link> {
-	let bytes = bytes.max(1);
-	let mut scratch = vec![0_u8; bytes];
-	let pointer = gpu.upload(0, scratch.as_ptr().cast(), bytes)?;
+	let probe_bytes = bytes.max(parse_natural(env!("RECIPE_TOPOLOGY_PROBE_BYTES"), "topology probe bytes must be a positive integer"));
+	let mut scratch = vec![0_u8; probe_bytes];
+	let pointer = gpu.upload(0, scratch.as_ptr().cast(), probe_bytes)?;
 	let measured = (|| {
 		gpu.synchronize()?;
 		let started = Instant::now();
@@ -5885,17 +5885,17 @@ fn measure_link(gpu: &'static Gpu, bytes: usize) -> Result<Link> {
 		gpu.synchronize()?;
 		let to_host_latency = started.elapsed();
 		let started = Instant::now();
-		gpu.download(scratch.as_mut_ptr().cast(), pointer, bytes)?;
+		gpu.download(scratch.as_mut_ptr().cast(), pointer, probe_bytes)?;
 		gpu.synchronize()?;
-		let to_host_bandwidth = bytes as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON);
+		let to_host_bandwidth = probe_bytes as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON);
 		let started = Instant::now();
 		gpu.upload(pointer, scratch.as_ptr().cast(), 1)?;
 		gpu.synchronize()?;
 		let from_host_latency = started.elapsed();
 		let started = Instant::now();
-		gpu.upload(pointer, scratch.as_ptr().cast(), bytes)?;
+		gpu.upload(pointer, scratch.as_ptr().cast(), probe_bytes)?;
 		gpu.synchronize()?;
-		let from_host_bandwidth = bytes as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON);
+		let from_host_bandwidth = probe_bytes as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON);
 		Ok(Link { to_host: TransferCost { latency: to_host_latency, bandwidth: to_host_bandwidth }, from_host: TransferCost { latency: from_host_latency, bandwidth: from_host_bandwidth } })
 	})();
 	gpu.free(pointer);
@@ -6093,6 +6093,7 @@ impl DeviceTape {
 		eprintln!("placement predicted local {:.3} ms/epoch placed {:.3} ms/epoch", placement.predicted_local * 1e3, placement.predicted_placed * 1e3);
 		for (index, (shard, gradient)) in self.shards.iter().zip(&placement.gradient_to_host).enumerate() {
 			let weights = if index == 0 { placement.weights_to_host } else { placement.weights_from_host[index - 1] };
+			let aggregate = if index == 0 { placement.gradient_to_primary.seconds() } else { 0.0 };
 			eprintln!(
 				"{}.{} rows {} gradient {}>{} {:.0?} {:.1} MB/s weights {}>{} {:.0?} {:.1} MB/s exchange {:.3} ms/epoch",
 				shard.device_label()?,
@@ -6106,7 +6107,7 @@ impl DeviceTape {
 				weights.to,
 				weights.cost.latency,
 				weights.cost.bandwidth / 1e6,
-				(gradient.seconds() + weights.seconds()) * 1e3,
+				(gradient.seconds() + weights.seconds() + aggregate) * 1e3,
 			);
 		}
 		Ok(())
