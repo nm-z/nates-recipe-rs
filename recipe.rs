@@ -6263,7 +6263,7 @@ impl Drop for NativeHsaProgram {
 	}
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(u8)]
 enum NativeEntry {
 	Forward = 0,
@@ -7260,7 +7260,10 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 					offset += bytes;
 				}
 				let implicit = offset.next_multiple_of(HSA_IMPLICIT_ARGUMENT_ALIGNMENT);
-				require(dispatch.kernel.kernarg == implicit + HSA_IMPLICIT_ARGUMENT_BYTES && dispatch.kernel.kernarg <= program.kernarg_size, "native HSA KERNARG layout is invalid")?;
+				require(
+					dispatch.kernel.kernarg == implicit + HSA_IMPLICIT_ARGUMENT_BYTES && dispatch.kernel.kernarg <= program.kernarg_size,
+					format!("native HSA KERNARG layout is invalid: entry={entry:?} metadata={} explicit={offset} implicit={implicit} allocation={} layout={:?}", dispatch.kernel.kernarg, program.kernarg_size, dispatch.kernel.layout),
+				)?;
 				let groups = threads.checked_div(block).filter(|groups| groups.saturating_mul(block) == threads && *groups <= u32::from(u16::MAX)).ok_or_else(|| RecipeError::new("native AMD grid size is invalid"))?;
 				let grid_sync = program.grid_sync as Ptr;
 				if std::env::var_os("RECIPE_DEBUG").is_some() {
