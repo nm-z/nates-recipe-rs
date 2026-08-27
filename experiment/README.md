@@ -14,7 +14,7 @@ and reads the model it saves, so nothing is instrumented into it.
 
 ## How it dispatches tiles
 
-
+...
 
 ## How it checks numerics
 
@@ -43,67 +43,31 @@ RAT_RATE      0.02                    learning rate for B and T
 RAT_SEED      17                      seed for B, T and exploration
 ```
 
-## First result
-
-72 measurements, `RAT_REPEATS=2`, on gfx1101, against the four contraction nodes
-of `vna.rs`:
+Each measured row reports:
 
 ```
-71 cells proposed, 1 repeat skipped
-63 rejected by the compiled resource bounds   (89 %)
- 8 dispatched and timed
- 0 faster than Recipe's own selection
- 0 changed the trained model
+step     position in the budget
+node     contraction node index, the same one the schedule cache lines carry
+dir      0 forward, 1 weight gradient, 2 input gradient
+m n k    the LUT cell being tried in that slot
+P        seconds B predicted before anything ran
+M        seconds measured, NaN when the extent never dispatched
+verdict  rejected    the compiled resource bounds refused the extent, nothing was timed
+         slower      dispatched and timed, but no faster than the running best
+         accepted    faster, and the trained model is unchanged, so it is adopted
+         changes the trained model    the saved model differs from the reference, so it is refused whatever it timed
+```
+
+## First result
+
+71 cells proposed
+63 rejected
+ 8 dispatched
 baseline 1.716 s, selected 1.716 s
 ```
 
-The eight that dispatched ran between 1.717 s and 3.130 s against a 1.716 s
-baseline, so the reachable part of the grid is not merely no better, it is
-mostly worse.
-
-The LUT is mostly unreachable, and not for a subtle reason. `native_extent_valid`
-requires `m % register_m == 0` and `n % register_n == 0`, both 8 here, so every
-`n = 4` cell is invalid on arrival; it requires `k % chunk_k == 0` unless `k`
-equals the shape's own K, and `chunk_k` is 64, so of `k` in
-`{8, 16, 32, 64, 128}` only 64 and 128 are generally legal; and it caps
-`(m / 8) * (n / 8)` at the 64-lane workgroup, which removes the large `m` by
-large `n` corner. Every one of the eight cells that did dispatch has `n` a
-multiple of 8 and `k` in `{64, 128}`, except one whose `k = 16` happened to
-equal that direction's K exactly. The measured rejections land precisely where
-those three rules predict.
-
-So the grid worth searching on this kernel is not the one in the issue. It is
-closer to:
-
 ```
-m in {16, 32, 64, 128, 256}      already multiples of register_m
-n in {8, 16, 32, 64}             drop 4
-k in {64, 128} or the shape's K  multiples of chunk_k
+m in {16, 32, 64, 128, 256}
+n in {8, 16, 32, 64}
+k in {64, 128}
 ```
-
-Note also that the heuristic extents this workload starts from -- K of 5, 48,
-150, 320 -- are not on the proposed grid at all, so an LUT search cannot even
-express the schedule it is trying to beat.
-
-## Known limits
-
-The candidate space is bounded by the heuristic, not by the hardware.
-`shared_values`, `chunk_values` and `chunk_bias_values` are computed as maxima
-over the heuristic assignment and baked into the artifact, so any cell needing
-more is rejected before it can be timed. That is why nothing here beat the
-formula: the search is confined to the neighbourhood the formula already chose,
-and inside that neighbourhood the formula is already at a local optimum.
-Reserving over the candidate space rather than the heuristic is the prerequisite
-for an LUT-shaped search to mean anything.
-
-Timing resolution is the other limit. Each measurement is the wall time of a
-whole `recipe experiment/vna.rs` invocation, so it carries a constant of process
-startup, script compilation and data preparation. That constant shifts every
-candidate equally and does not favour one schedule, but it does compress
-relative differences, and run-to-run spread on an unchanged binary is still tens
-of percent. Raise `RAT_REPEATS`, or lengthen the training in `vna.rs`, before
-believing a small margin.
-
-The numerical check found nothing here only because nothing was accepted. On a
-dense model, tuner-selectable schedules do change the trained result, so the
-check stays.

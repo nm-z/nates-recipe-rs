@@ -168,7 +168,7 @@ fn main() {
 	assert!(base.dispatched, "Recipe rejected its own schedule");
 	let (reference, mut best, mut fastest) = (base.model, heuristic.clone(), base.seconds);
 	println!("baseline: {fastest:.3} s, model {reference:#018x}\n");
-	println!("{:>4}  {:>4}  {:>3}  {:>5} {:>4} {:>5}  {:>9}  {:>9}  {:>9}  {}", "step", "node", "dir", "m", "n", "k", "P", "M", "best", "verdict");
+	println!("{:>4}  {:>4}  {:>3}  {:>5} {:>4} {:>5}  {:>9}  {:>9}  {}", "step", "node", "dir", "m", "n", "k", "P", "M", "verdict");
 
 	let (mut rejected, mut changed) = (0, Vec::new());
 	for step in 0..budget {
@@ -210,7 +210,7 @@ fn main() {
 
 		// A schedule that trains to a different model is not a scheduling choice. Recipe's own gate cannot see this: it compares a loss taken before the reverse pass has run.
 		let verdict = if !measurement.dispatched { "rejected" } else if measurement.model != reference { changed.push((slot, tile, measurement.model)); "changes the trained model" } else if measured < fastest { (best, fastest) = (candidate, measured); "accepted" } else { "slower" };
-		println!("{step:>4}  {:>4}  {:>3}  {:>5} {:>4} {:>5}  {:>9.3}  {:>9.3}  {fastest:>9.3}  {verdict}", slot.node, slot.direction, tile.m, tile.n, tile.k, prediction[0], if measured.is_finite() { measured } else { f64::NAN });
+		println!("{step:>4}  {:>4}  {:>3}  {:>5} {:>4} {:>5}  {:>9.3}  {:>9.3}  {verdict}", slot.node, slot.direction, tile.m, tile.n, tile.k, prediction[0], if measured.is_finite() { measured } else { f64::NAN });
 	}
 
 	std::fs::write(&bench.cache, best.render()).expect("cannot write schedule cache");
