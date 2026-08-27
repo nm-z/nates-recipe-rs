@@ -5874,8 +5874,8 @@ struct Link {
 	work: f64,
 	overhead: f64,
 }
-fn measure_link(gpu: &'static Gpu, bytes: usize, config: Config) -> Result<Link> {
-	let probe_bytes = bytes.max(parse_natural(env!("RECIPE_TOPOLOGY_PROBE_BYTES"), "topology probe bytes must be a positive integer"));
+fn measure_link(gpu: &'static Gpu, config: Config) -> Result<Link> {
+	let probe_bytes = parse_natural(env!("RECIPE_TOPOLOGY_PROBE_BYTES"), "topology probe bytes must be a positive integer");
 	let mut scratch = vec![0_u8; probe_bytes];
 	let pointer = gpu.upload(0, scratch.as_ptr().cast(), probe_bytes)?;
 	let measured = (|| {
@@ -5902,6 +5902,7 @@ fn measure_link(gpu: &'static Gpu, bytes: usize, config: Config) -> Result<Link>
 	gpu.free(pointer);
 	measured
 }
+static LINKS: OnceLock<Result<Vec<Link>>> = OnceLock::new();
 #[derive(Clone, Copy)]
 struct Transfer {
 	from: usize,
@@ -5981,8 +5982,8 @@ fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes
 /// policy allocates or dispatches the model being placed to decide.
 fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, precision: Compute, loss: LossFunction, config: Config) -> Result<(Vec<usize>, Vec<usize>, Placement)> {
 	let bytes = checked_mul(graph.parameters.len().max(1), precision.bytes(), "topology transfer bytes")?;
-	let links = gpus.iter().map(|gpu| measure_link(gpu, bytes, config)).collect::<Result<Vec<_>>>()?;
-	for (gpu, link) in gpus.iter().zip(&links) {
+	let links = LINKS.get_or_init(|| gpus.iter().map(|gpu| measure_link(gpu, config)).collect()).as_ref().map_err(Clone::clone)?;
+	for (gpu, link) in gpus.iter().zip(links) {
 		eprintln!("measured {} {:.6e} work/s {:.9}s/dispatch to-host {:.1} MB/s {:.0?} from-host {:.1} MB/s {:.0?}", device_label(gpu)?, link.work, link.overhead, link.to_host.bandwidth / 1e6, link.to_host.latency, link.from_host.bandwidth / 1e6, link.from_host.latency);
 	}
 	let candidates: Vec<Vec<usize>> = match config.multi_device { MultiDevice::Local => vec![vec![0]], MultiDevice::Forced => vec![(0..gpus.len()).collect()], MultiDevice::Auto => (1..1_u64 << gpus.len()).map(|mask| (0..gpus.len()).filter(|device| mask >> device & 1 == 1).collect()).collect() };
