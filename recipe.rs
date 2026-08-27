@@ -5945,17 +5945,65 @@ impl DeviceTape {
 			!graph.nodes.iter().any(|node| node.op == Primitive::Normalize && node.argument[0] == 0.0),
 			"batch normalization computes whole-batch statistics, so this model trains on one device",
 		)?;
-		let links = gpus.iter().map(|gpu| measure_link(gpu)).collect::<Result<Vec<_>>>()?;
-		let (mut shards, mut shares, mut start) = (Vec::new(), Vec::new(), 0);
-		for (index, gpu) in gpus.iter().enumerate() {
-			let count = rows / gpus.len() + usize::from(index < rows % gpus.len());
+		let bytes = checked_mul(graph.parameters.len().max(1), precision.bytes(), "topology transfer bytes")?;
+		let links = gpus.iter().map(|gpu| measure_link(gpu, bytes)).collect::<Result<Vec<_>>>()?;
+		let equal = (0..gpus.len()).map(|index| rows / gpus.len() + usize::from(index < rows % gpus.len())).collect::<Vec<_>>();
+		let mut candidates = Vec::new();
+		let mut start = 0;
+		for (gpu, count) in gpus.iter().zip(&equal) {
 			let end = start + count;
-			let shard = NativeTape::new(graph, &samples[start * input..end * input], &targets[start * output..end * output], gpu, precision, Some(loss))?;
-			shards.push(shard);
-			shares.push(count as f64 / rows as f64);
+			candidates.push(NativeTape::new(graph, &samples[start * input..end * input], &targets[start * output..end * output], gpu, precision, Some(loss))?);
 			start = end;
 		}
-		Ok(Self { shards, placement: Some(Placement { shares, links, loss }) })
+		let mut row_seconds = Vec::new();
+		for (shard, count) in candidates.iter_mut().zip(&equal) {
+			let started = Instant::now();
+			shard.gradient_launch()?;
+			shard.program.gpu.synchronize()?;
+			row_seconds.push(started.elapsed().as_secs_f64().max(f64::EPSILON) / *count as f64);
+		}
+		let fixed = links.iter().map(|link| link.to_host.seconds(bytes) + link.from_host.seconds(bytes)).collect::<Vec<_>>();
+		let mut counts = vec![0_usize; gpus.len()];
+		counts[0] = 1;
+		for _ in 1..rows {
+			let selected = (0..gpus.len())
+				.min_by(|left, right| {
+					let projected = |index: usize| row_seconds[index] * (counts[index] + 1) as f64 + if index == 0 { 0.0 } else { fixed[index] };
+					projected(*left).total_cmp(&projected(*right))
+				})
+				.ok_or_else(|| RecipeError::new("topology has no device"))?;
+			counts[selected] += 1;
+		}
+		let predicted_local = row_seconds[0] * rows as f64;
+		let predicted_placed = links[0].to_host.seconds(bytes)
+			+ links[0].from_host.seconds(bytes)
+			+ counts
+				.iter()
+				.enumerate()
+				.filter(|(_, count)| **count != 0)
+				.map(|(index, count)| row_seconds[index] * *count as f64 + if index == 0 { 0.0 } else { fixed[index] })
+				.max_by(f64::total_cmp)
+				.unwrap_or(0.0);
+		drop(candidates);
+		if counts.iter().filter(|count| **count != 0).count() == 1 || predicted_placed >= predicted_local {
+			return Ok(Self { shards: vec![NativeTape::new(graph, samples, targets, gpus[0], precision, Some(loss))?], placement: None });
+		}
+		let (mut shards, mut shares, mut active, mut start) = (Vec::new(), Vec::new(), Vec::new(), 0);
+		for (index, count) in counts.iter().copied().enumerate().filter(|(_, count)| *count != 0) {
+			let end = start + count;
+			shards.push(NativeTape::new(graph, &samples[start * input..end * input], &targets[start * output..end * output], gpus[index], precision, Some(loss))?);
+			shares.push(count as f64 / rows as f64);
+			active.push(index);
+			start = end;
+		}
+		let host = 0;
+		let primary = 1;
+		let gradient_to_host = active.iter().map(|index| Transfer { from: index + 1, to: host, bytes, cost: links[*index].to_host }).collect();
+		let gradient_to_primary = Transfer { from: host, to: primary, bytes, cost: links[0].from_host };
+		let weights_to_host = Transfer { from: primary, to: host, bytes, cost: links[0].to_host };
+		let weights_from_host = active.iter().skip(1).map(|index| Transfer { from: host, to: index + 1, bytes, cost: links[*index].from_host }).collect();
+		let placement = Placement { shares, gradient_to_host, gradient_to_primary, weights_to_host, weights_from_host, loss, predicted_local, predicted_placed };
+		Ok(Self { shards, placement: Some(placement) })
 	}
 	fn forward(&mut self) -> Result<()> {
 		self.shards.iter_mut().try_for_each(NativeTape::forward)
@@ -5992,8 +6040,11 @@ impl DeviceTape {
 		let measured = std::thread::scope(|scope| {
 			let dispatched = shards
 				.iter_mut()
-				.map(|shard| {
+				.zip(&placement.gradient_to_host)
+				.map(|(shard, transfer)| {
+					let transfer = *transfer;
 					scope.spawn(move || -> Result<(f64, Vec<f64>)> {
+						require(transfer.to == 0, "gradient transfer must end on the coordinating host")?;
 						let objective = shard.gradient_launch()?;
 						Ok((objective, shard.download_gradient()?))
 					})
@@ -6020,10 +6071,13 @@ impl DeviceTape {
 				*total += scale * partial;
 			}
 		}
+		require(placement.gradient_to_primary.from == 0 && placement.gradient_to_primary.to == 1, "aggregate gradient transfer must target the primary device")?;
 		self.shards[0].upload_gradient(&gradient)?;
 		self.shards[0].optimizer_launch(rate, config)?;
+		require(placement.weights_to_host.from == 1 && placement.weights_to_host.to == 0, "updated weights must return through the coordinating host")?;
 		let weights = self.shards[0].weights()?;
-		for shard in self.shards.iter().skip(1) {
+		for (shard, transfer) in self.shards.iter().skip(1).zip(&placement.weights_from_host) {
+			require(transfer.from == 0, "weight transfer must originate on the coordinating host")?;
 			shard.upload_weights(&weights)?;
 		}
 		let saved = observe_loss(&mut self.shards[0].best_loss, loss, tolerance);
@@ -6036,19 +6090,23 @@ impl DeviceTape {
 			eprintln!("{}.{}", self.shards[0].device_label()?, self.shards[0].precision.model.label());
 			return Ok(());
 		};
-		for (shard, link) in self.shards.iter().zip(&placement.links) {
-			// The per-epoch exchange moves the gradient to the host and the
-			// updated weights back over this measured link.
-			let bytes = 2 * shard.parameters * shard.precision.model.bytes();
-			let exchange = 2.0 * link.latency.as_secs_f64() + bytes as f64 / link.bandwidth;
+		eprintln!("placement predicted local {:.3} ms/epoch placed {:.3} ms/epoch", placement.predicted_local * 1e3, placement.predicted_placed * 1e3);
+		for (index, (shard, gradient)) in self.shards.iter().zip(&placement.gradient_to_host).enumerate() {
+			let weights = if index == 0 { placement.weights_to_host } else { placement.weights_from_host[index - 1] };
 			eprintln!(
-				"{}.{} rows {} link latency {:.0?} bandwidth {:.1} MB/s exchange {:.2} ms/epoch",
+				"{}.{} rows {} gradient {}>{} {:.0?} {:.1} MB/s weights {}>{} {:.0?} {:.1} MB/s exchange {:.3} ms/epoch",
 				shard.device_label()?,
 				shard.precision.model.label(),
 				shard.rows,
-				link.latency,
-				link.bandwidth / 1e6,
-				exchange * 1e3,
+				gradient.from,
+				gradient.to,
+				gradient.cost.latency,
+				gradient.cost.bandwidth / 1e6,
+				weights.from,
+				weights.to,
+				weights.cost.latency,
+				weights.cost.bandwidth / 1e6,
+				(gradient.seconds() + weights.seconds()) * 1e3,
 			);
 		}
 		Ok(())
