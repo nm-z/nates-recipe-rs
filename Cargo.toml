@@ -30,6 +30,7 @@ contraction-resident-waves-per-workgroup = 2
 contraction-matrix-max-waves-per-workgroup = 4
 attention-query-tile = 24
 topology-probe-bytes = 4194304
+topology-calibration-rows = 65536
 cpu-compiler = "/usr/bin/clang"
 hsa-compiler = "/opt/rocm/lib/llvm/bin/clang"
 hsa-runtime = "libhsa-runtime64.so.1"
