@@ -178,16 +178,17 @@ fn math_literal(arithmetic: &str, value: f64) -> String { if arithmetic == "doub
 
 /// Horner evaluation of `sum(coefficients[i] * variable^i)` as a chain of one
 /// multiply and one add per term, innermost coefficient first.
-fn horner(prefix: &str, variable: &str, coefficients: &[f64]) -> (String, String) {
-	horner_typed(prefix, variable, coefficients, "double")
-}
+fn horner(prefix: &str, variable: &str, coefficients: &[f64]) -> (String, String) { horner_typed(prefix, variable, coefficients, "double") }
 
 fn horner_typed(prefix: &str, variable: &str, coefficients: &[f64], arithmetic: &str) -> (String, String) {
 	let mut ir = String::new();
 	let intrinsic = if arithmetic == "double" { "f64" } else { "f32" };
 	let mut current = math_literal(arithmetic, coefficients[coefficients.len() - 1]);
 	for (step, coefficient) in coefficients.iter().rev().skip(1).enumerate() {
-		ir.push_str(&format!("%{prefix}.{step} = call {arithmetic} @llvm.fma.{intrinsic}({arithmetic} {current}, {arithmetic} {variable}, {arithmetic} {})\n", math_literal(arithmetic, *coefficient)));
+		ir.push_str(&format!(
+			"%{prefix}.{step} = call {arithmetic} @llvm.fma.{intrinsic}({arithmetic} {current}, {arithmetic} {variable}, {arithmetic} {})\n",
+			math_literal(arithmetic, *coefficient)
+		));
 		current = format!("%{prefix}.{step}");
 	}
 	(ir, current)
@@ -199,8 +200,16 @@ fn exponential_math(arithmetic: &str, name: &str, bias: i32, maximum: i32, shift
 	let stored = if arithmetic == "double" { "%stored = zext i32 %clamped to i64\n" } else { "%stored = add i32 %clamped, 0\n" };
 	let infinity = math_literal(arithmetic, f64::INFINITY);
 	let (polynomial, value) = horner_typed("exp.poly", "%r", &reciprocal_factorials(1, 1, terms), arithmetic);
-	format!("define internal {arithmetic} @{name}.pow2(i32 %k) #1 {{\nentry:\n%biased = add i32 %k, {bias}\n%low = icmp slt i32 %biased, 0\n%floor = select i1 %low, i32 0, i32 %biased\n%high = icmp sgt i32 %floor, {maximum}\n%clamped = select i1 %high, i32 {maximum}, i32 %floor\n{stored}%bits = shl {integer} %stored, {shift}\n%result = bitcast {integer} %bits to {arithmetic}\nret {arithmetic} %result\n}}\ndefine internal {arithmetic} @{name}.scale({arithmetic} %value, i32 %k) #1 {{\nentry:\n%half = ashr i32 %k, 1\n%rest = sub i32 %k, %half\n%first = call {arithmetic} @{name}.pow2(i32 %half)\n%second = call {arithmetic} @{name}.pow2(i32 %rest)\n%scaled = fmul {arithmetic} %value, %first\n%result = fmul {arithmetic} %scaled, %second\nret {arithmetic} %result\n}}\ndefine internal {arithmetic} @{name}({arithmetic} %x) #1 {{\nentry:\n%unordered = fcmp uno {arithmetic} %x, %x\nbr i1 %unordered, label %quiet, label %high.test\nquiet:\nret {arithmetic} %x\nhigh.test:\n%high = fcmp ogt {arithmetic} %x, {}\nbr i1 %high, label %overflow, label %low.test\noverflow:\nret {arithmetic} {infinity}\nlow.test:\n%low = fcmp olt {arithmetic} %x, {}\nbr i1 %low, label %underflow, label %reduce\nunderflow:\nret {arithmetic} 0.0\nreduce:\n%scaled = fmul {arithmetic} %x, {}\n%shifted = fadd {arithmetic} %scaled, {}\n%kf = call {arithmetic} @llvm.floor.{intrinsic}({arithmetic} %shifted)\n%k = fptosi {arithmetic} %kf to i32\n%upper = fmul {arithmetic} %kf, {}\n%partial = fsub {arithmetic} %x, %upper\n%lower = fmul {arithmetic} %kf, {}\n%r = fsub {arithmetic} %partial, %lower\n{polynomial}%body = fmul {arithmetic} %r, {value}\n%expanded = fadd {arithmetic} {}, %body\n%result = call {arithmetic} @{name}.scale({arithmetic} %expanded, i32 %k)\nret {arithmetic} %result\n}}\n",
-		math_literal(arithmetic, high), math_literal(arithmetic, low), math_literal(arithmetic, std::f64::consts::LOG2_E), math_literal(arithmetic, 0.5), math_literal(arithmetic, f64::from_bits(0x3FE62E42FEE00000)), math_literal(arithmetic, 1.90821492927058770002e-10), math_literal(arithmetic, 1.0))
+	format!(
+		"define internal {arithmetic} @{name}.pow2(i32 %k) #1 {{\nentry:\n%biased = add i32 %k, {bias}\n%low = icmp slt i32 %biased, 0\n%floor = select i1 %low, i32 0, i32 %biased\n%high = icmp sgt i32 %floor, {maximum}\n%clamped = select i1 %high, i32 {maximum}, i32 %floor\n{stored}%bits = shl {integer} %stored, {shift}\n%result = bitcast {integer} %bits to {arithmetic}\nret {arithmetic} %result\n}}\ndefine internal {arithmetic} @{name}.scale({arithmetic} %value, i32 %k) #1 {{\nentry:\n%half = ashr i32 %k, 1\n%rest = sub i32 %k, %half\n%first = call {arithmetic} @{name}.pow2(i32 %half)\n%second = call {arithmetic} @{name}.pow2(i32 %rest)\n%scaled = fmul {arithmetic} %value, %first\n%result = fmul {arithmetic} %scaled, %second\nret {arithmetic} %result\n}}\ndefine internal {arithmetic} @{name}({arithmetic} %x) #1 {{\nentry:\n%unordered = fcmp uno {arithmetic} %x, %x\nbr i1 %unordered, label %quiet, label %high.test\nquiet:\nret {arithmetic} %x\nhigh.test:\n%high = fcmp ogt {arithmetic} %x, {}\nbr i1 %high, label %overflow, label %low.test\noverflow:\nret {arithmetic} {infinity}\nlow.test:\n%low = fcmp olt {arithmetic} %x, {}\nbr i1 %low, label %underflow, label %reduce\nunderflow:\nret {arithmetic} 0.0\nreduce:\n%scaled = fmul {arithmetic} %x, {}\n%shifted = fadd {arithmetic} %scaled, {}\n%kf = call {arithmetic} @llvm.floor.{intrinsic}({arithmetic} %shifted)\n%k = fptosi {arithmetic} %kf to i32\n%upper = fmul {arithmetic} %kf, {}\n%partial = fsub {arithmetic} %x, %upper\n%lower = fmul {arithmetic} %kf, {}\n%r = fsub {arithmetic} %partial, %lower\n{polynomial}%body = fmul {arithmetic} %r, {value}\n%expanded = fadd {arithmetic} {}, %body\n%result = call {arithmetic} @{name}.scale({arithmetic} %expanded, i32 %k)\nret {arithmetic} %result\n}}\n",
+		math_literal(arithmetic, high),
+		math_literal(arithmetic, low),
+		math_literal(arithmetic, std::f64::consts::LOG2_E),
+		math_literal(arithmetic, 0.5),
+		math_literal(arithmetic, f64::from_bits(0x3FE62E42FEE00000)),
+		math_literal(arithmetic, 1.90821492927058770002e-10),
+		math_literal(arithmetic, 1.0)
+	)
 }
 
 /// Reciprocal factorials `1/(first!)`, `1/((first + step)!)`, ... up to `last`,
@@ -219,9 +228,7 @@ fn reciprocal_factorials(first: u32, step: u32, last: u32) -> Vec<f64> {
 
 /// The same terms with the alternating signs of a sine or cosine series, which
 /// starts negative at the leading term of the polynomial in `r * r`.
-fn alternating_factorials(first: u32, last: u32) -> Vec<f64> {
-	reciprocal_factorials(first, 2, last).into_iter().enumerate().map(|(term, value)| if term % 2 == 0 { -value } else { value }).collect()
-}
+fn alternating_factorials(first: u32, last: u32) -> Vec<f64> { reciprocal_factorials(first, 2, last).into_iter().enumerate().map(|(term, value)| if term % 2 == 0 { -value } else { value }).collect() }
 
 /// Deterministic implementations of the five transcendentals, evaluated in
 /// double regardless of the arithmetic type. A backend library would be free to
@@ -273,7 +280,9 @@ fn shared_math(arithmetic: &str) -> String {
 		if arithmetic == "double" {
 			block.push_str(&format!("define internal double @{name}(double %value) #1 {{ entry: %result = call double @{wide}(double %value) ret double %result }}\n"));
 		} else if name == "recipe.math.exp" {
-			block.push_str(&format!("define internal {arithmetic} @{name}({arithmetic} %value) #1 {{ entry: %result = call {arithmetic} @recipe.math.exp.narrow({arithmetic} %value) ret {arithmetic} %result }}\n"));
+			block.push_str(&format!(
+				"define internal {arithmetic} @{name}({arithmetic} %value) #1 {{ entry: %result = call {arithmetic} @recipe.math.exp.narrow({arithmetic} %value) ret {arithmetic} %result }}\n"
+			));
 		} else {
 			// Evaluating in double and rounding once is both deterministic and at
 			// least as accurate as a native narrow evaluation would be.
@@ -285,10 +294,14 @@ fn shared_math(arithmetic: &str) -> String {
 fn native_codec(ty: &str, rounded: bool) -> String {
 	let round = if rounded {
 		"define internal float @recipe.round(float %value) #1 { entry: %bits = bitcast float %value to i32 %absolute = and i32 %bits, 2147483647 %special = icmp uge i32 %absolute, 2139095040 %shifted = lshr i32 %bits, 13 %least = and i32 %shifted, 1 %bias = add i32 4095, %least %biased = add i32 %bits, %bias %masked = and i32 %biased, -8192 %encoded = select i1 %special, i32 %bits, i32 %masked %result = bitcast i32 %encoded to float ret float %result }\n"
-	} else { "" };
+	} else {
+		""
+	};
 	let conversion = if rounded { format!("%result = call {ty} @recipe.round({ty} %value)") } else { format!("ret {ty} %value") };
 	let returned = if rounded { format!("ret {ty} %result") } else { String::new() };
-	format!("{round}define internal {ty} @recipe.decode({ty} %value) #1 {{ entry: {conversion} {returned} }}\ndefine internal {ty} @recipe.encode({ty} %value) #1 {{ entry: {conversion} {returned} }}\n")
+	format!(
+		"{round}define internal {ty} @recipe.decode({ty} %value) #1 {{ entry: {conversion} {returned} }}\ndefine internal {ty} @recipe.encode({ty} %value) #1 {{ entry: {conversion} {returned} }}\n"
+	)
 }
 
 fn numeric_operations(prefix: &str, value: &str, arithmetic: &str, encoded: bool, vector: Option<bool>) -> String {
@@ -317,7 +330,9 @@ fn numeric_operations(prefix: &str, value: &str, arithmetic: &str, encoded: bool
 			// The state family reuses the model family's intrinsic when both name the
 			// same type, so the declaration is emitted once.
 			if declare {
-				block.push_str(&format!("declare <RECIPE_REGISTER_M x {value}> @llvm.fma.vRECIPE_REGISTER_M{intrinsic}(<RECIPE_REGISTER_M x {value}>, <RECIPE_REGISTER_M x {value}>, <RECIPE_REGISTER_M x {value}>)\n"));
+				block.push_str(&format!(
+					"declare <RECIPE_REGISTER_M x {value}> @llvm.fma.vRECIPE_REGISTER_M{intrinsic}(<RECIPE_REGISTER_M x {value}>, <RECIPE_REGISTER_M x {value}>, <RECIPE_REGISTER_M x {value}>)\n"
+				));
 			}
 			block.push_str(&format!("define internal <RECIPE_REGISTER_M x {value}> @{prefix}.madd.vector(<RECIPE_REGISTER_M x {value}> %sum, <RECIPE_REGISTER_M x {value}> %left, <RECIPE_REGISTER_M x {value}> %right) #1 {{\nentry:\n%result = call <RECIPE_REGISTER_M x {value}> @llvm.fma.vRECIPE_REGISTER_M{intrinsic}(<RECIPE_REGISTER_M x {value}> %left, <RECIPE_REGISTER_M x {value}> %right, <RECIPE_REGISTER_M x {value}> %sum)\nret <RECIPE_REGISTER_M x {value}> %result\n}}\n"));
 		} else {
@@ -346,7 +361,9 @@ fn numeric_operations(prefix: &str, value: &str, arithmetic: &str, encoded: bool
 	}
 	for (name, operation) in [("to.u32", "fptoui"), ("to.s32", "fptosi")] {
 		if encoded {
-			block.push_str(&format!("define internal i32 @{prefix}.{name}({value} %value) #1 {{ entry: %wide = call {arithmetic} @recipe.decode({value} %value) %result = {operation} {arithmetic} %wide to i32 ret i32 %result }}\n"))
+			block.push_str(&format!(
+				"define internal i32 @{prefix}.{name}({value} %value) #1 {{ entry: %wide = call {arithmetic} @recipe.decode({value} %value) %result = {operation} {arithmetic} %wide to i32 ret i32 %result }}\n"
+			))
 		} else {
 			block.push_str(&format!("define internal i32 @{prefix}.{name}({value} %value) #1 {{ entry: %result = {operation} {value} %value to i32 ret i32 %result }}\n"))
 		}
@@ -356,7 +373,9 @@ fn numeric_operations(prefix: &str, value: &str, arithmetic: &str, encoded: bool
 	let to_f16 = format!("%result = fptrunc {arithmetic} %wide to half");
 	for (name, source, conversion) in [("from.f32", "float", from_f32), ("from.f16", "half", from_f16)] {
 		if encoded {
-			block.push_str(&format!("define internal {value} @{prefix}.{name}({source} %value) #1 {{ entry: {conversion} %result = call {value} @recipe.encode({arithmetic} %wide) ret {value} %result }}\n"))
+			block.push_str(&format!(
+				"define internal {value} @{prefix}.{name}({source} %value) #1 {{ entry: {conversion} %result = call {value} @recipe.encode({arithmetic} %wide) ret {value} %result }}\n"
+			))
 		} else {
 			block.push_str(&format!("define internal {value} @{prefix}.{name}({source} %value) #1 {{ entry: {conversion} ret {value} %wide }}\n"))
 		}
@@ -366,7 +385,16 @@ fn numeric_operations(prefix: &str, value: &str, arithmetic: &str, encoded: bool
 	} else {
 		block.push_str(&format!("define internal half @{prefix}.to.f16({value} %value) #1 {{ entry: %wide = fadd {value} %value, 0.0 {to_f16} ret half %result }}\n"));
 	}
-	for (name, symbol) in [("abs", format!("llvm.fabs.{intrinsic}")), ("floor", format!("llvm.floor.{intrinsic}")), ("sqrt", format!("llvm.sqrt.{intrinsic}")), ("exp", math[0].to_owned()), ("tanh", math[1].to_owned()), ("cos", math[2].to_owned()), ("sin", math[3].to_owned()), ("log", math[4].to_owned())] {
+	for (name, symbol) in [
+		("abs", format!("llvm.fabs.{intrinsic}")),
+		("floor", format!("llvm.floor.{intrinsic}")),
+		("sqrt", format!("llvm.sqrt.{intrinsic}")),
+		("exp", math[0].to_owned()),
+		("tanh", math[1].to_owned()),
+		("cos", math[2].to_owned()),
+		("sin", math[3].to_owned()),
+		("log", math[4].to_owned()),
+	] {
 		if encoded {
 			block.push_str(&format!("define internal {value} @{prefix}.{name}({value} %value) #1 {{ entry: %wide = call {arithmetic} @recipe.decode({value} %value) %computed = call {arithmetic} @{symbol}({arithmetic} %wide) %result = call {value} @recipe.encode({arithmetic} %computed) ret {value} %result }}\n"))
 		} else {
@@ -382,7 +410,9 @@ fn numeric_program(value: &str, arithmetic: &str, codec: &str) -> String {
 	let mut block = if codec.starts_with("; NUMERIC BEGIN") {
 		format!("{codec}\n")
 	} else {
-		format!("; NUMERIC BEGIN\ndeclare {arithmetic} @llvm.sqrt.{intrinsic}({arithmetic}) declare {arithmetic} @llvm.fabs.{intrinsic}({arithmetic}) declare {arithmetic} @llvm.floor.{intrinsic}({arithmetic})\n{codec}\n")
+		format!(
+			"; NUMERIC BEGIN\ndeclare {arithmetic} @llvm.sqrt.{intrinsic}({arithmetic}) declare {arithmetic} @llvm.fabs.{intrinsic}({arithmetic}) declare {arithmetic} @llvm.floor.{intrinsic}({arithmetic})\n{codec}\n"
+		)
 	};
 	block.push_str(&format!("\ndeclare {arithmetic} @llvm.fma.{intrinsic}({arithmetic}, {arithmetic}, {arithmetic})\n"));
 	block.push_str(&shared_math(arithmetic));
@@ -396,7 +426,6 @@ fn numeric_program(value: &str, arithmetic: &str, codec: &str) -> String {
 	block.push_str(&format!("define internal {arithmetic} @recipe.state.from.model({value} %value) #1 {{ entry: %result = call {arithmetic} @recipe.decode({value} %value) ret {arithmetic} %result }}\ndefine internal {value} @recipe.model.from.state({arithmetic} %value) #1 {{ entry: %result = call {value} @recipe.encode({arithmetic} %value) ret {value} %result }}\n; NUMERIC END"));
 	block
 }
-
 
 fn native_ir(ir: String, suffix: &str, llvm: &str, format: FloatFormat) -> BuildResult<String> {
 	let (start, end) = numeric_region(&ir)?;
@@ -412,7 +441,10 @@ fn native_ir(ir: String, suffix: &str, llvm: &str, format: FloatFormat) -> Build
 			"bfloat" => format!("0xR{:04X}", format.pack(value)),
 			_ => format!("0x{:016X}", format.unpack(format.pack(value)).to_bits()),
 		};
-		kernel = kernel.replace(&format!("{llvm} 0.1"), &format!("{llvm} {}", literal(0.1))).replace("0x3CB0000000000000", &literal(f64::from_bits(0x3CB0000000000000))).replace("0x3FEFFFFFFFFFFFFE", &literal(f64::from_bits(0x3FEFFFFFFFFFFFFE)))
+		kernel = kernel
+			.replace(&format!("{llvm} 0.1"), &format!("{llvm} {}", literal(0.1)))
+			.replace("0x3CB0000000000000", &literal(f64::from_bits(0x3CB0000000000000)))
+			.replace("0x3FEFFFFFFFFFFFFE", &literal(f64::from_bits(0x3FEFFFFFFFFFFFFE)))
 	}
 	Ok(kernel.replace("@RECIPE_NUMERIC@", &numeric))
 }
@@ -439,7 +471,11 @@ fn custom_ir(ir: String, suffix: &str) -> BuildResult<String> {
 	let (start, end) = numeric_region(&ir)?;
 	// The custom float carries its values in double, so the arithmetic type is
 	// the model type and the widening accumulator folds away.
-	Ok(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]).replace("@contraction_tile", &format!("@contraction_tile{suffix}")).replace("RECIPE_STATE_ALIGN", "8").replace("RECIPE_STATE", "double").replace("@RECIPE_NUMERIC@", &custom_numeric()))
+	Ok(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..])
+		.replace("@contraction_tile", &format!("@contraction_tile{suffix}"))
+		.replace("RECIPE_STATE_ALIGN", "8")
+		.replace("RECIPE_STATE", "double")
+		.replace("@RECIPE_NUMERIC@", &custom_numeric()))
 }
 fn fp8_codec() -> &'static str {
 	r#"define internal float @recipe.decode(i8 %value) #1 { entry: %wide = zext i8 %value to i32 %sign = and i32 %wide, 128 %exponent.shifted = lshr i32 %wide, 2 %exponent = and i32 %exponent.shifted, 31 %mantissa = and i32 %wide, 3 %zero.exponent = icmp eq i32 %exponent, 0 br i1 %zero.exponent, label %subnormal, label %nonzero subnormal: %mantissa.float = uitofp i32 %mantissa to float %negative = icmp ne i32 %sign, 0 %subnormal.value = select i1 %negative, float 0xBEF0000000000000, float 0x3EF0000000000000 %scaled = fmul float %mantissa.float, %subnormal.value ret float %scaled nonzero: %special = icmp eq i32 %exponent, 31 %biased.exponent = add i32 %exponent, 112 %float.exponent = select i1 %special, i32 255, i32 %biased.exponent %float.sign = shl i32 %sign, 24 %float.exponent.bits = shl i32 %float.exponent, 23 %float.mantissa = shl i32 %mantissa, 21 %signed = or i32 %float.sign, %float.exponent.bits %bits = or i32 %signed, %float.mantissa %result = bitcast i32 %bits to float ret float %result }
@@ -458,7 +494,9 @@ fn encoded_ir(ir: String, suffix: &str, bytes: usize, codec: &str, pack: impl Fn
 		_ => "i64",
 	};
 	let numeric = numeric_program(llvm, "float", codec);
-	let mut kernel = word(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]), "double", llvm).replace("@contraction_tile", &format!("@contraction_tile{suffix}")).replace("align 8", &format!("align {bytes}"));
+	let mut kernel = word(format!("{}@RECIPE_NUMERIC@{}", &ir[..start], &ir[end..]), "double", llvm)
+		.replace("@contraction_tile", &format!("@contraction_tile{suffix}"))
+		.replace("align 8", &format!("align {bytes}"));
 	kernel = kernel.replace("RECIPE_STATE_ALIGN", "4").replace("RECIPE_STATE", "float");
 	for (source, value) in [("-2.0", -2.0), ("-1.0", -1.0), ("0.0", 0.0), ("0.1", 0.1), ("0.5", 0.5), ("1.0", 1.0), ("2.0", 2.0)] {
 		kernel = word(kernel, source, &pack(value).to_string())
@@ -487,7 +525,9 @@ fn int_codec(format: IntFormat) -> String {
 	let shift = 32 - bits;
 	let minimum = -(1i16 << (bits - 1));
 	let maximum = (1i16 << (bits - 1)) - 1;
-	format!("declare float @llvm.roundeven.f32(float)\ndefine internal float @recipe.decode(i8 %value) #1 {{ entry: %wide = zext i8 %value to i32 %masked = and i32 %wide, {mask} %shifted = shl i32 %masked, {shift} %signed = ashr i32 %shifted, {shift} %result = sitofp i32 %signed to float ret float %result }}\ndefine internal i8 @recipe.encode(float %value) #1 {{ entry: %nan = fcmp uno float %value, %value %rounded = call float @llvm.roundeven.f32(float %value) %below = fcmp olt float %rounded, {minimum}.0 %above = fcmp ogt float %rounded, {maximum}.0 %lowered = select i1 %below, float {minimum}.0, float %rounded %clamped = select i1 %above, float {maximum}.0, float %lowered %finite = select i1 %nan, float 0.0, float %clamped %integer = fptosi float %finite to i32 %masked = and i32 %integer, {mask} %result = trunc i32 %masked to i8 ret i8 %result }}")
+	format!(
+		"declare float @llvm.roundeven.f32(float)\ndefine internal float @recipe.decode(i8 %value) #1 {{ entry: %wide = zext i8 %value to i32 %masked = and i32 %wide, {mask} %shifted = shl i32 %masked, {shift} %signed = ashr i32 %shifted, {shift} %result = sitofp i32 %signed to float ret float %result }}\ndefine internal i8 @recipe.encode(float %value) #1 {{ entry: %nan = fcmp uno float %value, %value %rounded = call float @llvm.roundeven.f32(float %value) %below = fcmp olt float %rounded, {minimum}.0 %above = fcmp ogt float %rounded, {maximum}.0 %lowered = select i1 %below, float {minimum}.0, float %rounded %clamped = select i1 %above, float {maximum}.0, float %lowered %finite = select i1 %nan, float 0.0, float %clamped %integer = fptosi float %finite to i32 %masked = and i32 %integer, {mask} %result = trunc i32 %masked to i8 ret i8 %result }}"
+	)
 }
 fn setting<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	let prefix = format!("{key} = ");
@@ -498,8 +538,24 @@ fn number<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 	value.parse::<f64>().map_err(|error| io::Error::other(format!("{key} must be numeric: {error}")))?;
 	Ok(value)
 }
-fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> { setting(manifest, key)?.strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| io::Error::other(format!("{key} must be quoted")).into()) }
-const CPU_REPLACEMENTS: &[(&str, &str)] = &[("@contraction_tile = external addrspace(3) global [0 x double], align 16", "@contraction_tile = internal global [RECIPE_CONTRACTION_CPU_SHARED_VALUES x double] zeroinitializer, align 16"), (" addrspace(3)", ""), ("call i32 @llvm.amdgcn.workitem.id.x()", "add i32 0, 0"), ("call i32 @recipe.local.id.x()", "add i32 0, 0"), ("call i32 @recipe.group.id.x()", "add i32 0, 0"), ("call i32 @recipe.workgroup.size.x()", "add i32 1, 0"), ("call void @llvm.amdgcn.s.barrier()", ""), ("call void @recipe.local.barrier()", ""), ("call void @grid_barrier(i32 %threads)", ""), ("declare i32 @llvm.amdgcn.workitem.id.x()", ""), ("declare void @llvm.amdgcn.s.barrier()", ""), ("declare i64 @__ockl_steadyctr_u64()", ""), ("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }")];
+fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
+	setting(manifest, key)?.strip_prefix('"').and_then(|value| value.strip_suffix('"')).ok_or_else(|| io::Error::other(format!("{key} must be quoted")).into())
+}
+const CPU_REPLACEMENTS: &[(&str, &str)] = &[
+	("@contraction_tile = external addrspace(3) global [0 x double], align 16", "@contraction_tile = internal global [RECIPE_CONTRACTION_CPU_SHARED_VALUES x double] zeroinitializer, align 16"),
+	(" addrspace(3)", ""),
+	("call i32 @llvm.amdgcn.workitem.id.x()", "add i32 0, 0"),
+	("call i32 @recipe.local.id.x()", "add i32 0, 0"),
+	("call i32 @recipe.group.id.x()", "add i32 0, 0"),
+	("call i32 @recipe.workgroup.size.x()", "add i32 1, 0"),
+	("call void @llvm.amdgcn.s.barrier()", ""),
+	("call void @recipe.local.barrier()", ""),
+	("call void @grid_barrier(i32 %threads)", ""),
+	("declare i32 @llvm.amdgcn.workitem.id.x()", ""),
+	("declare void @llvm.amdgcn.s.barrier()", ""),
+	("declare i64 @__ockl_steadyctr_u64()", ""),
+	("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }"),
+];
 /// Compile-time contraction shape. A reverse K extent is cut into one contiguous
 /// partition per `split_span` elements, capped at `partitions`, so the summation
 /// order is a property of the program rather than of the device it runs on.
@@ -512,7 +568,12 @@ struct Schedule {
 	local_chunks: u32,
 }
 fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<[(&'static str, String); 10]> {
-	let ir = ir.replace("RECIPE_CONTRACTION_SWIZZLE_M", &schedule.swizzle_m.to_string()).replace("RECIPE_CONTRACTION_K_PARTITIONS", &schedule.partitions.to_string()).replace("RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN", &schedule.matrix_split_span.to_string()).replace("RECIPE_CONTRACTION_SPLIT_SPAN", &schedule.split_span.to_string()).replace("RECIPE_CONTRACTION_LOCAL_CHUNKS", &schedule.local_chunks.to_string());
+	let ir = ir
+		.replace("RECIPE_CONTRACTION_SWIZZLE_M", &schedule.swizzle_m.to_string())
+		.replace("RECIPE_CONTRACTION_K_PARTITIONS", &schedule.partitions.to_string())
+		.replace("RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN", &schedule.matrix_split_span.to_string())
+		.replace("RECIPE_CONTRACTION_SPLIT_SPAN", &schedule.split_span.to_string())
+		.replace("RECIPE_CONTRACTION_LOCAL_CHUNKS", &schedule.local_chunks.to_string());
 	Ok([
 		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
 		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
@@ -527,9 +588,37 @@ fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<[(&'static s
 	])
 }
 fn wmma_source(source: &str) -> String { source.lines().filter(|line| !line.starts_with("; RECIPE_WMMA ")).collect::<Vec<_>>().join("\n") }
-fn wmma_method(source: &str, key: &str) -> BuildResult<(String, String)> { let marker = format!("{key} "); let catalog = source.lines().find_map(|line| line.strip_prefix("; RECIPE_WMMA ")).ok_or_else(|| io::Error::other("WMMA methods are absent"))?; let method = catalog.split(" || ").find_map(|method| method.strip_prefix(&marker)).ok_or_else(|| io::Error::other(format!("WMMA method {key} is absent")))?; let (kind, body) = method.split_once(' ').ok_or_else(|| io::Error::other(format!("WMMA method {key} has no body")))?; Ok((kind.to_owned(), body.replace("\\n", "\n"))) }
-fn compose_wmma(ir: String, source: &str, key: &str) -> BuildResult<String> { let (kind, body) = wmma_method(source, key)?; if kind == "call" { return Ok(ir.replace("@recipe.wmma(", &body)) } if kind != "definition" { return Err(io::Error::other(format!("WMMA method {key} has an invalid kind")).into()) } let declaration = ir.lines().find(|line| line.starts_with("declare ") && line.contains("@recipe.wmma(")).ok_or_else(|| io::Error::other("specialized WMMA declaration is absent"))?.to_owned(); Ok(ir.replace(&declaration, &body)) }
-fn compose_contraction(mut ir: String, matrix: bool) -> String { for (operation, vector, native) in [("@contraction_product_accumulate(", "@contraction_vector_accumulate(", "@contraction_matrix_accumulate("), ("@contraction_a_index(", "@contraction_vector_a_index(", "@contraction_matrix_a_index("), ("@contraction_b_index(", "@contraction_vector_b_index(", "@contraction_matrix_b_index("), ("@contraction_output_m(", "@contraction_vector_output_m(", "@contraction_matrix_output_m("), ("@contraction_output_n(", "@contraction_vector_output_n(", "@contraction_matrix_output_n("), ("@contraction_store_lane(", "@contraction_vector_store_lane(", "@contraction_matrix_store_lane(")] { ir = ir.replace(operation, if matrix { native } else { vector }) } ir }
+fn wmma_method(source: &str, key: &str) -> BuildResult<(String, String)> {
+	let marker = format!("{key} ");
+	let catalog = source.lines().find_map(|line| line.strip_prefix("; RECIPE_WMMA ")).ok_or_else(|| io::Error::other("WMMA methods are absent"))?;
+	let method = catalog.split(" || ").find_map(|method| method.strip_prefix(&marker)).ok_or_else(|| io::Error::other(format!("WMMA method {key} is absent")))?;
+	let (kind, body) = method.split_once(' ').ok_or_else(|| io::Error::other(format!("WMMA method {key} has no body")))?;
+	Ok((kind.to_owned(), body.replace("\\n", "\n")))
+}
+fn compose_wmma(ir: String, source: &str, key: &str) -> BuildResult<String> {
+	let (kind, body) = wmma_method(source, key)?;
+	if kind == "call" {
+		return Ok(ir.replace("@recipe.wmma(", &body));
+	}
+	if kind != "definition" {
+		return Err(io::Error::other(format!("WMMA method {key} has an invalid kind")).into());
+	}
+	let declaration = ir.lines().find(|line| line.starts_with("declare ") && line.contains("@recipe.wmma(")).ok_or_else(|| io::Error::other("specialized WMMA declaration is absent"))?.to_owned();
+	Ok(ir.replace(&declaration, &body))
+}
+fn compose_contraction(mut ir: String, matrix: bool) -> String {
+	for (operation, vector, native) in [
+		("@contraction_product_accumulate(", "@contraction_vector_accumulate(", "@contraction_matrix_accumulate("),
+		("@contraction_a_index(", "@contraction_vector_a_index(", "@contraction_matrix_a_index("),
+		("@contraction_b_index(", "@contraction_vector_b_index(", "@contraction_matrix_b_index("),
+		("@contraction_output_m(", "@contraction_vector_output_m(", "@contraction_matrix_output_m("),
+		("@contraction_output_n(", "@contraction_vector_output_n(", "@contraction_matrix_output_n("),
+		("@contraction_store_lane(", "@contraction_vector_store_lane(", "@contraction_matrix_store_lane("),
+	] {
+		ir = ir.replace(operation, if matrix { native } else { vector })
+	}
+	ir
+}
 fn compile_amd(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
 	let source = fs::read_to_string("amd-nv-cpu.ll")?;
 	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER);
@@ -550,14 +639,29 @@ fn compile_amd(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 	}
 	println!("cargo:rustc-env=RECIPE_AMD_IR={}", values.join("\x3b"));
 	println!("cargo:rustc-env=RECIPE_HSA_COMPILER={}", text(manifest, "hsa-compiler")?);
-	for (key, environment) in [("hsa-device-library", "RECIPE_HSA_DEVICE_LIBRARY"), ("hsa-clock-library", "RECIPE_HSA_CLOCK_LIBRARY"), ("hsa-abi-library", "RECIPE_HSA_ABI_LIBRARY"), ("hsa-finite-library", "RECIPE_HSA_FINITE_LIBRARY"), ("hsa-math-library", "RECIPE_HSA_MATH_LIBRARY"), ("hsa-device-library-directory", "RECIPE_HSA_DEVICE_LIBRARY_DIRECTORY")] {
+	for (key, environment) in [
+		("hsa-device-library", "RECIPE_HSA_DEVICE_LIBRARY"),
+		("hsa-clock-library", "RECIPE_HSA_CLOCK_LIBRARY"),
+		("hsa-abi-library", "RECIPE_HSA_ABI_LIBRARY"),
+		("hsa-finite-library", "RECIPE_HSA_FINITE_LIBRARY"),
+		("hsa-math-library", "RECIPE_HSA_MATH_LIBRARY"),
+		("hsa-device-library-directory", "RECIPE_HSA_DEVICE_LIBRARY_DIRECTORY"),
+	] {
 		println!("cargo:rustc-env={environment}={}", text(manifest, key)?);
 	}
 	Ok(())
 }
 fn compile_nvidia(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
 	let ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?);
-	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER).replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda").replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x").replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x").replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x").replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0").replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }").replace(", addrspace(5)", "").replace(" addrspace(5)", "");
+	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER)
+		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
+		.replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x")
+		.replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x")
+		.replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x")
+		.replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0")
+		.replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }")
+		.replace(", addrspace(5)", "")
+		.replace(" addrspace(5)", "");
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
 		let path = out.join(format!("recipe-nvidia{suffix}.ll"));
@@ -579,11 +683,16 @@ fn compile_cpu(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 	}
 	let clang = text(manifest, "cpu-compiler")?;
 	if !Path::new(clang).exists() {
-		return Err(io::Error::other(format!("cpu-compiler {clang:?} is absent")).into())
+		return Err(io::Error::other(format!("cpu-compiler {clang:?} is absent")).into());
 	}
 	let mut values = Vec::new();
 	for (suffix, contents) in precision_sources(ir, schedule)? {
-		let contents = contents.replace(" addrspace(1)", "").replace(" addrspace(3)", "").replace(", addrspace(5)", "").replace(" addrspace(5)", "").replace("RECIPE_CONTRACTION_CPU_SHARED_VALUES", number(manifest, "contraction-cpu-shared-values")?);
+		let contents = contents
+			.replace(" addrspace(1)", "")
+			.replace(" addrspace(3)", "")
+			.replace(", addrspace(5)", "")
+			.replace(" addrspace(5)", "")
+			.replace("RECIPE_CONTRACTION_CPU_SHARED_VALUES", number(manifest, "contraction-cpu-shared-values")?);
 		let path = out.join(format!("recipe-cpu{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents, false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
@@ -595,8 +704,16 @@ fn compile_cpu(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 }
 fn main() -> BuildResult<()> {
 	let manifest = fs::read_to_string("Cargo.toml")?;
-	let positive = |key: &str| -> BuildResult<u32> { setting(&manifest, key)?.parse::<u32>().ok().filter(|value| *value != 0).ok_or_else(|| io::Error::other(format!("{key} must be a positive integer")).into()) };
-	let schedule = Schedule { swizzle_m: positive("contraction-swizzle-m-tiles")?, partitions: positive("contraction-k-partitions")?, split_span: positive("contraction-split-span")?, matrix_split_span: positive("contraction-matrix-split-span")?, local_chunks: positive("contraction-local-chunks")? };
+	let positive = |key: &str| -> BuildResult<u32> {
+		setting(&manifest, key)?.parse::<u32>().ok().filter(|value| *value != 0).ok_or_else(|| io::Error::other(format!("{key} must be a positive integer")).into())
+	};
+	let schedule = Schedule {
+		swizzle_m: positive("contraction-swizzle-m-tiles")?,
+		partitions: positive("contraction-k-partitions")?,
+		split_span: positive("contraction-split-span")?,
+		matrix_split_span: positive("contraction-matrix-split-span")?,
+		local_chunks: positive("contraction-local-chunks")?,
+	};
 	for (key, environment) in [
 		("epochs", "RECIPE_TRAIN_EPOCHS"),
 		("learning-rate", "RECIPE_TRAIN_LEARNING_RATE"),

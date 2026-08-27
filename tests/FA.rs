@@ -42,16 +42,10 @@ fn saved_moments(path: &std::path::Path) -> Vec<u64> {
 fn run(width: usize, bits: u8) -> (Evidence, f64) {
 	let bundle = std::env::temp_dir().join(format!("recipe-fa-{width}-{}.ogdl", std::process::id()));
 
-	let data = recipe
-		.data(auto)
-		.set("data/temporal/window_subfolders/window-0000");
-	let model = recipe
-		.model()
-		.conv(width, 1);
+	let data = recipe.data(auto).set("data/temporal/window_subfolders/window-0000");
+	let model = recipe.model().conv(width, 1);
 	let model = model.attn(1);
-	let model = model
-		.layer(1)
-		.loss(mse);
+	let model = model.layer(1).loss(mse);
 	let report = recipe
 		.train()
 		.seed(17)
@@ -107,11 +101,11 @@ fn compare(head_width: usize, bits: u8, test: &str) {
 			let reference = reference.parse::<f64>().unwrap_or_else(|error| panic!("upstream FA seconds are malformed: {error}"));
 			assert!(seconds >= reference * 0.7 && seconds <= reference * 1.3, "FA time {seconds} is outside 30% of the upstream {reference} seconds");
 		}
-		return
+		return;
 	}
 	if std::env::var_os("RECIPE_FA_CPU_REFERENCE").is_some() {
 		println!("FA_EVIDENCE {}", evidence.encode());
-		return
+		return;
 	}
 
 	let baseline = reference(test, bits);
@@ -126,16 +120,10 @@ fn compare(head_width: usize, bits: u8, test: &str) {
 }
 
 #[test]
-fn causal_sequence_head_64_forward_and_backward() {
-	compare(64, 16, "causal_sequence_head_64_forward_and_backward")
-}
+fn causal_sequence_head_64_forward_and_backward() { compare(64, 16, "causal_sequence_head_64_forward_and_backward") }
 
 #[test]
-fn causal_sequence_head_128_forward_and_backward() {
-	compare(128, 16, "causal_sequence_head_128_forward_and_backward")
-}
+fn causal_sequence_head_128_forward_and_backward() { compare(128, 16, "causal_sequence_head_128_forward_and_backward") }
 
 #[test]
-fn causal_sequence_fp32_forward_and_backward() {
-	compare(64, 32, "causal_sequence_fp32_forward_and_backward")
-}
+fn causal_sequence_fp32_forward_and_backward() { compare(64, 32, "causal_sequence_fp32_forward_and_backward") }
