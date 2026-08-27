@@ -574,16 +574,23 @@ pub fn emit_predictor_forward(code: &[f64], locals: usize, context: PredictorCon
 					format!("%{p}.acc")
 				};
 				let _ = writeln!(output, "%{p}.target.relative = add i32 {base}, %{p}.i\n%{p}.target.index = add i32 %{p}.target.relative, {offset}\n%{p}.target.ptr = getelementptr inbounds {ty}, {ptr} {weights}, i32 %{p}.target.index\n%{p}.target = load {ty}, {ptr} %{p}.target.ptr, align {align}", base = rows * context.features, offset = context.offset, weights = context.weights);
-				// Bubble the candidate through the k slots, keeping each slot's strictly nearer entry.
+				// Bubble the candidate through the k slots. A displaced entry precedes every later
+				// equal-distance slot because rows are visited in ascending index order.
 				let (mut carry_distance, mut carry_target) = (candidate_distance, format!("%{p}.target"));
+				let mut carry_precedes = "false".to_owned();
 				for slot in 0..count {
-					let _ = writeln!(output, "%{p}.swap{slot} = call i1 @recipe.ogt({ty} %{p}.d{slot}, {ty} {carry_distance})");
+					let _ = writeln!(output, "%{p}.nearer{slot} = call i1 @recipe.ogt({ty} %{p}.d{slot}, {ty} {carry_distance})");
+					let _ = writeln!(output, "%{p}.equal{slot} = call i1 @recipe.oeq({ty} %{p}.d{slot}, {ty} {carry_distance})");
+					let _ = writeln!(output, "%{p}.tie{slot} = and i1 %{p}.equal{slot}, {carry_precedes}");
+					let _ = writeln!(output, "%{p}.swap{slot} = or i1 %{p}.nearer{slot}, %{p}.tie{slot}");
 					let _ = writeln!(output, "%{p}.d{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_distance}, {ty} %{p}.d{slot}");
 					let _ = writeln!(output, "%{p}.t{slot}.new = select i1 %{p}.swap{slot}, {ty} {carry_target}, {ty} %{p}.t{slot}");
 					let _ = writeln!(output, "%{p}.carry.d{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.d{slot}, {ty} {carry_distance}");
 					let _ = writeln!(output, "%{p}.carry.t{slot} = select i1 %{p}.swap{slot}, {ty} %{p}.t{slot}, {ty} {carry_target}");
+					let _ = writeln!(output, "%{p}.carry.precedes{slot} = or i1 {carry_precedes}, %{p}.swap{slot}");
 					carry_distance = format!("%{p}.carry.d{slot}");
 					carry_target = format!("%{p}.carry.t{slot}");
+					carry_precedes = format!("%{p}.carry.precedes{slot}");
 				}
 				let _ = writeln!(output, "br label %{p}.latch\n{p}.latch:\n%{p}.i.next = add i32 %{p}.i, 1\nbr label %{p}.head\n{p}.done:");
 				let mut sum = zero;
@@ -1000,6 +1007,7 @@ pub(crate) struct NativeArtifact {
 	pub(crate) artifact: Vec<u8>,
 	pub(crate) path: PathBuf,
 	pub(crate) storage: Vec<u8>,
+	pub(crate) training: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1194,14 +1202,14 @@ fn prune_internal_definitions(mut ir: String) -> String {
 	loop {
 		let names = ir.match_indices("define internal ").filter_map(|(start, _)| {
 			let signature = &ir[start..ir[start..].find('{').map(|offset| start + offset)?];
-			let name = signature.rsplit_once('@')?.1.split_once('(')?.0;
-			Some(name.to_owned())
+			Some(signature.rsplit_once('@')?.1.split_once('(')?.0.to_owned())
 		}).collect::<Vec<_>>();
-		let dead: Vec<_> = names.iter().filter(|name| ir.match_indices(&format!("@{name}(")).count() == 1).cloned().collect();
-		if dead.is_empty() { return ir }
-		let mut spans: Vec<_> = dead.iter().filter_map(|name| definition_span(&ir, name)).collect();
-		spans.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-		for (start, end) in spans { ir.replace_range(start..end, "") }
+		// A reference reads "@name(", so one pass over the module's '@' positions counts every name at once instead of searching the whole module again once per name, and no name outruns the window so a later '(' names nothing. The definitions arrive in ascending order, so removing their spans in reverse leaves the earlier spans valid.
+		let (bytes, window, mut counts) = (ir.as_bytes(), names.iter().map(|name| name.len() + 1).max().unwrap_or(0), HashMap::new());
+		ir.match_indices('@').filter_map(|(at, _)| bytes[at + 1..(at + 1 + window).min(bytes.len())].iter().position(|&byte| byte == b'(').map(|stop| &bytes[at + 1..at + 1 + stop])).for_each(|name| *counts.entry(name).or_insert(0usize) += 1);
+		let spans: Vec<_> = names.iter().filter(|name| counts[name.as_bytes()] == 1).filter_map(|name| definition_span(&ir, name)).collect();
+		if spans.is_empty() { return ir }
+		for (start, end) in spans.into_iter().rev() { ir.replace_range(start..end, "") }
 	}
 }
 
@@ -2353,7 +2361,7 @@ impl NativeModelIr {
 		Ok(ir)
 	}
 
-	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: LossFunction) -> Result<String> {
+	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>) -> Result<String> {
 		let register_count = self.schedule.register_count;
 		let mut ir = backend_template(backend, self.precision, matrix)?
 			.replace("RECIPE_WORKGROUP_SIZE", &self.schedule.block.to_string())
@@ -2387,32 +2395,36 @@ impl NativeModelIr {
 			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
 		};
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
-		let training_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, true)?;
-		let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
 		let mut body = String::new();
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads");
 		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
 		body.push_str(&inference_forward);
 		body.push_str("ret void\n}\n");
-		body.push_str(&format!("define internal void @recipe_model_training_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
-		body.push_str(&training_forward);
-		body.push_str("ret void\n}\n");
+		if loss.is_some() {
+			let training_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, true)?;
+			body.push_str(&format!("define internal void @recipe_model_training_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
+			body.push_str(&training_forward);
+			body.push_str("ret void\n}\n");
+		}
 		body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"));
-		let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
-		let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
-		let epoch_args = format!("{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %step");
-		body.push_str(&format!("define {kernel}void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n"));
-		body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "entry")?);
-		body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
-		body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
-		body.push_str(barrier(backend));
-		body.push_str(&format!("\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads)\n"));
-		body.push('\n');
-		body.push_str(&self.emit_loss_and_seed(backend, loss, model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
-		body.push_str(barrier(backend));
-		body.push_str(&reverse);
-		body.push_str(&self.emit_adamw(model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
-		body.push_str("ret void\n}\n");
+		if let Some(loss) = loss {
+			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
+			let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
+			let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
+			let epoch_args = format!("{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %step");
+			body.push_str(&format!("define {kernel}void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n"));
+			body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "entry")?);
+			body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
+			body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
+			body.push_str(barrier(backend));
+			body.push_str(&format!("\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads)\n"));
+			body.push('\n');
+			body.push_str(&self.emit_loss_and_seed(backend, loss, model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
+			body.push_str(barrier(backend));
+			body.push_str(&reverse);
+			body.push_str(&self.emit_adamw(model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
+			body.push_str("ret void\n}\n");
+		}
 		ir.push_str(&body);
 		Ok(prune_internal_definitions(ir))
 	}
@@ -2853,9 +2865,9 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			let bitcode = bitcode.ok_or_else(|| RecipeError::new("NVIDIA bitcode path is absent"))?;
 			let ptx_version = option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))?;
 			let mut llvm = Command::new(compiler);
-			llvm.args(["-target", "nvptx64-nvidia-cuda"]).arg(format!("-march={architecture}")).args(["-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(bitcode);
+			llvm.args(["-target", "nvptx64-nvidia-cuda"]).arg(format!("-march={architecture}")).args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-emit-llvm", "-c", "-x", "ir"]).arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"]).arg(bitcode);
 			native_command(llvm, "NVIDIA LLVM IR compiler", key)?;
-			// Clang stamps its own newest PTX ISA and ignores the requested one, so the generator pins it instead, and the driver JIT then loads the artifact on every driver at or above that version.
+			// Both stages take the pinned ISA: the bitcode step rejects any target newer than its own default, and the generator stamps the version into the artifact so the driver JIT loads it on every driver at or above that version.
 			let generator = option_env!("RECIPE_NV_PTX_GENERATOR").ok_or_else(|| RecipeError::new("NVIDIA PTX generator is unavailable"))?;
 			let mut llc = Command::new(generator);
 			llc.args(["-march=nvptx64", &format!("-mcpu={architecture}"), &format!("-mattr={ptx_version}"), "-O2"]).arg(bitcode).args(["-o"]).arg(output);
@@ -2865,7 +2877,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 	}
 }
 
-pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: LossFunction, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
+pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
 	target.validate()?;
 	let model = NativeModelIr::from_graph(graph, rows, precision, schedule)?;
 	let matrix = match target { BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") => Some(NativeMatrix::Gfx11), BackendTarget::Amd { architecture } if architecture.starts_with("gfx12") => Some(NativeMatrix::Gfx12), _ => None }.filter(|_| model.schedule.matrix);
@@ -2873,7 +2885,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 	let key = native_artifact_key(target, &ir);
 	let directory = native_artifact_directory(&key)?;
 	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native artifact directory: {error}")))?;
-	let path = directory.join(format!("artifact.{}", target.artifact_extension())); let cached = path.is_file(); debug(&format!("native artifact key={key} target={} arithmetic={} loss={} rows={rows} cache={} path={}", native_target_label(target).split(";features=").next().unwrap_or("unknown"), model.precision.model.label(), loss.name(), if cached { "hit" } else { "miss" }, path.display()))?;
+	let path = directory.join(format!("artifact.{}", target.artifact_extension())); let cached = path.is_file(); debug(&format!("native artifact key={key} target={} arithmetic={} loss={} rows={rows} cache={} path={}", native_target_label(target).split(";features=").next().unwrap_or("unknown"), model.precision.model.label(), loss.map_or("none", |loss| loss.name()), if cached { "hit" } else { "miss" }, path.display()))?;
 	let artifact = if cached {
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	} else {
@@ -2907,6 +2919,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		artifact,
 		path,
 		storage: model.storage(),
+		training: loss.is_some(),
 	})
 }
 
@@ -3164,7 +3177,7 @@ mod bundle {
 		for node in &graph.nodes {
 			if node.op != Primitive::Predictor { continue }
 			let code = graph.programs.get(node.program_offset..node.program_offset + node.program_count * 2).ok_or_else(|| RecipeError::new("fitted estimator program span is invalid"))?.to_vec();
-			predictors.push(PredictorProgram { code, locals: node.argument[0] as usize, stack: node.argument[1] as usize, table: vec![0.0; node.parameters] });
+			predictors.push(PredictorProgram { code, locals: node.argument[0] as usize, stack: node.argument[1] as usize, table: vec![0.0; node.parameters], nearest: None });
 		}
 		Ok(SemanticGraph { model: stored.model.clone(), precision: stored.precision, input: graph.input, output: graph.output, inputs: stored.inputs.clone(), outputs: stored.outputs.clone(), tensors, predictors, frozen: graph.frozen.clone(), state: graph.state.clone(), norm_mean: stored.norm_mean.clone(), norm_scale: stored.norm_scale.clone(), target_min: stored.target_min, target_span: stored.target_span, bn_stats: stored.bn_stats.clone(), artifact: stored.artifact.clone() })
 	}
@@ -3287,7 +3300,7 @@ mod bundle {
 					let fields = values::<f64>(value, "fitted estimator program")?;
 					require(fields.len() >= 3 && (fields.len() - 3) % 2 == 0, "fitted estimator program has the wrong width")?;
 					let slot = |value: f64, role| usize::try_from(value as i64).ok().filter(|_| value.fract() == 0.0).ok_or_else(|| RecipeError::new(format!("invalid fitted estimator {role}")));
-					builder.predictors.push(PredictorProgram { locals: slot(fields[0], "locals")?, stack: slot(fields[1], "stack")?, table: vec![0.0; slot(fields[2], "table width")?], code: fields[3..].to_vec() });
+					builder.predictors.push(PredictorProgram { locals: slot(fields[0], "locals")?, stack: slot(fields[1], "stack")?, table: vec![0.0; slot(fields[2], "table width")?], code: fields[3..].to_vec(), nearest: None });
 				}
 				"frozen" => builder.frozen = values(value, "frozen weight")?,
 				"moments" => builder.state.moments = values(value, "Adam moment")?,
@@ -3451,7 +3464,7 @@ mod bundle {
 	}
 }
 use std::{
-	collections::{BTreeMap, BTreeSet},
+	collections::{BTreeMap, BTreeSet, HashMap},
 	error::Error,
 	ffi::c_void,
 	fmt, fs,
@@ -4915,7 +4928,7 @@ impl Recipe {
 		let result = bundle::run_infer(&path, input, |stored, samples| {
 			let config = Config::load()?;
 			let graph = materialize_saved_graph(stored, samples, device, config)?;
-			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, stored.model.loss)?;
+			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, None)?;
 			tape.inject_bn_stats(&stored.bn_stats)?;
 			tape.forward()?;
 			tape.predictions()
@@ -5660,7 +5673,7 @@ struct NativeTape {
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 impl NativeTape {
-	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: LossFunction) -> Result<Self> {
+	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
 		let input = graph.input.elements();
 		require(input != 0 && !samples.is_empty() && samples.len() % input == 0, format!("model input batch expected a nonempty multiple of {input} values, received {}", samples.len()))?;
 		let rows = samples.len() / input;
@@ -5751,7 +5764,7 @@ impl NativeTape {
 	}
 	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
 		require(self.step != 0, "optimizer epoch is absent")?;
-		let threads = self.program.epoch.geometry.threads()?;
+		let threads = self.program.dispatch(NativeEntry::Epoch)?.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
 		let beta1 = self.precision.state.below_one(config.beta1);
@@ -5965,7 +5978,7 @@ enum NativeCpuEpoch {
 struct NativeCpuProgram {
 	_library: Library,
 	forward: NativeForward,
-	epoch: NativeCpuEpoch,
+	epoch: Option<NativeCpuEpoch>,
 	model_load: Option<NativeModelLoad>,
 }
 
@@ -6050,7 +6063,7 @@ struct NativeProgram {
 	artifact: NativeArtifact,
 	backend: NativeBackend,
 	forward: Dispatch,
-	epoch: Dispatch,
+	epoch: Option<Dispatch>,
 	model_load: Option<Dispatch>,
 	tile: Tile,
 	contractions: Vec<Option<NativeContractionTiles>>,
@@ -6269,7 +6282,7 @@ fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
 		1 => library.function::<NativeEpochF8>(&native_symbol(symbol)).map(NativeCpuEpoch::F8),
 		_ => Err(RecipeError::new("native CPU precision width is invalid")),
 	} };
-	let epoch = epoch(NATIVE_EPOCH_SYMBOL)?;
+	let epoch = artifact.training.then(|| epoch(NATIVE_EPOCH_SYMBOL)).transpose()?;
 	let model_load = (!artifact.storage.is_empty()).then(|| library.function::<NativeModelLoad>(&native_symbol(NATIVE_MODEL_LOAD_SYMBOL))).transpose()?;
 	Ok(NativeCpuProgram { _library: library, forward, epoch, model_load })
 }
@@ -6288,7 +6301,7 @@ impl Gpu {
 			Driver::Hsa(_) => Ok(()),
 		}
 	}
-	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: LossFunction) -> Result<NativeProgram> {
+	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>) -> Result<NativeProgram> {
 		let vector_waves = if matches!(&self.driver, Driver::Cpu) { 1 } else { narrow(natural("contraction resident waves per workgroup", env!("RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"))?, "contraction resident waves per workgroup")? as u32 };
 		let shared_values = if matches!(&self.driver, Driver::Cpu) { narrow(natural("CPU contraction shared values", env!("RECIPE_CONTRACTION_CPU_SHARED_VALUES"))?, "CPU contraction shared values")? as u32 } else { self.shared_limit / precision.bytes() as u32 };
 		let shapes = native_contraction_shapes(graph, rows)?;
@@ -6376,7 +6389,7 @@ impl Gpu {
 		let schedule = NativeSchedule { matrix, block, tile: extent, register_m, register_n, register_count, fragment_k, chunk_k, chunk_values, chunk_bias_values, scratch_base, shared_values, contractions, attention };
 		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
 		let program = NativeProgram::load(self, artifact, graph, schedule, register_values, waves)?;
-		let fixed = program.forward.kernel.shared.max(program.epoch.kernel.shared).max(program.model_load.map_or(0, |dispatch| dispatch.kernel.shared));
+		let fixed = program.forward.kernel.shared.max(program.epoch.map_or(0, |dispatch| dispatch.kernel.shared)).max(program.model_load.map_or(0, |dispatch| dispatch.kernel.shared));
 		let required = fixed.checked_add(shared_values.max(program.reduction_values).checked_mul(precision.bytes() as u32).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?).ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
 		require(required <= self.shared_limit, "native model exceeds resident device shared memory")?;
 		Ok(program)
@@ -6600,7 +6613,7 @@ impl Hsa {
 		}
 	}
 
-	unsafe fn load_native(&self, artifact: &NativeArtifact, waves: u32) -> Result<(NativeHsaProgram, Dispatch, Dispatch, Option<Dispatch>)> {
+	unsafe fn load_native(&self, artifact: &NativeArtifact, waves: u32) -> Result<(NativeHsaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
 		unsafe {
 		require(artifact.artifact.len() != 0, "native AMD artifact is empty")?;
 		let mut reader = HsaReader { handle: 0, destroy: self.reader_destroy };
@@ -6610,9 +6623,9 @@ impl Hsa {
 		driver_status(Backend::Amd, (self.executable_load)(executable.handle, self.agent, reader.handle, ptr::null_mut(), ptr::null_mut()), "native code-object load")?;
 		driver_status(Backend::Amd, (self.executable_freeze)(executable.handle, ptr::null_mut()), "native executable freeze")?;
 		let forward = self.native_dispatch(executable.handle, artifact, waves, NATIVE_FORWARD_SYMBOL, NATIVE_FORWARD_LAYOUT)?;
-		let epoch = self.native_dispatch(executable.handle, artifact, waves, NATIVE_EPOCH_SYMBOL, artifact.precision.epoch_layout)?;
+		let epoch = artifact.training.then(|| self.native_dispatch(executable.handle, artifact, waves, NATIVE_EPOCH_SYMBOL, artifact.precision.epoch_layout)).transpose()?;
 		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(executable.handle, artifact, waves, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
-		let kernarg_size = forward.kernel.kernarg.max(epoch.kernel.kernarg).max(model_load.map_or(0, |dispatch| dispatch.kernel.kernarg));
+		let kernarg_size = forward.kernel.kernarg.max(epoch.map_or(0, |dispatch| dispatch.kernel.kernarg)).max(model_load.map_or(0, |dispatch| dispatch.kernel.kernarg));
 		let grid_sync = kernarg_size.next_multiple_of(HSA_GRID_SYNC_ALIGNMENT);
 		let allocation_size = grid_sync.checked_add(HSA_GRID_SYNC_BYTES).ok_or_else(|| RecipeError::new("native AMD KERNARG allocation overflows"))?;
 		let mut kernarg = ptr::null_mut();
@@ -6652,7 +6665,7 @@ impl Cuda {
 		}
 	}
 
-	unsafe fn load_native(&self, artifact: &NativeArtifact, waves: u32, shared_values: u32, register_values: u32) -> Result<(NativeCudaProgram, Dispatch, Dispatch, Option<Dispatch>)> {
+	unsafe fn load_native(&self, artifact: &NativeArtifact, waves: u32, shared_values: u32, register_values: u32) -> Result<(NativeCudaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
 		unsafe {
 		driver_status(Backend::Nvidia, (self.set)(self.context), "native context")?;
 		let mut module = ptr::null_mut();
@@ -6660,7 +6673,7 @@ impl Cuda {
 		let program = NativeCudaProgram { module: module as usize, unload: self.unload };
 		let element = u8::try_from(artifact.precision.model.bytes()).map_err(|_| RecipeError::new("native NVIDIA precision width is invalid"))?;
 		let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves, shared_values, register_values)?;
-		let epoch = self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, artifact.precision.epoch_layout, waves, shared_values, register_values)?;
+		let epoch = artifact.training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, artifact.precision.epoch_layout, waves, shared_values, register_values)).transpose()?;
 		let model_load = (!artifact.storage.is_empty()).then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves, 0, 0)).transpose()?;
 		Ok((program, forward, epoch, model_load))
 		}
@@ -6694,7 +6707,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 		NativeEntry::Epoch => {
 			require(arguments.len() == NATIVE_EPOCH_LAYOUT_FP64.len(), "native CPU epoch argument count is invalid")?;
 			let pointers = (0..12).map(|index| native_cpu_pointer(arguments, index)).collect::<Vec<_>>();
-			match cpu.epoch {
+			match cpu.epoch.ok_or_else(|| RecipeError::new("native epoch symbol is absent"))? {
 				NativeCpuEpoch::F64(function) => function(
 					pointers[0], pointers[1], pointers[2], pointers[3], pointers[4], pointers[5], pointers[6], pointers[7], pointers[8], pointers[9], pointers[10], pointers[11],
 					native_cpu_value(arguments, 12), native_cpu_value(arguments, 13), native_cpu_value(arguments, 14), native_cpu_value(arguments, 15), native_cpu_value(arguments, 16), native_cpu_value(arguments, 17), native_cpu_value(arguments, 18), native_cpu_value(arguments, 19), native_cpu_value(arguments, 20), native_cpu_value(arguments, 21),
@@ -6733,7 +6746,7 @@ impl NativeProgram {
 				{
 					let cpu = load_native_cpu(&artifact)?;
 					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } };
-					let epoch = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry: Geometry { groups: 1, block: 1 } };
+					let epoch = artifact.training.then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry: Geometry { groups: 1, block: 1 } });
 					let model_load = (!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry: Geometry { groups: 1, block: 1 } });
 					(NativeBackend::Cpu(cpu), forward, epoch, model_load)
 				}
@@ -6751,7 +6764,8 @@ impl NativeProgram {
 				(NativeBackend::Nvidia(program), forward, epoch, model_load)
 			}
 		};
-		debug(&format!("native load key={} path={} entrypoints={}", artifact.path.parent().and_then(Path::file_name).and_then(|key| key.to_str()).unwrap_or("unknown"), artifact.path.display(), if model_load.is_some() { "recipe_model_forward,recipe_model_epoch,recipe_model_load" } else { "recipe_model_forward,recipe_model_epoch" }))?; let block = forward.geometry.block.max(epoch.geometry.block);
+		let entrypoints = [Some(NATIVE_FORWARD_SYMBOL), epoch.map(|_| NATIVE_EPOCH_SYMBOL), model_load.map(|_| NATIVE_MODEL_LOAD_SYMBOL)].into_iter().flatten().collect::<Vec<_>>().join(",");
+		debug(&format!("native load key={} path={} entrypoints={entrypoints}", artifact.path.parent().and_then(Path::file_name).and_then(|key| key.to_str()).unwrap_or("unknown"), artifact.path.display()))?; let block = forward.geometry.block.max(epoch.map_or(0, |dispatch| dispatch.geometry.block));
 		let reduction_values = block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native contraction lane reduction overflows"))?;
 		let gradient_values = native_gradient_values(graph.parameters.len(), &schedule.contractions)?;
 		Ok(Self { gpu, artifact, backend, forward, epoch, model_load, tile: schedule.tile, contractions: schedule.contractions, shared_values: schedule.shared_values, reduction_values, gradient_values })
@@ -6760,7 +6774,7 @@ impl NativeProgram {
 	fn dispatch(&self, entry: NativeEntry) -> Result<Dispatch> {
 		match entry {
 			NativeEntry::Forward => Ok(self.forward),
-			NativeEntry::Epoch => Ok(self.epoch),
+			NativeEntry::Epoch => self.epoch.ok_or_else(|| RecipeError::new("native epoch symbol is absent")),
 			NativeEntry::ModelLoad => self.model_load.ok_or_else(|| RecipeError::new("native model-load symbol is absent")),
 		}
 	}
@@ -6770,7 +6784,8 @@ impl NativeProgram {
 	}
 
 	fn launch_epoch(&self, arguments: &mut [Ptr]) -> Result<()> {
-		self.launch(NativeEntry::Epoch, arguments, self.epoch.geometry.threads()?)
+		let dispatch = self.dispatch(NativeEntry::Epoch)?;
+		self.launch(NativeEntry::Epoch, arguments, dispatch.geometry.threads()?)
 	}
 
 	fn launch_model_load(&self, arguments: &mut [Ptr]) -> Result<()> {
@@ -6994,7 +7009,7 @@ fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gp
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
 	let _ = targets;
-	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, mse)?;
+	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, None)?;
 	tape.forward()?;
 	tape.predictions()
 }
@@ -7006,7 +7021,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	let model = surrogate_model(hidden);
 	let prepared = Prepared { samples: samples.to_vec(), targets: targets.to_vec(), target_width: 1, rows: targets.len(), source_rows: targets.len(), features: input.elements(), schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
 	let mut graph = compile(&model, &prepared, targets, prepared.rows, gpu, config, true)?;
-	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, mse)?;
+	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, Some(mse))?;
 	for _ in 0..config.surrogate_epochs {
 		tape.advance()?;
 		tape.epoch(config.surrogate_rate, 0.0, config)?;
@@ -7016,11 +7031,88 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	Ok(graph)
 }
 #[derive(Clone)]
+struct NearestNode {
+	minimum: u32,
+	start: u32,
+	end: u32,
+	split: Option<(usize, f64, Box<NearestNode>, Box<NearestNode>)>,
+}
+#[derive(Clone)]
+struct NearestIndex {
+	features: usize,
+	permutation: Vec<u32>,
+	root: NearestNode,
+}
+impl NearestIndex {
+	fn build(samples: &[f64], features: usize, rows: usize) -> Self {
+		let mut permutation = (0..rows as u32).collect::<Vec<_>>();
+		let root = Self::partition(samples, features, &mut permutation, 0);
+		Self { features, permutation, root }
+	}
+	fn partition(samples: &[f64], features: usize, permutation: &mut [u32], start: u32) -> NearestNode {
+		let minimum = permutation.iter().copied().min().unwrap_or(0);
+		let end = start + permutation.len() as u32;
+		if permutation.len() <= 16 {
+			return NearestNode { minimum, start, end, split: None };
+		}
+		let mut widest = (f64::NEG_INFINITY, 0);
+		for feature in 0..features {
+			let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+			for &row in permutation.iter() {
+				let value = samples[row as usize * features + feature];
+				(low, high) = (low.min(value), high.max(value));
+			}
+			widest = if high - low > widest.0 { (high - low, feature) } else { widest };
+		}
+		let (dimension, middle) = (widest.1, permutation.len() / 2);
+		permutation.select_nth_unstable_by(middle, |&a, &b| samples[a as usize * features + dimension].total_cmp(&samples[b as usize * features + dimension]).then(a.cmp(&b)));
+		let threshold = samples[permutation[middle] as usize * features + dimension];
+		let (left, right) = permutation.split_at_mut(middle);
+		let left = Box::new(Self::partition(samples, features, left, start));
+		let right = Box::new(Self::partition(samples, features, right, start + middle as u32));
+		NearestNode { minimum, start, end, split: Some((dimension, threshold, left, right)) }
+	}
+	fn nearest(&self, node: &NearestNode, samples: &[f64], query: &[f64], row: usize, count: usize, exclude: bool, best: &mut Vec<(f64, u32)>) {
+		let Some((dimension, threshold, left, right)) = &node.split else {
+			for &candidate in &self.permutation[node.start as usize..node.end as usize] {
+				if exclude && candidate as usize == row {
+					continue;
+				}
+				let base = candidate as usize * self.features;
+				let measured = distance(query, &samples[base..base + self.features]);
+				let keeps = best.len() < count || best.last().is_some_and(|&(kept, index)| measured < kept || (measured == kept && candidate < index));
+				if measured < f64::MAX && keeps {
+					let position = best.iter().position(|&(kept, index)| kept > measured || (kept == measured && index > candidate)).unwrap_or(best.len());
+					best.insert(position, (measured, candidate));
+					best.truncate(count);
+				}
+			}
+			return;
+		};
+		// On an equal coordinate the left child holds the lower row indices, so it is
+		// searched first to settle tie-breaks before the far bound is consulted.
+		let (near, far) = if query[*dimension] <= *threshold { (left, right) } else { (right, left) };
+		self.nearest(near, samples, query, row, count, exclude, best);
+		// The squared split coordinate gap lower-bounds every far-side distance, so the
+		// far subtree is skipped only when no far row can displace or tie a kept one.
+		if best.len() == count {
+			if let Some(&(kept, index)) = best.last() {
+				let gap = (query[*dimension] - threshold).powi(2);
+				if gap > kept || (gap == kept && far.minimum > index) {
+					return;
+				}
+			}
+		}
+		self.nearest(far, samples, query, row, count, exclude, best);
+	}
+}
+#[derive(Clone)]
 struct PredictorProgram {
 	code: Vec<f64>,
 	locals: usize,
 	stack: usize,
 	table: Vec<f64>,
+	nearest: Option<NearestIndex>,
 }
 impl PredictorProgram {
 	fn evaluate(&self, row: usize, query: &[f64]) -> Result<f64> {
@@ -7049,17 +7141,14 @@ impl PredictorProgram {
 					let features = query.len();
 					let rows = self.table.len().checked_div(features + 1).filter(|rows| rows * (features + 1) == self.table.len()).ok_or_else(|| RecipeError::new("nearest table width is invalid"))?;
 					let (samples, targets) = self.table.split_at(rows * features);
-					let mut best = vec![(f64::MAX, 0.0); count];
-					for (candidate, sample) in samples.chunks_exact(features).enumerate() {
-						let (mut carry_distance, mut carry_target) = (if exclude && candidate == row { f64::MAX } else { distance(query, sample) }, targets[candidate]);
-						for slot in &mut best {
-							if slot.0 > carry_distance {
-								std::mem::swap(&mut slot.0, &mut carry_distance);
-								std::mem::swap(&mut slot.1, &mut carry_target);
-							}
-						}
-					}
-					stack.push(best.iter().map(|slot| slot.1).sum::<f64>() / count as f64)
+					// An index is built beside the table it searches and neither is replaced afterwards, so a
+					// program that carries an absent or differently shaped index rebuilds from the table it holds
+					// now rather than answering from one that never saw these values.
+					let rebuilt = self.nearest.as_ref().filter(|index| index.features == features && index.permutation.len() == rows).is_none().then(|| NearestIndex::build(samples, features, rows));
+					let index = rebuilt.as_ref().or(self.nearest.as_ref()).ok_or_else(|| RecipeError::new("nearest index is absent"))?;
+					let mut best = Vec::with_capacity(count);
+					index.nearest(&index.root, samples, query, row, count, exclude, &mut best);
+					stack.push((0..count).map(|slot| best.get(slot).map_or(0.0, |&(_, candidate)| targets[candidate as usize])).sum::<f64>() / count as f64)
 				},
 				value if value == PredictorOpcode::Affine as i32 => {
 					require(self.table.len() == 3 * query.len() && !query.is_empty(), "affine table width is invalid")?;
@@ -7081,15 +7170,16 @@ struct PredictorBuilder {
 	depth: usize,
 	stack: usize,
 	table: Vec<f64>,
+	index: Option<NearestIndex>,
 }
 impl PredictorBuilder {
-	fn new() -> Self { Self { code: Vec::new(), locals: 0, depth: 0, stack: 0, table: Vec::new() } }
-	fn nearest(&mut self, count: usize, exclude: bool, table: Vec<f64>) {
-		self.table = table;
+	fn new() -> Self { Self { code: Vec::new(), locals: 0, depth: 0, stack: 0, table: Vec::new(), index: None } }
+	fn nearest(&mut self, count: usize, exclude: bool, features: usize, table: Vec<f64>) {
+		(self.index, self.table) = (Some(NearestIndex::build(&table, features, table.len() / (features + 1))), table);
 		self.push(PredictorOpcode::Nearest, if exclude { -(count as f64) } else { count as f64 });
 	}
 	fn affine(&mut self, table: Vec<f64>) {
-		self.table = table;
+		(self.index, self.table) = (None, table);
 		self.push(PredictorOpcode::Affine, 0.0);
 	}
 	fn emit(&mut self, opcode: PredictorOpcode, argument: f64) { self.code.extend([opcode as i32 as f64, argument]) }
@@ -7105,7 +7195,7 @@ impl PredictorBuilder {
 	fn finish(self) -> Result<PredictorProgram> {
 		require(self.depth == 1 && self.stack != 0 && self.code.len() % 2 == 0, "predictor program is invalid")?;
 		require(self.code.chunks_exact(2).all(|instruction| instruction[0].is_finite() && instruction[1].is_finite()), "predictor program contains a nonfinite value")?;
-		Ok(PredictorProgram { code: self.code, locals: self.locals, stack: self.stack, table: self.table })
+		Ok(PredictorProgram { code: self.code, locals: self.locals, stack: self.stack, table: self.table, nearest: self.index })
 	}
 }
 struct Predictor {
@@ -7113,8 +7203,8 @@ struct Predictor {
 	predict: Box<dyn Fn(usize, &[f64]) -> Result<f64> + Send + Sync>,
 }
 impl Predictor {
-	fn new(program: PredictorProgram) -> Self {
-		let evaluator = program.clone();
+	fn new(mut program: PredictorProgram) -> Self {
+		let evaluator = PredictorProgram { nearest: program.nearest.take(), code: program.code.clone(), locals: program.locals, stack: program.stack, table: program.table.clone() };
 		Self { program, predict: Box::new(move |row, query| evaluator.evaluate(row, query)) }
 	}
 }
@@ -7509,25 +7599,26 @@ fn catboost_borders(samples: &[f64], features: usize, rows: usize, count: usize)
 	}).collect()
 }
 fn ordered_split(borders: &[CatboostBorders], residuals: &[f64], permutation: &[usize], codes: &[usize], level: usize, prior: f64, minimum: usize) -> Option<(usize, f64)> {
-	let mut best = None;
-	for (feature, candidates) in borders.iter().enumerate() {
+	let groups = 1_usize.checked_shl((level + 1) as u32)?;
+	// Each feature's candidate scan is independent; the reduction keeps the first
+	// strict minimum in feature order, matching the sequential scan.
+	parallel_map(borders.len(), |feature| {
+		let candidates = &borders[feature];
+		let (mut counts, mut sums, mut best) = (vec![0_usize; groups], vec![0.0; groups], None);
 		for (index, &threshold) in candidates.thresholds.iter().enumerate() {
-			let groups = 1_usize.checked_shl((level + 1) as u32)?;
-			let mut counts = vec![0_usize; groups];
-			let mut sums = vec![0.0; groups];
+			counts.fill(0);
+			sums.fill(0.0);
 			let mut error = 0.0;
 			for &row in permutation {
-				let side = usize::from(candidates.bins[row] <= index);
-				let group = codes[row] | side << level;
-				let estimate = sums[group] / (counts[group] as f64 + prior);
-				error += (residuals[row] - estimate).powi(2);
+				let group = codes[row] | usize::from(candidates.bins[row] <= index) << level;
+				error += (residuals[row] - sums[group] / (counts[group] as f64 + prior)).powi(2);
 				sums[group] += residuals[row];
 				counts[group] += 1;
 			}
-			if counts.iter().filter(|count| **count != 0).all(|count| *count >= minimum) && best.as_ref().is_none_or(|value: &(f64, usize, f64)| error < value.0) { best = Some((error, feature, threshold)) }
+			if counts.iter().filter(|count| **count != 0).all(|count| *count >= minimum) && best.as_ref().is_none_or(|value: &(f64, f64)| error < value.0) { best = Some((error, threshold)) }
 		}
-	}
-	best.map(|(_, feature, threshold)| (feature, threshold))
+		best
+	}).into_iter().enumerate().filter_map(|(feature, best)| best.map(|(error, threshold)| (error, feature, threshold))).reduce(|best, candidate| if candidate.0 < best.0 { candidate } else { best }).map(|(_, feature, threshold)| (feature, threshold))
 }
 fn oblivious_tree(splits: &[(usize, f64)], leaves: &[f64], level: usize, code: usize) -> TreeNode {
 	if level == splits.len() { return TreeNode::Leaf(leaves[code]) }
@@ -7598,27 +7689,24 @@ fn fit_kmeans(clusters: usize, data: &Prepared, rows: usize, config: Config, _: 
 	let groups = table.len() / data.features.max(1);
 	table.extend((0..groups).map(|group| group as f64));
 	let mut program = PredictorBuilder::new();
-	program.nearest(1, false, table);
+	program.nearest(1, false, data.features, table);
 	Ok(Predictor::new(program.finish()?))
 }
-/// Evaluates the immutable teacher once for each prepared sample. Worker threads process
-/// disjoint sample ranges and preserve input order.
+/// Runs the work over disjoint index ranges, one worker per available core, and
+/// returns the results in index order. A worker panic resumes on the caller.
+fn parallel_map<R: Send>(count: usize, work: impl Fn(usize) -> R + Sync) -> Vec<R> {
+	let span = count.div_ceil(std::thread::available_parallelism().map_or(1, |value| value.get())).max(1);
+	let mut results = Vec::with_capacity(count);
+	std::thread::scope(|scope| {
+		let handles = (0..count).step_by(span).map(|start| { let work = &work; scope.spawn(move || (start..(start + span).min(count)).map(work).collect::<Vec<_>>()) }).collect::<Vec<_>>();
+		for handle in handles { results.extend(handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))) }
+	});
+	results
+}
+/// Evaluates the immutable teacher once for each prepared sample.
 fn predict_rows(teacher: &Predictor, inputs: &[f64], features: usize) -> Result<Vec<f64>> {
 	require(features != 0, "teacher prediction has no features")?;
-	let rows = inputs.len() / features;
-	let mut targets = vec![0.0; rows];
-	let span = rows.div_ceil(std::thread::available_parallelism().map_or(1, |value| value.get())).max(1);
-	std::thread::scope(|scope| {
-		let handles = targets.chunks_mut(span).enumerate().map(|(chunk, slice)| scope.spawn(move || {
-			for (offset, value) in slice.iter_mut().enumerate() {
-				let row = chunk * span + offset;
-				*value = (teacher.predict)(row, &inputs[row * features..row * features + features])?;
-			}
-			Ok(())
-		})).collect::<Vec<_>>();
-		handles.into_iter().try_for_each(|handle| handle.join().map_err(|_| RecipeError::new("teacher prediction panicked"))?)
-	})?;
-	Ok(targets)
+	parallel_map(inputs.len() / features, |row| (teacher.predict)(row, &inputs[row * features..row * features + features])).into_iter().collect()
 }
 fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool) -> Result<Predictor> {
 	let maximum = rows.checked_sub(usize::from(exclude)).unwrap_or(0);
@@ -7626,7 +7714,7 @@ fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool)
 	let mut table = data.samples[..rows * data.features].to_vec();
 	table.extend_from_slice(&data.targets[..rows]);
 	let mut program = PredictorBuilder::new();
-	program.nearest(count, exclude, table);
+	program.nearest(count, exclude, data.features, table);
 	Ok(Predictor::new(program.finish()?))
 }
 impl Estimator {
@@ -9941,7 +10029,7 @@ impl Train {
 		stored.graph.state.trained_samples.sort_unstable();
 		stored.graph.state.trained_samples.dedup();
 		let (samples, targets) = (&prepared.samples[..training_rows * prepared.features], &target_values[..training_values]);
-		let mut tape = NativeTape::new(&stored.graph, samples, targets, gpu, config.precision, model.loss)?;
+		let mut tape = NativeTape::new(&stored.graph, samples, targets, gpu, config.precision, Some(model.loss))?;
 		self.finish_dispatch(if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) }, &mut stored, &prepared.schema, &tape, None)?;
 		tape.print_devices()?;
 		stored.bn_stats = tape.extract_bn_stats()?;
@@ -9986,7 +10074,7 @@ impl Train {
 			let mut raw_outputs = Vec::new();
 			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
 			for sample in prepared.samples.chunks_exact(prepared.features) {
-				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, model.loss)?;
+				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, None)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
 				validation.forward()?;
 				let raw = validation.predictions()?;
@@ -10009,7 +10097,7 @@ impl Train {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
 			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_values..]);
-			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, model.loss)?;
+			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, None)?;
 			validation.inject_bn_stats(&stored.bn_stats)?;
 			validation.forward()?;
 			let raw = validation.predictions()?;
