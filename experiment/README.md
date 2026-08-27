@@ -1,14 +1,12 @@
 # experiment/rat-lut
 
-Experimental branch. Nothing here is part of the library, nothing here is
-proposed for `minimal`, and `recipe.rs` is unmodified from #378.
-
-Two scripts:
-
 ```
+vna.rs   an ordinary training script: fill percentage from a VNA sweep
 rat.rs   the RAT: R/P/M/B/T/L over an m/n/k lookup table, per node, per direction
-vna.rs   the workload it tunes: fill percentage from a VNA sweep
 ```
+
+`vna.rs` is just training. The RAT runs it untouched, times it from the outside,
+and reads the model it saves, so nothing is instrumented into it.
 
 ## Why it exists
 
@@ -49,9 +47,9 @@ tile at all, and for a forward tile it is a mean over every row, which absorbs
 per-element differences. Measured on a dense model, a tile that costs 32 % of
 final accuracy passes it.
 
-`rat.rs` compares the trained model instead: a digest over prediction bit
-patterns after a long enough run for a difference to surface. Any cell that
-measures faster but changes that digest is rejected and reported by name.
+`rat.rs` compares the saved model instead. `vna.rs` ends with `.save()` like any
+training script, and a schedule that changes training changes those bytes. Any
+cell that changes them is rejected and reported by name, fast or not.
 
 ## The loop
 
@@ -78,31 +76,40 @@ unzip vna-temp-fill-data-v2.zip -d ~/Desktop/vna-temp-fill-data-v2
 ./target/release/recipe experiment/rat.rs
 ```
 
+Or run the workload on its own, which is just training:
+
+```bash
+./target/release/recipe experiment/vna.rs
+```
+
 | variable | default | meaning |
 | --- | --- | --- |
 | `RECIPE_BIN` | `target/release/recipe` | driver binary |
 | `RAT_SCRIPT` | `experiment/vna.rs` | workload |
-| `VNA_DATA` | `~/Desktop/vna-temp-fill-data-v2` | data root |
+| `RAT_MODEL` | `vna.ogdl` | model the workload saves |
 | `RAT_BUDGET` | 120 | measurements |
-| `RAT_MEASURE_EPOCHS` | 40 | epochs per timing |
 | `RAT_REPEATS` | 3 | timings per candidate, min taken |
-| `RAT_CHECK_EPOCHS` | 300 | epochs for the numerical check |
 | `RAT_EXPLORE` | 0.25 | random exploration rate |
 | `RAT_HIDDEN` | 24 | hidden units in B and T |
+| `RAT_RATE` | 0.02 | learning rate for B and T |
 | `RAT_SEED` | 17 | |
 
 ## First result
 
-72 measurements, `RAT_REPEATS=2`, `RAT_MEASURE_EPOCHS=20`, `RAT_CHECK_EPOCHS=150`,
-on gfx1101, against the four contraction nodes of `vna.rs`:
+72 measurements, `RAT_REPEATS=2`, on gfx1101, against the four contraction nodes
+of `vna.rs`:
 
 ```
-65 of 72 cells rejected by the compiled resource bounds   (90 %)
- 7 cells dispatched and timed
- 0 cells faster than the heuristic
+63 of 72 cells rejected by the compiled resource bounds   (88 %)
+ 9 cells dispatched and timed
+ 0 cells faster than Recipe's own selection
  0 cells changed the trained model
-baseline 0.132004 s, selected 0.132004 s over 20 epochs
+baseline 1.716 s, selected 1.716 s
 ```
+
+The nine that dispatched ran between 1.717 s and 3.130 s against a 1.716 s
+baseline, so the reachable part of the grid is not merely no better, it is
+mostly worse.
 
 The LUT is mostly unreachable, and not for a subtle reason. `native_extent_valid`
 requires `m % register_m == 0` and `n % register_n == 0`, both 8 here, so every
@@ -139,10 +146,13 @@ and inside that neighbourhood the formula is already at a local optimum.
 Reserving over the candidate space rather than the heuristic is the prerequisite
 for an LUT-shaped search to mean anything.
 
-Timing resolution is the other limit. A 20-epoch measurement on this workload is
-around 130 ms and run-to-run spread on an unchanged binary is tens of percent,
-so a single-digit-percent difference is not separable from noise at small repeat
-counts. Raise `RAT_MEASURE_EPOCHS` and `RAT_REPEATS` before believing a margin.
+Timing resolution is the other limit. Each measurement is the wall time of a
+whole `recipe experiment/vna.rs` invocation, so it carries a constant of process
+startup, script compilation and data preparation. That constant shifts every
+candidate equally and does not favour one schedule, but it does compress
+relative differences, and run-to-run spread on an unchanged binary is still tens
+of percent. Raise `RAT_REPEATS`, or lengthen the training in `vna.rs`, before
+believing a small margin.
 
 The numerical check found nothing here only because nothing was accepted. On a
 dense model, tuner-selectable schedules do change the trained result, so the

@@ -27,16 +27,19 @@
 //!
 //! Numerics. #378 accepts a candidate when the epoch loss is unchanged, which
 //! is measured before the reverse pass and so cannot see a gradient tile at
-//! all. This script instead compares the trained model itself, over a long
-//! enough run for a difference to surface, and reports every cell that changes
-//! it.
+//! all. This script compares the saved model instead, which is the thing a
+//! scheduling choice is not allowed to change.
+//!
+//! The workload is an ordinary training script. It is run untouched, timed from
+//! the outside, and read through the model it saves, so nothing here needs to
+//! be instrumented into it.
 //!
 //! Run:
 //!   cargo build --release
 //!   ./target/release/recipe experiment/rat.rs
 //!
-//! Environment: RECIPE_BIN, VNA_DATA, RAT_BUDGET, RAT_MEASURE_EPOCHS,
-//! RAT_REPEATS, RAT_CHECK_EPOCHS, RAT_EXPLORE, RAT_SEED, RAT_HIDDEN.
+//! Environment: RECIPE_BIN, RAT_SCRIPT, RAT_MODEL, RAT_BUDGET, RAT_REPEATS,
+//! RAT_EXPLORE, RAT_SEED, RAT_HIDDEN, RAT_RATE.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -311,7 +314,7 @@ impl Schedule {
 
 struct Measurement {
 	seconds: f64,
-	digest: String,
+	digest: u64,
 	dispatched: bool,
 }
 
@@ -319,39 +322,43 @@ struct Bench {
 	binary: PathBuf,
 	script: PathBuf,
 	cache: PathBuf,
+	model: PathBuf,
 	repeats: usize,
 }
 
 impl Bench {
-	fn run(&self, epochs: usize, debug: bool) -> (f64, String) {
+	/// Runs the workload untouched and times the whole invocation. Process
+	/// startup and data preparation are a constant across candidates, so they
+	/// shift every measurement equally rather than favouring one schedule.
+	/// The saved model is the numerical fingerprint: a schedule that changes
+	/// training changes those bytes.
+	fn run(&self, debug: bool) -> (f64, u64) {
 		let mut command = Command::new(&self.binary);
-		command.arg(&self.script).env("VNA_EPOCHS", epochs.to_string());
-		if debug {
-			command.env("RECIPE_DEBUG", "1");
-		} else {
-			command.env_remove("RECIPE_DEBUG");
-		}
+		command.arg(&self.script);
+		if debug { command.env("RECIPE_DEBUG", "1") } else { command.env_remove("RECIPE_DEBUG") };
+		std::fs::remove_file(&self.model).ok();
+		let started = std::time::Instant::now();
 		let output = command.output().expect("cannot execute recipe");
+		let seconds = started.elapsed().as_secs_f64();
 		assert!(output.status.success(), "workload failed: {}", String::from_utf8_lossy(&output.stderr));
-		let text = String::from_utf8_lossy(&output.stdout).into_owned();
-		let field = |name: &str| {
-			text.lines()
-				.find_map(|line| line.strip_prefix(name).map(|rest| rest.trim().to_owned()))
-				.unwrap_or_else(|| panic!("workload printed no {name}: {text}"))
-		};
-		(field("epoch_seconds ").parse().expect("epoch_seconds"), field("prediction_digest "))
+		let saved = std::fs::read(&self.model).expect("workload saved no model");
+		let mut digest = 0xcbf29ce484222325_u64;
+		for byte in saved {
+			digest = (digest ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+		}
+		(seconds, digest)
 	}
 
 	/// Dispatches one assignment and measures it. The written file is read back
 	/// afterwards: Recipe rewrites it when it rejects an extent, so a surviving
-	/// file is proof the measured epochs actually used this schedule.
-	fn measure(&self, schedule: &Schedule, epochs: usize) -> Measurement {
+	/// file is proof the timed run actually used this schedule.
+	fn measure(&self, schedule: &Schedule) -> Measurement {
 		let written = schedule.render();
 		let mut best = f64::INFINITY;
-		let mut digest = String::new();
+		let mut digest = 0;
 		for _ in 0..self.repeats {
 			std::fs::write(&self.cache, &written).expect("cannot write schedule cache");
-			let (seconds, observed) = self.run(epochs, false);
+			let (seconds, observed) = self.run(false);
 			if std::fs::read_to_string(&self.cache).expect("cannot read schedule cache") != written {
 				return Measurement { seconds: f64::INFINITY, digest: observed, dispatched: false };
 			}
@@ -394,33 +401,29 @@ fn locate_cache(log: &Path) -> PathBuf {
 fn main() {
 	let binary = PathBuf::from(std::env::var("RECIPE_BIN").unwrap_or_else(|_| "target/release/recipe".to_owned()));
 	let script = PathBuf::from(std::env::var("RAT_SCRIPT").unwrap_or_else(|_| "experiment/vna.rs".to_owned()));
+	let model = PathBuf::from(std::env::var("RAT_MODEL").unwrap_or_else(|_| "vna.ogdl".to_owned()));
 	let log = PathBuf::from(std::env::var("RAT_LOG").unwrap_or_else(|_| "recipe.log".to_owned()));
 	let budget: usize = variable("RAT_BUDGET", 120);
-	let measure_epochs: usize = variable("RAT_MEASURE_EPOCHS", 40);
-	let check_epochs: usize = variable("RAT_CHECK_EPOCHS", 300);
 	let repeats: usize = variable("RAT_REPEATS", 3);
 	let explore: f64 = variable("RAT_EXPLORE", 0.25);
 	let hidden: usize = variable("RAT_HIDDEN", 24);
 	let rate: f64 = variable("RAT_RATE", 0.02);
 	let mut random = Random(variable("RAT_SEED", 17_u64) | 1);
 
-	// Bootstrap. Let Recipe compile the artifact and write its own schedule, so
-	// the node set, the device line and the heuristic extents all come from the
-	// runtime rather than from an assumption here.
+	// Bootstrap. The first run compiles the artifact and names the schedule file
+	// in the log. That file is then cleared and the workload run again, so the
+	// baseline is Recipe's own selection on a cold cache rather than whatever a
+	// previous session happened to leave behind.
 	println!("bootstrap: compiling the workload and reading Recipe's own schedule");
-	let bench = Bench { binary, script, cache: PathBuf::new(), repeats };
-	bench.run(measure_epochs, true);
+	let bench = Bench { binary, script, cache: PathBuf::new(), model, repeats };
+	bench.run(true);
 	let cache = locate_cache(&log);
+	std::fs::remove_file(&cache).expect("cannot clear schedule cache");
 	let bench = Bench { cache, ..bench };
+	bench.run(true);
 	let heuristic = Schedule::parse(&std::fs::read_to_string(&bench.cache).expect("cannot read schedule cache"));
 	println!("bootstrap: cache {}", bench.cache.display());
 	println!("bootstrap: {}", heuristic.device);
-
-	// Reference: what the model trains to under the schedule Recipe picked, at
-	// a length where a numerical difference has room to appear.
-	let reference = bench.measure(&heuristic, check_epochs);
-	assert!(reference.dispatched, "Recipe rejected its own schedule");
-	println!("reference: {check_epochs} epochs, digest {}", reference.digest);
 
 	let slots = heuristic.slots();
 	let mut lookup = Lookup::new();
@@ -430,15 +433,17 @@ fn main() {
 		lookup.enter(*slot, hidden);
 	}
 
-	let base = bench.measure(&heuristic, measure_epochs);
+	// The schedule Recipe picked, and the model it trains to under it. Both are
+	// the reference every candidate is judged against.
+	let base = bench.measure(&heuristic);
 	assert!(base.dispatched, "Recipe rejected its own schedule");
+	let reference = base.digest;
 	let mut best = heuristic.clone();
 	let mut best_seconds = base.seconds;
-	println!("baseline: {:.6} s over {measure_epochs} epochs\n", best_seconds);
+	println!("baseline: {best_seconds:.3} s, model {reference:#018x}\n");
 
 	let mut rejected = Vec::new();
 	let mut broke_numerics = Vec::new();
-
 	for step in 0..budget {
 		let slot = slots[step % slots.len()];
 		let state = state_features(slot, heuristic.nodes.len(), heuristic.get(slot));
@@ -471,7 +476,7 @@ fn main() {
 		// state + action -> benchmark -> M
 		let mut candidate = best.clone();
 		candidate.set(slot, tile);
-		let measurement = bench.measure(&candidate, measure_epochs);
+		let measurement = bench.measure(&candidate);
 		let measured = if measurement.dispatched { measurement.seconds } else { f64::INFINITY };
 		lookup.store(slot, action, measured);
 		if !measurement.dispatched {
@@ -513,43 +518,41 @@ fn main() {
 		}
 		t.backward(&state, &proposal, &grad_logits, rate, &lookup.selected_t[&slot], false);
 
+
 		let verdict = if !measurement.dispatched {
-			"rejected".to_owned()
+			"rejected"
+		} else if measurement.digest != reference {
+			// Faster or not, a schedule that trains to a different model is not
+			// a scheduling choice. Recipe's own gate cannot see this, because it
+			// compares a loss taken before the reverse pass has run.
+			broke_numerics.push((slot, tile, measurement.digest));
+			"changes the trained model"
 		} else if measured < best_seconds {
-			// Only a winner is worth the long numerical check.
-			let checked = bench.measure(&candidate, check_epochs);
-			if checked.dispatched && checked.digest == reference.digest {
-				best = candidate;
-				best_seconds = measured;
-				"accepted".to_owned()
-			} else {
-				broke_numerics.push((slot, tile, checked.digest.clone()));
-				"changes the trained model".to_owned()
-			}
+			best = candidate;
+			best_seconds = measured;
+			"accepted"
 		} else {
-			"slower".to_owned()
+			"slower"
 		};
 
 		println!(
-			"{step:>4}  node {:>2} dir {}  {:>4}x{:<3}x{:<4}  P {:>9.6}  M {:>9.6}  best {:>9.6}  {verdict}",
+			"{step:>4}  node {:>2} dir {}  {:>4}x{:<3}x{:<4}  P {predicted:>8.3}  M {:>8.3}  best {best_seconds:>8.3}  {verdict}",
 			slot.node,
 			slot.direction,
 			tile.m,
 			tile.n,
 			tile.k,
-			predicted,
-			if measured.is_finite() { measured } else { f64::NAN },
-			best_seconds
+			if measured.is_finite() { measured } else { f64::NAN }
 		);
 	}
 
 	std::fs::write(&bench.cache, best.render()).expect("cannot write schedule cache");
 	println!("\nselected schedule, written to {}", bench.cache.display());
 	print!("{}", best.render());
-	println!("\nbaseline {:.6} s, selected {:.6} s over {measure_epochs} epochs", base.seconds, best_seconds);
-	println!("{} cells rejected by the compiled resource bounds", rejected.len());
-	println!("{} cells measured faster but changed the trained model:", broke_numerics.len());
+	println!("\nbaseline {:.3} s, selected {:.3} s", base.seconds, best_seconds);
+	println!("{} of {budget} cells rejected by the compiled resource bounds", rejected.len());
+	println!("{} cells changed the trained model:", broke_numerics.len());
 	for (slot, tile, digest) in &broke_numerics {
-		println!("  node {} dir {}  {}x{}x{}  digest {digest} against reference {}", slot.node, slot.direction, tile.m, tile.n, tile.k, reference.digest);
+		println!("  node {} dir {}  {}x{}x{}  model {digest:#018x} against {reference:#018x}", slot.node, slot.direction, tile.m, tile.n, tile.k);
 	}
 }
