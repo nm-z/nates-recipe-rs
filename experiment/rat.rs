@@ -1,337 +1,109 @@
-//! The RAT: R/P/M/B/T/L, per contraction node and direction, measured on the
-//! real fused epoch of a real model on a real device.
-//!
-//! This is the design from the issue thread, built as one script on top of the
-//! runtime-schedule plumbing in #378. It replaces that PR's selector (an
-//! XGBoost regressor plus argmin, which is B alone) with the two-model loop:
-//!
-//!   state -> L                       lookup state: selected neurons, memory
-//!   L + state -> T -> action         tile proposer picks an LUT cell
-//!   L + state + action -> B -> P     benchmark surrogate predicts seconds
-//!   state + action -> benchmark -> M measured seconds, real epochs
-//!   M -> L                           stored
-//!   difference(P, M) -> backward     updates the selected B neurons
-//!   objective(P)     -> backward     through frozen B, updates selected T neurons
-//!
-//! T's discrete choice is made differentiable the same way Recipe's own RAT
-//! does it: the softmax over LUT cells forms an expected action embedding, B
-//! scores that, and the gradient of the score reaches T's logits. The argmax
-//! cell is what actually gets benchmarked.
-//!
-//! Dispatch channel. Recipe has no public tile knob, but #378 reads a schedule
-//! cache beside the native artifact before the first epoch, and a cache hit
-//! short-circuits its own tuner. Writing that file is therefore a supported way
-//! to dispatch an arbitrary assignment, and it doubles as a validity oracle: if
-//! an extent violates a compiled resource bound, Recipe rejects the whole file
-//! and retunes, overwriting it. A file that survives a run was dispatched.
-//!
-//! Numerics. #378 accepts a candidate when the epoch loss is unchanged, which
-//! is measured before the reverse pass and so cannot see a gradient tile at
-//! all. This script compares the saved model instead, which is the thing a
-//! scheduling choice is not allowed to change.
-//!
-//! The workload is an ordinary training script. It is run untouched, timed from
-//! the outside, and read through the model it saves, so nothing here needs to
-//! be instrumented into it.
-//!
-//! Run:
-//!   cargo build --release
-//!   ./target/release/recipe experiment/rat.rs
-//!
-//! Environment: RECIPE_BIN, RAT_SCRIPT, RAT_MODEL, RAT_BUDGET, RAT_REPEATS,
-//! RAT_EXPLORE, RAT_SEED, RAT_HIDDEN, RAT_RATE.
+//! RAT: B, T and L over an m/n/k lookup table, one slot per contraction node and direction.
+//! Tiles reach the runtime through the #378 schedule cache, whose rewrite-on-reject doubles as the validity oracle.
+//! The workload is an ordinary training script: run untouched, timed from the outside, judged by the model it saves.
+//! Environment: RECIPE_BIN, RAT_SCRIPT, RAT_MODEL, RAT_LOG, RAT_BUDGET, RAT_REPEATS, RAT_EXPLORE, RAT_HIDDEN, RAT_RATE, RAT_SEED.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// ---------------------------------------------------------------- LUT
-
-const TILE_M: [u32; 5] = [16, 32, 64, 128, 256];
-const TILE_N: [u32; 5] = [4, 8, 16, 32, 64];
-const TILE_K: [u32; 5] = [8, 16, 32, 64, 128];
-const ACTIONS: usize = TILE_M.len() * TILE_N.len() * TILE_K.len();
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Tile {
-	m: u32,
-	n: u32,
-	k: u32,
-}
-
-fn action_tile(action: usize) -> Tile {
-	let k = action % TILE_K.len();
-	let n = (action / TILE_K.len()) % TILE_N.len();
-	let m = action / (TILE_K.len() * TILE_N.len());
-	Tile { m: TILE_M[m], n: TILE_N[n], k: TILE_K[k] }
-}
-
-/// Log-scaled tile extents, so the models see ratios rather than magnitudes.
-fn tile_features(tile: Tile) -> [f64; 3] { [f64::from(tile.m).log2() / 8.0, f64::from(tile.n).log2() / 8.0, f64::from(tile.k).log2() / 8.0] }
-
-// ---------------------------------------------------------------- state
-
+const M: [u32; 5] = [16, 32, 64, 128, 256];
+const N: [u32; 5] = [4, 8, 16, 32, 64];
+const K: [u32; 5] = [8, 16, 32, 64, 128];
+const ACTIONS: usize = M.len() * N.len() * K.len();
 const STATE: usize = 7;
-const ACTION_FEATURES: usize = 3;
+const EXTENT: usize = 3;
+const PRIME: u64 = 0x100000001b3;
+const OFFSET: u64 = 0xcbf29ce484222325;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Tile { m: u32, n: u32, k: u32 }
 /// One tuneable slot: a contraction node and one of its three directions.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct Slot {
-	node: usize,
-	direction: usize,
-}
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Slot { node: usize, direction: usize }
 
-/// What the models see. Everything here is publicly observable: the slot
-/// identity and the heuristic extent Recipe derived for it.
-fn state_features(slot: Slot, nodes: usize, heuristic: Tile) -> [f64; STATE] {
-	let tile = tile_features(heuristic);
-	[
-		slot.node as f64 / nodes.max(1) as f64,
-		f64::from(slot.direction == 0),
-		f64::from(slot.direction == 1),
-		f64::from(slot.direction == 2),
-		tile[0],
-		tile[1],
-		tile[2],
-	]
-}
-
-// ---------------------------------------------------------------- nets
-
-/// A one-hidden-layer tanh network. Small on purpose: the point is the loop,
-/// not the capacity.
-struct Net {
-	inputs: usize,
-	hidden: usize,
-	outputs: usize,
-	w1: Vec<f64>,
-	b1: Vec<f64>,
-	w2: Vec<f64>,
-	b2: Vec<f64>,
-}
-
-struct Pass {
-	hidden: Vec<f64>,
-	output: Vec<f64>,
-}
-
-impl Net {
-	fn new(inputs: usize, hidden: usize, outputs: usize, random: &mut Random) -> Self {
-		let scale = (1.0 / inputs as f64).sqrt();
-		Self {
-			inputs,
-			hidden,
-			outputs,
-			w1: (0..inputs * hidden).map(|_| random.symmetric() * scale).collect(),
-			b1: vec![0.0; hidden],
-			w2: (0..hidden * outputs).map(|_| random.symmetric() * scale).collect(),
-			b2: vec![0.0; outputs],
-		}
-	}
-
-	fn forward(&self, input: &[f64]) -> Pass {
-		assert_eq!(input.len(), self.inputs, "net input width");
-		let mut hidden = vec![0.0; self.hidden];
-		for (unit, value) in hidden.iter_mut().enumerate() {
-			let mut sum = self.b1[unit];
-			for (index, feature) in input.iter().enumerate() {
-				sum += self.w1[index * self.hidden + unit] * feature;
-			}
-			*value = sum.tanh();
-		}
-		let mut output = vec![0.0; self.outputs];
-		for (index, value) in output.iter_mut().enumerate() {
-			let mut sum = self.b2[index];
-			for (unit, activation) in hidden.iter().enumerate() {
-				sum += self.w2[unit * self.outputs + index] * activation;
-			}
-			*value = sum;
-		}
-		Pass { hidden, output }
-	}
-
-	/// Backward pass. `selected` masks which hidden units may be written, which
-	/// is the "update only selected neurons" rule. Returns the gradient with
-	/// respect to the input, so a caller can chain through a frozen net.
-	fn backward(&mut self, input: &[f64], pass: &Pass, grad_output: &[f64], rate: f64, selected: &[bool], frozen: bool) -> Vec<f64> {
-		let mut grad_hidden = vec![0.0; self.hidden];
-		for unit in 0..self.hidden {
-			let mut sum = 0.0;
-			for index in 0..self.outputs {
-				sum += self.w2[unit * self.outputs + index] * grad_output[index];
-			}
-			grad_hidden[unit] = sum * (1.0 - pass.hidden[unit] * pass.hidden[unit]);
-		}
-		let mut grad_input = vec![0.0; self.inputs];
-		for index in 0..self.inputs {
-			let mut sum = 0.0;
-			for unit in 0..self.hidden {
-				sum += self.w1[index * self.hidden + unit] * grad_hidden[unit];
-			}
-			grad_input[index] = sum;
-		}
-		if frozen {
-			return grad_input;
-		}
-		for index in 0..self.outputs {
-			for unit in 0..self.hidden {
-				if selected[unit] {
-					self.w2[unit * self.outputs + index] -= rate * grad_output[index] * pass.hidden[unit];
-				}
-			}
-			self.b2[index] -= rate * grad_output[index];
-		}
-		for unit in 0..self.hidden {
-			if !selected[unit] {
-				continue;
-			}
-			for (index, feature) in input.iter().enumerate() {
-				self.w1[index * self.hidden + unit] -= rate * grad_hidden[unit] * feature;
-			}
-			self.b1[unit] -= rate * grad_hidden[unit];
-		}
-		grad_input
-	}
-}
-
-fn softmax(logits: &[f64]) -> Vec<f64> {
-	let peak = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-	let raw = logits.iter().map(|value| (value - peak).exp()).collect::<Vec<_>>();
-	let total = raw.iter().sum::<f64>();
-	raw.into_iter().map(|value| value / total).collect()
-}
-
-// ---------------------------------------------------------------- L
-
-/// Lookup state. One entry per slot: which B and T hidden units this slot is
-/// allowed to write, and every measurement taken for it.
-struct Lookup {
-	selected_b: BTreeMap<Slot, Vec<bool>>,
-	selected_t: BTreeMap<Slot, Vec<bool>>,
-	measured: BTreeMap<Slot, Vec<(usize, f64)>>,
-}
-
-impl Lookup {
-	fn new() -> Self { Self { selected_b: BTreeMap::new(), selected_t: BTreeMap::new(), measured: BTreeMap::new() } }
-
-	/// Half the units, chosen by a hash of the slot. Deterministic, so the same
-	/// slot always writes the same subgraph, and different slots overlap only
-	/// partially.
-	fn select(slot: Slot, hidden: usize, salt: u64) -> Vec<bool> {
-		let mut hash = 0xcbf29ce484222325_u64 ^ salt;
-		for byte in [slot.node as u64, slot.direction as u64] {
-			hash = (hash ^ byte).wrapping_mul(0x100000001b3);
-		}
-		(0..hidden)
-			.map(|unit| {
-				let mut local = hash;
-				local = (local ^ unit as u64).wrapping_mul(0x100000001b3);
-				local >> 60 < 8
-			})
-			.collect()
-	}
-
-	fn enter(&mut self, slot: Slot, hidden: usize) {
-		self.selected_b.entry(slot).or_insert_with(|| Self::select(slot, hidden, 0x5b));
-		self.selected_t.entry(slot).or_insert_with(|| Self::select(slot, hidden, 0x7d));
-		self.measured.entry(slot).or_default();
-	}
-
-	fn store(&mut self, slot: Slot, action: usize, measured: f64) { self.measured.entry(slot).or_default().push((action, measured)); }
-
-	fn seen(&self, slot: Slot, action: usize) -> bool { self.measured.get(&slot).is_some_and(|rows| rows.iter().any(|(seen, _)| *seen == action)) }
-}
-
-// ---------------------------------------------------------------- random
+fn cell(action: usize) -> Tile { Tile { m: M[action / (K.len() * N.len())], n: N[action / K.len() % N.len()], k: K[action % K.len()] } }
+/// Log-scaled, so the nets see ratios rather than magnitudes.
+fn scaled(tile: Tile) -> [f64; EXTENT] { [f64::from(tile.m).log2() / 8.0, f64::from(tile.n).log2() / 8.0, f64::from(tile.k).log2() / 8.0] }
+/// Everything the nets see is publicly observable: the slot identity and the extent Recipe derived for it.
+fn state(slot: Slot, nodes: usize, heuristic: Tile) -> [f64; STATE] { let e = scaled(heuristic); [slot.node as f64 / nodes as f64, f64::from(slot.direction == 0), f64::from(slot.direction == 1), f64::from(slot.direction == 2), e[0], e[1], e[2]] }
+fn joined(state: &[f64; STATE], extent: [f64; EXTENT]) -> Vec<f64> { state.iter().copied().chain(extent).collect() }
+fn softmax(logits: &[f64]) -> Vec<f64> { let peak = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max); let raw = logits.iter().map(|value| (value - peak).exp()).collect::<Vec<_>>(); let total = raw.iter().sum::<f64>(); raw.into_iter().map(|value| value / total).collect() }
+fn digest(bytes: &[u8]) -> u64 { bytes.iter().fold(OFFSET, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(PRIME)) }
 
 struct Random(u64);
-
 impl Random {
-	fn next(&mut self) -> u64 {
-		self.0 ^= self.0 << 13;
-		self.0 ^= self.0 >> 7;
-		self.0 ^= self.0 << 17;
-		self.0
-	}
+	fn next(&mut self) -> u64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; self.0 }
 	fn unit(&mut self) -> f64 { (self.next() >> 11) as f64 / (1_u64 << 53) as f64 }
 	fn symmetric(&mut self) -> f64 { self.unit() * 2.0 - 1.0 }
 	fn below(&mut self, bound: usize) -> usize { (self.next() % bound as u64) as usize }
 }
 
-// ---------------------------------------------------------------- schedule cache
+/// One hidden tanh layer. `selected` masks the units a slot may write; `frozen` returns the input gradient and writes nothing.
+struct Net { inputs: usize, units: usize, outputs: usize, w1: Vec<f64>, b1: Vec<f64>, w2: Vec<f64>, b2: Vec<f64> }
+impl Net {
+	fn new(inputs: usize, units: usize, outputs: usize, random: &mut Random) -> Self { let scale = (1.0 / inputs as f64).sqrt(); Self { inputs, units, outputs, w1: (0..inputs * units).map(|_| random.symmetric() * scale).collect(), b1: vec![0.0; units], w2: (0..units * outputs).map(|_| random.symmetric() * scale).collect(), b2: vec![0.0; outputs] } }
 
-/// The schedule file #378 reads: a device line, then one line per contraction
-/// node holding forward, gradient and previous extents.
-#[derive(Clone)]
-struct Schedule {
-	device: String,
-	nodes: Vec<(usize, [Tile; 3])>,
+	fn forward(&self, input: &[f64]) -> (Vec<f64>, Vec<f64>) {
+		assert_eq!(input.len(), self.inputs, "net input width");
+		let hidden = (0..self.units).map(|unit| (self.b1[unit] + input.iter().enumerate().map(|(index, feature)| self.w1[index * self.units + unit] * feature).sum::<f64>()).tanh()).collect::<Vec<_>>();
+		let output = (0..self.outputs).map(|index| self.b2[index] + hidden.iter().enumerate().map(|(unit, value)| self.w2[unit * self.outputs + index] * value).sum::<f64>()).collect();
+		(hidden, output)
+	}
+
+	fn backward(&mut self, input: &[f64], hidden: &[f64], gradient: &[f64], rate: f64, selected: &[bool], frozen: bool) -> Vec<f64> {
+		let inner = (0..self.units).map(|unit| (0..self.outputs).map(|index| self.w2[unit * self.outputs + index] * gradient[index]).sum::<f64>() * (1.0 - hidden[unit] * hidden[unit])).collect::<Vec<_>>();
+		let source = (0..self.inputs).map(|index| (0..self.units).map(|unit| self.w1[index * self.units + unit] * inner[unit]).sum()).collect();
+		if frozen { return source }
+		for index in 0..self.outputs {
+			for unit in 0..self.units { if selected[unit] { self.w2[unit * self.outputs + index] -= rate * gradient[index] * hidden[unit] } }
+			self.b2[index] -= rate * gradient[index];
+		}
+		for unit in (0..self.units).filter(|unit| selected[*unit]) {
+			for (index, feature) in input.iter().enumerate() { self.w1[index * self.units + unit] -= rate * inner[unit] * feature }
+			self.b1[unit] -= rate * inner[unit];
+		}
+		source
+	}
 }
 
+/// L: per slot, the B and T units it may write and every cell it has measured.
+struct Lookup { b: BTreeMap<Slot, Vec<bool>>, t: BTreeMap<Slot, Vec<bool>>, measured: BTreeMap<Slot, Vec<(usize, f64)>> }
+impl Lookup {
+	/// A deterministic half of the units, so one slot always writes the same subgraph and neighbouring slots overlap only partly.
+	fn select(slot: Slot, units: usize, salt: u64) -> Vec<bool> { let seed = [slot.node as u64, slot.direction as u64].iter().fold(OFFSET ^ salt, |hash, part| (hash ^ part).wrapping_mul(PRIME)); (0..units).map(|unit| (seed ^ unit as u64).wrapping_mul(PRIME) >> 60 < 8).collect() }
+	fn new(slots: &[Slot], units: usize) -> Self { Self { b: slots.iter().map(|slot| (*slot, Self::select(*slot, units, 0x5b))).collect(), t: slots.iter().map(|slot| (*slot, Self::select(*slot, units, 0x7d))).collect(), measured: slots.iter().map(|slot| (*slot, Vec::new())).collect() } }
+	fn store(&mut self, slot: Slot, action: usize, seconds: f64) { self.measured.entry(slot).or_default().push((action, seconds)) }
+	fn seen(&self, slot: Slot, action: usize) -> bool { self.measured[&slot].iter().any(|(seen, _)| *seen == action) }
+}
+
+/// The schedule file #378 reads: a device line, then one line per contraction node holding forward, gradient and previous extents.
+#[derive(Clone)]
+struct Schedule { device: String, nodes: Vec<(usize, [Tile; 3])> }
 impl Schedule {
 	fn parse(text: &str) -> Self {
 		let mut lines = text.lines();
 		let device = lines.next().expect("schedule cache is empty").to_owned();
 		assert!(device.starts_with("device "), "schedule cache has no device line");
-		let nodes = lines
-			.filter(|line| !line.trim().is_empty())
-			.map(|line| {
-				let fields = line.split_whitespace().collect::<Vec<_>>();
-				assert!(fields.len() == 11 && fields[0] == "node", "unexpected schedule line: {line}");
-				let node = fields[1].parse().expect("node index");
-				let value = |index: usize| fields[index].parse::<u32>().expect("tile extent");
-				(node, [
-					Tile { m: value(2), n: value(3), k: value(4) },
-					Tile { m: value(5), n: value(6), k: value(7) },
-					Tile { m: value(8), n: value(9), k: value(10) },
-				])
-			})
-			.collect();
+		let nodes = lines.filter(|line| !line.trim().is_empty()).map(|line| {
+			let fields = line.split_whitespace().collect::<Vec<_>>();
+			assert!(fields.len() == 11 && fields[0] == "node", "unexpected schedule line: {line}");
+			let at = |index: usize| fields[index].parse::<u32>().expect("tile extent");
+			(fields[1].parse().expect("node index"), [Tile { m: at(2), n: at(3), k: at(4) }, Tile { m: at(5), n: at(6), k: at(7) }, Tile { m: at(8), n: at(9), k: at(10) }])
+		}).collect();
 		Self { device, nodes }
 	}
-
-	fn render(&self) -> String {
-		let mut text = format!("{}\n", self.device);
-		for (node, tiles) in &self.nodes {
-			let extents = tiles.iter().flat_map(|tile| [tile.m, tile.n, tile.k]).map(|extent| extent.to_string()).collect::<Vec<_>>().join(" ");
-			let _ = writeln!(text, "node {node} {extents}");
-		}
-		text
-	}
-
+	fn render(&self) -> String { self.nodes.iter().fold(format!("{}\n", self.device), |mut text, (node, tiles)| { let _ = writeln!(text, "node {node} {}", tiles.iter().flat_map(|tile| [tile.m, tile.n, tile.k]).map(|extent| extent.to_string()).collect::<Vec<_>>().join(" ")); text }) }
 	fn get(&self, slot: Slot) -> Tile { self.nodes.iter().find(|(node, _)| *node == slot.node).expect("slot node").1[slot.direction] }
-
-	fn set(&mut self, slot: Slot, tile: Tile) {
-		let entry = self.nodes.iter_mut().find(|(node, _)| *node == slot.node).expect("slot node");
-		entry.1[slot.direction] = tile;
-	}
-
+	fn set(&mut self, slot: Slot, tile: Tile) { self.nodes.iter_mut().find(|(node, _)| *node == slot.node).expect("slot node").1[slot.direction] = tile }
 	fn slots(&self) -> Vec<Slot> { self.nodes.iter().flat_map(|(node, _)| (0..3).map(move |direction| Slot { node: *node, direction })).collect() }
 }
 
-// ---------------------------------------------------------------- measurement
-
-struct Measurement {
-	seconds: f64,
-	digest: u64,
-	dispatched: bool,
-}
-
-struct Bench {
-	binary: PathBuf,
-	script: PathBuf,
-	cache: PathBuf,
-	model: PathBuf,
-	repeats: usize,
-}
-
+struct Measurement { seconds: f64, model: u64, dispatched: bool }
+struct Bench { binary: PathBuf, script: PathBuf, cache: PathBuf, model: PathBuf, repeats: usize }
 impl Bench {
-	/// Runs the workload untouched and times the whole invocation. Process
-	/// startup and data preparation are a constant across candidates, so they
-	/// shift every measurement equally rather than favouring one schedule.
-	/// The saved model is the numerical fingerprint: a schedule that changes
-	/// training changes those bytes.
+	/// Times the whole invocation. Startup and data preparation are a constant across candidates, so they shift every measurement equally rather than favouring one schedule.
 	fn run(&self, debug: bool) -> (f64, u64) {
 		let mut command = Command::new(&self.binary);
 		command.arg(&self.script);
@@ -341,218 +113,109 @@ impl Bench {
 		let output = command.output().expect("cannot execute recipe");
 		let seconds = started.elapsed().as_secs_f64();
 		assert!(output.status.success(), "workload failed: {}", String::from_utf8_lossy(&output.stderr));
-		let saved = std::fs::read(&self.model).expect("workload saved no model");
-		let mut digest = 0xcbf29ce484222325_u64;
-		for byte in saved {
-			digest = (digest ^ u64::from(byte)).wrapping_mul(0x100000001b3);
-		}
-		(seconds, digest)
+		(seconds, digest(&std::fs::read(&self.model).expect("workload saved no model")))
 	}
 
-	/// Dispatches one assignment and measures it. The written file is read back
-	/// afterwards: Recipe rewrites it when it rejects an extent, so a surviving
-	/// file is proof the timed run actually used this schedule.
+	/// Dispatches one assignment. Recipe rewrites the cache when it rejects an extent, so a file that survives is proof the timed run used this schedule.
 	fn measure(&self, schedule: &Schedule) -> Measurement {
 		let written = schedule.render();
-		let mut best = f64::INFINITY;
-		let mut digest = 0;
+		let (mut seconds, mut model) = (f64::INFINITY, 0);
 		for _ in 0..self.repeats {
 			std::fs::write(&self.cache, &written).expect("cannot write schedule cache");
-			let (seconds, observed) = self.run(false);
-			if std::fs::read_to_string(&self.cache).expect("cannot read schedule cache") != written {
-				return Measurement { seconds: f64::INFINITY, digest: observed, dispatched: false };
-			}
-			best = best.min(seconds);
-			digest = observed;
+			let (elapsed, observed) = self.run(false);
+			if std::fs::read_to_string(&self.cache).expect("cannot read schedule cache") != written { return Measurement { seconds: f64::INFINITY, model: observed, dispatched: false } }
+			(seconds, model) = (seconds.min(elapsed), observed);
 		}
-		Measurement { seconds: best, digest, dispatched: true }
+		Measurement { seconds, model, dispatched: true }
 	}
 }
 
-// ---------------------------------------------------------------- main
-
-fn variable<T: std::str::FromStr>(name: &str, fallback: T) -> T {
-	std::env::var(name).map_or(fallback, |value| value.parse().ok().expect("invalid environment value"))
-}
-
-/// Recipe names the schedule file it used in the debug log, on a cache hit and
-/// on a fresh selection alike. Reading it back is exact, and it identifies the
-/// training tape specifically: the evaluation tape never tunes and so never
-/// appears here.
-fn locate_cache(log: &Path) -> PathBuf {
-	let text = std::fs::read_to_string(log).expect("cannot read recipe.log; is RECIPE_DEBUG reaching the workload?");
-	let found = text
-		.lines()
-		.filter_map(|line| {
-			let field = if line.starts_with("schedule cache hit") {
-				line.split_whitespace().find_map(|token| token.strip_prefix("path="))
-			} else if line.starts_with("schedule select") {
-				line.split_whitespace().find_map(|token| token.strip_prefix("cache="))
-			} else {
-				None
-			};
-			field.map(PathBuf::from)
-		})
-		.collect::<Vec<_>>();
+fn variable<T: std::str::FromStr>(name: &str, fallback: T) -> T { std::env::var(name).map_or(fallback, |value| value.parse().ok().expect("invalid environment value")) }
+fn path(name: &str, fallback: &str) -> PathBuf { PathBuf::from(std::env::var(name).unwrap_or_else(|_| fallback.to_owned())) }
+/// Recipe names the schedule file it used in the debug log on a hit and on a fresh selection alike, and only the training tape ever appears there.
+fn locate(log: &Path) -> PathBuf {
+	let text = std::fs::read_to_string(log).expect("cannot read recipe.log");
+	let found = text.lines().filter_map(|line| line.strip_prefix("schedule cache hit ").map(|rest| (rest, "path=")).or_else(|| line.strip_prefix("schedule select ").map(|rest| (rest, "cache="))).and_then(|(rest, key)| rest.split_whitespace().find_map(|token| token.strip_prefix(key)))).collect::<Vec<_>>();
 	assert_eq!(found.len(), 1, "expected exactly one schedule cache in the log, found {found:?}");
-	found.into_iter().next().expect("schedule cache")
+	PathBuf::from(found[0])
 }
 
 fn main() {
-	let binary = PathBuf::from(std::env::var("RECIPE_BIN").unwrap_or_else(|_| "target/release/recipe".to_owned()));
-	let script = PathBuf::from(std::env::var("RAT_SCRIPT").unwrap_or_else(|_| "experiment/vna.rs".to_owned()));
-	let model = PathBuf::from(std::env::var("RAT_MODEL").unwrap_or_else(|_| "vna.ogdl".to_owned()));
-	let log = PathBuf::from(std::env::var("RAT_LOG").unwrap_or_else(|_| "recipe.log".to_owned()));
-	let budget: usize = variable("RAT_BUDGET", 120);
-	let repeats: usize = variable("RAT_REPEATS", 3);
-	let explore: f64 = variable("RAT_EXPLORE", 0.25);
-	let hidden: usize = variable("RAT_HIDDEN", 24);
-	let rate: f64 = variable("RAT_RATE", 0.02);
+	let (budget, repeats): (usize, usize) = (variable("RAT_BUDGET", 120), variable("RAT_REPEATS", 3));
+	let (explore, rate): (f64, f64) = (variable("RAT_EXPLORE", 0.25), variable("RAT_RATE", 0.02));
+	let units: usize = variable("RAT_HIDDEN", 24);
+	let log = path("RAT_LOG", "recipe.log");
 	let mut random = Random(variable("RAT_SEED", 17_u64) | 1);
 
-	// Bootstrap. The first run compiles the artifact and names the schedule file
-	// in the log. That file is then cleared and the workload run again, so the
-	// baseline is Recipe's own selection on a cold cache rather than whatever a
-	// previous session happened to leave behind.
+	// The first run compiles the artifact and names the schedule file in the log. Clearing it and running again makes the
+	// baseline Recipe's own selection on a cold cache, not whatever a previous session happened to leave behind.
 	println!("bootstrap: compiling the workload and reading Recipe's own schedule");
-	let bench = Bench { binary, script, cache: PathBuf::new(), model, repeats };
+	let bench = Bench { binary: path("RECIPE_BIN", "target/release/recipe"), script: path("RAT_SCRIPT", "experiment/vna.rs"), cache: PathBuf::new(), model: path("RAT_MODEL", "vna.ogdl"), repeats };
 	bench.run(true);
-	let cache = locate_cache(&log);
+	let cache = locate(&log);
 	std::fs::remove_file(&cache).expect("cannot clear schedule cache");
 	let bench = Bench { cache, ..bench };
 	bench.run(true);
 	let heuristic = Schedule::parse(&std::fs::read_to_string(&bench.cache).expect("cannot read schedule cache"));
-	println!("bootstrap: cache {}", bench.cache.display());
-	println!("bootstrap: {}", heuristic.device);
+	println!("bootstrap: cache {}\nbootstrap: {}", bench.cache.display(), heuristic.device);
 
 	let slots = heuristic.slots();
-	let mut lookup = Lookup::new();
-	let mut b = Net::new(STATE + ACTION_FEATURES, hidden, 1, &mut random);
-	let mut t = Net::new(STATE, hidden, ACTIONS, &mut random);
-	for slot in &slots {
-		lookup.enter(*slot, hidden);
-	}
+	let mut lookup = Lookup::new(&slots, units);
+	let mut b = Net::new(STATE + EXTENT, units, 1, &mut random);
+	let mut t = Net::new(STATE, units, ACTIONS, &mut random);
 
-	// The schedule Recipe picked, and the model it trains to under it. Both are
-	// the reference every candidate is judged against.
 	let base = bench.measure(&heuristic);
 	assert!(base.dispatched, "Recipe rejected its own schedule");
-	let reference = base.digest;
-	let mut best = heuristic.clone();
-	let mut best_seconds = base.seconds;
-	println!("baseline: {best_seconds:.3} s, model {reference:#018x}\n");
+	let (reference, mut best, mut fastest) = (base.model, heuristic.clone(), base.seconds);
+	println!("baseline: {fastest:.3} s, model {reference:#018x}\n");
 
-	let mut rejected = Vec::new();
-	let mut broke_numerics = Vec::new();
+	let (mut rejected, mut changed) = (0, Vec::new());
 	for step in 0..budget {
 		let slot = slots[step % slots.len()];
-		let state = state_features(slot, heuristic.nodes.len(), heuristic.get(slot));
+		let state = state(slot, heuristic.nodes.len(), heuristic.get(slot));
 
 		// state -> T -> action, with R exploring the cells T has not learned yet.
-		let proposal = t.forward(&state);
-		let distribution = softmax(&proposal.output);
-		let action = if random.unit() < explore {
-			random.below(ACTIONS)
-		} else {
-			let mut choice = 0;
-			for candidate in 0..ACTIONS {
-				if distribution[candidate] > distribution[choice] && !lookup.seen(slot, candidate) {
-					choice = candidate;
-				}
-			}
-			choice
-		};
-		if lookup.seen(slot, action) {
-			continue;
-		}
-		let tile = action_tile(action);
+		let (proposal, logits) = t.forward(&state);
+		let distribution = softmax(&logits);
+		let action = if random.unit() < explore { random.below(ACTIONS) } else { (0..ACTIONS).filter(|cell| !lookup.seen(slot, *cell)).max_by(|left, right| distribution[*left].total_cmp(&distribution[*right])).unwrap_or(0) };
+		if lookup.seen(slot, action) { continue }
+		let tile = cell(action);
 
-		// state + action -> B -> P
-		let mut input = state.to_vec();
-		input.extend(tile_features(tile));
-		let prediction = b.forward(&input);
-		let predicted = prediction.output[0];
-
-		// state + action -> benchmark -> M
+		// state + action -> B -> P, then benchmark -> M.
+		let input = joined(&state, scaled(tile));
+		let (hidden, prediction) = b.forward(&input);
 		let mut candidate = best.clone();
 		candidate.set(slot, tile);
 		let measurement = bench.measure(&candidate);
 		let measured = if measurement.dispatched { measurement.seconds } else { f64::INFINITY };
 		lookup.store(slot, action, measured);
-		if !measurement.dispatched {
-			rejected.push((slot, tile));
-		}
+		rejected += usize::from(!measurement.dispatched);
 
-		// difference(P, M) -> backward -> update selected B neurons.
-		// A rejected extent is a real signal too: it teaches B that this cell is
-		// expensive, using a value well above anything measurable.
-		let target = if measured.is_finite() { measured } else { best_seconds * 4.0 };
-		let error = predicted - target;
-		b.backward(&input, &prediction, &[error], rate, &lookup.selected_b[&slot], false);
+		// difference(P, M) -> backward -> the selected B units. A rejected extent is a signal too, priced above anything measurable.
+		let error = prediction[0] - if measured.is_finite() { measured } else { fastest * 4.0 };
+		b.backward(&input, &hidden, &[error], rate, &lookup.b[&slot], false);
 
-		// objective(P) -> backward through frozen B -> update selected T neurons.
-		// The softmax forms an expected action, B scores it, and the gradient of
-		// that score reaches T's logits. B is not written here.
-		let mut expected = state.to_vec();
-		expected.extend([0.0; ACTION_FEATURES]);
-		for cell in 0..ACTIONS {
-			let features = tile_features(action_tile(cell));
-			for axis in 0..ACTION_FEATURES {
-				expected[STATE + axis] += distribution[cell] * features[axis];
-			}
-		}
-		let scored = b.forward(&expected);
-		let grad_expected = b.backward(&expected, &scored, &[1.0], rate, &lookup.selected_b[&slot], true);
-		let mut grad_logits = vec![0.0; ACTIONS];
-		for cell in 0..ACTIONS {
-			let features = tile_features(action_tile(cell));
-			let mut direct = 0.0;
-			for axis in 0..ACTION_FEATURES {
-				direct += grad_expected[STATE + axis] * features[axis];
-			}
-			grad_logits[cell] = direct;
-		}
-		let weighted = (0..ACTIONS).map(|cell| distribution[cell] * grad_logits[cell]).sum::<f64>();
-		for cell in 0..ACTIONS {
-			grad_logits[cell] = distribution[cell] * (grad_logits[cell] - weighted);
-		}
-		t.backward(&state, &proposal, &grad_logits, rate, &lookup.selected_t[&slot], false);
+		// objective(P) -> backward through frozen B -> the selected T units. The softmax forms an expected action, B scores it,
+		// and the gradient of that score reaches T's logits. B is not written here.
+		let mut expected = [0.0; EXTENT];
+		for index in 0..ACTIONS { for axis in 0..EXTENT { expected[axis] += distribution[index] * scaled(cell(index))[axis] } }
+		let expected = joined(&state, expected);
+		let (scored, _) = b.forward(&expected);
+		let source = b.backward(&expected, &scored, &[1.0], rate, &lookup.b[&slot], true);
+		let direct = (0..ACTIONS).map(|index| (0..EXTENT).map(|axis| source[STATE + axis] * scaled(cell(index))[axis]).sum::<f64>()).collect::<Vec<_>>();
+		let mean = (0..ACTIONS).map(|index| distribution[index] * direct[index]).sum::<f64>();
+		let gradient = (0..ACTIONS).map(|index| distribution[index] * (direct[index] - mean)).collect::<Vec<_>>();
+		t.backward(&state, &proposal, &gradient, rate, &lookup.t[&slot], false);
 
-
-		let verdict = if !measurement.dispatched {
-			"rejected"
-		} else if measurement.digest != reference {
-			// Faster or not, a schedule that trains to a different model is not
-			// a scheduling choice. Recipe's own gate cannot see this, because it
-			// compares a loss taken before the reverse pass has run.
-			broke_numerics.push((slot, tile, measurement.digest));
-			"changes the trained model"
-		} else if measured < best_seconds {
-			best = candidate;
-			best_seconds = measured;
-			"accepted"
-		} else {
-			"slower"
-		};
-
-		println!(
-			"{step:>4}  node {:>2} dir {}  {:>4}x{:<3}x{:<4}  P {predicted:>8.3}  M {:>8.3}  best {best_seconds:>8.3}  {verdict}",
-			slot.node,
-			slot.direction,
-			tile.m,
-			tile.n,
-			tile.k,
-			if measured.is_finite() { measured } else { f64::NAN }
-		);
+		// A schedule that trains to a different model is not a scheduling choice. Recipe's own gate cannot see this: it compares a loss taken before the reverse pass has run.
+		let verdict = if !measurement.dispatched { "rejected" } else if measurement.model != reference { changed.push((slot, tile, measurement.model)); "changes the trained model" } else if measured < fastest { (best, fastest) = (candidate, measured); "accepted" } else { "slower" };
+		println!("{step:>4}  node {:>2} dir {}  {:>4}x{:<3}x{:<4}  P {:>8.3}  M {:>8.3}  best {fastest:>8.3}  {verdict}", slot.node, slot.direction, tile.m, tile.n, tile.k, prediction[0], if measured.is_finite() { measured } else { f64::NAN });
 	}
 
 	std::fs::write(&bench.cache, best.render()).expect("cannot write schedule cache");
-	println!("\nselected schedule, written to {}", bench.cache.display());
-	print!("{}", best.render());
-	println!("\nbaseline {:.3} s, selected {:.3} s", base.seconds, best_seconds);
-	println!("{} of {budget} cells rejected by the compiled resource bounds", rejected.len());
-	println!("{} cells changed the trained model:", broke_numerics.len());
-	for (slot, tile, digest) in &broke_numerics {
-		println!("  node {} dir {}  {}x{}x{}  model {digest:#018x} against {reference:#018x}", slot.node, slot.direction, tile.m, tile.n, tile.k);
-	}
+	println!("\nselected schedule, written to {}\n{}", bench.cache.display(), best.render());
+	println!("baseline {:.3} s, selected {fastest:.3} s", base.seconds);
+	println!("{rejected} of {budget} cells rejected by the compiled resource bounds");
+	println!("{} cells changed the trained model:", changed.len());
+	for (slot, tile, model) in &changed { println!("  node {} dir {}  {}x{}x{}  model {model:#018x} against {reference:#018x}", slot.node, slot.direction, tile.m, tile.n, tile.k) }
 }
