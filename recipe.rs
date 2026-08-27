@@ -1978,7 +1978,7 @@ impl NativeModelIr {
 				}
 				(false, Primitive::Scan) => {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?.forward;
-					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i1 {indexed}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, indexed = node.source < 0 && self.graph.input_values != node.input.elements(), in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 						ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Elementwise) => {
@@ -2066,7 +2066,7 @@ impl NativeModelIr {
 				}
 				(true, Primitive::Scan) => {
 					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?;
-						ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+						ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {indexed}, i1 {write_input}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, indexed = node.source < 0 && self.graph.input_values != node.input.elements(), write_input = node.source >= 0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 						ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Predictor) => {
@@ -2412,7 +2412,7 @@ impl NativeModelIr {
 		if let Some(loss) = loss {
 			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
 			let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
-			let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
+			let input_bytes = checked_mul(if self.graph.input_values == self.graph.input.elements() { checked_mul(self.rows, self.graph.input_values, "native input clear elements")? } else { 1 }, self.precision.model.bytes(), "native input clear bytes")?;
 			let gradient_args = format!("{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads");
 			body.push_str(&format!("define {kernel}void @recipe_model_gradient({gradient_args}) #0 {{\nentry:\n%tid = {thread}\n"));
 			body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "entry")?);
@@ -3233,7 +3233,7 @@ mod bundle {
 			let (input, output) = (self.input.ok_or_else(|| RecipeError::new("semantic model has no input shape"))?, self.output.ok_or_else(|| RecipeError::new("semantic model has no output shape"))?);
 			let parts = self.model.ok_or_else(|| RecipeError::new("semantic model is absent"))?;
 			let model = model(parts.blocks, parts.loss.ok_or_else(|| RecipeError::new("semantic model has no loss"))?, parts.quantization.ok_or_else(|| RecipeError::new("semantic model has no quantization"))?)?;
-			require(self.inputs.len() == input.elements(), "semantic model input schema has the wrong width")?;
+			require(!self.inputs.is_empty() && input.elements() % self.inputs.len() == 0, "semantic model input schema has the wrong width")?;
 			require(self.outputs.len() == output.elements(), "semantic model output schema has the wrong width")?;
 			require(self.norm_mean.len() == self.norm_scale.len() && (self.norm_mean.is_empty() || self.norm_mean.len() == self.inputs.len()), "semantic model normalization stats have the wrong width")?;
 			require(!self.artifact.is_empty(), "native artifact identity is absent")?;
@@ -5025,15 +5025,14 @@ struct Graph {
 	frozen: Vec<u8>,
 	programs: Vec<f64>,
 	stored: Vec<Option<StoredWeight>>,
-	input: Shape,
-	output: Shape,
+	input: Shape, input_values: usize, output: Shape,
 	source: i32,
 	state: TrainingState,
 	block_index: usize,
 	block_kind: &'static str,
 }
 impl Graph {
-	fn new(shape: Shape) -> Self { Self { nodes: Vec::new(), parameters: Vec::new(), frozen: Vec::new(), programs: Vec::new(), stored: Vec::new(), input: shape, output: shape, source: -1, state: TrainingState::default(), block_index: 0, block_kind: "" } }
+	fn new(shape: Shape, input_values: usize) -> Self { Self { nodes: Vec::new(), parameters: Vec::new(), frozen: Vec::new(), programs: Vec::new(), stored: Vec::new(), input: shape, input_values, output: shape, source: -1, state: TrainingState::default(), block_index: 0, block_kind: "" } }
 	fn refresh_storage(&mut self, config: Config) -> Result<()> { encode_graph_storage(self, config) }
 }
 fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
@@ -5060,7 +5059,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	}
 	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..));
 	let shape = if sequential { data.sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
-	let mut graph = Graph::new(shape);
+	let mut graph = Graph::new(shape, data.features);
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
 		graph.block_kind = block.operation.name();
@@ -5094,9 +5093,10 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	Ok(graph)
 }
 fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: &'static Gpu, config: Config) -> Result<Graph> {
-	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], target_width: saved.output.elements().max(1), rows: 1, source_rows: 1, features: saved.input.elements(), schema: DataSchema::default(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new(), fitted: saved.predictors.clone() };
+	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], target_width: saved.output.elements().max(1), rows: 1, source_rows: 1, features: saved.inputs.len(), schema: DataSchema::default(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new(), fitted: saved.predictors.clone() };
 	let mut graph = compile(&saved.model, &prepared, &prepared.targets, 1, gpu, config, false)?;
 	require(graph.input == saved.input, "saved semantic input shape does not match the compiled model")?;
+	require(graph.input_values == saved.inputs.len(), "saved semantic input value width does not match the compiled model")?;
 	require(graph.output == saved.output, "saved semantic output shape does not match the compiled model")?;
 	require(graph.parameters.len() == saved.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "saved semantic weights do not match the compiled model")?;
 	let mut tensor = 0;
@@ -5592,8 +5592,13 @@ struct NativeContractionShapes {
 	previous: Tile,
 	parameters: usize,
 }
+/// The permitted placement policy: `false` trains on the local device, `true`
+/// forces every selected device, and `"auto"` takes the candidate route with the lowest predicted complete epoch.
+#[derive(Clone, Copy, PartialEq)]
+enum MultiDevice { Local, Forced, Auto }
 #[derive(Clone, Copy)]
 struct Config {
+	multi_device: MultiDevice,
 	kmeans_iterations: usize,
 	svm_iterations: usize,
 	svm_rate: f64,
@@ -5628,7 +5633,7 @@ struct Config {
 	precision: Compute,
 }
 impl Config {
-	fn load() -> Result<Self> { Ok(Self { kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, catboost_borders: natural("CatBoost border count", env!("RECIPE_CATBOOST_BORDER_COUNT"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
+	fn load() -> Result<Self> { Ok(Self { multi_device: match env!("RECIPE_MULTI_DEVICE") { "false" => MultiDevice::Local, "true" => MultiDevice::Forced, "auto" => MultiDevice::Auto, value => return Err(RecipeError::new(format!("multi-device must be false, true, or \"auto\", not {value:?}"))) }, kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?, svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?, svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?, svm_regularization: number("SVM regularization", env!("RECIPE_SVM_REGULARIZATION"))?, svm_epsilon: number("SVM epsilon", env!("RECIPE_SVM_EPSILON"))?, tree_depth: natural("tree depth", env!("RECIPE_TREE_DEPTH"))?, tree_min_rows: natural("tree minimum rows", env!("RECIPE_TREE_MIN_ROWS"))?, forest_feature_fraction: fraction("forest feature fraction", env!("RECIPE_FOREST_FEATURE_FRACTION"))?, bayes_prior_precision: number("Bayes prior precision", env!("RECIPE_BAYES_PRIOR_PRECISION"))?, bayes_noise_variance: number("Bayes noise variance", env!("RECIPE_BAYES_NOISE_VARIANCE"))?, bayes_variance_epsilon: number("Bayes variance epsilon", env!("RECIPE_BAYES_VARIANCE_EPSILON"))?, boost_iterations: natural("boost iterations", env!("RECIPE_BOOST_ITERATIONS"))?, boost_rate: fraction("boost learning rate", env!("RECIPE_BOOST_LEARNING_RATE"))?, catboost_prior: number("CatBoost ordered prior", env!("RECIPE_CATBOOST_ORDERED_PRIOR"))?, catboost_borders: natural("CatBoost border count", env!("RECIPE_CATBOOST_BORDER_COUNT"))?, xgboost_regularization: number("XGBoost L2 regularization", env!("RECIPE_XGBOOST_L2_REGULARIZATION"))?, xgboost_min_gain: number("XGBoost minimum gain", env!("RECIPE_XGBOOST_MINIMUM_GAIN"))?, lightgbm_bins: natural("LightGBM histogram bins", env!("RECIPE_LIGHTGBM_HISTOGRAM_BINS"))?, lightgbm_leaves: natural("LightGBM leaves", env!("RECIPE_LIGHTGBM_LEAVES"))?, quantization_block: natural("quantization block weights", env!("RECIPE_QUANTIZATION_BLOCK_WEIGHTS"))?, surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?, surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?, surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?, progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?, random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?, initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?, beta1: number("AdamW beta1", env!("RECIPE_ADAMW_BETA1"))?, beta2: number("AdamW beta2", env!("RECIPE_ADAMW_BETA2"))?, epsilon: number("AdamW epsilon", env!("RECIPE_ADAMW_EPSILON"))?, decay: number("AdamW weight decay", env!("RECIPE_ADAMW_WEIGHT_DECAY"))?, activation: [number("leak slope", env!("RECIPE_LEAK_SLOPE"))?, number("PReLU slope", env!("RECIPE_PRELU_SLOPE"))?, number("ELU alpha", env!("RECIPE_ELU_ALPHA"))?, number("SELU alpha", env!("RECIPE_SELU_ALPHA"))?, number("SELU scale", env!("RECIPE_SELU_SCALE"))?, number("GELU scale", env!("RECIPE_GELU_SCALE"))?, number("GELU cubic", env!("RECIPE_GELU_CUBIC"))?, number("Huber threshold", env!("RECIPE_HUBER_THRESHOLD"))?], precision: Compute::FP64 }) }
 }
 fn number(name: &str, text: &str) -> Result<f64> {
 	let value = text.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))?;
@@ -5641,7 +5646,7 @@ fn natural(name: &str, text: &str) -> Result<usize> {
 }
 fn count(name: &str, text: &str) -> Result<usize> { text.parse::<usize>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}"))) }
 fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetScale>, precision: Compute, target: &str) -> bundle::StoredGraph {
-	let inputs = if data.autoregressive { CHAR_IDS.iter().enumerate().flat_map(|(id, character)| (0..graph.input.length).map(move |position| format!("char{id}.u{:04X}.{position}", *character as u32))).collect() } else { (0..graph.input.elements()).map(|index| format!("input{index}")).collect() };
+	let inputs = if data.autoregressive { (0..graph.input_values).map(|position| format!("char-id.{position}")).collect() } else { (0..graph.input_values).map(|index| format!("input{index}")).collect() };
 	// Every selected target column is an output, in the order the user declared them.
 	let outputs = if data.autoregressive { vec!["char-id".to_owned()] } else if data.target.is_empty() { vec!["target".to_owned()] } else { data.target.clone() };
 	let (norm_mean, norm_scale) = match data.prepared.get() {
@@ -5679,13 +5684,14 @@ struct NativeTape {
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 impl NativeTape {
 	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
-		let input = graph.input.elements();
+		let input = graph.input_values;
 		require(input != 0 && !samples.is_empty() && samples.len() % input == 0, format!("model input batch expected a nonempty multiple of {input} values, received {}", samples.len()))?;
-		let rows = samples.len() / input;
+		let (rows, indexed) = (samples.len() / input, input != graph.input.elements());
+		let indexed_samples = if indexed { Some(samples.iter().map(|value| u8::try_from(*value as u64).ok().filter(|id| value.fract() == 0.0 && (*id as usize) < graph.input.channels || *id == u8::MAX).ok_or_else(|| RecipeError::new(format!("indexed input value {value} is invalid")))).collect::<Result<Vec<_>>>()?) } else { None };
 		let output = graph.output.elements();
 		require(targets.is_empty() || targets.len() == rows * output, format!("target batch expected 0 or {} values, received {}", rows * output, targets.len()))?;
 		let program = gpu.native_program(graph, rows, precision, loss)?;
-		let precision = program.artifact.precision;
+		let precision = program.artifact.precision; let sample_buffer = if let Some(values) = indexed_samples { Buffer::upload(gpu, &values)? } else { Buffer::upload_float(gpu, samples, precision.model)? };
 		let layout = program.artifact.layout.clone();
 		let parameters = graph.parameters.len();
 		let zeros = vec![0.0; parameters.max(1)];
@@ -5719,8 +5725,8 @@ impl NativeTape {
 			contexts: Buffer::upload(gpu, &vec![0_u8; layout.contexts_bytes.max(1)])?,
 			adjoints: Buffer::upload(gpu, &vec![0_u8; layout.adjoints_bytes.max(1)])?,
 			batch_normalizations,
-			samples: Buffer::upload_float(gpu, samples, precision.model)?,
-			input_adjoint: Buffer::upload_float(gpu, &vec![0.0; samples.len().max(1)], precision.model)?,
+			samples: sample_buffer,
+			input_adjoint: Buffer::upload_float(gpu, &vec![0.0; if indexed { 1 } else { samples.len().max(1) }], precision.model)?,
 			targets: Buffer::upload_float(gpu, &target_buffer, precision.model)?,
 			weights,
 			frozen: Buffer::upload(gpu, &frozen)?,
@@ -5766,12 +5772,6 @@ impl NativeTape {
 		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
 		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision.model)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
-	}
-	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
-		let objective = self.gradient_launch()?;
-		self.optimizer_launch(rate, config)?;
-		let saved = observe_loss(&mut self.best_loss, objective, tolerance);
-		Ok((objective, saved))
 	}
 	/// Computes this shard's loss and reduced parameter gradient without
 	/// changing optimizer state or model weights.
@@ -5837,14 +5837,11 @@ impl NativeTape {
 		if extents.windows(2).all(|pair| pair[0] == pair[1]) { return extents.first().cloned().unwrap_or_default() }
 		self.program.contractions.iter().flatten().map(|node| [node.forward, node.gradient, node.previous].map(|extent| format!("{}x{}x{}", extent.m, extent.n, extent.k)).join("/")).collect::<Vec<_>>().join(" ")
 	}
-	fn device_label(&self) -> Result<String> {
-		let name = &self.program.gpu.name;
-		if name.contains(':') {
-			return Ok(name.clone());
-		}
-		Ok(format!("{}:{name}", local_host()?))
-	}
+	fn device_label(&self) -> Result<String> { device_label(self.program.gpu) }
 }
+/// The `host:device` name of one device: a remote device already carries its
+/// owning host, and a local device takes this host's name.
+fn device_label(gpu: &Gpu) -> Result<String> { if gpu.name.contains(':') { Ok(gpu.name.clone()) } else { Ok(format!("{}:{}", local_host()?, gpu.name)) } }
 /// Tracks the running best loss and decides whether this epoch triggers a
 /// checkpoint, updating the four-slot loss state in place.
 fn observe_loss(best_loss: &mut [f64; 4], loss: f64, tolerance: f64) -> bool {
@@ -5868,14 +5865,17 @@ struct TransferCost {
 impl TransferCost {
 	fn seconds(self, bytes: usize) -> f64 { self.latency.as_secs_f64() + bytes as f64 / self.bandwidth }
 }
-/// The two measured directions between the coordinating host and one device.
+/// The measured behavior of one device: the two transfer directions between it and the coordinating
+/// host, the gradient work it retires each second, and the fixed cost of one dispatch on it.
 #[derive(Clone, Copy)]
 struct Link {
 	to_host: TransferCost,
 	from_host: TransferCost,
+	work: f64,
+	overhead: f64,
 }
-fn measure_link(gpu: &'static Gpu, bytes: usize) -> Result<Link> {
-	let probe_bytes = bytes.max(parse_natural(env!("RECIPE_TOPOLOGY_PROBE_BYTES"), "topology probe bytes must be a positive integer"));
+fn measure_link(gpu: &'static Gpu, config: Config) -> Result<Link> {
+	let probe_bytes = parse_natural(env!("RECIPE_TOPOLOGY_PROBE_BYTES"), "topology probe bytes must be a positive integer");
 	let mut scratch = vec![0_u8; probe_bytes];
 	let pointer = gpu.upload(0, scratch.as_ptr().cast(), probe_bytes)?;
 	let measured = (|| {
@@ -5896,11 +5896,13 @@ fn measure_link(gpu: &'static Gpu, bytes: usize) -> Result<Link> {
 		gpu.upload(pointer, scratch.as_ptr().cast(), probe_bytes)?;
 		gpu.synchronize()?;
 		let from_host_bandwidth = probe_bytes as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON);
-		Ok(Link { to_host: TransferCost { latency: to_host_latency, bandwidth: to_host_bandwidth }, from_host: TransferCost { latency: from_host_latency, bandwidth: from_host_bandwidth } })
+		let (work, overhead) = calibrate(gpu, config)?;
+		Ok(Link { to_host: TransferCost { latency: to_host_latency, bandwidth: to_host_bandwidth }, from_host: TransferCost { latency: from_host_latency, bandwidth: from_host_bandwidth }, work, overhead })
 	})();
 	gpu.free(pointer);
 	measured
 }
+static LINKS: OnceLock<Result<Vec<Link>>> = OnceLock::new();
 #[derive(Clone, Copy)]
 struct Transfer {
 	from: usize,
@@ -5911,7 +5913,8 @@ struct Transfer {
 impl Transfer {
 	fn seconds(self) -> f64 { self.cost.seconds(self.bytes) }
 }
-/// The measured placement selected for a tape that spans several devices.
+/// The route one training run takes: the row share of every shard, the movement its fused epoch performs, and the
+/// complete epoch predicted for it from computation, transfers, synchronization, and persistent-state movement.
 struct Placement {
 	shares: Vec<f64>,
 	gradient_to_host: Vec<Transfer>,
@@ -5919,8 +5922,81 @@ struct Placement {
 	weights_to_host: Transfer,
 	weights_from_host: Vec<Transfer>,
 	loss: LossFunction,
-	predicted_local: f64,
-	predicted_placed: f64,
+	predicted: [f64; 4],
+}
+impl Placement {
+	fn movements(&self) -> impl Iterator<Item = &Transfer> { self.gradient_to_host.iter().chain([&self.gradient_to_primary, &self.weights_to_host]).chain(&self.weights_from_host) }
+	fn seconds(&self) -> f64 { self.predicted.iter().sum() }
+}
+/// The planned gradient work of one fused epoch over `rows` rows: every
+/// contraction's forward, gradient, and previous-adjoint tile, every node's
+/// elementwise traffic, and the loss reduction. The one optimizer update the
+/// leading device applies is priced once, separately, by `optimizer_work`.
+fn gradient_work(graph: &Graph, rows: usize) -> Result<f64> {
+	let tiles = native_contraction_shapes(graph, rows)?.iter().flatten().flat_map(|shapes| [shapes.forward, shapes.gradient, shapes.previous]).map(|extent| 2.0 * f64::from(extent.m) * f64::from(extent.n) * f64::from(extent.k)).sum::<f64>();
+	let elementwise = graph.nodes.iter().map(|node| 8.0 * rows as f64 * node.output.elements() as f64).sum::<f64>();
+	Ok(8.0 * checked_mul(rows, graph.output.elements(), "predicted loss reduction")? as f64 + tiles + elementwise)
+}
+fn optimizer_work(graph: &Graph) -> f64 { 16.0 * graph.parameters.len() as f64 }
+/// Measures one device through the configured surrogate workload. The optimizer
+/// dispatch isolates fixed cost, and the gradient dispatch measures planned work
+/// without allocating, forwarding, training, or dispatching the placed model.
+fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
+	let (rows, features) = (config.surrogate_epochs * config.surrogate_width, config.surrogate_width);
+	let samples = (0..rows * features).map(|value| ((value % 17) as f64 - 8.0) / 8.0).collect::<Vec<_>>();
+	let targets = (0..rows).map(|value| ((value % 5) as f64 - 2.0) / 2.0).collect::<Vec<_>>();
+	let prepared = Prepared { samples: samples.clone(), targets: targets.clone(), target_width: 1, rows, source_rows: rows, features, schema: DataSchema::default(), sequence: None, target_categorical: false, norm_mean: Vec::new(), norm_scale: Vec::new(), identities: Vec::new(), fitted: Vec::new() };
+	let graph = compile(&surrogate_model(config.surrogate_width), &prepared, &targets, rows, gpu, config, true)?;
+	let mut tape = NativeTape::new(&graph, &samples, &targets, gpu, config.precision, Some(mse))?;
+	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<f64> {
+		tape.advance()?; let started = Instant::now(); gradient.then(|| tape.gradient_launch()).transpose()?;
+		tape.optimizer_launch(config.surrogate_rate, config)?; gpu.synchronize()?; Ok(started.elapsed().as_secs_f64())
+	};
+	timed(&mut tape, true)?;
+	let overhead = timed(&mut tape, false)?;
+	let epoch = timed(&mut tape, true)?;
+	Ok((((gradient_work(&graph, rows)?) / (epoch - overhead).max(f64::MIN_POSITIVE)).max(1.0), overhead))
+}
+/// Plans one candidate route from the workload and storage plan already established for this run: the row share of
+/// every shard, the movement list its fused epoch performs, and the complete epoch that movement and each device's
+/// measured behavior predict.
+fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes: usize, loss: LossFunction, policy: MultiDevice) -> Result<(Vec<usize>, Placement)> {
+	let total = route.iter().map(|device| if policy == MultiDevice::Auto { 1.0 } else { links[*device].work }).sum::<f64>();
+	let mut counts = route.iter().map(|device| ((rows as f64 * if policy == MultiDevice::Auto { 1.0 } else { links[*device].work } / total) as usize).max(1)).collect::<Vec<_>>();
+	counts[0] += rows - counts.iter().sum::<usize>();
+	let (gradient_to_host, weights_from_host) = (route.iter().enumerate().map(|(shard, device)| Transfer { from: shard + 1, to: 0, bytes, cost: links[*device].to_host }).collect::<Vec<_>>(), route.iter().enumerate().skip(1).map(|(shard, device)| Transfer { from: 0, to: shard + 1, bytes, cost: links[*device].from_host }).collect::<Vec<_>>());
+	let placement = Placement { shares: counts.iter().map(|count| *count as f64 / rows as f64).collect(), gradient_to_host, gradient_to_primary: Transfer { from: 0, to: 1, bytes, cost: links[route[0]].from_host }, weights_to_host: Transfer { from: 1, to: 0, bytes, cost: links[route[0]].to_host }, weights_from_host, loss, predicted: [0.0; 4] };
+	let bandwidth = |transfer: &Transfer| transfer.bytes as f64 / transfer.cost.bandwidth;
+	// Shards compute their gradients concurrently, so the slowest shard sets the
+	// route's gradient time, and the leading device adds the one optimizer update.
+	let computation = route.iter().zip(&counts).map(|(device, count)| Ok(gradient_work(graph, *count)? / links[*device].work)).collect::<Result<Vec<_>>>()?.into_iter().fold(0.0, f64::max) + optimizer_work(graph) / links[route[0]].work;
+	let transfers = placement.gradient_to_host.iter().map(bandwidth).sum::<f64>() + bandwidth(&placement.gradient_to_primary);
+	let movement = bandwidth(&placement.weights_to_host) + placement.weights_from_host.iter().map(bandwidth).sum::<f64>();
+	let synchronization = route.iter().map(|device| links[*device].overhead).sum::<f64>() + placement.movements().map(|transfer| transfer.cost.latency.as_secs_f64()).sum::<f64>();
+	Ok((counts, Placement { predicted: [computation, transfers, synchronization, movement], ..placement }))
+}
+/// Selects the route this run trains on. `multi-device = false` keeps the
+/// local device, `true` forces every selected device, and `"auto"` predicts the
+/// complete epoch of every valid candidate route from the established workload,
+/// the storage plan, and measured device behavior, then takes the lowest. No
+/// policy allocates or dispatches the model being placed to decide.
+fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, precision: Compute, loss: LossFunction, config: Config) -> Result<(Vec<usize>, Vec<usize>, Placement)> {
+	let bytes = checked_mul(graph.parameters.len().max(1), precision.bytes(), "topology transfer bytes")?;
+	let links = LINKS.get_or_init(|| gpus.iter().map(|gpu| measure_link(gpu, config)).collect()).as_ref().map_err(Clone::clone)?;
+	for (gpu, link) in gpus.iter().zip(links) {
+		eprintln!("measured {} {:.6e} work/s {:.9}s/dispatch to-host {:.1} MB/s {:.0?} from-host {:.1} MB/s {:.0?}", device_label(gpu)?, link.work, link.overhead, link.to_host.bandwidth / 1e6, link.to_host.latency, link.from_host.bandwidth / 1e6, link.from_host.latency);
+	}
+	let candidates: Vec<Vec<usize>> = match config.multi_device { MultiDevice::Local => vec![vec![0]], MultiDevice::Forced => vec![(0..gpus.len()).collect()], MultiDevice::Auto => (1..1_u64 << gpus.len()).map(|mask| (0..gpus.len()).filter(|device| mask >> device & 1 == 1).collect()).collect() };
+	let mut best: Option<(Vec<usize>, Vec<usize>, Placement)> = None;
+	for mut route in candidates.into_iter().filter(|route| route.len() <= rows) {
+		// The fastest device leads the route and applies the one update.
+		route.sort_by(|left, right| links[*right].work.total_cmp(&links[*left].work).then(left.cmp(right)));
+		let (counts, placement) = plan_route(&route, &links, graph, rows, bytes, loss, config.multi_device)?;
+		let [computation, transfers, synchronization, movement] = placement.predicted;
+		eprintln!("route {} rows {} predicted epoch {:.9}s = computation {computation:.9} + transfers {transfers:.9} + synchronization {synchronization:.9} + persistent-state {movement:.9}", route.iter().map(|device| device_label(gpus[*device])).collect::<Result<Vec<_>>>()?.join(","), counts.iter().map(usize::to_string).collect::<Vec<_>>().join(","), placement.seconds());
+		best = if best.as_ref().is_none_or(|previous| placement.seconds() < previous.2.seconds()) { Some((route, counts, placement)) } else { best };
+	}
+	best.ok_or_else(|| RecipeError::new("no candidate route fits this workload"))
 }
 /// A training tape placed across the selected device topology. One device
 /// trains through the same gradient and optimizer entrypoints. Across several
@@ -5928,82 +6004,23 @@ struct Placement {
 /// primary device applies the one emitted optimizer, and its weights broadcast.
 struct DeviceTape {
 	shards: Vec<NativeTape>,
-	placement: Option<Placement>,
+	placement: Placement,
 }
 impl DeviceTape {
-	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpus: &'static [&'static Gpu], precision: Compute, loss: LossFunction) -> Result<Self> {
-		if gpus.len() == 1 {
-			return Ok(Self { shards: vec![NativeTape::new(graph, samples, targets, gpus[0], precision, Some(loss))?], placement: None });
-		}
-		let input = graph.input.elements();
+	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpus: &'static [&'static Gpu], precision: Compute, loss: LossFunction, config: Config) -> Result<Self> {
+		let (input, output) = (graph.input_values, graph.output.elements());
 		require(input != 0 && samples.len() % input == 0, "model input batch is not a whole number of rows")?;
 		let rows = samples.len() / input;
-		let output = graph.output.elements();
-		require(rows >= gpus.len(), format!("{rows} training rows cannot shard across {} devices", gpus.len()))?;
-		require(!targets.is_empty(), "multi-device training requires targets")?;
-		require(
-			!graph.nodes.iter().any(|node| node.op == Primitive::Normalize && node.argument[0] == 0.0),
-			"batch normalization computes whole-batch statistics, so this model trains on one device",
-		)?;
-		let bytes = checked_mul(graph.parameters.len().max(1), precision.bytes(), "topology transfer bytes")?;
-		let links = gpus.iter().map(|gpu| measure_link(gpu, bytes)).collect::<Result<Vec<_>>>()?;
-		let equal = (0..gpus.len()).map(|index| rows / gpus.len() + usize::from(index < rows % gpus.len())).collect::<Vec<_>>();
-		let mut candidates = Vec::new();
-		let mut start = 0;
-		for (gpu, count) in gpus.iter().zip(&equal) {
+		require(!targets.is_empty(), "training requires targets")?;
+		require(gpus.len() == 1 || !graph.nodes.iter().any(|node| node.op == Primitive::Normalize && node.argument[0] == 0.0), "batch normalization computes whole-batch statistics, so this model trains on one device")?;
+		let (route, counts, placement) = select_route(gpus, graph, rows, precision, loss, config)?;
+		eprintln!("selected route {} predicted epoch {:.9}s", route.iter().map(|device| device_label(gpus[*device])).collect::<Result<Vec<_>>>()?.join(","), placement.seconds());
+		let (mut shards, mut start) = (Vec::new(), 0);
+		for (device, count) in route.iter().zip(&counts) {
 			let end = start + count;
-			candidates.push(NativeTape::new(graph, &samples[start * input..end * input], &targets[start * output..end * output], gpu, precision, Some(loss))?);
-			start = end;
+			shards.push(NativeTape::new(graph, &samples[start * input..end * input], &targets[start * output..end * output], gpus[*device], precision, Some(loss))?); start = end;
 		}
-		let mut row_seconds = Vec::new();
-		for (shard, count) in candidates.iter_mut().zip(&equal) {
-			let started = Instant::now();
-			shard.gradient_launch()?;
-			shard.program.gpu.synchronize()?;
-			row_seconds.push(started.elapsed().as_secs_f64().max(f64::EPSILON) / *count as f64);
-		}
-		let fixed = links.iter().map(|link| link.to_host.seconds(bytes) + link.from_host.seconds(bytes)).collect::<Vec<_>>();
-		let mut counts = vec![0_usize; gpus.len()];
-		counts[0] = 1;
-		for _ in 1..rows {
-			let selected = (0..gpus.len())
-				.min_by(|left, right| {
-					let projected = |index: usize| row_seconds[index] * (counts[index] + 1) as f64 + if index == 0 { 0.0 } else { fixed[index] };
-					projected(*left).total_cmp(&projected(*right))
-				})
-				.ok_or_else(|| RecipeError::new("topology has no device"))?;
-			counts[selected] += 1;
-		}
-		let predicted_local = row_seconds[0] * rows as f64;
-		let predicted_placed = links[0].to_host.seconds(bytes)
-			+ links[0].from_host.seconds(bytes)
-			+ counts
-				.iter()
-				.enumerate()
-				.filter(|(_, count)| **count != 0)
-				.map(|(index, count)| row_seconds[index] * *count as f64 + if index == 0 { 0.0 } else { fixed[index] })
-				.max_by(f64::total_cmp)
-				.unwrap_or(0.0);
-		drop(candidates);
-		if counts.iter().filter(|count| **count != 0).count() == 1 || predicted_placed >= predicted_local {
-			return Ok(Self { shards: vec![NativeTape::new(graph, samples, targets, gpus[0], precision, Some(loss))?], placement: None });
-		}
-		let (mut shards, mut shares, mut active, mut start) = (Vec::new(), Vec::new(), Vec::new(), 0);
-		for (index, count) in counts.iter().copied().enumerate().filter(|(_, count)| *count != 0) {
-			let end = start + count;
-			shards.push(NativeTape::new(graph, &samples[start * input..end * input], &targets[start * output..end * output], gpus[index], precision, Some(loss))?);
-			shares.push(count as f64 / rows as f64);
-			active.push(index);
-			start = end;
-		}
-		let host = 0;
-		let primary = 1;
-		let gradient_to_host = active.iter().map(|index| Transfer { from: index + 1, to: host, bytes, cost: links[*index].to_host }).collect();
-		let gradient_to_primary = Transfer { from: host, to: primary, bytes, cost: links[0].from_host };
-		let weights_to_host = Transfer { from: primary, to: host, bytes, cost: links[0].to_host };
-		let weights_from_host = active.iter().skip(1).map(|index| Transfer { from: host, to: index + 1, bytes, cost: links[*index].from_host }).collect();
-		let placement = Placement { shares, gradient_to_host, gradient_to_primary, weights_to_host, weights_from_host, loss, predicted_local, predicted_placed };
-		Ok(Self { shards, placement: Some(placement) })
+		Ok(Self { shards, placement })
 	}
 	fn forward(&mut self) -> Result<()> {
 		self.shards.iter_mut().try_for_each(NativeTape::forward)
@@ -6016,13 +6033,13 @@ impl DeviceTape {
 		Ok(predictions)
 	}
 	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
-		if self.placement.is_some() {
+		if self.shards.len() > 1 {
 			return require(stats.is_empty(), "batch normalization statistics cannot place across devices");
 		}
 		self.shards[0].inject_bn_stats(stats)
 	}
 	fn extract_bn_stats(&self) -> Result<Vec<f64>> {
-		if self.placement.is_some() {
+		if self.shards.len() > 1 {
 			return Ok(Vec::new());
 		}
 		self.shards[0].extract_bn_stats()
@@ -6034,26 +6051,22 @@ impl DeviceTape {
 	fn best_loss(&self) -> [f64; 4] { self.shards[0].best_loss }
 	fn tile(&self) -> Tile { self.shards[0].tile() }
 	fn schedule(&self) -> String { self.shards[0].schedule() }
+	/// The one fused epoch every policy runs: each shard computes its gradient
+	/// concurrently, the leading device applies the one emitted optimizer to the
+	/// aggregate, and the updated persistent weights return to every shard.
 	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
-		let Some(placement) = &self.placement else { return self.shards[0].epoch(rate, tolerance, config) };
+		let placement = &self.placement;
 		let shards = &mut self.shards;
 		let measured = std::thread::scope(|scope| {
-			let dispatched = shards
-				.iter_mut()
-				.zip(&placement.gradient_to_host)
-				.map(|(shard, transfer)| {
-					let transfer = *transfer;
-					scope.spawn(move || -> Result<(f64, Vec<f64>)> {
-						require(transfer.to == 0, "gradient transfer must end on the coordinating host")?;
-						let objective = shard.gradient_launch()?;
-						Ok((objective, shard.download_gradient()?))
-					})
+			let dispatched = shards.iter_mut().zip(&placement.gradient_to_host).map(|(shard, transfer)| {
+				let transfer = *transfer;
+				scope.spawn(move || -> Result<(f64, Vec<f64>)> {
+					require(transfer.to == 0, "gradient transfer must end on the coordinating host")?;
+					let objective = shard.gradient_launch()?;
+					Ok((objective, shard.download_gradient()?))
 				})
-				.collect::<Vec<_>>();
-			dispatched
-				.into_iter()
-				.map(|shard| shard.join().map_err(|_| RecipeError::new("device epoch panicked"))?)
-				.collect::<Result<Vec<_>>>()
+			});
+			dispatched.collect::<Vec<_>>().into_iter().map(|shard| shard.join().map_err(|_| RecipeError::new("device epoch panicked"))?).collect::<Result<Vec<_>>>()
 		})?;
 		let root_metric = placement.loss.0 == 1;
 		let loss = if root_metric {
@@ -6071,10 +6084,9 @@ impl DeviceTape {
 				*total += scale * partial;
 			}
 		}
-		require(placement.gradient_to_primary.from == 0 && placement.gradient_to_primary.to == 1, "aggregate gradient transfer must target the primary device")?;
+		require(placement.gradient_to_primary.from == 0 && placement.gradient_to_primary.to == 1 && placement.weights_to_host.from == 1 && placement.weights_to_host.to == 0, "the aggregate gradient and the updated weights must cross the coordinating host")?;
 		self.shards[0].upload_gradient(&gradient)?;
 		self.shards[0].optimizer_launch(rate, config)?;
-		require(placement.weights_to_host.from == 1 && placement.weights_to_host.to == 0, "updated weights must return through the coordinating host")?;
 		let weights = self.shards[0].weights()?;
 		for (shard, transfer) in self.shards.iter().skip(1).zip(&placement.weights_from_host) {
 			require(transfer.from == 0, "weight transfer must originate on the coordinating host")?;
@@ -6085,30 +6097,14 @@ impl DeviceTape {
 	}
 	fn weights(&self) -> Result<Vec<f64>> { self.shards[0].weights() }
 	fn capture(&self, graph: &mut Graph) -> Result<()> { self.shards[0].capture(graph) }
+	/// Reports the executing route and every movement its fused epoch performs, in the order the epoch performs them.
 	fn print_devices(&self) -> Result<()> {
-		let Some(placement) = &self.placement else {
-			eprintln!("{}.{}", self.shards[0].device_label()?, self.shards[0].precision.model.label());
-			return Ok(());
-		};
-		eprintln!("placement predicted local {:.3} ms/epoch placed {:.3} ms/epoch", placement.predicted_local * 1e3, placement.predicted_placed * 1e3);
-		for (index, (shard, gradient)) in self.shards.iter().zip(&placement.gradient_to_host).enumerate() {
-			let weights = if index == 0 { placement.weights_to_host } else { placement.weights_from_host[index - 1] };
-			let aggregate = if index == 0 { placement.gradient_to_primary.seconds() } else { 0.0 };
-			eprintln!(
-				"{}.{} rows {} gradient {}>{} {:.0?} {:.1} MB/s weights {}>{} {:.0?} {:.1} MB/s exchange {:.3} ms/epoch",
-				shard.device_label()?,
-				shard.precision.model.label(),
-				shard.rows,
-				gradient.from,
-				gradient.to,
-				gradient.cost.latency,
-				gradient.cost.bandwidth / 1e6,
-				weights.from,
-				weights.to,
-				weights.cost.latency,
-				weights.cost.bandwidth / 1e6,
-				(gradient.seconds() + weights.seconds() + aggregate) * 1e3,
-			);
+		for (shard, share) in self.shards.iter().zip(&self.placement.shares) {
+			eprintln!("{}.{} rows {} share {share:.6}", shard.device_label()?, shard.precision.model.label(), shard.rows);
+		}
+		for (index, movement) in self.placement.movements().enumerate() {
+			let kind = ["gradient", "aggregate", "weights"][(index >= self.shards.len()) as usize + (index > self.shards.len()) as usize];
+			eprintln!("movement {kind} {}>{} {} bytes {:.0?} {:.1} MB/s {:.6} ms", movement.from, movement.to, movement.bytes, movement.cost.latency, movement.cost.bandwidth / 1e6, movement.seconds() * 1e3);
 		}
 		Ok(())
 	}
@@ -6913,13 +6909,15 @@ fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 	SELECTED
 		.get_or_init(|| {
 			let Some(selection) = std::env::var("RECIPE_DEVICE").ok() else { return device(None).map(|gpu| vec![gpu]) };
-			let host = local_host()?;
+			let (host, local_only) = (local_host()?, Config::load()?.multi_device == MultiDevice::Local);
 			let mut selected = Vec::new();
-			for name in selection.split(',') {
+			// `multi-device = false` trains on the local device, so a wider
+			// selection never connects to, allocates on, or executes on another.
+			for name in selection.split(',').take(if local_only { 1 } else { usize::MAX }) {
 				let gpu = match devices()?.iter().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
 					Some(gpu) => gpu,
 					None => match name.split_once(':') {
-						Some((remote, device)) if remote != host => connect_remote(remote, device, name)?,
+						Some((remote, device)) if remote != host && !local_only => connect_remote(remote, device, name)?,
 						_ => return Err(RecipeError::new(format!("GPU {name:?} is absent"))),
 					},
 				};
@@ -7718,8 +7716,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 	let mut graph = compile(&model, &prepared, targets, prepared.rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, Some(mse))?;
 	for _ in 0..config.surrogate_epochs {
-		tape.advance()?;
-		tape.epoch(config.surrogate_rate, 0.0, config)?;
+		tape.advance()?; tape.gradient_launch()?; tape.optimizer_launch(config.surrogate_rate, config)?;
 	}
 	tape.capture(&mut graph)?;
 	graph.frozen.fill(1);
@@ -9409,14 +9406,13 @@ fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 	}
 	let length = sequences.iter().map(|sequence| sequence.len().saturating_sub(1)).max().unwrap_or(0);
 	require(length != 0, "autoregression requires a string containing at least two characters")?;
-	let features = checked_mul(CHAR_IDS.len(), length, "autoregression input width")?;
 	let mut samples = Vec::new();
 	let mut targets = Vec::new();
 	for sequence in &sequences {
 		for prefix in 1..sequence.len() {
-			let mut sample = vec![0.0; features];
+			let mut sample = vec![f64::from(u8::MAX); length];
 			for (position, id) in sequence[..prefix].iter().copied().enumerate() {
-				sample[id * length + position] = 1.0
+				sample[position] = id as f64
 			}
 			samples.extend(sample);
 			targets.push(sequence[prefix] as f64)
@@ -9424,7 +9420,7 @@ fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 	}
 	let schema = CHAR_IDS.iter().map(|character| ("character".to_owned(), format!("U+{:04X}", *character as u32))).collect();
 	let source_rows = targets.len();
-	finish_prepared(data, samples, targets, 1, source_rows, features, Some(Shape { channels: CHAR_IDS.len(), length }), true, schema)
+	finish_prepared(data, samples, targets, 1, source_rows, length, Some(Shape { channels: CHAR_IDS.len(), length }), true, schema)
 }
 fn finish_prepared(data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, target_width: usize, source_rows: usize, features: usize, sequence: Option<Shape>, target_categorical: bool, schema: DataSchema) -> Result<Prepared> {
 	require(target_width != 0 && targets.len() % target_width == 0, "target vector width does not divide the target buffer")?;
@@ -10440,9 +10436,8 @@ fn records(bytes: &[u8], delimiter: u8) -> Result<(Vec<Vec<String>>, usize)> {
 			let value = String::from_utf8(field).map_err(|_| RecipeError::new("feature is not UTF-8"))?;
 			row.push(value.trim_end_matches('\r').to_owned());
 			field = Vec::new();
-			if row.iter().any(|value| !value.is_empty()) {
-				rows.push(row);
-			} else { blank += 1 }
+			// One rule decides whether an assembled record carries data, so a record of blank fields is padding wherever it ends.
+			if row.iter().any(|value| !value.trim().is_empty()) { rows.push(row) } else { blank += 1 }
 			row = Vec::new();
 		} else {
 			field.push(byte);
@@ -10452,7 +10447,7 @@ fn records(bytes: &[u8], delimiter: u8) -> Result<(Vec<Vec<String>>, usize)> {
 	require(!quoted, "unterminated quoted feature")?;
 	if !field.is_empty() || !row.is_empty() {
 		row.push(String::from_utf8(field).map_err(|_| RecipeError::new("feature is not UTF-8"))?);
-		rows.push(row);
+		if row.iter().any(|value| !value.trim().is_empty()) { rows.push(row) } else { blank += 1 }
 	}
 	Ok((rows, blank))
 }
@@ -10725,7 +10720,7 @@ impl Train {
 		stored.graph.state.trained_samples.sort_unstable();
 		stored.graph.state.trained_samples.dedup();
 		let (samples, targets) = (&prepared.samples[..training_rows * prepared.features], &target_values[..training_values]);
-		let mut tape = DeviceTape::new(&stored.graph, samples, targets, gpus, config.precision, model.loss)?;
+		let mut tape = DeviceTape::new(&stored.graph, samples, targets, gpus, config.precision, model.loss, config)?;
 		self.finish_dispatch(if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) }, &mut stored, &prepared.schema, &tape, None)?;
 		tape.print_devices()?;
 		stored.bn_stats = tape.extract_bn_stats()?;
