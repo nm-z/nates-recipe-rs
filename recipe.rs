@@ -1978,7 +1978,7 @@ impl NativeModelIr {
 				}
 				(false, Primitive::Scan) => {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?.forward;
-					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
+					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i1 {indexed}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, indexed = node.source < 0 && self.graph.input_values != node.input.elements(), in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 						ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Elementwise) => {
@@ -2066,7 +2066,7 @@ impl NativeModelIr {
 				}
 				(true, Primitive::Scan) => {
 					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?;
-						ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+						ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {indexed}, i1 {write_input}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, indexed = node.source < 0 && self.graph.input_values != node.input.elements(), write_input = node.source >= 0, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 						ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Predictor) => {
@@ -2412,7 +2412,7 @@ impl NativeModelIr {
 		if let Some(loss) = loss {
 			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
 			let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
-			let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
+			let input_bytes = checked_mul(if self.graph.input_values == self.graph.input.elements() { checked_mul(self.rows, self.graph.input_values, "native input clear elements")? } else { 1 }, self.precision.model.bytes(), "native input clear bytes")?;
 			let gradient_args = format!("{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads");
 			body.push_str(&format!("define {kernel}void @recipe_model_gradient({gradient_args}) #0 {{\nentry:\n%tid = {thread}\n"));
 			body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "entry")?);
@@ -3233,7 +3233,7 @@ mod bundle {
 			let (input, output) = (self.input.ok_or_else(|| RecipeError::new("semantic model has no input shape"))?, self.output.ok_or_else(|| RecipeError::new("semantic model has no output shape"))?);
 			let parts = self.model.ok_or_else(|| RecipeError::new("semantic model is absent"))?;
 			let model = model(parts.blocks, parts.loss.ok_or_else(|| RecipeError::new("semantic model has no loss"))?, parts.quantization.ok_or_else(|| RecipeError::new("semantic model has no quantization"))?)?;
-			require(self.inputs.len() == input.elements(), "semantic model input schema has the wrong width")?;
+			require(!self.inputs.is_empty() && input.elements() % self.inputs.len() == 0, "semantic model input schema has the wrong width")?;
 			require(self.outputs.len() == output.elements(), "semantic model output schema has the wrong width")?;
 			require(self.norm_mean.len() == self.norm_scale.len() && (self.norm_mean.is_empty() || self.norm_mean.len() == self.inputs.len()), "semantic model normalization stats have the wrong width")?;
 			require(!self.artifact.is_empty(), "native artifact identity is absent")?;
@@ -5025,15 +5025,14 @@ struct Graph {
 	frozen: Vec<u8>,
 	programs: Vec<f64>,
 	stored: Vec<Option<StoredWeight>>,
-	input: Shape,
-	output: Shape,
+	input: Shape, input_values: usize, output: Shape,
 	source: i32,
 	state: TrainingState,
 	block_index: usize,
 	block_kind: &'static str,
 }
 impl Graph {
-	fn new(shape: Shape) -> Self { Self { nodes: Vec::new(), parameters: Vec::new(), frozen: Vec::new(), programs: Vec::new(), stored: Vec::new(), input: shape, output: shape, source: -1, state: TrainingState::default(), block_index: 0, block_kind: "" } }
+	fn new(shape: Shape, input_values: usize) -> Self { Self { nodes: Vec::new(), parameters: Vec::new(), frozen: Vec::new(), programs: Vec::new(), stored: Vec::new(), input: shape, input_values, output: shape, source: -1, state: TrainingState::default(), block_index: 0, block_kind: "" } }
 	fn refresh_storage(&mut self, config: Config) -> Result<()> { encode_graph_storage(self, config) }
 }
 fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
@@ -5060,7 +5059,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	}
 	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..));
 	let shape = if sequential { data.sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
-	let mut graph = Graph::new(shape);
+	let mut graph = Graph::new(shape, data.features);
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
 		graph.block_kind = block.operation.name();
@@ -5094,9 +5093,10 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	Ok(graph)
 }
 fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: &'static Gpu, config: Config) -> Result<Graph> {
-	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], target_width: saved.output.elements().max(1), rows: 1, source_rows: 1, features: saved.input.elements(), schema: DataSchema::default(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new(), fitted: saved.predictors.clone() };
+	let prepared = Prepared { samples: samples.to_vec(), targets: vec![0.0; saved.output.elements()], target_width: saved.output.elements().max(1), rows: 1, source_rows: 1, features: saved.inputs.len(), schema: DataSchema::default(), sequence: (saved.input.length > 1).then_some(saved.input), target_categorical: false, norm_mean: saved.norm_mean.clone(), norm_scale: saved.norm_scale.clone(), identities: Vec::new(), fitted: saved.predictors.clone() };
 	let mut graph = compile(&saved.model, &prepared, &prepared.targets, 1, gpu, config, false)?;
 	require(graph.input == saved.input, "saved semantic input shape does not match the compiled model")?;
+	require(graph.input_values == saved.inputs.len(), "saved semantic input value width does not match the compiled model")?;
 	require(graph.output == saved.output, "saved semantic output shape does not match the compiled model")?;
 	require(graph.parameters.len() == saved.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "saved semantic weights do not match the compiled model")?;
 	let mut tensor = 0;
@@ -5646,7 +5646,7 @@ fn natural(name: &str, text: &str) -> Result<usize> {
 }
 fn count(name: &str, text: &str) -> Result<usize> { text.parse::<usize>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}"))) }
 fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetScale>, precision: Compute, target: &str) -> bundle::StoredGraph {
-	let inputs = if data.autoregressive { CHAR_IDS.iter().enumerate().flat_map(|(id, character)| (0..graph.input.length).map(move |position| format!("char{id}.u{:04X}.{position}", *character as u32))).collect() } else { (0..graph.input.elements()).map(|index| format!("input{index}")).collect() };
+	let inputs = if data.autoregressive { (0..graph.input_values).map(|position| format!("char-id.{position}")).collect() } else { (0..graph.input_values).map(|index| format!("input{index}")).collect() };
 	// Every selected target column is an output, in the order the user declared them.
 	let outputs = if data.autoregressive { vec!["char-id".to_owned()] } else if data.target.is_empty() { vec!["target".to_owned()] } else { data.target.clone() };
 	let (norm_mean, norm_scale) = match data.prepared.get() {
@@ -5684,13 +5684,14 @@ struct NativeTape {
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 impl NativeTape {
 	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
-		let input = graph.input.elements();
+		let input = graph.input_values;
 		require(input != 0 && !samples.is_empty() && samples.len() % input == 0, format!("model input batch expected a nonempty multiple of {input} values, received {}", samples.len()))?;
-		let rows = samples.len() / input;
+		let (rows, indexed) = (samples.len() / input, input != graph.input.elements());
+		let indexed_samples = if indexed { Some(samples.iter().map(|value| u8::try_from(*value as u64).ok().filter(|id| value.fract() == 0.0 && (*id as usize) < graph.input.channels || *id == u8::MAX).ok_or_else(|| RecipeError::new(format!("indexed input value {value} is invalid")))).collect::<Result<Vec<_>>>()?) } else { None };
 		let output = graph.output.elements();
 		require(targets.is_empty() || targets.len() == rows * output, format!("target batch expected 0 or {} values, received {}", rows * output, targets.len()))?;
 		let program = gpu.native_program(graph, rows, precision, loss)?;
-		let precision = program.artifact.precision;
+		let precision = program.artifact.precision; let sample_buffer = if let Some(values) = indexed_samples { Buffer::upload(gpu, &values)? } else { Buffer::upload_float(gpu, samples, precision.model)? };
 		let layout = program.artifact.layout.clone();
 		let parameters = graph.parameters.len();
 		let zeros = vec![0.0; parameters.max(1)];
@@ -5724,8 +5725,8 @@ impl NativeTape {
 			contexts: Buffer::upload(gpu, &vec![0_u8; layout.contexts_bytes.max(1)])?,
 			adjoints: Buffer::upload(gpu, &vec![0_u8; layout.adjoints_bytes.max(1)])?,
 			batch_normalizations,
-			samples: Buffer::upload_float(gpu, samples, precision.model)?,
-			input_adjoint: Buffer::upload_float(gpu, &vec![0.0; samples.len().max(1)], precision.model)?,
+			samples: sample_buffer,
+			input_adjoint: Buffer::upload_float(gpu, &vec![0.0; if indexed { 1 } else { samples.len().max(1) }], precision.model)?,
 			targets: Buffer::upload_float(gpu, &target_buffer, precision.model)?,
 			weights,
 			frozen: Buffer::upload(gpu, &frozen)?,
@@ -6008,7 +6009,7 @@ struct DeviceTape {
 }
 impl DeviceTape {
 	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpus: &'static [&'static Gpu], precision: Compute, loss: LossFunction, config: Config) -> Result<Self> {
-		let (input, output) = (graph.input.elements(), graph.output.elements());
+		let (input, output) = (graph.input_values, graph.output.elements());
 		require(input != 0 && samples.len() % input == 0, "model input batch is not a whole number of rows")?;
 		let rows = samples.len() / input;
 		require(!targets.is_empty(), "training requires targets")?;
@@ -9406,14 +9407,13 @@ fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 	}
 	let length = sequences.iter().map(|sequence| sequence.len().saturating_sub(1)).max().unwrap_or(0);
 	require(length != 0, "autoregression requires a string containing at least two characters")?;
-	let features = checked_mul(CHAR_IDS.len(), length, "autoregression input width")?;
 	let mut samples = Vec::new();
 	let mut targets = Vec::new();
 	for sequence in &sequences {
 		for prefix in 1..sequence.len() {
-			let mut sample = vec![0.0; features];
+			let mut sample = vec![f64::from(u8::MAX); length];
 			for (position, id) in sequence[..prefix].iter().copied().enumerate() {
-				sample[id * length + position] = 1.0
+				sample[position] = id as f64
 			}
 			samples.extend(sample);
 			targets.push(sequence[prefix] as f64)
@@ -9421,7 +9421,7 @@ fn prepare_autoregression(data: &Data, tables: &[Table]) -> Result<Prepared> {
 	}
 	let schema = CHAR_IDS.iter().map(|character| ("character".to_owned(), format!("U+{:04X}", *character as u32))).collect();
 	let source_rows = targets.len();
-	finish_prepared(data, samples, targets, 1, source_rows, features, Some(Shape { channels: CHAR_IDS.len(), length }), true, schema)
+	finish_prepared(data, samples, targets, 1, source_rows, length, Some(Shape { channels: CHAR_IDS.len(), length }), true, schema)
 }
 fn finish_prepared(data: &Data, mut samples: Vec<f64>, mut targets: Vec<f64>, target_width: usize, source_rows: usize, features: usize, sequence: Option<Shape>, target_categorical: bool, schema: DataSchema) -> Result<Prepared> {
 	require(target_width != 0 && targets.len() % target_width == 0, "target vector width does not divide the target buffer")?;
