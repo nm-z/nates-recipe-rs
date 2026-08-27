@@ -1,6 +1,6 @@
 use std::{fs, os::unix::process::ExitStatusExt, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [--device <name>] <source.rs> [export]";
+const USAGE: &str = "usage: recipe [--device <name>]... <source.rs> [export]\n       recipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -58,6 +58,7 @@ fn run(source: &Path, device: Option<&str>) {
 		std::process::exit(status.code().unwrap_or(1));
 	}
 	let mut command = Command::new(&output);
+	command.env("RECIPE_BINARY", std::env::current_exe().expect("cannot locate recipe"));
 	if let Some(device) = device {
 		command.env("RECIPE_DEVICE", device);
 	}
@@ -72,12 +73,22 @@ fn main() {
 	let mut arguments = std::env::args().skip(1);
 	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
 	while let Some(argument) = arguments.next() {
+		if argument == "--worker" {
+			let name = arguments.next().unwrap_or_else(|| invalid("--worker requires a device name"));
+			recipe::worker_serve(&name).unwrap_or_else(|error| {
+				eprintln!("{error}");
+				std::process::exit(1)
+			});
+			return;
+		}
 		if argument == "--device" {
 			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
-			if device.is_some() {
-				invalid("duplicate --device")
+			if let Some(devices) = &mut device {
+				devices.push(',');
+				devices.push_str(&selected);
+			} else {
+				device = Some(selected);
 			}
-			device = Some(selected);
 			continue;
 		}
 		if argument.starts_with("--") {
@@ -101,6 +112,7 @@ fn main() {
 	}
 	match operation.as_deref() {
 		None => run(source, device),
+		Some("export") if device.is_some_and(|names| names.contains(',')) => invalid("export requires one device"),
 		Some("export") => export(source, device),
 		Some(_) => invalid(USAGE),
 	}

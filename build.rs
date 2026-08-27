@@ -654,6 +654,7 @@ fn main() -> BuildResult<()> {
 		("contraction-resident-waves-per-workgroup", "RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"),
 		("contraction-matrix-max-waves-per-workgroup", "RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"),
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
+		("topology-probe-bytes", "RECIPE_TOPOLOGY_PROBE_BYTES"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
