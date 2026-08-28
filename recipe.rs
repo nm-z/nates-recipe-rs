@@ -6065,26 +6065,11 @@ impl Recipe {
 	pub fn data<T: IntoDataSources>(&self, sources: T) -> Data {
 		Self::prepared_data(sources.into_data_sources(), T::AUTO, OnceLock::new())
 	}
-	pub fn lut<const N: usize>(&self, axes: [[u32; N]; 3]) -> Data {
-		assert!(N != 0 && axes.iter().flatten().all(|extent| *extent != 0), "RAT LUT extents must be positive");
-		let mut samples = Vec::new();
-		for m in axes[0] {
-			for n in axes[1] {
-				for k in axes[2] {
-					samples.extend([f64::from(m), f64::from(n), f64::from(k)])
-				}
-			}
-		}
-		let targets = vec![0.0; samples.len() / 3];
-		let prepared = OnceLock::new();
-		assert!(prepared.set(Prepared::matrix(samples, targets, 1)).is_ok());
-		Self::prepared_data(Vec::new(), false, prepared)
-	}
 	pub fn model(&self) -> Model {
 		Model { blocks: Vec::new(), loss: mse, quantization: 0, downstream: None }
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64, rat: None }
+		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64 }
 	}
 }
 impl Recipe {
@@ -6725,19 +6710,6 @@ fn fit_estimator_rat(estimator: &Estimator, input: Shape, prepared: &Prepared, g
 	let surrogate = fit_surrogate(input, &prepared.samples, &targets, config.surrogate_width, gpu, config)?;
 	Ok((predictor.program, surrogate))
 }
-fn estimator_rat_graph(estimator: &Estimator, input: Shape, prepared: &Prepared, gpu: &'static Gpu, config: Config) -> Result<Graph> {
-	let (predictor, surrogate) = fit_estimator_rat(estimator, input, prepared, gpu, config)?;
-	let mut graph = Graph::new(input);
-	push_predictor(&mut graph, predictor)?;
-	let real = graph.source;
-	reset(&mut graph, -1, input);
-	let surrogate = append_graph(&mut graph, surrogate)?;
-	let mut rat = ScalarProgram(Vec::new());
-	rat.op(ScalarOpcode::StraightThrough, -1.0, -2.0);
-	program(&mut graph, real, surrogate, Shape { channels: 1, length: 1 }, &[], rat)?;
-	graph.frozen.fill(1);
-	Ok(graph)
-}
 fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let (source, input) = (graph.source, graph.output);
 	let restored = data.fitted.get(graph.nodes.iter().filter(|node| node.op == Primitive::Predictor).count()).cloned();
@@ -6871,11 +6843,6 @@ struct Config {
 	surrogate_epochs: usize,
 	surrogate_width: usize,
 	surrogate_rate: f64,
-	tuning_budget_per_direction: usize,
-	tuning_candidates: usize,
-	tuning_measurements: usize,
-	tuning_warmups: usize,
-	tuning_minimum_improvement: f64,
 	initial: f64,
 	beta1: f64,
 	beta2: f64,
@@ -6912,11 +6879,6 @@ impl Config {
 			surrogate_epochs: natural("surrogate epochs", env!("RECIPE_SURROGATE_EPOCHS"))?,
 			surrogate_width: natural("surrogate width", env!("RECIPE_SURROGATE_WIDTH"))?,
 			surrogate_rate: number("surrogate rate", env!("RECIPE_SURROGATE_RATE"))?,
-			tuning_budget_per_direction: natural("tuning budget per direction", env!("RECIPE_TUNING_BUDGET_PER_DIRECTION"))?,
-			tuning_candidates: natural("tuning candidates", env!("RECIPE_TUNING_CANDIDATES"))?,
-			tuning_measurements: natural("tuning measurements", env!("RECIPE_TUNING_MEASUREMENTS"))?,
-			tuning_warmups: natural("tuning warmups", env!("RECIPE_TUNING_WARMUPS"))?,
-			tuning_minimum_improvement: fraction("tuning minimum improvement", env!("RECIPE_TUNING_MINIMUM_IMPROVEMENT"))?,
 			progress_refresh_hz: natural("progress refresh Hz", env!("RECIPE_PROGRESS_REFRESH_HZ"))?,
 			random_seed: natural("random seed", env!("RECIPE_RANDOM_SEED"))?,
 			initial: number("initial weight", env!("RECIPE_TRAIN_INITIAL_WEIGHT"))?,
@@ -7196,53 +7158,6 @@ impl NativeTape {
 		self.program.contractions = contractions;
 		Ok(())
 	}
-	/// The complete mutable training state a candidate measurement can touch.
-	/// Restoring it makes every measured epoch start from identical state.
-	fn snapshot_state(&self) -> Result<NativeTrainingState> {
-		Ok(NativeTrainingState {
-			values: self.values.download(self.values.bytes)?,
-			contexts: self.contexts.download(self.contexts.bytes)?,
-			adjoints: self.adjoints.download(self.adjoints.bytes)?,
-			input_adjoint: self.input_adjoint.download(self.input_adjoint.bytes)?,
-			weights: self.weights.download(self.weights.bytes)?,
-			moments: self.moments.download(self.moments.bytes)?,
-			variances: self.variances.download(self.variances.bytes)?,
-			gradient: self.gradient.download(self.gradient.bytes)?,
-			metrics: self.metrics.download(self.metrics.bytes)?,
-			contractions: self.program.contractions.clone(),
-			tile: self.program.tile,
-			best_loss: self.best_loss,
-			step: self.step,
-		})
-	}
-	fn restore_state(&mut self, state: &NativeTrainingState) -> Result<()> {
-		self.values.write_bytes(0, &state.values)?;
-		self.contexts.write_bytes(0, &state.contexts)?;
-		self.adjoints.write_bytes(0, &state.adjoints)?;
-		self.input_adjoint.write_bytes(0, &state.input_adjoint)?;
-		self.weights.write_bytes(0, &state.weights)?;
-		self.moments.write_bytes(0, &state.moments)?;
-		self.variances.write_bytes(0, &state.variances)?;
-		self.gradient.write_bytes(0, &state.gradient)?;
-		self.metrics.write_bytes(0, &state.metrics)?;
-		self.program.contractions.clone_from(&state.contractions);
-		self.program.tile = state.tile;
-		self.best_loss = state.best_loss;
-		self.step = state.step;
-		Ok(())
-	}
-	fn epoch_state(&self, objective: f64) -> Result<NativeEpochState> {
-		Ok(NativeEpochState {
-			weights: self.weights.download(self.weights.bytes)?,
-			moments: self.moments.download(self.moments.bytes)?,
-			variances: self.variances.download(self.variances.bytes)?,
-			input_adjoint: self.input_adjoint.download(self.input_adjoint.bytes)?,
-			batch_normalizations: self.extract_bn_stats()?.into_iter().map(f64::to_bits).collect(),
-			best_loss: self.best_loss.map(f64::to_bits),
-			step: self.step,
-			objective: objective.to_bits(),
-		})
-	}
 	fn tile(&self) -> Tile {
 		self.program.tile
 	}
@@ -7290,32 +7205,6 @@ fn observe_loss(best_loss: &mut [f64; 4], loss: f64, tolerance: f64) -> bool {
 	}
 	trigger
 }
-struct NativeTrainingState {
-	values: Vec<u8>,
-	contexts: Vec<u8>,
-	adjoints: Vec<u8>,
-	input_adjoint: Vec<u8>,
-	weights: Vec<u8>,
-	moments: Vec<u8>,
-	variances: Vec<u8>,
-	gradient: Vec<u8>,
-	metrics: Vec<u8>,
-	contractions: Vec<Option<NativeContractionTiles>>,
-	tile: Tile,
-	best_loss: [f64; 4],
-	step: u32,
-}
-#[derive(PartialEq, Eq)]
-struct NativeEpochState {
-	weights: Vec<u8>,
-	moments: Vec<u8>,
-	variances: Vec<u8>,
-	input_adjoint: Vec<u8>,
-	batch_normalizations: Vec<u64>,
-	best_loss: [u64; 4],
-	step: u32,
-	objective: u64,
-}
 fn write_contraction_schedule(contexts: &Buffer, layout: &NativeLayout, contractions: &[Option<NativeContractionTiles>]) -> Result<()> {
 	require(layout.schedule.len() == contractions.len(), "native contraction schedule does not cover the graph")?;
 	for (offset, tiles) in layout.schedule.iter().zip(contractions) {
@@ -7331,22 +7220,6 @@ fn write_contraction_schedule(contexts: &Buffer, layout: &NativeLayout, contract
 		contexts.write_bytes(*offset, &words)?;
 	}
 	Ok(())
-}
-#[derive(Clone, Copy)]
-struct ScheduleCandidate {
-	node: usize,
-	direction: usize,
-	limits: Tile,
-	extent: Tile,
-}
-struct ScheduleGroup {
-	reference: ScheduleCandidate,
-	candidates: Vec<ScheduleCandidate>,
-	unmeasured: Vec<usize>,
-	samples: Vec<f64>,
-	scores: Vec<f64>,
-	best: Option<(ScheduleCandidate, f64)>,
-	measurements: usize,
 }
 /// Whether one runtime extent satisfies the contraction body's structural
 /// bounds and fits within the local-memory capacity reserved for candidates.
@@ -7413,363 +7286,6 @@ fn native_valid_extents(limits: Tile, selected: Tile, matrix: bool, block: u32, 
 	extents.sort_unstable_by_key(|extent| (extent.m, extent.n, extent.k));
 	extents.dedup();
 	Ok(extents)
-}
-/// Keeps the analytic tile and at most `cap - 1` evenly spaced alternatives.
-fn sample_candidates(extents: Vec<Tile>, cap: usize, selected: Tile) -> Vec<Tile> {
-	if extents.len() <= cap {
-		return extents;
-	}
-	let mut sampled = vec![selected];
-	for index in 0..cap.saturating_sub(1) {
-		let extent = extents[index * extents.len() / cap.saturating_sub(1).max(1)];
-		if extent != selected {
-			sampled.push(extent)
-		}
-	}
-	sampled.sort_unstable_by_key(|extent| (extent.m, extent.n, extent.k));
-	sampled.dedup();
-	sampled
-}
-fn tile_features(reference: Tile, extent: Tile) -> [f64; 3] {
-	let axis = |base: u32, value: u32| (f64::from(value) / f64::from(base)).log2();
-	[axis(reference.m, extent.m), axis(reference.n, extent.n), axis(reference.k, extent.k)]
-}
-fn candidate_state(candidate: &ScheduleCandidate) -> [f64; 5] {
-	let limits = tile_features(candidate.extent, candidate.limits);
-	[(candidate.node as f64 + 1.0).log2() / 8.0, candidate.direction as f64 / 2.0, limits[0], limits[1], limits[2]]
-}
-fn tile_from_features(reference: Tile, features: &[f64]) -> Result<Tile> {
-	require(features.len() == 3, "RAT tile model must produce three values")?;
-	let axis = |base: u32, value: f64| {
-		require(value.is_finite(), "RAT tile proposal must be finite")?;
-		Ok((f64::from(base) * value.exp2()).round().clamp(1.0, f64::from(u32::MAX)) as u32)
-	};
-	Ok(Tile { m: axis(reference.m, features[0])?, n: axis(reference.n, features[1])?, k: axis(reference.k, features[2])? })
-}
-/// Trains B on measured scores, then trains T through the frozen B graph. A
-/// user RAT returns one positive integer tile directly. The built-in RAT
-/// projects the same three-value proposal onto its sampled valid candidates.
-fn propose_candidate(
-	rat: Option<&RatModels>, learn: bool, reference: ScheduleCandidate, candidates: &[ScheduleCandidate], unmeasured: &[usize], samples: &[f64], scores: &[f64], gpu: &'static Gpu, config: Config,
-) -> Result<ScheduleCandidate> {
-	let features = tile_features(reference.extent, reference.extent).len();
-	require(samples.len() == scores.len() * features && scores.len() >= 2, "native RAT measurements are incomplete")?;
-	let invalid = rat.map(|rat| rat.invalid_score);
-	let scale = scores.iter().filter(|score| Some(**score) != invalid).map(|score| score.abs()).fold(f64::EPSILON, f64::max);
-	let targets = scores.iter().map(|score| if Some(*score) == invalid { -2.0 } else { score / scale }).collect::<Vec<_>>();
-	let input = Shape { channels: features, length: 1 };
-	let benchmark = if let Some(rat) = rat {
-		fit_model(&rat.benchmark, input, samples, &targets, 1, gpu, config)?
-	} else {
-		let prepared = Prepared::matrix(samples.to_vec(), targets, 1)?;
-		let estimator = Estimator { fit: fit_knn, validate: neighbor_estimator, param: 1, name: "knn" };
-		estimator_rat_graph(&estimator, input, &prepared, gpu, config)?
-	};
-	let state = candidate_state(&reference);
-	let proposer_model = rat.map_or_else(|| recipe.model().layer(config.surrogate_width).tanh().layer(features), |rat| rat.tile.clone());
-	let proposer_data = Prepared::matrix(state.to_vec(), vec![0.0; features], features)?;
-	let mut proposer = compile(&proposer_model, &proposer_data, &proposer_data.targets, 1, gpu, config, true)?;
-	proposer.parameters.fill(0.0);
-	require(proposer.output == benchmark.input, "RAT tile output must match benchmark input")?;
-	if learn {
-		let mut proposal_graph = proposer.clone();
-		append_graph(&mut proposal_graph, benchmark)?;
-		let mut tape = NativeTape::new(&proposal_graph, &state, &[0.0], gpu, config.precision, Some(proposer_model.loss))?;
-		for _ in 0..config.surrogate_epochs {
-			tape.advance()?;
-			tape.full_epoch(config.surrogate_rate, config)?;
-		}
-		tape.capture(&mut proposal_graph)?;
-		let parameters = proposer.parameters.len();
-		proposer.parameters.copy_from_slice(&proposal_graph.parameters[..parameters]);
-	}
-	let mut tape = NativeTape::new(&proposer, &state, &[], gpu, config.precision, None)?;
-	tape.forward()?;
-	let proposal = tape.predictions()?;
-	if rat.is_some() {
-		return Ok(ScheduleCandidate { extent: tile_from_features(reference.extent, &proposal)?, ..reference });
-	}
-	require(!candidates.is_empty() && !unmeasured.is_empty(), "native RAT has no schedule candidates")?;
-	let mut best = 0;
-	for (position, candidate) in unmeasured.iter().enumerate().skip(1) {
-		if distance(&proposal, &tile_features(reference.extent, candidates[*candidate].extent)) < distance(&proposal, &tile_features(reference.extent, candidates[unmeasured[best]].extent)) {
-			best = position
-		}
-	}
-	Ok(candidates[unmeasured[best]])
-}
-fn fnv(text: &str) -> u64 {
-	let mut hash = 14695981039346656037_u64;
-	for byte in text.as_bytes() {
-		hash = (hash ^ u64::from(*byte)).wrapping_mul(1099511628211);
-	}
-	hash
-}
-fn native_device_identity(gpu: &Gpu) -> String {
-	format!("{};{};{}", native_target_label(&gpu.native_target), gpu.name, gpu.memory)
-}
-fn native_schedule_cache_path(artifact: &NativeArtifact, identity: &str) -> Result<PathBuf> {
-	let directory = artifact.path.parent().ok_or_else(|| RecipeError::new("native artifact has no directory"))?;
-	Ok(directory.join(format!("schedule-{:016x}.tsv", fnv(identity))))
-}
-fn load_schedule_cache(
-	path: &Path, identity: &str, heuristic: &[Option<NativeContractionTiles>], shapes: &[Option<NativeContractionShapes>], compiled: &NativeSchedule, ratio: u32,
-) -> Option<Vec<Option<NativeContractionTiles>>> {
-	let text = fs::read_to_string(path).ok()?;
-	let mut lines = text.lines();
-	if lines.next() != Some(&format!("device {identity}")) {
-		return None;
-	}
-	let mut assignment = heuristic.to_vec();
-	let mut restored = vec![false; assignment.len()];
-	for line in lines {
-		let fields = line.split_whitespace().collect::<Vec<_>>();
-		if fields.len() != 11 || fields[0] != "node" {
-			return None;
-		}
-		let node = fields[1].parse::<usize>().ok()?;
-		let extents = fields[2..11].iter().map(|field| field.parse::<u32>().ok()).collect::<Option<Vec<_>>>()?;
-		let shape = (*shapes.get(node)?)?;
-		let fixed = (*heuristic.get(node)?)?;
-		let tiles = assignment.get_mut(node)?.as_mut()?;
-		tiles.forward = Tile { m: extents[0], n: extents[1], k: extents[2] };
-		tiles.gradient = Tile { m: extents[3], n: extents[4], k: extents[5] };
-		tiles.previous = Tile { m: extents[6], n: extents[7], k: extents[8] };
-		for (extent, limits, selected) in [(tiles.forward, shape.forward, fixed.forward), (tiles.gradient, shape.gradient, fixed.gradient), (tiles.previous, shape.previous, fixed.previous)] {
-			if !native_extent_valid(extent, limits, selected.k, compiled, ratio).ok()? {
-				return None;
-			}
-		}
-		*restored.get_mut(node)? = true;
-	}
-	assignment.iter().zip(&restored).all(|(tiles, restored)| tiles.is_none() || *restored).then_some(assignment)
-}
-fn store_schedule_cache(path: &Path, identity: &str, assignment: &[Option<NativeContractionTiles>]) -> Result<()> {
-	let mut text = format!("device {identity}\n");
-	for (node, tiles) in assignment.iter().enumerate() {
-		let Some(tiles) = tiles else { continue };
-		let extents =
-			[tiles.forward, tiles.gradient, tiles.previous].iter().flat_map(|direction| [direction.m, direction.n, direction.k]).map(|extent| extent.to_string()).collect::<Vec<_>>().join(" ");
-		text.push_str(&format!("node {node} {extents}\n"));
-	}
-	let temporary =
-		path.with_file_name(format!(".{}-{}", path.file_name().and_then(|name| name.to_str()).ok_or_else(|| RecipeError::new("native schedule cache path is invalid"))?, std::process::id()));
-	fs::write(&temporary, text).map_err(|error| RecipeError::new(format!("cannot write native schedule cache: {error}")))?;
-	fs::rename(&temporary, path).map_err(|error| RecipeError::new(format!("cannot publish native schedule cache: {error}")))
-}
-fn assign_candidate(assignment: &mut [Option<NativeContractionTiles>], candidate: &ScheduleCandidate) -> Result<()> {
-	let tiles = assignment.get_mut(candidate.node).and_then(Option::as_mut).ok_or_else(|| RecipeError::new("native candidate node has no contraction"))?;
-	match candidate.direction {
-		0 => tiles.forward = candidate.extent,
-		1 => tiles.gradient = candidate.extent,
-		2 => tiles.previous = candidate.extent,
-		_ => return Err(RecipeError::new("native candidate direction is invalid")),
-	}
-	Ok(())
-}
-struct ScheduleMeasurement {
-	median: f64,
-	low: f64,
-	high: f64,
-	repeatable: bool,
-	state: NativeEpochState,
-}
-/// Measures one schedule assignment on the real fused epoch. Every launch
-/// starts from the complete same tape state, and the tape is restored again
-/// before this function returns, so tuning cannot consume training progress.
-fn measure_schedule(tape: &mut NativeTape, snapshot: &NativeTrainingState, assignment: &[Option<NativeContractionTiles>], rate: f64, config: Config) -> Result<ScheduleMeasurement> {
-	let measured = (|| {
-		let mut times = Vec::with_capacity(config.tuning_measurements);
-		let mut observed: Option<NativeEpochState> = None;
-		let mut repeatable = true;
-		let launches = checked_add(config.tuning_warmups, config.tuning_measurements, "native schedule measurement launches")?;
-		for launch in 0..launches {
-			require(!INTERRUPTED.load(Ordering::Acquire), "interrupted during native schedule tuning")?;
-			tape.restore_state(snapshot)?;
-			tape.apply_contraction_schedule(assignment.to_vec())?;
-			tape.advance()?;
-			tape.program.gpu.synchronize()?;
-			let started = Instant::now();
-			let objective = tape.full_epoch(rate, config)?;
-			let elapsed = started.elapsed().as_secs_f64();
-			if launch < config.tuning_warmups {
-				continue;
-			}
-			let state = tape.epoch_state(objective)?;
-			if let Some(first) = &observed {
-				repeatable &= first == &state;
-			} else {
-				observed = Some(state)
-			}
-			times.push(elapsed);
-		}
-		times.sort_by(f64::total_cmp);
-		let state = observed.ok_or_else(|| RecipeError::new("native schedule measurement is empty"))?;
-		let last = times.len() - 1;
-		Ok(ScheduleMeasurement { median: times[times.len() / 2], low: times[0], high: times[last], repeatable, state })
-	})();
-	let restored = tape.restore_state(snapshot);
-	match (measured, restored) {
-		(Ok(measured), Ok(())) => Ok(measured),
-		(Err(error), _) | (_, Err(error)) => Err(error),
-	}
-}
-/// Selects a measured contraction schedule for this model on this device
-/// before the first real training epoch. The selection is cached beside the
-/// target-specific native artifact, keyed by the exact device, so a warm rerun
-/// reuses it and a different target retunes.
-fn tune_contraction_schedule(tape: &mut NativeTape, graph: &Graph, rate: f64, config: Config, rat: Option<&RatModels>) -> Result<()> {
-	if tape.program.contractions.iter().all(Option::is_none) {
-		return Ok(());
-	}
-	let identity = native_device_identity(tape.program.gpu);
-	let cache = native_schedule_cache_path(&tape.program.artifact, &identity)?;
-	let shapes = native_contraction_shapes(graph, tape.rows as usize)?;
-	let compiled = tape.program.compiled.clone();
-	let ratio = narrow(tape.precision.state.bytes().div_ceil(tape.precision.model.bytes()), "native contraction state ratio")? as u32;
-	if rat.is_none()
-		&& let Some(assignment) = load_schedule_cache(&cache, &identity, &tape.program.contractions, &shapes, &compiled, ratio)
-	{
-		tape.apply_contraction_schedule(assignment)?;
-		debug(&format!("schedule cache hit path={} tiles={}", cache.display(), tape.schedule()))?;
-		return Ok(());
-	}
-	let heuristic = tape.program.contractions.clone();
-	let mut groups = Vec::new();
-	for (node, shape) in shapes.iter().enumerate() {
-		let Some(shape) = shape else { continue };
-		let heuristic = tape.program.contractions[node].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?;
-		for (direction, (limits, selected)) in [(shape.forward, heuristic.forward), (shape.gradient, heuristic.gradient), (shape.previous, heuristic.previous)].into_iter().enumerate() {
-			let extents = native_valid_extents(limits, selected, compiled.matrix, compiled.block, compiled.register_m, compiled.register_n, compiled.chunk_k, ratio, compiled.shared_values)?;
-			let candidates = if rat.is_some() {
-				Vec::new()
-			} else {
-				sample_candidates(extents, config.tuning_candidates, selected)
-					.into_iter()
-					.filter(|extent| *extent != selected)
-					.map(|extent| ScheduleCandidate { node, direction, limits, extent })
-					.collect::<Vec<_>>()
-			};
-			if rat.is_some() || !candidates.is_empty() {
-				groups.push(ScheduleGroup {
-					reference: ScheduleCandidate { node, direction, limits, extent: selected },
-					unmeasured: (0..candidates.len()).collect(),
-					candidates,
-					samples: Vec::new(),
-					scores: Vec::new(),
-					best: None,
-					measurements: 0,
-				})
-			}
-		}
-	}
-	if groups.is_empty() {
-		if rat.is_none() {
-			store_schedule_cache(&cache, &identity, &heuristic)?;
-		}
-		return Ok(());
-	}
-	let snapshot = tape.snapshot_state()?;
-	let baseline = measure_schedule(tape, &snapshot, &heuristic, rate, config)?;
-	let launches = checked_add(config.tuning_warmups, config.tuning_measurements, "native schedule launches")?;
-	let mut assignments = 1;
-	debug(&format!("schedule tune baseline median={:.6} low={:.6} high={:.6} repeatable={}", baseline.median, baseline.low, baseline.high, baseline.repeatable))?;
-	for group in &mut groups {
-		group.samples.extend(tile_features(group.reference.extent, group.reference.extent));
-		group.scores.push(if baseline.repeatable { -baseline.median } else { rat.map_or(-baseline.median, |rat| rat.invalid_score) });
-	}
-	let mut random = config.random_seed as u64 ^ fnv(&identity);
-	while groups.iter().any(|group| group.measurements < config.tuning_budget_per_direction && (rat.is_some() || !group.unmeasured.is_empty())) {
-		for group in &mut groups {
-			if group.measurements >= config.tuning_budget_per_direction || (rat.is_none() && group.unmeasured.is_empty()) {
-				continue;
-			}
-			let candidate = if let Some(rat) = rat {
-				if group.scores.len() == 1 {
-					ScheduleCandidate { extent: Tile { m: u32::MAX, n: u32::MAX, k: u32::MAX }, ..group.reference }
-				} else {
-					propose_candidate(Some(rat), group.scores.len() > 2, group.reference, &group.candidates, &group.unmeasured, &group.samples, &group.scores, tape.program.gpu, config)?
-				}
-			} else {
-				let pick = if group.scores.len() >= 2 {
-					let proposed = propose_candidate(None, true, group.reference, &group.candidates, &group.unmeasured, &group.samples, &group.scores, tape.program.gpu, config)?;
-					group.unmeasured.iter().position(|candidate| group.candidates[*candidate].extent == proposed.extent).ok_or_else(|| RecipeError::new("native RAT proposal is absent"))?
-				} else {
-					next_random(&mut random) as usize % group.unmeasured.len()
-				};
-				group.candidates[group.unmeasured.remove(pick)]
-			};
-			group.measurements += 1;
-			let valid = native_extent_valid(candidate.extent, candidate.limits, group.reference.extent.k, &compiled, ratio)?;
-			let measurement = if valid {
-				let mut assignment = heuristic.clone();
-				assign_candidate(&mut assignment, &candidate)?;
-				assignments += 1;
-				Some(measure_schedule(tape, &snapshot, &assignment, rate, config)?)
-			} else {
-				require(rat.is_some(), "built-in native RAT produced an invalid tile")?;
-				None
-			};
-			let exact = measurement.as_ref().is_some_and(|measurement| baseline.repeatable && measurement.repeatable && measurement.state == baseline.state);
-			let stable =
-				measurement.as_ref().is_some_and(|measurement| exact && measurement.high < baseline.low && measurement.median <= baseline.median * (1.0 - config.tuning_minimum_improvement));
-			let seconds = measurement.as_ref().map(|measurement| measurement.median);
-			let score = if exact { -seconds.unwrap_or_default() } else { rat.map_or(-seconds.unwrap_or_default(), |rat| rat.invalid_score) };
-			debug(&format!(
-				"schedule tune node={} direction={} tile={}x{}x{} seconds={seconds:?} score={score:.6} valid={valid} exact={exact} stable={stable}",
-				candidate.node, candidate.direction, candidate.extent.m, candidate.extent.n, candidate.extent.k,
-			))?;
-			if rat.is_some() {
-				eprintln!(
-					"RAT node={} direction={} tile={}x{}x{} score={score:.9} seconds={} valid={valid} exact={exact}",
-					candidate.node,
-					candidate.direction,
-					candidate.extent.m,
-					candidate.extent.n,
-					candidate.extent.k,
-					seconds.map_or_else(|| "none".to_owned(), |seconds| format!("{seconds:.9}")),
-				);
-			}
-			if rat.is_some() || exact {
-				group.samples.extend(tile_features(group.reference.extent, candidate.extent));
-				group.scores.push(score);
-			}
-			if stable
-				&& let Some(seconds) = seconds
-				&& group.best.is_none_or(|(_, best)| seconds < best)
-			{
-				group.best = Some((candidate, seconds))
-			}
-		}
-	}
-	let winners = groups.iter().filter_map(|group| group.best).collect::<Vec<_>>();
-	let mut best_assignment = heuristic.clone();
-	let mut best_seconds = baseline.median;
-	if !winners.is_empty() {
-		for (candidate, _) in &winners {
-			assign_candidate(&mut best_assignment, candidate)?;
-		}
-		let combined = measure_schedule(tape, &snapshot, &best_assignment, rate, config)?;
-		assignments += 1;
-		let exact = baseline.repeatable && combined.repeatable && combined.state == baseline.state;
-		let stable = exact && combined.high < baseline.low && combined.median <= baseline.median * (1.0 - config.tuning_minimum_improvement);
-		debug(&format!("schedule tune combined median={:.6} low={:.6} high={:.6} exact={exact} stable={stable}", combined.median, combined.low, combined.high))?;
-		if stable {
-			best_seconds = combined.median
-		} else {
-			let (candidate, seconds) = winners.iter().min_by(|left, right| left.1.total_cmp(&right.1)).copied().ok_or_else(|| RecipeError::new("native schedule winner is absent"))?;
-			best_assignment.clone_from(&heuristic);
-			assign_candidate(&mut best_assignment, &candidate)?;
-			best_seconds = seconds
-		}
-	}
-	tape.restore_state(&snapshot)?;
-	tape.apply_contraction_schedule(best_assignment.clone())?;
-	if rat.is_none() {
-		store_schedule_cache(&cache, &identity, &best_assignment)?;
-	}
-	debug(&format!("schedule select seconds={best_seconds:.6} assignments={assignments} launches={} tiles={}", assignments * launches, tape.schedule()))?;
-	Ok(())
 }
 fn checkpoint(path: &Path, schema: &DataSchema, stored: &mut bundle::StoredGraph, tape: &NativeTape) -> Result<()> {
 	if let Ok((_, saved)) = bundle::load_semantic(path) {
@@ -12914,12 +12430,6 @@ fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, identities: &mut Vec<
 	}
 	Ok(())
 }
-#[derive(Clone)]
-struct RatModels {
-	benchmark: Model,
-	tile: Model,
-	invalid_score: f64,
-}
 pub struct Train {
 	epochs: usize,
 	learning_rate: f64,
@@ -12929,7 +12439,6 @@ pub struct Train {
 	save: Option<PathBuf>,
 	seed: Option<usize>,
 	precision: Compute,
-	rat: Option<RatModels>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Compute {
@@ -13015,15 +12524,6 @@ impl Compute {
 	}
 }
 impl Train {
-	/// Selects native contraction tiles by training the tile model through the frozen benchmark model.
-	pub fn rat(mut self, model: &Model, invalid_score: f64) -> Self {
-		assert!(invalid_score.is_finite() && invalid_score < 0.0, "RAT invalid score must be finite and negative");
-		let benchmark = model.downstream.as_deref().unwrap_or_else(|| panic!("RAT tile model requires .loss(&benchmark)"));
-		let mut tile_model = model.clone();
-		tile_model.downstream = None;
-		self.rat = Some(RatModels { benchmark: benchmark.clone(), tile: tile_model, invalid_score });
-		self
-	}
 	fn arithmetic(mut self, format: Compute) -> Self {
 		self.precision = format;
 		self
@@ -13163,11 +12663,6 @@ impl Train {
 		let report_r2 = self.log_metrics.iter().any(|metric| metric.0 == R2.0);
 		let mut epoch_seconds = 0.0;
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
-		if self.epochs != 0 || self.rat.is_some() {
-			let tuning = Instant::now();
-			tune_contraction_schedule(&mut tape, &stored.graph, self.learning_rate, config, self.rat.as_ref())?;
-			epoch_seconds += tuning.elapsed().as_secs_f64();
-		}
 		for _ in 0..self.epochs {
 			if INTERRUPTED.load(Ordering::Acquire) {
 				self.finish_dispatch::<()>(Err(RecipeError::new("interrupted")), &mut stored, &prepared.schema, &tape, None).ok();

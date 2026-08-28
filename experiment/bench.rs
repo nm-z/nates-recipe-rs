@@ -1,31 +1,11 @@
-//! One-file measured contraction schedule experiment.
+//! One-file measured contraction experiment.
 
 use recipe::*;
 
-#[rustfmt::skip]
 fn main() {
-	let lut = recipe.lut([
-		[16, 32, 64, 128, 256],
-		[4, 8, 16, 32, 64],
-		[8, 16, 32, 64, 128],
-	]);
+	let data = recipe.data("data/numeric/single_csv.csv").target("target").split(0.8);
 
-	let benchmark = recipe.model()
-		.layer(24).tanh()
-		.layer(1)
-		.loss(huber);
+	let model = recipe.model().layer(24).tanh().layer(1).loss(huber);
 
-	let tiles = recipe.model()
-		.layer(24).tanh()
-		.layer(3)
-		.loss(&benchmark);
-
-	recipe.train()
-		.fp(32)
-		.lr(0.001)
-		.epochs(0)
-		.seed(17)
-		.log(all)
-		.rat(&tiles, -99999999.0)
-		.run(&benchmark, &lut);
+	recipe.train().fp(32).lr(0.001).epochs(8).seed(17).log(all).run(&model, &data);
 }
