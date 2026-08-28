@@ -7311,8 +7311,8 @@ impl TransferCost {
 struct Link {
 	to_host: TransferCost,
 	from_host: TransferCost,
-	work: f64,
-	overhead: f64,
+	gradient_rate: f64,
+	optimizer_rate: f64,
 }
 fn measure_link(gpu: &'static Gpu, config: Config) -> Result<Link> {
 	let probe_bytes = parse_natural(env!("RECIPE_TOPOLOGY_PROBE_BYTES"), "topology probe bytes must be a positive integer");
@@ -7336,12 +7336,12 @@ fn measure_link(gpu: &'static Gpu, config: Config) -> Result<Link> {
 		gpu.upload(pointer, scratch.as_ptr().cast(), probe_bytes)?;
 		gpu.synchronize()?;
 		let from_host_bandwidth = probe_bytes as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON);
-		let (work, overhead) = calibrate(gpu, config)?;
+		let (gradient_rate, optimizer_rate) = calibrate(gpu, config)?;
 		Ok(Link {
 			to_host: TransferCost { latency: to_host_latency, bandwidth: to_host_bandwidth },
 			from_host: TransferCost { latency: from_host_latency, bandwidth: from_host_bandwidth },
-			work,
-			overhead,
+			gradient_rate,
+			optimizer_rate,
 		})
 	})();
 	gpu.free(pointer);
@@ -7396,9 +7396,11 @@ fn gradient_work(graph: &Graph, rows: usize) -> Result<f64> {
 fn optimizer_work(graph: &Graph) -> f64 {
 	16.0 * graph.parameters.len() as f64
 }
-/// Measures one device through the configured surrogate workload. The optimizer
-/// dispatch isolates fixed cost, and the gradient dispatch measures planned work
-/// without allocating, forwarding, training, or dispatching the placed model.
+/// Measures one device through the configured surrogate workload. The gradient
+/// dispatch and the optimizer dispatch are each timed on their own epoch mode,
+/// so every rate divides the work that mode performs by the duration that
+/// performed it, without allocating, forwarding, training, or dispatching the
+/// placed model.
 fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 	let (rows, features) = (config.surrogate_epochs * config.surrogate_width, config.surrogate_width);
 	let samples = (0..rows * features).map(|value| ((value % 17) as f64 - 8.0) / 8.0).collect::<Vec<_>>();
@@ -7406,28 +7408,36 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 	let prepared = Prepared::matrix(samples.clone(), targets.clone(), 1)?;
 	let graph = compile(&surrogate_model(config.surrogate_width), &prepared, &targets, rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, &samples, &targets, gpu, config.precision, Some(mse))?;
-	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<f64> {
+	let timed = |tape: &mut NativeTape, operation: EpochOperation| -> Result<f64> {
 		tape.advance()?;
 		let started = Instant::now();
-		if gradient {
-			tape.full_epoch(config.surrogate_rate, config)?;
-		} else {
-			tape.optimizer_launch(config.surrogate_rate, config)?;
-		}
+		match operation {
+			EpochOperation::Full => tape.full_epoch(config.surrogate_rate, config).map(drop),
+			EpochOperation::Gradient => tape.gradient_launch(config.surrogate_rate, config).map(drop),
+			EpochOperation::Optimizer => tape.optimizer_launch(config.surrogate_rate, config),
+		}?;
 		gpu.synchronize()?;
 		Ok(started.elapsed().as_secs_f64())
 	};
-	timed(&mut tape, true)?;
-	let overhead = timed(&mut tape, false)?;
-	let epoch = timed(&mut tape, true)?;
-	Ok((((gradient_work(&graph, rows)?) / (epoch - overhead).max(f64::MIN_POSITIVE)).max(1.0), overhead))
+	timed(&mut tape, EpochOperation::Full)?;
+	let gradient_seconds = timed(&mut tape, EpochOperation::Gradient)?;
+	let optimizer_seconds = timed(&mut tape, EpochOperation::Optimizer)?;
+	let label = device_label(gpu)?;
+	for (seconds, mode) in [(gradient_seconds, "gradient"), (optimizer_seconds, "optimizer")] {
+		require(seconds.is_finite() && seconds > 0.0, format!("device {label} measured an unusable {mode} duration of {seconds} seconds"))?;
+	}
+	let (gradient_rate, optimizer_rate) = (gradient_work(&graph, rows)? / gradient_seconds, optimizer_work(&graph) / optimizer_seconds);
+	for (rate, mode) in [(gradient_rate, "gradient"), (optimizer_rate, "optimizer")] {
+		require(rate.is_finite() && rate > 0.0, format!("device {label} measured an unusable {mode} rate of {rate} work/s"))?;
+	}
+	Ok((gradient_rate, optimizer_rate))
 }
 /// Plans one candidate route from the workload and storage plan already established for this run: the row share of
 /// every shard, the movement list its fused epoch performs, and the complete epoch that movement and each device's
 /// measured behavior predict.
 fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes: usize, loss: LossFunction, policy: MultiDevice) -> Result<(Vec<usize>, Placement)> {
-	let total = route.iter().map(|device| if policy == MultiDevice::Auto { 1.0 } else { links[*device].work }).sum::<f64>();
-	let mut counts = route.iter().map(|device| ((rows as f64 * if policy == MultiDevice::Auto { 1.0 } else { links[*device].work } / total) as usize).max(1)).collect::<Vec<_>>();
+	let total = route.iter().map(|device| if policy == MultiDevice::Auto { 1.0 } else { links[*device].gradient_rate }).sum::<f64>();
+	let mut counts = route.iter().map(|device| ((rows as f64 * if policy == MultiDevice::Auto { 1.0 } else { links[*device].gradient_rate } / total) as usize).max(1)).collect::<Vec<_>>();
 	counts[0] += rows - counts.iter().sum::<usize>();
 	let (gradient_to_host, weights_from_host) = (
 		route.iter().enumerate().map(|(shard, device)| Transfer { from: shard + 1, to: 0, bytes, cost: links[*device].to_host }).collect::<Vec<_>>(),
@@ -7445,11 +7455,11 @@ fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes
 	let bandwidth = |transfer: &Transfer| transfer.bytes as f64 / transfer.cost.bandwidth;
 	// Shards compute their gradients concurrently, so the slowest shard sets the
 	// route's gradient time, and the leading device adds the one optimizer update.
-	let computation = route.iter().zip(&counts).map(|(device, count)| Ok(gradient_work(graph, *count)? / links[*device].work)).collect::<Result<Vec<_>>>()?.into_iter().fold(0.0, f64::max)
-		+ optimizer_work(graph) / links[route[0]].work;
+	let computation = route.iter().zip(&counts).map(|(device, count)| Ok(gradient_work(graph, *count)? / links[*device].gradient_rate)).collect::<Result<Vec<_>>>()?.into_iter().fold(0.0, f64::max)
+		+ optimizer_work(graph) / links[route[0]].optimizer_rate;
 	let transfers = placement.gradient_to_host.iter().map(bandwidth).sum::<f64>() + bandwidth(&placement.gradient_to_primary);
 	let movement = bandwidth(&placement.weights_to_host) + placement.weights_from_host.iter().map(bandwidth).sum::<f64>();
-	let synchronization = route.iter().map(|device| links[*device].overhead).sum::<f64>() + placement.movements().map(|transfer| transfer.cost.latency.as_secs_f64()).sum::<f64>();
+	let synchronization = placement.movements().map(|transfer| transfer.cost.latency.as_secs_f64()).sum::<f64>();
 	Ok((counts, Placement { predicted: [computation, transfers, synchronization, movement], ..placement }))
 }
 /// Selects the route this run trains on. `multi-device = false` keeps the
@@ -7462,10 +7472,10 @@ fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, preci
 	let links = LINKS.get_or_init(|| gpus.iter().map(|gpu| measure_link(gpu, config)).collect()).as_ref().map_err(Clone::clone)?;
 	for (gpu, link) in gpus.iter().zip(links) {
 		eprintln!(
-			"measured {} {:.6e} work/s {:.9}s/dispatch to-host {:.1} MB/s {:.0?} from-host {:.1} MB/s {:.0?}",
+			"measured {} gradient {:.6e} work/s optimizer {:.6e} work/s to-host {:.1} MB/s {:.0?} from-host {:.1} MB/s {:.0?}",
 			device_label(gpu)?,
-			link.work,
-			link.overhead,
+			link.gradient_rate,
+			link.optimizer_rate,
 			link.to_host.bandwidth / 1e6,
 			link.to_host.latency,
 			link.from_host.bandwidth / 1e6,
@@ -7480,7 +7490,7 @@ fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, preci
 	let mut best: Option<(Vec<usize>, Vec<usize>, Placement)> = None;
 	for mut route in candidates.into_iter().filter(|route| route.len() <= rows) {
 		// The fastest device leads the route and applies the one update.
-		route.sort_by(|left, right| links[*right].work.total_cmp(&links[*left].work).then(left.cmp(right)));
+		route.sort_by(|left, right| links[*right].gradient_rate.total_cmp(&links[*left].gradient_rate).then(left.cmp(right)));
 		let (counts, placement) = plan_route(&route, &links, graph, rows, bytes, loss, config.multi_device)?;
 		let [computation, transfers, synchronization, movement] = placement.predicted;
 		eprintln!(
