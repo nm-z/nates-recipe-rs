@@ -19,6 +19,5 @@ largest valid magnitude and maps the exact invalid score below that valid band.
 Run it through the public Recipe entrypoint:
 
 ```bash
-cargo build --release
-RECIPE_DEVICE=amd0 target/release/recipe experiment/bench.rs
+cargo run rat
 ```

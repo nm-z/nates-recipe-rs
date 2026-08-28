@@ -1,6 +1,6 @@
 use std::{fs, os::unix::process::ExitStatusExt, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [--device <name>]... <source.rs> [export]\n       recipe --worker <device>";
+const USAGE: &str = "usage: recipe [--device <name>]... <source.rs> [export]\n       recipe rat\n       recipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -132,14 +132,14 @@ fn main() {
 	}
 	let source = source.unwrap_or_else(|| invalid(USAGE));
 	let device = device.as_deref();
-	let source = Path::new(&source);
+	let source = if source == "rat" { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("experiment/bench.rs") } else { PathBuf::from(source) };
 	if source.extension().and_then(|value| value.to_str()) != Some("rs") {
 		invalid("recipe requires a Rust source")
 	}
 	match operation.as_deref() {
-		None => run(source, device),
+		None => run(&source, device),
 		Some("export") if device.is_some_and(|names| names.contains(',')) => invalid("export requires one device"),
-		Some("export") => export(source, device),
+		Some("export") => export(&source, device),
 		Some(_) => invalid(USAGE),
 	}
 }
