@@ -12883,16 +12883,6 @@ impl Train {
 		let report_r2 = self.log_metrics.iter().any(|metric| metric.0 == R2.0);
 		let mut epoch_seconds = 0.0;
 		let (mut observations, mut scores) = (Vec::new(), Vec::new());
-		// The measured proposal is dithered by up to one tile unit in log space,
-		// from the seed the script already owns. Without it every observation
-		// carries the same tile, so the benchmark model is fitted on one point of
-		// its proposal axis, its gradient there is unconstrained, and the tile
-		// model has no direction to move. This hides no additional epoch, warmup,
-		// candidate loop, measurement loop, or threshold: one public epoch still
-		// performs exactly one benchmark call, one benchmark update, and one tile
-		// update. The magnitude is not a tuned constant: one unit of the tile
-		// quantum is exactly `ln 2` in the exponent this proposal is read through.
-		let mut exploration = config.random_seed as u64;
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
 		for _ in 0..self.epochs {
 			if INTERRUPTED.load(Ordering::Acquire) {
@@ -12930,11 +12920,10 @@ impl Train {
 						.map(|(axis, value)| (value.exp().round().clamp(1.0, f64::from(u32::MAX)) as u32).saturating_mul(quanta.get(axis).copied().unwrap_or(1)))
 						.collect::<Vec<_>>()
 				};
-				let explored = proposed.iter().map(|value| value + std::f64::consts::LN_2 * (2.0 * (next_random(&mut exploration) as f64 / u64::MAX as f64) - 1.0)).collect::<Vec<_>>();
-				let (extents, sampled) = (units(&explored), whole(&workload));
+				let (extents, sampled) = (units(&proposed), whole(&workload));
 				let measured = (rat.measure)(&sampled, &extents);
 				require(measured.is_finite(), "the RAT benchmark must return a finite measurement")?;
-				observations.extend(workload.iter().chain(&explored).copied());
+				observations.extend(workload.iter().chain(&proposed).copied());
 				scores.push(measured);
 				fit_step(benchmark, &observations, &scores, *loss, self.learning_rate, gpu, config)?;
 				// Publish the refitted benchmark into the composed tape, whose
