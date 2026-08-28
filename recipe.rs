@@ -6357,7 +6357,7 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 /// proposal, so `.loss(&benchmark)` evaluates `B(X, T(X))`. No primitive
 /// concatenates, so two frozen projections place each branch into disjoint
 /// channels of one wide vector and the existing elementwise add joins them.
-fn compose_benchmark(graph: &mut Graph, benchmark: Graph) -> Result<()> {
+fn compose_benchmark(graph: &mut Graph, benchmark: Graph) -> Result<usize> {
 	let (workload, proposal, tail) = (graph.input, graph.output, graph.source);
 	require(
 		workload.length == 1 && proposal.length == 1,
@@ -6382,11 +6382,21 @@ fn compose_benchmark(graph: &mut Graph, benchmark: Graph) -> Result<()> {
 	// The benchmark is frozen in the composed graph only. Its own graph stays
 	// trainable, because the epoch that fits it owns it separately.
 	graph.frozen[base..].fill(1);
-	Ok(())
+	Ok(base)
+}
+/// The composed graph a RAT run trains, and the pieces its epoch updates: the
+/// benchmark's own trainable graph, the node holding the proposal, and where
+/// the benchmark's weights begin in the composed parameters.
+struct RatComposition {
+	graph: Graph,
+	benchmark: Graph,
+	loss: LossFunction,
+	proposal: usize,
+	offset: usize,
 }
 /// The one graph a RAT run trains: the tile model over the sampled workload,
 /// composed with the benchmark model that scores its proposal.
-fn rat_graph(model: &Model, rat: &RatBenchmark, prepared: &Prepared, gpu: &'static Gpu, config: Config) -> Result<Graph> {
+fn rat_graph(model: &Model, rat: &RatBenchmark, prepared: &Prepared, gpu: &'static Gpu, config: Config) -> Result<RatComposition> {
 	let benchmark = model.downstream.as_deref().ok_or_else(|| RecipeError::new("a RAT tile model requires .loss(&benchmark)"))?;
 	require(prepared.features == rat.workload, format!("the trial generator supplies {} workload values, but the benchmark takes {}", prepared.features, rat.workload))?;
 	let mut proposer = model.clone();
@@ -6396,9 +6406,13 @@ fn rat_graph(model: &Model, rat: &RatBenchmark, prepared: &Prepared, gpu: &'stat
 	let proposals = Prepared::matrix(prepared.samples.clone(), vec![0.0; rat.tile], rat.tile)?;
 	let mut graph = compile(&proposer, &proposals, &proposals.targets, 1, gpu, config, true)?;
 	let observations = Prepared::matrix(vec![0.0; checked_add(rat.workload, rat.tile, "composed benchmark samples")?], vec![0.0], 1)?;
+	let loss = benchmark.loss;
 	let benchmark = compile(benchmark, &observations, &observations.targets, 1, gpu, config, true)?;
-	compose_benchmark(&mut graph, benchmark)?;
-	Ok(graph)
+	// The proposal is the tile model's own last node, read before the
+	// composition appends anything after it.
+	let proposal = graph.nodes.len() - 1;
+	let offset = compose_benchmark(&mut graph, benchmark.clone())?;
+	Ok(RatComposition { graph, benchmark, loss, proposal, offset })
 }
 fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let skip = graph.source;
@@ -7131,6 +7145,12 @@ impl NativeTape {
 			stats.extend(self.contexts.download_float_bytes(self.program.artifact.layout.contexts[node], 2 * channels, self.precision.model)?);
 		}
 		Ok(stats)
+	}
+	/// The forward values one node left in the arena, for reading an inner
+	/// model's output without a second dispatch.
+	fn node_values(&self, node: usize, width: usize) -> Result<Vec<f64>> {
+		let offset = *self.program.artifact.layout.values.get(node).ok_or_else(|| RecipeError::new("native model has no arena for that node"))?;
+		self.values.download_float_bytes(offset, width, self.precision.model)
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
 		let offset = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
@@ -9343,6 +9363,15 @@ fn graph_inputs(graph: &Graph, samples: &[f64], rows: usize, gpu: &'static Gpu, 
 }
 fn surrogate_model(hidden: usize) -> Model {
 	recipe.model().layer(hidden).tanh().layer(1)
+}
+/// One update of an already-compiled model on the observations gathered so
+/// far. The caller owns the learning rate and how many times this runs, and the
+/// model's own weights and optimizer state carry across calls.
+fn fit_step(graph: &mut Graph, samples: &[f64], targets: &[f64], loss: LossFunction, rate: f64, gpu: &'static Gpu, config: Config) -> Result<()> {
+	let mut tape = NativeTape::new(graph, samples, targets, gpu, config.precision, Some(loss))?;
+	tape.advance()?;
+	tape.full_epoch(rate, config)?;
+	tape.capture(graph)
 }
 fn fit_model(model: &Model, input: Shape, samples: &[f64], targets: &[f64], outputs: usize, gpu: &'static Gpu, config: Config) -> Result<Graph> {
 	require(outputs != 0 && !targets.is_empty() && targets.len() % outputs == 0, "model fitting requires a whole target batch")?;
@@ -12806,13 +12835,15 @@ impl Train {
 		let training_values = training_rows * prepared.target_width;
 		let scale = probability.then(|| TargetScale::fit(&prepared.targets[..training_values]));
 		let target_values = prepared.targets.iter().map(|target| scale.map_or(*target, |scale| scale.encode(*target))).collect::<Vec<_>>();
-		let (run, mut graph) = (
-			RUN.fetch_add(1, Ordering::Relaxed) + 1,
-			match &self.rat {
-				Some(rat) => rat_graph(model, rat, prepared, gpu, config)?,
-				None => compile(model, prepared, &target_values, training_rows, gpu, config, true)?,
-			},
-		);
+		let run = RUN.fetch_add(1, Ordering::Relaxed) + 1;
+		let (mut graph, mut composed) = match &self.rat {
+			Some(rat) => {
+				require(data.trial.is_some(), "a RAT run draws its workloads from recipe.data(trial)")?;
+				let composition = rat_graph(model, rat, prepared, gpu, config)?;
+				(composition.graph, Some((composition.benchmark, composition.loss, composition.proposal, composition.offset)))
+			}
+			None => (compile(model, prepared, &target_values, training_rows, gpu, config, true)?, None),
+		};
 		graph.state.training_rows = training_rows;
 		if let Some(scale) = scale
 			&& let Some(offset) = output_bias_offset(&graph)
@@ -12847,11 +12878,36 @@ impl Train {
 		let tolerance = self.stop.unwrap_or(0.0);
 		let report_r2 = self.log_metrics.iter().any(|metric| metric.0 == R2.0);
 		let mut epoch_seconds = 0.0;
+		let (mut observations, mut scores) = (Vec::new(), Vec::new());
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
 		for _ in 0..self.epochs {
 			if INTERRUPTED.load(Ordering::Acquire) {
 				self.finish_dispatch::<()>(Err(RecipeError::new("interrupted")), &mut stored, &prepared.schema, &tape, None).ok();
 				break;
+			}
+			// One public epoch draws a new workload, proposes a tile for it,
+			// measures that tile for real, and updates the benchmark model on
+			// everything measured so far. The tile model's own update is the
+			// ordinary epoch below, through the frozen benchmark.
+			let mut observed = None;
+			if let (Some(rat), Some(trial), Some((benchmark, loss, proposal, offset))) = (&self.rat, &data.trial, composed.as_mut()) {
+				let workload = (trial.generate)();
+				require(workload.len() == rat.workload, format!("trial generator produced {} values, expected {}", workload.len(), rat.workload))?;
+				require(workload.iter().all(|value| value.is_finite()), "trial generator produced a nonfinite workload")?;
+				tape.samples.write_float_bytes(0, &workload, tape.precision.model)?;
+				tape.forward()?;
+				let proposed = tape.node_values(*proposal, rat.tile)?;
+				let whole = |values: &[f64]| values.iter().map(|value| value.round().clamp(0.0, f64::from(u32::MAX)) as u32).collect::<Vec<_>>();
+				let (extents, sampled) = (whole(&proposed), whole(&workload));
+				let measured = (rat.measure)(&sampled, &extents);
+				require(measured.is_finite(), "the RAT benchmark must return a finite measurement")?;
+				observations.extend(workload.iter().chain(&proposed).copied());
+				scores.push(measured);
+				fit_step(benchmark, &observations, &scores, *loss, self.learning_rate, gpu, config)?;
+				// Publish the refitted benchmark into the composed tape, whose
+				// copy of those weights is frozen and so never drifts from it.
+				tape.weights.write_float_bytes(checked_mul(*offset, tape.precision.model.bytes(), "benchmark weight offset")?, &benchmark.parameters, tape.precision.model)?;
+				observed = Some((extents, measured));
 			}
 			tape.advance()?;
 			let epoch = tape.step as usize;
@@ -12869,7 +12925,17 @@ impl Train {
 				Ok((loss, saved, predictions))
 			})?;
 			epoch_seconds += seconds;
-			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, saved, live, &schedule)?;
+			// A RAT epoch reports what it proposed and what that cost, in place
+			// of the composed model's own contraction schedule.
+			let reported = match &observed {
+				Some((extents, measured)) => format!(
+					"{} measured {measured:.9} predicted {:.9}",
+					extents.iter().map(u32::to_string).collect::<Vec<_>>().join("x"),
+					tape.predictions()?.first().copied().unwrap_or(f64::NAN)
+				),
+				None => schedule.clone(),
+			};
+			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, saved, live, &reported)?;
 			if INTERRUPTED.load(Ordering::Acquire) {
 				std::process::exit(INTERRUPTED_EXIT)
 			}
