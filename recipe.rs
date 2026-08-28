@@ -6331,6 +6331,10 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	let (node_base, weight_base) = (narrow(graph.nodes.len(), "model graph nodes")?, graph.parameters.len());
 	let program_base = graph.programs.len();
 	for node in &mut part.nodes {
+		// A rebased root keeps `second == -1`, which resolves to the host's own
+		// source instead of the appended model's input, so reject it rather than
+		// silently joining the wrong value.
+		require(node.source >= 0 || node.second != -1, "an appended model's first block cannot take the graph input as its second operand")?;
 		node.source = if node.source < 0 { source } else { node.source + node_base };
 		if node.second >= 0 {
 			node.second += node_base
@@ -6348,6 +6352,53 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	graph.output = part.output;
 	graph.source = narrow(graph.nodes.len(), "model graph nodes")? - 1;
 	Ok(graph.source)
+}
+/// Carries the workload through the tile model and concatenates it with the
+/// proposal, so `.loss(&benchmark)` evaluates `B(X, T(X))`. No primitive
+/// concatenates, so two frozen projections place each branch into disjoint
+/// channels of one wide vector and the existing elementwise add joins them.
+fn compose_benchmark(graph: &mut Graph, benchmark: Graph) -> Result<()> {
+	let (workload, proposal, tail) = (graph.input, graph.output, graph.source);
+	require(
+		workload.length == 1 && proposal.length == 1,
+		format!("a RAT workload and proposal must be flat, received {}x{} and {}x{}", workload.channels, workload.length, proposal.channels, proposal.length),
+	)?;
+	require(
+		checked_add(workload.channels, proposal.channels, "composed benchmark input")? == benchmark.input.channels,
+		format!("the benchmark model takes {} values, but the workload is {} and the proposal is {}", benchmark.input.channels, workload.channels, proposal.channels),
+	)?;
+	let wide = Shape { channels: workload.channels + proposal.channels, length: 1 };
+	reset(graph, -1, workload);
+	lower_project(graph, wide.channels)?;
+	embed(graph, 0)?;
+	let carried = graph.source;
+	reset(graph, tail, proposal);
+	lower_project(graph, wide.channels)?;
+	embed(graph, workload.channels)?;
+	let placed = graph.source;
+	binary(graph, carried, placed, wide, ScalarOpcode::Add)?;
+	let base = graph.parameters.len();
+	append_graph(graph, benchmark)?;
+	// The benchmark is frozen in the composed graph only. Its own graph stays
+	// trainable, because the epoch that fits it owns it separately.
+	graph.frozen[base..].fill(1);
+	Ok(())
+}
+/// The one graph a RAT run trains: the tile model over the sampled workload,
+/// composed with the benchmark model that scores its proposal.
+fn rat_graph(model: &Model, rat: &RatBenchmark, prepared: &Prepared, gpu: &'static Gpu, config: Config) -> Result<Graph> {
+	let benchmark = model.downstream.as_deref().ok_or_else(|| RecipeError::new("a RAT tile model requires .loss(&benchmark)"))?;
+	require(prepared.features == rat.workload, format!("the trial generator supplies {} workload values, but the benchmark takes {}", prepared.features, rat.workload))?;
+	let mut proposer = model.clone();
+	proposer.downstream = None;
+	// The proposal width comes from the benchmark's tile argument, and the
+	// predicted-time width from its result, so neither model declares an output.
+	let proposals = Prepared::matrix(prepared.samples.clone(), vec![0.0; rat.tile], rat.tile)?;
+	let mut graph = compile(&proposer, &proposals, &proposals.targets, 1, gpu, config, true)?;
+	let observations = Prepared::matrix(vec![0.0; checked_add(rat.workload, rat.tile, "composed benchmark samples")?], vec![0.0], 1)?;
+	let benchmark = compile(benchmark, &observations, &observations.targets, 1, gpu, config, true)?;
+	compose_benchmark(&mut graph, benchmark)?;
+	Ok(graph)
 }
 fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
 	let skip = graph.source;
@@ -6421,6 +6472,19 @@ fn push_program(graph: &mut Graph, second: i32, initial: &[f64], program: Scalar
 	graph.parameters[node.offset..node.offset + initial.len()].copy_from_slice(initial);
 	node.program_offset = program_offset;
 	node.program_count = program_count;
+	Ok(())
+}
+/// Turns the projection just pushed into the selection matrix that places its
+/// input channels at `base` of a wider output, then freezes it. The layout is
+/// row-major and out-channel-major, so the weight for output `base + index`
+/// from input `index` sits at `(base + index) * inputs + index`.
+fn embed(graph: &mut Graph, base: usize) -> Result<()> {
+	let node = graph.nodes.last().ok_or_else(|| RecipeError::new("channel embedding node is absent"))?;
+	let (offset, inputs, count) = (node.offset, node.input.channels, node.parameters);
+	for index in 0..inputs {
+		graph.parameters[checked_add(offset, checked_add(checked_mul(base + index, inputs, "channel embedding row")?, index, "channel embedding column")?, "channel embedding weight")?] = 1.0;
+	}
+	graph.frozen[offset..offset + count].fill(1);
 	Ok(())
 }
 fn push_predictor(graph: &mut Graph, program: PredictorProgram) -> Result<()> {
@@ -12742,7 +12806,13 @@ impl Train {
 		let training_values = training_rows * prepared.target_width;
 		let scale = probability.then(|| TargetScale::fit(&prepared.targets[..training_values]));
 		let target_values = prepared.targets.iter().map(|target| scale.map_or(*target, |scale| scale.encode(*target))).collect::<Vec<_>>();
-		let (run, mut graph) = (RUN.fetch_add(1, Ordering::Relaxed) + 1, compile(model, prepared, &target_values, training_rows, gpu, config, true)?);
+		let (run, mut graph) = (
+			RUN.fetch_add(1, Ordering::Relaxed) + 1,
+			match &self.rat {
+				Some(rat) => rat_graph(model, rat, prepared, gpu, config)?,
+				None => compile(model, prepared, &target_values, training_rows, gpu, config, true)?,
+			},
+		);
 		graph.state.training_rows = training_rows;
 		if let Some(scale) = scale
 			&& let Some(offset) = output_bias_offset(&graph)
