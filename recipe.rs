@@ -6409,24 +6409,11 @@ fn rat_graph(model: &Model, rat: &RatBenchmark, prepared: &Prepared, gpu: &'stat
 	let loss = benchmark.loss;
 	let benchmark = compile(benchmark, &observations, &observations.targets, 1, gpu, config, true)?;
 	// The proposal is the tile model's own last node, read before the
-	// composition appends anything after it.
+	// composition appends anything after it. Recipe applies no conversion,
+	// bound, seed, or policy to it: the tile model's real-valued output is
+	// exactly what the composed benchmark model sees, and exactly what the
+	// caller's benchmark function receives.
 	let proposal = graph.nodes.len() - 1;
-	// A freshly initialized projection proposes near zero, which no device can
-	// dispatch, so every measurement would be the caller's penalty and the
-	// benchmark model would learn one constant with no gradient toward a valid
-	// extent. Start the proposal at the extent the compiler itself chose for a
-	// sampled workload: device-derived, dispatchable, and in the right decade.
-	if rat.workload == 3
-		&& rat.tile == 3
-		&& let Some(bias) = output_bias_offset(&graph)
-	{
-		let whole = |value: f64| value.round().clamp(1.0, f64::from(u32::MAX)) as u32;
-		let sampled = [whole(prepared.samples[0]), whole(prepared.samples[1]), whole(prepared.samples[2])];
-		let analytic = contraction_probe(sampled, gpu, config)?.2.forward;
-		for (channel, extent) in [analytic.m, analytic.n, analytic.k].into_iter().enumerate() {
-			graph.parameters[bias + channel] = f64::from(extent);
-		}
-	}
 	let offset = compose_benchmark(&mut graph, benchmark.clone())?;
 	Ok(RatComposition { graph, benchmark, loss, proposal, offset })
 }
@@ -12640,11 +12627,14 @@ fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, identities: &mut Vec<
 }
 /// The caller's real measurement. `workload` and `tile` are the widths its
 /// signature declares, so the models take their shapes from the benchmark
-/// rather than from a Recipe-owned control.
+/// rather than from a Recipe-owned control. `measure` receives the tile
+/// model's raw real-valued proposal directly: Recipe applies no rounding,
+/// clamping, bound, seed, or other conversion to it. Any integer conversion
+/// a physical measurement needs is the caller's own.
 struct RatBenchmark {
 	workload: usize,
 	tile: usize,
-	measure: Box<dyn Fn(&[u32], &[u32]) -> f64>,
+	measure: Box<dyn Fn(&[f64], &[f64]) -> f64>,
 }
 pub struct Train {
 	epochs: usize,
@@ -12743,12 +12733,14 @@ impl Compute {
 impl Train {
 	/// Learns tiles for the caller's own measurement. The benchmark's workload
 	/// and tile widths give the models their input and output shapes, and its
-	/// `f64` result is the one value the benchmark model predicts.
-	pub fn rat<const X: usize, const Y: usize>(mut self, benchmark: fn([u32; X], [u32; Y]) -> f64) -> Self {
+	/// `f64` result is the one value the benchmark model predicts. The
+	/// benchmark receives the tile model's real-valued proposal exactly as
+	/// produced: Recipe converts nothing.
+	pub fn rat<const X: usize, const Y: usize>(mut self, benchmark: fn([f64; X], [f64; Y]) -> f64) -> Self {
 		assert!(X != 0 && Y != 0, "RAT benchmark must take a workload and a tile");
-		let measure = move |workload: &[u32], extent: &[u32]| {
-			let workload = <[u32; X]>::try_from(workload).unwrap_or_else(|_| panic!("RAT benchmark takes {X} workload values, received {}", workload.len()));
-			let extent = <[u32; Y]>::try_from(extent).unwrap_or_else(|_| panic!("RAT benchmark takes {Y} tile values, received {}", extent.len()));
+		let measure = move |workload: &[f64], extent: &[f64]| {
+			let workload = <[f64; X]>::try_from(workload).unwrap_or_else(|_| panic!("RAT benchmark takes {X} workload values, received {}", workload.len()));
+			let extent = <[f64; Y]>::try_from(extent).unwrap_or_else(|_| panic!("RAT benchmark takes {Y} tile values, received {}", extent.len()));
 			benchmark(workload, extent)
 		};
 		self.rat = Some(RatBenchmark { workload: X, tile: Y, measure: Box::new(measure) });
@@ -12923,9 +12915,12 @@ impl Train {
 				tape.samples.write_float_bytes(0, &workload, tape.precision.model)?;
 				tape.forward()?;
 				let proposed = tape.node_values(*proposal, rat.tile)?;
-				let whole = |values: &[f64]| values.iter().map(|value| value.round().clamp(0.0, f64::from(u32::MAX)) as u32).collect::<Vec<_>>();
-				let (extents, sampled) = (whole(&proposed), whole(&workload));
-				let measured = (rat.measure)(&sampled, &extents);
+				require(proposed.iter().all(|value| value.is_finite()), "the tile model produced a nonfinite proposal")?;
+				// Recipe converts nothing here: the caller's benchmark receives
+				// the workload and the proposal exactly as produced, real-valued.
+				// Any integer conversion a physical measurement needs is the
+				// caller's own, inside its own benchmark function.
+				let measured = (rat.measure)(&workload, &proposed);
 				require(measured.is_finite(), "the RAT benchmark must return a finite measurement")?;
 				observations.extend(workload.iter().chain(&proposed).copied());
 				scores.push(measured);
@@ -12933,7 +12928,7 @@ impl Train {
 				// Publish the refitted benchmark into the composed tape, whose
 				// copy of those weights is frozen and so never drifts from it.
 				tape.weights.write_float_bytes(checked_mul(*offset, tape.precision.model.bytes(), "benchmark weight offset")?, &benchmark.parameters, tape.precision.model)?;
-				observed = Some((extents, measured));
+				observed = Some((proposed, measured));
 			}
 			tape.advance()?;
 			let epoch = tape.step as usize;
@@ -12954,9 +12949,9 @@ impl Train {
 			// A RAT epoch reports what it proposed and what that cost, in place
 			// of the composed model's own contraction schedule.
 			let reported = match &observed {
-				Some((extents, measured)) => format!(
+				Some((proposed, measured)) => format!(
 					"{} measured {measured:.9} predicted {:.9}",
-					extents.iter().map(u32::to_string).collect::<Vec<_>>().join("x"),
+					proposed.iter().map(|value| format!("{value:.6}")).collect::<Vec<_>>().join("x"),
 					tape.predictions()?.first().copied().unwrap_or(f64::NAN)
 				),
 				None => schedule.clone(),

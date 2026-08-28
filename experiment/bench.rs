@@ -11,9 +11,13 @@ fn trial() -> [u32; 3] {
 	[draw(0, [128, 256, 384, 512]), draw(7, [32, 48, 64, 96]), draw(13, [16, 32, 48, 64])]
 }
 
-/// The caller owns invalid-tile policy. A penalty must sit farther from zero
-/// time than any real measurement, so an unusable extent is never preferred.
-fn benchmark(workload: [u32; 3], extent: [u32; 3]) -> f64 {
+/// The caller owns invalid-tile policy and owns the conversion from the tile
+/// model's real-valued proposal into the integer workload and extent the
+/// physical measurement takes. A penalty must sit farther from zero time
+/// than any real measurement, so an unusable extent is never preferred.
+fn benchmark(workload: [f64; 3], extent: [f64; 3]) -> f64 {
+	let whole = |value: f64| value.round().clamp(1.0, f64::from(u32::MAX)) as u32;
+	let (workload, extent) = ([whole(workload[0]), whole(workload[1]), whole(workload[2])], [whole(extent[0]), whole(extent[1]), whole(extent[2])]);
 	measure_contraction(workload, extent).unwrap_or(1.0)
 }
 
