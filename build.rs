@@ -796,22 +796,12 @@ fn main() -> BuildResult<()> {
 		("contraction-resident-waves-per-workgroup", "RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"),
 		("contraction-matrix-max-waves-per-workgroup", "RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"),
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
-		("topology-probe-bytes", "RECIPE_TOPOLOGY_PROBE_BYTES"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
 	for (key, environment) in [("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME")] {
 		println!("cargo:rustc-env={environment}={}", text(&manifest, key)?);
 	}
-	let placement = setting(&manifest, "multi-device")?;
-	println!(
-		"cargo:rustc-env=RECIPE_MULTI_DEVICE={}",
-		match placement {
-			"false" | "true" => placement,
-			"\"auto\"" => "auto",
-			value => return Err(io::Error::other(format!("multi-device must be false, true, or \"auto\", not {value}")).into()),
-		}
-	);
 	let out = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR must be configured"))?);
 	println!("cargo::rustc-check-cfg=cfg(amd)");
 	println!("cargo::rustc-check-cfg=cfg(nvidia)");

@@ -6846,17 +6846,8 @@ struct NativeContractionShapes {
 	previous: Tile,
 	parameters: usize,
 }
-/// The permitted placement policy: `false` trains on the local device, `true`
-/// forces every selected device, and `"auto"` takes the candidate route with the lowest predicted complete epoch.
-#[derive(Clone, Copy, PartialEq)]
-enum MultiDevice {
-	Local,
-	Forced,
-	Auto,
-}
 #[derive(Clone, Copy)]
 struct Config {
-	multi_device: MultiDevice,
 	kmeans_iterations: usize,
 	svm_iterations: usize,
 	svm_rate: f64,
@@ -6898,12 +6889,6 @@ struct Config {
 impl Config {
 	fn load() -> Result<Self> {
 		Ok(Self {
-			multi_device: match env!("RECIPE_MULTI_DEVICE") {
-				"false" => MultiDevice::Local,
-				"true" => MultiDevice::Forced,
-				"auto" => MultiDevice::Auto,
-				value => return Err(RecipeError::new(format!("multi-device must be false, true, or \"auto\", not {value:?}"))),
-			},
 			kmeans_iterations: natural("kmeans iterations", env!("RECIPE_KMEANS_ITERATIONS"))?,
 			svm_iterations: natural("SVM iterations", env!("RECIPE_SVM_ITERATIONS"))?,
 			svm_rate: number("SVM learning rate", env!("RECIPE_SVM_LEARNING_RATE"))?,
@@ -7012,22 +6997,6 @@ struct NativeTape {
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
-#[derive(Clone, Copy, Debug)]
-enum EpochOperation {
-	Full,
-	Gradient,
-	Optimizer,
-}
-
-impl EpochOperation {
-	fn gradient(self) -> bool {
-		matches!(self, Self::Full | Self::Gradient)
-	}
-	fn optimizer(self) -> bool {
-		matches!(self, Self::Full | Self::Optimizer)
-	}
-}
-
 impl NativeTape {
 	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
 		let input = graph.input.elements();
@@ -7125,7 +7094,7 @@ impl NativeTape {
 		let values = self.values.download_float_bytes(offset, self.capacity * self.output, self.precision.model)?;
 		require(values.iter().all(|value| value.is_finite()), format!("device {} produced a nonfinite prediction", self.program.gpu.name)).map(|_| values)
 	}
-	fn epoch_launch(&mut self, rate: f64, config: Config, operation: EpochOperation) -> Result<()> {
+	fn epoch_launch(&mut self, rate: f64, config: Config) -> Result<()> {
 		require(self.step != 0, "optimizer epoch is absent")?;
 		let threads = self.program.dispatch(NativeEntry::Epoch)?.geometry.threads()?;
 		let rows = self.rows;
@@ -7137,8 +7106,9 @@ impl NativeTape {
 		let beta2_power = beta2.powi(self.step as i32);
 		let decay = config.decay;
 		let encoded = [rate, beta1, beta2, beta1_power, beta2_power, epsilon, decay].map(|value| self.precision.state.pack(value));
-		let run_gradient = u32::from(operation.gradient());
-		let run_optimizer = u32::from(operation.optimizer());
+		// One device runs the whole fused epoch, so the emitted entrypoint always
+		// computes the gradient and applies the optimizer in the same dispatch.
+		let (run_gradient, run_optimizer) = (1_u32, 1_u32);
 		let mut call = ptrs![
 			self.samples.pointer,
 			self.targets.pointer,
@@ -7164,9 +7134,9 @@ impl NativeTape {
 			run_gradient,
 			run_optimizer
 		];
-		debug(&format!("epoch {} {operation:?} launch", self.step))?;
+		debug(&format!("epoch {} launch", self.step))?;
 		self.program.launch_epoch(&mut call).map_err(|error| RecipeError::new(format!("training epoch: {error}")))?;
-		debug(&format!("epoch {} {operation:?} launch complete", self.step))?;
+		debug(&format!("epoch {} launch complete", self.step))?;
 		Ok(())
 	}
 	fn objective(&self) -> Result<f64> {
@@ -7175,19 +7145,15 @@ impl NativeTape {
 		Ok(objective)
 	}
 	fn full_epoch(&mut self, rate: f64, config: Config) -> Result<f64> {
-		self.epoch_launch(rate, config, EpochOperation::Full)?;
+		self.epoch_launch(rate, config)?;
 		self.objective()
 	}
-	/// Computes this shard's loss and reduced parameter gradient without
-	/// changing optimizer state or model weights.
-	fn gradient_launch(&mut self, rate: f64, config: Config) -> Result<f64> {
-		self.epoch_launch(rate, config, EpochOperation::Gradient)?;
-		self.objective()
-	}
-	/// Applies the emitted AdamW operation to the gradient already stored on
-	/// this tape's device through the same model epoch entrypoint.
-	fn optimizer_launch(&mut self, rate: f64, config: Config) -> Result<()> {
-		self.epoch_launch(rate, config, EpochOperation::Optimizer)
+	/// The one fused epoch a training run performs: the model epoch dispatch,
+	/// then the running best-loss state this epoch's checkpoint decision reads.
+	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
+		let loss = self.full_epoch(rate, config)?;
+		let saved = observe_loss(&mut self.best_loss, loss, tolerance);
+		Ok((loss, saved))
 	}
 	fn advance(&mut self) -> Result<()> {
 		self.step = self.step.checked_add(1).ok_or_else(|| RecipeError::new("optimizer epoch overflows"))?;
@@ -7195,17 +7161,6 @@ impl NativeTape {
 	}
 	fn weights(&self) -> Result<Vec<f64>> {
 		self.weights.download_float(self.parameters, self.precision.model)
-	}
-	/// The reduced full-shard parameter gradient the last epoch dispatch left
-	/// on the device.
-	fn download_gradient(&self) -> Result<Vec<f64>> {
-		self.gradient.download_float(self.parameters, self.precision.model)
-	}
-	fn upload_gradient(&self, gradient: &[f64]) -> Result<()> {
-		self.gradient.write_float_bytes(0, gradient, self.precision.model)
-	}
-	fn upload_weights(&self, weights: &[f64]) -> Result<()> {
-		self.weights.write_float_bytes(0, weights, self.precision.model)
 	}
 	fn optimizer_state(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
 		Ok((self.weights()?, self.moments.download_float(self.parameters, self.precision.state)?, self.variances.download_float(self.parameters, self.precision.state)?))
@@ -7314,14 +7269,6 @@ impl NativeTape {
 			.collect::<Vec<_>>()
 			.join(" ")
 	}
-	fn device_label(&self) -> Result<String> {
-		device_label(self.program.gpu)
-	}
-}
-/// The `host:device` name of one device: a remote device already carries its
-/// owning host, and a local device takes this host's name.
-fn device_label(gpu: &Gpu) -> Result<String> {
-	if gpu.name.contains(':') { Ok(gpu.name.clone()) } else { Ok(format!("{}:{}", local_host()?, gpu.name)) }
 }
 /// Tracks the running best loss and decides whether this epoch triggers a
 /// checkpoint, updating the four-slot loss state in place.
@@ -7342,348 +7289,6 @@ fn observe_loss(best_loss: &mut [f64; 4], loss: f64, tolerance: f64) -> bool {
 		best_loss[3] = best;
 	}
 	trigger
-}
-/// One measured direction of a topology link.
-#[derive(Clone, Copy)]
-struct TransferCost {
-	latency: Duration,
-	bandwidth: f64,
-}
-impl TransferCost {
-	fn seconds(self, bytes: usize) -> f64 {
-		self.latency.as_secs_f64() + bytes as f64 / self.bandwidth
-	}
-}
-/// The measured behavior of one device: the two transfer directions between it and the coordinating
-/// host, the gradient work it retires each second, and the fixed cost of one dispatch on it.
-#[derive(Clone, Copy)]
-struct Link {
-	to_host: TransferCost,
-	from_host: TransferCost,
-	work: f64,
-	overhead: f64,
-}
-fn measure_link(gpu: &'static Gpu, config: Config) -> Result<Link> {
-	let probe_bytes = parse_natural(env!("RECIPE_TOPOLOGY_PROBE_BYTES"), "topology probe bytes must be a positive integer");
-	let mut scratch = vec![0_u8; probe_bytes];
-	let pointer = gpu.upload(0, scratch.as_ptr().cast(), probe_bytes)?;
-	let measured = (|| {
-		gpu.synchronize()?;
-		let started = Instant::now();
-		gpu.download(scratch.as_mut_ptr().cast(), pointer, 1)?;
-		gpu.synchronize()?;
-		let to_host_latency = started.elapsed();
-		let started = Instant::now();
-		gpu.download(scratch.as_mut_ptr().cast(), pointer, probe_bytes)?;
-		gpu.synchronize()?;
-		let to_host_bandwidth = probe_bytes as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON);
-		let started = Instant::now();
-		gpu.upload(pointer, scratch.as_ptr().cast(), 1)?;
-		gpu.synchronize()?;
-		let from_host_latency = started.elapsed();
-		let started = Instant::now();
-		gpu.upload(pointer, scratch.as_ptr().cast(), probe_bytes)?;
-		gpu.synchronize()?;
-		let from_host_bandwidth = probe_bytes as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON);
-		let (work, overhead) = calibrate(gpu, config)?;
-		Ok(Link {
-			to_host: TransferCost { latency: to_host_latency, bandwidth: to_host_bandwidth },
-			from_host: TransferCost { latency: from_host_latency, bandwidth: from_host_bandwidth },
-			work,
-			overhead,
-		})
-	})();
-	gpu.free(pointer);
-	measured
-}
-static LINKS: OnceLock<Result<Vec<Link>>> = OnceLock::new();
-#[derive(Clone, Copy)]
-struct Transfer {
-	from: usize,
-	to: usize,
-	bytes: usize,
-	cost: TransferCost,
-}
-impl Transfer {
-	fn seconds(self) -> f64 {
-		self.cost.seconds(self.bytes)
-	}
-}
-/// The route one training run takes: the row share of every shard, the movement its fused epoch performs, and the
-/// complete epoch predicted for it from computation, transfers, synchronization, and persistent-state movement.
-struct Placement {
-	shares: Vec<f64>,
-	gradient_to_host: Vec<Transfer>,
-	gradient_to_primary: Transfer,
-	weights_to_host: Transfer,
-	weights_from_host: Vec<Transfer>,
-	loss: LossFunction,
-	predicted: [f64; 4],
-}
-impl Placement {
-	fn movements(&self) -> impl Iterator<Item = &Transfer> {
-		self.gradient_to_host.iter().chain([&self.gradient_to_primary, &self.weights_to_host]).chain(&self.weights_from_host)
-	}
-	fn seconds(&self) -> f64 {
-		self.predicted.iter().sum()
-	}
-}
-/// The planned gradient work of one fused epoch over `rows` rows: every
-/// contraction's forward, gradient, and previous-adjoint tile, every node's
-/// elementwise traffic, and the loss reduction. The one optimizer update the
-/// leading device applies is priced once, separately, by `optimizer_work`.
-fn gradient_work(graph: &Graph, rows: usize) -> Result<f64> {
-	let tiles = native_contraction_shapes(graph, rows)?
-		.iter()
-		.flatten()
-		.flat_map(|shapes| [shapes.forward, shapes.gradient, shapes.previous])
-		.map(|extent| 2.0 * f64::from(extent.m) * f64::from(extent.n) * f64::from(extent.k))
-		.sum::<f64>();
-	let elementwise = graph.nodes.iter().map(|node| 8.0 * rows as f64 * node.output.elements() as f64).sum::<f64>();
-	Ok(8.0 * checked_mul(rows, graph.output.elements(), "predicted loss reduction")? as f64 + tiles + elementwise)
-}
-fn optimizer_work(graph: &Graph) -> f64 {
-	16.0 * graph.parameters.len() as f64
-}
-/// Measures one device through the configured surrogate workload. The optimizer
-/// dispatch isolates fixed cost, and the gradient dispatch measures planned work
-/// without allocating, forwarding, training, or dispatching the placed model.
-fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
-	let (rows, features) = (config.surrogate_epochs * config.surrogate_width, config.surrogate_width);
-	let samples = (0..rows * features).map(|value| ((value % 17) as f64 - 8.0) / 8.0).collect::<Vec<_>>();
-	let targets = (0..rows).map(|value| ((value % 5) as f64 - 2.0) / 2.0).collect::<Vec<_>>();
-	let prepared = Prepared::matrix(samples.clone(), targets.clone(), 1)?;
-	let graph = compile(&surrogate_model(config.surrogate_width), &prepared, &targets, rows, gpu, config, true)?;
-	let mut tape = NativeTape::new(&graph, &samples, &targets, gpu, config.precision, Some(mse))?;
-	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<f64> {
-		tape.advance()?;
-		let started = Instant::now();
-		if gradient {
-			tape.full_epoch(config.surrogate_rate, config)?;
-		} else {
-			tape.optimizer_launch(config.surrogate_rate, config)?;
-		}
-		gpu.synchronize()?;
-		Ok(started.elapsed().as_secs_f64())
-	};
-	timed(&mut tape, true)?;
-	let overhead = timed(&mut tape, false)?;
-	let epoch = timed(&mut tape, true)?;
-	Ok((((gradient_work(&graph, rows)?) / (epoch - overhead).max(f64::MIN_POSITIVE)).max(1.0), overhead))
-}
-/// Plans one candidate route from the workload and storage plan already established for this run: the row share of
-/// every shard, the movement list its fused epoch performs, and the complete epoch that movement and each device's
-/// measured behavior predict.
-fn plan_route(route: &[usize], links: &[Link], graph: &Graph, rows: usize, bytes: usize, loss: LossFunction, policy: MultiDevice) -> Result<(Vec<usize>, Placement)> {
-	let total = route.iter().map(|device| if policy == MultiDevice::Auto { 1.0 } else { links[*device].work }).sum::<f64>();
-	let mut counts = route.iter().map(|device| ((rows as f64 * if policy == MultiDevice::Auto { 1.0 } else { links[*device].work } / total) as usize).max(1)).collect::<Vec<_>>();
-	counts[0] += rows - counts.iter().sum::<usize>();
-	let (gradient_to_host, weights_from_host) = (
-		route.iter().enumerate().map(|(shard, device)| Transfer { from: shard + 1, to: 0, bytes, cost: links[*device].to_host }).collect::<Vec<_>>(),
-		route.iter().enumerate().skip(1).map(|(shard, device)| Transfer { from: 0, to: shard + 1, bytes, cost: links[*device].from_host }).collect::<Vec<_>>(),
-	);
-	let placement = Placement {
-		shares: counts.iter().map(|count| *count as f64 / rows as f64).collect(),
-		gradient_to_host,
-		gradient_to_primary: Transfer { from: 0, to: 1, bytes, cost: links[route[0]].from_host },
-		weights_to_host: Transfer { from: 1, to: 0, bytes, cost: links[route[0]].to_host },
-		weights_from_host,
-		loss,
-		predicted: [0.0; 4],
-	};
-	let bandwidth = |transfer: &Transfer| transfer.bytes as f64 / transfer.cost.bandwidth;
-	// Shards compute their gradients concurrently, so the slowest shard sets the
-	// route's gradient time, and the leading device adds the one optimizer update.
-	let computation = route.iter().zip(&counts).map(|(device, count)| Ok(gradient_work(graph, *count)? / links[*device].work)).collect::<Result<Vec<_>>>()?.into_iter().fold(0.0, f64::max)
-		+ optimizer_work(graph) / links[route[0]].work;
-	let transfers = placement.gradient_to_host.iter().map(bandwidth).sum::<f64>() + bandwidth(&placement.gradient_to_primary);
-	let movement = bandwidth(&placement.weights_to_host) + placement.weights_from_host.iter().map(bandwidth).sum::<f64>();
-	let synchronization = route.iter().map(|device| links[*device].overhead).sum::<f64>() + placement.movements().map(|transfer| transfer.cost.latency.as_secs_f64()).sum::<f64>();
-	Ok((counts, Placement { predicted: [computation, transfers, synchronization, movement], ..placement }))
-}
-/// Selects the route this run trains on. `multi-device = false` keeps the
-/// local device, `true` forces every selected device, and `"auto"` predicts the
-/// complete epoch of every valid candidate route from the established workload,
-/// the storage plan, and measured device behavior, then takes the lowest. No
-/// policy allocates or dispatches the model being placed to decide.
-fn select_route(gpus: &'static [&'static Gpu], graph: &Graph, rows: usize, precision: Compute, loss: LossFunction, config: Config) -> Result<(Vec<usize>, Vec<usize>, Placement)> {
-	let bytes = checked_mul(graph.parameters.len().max(1), precision.bytes(), "topology transfer bytes")?;
-	let links = LINKS.get_or_init(|| gpus.iter().map(|gpu| measure_link(gpu, config)).collect()).as_ref().map_err(Clone::clone)?;
-	for (gpu, link) in gpus.iter().zip(links) {
-		eprintln!(
-			"measured {} {:.6e} work/s {:.9}s/dispatch to-host {:.1} MB/s {:.0?} from-host {:.1} MB/s {:.0?}",
-			device_label(gpu)?,
-			link.work,
-			link.overhead,
-			link.to_host.bandwidth / 1e6,
-			link.to_host.latency,
-			link.from_host.bandwidth / 1e6,
-			link.from_host.latency
-		);
-	}
-	let candidates: Vec<Vec<usize>> = match config.multi_device {
-		MultiDevice::Local => vec![vec![0]],
-		MultiDevice::Forced => vec![(0..gpus.len()).collect()],
-		MultiDevice::Auto => (1..1_u64 << gpus.len()).map(|mask| (0..gpus.len()).filter(|device| mask >> device & 1 == 1).collect()).collect(),
-	};
-	let mut best: Option<(Vec<usize>, Vec<usize>, Placement)> = None;
-	for mut route in candidates.into_iter().filter(|route| route.len() <= rows) {
-		// The fastest device leads the route and applies the one update.
-		route.sort_by(|left, right| links[*right].work.total_cmp(&links[*left].work).then(left.cmp(right)));
-		let (counts, placement) = plan_route(&route, &links, graph, rows, bytes, loss, config.multi_device)?;
-		let [computation, transfers, synchronization, movement] = placement.predicted;
-		eprintln!(
-			"route {} rows {} predicted epoch {:.9}s = computation {computation:.9} + transfers {transfers:.9} + synchronization {synchronization:.9} + persistent-state {movement:.9}",
-			route.iter().map(|device| device_label(gpus[*device])).collect::<Result<Vec<_>>>()?.join(","),
-			counts.iter().map(usize::to_string).collect::<Vec<_>>().join(","),
-			placement.seconds()
-		);
-		best = if best.as_ref().is_none_or(|previous| placement.seconds() < previous.2.seconds()) { Some((route, counts, placement)) } else { best };
-	}
-	best.ok_or_else(|| RecipeError::new("no candidate route fits this workload"))
-}
-/// A training tape placed across the selected device topology. One device
-/// trains through the same gradient and optimizer entrypoints. Across several
-/// devices the rows shard contiguously, every device computes a gradient, the
-/// primary device applies the one emitted optimizer, and its weights broadcast.
-struct DeviceTape {
-	shards: Vec<NativeTape>,
-	placement: Placement,
-}
-impl DeviceTape {
-	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpus: &'static [&'static Gpu], precision: Compute, loss: LossFunction, config: Config) -> Result<Self> {
-		let (input, output) = (graph.input.elements(), graph.output.elements());
-		require(input != 0 && samples.len() % input == 0, "model input batch is not a whole number of rows")?;
-		let rows = samples.len() / input;
-		require(!targets.is_empty(), "training requires targets")?;
-		require(
-			gpus.len() == 1 || !graph.nodes.iter().any(|node| node.op == Primitive::Normalize && node.argument[0] == 0.0),
-			"batch normalization computes whole-batch statistics, so this model trains on one device",
-		)?;
-		let (route, counts, placement) = select_route(gpus, graph, rows, precision, loss, config)?;
-		eprintln!("selected route {} predicted epoch {:.9}s", route.iter().map(|device| device_label(gpus[*device])).collect::<Result<Vec<_>>>()?.join(","), placement.seconds());
-		let (mut shards, mut start) = (Vec::new(), 0);
-		for (device, count) in route.iter().zip(&counts) {
-			let end = start + count;
-			shards.push(NativeTape::new(graph, &samples[start * input..end * input], &targets[start * output..end * output], gpus[*device], precision, Some(loss))?);
-			start = end;
-		}
-		Ok(Self { shards, placement })
-	}
-	fn forward(&mut self) -> Result<()> {
-		self.shards.iter_mut().try_for_each(NativeTape::forward)
-	}
-	fn predictions(&self) -> Result<Vec<f64>> {
-		let mut predictions = Vec::new();
-		for shard in &self.shards {
-			predictions.extend(shard.predictions()?);
-		}
-		Ok(predictions)
-	}
-	fn inject_bn_stats(&self, stats: &[f64]) -> Result<()> {
-		if self.shards.len() > 1 {
-			return require(stats.is_empty(), "batch normalization statistics cannot place across devices");
-		}
-		self.shards[0].inject_bn_stats(stats)
-	}
-	fn extract_bn_stats(&self) -> Result<Vec<f64>> {
-		if self.shards.len() > 1 {
-			return Ok(Vec::new());
-		}
-		self.shards[0].extract_bn_stats()
-	}
-	fn advance(&mut self) -> Result<()> {
-		self.shards.iter_mut().try_for_each(NativeTape::advance)
-	}
-	fn step(&self) -> u32 {
-		self.shards[0].step
-	}
-	fn best_loss(&self) -> [f64; 4] {
-		self.shards[0].best_loss
-	}
-	fn tile(&self) -> Tile {
-		self.shards[0].tile()
-	}
-	fn schedule(&self) -> String {
-		self.shards[0].schedule()
-	}
-	/// The one fused epoch every policy runs: each shard computes its gradient
-	/// concurrently, the leading device applies the one emitted optimizer to the
-	/// aggregate, and the updated persistent weights return to every shard.
-	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
-		if self.shards.len() == 1 {
-			let loss = self.shards[0].full_epoch(rate, config)?;
-			let saved = observe_loss(&mut self.shards[0].best_loss, loss, tolerance);
-			return Ok((loss, saved));
-		}
-		let placement = &self.placement;
-		let shards = &mut self.shards;
-		let measured = std::thread::scope(|scope| {
-			let dispatched = shards.iter_mut().zip(&placement.gradient_to_host).map(|(shard, transfer)| {
-				let transfer = *transfer;
-				scope.spawn(move || -> Result<(f64, Vec<f64>)> {
-					require(transfer.to == 0, "gradient transfer must end on the coordinating host")?;
-					let objective = shard.gradient_launch(rate, config)?;
-					Ok((objective, shard.download_gradient()?))
-				})
-			});
-			dispatched.collect::<Vec<_>>().into_iter().map(|shard| shard.join().map_err(|_| RecipeError::new("device epoch panicked"))?).collect::<Result<Vec<_>>>()
-		})?;
-		let root_metric = placement.loss.0 == 1;
-		let loss = if root_metric {
-			measured.iter().zip(&placement.shares).map(|((objective, _), share)| share * objective * objective).sum::<f64>().sqrt()
-		} else {
-			measured.iter().zip(&placement.shares).map(|((objective, _), share)| share * objective).sum()
-		};
-		let parameters = self.shards[0].parameters;
-		let mut gradient = vec![0.0; parameters];
-		for ((objective, shard_gradient), share) in measured.iter().zip(&placement.shares) {
-			// The RMSE seed divides by the shard-local loss, so restoring the
-			// whole-batch gradient rescales each shard by its loss ratio.
-			let scale = share * if root_metric { if loss == 0.0 { 0.0 } else { objective / loss } } else { 1.0 };
-			for (total, partial) in gradient.iter_mut().zip(shard_gradient) {
-				*total += scale * partial;
-			}
-		}
-		require(
-			placement.gradient_to_primary.from == 0 && placement.gradient_to_primary.to == 1 && placement.weights_to_host.from == 1 && placement.weights_to_host.to == 0,
-			"the aggregate gradient and the updated weights must cross the coordinating host",
-		)?;
-		self.shards[0].upload_gradient(&gradient)?;
-		self.shards[0].optimizer_launch(rate, config)?;
-		let weights = self.shards[0].weights()?;
-		for (shard, transfer) in self.shards.iter().skip(1).zip(&placement.weights_from_host) {
-			require(transfer.from == 0, "weight transfer must originate on the coordinating host")?;
-			shard.upload_weights(&weights)?;
-		}
-		let saved = observe_loss(&mut self.shards[0].best_loss, loss, tolerance);
-		Ok((loss, saved))
-	}
-	fn weights(&self) -> Result<Vec<f64>> {
-		self.shards[0].weights()
-	}
-	fn capture(&self, graph: &mut Graph) -> Result<()> {
-		self.shards[0].capture(graph)
-	}
-	/// Reports the executing route and every movement its fused epoch performs, in the order the epoch performs them.
-	fn print_devices(&self) -> Result<()> {
-		for (shard, share) in self.shards.iter().zip(&self.placement.shares) {
-			eprintln!("{}.{} rows {} share {share:.6}", shard.device_label()?, shard.precision.model.label(), shard.rows);
-		}
-		for (index, movement) in self.placement.movements().enumerate() {
-			let kind = ["gradient", "aggregate", "weights"][(index >= self.shards.len()) as usize + (index > self.shards.len()) as usize];
-			eprintln!(
-				"movement {kind} {}>{} {} bytes {:.0?} {:.1} MB/s {:.6} ms",
-				movement.from,
-				movement.to,
-				movement.bytes,
-				movement.cost.latency,
-				movement.cost.bandwidth / 1e6,
-				movement.seconds() * 1e3
-			);
-		}
-		Ok(())
-	}
 }
 struct NativeTrainingState {
 	values: Vec<u8>,
@@ -8166,16 +7771,9 @@ fn tune_contraction_schedule(tape: &mut NativeTape, graph: &Graph, rate: f64, co
 	debug(&format!("schedule select seconds={best_seconds:.6} assignments={assignments} launches={} tiles={}", assignments * launches, tape.schedule()))?;
 	Ok(())
 }
-fn tune_contraction_schedules(tape: &mut DeviceTape, graph: &Graph, rate: f64, config: Config, rat: Option<&RatModels>) -> Result<f64> {
-	let started = Instant::now();
-	for shard in &mut tape.shards {
-		tune_contraction_schedule(shard, graph, rate, config, rat)?;
-	}
-	Ok(started.elapsed().as_secs_f64())
-}
-fn checkpoint(path: &Path, schema: &DataSchema, stored: &mut bundle::StoredGraph, tape: &DeviceTape) -> Result<()> {
+fn checkpoint(path: &Path, schema: &DataSchema, stored: &mut bundle::StoredGraph, tape: &NativeTape) -> Result<()> {
 	if let Ok((_, saved)) = bundle::load_semantic(path) {
-		if saved.first().and_then(|g| g.state.best_loss.first().copied()).is_some_and(|v| v <= tape.best_loss()[0]) {
+		if saved.first().and_then(|g| g.state.best_loss.first().copied()).is_some_and(|v| v <= tape.best_loss[0]) {
 			return Ok(());
 		}
 	}
@@ -9073,38 +8671,28 @@ fn local_host() -> Result<String> {
 	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	Ok(host.trim().to_owned())
 }
-static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
-/// Resolves the `RECIPE_DEVICE` selection to the ordered device list. Each
-/// comma-separated name is a local device (`amd0`, `engi:amd0`) or a device on
-/// a reachable host (`benji:nv0`); the first name is the primary device.
-fn selected_gpus() -> Result<&'static [&'static Gpu]> {
+static SELECTED: OnceLock<Result<&'static Gpu>> = OnceLock::new();
+/// Resolves the `RECIPE_DEVICE` selection to the one device this run trains on:
+/// a local device (`amd0`, `engi:amd0`) or a device on a reachable host
+/// (`benji:nv0`). Training places one device, so a wider selection is an error.
+fn selected_gpu() -> Result<&'static Gpu> {
 	SELECTED
 		.get_or_init(|| {
-			let Some(selection) = std::env::var("RECIPE_DEVICE").ok() else { return device(None).map(|gpu| vec![gpu]) };
-			let (host, local_only) = (local_host()?, Config::load()?.multi_device == MultiDevice::Local);
-			let mut selected = Vec::new();
-			// `multi-device = false` trains on the local device, so a wider
-			// selection never connects to, allocates on, or executes on another.
-			for name in selection.split(',').take(if local_only { 1 } else { usize::MAX }) {
-				let gpu = match devices()?.iter().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
-					Some(gpu) => gpu,
-					None => match name.split_once(':') {
-						Some((remote, device)) if remote != host && !local_only => connect_remote(remote, device, name)?,
-						_ => return Err(RecipeError::new(format!("GPU {name:?} is absent"))),
-					},
-				};
-				require(!selected.iter().any(|previous: &&Gpu| ptr::eq(*previous, gpu)), format!("GPU {name:?} is selected twice"))?;
-				selected.push(gpu);
+			let Some(name) = std::env::var("RECIPE_DEVICE").ok() else { return device(None) };
+			require(!name.is_empty(), "RECIPE_DEVICE selects no device")?;
+			require(!name.contains(','), format!("training places one device, so {name:?} cannot select several"))?;
+			let host = local_host()?;
+			match devices()?.iter().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
+				Some(gpu) => Ok(gpu),
+				None => match name.split_once(':') {
+					Some((remote, device)) if remote != host => connect_remote(remote, device, &name),
+					_ => Err(RecipeError::new(format!("GPU {name:?} is absent"))),
+				},
 			}
-			require(!selected.is_empty(), "RECIPE_DEVICE selects no device")?;
-			Ok(selected)
 		})
 		.as_ref()
-		.map(Vec::as_slice)
+		.copied()
 		.map_err(Clone::clone)
-}
-fn selected_gpu() -> Result<&'static Gpu> {
-	selected_gpus().map(|gpus| gpus[0])
 }
 struct RemoteDirectory {
 	host: String,
@@ -9945,7 +9533,7 @@ struct WorkerProgram {
 	reduction_values: u32,
 }
 /// Serves one local device to a remote Recipe process over stdin/stdout: the
-/// transport half of a cross-host topology link. Commands mirror the `Gpu`
+/// transport half of a host-qualified selection. Commands mirror the `Gpu`
 /// verbs plus artifact load and entrypoint dispatch, so a driving process can
 /// place work on this host's device exactly as on a local one.
 pub fn worker_serve(name: &str) -> Result<()> {
@@ -13529,8 +13117,7 @@ impl Train {
 		let prepared = prepare(data)?;
 		let training_rows = ((prepared.source_rows as f64) * data.split).floor() as usize;
 		require(training_rows != 0 && training_rows <= prepared.source_rows, "split must select training rows")?;
-		let (gpus, mut config) = (selected_gpus()?, Config::load()?);
-		let gpu = gpus[0];
+		let (gpu, mut config) = (selected_gpu()?, Config::load()?);
 		let precision = self.precision;
 		config.precision = precision;
 		if let Some(seed) = self.seed {
@@ -13560,7 +13147,8 @@ impl Train {
 		stored.graph.state.trained_samples.sort_unstable();
 		stored.graph.state.trained_samples.dedup();
 		let (samples, targets) = (&prepared.samples[..training_rows * prepared.features], &target_values[..training_values]);
-		let mut tape = DeviceTape::new(&stored.graph, samples, targets, gpus, config.precision, model.loss, config)?;
+		require(!targets.is_empty(), "training requires targets")?;
+		let mut tape = NativeTape::new(&stored.graph, samples, targets, gpu, config.precision, Some(model.loss))?;
 		self.finish_dispatch(
 			if stored.bn_stats.is_empty() { tape.forward() } else { tape.inject_bn_stats(&stored.bn_stats).and_then(|_| tape.forward()) },
 			&mut stored,
@@ -13568,7 +13156,6 @@ impl Train {
 			&tape,
 			None,
 		)?;
-		tape.print_devices()?;
 		stored.bn_stats = tape.extract_bn_stats()?;
 		let initial_predictions = tape.predictions()?;
 		let initial_loss = model_loss(&initial_predictions, targets, model.loss, config.activation[7]);
@@ -13577,7 +13164,9 @@ impl Train {
 		let mut epoch_seconds = 0.0;
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
 		if self.epochs != 0 || self.rat.is_some() {
-			epoch_seconds += tune_contraction_schedules(&mut tape, &stored.graph, self.learning_rate, config, self.rat.as_ref())?;
+			let tuning = Instant::now();
+			tune_contraction_schedule(&mut tape, &stored.graph, self.learning_rate, config, self.rat.as_ref())?;
+			epoch_seconds += tuning.elapsed().as_secs_f64();
 		}
 		for _ in 0..self.epochs {
 			if INTERRUPTED.load(Ordering::Acquire) {
@@ -13585,7 +13174,7 @@ impl Train {
 				break;
 			}
 			tape.advance()?;
-			let epoch = tape.step() as usize;
+			let epoch = tape.step as usize;
 			// Read once per epoch from the dispatched schedule, so a schedule change appears on the next line.
 			let schedule = tape.schedule();
 			let ((loss, saved, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &schedule, || {
@@ -13669,12 +13258,12 @@ impl Train {
 			tile: tape.tile(),
 			schedule: tape.schedule(),
 			run,
-			epoch: tape.step() as usize,
+			epoch: tape.step as usize,
 			seconds: started.elapsed().as_secs_f64(),
 			epoch_seconds,
 		})
 	}
-	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &DataSchema, tape: &DeviceTape, save: Option<()>) -> Result<T> {
+	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &DataSchema, tape: &NativeTape, save: Option<()>) -> Result<T> {
 		let save = if INTERRUPTED.load(Ordering::Acquire) && !INTERRUPT_CHECKPOINTED.swap(true, Ordering::AcqRel) { Some(()) } else { save.filter(|_| !INTERRUPTED.load(Ordering::Acquire)) };
 		if save.is_some()
 			&& let Some(path) = &self.save

@@ -1,6 +1,6 @@
 use std::{fs, os::unix::process::ExitStatusExt, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [--device <name>]... <source.rs> [export]\n       recipe rat\n       recipe --worker <device>";
+const USAGE: &str = "usage: recipe [--device <name>] <source.rs> [export]\n       recipe rat\n       recipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -109,12 +109,10 @@ fn main() {
 		}
 		if argument == "--device" {
 			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
-			if let Some(devices) = &mut device {
-				devices.push(',');
-				devices.push_str(&selected);
-			} else {
-				device = Some(selected);
+			if device.is_some() {
+				invalid("recipe trains one device, so --device is given once")
 			}
+			device = Some(selected);
 			continue;
 		}
 		if argument.starts_with("--") {
@@ -138,7 +136,6 @@ fn main() {
 	}
 	match operation.as_deref() {
 		None => run(&source, device),
-		Some("export") if device.is_some_and(|names| names.contains(',')) => invalid("export requires one device"),
 		Some("export") => export(&source, device),
 		Some(_) => invalid(USAGE),
 	}

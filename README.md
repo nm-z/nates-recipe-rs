@@ -27,14 +27,14 @@ let prediction = recipe.infer("model.ogdl", &input);
 
 ## devices
 
-Select one or more local or host-qualified devices by repeating `--device`:
+Select the local or host-qualified device to train on with `--device`:
 
 ```text
 recipe --device amd0 model.rs
-recipe --device amd0 --device archy:nv0 model.rs
+recipe --device engi:amd0 model.rs
 ```
 
-Recipe measures each selected link and each device's gradient throughput before it places training rows. It keeps the tape on the primary device when the measured multi-device placement is not faster.
+Recipe trains one device, so `--device` is given once.
 
 `recipe --worker <device>` serves one local GPU over stdin and stdout. Recipe starts this transport entrypoint through SSH for a host-qualified selector. It is a protocol endpoint, not a model script invocation.
 
