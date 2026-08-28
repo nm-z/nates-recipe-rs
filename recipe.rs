@@ -6086,7 +6086,7 @@ impl Recipe {
 		Model { blocks: Vec::new(), loss: mse, quantization: 0, downstream: None }
 	}
 	pub const fn train(&self) -> Train {
-		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64 }
+		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64, rat: None }
 	}
 }
 impl Recipe {
@@ -7278,6 +7278,41 @@ fn native_extent_valid(extent: Tile, limits: Tile, fixed_k: u32, compiled: &Nati
 	let owned = extent.k.div_ceil(compiled.chunk_k).div_ceil((compiled.block / lanes).max(2));
 	Ok(owned.checked_mul(compiled.register_count).ok_or_else(|| RecipeError::new("native contraction chunk buffer overflows"))? <= compiled.chunk_values
 		&& owned.checked_mul(compiled.register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))? <= compiled.chunk_bias_values)
+}
+/// Measures one real contraction on the selected device. `workload` is the
+/// `M, N, K` of a projection and `extent` is the runtime tile to dispatch it
+/// with. `None` means the device cannot dispatch that extent, so what an
+/// invalid tile is worth stays with the caller.
+pub fn measure_contraction(workload: [u32; 3], extent: [u32; 3]) -> Option<f64> {
+	measured_contraction(workload, extent).unwrap_or_else(|error| panic!("{error}"))
+}
+fn measured_contraction(workload: [u32; 3], extent: [u32; 3]) -> Result<Option<f64>> {
+	let [m, n, k] = workload;
+	require(m != 0 && n != 0 && k != 0, "contraction workload must be positive")?;
+	let (gpu, config) = (selected_gpu()?, Config::load()?);
+	// One projection node over `m` rows: `native_contraction_shapes` reads its
+	// forward extent back as exactly this workload's `m, n, k`.
+	let mut graph = Graph::new(Shape { channels: k as usize, length: 1 });
+	lower_project(&mut graph, n as usize)?;
+	let rows = m as usize;
+	let samples = (0..checked_mul(rows, k as usize, "contraction sample values")?).map(|value| ((value % 17) as f64 - 8.0) / 8.0).collect::<Vec<_>>();
+	// No targets and no loss, so the artifact emits the forward pass alone.
+	let mut tape = NativeTape::new(&graph, &samples, &[], gpu, config.precision, None)?;
+	let shapes = native_contraction_shapes(&graph, rows)?;
+	let shape = shapes.first().copied().flatten().ok_or_else(|| RecipeError::new("contraction workload has no contraction node"))?;
+	let mut tiles = tape.program.contractions.first().copied().flatten().ok_or_else(|| RecipeError::new("contraction workload has no dispatched schedule"))?;
+	let ratio = narrow(tape.precision.state.bytes().div_ceil(tape.precision.model.bytes()), "native contraction state ratio")? as u32;
+	let extent = Tile { m: extent[0], n: extent[1], k: extent[2] };
+	if !native_extent_valid(extent, shape.forward, tiles.forward.k, &tape.program.compiled, ratio)? {
+		return Ok(None);
+	}
+	tiles.forward = extent;
+	tape.apply_contraction_schedule(vec![Some(tiles)])?;
+	gpu.synchronize()?;
+	let started = Instant::now();
+	tape.forward()?;
+	gpu.synchronize()?;
+	Ok(Some(started.elapsed().as_secs_f64()))
 }
 /// Valid runtime extents for one contraction direction. M and N vary over the
 /// workgroup's lane splits, while K remains fixed so tuning cannot change the
@@ -12484,6 +12519,14 @@ fn shuffle(samples: &mut Vec<f64>, targets: &mut Vec<f64>, identities: &mut Vec<
 	}
 	Ok(())
 }
+/// The caller's real measurement. `workload` and `tile` are the widths its
+/// signature declares, so the models take their shapes from the benchmark
+/// rather than from a Recipe-owned control.
+struct RatBenchmark {
+	workload: usize,
+	tile: usize,
+	measure: Box<dyn Fn(&[u32], &[u32]) -> f64>,
+}
 pub struct Train {
 	epochs: usize,
 	learning_rate: f64,
@@ -12493,6 +12536,7 @@ pub struct Train {
 	save: Option<PathBuf>,
 	seed: Option<usize>,
 	precision: Compute,
+	rat: Option<RatBenchmark>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Compute {
@@ -12578,6 +12622,19 @@ impl Compute {
 	}
 }
 impl Train {
+	/// Learns tiles for the caller's own measurement. The benchmark's workload
+	/// and tile widths give the models their input and output shapes, and its
+	/// `f64` result is the one value the benchmark model predicts.
+	pub fn rat<const X: usize, const Y: usize>(mut self, benchmark: fn([u32; X], [u32; Y]) -> f64) -> Self {
+		assert!(X != 0 && Y != 0, "RAT benchmark must take a workload and a tile");
+		let measure = move |workload: &[u32], extent: &[u32]| {
+			let workload = <[u32; X]>::try_from(workload).unwrap_or_else(|_| panic!("RAT benchmark takes {X} workload values, received {}", workload.len()));
+			let extent = <[u32; Y]>::try_from(extent).unwrap_or_else(|_| panic!("RAT benchmark takes {Y} tile values, received {}", extent.len()));
+			benchmark(workload, extent)
+		};
+		self.rat = Some(RatBenchmark { workload: X, tile: Y, measure: Box::new(measure) });
+		self
+	}
 	fn arithmetic(mut self, format: Compute) -> Self {
 		self.precision = format;
 		self
