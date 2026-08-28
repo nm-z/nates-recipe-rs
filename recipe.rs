@@ -3819,7 +3819,7 @@ mod bundle {
 	fn model(blocks: Vec<Block>, loss: u8, quantization: u16) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		Ok(Model { blocks, loss: LossFunction(loss), quantization })
+		Ok(Model { blocks, loss: LossFunction(loss), quantization, downstream: None })
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -4505,6 +4505,21 @@ pub struct Model {
 	blocks: Vec<Block>,
 	loss: LossFunction,
 	quantization: u16,
+	downstream: Option<Box<Model>>,
+}
+pub enum ModelLoss<'a> {
+	Function(LossFunction),
+	Model(&'a Model),
+}
+impl From<LossFunction> for ModelLoss<'_> {
+	fn from(loss: LossFunction) -> Self {
+		Self::Function(loss)
+	}
+}
+impl<'a> From<&'a Model> for ModelLoss<'a> {
+	fn from(model: &'a Model) -> Self {
+		Self::Model(model)
+	}
 }
 macro_rules! operation_methods { ($(fn $method:ident($($argument:ident: $kind:ty),*) = $operation:expr;)+) => {
 $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) })+ }; }
@@ -4558,9 +4573,15 @@ impl Model {
 		block.normalization = Some(normalization.normalization());
 		model
 	}
-	pub fn loss(&self, loss: LossFunction) -> Self {
+	pub fn loss<'a>(&self, loss: impl Into<ModelLoss<'a>>) -> Self {
 		let mut model = self.clone();
-		model.loss = loss;
+		match loss.into() {
+			ModelLoss::Function(loss) => {
+				model.loss = loss;
+				model.downstream = None
+			}
+			ModelLoss::Model(downstream) => model.downstream = Some(Box::new(downstream.clone())),
+		}
 		model
 	}
 	pub fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self {
@@ -6038,21 +6059,29 @@ impl LossFunction {
 	}
 }
 impl Recipe {
+	fn prepared_data(sources: Vec<String>, autoregressive: bool, prepared: OnceLock<Result<Prepared>>) -> Data {
+		Data { sources, tests: Vec::new(), autoregressive, target: Vec::new(), exclusions: Vec::new(), broadcast: false, normalize: false, split: 1.0, prepared }
+	}
 	pub fn data<T: IntoDataSources>(&self, sources: T) -> Data {
-		Data {
-			sources: sources.into_data_sources(),
-			tests: Vec::new(),
-			autoregressive: T::AUTO,
-			target: Vec::new(),
-			exclusions: Vec::new(),
-			broadcast: false,
-			normalize: false,
-			split: 1.0,
-			prepared: OnceLock::new(),
+		Self::prepared_data(sources.into_data_sources(), T::AUTO, OnceLock::new())
+	}
+	pub fn lut<const N: usize>(&self, axes: [[u32; N]; 3]) -> Data {
+		assert!(N != 0 && axes.iter().flatten().all(|extent| *extent != 0), "RAT LUT extents must be positive");
+		let mut samples = Vec::new();
+		for m in axes[0] {
+			for n in axes[1] {
+				for k in axes[2] {
+					samples.extend([f64::from(m), f64::from(n), f64::from(k)])
+				}
+			}
 		}
+		let targets = vec![0.0; samples.len() / 3];
+		let prepared = OnceLock::new();
+		assert!(prepared.set(Prepared::matrix(samples, targets, 1)).is_ok());
+		Self::prepared_data(Vec::new(), false, prepared)
 	}
 	pub fn model(&self) -> Model {
-		Model { blocks: Vec::new(), loss: mse, quantization: 0 }
+		Model { blocks: Vec::new(), loss: mse, quantization: 0, downstream: None }
 	}
 	pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64, rat: None }
@@ -11357,6 +11386,7 @@ impl Prepared {
 		require(target_width != 0 && !targets.is_empty() && targets.len() % target_width == 0, "prepared matrix requires a whole target batch")?;
 		let rows = targets.len() / target_width;
 		require(samples.len() % rows == 0, "prepared matrix requires a whole sample batch")?;
+		let identities = (0..rows as u64).collect();
 		Ok(Self {
 			features: samples.len() / rows,
 			samples,
@@ -11369,7 +11399,7 @@ impl Prepared {
 			target_categorical: false,
 			norm_mean: Vec::new(),
 			norm_scale: Vec::new(),
-			identities: Vec::new(),
+			identities,
 			fitted: Vec::new(),
 		})
 	}
@@ -13398,9 +13428,12 @@ impl Compute {
 }
 impl Train {
 	/// Selects native contraction tiles by training the tile model through the frozen benchmark model.
-	pub fn rat(mut self, benchmark: &Model, tiles: &Model, invalid_score: f64) -> Self {
+	pub fn rat(mut self, model: &Model, invalid_score: f64) -> Self {
 		assert!(invalid_score.is_finite() && invalid_score < 0.0, "RAT invalid score must be finite and negative");
-		self.rat = Some(RatModels { benchmark: benchmark.clone(), tile: tiles.clone(), invalid_score });
+		let benchmark = model.downstream.as_deref().unwrap_or_else(|| panic!("RAT tile model requires .loss(&benchmark)"));
+		let mut tile_model = model.clone();
+		tile_model.downstream = None;
+		self.rat = Some(RatModels { benchmark: benchmark.clone(), tile: tile_model, invalid_score });
 		self
 	}
 	fn arithmetic(mut self, format: Compute) -> Self {
@@ -13543,7 +13576,7 @@ impl Train {
 		let report_r2 = self.log_metrics.iter().any(|metric| metric.0 == R2.0);
 		let mut epoch_seconds = 0.0;
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
-		if self.epochs != 0 {
+		if self.epochs != 0 || self.rat.is_some() {
 			epoch_seconds += tune_contraction_schedules(&mut tape, &stored.graph, self.learning_rate, config, self.rat.as_ref())?;
 		}
 		for _ in 0..self.epochs {
