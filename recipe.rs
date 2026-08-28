@@ -4379,6 +4379,19 @@ enum Backend {
 	Amd,
 	Nvidia,
 }
+/// The caller's workload generator. Recipe calls it for one sampled workload
+/// and knows only how many values one workload carries; the distribution, its
+/// limits, and its cardinality stay with the caller.
+pub struct Trial {
+	generate: Box<dyn Fn() -> Vec<f64>>,
+	width: usize,
+}
+/// Where one `recipe.data()` draws its rows: named files, or the caller's
+/// generator.
+pub enum Source {
+	Paths(Vec<String>),
+	Trial(Trial),
+}
 pub struct Data {
 	sources: Vec<String>,
 	tests: Vec<String>,
@@ -4388,6 +4401,7 @@ pub struct Data {
 	broadcast: bool,
 	normalize: bool,
 	split: f64,
+	trial: Option<Trial>,
 	prepared: OnceLock<Result<Prepared>>,
 }
 #[derive(Clone, Copy)]
@@ -6059,11 +6073,14 @@ impl LossFunction {
 	}
 }
 impl Recipe {
-	fn prepared_data(sources: Vec<String>, autoregressive: bool, prepared: OnceLock<Result<Prepared>>) -> Data {
-		Data { sources, tests: Vec::new(), autoregressive, target: Vec::new(), exclusions: Vec::new(), broadcast: false, normalize: false, split: 1.0, prepared }
+	fn prepared_data(sources: Vec<String>, autoregressive: bool, trial: Option<Trial>) -> Data {
+		Data { sources, tests: Vec::new(), autoregressive, target: Vec::new(), exclusions: Vec::new(), broadcast: false, normalize: false, split: 1.0, trial, prepared: OnceLock::new() }
 	}
 	pub fn data<T: IntoDataSources>(&self, sources: T) -> Data {
-		Self::prepared_data(sources.into_data_sources(), T::AUTO, OnceLock::new())
+		match sources.into_source() {
+			Source::Paths(paths) => Self::prepared_data(paths, T::AUTO, None),
+			Source::Trial(trial) => Self::prepared_data(Vec::new(), false, Some(trial)),
+		}
 	}
 	pub fn model(&self) -> Model {
 		Model { blocks: Vec::new(), loss: mse, quantization: 0, downstream: None }
@@ -10406,6 +10423,12 @@ fn nvidia(cus: u32, wave: u32, workgroup: u32, block_lds: u32, sm_lds: u32, wave
 pub trait IntoDataSources {
 	const AUTO: bool = false;
 	fn into_data_sources(self) -> Vec<String>;
+	fn into_source(self) -> Source
+	where
+		Self: Sized,
+	{
+		Source::Paths(self.into_data_sources())
+	}
 }
 impl IntoDataSources for Auto {
 	const AUTO: bool = true;
@@ -10436,6 +10459,16 @@ impl<T: Into<String>> IntoDataSources for Vec<T> {
 impl<T: Clone + Into<String>> IntoDataSources for &[T] {
 	fn into_data_sources(self) -> Vec<String> {
 		self.iter().cloned().map(Into::into).collect()
+	}
+}
+/// A workload generator names its own misuse rather than reading as an empty
+/// column list, so `.target()`, `.exclude()`, and `.test()` stay honest.
+impl<const N: usize, F: Fn() -> [u32; N] + 'static> IntoDataSources for F {
+	fn into_data_sources(self) -> Vec<String> {
+		panic!("a trial generator belongs in recipe.data(), not in .target(), .exclude(), or .test()")
+	}
+	fn into_source(self) -> Source {
+		Source::Trial(Trial { generate: Box::new(move || self().map(f64::from).to_vec()), width: N })
 	}
 }
 impl Data {
@@ -10523,6 +10556,24 @@ fn prepare(data: &Data) -> Result<&Prepared> {
 		Ok(prepared) => Ok(prepared),
 		Err(error) => Err(error.clone()),
 	}
+}
+/// One sampled workload, drawn once from the caller's generator. Every table
+/// setting names a file or column a generator does not have, so each is an
+/// error here rather than a value this quietly ignores.
+fn prepare_trial(data: &Data, trial: &Trial) -> Result<Prepared> {
+	require(data.sources.is_empty(), "a trial generator supplies its own workloads, so .set() has no source to add")?;
+	require(data.tests.is_empty(), "a trial generator supplies its own workloads, so .test() has no held-out file")?;
+	require(data.target.is_empty(), "a trial generator's values are the workload, so .target() has no column to name")?;
+	require(data.exclusions.is_empty(), "a trial generator's values are the workload, so .exclude() has no column to drop")?;
+	require(!data.broadcast, "a trial generator draws one row, so .broadcast() has no tables to align")?;
+	// One row's variance is zero, so normalizing would divide the workload out
+	// to exactly zero instead of scaling it.
+	require(!data.normalize, "a trial generator's workload must reach the benchmark unscaled, so .norm() is unsupported")?;
+	require(data.split == 1.0, "a trial generator draws one row, so .split() cannot hold any of it back")?;
+	let workload = (trial.generate)();
+	require(workload.len() == trial.width, format!("trial generator produced {} values, expected {}", workload.len(), trial.width))?;
+	require(workload.iter().all(|value| value.is_finite()), "trial generator produced a nonfinite workload")?;
+	Prepared::matrix(workload, vec![0.0], 1)
 }
 fn column_match(name: &str, table: &Table, header: &str, column: usize) -> bool {
 	name == header
@@ -11096,6 +11147,9 @@ fn png_pixels(bytes: &[u8]) -> Result<(usize, usize, usize, Vec<u8>)> {
 	Ok((width, height, channels, pixels))
 }
 fn prepare_data(data: &Data) -> Result<Prepared> {
+	if let Some(trial) = &data.trial {
+		return prepare_trial(data, trial);
+	}
 	let (mut tables, sources) = load_tables(data, &data.sources)?;
 	let source_table_rows = tables.first().map_or(0, |table| table.rows.len());
 	if !data.tests.is_empty() {
@@ -12615,6 +12669,10 @@ impl Train {
 	fn try_run(&self, model: &Model, data: &Data, evaluation: bool) -> Result<TrainingReport> {
 		let started = Instant::now();
 		let prepared = prepare(data)?;
+		require(
+			data.trial.is_none() || (self.save.is_none() && self.resume.is_none()),
+			"a trial generator draws a new workload every run, so its row has no saved identity to match: .save() and .resume() are unsupported",
+		)?;
 		let training_rows = ((prepared.source_rows as f64) * data.split).floor() as usize;
 		require(training_rows != 0 && training_rows <= prepared.source_rows, "split must select training rows")?;
 		let (gpu, mut config) = (selected_gpu()?, Config::load()?);
