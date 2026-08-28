@@ -6411,6 +6411,22 @@ fn rat_graph(model: &Model, rat: &RatBenchmark, prepared: &Prepared, gpu: &'stat
 	// The proposal is the tile model's own last node, read before the
 	// composition appends anything after it.
 	let proposal = graph.nodes.len() - 1;
+	// A freshly initialized projection proposes near zero, which no device can
+	// dispatch, so every measurement would be the caller's penalty and the
+	// benchmark model would learn one constant with no gradient toward a valid
+	// extent. Start the proposal at the extent the compiler itself chose for a
+	// sampled workload: device-derived, dispatchable, and in the right decade.
+	if rat.workload == 3
+		&& rat.tile == 3
+		&& let Some(bias) = output_bias_offset(&graph)
+	{
+		let whole = |value: f64| value.round().clamp(1.0, f64::from(u32::MAX)) as u32;
+		let sampled = [whole(prepared.samples[0]), whole(prepared.samples[1]), whole(prepared.samples[2])];
+		let analytic = contraction_probe(sampled, gpu, config)?.2.forward;
+		for (channel, extent) in [analytic.m, analytic.n, analytic.k].into_iter().enumerate() {
+			graph.parameters[bias + channel] = f64::from(extent);
+		}
+	}
 	let offset = compose_benchmark(&mut graph, benchmark.clone())?;
 	Ok(RatComposition { graph, benchmark, loss, proposal, offset })
 }
@@ -7367,10 +7383,11 @@ fn native_extent_valid(extent: Tile, limits: Tile, compiled: &NativeSchedule, ra
 pub fn measure_contraction(workload: [u32; 3], extent: [u32; 3]) -> Option<f64> {
 	measured_contraction(workload, extent).unwrap_or_else(|error| panic!("{error}"))
 }
-fn measured_contraction(workload: [u32; 3], extent: [u32; 3]) -> Result<Option<f64>> {
+/// The tape one workload's contraction runs on, the shape bounding its extents,
+/// and the analytic extent the compiler chose for it.
+fn contraction_probe(workload: [u32; 3], gpu: &'static Gpu, config: Config) -> Result<(NativeTape, NativeContractionShapes, NativeContractionTiles)> {
 	let [m, n, k] = workload;
 	require(m != 0 && n != 0 && k != 0, "contraction workload must be positive")?;
-	let (gpu, config) = (selected_gpu()?, Config::load()?);
 	// One projection node over `m` rows: `native_contraction_shapes` reads its
 	// forward extent back as exactly this workload's `m, n, k`.
 	let mut graph = Graph::new(Shape { channels: k as usize, length: 1 });
@@ -7378,10 +7395,15 @@ fn measured_contraction(workload: [u32; 3], extent: [u32; 3]) -> Result<Option<f
 	let rows = m as usize;
 	let samples = (0..checked_mul(rows, k as usize, "contraction sample values")?).map(|value| ((value % 17) as f64 - 8.0) / 8.0).collect::<Vec<_>>();
 	// No targets and no loss, so the artifact emits the forward pass alone.
-	let mut tape = NativeTape::new(&graph, &samples, &[], gpu, config.precision, None)?;
+	let tape = NativeTape::new(&graph, &samples, &[], gpu, config.precision, None)?;
 	let shapes = native_contraction_shapes(&graph, rows)?;
 	let shape = shapes.first().copied().flatten().ok_or_else(|| RecipeError::new("contraction workload has no contraction node"))?;
-	let mut tiles = tape.program.contractions.first().copied().flatten().ok_or_else(|| RecipeError::new("contraction workload has no dispatched schedule"))?;
+	let tiles = tape.program.contractions.first().copied().flatten().ok_or_else(|| RecipeError::new("contraction workload has no dispatched schedule"))?;
+	Ok((tape, shape, tiles))
+}
+fn measured_contraction(workload: [u32; 3], extent: [u32; 3]) -> Result<Option<f64>> {
+	let (gpu, config) = (selected_gpu()?, Config::load()?);
+	let (mut tape, shape, mut tiles) = contraction_probe(workload, gpu, config)?;
 	let ratio = narrow(tape.precision.state.bytes().div_ceil(tape.precision.model.bytes()), "native contraction state ratio")? as u32;
 	let extent = Tile { m: extent[0], n: extent[1], k: extent[2] };
 	if !native_extent_valid(extent, shape.forward, &tape.program.compiled, ratio)? {
@@ -12901,26 +12923,8 @@ impl Train {
 				tape.samples.write_float_bytes(0, &workload, tape.precision.model)?;
 				tape.forward()?;
 				let proposed = tape.node_values(*proposal, rat.tile)?;
-				require(proposed.iter().all(|value| value.is_finite()), "the tile model produced a nonfinite proposal")?;
-				// The proposal is exponentiated, so a near-zero initial output is
-				// one tile unit rather than zero, every proposal stays positive,
-				// and none is bounded above. One unit is one of the backend's own
-				// structural quanta, so the smallest proposal is the smallest tile
-				// the hardware dispatches. Axes past the backend's three take a
-				// unit quantum, so a wider tile still maps.
-				let quanta = [
-					narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32,
-					narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32,
-					narrow(natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?, "contraction fragment K")? as u32,
-				];
 				let whole = |values: &[f64]| values.iter().map(|value| value.round().clamp(0.0, f64::from(u32::MAX)) as u32).collect::<Vec<_>>();
-				let units = |values: &[f64]| {
-					values.iter()
-						.enumerate()
-						.map(|(axis, value)| (value.exp().round().clamp(1.0, f64::from(u32::MAX)) as u32).saturating_mul(quanta.get(axis).copied().unwrap_or(1)))
-						.collect::<Vec<_>>()
-				};
-				let (extents, sampled) = (units(&proposed), whole(&workload));
+				let (extents, sampled) = (whole(&proposed), whole(&workload));
 				let measured = (rat.measure)(&sampled, &extents);
 				require(measured.is_finite(), "the RAT benchmark must return a finite measurement")?;
 				observations.extend(workload.iter().chain(&proposed).copied());
