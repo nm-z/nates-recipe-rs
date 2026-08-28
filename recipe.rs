@@ -7340,11 +7340,8 @@ fn write_contraction_schedule(contexts: &Buffer, layout: &NativeLayout, contract
 }
 /// Whether one runtime extent satisfies the contraction body's structural
 /// bounds and fits within the local-memory capacity reserved for candidates.
-fn native_extent_supported(extent: Tile, limits: Tile, fixed_k: u32, matrix: bool, block: u32, register_m: u32, register_n: u32, chunk: u32, ratio: u32, shared_values: u32) -> Result<bool> {
+fn native_extent_supported(extent: Tile, limits: Tile, matrix: bool, block: u32, register_m: u32, register_n: u32, chunk: u32, ratio: u32, shared_values: u32) -> Result<bool> {
 	if extent.m == 0 || extent.n == 0 || extent.k == 0 {
-		return Ok(false);
-	}
-	if extent.k != fixed_k {
 		return Ok(false);
 	}
 	if matrix {
@@ -7370,8 +7367,8 @@ fn native_extent_supported(extent: Tile, limits: Tile, fixed_k: u32, matrix: boo
 }
 /// Whether one supported runtime extent fits every resource bound the compiled
 /// artifact reserved, including its private chunk buffers.
-fn native_extent_valid(extent: Tile, limits: Tile, fixed_k: u32, compiled: &NativeSchedule, ratio: u32) -> Result<bool> {
-	if !native_extent_supported(extent, limits, fixed_k, compiled.matrix, compiled.block, compiled.register_m, compiled.register_n, compiled.chunk_k, ratio, compiled.shared_values)? {
+fn native_extent_valid(extent: Tile, limits: Tile, compiled: &NativeSchedule, ratio: u32) -> Result<bool> {
+	if !native_extent_supported(extent, limits, compiled.matrix, compiled.block, compiled.register_m, compiled.register_n, compiled.chunk_k, ratio, compiled.shared_values)? {
 		return Ok(false);
 	}
 	let lanes = (extent.m / compiled.register_m).max(1).checked_mul((extent.n / compiled.register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
@@ -7409,7 +7406,7 @@ fn measured_contraction(workload: [u32; 3], extent: [u32; 3]) -> Result<Option<f
 	let (mut tape, shape, mut tiles) = contraction_probe(workload, gpu, config)?;
 	let ratio = narrow(tape.precision.state.bytes().div_ceil(tape.precision.model.bytes()), "native contraction state ratio")? as u32;
 	let extent = Tile { m: extent[0], n: extent[1], k: extent[2] };
-	if !native_extent_valid(extent, shape.forward, tiles.forward.k, &tape.program.compiled, ratio)? {
+	if !native_extent_valid(extent, shape.forward, &tape.program.compiled, ratio)? {
 		return Ok(None);
 	}
 	tiles.forward = extent;
@@ -7421,23 +7418,30 @@ fn measured_contraction(workload: [u32; 3], extent: [u32; 3]) -> Result<Option<f
 	Ok(Some(started.elapsed().as_secs_f64()))
 }
 /// Valid runtime extents for one contraction direction. M and N vary over the
-/// workgroup's lane splits, while K remains fixed so tuning cannot change the
-/// deterministic reduction order.
+/// workgroup's lane splits, and K over the staging fragment's multiples up to
+/// the contraction's own depth.
 fn native_valid_extents(limits: Tile, selected: Tile, matrix: bool, block: u32, register_m: u32, register_n: u32, chunk: u32, ratio: u32, shared_values: u32) -> Result<Vec<Tile>> {
 	let mut extents = Vec::new();
 	if matrix {
-		return native_extent_supported(selected, limits, selected.k, matrix, block, register_m, register_n, chunk, ratio, shared_values)
-			.map(|valid| if valid { vec![selected] } else { Vec::new() });
+		return native_extent_supported(selected, limits, matrix, block, register_m, register_n, chunk, ratio, shared_values).map(|valid| if valid { vec![selected] } else { Vec::new() });
 	}
+	let fragment = narrow(natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?, "contraction fragment K")? as u32;
+	// A staging load never straddles a depth boundary, and the analytic choice
+	// stays a candidate even when it is not a multiple of the fragment.
+	let mut depths = (1..=limits.k.div_ceil(fragment.max(1))).map(|step| (step * fragment).min(limits.k)).chain([selected.k]).collect::<Vec<_>>();
+	depths.sort_unstable();
+	depths.dedup();
 	let lane_n_limit = limits.n.div_ceil(register_n).min(block);
-	for lane_n in 1..=lane_n_limit {
-		let lane_m_limit = limits.m.div_ceil(register_m).min((block / lane_n).max(1));
-		for lane_m in 1..=lane_m_limit {
-			let m = lane_m.checked_mul(register_m).ok_or_else(|| RecipeError::new("native contraction M tile overflows"))?;
-			let n = lane_n.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction N tile overflows"))?;
-			let extent = Tile { m, n, k: selected.k };
-			if native_extent_supported(extent, limits, selected.k, matrix, block, register_m, register_n, chunk, ratio, shared_values)? {
-				extents.push(extent);
+	for depth in depths {
+		for lane_n in 1..=lane_n_limit {
+			let lane_m_limit = limits.m.div_ceil(register_m).min((block / lane_n).max(1));
+			for lane_m in 1..=lane_m_limit {
+				let m = lane_m.checked_mul(register_m).ok_or_else(|| RecipeError::new("native contraction M tile overflows"))?;
+				let n = lane_n.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction N tile overflows"))?;
+				let extent = Tile { m, n, k: depth };
+				if native_extent_supported(extent, limits, matrix, block, register_m, register_n, chunk, ratio, shared_values)? {
+					extents.push(extent);
+				}
 			}
 		}
 	}
