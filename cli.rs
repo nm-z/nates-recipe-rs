@@ -1,6 +1,6 @@
 use std::{fs, os::unix::process::ExitStatusExt, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [--device <name>]... <source.rs> [export]\n       recipe --worker <device>";
+const USAGE: &str = "usage: recipe [--device <name>]... <source.rs> [export]\n       recipe --devices\n       recipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -99,6 +99,16 @@ fn main() {
 	let mut arguments = std::env::args().skip(1);
 	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
 	while let Some(argument) = arguments.next() {
+		if argument == "--devices" {
+			let names = recipe::worker_devices().unwrap_or_else(|error| {
+				eprintln!("{error}");
+				std::process::exit(1)
+			});
+			for name in names {
+				println!("{name}");
+			}
+			return;
+		}
 		if argument == "--worker" {
 			let name = arguments.next().unwrap_or_else(|| invalid("--worker requires a device name"));
 			recipe::worker_serve(&name).unwrap_or_else(|error| {

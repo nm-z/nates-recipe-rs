@@ -32,11 +32,14 @@ Select one or more local or host-qualified devices by repeating `--device`:
 ```text
 recipe --device amd0 model.rs
 recipe --device amd0 --device archy:nv0 model.rs
+recipe --device amd0 --device archy:* model.rs
 ```
+
+A `host:*` selector expands into every device that host reports, so each route candidate carries a concrete `host:device` identity. Quote it when the shell would otherwise glob it.
 
 Recipe measures each selected link and each device's gradient throughput before it places training rows. It keeps the tape on the primary device when the measured multi-device placement is not faster.
 
-`recipe --worker <device>` serves one local GPU over stdin and stdout. Recipe starts this transport entrypoint through SSH for a host-qualified selector. It is a protocol endpoint, not a model script invocation.
+`recipe --worker <device>` serves one local GPU over stdin and stdout, and `recipe --devices` lists this host's devices for an expanding selector. Recipe starts both transport entrypoints through SSH for a host-qualified selector. They are protocol endpoints, not model script invocations.
 
 ## files
 

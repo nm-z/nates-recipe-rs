@@ -8902,19 +8902,60 @@ fn local_host() -> Result<String> {
 	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	Ok(host.trim().to_owned())
 }
+/// Asks the remote host which devices it has by running the verified copy of
+/// this binary there, the same transport that serves each device.
+fn remote_device_names(host: &str) -> Result<Vec<String>> {
+	let (directory, remote_path) = upload_worker(host, host)?;
+	let mut listing = Command::new("ssh");
+	listing.args(["-o", "BatchMode=yes", host, &format!("{remote_path} --devices")]);
+	let listed = command_output(&mut listing, &format!("list the devices on {host}"))?;
+	drop(directory);
+	let listed = String::from_utf8(listed).map_err(|error| RecipeError::new(format!("device listing from {host} is invalid: {error}")))?;
+	listed.lines()
+		.map(str::trim)
+		.filter(|name| !name.is_empty())
+		.map(|name| {
+			require(name.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)), format!("device name from {host} is unsafe: {name:?}"))?;
+			Ok(name.to_owned())
+		})
+		.collect()
+}
+/// Expands one `host:*` selector into the concrete `host:device` candidates
+/// that host actually reports. The local host answers from its own device
+/// list; a remote host answers over the worker transport. A remote listing
+/// drops the CPU fallback device, which `worker_serve` refuses to serve.
+fn expand_host(remote: &str, host: &str, local_only: bool) -> Result<Vec<String>> {
+	require(!remote.is_empty() && remote.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)), format!("remote host name is unsafe: {remote:?}"))?;
+	let names = if remote == host {
+		devices()?.iter().map(|gpu| gpu.name.clone()).collect()
+	} else {
+		require(!local_only, format!("multi-device is local, so host {remote:?} cannot be expanded"))?;
+		remote_device_names(remote)?.into_iter().filter(|name| name != "cpu").collect::<Vec<_>>()
+	};
+	require(!names.is_empty(), format!("host {remote:?} reports no eligible device"))?;
+	Ok(names.into_iter().map(|name| format!("{remote}:{name}")).collect())
+}
 static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 /// Resolves the `RECIPE_DEVICE` selection to the ordered device list. Each
-/// comma-separated name is a local device (`amd0`, `engi:amd0`) or a device on
-/// a reachable host (`benji:nv0`); the first name is the primary device.
+/// comma-separated name is a local device (`amd0`, `engi:amd0`), a device on a
+/// reachable host (`benji:nv0`), or a `host:*` selector that expands into every
+/// device that host reports; the first name is the primary device.
 fn selected_gpus() -> Result<&'static [&'static Gpu]> {
 	SELECTED
 		.get_or_init(|| {
 			let Some(selection) = std::env::var("RECIPE_DEVICE").ok() else { return device(None).map(|gpu| vec![gpu]) };
 			let (host, local_only) = (local_host()?, Config::load()?.multi_device == MultiDevice::Local);
-			let mut selected = Vec::new();
+			let mut names = Vec::new();
 			// `multi-device = false` trains on the local device, so a wider
 			// selection never connects to, allocates on, or executes on another.
-			for name in selection.split(',').take(if local_only { 1 } else { usize::MAX }) {
+			for selector in selection.split(',').take(if local_only { 1 } else { usize::MAX }) {
+				match selector.split_once(':') {
+					Some((remote, "*")) => names.extend(expand_host(remote, &host, local_only)?),
+					_ => names.push(selector.to_owned()),
+				}
+			}
+			let mut selected = Vec::new();
+			for name in names.iter().map(String::as_str).take(if local_only { 1 } else { usize::MAX }) {
 				let gpu = match devices()?.iter().find(|gpu| gpu.name == name || format!("{host}:{}", gpu.name) == name) {
 					Some(gpu) => gpu,
 					None => match name.split_once(':') {
@@ -8960,18 +9001,10 @@ fn remote_directory(host: &str) -> Result<RemoteDirectory> {
 	)?;
 	Ok(RemoteDirectory { host: host.to_owned(), path })
 }
-/// Uploads this build's `recipe` binary to the remote host, starts it as a
-/// device worker over SSH, and wraps the probed device as a local `Gpu` whose
-/// driver speaks the worker protocol.
-fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'static Gpu> {
-	static REMOTES: Mutex<Vec<&'static Gpu>> = Mutex::new(Vec::new());
-	for (kind, value) in [("host", host), ("device", device_name)] {
-		require(!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)), format!("remote {kind} name is unsafe: {value:?}"))?;
-	}
-	let mut remotes = REMOTES.lock().map_err(|_| RecipeError::new("remote registry is poisoned"))?;
-	if let Some(gpu) = remotes.iter().find(|gpu| gpu.name == canonical) {
-		return Ok(gpu);
-	}
+/// Copies this build's `recipe` binary into a private directory on the remote
+/// host and verifies the copy by hash. Both the device listing and the device
+/// worker run from the returned path; dropping the directory removes it.
+fn upload_worker(host: &str, canonical: &str) -> Result<(RemoteDirectory, String)> {
 	let binary = std::env::var_os("RECIPE_BINARY").map(PathBuf::from).ok_or_else(|| RecipeError::new(format!("GPU {canonical:?} requires the recipe launcher to reach host {host:?}")))?;
 	require(binary.is_file(), format!("recipe binary is absent at {}", binary.display()))?;
 	let directory = remote_directory(host)?;
@@ -8990,6 +9023,21 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 	remote_hash.args(["-o", "BatchMode=yes", host, &format!("sha256sum {remote_path}")]);
 	let remote_hash = command_output(&mut remote_hash, &format!("hash the copied worker on {host}"))?;
 	require(local_hash.split(|byte| byte.is_ascii_whitespace()).next() == remote_hash.split(|byte| byte.is_ascii_whitespace()).next(), format!("copied worker hash differs on {host}"))?;
+	Ok((directory, remote_path))
+}
+/// Uploads this build's `recipe` binary to the remote host, starts it as a
+/// device worker over SSH, and wraps the probed device as a local `Gpu` whose
+/// driver speaks the worker protocol.
+fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'static Gpu> {
+	static REMOTES: Mutex<Vec<&'static Gpu>> = Mutex::new(Vec::new());
+	for (kind, value) in [("host", host), ("device", device_name)] {
+		require(!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)), format!("remote {kind} name is unsafe: {value:?}"))?;
+	}
+	let mut remotes = REMOTES.lock().map_err(|_| RecipeError::new("remote registry is poisoned"))?;
+	if let Some(gpu) = remotes.iter().find(|gpu| gpu.name == canonical) {
+		return Ok(gpu);
+	}
+	let (directory, remote_path) = upload_worker(host, canonical)?;
 	let mut child = Command::new("ssh")
 		.args(["-o", "BatchMode=yes", host, &format!("{remote_path} --worker {device_name}")])
 		.stdin(std::process::Stdio::piped())
@@ -9772,6 +9820,11 @@ struct WorkerProgram {
 	dispatches: [Option<Dispatch>; 3],
 	shared_values: u32,
 	reduction_values: u32,
+}
+/// Lists this host's device names, one per line, for a driving process
+/// expanding a `host:*` selector into concrete `host:device` candidates.
+pub fn worker_devices() -> Result<Vec<String>> {
+	Ok(devices()?.iter().map(|gpu| gpu.name.clone()).collect())
 }
 /// Serves one local device to a remote Recipe process over stdin/stdout: the
 /// transport half of a cross-host topology link. Commands mirror the `Gpu`
