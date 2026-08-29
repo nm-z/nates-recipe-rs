@@ -1,0 +1,76 @@
+rm	register tile M
+rn	register tile N
+
+rdfk	reduction fragment K
+rdck	reduction chunk K
+
+kpl	split-K partition limit
+kvs	split-K vector span
+kms	split-K matrix span
+
+swz	swizzle width
+
+cu	CUs
+tpwg	threads/wkgrp
+tpwv	threads/wave
+wpwg	waves/wkgrp
+wvmd	wave mode
+wg	workgroups
+
+F(
+	wg,
+	wvmd,
+	wpwg,
+	M, N, K,
+	m, n, k,
+	rm, rn,
+	rdfk, rdck,
+	kpl, kvs, kms,
+	swz
+) -> time
+
+constraints
+	real
+		cu	54
+		tpwg	<= 1024
+		tpwg = tpwv × wpwg
+		wvmd
+			wave32
+				tpwv = 32
+				wpwg <= 32
+			wave64
+				tpwv = 64
+				wpwg <= 16
+	reasonable
+		m <= M
+		n <= N
+		k <= K
+RAT
+	wg
+	wpwg
+	wvmd
+	load
+		M
+		N
+		K
+	tile
+		m
+		n
+		k
+	register tile
+		rm
+		rn
+	reduction
+		fragment
+			rdfk
+		chunk
+			rdck
+	split-K
+		partition limit
+			kpl
+		vector span
+			kvs
+		matrix span
+			kms
+	swizzle
+		swz
