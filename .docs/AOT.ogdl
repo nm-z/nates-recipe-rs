@@ -1,0 +1,17 @@
+fwd	forward pass
+tt	through the
+bih	bitch
+wgd	weight-gradient
+igd	input-gradient
+
+vec	vector
+mat	matrix
+
+AOT
+	ops
+		fwd
+		wgd
+		igd
+	implementation
+		vector
+		matrix
