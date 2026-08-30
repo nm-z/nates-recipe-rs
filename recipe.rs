@@ -10772,6 +10772,9 @@ fn column_match(name: &str, table: &Table, header: &str, column: usize) -> bool 
 		|| header.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.'))
 		|| header.rsplit_once('.').is_some_and(|(base, row)| row.parse::<usize>().is_ok() && (base == name || base.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.'))))
 }
+fn headerless_header(column: usize, width: usize) -> String {
+	if column == width { "target".to_owned() } else { format!("col{column}") }
+}
 fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathBuf>)> {
 	let mut paths = Vec::new();
 	for source in sources {
@@ -10829,13 +10832,15 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 	}
 	Ok((tables, paths))
 }
-/// One interpretation of directory layout for sample trees whose target is not a table
-/// column: flat sidecar-labeled samples, class-labeled subdirectories, and paired
-/// subdirectories. Each file is read once; text samples contribute their content and image
-/// samples their decoded pixels. Anything else falls through to the table flow.
+/// Recognizes flat, class-labeled, and paired sample trees; other layouts use table flow.
 fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>)], parsed: &[(PathBuf, Table)]) -> Result<Option<Table>> {
 	let [source] = sources else { return Ok(None) };
 	let [target] = data.target.as_slice() else { return Ok(None) };
+	if parsed.iter().any(|(_, table)| {
+		target_column(table, target).is_some() && (table.rows.len() > 1 || !table.headers.iter().enumerate().all(|(column, header)| *header == headerless_header(column + 1, table.headers.len())))
+	}) {
+		return Ok(None);
+	}
 	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension) || is_document(extension));
 	let samples = files.iter().filter(|(path, _)| sample(path)).collect::<Vec<_>>();
 	if samples.is_empty() {
@@ -10933,9 +10938,6 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 		return Ok(None);
 	}
 	// Class subdirectories: differing sample stems, the directory name is the target value.
-	if parsed.iter().any(|(_, table)| target_column(table, target).is_some()) {
-		return Ok(None);
-	}
 	let mut builder = SampleTableBuilder::new(target.clone());
 	for (directory, entries) in &directories {
 		for (path, bytes) in entries {
@@ -12548,10 +12550,8 @@ fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	let first = rows.remove(0);
 	let numeric = |value: &String| value.parse::<f64>().is_ok();
 	let headerless = first.iter().all(numeric) || rows.is_empty();
-	// A headerless table carries its label in the conventional final position, so that
-	// column's authoritative name is "target" and the earlier columns take positional
-	// names. Positional colN forms still match every column through column_match.
-	let headers = if headerless { (1..=first.len()).map(|column| if column == first.len() { "target".to_owned() } else { format!("col{column}") }).collect() } else { first.clone() };
+	// Headerless tables use positional features and a final "target" column.
+	let headers = if headerless { (1..=first.len()).map(|column| headerless_header(column, first.len())).collect() } else { first.clone() };
 	if headerless {
 		rows.insert(0, first);
 	}
