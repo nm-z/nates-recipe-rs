@@ -10853,9 +10853,9 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 /// subdirectories. Each file is read once; text samples contribute their content and image
 /// samples their decoded pixels. Anything else falls through to the table flow.
 fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>)], parsed: &[(PathBuf, Table)]) -> Result<Option<Table>> {
-	let [source] = sources else { return Ok(None) };
-	let [target] = data.target.as_slice() else { return Ok(None) };
-	if parsed.iter().any(|(_, table)| target_column(table, target).is_some()) {
+	let ([source], [target]) = (sources, data.target.as_slice()) else { return Ok(None) };
+	let scalar_target = |table: &Table| table.name == *target && table.headers.len() == 1 && table.rows.len() == 1;
+	if parsed.iter().any(|(_, table)| target_column(table, target).is_some() && !scalar_target(table)) {
 		return Ok(None);
 	}
 	let sample = |path: &Path| path.extension().and_then(|value| value.to_str()).is_some_and(|extension| is_table(extension) || is_image(extension) || is_document(extension));
