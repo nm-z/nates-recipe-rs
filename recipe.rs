@@ -4433,11 +4433,16 @@ pub struct Data {
 	tests: Vec<String>,
 	autoregressive: bool,
 	target: Vec<String>,
-	exclusions: Vec<String>,
+	features: FeatureSelection,
 	broadcast: bool,
 	normalize: bool,
 	split: f64,
 	prepared: OnceLock<Result<Prepared>>,
+}
+enum FeatureSelection {
+	All,
+	Include(Vec<String>),
+	Exclude(Vec<String>),
 }
 #[derive(Clone, Copy)]
 pub struct Auto;
@@ -6048,7 +6053,7 @@ impl Recipe {
 			tests: Vec::new(),
 			autoregressive: T::AUTO,
 			target: Vec::new(),
-			exclusions: Vec::new(),
+			features: FeatureSelection::All,
 			broadcast: false,
 			normalize: false,
 			split: 1.0,
@@ -10731,8 +10736,14 @@ impl Data {
 		self.target = target.into_data_sources();
 		self
 	}
+	pub fn include(mut self, names: impl IntoDataSources) -> Self {
+		assert!(!matches!(&self.features, FeatureSelection::Exclude(_)), "include and exclude are mutually exclusive");
+		self.features = FeatureSelection::Include(names.into_data_sources());
+		self
+	}
 	pub fn exclude(mut self, names: impl IntoDataSources) -> Self {
-		self.exclusions = names.into_data_sources();
+		assert!(!matches!(&self.features, FeatureSelection::Include(_)), "include and exclude are mutually exclusive");
+		self.features = FeatureSelection::Exclude(names.into_data_sources());
 		self
 	}
 	pub fn test(mut self, sources: impl IntoDataSources) -> Self {
@@ -10797,6 +10808,15 @@ fn column_match(name: &str, table: &Table, header: &str, column: usize) -> bool 
 		|| header.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.'))
 		|| header.rsplit_once('.').is_some_and(|(base, row)| row.parse::<usize>().is_ok() && (base == name || base.strip_suffix(name).is_some_and(|prefix| prefix.ends_with('.'))))
 }
+impl FeatureSelection {
+	fn selects(&self, table: &Table, header: &str, column: usize) -> bool {
+		match self {
+			Self::All => true,
+			Self::Include(names) => names.iter().any(|name| column_match(name, table, header, column)),
+			Self::Exclude(names) => !names.iter().any(|name| column_match(name, table, header, column)),
+		}
+	}
+}
 fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathBuf>)> {
 	let mut paths = Vec::new();
 	for source in sources {
@@ -10836,7 +10856,7 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 		return Ok((vec![table], paths));
 	}
 	let mut tables = merge_captures(grouped, &data.target)?;
-	tables = merge_partitions(tables, &data.target, &data.exclusions)?;
+	tables = merge_partitions(tables, &data.target, &data.features)?;
 	require(!tables.is_empty(), "data source contains no supported table")?;
 	if tables.len() > 1 {
 		let rows = tables.iter().map(|table| table.rows.len()).max().unwrap_or(0);
@@ -11403,8 +11423,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	let mut columns = Vec::new();
 	for (table, value) in tables.iter().enumerate() {
 		for (column, header) in value.headers.iter().enumerate() {
-			let excluded = data.exclusions.iter().any(|name| column_match(name, value, header, column));
-			if !selected.contains(&(table, column)) && !excluded {
+			if !selected.contains(&(table, column)) && data.features.selects(value, header, column) {
 				columns.push((table, column, infer_feature(value, column, source_table_rows)));
 			}
 		}
@@ -11698,7 +11717,7 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 	}
 	Ok(vec![Table { name: "data".to_owned(), headers, rows }])
 }
-fn merge_partitions(mut tables: Vec<Table>, targets: &[String], exclusions: &[String]) -> Result<Vec<Table>> {
+fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &FeatureSelection) -> Result<Vec<Table>> {
 	if targets.is_empty() || targets.iter().any(|target| target.contains('.')) {
 		return Ok(tables);
 	}
@@ -11717,7 +11736,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], exclusions: &[St
 	let union = Table { name: "data".to_owned(), headers: headers.clone(), rows: Vec::new() };
 	for &index in &members {
 		for (column, header) in headers.iter().enumerate() {
-			let ignored = targets.iter().chain(exclusions).any(|name| column_match(name, &union, header, column));
+			let ignored = targets.iter().any(|name| column_match(name, &union, header, column)) || !features.selects(&union, header, column);
 			require(ignored || tables[index].headers.contains(header), format!("feature {header:?} is absent from partition {:?}", tables[index].name))?;
 		}
 	}
