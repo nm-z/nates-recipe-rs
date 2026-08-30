@@ -1,6 +1,6 @@
 use std::{fs, os::unix::process::ExitStatusExt, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [--device <name>]... <source.rs> [export]\n       recipe --worker <device>";
+const USAGE: &str = "usage: recipe [--device <name>]... <source.rs> [export]\n       recipe --runtime\n       recipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -59,6 +59,10 @@ fn library_path(directory: &Path) -> PathBuf {
 }
 
 fn run(source: &Path, device: Option<&str>) {
+	if std::env::var_os("RECIPE_RUNTIME_EXECUTOR").is_none() {
+		recipe::submit(source, device)
+	}
+	recipe::runtime_watch().unwrap_or_else(|error| panic!("{error}"));
 	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
@@ -67,6 +71,7 @@ fn run(source: &Path, device: Option<&str>) {
 	fs::metadata(&library).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", library.display()));
 	let status = Command::new("rustc")
 		.arg("--edition=2024")
+		.args(["--crate-name", "recipe_script"])
 		.arg(source)
 		.arg("--extern")
 		.arg(format!("recipe={}", library.display()))
@@ -95,6 +100,13 @@ fn main() {
 	let mut arguments = std::env::args().skip(1);
 	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
 	while let Some(argument) = arguments.next() {
+		if argument == "--runtime" {
+			recipe::runtime_serve().unwrap_or_else(|error| {
+				eprintln!("{error}");
+				std::process::exit(1)
+			});
+			return;
+		}
 		if argument == "--worker" {
 			let name = arguments.next().unwrap_or_else(|| invalid("--worker requires a device name"));
 			recipe::worker_serve(&name).unwrap_or_else(|error| {
@@ -129,7 +141,7 @@ fn main() {
 	let source = source.unwrap_or_else(|| invalid(USAGE));
 	let device = device.as_deref();
 	let source = Path::new(&source);
-	if source.extension().and_then(|value| value.to_str()) != Some("rs") {
+	if source.extension().and_then(|value| value.to_str()) != Some("rs") && std::env::var_os("RECIPE_RUNTIME_EXECUTOR").is_none() {
 		invalid("recipe requires a Rust source")
 	}
 	match operation.as_deref() {
