@@ -85,12 +85,8 @@ fn run(source: &Path, device: Option<&str>) {
 	if let Some(device) = device {
 		command.env("RECIPE_DEVICE", device);
 	}
-	// The running child holds the inode, so unlinking now leaves nothing behind
-	// when this process is killed before it could otherwise clean up.
-	let status = command.spawn().and_then(|mut child| {
-		fs::remove_file(&output).ok();
-		child.wait()
-	});
+	let status = command.status();
+	fs::remove_file(&output).ok();
 	let status = status.unwrap_or_else(|error| panic!("cannot execute Recipe script: {error}"));
 	std::process::exit(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)));
 }
