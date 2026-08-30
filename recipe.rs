@@ -9400,7 +9400,7 @@ pub fn worker_serve(name: &str) -> Result<()> {
 				let training = wire.read_u8()? != 0;
 				let epoch_layout: &'static [u8] = if wire.read_u8()? != 0 { NATIVE_EPOCH_LAYOUT_FP64 } else { NATIVE_EPOCH_LAYOUT_FP32 };
 				let has_storage = wire.read_u8()? != 0;
-				let loaded = match &gpu.driver {
+				let loaded: Result<(NativeBackend, Dispatch, Option<Dispatch>, Option<Dispatch>)> = match &gpu.driver {
 					#[cfg(amd)]
 					Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves) }
 						.map(|(program, forward, epoch, model_load)| (NativeBackend::Amd(program), forward, epoch, model_load)),
