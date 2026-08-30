@@ -1138,6 +1138,16 @@ fn cpu_identity_field<'a>(field: &'a str, name: &str) -> Result<&'a str> {
 	field.strip_prefix(&prefix).filter(|value| !value.is_empty()).ok_or_else(|| RecipeError::new(format!("CPU native target field {name:?} is absent")))
 }
 
+const LLVM_OPAQUE_POINTER_DEFAULT_MAJOR: u32 = 15;
+fn cpu_llvm_major(compiler: &str) -> Result<u32> {
+	compiler
+		.split_once("clang version ")
+		.and_then(|(_, version)| version.split('.').next())
+		.and_then(|major| major.parse().ok())
+		.filter(|major| *major != 0)
+		.ok_or_else(|| RecipeError::new("CPU compiler LLVM major version is absent"))
+}
+
 fn cpu_identity(target: &str) -> Result<(&str, &str, &str, &str)> {
 	let mut fields = target.split(';');
 	let target = cpu_identity_field(fields.next().unwrap_or_default(), "target")?;
@@ -3416,9 +3426,13 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
-			let (target, _, _, _) = cpu_identity(target)?;
+			let (target, compiler_identity, _, _) = cpu_identity(target)?;
 			let mut command = Command::new(compiler);
-			command.args(["-target", target, "-march=native", "-Xclang", "-opaque-pointers", "-x", "ir", "-O2", "-fPIC", "-shared", "-o"]).arg(output).arg(source);
+			command.args(["-target", target, "-march=native"]);
+			if cpu_llvm_major(compiler_identity)? < LLVM_OPAQUE_POINTER_DEFAULT_MAJOR {
+				command.args(["-mllvm", "-opaque-pointers=1"]);
+			}
+			command.args(["-x", "ir", "-O2", "-fPIC", "-shared", "-o"]).arg(output).arg(source);
 			native_command(command, "CPU LLVM IR compiler", key).map(|_| Vec::new())
 		}
 		BackendTarget::Amd { architecture } => {
