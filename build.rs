@@ -261,7 +261,7 @@ fn alternating_factorials(first: u32, last: u32) -> Vec<f64> {
 fn shared_math(arithmetic: &str) -> String {
 	let mut block = String::new();
 	if arithmetic != "double" {
-		block.push_str("declare double @llvm.floor.f64(double) declare double @llvm.fabs.f64(double)\n");
+		block.push_str("declare double @llvm.floor.f64(double) declare double @llvm.fabs.f64(double) declare double @llvm.fma.f64(double, double, double)\n");
 	}
 	let infinity = constant(f64::INFINITY);
 	let negative_infinity = constant(f64::NEG_INFINITY);
