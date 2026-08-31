@@ -3433,7 +3433,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			if cpu_llvm_major(compiler_identity)? < LLVM_OPAQUE_POINTER_DEFAULT_MAJOR {
 				command.args(["-mllvm", "-opaque-pointers=1"]);
 			}
-			if compiler_identity.starts_with(APPLE_CLANG_BROKEN_LICM_PROMOTION_PREFIX) {
+			if compiler_identity.contains(APPLE_CLANG_BROKEN_LICM_PROMOTION_PREFIX) {
 				command.args(["-mllvm", "-disable-licm-promotion"]);
 			}
 			command.args(["-x", "ir", "-O2", "-fPIC", "-shared", "-o"]).arg(output).arg(source);
