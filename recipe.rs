@@ -1178,7 +1178,7 @@ const NATIVE_FORWARD_SYMBOL: &str = "recipe_model_forward";
 const NATIVE_EPOCH_SYMBOL: &str = "recipe_model_epoch";
 const NATIVE_MODEL_LOAD_SYMBOL: &str = "recipe_model_load";
 const NATIVE_CPU_THREAD_SYMBOL: &str = "recipe_model_thread";
-const NATIVE_FORWARD_LAYOUT: &[u8] = b"888844";
+const NATIVE_FORWARD_LAYOUT: &[u8] = b"8888444";
 const NATIVE_EPOCH_LAYOUT_FP64: &[u8] = b"88888888888844888888844";
 const NATIVE_EPOCH_LAYOUT_FP32: &[u8] = b"88888888888844444444444";
 const NATIVE_MODEL_LOAD_LAYOUT: &[u8] = b"884";
@@ -2918,7 +2918,14 @@ impl NativeModelIr {
 			body.push_str(&training_forward);
 			body.push_str("ret void\n}\n");
 		}
-		body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"));
+		let forward_entry_args = format!("{forward_args}, i32 %training");
+		if loss.is_some() {
+			body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%forward.training = icmp ne i32 %training, 0\nbr i1 %forward.training, label %forward.training.entry, label %forward.inference.entry\nforward.inference.entry:\ncall void @recipe_model_inference_forward_body({forward_args})\nbr label %forward.done\nforward.training.entry:\ncall void @recipe_model_training_forward_body({forward_args})\nbr label %forward.done\nforward.done:\nret void\n}}\n"));
+		} else {
+			body.push_str(&format!(
+				"define {kernel}void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
+			));
+		}
 		if let Some(loss) = loss {
 			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
 			let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
@@ -6002,7 +6009,7 @@ impl Recipe {
 			let graph = materialize_saved_graph(stored, samples, device, config)?;
 			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, None)?;
 			tape.inject_bn_stats(&stored.bn_stats)?;
-			tape.forward()?;
+			tape.forward(ForwardMode::Inference)?;
 			tape.predictions()
 		});
 		result.unwrap_or_else(|error| panic!("{error}"))
@@ -6269,6 +6276,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Moe(top_k, experts) => lower_moe(graph, *top_k, experts, config)?,
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
+			graph.refresh_storage(config)?;
 			lower_estimator(graph, estimator, data, targets, rows, gpu, config)?
 		}
 	}
@@ -6648,7 +6656,7 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 		(program, surrogate)
 	} else {
 		(estimator.validate)(estimator.param, rows)?;
-		let inputs = graph_inputs(graph, &data.samples, &data.targets, rows, gpu, config.precision)?;
+		let inputs = graph_inputs(graph, &data.samples, rows, gpu, config.precision)?;
 		let prepared = Prepared {
 			samples: inputs.clone(),
 			targets: targets[..rows].to_vec(),
@@ -6919,6 +6927,13 @@ struct NativeTape {
 }
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
+#[derive(Clone, Copy)]
+#[repr(i32)]
+enum ForwardMode {
+	Inference,
+	Training,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum EpochOperation {
 	Full,
@@ -7011,11 +7026,12 @@ impl NativeTape {
 			capacity: rows,
 		})
 	}
-	fn forward(&mut self) -> Result<()> {
+	fn forward(&mut self, mode: ForwardMode) -> Result<()> {
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
-		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count];
+		let mode = mode as i32;
+		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, mode];
 		self.program.launch_forward(&mut call).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
 		Ok(())
 	}
@@ -7437,7 +7453,7 @@ impl DeviceTape {
 		Ok(Self { shards, placement })
 	}
 	fn forward(&mut self) -> Result<()> {
-		self.shards.iter_mut().try_for_each(NativeTape::forward)
+		self.shards.iter_mut().try_for_each(|tape| tape.forward(ForwardMode::Inference))
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
 		let mut predictions = Vec::new();
@@ -7700,7 +7716,7 @@ struct Dispatch {
 	kernel: Kernel,
 	geometry: Geometry,
 }
-type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32);
+type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32);
 type NativeCpuThread = unsafe extern "C" fn(i32, Ptr, Ptr);
 type NativeEpochF64 = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, i32, i32, f64, f64, f64, f64, f64, f64, f64, i32, i32);
@@ -8783,6 +8799,7 @@ unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCp
 					native_cpu_pointer(arguments, 3),
 					native_cpu_value(arguments, 4),
 					native_cpu_value(arguments, 5),
+					native_cpu_value(arguments, 6),
 				);
 			}
 			NativeEntry::Epoch => {
@@ -9471,14 +9488,13 @@ fn distance(left: &[f64], right: &[f64]) -> f64 {
 fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) {
 	state.chunks_exact(features).enumerate().map(|(index, row)| (index, distance(query, row))).min_by(|left, right| left.1.total_cmp(&right.1)).unwrap_or((0, f64::INFINITY))
 }
-fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gpu: &'static Gpu, precision: Compute) -> Result<Vec<f64>> {
+fn graph_inputs(graph: &Graph, samples: &[f64], rows: usize, gpu: &'static Gpu, precision: Compute) -> Result<Vec<f64>> {
 	let input_count = checked_mul(rows, graph.input.elements(), "estimator input slice")?;
 	if graph.nodes.is_empty() {
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
-	let _ = targets;
-	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, None)?;
-	tape.forward()?;
+	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, Some(mse))?;
+	tape.forward(ForwardMode::Training)?;
 	tape.predictions()
 }
 fn surrogate_model(hidden: usize) -> Model {
@@ -12940,7 +12956,7 @@ impl Train {
 			for sample in prepared.samples.chunks_exact(prepared.features) {
 				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, None)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
-				validation.forward()?;
+				validation.forward(ForwardMode::Inference)?;
 				let raw = validation.predictions()?;
 				require(raw.len() == 1, "autoregressive forward must produce one char ID")?;
 				raw_outputs.push(raw[0]);
@@ -12963,7 +12979,7 @@ impl Train {
 			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_values..]);
 			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, None)?;
 			validation.inject_bn_stats(&stored.bn_stats)?;
-			validation.forward()?;
+			validation.forward(ForwardMode::Inference)?;
 			let raw = validation.predictions()?;
 			final_loss = model_loss(&raw, validation_targets, model.loss, config.activation[7]);
 			evaluated = raw.into_iter().map(|value| scale.map_or(value, |scale| scale.decode(value))).collect();
