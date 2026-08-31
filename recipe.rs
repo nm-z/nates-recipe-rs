@@ -1139,6 +1139,7 @@ fn cpu_identity_field<'a>(field: &'a str, name: &str) -> Result<&'a str> {
 }
 
 const LLVM_OPAQUE_POINTER_DEFAULT_MAJOR: u32 = 15;
+const APPLE_CLANG_BROKEN_LICM_PROMOTION_PREFIX: &str = "Apple clang version 14.";
 fn cpu_llvm_major(compiler: &str) -> Result<u32> {
 	compiler
 		.split_once("clang version ")
@@ -3431,6 +3432,9 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			command.args(["-target", target, "-march=native"]);
 			if cpu_llvm_major(compiler_identity)? < LLVM_OPAQUE_POINTER_DEFAULT_MAJOR {
 				command.args(["-mllvm", "-opaque-pointers=1"]);
+			}
+			if compiler_identity.starts_with(APPLE_CLANG_BROKEN_LICM_PROMOTION_PREFIX) {
+				command.args(["-mllvm", "-disable-licm-promotion"]);
 			}
 			command.args(["-x", "ir", "-O2", "-fPIC", "-shared", "-o"]).arg(output).arg(source);
 			native_command(command, "CPU LLVM IR compiler", key).map(|_| Vec::new())
