@@ -1,20 +1,33 @@
 use std::{fs, os::unix::process::ExitStatusExt, path::Path, path::PathBuf, process::Command};
 
-const USAGE: &str = "usage: recipe [--device <name>] <source.rs> [export]";
+const USAGE: &str = "usage: recipe [--device <name>]... <source.rs> [export]\n       recipe --worker <device>";
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
 	std::process::exit(2)
 }
 
-fn mapped(mapping: Option<&'static str>, suffix: &str) -> Vec<(String, &'static str)> { mapping.into_iter().flat_map(|values| values.split(';')).filter_map(|value| value.split_once('=')).map(|(target, path)| (format!("{target}.{suffix}"), path)).collect() }
+fn mapped(mapping: Option<&'static str>, suffix: &str) -> Vec<(String, &'static str)> {
+	mapping.into_iter().flat_map(|values| values.split(';')).filter_map(|value| value.split_once('=')).map(|(target, path)| (format!("{target}.{suffix}"), path)).collect()
+}
 
 fn export(source: &Path, selected: Option<&str>) {
-	fs::metadata(source).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", source.display())); let device = selected.map(|name| name.rsplit(':').next().unwrap_or(name));
-	if device.is_some_and(|name| name != "cpu" && !name.starts_with("amd") && !name.starts_with("nv")) { invalid("export device must be cpu, an amd device, or an nv device") }
-	let mut artifacts = mapped(option_env!("RECIPE_HSA_CODE_OBJECTS"), "hsaco"); artifacts.push(("cpu.a".to_owned(), concat!(env!("OUT_DIR"), "/librecipe_cpu.a")));
-	artifacts.extend(mapped(option_env!("RECIPE_HSA_ASSEMBLIES"), "amd.s")); artifacts.extend(option_env!("RECIPE_NV_PTX").map(|path| ("ptx".to_owned(), path)));
-	artifacts.retain(|(extension, _)| device.is_none_or(|name| match name { "cpu" => extension == "cpu.a", name if name.starts_with("amd") => extension.ends_with(".hsaco") || extension.ends_with(".amd.s"), _ => extension == "ptx" }));
+	fs::metadata(source).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", source.display()));
+	let device = selected.map(|name| name.rsplit(':').next().unwrap_or(name));
+	if device.is_some_and(|name| name != "cpu" && !name.starts_with("amd") && !name.starts_with("nv")) {
+		invalid("export device must be cpu, an amd device, or an nv device")
+	}
+	let mut artifacts = mapped(option_env!("RECIPE_HSA_CODE_OBJECTS"), "hsaco");
+	artifacts.push(("cpu.a".to_owned(), concat!(env!("OUT_DIR"), "/librecipe_cpu.a")));
+	artifacts.extend(mapped(option_env!("RECIPE_HSA_ASSEMBLIES"), "amd.s"));
+	artifacts.extend(option_env!("RECIPE_NV_PTX").map(|path| ("ptx".to_owned(), path)));
+	artifacts.retain(|(extension, _)| {
+		device.is_none_or(|name| match name {
+			"cpu" => extension == "cpu.a",
+			name if name.starts_with("amd") => extension.ends_with(".hsaco") || extension.ends_with(".amd.s"),
+			_ => extension == "ptx",
+		})
+	});
 	assert!(!artifacts.is_empty(), "Recipe artifacts for {} were not compiled", selected.unwrap_or("this build"));
 	for (extension, compiled) in artifacts {
 		let output = source.with_file_name(format!("recipe.{extension}"));
@@ -52,18 +65,32 @@ fn run(source: &Path, device: Option<&str>) {
 	// Each invocation compiles to its own output, so concurrent invocations never share one.
 	let output = directory.join(format!("recipe-script-{}", std::process::id()));
 	fs::metadata(&library).unwrap_or_else(|error| panic!("cannot inspect {}: {error}", library.display()));
-	let status = Command::new("rustc").arg("--edition=2024").arg(source).arg("--extern").arg(format!("recipe={}", library.display())).arg("-L").arg(format!("dependency={}", dependencies.display())).arg("-o").arg(&output).status().expect("cannot execute rustc");
+	let status = Command::new("rustc")
+		.arg("--edition=2024")
+		.arg(source)
+		.arg("--extern")
+		.arg(format!("recipe={}", library.display()))
+		.arg("-L")
+		.arg(format!("dependency={}", dependencies.display()))
+		.arg("-o")
+		.arg(&output)
+		.status()
+		.expect("cannot execute rustc");
 	if !status.success() {
 		fs::remove_file(&output).ok();
 		std::process::exit(status.code().unwrap_or(1));
 	}
 	let mut command = Command::new(&output);
+	command.env("RECIPE_BINARY", std::env::current_exe().expect("cannot locate recipe"));
 	if let Some(device) = device {
 		command.env("RECIPE_DEVICE", device);
 	}
 	// The running child holds the inode, so unlinking now leaves nothing behind
 	// when this process is killed before it could otherwise clean up.
-	let status = command.spawn().and_then(|mut child| { fs::remove_file(&output).ok(); child.wait() });
+	let status = command.spawn().and_then(|mut child| {
+		fs::remove_file(&output).ok();
+		child.wait()
+	});
 	let status = status.unwrap_or_else(|error| panic!("cannot execute Recipe script: {error}"));
 	std::process::exit(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)));
 }
@@ -72,12 +99,22 @@ fn main() {
 	let mut arguments = std::env::args().skip(1);
 	let (mut source, mut operation, mut device) = (None::<String>, None::<String>, None::<String>);
 	while let Some(argument) = arguments.next() {
+		if argument == "--worker" {
+			let name = arguments.next().unwrap_or_else(|| invalid("--worker requires a device name"));
+			recipe::worker_serve(&name).unwrap_or_else(|error| {
+				eprintln!("{error}");
+				std::process::exit(1)
+			});
+			return;
+		}
 		if argument == "--device" {
 			let selected = arguments.next().unwrap_or_else(|| invalid(USAGE));
-			if device.is_some() {
-				invalid("duplicate --device")
+			if let Some(devices) = &mut device {
+				devices.push(',');
+				devices.push_str(&selected);
+			} else {
+				device = Some(selected);
 			}
-			device = Some(selected);
 			continue;
 		}
 		if argument.starts_with("--") {
@@ -101,6 +138,7 @@ fn main() {
 	}
 	match operation.as_deref() {
 		None => run(source, device),
+		Some("export") if device.is_some_and(|names| names.contains(',')) => invalid("export requires one device"),
 		Some("export") => export(source, device),
 		Some(_) => invalid(USAGE),
 	}

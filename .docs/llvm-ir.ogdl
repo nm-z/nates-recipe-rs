@@ -1,0 +1,33 @@
+rust:
+	\n	newline
+	{}	rust format-string
+identifiers:
+	prefix:
+		[%@]	starts with % or @
+			global	@name
+			local		%name
+	named:
+		unquoted:	[%@][-a-zA-Z$._][-a-zA-Z$._0-9]*
+			[-a-zA-Z$._]	characters
+			[-a-zA-Z$._0-9]*	characters and numbers
+	unnamed
+		numeric:	[%@][0-9]+
+			[0-9]+	numbers
+
+
+%{p}.more = icmp ult i32 %{p}.j, {features}
+	%{p}.more	composed identifier
+		%	llvm local prefix
+		{}	rust format string
+		p	rust variable name
+		.more	llvm name suffix
+	icmp		integer comparison
+	ult		unsigned less than
+	i32		32-bit integer
+	%{p}.j	left operand
+		%	llvm local prefix
+		{}	rust format string
+		p	rust variable name
+		.j	llvm name suffix
+	{features}	right operand
+	%{p}.more	Boolean result

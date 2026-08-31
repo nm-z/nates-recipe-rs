@@ -164,7 +164,8 @@ impl Evidence {
 		let predictions = (0..count).map(|index| number(&format!("prediction {index}"))).collect();
 		let bundle = fields.next().unwrap_or_else(|| panic!("bundle is absent"));
 		let bundle = bundle.strip_prefix('|').unwrap_or_else(|| panic!("bundle marker is absent"));
-		let bundle = (0..bundle.len() / 2).map(|index| u8::from_str_radix(&bundle[index * 2..index * 2 + 2], 16).unwrap_or_else(|error| panic!("bundle byte {index} is malformed: {error}"))).collect();
+		let bundle =
+			(0..bundle.len() / 2).map(|index| u8::from_str_radix(&bundle[index * 2..index * 2 + 2], 16).unwrap_or_else(|error| panic!("bundle byte {index} is malformed: {error}"))).collect();
 		Self { initial, final_loss, predictions, bundle }
 	}
 }
@@ -251,7 +252,10 @@ fn child(case: &Case) -> Evidence {
 		.output()
 		.unwrap_or_else(|error| panic!("cannot run the CPU side of {}: {error}", case.name));
 	let text = String::from_utf8_lossy(&output.stdout);
-	let line = text.lines().find_map(|line| line.strip_prefix("EVIDENCE ")).unwrap_or_else(|| panic!("the CPU side of {} produced no evidence:\n{}\n{}", case.name, text, String::from_utf8_lossy(&output.stderr)));
+	let line = text
+		.lines()
+		.find_map(|line| line.strip_prefix("EVIDENCE "))
+		.unwrap_or_else(|| panic!("the CPU side of {} produced no evidence:\n{}\n{}", case.name, text, String::from_utf8_lossy(&output.stderr)));
 	Evidence::decode(line)
 }
 
