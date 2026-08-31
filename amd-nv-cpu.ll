@@ -446,44 +446,43 @@ br i1 %local, label %local.owner.test, label %shared.chunk.loop
 local.owner.test:
 br i1 %local.owner.active, label %local.k.begin, label %exit
 local.k.begin:
-%local.k.first = add i32 0, 0
-%local.k.limit = add i32 %k.count, 0
-%local.a.initial = call <RECIPE_REGISTER_M x double> @contraction_a_fragment(i32 %local.k.first, i32 %output.m.base, i32 %tile.m, i32 %tile.k)
-%local.b.initial = call <RECIPE_REGISTER_N x double> @contraction_b_fragment(i32 %local.k.first, i32 %output.n.base, i32 %tile.m, i32 %tile.n, i32 %tile.k)
+%local.sums.initial = load <RECIPE_REGISTER_COUNT x RECIPE_STATE>, ptr addrspace(5) %sums, align RECIPE_STATE_ALIGN
+%local.a.initial = call <RECIPE_REGISTER_M x double> @contraction_a_fragment(i32 0, i32 %output.m.base, i32 %tile.m, i32 %tile.k)
+%local.b.initial = call <RECIPE_REGISTER_N x double> @contraction_b_fragment(i32 0, i32 %output.n.base, i32 %tile.m, i32 %tile.n, i32 %tile.k)
 br label %local.k.loop
 local.k.loop:
-%local.k = phi i32 [ %local.k.first, %local.k.begin ], [ %local.k.next, %local.register.done ]
-%local.a.fragment = phi <RECIPE_REGISTER_M x double> [ %local.a.initial, %local.k.begin ], [ %local.a.next, %local.register.done ]
-%local.b.fragment = phi <RECIPE_REGISTER_N x double> [ %local.b.initial, %local.k.begin ], [ %local.b.next, %local.register.done ]
+%local.k = phi i32 [ 0, %local.k.begin ], [ %local.k.next, %local.product.done ]
+%local.sums = phi <RECIPE_REGISTER_COUNT x RECIPE_STATE> [ %local.sums.initial, %local.k.begin ], [ %local.sums.current, %local.product.done ]
+%local.a.fragment = phi <RECIPE_REGISTER_M x double> [ %local.a.initial, %local.k.begin ], [ %local.a.next, %local.product.done ]
+%local.b.fragment = phi <RECIPE_REGISTER_N x double> [ %local.b.initial, %local.k.begin ], [ %local.b.next, %local.product.done ]
 %local.k.next = add i32 %local.k, 1
-%local.k.more = icmp ult i32 %local.k.next, %local.k.limit
+%local.k.more = icmp ult i32 %local.k.next, %k.count
 %local.k.prefetch = select i1 %local.k.more, i32 %local.k.next, i32 %local.k
 %local.a.next = call <RECIPE_REGISTER_M x double> @contraction_a_fragment(i32 %local.k.prefetch, i32 %output.m.base, i32 %tile.m, i32 %tile.k)
 %local.b.next = call <RECIPE_REGISTER_N x double> @contraction_b_fragment(i32 %local.k.prefetch, i32 %output.n.base, i32 %tile.m, i32 %tile.n, i32 %tile.k)
 %local.a.wide = call <RECIPE_REGISTER_M x RECIPE_STATE> @contraction_widen_m(<RECIPE_REGISTER_M x double> %local.a.fragment)
-br label %local.register.loop
-local.register.loop:
-%local.register.n = phi i32 [ 0, %local.k.loop ], [ %local.register.n.next, %local.register.next ]
-%local.register.more = icmp ult i32 %local.register.n, RECIPE_REGISTER_N
-br i1 %local.register.more, label %local.register.step, label %local.register.done
-local.register.step:
-%local.output.n.raw = add i32 %output.n.base, %local.register.n
-%local.output.n.valid = icmp ult i32 %local.output.n.raw, %n.count
-%local.b = extractelement <RECIPE_REGISTER_N x double> %local.b.fragment, i32 %local.register.n
+br label %local.product.loop
+local.product.loop:
+%local.product = phi i32 [ 0, %local.k.loop ], [ %local.product.next, %local.product.step ]
+%local.sums.current = phi <RECIPE_REGISTER_COUNT x RECIPE_STATE> [ %local.sums, %local.k.loop ], [ %local.candidate, %local.product.step ]
+%local.product.more = icmp ult i32 %local.product, RECIPE_REGISTER_COUNT
+br i1 %local.product.more, label %local.product.step, label %local.product.done
+local.product.step:
+%local.a.index = urem i32 %local.product, RECIPE_REGISTER_M
+%local.b.index = udiv i32 %local.product, RECIPE_REGISTER_M
+%local.a = extractelement <RECIPE_REGISTER_M x RECIPE_STATE> %local.a.wide, i32 %local.a.index
+%local.b = extractelement <RECIPE_REGISTER_N x double> %local.b.fragment, i32 %local.b.index
 %local.b.wide = call RECIPE_STATE @recipe.decode(double %local.b)
-%local.b.seed = insertelement <RECIPE_REGISTER_M x RECIPE_STATE> poison, RECIPE_STATE %local.b.wide, i32 0
-%local.b.vector = shufflevector <RECIPE_REGISTER_M x RECIPE_STATE> %local.b.seed, <RECIPE_REGISTER_M x RECIPE_STATE> poison, <RECIPE_REGISTER_M x i32> zeroinitializer
-%local.register.base = mul i32 %local.register.n, RECIPE_REGISTER_M
-%local.sum.ptr = getelementptr RECIPE_STATE, ptr addrspace(5) %sums, i32 %local.register.base
-%local.sum = load <RECIPE_REGISTER_M x RECIPE_STATE>, ptr addrspace(5) %local.sum.ptr, align RECIPE_STATE_ALIGN
-%local.candidate = call <RECIPE_REGISTER_M x RECIPE_STATE> @recipe.state.madd.vector(<RECIPE_REGISTER_M x RECIPE_STATE> %local.sum, <RECIPE_REGISTER_M x RECIPE_STATE> %local.a.wide, <RECIPE_REGISTER_M x RECIPE_STATE> %local.b.vector)
-store <RECIPE_REGISTER_M x RECIPE_STATE> %local.candidate, ptr addrspace(5) %local.sum.ptr, align RECIPE_STATE_ALIGN
-br label %local.register.next
-local.register.next:
-%local.register.n.next = add i32 %local.register.n, 1
-br label %local.register.loop
-local.register.done:
-br i1 %local.k.more, label %local.k.loop, label %exit
+%local.sum = extractelement <RECIPE_REGISTER_COUNT x RECIPE_STATE> %local.sums.current, i32 %local.product
+%local.value = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %local.sum, RECIPE_STATE %local.a, RECIPE_STATE %local.b.wide)
+%local.candidate = insertelement <RECIPE_REGISTER_COUNT x RECIPE_STATE> %local.sums.current, RECIPE_STATE %local.value, i32 %local.product
+%local.product.next = add i32 %local.product, 1
+br label %local.product.loop
+local.product.done:
+br i1 %local.k.more, label %local.k.loop, label %local.store
+local.store:
+store <RECIPE_REGISTER_COUNT x RECIPE_STATE> %local.sums.current, ptr addrspace(5) %sums, align RECIPE_STATE_ALIGN
+br label %exit
 shared.chunk.loop:
 %chunk = phi i32 [ %chunk.first, %entry ], [ %chunk.next, %chunk.finish ]
 %slot = phi i32 [ 0, %entry ], [ %slot.next, %chunk.finish ]
