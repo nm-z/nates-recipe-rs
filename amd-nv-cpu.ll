@@ -439,7 +439,9 @@ entry:
 %chunk.first = select i1 %lane.active, i32 %lane.k, i32 %chunks
 %local.lane = icmp eq i32 %k.lanes, 1
 %few.chunks = icmp ule i32 %chunks, RECIPE_CONTRACTION_LOCAL_CHUNKS
-%local = or i1 %local.lane, %few.chunks
+%local.parallel = or i1 %local.lane, %few.chunks
+%local.serial = icmp eq i32 RECIPE_WORKGROUP_SIZE, 1
+%local = or i1 %local.serial, %local.parallel
 %local.owner = icmp eq i32 %lane.k, 0
 %local.owner.active = and i1 %lane.active, %local.owner
 br i1 %local, label %local.owner.test, label %shared.chunk.loop
