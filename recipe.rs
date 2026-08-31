@@ -7200,8 +7200,6 @@ impl NativeTape {
 		device_label(self.program.gpu)
 	}
 }
-/// The `host:device` name of one device: a remote device already carries its
-/// owning host, and a local device takes this host's name.
 fn device_label(gpu: &Gpu) -> Result<String> {
 	if gpu.name.contains(':') { Ok(gpu.name.clone()) } else { Ok(format!("{}:{}", local_host()?, gpu.name)) }
 }
@@ -8463,7 +8461,9 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	Ok(&found[0])
 }
 fn local_host() -> Result<String> {
-	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
+	let output = Command::new("hostname").output().map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
+	require(output.status.success(), "cannot read hostname")?;
+	let host = String::from_utf8(output.stdout).map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	Ok(host.trim().to_owned())
 }
 static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
