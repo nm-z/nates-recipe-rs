@@ -4873,172 +4873,127 @@ const IQ2_S: [u16; 1024] = [
 	39168, 39241, 39250, 39568, 40960, 40965, 40970, 40980, 40994, 41002, 41025, 41028, 41040, 41122, 41130, 41280, 41317, 41474, 41482, 41506, 41512, 41514, 41602, 41608, 41610, 41640, 41985,
 	41988, 42000, 42048, 42121, 42148, 42240, 42265, 42577, 43018, 43048, 43170, 43348, 43398, 43528, 43530, 43552, 43554, 43560, 43656, 43690,
 ];
-fn iq3_grid(grid: &[u16], index: usize, lane: usize) -> i8 {
-	(2 * (grid[index] >> (3 * lane) & 7) + 1) as i8
-}
-/// Every 12-bit level key resolved against one IQ3 grid: either the first
-/// exact grid index, or the first two distance shells in (distance, index)
-/// order, which is the same candidate order an exhaustive sorted scan yields.
-struct Iq3Neighbours {
+const IQ_NEIGHBOR_SHELLS: usize = 3;
+struct IqNeighbors {
 	exact: Vec<i32>,
-	offsets: Vec<u32>,
-	candidates: Vec<u16>,
+	candidates: Vec<OnceLock<Vec<u16>>>,
 }
-fn iq3_neighbours(grid: &'static [u16]) -> &'static Iq3Neighbours {
-	static XXS: OnceLock<Iq3Neighbours> = OnceLock::new();
-	static S: OnceLock<Iq3Neighbours> = OnceLock::new();
-	let cache = if std::ptr::eq(grid.as_ptr(), IQ3_XXS.as_ptr()) { &XXS } else { &S };
-	cache.get_or_init(|| {
-		let keys = 1_usize << 12;
-		let mut exact = vec![-1_i32; keys];
-		for (index, point) in grid.iter().enumerate() {
-			if exact[usize::from(*point)] < 0 {
-				exact[usize::from(*point)] = index as i32
-			}
-		}
-		let (mut offsets, mut candidates) = (Vec::with_capacity(keys + 1), Vec::new());
-		offsets.push(0_u32);
-		for key in 0..keys {
-			if exact[key] >= 0 {
-				offsets.push(candidates.len() as u32);
-				continue;
-			}
-			let distance = |point: u16| {
-				let mut total = 0_i32;
-				for lane in 0..4 {
-					let difference = i32::from(point >> (3 * lane) & 7) - (key as i32 >> (3 * lane) & 7);
-					total += difference * difference
+struct IqGrid {
+	points: &'static [u16],
+	bits: usize,
+	lanes: usize,
+	shells: usize,
+	neighbors: OnceLock<IqNeighbors>,
+}
+impl IqGrid {
+	const fn new(points: &'static [u16], bits: usize, lanes: usize, shells: usize) -> Self {
+		Self { points, bits, lanes, shells, neighbors: OnceLock::new() }
+	}
+	fn code(&self, index: usize, lane: usize) -> i8 {
+		let mask = (1_u16 << self.bits) - 1;
+		(self.points[index] >> (self.bits * lane) & mask) as i8
+	}
+	fn key(&self, levels: &[i8]) -> usize {
+		levels.iter().enumerate().fold(0, |key, (lane, level)| key | (*level as usize) << (self.bits * lane))
+	}
+	fn distance(&self, point: u16, key: usize) -> i32 {
+		let mask = (1_u16 << self.bits) - 1;
+		(0..self.lanes)
+			.map(|lane| {
+				let difference = i32::from(point >> (self.bits * lane) & mask) - ((key >> (self.bits * lane) & usize::from(mask)) as i32);
+				difference * difference
+			})
+			.sum()
+	}
+	fn neighbors(&self) -> &IqNeighbors {
+		self.neighbors.get_or_init(|| {
+			let keys = 1_usize << (self.bits * self.lanes);
+			let mut exact = vec![-1_i32; keys];
+			for (index, point) in self.points.iter().enumerate() {
+				if exact[usize::from(*point)] < 0 {
+					exact[usize::from(*point)] = index as i32
 				}
-				total
-			};
-			let (mut first, mut second) = (i32::MAX, i32::MAX);
-			for point in grid {
-				let d = distance(*point);
-				if d < first {
-					second = first;
-					first = d
-				} else if d > first && d < second {
-					second = d
+			}
+			IqNeighbors { exact, candidates: (0..keys).map(|_| OnceLock::new()).collect() }
+		})
+	}
+	fn candidates(&self, key: usize) -> &[u16] {
+		self.neighbors().candidates[key].get_or_init(|| {
+			let mut nearest = [i32::MAX; IQ_NEIGHBOR_SHELLS];
+			for point in self.points {
+				let distance = self.distance(*point, key);
+				if nearest[..self.shells].contains(&distance) {
+					continue;
+				}
+				for position in 0..self.shells {
+					if distance < nearest[position] {
+						for slot in (position + 1..self.shells).rev() {
+							nearest[slot] = nearest[slot - 1]
+						}
+						nearest[position] = distance;
+						break;
+					}
 				}
 			}
-			for shell in [first, second] {
-				for (index, point) in grid.iter().enumerate() {
-					if distance(*point) == shell {
+			let shells = if nearest[self.shells - 1] == i32::MAX { 1 } else { self.shells };
+			let mut candidates = Vec::new();
+			for shell in &nearest[..shells] {
+				for (index, point) in self.points.iter().enumerate() {
+					if self.distance(*point, key) == *shell {
 						candidates.push(index as u16)
 					}
 				}
-				if second == first || second == i32::MAX {
-					break;
-				}
 			}
-			offsets.push(candidates.len() as u32);
-		}
-		Iq3Neighbours { exact, offsets, candidates }
-	})
+			candidates
+		})
+	}
 }
-fn iq3_nearest(grid: &'static [u16], levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32) -> usize {
-	let key = levels.iter().enumerate().fold(0_u16, |key, (lane, level)| key | (*level as u16) << (3 * lane));
-	let neighbours = iq3_neighbours(grid);
-	let exact = neighbours.exact[usize::from(key)];
+static IQ3_XXS_GRID: IqGrid = IqGrid::new(&IQ3_XXS, 3, 4, 2);
+static IQ3_S_GRID: IqGrid = IqGrid::new(&IQ3_S, 3, 4, 2);
+static IQ2_XXS_GRID: IqGrid = IqGrid::new(&IQ2_XXS, 2, 8, 2);
+static IQ2_XS_GRID: IqGrid = IqGrid::new(&IQ2_XS, 2, 8, 2);
+static IQ2_S_GRID: IqGrid = IqGrid::new(&IQ2_S, 2, 8, 1);
+static IQ1_GRID: IqGrid = IqGrid::new(&IQ1, 2, 8, 3);
+fn iq_nearest(grid: &IqGrid, levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32) -> usize {
+	let key = grid.key(levels);
+	let exact = grid.neighbors().exact[key];
 	if exact >= 0 {
 		return exact as usize;
 	}
-	let span = neighbours.offsets[usize::from(key)] as usize..neighbours.offsets[usize::from(key) + 1] as usize;
-	let index = neighbours.candidates[span]
+	let index = grid
+		.candidates(key)
 		.iter()
 		.map(|index| usize::from(*index))
 		.min_by(|left, right| {
 			let error = |index| {
-				(0..4).map(|lane| {
-					let difference = scale * f32::from(iq3_grid(grid, index, lane)) - values[lane];
-					weights[lane] * difference * difference
-				})
-				.sum::<f32>()
+				(0..grid.lanes)
+					.map(|lane| {
+						let difference = scale * f32::from(2 * grid.code(index, lane) + 1) - values[lane];
+						weights[lane] * difference * difference
+					})
+					.sum::<f32>()
 			};
 			error(*left).total_cmp(&error(*right))
 		})
 		.unwrap();
-	for lane in 0..4 {
-		levels[lane] = (iq3_grid(grid, index, lane) - 1) / 2
-	}
-	index
-}
-fn iq2_grid(grid: &[u16], index: usize, lane: usize) -> i8 {
-	(2 * (grid[index] >> (2 * lane) & 3) + 1) as i8
-}
-fn iq2_nearest(grid: &[u16], shells: usize, levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32) -> usize {
-	let key = levels.iter().enumerate().fold(0_u16, |key, (lane, level)| key | (*level as u16) << (2 * lane));
-	if let Some(index) = grid.iter().position(|value| *value == key) {
-		return index;
-	}
-	let mut candidates = grid
-		.iter()
-		.enumerate()
-		.map(|(index, point)| {
-			(
-				(0..8).map(|lane| {
-					let difference = i32::from((*point >> (2 * lane) & 3) as i8 - levels[lane]);
-					difference * difference
-				})
-				.sum::<i32>(),
-				index,
-			)
-		})
-		.collect::<Vec<_>>();
-	candidates.sort_unstable();
-	let mut distances = candidates.iter().map(|item| item.0).collect::<Vec<_>>();
-	distances.dedup();
-	let limit = distances.get(shells.saturating_sub(1)).copied().unwrap_or(candidates[0].0);
-	let index = candidates
-		.into_iter()
-		.take_while(|item| item.0 <= limit)
-		.map(|item| item.1)
-		.min_by(|left, right| {
-			let error = |index| {
-				(0..8).map(|lane| {
-					let difference = scale * f32::from(iq2_grid(grid, index, lane)) - values[lane];
-					weights[lane] * difference * difference
-				})
-				.sum::<f32>()
-			};
-			error(*left).total_cmp(&error(*right))
-		})
-		.unwrap();
-	for lane in 0..8 {
-		levels[lane] = (iq2_grid(grid, index, lane) - 1) / 2
+	for lane in 0..grid.lanes {
+		levels[lane] = grid.code(index, lane)
 	}
 	index
 }
 fn iq1_level(index: usize, lane: usize) -> i8 {
-	(IQ1[index] >> (2 * lane) & 3) as i8
+	IQ1_GRID.code(index, lane)
 }
 fn iq1_nearest(levels: &mut [i8], values: &[f32], weights: &[f32], scale: f32, shift: i8) -> usize {
-	let key = levels.iter().enumerate().fold(0_u16, |key, (lane, level)| key | (*level as u16) << (2 * lane));
-	if let Some(index) = IQ1.iter().position(|value| *value == key) {
-		return index;
+	let key = IQ1_GRID.key(levels);
+	let exact = IQ1_GRID.neighbors().exact[key];
+	if exact >= 0 {
+		return exact as usize;
 	}
-	let mut candidates = IQ1
+	let index = IQ1_GRID
+		.candidates(key)
 		.iter()
-		.enumerate()
-		.map(|(index, point)| {
-			(
-				(0..8).map(|lane| {
-					let difference = i32::from((*point >> (2 * lane) & 3) as i8 - levels[lane]);
-					difference * difference
-				})
-				.sum::<i32>(),
-				index,
-			)
-		})
-		.collect::<Vec<_>>();
-	candidates.sort_unstable();
-	let mut distances = candidates.iter().map(|item| item.0).collect::<Vec<_>>();
-	distances.dedup();
-	let limit = distances.get(2).copied().unwrap_or(candidates[0].0);
-	let index = candidates
-		.into_iter()
-		.take_while(|item| item.0 <= limit)
-		.map(|item| item.1)
+		.map(|index| usize::from(*index))
 		.min_by(|left, right| {
 			let error = |index| {
 				(0..8).map(|lane| {
@@ -5131,17 +5086,17 @@ fn qp_scale(values: &[f32], weights: &[f32], nmax: i8) -> f32 {
 #[rustfmt::skip] fn iq2_xxs(values:&[f32],importance:&[f32])->Vec<u8>{
 	let mut output=Vec::new();for (chunk,values)in values.chunks(256).enumerate(){let value=|index|values.get(index).copied().unwrap_or(0.0);let importance=|index|importance.get(chunk*256+index).copied().unwrap_or(0.0);let sigma2=(0..256).map(|index|value(index)*value(index)).sum::<f32>()/256.0;let mut packed=[0_u8;64];let mut scales=[0.0_f32;8];let mut maximum=0.0_f32;
 		for block in 0..8{let x=(0..32).map(|offset|value(block*32+offset)).collect::<Vec<_>>();let weights=(0..32).map(|offset|importance(block*32+offset)*(sigma2+x[offset]*x[offset]).sqrt()).collect::<Vec<_>>();let mut magnitudes=x.iter().map(|value|value.abs()).collect::<Vec<_>>();let mut signs=[0_u8;4];for group in 0..4{let mut flips=0;for lane in 0..8{if x[group*8+lane]<0.0{flips+=1;signs[group]|=1<<lane}}if flips%2!=0{let lane=(0..8).min_by(|a,b|(weights[group*8+*a]*x[group*8+*a]*x[group*8+*a]).total_cmp(&(weights[group*8+*b]*x[group*8+*b]*x[group*8+*b]))).unwrap();magnitudes[group*8+lane]=-magnitudes[group*8+lane];signs[group]^=1<<lane}signs[group]&=127}let max=magnitudes.iter().copied().fold(0.0_f32,f32::max);if max<1.0e-15{continue}
-			let seed=qp_scale(&magnitudes,&weights,4);let effective=seed*3.0;if effective<=0.0{continue}let mut best=0.0_f32;let mut scale=seed;let mut levels=[0_i8;32];for step in -6..=6{let inverse=(5.0+0.1*step as f32)/effective;let trial_scale=inverse.recip();let mut trial=[0_i8;32];for group in 0..4{for lane in 0..8{trial[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}iq2_nearest(&IQ2_XXS,2,&mut trial[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),trial_scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..32{let level=f32::from(2*trial[lane]+1);qx+=weights[lane]*magnitudes[lane]*level;q2+=weights[lane]*level*level}if q2>0.0&&qx*qx>best*q2{scale=qx/q2;best=scale*qx;levels=trial}}
-			if scale>0.0{let inverse=scale.recip();for group in 0..4{for lane in 0..8{levels[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}iq2_nearest(&IQ2_XXS,2,&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..32{let level=f32::from(2*levels[lane]+1);qx+=weights[lane]*magnitudes[lane]*level;q2+=weights[lane]*level*level}if q2>0.0{scale=qx/q2}}if scale<0.0{scale=-scale;for sign in &mut signs{*sign=(!*sign)&127}}
-			for group in 0..4{packed[block*8+group]=iq2_nearest(&IQ2_XXS,2,&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale)as u8}let word=u32::from(signs[0])|u32::from(signs[1])<<7|u32::from(signs[2])<<14|u32::from(signs[3])<<21;packed[block*8+4..block*8+8].copy_from_slice(&word.to_le_bytes());scales[block]=scale;maximum=maximum.max(scale)}
+			let seed=qp_scale(&magnitudes,&weights,4);let effective=seed*3.0;if effective<=0.0{continue}let mut best=0.0_f32;let mut scale=seed;let mut levels=[0_i8;32];for step in -6..=6{let inverse=(5.0+0.1*step as f32)/effective;let trial_scale=inverse.recip();let mut trial=[0_i8;32];for group in 0..4{for lane in 0..8{trial[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}iq_nearest(&IQ2_XXS_GRID,&mut trial[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),trial_scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..32{let level=f32::from(2*trial[lane]+1);qx+=weights[lane]*magnitudes[lane]*level;q2+=weights[lane]*level*level}if q2>0.0&&qx*qx>best*q2{scale=qx/q2;best=scale*qx;levels=trial}}
+			if scale>0.0{let inverse=scale.recip();for group in 0..4{for lane in 0..8{levels[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}iq_nearest(&IQ2_XXS_GRID,&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..32{let level=f32::from(2*levels[lane]+1);qx+=weights[lane]*magnitudes[lane]*level;q2+=weights[lane]*level*level}if q2>0.0{scale=qx/q2}}if scale<0.0{scale=-scale;for sign in &mut signs{*sign=(!*sign)&127}}
+			for group in 0..4{packed[block*8+group]=iq_nearest(&IQ2_XXS_GRID,&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale)as u8}let word=u32::from(signs[0])|u32::from(signs[1])<<7|u32::from(signs[2])<<14|u32::from(signs[3])<<21;packed[block*8+4..block*8+8].copy_from_slice(&word.to_le_bytes());scales[block]=scale;maximum=maximum.max(scale)}
 		if maximum==0.0{put_half(&mut output,0.0);output.extend(packed);continue}let scale=maximum/31.0;for block in 0..8{let code=qround(0.5*(scales[block]/scale-1.0)).max(0.0).min(15.0)as u32;let mut word=u32::from_le_bytes(packed[block*8+4..block*8+8].try_into().unwrap());word|=code<<28;packed[block*8+4..block*8+8].copy_from_slice(&word.to_le_bytes())}put_half(&mut output,scale);output.extend(packed)}output
 }
 #[rustfmt::skip] fn iq2_16(values:&[f32],importance:Option<&[f32]>,xs:bool)->Vec<u8>{
-	let grid=if xs{&IQ2_XS[..]}else{&IQ2_S[..]};let shells=if xs{2}else{1};let mut output=Vec::new();for(chunk,values)in values.chunks(256).enumerate(){let value=|index|values.get(index).copied().unwrap_or(0.0);let importance=|index|importance.and_then(|values|values.get(chunk*256+index)).copied().unwrap_or(0.0);let sigma2=(if xs{1.0}else{2.0})*(0..256).map(|index|value(index)*value(index)).sum::<f32>()/256.0;let mut packed=vec![0_u8;if xs{72}else{80}];let mut scales=[0.0_f32;16];let mut maximum=0.0_f32;
+	let grid=if xs{&IQ2_XS_GRID}else{&IQ2_S_GRID};let mut output=Vec::new();for(chunk,values)in values.chunks(256).enumerate(){let value=|index|values.get(index).copied().unwrap_or(0.0);let importance=|index|importance.and_then(|values|values.get(chunk*256+index)).copied().unwrap_or(0.0);let sigma2=(if xs{1.0}else{2.0})*(0..256).map(|index|value(index)*value(index)).sum::<f32>()/256.0;let mut packed=vec![0_u8;if xs{72}else{80}];let mut scales=[0.0_f32;16];let mut maximum=0.0_f32;
 		for block in 0..16{let x=(0..16).map(|offset|value(block*16+offset)).collect::<Vec<_>>();let weights=x.iter().enumerate().map(|(offset,value)|if xs{importance(block*16+offset)*(sigma2+value*value).sqrt()}else{0.25*sigma2+value*value}).collect::<Vec<_>>();let mut magnitudes=x.iter().map(|value|value.abs()).collect::<Vec<_>>();let mut signs=[0_u8;2];for group in 0..2{let mut flips=0;for lane in 0..8{if x[group*8+lane]<0.0{flips+=1;signs[group]|=1<<lane}}if xs&&flips%2!=0{let lane=(0..8).min_by(|a,b|(weights[group*8+*a]*x[group*8+*a]*x[group*8+*a]).total_cmp(&(weights[group*8+*b]*x[group*8+*b]*x[group*8+*b]))).unwrap();magnitudes[group*8+lane]=-magnitudes[group*8+lane];signs[group]^=1<<lane}if xs{signs[group]&=127}}let max=magnitudes.iter().copied().fold(0.0_f32,f32::max);if max<if xs{1.0e-15}else{1.0e-8}{continue}let mut best=0.0_f32;let mut scale=max/5.0;let mut levels=[0_i8;16];let mut on_grid=[true;2];
-			for step in -9..=9{let inverse=(5.0+0.1*step as f32)/max;let trial_scale=inverse.recip();let mut trial=[0_i8;16];let mut trial_on=[true;2];for group in 0..2{for lane in 0..8{trial[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}let key=(0..8).fold(0_u16,|key,lane|key|(trial[group*8+lane]as u16)<<(2*lane));trial_on[group]=grid.contains(&key);iq2_nearest(grid,shells,&mut trial[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),trial_scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..16{let level=f32::from(2*trial[lane]+1);qx+=weights[lane]*magnitudes[lane]*level;q2+=weights[lane]*level*level}if q2>0.0&&qx*qx>best*q2{scale=qx/q2;best=scale*qx;levels=trial;on_grid=trial_on}}
-			if on_grid.iter().any(|value|!*value)&&scale>0.0{let inverse=scale.recip();for group in 0..2{if on_grid[group]{continue}for lane in 0..8{levels[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}iq2_nearest(grid,shells,&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..16{let level=f32::from(2*levels[lane]+1);qx+=weights[lane]*magnitudes[lane]*level;q2+=weights[lane]*level*level}if q2>0.0{scale=qx/q2}}if scale<0.0{scale=-scale;for sign in &mut signs{*sign=if xs{(!*sign)&127}else{!*sign}}}
-			for group in 0..2{let index=iq2_nearest(grid,shells,&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);let slot=2*block+group;if xs{let word=index as u16|u16::from(signs[group])<<9;packed[2*slot..2*slot+2].copy_from_slice(&word.to_le_bytes())}else{packed[slot]=index as u8;packed[64+slot/4]|=((index>>8)as u8)<<(2*(slot%4));packed[32+slot]=signs[group]}}scales[block]=scale;maximum=maximum.max(scale)}
+			for step in -9..=9{let inverse=(5.0+0.1*step as f32)/max;let trial_scale=inverse.recip();let mut trial=[0_i8;16];let mut trial_on=[true;2];for group in 0..2{for lane in 0..8{trial[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}let key=(0..8).fold(0_u16,|key,lane|key|(trial[group*8+lane]as u16)<<(2*lane));trial_on[group]=grid.points.contains(&key);iq_nearest(grid,&mut trial[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),trial_scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..16{let level=f32::from(2*trial[lane]+1);qx+=weights[lane]*magnitudes[lane]*level;q2+=weights[lane]*level*level}if q2>0.0&&qx*qx>best*q2{scale=qx/q2;best=scale*qx;levels=trial;on_grid=trial_on}}
+			if on_grid.iter().any(|value|!*value)&&scale>0.0{let inverse=scale.recip();for group in 0..2{if on_grid[group]{continue}for lane in 0..8{levels[group*8+lane]=qround(0.5*(inverse*magnitudes[group*8+lane]-1.0)).max(0.0).min(2.0)as i8}iq_nearest(grid,&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);}let(mut qx,mut q2)=(0.0,0.0);for lane in 0..16{let level=f32::from(2*levels[lane]+1);qx+=weights[lane]*magnitudes[lane]*level;q2+=weights[lane]*level*level}if q2>0.0{scale=qx/q2}}if scale<0.0{scale=-scale;for sign in &mut signs{*sign=if xs{(!*sign)&127}else{!*sign}}}
+			for group in 0..2{let index=iq_nearest(grid,&mut levels[group*8..group*8+8],&magnitudes[group*8..group*8+8],&weights[group*8..group*8+8].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);let slot=2*block+group;if xs{let word=index as u16|u16::from(signs[group])<<9;packed[2*slot..2*slot+2].copy_from_slice(&word.to_le_bytes())}else{packed[slot]=index as u8;packed[64+slot/4]|=((index>>8)as u8)<<(2*(slot%4));packed[32+slot]=signs[group]}}scales[block]=scale;maximum=maximum.max(scale)}
 		if maximum==0.0{put_half(&mut output,0.0);output.extend(packed);continue}let scale=maximum/31.0;let offset=if xs{64}else{72};for block in 0..16{let code=qround(0.5*(scales[block]/scale-1.0)).max(0.0).min(15.0)as u8;packed[offset+block/2]|=code<<(block%2*4)}put_half(&mut output,scale*if xs{1.0}else{0.9875});output.extend(packed)}output
 }
 #[rustfmt::skip] fn iq3_xxs(values: &[f32]) -> Vec<u8> {
@@ -5151,8 +5106,8 @@ fn qp_scale(values: &[f32], weights: &[f32], nmax: i8) -> f32 {
 			for group in 0..4 { let mut flips = 0; for lane in 0..8 { if x[group * 8 + lane] < 0.0 { flips += 1; signs[group] |= 1 << lane } } if flips % 2 != 0 { let lane = (0..8).min_by(|a,b| (weights[group*8+*a]*x[group*8+*a]*x[group*8+*a]).total_cmp(&(weights[group*8+*b]*x[group*8+*b]*x[group*8+*b]))).unwrap(); magnitudes[group*8+lane] = -magnitudes[group*8+lane]; signs[group] ^= 1 << lane } signs[group] &= 127 }
 			let max = magnitudes.iter().copied().fold(0.0_f32, f32::max); if max < 1.0e-6 { continue }
 			let mut best = 0.0_f32; let mut scale = max / 15.0; let mut levels = [0_i8; 32];
-			for step in -15..=15 { let inverse = (15.0 + 0.2 * step as f32) / max; let trial_scale = inverse.recip(); let mut trial = [0_i8; 32]; for group in 0..8 { for lane in 0..4 { trial[group*4+lane] = qround(0.5*(inverse*magnitudes[group*4+lane]-1.0)).max(0.0).min(7.0) as i8 } iq3_nearest(&IQ3_XXS, &mut trial[group*4..group*4+4], &magnitudes[group*4..group*4+4], &weights[group*4..group*4+4].iter().map(|value| value.sqrt()).collect::<Vec<_>>(), trial_scale); } let (mut qx, mut q2) = (0.0,0.0); for lane in 0..32 { let level = f32::from(2*trial[lane]+1); qx += weights[lane]*magnitudes[lane]*level; q2 += weights[lane]*level*level } if q2 > 0.0 && qx*qx > best*q2 { scale=qx/q2; best=scale*qx; levels=trial } }
-			for group in 0..8 { packed[block*8+group] = iq3_nearest(&IQ3_XXS, &mut levels[group*4..group*4+4], &magnitudes[group*4..group*4+4], &weights[group*4..group*4+4].iter().map(|value| value.sqrt()).collect::<Vec<_>>(), scale) as u8 }
+			for step in -15..=15 { let inverse = (15.0 + 0.2 * step as f32) / max; let trial_scale = inverse.recip(); let mut trial = [0_i8; 32]; for group in 0..8 { for lane in 0..4 { trial[group*4+lane] = qround(0.5*(inverse*magnitudes[group*4+lane]-1.0)).max(0.0).min(7.0) as i8 } iq_nearest(&IQ3_XXS_GRID, &mut trial[group*4..group*4+4], &magnitudes[group*4..group*4+4], &weights[group*4..group*4+4].iter().map(|value| value.sqrt()).collect::<Vec<_>>(), trial_scale); } let (mut qx, mut q2) = (0.0,0.0); for lane in 0..32 { let level = f32::from(2*trial[lane]+1); qx += weights[lane]*magnitudes[lane]*level; q2 += weights[lane]*level*level } if q2 > 0.0 && qx*qx > best*q2 { scale=qx/q2; best=scale*qx; levels=trial } }
+			for group in 0..8 { packed[block*8+group] = iq_nearest(&IQ3_XXS_GRID, &mut levels[group*4..group*4+4], &magnitudes[group*4..group*4+4], &weights[group*4..group*4+4].iter().map(|value| value.sqrt()).collect::<Vec<_>>(), scale) as u8 }
 			let word = u32::from(signs[0]) | u32::from(signs[1])<<7 | u32::from(signs[2])<<14 | u32::from(signs[3])<<21; packed[64+block*4..68+block*4].copy_from_slice(&word.to_le_bytes()); scales[block]=scale; maximum=maximum.max(scale)
 		} if maximum == 0.0 { put_half(&mut output, 0.0); output.extend(packed); continue }
 		let scale = maximum / 31.0; for block in 0..8 { let code=qround(0.5*(scales[block]/scale-1.0)).max(0.0).min(15.0) as u32; let mut word=u32::from_le_bytes(packed[64+block*4..68+block*4].try_into().unwrap()); word|=code<<28; packed[64+block*4..68+block*4].copy_from_slice(&word.to_le_bytes()) }
@@ -5163,8 +5118,8 @@ fn qp_scale(values: &[f32], weights: &[f32], nmax: i8) -> f32 {
 	let mut output=Vec::new(); for values in values.chunks(256) {
 		let value=|index| values.get(index).copied().unwrap_or(0.0); let mut packed=[0_u8;108]; let mut scales=[0.0_f32;8]; let mut maximum=0.0_f32;
 		for block in 0..8 { let x=(0..32).map(|offset| value(block*32+offset)).collect::<Vec<_>>(); let weights=x.iter().map(|value| value*value).collect::<Vec<_>>(); let magnitudes=x.iter().map(|value| value.abs()).collect::<Vec<_>>(); let max=magnitudes.iter().copied().fold(0.0_f32,f32::max); if max==0.0 {continue} let mut best=0.0_f32; let mut scale=max/15.0; let mut levels=[0_i8;32];
-			for step in -9..=9 { let inverse=(15.0+0.2*step as f32)/max; let trial_scale=inverse.recip(); let mut trial=[0_i8;32]; for group in 0..8 { for lane in 0..4 {trial[group*4+lane]=qround(0.5*(inverse*magnitudes[group*4+lane]-1.0)).max(0.0).min(7.0) as i8} iq3_nearest(&IQ3_S,&mut trial[group*4..group*4+4],&magnitudes[group*4..group*4+4],&weights[group*4..group*4+4].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),trial_scale); } let(mut qx,mut q2)=(0.0,0.0); for lane in 0..32 {let level=f32::from(2*trial[lane]+1);qx+=weights[lane]*magnitudes[lane]*level;q2+=weights[lane]*level*level} if q2>0.0&&qx*qx>best*q2 {scale=qx/q2;best=scale*qx;levels=trial} }
-			for group in 0..8 {let index=iq3_nearest(&IQ3_S,&mut levels[group*4..group*4+4],&magnitudes[group*4..group*4+4],&weights[group*4..group*4+4].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);packed[block*8+group]=index as u8;packed[64+(block*8+group)/8]|=((index>>8)as u8)<<((block*8+group)%8)} for group in 0..4 {packed[72+block*4+group]=(0..8).fold(0,|signs,lane|signs|u8::from(x[group*8+lane]<0.0)<<lane)} scales[block]=scale;maximum=maximum.max(scale)
+			for step in -9..=9 { let inverse=(15.0+0.2*step as f32)/max; let trial_scale=inverse.recip(); let mut trial=[0_i8;32]; for group in 0..8 { for lane in 0..4 {trial[group*4+lane]=qround(0.5*(inverse*magnitudes[group*4+lane]-1.0)).max(0.0).min(7.0) as i8} iq_nearest(&IQ3_S_GRID,&mut trial[group*4..group*4+4],&magnitudes[group*4..group*4+4],&weights[group*4..group*4+4].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),trial_scale); } let(mut qx,mut q2)=(0.0,0.0); for lane in 0..32 {let level=f32::from(2*trial[lane]+1);qx+=weights[lane]*magnitudes[lane]*level;q2+=weights[lane]*level*level} if q2>0.0&&qx*qx>best*q2 {scale=qx/q2;best=scale*qx;levels=trial} }
+			for group in 0..8 {let index=iq_nearest(&IQ3_S_GRID,&mut levels[group*4..group*4+4],&magnitudes[group*4..group*4+4],&weights[group*4..group*4+4].iter().map(|value|value.sqrt()).collect::<Vec<_>>(),scale);packed[block*8+group]=index as u8;packed[64+(block*8+group)/8]|=((index>>8)as u8)<<((block*8+group)%8)} for group in 0..4 {packed[72+block*4+group]=(0..8).fold(0,|signs,lane|signs|u8::from(x[group*8+lane]<0.0)<<lane)} scales[block]=scale;maximum=maximum.max(scale)
 		}
 		if maximum==0.0 {put_half(&mut output,0.0);output.extend(packed);continue} let scale=maximum/31.0; for pair in 0..4 {let low=qround(0.5*(scales[pair*2]/scale-1.0)).max(0.0).min(15.0)as u8;let high=qround(0.5*(scales[pair*2+1]/scale-1.0)).max(0.0).min(15.0)as u8;packed[104+pair]=low|high<<4} put_half(&mut output,scale*1.033);output.extend(packed)
 	} output
