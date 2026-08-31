@@ -7563,25 +7563,17 @@ const NEAREST_NODE_FIELDS: usize = 5;
 fn nearest_rows(parameters: usize, features: usize) -> Option<usize> {
 	features.checked_add(1).and_then(|width| parameters.checked_div(width).filter(|rows| *rows != 0 && *rows * width == parameters))
 }
-fn nearest_index_shape(rows: usize, features: usize) -> Option<(usize, usize)> {
-	Some((rows.div_ceil(NEAREST_LEAF_ROWS).checked_next_power_of_two()?.checked_mul(2)?.checked_sub(1)?, features.checked_mul(2)?.checked_add(NEAREST_NODE_FIELDS)?))
-}
+#[rustfmt::skip]
+fn nearest_index_shape(rows: usize, features: usize) -> Option<(usize, usize)> { Some((rows.div_ceil(NEAREST_LEAF_ROWS).checked_next_power_of_two()?.checked_mul(2)?.checked_sub(1)?, features.checked_mul(2)?.checked_add(NEAREST_NODE_FIELDS)?)) }
+#[rustfmt::skip]
 fn nearest_layout(node: &Node, programs: &[f64]) -> Result<Option<(usize, usize, usize)>> {
-	if node.op != Primitive::Predictor {
-		return Ok(None);
-	}
+	if node.op != Primitive::Predictor { return Ok(None) }
 	let end = node.program_offset.checked_add(checked_mul(node.program_count, 2, "predictor program")?).ok_or_else(|| RecipeError::new("predictor program range overflows"))?;
 	let program = programs.get(node.program_offset..end).ok_or_else(|| RecipeError::new("predictor program range is invalid"))?;
-	if !program.chunks_exact(2).any(|instruction| instruction[0] == PredictorOpcode::Nearest as i32 as f64) {
-		return Ok(None);
-	}
+	if !program.chunks_exact(2).any(|instruction| instruction[0] == PredictorOpcode::Nearest as i32 as f64) { return Ok(None) }
 	let table_rows = nearest_rows(node.parameters, node.input.elements()).ok_or_else(|| RecipeError::new("nearest table width is invalid"))?;
 	let (nodes, stride) = nearest_index_shape(table_rows, node.input.elements()).ok_or_else(|| RecipeError::new("nearest index size overflows"))?;
-	Ok(Some((
-		node.input.elements(),
-		table_rows,
-		checked_mul(checked_add(checked_mul(nodes, stride, "nearest index fields")?, table_rows, "nearest index values")?, size_of::<u32>(), "nearest index bytes")?,
-	)))
+	Ok(Some((node.input.elements(), table_rows, checked_mul(checked_add(checked_mul(nodes, stride, "nearest index fields")?, table_rows, "nearest index values")?, size_of::<u32>(), "nearest index bytes")?)))
 }
 fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> Result<usize> {
 	if let Some((_, _, bytes)) = nearest_layout(node, &graph.programs)?.filter(|_| precision.pack(f64::MAX) != precision.pack(0.0)) {
@@ -9493,10 +9485,8 @@ fn distance(left: &[f64], right: &[f64]) -> f64 {
 }
 #[rustfmt::skip]
 fn nearest_bounds_distance(query: &[f64], samples: &[f64], bounds: &[u32]) -> f64 {
-	let features = query.len();
-	query.iter().enumerate().map(|(feature, &value)| {
-		let (lower, upper) = (samples[bounds[feature] as usize * features + feature], samples[bounds[features + feature] as usize * features + feature]);
-		(value - if value < lower { lower } else if value > upper { upper } else { value }).powi(2)
+	let features = query.len(); query.iter().enumerate().map(|(feature, &value)| {
+		let (lower, upper) = (samples[bounds[feature] as usize * features + feature], samples[bounds[features + feature] as usize * features + feature]); (value - if value < lower { lower } else if value > upper { upper } else { value }).powi(2)
 	}).sum()
 }
 fn nearest(query: &[f64], state: &[f64], features: usize) -> (usize, f64) {
@@ -9564,58 +9554,46 @@ impl NearestIndex {
 			target[position * size_of::<u32>()..(position + 1) * size_of::<u32>()].copy_from_slice(&value.to_le_bytes())
 		}
 	}
+	#[rustfmt::skip]
 	fn partition(samples: &[f64], features: usize, permutation: &mut [u32], start: u32, parent: u32, nodes: &mut Vec<u32>) -> u32 {
-		let stride = features * 2 + NEAREST_NODE_FIELDS;
-		let (base, index) = (nodes.len(), (nodes.len() / stride) as u32);
-		nodes.extend([permutation.iter().copied().min().unwrap_or(0), start, start + permutation.len() as u32, u32::MAX, parent]);
-		nodes.resize(base + stride, 0);
+		let stride = features * 2 + NEAREST_NODE_FIELDS; let (base, index) = (nodes.len(), (nodes.len() / stride) as u32);
+		nodes.extend([permutation.iter().copied().min().unwrap_or(0), start, start + permutation.len() as u32, u32::MAX, parent]); nodes.resize(base + stride, 0);
 		let (mut widest, mut dimension) = (f64::NEG_INFINITY, 0);
 		for feature in 0..features {
 			let (mut lower, mut upper) = (permutation[0], permutation[0]);
 			for &row in permutation.iter() {
 				let value = samples[row as usize * features + feature];
-				if value.total_cmp(&samples[lower as usize * features + feature]).is_lt() {
-					lower = row
-				}
-				if value.total_cmp(&samples[upper as usize * features + feature]).is_gt() {
-					upper = row
-				}
+				if value.total_cmp(&samples[lower as usize * features + feature]).is_lt() { lower = row }
+				if value.total_cmp(&samples[upper as usize * features + feature]).is_gt() { upper = row }
 			}
 			(nodes[base + NEAREST_NODE_FIELDS + feature], nodes[base + NEAREST_NODE_FIELDS + features + feature]) = (lower, upper);
 			let range = samples[upper as usize * features + feature] - samples[lower as usize * features + feature];
-			if range > widest {
-				(widest, dimension) = (range, feature)
-			}
+			if range > widest { (widest, dimension) = (range, feature) }
 		}
 		if widest == 0.0 {
-			permutation.sort_unstable();
-			nodes[base + 3] = NEAREST_IDENTICAL_LEAF;
+			permutation.sort_unstable(); nodes[base + 3] = NEAREST_IDENTICAL_LEAF
 		} else if permutation.len() > NEAREST_LEAF_ROWS {
 			let middle = permutation.len() / 2;
 			permutation.select_nth_unstable_by(middle, |&a, &b| samples[a as usize * features + dimension].total_cmp(&samples[b as usize * features + dimension]).then(a.cmp(&b)));
 			let pivot = permutation[middle];
 			let (left, right) = permutation.split_at_mut(middle);
-			Self::partition(samples, features, left, start, index, nodes);
-			let right = Self::partition(samples, features, right, start + middle as u32, index, nodes);
+			Self::partition(samples, features, left, start, index, nodes); let right = Self::partition(samples, features, right, start + middle as u32, index, nodes);
 			nodes[base + 1..base + 4].copy_from_slice(&[pivot, right, dimension as u32]);
 		}
 		index
 	}
+	#[rustfmt::skip]
 	fn nearest(&self, index: usize, samples: &[f64], query: &[f64], row: usize, count: usize, exclude: bool, best: &mut Vec<(f64, u32)>) {
-		let stride = self.features * 2 + NEAREST_NODE_FIELDS;
-		let (first, second, dimension) = (self.nodes[index * stride + 1], self.nodes[index * stride + 2], self.nodes[index * stride + 3]);
+		let stride = self.features * 2 + NEAREST_NODE_FIELDS; let (first, second, dimension) = (self.nodes[index * stride + 1], self.nodes[index * stride + 2], self.nodes[index * stride + 3]);
 		if dimension >= NEAREST_IDENTICAL_LEAF {
 			let end = if dimension == NEAREST_IDENTICAL_LEAF { (second as usize).min(first as usize + count + usize::from(exclude)) } else { second as usize };
 			for &candidate in &self.permutation[first as usize..end] {
-				if exclude && candidate as usize == row {
-					continue;
-				}
+				if exclude && candidate as usize == row { continue }
 				let base = candidate as usize * query.len();
 				let measured = distance(query, &samples[base..base + query.len()]);
 				let position = best.partition_point(|&(kept, index)| kept < measured || (kept == measured && index < candidate));
 				if measured < f64::MAX && position < count {
-					best.insert(position, (measured, candidate));
-					best.truncate(count)
+					best.insert(position, (measured, candidate)); best.truncate(count)
 				}
 			}
 			return;
@@ -9623,13 +9601,9 @@ impl NearestIndex {
 		let (dimension, threshold, left, right) = (dimension as usize, samples[first as usize * query.len() + dimension as usize], index + 1, second as usize);
 		let (near, far) = if query[dimension] <= threshold { (left, right) } else { (right, left) };
 		self.nearest(near, samples, query, row, count, exclude, best);
-		if best.len() == count
-			&& let Some(&(kept, index)) = best.last()
-		{
+		if best.len() == count && let Some(&(kept, index)) = best.last() {
 			let gap = nearest_bounds_distance(query, samples, &self.nodes[far * stride + NEAREST_NODE_FIELDS..far * stride + NEAREST_NODE_FIELDS + 2 * self.features]);
-			if gap > kept || (gap == kept && self.nodes[far * stride] > index) {
-				return;
-			}
+			if gap > kept || (gap == kept && self.nodes[far * stride] > index) { return }
 		}
 		self.nearest(far, samples, query, row, count, exclude, best);
 	}
@@ -9697,9 +9671,7 @@ impl PredictorProgram {
 					let features = query.len();
 					let rows = nearest_rows(self.table.len(), features).ok_or_else(|| RecipeError::new("nearest table width is invalid"))?;
 					let (samples, targets) = self.table.split_at(rows * features);
-					let rebuilt =
-						self.nearest.as_ref().filter(|index| index.features == features && index.permutation.len() == rows).is_none().then(|| NearestIndex::build(samples, features, rows));
-					let index = rebuilt.as_ref().or(self.nearest.as_ref()).ok_or_else(|| RecipeError::new("nearest index is absent"))?;
+					let index = self.nearest.as_ref().ok_or_else(|| RecipeError::new("nearest index is absent"))?;
 					let mut best = Vec::with_capacity(count);
 					index.nearest(0, samples, query, row, count, exclude, &mut best);
 					stack.push((0..count).map(|slot| best.get(slot).map_or(0.0, |&(_, candidate)| targets[candidate as usize])).sum::<f64>() / count as f64)
