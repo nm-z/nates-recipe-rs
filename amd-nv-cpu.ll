@@ -506,44 +506,43 @@ k.begin:
 %k.over = icmp ugt i32 %k.limit.raw, %k.count
 %k.limit = select i1 %k.over, i32 %k.count, i32 %k.limit.raw
 %slot.sum.base = mul i32 %sum.slot, RECIPE_REGISTER_COUNT
+%slot.sum.ptr = getelementptr RECIPE_STATE, ptr addrspace(5) %chunk.sums, i32 %slot.sum.base
+%shared.sums.initial = load <RECIPE_REGISTER_COUNT x RECIPE_STATE>, ptr addrspace(5) %slot.sum.ptr, align RECIPE_STATE_ALIGN
 %a.initial = call <RECIPE_REGISTER_M x double> @contraction_a_fragment(i32 %k.first, i32 %output.m.base, i32 %tile.m, i32 %tile.k)
 %b.initial = call <RECIPE_REGISTER_N x double> @contraction_b_fragment(i32 %k.first, i32 %output.n.base, i32 %tile.m, i32 %tile.n, i32 %tile.k)
 br label %k.loop
 k.loop:
-%k = phi i32 [ %k.first, %k.begin ], [ %k.next, %register.done ]
-%a.fragment = phi <RECIPE_REGISTER_M x double> [ %a.initial, %k.begin ], [ %a.next, %register.done ]
-%b.fragment = phi <RECIPE_REGISTER_N x double> [ %b.initial, %k.begin ], [ %b.next, %register.done ]
+%k = phi i32 [ %k.first, %k.begin ], [ %k.next, %shared.product.done ]
+%shared.sums = phi <RECIPE_REGISTER_COUNT x RECIPE_STATE> [ %shared.sums.initial, %k.begin ], [ %shared.sums.current, %shared.product.done ]
+%a.fragment = phi <RECIPE_REGISTER_M x double> [ %a.initial, %k.begin ], [ %a.next, %shared.product.done ]
+%b.fragment = phi <RECIPE_REGISTER_N x double> [ %b.initial, %k.begin ], [ %b.next, %shared.product.done ]
 %k.next = add i32 %k, 1
 %k.more = icmp ult i32 %k.next, %k.limit
 %k.prefetch = select i1 %k.more, i32 %k.next, i32 %k
 %a.next = call <RECIPE_REGISTER_M x double> @contraction_a_fragment(i32 %k.prefetch, i32 %output.m.base, i32 %tile.m, i32 %tile.k)
 %b.next = call <RECIPE_REGISTER_N x double> @contraction_b_fragment(i32 %k.prefetch, i32 %output.n.base, i32 %tile.m, i32 %tile.n, i32 %tile.k)
 %a.wide = call <RECIPE_REGISTER_M x RECIPE_STATE> @contraction_widen_m(<RECIPE_REGISTER_M x double> %a.fragment)
-br label %register.loop
-register.loop:
-%register.n = phi i32 [ 0, %k.loop ], [ %register.n.next, %register.next ]
-%register.more = icmp ult i32 %register.n, RECIPE_REGISTER_N
-br i1 %register.more, label %register.step, label %register.done
-register.step:
-%output.n.raw = add i32 %output.n.base, %register.n
-%output.n.valid = icmp ult i32 %output.n.raw, %n.count
-%b = extractelement <RECIPE_REGISTER_N x double> %b.fragment, i32 %register.n
+br label %shared.product.loop
+shared.product.loop:
+%shared.product = phi i32 [ 0, %k.loop ], [ %shared.product.next, %shared.product.step ]
+%shared.sums.current = phi <RECIPE_REGISTER_COUNT x RECIPE_STATE> [ %shared.sums, %k.loop ], [ %shared.candidate, %shared.product.step ]
+%shared.product.more = icmp ult i32 %shared.product, RECIPE_REGISTER_COUNT
+br i1 %shared.product.more, label %shared.product.step, label %shared.product.done
+shared.product.step:
+%shared.a.index = urem i32 %shared.product, RECIPE_REGISTER_M
+%shared.b.index = udiv i32 %shared.product, RECIPE_REGISTER_M
+%shared.a = extractelement <RECIPE_REGISTER_M x RECIPE_STATE> %a.wide, i32 %shared.a.index
+%b = extractelement <RECIPE_REGISTER_N x double> %b.fragment, i32 %shared.b.index
 %b.wide = call RECIPE_STATE @recipe.decode(double %b)
-%b.seed = insertelement <RECIPE_REGISTER_M x RECIPE_STATE> poison, RECIPE_STATE %b.wide, i32 0
-%b.vector = shufflevector <RECIPE_REGISTER_M x RECIPE_STATE> %b.seed, <RECIPE_REGISTER_M x RECIPE_STATE> poison, <RECIPE_REGISTER_M x i32> zeroinitializer
-%register.base = mul i32 %register.n, RECIPE_REGISTER_M
-%sum.index = add i32 %slot.sum.base, %register.base
-%sum.ptr = getelementptr RECIPE_STATE, ptr addrspace(5) %chunk.sums, i32 %sum.index
-%sum = load <RECIPE_REGISTER_M x RECIPE_STATE>, ptr addrspace(5) %sum.ptr, align RECIPE_STATE_ALIGN
-%candidate = call <RECIPE_REGISTER_M x RECIPE_STATE> @recipe.state.madd.vector(<RECIPE_REGISTER_M x RECIPE_STATE> %sum, <RECIPE_REGISTER_M x RECIPE_STATE> %a.wide, <RECIPE_REGISTER_M x RECIPE_STATE> %b.vector)
-store <RECIPE_REGISTER_M x RECIPE_STATE> %candidate, ptr addrspace(5) %sum.ptr, align RECIPE_STATE_ALIGN
-br label %register.next
-register.next:
-%register.n.next = add i32 %register.n, 1
-br label %register.loop
-register.done:
+%shared.sum = extractelement <RECIPE_REGISTER_COUNT x RECIPE_STATE> %shared.sums.current, i32 %shared.product
+%shared.value = call RECIPE_STATE @recipe.state.madd(RECIPE_STATE %shared.sum, RECIPE_STATE %shared.a, RECIPE_STATE %b.wide)
+%shared.candidate = insertelement <RECIPE_REGISTER_COUNT x RECIPE_STATE> %shared.sums.current, RECIPE_STATE %shared.value, i32 %shared.product
+%shared.product.next = add i32 %shared.product, 1
+br label %shared.product.loop
+shared.product.done:
 br i1 %k.more, label %k.loop, label %chunk.finish
 chunk.finish:
+store <RECIPE_REGISTER_COUNT x RECIPE_STATE> %shared.sums.current, ptr addrspace(5) %slot.sum.ptr, align RECIPE_STATE_ALIGN
 %chunk.next = add i32 %chunk, %k.lanes
 %slot.next = add i32 %slot, 1
 br label %shared.chunk.loop
