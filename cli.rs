@@ -1,6 +1,18 @@
-use std::{fs, os::unix::process::ExitStatusExt, path::Path, path::PathBuf, process::Command};
+use std::{
+	fs,
+	os::unix::process::{CommandExt, ExitStatusExt},
+	path::Path,
+	path::PathBuf,
+	process::Command,
+};
 
-const USAGE: &str = "usage: recipe [--device <name>] <source.rs> [export]\n       recipe rat\n       recipe --worker <device>";
+const USAGE: &str = "usage: recipe [--device <name>] <source.rs> [argument | export]\n       recipe --worker <device>";
+const PR_SET_PDEATHSIG: i32 = 1;
+const SIGTERM: usize = 15;
+
+unsafe extern "C" {
+	fn prctl(option: i32, argument: usize, third: usize, fourth: usize, fifth: usize) -> i32;
+}
 
 fn invalid(message: &str) -> ! {
 	eprintln!("{message}");
@@ -58,7 +70,7 @@ fn library_path(directory: &Path) -> PathBuf {
 	selected
 }
 
-fn run(source: &Path, device: Option<&str>) {
+fn run(source: &Path, device: Option<&str>, argument: Option<&str>) {
 	let directory = std::env::current_exe().expect("cannot locate recipe").parent().expect("recipe has no parent directory").to_owned();
 	let library = library_path(&directory);
 	let dependencies = directory.join("deps");
@@ -84,6 +96,18 @@ fn run(source: &Path, device: Option<&str>) {
 	command.env("RECIPE_BINARY", std::env::current_exe().expect("cannot locate recipe"));
 	if let Some(device) = device {
 		command.env("RECIPE_DEVICE", device);
+	}
+	if let Some(argument) = argument {
+		command.arg(argument);
+	}
+	unsafe {
+		command.pre_exec(|| {
+			if prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) == 0 {
+				Ok(())
+			} else {
+				Err(std::io::Error::last_os_error())
+			}
+		});
 	}
 	// The running child holds the inode, so unlinking now leaves nothing behind
 	// when this process is killed before it could otherwise clean up.
@@ -130,13 +154,12 @@ fn main() {
 	}
 	let source = source.unwrap_or_else(|| invalid(USAGE));
 	let device = device.as_deref();
-	let source = if source == "rat" { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("experiment/bench.rs") } else { PathBuf::from(source) };
+	let source = PathBuf::from(source);
 	if source.extension().and_then(|value| value.to_str()) != Some("rs") {
 		invalid("recipe requires a Rust source")
 	}
 	match operation.as_deref() {
-		None => run(&source, device),
 		Some("export") => export(&source, device),
-		Some(_) => invalid(USAGE),
+		values => run(&source, device, values),
 	}
 }

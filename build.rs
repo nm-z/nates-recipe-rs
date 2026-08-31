@@ -120,45 +120,107 @@ impl IntFormat {
 	}
 }
 type BuildResult<T> = Result<T, Box<dyn Error>>;
-const PARALLEL: &str = r#"declare i32 @llvm.amdgcn.workgroup.id.x()
-declare i32 @recipe.workgroup.size.x()
-define internal i32 @global_id() #1 { entry:
-%lane = call i32 @llvm.amdgcn.workitem.id.x() %group = call i32 @llvm.amdgcn.workgroup.id.x()
-%width = call i32 @recipe.workgroup.size.x() %base = mul i32 %group, %width %id = add i32 %base, %lane ret i32 %id }
+const PARALLEL: &str = r#"declare i32 @llvm.amdgcn.workitem.id.y()
+declare i32 @llvm.amdgcn.workitem.id.z()
+declare i32 @llvm.amdgcn.workgroup.id.x()
+declare i32 @llvm.amdgcn.workgroup.id.y()
+declare i32 @llvm.amdgcn.workgroup.id.z()
+@RECIPE_GEOMETRY@
+declare <3 x i32> @llvm.umin.v3i32(<3 x i32>, <3 x i32>)
+define internal <3 x i32> @recipe.local.shape() #1 { entry:
+%wx = call i32 @recipe.workgroup.size.x() %wy = call i32 @recipe.workgroup.size.y() %wz = call i32 @recipe.workgroup.size.z()
+%gx = call i32 @recipe.grid.size.x() %gy = call i32 @recipe.grid.size.y() %gz = call i32 @recipe.grid.size.z()
+%bx = call i32 @llvm.amdgcn.workgroup.id.x() %by = call i32 @llvm.amdgcn.workgroup.id.y() %bz = call i32 @llvm.amdgcn.workgroup.id.z()
+%w0 = insertelement <3 x i32> poison, i32 %wx, i32 0 %w1 = insertelement <3 x i32> %w0, i32 %wy, i32 1 %width = insertelement <3 x i32> %w1, i32 %wz, i32 2
+%g0 = insertelement <3 x i32> poison, i32 %gx, i32 0 %g1 = insertelement <3 x i32> %g0, i32 %gy, i32 1 %grid = insertelement <3 x i32> %g1, i32 %gz, i32 2
+%b0 = insertelement <3 x i32> poison, i32 %bx, i32 0 %b1 = insertelement <3 x i32> %b0, i32 %by, i32 1 %group = insertelement <3 x i32> %b1, i32 %bz, i32 2
+%base = mul <3 x i32> %group, %width %remaining = sub <3 x i32> %grid, %base
+%shape = call <3 x i32> @llvm.umin.v3i32(<3 x i32> %width, <3 x i32> %remaining) ret <3 x i32> %shape }
+define internal i32 @recipe.local.id() #1 { entry:
+%x = call i32 @llvm.amdgcn.workitem.id.x() %y = call i32 @llvm.amdgcn.workitem.id.y() %z = call i32 @llvm.amdgcn.workitem.id.z()
+%shape = call <3 x i32> @recipe.local.shape() %sx = extractelement <3 x i32> %shape, i32 0 %sy = extractelement <3 x i32> %shape, i32 1
+%zy = mul i32 %z, %sy %row = add i32 %zy, %y %base = mul i32 %row, %sx %id = add i32 %base, %x ret i32 %id }
+define internal i32 @recipe.workgroup.size() #1 { entry:
+%shape = call <3 x i32> @recipe.local.shape() %x = extractelement <3 x i32> %shape, i32 0 %y = extractelement <3 x i32> %shape, i32 1 %z = extractelement <3 x i32> %shape, i32 2
+%xy = mul i32 %x, %y %size = mul i32 %xy, %z ret i32 %size }
+define internal i64 @recipe.grid.groups() #1 { entry:
+%gx = call i32 @recipe.grid.size.x() %gy = call i32 @recipe.grid.size.y() %gz = call i32 @recipe.grid.size.z()
+%wx = call i32 @recipe.workgroup.size.x() %wy = call i32 @recipe.workgroup.size.y() %wz = call i32 @recipe.workgroup.size.z()
+%gxa = add i32 %gx, %wx %gxn = sub i32 %gxa, 1 %nx = udiv i32 %gxn, %wx
+%gya = add i32 %gy, %wy %gyn = sub i32 %gya, 1 %ny = udiv i32 %gyn, %wy
+%gza = add i32 %gz, %wz %gzn = sub i32 %gza, 1 %nz = udiv i32 %gzn, %wz
+%nx.wide = zext i32 %nx to i64 %ny.wide = zext i32 %ny to i64 %nz.wide = zext i32 %nz to i64
+%nxy = mul i64 %nx.wide, %ny.wide %groups = mul i64 %nxy, %nz.wide ret i64 %groups }
+define internal i64 @recipe.group.id() #1 { entry:
+%x.raw = call i32 @llvm.amdgcn.workgroup.id.x() %y.raw = call i32 @llvm.amdgcn.workgroup.id.y() %z.raw = call i32 @llvm.amdgcn.workgroup.id.z()
+%x = zext i32 %x.raw to i64 %y = zext i32 %y.raw to i64 %z = zext i32 %z.raw to i64
+%gx = call i32 @recipe.grid.size.x() %gy = call i32 @recipe.grid.size.y()
+%wx = call i32 @recipe.workgroup.size.x() %wy = call i32 @recipe.workgroup.size.y()
+%gxa = add i32 %gx, %wx %gxn = sub i32 %gxa, 1 %nx = udiv i32 %gxn, %wx
+%gya = add i32 %gy, %wy %gyn = sub i32 %gya, 1 %ny = udiv i32 %gyn, %wy
+%nx.wide = zext i32 %nx to i64 %ny.wide = zext i32 %ny to i64
+%zy = mul i64 %z, %ny.wide %row = add i64 %zy, %y %base = mul i64 %row, %nx.wide %id = add i64 %base, %x ret i64 %id }
+define internal i64 @global_id() #1 { entry:
+%lx = call i32 @llvm.amdgcn.workitem.id.x() %ly = call i32 @llvm.amdgcn.workitem.id.y() %lz = call i32 @llvm.amdgcn.workitem.id.z()
+%bx = call i32 @llvm.amdgcn.workgroup.id.x() %by = call i32 @llvm.amdgcn.workgroup.id.y() %bz = call i32 @llvm.amdgcn.workgroup.id.z()
+%wx = call i32 @recipe.workgroup.size.x() %wy = call i32 @recipe.workgroup.size.y() %wz = call i32 @recipe.workgroup.size.z()
+%gx = mul i32 %bx, %wx %x = add i32 %gx, %lx %gy = mul i32 %by, %wy %y = add i32 %gy, %ly %gz = mul i32 %bz, %wz %z = add i32 %gz, %lz
+%sx = call i32 @recipe.grid.size.x() %sy = call i32 @recipe.grid.size.y()
+%x.wide = zext i32 %x to i64 %y.wide = zext i32 %y to i64 %z.wide = zext i32 %z to i64
+%sx.wide = zext i32 %sx to i64 %sy.wide = zext i32 %sy to i64
+%zy = mul i64 %z.wide, %sy.wide %row = add i64 %zy, %y.wide %base = mul i64 %row, %sx.wide %id = add i64 %base, %x.wide ret i64 %id }
 @RECIPE_GRID_BARRIER@"#;
 const AMD_GRID_BARRIER: &str = r#"declare void @__ockl_grid_sync()
-define internal void @grid_barrier(i32 %threads) #1 { entry: call void @__ockl_grid_sync() ret void }"#;
+define internal void @grid_barrier(i64 %threads) #1 { entry: call void @__ockl_grid_sync() ret void }"#;
 // PTX only accepts ordered atomics on sm_70 and newer, so the counting barrier uses
 // relaxed atomics with explicit fences. A release fence before each arrival publishes the
 // block's writes; the last arriver acquires them, republishes with a release fence, and
 // flips the phase; each waiter acquires after it observes the flip. The fences lower to
 // membar, which every NVIDIA architecture supports, so one barrier serves them all.
-const NVIDIA_GRID_BARRIER: &str = r#"@grid.count = internal addrspace(1) global i32 0, align 4
+const NVIDIA_GRID_BARRIER: &str = r#"@grid.count = internal addrspace(1) global i64 0, align 8
 @grid.phase = internal addrspace(1) global i32 0, align 4
-define internal void @grid_barrier(i32 %threads) #1 { entry:
-call void @llvm.amdgcn.s.barrier() %lane = call i32 @llvm.amdgcn.workitem.id.x()
+define internal void @grid_barrier(i64 %threads) #1 { entry:
+call void @llvm.amdgcn.s.barrier() %lane = call i32 @recipe.local.id()
 %leader = icmp eq i32 %lane, 0 br i1 %leader, label %arrive, label %joined arrive:
-%width = call i32 @recipe.workgroup.size.x() %groups = udiv i32 %threads, %width
+%groups = call i64 @recipe.grid.groups()
 %phase = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4
 fence release
-%prior = atomicrmw add ptr addrspace(1) @grid.count, i32 1 monotonic %limit = sub i32 %groups, 1
-%last = icmp eq i32 %prior, %limit br i1 %last, label %release, label %wait release:
+%prior = atomicrmw add ptr addrspace(1) @grid.count, i64 1 monotonic %limit = sub i64 %groups, 1
+%last = icmp eq i64 %prior, %limit br i1 %last, label %release, label %wait release:
 fence acquire
-store atomic i32 0, ptr addrspace(1) @grid.count monotonic, align 4 %next = xor i32 %phase, 1
+store atomic i64 0, ptr addrspace(1) @grid.count monotonic, align 8 %next = xor i32 %phase, 1
 fence release
 store atomic i32 %next, ptr addrspace(1) @grid.phase monotonic, align 4 br label %joined wait:
 %seen = load atomic i32, ptr addrspace(1) @grid.phase monotonic, align 4 %ready = icmp ne i32 %seen, %phase
 br i1 %ready, label %waited, label %wait waited:
 fence acquire br label %joined joined: call void @llvm.amdgcn.s.barrier() ret void }"#;
-const AMD_WIDTH: &str = r#"declare ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
-define internal i32 @recipe.workgroup.size.x() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
-%address = getelementptr i8, ptr addrspace(4) %args, i32 4 %value = load i16, ptr addrspace(4) %address, align 2
-%width = zext i16 %value to i32 ret i32 %width }"#;
-fn parallel_ir(ir: String, width: &str, grid_barrier: &str) -> String {
-	let mut ir = ir.replace("call i32 @llvm.amdgcn.workitem.id.x()", "call i32 @global_id()").replace("call void @llvm.amdgcn.s.barrier()", "call void @grid_barrier(i32 %threads)");
+const AMD_GEOMETRY: &str = r#"declare ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
+define internal i32 @recipe.workgroup.size.x() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr() %address = getelementptr i8, ptr addrspace(4) %args, i32 4 %value = load i16, ptr addrspace(4) %address, align 2 %wide = zext i16 %value to i32 ret i32 %wide }
+define internal i32 @recipe.workgroup.size.y() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr() %address = getelementptr i8, ptr addrspace(4) %args, i32 6 %value = load i16, ptr addrspace(4) %address, align 2 %wide = zext i16 %value to i32 ret i32 %wide }
+define internal i32 @recipe.workgroup.size.z() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr() %address = getelementptr i8, ptr addrspace(4) %args, i32 8 %value = load i16, ptr addrspace(4) %address, align 2 %wide = zext i16 %value to i32 ret i32 %wide }
+define internal i32 @recipe.grid.size.x() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr() %address = getelementptr i8, ptr addrspace(4) %args, i32 12 %value = load i32, ptr addrspace(4) %address, align 4 ret i32 %value }
+define internal i32 @recipe.grid.size.y() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr() %address = getelementptr i8, ptr addrspace(4) %args, i32 16 %value = load i32, ptr addrspace(4) %address, align 4 ret i32 %value }
+define internal i32 @recipe.grid.size.z() #1 { entry: %args = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr() %address = getelementptr i8, ptr addrspace(4) %args, i32 20 %value = load i32, ptr addrspace(4) %address, align 4 ret i32 %value }"#;
+const NVIDIA_GEOMETRY: &str = r#"declare i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
+declare i32 @llvm.nvvm.read.ptx.sreg.ntid.y()
+declare i32 @llvm.nvvm.read.ptx.sreg.ntid.z()
+declare i32 @llvm.nvvm.read.ptx.sreg.nctaid.x()
+declare i32 @llvm.nvvm.read.ptx.sreg.nctaid.y()
+declare i32 @llvm.nvvm.read.ptx.sreg.nctaid.z()
+define internal i32 @recipe.workgroup.size.x() #1 { entry: %value = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x() ret i32 %value }
+define internal i32 @recipe.workgroup.size.y() #1 { entry: %value = call i32 @llvm.nvvm.read.ptx.sreg.ntid.y() ret i32 %value }
+define internal i32 @recipe.workgroup.size.z() #1 { entry: %value = call i32 @llvm.nvvm.read.ptx.sreg.ntid.z() ret i32 %value }
+define internal i32 @recipe.grid.size.x() #1 { entry: %groups = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.x() %width = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x() %value = mul i32 %groups, %width ret i32 %value }
+define internal i32 @recipe.grid.size.y() #1 { entry: %groups = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.y() %width = call i32 @llvm.nvvm.read.ptx.sreg.ntid.y() %value = mul i32 %groups, %width ret i32 %value }
+define internal i32 @recipe.grid.size.z() #1 { entry: %groups = call i32 @llvm.nvvm.read.ptx.sreg.nctaid.z() %width = call i32 @llvm.nvvm.read.ptx.sreg.ntid.z() %value = mul i32 %groups, %width ret i32 %value }"#;
+fn parallel_ir(ir: String, geometry: &str, grid_barrier: &str) -> String {
+	let mut ir = ir
+		.replace("call i32 @recipe.local.id.x()", "call i32 @recipe.local.id()")
+		.replace("call i32 @recipe.workgroup.size.x()", "call i32 @recipe.workgroup.size()")
+		.replace("call void @llvm.amdgcn.s.barrier()", "call void @grid_barrier(i64 %threads)");
 	let target = ir.find("target triple").and_then(|start| ir[start..].find('\n').map(|end| start + end + 1)).expect("kernel target triple is absent");
-	ir.insert_str(target, &format!("{}\n", PARALLEL.replace("declare i32 @recipe.workgroup.size.x()", width).replace("@RECIPE_GRID_BARRIER@", grid_barrier)));
-	ir.replace("recipe.local.id.x", "llvm.amdgcn.workitem.id.x").replace("recipe.group.id.x", "llvm.amdgcn.workgroup.id.x").replace("recipe.local.barrier", "llvm.amdgcn.s.barrier")
+	ir.insert_str(target, &format!("{}\n", PARALLEL.replace("@RECIPE_GEOMETRY@", geometry).replace("@RECIPE_GRID_BARRIER@", grid_barrier)));
+	ir.replace("recipe.local.barrier", "llvm.amdgcn.s.barrier")
 }
 fn word(text: String, from: &str, to: &str) -> String {
 	let (mut output, mut rest) = (String::with_capacity(text.len()), text.as_str());
@@ -322,7 +384,7 @@ fn native_codec(ty: &str, rounded: bool) -> String {
 	)
 }
 
-fn numeric_operations(prefix: &str, value: &str, arithmetic: &str, encoded: bool, vector: Option<bool>) -> String {
+fn numeric_operations(prefix: &str, value: &str, arithmetic: &str, encoded: bool) -> String {
 	let intrinsic = if arithmetic == "double" { "f64" } else { "f32" };
 	let math = MATH_NAMES;
 	let mut block = String::new();
@@ -337,25 +399,6 @@ fn numeric_operations(prefix: &str, value: &str, arithmetic: &str, encoded: bool
 		block.push_str(&format!("define internal {value} @{prefix}.madd({value} %sum, {value} %left, {value} %right) #1 {{ entry: %sum.wide = call {arithmetic} @recipe.decode({value} %sum) %left.wide = call {arithmetic} @recipe.decode({value} %left) %right.wide = call {arithmetic} @recipe.decode({value} %right) %wide = call {arithmetic} @llvm.fma.{intrinsic}({arithmetic} %left.wide, {arithmetic} %right.wide, {arithmetic} %sum.wide) %result = call {value} @recipe.encode({arithmetic} %wide) ret {value} %result }}\n"));
 	} else {
 		block.push_str(&format!("define internal {value} @{prefix}.madd({value} %sum, {value} %left, {value} %right) #1 {{ entry: %result = call {value} @llvm.fma.{intrinsic}({value} %left, {value} %right, {value} %sum) ret {value} %result }}\n"));
-	}
-	if let Some(declare) = vector {
-		if let Some(intrinsic) = match value {
-			"half" => Some("f16"),
-			"float" => Some("f32"),
-			"double" => Some("f64"),
-			_ => None,
-		} {
-			// The state family reuses the model family's intrinsic when both name the
-			// same type, so the declaration is emitted once.
-			if declare {
-				block.push_str(&format!(
-					"declare <RECIPE_REGISTER_M x {value}> @llvm.fma.vRECIPE_REGISTER_M{intrinsic}(<RECIPE_REGISTER_M x {value}>, <RECIPE_REGISTER_M x {value}>, <RECIPE_REGISTER_M x {value}>)\n"
-				));
-			}
-			block.push_str(&format!("define internal <RECIPE_REGISTER_M x {value}> @{prefix}.madd.vector(<RECIPE_REGISTER_M x {value}> %sum, <RECIPE_REGISTER_M x {value}> %left, <RECIPE_REGISTER_M x {value}> %right) #1 {{\nentry:\n%result = call <RECIPE_REGISTER_M x {value}> @llvm.fma.vRECIPE_REGISTER_M{intrinsic}(<RECIPE_REGISTER_M x {value}> %left, <RECIPE_REGISTER_M x {value}> %right, <RECIPE_REGISTER_M x {value}> %sum)\nret <RECIPE_REGISTER_M x {value}> %result\n}}\n"));
-		} else {
-			block.push_str(&format!("define internal <RECIPE_REGISTER_M x {value}> @{prefix}.madd.vector(<RECIPE_REGISTER_M x {value}> %sum, <RECIPE_REGISTER_M x {value}> %left, <RECIPE_REGISTER_M x {value}> %right) #1 {{\nentry:\nbr label %loop\nloop:\n%p = phi i32 [ 0, %entry ], [ %p.next, %step ]\n%result = phi <RECIPE_REGISTER_M x {value}> [ poison, %entry ], [ %next, %step ]\n%more = icmp ult i32 %p, RECIPE_REGISTER_M\nbr i1 %more, label %step, label %done\nstep:\n%sum.value = extractelement <RECIPE_REGISTER_M x {value}> %sum, i32 %p\n%left.value = extractelement <RECIPE_REGISTER_M x {value}> %left, i32 %p\n%right.value = extractelement <RECIPE_REGISTER_M x {value}> %right, i32 %p\n%value = call {value} @{prefix}.madd({value} %sum.value, {value} %left.value, {value} %right.value)\n%next = insertelement <RECIPE_REGISTER_M x {value}> %result, {value} %value, i32 %p\n%p.next = add i32 %p, 1\nbr label %loop\ndone:\nret <RECIPE_REGISTER_M x {value}> %result\n}}\n"));
-		}
 	}
 	if encoded {
 		block.push_str(&format!("define internal {value} @{prefix}.neg({value} %value) #1 {{ entry: %wide = call {arithmetic} @recipe.decode({value} %value) %negative = fneg {arithmetic} %wide %result = call {value} @recipe.encode({arithmetic} %negative) ret {value} %result }}\n"));
@@ -434,13 +477,13 @@ fn numeric_program(value: &str, arithmetic: &str, codec: &str) -> String {
 	};
 	block.push_str(&format!("\ndeclare {arithmetic} @llvm.fma.{intrinsic}({arithmetic}, {arithmetic}, {arithmetic})\n"));
 	block.push_str(&shared_math(arithmetic));
-	block.push_str(&numeric_operations("recipe", value, arithmetic, true, Some(true)));
+	block.push_str(&numeric_operations("recipe", value, arithmetic, true));
 	// No floating-point atomic is emitted. Every reduction names its own owner and
 	// a fixed order, so a read-modify-write race has nowhere left to happen.
 	if !codec.contains("@recipe.set.format") {
 		block.push_str("define internal void @recipe.set.format(i32 %exp, i32 %man) #1 { entry: ret void }\n")
 	}
-	block.push_str(&numeric_operations("recipe.state", arithmetic, arithmetic, false, Some(value != arithmetic)));
+	block.push_str(&numeric_operations("recipe.state", arithmetic, arithmetic, false));
 	block.push_str(&format!("define internal {arithmetic} @recipe.state.from.model({value} %value) #1 {{ entry: %result = call {arithmetic} @recipe.decode({value} %value) ret {arithmetic} %result }}\ndefine internal {value} @recipe.model.from.state({arithmetic} %value) #1 {{ entry: %result = call {value} @recipe.encode({arithmetic} %value) ret {value} %result }}\n; NUMERIC END"));
 	block
 }
@@ -562,36 +605,20 @@ fn text<'a>(manifest: &'a str, key: &str) -> BuildResult<&'a str> {
 const CPU_REPLACEMENTS: &[(&str, &str)] = &[
 	("@contraction_tile = external addrspace(3) global [0 x double], align 16", "@contraction_tile = internal global [RECIPE_CONTRACTION_CPU_SHARED_VALUES x double] zeroinitializer, align 16"),
 	(" addrspace(3)", ""),
-	("call i32 @llvm.amdgcn.workitem.id.x()", "add i32 0, 0"),
+	("call i64 @global_id()", "add i64 0, 0"),
 	("call i32 @recipe.local.id.x()", "add i32 0, 0"),
-	("call i32 @recipe.group.id.x()", "add i32 0, 0"),
+	("call i64 @recipe.group.id()", "add i64 0, 0"),
+	("call i64 @recipe.grid.groups()", "add i64 1, 0"),
 	("call i32 @recipe.workgroup.size.x()", "add i32 1, 0"),
 	("call void @llvm.amdgcn.s.barrier()", ""),
 	("call void @recipe.local.barrier()", ""),
-	("call void @grid_barrier(i32 %threads)", ""),
+	("call void @grid_barrier(i64 %threads)", ""),
 	("declare i32 @llvm.amdgcn.workitem.id.x()", ""),
 	("declare void @llvm.amdgcn.s.barrier()", ""),
 	("declare i64 @__ockl_steadyctr_u64()", ""),
 	("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }"),
 ];
-/// Compile-time contraction shape. A reverse K extent is cut into one contiguous
-/// partition per `split_span` elements, capped at `partitions`, so the summation
-/// order is a property of the program rather than of the device it runs on.
-#[derive(Clone, Copy)]
-struct Schedule {
-	swizzle_m: u32,
-	partitions: u32,
-	split_span: u32,
-	matrix_split_span: u32,
-	local_chunks: u32,
-}
-fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<[(&'static str, String); 10]> {
-	let ir = ir
-		.replace("RECIPE_CONTRACTION_SWIZZLE_M", &schedule.swizzle_m.to_string())
-		.replace("RECIPE_CONTRACTION_K_PARTITIONS", &schedule.partitions.to_string())
-		.replace("RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN", &schedule.matrix_split_span.to_string())
-		.replace("RECIPE_CONTRACTION_SPLIT_SPAN", &schedule.split_span.to_string())
-		.replace("RECIPE_CONTRACTION_LOCAL_CHUNKS", &schedule.local_chunks.to_string());
+fn precision_sources(ir: String) -> BuildResult<[(&'static str, String); 10]> {
 	Ok([
 		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
 		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
@@ -605,8 +632,8 @@ fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<[(&'static s
 		("-f", custom_ir(ir, "_f")?),
 	])
 }
-fn wmma_source(source: &str) -> String {
-	source.lines().filter(|line| !line.starts_with("; RECIPE_WMMA ")).collect::<Vec<_>>().join("\n")
+fn native_source(source: &str) -> String {
+	source.lines().filter(|line| !line.starts_with("; RECIPE_WMMA ") && !line.contains("@recipe_wave_probe(")).collect::<Vec<_>>().join("\n")
 }
 fn wmma_method(source: &str, key: &str) -> BuildResult<(String, String)> {
 	let marker = format!("{key} ");
@@ -639,11 +666,15 @@ fn compose_contraction(mut ir: String, matrix: bool) -> String {
 	}
 	ir
 }
-fn compile_amd(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
+fn compile_amd(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	let source = fs::read_to_string("amd-nv-cpu.ll")?;
-	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER);
+	let probe = source.lines().find(|line| line.starts_with("define protected amdgpu_kernel void @recipe_wave_probe(")).ok_or_else(|| io::Error::other("AMD wave probe method is absent"))?;
+	let probe_path = out.join("recipe-amd-wave-probe.ll");
+	fs::write(&probe_path, format!("target triple = \"amdgcn-amd-amdhsa\"\n{probe}\n"))?;
+	println!("cargo:rustc-env=RECIPE_HSA_WAVE_PROBE={}", probe_path.display());
+	let ir = parallel_ir(native_source(&source), AMD_GEOMETRY, AMD_GRID_BARRIER);
 	let mut values = Vec::new();
-	for (suffix, contents) in precision_sources(ir, schedule)? {
+	for (suffix, contents) in precision_sources(ir)? {
 		let path = out.join(format!("recipe-amd{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents.clone(), false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
@@ -671,19 +702,22 @@ fn compile_amd(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 	}
 	Ok(())
 }
-fn compile_nvidia(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
-	let ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?);
-	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER)
+fn compile_nvidia(manifest: &str, out: &PathBuf) -> BuildResult<()> {
+	let ir = native_source(&fs::read_to_string("amd-nv-cpu.ll")?);
+	let ir = parallel_ir(ir, NVIDIA_GEOMETRY, NVIDIA_GRID_BARRIER)
 		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
 		.replace("llvm.amdgcn.workitem.id.x", "llvm.nvvm.read.ptx.sreg.tid.x")
+		.replace("llvm.amdgcn.workitem.id.y", "llvm.nvvm.read.ptx.sreg.tid.y")
+		.replace("llvm.amdgcn.workitem.id.z", "llvm.nvvm.read.ptx.sreg.tid.z")
 		.replace("llvm.amdgcn.workgroup.id.x", "llvm.nvvm.read.ptx.sreg.ctaid.x")
-		.replace("recipe.workgroup.size.x", "llvm.nvvm.read.ptx.sreg.ntid.x")
+		.replace("llvm.amdgcn.workgroup.id.y", "llvm.nvvm.read.ptx.sreg.ctaid.y")
+		.replace("llvm.amdgcn.workgroup.id.z", "llvm.nvvm.read.ptx.sreg.ctaid.z")
 		.replace("llvm.amdgcn.s.barrier", "llvm.nvvm.barrier0")
 		.replace("attributes #0 = { nounwind \"amdgpu-flat-work-group-size\"=\"RECIPE_WORKGROUP_SIZE,RECIPE_WORKGROUP_SIZE\" }", "attributes #0 = { nounwind }")
 		.replace(", addrspace(5)", "")
 		.replace(" addrspace(5)", "");
 	let mut values = Vec::new();
-	for (suffix, contents) in precision_sources(ir, schedule)? {
+	for (suffix, contents) in precision_sources(ir)? {
 		let path = out.join(format!("recipe-nvidia{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents, false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
@@ -695,9 +729,9 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildRes
 	println!("cargo:rustc-env=RECIPE_NV_PTX_GENERATOR={}", text(manifest, "nvidia-ptx-generator")?);
 	Ok(())
 }
-fn compile_cpu(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
+fn compile_cpu(manifest: &str, out: &PathBuf) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
-	let mut ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target);
+	let mut ir = native_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target);
 	for (pattern, replacement) in CPU_REPLACEMENTS {
 		ir = ir.replace(pattern, replacement);
 	}
@@ -706,7 +740,7 @@ fn compile_cpu(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 		return Err(io::Error::other(format!("cpu-compiler {clang:?} is absent")).into());
 	}
 	let mut values = Vec::new();
-	for (suffix, contents) in precision_sources(ir, schedule)? {
+	for (suffix, contents) in precision_sources(ir)? {
 		let contents = contents
 			.replace(" addrspace(1)", "")
 			.replace(" addrspace(3)", "")
@@ -724,16 +758,6 @@ fn compile_cpu(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 }
 fn main() -> BuildResult<()> {
 	let manifest = fs::read_to_string("Cargo.toml")?;
-	let positive = |key: &str| -> BuildResult<u32> {
-		setting(&manifest, key)?.parse::<u32>().ok().filter(|value| *value != 0).ok_or_else(|| io::Error::other(format!("{key} must be a positive integer")).into())
-	};
-	let schedule = Schedule {
-		swizzle_m: positive("contraction-swizzle-m-tiles")?,
-		partitions: positive("contraction-k-partitions")?,
-		split_span: positive("contraction-split-span")?,
-		matrix_split_span: positive("contraction-matrix-split-span")?,
-		local_chunks: positive("contraction-local-chunks")?,
-	};
 	for (key, environment) in [
 		("epochs", "RECIPE_TRAIN_EPOCHS"),
 		("learning-rate", "RECIPE_TRAIN_LEARNING_RATE"),
@@ -784,6 +808,7 @@ fn main() -> BuildResult<()> {
 		("contraction-register-m", "RECIPE_CONTRACTION_REGISTER_M"),
 		("contraction-register-n", "RECIPE_CONTRACTION_REGISTER_N"),
 		("contraction-fragment-k", "RECIPE_CONTRACTION_FRAGMENT_K"),
+		("contraction-swizzle-m-tiles", "RECIPE_CONTRACTION_SWIZZLE_M"),
 		("contraction-k-partitions", "RECIPE_CONTRACTION_K_PARTITIONS"),
 		("contraction-split-span", "RECIPE_CONTRACTION_SPLIT_SPAN"),
 		("contraction-matrix-split-span", "RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN"),
@@ -791,28 +816,41 @@ fn main() -> BuildResult<()> {
 		("contraction-resident-waves-per-workgroup", "RECIPE_CONTRACTION_RESIDENT_WAVES_PER_WORKGROUP"),
 		("contraction-matrix-max-waves-per-workgroup", "RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"),
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
+		("rat-invalid-time-ms", "RECIPE_RAT_INVALID_TIME_MS"),
+		("hsa-queue-packets", "RECIPE_HSA_QUEUE_PACKETS"),
+		("rat-learning-rate", "RECIPE_RAT_LEARNING_RATE"),
+		("rat-initial-epochs", "RECIPE_RAT_INITIAL_EPOCHS"),
+		("rat-shuffles", "RECIPE_RAT_SHUFFLES"),
+		("rat-prediction-shuffles", "RECIPE_RAT_PREDICTION_SHUFFLES"),
+		("rat-observation-epochs", "RECIPE_RAT_OBSERVATION_EPOCHS"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
-	for (key, environment) in [("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME")] {
+	for (key, environment) in [
+		("hsa-runtime", "RECIPE_HSA_RUNTIME"),
+		("hsa-occupancy-runtime", "RECIPE_HSA_OCCUPANCY_RUNTIME"),
+		("nvidia-runtime", "RECIPE_NV_RUNTIME"),
+		("rat-bench-model", "RECIPE_RAT_BENCH_MODEL"),
+		("rat-knob-model", "RECIPE_RAT_KNOB_MODEL"),
+	] {
 		println!("cargo:rustc-env={environment}={}", text(&manifest, key)?);
 	}
 	let out = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR must be configured"))?);
 	println!("cargo::rustc-check-cfg=cfg(amd)");
 	println!("cargo::rustc-check-cfg=cfg(nvidia)");
 	let toolchain = |compiler: &str, library: &str| -> BuildResult<bool> { Ok(Path::new(text(&manifest, compiler)?).exists() && Path::new(text(&manifest, library)?).exists()) };
-	compile_cpu(&manifest, &out, schedule)?;
+	compile_cpu(&manifest, &out)?;
 	// GPU driver stubs and library search paths are host-arch: cross-compiled builds are CPU-only.
 	let native = env::var("TARGET")? == env::var("HOST")?;
 	let amd = native && toolchain("hsa-compiler", "hsa-device-library")?;
 	let nvidia = native && toolchain("nvidia-compiler", "nvidia-device-library")? && Path::new(text(&manifest, "nvidia-ptx-generator")?).exists();
 	if amd {
 		println!("cargo:rustc-cfg=amd");
-		compile_amd(&manifest, &out, schedule)?;
+		compile_amd(&manifest, &out)?;
 	}
 	if nvidia {
 		println!("cargo:rustc-cfg=nvidia");
-		compile_nvidia(&manifest, &out, schedule)?;
+		compile_nvidia(&manifest, &out)?;
 	}
 	println!("cargo:rerun-if-changed=Cargo.toml");
 	println!("cargo:rerun-if-changed=amd-nv-cpu.ll");

@@ -38,6 +38,14 @@ Recipe trains one device, so `--device` is given once.
 
 `recipe --worker <device>` serves one local GPU over stdin and stdout. Recipe starts this transport entrypoint through SSH for a host-qualified selector. It is a protocol endpoint, not a model script invocation.
 
+## RAT
+
+AMD training tunes the supplied workload through two models. The knob model selects a configuration from the queried device's search space. The bench model learns from measured training time and supplies gradients to the knob model. Training retains the fastest measured configuration after the configured observation budget.
+
+Run the normal entrypoint, such as `recipe --device amd0 model.rs`. There is no CSV collection phase. `Cargo.toml` defines the tuning policy and the paths for both saved models. New models bootstrap from real workload observations; initialized models continue online. Decisions and measurements go to `recipe.log`. Set `RECIPE_DEBUG=1` for additional diagnostics in that same file.
+
+The [RAT evidence](.docs/RAT-evidence.md) records the controlled VNA comparison and the pretrained state used. Performance depends on that learned state; new or subsequently updated models are not guaranteed to beat the untuned schedule.
+
 ## files
 
 ```bash
