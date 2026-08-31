@@ -10387,10 +10387,10 @@ fn predict_rows(teacher: &Predictor, inputs: &[f64], features: usize) -> Result<
 	parallel_map(inputs.len() / features, |row| (teacher.predict)(row, &inputs[row * features..row * features + features])).into_iter().collect()
 }
 fn fit_knn(count: usize, data: &Prepared, rows: usize, _: Config, exclude: bool) -> Result<Predictor> {
-	let maximum = rows.checked_sub(usize::from(exclude)).unwrap_or(0);
-	require(count != 0 && count <= maximum, "knn neighbor count is invalid")?;
-	let mut table = data.samples[..rows * data.features].to_vec();
-	table.extend_from_slice(&data.targets[..rows]);
+	require(count != 0 && count <= rows.checked_sub(usize::from(exclude)).unwrap_or(0), "knn neighbor count is invalid")?;
+	let (mut seen, sample) = (HashMap::new(), |row| &data.samples[row * data.features..(row + 1) * data.features]);
+	let kept = (0..rows).filter(|&r| exclude || *seen.entry(sample(r).iter().map(|&x| x.to_bits()).collect::<Vec<_>>()).and_modify(|n| *n += 1).or_insert(1) <= count).collect::<Vec<_>>();
+	let table = kept.iter().flat_map(|&r| sample(r).iter().copied()).chain(kept.iter().map(|&r| data.targets[r])).collect::<Vec<_>>();
 	let mut program = PredictorBuilder::new();
 	program.nearest(count, exclude, data.features, table);
 	Ok(Predictor::new(program.finish()?))
