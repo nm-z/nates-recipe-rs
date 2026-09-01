@@ -1205,6 +1205,17 @@ fn cpu_identity_field<'a>(field: &'a str, name: &str) -> Result<&'a str> {
 	field.strip_prefix(&prefix).filter(|value| !value.is_empty()).ok_or_else(|| RecipeError::new(format!("CPU native target field {name:?} is absent")))
 }
 
+const LLVM_OPAQUE_POINTER_DEFAULT_MAJOR: u32 = 15;
+const APPLE_CLANG_BROKEN_LICM_PROMOTION_PREFIX: &str = "Apple clang version 14.";
+fn cpu_llvm_major(compiler: &str) -> Result<u32> {
+	compiler
+		.split_once("clang version ")
+		.and_then(|(_, version)| version.split('.').next())
+		.and_then(|major| major.parse().ok())
+		.filter(|major| *major != 0)
+		.ok_or_else(|| RecipeError::new("CPU compiler LLVM major version is absent"))
+}
+
 fn cpu_identity(target: &str) -> Result<(&str, &str, &str, &str)> {
 	let mut fields = target.split(';');
 	let target = cpu_identity_field(fields.next().unwrap_or_default(), "target")?;
@@ -3483,9 +3494,16 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
-			let (target, _, _, _) = cpu_identity(target)?;
+			let (target, compiler_identity, _, _) = cpu_identity(target)?;
 			let mut command = Command::new(compiler);
-			command.args(["-target", target, "-march=native", "-Xclang", "-opaque-pointers", "-x", "ir", "-O2", "-fPIC", "-shared", "-o"]).arg(output).arg(source);
+			command.args(["-target", target, "-march=native"]);
+			if cpu_llvm_major(compiler_identity)? < LLVM_OPAQUE_POINTER_DEFAULT_MAJOR {
+				command.args(["-mllvm", "-opaque-pointers=1"]);
+			}
+			if compiler_identity.contains(APPLE_CLANG_BROKEN_LICM_PROMOTION_PREFIX) {
+				command.args(["-mllvm", "-disable-licm-promotion"]);
+			}
+			command.args(["-x", "ir", "-O2", "-fPIC", "-shared", "-o"]).arg(output).arg(source);
 			native_command(command, "CPU LLVM IR compiler", key).map(|_| Vec::new())
 		}
 		BackendTarget::Amd { architecture } => {
@@ -7204,8 +7222,6 @@ impl NativeTape {
 		device_label(self.program.gpu)
 	}
 }
-/// The `host:device` name of one device: a remote device already carries its
-/// owning host, and a local device takes this host's name.
 fn device_label(gpu: &Gpu) -> Result<String> {
 	if gpu.name.contains(':') { Ok(gpu.name.clone()) } else { Ok(format!("{}:{}", local_host()?, gpu.name)) }
 }
@@ -8479,7 +8495,9 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	Ok(&found[0])
 }
 fn local_host() -> Result<String> {
-	let host = fs::read_to_string("/etc/hostname").map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
+	let output = Command::new("hostname").output().map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
+	require(output.status.success(), "cannot read hostname")?;
+	let host = String::from_utf8(output.stdout).map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	Ok(host.trim().to_owned())
 }
 static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
@@ -9399,7 +9417,7 @@ pub fn worker_serve(name: &str) -> Result<()> {
 				let training = wire.read_u8()? != 0;
 				let epoch_layout: &'static [u8] = if wire.read_u8()? != 0 { NATIVE_EPOCH_LAYOUT_FP64 } else { NATIVE_EPOCH_LAYOUT_FP32 };
 				let has_storage = wire.read_u8()? != 0;
-				let loaded = match &gpu.driver {
+				let loaded: Result<(NativeBackend, Dispatch, Option<Dispatch>, Option<Dispatch>)> = match &gpu.driver {
 					#[cfg(amd)]
 					Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves) }
 						.map(|(program, forward, epoch, model_load)| (NativeBackend::Amd(program), forward, epoch, model_load)),
