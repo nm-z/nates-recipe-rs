@@ -45,22 +45,42 @@ ptr addrspace(1) %input, i32 %row.base, i32 %position, i32 %term, i32 %span, i32
 %local.0 = add i32 %channel.base, %position %local = add i32 %local.0, %offset
 %index = add i32 %row.base, %local %ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %index
 %value = load double, ptr addrspace(1) %ptr, align 8 ret double %value }
-define internal double @contraction_delta(ptr addrspace(1) %delta, ptr addrspace(1) %output, i32 %index, i1 %relu) #1 {
+define internal double @contraction_delta(ptr addrspace(1) %delta, ptr addrspace(1) %output, ptr addrspace(1) %targets, i32 %index, i1 %relu, i1 %inline.loss, i1 %huber.loss, double %loss.denominator, double %loss.threshold) #1 {
 entry:
+br i1 %inline.loss, label %loss, label %adjoint
+adjoint:
 %delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %index
 %delta.value = load double, ptr addrspace(1) %delta.ptr, align 8
+br label %activation.test
+loss:
+%loss.output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %index
+%loss.output = load double, ptr addrspace(1) %loss.output.ptr, align 8
+%loss.target.ptr = getelementptr inbounds double, ptr addrspace(1) %targets, i32 %index
+%loss.target = load double, ptr addrspace(1) %loss.target.ptr, align 8
+%loss.difference = call double @recipe.sub(double %loss.output, double %loss.target)
+%loss.twice = call double @recipe.add(double %loss.difference, double %loss.difference)
+%loss.negative.threshold = call double @recipe.neg(double %loss.threshold)
+%loss.low = call i1 @recipe.olt(double %loss.difference, double %loss.negative.threshold)
+%loss.high = call i1 @recipe.ogt(double %loss.difference, double %loss.threshold)
+%loss.lower = select i1 %loss.low, double %loss.negative.threshold, double %loss.difference
+%loss.clamped = select i1 %loss.high, double %loss.threshold, double %loss.lower
+%loss.numerator = select i1 %huber.loss, double %loss.clamped, double %loss.twice
+%loss.value = call double @recipe.div(double %loss.numerator, double %loss.denominator)
+br label %activation.test
+activation.test:
+%delta.raw = phi double [ %delta.value, %adjoint ], [ %loss.value, %loss ]
 br i1 %relu, label %activation, label %done
 activation:
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %index
 %output.value = load double, ptr addrspace(1) %output.ptr, align 8
 %positive = call i1 @recipe.ogt(double %output.value, double 0.0)
-%activated = select i1 %positive, double %delta.value, double 0.0
+%activated = select i1 %positive, double %delta.raw, double 0.0
 br label %done
 done:
-%value = phi double [ %delta.value, %entry ], [ %activated, %activation ]
+%value = phi double [ %delta.raw, %activation.test ], [ %activated, %activation ]
 ret double %value
 }
-define internal <16 x double> @contraction_delta_vector16(ptr addrspace(1) %delta, ptr addrspace(1) %output, i32 %index, i1 %relu) #1 {
+define internal <16 x double> @contraction_delta_vector16(ptr addrspace(1) %delta, ptr addrspace(1) %output, ptr addrspace(1) %targets, i32 %index, i1 %relu, i1 %inline.loss, i1 %huber.loss, double %loss.denominator, double %loss.threshold) #1 {
 entry:
 %delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %index
 %delta.value = load <16 x double>, ptr addrspace(1) %delta.ptr, align 8
@@ -616,7 +636,9 @@ define internal void @contraction_bias_accumulate(
 ptr addrspace(5) %sums, ptr addrspace(1) %destination,
 i1 %enable, i1 %first, i1 %last, i32 %lid, i32 %block,
 i32 %n.base, i32 %n.count, i32 %r.count, i32 %out.channels, i32 %window,
-i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %store.offset ) #1 { entry:
+i32 %tile.m, i32 %tile.n, i32 %tile.k, i32 %store.offset, i1 %inline.optimizer,
+ptr addrspace(1) %frozen, ptr addrspace(1) %weights, ptr addrspace(1) %moments, ptr addrspace(1) %variances,
+RECIPE_STATE %rate, RECIPE_STATE %beta1, RECIPE_STATE %beta2, RECIPE_STATE %beta1.power, RECIPE_STATE %beta2.power, RECIPE_STATE %epsilon, RECIPE_STATE %decay ) #1 { entry:
 %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false) br i1 %enable, label %channel.loop, label %exit
 channel.loop:
 %channel = phi i32 [ %lid, %entry ], [ %channel.next, %channel.done ] %slot = phi i32 [ 0, %entry ], [ %slot.next, %channel.done ]
@@ -637,7 +659,14 @@ store RECIPE_STATE %sum, ptr addrspace(5) %sum.ptr, align RECIPE_STATE_ALIGN br 
 destination.store:
 %filter = add i32 %n.base, %channel %bias.base = mul i32 %out.channels, %window %bias.local = add i32 %bias.base, %filter %bias.index = add i32 %store.offset, %bias.local
 %bias.ptr = getelementptr inbounds double, ptr addrspace(1) %destination, i32 %bias.index
-%bias = call double @recipe.encode(RECIPE_STATE %sum) store double %bias, ptr addrspace(1) %bias.ptr, align 8 br label %channel.done
+%bias = call double @recipe.encode(RECIPE_STATE %sum)
+br i1 %inline.optimizer, label %destination.update, label %destination.write
+destination.update:
+call void @recipe_model_adamw_update(ptr addrspace(1) %frozen, ptr addrspace(1) %weights, ptr addrspace(1) %moments, ptr addrspace(1) %variances, i32 %bias.index, double %bias, RECIPE_STATE %rate, RECIPE_STATE %beta1, RECIPE_STATE %beta2, RECIPE_STATE %beta1.power, RECIPE_STATE %beta2.power, RECIPE_STATE %epsilon, RECIPE_STATE %decay)
+br label %channel.done
+destination.write:
+store double %bias, ptr addrspace(1) %bias.ptr, align 8
+br label %channel.done
 channel.done:
 %channel.next = add i32 %channel, %block %slot.next = add i32 %slot, 1 br label %channel.loop
 exit: ret void
@@ -2467,7 +2496,8 @@ store double %output.value, ptr addrspace(1) %output.ptr, align 8 %output.next =
 br label %output.loop output.done: %time.next = add nuw i32 %time, 1 br label %time.loop time.done:
 %row.next = add i32 %row, %threads br label %row.loop exit: ret void }
 define internal void @contraction_reverse_body(
-ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.input, i1 %has.bias, i1 %relu, i1 %matrix.gradient,
+ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %delta, ptr addrspace(1) %targets, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, ptr addrspace(1) %frozen, ptr addrspace(1) %moments, ptr addrspace(1) %variances, i1 %write.input, i1 %has.bias, i1 %relu, i1 %matrix.gradient, i1 %inline.loss, i1 %huber.loss, i1 %inline.optimizer, double %loss.denominator, double %loss.threshold,
+RECIPE_STATE %rate, RECIPE_STATE %beta1, RECIPE_STATE %beta2, RECIPE_STATE %beta1.power, RECIPE_STATE %beta2.power, RECIPE_STATE %epsilon, RECIPE_STATE %decay,
 i32 %rows, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %out.length, i32 %kernel, i32 %offset,
 i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k, i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads ) #1 { entry:
 %sums = alloca [RECIPE_REGISTER_COUNT x RECIPE_STATE], align RECIPE_STATE_ALIGN, addrspace(5)
@@ -2579,7 +2609,9 @@ gradient.load.generic.entry:
 %gradient.b.unit = icmp eq i32 %out.length, 1
 %gradient.b.fragment.remainder = urem i32 %gradient.n.count, RECIPE_FRAGMENT_K
 %gradient.b.fragment.full = icmp eq i32 %gradient.b.fragment.remainder, 0
-%gradient.b.vector = and i1 %gradient.b.unit, %gradient.b.fragment.full
+%gradient.b.vector.raw = and i1 %gradient.b.unit, %gradient.b.fragment.full
+%gradient.b.not.loss = xor i1 %inline.loss, true
+%gradient.b.vector = and i1 %gradient.b.vector.raw, %gradient.b.not.loss
 %gradient.b.width = select i1 %gradient.b.vector, i32 RECIPE_FRAGMENT_K, i32 1
 %gradient.b.columns = udiv i32 %gradient.n.count, %gradient.b.width
 %gradient.a.count = mul i32 %gradient.a.columns, %gradient.r.count %gradient.b.count = mul i32 %gradient.b.columns, %gradient.r.count %gradient.load.count = add i32 %gradient.a.count, %gradient.b.count br label %gradient.load.loop gradient.load.loop:
@@ -2605,11 +2637,11 @@ gradient.load.b.step: %gradient.b.local = sub i32 %gradient.load, %gradient.a.co
 %gradient.b.tile.local = call i32 @contraction_b_index(i32 %gradient.b.r, i32 %gradient.b.n, i32 %gradient.tile.n, i32 %gradient.tile.k) %gradient.b.tile.index = add i32 %gradient.b.tile.base, %gradient.b.tile.local
 br i1 %gradient.b.vector, label %gradient.load.b.vector, label %gradient.load.b.scalar
 gradient.load.b.vector:
-%gradient.b.vector.value = call <RECIPE_FRAGMENT_K x double> @contraction_delta_vector16(ptr addrspace(1) %delta, ptr addrspace(1) %output, i32 %gradient.b.index, i1 %relu)
+%gradient.b.vector.value = call <RECIPE_FRAGMENT_K x double> @contraction_delta_vector16(ptr addrspace(1) %delta, ptr addrspace(1) %output, ptr addrspace(1) %targets, i32 %gradient.b.index, i1 %relu, i1 %inline.loss, i1 %huber.loss, double %loss.denominator, double %loss.threshold)
 call void @contraction_stage_b_fragment(<RECIPE_FRAGMENT_K x double> %gradient.b.vector.value, i32 %gradient.b.r, i32 %gradient.b.n, i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k)
 br label %gradient.load.advance
 gradient.load.b.scalar:
-%gradient.b.value = call double @contraction_delta(ptr addrspace(1) %delta, ptr addrspace(1) %output, i32 %gradient.b.index, i1 %relu)
+%gradient.b.value = call double @contraction_delta(ptr addrspace(1) %delta, ptr addrspace(1) %output, ptr addrspace(1) %targets, i32 %gradient.b.index, i1 %relu, i1 %inline.loss, i1 %huber.loss, double %loss.denominator, double %loss.threshold)
 br label %gradient.load.store
 gradient.load.store: %gradient.load.value = phi double [ %gradient.a.value, %gradient.load.a.scalar ], [ %gradient.b.value, %gradient.load.b.scalar ] %gradient.load.index = phi i32 [ %gradient.a.tile.index, %gradient.load.a.scalar ], [ %gradient.b.tile.index, %gradient.load.b.scalar ]
 %gradient.load.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %gradient.load.index store double %gradient.load.value, ptr addrspace(3) %gradient.load.ptr, align 8
@@ -2632,7 +2664,7 @@ gradient.load.ready:
 call void @recipe.local.barrier()
 br label %gradient.scalar.ready
 gradient.scalar.ready:
-call void @contraction_bias_accumulate(ptr addrspace(5) %bias.sums, ptr addrspace(1) %gradient.destination, i1 %gradient.bias.enable, i1 %gradient.r.first.tile, i1 %gradient.r.last.tile, i32 %lid, i32 %block, i32 %gradient.n.base, i32 %gradient.n.count, i32 %gradient.r.count, i32 %out.channels, i32 %window, i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k, i32 %gradient.store.offset)
+call void @contraction_bias_accumulate(ptr addrspace(5) %bias.sums, ptr addrspace(1) %gradient.destination, i1 %gradient.bias.enable, i1 %gradient.r.first.tile, i1 %gradient.r.last.tile, i32 %lid, i32 %block, i32 %gradient.n.base, i32 %gradient.n.count, i32 %gradient.r.count, i32 %out.channels, i32 %window, i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k, i32 %gradient.store.offset, i1 %inline.optimizer, ptr addrspace(1) %frozen, ptr addrspace(1) %weights, ptr addrspace(1) %moments, ptr addrspace(1) %variances, RECIPE_STATE %rate, RECIPE_STATE %beta1, RECIPE_STATE %beta2, RECIPE_STATE %beta1.power, RECIPE_STATE %beta2.power, RECIPE_STATE %epsilon, RECIPE_STATE %decay)
 call void @contraction_product_accumulate(ptr addrspace(5) %sums, i1 %gradient.lane.active, i1 %gradient.method.store, i32 %lid, i32 %gradient.lane.k, i32 %gradient.k.lanes, i32 %gradient.output.lane, i32 %gradient.output.lanes, i32 %gradient.output.m.base, i32 %gradient.output.n.base, i32 %gradient.m.count, i32 %gradient.n.count, i32 %gradient.r.count, i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k)
 br label %gradient.product.done
 gradient.product.done:
@@ -2643,7 +2675,13 @@ gradient.store.loop:
 gradient.store.test: %gradient.store.register.m = urem i32 %gradient.store.register, RECIPE_REGISTER_M %gradient.store.register.n = udiv i32 %gradient.store.register, RECIPE_REGISTER_M %gradient.store.output.m.raw = call i32 @contraction_output_m(i32 %lid, i32 %gradient.store.register, i32 %gradient.m.lanes) %gradient.store.output.n.raw = call i32 @contraction_output_n(i32 %lid, i32 %gradient.store.register, i32 %gradient.m.lanes) %gradient.store.register.valid = call i1 @contraction_output_register_valid(i32 %gradient.store.register)
 %gradient.store.output.m.valid = icmp ult i32 %gradient.store.output.m.raw, %gradient.m.count %gradient.store.output.n.valid = icmp ult i32 %gradient.store.output.n.raw, %gradient.n.count %gradient.store.output.valid = and i1 %gradient.store.output.m.valid, %gradient.store.output.n.valid %gradient.store.lane.active = and i1 %gradient.method.store, %gradient.store.output.valid %gradient.store.active = and i1 %gradient.store.lane.active, %gradient.store.register.valid br i1 %gradient.store.active, label %gradient.store, label %gradient.store.next
 gradient.store: %gradient.store.filter = add i32 %gradient.n.base, %gradient.store.output.n.raw %gradient.store.term = add i32 %gradient.m.base, %gradient.store.output.m.raw %gradient.store.filter.base = mul i32 %gradient.store.filter, %window %gradient.store.local = add i32 %gradient.store.filter.base, %gradient.store.term %gradient.store.index = add i32 %gradient.store.offset, %gradient.store.local
-%gradient.store.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient.destination, i32 %gradient.store.index %gradient.store.sum.ptr = getelementptr [RECIPE_REGISTER_COUNT x RECIPE_STATE], ptr addrspace(5) %sums, i32 0, i32 %gradient.store.register %gradient.store.sum.wide = load RECIPE_STATE, ptr addrspace(5) %gradient.store.sum.ptr, align RECIPE_STATE_ALIGN %gradient.store.sum = call double @recipe.encode(RECIPE_STATE %gradient.store.sum.wide) store double %gradient.store.sum, ptr addrspace(1) %gradient.store.ptr, align 8
+%gradient.store.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient.destination, i32 %gradient.store.index %gradient.store.sum.ptr = getelementptr [RECIPE_REGISTER_COUNT x RECIPE_STATE], ptr addrspace(5) %sums, i32 0, i32 %gradient.store.register %gradient.store.sum.wide = load RECIPE_STATE, ptr addrspace(5) %gradient.store.sum.ptr, align RECIPE_STATE_ALIGN %gradient.store.sum = call double @recipe.encode(RECIPE_STATE %gradient.store.sum.wide)
+br i1 %inline.optimizer, label %gradient.store.update, label %gradient.store.write
+gradient.store.update:
+call void @recipe_model_adamw_update(ptr addrspace(1) %frozen, ptr addrspace(1) %weights, ptr addrspace(1) %moments, ptr addrspace(1) %variances, i32 %gradient.store.index, double %gradient.store.sum, RECIPE_STATE %rate, RECIPE_STATE %beta1, RECIPE_STATE %beta2, RECIPE_STATE %beta1.power, RECIPE_STATE %beta2.power, RECIPE_STATE %epsilon, RECIPE_STATE %decay)
+br label %gradient.store.next
+gradient.store.write:
+store double %gradient.store.sum, ptr addrspace(1) %gradient.store.ptr, align 8
 br label %gradient.store.next
 gradient.store.next: %gradient.store.register.next = add i32 %gradient.store.register, 1 br label %gradient.store.loop gradient.bias.store.test:
 br label %gradient.job.done
@@ -2685,7 +2723,7 @@ previous.sum.init.step: %previous.sum.init.ptr = getelementptr [RECIPE_REGISTER_
 %previous.r.base = phi i32 [ 0, %previous.sum.init.loop ], [ %previous.r.next, %previous.tile.done ]
 %previous.r.remaining = sub i32 %previous.r.total, %previous.r.base %previous.r.partial = icmp ult i32 %previous.r.remaining, %previous.k.tile %previous.r.count = select i1 %previous.r.partial, i32 %previous.r.remaining, i32 %previous.k.tile
 %previous.a.project = icmp eq i32 %span, 1 %previous.a.unit = icmp eq i32 %out.length, 1 %previous.a.contiguous = and i1 %previous.a.project, %previous.a.unit
-%previous.a.fragment.remainder = urem i32 %previous.r.count, RECIPE_FRAGMENT_K %previous.a.fragment.full = icmp eq i32 %previous.a.fragment.remainder, 0 %previous.a.vector = and i1 %previous.a.contiguous, %previous.a.fragment.full
+%previous.a.fragment.remainder = urem i32 %previous.r.count, RECIPE_FRAGMENT_K %previous.a.fragment.full = icmp eq i32 %previous.a.fragment.remainder, 0 %previous.a.vector.raw = and i1 %previous.a.contiguous, %previous.a.fragment.full %previous.a.not.loss = xor i1 %inline.loss, true %previous.a.vector = and i1 %previous.a.vector.raw, %previous.a.not.loss
 %previous.a.width = select i1 %previous.a.vector, i32 RECIPE_FRAGMENT_K, i32 1 %previous.a.columns = udiv i32 %previous.r.count, %previous.a.width
 %previous.b.fragment.remainder = urem i32 %previous.n.count, RECIPE_FRAGMENT_K %previous.b.fragment.full = icmp eq i32 %previous.b.fragment.remainder, 0 %previous.b.vector = and i1 %previous.a.project, %previous.b.fragment.full
 %previous.b.width = select i1 %previous.b.vector, i32 RECIPE_FRAGMENT_K, i32 1 %previous.b.columns = udiv i32 %previous.n.count, %previous.b.width
@@ -2706,7 +2744,7 @@ previous.load.a.vector:
 call void @contraction_stage_delta_a_fragment(<RECIPE_FRAGMENT_K x double> %previous.a.vector.delta.value, <RECIPE_FRAGMENT_K x double> %previous.a.vector.output.value, i1 %relu, i32 %previous.a.r, i32 %previous.a.m, i32 %previous.tile.m, i32 %previous.tile.k)
 br label %previous.load.advance
 previous.load.a.scalar:
-%previous.a.raw = call double @contraction_delta(ptr addrspace(1) %delta, ptr addrspace(1) %output, i32 %previous.a.index, i1 %relu)
+%previous.a.raw = call double @contraction_delta(ptr addrspace(1) %delta, ptr addrspace(1) %output, ptr addrspace(1) %targets, i32 %previous.a.index, i1 %relu, i1 %inline.loss, i1 %huber.loss, double %loss.denominator, double %loss.threshold)
 %previous.a.value = select i1 %previous.a.valid, double %previous.a.raw, double 0.0
 br label %previous.load.store
 previous.load.b.step: %previous.b.local = sub i32 %previous.load, %previous.a.count %previous.b.r = udiv i32 %previous.b.local, %previous.b.columns %previous.b.column = urem i32 %previous.b.local, %previous.b.columns %previous.b.n = mul i32 %previous.b.column, %previous.b.width %previous.b.term = add i32 %previous.r.base, %previous.b.r

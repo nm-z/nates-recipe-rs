@@ -15,3 +15,39 @@ AOT
 	implementation
 		vector
 		matrix
+	runtime:
+		transport:
+			directions
+				Master	<-eth/wlan->	Worker[s]
+				DISK		<-SATA/SAS->	RAM
+				RAM		  <-PCIe->		VRAM
+			concurrency
+				bidirectional
+					PCIe	(SDMA)
+					NVMe	(PCIe SQ/CQ)
+					SAS	(Full duplex)
+					eth	(Full duplex)
+				unidirectional
+					SATA	(Half duplex)
+					wlan	(Half duplex)
+		ops
+			calcs
+				in-place
+				scalar
+			transfers
+				async
+				sync
+		run
+			init
+			loop
+			exit
+		lifecycle
+			run
+				ops
+				ops
+				...
+			run
+				ops
+				ops
+				...
+			...

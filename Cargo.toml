@@ -17,19 +17,36 @@ path = "cli.rs"
 dependency-allowlist = []
 multi-device = "auto"
 contraction-cpu-shared-values = 65536
-contraction-register-m = 8
+contraction-register-m = 4
 contraction-register-n = 8
 contraction-fragment-k = 16
-contraction-chunk-k = 64
+contraction-chunk-k = 80
 contraction-local-chunks = 3
 contraction-k-partitions = 32
 contraction-split-span = 128
 contraction-matrix-split-span = 64
 contraction-swizzle-m-tiles = 4
-contraction-resident-waves-per-workgroup = 2
+contraction-resident-waves-per-workgroup = 1
 contraction-matrix-max-waves-per-workgroup = 4
 attention-query-tile = 24
 topology-probe-bytes = 4194304
+# Direct HSA probes measure each rate from device-active timestamps. Calculation
+# probes use 6,912 workgroups. VRAM probes stream 432 MiB, and PCIe probes copy
+# 256 MiB. Values are medians of 11 samples after eight warm-up operations.
+# Division and square root include LLVM's strict IEEE correction sequences.
+# The packet floor is the median of 31 empty 50-group by 288-thread dispatches
+# with agent acquire and system release, matching the epoch packet.
+gfx1101-fp32-fma-flops-per-second = 19654667481683
+gfx1101-fp32-arithmetic-ops-per-second = 11712096065621
+gfx1101-fp32-comparison-ops-per-second = 5373868266693
+gfx1101-fp32-selection-ops-per-second = 8089022252820
+gfx1101-fp32-division-ops-per-second = 586178196321
+gfx1101-fp32-square-root-ops-per-second = 553616015515
+gfx1101-vram-read-bytes-per-second = 423620318745
+gfx1101-vram-write-bytes-per-second = 411117452838
+gfx1101-pcie-host-to-device-bytes-per-second = 28569366764
+gfx1101-pcie-device-to-host-bytes-per-second = 28640691724
+gfx1101-kernel-packet-floor-seconds = 0.000002640
 cpu-compiler = "/usr/bin/clang"
 hsa-compiler = "/opt/rocm/lib/llvm/bin/clang"
 hsa-runtime = "libhsa-runtime64.so.1"
@@ -76,13 +93,7 @@ quantization-block-weights = 64
 surrogate-epochs = 8
 surrogate-rate = 0.01
 surrogate-width = 8
-tuning-budget-per-direction = 3
-tuning-candidates = 12
-tuning-measurements = 3
-tuning-warmups = 1
-tuning-minimum-improvement = 0.05
 random-seed = 17
-progress-refresh-hz = 240
 normalization-epsilon = 0.00001
 categorical-ratio = 0.5
 leak-slope = 0.01
