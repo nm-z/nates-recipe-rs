@@ -7038,9 +7038,7 @@ impl NativeTape {
 		let output = graph.output.elements();
 		require(targets.is_empty() || targets.len() == rows * output, format!("target batch expected 0 or {} values, received {}", rows * output, targets.len()))?;
 		let program = gpu.native_program(graph, rows, precision, loss)?;
-		let precision = program.artifact.precision;
-		let layout = program.artifact.layout.clone();
-		let parameters = graph.parameters.len();
+		let (precision, layout, parameters) = (program.artifact.precision, program.artifact.layout.clone(), graph.parameters.len());
 		let zeros = vec![0.0; parameters.max(1)];
 		let gradient_bytes = checked_mul(program.gradient_values.max(1), precision.model.bytes(), "native gradient allocation")?;
 		require(graph.state.moments.is_empty() || graph.state.moments.len() == parameters, "saved optimizer moments have the wrong shape")?;
@@ -7059,6 +7057,8 @@ impl NativeTape {
 		let step = narrow(graph.state.epoch, "optimizer epoch")? as u32;
 		let target_buffer = if targets.is_empty() { vec![0.0] } else { targets.to_vec() };
 		let parameter_values = if graph.parameters.is_empty() { vec![0.0] } else { graph.parameters.clone() };
+		let adjoints_bytes = layout.adjoints_bytes.max(1);
+		let input_adjoint_bytes = checked_mul(samples.len(), precision.model.bytes(), "native input adjoint allocation")?.max(1);
 		let weights = Buffer::upload_float(gpu, &parameter_values, precision.model)?;
 		if program.model_load.is_some() {
 			require(!program.artifact.storage.is_empty(), "native model-load storage is empty")?;
@@ -7075,10 +7075,10 @@ impl NativeTape {
 			precision,
 			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
 			contexts: Buffer::upload(gpu, &vec![0_u8; layout.contexts_bytes.max(1)])?,
-			adjoints: Buffer::upload(gpu, &vec![0_u8; layout.adjoints_bytes.max(1)])?,
+			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes },
 			batch_normalizations,
 			samples: Buffer::upload_float(gpu, samples, precision.model)?,
-			input_adjoint: Buffer::upload_float(gpu, &vec![0.0; samples.len().max(1)], precision.model)?,
+			input_adjoint: Buffer { runtime: gpu, pointer: gpu.allocate(input_adjoint_bytes)?, bytes: input_adjoint_bytes },
 			targets: Buffer::upload_float(gpu, &target_buffer, precision.model)?,
 			weights,
 			frozen: Buffer::upload(gpu, &frozen)?,
