@@ -9963,17 +9963,22 @@ fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config, _: bool) ->
 				*mean += value / rows as f64
 			}
 		}
-		let mut matrix = vec![0.0; data.features * data.features];
-		let mut values = vec![0.0; data.features];
-		for (sample, target) in data.samples[..rows * data.features].chunks_exact(data.features).zip(&data.targets[..rows]) {
-			for left in 0..data.features {
-				let centered = sample[left] - means[left];
-				values[left] += centered * (target - target_mean) / config.bayes_noise_variance;
-				for right in 0..data.features {
-					matrix[left * data.features + right] += centered * (sample[right] - means[right]) / config.bayes_noise_variance
-				}
-			}
-		}
+		let samples = &data.samples[..rows * data.features];
+		let mut matrix = parallel_map(data.features, |left| {
+			(0..data.features)
+				.map(|right| samples.chunks_exact(data.features).map(|sample| (sample[left] - means[left]) * (sample[right] - means[right]) / config.bayes_noise_variance).sum::<f64>())
+				.collect::<Vec<_>>()
+		})
+		.into_iter()
+		.flatten()
+		.collect::<Vec<_>>();
+		let values = parallel_map(data.features, |feature| {
+			samples
+				.chunks_exact(data.features)
+				.zip(&data.targets[..rows])
+				.map(|(sample, target)| (sample[feature] - means[feature]) * (target - target_mean) / config.bayes_noise_variance)
+				.sum::<f64>()
+		});
 		for feature in 0..data.features {
 			matrix[feature * data.features + feature] += config.bayes_prior_precision
 		}
