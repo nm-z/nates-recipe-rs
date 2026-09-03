@@ -84,6 +84,11 @@ prelu cos   exp      log    ln     huber  tan
 ```
 
 ## compute precisions
+key:<br>
+`.`       optional continue<br>
+`[...]`   optional children<br>
+`|`       chain alternative<br>
+`(...)`   multiple children
 
 ```rust
 .fp(8|16|32|64)
@@ -92,15 +97,14 @@ prelu cos   exp      log    ln     huber  tan
 .tf(32)
 .f(exp, mantissa)
 ```
-
 ## 32 quantizations
 
 ```rust
 quantized integer:
 	.qi(4|5|8).(0|1)
 	.qi(2|6|8).k
-	.qi(3).k[.s|m|l]
-	.qi(4|5).k[.s|m]
+	.qi(3).k.[s|m|l]
+	.qi(4|5).k.[s|m]
 	.qi(4).nf
 importance quantized:
 	.iq(1).(s|m)
