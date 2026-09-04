@@ -9924,22 +9924,35 @@ fn fit_svm(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<Pre
 	}
 	let mut weights = vec![0.0; data.features];
 	let mut bias = data.targets[..rows].iter().sum::<f64>() / rows as f64;
+	// Each row block accumulates the hinge gradient over its own rows in one pass, and the blocks reduce in block order.
+	let blocks = (cpu_worker_threads()? as usize).min(rows);
 	for _ in 0..config.svm_iterations {
+		let partials = parallel_map(blocks, |block| {
+			let (start, end) = (block * rows / blocks, (block + 1) * rows / blocks);
+			let (mut bias_partial, mut partial) = (0.0, vec![0.0; data.features]);
+			for (sample, target) in data.samples[start * data.features..end * data.features].chunks_exact(data.features).zip(&data.targets[start..end]) {
+				let prediction = bias + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
+				let error = prediction - target;
+				let direction = if error > config.svm_epsilon {
+					1.0
+				} else if error < -config.svm_epsilon {
+					-1.0
+				} else {
+					0.0
+				};
+				bias_partial += direction / rows as f64;
+				for (((value, mean), scale), value_gradient) in sample.iter().zip(&means).zip(&inverse).zip(&mut partial) {
+					*value_gradient += direction * (value - mean) * scale / rows as f64
+				}
+			}
+			(bias_partial, partial)
+		})?;
 		let mut gradient = weights.iter().map(|weight| config.svm_regularization * weight).collect::<Vec<_>>();
 		let mut bias_gradient = 0.0;
-		for (sample, target) in data.samples[..rows * data.features].chunks_exact(data.features).zip(&data.targets[..rows]) {
-			let prediction = bias + weights.iter().zip(sample).zip(&means).zip(&inverse).map(|(((weight, value), mean), scale)| weight * (value - mean) * scale).sum::<f64>();
-			let error = prediction - target;
-			let direction = if error > config.svm_epsilon {
-				1.0
-			} else if error < -config.svm_epsilon {
-				-1.0
-			} else {
-				0.0
-			};
-			bias_gradient += direction / rows as f64;
-			for (((value, mean), scale), value_gradient) in sample.iter().zip(&means).zip(&inverse).zip(&mut gradient) {
-				*value_gradient += direction * (value - mean) * scale / rows as f64
+		for (bias_partial, partial) in partials {
+			bias_gradient += bias_partial;
+			for (value_gradient, partial) in gradient.iter_mut().zip(partial) {
+				*value_gradient += partial
 			}
 		}
 		bias -= config.svm_rate * bias_gradient;
