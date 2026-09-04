@@ -11700,21 +11700,31 @@ fn cpu_worker_threads() -> Result<u32> {
 fn cpu_device() -> Result<Gpu> {
 	Ok(Gpu { name: "cpu".to_owned(), backend: Backend::Cpu, native_target: native_cpu_target()?, driver: Driver::Cpu, memory: u64::MAX, shared_limit: u32::MAX, dispatch: Mutex::new(()) })
 }
+/// The local device names `RECIPE_DEVICE` selects, without this host's prefix.
+/// `None` selects the whole machine, so an unnamed run still sees every device.
+fn device_selection() -> Result<Option<Vec<String>>> {
+	let Ok(selection) = std::env::var("RECIPE_DEVICE") else { return Ok(None) };
+	let prefix = format!("{}:", local_host()?);
+	Ok(Some(selection.split(',').map(|name| name.strip_prefix(&prefix).unwrap_or(name).to_owned()).collect()))
+}
 fn devices() -> Result<&'static [Gpu]> {
 	DEVICES
 		.get_or_init(|| {
 			if std::env::var_os("RECIPE_FORCE_CPU").is_some() {
 				return cpu_device().map(|gpu| vec![gpu]);
 			}
+			let selection = device_selection()?;
 			let mut found = Vec::new();
 			let mut errors = Vec::new();
-			for load in [load_amd as fn() -> Result<Vec<Gpu>>, load_nvidia] {
-				match load() {
+			for load in [load_amd as fn(Option<&[String]>) -> Result<Vec<Gpu>>, load_nvidia] {
+				match load(selection.as_deref()) {
 					Ok(mut devices) => found.append(&mut devices),
 					Err(error) => errors.push(error.to_string()),
 				}
 			}
-			if found.is_empty() && cfg!(any(amd, nvidia)) {
+			// A selection can name only another host, so an empty local accelerator
+			// list is an error only when no selection explains it.
+			if found.is_empty() && cfg!(any(amd, nvidia)) && selection.is_none() {
 				return Err(RecipeError::new(errors.join("; ")));
 			}
 			// The CPU is always selectable, after the accelerators, so a placement
@@ -12376,7 +12386,7 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 	}
 }
 
-fn load_amd() -> Result<Vec<Gpu>> {
+fn load_amd(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 	#[cfg(not(amd))]
 	return Err(RecipeError::new("AMD support is not compiled into this build"));
 	#[cfg(amd)]
@@ -12392,7 +12402,12 @@ fn load_amd() -> Result<Vec<Gpu>> {
 		check(iterate(collect_hsa, (&mut cpu as *mut HsaQuery).cast()), "CPU agent")?;
 		check(iterate(collect_discrete_hsa, (&mut gpu as *mut HsaGpuQuery).cast()), "GPU agent")?;
 		require(cpu.found != 0 && !gpu.found.is_empty(), "AMD CPU or discrete GPU agent is absent")?;
-		gpu.found.into_iter().enumerate().map(|(index, agent)| load_amd_gpu(&runtime, info, cpu.found, agent, index)).collect()
+		gpu.found
+			.into_iter()
+			.enumerate()
+			.filter(|(index, _)| _selection.is_none_or(|names| names.contains(&format!("amd{index}"))))
+			.map(|(index, agent)| load_amd_gpu(&runtime, info, cpu.found, agent, index))
+			.collect()
 	}
 }
 #[cfg(amd)]
@@ -12472,7 +12487,7 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		Ok(Gpu { name: format!("amd{index}"), backend: Backend::Amd, native_target, driver: Driver::Hsa(hsa), memory: memory as u64, shared_limit: lds, dispatch: Mutex::new(()) })
 	}
 }
-fn load_nvidia() -> Result<Vec<Gpu>> {
+fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 	#[cfg(not(nvidia))]
 	return Err(RecipeError::new("NVIDIA support is not compiled into this build"));
 	#[cfg(nvidia)]
@@ -12559,17 +12574,17 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 				dispatch: Mutex::new(()),
 			})
 		};
-		let mut found = Vec::new();
+		let mut discrete = Vec::new();
 		for ordinal in 0..count {
 			let (mut gpu, mut integrated) = (0, 0);
 			check(get_device(&mut gpu, ordinal), "device enumeration")?;
 			check(attribute(&mut integrated, INTEGRATED, gpu), "device probe")?;
 			if integrated == 0 {
-				found.push(load_device(gpu, found.len())?)
+				discrete.push(gpu)
 			}
 		}
-		require(!found.is_empty(), "Nvidia has no discrete GPU")?;
-		Ok(found)
+		require(!discrete.is_empty(), "Nvidia has no discrete GPU")?;
+		discrete.into_iter().enumerate().filter(|(index, _)| _selection.is_none_or(|names| names.contains(&format!("nv{index}")))).map(|(index, device)| load_device(device, index)).collect()
 	}
 }
 type WorkerWire = Wire<std::io::Stdin, std::io::Stdout>;
