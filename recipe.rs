@@ -7541,8 +7541,8 @@ impl DeviceTape {
 	fn epoch(&mut self, rate: f64, tolerance: f64, config: Config) -> Result<(f64, bool)> {
 		if self.shards.len() == 1 {
 			let loss = self.shards[0].full_epoch(rate, config)?;
-			let saved = observe_loss(&mut self.shards[0].best_loss, loss, tolerance);
-			return Ok((loss, saved));
+			let checkpoint_requested = observe_loss(&mut self.shards[0].best_loss, loss, tolerance);
+			return Ok((loss, checkpoint_requested));
 		}
 		let placement = &self.placement;
 		let shards = &mut self.shards;
@@ -7584,8 +7584,8 @@ impl DeviceTape {
 			require(transfer.from == 0, "weight transfer must originate on the coordinating host")?;
 			shard.upload_weights(&weights)?;
 		}
-		let saved = observe_loss(&mut self.shards[0].best_loss, loss, tolerance);
-		Ok((loss, saved))
+		let checkpoint_requested = observe_loss(&mut self.shards[0].best_loss, loss, tolerance);
+		Ok((loss, checkpoint_requested))
 	}
 	fn weights(&self) -> Result<Vec<f64>> {
 		self.shards[0].weights()
@@ -7613,14 +7613,20 @@ impl DeviceTape {
 		Ok(())
 	}
 }
-fn checkpoint(path: &Path, schema: &DataSchema, stored: &mut bundle::StoredGraph, tape: &DeviceTape) -> Result<()> {
+#[derive(Clone, Copy)]
+enum CheckpointStatus {
+	Saved,
+	Kept,
+}
+fn checkpoint(path: &Path, schema: &DataSchema, stored: &mut bundle::StoredGraph, tape: &DeviceTape) -> Result<CheckpointStatus> {
 	if let Ok((_, saved)) = bundle::load_semantic(path) {
 		if saved.first().and_then(|g| g.state.best_loss.first().copied()).is_some_and(|v| v <= tape.best_loss()[0]) {
-			return Ok(());
+			return Ok(CheckpointStatus::Kept);
 		}
 	}
 	tape.capture(&mut stored.graph)?;
-	bundle::save_semantic(path, schema, std::slice::from_mut(stored))
+	bundle::save_semantic(path, schema, std::slice::from_mut(stored))?;
+	Ok(CheckpointStatus::Saved)
 }
 fn structural(value: f64) -> Result<i32> {
 	require(value.is_finite() && value.fract() == 0.0 && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX), "node structural argument is invalid").map(|_| value as i32)
@@ -12874,7 +12880,7 @@ impl Train {
 		self.log_metrics = metrics.into_metrics();
 		self
 	}
-	// Recipe has no checkpoints: save and resume use the same file.
+	// Save and resume use the same file.
 	pub fn save(mut self, path: impl AsRef<Path>) -> Self {
 		self.save = Some(resolve_path(path).unwrap_or_else(|error| panic!("{error}")));
 		self
@@ -12965,19 +12971,20 @@ impl Train {
 			let epoch = tape.step() as usize;
 			// Read once per epoch from the dispatched schedule, so a schedule change appears on the next line.
 			let schedule = tape.schedule();
-			let ((loss, saved, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &schedule, || {
+			let ((loss, checkpoint, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &schedule, || {
 				let dispatched = tape.epoch(self.learning_rate, tolerance, config);
-				let (loss, saved) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
-				if saved {
+				let ((loss, checkpoint_requested), checkpoint) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
+				if checkpoint_requested {
 					stored.bn_stats = tape.extract_bn_stats()?
 				}
-				self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, saved.then_some(()))?;
+				let (_, persisted) = self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, checkpoint_requested.then_some(()))?;
+				let checkpoint = checkpoint.or(persisted);
 				let predictions = if report_r2 { tape.predictions()? } else { Vec::new() };
-				self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, None)?;
-				Ok((loss, saved, predictions))
+				let (_, persisted) = self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, None)?;
+				Ok((loss, checkpoint.or(persisted), predictions))
 			})?;
 			epoch_seconds += seconds;
-			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, saved, live, &schedule)?;
+			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, checkpoint, live, &schedule)?;
 			if INTERRUPTED.load(Ordering::Acquire) {
 				std::process::exit(INTERRUPTED_EXIT)
 			}
@@ -13051,16 +13058,21 @@ impl Train {
 			epoch_seconds,
 		})
 	}
-	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &DataSchema, tape: &DeviceTape, save: Option<()>) -> Result<T> {
-		let save = if INTERRUPTED.load(Ordering::Acquire) && !INTERRUPT_CHECKPOINTED.swap(true, Ordering::AcqRel) { Some(()) } else { save.filter(|_| !INTERRUPTED.load(Ordering::Acquire)) };
-		if save.is_some()
+	fn finish_dispatch<T>(&self, result: Result<T>, stored: &mut bundle::StoredGraph, schema: &DataSchema, tape: &DeviceTape, request: Option<()>) -> Result<(T, Option<CheckpointStatus>)> {
+		let request = if INTERRUPTED.load(Ordering::Acquire) && !INTERRUPT_CHECKPOINTED.swap(true, Ordering::AcqRel) { Some(()) } else { request.filter(|_| !INTERRUPTED.load(Ordering::Acquire)) };
+		let checkpoint = if request.is_some()
 			&& let Some(path) = &self.save
 		{
-			checkpoint(path, schema, stored, tape)?;
-		}
-		result
+			Some(checkpoint(path, schema, stored, tape)?)
+		} else {
+			None
+		};
+		result.map(|value| (value, checkpoint))
 	}
-	fn print(&self, model: &Model, run: u64, epoch: usize, epochs: usize, loss: f64, targets: &[f64], predictions: &[f64], seconds: f64, checkpoint: bool, live: bool, schedule: &str) -> Result<()> {
+	fn print(
+		&self, model: &Model, run: u64, epoch: usize, epochs: usize, loss: f64, targets: &[f64], predictions: &[f64], seconds: f64, checkpoint: Option<CheckpointStatus>, live: bool,
+		schedule: &str,
+	) -> Result<()> {
 		if self.log_metrics.is_empty() {
 			return Ok(());
 		}
@@ -13088,7 +13100,7 @@ impl Train {
 				metrics,
 				self.epochs,
 				&report.schedule,
-				Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: false, evaluation: true },
+				Metrics { run: report.run, epoch: report.epoch, loss: Some(report.final_loss), r2: Some(report.r2), seconds: report.seconds, checkpoint: None, evaluation: true },
 			),
 			false,
 			true,
@@ -13124,8 +13136,12 @@ impl Train {
 			};
 			values.push(value);
 		}
-		if measurement.checkpoint {
-			values.push("\x1b[1\x3b32m← checkpoint\x1b[0m".to_owned())
+		if let Some(checkpoint) = measurement.checkpoint {
+			values.push(match checkpoint {
+				CheckpointStatus::Saved => "\x1b[1\x3b32m← checkpoint\x1b[0m",
+				CheckpointStatus::Kept => "kept",
+			}
+			.to_owned())
 		}
 		values.join("  ")
 	}
@@ -13151,7 +13167,7 @@ impl Train {
 	}
 	fn live_epoch<T>(&self, model: &Model, run: u64, epoch: usize, epochs: usize, config: Config, schedule: &str, action: impl FnOnce() -> Result<T>) -> Result<(T, f64, bool)> {
 		let started = Instant::now();
-		let partial = Metrics { run, epoch, loss: None, r2: None, seconds: 0.0, checkpoint: false, evaluation: false };
+		let partial = Metrics { run, epoch, loss: None, r2: None, seconds: 0.0, checkpoint: None, evaluation: false };
 		let line = Self::metric_line(model.loss.name(), &model.description(&self.log_metrics), &self.log_metrics, epochs, schedule, partial);
 		let live = !line.is_empty() && std::io::stderr().is_terminal();
 		if !live {
@@ -13206,7 +13222,7 @@ struct Metrics {
 	loss: Option<f64>,
 	r2: Option<f64>,
 	seconds: f64,
-	checkpoint: bool,
+	checkpoint: Option<CheckpointStatus>,
 	evaluation: bool,
 }
 pub struct TrainingReport {
