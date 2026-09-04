@@ -102,6 +102,22 @@ convolves them across as many trailing positions; and the gathered vector is
 added to the stream before the block `ngram.layer` names. The gather stays on the
 host holding the table and the blocks either side of it run on the device.
 
+## placement
+
+```text
+recipe --device nv0 --device nv1 --device cpu model.rs
+```
+
+```rust
+let placed = recipe.place("model.ogdl", &[]);
+let prediction = placed.infer(&input);
+placed.split();
+placed.resident_bytes();
+placed.moved_bytes();
+```
+
+Inference blocks across the selected devices. An empty split is measured: each block joins the current device while its parameters and carried state fit that device's free memory, and the CPU is selectable last so a placement can end on the host. A split names the blocks each device takes instead. Every range runs as its own tape on its device and the stream hops between them, so the output equals a single-device run.
+
 ## files
 
 ```bash
