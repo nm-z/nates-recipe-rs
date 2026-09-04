@@ -25,6 +25,8 @@ recipe.train()
 let prediction = recipe.infer("model.ogdl", &input);
 ```
 
+Use `.include([...])` or `.exclude([...])` to select feature columns. A data source cannot use both selectors.
+
 ## devices
 
 Select one or more local or host-qualified devices by repeating `--device`:
