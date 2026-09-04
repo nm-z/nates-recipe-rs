@@ -143,7 +143,7 @@ weights:
 	lstm(hidden)
 
 blocks:
-	moe(topk, [...])
+	moe(experts, topk, hidden, activation, scoring, renormalize, shared)
 	res([...])
 	hyper(lanes, rank, [...])
 
@@ -171,6 +171,8 @@ Feature generation is banned.
 `dconv(kernel)` is a causal depthwise convolution: every channel mixes its own last `kernel` positions with one tap each, left-padded with zeros, so the shape is unchanged and position `t` sees `t - kernel + 1 ..= t`.
 
 `delta(heads, kernel)` is a gated delta rule. It projects the input to a query, key and value stream, runs `dconv(kernel)` over that stream, normalizes each head's query and key to unit length, and carries one `channels / heads` square state per head with `S <- g S + beta k' (v - k S)`, reading `o = q S`. The decay `g = exp(-softplus(a) exp(A))` and the write gate `beta = sigmoid(b)` come from a second projection, one of each per head; `A` is one trained scale per head. The output takes a per-head `rms` normalization, the gate `sigmoid(z)` from a third projection, and a fourth projection back to the input width. The sequence walks in chunks of `delta-chunk` positions and commits the carried state at each chunk start; a chunk of one is a decode step, and every chunk size gives the same values.
+
+`moe` scores every position with one `[width, experts]` router and keeps the `topk` highest scores. `scoring` reads those scores as a softmax over every expert or as a sigmoid of each one, and `renormalize` divides the kept weights by their own total; a plain softmax leaves the dropped experts weighted zero, which is the evaluate-all-then-mask reference. Only the kept experts run: each position gathers its own slices of the `[experts, hidden, width]` gate and up tables and the `[experts, width, hidden]` down table, and takes `down(activation(gate(x)) * up(x))` under its routing weight. A position costs `topk` experts, not `experts`. With `shared` set, one always-on expert of the same shape runs for every position and joins the sum under a trainable gain.
 
 ## 15 activations
 
