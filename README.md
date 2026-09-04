@@ -85,6 +85,23 @@ recipe.serve("model.ogdl", "127.0.0.1:8080", 64);
 
 `serve` answers that many decode requests over HTTP and returns. A request names its prompt in the target, as `GET /decode?ids=3,1,4&budget=16&stop=2&temperature=0.8&top_k=40&top_p=0.95&min_p=0.05&penalty=1.1&seed=7`, and each field it leaves out keeps the sampler's default. The answer is chunked and carries one id per chunk as the decode reaches it.
 
+## ngram
+
+```rust
+let table = recipe.gguf("ngram.gguf");
+let ngram = table.ngram();
+let prediction = ngram.infer("model.ogdl", &input, &ids);
+```
+
+N-gram embeddings from a table too large for device memory. Each of `ngram.heads`
+heads hashes the current token with its previous one, and as many heads with its
+previous two, into its own row range of the mapped `[width, rows]` tensor
+`ngram.table` names, seeded by `ngram.seeds` and reset at the end-of-sequence id.
+Only the addressed rows decode, in any quantization; an `ngram.conv` tensor
+convolves them across as many trailing positions; and the gathered vector is
+added to the stream before the block `ngram.layer` names. The gather stays on the
+host holding the table and the blocks either side of it run on the device.
+
 ## files
 
 ```bash

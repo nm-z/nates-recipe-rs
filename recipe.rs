@@ -4471,30 +4471,47 @@ mod gguf {
 		/// The tensor's elements decoded to f64, dequantizing block formats through
 		/// the same decoders the saved-model path uses.
 		pub fn values(&self, tensor: &GgufTensor) -> Result<Vec<f64>> {
-			let data = self.data(tensor);
-			match tensor.kind {
-				0 => Ok(data.chunks_exact(4).map(|bytes| f64::from(f32::from_le_bytes(bytes.try_into().unwrap()))).collect()),
-				1 => Ok(data.chunks_exact(2).map(|bytes| f64::from(unfp16(u16::from_le_bytes(bytes.try_into().unwrap())))).collect()),
-				30 => Ok(data.chunks_exact(2).map(|bytes| f64::from(f32::from_bits(u32::from(u16::from_le_bytes(bytes.try_into().unwrap())) << 16))).collect()),
-				28 => Ok(data.chunks_exact(8).map(|bytes| f64::from_le_bytes(bytes.try_into().unwrap())).collect()),
-				24 => Ok(data.iter().map(|byte| f64::from(*byte as i8)).collect()),
-				25 => Ok(data.chunks_exact(2).map(|bytes| f64::from(i16::from_le_bytes(bytes.try_into().unwrap()))).collect()),
-				26 => Ok(data.chunks_exact(4).map(|bytes| f64::from(i32::from_le_bytes(bytes.try_into().unwrap()))).collect()),
-				27 => Ok(data.chunks_exact(8).map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()) as f64).collect()),
-				_ => {
-					let stored = self.stored(tensor)?;
-					stored.format.decompress(&stored.bytes, &[], stored.count)
-				}
-			}
+			decode(tensor, self.data(tensor), tensor.elements())
+		}
+		/// Row `index` of a tensor whose rows are its first dimension, decoded from
+		/// that row's own bytes so a table larger than memory reads only the rows it
+		/// addresses.
+		pub fn row(&self, tensor: &GgufTensor, index: usize) -> Result<Vec<f64>> {
+			let (_, block, stride, _) = layout(tensor.kind)?;
+			let width = tensor.shape.first().copied().unwrap_or(0) as usize;
+			require(width != 0 && width % block == 0, format!("tensor {} has rows of {width}, not whole blocks of {block}", tensor.name))?;
+			let rows = tensor.elements() / width;
+			require(index < rows, format!("tensor {} has {rows} rows, row {index} requested", tensor.name))?;
+			let bytes = width / block * stride;
+			decode(tensor, &self.data(tensor)[index * bytes..(index + 1) * bytes], width)
 		}
 		/// The tensor as the weight the tape binds: a view of its block bytes where the
 		/// file is mapped, in the Recipe storage format the kernels already decode.
 		pub(super) fn stored(&self, tensor: &GgufTensor) -> Result<StoredWeight> {
-			let (name, _, _, format) = layout(tensor.kind)?;
-			let format = format.ok_or_else(|| RecipeError::new(format!("tensor {} is {name}, which the tape reads only as a block-quantized weight", tensor.name)))?;
 			let shard = &self.shards[tensor.shard];
 			let bytes = StoredBytes::mapped(&shard.mapping, shard.data + tensor.offset, tensor.bytes);
-			Ok(StoredWeight { format, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new() })
+			Ok(StoredWeight { format: block_format(tensor)?, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new() })
+		}
+	}
+
+	/// The Recipe storage format a block-quantized tensor decodes through.
+	fn block_format(tensor: &GgufTensor) -> Result<StorageFormat> {
+		let (name, _, _, format) = layout(tensor.kind)?;
+		format.ok_or_else(|| RecipeError::new(format!("tensor {} is {name}, which the tape reads only as a block-quantized weight", tensor.name)))
+	}
+
+	/// `count` elements of a tensor decoded to f64 from `data`, the bytes holding them.
+	fn decode(tensor: &GgufTensor, data: &[u8], count: usize) -> Result<Vec<f64>> {
+		match tensor.kind {
+			0 => Ok(data.chunks_exact(4).map(|bytes| f64::from(f32::from_le_bytes(bytes.try_into().unwrap()))).collect()),
+			1 => Ok(data.chunks_exact(2).map(|bytes| f64::from(unfp16(u16::from_le_bytes(bytes.try_into().unwrap())))).collect()),
+			30 => Ok(data.chunks_exact(2).map(|bytes| f64::from(f32::from_bits(u32::from(u16::from_le_bytes(bytes.try_into().unwrap())) << 16))).collect()),
+			28 => Ok(data.chunks_exact(8).map(|bytes| f64::from_le_bytes(bytes.try_into().unwrap())).collect()),
+			24 => Ok(data.iter().map(|byte| f64::from(*byte as i8)).collect()),
+			25 => Ok(data.chunks_exact(2).map(|bytes| f64::from(i16::from_le_bytes(bytes.try_into().unwrap()))).collect()),
+			26 => Ok(data.chunks_exact(4).map(|bytes| f64::from(i32::from_le_bytes(bytes.try_into().unwrap()))).collect()),
+			27 => Ok(data.chunks_exact(8).map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()) as f64).collect()),
+			_ => block_format(tensor)?.decompress(data, &[], count),
 		}
 	}
 
@@ -5048,6 +5065,148 @@ mod tokenizer {
 	}
 }
 pub use tokenizer::Tokenizer;
+mod ngram {
+	//! N-gram embeddings gathered on the host from a mapped GGUF table. Each head
+	//! hashes the current token with its previous one, and as many heads with its
+	//! previous two, into its own row range; the gathered rows are added to the
+	//! stream before the block the table names, so only `2 * heads` rows of a table
+	//! far larger than device memory are ever read.
+	use super::*;
+
+	/// A token outside the context, before the sequence start or an end id.
+	const ABSENT: u32 = u32::MAX;
+
+	pub struct Ngram<'a> {
+		model: &'a Gguf,
+		table: GgufTensor,
+		taps: Vec<f64>,
+		heads: usize,
+		layer: usize,
+		width: usize,
+		rows: usize,
+		seeds: Vec<u64>,
+		ends: Vec<u32>,
+	}
+
+	impl<'a> Ngram<'a> {
+		pub(super) fn new(model: &'a Gguf) -> Result<Self> {
+			let integer = |key: &str| model.value(key).and_then(GgufValue::integer);
+			let named = |key: &str, fallback| model.value(key).and_then(GgufValue::text).unwrap_or(fallback);
+			let heads = integer("ngram.heads").ok_or_else(|| RecipeError::new("ngram.heads is absent"))? as usize;
+			let name = named("ngram.table", "ngram.table");
+			let table = model.tensor(name).ok_or_else(|| RecipeError::new(format!("n-gram table {name:?} is absent")))?.clone();
+			require(table.shape.len() == 2 && heads != 0, format!("n-gram table {name:?} must be [width, rows] with at least one head"))?;
+			let (width, rows) = (table.shape[0] as usize, table.shape[1] as usize);
+			require(rows % (2 * heads) == 0, format!("n-gram table rows {rows} do not split into {} head ranges", 2 * heads))?;
+			let seeds = match model.value("ngram.seeds") {
+				Some(GgufValue::Array(items)) => items.iter().map(|item| item.integer().ok_or_else(|| RecipeError::new("ngram.seeds holds a non-integer"))).collect::<Result<Vec<_>>>()?,
+				_ => (1..=2 * heads as u64).collect(),
+			};
+			require(seeds.len() == 2 * heads, format!("ngram.seeds holds {} seeds for {} heads", seeds.len(), 2 * heads))?;
+			let taps = match model.tensor(named("ngram.conv", "ngram.conv")) {
+				Some(tensor) => model.values(tensor)?,
+				None => Vec::new(),
+			};
+			let ends = integer("tokenizer.ggml.eos_token_id").map(|id| id as u32).into_iter().collect();
+			Ok(Self { model, table, taps, heads, layer: integer("ngram.layer").unwrap_or(0) as usize, width, rows, seeds, ends })
+		}
+		pub fn heads(&self) -> usize {
+			self.heads
+		}
+		/// Values per token: `2 * heads` rows of the table width.
+		pub fn width(&self) -> usize {
+			2 * self.heads * self.width
+		}
+		/// The block the gathered vector is added to the stream before.
+		pub fn layer(&self) -> usize {
+			self.layer
+		}
+		/// The mapped table bytes one token reads, over every convolved position.
+		pub fn bytes(&self) -> usize {
+			2 * self.heads * (self.table.bytes / self.rows) * self.taps.len().max(1)
+		}
+		/// The row each head addresses for the token at `position`: the first
+		/// `heads` rows hash the bigram, the rest the trigram. A token before the
+		/// sequence start or behind an end id is absent from the context.
+		pub fn rows(&self, ids: &[u32], position: usize) -> Vec<usize> {
+			let previous = |back: usize| if back <= position && !ids[position - back..position].iter().any(|id| self.ends.contains(id)) { ids[position - back] } else { ABSENT };
+			let context = [ids[position], previous(1), previous(2)];
+			let range = self.rows / (2 * self.heads);
+			(0..2 * self.heads)
+				.map(|head| {
+					let order = if head < self.heads { 2 } else { 3 };
+					let hash = context[..order].iter().fold(self.seeds[head], |hash, id| {
+						let mixed = (hash ^ u64::from(*id)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+						mixed ^ (mixed >> 32)
+					});
+					head * range + (hash % range as u64) as usize
+				})
+				.collect()
+		}
+		/// The rows one token addresses, concatenated, decoded from their own bytes.
+		fn gather(&self, ids: &[u32], position: usize) -> Result<Vec<f64>> {
+			self.rows(ids, position).into_iter().try_fold(Vec::with_capacity(self.width()), |mut values, row| {
+				values.extend(self.model.row(&self.table, row)?);
+				Ok(values)
+			})
+		}
+		/// The addressed rows of every token, concatenated: `ids.len() * width()` values.
+		pub fn lookup(&self, ids: &[u32]) -> Result<Vec<f64>> {
+			(0..ids.len()).try_fold(Vec::with_capacity(ids.len() * self.width()), |mut values, position| {
+				values.extend(self.gather(ids, position)?);
+				Ok(values)
+			})
+		}
+		/// The vector the last token of `ids` adds to the stream: its gathered rows,
+		/// or the `ngram.conv` taps applied across the positions ending at it.
+		pub fn inject(&self, ids: &[u32]) -> Result<Vec<f64>> {
+			let last = ids.len().checked_sub(1).ok_or_else(|| RecipeError::new("an n-gram injection reads at least one token"))?;
+			if self.taps.is_empty() {
+				return self.gather(ids, last);
+			}
+			let mut injected = vec![0.0; self.width()];
+			for (tap, position) in self.taps.iter().rev().zip((0..=last).rev()) {
+				for (value, row) in injected.iter_mut().zip(self.gather(ids, position)?) {
+					*value += tap * row;
+				}
+			}
+			Ok(injected)
+		}
+		/// Inference with the gathered vector added to the stream: the blocks before
+		/// `ngram.layer` run on the selected device, the gather and the addition on
+		/// the host that holds the table, and the blocks from it on the device again.
+		pub fn infer(&self, path: impl AsRef<Path>, input: &[f64], ids: &[u32]) -> Vec<f64> {
+			self.decode(path.as_ref(), input, ids).unwrap_or_else(|error| panic!("{error}"))
+		}
+		fn decode(&self, path: &Path, input: &[f64], ids: &[u32]) -> Result<Vec<f64>> {
+			let path = resolve_path(path)?;
+			let device = selected_gpu()?;
+			let injected = self.inject(ids)?;
+			bundle::run_infer(&path, input, |stored, samples| {
+				let graph = materialize_saved_graph(stored, samples, device, Config::load()?)?;
+				let (head, tail) = split_at_block(&graph, self.layer)?;
+				let mut statistics = 0;
+				let mut stream = match &head {
+					Some(head) => forward_part(head, samples, device, stored, &mut statistics)?,
+					None => samples.to_vec(),
+				};
+				require(stream.len() == injected.len(), format!("block {} takes {} values, the n-gram table gathers {}", self.layer, stream.len(), injected.len()))?;
+				for (value, added) in stream.iter_mut().zip(&injected) {
+					*value += added;
+				}
+				forward_part(&tail, &stream, device, stored, &mut statistics)
+			})
+		}
+	}
+
+	impl Gguf {
+		/// The n-gram table the metadata describes, gathered on the host.
+		pub fn ngram(&self) -> Ngram<'_> {
+			Ngram::new(self).unwrap_or_else(|error| panic!("{error}"))
+		}
+	}
+}
+pub use ngram::Ngram;
 mod bundle {
 	use super::*;
 	use std::{collections::BTreeMap, io::Write as _, str::FromStr};
@@ -8119,6 +8278,48 @@ fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: 
 	graph.frozen = saved.frozen.clone();
 	graph.state = saved.state.clone();
 	Ok(graph)
+}
+/// The graph either side of a block boundary: the nodes before `block`, when it
+/// is not the first, and the nodes from it on, whose reads of the boundary node
+/// become reads of the stream the host hands back.
+fn split_at_block(graph: &Graph, block: usize) -> Result<(Option<Graph>, Graph)> {
+	let at = graph.nodes.iter().position(|node| node.block_index >= block).unwrap_or(graph.nodes.len());
+	require(at < graph.nodes.len(), format!("the model has no block {block} to inject before"))?;
+	let boundary = at as i32 - 1;
+	let rebase = |reference: i32| match reference {
+		_ if reference == boundary => Ok(-1),
+		-2 => Ok(-2),
+		_ if reference > boundary => Ok(reference - at as i32),
+		_ => Err(RecipeError::new(format!("block {block} reads node {reference}, which an earlier block holds"))),
+	};
+	let mut tail = graph.clone();
+	tail.nodes = graph.nodes[at..].to_vec();
+	tail.stored = graph.stored[at..].to_vec();
+	for node in &mut tail.nodes {
+		node.source = rebase(node.source)?;
+		node.second = rebase(node.second)?;
+	}
+	tail.input = tail.nodes[0].input;
+	tail.source = tail.nodes.len() as i32 - 1;
+	let head = (at != 0).then(|| {
+		let mut head = graph.clone();
+		head.nodes.truncate(at);
+		head.stored.truncate(at);
+		head.output = graph.nodes[at - 1].output;
+		head.source = boundary;
+		head
+	});
+	Ok((head, tail))
+}
+/// One part of a split graph run forward on its device, reading the batch
+/// normalization statistics that follow the parts already run.
+fn forward_part(graph: &Graph, samples: &[f64], gpu: &'static Gpu, stored: &bundle::SemanticGraph, statistics: &mut usize) -> Result<Vec<f64>> {
+	let mut tape = NativeTape::new(graph, samples, &[], gpu, stored.precision, None)?;
+	let count = tape.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
+	tape.inject_bn_stats(stored.bn_stats.get(*statistics..*statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
+	*statistics += count;
+	tape.forward()?;
+	tape.predictions()
 }
 fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	let source = graph.source;
