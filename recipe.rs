@@ -3793,6 +3793,19 @@ mod gguf {
 		pub fn elements(&self) -> usize {
 			self.shape.iter().product::<u64>() as usize
 		}
+		/// The `[k, n]` slice of a `[k, n, experts]` tensor at `index`. The slice is the
+		/// expert's own blocks where the file is mapped, so reading one expert leaves
+		/// the others untouched.
+		pub fn expert(&self, index: usize) -> Result<Self> {
+			require(self.shape.len() == 3, format!("tensor {} has {} dimensions; an expert slice takes a [k, n, experts] tensor", self.name, self.shape.len()))?;
+			let experts = self.shape[2] as usize;
+			require(index < experts, format!("tensor {} holds {experts} experts, so expert {index} is absent", self.name))?;
+			let (_, block, stride, _) = layout(self.kind)?;
+			let elements = self.elements() / experts;
+			require(elements % block == 0, format!("tensor {} gives each expert {elements} elements, not a multiple of its {block}-element block", self.name))?;
+			let bytes = elements / block * stride;
+			Ok(Self { name: self.name.clone(), shape: self.shape[..2].to_vec(), kind: self.kind, offset: self.offset + index * bytes, bytes, shard: self.shard })
+		}
 	}
 
 	/// GGML type id to its name, elements per block, bytes per block, and the Recipe
@@ -6463,12 +6476,18 @@ impl Gguf {
 	/// mapped bytes are the contraction's parameters, so the tape decodes the file's
 	/// own blocks and never holds a second copy of the weight.
 	pub fn contract(&self, name: &str, input: &[f64], width: usize) -> Vec<f64> {
-		contract_gguf(self, name, input, width).unwrap_or_else(|error| panic!("{error}"))
+		contract_gguf(self, name, None, input, width).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Contracts `input` through expert `index` of a `[k, n, experts]` tensor, over that
+	/// expert's mapped blocks alone.
+	pub fn expert(&self, name: &str, index: usize, input: &[f64], width: usize) -> Vec<f64> {
+		contract_gguf(self, name, Some(index), input, width).unwrap_or_else(|error| panic!("{error}"))
 	}
 }
-fn contract_gguf(model: &Gguf, name: &str, input: &[f64], width: usize) -> Result<Vec<f64>> {
+fn contract_gguf(model: &Gguf, name: &str, expert: Option<usize>, input: &[f64], width: usize) -> Result<Vec<f64>> {
 	let tensor = model.tensor(name).ok_or_else(|| RecipeError::new(format!("tensor {name} is absent")))?;
-	let stored = model.stored(tensor)?;
+	let sliced = expert.map(|index| tensor.expert(index)).transpose()?;
+	let stored = model.stored(sliced.as_ref().unwrap_or(tensor))?;
 	let device = selected_gpu()?;
 	let config = Config::load()?;
 	let data = Prepared {
