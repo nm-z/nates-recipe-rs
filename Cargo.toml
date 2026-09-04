@@ -32,6 +32,16 @@ attention-query-tile = 24
 topology-probe-bytes = 4194304
 # Zero uses every logical CPU available to the process. A positive value limits the worker count.
 cpu-worker-threads = 0
+rat-invalid-time-ms = 999999999999
+rat-learning-rate = 0.01
+rat-initial-epochs = 10
+rat-shuffles = 2
+rat-prediction-shuffles = 16
+rat-observation-epochs = 8
+# A proposal whose kernel the compiler cannot produce within this is unusable.
+rat-compile-budget-ms = 20000
+rat-bench-model = "~/.local/share/recipe/rat/bench.ogdl"
+rat-knob-model = "~/.local/share/recipe/rat/knob.ogdl"
 cpu-compiler = "/usr/bin/clang"
 hsa-compiler = "/opt/rocm/lib/llvm/bin/clang"
 hsa-runtime = "libhsa-runtime64.so.1"

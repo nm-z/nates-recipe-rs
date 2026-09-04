@@ -583,24 +583,11 @@ const CPU_PARALLEL: &str = r#"@recipe.cpu.thread = internal thread_local global 
 define void @recipe_model_thread(i32 %thread, ptr %context, ptr %wait) #0 { entry: store i32 %thread, ptr @recipe.cpu.thread, align 4 store ptr %context, ptr @recipe.cpu.barrier.context, align 8 store ptr %wait, ptr @recipe.cpu.barrier.wait, align 8 ret void }
 define internal i32 @recipe.cpu.thread.id() #1 { entry: %thread = load i32, ptr @recipe.cpu.thread, align 4 ret i32 %thread }
 define internal void @recipe.cpu.barrier() #1 { entry: %context = load ptr, ptr @recipe.cpu.barrier.context, align 8 %wait = load ptr, ptr @recipe.cpu.barrier.wait, align 8 call void %wait(ptr %context) ret void }"#;
-/// Compile-time contraction shape. A reverse K extent is cut into one contiguous
-/// partition per `split_span` elements, capped at `partitions`, so the summation
-/// order is a property of the program rather than of the device it runs on.
-#[derive(Clone, Copy)]
-struct Schedule {
-	swizzle_m: u32,
-	partitions: u32,
-	split_span: u32,
-	matrix_split_span: u32,
-	local_chunks: u32,
-}
-fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<[(&'static str, String); 10]> {
-	let ir = ir
-		.replace("RECIPE_CONTRACTION_SWIZZLE_M", &schedule.swizzle_m.to_string())
-		.replace("RECIPE_CONTRACTION_K_PARTITIONS", &schedule.partitions.to_string())
-		.replace("RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN", &schedule.matrix_split_span.to_string())
-		.replace("RECIPE_CONTRACTION_SPLIT_SPAN", &schedule.split_span.to_string())
-		.replace("RECIPE_CONTRACTION_LOCAL_CHUNKS", &schedule.local_chunks.to_string());
+/// Emits the ten precision variants. The chunk count is a property of the local
+/// accumulator layout, so it is fixed here; the tile and partition shape stays a
+/// placeholder that the running program resolves per device and per tuned choice.
+fn precision_sources(ir: String, local_chunks: u32) -> BuildResult<[(&'static str, String); 10]> {
+	let ir = ir.replace("RECIPE_CONTRACTION_LOCAL_CHUNKS", &local_chunks.to_string());
 	Ok([
 		("", native_ir(ir.clone(), "", "double", FloatFormat::FP64)?),
 		("-f32", native_ir(ir.clone(), "_f32", "float", FloatFormat::FP32)?),
@@ -615,7 +602,7 @@ fn precision_sources(ir: String, schedule: Schedule) -> BuildResult<[(&'static s
 	])
 }
 fn wmma_source(source: &str) -> String {
-	source.lines().filter(|line| !line.starts_with("; RECIPE_WMMA ")).collect::<Vec<_>>().join("\n")
+	source.lines().filter(|line| !line.starts_with("; RECIPE_WMMA ") && !line.contains("@recipe_wave_probe(")).collect::<Vec<_>>().join("\n")
 }
 fn wmma_method(source: &str, key: &str) -> BuildResult<(String, String)> {
 	let marker = format!("{key} ");
@@ -648,11 +635,17 @@ fn compose_contraction(mut ir: String, matrix: bool) -> String {
 	}
 	ir
 }
-fn compile_amd(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
+fn compile_amd(manifest: &str, out: &PathBuf, local_chunks: u32) -> BuildResult<()> {
 	let source = fs::read_to_string("amd-nv-cpu.ll")?;
+	// The probe is compiled on its own for each wave width the tuner may pick,
+	// so the accepted widths come from the compiler rather than from a table.
+	let probe = source.lines().find(|line| line.contains("@recipe_wave_probe(")).ok_or_else(|| io::Error::other("AMD wave probe method is absent"))?;
+	let probe_path = out.join("recipe-amd-wave-probe.ll");
+	fs::write(&probe_path, format!("target triple = \"amdgcn-amd-amdhsa\"\n{probe}\n"))?;
+	println!("cargo:rustc-env=RECIPE_HSA_WAVE_PROBE={}", probe_path.display());
 	let ir = parallel_ir(wmma_source(&source), AMD_WIDTH, AMD_GRID_BARRIER);
 	let mut values = Vec::new();
-	for (suffix, contents) in precision_sources(ir, schedule)? {
+	for (suffix, contents) in precision_sources(ir, local_chunks)? {
 		let path = out.join(format!("recipe-amd{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents.clone(), false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
@@ -680,7 +673,7 @@ fn compile_amd(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 	}
 	Ok(())
 }
-fn compile_nvidia(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
+fn compile_nvidia(manifest: &str, out: &PathBuf, local_chunks: u32) -> BuildResult<()> {
 	let ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?);
 	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER)
 		.replace("amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda")
@@ -692,7 +685,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildRes
 		.replace(", addrspace(5)", "")
 		.replace(" addrspace(5)", "");
 	let mut values = Vec::new();
-	for (suffix, contents) in precision_sources(ir, schedule)? {
+	for (suffix, contents) in precision_sources(ir, local_chunks)? {
 		let path = out.join(format!("recipe-nvidia{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents, false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));
@@ -704,7 +697,7 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildRes
 	println!("cargo:rustc-env=RECIPE_NV_PTX_GENERATOR={}", text(manifest, "nvidia-ptx-generator")?);
 	Ok(())
 }
-fn compile_cpu(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
+fn compile_cpu(manifest: &str, out: &PathBuf, local_chunks: u32) -> BuildResult<()> {
 	let target = env::var("TARGET")?;
 	let mut ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?).replace("amdgcn-amd-amdhsa", &target);
 	for (pattern, replacement) in CPU_REPLACEMENTS {
@@ -716,7 +709,7 @@ fn compile_cpu(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 		return Err(io::Error::other(format!("cpu-compiler {clang:?} is absent")).into());
 	}
 	let mut values = Vec::new();
-	for (suffix, contents) in precision_sources(ir, schedule)? {
+	for (suffix, contents) in precision_sources(ir, local_chunks)? {
 		let contents = contents
 			.replace(" addrspace(1)", "")
 			.replace(" addrspace(3)", "")
@@ -737,13 +730,7 @@ fn main() -> BuildResult<()> {
 	let positive = |key: &str| -> BuildResult<u32> {
 		setting(&manifest, key)?.parse::<u32>().ok().filter(|value| *value != 0).ok_or_else(|| io::Error::other(format!("{key} must be a positive integer")).into())
 	};
-	let schedule = Schedule {
-		swizzle_m: positive("contraction-swizzle-m-tiles")?,
-		partitions: positive("contraction-k-partitions")?,
-		split_span: positive("contraction-split-span")?,
-		matrix_split_span: positive("contraction-matrix-split-span")?,
-		local_chunks: positive("contraction-local-chunks")?,
-	};
+	let local_chunks = positive("contraction-local-chunks")?;
 	for (key, environment) in [
 		("epochs", "RECIPE_TRAIN_EPOCHS"),
 		("learning-rate", "RECIPE_TRAIN_LEARNING_RATE"),
@@ -803,10 +790,20 @@ fn main() -> BuildResult<()> {
 		("attention-query-tile", "RECIPE_ATTENTION_QUERY_TILE"),
 		("topology-probe-bytes", "RECIPE_TOPOLOGY_PROBE_BYTES"),
 		("cpu-worker-threads", "RECIPE_CPU_WORKER_THREADS"),
+		("contraction-swizzle-m-tiles", "RECIPE_CONTRACTION_SWIZZLE_M_TILES"),
+		("rat-invalid-time-ms", "RECIPE_RAT_INVALID_TIME_MS"),
+		("rat-learning-rate", "RECIPE_RAT_LEARNING_RATE"),
+		("rat-initial-epochs", "RECIPE_RAT_INITIAL_EPOCHS"),
+		("rat-shuffles", "RECIPE_RAT_SHUFFLES"),
+		("rat-prediction-shuffles", "RECIPE_RAT_PREDICTION_SHUFFLES"),
+		("rat-observation-epochs", "RECIPE_RAT_OBSERVATION_EPOCHS"),
+		("rat-compile-budget-ms", "RECIPE_RAT_COMPILE_BUDGET_MS"),
 	] {
 		println!("cargo:rustc-env={environment}={}", number(&manifest, key)?);
 	}
-	for (key, environment) in [("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME")] {
+	for (key, environment) in
+		[("hsa-runtime", "RECIPE_HSA_RUNTIME"), ("nvidia-runtime", "RECIPE_NV_RUNTIME"), ("rat-bench-model", "RECIPE_RAT_BENCH_MODEL"), ("rat-knob-model", "RECIPE_RAT_KNOB_MODEL")]
+	{
 		println!("cargo:rustc-env={environment}={}", text(&manifest, key)?);
 	}
 	let placement = setting(&manifest, "multi-device")?;
@@ -822,18 +819,18 @@ fn main() -> BuildResult<()> {
 	println!("cargo::rustc-check-cfg=cfg(amd)");
 	println!("cargo::rustc-check-cfg=cfg(nvidia)");
 	let toolchain = |compiler: &str, library: &str| -> BuildResult<bool> { Ok(Path::new(text(&manifest, compiler)?).exists() && Path::new(text(&manifest, library)?).exists()) };
-	compile_cpu(&manifest, &out, schedule)?;
+	compile_cpu(&manifest, &out, local_chunks)?;
 	// GPU driver stubs and library search paths are host-arch: cross-compiled builds are CPU-only.
 	let native = env::var("TARGET")? == env::var("HOST")?;
 	let amd = native && toolchain("hsa-compiler", "hsa-device-library")?;
 	let nvidia = native && toolchain("nvidia-compiler", "nvidia-device-library")? && Path::new(text(&manifest, "nvidia-ptx-generator")?).exists();
 	if amd {
 		println!("cargo:rustc-cfg=amd");
-		compile_amd(&manifest, &out, schedule)?;
+		compile_amd(&manifest, &out, local_chunks)?;
 	}
 	if nvidia {
 		println!("cargo:rustc-cfg=nvidia");
-		compile_nvidia(&manifest, &out, schedule)?;
+		compile_nvidia(&manifest, &out, local_chunks)?;
 	}
 	println!("cargo:rerun-if-changed=Cargo.toml");
 	println!("cargo:rerun-if-changed=amd-nv-cpu.ll");
