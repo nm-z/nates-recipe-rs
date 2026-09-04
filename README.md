@@ -143,6 +143,7 @@ weights:
 blocks:
 	moe(topk, [...])
 	res([...])
+	hyper(lanes, rank, [...])
 
 feature reduction:
 	pool(size)
@@ -162,6 +163,8 @@ estimators:
 Feature generation is banned.
 
 `embed` must be the first block and must carry a quantization. Every input column is one token id below `vocab`, the input reaches the tape as `i32` ids, and the block emits one `width`-channel vector per column. The gather decodes each addressed row out of the packed table, so `width` must be a whole number of the layout's blocks and the run reads one packed row per token instead of the table. The table keeps the values it was quantized from and no optimizer step writes it back.
+
+`hyper` widens the residual stream to `lanes` copies of the width. Each block reads the stream into its parts through a gate, writes their output back through one gate per lane, and the head reads the stream once more before the output projection; gates come from a `rank` bottleneck on the normalized stream, and `rank` zero fixes them at one, which is the plain residual.
 
 ## 15 activations
 
