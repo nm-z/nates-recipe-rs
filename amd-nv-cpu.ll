@@ -1,4 +1,5 @@
 target triple = "amdgcn-amd-amdhsa"
+define protected amdgpu_kernel void @recipe_wave_probe() { entry: ret void }
 ; NUMERIC BEGIN
 declare double @llvm.sqrt.f64(double) declare double @llvm.fabs.f64(double) declare double @llvm.floor.f64(double)
 define internal double @recipe.add(double %left, double %right) #1 { entry: %result = fadd double %left, %right ret double %result }
@@ -355,6 +356,20 @@ store double %value, ptr addrspace(3) %target, align 8
 br label %loop
 exit:
 ret void
+}
+; A staged fragment is only loadable as a vector when the compiled tile is at
+; least as wide as the fragment. Testing the extent as well as the running count
+; leaves the branch constant-false for a narrow tile, so no unreachable wide load
+; survives to claim private storage.
+define internal i1 @contraction_fragment_full(i32 %count, i32 %extent) #1 {
+entry:
+%fits = icmp uge i32 %extent, RECIPE_FRAGMENT_K
+%present = icmp uge i32 %count, RECIPE_FRAGMENT_K
+%remainder = urem i32 %count, RECIPE_FRAGMENT_K
+%divisible = icmp eq i32 %remainder, 0
+%available = and i1 %fits, %present
+%full = and i1 %available, %divisible
+ret i1 %full
 }
 define internal i32 @contraction_output_lanes(i32 %m.lanes, i32 %n.lanes, i32 %block) #1 {
 entry:
@@ -788,33 +803,39 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 ; position each own a share of the K chunks, so a skinny output tile still
 ; drives the whole workgroup.
 %lanes = call i32 @contraction_output_lanes(i32 %m.lanes, i32 %n.lanes, i32 %block)
+; A tuned tile can own more output lanes than the workgroup has threads, so the
+; workgroup strides the lane space one block at a time. A tile that fits the
+; workgroup makes exactly one pass and keeps the untuned indexing.
+br label %output.pass
+output.pass:
+%output.first = phi i32 [ 0, %job.step ], [ %output.next, %output.done ]
+%output.id = add i32 %output.first, %lid
 %k.lanes.raw = udiv i32 %block, %lanes
 %k.lanes.some = icmp ugt i32 %k.lanes.raw, 0
 %k.lanes = select i1 %k.lanes.some, i32 %k.lanes.raw, i32 1
 %active.lanes = mul i32 %lanes, %k.lanes
-%lane.active = icmp ult i32 %lid, %active.lanes
-%output.lane.raw = urem i32 %lid, %lanes
+%lane.active = icmp ult i32 %output.id, %active.lanes
+%output.lane.raw = urem i32 %output.id, %lanes
 %output.lane = select i1 %lane.active, i32 %output.lane.raw, i32 0
 %lane.k.raw = udiv i32 %lid, %lanes
 %lane.k = select i1 %lane.active, i32 %lane.k.raw, i32 0
 %lane.owner = icmp eq i32 %lane.k, 0
 %lane.store = and i1 %lane.active, %lane.owner
-%method.store = call i1 @contraction_store_lane(i1 %lane.store, i32 %lid)
+%method.store = call i1 @contraction_store_lane(i1 %lane.store, i32 %output.id)
 %lane.n = udiv i32 %output.lane, %m.lanes %lane.m = urem i32 %output.lane, %m.lanes
 %output.m.base = mul i32 %lane.m, RECIPE_REGISTER_M %output.n.base = mul i32 %lane.n, RECIPE_REGISTER_N br label %sum.init.loop sum.init.loop:
-%sum.init = phi i32 [ 0, %job.step ], [ %sum.init.next, %sum.init.step ] %sum.init.more = icmp ult i32 %sum.init, RECIPE_REGISTER_COUNT br i1 %sum.init.more, label %sum.init.step, label %sum.init.done
+%sum.init = phi i32 [ 0, %output.pass ], [ %sum.init.next, %sum.init.step ] %sum.init.more = icmp ult i32 %sum.init, RECIPE_REGISTER_COUNT br i1 %sum.init.more, label %sum.init.step, label %sum.init.done
 sum.init.step: %sum.init.ptr = getelementptr [RECIPE_REGISTER_COUNT x RECIPE_STATE], ptr addrspace(5) %sums, i32 0, i32 %sum.init store RECIPE_STATE %state.zero, ptr addrspace(5) %sum.init.ptr, align RECIPE_STATE_ALIGN %sum.init.next = add i32 %sum.init, 1 br label %sum.init.loop sum.init.done: br label %tile.loop tile.loop:
 %term.base = phi i32 [ 0, %sum.init.done ], [ %term.next, %tile.done ] %k.remaining = sub i32 %terms, %term.base %k.partial = icmp ult i32 %k.remaining, %k.tile %k.count = select i1 %k.partial, i32 %k.remaining, i32 %k.tile
 %a.project = icmp eq i32 %span, 1
 %a.unit = icmp eq i32 %in.length, 1
 %a.contiguous = and i1 %a.project, %a.unit
-%a.fragment.remainder = urem i32 %k.count, RECIPE_FRAGMENT_K
-%a.fragment.full = icmp eq i32 %a.fragment.remainder, 0
+%a.fragment.full = call i1 @contraction_fragment_full(i32 %k.count, i32 %tile.k)
 %a.gate = and i1 %reverse, %relu %a.ungated = xor i1 %a.gate, true %a.vector.shape = and i1 %a.contiguous, %a.fragment.full %a.vector = and i1 %a.vector.shape, %a.ungated
 %a.width = select i1 %a.vector, i32 RECIPE_FRAGMENT_K, i32 1
 %a.columns = udiv i32 %k.count, %a.width
-%b.fragment.remainder = urem i32 %k.count, RECIPE_FRAGMENT_K
-%b.fragment.full = icmp eq i32 %b.fragment.remainder, 0 %b.direct = xor i1 %transpose, true %b.vector = and i1 %b.fragment.full, %b.direct
+%b.fragment.full = call i1 @contraction_fragment_full(i32 %k.count, i32 %tile.k)
+%b.direct = xor i1 %transpose, true %b.vector = and i1 %b.fragment.full, %b.direct
 %b.width = select i1 %b.vector, i32 RECIPE_FRAGMENT_K, i32 1
 %b.rows = udiv i32 %k.count, %b.width
 %a.count = mul i32 %m.count, %a.columns %b.count = mul i32 %n.count, %b.rows %load.count = add i32 %a.count, %b.count br label %load.loop load.loop:
@@ -870,19 +891,21 @@ call void @contraction_zero_edges(i32 %m.count, i32 %n.count, i32 %k.count, i32 
 br label %load.ready
 load.ready:
 call void @recipe.local.barrier()
-call void @contraction_product_accumulate(ptr addrspace(5) %sums, i1 %lane.active, i1 %method.store, i32 %lid, i32 %lane.k, i32 %k.lanes, i32 %output.lane, i32 %lanes, i32 %output.m.base, i32 %output.n.base, i32 %m.count, i32 %n.count, i32 %k.count, i32 %tile.m, i32 %tile.n, i32 %tile.k)
+call void @contraction_product_accumulate(ptr addrspace(5) %sums, i1 %lane.active, i1 %method.store, i32 %output.id, i32 %lane.k, i32 %k.lanes, i32 %output.lane, i32 %lanes, i32 %output.m.base, i32 %output.n.base, i32 %m.count, i32 %n.count, i32 %k.count, i32 %tile.m, i32 %tile.n, i32 %tile.k)
 br label %accumulate.done
 accumulate.done:
 call void @recipe.local.barrier()
 %term.next = add i32 %term.base, %k.count %term.more = icmp ult i32 %term.next, %terms br i1 %term.more, label %tile.done, label %store.loop tile.done: br label %tile.loop store.loop:
-%store.register = phi i32 [ 0, %accumulate.done ], [ %store.register.next, %store.next ] %store.more = icmp ult i32 %store.register, RECIPE_REGISTER_COUNT br i1 %store.more, label %store.test, label %job.done
-store.test: %store.output.m.raw = call i32 @contraction_output_m(i32 %lid, i32 %store.register, i32 %m.lanes) %store.output.n.raw = call i32 @contraction_output_n(i32 %lid, i32 %store.register, i32 %m.lanes) %store.register.valid = call i1 @contraction_output_register_valid(i32 %store.register)
+%store.register = phi i32 [ 0, %accumulate.done ], [ %store.register.next, %store.next ] %store.more = icmp ult i32 %store.register, RECIPE_REGISTER_COUNT br i1 %store.more, label %store.test, label %output.done
+store.test: %store.output.m.raw = call i32 @contraction_output_m(i32 %output.id, i32 %store.register, i32 %m.lanes) %store.output.n.raw = call i32 @contraction_output_n(i32 %output.id, i32 %store.register, i32 %m.lanes) %store.register.valid = call i1 @contraction_output_register_valid(i32 %store.register)
 %store.output.m.valid = icmp ult i32 %store.output.m.raw, %m.count %store.output.n.valid = icmp ult i32 %store.output.n.raw, %n.count %store.output.valid = and i1 %store.output.m.valid, %store.output.n.valid %store.lane.active = and i1 %method.store, %store.output.valid %store.active = and i1 %store.lane.active, %store.register.valid br i1 %store.active, label %store, label %store.next
 store: %store.channel = add i32 %n.base, %store.output.n.raw %store.m.global = add i32 %m.base, %store.output.m.raw %store.position = urem i32 %store.m.global, %out.length %store.row = udiv i32 %store.m.global, %out.length %store.output.row.base = mul i32 %store.row, %out.elements
 %store.output.channel.base = mul i32 %store.channel, %out.length %store.output.local = add i32 %store.output.channel.base, %store.position %store.output.index = add i32 %store.output.row.base, %store.output.local %store.output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %store.output.index
 %store.bias.base = mul i32 %out.channels, %terms %store.bias.index = add i32 %store.bias.base, %store.channel %store.bias.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %store.bias.index %store.bias = load double, ptr addrspace(1) %store.bias.ptr, align 8 %store.sum.ptr = getelementptr [RECIPE_REGISTER_COUNT x RECIPE_STATE], ptr addrspace(5) %sums, i32 0, i32 %store.register %store.sum.wide = load RECIPE_STATE, ptr addrspace(5) %store.sum.ptr, align RECIPE_STATE_ALIGN %store.sum = call double @recipe.encode(RECIPE_STATE %store.sum.wide)
 %store.biased = call double @recipe.add(double %store.sum, double %store.bias) %store.raw = select i1 %has.bias, double %store.biased, double %store.sum %store.forward = xor i1 %reverse, true %store.activate = and i1 %relu, %store.forward %store.positive = call i1 @recipe.ogt(double %store.raw, double 0.0) %store.activated = select i1 %store.positive, double %store.raw, double 0.0 %store.result = select i1 %store.activate, double %store.activated, double %store.raw %store.prior = load double, ptr addrspace(1) %store.output.ptr, align 2 %store.accumulated = call double @recipe.add(double %store.prior, double %store.result) %store.value = select i1 %accumulate, double %store.accumulated, double %store.result store double %store.value, ptr addrspace(1) %store.output.ptr, align 8 br label %store.next
-store.next: %store.register.next = add i32 %store.register, 1 br label %store.loop job.done: %job.next = add i32 %job, %groups br label %job.loop exit: ret void }
+store.next: %store.register.next = add i32 %store.register, 1 br label %store.loop
+output.done: %output.next = add i32 %output.first, %block %output.more = icmp ult i32 %output.next, %lanes br i1 %output.more, label %output.pass, label %job.done
+job.done: %job.next = add i32 %job, %groups br label %job.loop exit: ret void }
 define internal void @pool_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %context,
 i32 %p, i32 %from, i32 %to, i32 %size, i32 %channels ) #1 { entry: %length = udiv i32 %from, %channels
 %pooled.length = udiv i32 %to, %channels %row = udiv i32 %p, %to %out = urem i32 %p, %to
@@ -2537,18 +2560,22 @@ gradient.job.step:
 ; position each own a share of the K chunks inside the accumulator, so a skinny
 ; output tile still drives the whole workgroup.
 %gradient.output.lanes = call i32 @contraction_output_lanes(i32 %gradient.m.lanes, i32 %gradient.n.lanes, i32 %block)
+br label %gradient.output.pass
+gradient.output.pass:
+%gradient.output.first = phi i32 [ 0, %gradient.job.step ], [ %gradient.output.next, %gradient.output.done ]
+%gradient.output.id = add i32 %gradient.output.first, %lid
 %gradient.k.lanes.raw = udiv i32 %block, %gradient.output.lanes
 %gradient.k.lanes.some = icmp ugt i32 %gradient.k.lanes.raw, 0
 %gradient.k.lanes = select i1 %gradient.k.lanes.some, i32 %gradient.k.lanes.raw, i32 1
 %gradient.active.lanes = mul i32 %gradient.output.lanes, %gradient.k.lanes
-%gradient.lane.active = icmp ult i32 %lid, %gradient.active.lanes
-%gradient.output.lane.raw = urem i32 %lid, %gradient.output.lanes
+%gradient.lane.active = icmp ult i32 %gradient.output.id, %gradient.active.lanes
+%gradient.output.lane.raw = urem i32 %gradient.output.id, %gradient.output.lanes
 %gradient.output.lane = select i1 %gradient.lane.active, i32 %gradient.output.lane.raw, i32 0
 %gradient.lane.k.raw = udiv i32 %lid, %gradient.output.lanes
 %gradient.lane.k = select i1 %gradient.lane.active, i32 %gradient.lane.k.raw, i32 0
 %gradient.lane.owner = icmp eq i32 %gradient.lane.k, 0
 %gradient.lane.store = and i1 %gradient.lane.active, %gradient.lane.owner
-%gradient.method.store = call i1 @contraction_store_lane(i1 %gradient.lane.store, i32 %lid)
+%gradient.method.store = call i1 @contraction_store_lane(i1 %gradient.lane.store, i32 %gradient.output.id)
 %gradient.lane.n = udiv i32 %gradient.output.lane, %gradient.m.lanes
 %gradient.lane.m = urem i32 %gradient.output.lane, %gradient.m.lanes
 %gradient.output.m.base = mul i32 %gradient.lane.m, RECIPE_REGISTER_M %gradient.output.n.base = mul i32 %gradient.lane.n, RECIPE_REGISTER_N
@@ -2557,7 +2584,7 @@ gradient.job.step:
 %gradient.bias.owner = and i1 %gradient.bias.first, %gradient.bias.channel
 %gradient.bias.enable = and i1 %has.bias, %gradient.bias.owner
 br label %gradient.sum.init.loop gradient.sum.init.loop:
-%gradient.sum.init = phi i32 [ 0, %gradient.job.step ], [ %gradient.sum.init.next, %gradient.sum.init.step ] %gradient.sum.init.more = icmp ult i32 %gradient.sum.init, RECIPE_REGISTER_COUNT br i1 %gradient.sum.init.more, label %gradient.sum.init.step, label %gradient.tile.loop
+%gradient.sum.init = phi i32 [ 0, %gradient.output.pass ], [ %gradient.sum.init.next, %gradient.sum.init.step ] %gradient.sum.init.more = icmp ult i32 %gradient.sum.init, RECIPE_REGISTER_COUNT br i1 %gradient.sum.init.more, label %gradient.sum.init.step, label %gradient.tile.loop
 gradient.sum.init.step: %gradient.sum.init.ptr = getelementptr [RECIPE_REGISTER_COUNT x RECIPE_STATE], ptr addrspace(5) %sums, i32 0, i32 %gradient.sum.init store RECIPE_STATE %state.zero, ptr addrspace(5) %gradient.sum.init.ptr, align RECIPE_STATE_ALIGN %gradient.sum.init.next = add i32 %gradient.sum.init, 1 br label %gradient.sum.init.loop gradient.tile.loop:
 %gradient.r.base = phi i32 [ %gradient.r.first, %gradient.sum.init.loop ], [ %gradient.r.next, %gradient.tile.done ]
 %gradient.r.remaining = sub i32 %gradient.r.limit, %gradient.r.base %gradient.r.partial = icmp ult i32 %gradient.r.remaining, %gradient.k.tile %gradient.r.count = select i1 %gradient.r.partial, i32 %gradient.r.remaining, i32 %gradient.k.tile
@@ -2570,14 +2597,12 @@ gradient.load.generic.entry:
 %gradient.a.project = icmp eq i32 %span, 1
 %gradient.a.unit = icmp eq i32 %in.length, 1
 %gradient.a.contiguous = and i1 %gradient.a.project, %gradient.a.unit
-%gradient.a.fragment.remainder = urem i32 %gradient.m.count, RECIPE_FRAGMENT_K
-%gradient.a.fragment.full = icmp eq i32 %gradient.a.fragment.remainder, 0
+%gradient.a.fragment.full = call i1 @contraction_fragment_full(i32 %gradient.m.count, i32 %gradient.tile.m)
 %gradient.a.vector = and i1 %gradient.a.contiguous, %gradient.a.fragment.full
 %gradient.a.width = select i1 %gradient.a.vector, i32 RECIPE_FRAGMENT_K, i32 1
 %gradient.a.columns = udiv i32 %gradient.m.count, %gradient.a.width
 %gradient.b.unit = icmp eq i32 %out.length, 1
-%gradient.b.fragment.remainder = urem i32 %gradient.n.count, RECIPE_FRAGMENT_K
-%gradient.b.fragment.full = icmp eq i32 %gradient.b.fragment.remainder, 0
+%gradient.b.fragment.full = call i1 @contraction_fragment_full(i32 %gradient.n.count, i32 %gradient.tile.n)
 %gradient.b.vector = and i1 %gradient.b.unit, %gradient.b.fragment.full
 %gradient.b.width = select i1 %gradient.b.vector, i32 RECIPE_FRAGMENT_K, i32 1
 %gradient.b.columns = udiv i32 %gradient.n.count, %gradient.b.width
@@ -2632,20 +2657,21 @@ call void @recipe.local.barrier()
 br label %gradient.scalar.ready
 gradient.scalar.ready:
 call void @contraction_bias_accumulate(ptr addrspace(5) %bias.sums, ptr addrspace(1) %gradient.destination, i1 %gradient.bias.enable, i1 %gradient.r.first.tile, i1 %gradient.r.last.tile, i32 %lid, i32 %block, i32 %gradient.n.base, i32 %gradient.n.count, i32 %gradient.r.count, i32 %out.channels, i32 %window, i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k, i32 %gradient.store.offset)
-call void @contraction_product_accumulate(ptr addrspace(5) %sums, i1 %gradient.lane.active, i1 %gradient.method.store, i32 %lid, i32 %gradient.lane.k, i32 %gradient.k.lanes, i32 %gradient.output.lane, i32 %gradient.output.lanes, i32 %gradient.output.m.base, i32 %gradient.output.n.base, i32 %gradient.m.count, i32 %gradient.n.count, i32 %gradient.r.count, i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k)
+call void @contraction_product_accumulate(ptr addrspace(5) %sums, i1 %gradient.lane.active, i1 %gradient.method.store, i32 %gradient.output.id, i32 %gradient.lane.k, i32 %gradient.k.lanes, i32 %gradient.output.lane, i32 %gradient.output.lanes, i32 %gradient.output.m.base, i32 %gradient.output.n.base, i32 %gradient.m.count, i32 %gradient.n.count, i32 %gradient.r.count, i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k)
 br label %gradient.product.done
 gradient.product.done:
 call void @recipe.local.barrier()
 br i1 %gradient.r.more, label %gradient.tile.done, label %gradient.store.loop gradient.tile.done: br label %gradient.tile.loop
 gradient.store.loop:
 %gradient.store.register = phi i32 [ 0, %gradient.product.done ], [ %gradient.store.register.next, %gradient.store.next ] %gradient.store.more = icmp ult i32 %gradient.store.register, RECIPE_REGISTER_COUNT br i1 %gradient.store.more, label %gradient.store.test, label %gradient.bias.store.test
-gradient.store.test: %gradient.store.register.m = urem i32 %gradient.store.register, RECIPE_REGISTER_M %gradient.store.register.n = udiv i32 %gradient.store.register, RECIPE_REGISTER_M %gradient.store.output.m.raw = call i32 @contraction_output_m(i32 %lid, i32 %gradient.store.register, i32 %gradient.m.lanes) %gradient.store.output.n.raw = call i32 @contraction_output_n(i32 %lid, i32 %gradient.store.register, i32 %gradient.m.lanes) %gradient.store.register.valid = call i1 @contraction_output_register_valid(i32 %gradient.store.register)
+gradient.store.test: %gradient.store.register.m = urem i32 %gradient.store.register, RECIPE_REGISTER_M %gradient.store.register.n = udiv i32 %gradient.store.register, RECIPE_REGISTER_M %gradient.store.output.m.raw = call i32 @contraction_output_m(i32 %gradient.output.id, i32 %gradient.store.register, i32 %gradient.m.lanes) %gradient.store.output.n.raw = call i32 @contraction_output_n(i32 %gradient.output.id, i32 %gradient.store.register, i32 %gradient.m.lanes) %gradient.store.register.valid = call i1 @contraction_output_register_valid(i32 %gradient.store.register)
 %gradient.store.output.m.valid = icmp ult i32 %gradient.store.output.m.raw, %gradient.m.count %gradient.store.output.n.valid = icmp ult i32 %gradient.store.output.n.raw, %gradient.n.count %gradient.store.output.valid = and i1 %gradient.store.output.m.valid, %gradient.store.output.n.valid %gradient.store.lane.active = and i1 %gradient.method.store, %gradient.store.output.valid %gradient.store.active = and i1 %gradient.store.lane.active, %gradient.store.register.valid br i1 %gradient.store.active, label %gradient.store, label %gradient.store.next
 gradient.store: %gradient.store.filter = add i32 %gradient.n.base, %gradient.store.output.n.raw %gradient.store.term = add i32 %gradient.m.base, %gradient.store.output.m.raw %gradient.store.filter.base = mul i32 %gradient.store.filter, %window %gradient.store.local = add i32 %gradient.store.filter.base, %gradient.store.term %gradient.store.index = add i32 %gradient.store.offset, %gradient.store.local
 %gradient.store.ptr = getelementptr inbounds double, ptr addrspace(1) %gradient.destination, i32 %gradient.store.index %gradient.store.sum.ptr = getelementptr [RECIPE_REGISTER_COUNT x RECIPE_STATE], ptr addrspace(5) %sums, i32 0, i32 %gradient.store.register %gradient.store.sum.wide = load RECIPE_STATE, ptr addrspace(5) %gradient.store.sum.ptr, align RECIPE_STATE_ALIGN %gradient.store.sum = call double @recipe.encode(RECIPE_STATE %gradient.store.sum.wide) store double %gradient.store.sum, ptr addrspace(1) %gradient.store.ptr, align 8
 br label %gradient.store.next
 gradient.store.next: %gradient.store.register.next = add i32 %gradient.store.register, 1 br label %gradient.store.loop gradient.bias.store.test:
-br label %gradient.job.done
+br label %gradient.output.done
+gradient.output.done: %gradient.output.next = add i32 %gradient.output.first, %block %gradient.output.more = icmp ult i32 %gradient.output.next, %gradient.output.lanes br i1 %gradient.output.more, label %gradient.output.pass, label %gradient.job.done
 gradient.job.done: %gradient.task.next = add i32 %gradient.task, %groups br label %gradient.job.loop
 gradient.finish:
 br i1 %gradient.direct, label %previous.test, label %gradient.reduce.entry
@@ -2665,28 +2691,32 @@ previous.job.step: %previous.m.group.short = icmp ult i32 %previous.m.tiles, REC
 %previous.n.remaining = sub i32 %in.channels, %previous.n.base %previous.n.partial = icmp ult i32 %previous.n.remaining, %previous.n.tile %previous.n.count = select i1 %previous.n.partial, i32 %previous.n.remaining, i32 %previous.n.tile
 %previous.m.lanes.adjusted = add i32 %previous.m.count, RECIPE_REGISTER_M %previous.m.lanes.numerator = sub i32 %previous.m.lanes.adjusted, 1 %previous.m.lanes = udiv i32 %previous.m.lanes.numerator, RECIPE_REGISTER_M %previous.n.lanes.adjusted = add i32 %previous.n.count, RECIPE_REGISTER_N %previous.n.lanes.numerator = sub i32 %previous.n.lanes.adjusted, 1 %previous.n.lanes = udiv i32 %previous.n.lanes.numerator, RECIPE_REGISTER_N
 %previous.lanes = call i32 @contraction_output_lanes(i32 %previous.m.lanes, i32 %previous.n.lanes, i32 %block)
+br label %previous.output.pass
+previous.output.pass:
+%previous.output.first = phi i32 [ 0, %previous.job.step ], [ %previous.output.next, %previous.output.done ]
+%previous.output.id = add i32 %previous.output.first, %lid
 %previous.k.lanes.raw = udiv i32 %block, %previous.lanes
 %previous.k.lanes.some = icmp ugt i32 %previous.k.lanes.raw, 0
 %previous.k.lanes = select i1 %previous.k.lanes.some, i32 %previous.k.lanes.raw, i32 1
 %previous.active.lanes = mul i32 %previous.lanes, %previous.k.lanes
-%previous.lane.active = icmp ult i32 %lid, %previous.active.lanes
-%previous.output.lane.raw = urem i32 %lid, %previous.lanes
+%previous.lane.active = icmp ult i32 %previous.output.id, %previous.active.lanes
+%previous.output.lane.raw = urem i32 %previous.output.id, %previous.lanes
 %previous.output.lane = select i1 %previous.lane.active, i32 %previous.output.lane.raw, i32 0
 %previous.lane.k.raw = udiv i32 %lid, %previous.lanes
 %previous.lane.k = select i1 %previous.lane.active, i32 %previous.lane.k.raw, i32 0
 %previous.lane.owner = icmp eq i32 %previous.lane.k, 0
 %previous.lane.store = and i1 %previous.lane.active, %previous.lane.owner
-%previous.method.store = call i1 @contraction_store_lane(i1 %previous.lane.store, i32 %lid)
+%previous.method.store = call i1 @contraction_store_lane(i1 %previous.lane.store, i32 %previous.output.id)
 %previous.lane.n = udiv i32 %previous.output.lane, %previous.m.lanes %previous.lane.m = urem i32 %previous.output.lane, %previous.m.lanes
 %previous.output.m.base = mul i32 %previous.lane.m, RECIPE_REGISTER_M %previous.output.n.base = mul i32 %previous.lane.n, RECIPE_REGISTER_N br label %previous.sum.init.loop previous.sum.init.loop:
-%previous.sum.init = phi i32 [ 0, %previous.job.step ], [ %previous.sum.init.next, %previous.sum.init.step ] %previous.sum.init.more = icmp ult i32 %previous.sum.init, RECIPE_REGISTER_COUNT br i1 %previous.sum.init.more, label %previous.sum.init.step, label %previous.tile.loop
+%previous.sum.init = phi i32 [ 0, %previous.output.pass ], [ %previous.sum.init.next, %previous.sum.init.step ] %previous.sum.init.more = icmp ult i32 %previous.sum.init, RECIPE_REGISTER_COUNT br i1 %previous.sum.init.more, label %previous.sum.init.step, label %previous.tile.loop
 previous.sum.init.step: %previous.sum.init.ptr = getelementptr [RECIPE_REGISTER_COUNT x RECIPE_STATE], ptr addrspace(5) %sums, i32 0, i32 %previous.sum.init store RECIPE_STATE %state.zero, ptr addrspace(5) %previous.sum.init.ptr, align RECIPE_STATE_ALIGN %previous.sum.init.next = add i32 %previous.sum.init, 1 br label %previous.sum.init.loop previous.tile.loop:
 %previous.r.base = phi i32 [ 0, %previous.sum.init.loop ], [ %previous.r.next, %previous.tile.done ]
 %previous.r.remaining = sub i32 %previous.r.total, %previous.r.base %previous.r.partial = icmp ult i32 %previous.r.remaining, %previous.k.tile %previous.r.count = select i1 %previous.r.partial, i32 %previous.r.remaining, i32 %previous.k.tile
 %previous.a.project = icmp eq i32 %span, 1 %previous.a.unit = icmp eq i32 %out.length, 1 %previous.a.contiguous = and i1 %previous.a.project, %previous.a.unit
-%previous.a.fragment.remainder = urem i32 %previous.r.count, RECIPE_FRAGMENT_K %previous.a.fragment.full = icmp eq i32 %previous.a.fragment.remainder, 0 %previous.a.vector = and i1 %previous.a.contiguous, %previous.a.fragment.full
+%previous.a.fragment.full = call i1 @contraction_fragment_full(i32 %previous.r.count, i32 %previous.tile.k) %previous.a.vector = and i1 %previous.a.contiguous, %previous.a.fragment.full
 %previous.a.width = select i1 %previous.a.vector, i32 RECIPE_FRAGMENT_K, i32 1 %previous.a.columns = udiv i32 %previous.r.count, %previous.a.width
-%previous.b.fragment.remainder = urem i32 %previous.n.count, RECIPE_FRAGMENT_K %previous.b.fragment.full = icmp eq i32 %previous.b.fragment.remainder, 0 %previous.b.vector = and i1 %previous.a.project, %previous.b.fragment.full
+%previous.b.fragment.full = call i1 @contraction_fragment_full(i32 %previous.n.count, i32 %previous.tile.n) %previous.b.vector = and i1 %previous.a.project, %previous.b.fragment.full
 %previous.b.width = select i1 %previous.b.vector, i32 RECIPE_FRAGMENT_K, i32 1 %previous.b.columns = udiv i32 %previous.n.count, %previous.b.width
 %previous.a.count = mul i32 %previous.m.count, %previous.a.columns %previous.b.count = mul i32 %previous.r.count, %previous.b.columns %previous.load.count = add i32 %previous.a.count, %previous.b.count br label %previous.load.loop previous.load.loop:
 %previous.load = phi i32 [ %lid, %previous.tile.loop ], [ %previous.load.next, %previous.load.advance ] %previous.load.more = icmp ult i32 %previous.load, %previous.load.count br i1 %previous.load.more, label %previous.load.classify, label %previous.load.done
@@ -2742,15 +2772,17 @@ call void @contraction_zero_edges(i32 %previous.m.count, i32 %previous.n.count, 
 br label %previous.load.ready
 previous.load.ready:
 call void @recipe.local.barrier()
-call void @contraction_product_accumulate(ptr addrspace(5) %sums, i1 %previous.lane.active, i1 %previous.method.store, i32 %lid, i32 %previous.lane.k, i32 %previous.k.lanes, i32 %previous.output.lane, i32 %previous.lanes, i32 %previous.output.m.base, i32 %previous.output.n.base, i32 %previous.m.count, i32 %previous.n.count, i32 %previous.r.count, i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k) call void @recipe.local.barrier()
+call void @contraction_product_accumulate(ptr addrspace(5) %sums, i1 %previous.lane.active, i1 %previous.method.store, i32 %previous.output.id, i32 %previous.lane.k, i32 %previous.k.lanes, i32 %previous.output.lane, i32 %previous.lanes, i32 %previous.output.m.base, i32 %previous.output.n.base, i32 %previous.m.count, i32 %previous.n.count, i32 %previous.r.count, i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k) call void @recipe.local.barrier()
 %previous.r.next = add i32 %previous.r.base, %previous.r.count %previous.r.more = icmp ult i32 %previous.r.next, %previous.r.total br i1 %previous.r.more, label %previous.tile.done, label %previous.store.loop previous.tile.done: br label %previous.tile.loop previous.store.loop:
-%previous.store.register = phi i32 [ 0, %previous.load.ready ], [ %previous.store.register.next, %previous.store.next ] %previous.store.more = icmp ult i32 %previous.store.register, RECIPE_REGISTER_COUNT br i1 %previous.store.more, label %previous.store.test, label %previous.job.done
-previous.store.test: %previous.store.output.m.raw = call i32 @contraction_output_m(i32 %lid, i32 %previous.store.register, i32 %previous.m.lanes) %previous.store.output.n.raw = call i32 @contraction_output_n(i32 %lid, i32 %previous.store.register, i32 %previous.m.lanes) %previous.store.register.valid = call i1 @contraction_output_register_valid(i32 %previous.store.register)
+%previous.store.register = phi i32 [ 0, %previous.load.ready ], [ %previous.store.register.next, %previous.store.next ] %previous.store.more = icmp ult i32 %previous.store.register, RECIPE_REGISTER_COUNT br i1 %previous.store.more, label %previous.store.test, label %previous.output.done
+previous.store.test: %previous.store.output.m.raw = call i32 @contraction_output_m(i32 %previous.output.id, i32 %previous.store.register, i32 %previous.m.lanes) %previous.store.output.n.raw = call i32 @contraction_output_n(i32 %previous.output.id, i32 %previous.store.register, i32 %previous.m.lanes) %previous.store.register.valid = call i1 @contraction_output_register_valid(i32 %previous.store.register)
 %previous.store.output.m.valid = icmp ult i32 %previous.store.output.m.raw, %previous.m.count %previous.store.output.n.valid = icmp ult i32 %previous.store.output.n.raw, %previous.n.count %previous.store.output.valid = and i1 %previous.store.output.m.valid, %previous.store.output.n.valid %previous.lane.output.active = and i1 %previous.method.store, %previous.store.output.valid %previous.store.active = and i1 %previous.lane.output.active, %previous.store.register.valid br i1 %previous.store.active, label %previous.store, label %previous.store.next
 previous.store: %previous.store.m.global = add i32 %previous.m.base, %previous.store.output.m.raw %previous.store.channel = add i32 %previous.n.base, %previous.store.output.n.raw %previous.store.row = udiv i32 %previous.store.m.global, %in.length %previous.store.position = urem i32 %previous.store.m.global, %in.length
 %previous.store.row.base = mul i32 %previous.store.row, %in.elements %previous.store.channel.base = mul i32 %previous.store.channel, %in.length %previous.store.local = add i32 %previous.store.channel.base, %previous.store.position %previous.store.index = add i32 %previous.store.row.base, %previous.store.local %previous.store.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %previous.store.index
 %previous.store.old = load double, ptr addrspace(1) %previous.store.ptr, align 8 %previous.store.sum.ptr = getelementptr [RECIPE_REGISTER_COUNT x RECIPE_STATE], ptr addrspace(5) %sums, i32 0, i32 %previous.store.register %previous.store.sum.wide = load RECIPE_STATE, ptr addrspace(5) %previous.store.sum.ptr, align RECIPE_STATE_ALIGN %previous.store.sum = call double @recipe.encode(RECIPE_STATE %previous.store.sum.wide) %previous.store.value = call double @recipe.add(double %previous.store.old, double %previous.store.sum) store double %previous.store.value, ptr addrspace(1) %previous.store.ptr, align 8 br label %previous.store.next
-previous.store.next: %previous.store.register.next = add i32 %previous.store.register, 1 br label %previous.store.loop previous.job.done: %previous.job.next = add i32 %previous.job, %groups br label %previous.job.loop exit: ret void }
+previous.store.next: %previous.store.register.next = add i32 %previous.store.register, 1 br label %previous.store.loop
+previous.output.done: %previous.output.next = add i32 %previous.output.first, %block %previous.output.more = icmp ult i32 %previous.output.next, %previous.lanes br i1 %previous.output.more, label %previous.output.pass, label %previous.job.done
+previous.job.done: %previous.job.next = add i32 %previous.job, %groups br label %previous.job.loop exit: ret void }
 define internal void @scan_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
 ptr addrspace(1) %context, ptr addrspace(1) %delta, ptr addrspace(1) %previous,
 ptr addrspace(1) %gradient, i1 %write.input, i32 %rows, i32 %in.channels,

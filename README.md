@@ -36,6 +36,23 @@ recipe --device amd0 model.rs
 recipe --device amd0 --device archy:nv0 model.rs
 ```
 
+## online kernel tuning
+
+An AMD training run placed on one device tunes its own contraction kernel while
+it trains. A knob model proposes a configuration from the search space the
+device reports, and a bench model learns epoch time from the epochs the run
+already performs and supplies the knob model's gradient. Both control models run
+on the CPU backend; the workload stays on the GPU.
+
+Run the normal entrypoint, such as `recipe --device amd0 model.rs`. `Cargo.toml`
+sets the observation budget, learning rate, and the path of each saved model.
+New models bootstrap from real observations; saved models continue online. The
+run keeps the fastest configuration it measured. Decisions and measurements go
+to `recipe.log`.
+
+A route placed across several devices keeps the schedule it was planned with: one
+measured epoch time does not describe any single device in that route.
+
 ## files
 
 ```bash

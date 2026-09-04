@@ -1145,7 +1145,7 @@ mod program_ir {
 use program_ir::{PredictorOpcode, ScalarOpcode};
 use std::sync::atomic::AtomicUsize;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct NativeLayout {
 	pub values: Vec<usize>,
 	pub contexts: Vec<usize>,
@@ -2993,7 +2993,16 @@ impl NativeModelIr {
 			.replace("RECIPE_CHUNK_BIAS_VALUES", &self.schedule.chunk_bias_values.to_string())
 			.replace("RECIPE_SCRATCH_ROW_MASK", &(NATIVE_SCRATCH_ROW_VALUES - 1).to_string())
 			.replace("RECIPE_SCRATCH_ROW_CLEAR", &(-(NATIVE_SCRATCH_ROW_VALUES as i64)).to_string())
+			.replace("RECIPE_CONTRACTION_SWIZZLE_M", &self.schedule.swizzle_m.to_string())
+			.replace("RECIPE_CONTRACTION_K_PARTITIONS", &self.schedule.k_partitions.to_string())
+			.replace("RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN", &self.schedule.matrix_split_span.to_string())
+			.replace("RECIPE_CONTRACTION_SPLIT_SPAN", &self.schedule.split_span.to_string())
 			.replace("RECIPE_GRADIENT_SCRATCH_BASE", &self.schedule.scratch_base.to_string());
+		// A tuned launch is fixed, so the workgroup width becomes a constant the
+		// compiler can fold instead of a dispatch-packet read.
+		if let Some(dispatch) = self.schedule.dispatch {
+			ir = ir.replace("call i32 @recipe.workgroup.size.x()", &format!("add i32 0, {}", dispatch.block));
+		}
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let model_load = self.emit_model_load(backend)?;
 		ir.push_str(&quantized_definitions);
@@ -3412,14 +3421,32 @@ fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
 
 /// Run a compiler and return whatever it wrote to its diagnostic stream, which
 /// is where the resource-usage remarks below arrive.
-fn native_command(mut command: Command, role: &str, key: &str) -> Result<String> {
+/// Runs one compiler. A tuned choice carries a budget: a configuration whose
+/// kernel the compiler cannot produce within it is reported as unusable, so the
+/// tuner scores it and proposes another instead of stalling the run.
+fn native_command(mut command: Command, role: &str, key: &str, budget: Option<Duration>) -> Result<String> {
 	debug(&format!("native compiler key={key} role={role} command={command:?}"))?;
-	let output = command.output().map_err(|error| RecipeError::new(format!("cannot start {role}: {error}")))?;
-	let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-	if output.status.success() {
-		return Ok(diagnostic);
+	let Some(budget) = budget else {
+		let output = command.output().map_err(|error| RecipeError::new(format!("cannot start {role}: {error}")))?;
+		let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+		return if output.status.success() { Ok(diagnostic) } else { Err(RecipeError::new(format!("{role} failed: {diagnostic}"))) };
+	};
+	let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|error| RecipeError::new(format!("cannot start {role}: {error}")))?;
+	let started = Instant::now();
+	loop {
+		match child.try_wait().map_err(|error| RecipeError::new(format!("cannot wait for {role}: {error}")))? {
+			Some(_) => break,
+			None if started.elapsed() >= budget => {
+				child.kill().ok();
+				child.wait().ok();
+				return Err(RecipeError::Residency(format!("{role} exceeded the {} ms tuning budget", budget.as_millis())));
+			}
+			None => std::thread::yield_now(),
+		}
 	}
-	Err(RecipeError::new(format!("{role} failed: {diagnostic}")))
+	let output = child.wait_with_output().map_err(|error| RecipeError::new(format!("cannot collect {role}: {error}")))?;
+	let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+	if output.status.success() { Ok(diagnostic) } else { Err(RecipeError::new(format!("{role} failed: {diagnostic}"))) }
 }
 
 /// What the AMD backend reports about a compiled kernel. `occupancy` is the
@@ -3490,7 +3517,9 @@ fn native_amd_library(name: &'static str) -> Result<&'static str> {
 		.ok_or_else(|| RecipeError::new(format!("AMD native {name} library is unavailable")))
 }
 
-fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, bitcode: Option<&Path>, key: &str) -> Result<Vec<KernelResources>> {
+fn compile_native_artifact(
+	target: &BackendTarget, source: &Path, output: &Path, bitcode: Option<&Path>, key: &str, wave_mode: Option<WaveMode>, budget: Option<Duration>,
+) -> Result<Vec<KernelResources>> {
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
@@ -3504,7 +3533,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				command.args(["-mllvm", "-disable-licm-promotion"]);
 			}
 			command.args(["-x", "ir", "-O2", "-fPIC", "-shared", "-o"]).arg(output).arg(source);
-			native_command(command, "CPU LLVM IR compiler", key).map(|_| Vec::new())
+			native_command(command, "CPU LLVM IR compiler", key, budget).map(|_| Vec::new())
 		}
 		BackendTarget::Amd { architecture } => {
 			let compiler = native_amd_compiler()?;
@@ -3513,13 +3542,21 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			// allocation of the compiled kernel, which decides whether the requested
 			// workgroup can be resident at all.
 			command.args(["-target", "amdgcn-amd-amdhsa"]).arg(format!("-mcpu={architecture}")).args(["-O3", "-nogpulib", "-Rpass-analysis=kernel-resource-usage"]);
+			// Without a selected width the compiler keeps the target default.
+			if let Some(mode) = wave_mode {
+				command.arg(match mode {
+					WaveMode::Wave32 => "-mno-wavefrontsize64",
+					WaveMode::Wave64 => "-mwavefrontsize64",
+					mode => return Err(RecipeError::new(format!("AMD compiler cannot select wave mode {}", mode as u32))),
+				});
+			}
 			for name in ["device", "clock", "abi", "finite", "math"] {
 				command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", native_amd_library(name)?]);
 			}
 			let library_directory = option_env!("RECIPE_HSA_DEVICE_LIBRARY_DIRECTORY").ok_or_else(|| RecipeError::new("AMD native device library directory is unavailable"))?;
 			let isa = Path::new(library_directory).join(format!("oclc_isa_version_{}.bc", architecture.trim_start_matches("gfx")));
 			command.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(isa).arg(source).arg("-o").arg(output);
-			native_command(command, "AMD LLVM IR compiler", key).map(|diagnostic| kernel_resources(&diagnostic))
+			native_command(command, "AMD LLVM IR compiler", key, budget).map(|diagnostic| kernel_resources(&diagnostic))
 		}
 		BackendTarget::Nvidia { architecture } => {
 			let compiler = native_nvidia_compiler()?;
@@ -3533,12 +3570,12 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 				.arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?)
 				.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"])
 				.arg(bitcode);
-			native_command(llvm, "NVIDIA LLVM IR compiler", key)?;
+			native_command(llvm, "NVIDIA LLVM IR compiler", key, budget)?;
 			// Both stages take the pinned ISA: the bitcode step rejects any target newer than its own default, and the generator stamps the version into the artifact so the driver JIT loads it on every driver at or above that version.
 			let generator = option_env!("RECIPE_NV_PTX_GENERATOR").ok_or_else(|| RecipeError::new("NVIDIA PTX generator is unavailable"))?;
 			let mut llc = Command::new(generator);
 			llc.args(["-march=nvptx64", &format!("-mcpu={architecture}"), &format!("-mattr={ptx_version}"), "-O2"]).arg(bitcode).args(["-o"]).arg(output);
-			native_command(llc, "NVIDIA PTX generator", key)?;
+			native_command(llc, "NVIDIA PTX generator", key, budget)?;
 			fs::read(output)
 				.and_then(|mut image| {
 					image.push(0);
@@ -3552,6 +3589,7 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 
 pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Compute, loss: Option<LossFunction>, rows: usize, schedule: NativeSchedule) -> Result<NativeArtifact> {
 	target.validate()?;
+	let (wave_mode, budget) = (schedule.wave_mode, schedule.compile_budget);
 	let model = NativeModelIr::from_graph(graph, rows, precision, schedule)?;
 	let matrix = match target {
 		BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") => Some(NativeMatrix::Gfx11),
@@ -3591,9 +3629,11 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		// nonzero occupancy here holds for every workgroup width the schedule can
 		// pick. It does not bound the tile: local memory is checked separately, and
 		// the schedule still does not resize itself from these numbers.
-		for kernel in compile_native_artifact(target, &source, &output, bitcode.as_deref(), &key)? {
+		for kernel in compile_native_artifact(target, &source, &output, bitcode.as_deref(), &key, wave_mode, budget)? {
 			debug(&format!("native kernel {} registers={} scalars={} occupancy={} waves per SIMD", kernel.name, kernel.registers, kernel.scalars, kernel.occupancy))?;
-			require(kernel.occupancy != 0, format!("native kernel {} cannot be resident at any workgroup width", kernel.name))?;
+			if kernel.occupancy == 0 {
+				return Err(RecipeError::Residency(format!("native kernel {} cannot be resident at any workgroup width", kernel.name)));
+			}
 		}
 		fs::rename(&output, &path).map_err(|error| RecipeError::new(format!("cannot publish native artifact {}: {error}", path.display())))?;
 		drop(temporary);
@@ -3868,7 +3908,7 @@ mod bundle {
 	fn model(blocks: Vec<Block>, loss: u8, quantization: u16) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		Ok(Model { blocks, loss: LossFunction(loss), quantization })
+		Ok(Model { blocks, loss: LossFunction(loss), quantization, downstream: None })
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -4371,7 +4411,7 @@ use std::{
 	io::{IsTerminal, Read, Write},
 	mem::{size_of, size_of_val},
 	path::{Path, PathBuf},
-	process::Command,
+	process::{Command, Stdio},
 	ptr,
 	sync::{
 		Mutex, OnceLock,
@@ -4396,10 +4436,7 @@ extern "C" fn interrupt(_: i32) {
 		}
 	}
 }
-fn debug(message: &str) -> Result<()> {
-	if std::env::var_os("RECIPE_DEBUG").is_none() {
-		return Ok(());
-	}
+fn write_log(message: &str) -> Result<()> {
 	let file = DEBUG_LOG
 		.get_or_init(|| fs::OpenOptions::new().create(true).write(true).truncate(true).open(DEBUG_LOG_PATH).map(Mutex::new))
 		.as_ref()
@@ -4407,16 +4444,36 @@ fn debug(message: &str) -> Result<()> {
 	let mut file = file.lock().map_err(|_| RecipeError::new("debug log lock is poisoned"))?;
 	writeln!(file, "{message}").and_then(|_| file.flush()).map_err(|error| RecipeError::new(format!("cannot write {DEBUG_LOG_PATH}: {error}")))
 }
+fn debug(message: &str) -> Result<()> {
+	if std::env::var_os("RECIPE_DEBUG").is_none() {
+		return Ok(());
+	}
+	write_log(message)
+}
+/// Reports a decision the run continues past. The message reaches the terminal
+/// and the log, so a tuning rejection is visible without the debug switch.
+fn log_error(message: &str) {
+	eprintln!("{message}");
+	if let Err(error) = write_log(message) {
+		eprintln!("{error}")
+	}
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecipeError(String);
+pub enum RecipeError {
+	Message(String),
+	/// The compiled kernel cannot hold the requested cooperative grid. A tuner
+	/// scores the configuration and moves on; every other caller reports it.
+	Residency(String),
+}
 impl RecipeError {
 	fn new(message: impl Into<String>) -> Self {
-		Self(message.into())
+		Self::Message(message.into())
 	}
 }
 impl fmt::Display for RecipeError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(&self.0)
+		let (Self::Message(message) | Self::Residency(message)) = self;
+		formatter.write_str(message)
 	}
 }
 impl Error for RecipeError {}
@@ -4559,6 +4616,23 @@ pub struct Model {
 	blocks: Vec<Block>,
 	loss: LossFunction,
 	quantization: u16,
+	downstream: Option<Box<Model>>,
+}
+/// A model's objective. A plain function scores the outputs directly; a model
+/// scores them through its own graph, which is what a tuner trains against.
+pub enum ModelLoss<'a> {
+	Function(LossFunction),
+	Model(&'a Model),
+}
+impl From<LossFunction> for ModelLoss<'_> {
+	fn from(loss: LossFunction) -> Self {
+		Self::Function(loss)
+	}
+}
+impl<'a> From<&'a Model> for ModelLoss<'a> {
+	fn from(model: &'a Model) -> Self {
+		Self::Model(model)
+	}
 }
 macro_rules! operation_methods { ($(fn $method:ident($($argument:ident: $kind:ty),*) = $operation:expr;)+) => {
 $(pub fn $method(&self, $($argument: $kind),*) -> Self { self.push($operation) })+ }; }
@@ -4612,9 +4686,18 @@ impl Model {
 		block.normalization = Some(normalization.normalization());
 		model
 	}
-	pub fn loss(&self, loss: LossFunction) -> Self {
+	pub fn loss<'a>(&self, loss: impl Into<ModelLoss<'a>>) -> Self {
 		let mut model = self.clone();
-		model.loss = loss;
+		match loss.into() {
+			ModelLoss::Function(loss) => {
+				model.loss = loss;
+				model.downstream = None
+			}
+			ModelLoss::Model(downstream) => {
+				model.loss = downstream.loss;
+				model.downstream = Some(Box::new(downstream.clone()))
+			}
+		}
 		model
 	}
 	pub fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self {
@@ -6065,7 +6148,7 @@ impl Recipe {
 		}
 	}
 	pub fn model(&self) -> Model {
-		Model { blocks: Vec::new(), loss: mse, quantization: 0 }
+		Model { blocks: Vec::new(), loss: mse, quantization: 0, downstream: None }
 	}
 	pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64 }
@@ -6078,7 +6161,7 @@ impl Recipe {
 		let result = bundle::run_infer(&path, input, |stored, samples| {
 			let config = Config::load()?;
 			let graph = materialize_saved_graph(stored, samples, device, config)?;
-			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, None)?;
+			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, None, None)?;
 			tape.inject_bn_stats(&stored.bn_stats)?;
 			tape.forward()?;
 			tape.predictions()
@@ -6822,6 +6905,15 @@ struct NativeSchedule {
 	chunk_bias_values: u32,
 	scratch_base: i32,
 	shared_values: u32,
+	swizzle_m: u32,
+	k_partitions: u32,
+	split_span: u32,
+	matrix_split_span: u32,
+	/// A tuned width the compiler must be told about. Without one the compiler
+	/// keeps the target default, which is what the untuned schedule uses.
+	wave_mode: Option<WaveMode>,
+	compile_budget: Option<Duration>,
+	dispatch: Option<Geometry>,
 	contractions: Vec<Option<NativeContractionTiles>>,
 	attention: Vec<Option<Tile>>,
 }
@@ -7013,13 +7105,13 @@ impl EpochOperation {
 }
 
 impl NativeTape {
-	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
+	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>, knobs: Option<Knobs>) -> Result<Self> {
 		let input = graph.input.elements();
 		require(input != 0 && !samples.is_empty() && samples.len() % input == 0, format!("model input batch expected a nonempty multiple of {input} values, received {}", samples.len()))?;
 		let rows = samples.len() / input;
 		let output = graph.output.elements();
 		require(targets.is_empty() || targets.len() == rows * output, format!("target batch expected 0 or {} values, received {}", rows * output, targets.len()))?;
-		let program = gpu.native_program(graph, rows, precision, loss)?;
+		let program = gpu.native_program(graph, rows, precision, loss, knobs)?;
 		let (precision, layout, parameters) = (program.artifact.precision, program.artifact.layout.clone(), graph.parameters.len());
 		let zeros = vec![0.0; parameters.max(1)];
 		let gradient_bytes = checked_mul(program.gradient_values.max(1), precision.model.bytes(), "native gradient allocation")?;
@@ -7159,6 +7251,21 @@ impl NativeTape {
 	fn full_epoch(&mut self, rate: f64, config: Config) -> Result<f64> {
 		self.epoch_launch(rate, config, EpochOperation::Full)?;
 		self.objective()
+	}
+	/// Recompiles this tape's kernels for a tuned choice. Everything the run has
+	/// learned stays where it is: only the gradient scratch is resized, and only
+	/// when the new schedule reduces differently.
+	fn retune(&mut self, graph: &Graph, precision: Compute, loss: Option<LossFunction>, knobs: Knobs) -> Result<()> {
+		require(graph.parameters.len() == self.parameters && graph.output.elements() == self.output, "native retune changed model shape")?;
+		let program = self.program.gpu.native_program(graph, self.capacity, precision, loss, Some(knobs))?;
+		require(program.artifact.precision == self.precision, "native retune changed arithmetic format")?;
+		require(program.artifact.layout == self.program.artifact.layout, "native retune changed buffer layout")?;
+		if program.gradient_values != self.program.gradient_values {
+			let bytes = checked_mul(program.gradient_values.max(1), self.precision.model.bytes(), "native retuned gradient allocation")?;
+			self.gradient = Buffer::upload(self.program.gpu, &vec![0_u8; bytes])?;
+		}
+		self.program = program;
+		Ok(())
 	}
 	/// Computes this shard's loss and reduced parameter gradient without
 	/// changing optimizer state or model weights.
@@ -7381,7 +7488,7 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 		fitted: Vec::new(),
 	};
 	let graph = compile(&surrogate_model(config.surrogate_width), &prepared, &targets, rows, gpu, config, true)?;
-	let mut tape = NativeTape::new(&graph, &samples, &targets, gpu, config.precision, Some(mse))?;
+	let mut tape = NativeTape::new(&graph, &samples, &targets, gpu, config.precision, Some(mse), None)?;
 	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<f64> {
 		tape.advance()?;
 		let started = Instant::now();
@@ -7494,7 +7601,7 @@ impl DeviceTape {
 		let (mut shards, mut start) = (Vec::new(), 0);
 		for (device, count) in route.iter().zip(&counts) {
 			let end = start + count;
-			shards.push(NativeTape::new(graph, &samples[start * input..end * input], &targets[start * output..end * output], gpus[*device], precision, Some(loss))?);
+			shards.push(NativeTape::new(graph, &samples[start * input..end * input], &targets[start * output..end * output], gpus[*device], precision, Some(loss), None)?);
 			start = end;
 		}
 		Ok(Self { shards, placement })
@@ -7535,6 +7642,16 @@ impl DeviceTape {
 	}
 	fn schedule(&self) -> String {
 		self.shards[0].schedule()
+	}
+	/// The device a tuner measures. A placed route spreads one epoch over several
+	/// devices, so a single measured time does not describe any one of them.
+	fn tuned_device(&self) -> Result<&'static Gpu> {
+		require(self.shards.len() == 1, "online tuning measures one device, so a placed route is left untuned")?;
+		Ok(self.shards[0].program.gpu)
+	}
+	fn retune(&mut self, graph: &Graph, precision: Compute, loss: Option<LossFunction>, knobs: Knobs) -> Result<()> {
+		require(self.shards.len() == 1, "online tuning measures one device, so a placed route is left untuned")?;
+		self.shards[0].retune(graph, precision, loss, knobs)
 	}
 	/// The one fused epoch every policy runs: each shard computes its gradient
 	/// concurrently, the leading device applies the one emitted optimizer to the
@@ -7947,6 +8064,7 @@ impl Kernel {
 #[allow(dead_code)]
 struct Hsa {
 	_runtime: std::sync::Arc<Library>,
+	query: Query,
 	reader_create: unsafe extern "C" fn(*const c_void, usize, *mut u64) -> i32,
 	reader_destroy: unsafe extern "C" fn(u64) -> i32,
 	executable_create: unsafe extern "C" fn(i32, i32, Ptr, *mut u64) -> i32,
@@ -8169,6 +8287,15 @@ impl Gpu {
 	fn status(&self, status: i32, action: &str) -> Result<()> {
 		driver_status(self.backend, status, action).map_err(|error| RecipeError::new(format!("device {} {:?}: {error}", self.name, self.backend)))
 	}
+	/// The device limits a tuner searches within. Only a device whose driver
+	/// reports them can be tuned.
+	fn query(&self) -> Result<Query> {
+		match &self.driver {
+			#[cfg(amd)]
+			Driver::Hsa(driver) => Ok(driver.query),
+			_ => Err(RecipeError::new(format!("device {} reports no tuning query", self.name))),
+		}
+	}
 	fn activate(&self) -> Result<()> {
 		match &self.driver {
 			Driver::Cpu | Driver::Remote(_) => Ok(()),
@@ -8178,7 +8305,7 @@ impl Gpu {
 			Driver::Hsa(_) => Ok(()),
 		}
 	}
-	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>) -> Result<NativeProgram> {
+	fn native_program(&'static self, graph: &Graph, rows: usize, precision: Compute, loss: Option<LossFunction>, knobs: Option<Knobs>) -> Result<NativeProgram> {
 		let vector_waves = if matches!(&self.driver, Driver::Cpu) {
 			1
 		} else {
@@ -8190,19 +8317,7 @@ impl Gpu {
 			self.shared_limit / precision.bytes() as u32
 		};
 		let shapes = native_contraction_shapes(graph, rows)?;
-		let mut limits = Tile { m: 1, n: 1, k: 1 };
-		let mut dominant = None;
-		for (index, shape) in shapes.iter().enumerate().filter_map(|(index, shape)| shape.map(|shape| (index, shape))) {
-			for direction in [shape.forward, shape.gradient, shape.previous] {
-				limits.m = limits.m.max(direction.m);
-				limits.n = limits.n.max(direction.n);
-				limits.k = limits.k.max(direction.k);
-			}
-			let work = checked_mul(checked_mul(shape.gradient.m as usize, shape.gradient.n as usize, "native contraction output work")?, shape.gradient.k as usize, "native contraction work")?;
-			if dominant.is_none_or(|(_, best)| work > best) {
-				dominant = Some((index, work))
-			}
-		}
+		let (limits, dominant) = native_contraction_bounds(&shapes)?;
 		let wave = match &self.driver {
 			Driver::Cpu => 1,
 			#[cfg(amd)]
@@ -8212,35 +8327,52 @@ impl Gpu {
 			Driver::Remote(remote) => remote.wave,
 		};
 		let dominant_shape = dominant.and_then(|(index, _)| shapes[index]).map_or(limits, |shape| shape.gradient);
-		let fragment_k = narrow(natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?, "contraction fragment K")? as u32;
+		let fragment_k = match knobs {
+			Some(knobs) => knobs.rdfk,
+			None => narrow(natural("contraction fragment K", env!("RECIPE_CONTRACTION_FRAGMENT_K"))?, "contraction fragment K")? as u32,
+		};
 		let aligned_attention = graph.nodes.iter().filter(|node| node.op == Primitive::Attention).try_fold(true, |aligned, node| {
 			let heads = integer_argument(node.argument[0], "attention heads")?;
 			require(heads != 0, "attention heads are empty")?;
 			Ok::<_, RecipeError>(aligned && node.output.channels / heads as usize % fragment_k as usize == 0)
 		})?;
-		let matrix = matches!(&self.native_target, BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") || architecture.starts_with("gfx12"))
-			&& [Compute::FP16, Compute::BF16, Compute::INT8, Compute::INT4].contains(&precision)
-			&& dominant_shape.m >= fragment_k
-			&& dominant_shape.n >= fragment_k
-			&& dominant_shape.k >= fragment_k
-			&& aligned_attention;
+		let matrix =
+			native_matrix_arithmetic(&self.native_target, precision) && dominant_shape.m >= fragment_k && dominant_shape.n >= fragment_k && dominant_shape.k >= fragment_k && aligned_attention;
 		let matrix_waves =
 			narrow(natural("contraction matrix maximum waves per workgroup", env!("RECIPE_CONTRACTION_MATRIX_MAX_WAVES_PER_WORKGROUP"))?, "contraction matrix maximum waves per workgroup")?
 				as u32;
-		let waves_per_workgroup = if matrix { matrix_waves.min(dominant_shape.m.div_ceil(fragment_k)).max(1) } else { vector_waves };
+		let waves_per_workgroup = match knobs {
+			Some(knobs) => knobs.wpwg,
+			None if matrix => matrix_waves.min(dominant_shape.m.div_ceil(fragment_k)).max(1),
+			None => vector_waves,
+		};
 		// The reduction chunk is a multiple of the staging fragment so a chunk
 		// boundary never falls inside a vector staging load.
-		let chunk_k = narrow(natural("contraction chunk K", env!("RECIPE_CONTRACTION_CHUNK_K"))?, "contraction chunk K")? as u32;
+		let chunk_k = match knobs {
+			Some(knobs) => knobs.rdck,
+			None => narrow(natural("contraction chunk K", env!("RECIPE_CONTRACTION_CHUNK_K"))?, "contraction chunk K")? as u32,
+		};
 		require(chunk_k % fragment_k == 0, "contraction chunk K must be a multiple of the staging fragment")?;
-		let register_m = (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(limits.m);
 		let waves = if self.backend == Backend::Amd { waves_per_workgroup } else { 1 };
-		let block = wave.checked_mul(waves).ok_or_else(|| RecipeError::new("native contraction workgroup overflows"))?;
-		let register_n = (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(limits.n).min((self.shared_limit
-			/ precision.bytes() as u32
-			/ block / register_m
-			.checked_add(1)
-			.ok_or_else(|| RecipeError::new("native contraction register width overflows"))?)
-		.max(1));
+		// A tuned choice states the workgroup outright; otherwise it is the wave
+		// width times the resident wave count.
+		let block = match knobs {
+			Some(knobs) => knobs.tpwg,
+			None => wave.checked_mul(waves).ok_or_else(|| RecipeError::new("native contraction workgroup overflows"))?,
+		};
+		let register_m = match knobs {
+			Some(knobs) => knobs.rm,
+			None => (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(limits.m),
+		};
+		let register_n = match knobs {
+			Some(knobs) => knobs.rn,
+			None => (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(limits.n).min((self.shared_limit
+				/ precision.bytes() as u32
+				/ block / register_m
+				.checked_add(1)
+				.ok_or_else(|| RecipeError::new("native contraction register width overflows"))?)
+			.max(1)),
+		};
 		// A cooperative grid deadlocks unless every workgroup is resident, so the
 		// tile must leave local memory unclaimed for the waves that share a compute
 		// unit. Local memory is allocated per workgroup rather than per wave, so
@@ -8253,15 +8385,21 @@ impl Gpu {
 		// counted in model elements, so a narrow model needs proportionally more
 		// elements per partial value.
 		let ratio = narrow(NativePrecision::new(precision)?.state.bytes().div_ceil(precision.bytes()), "native contraction state ratio")? as u32;
-		let mut extent = native_contraction_tile(dominant_shape, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?;
+		// A tuned choice names the tile, so every direction takes it as stated
+		// instead of deriving one from the shape and the local-memory budget.
+		let select = |shape| match knobs {
+			Some(knobs) => Ok(Tile { m: knobs.m, n: knobs.n, k: knobs.k }),
+			None => native_contraction_tile(shape, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix),
+		};
+		let mut extent = select(dominant_shape)?;
 		let contractions = shapes
 			.iter()
 			.map(|shape| {
 				shape.map(|shape| {
 					Ok(NativeContractionTiles {
-						forward: native_contraction_tile(shape.forward, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
-						gradient: native_contraction_tile(shape.gradient, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
-						previous: native_contraction_tile(shape.previous, register_m, register_n, block, shared_budget, chunk_k, ratio, matrix)?,
+						forward: select(shape.forward)?,
+						gradient: select(shape.gradient)?,
+						previous: select(shape.previous)?,
 						gradient_shape: shape.gradient,
 						parameters: shape.parameters,
 					})
@@ -8290,6 +8428,13 @@ impl Gpu {
 			.max()
 			.unwrap_or(1);
 		let shared_values = contraction_shared_values.max(attention_shared_values);
+		// The untuned schedule fits the staged tile and its partials inside the
+		// per-wave budget by construction, because the tile is derived from it. A
+		// tuned choice states the tile outright, so it is held to the same rule
+		// here: a choice that overruns is unusable, not silently wrong.
+		if knobs.is_some() && shared_values > shared_budget {
+			return Err(RecipeError::Residency(format!("tuned tile claims {shared_values} local values, budget is {shared_budget}")));
+		}
 		let register_count = register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
 		let register_values =
 			register_count.checked_add(register_n).and_then(|values| values.checked_mul(ratio)).ok_or_else(|| RecipeError::new("native contraction register reduction overflows"))?;
@@ -8298,16 +8443,28 @@ impl Gpu {
 		// exchange only ever runs with at least two k lanes, and tails only shrink
 		// the output lanes and so grow the k lanes, so the full-tile lane count
 		// bounds how many chunks a lane can hold.
+		// Tile tails reduce output lanes, but a partial workgroup reduces the
+		// threads that share them, so the storage is sized for the smallest
+		// workgroup the grid actually launches.
+		let dispatch = knobs.map(Geometry::from_knobs).transpose()?;
+		let minimum_block = knobs.map_or(block, |knobs| {
+			[(knobs.gx, knobs.tpwgx), (knobs.gy, knobs.tpwgy), (knobs.gz, knobs.tpwgz)].into_iter().map(|(grid, width)| if grid % width == 0 { width } else { grid % width }).product()
+		});
 		let mut owned = 1_u32;
 		for extent in contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]) {
-			let output_lanes = (extent.m / register_m).max(1).checked_mul((extent.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
-			let k_lanes = (block / output_lanes).max(2);
+			let output_lanes =
+				extent.m.div_ceil(register_m).max(1).checked_mul(extent.n.div_ceil(register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
+			let k_lanes = (minimum_block / output_lanes).max(2);
 			owned = owned.max(extent.k.div_ceil(chunk_k).div_ceil(k_lanes));
 		}
 		let chunk_values = owned.checked_mul(register_count).ok_or_else(|| RecipeError::new("native contraction chunk buffer overflows"))?;
 		let chunk_bias_values = owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?;
 		let scratch_base = narrow(graph.parameters.len().next_multiple_of(NATIVE_SCRATCH_ROW_VALUES), "native gradient scratch base")?;
 		debug(&format!("native schedule block={block} waves={waves} registers={register_count} shared={shared_values} contractions={contractions:?} attention={attention:?}"))?;
+		// A reverse K extent is cut into one contiguous partition per split span,
+		// capped at the partition count, so the summation order is a property of
+		// the emitted program rather than of the device it runs on.
+		let tuned = |name: &'static str, value: &'static str| -> Result<u32> { Ok(narrow(natural(name, value)?, name)? as u32) };
 		let schedule = NativeSchedule {
 			matrix,
 			block,
@@ -8321,6 +8478,19 @@ impl Gpu {
 			chunk_bias_values,
 			scratch_base,
 			shared_values,
+			swizzle_m: knobs.map_or_else(
+				|| tuned("contraction swizzle M tiles", env!("RECIPE_CONTRACTION_SWIZZLE_M_TILES")),
+				|knobs| narrow(knobs.swz as usize, "knob swizzle M tiles").map(|value| value as u32),
+			)?,
+			k_partitions: knobs.map_or_else(|| tuned("contraction K partitions", env!("RECIPE_CONTRACTION_K_PARTITIONS")), |knobs| Ok(knobs.kpl))?,
+			split_span: knobs.map_or_else(|| tuned("contraction split span", env!("RECIPE_CONTRACTION_SPLIT_SPAN")), |knobs| Ok(knobs.kvs))?,
+			matrix_split_span: knobs.map_or_else(|| tuned("contraction matrix split span", env!("RECIPE_CONTRACTION_MATRIX_SPLIT_SPAN")), |knobs| Ok(knobs.kms))?,
+			wave_mode: knobs.map(|knobs| knobs.wvmd),
+			compile_budget: match knobs {
+				Some(_) => Some(Duration::from_millis(natural("RAT compile budget", env!("RECIPE_RAT_COMPILE_BUDGET_MS"))? as u64)),
+				None => None,
+			},
+			dispatch,
 			contractions,
 			attention,
 		};
@@ -8644,6 +8814,17 @@ fn connect_remote(host: &str, device_name: &str, canonical: &str) -> Result<&'st
 }
 #[cfg(amd)]
 type HsaInfo = unsafe extern "C" fn(u64, i32, Ptr) -> i32;
+#[cfg(amd)]
+type HsaIterate = unsafe extern "C" fn(u64, extern "C" fn(u64, Ptr) -> i32, Ptr) -> i32;
+#[cfg(amd)]
+struct HsaHandles {
+	found: Vec<u64>,
+}
+#[cfg(amd)]
+extern "C" fn collect_hsa_handle(handle: u64, pointer: Ptr) -> i32 {
+	unsafe { (*pointer.cast::<HsaHandles>()).found.push(handle) };
+	0
+}
 #[cfg(amd)]
 struct HsaQuery {
 	info: HsaInfo,
@@ -8978,6 +9159,12 @@ impl NativeProgram {
 				(NativeBackend::Remote, forward, epoch, model_load)
 			}
 		};
+		// A tuned choice states the launch, so it replaces the geometry the driver
+		// would otherwise derive from the device and the kernel's registers.
+		let (forward, epoch, model_load) = match schedule.dispatch {
+			Some(geometry) => (Dispatch { geometry, ..forward }, epoch.map(|dispatch| Dispatch { geometry, ..dispatch }), model_load.map(|dispatch| Dispatch { geometry, ..dispatch })),
+			None => (forward, epoch, model_load),
+		};
 		let entrypoints = [Some(NATIVE_FORWARD_SYMBOL), epoch.map(|_| NATIVE_EPOCH_SYMBOL), model_load.map(|_| NATIVE_MODEL_LOAD_SYMBOL)].into_iter().flatten().collect::<Vec<_>>().join(",");
 		debug(&format!(
 			"native load key={} path={} entrypoints={entrypoints}",
@@ -9181,22 +9368,62 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		require(vram.found != 0 && kernarg.found != 0, "AMD VRAM or KERNARG pool is absent")?;
 		let mut memory = 0_usize;
 		check(pool_info(vram.found, 2, (&mut memory as *mut usize).cast()), "VRAM size")?;
-		let (mut wave, mut workgroup, mut available, mut node, mut cus) = (0_u32, 0_u32, 0_u32, 0_u32, 0_u32);
+		let (mut wave, mut workgroup, mut available, mut node, mut cus, mut sdpcu, mut mwvpcu) = (0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32);
 		for (attribute, output, action) in [
 			(6, (&mut wave as *mut u32).cast(), "wave query"),
 			(8, (&mut workgroup as *mut u32).cast(), "workgroup query"),
 			(0xA002, (&mut available as *mut u32).cast(), "CU query"),
 			(0xA004, (&mut node as *mut u32).cast(), "KFD node query"),
 			(0xA014, (&mut cus as *mut u32).cast(), "cooperative CU query"),
+			(0xA00B, (&mut sdpcu as *mut u32).cast(), "SIMDs per CU query"),
+			(0xA00A, (&mut mwvpcu as *mut u32).cast(), "maximum waves per CU query"),
 		] {
 			check(info(agent, attribute, output), action)?;
 		}
 		require(cus <= available, "AMD cooperative CU count exceeds available CUs")?;
+		let sd = available.checked_mul(sdpcu).ok_or_else(|| RecipeError::new("AMD SIMD count overflows"))?;
+		require(sdpcu != 0 && mwvpcu % sdpcu == 0, "AMD waves per SIMD cannot be derived from waves per CU")?;
+		let mwvpsd = mwvpcu / sdpcu;
 		let path = format!("/sys/class/kfd/kfd/topology/nodes/{node}/properties");
 		let properties = fs::read_to_string(&path).map_err(|error| RecipeError::new(format!("cannot read {path}: {error}")))?;
 		let gfx = kfd_property(&properties, "gfx_target_version")?;
 		let target = format!("gfx{}{}{}", gfx / 10000, gfx / 100 % 100, gfx % 100);
 		let native_target = BackendTarget::Amd { architecture: target.clone() };
+		// The accepted wave widths come from the compiler, not from a table: the
+		// probe kernel is compiled once for each width the tuner may select.
+		let (probe, mut wvmd) = (Path::new(env!("RECIPE_HSA_WAVE_PROBE")), SubgroupModes(0));
+		for mode in [WaveMode::Wave32, WaveMode::Wave64] {
+			if compile_native_artifact(&native_target, probe, Path::new("/dev/null"), None, "AMD wave probe", Some(mode), None).is_ok() {
+				wvmd.insert(mode as u32)?;
+				debug(&format!("AMD compiler accepted wave mode {}", mode as u32))?
+			}
+		}
+		require(wvmd.0 != 0, "AMD compiler generated no wave mode for the selected GPU")?;
+		let iterate_isas: HsaIterate = runtime.function(b"hsa_agent_iterate_isas\0")?;
+		let isa_info: HsaInfo = runtime.function(b"hsa_isa_get_info_alt\0")?;
+		let mut isas = HsaHandles { found: Vec::new() };
+		check(iterate_isas(agent, collect_hsa_handle, (&mut isas as *mut HsaHandles).cast()), "ISA query")?;
+		let mut isa_names = Vec::with_capacity(isas.found.len());
+		for isa in &isas.found {
+			let mut length = 0_u32;
+			check(isa_info(*isa, 0, (&mut length as *mut u32).cast()), "ISA name length query")?;
+			let mut name = vec![0_u8; length as usize];
+			check(isa_info(*isa, 1, name.as_mut_ptr().cast()), "ISA name query")?;
+			isa_names.push(String::from_utf8(name).map_err(|error| RecipeError::new(format!("queried ISA name is not UTF-8: {error}")))?);
+		}
+		let suffix = format!("--{target}");
+		let matching = isas.found.iter().copied().zip(&isa_names).filter_map(|(isa, name)| name.trim_end_matches('\0').ends_with(&suffix).then_some(isa)).collect::<Vec<_>>();
+		require(matching.len() == 1, format!("AMD agent ISAs {isa_names:?} contain {} exact matches for compiler target {target}", matching.len()))?;
+		let (mut gms, mut mtpwg) = (0_u64, 0_u32);
+		let (mut grid, mut workgroup_dimensions) = ([0_u32; 3], [0_u16; 3]);
+		for (attribute, output, action) in [
+			(12, workgroup_dimensions.as_mut_ptr().cast(), "workgroup dimension query"),
+			(13, (&mut mtpwg as *mut u32).cast(), "workgroup size query"),
+			(14, grid.as_mut_ptr().cast(), "grid dimension query"),
+			(16, (&mut gms as *mut u64).cast(), "grid size query"),
+		] {
+			check(isa_info(matching[0], attribute, output), action)?;
+		}
 		let reader_create: unsafe extern "C" fn(*const c_void, usize, *mut u64) -> i32 = runtime.function(b"hsa_code_object_reader_create_from_memory\0")?;
 		let reader_destroy: unsafe extern "C" fn(u64) -> i32 = runtime.function(b"hsa_code_object_reader_destroy\0")?;
 		let executable_create: unsafe extern "C" fn(i32, i32, Ptr, *mut u64) -> i32 = runtime.function(b"hsa_executable_create_alt\0")?;
@@ -9206,6 +9433,30 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		let symbol: HsaSymbol = runtime.function(b"hsa_executable_get_symbol_by_name\0")?;
 		let symbol_info: HsaSymbolInfo = runtime.function(b"hsa_executable_symbol_get_info\0")?;
 		let lds = kfd_property(&properties, "lds_size_in_kb")?.checked_mul(1024).ok_or_else(|| RecipeError::new("AMD LDS size overflows"))?;
+		// The contraction kernels index one dimension, so the searched grid and
+		// workgroup are the X extents and the other two axes stay at one. Reporting
+		// the device's Y and Z maxima would enumerate launches the kernel cannot
+		// distinguish, and the search would cost more than the epochs it saves.
+		let query = Query {
+			wvmd,
+			cu: available,
+			sd,
+			sdpcu,
+			lds: u64::from(lds),
+			gms,
+			gmx: grid[0],
+			gmy: 1,
+			gmz: 1,
+			mwvpcu,
+			mwvpsd,
+			mtpwg,
+			mtpwgx: u32::from(workgroup_dimensions[0]),
+			mtpwgy: 1,
+			mtpwgz: 1,
+			M: 0,
+			N: 0,
+			K: 0,
+		};
 		let queue_create: unsafe extern "C" fn(u64, u32, u32, Ptr, Ptr, u32, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_queue_create\0")?;
 		let signal_create: unsafe extern "C" fn(i64, u32, *const u64, *mut u64) -> i32 = runtime.function(b"hsa_signal_create\0")?;
 		let allocate: unsafe extern "C" fn(u64, usize, u32, *mut Ptr) -> i32 = runtime.function(b"hsa_amd_memory_pool_allocate\0")?;
@@ -9215,6 +9466,7 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 		check(signal_create(0, 0, ptr::null(), &mut completion), "signal creation")?;
 		let hsa = Hsa {
 			_runtime: runtime.clone(),
+			query,
 			reader_create,
 			reader_destroy,
 			executable_create,
@@ -9524,7 +9776,7 @@ fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gp
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
 	let _ = targets;
-	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, None)?;
+	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, None, None)?;
 	tape.forward()?;
 	tape.predictions()
 }
@@ -9552,7 +9804,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 		fitted: Vec::new(),
 	};
 	let mut graph = compile(&model, &prepared, targets, prepared.rows, gpu, config, true)?;
-	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, Some(mse))?;
+	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, Some(mse), None)?;
 	for _ in 0..config.surrogate_epochs {
 		tape.advance()?;
 		tape.full_epoch(config.surrogate_rate, config)?;
@@ -10426,6 +10678,29 @@ impl Estimator {
 		(self.fit)(self.param, data, rows, config)
 	}
 }
+/// The widest extent any contraction direction reaches, and the contraction
+/// whose gradient pass carries the most work. The schedule is sized from the
+/// first and shaped for the second.
+fn native_contraction_bounds(shapes: &[Option<NativeContractionShapes>]) -> Result<(Tile, Option<(usize, usize)>)> {
+	let mut limits = Tile { m: 1, n: 1, k: 1 };
+	let mut dominant = None;
+	for (index, shape) in shapes.iter().enumerate().filter_map(|(index, shape)| shape.map(|shape| (index, shape))) {
+		for direction in [shape.forward, shape.gradient, shape.previous] {
+			limits.m = limits.m.max(direction.m);
+			limits.n = limits.n.max(direction.n);
+			limits.k = limits.k.max(direction.k);
+		}
+		let work = checked_mul(checked_mul(shape.gradient.m as usize, shape.gradient.n as usize, "native contraction output work")?, shape.gradient.k as usize, "native contraction work")?;
+		if dominant.is_none_or(|(_, best)| work > best) {
+			dominant = Some((index, work))
+		}
+	}
+	Ok((limits, dominant))
+}
+fn native_matrix_arithmetic(target: &BackendTarget, precision: Compute) -> bool {
+	matches!(target, BackendTarget::Amd { architecture } if architecture.starts_with("gfx11") || architecture.starts_with("gfx12"))
+		&& [Compute::FP16, Compute::BF16, Compute::INT8, Compute::INT4].contains(&precision)
+}
 fn native_contraction_shapes(graph: &Graph, rows: usize) -> Result<Vec<Option<NativeContractionShapes>>> {
 	graph.nodes
 		.iter()
@@ -10689,6 +10964,11 @@ impl Geometry {
 	pub fn threads(self) -> Result<u32> {
 		self.groups.checked_mul(self.block).filter(|value| *value != 0).ok_or_else(|| RecipeError::new("GPU launch size overflows"))
 	}
+	/// The launch a tuned choice asks for. The kernels index one dimension, so
+	/// the searched grid becomes that many workgroups of that many threads.
+	fn from_knobs(knobs: Knobs) -> Result<Self> {
+		Ok(Self { groups: narrow(knobs.wg as usize, "knob workgroup count")? as u32, block: knobs.tpwg })
+	}
 }
 #[cfg(any(amd, nvidia))]
 fn geometry(cus: u32, wave: u32, workgroup: u32, lds: u32, groups_per_cu: u32, resources: Resources) -> Result<Geometry> {
@@ -10798,6 +11078,30 @@ struct Prepared {
 	norm_scale: Vec<f64>,
 	identities: Vec<u64>,
 	fitted: Vec<PredictorProgram>,
+}
+impl Prepared {
+	/// A prepared batch straight from a value matrix, with no source table.
+	fn matrix(samples: Vec<f64>, targets: Vec<f64>, rows: usize, target_width: usize) -> Result<Self> {
+		require(rows != 0 && target_width != 0, "prepared matrix shape must be positive")?;
+		require(targets.is_empty() || targets.len() == checked_mul(rows, target_width, "prepared matrix targets")?, "prepared matrix requires a whole target batch")?;
+		require(samples.len() % rows == 0, "prepared matrix requires a whole sample batch")?;
+		let identities = (0..rows as u64).collect();
+		Ok(Self {
+			features: samples.len() / rows,
+			samples,
+			targets,
+			target_width,
+			rows,
+			source_rows: rows,
+			schema: DataSchema::default(),
+			sequence: None,
+			target_categorical: false,
+			norm_mean: Vec::new(),
+			norm_scale: Vec::new(),
+			identities,
+			fitted: Vec::new(),
+		})
+	}
 }
 struct Table {
 	name: String,
@@ -12962,7 +13266,18 @@ impl Train {
 		let report_r2 = self.log_metrics.iter().any(|metric| metric.0 == R2.0);
 		let mut epoch_seconds = 0.0;
 		require(tolerance.is_finite() && (0.0..=1.0).contains(&tolerance), "stop must be between zero and one")?;
-		for _ in 0..self.epochs {
+		// Online tuning measures the epochs the run already performs, so it needs
+		// one device to attribute them to and a backend whose search space is
+		// queryable. A placed route keeps the schedule it was planned with.
+		let mut rat_training = match tape.tuned_device() {
+			Ok(gpu) if gpu.backend == Backend::Amd => Some(RatTraining::load(&stored.graph, training_rows, gpu, config)?),
+			_ => None,
+		};
+		if let Some(rat) = &mut rat_training {
+			let (graph, precision, loss) = (&stored.graph, config.precision, Some(model.loss));
+			rat.apply(config, |knobs| tape.retune(graph, precision, loss, knobs))?;
+		}
+		for iteration in 0..self.epochs {
 			if INTERRUPTED.load(Ordering::Acquire) {
 				self.finish_dispatch::<()>(Err(RecipeError::new("interrupted")), &mut stored, &prepared.schema, &tape, None).ok();
 				break;
@@ -12971,8 +13286,10 @@ impl Train {
 			let epoch = tape.step() as usize;
 			// Read once per epoch from the dispatched schedule, so a schedule change appears on the next line.
 			let schedule = tape.schedule();
-			let ((loss, checkpoint, predictions), seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &schedule, || {
+			let ((loss, checkpoint, predictions, milliseconds), mut seconds, live) = self.live_epoch(model, run, epoch, self.epochs, config, &schedule, || {
+				let started = Instant::now();
 				let dispatched = tape.epoch(self.learning_rate, tolerance, config);
+				let milliseconds = started.elapsed().as_secs_f64() * 1000.0;
 				let ((loss, checkpoint_requested), checkpoint) = self.finish_dispatch(dispatched, &mut stored, &prepared.schema, &tape, None)?;
 				if checkpoint_requested {
 					stored.bn_stats = tape.extract_bn_stats()?
@@ -12981,13 +13298,40 @@ impl Train {
 				let checkpoint = checkpoint.or(persisted);
 				let predictions = if report_r2 { tape.predictions()? } else { Vec::new() };
 				let (_, persisted) = self.finish_dispatch(Ok(()), &mut stored, &prepared.schema, &tape, None)?;
-				Ok((loss, checkpoint.or(persisted), predictions))
+				Ok((loss, checkpoint.or(persisted), predictions, milliseconds))
 			})?;
+			if let Some(rat) = &mut rat_training
+				&& rat.updates < rat.config.initial_epochs + rat.config.shuffles
+			{
+				rat.timings.push(milliseconds);
+				if rat.timings.len() == rat.config.observation_epochs || iteration + 1 == self.epochs {
+					rat.timings.sort_unstable_by(f64::total_cmp);
+					let measured = rat.timings[rat.timings.len() / 2];
+					rat.timings.clear();
+					let tuning = Instant::now();
+					let (knob_loss, benchmark) = rat.update(measured, config)?;
+					write_log(&format!(
+						"rat training update\tepoch\t{epoch}\tupdates\t{}\tbudget\t{}\tmeasured ms\t{measured}\tknob loss\t{knob_loss}\tbench loss\t{}\tbench predicted ms\t{}",
+						rat.updates,
+						rat.config.initial_epochs + rat.config.shuffles,
+						benchmark.loss,
+						benchmark.predicted
+					))?;
+					if iteration + 1 < self.epochs {
+						let (graph, precision, loss) = (&stored.graph, config.precision, Some(model.loss));
+						rat.apply(config, |knobs| tape.retune(graph, precision, loss, knobs))?;
+					}
+					seconds += tuning.elapsed().as_secs_f64()
+				}
+			}
 			epoch_seconds += seconds;
 			self.print(model, run, epoch, self.epochs, loss, targets, &predictions, seconds, checkpoint, live, &schedule)?;
 			if INTERRUPTED.load(Ordering::Acquire) {
 				std::process::exit(INTERRUPTED_EXIT)
 			}
+		}
+		if let Some(rat) = &mut rat_training {
+			rat.models.save()?
 		}
 		stored.bn_stats = tape.extract_bn_stats()?;
 		tape.inject_bn_stats(&stored.bn_stats)?;
@@ -13003,7 +13347,7 @@ impl Train {
 			let mut raw_outputs = Vec::new();
 			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
 			for sample in prepared.samples.chunks_exact(prepared.features) {
-				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, None)?;
+				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, None, None)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
 				validation.forward()?;
 				let raw = validation.predictions()?;
@@ -13026,7 +13370,7 @@ impl Train {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
 			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_values..]);
-			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, None)?;
+			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, None, None)?;
 			validation.inject_bn_stats(&stored.bn_stats)?;
 			validation.forward()?;
 			let raw = validation.predictions()?;
@@ -13302,4 +13646,1001 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let residual = targets.iter().zip(predictions).map(|(target, value)| (target - value).powi(2)).sum::<f64>();
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum WaveMode {
+	Wave1 = 1,
+	Wave2 = 2,
+	Wave4 = 4,
+	Wave8 = 8,
+	Wave16 = 16,
+	Wave32 = 32,
+	Wave64 = 64,
+	Wave128 = 128,
+}
+impl WaveMode {
+	fn from_size(size: u32) -> Result<Self> {
+		match size {
+			1 => Ok(Self::Wave1),
+			2 => Ok(Self::Wave2),
+			4 => Ok(Self::Wave4),
+			8 => Ok(Self::Wave8),
+			16 => Ok(Self::Wave16),
+			32 => Ok(Self::Wave32),
+			64 => Ok(Self::Wave64),
+			128 => Ok(Self::Wave128),
+			_ => Err(RecipeError::new(format!("wave mode {size} is not represented"))),
+		}
+	}
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum GridDimensions {
+	One = 1,
+	Two = 2,
+	Three = 3,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubgroupModes(u8);
+impl SubgroupModes {
+	pub const W1: u8 = 1 << 0;
+	pub const W2: u8 = 1 << 1;
+	pub const W4: u8 = 1 << 2;
+	pub const W8: u8 = 1 << 3;
+	pub const W16: u8 = 1 << 4;
+	pub const W32: u8 = 1 << 5;
+	pub const W64: u8 = 1 << 6;
+	pub const W128: u8 = 1 << 7;
+	pub const fn contains(self, mode: u8) -> bool {
+		self.0 & mode != 0
+	}
+	const fn bit(size: u32) -> Option<u8> {
+		match size {
+			1 => Some(Self::W1),
+			2 => Some(Self::W2),
+			4 => Some(Self::W4),
+			8 => Some(Self::W8),
+			16 => Some(Self::W16),
+			32 => Some(Self::W32),
+			64 => Some(Self::W64),
+			128 => Some(Self::W128),
+			_ => None,
+		}
+	}
+	fn insert(&mut self, size: u32) -> Result<()> {
+		self.0 |= Self::bit(size).ok_or_else(|| RecipeError::new(format!("queried subgroup size {size} is not represented by SubgroupModes")))?;
+		Ok(())
+	}
+}
+#[allow(non_snake_case)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Query {
+	pub wvmd: SubgroupModes,
+	pub cu: u32,
+	pub sd: u32,
+	pub sdpcu: u32,
+	pub lds: u64,
+	pub gms: u64,
+	pub gmx: u32,
+	pub gmy: u32,
+	pub gmz: u32,
+	pub mwvpcu: u32,
+	pub mwvpsd: u32,
+	pub mtpwg: u32,
+	pub mtpwgx: u32,
+	pub mtpwgy: u32,
+	pub mtpwgz: u32,
+	pub M: u32,
+	pub N: u32,
+	pub K: u32,
+}
+#[allow(non_snake_case)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Knobs {
+	pub wvmd: WaveMode,
+	pub tpwgx: u32,
+	pub tpwgy: u32,
+	pub tpwgz: u32,
+	pub swz: u64,
+	pub wg: u64,
+	pub gd: GridDimensions,
+	pub gx: u32,
+	pub gy: u32,
+	pub gz: u32,
+	pub wv: u64,
+	pub wpwg: u32,
+	pub wgx: u32,
+	pub wgy: u32,
+	pub wgz: u32,
+	pub t: u64,
+	pub tpwv: u32,
+	pub tpwg: u32,
+	pub g: u64,
+	pub m: u32,
+	pub n: u32,
+	pub k: u32,
+	pub rm: u32,
+	pub rn: u32,
+	pub rdfk: u32,
+	pub rdck: u32,
+	pub kpl: u32,
+	pub kvs: u32,
+	pub kms: u32,
+}
+impl Query {
+	const WIDTH: usize = 16;
+	pub fn wave_modes(self) -> impl Iterator<Item = WaveMode> {
+		[
+			(SubgroupModes::W1, WaveMode::Wave1),
+			(SubgroupModes::W2, WaveMode::Wave2),
+			(SubgroupModes::W4, WaveMode::Wave4),
+			(SubgroupModes::W8, WaveMode::Wave8),
+			(SubgroupModes::W16, WaveMode::Wave16),
+			(SubgroupModes::W32, WaveMode::Wave32),
+			(SubgroupModes::W64, WaveMode::Wave64),
+			(SubgroupModes::W128, WaveMode::Wave128),
+		]
+		.into_iter()
+		.filter_map(move |(bit, mode)| self.wvmd.contains(bit).then_some(mode))
+	}
+	fn with_load(mut self, dimensions: [u32; 3]) -> Self {
+		[self.M, self.N, self.K] = dimensions;
+		self
+	}
+	fn log_scale(self) -> f64 {
+		self.values().into_iter().fold(0.0, f64::max).ln_1p()
+	}
+	fn values(self) -> [f64; Self::WIDTH] {
+		[
+			f64::from(self.wvmd.0),
+			f64::from(self.cu),
+			f64::from(self.sdpcu),
+			self.lds as f64,
+			self.gms as f64,
+			f64::from(self.gmx),
+			f64::from(self.gmy),
+			f64::from(self.gmz),
+			f64::from(self.mwvpcu),
+			f64::from(self.mtpwg),
+			f64::from(self.mtpwgx),
+			f64::from(self.mtpwgy),
+			f64::from(self.mtpwgz),
+			f64::from(self.M),
+			f64::from(self.N),
+			f64::from(self.K),
+		]
+	}
+	pub fn constrain(self, knobs: Knobs) -> Result<()> {
+		require(knobs.words().into_iter().chain([self.M, self.N, self.K].map(u64::from)).all(|value| value != 0), "RAT choose values must be positive")?;
+		let mode = SubgroupModes::bit(knobs.wvmd as u32).ok_or_else(|| RecipeError::new("knob wvmd is not represented"))?;
+		require(self.wvmd.contains(mode), "knob wvmd is not a queried option")?;
+		require(knobs.tpwv == knobs.wvmd as u32, "tpwv != selected wvmd")?;
+		require(
+			knobs.g <= self.gms && u64::from(knobs.gx) <= u64::from(self.gmx) && u64::from(knobs.gy) <= u64::from(self.gmy) && u64::from(knobs.gz) <= u64::from(self.gmz),
+			"grid exceeds the queried limit",
+		)?;
+		require(knobs.tpwg <= self.mtpwg && knobs.tpwgx <= self.mtpwgx && knobs.tpwgy <= self.mtpwgy && knobs.tpwgz <= self.mtpwgz, "workgroup exceeds the queried limit")?;
+		let product = |values: [u64; 3], role| values.into_iter().try_fold(1_u64, |volume, value| volume.checked_mul(value).ok_or_else(|| RecipeError::new(format!("{role} overflows"))));
+		require(knobs.wv == knobs.wg.checked_mul(u64::from(knobs.wpwg)).ok_or_else(|| RecipeError::new("wv constraint overflows"))?, "wv != wg × wpwg")?;
+		require(knobs.wg == product([u64::from(knobs.wgx), u64::from(knobs.wgy), u64::from(knobs.wgz)], "wg constraint")?, "wg != wgx × wgy × wgz")?;
+		require(knobs.t == knobs.g, "t != g")?;
+		require(knobs.g == product([u64::from(knobs.gx), u64::from(knobs.gy), u64::from(knobs.gz)], "g constraint")?, "g != gx × gy × gz")?;
+		require(u64::from(knobs.tpwg) == product([u64::from(knobs.tpwgx), u64::from(knobs.tpwgy), u64::from(knobs.tpwgz)], "tpwg constraint")?, "tpwg != tpwgx × tpwgy × tpwgz")?;
+		let wave_floor = u64::from(knobs.wpwg - 1).checked_mul(u64::from(knobs.tpwv)).ok_or_else(|| RecipeError::new("wave coverage constraint overflows"))?;
+		let wave_ceiling = u64::from(knobs.wpwg).checked_mul(u64::from(knobs.tpwv)).ok_or_else(|| RecipeError::new("wave coverage constraint overflows"))?;
+		require(wave_floor < u64::from(knobs.tpwg) && u64::from(knobs.tpwg) <= wave_ceiling, "tpwg is outside the wpwg wave coverage")?;
+		for (groups, threads, workgroup, axis) in [(knobs.wgx, knobs.gx, knobs.tpwgx, "X"), (knobs.wgy, knobs.gy, knobs.tpwgy, "Y"), (knobs.wgz, knobs.gz, knobs.tpwgz, "Z")] {
+			require(workgroup <= threads, format!("workgroup {axis} exceeds grid {axis}"))?;
+			let floor = u64::from(groups - 1).checked_mul(u64::from(workgroup)).ok_or_else(|| RecipeError::new(format!("{axis} coverage constraint overflows")))?;
+			let ceiling = u64::from(groups).checked_mul(u64::from(workgroup)).ok_or_else(|| RecipeError::new(format!("{axis} coverage constraint overflows")))?;
+			require(floor < u64::from(threads) && u64::from(threads) <= ceiling, format!("g{axis} is outside the wg{axis} workgroup coverage"))?;
+		}
+		require(knobs.rdck % knobs.rdfk == 0, "reduction chunk does not contain whole fragments")?;
+		require(knobs.m <= self.M && knobs.n <= self.N && knobs.k <= self.K, "tile exceeds the load")?;
+		require(knobs.wg <= u64::from(self.M.div_ceil(knobs.m)) * u64::from(self.N.div_ceil(knobs.n)), "workgroups exceed forward output tiles")?;
+		require(knobs.kpl <= self.K && knobs.kvs <= self.K && knobs.kms <= self.K, "split-K value exceeds load K")
+	}
+}
+impl Knobs {
+	pub const WIDTH: usize = 29;
+	fn words(self) -> [u64; Self::WIDTH] {
+		[
+			u64::from(self.wvmd as u32),
+			u64::from(self.tpwgx),
+			u64::from(self.tpwgy),
+			u64::from(self.tpwgz),
+			self.swz,
+			self.wg,
+			u64::from(self.gd as u32),
+			u64::from(self.gx),
+			u64::from(self.gy),
+			u64::from(self.gz),
+			self.wv,
+			u64::from(self.wpwg),
+			u64::from(self.wgx),
+			u64::from(self.wgy),
+			u64::from(self.wgz),
+			self.t,
+			u64::from(self.tpwv),
+			u64::from(self.tpwg),
+			self.g,
+			u64::from(self.m),
+			u64::from(self.n),
+			u64::from(self.k),
+			u64::from(self.rm),
+			u64::from(self.rn),
+			u64::from(self.rdfk),
+			u64::from(self.rdck),
+			u64::from(self.kpl),
+			u64::from(self.kvs),
+			u64::from(self.kms),
+		]
+	}
+	pub fn from_values(values: [u64; Self::WIDTH]) -> Result<Self> {
+		let [wvmd, tpwgx, tpwgy, tpwgz, swz, wg, gd, gx, gy, gz, wv, wpwg, wgx, wgy, wgz, t, tpwv, tpwg, g, m, n, k, rm, rn, rdfk, rdck, kpl, kvs, kms] = values;
+		let word = |name, value| u32::try_from(value).map_err(|error| RecipeError::new(format!("knob {name} does not fit u32: {error}")));
+		let gd = match gd {
+			1 => GridDimensions::One,
+			2 => GridDimensions::Two,
+			3 => GridDimensions::Three,
+			value => return Err(RecipeError::new(format!("grid dimension count {value} is not represented"))),
+		};
+		Ok(Self {
+			wvmd: WaveMode::from_size(word("wvmd", wvmd)?)?,
+			tpwgx: word("tpwgx", tpwgx)?,
+			tpwgy: word("tpwgy", tpwgy)?,
+			tpwgz: word("tpwgz", tpwgz)?,
+			swz,
+			wg,
+			gd,
+			gx: word("gx", gx)?,
+			gy: word("gy", gy)?,
+			gz: word("gz", gz)?,
+			wv,
+			wpwg: word("wpwg", wpwg)?,
+			wgx: word("wgx", wgx)?,
+			wgy: word("wgy", wgy)?,
+			wgz: word("wgz", wgz)?,
+			t,
+			tpwv: word("tpwv", tpwv)?,
+			tpwg: word("tpwg", tpwg)?,
+			g,
+			m: word("m", m)?,
+			n: word("n", n)?,
+			k: word("k", k)?,
+			rm: word("rm", rm)?,
+			rn: word("rn", rn)?,
+			rdfk: word("rdfk", rdfk)?,
+			rdck: word("rdck", rdck)?,
+			kpl: word("kpl", kpl)?,
+			kvs: word("kvs", kvs)?,
+			kms: word("kms", kms)?,
+		})
+	}
+	fn values(self) -> [f64; Self::WIDTH] {
+		self.words().map(|value| value as f64)
+	}
+}
+/// Scores each decision in the coordinates used to fit the bench model.
+/// Frozen projections carry the measured configuration and replace only the
+/// selected knob with a differentiable, bounded proposal.
+fn compose_benchmark(graph: &mut Graph, benchmark: Graph) -> Result<usize> {
+	let (decision, proposal, tail) = (graph.input, graph.output, graph.source);
+	require(
+		decision.length == 1 && proposal.length == 1,
+		format!("a RAT decision and knob proposal must be flat, received {}x{} and {}x{}", decision.channels, decision.length, proposal.channels, proposal.length),
+	)?;
+	require(decision.channels == RatDecision::WIDTH, format!("the RAT decision has {} values, expected {}", decision.channels, RatDecision::WIDTH))?;
+	require(
+		checked_add(Query::WIDTH, proposal.channels, "composed benchmark input")? == benchmark.input.channels,
+		format!("the benchmark model takes {} values, but the query is {} and the knob proposal is {}", benchmark.input.channels, Query::WIDTH, proposal.channels),
+	)?;
+	let wide = Shape { channels: Query::WIDTH + proposal.channels, length: 1 };
+	let carried = embed(graph, -1, decision, (0..Query::WIDTH).chain(RatDecision::CONTEXT..RatDecision::WIDTH).map(Some))?;
+	let completed = embed(graph, -1, decision, (RatDecision::CONTEXT..RatDecision::WIDTH).map(Some))?;
+	let lower = embed(graph, -1, decision, std::iter::repeat_n(Some(RatDecision::CONTEXT - 4), proposal.channels))?;
+	let upper = embed(graph, -1, decision, std::iter::repeat_n(Some(RatDecision::CONTEXT - 3), proposal.channels))?;
+	let span = binary(graph, upper, lower, proposal, ScalarOpcode::Subtract)?;
+	let mut fraction = ScalarProgram(Vec::new());
+	let one = fraction.constant(1.0);
+	let two = fraction.constant(2.0);
+	let bounded = fraction.unary(ScalarOpcode::Tanh, -1.0);
+	let shifted = fraction.op(ScalarOpcode::Add, bounded, one);
+	fraction.op(ScalarOpcode::Divide, shifted, two);
+	let fraction = program(graph, tail, -2, proposal, &[], fraction)?;
+	let scaled = binary(graph, fraction, span, proposal, ScalarOpcode::Multiply)?;
+	let decoded = binary(graph, scaled, lower, proposal, ScalarOpcode::Add)?;
+	let difference = binary(graph, decoded, completed, proposal, ScalarOpcode::Subtract)?;
+	let active = embed(graph, -1, decision, (Query::WIDTH + Knobs::WIDTH * 2..Query::WIDTH + Knobs::WIDTH * 3).map(Some))?;
+	let selected = binary(graph, difference, active, proposal, ScalarOpcode::Multiply)?;
+	let placed = embed(graph, selected, proposal, std::iter::repeat_n(None, Query::WIDTH).chain((0..proposal.channels).map(Some)))?;
+	binary(graph, carried, placed, wide, ScalarOpcode::Add)?;
+	let base = graph.parameters.len();
+	append_graph(graph, benchmark)?;
+	// The benchmark is frozen in the composed graph only. Its own graph stays
+	// trainable, because the epoch that fits it owns it separately.
+	graph.frozen[base..].fill(1);
+	Ok(base)
+}
+/// The two trainable models and their composition.
+struct RatComposition {
+	proposer: Graph,
+	benchmark: Graph,
+}
+struct RatModels {
+	graph: Graph,
+	offset: usize,
+	proposer: bundle::StoredGraph,
+	benchmark: bundle::StoredGraph,
+	schema: DataSchema,
+	proposer_path: PathBuf,
+	benchmark_path: PathBuf,
+	inference: NativeTape,
+	training: NativeTape,
+	measurement: NativeTape,
+	observations: Vec<(Vec<f64>, f64)>,
+}
+#[derive(Clone)]
+struct RatChoice {
+	knobs: Knobs,
+	decision: Vec<f64>,
+}
+struct RatTraining {
+	config: RatConfig,
+	models: RatModels,
+	query: Query,
+	seed: u64,
+	choice: RatChoice,
+	best: Option<(f64, RatChoice)>,
+	updates: usize,
+	timings: Vec<f64>,
+}
+/// The one graph a RAT run trains: the knob model over the queried device,
+/// composed with the benchmark model that scores its proposal.
+fn rat_graph(model: &Model, prepared: &Prepared, gpu: &'static Gpu, config: Config) -> Result<RatComposition> {
+	let benchmark = model.downstream.as_deref().ok_or_else(|| RecipeError::new("a RAT knob model requires .loss(&benchmark)"))?;
+	require(prepared.features == RatDecision::WIDTH, format!("the RAT decision supplies {} values, expected {}", prepared.features, RatDecision::WIDTH))?;
+	let mut proposer = model.clone();
+	proposer.downstream = None;
+	// The proposal width comes from the benchmark's knob argument, and the
+	// predicted-time width from its result, so neither model declares an output.
+	let proposals = Prepared::matrix(prepared.samples.clone(), vec![0.0; Knobs::WIDTH], 1, Knobs::WIDTH)?;
+	let mut graph = compile(&proposer, &proposals, &proposals.targets, 1, gpu, config, true)?;
+	let first = &graph.nodes[0];
+	require(first.op == Primitive::Contraction && first.source == -1, "the knob model must start with a projection")?;
+	for row in 0..first.output.channels {
+		let start = first.offset + row * RatDecision::WIDTH + RatDecision::CONTEXT;
+		graph.parameters[start..start + Knobs::WIDTH].fill(0.0);
+		graph.frozen[start..start + Knobs::WIDTH].fill(1);
+	}
+	let observations = Prepared::matrix(vec![0.0; Query::WIDTH + Knobs::WIDTH], vec![0.0], 1, 1)?;
+	let benchmark = compile(benchmark, &observations, &observations.targets, 1, gpu, config, true)?;
+	Ok(RatComposition { proposer: graph, benchmark })
+}
+fn rat_query(graph: &Graph, rows: usize, gpu: &'static Gpu) -> Result<Query> {
+	let shapes = native_contraction_shapes(graph, rows)?;
+	let (limits, dominant) = native_contraction_bounds(&shapes)?;
+	let load = dominant.and_then(|(index, _)| shapes[index]).map_or(limits, |shape| shape.forward);
+	Ok(gpu.query()?.with_load([load.m, load.n, load.k]))
+}
+#[derive(Clone, Copy, Debug)]
+struct RatConfig {
+	model_bytes: u64,
+	state_ratio: u32,
+	matrix: bool,
+	invalid_time_ms: f64,
+	learning_rate: f64,
+	initial_epochs: usize,
+	shuffles: usize,
+	prediction_shuffles: usize,
+	observation_epochs: usize,
+	bench_model: &'static str,
+	knob_model: &'static str,
+}
+fn rat_config(gpu: &Gpu, precision: Compute) -> Result<RatConfig> {
+	Ok(RatConfig {
+		model_bytes: precision.bytes() as u64,
+		state_ratio: NativePrecision::new(precision)?.state.bytes().div_ceil(precision.bytes()) as u32,
+		matrix: native_matrix_arithmetic(&gpu.native_target, precision),
+		invalid_time_ms: number("RAT invalid time", env!("RECIPE_RAT_INVALID_TIME_MS"))?,
+		learning_rate: number("RAT learning rate", env!("RECIPE_RAT_LEARNING_RATE"))?,
+		initial_epochs: natural("RAT initial epochs", env!("RECIPE_RAT_INITIAL_EPOCHS"))?,
+		shuffles: natural("RAT shuffles", env!("RECIPE_RAT_SHUFFLES"))?,
+		prediction_shuffles: natural("RAT prediction shuffles", env!("RECIPE_RAT_PREDICTION_SHUFFLES"))?,
+		observation_epochs: natural("RAT observation epochs", env!("RECIPE_RAT_OBSERVATION_EPOCHS"))?,
+		bench_model: env!("RECIPE_RAT_BENCH_MODEL"),
+		knob_model: env!("RECIPE_RAT_KNOB_MODEL"),
+	})
+}
+macro_rules! rat_fields {
+	($($field:ident, $name:literal, $predicted:literal;)*) => {
+		#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+		#[repr(usize)]
+		enum RatField { $($field,)* }
+		impl RatField {
+			const ALL: [Self; Knobs::WIDTH] = [$(Self::$field,)*];
+			const fn predicted(self) -> bool { match self { $(Self::$field => $predicted,)* } }
+			const fn name(self) -> &'static str { match self { $(Self::$field => $name,)* } }
+		}
+	};
+}
+rat_fields! {
+	Wvmd, "wvmd", true;
+	Tpwgx, "tpwgx", true;
+	Tpwgy, "tpwgy", true;
+	Tpwgz, "tpwgz", true;
+	Swz, "swz", true;
+	Wg, "wg", false;
+	Gd, "gd", false;
+	Gx, "gx", true;
+	Gy, "gy", true;
+	Gz, "gz", true;
+	Wv, "wv", false;
+	Wpwg, "wpwg", false;
+	Wgx, "wgx", false;
+	Wgy, "wgy", false;
+	Wgz, "wgz", false;
+	T, "t", false;
+	Tpwv, "tpwv", false;
+	Tpwg, "tpwg", false;
+	G, "g", false;
+	M, "m", true;
+	N, "n", true;
+	K, "k", true;
+	Rm, "rm", true;
+	Rn, "rn", true;
+	Rdfk, "rdfk", true;
+	Rdck, "rdck", true;
+	Kpl, "kpl", true;
+	Kvs, "kvs", true;
+	Kms, "kms", true;
+}
+#[derive(Clone, Debug)]
+enum RatDomain {
+	Values(Vec<u64>),
+	Range { first: u64, last: u64 },
+}
+impl RatDomain {
+	fn length(&self) -> u64 {
+		match self {
+			Self::Values(values) => values.len() as u64,
+			Self::Range { first, last } => last - first + 1,
+		}
+	}
+	fn only(&self) -> Option<u64> {
+		(self.length() == 1).then(|| match self {
+			Self::Values(values) => values[0],
+			Self::Range { first, .. } => *first,
+		})
+	}
+	fn contains(&self, value: u64) -> bool {
+		match self {
+			Self::Values(values) => values.contains(&value),
+			Self::Range { first, last, .. } => (*first..=*last).contains(&value),
+		}
+	}
+	fn select(&self, prediction: f64) -> Result<u64> {
+		require(prediction.is_finite(), "knob model prediction is not finite")?;
+		let [lower, upper, ..] = self.tokens();
+		let value = prediction.mul_add(upper - lower, lower);
+		let (mut first, mut last) = (0, self.length() - 1);
+		while first < last {
+			let middle = first + (last - first) / 2;
+			let boundary = ((self.at(middle)? as f64).ln_1p() + (self.at(middle + 1)? as f64).ln_1p()) / 2.0;
+			if value <= boundary { last = middle } else { first = middle + 1 }
+		}
+		self.at(first)
+	}
+	fn at(&self, index: u64) -> Result<u64> {
+		require(index < self.length(), "RAT domain index is outside the search space")?;
+		match self {
+			Self::Values(values) => Ok(values[index as usize]),
+			Self::Range { first, .. } => Ok(first + index),
+		}
+	}
+	fn tokens(&self) -> [f64; 4] {
+		match self {
+			Self::Values(values) => [values[0] as f64, values[values.len() - 1] as f64, 0.0, values.len() as f64],
+			Self::Range { first, last, .. } => {
+				let length = self.length();
+				let interval = if length == 1 { 0.0 } else { (last - first) as f64 / (length - 1) as f64 };
+				[*first as f64, *last as f64, interval, length as f64]
+			}
+		}
+		.map(f64::ln_1p)
+	}
+}
+fn rat_range(field: RatField, lower: u64, upper: u64) -> Result<RatDomain> {
+	require(lower != 0 && lower <= upper, format!("RAT {} search space is empty", field.name()))?;
+	Ok(RatDomain::Range { first: lower, last: upper })
+}
+fn rat_values(field: RatField, values: impl IntoIterator<Item = u64>) -> Result<RatDomain> {
+	let mut values = values.into_iter().collect::<Vec<_>>();
+	values.sort_unstable();
+	values.dedup();
+	require(!values.is_empty(), format!("RAT {} search space is empty", field.name()))?;
+	Ok(RatDomain::Values(values))
+}
+#[derive(Clone)]
+struct RatSearchSpace {
+	query: Query,
+	rat: RatConfig,
+	chosen: [Option<u64>; Knobs::WIDTH],
+}
+impl RatSearchSpace {
+	fn new(query: Query, rat: RatConfig) -> Result<Self> {
+		require(query.M != 0 && query.N != 0 && query.K != 0, "RAT load dimensions must be positive")?;
+		let mut chosen = [None; Knobs::WIDTH];
+		chosen[RatField::Gd as usize] = Some(GridDimensions::Three as u64);
+		Ok(Self { query, rat, chosen })
+	}
+	fn selected(&self, field: RatField) -> Option<u64> {
+		self.chosen[field as usize]
+	}
+	fn product(&self, fields: [RatField; 3], except: RatField, role: &str) -> Result<u64> {
+		fields.into_iter()
+			.filter(|field| *field != except)
+			.try_fold(1_u64, |product, field| product.checked_mul(self.selected(field).unwrap_or(1)).ok_or_else(|| RecipeError::new(format!("RAT {role} overflows"))))
+	}
+	fn minimum_groups(&self, change: Option<(RatField, u64)>) -> u64 {
+		let chosen = |field| change.filter(|(changed, _)| *changed == field).map(|(_, value)| value).or_else(|| self.selected(field));
+		let grids = [RatField::Gx, RatField::Gy, RatField::Gz].map(|field| chosen(field).unwrap_or(1));
+		let widths = [RatField::Tpwgx, RatField::Tpwgy, RatField::Tpwgz].map(chosen);
+		let maximums = [self.query.mtpwgx, self.query.mtpwgy, self.query.mtpwgz].map(u64::from);
+		let range = |axis: usize, budget: u64| match widths[axis] {
+			Some(width) => width..=width.min(maximums[axis]).min(budget),
+			None => 1..=grids[axis].min(maximums[axis]).min(budget),
+		};
+		let mut best = u64::MAX;
+		for x in range(0, u64::from(self.query.mtpwg)) {
+			for y in range(1, u64::from(self.query.mtpwg) / x) {
+				let remaining = u64::from(self.query.mtpwg) / x / y;
+				let z = widths[2].unwrap_or(grids[2].min(maximums[2]).min(remaining));
+				if z != 0 && z <= remaining && z <= maximums[2] {
+					best = best.min(grids[0].div_ceil(x) * grids[1].div_ceil(y) * grids[2].div_ceil(z));
+					if best == 1 {
+						return best;
+					}
+				}
+			}
+		}
+		best
+	}
+	fn domain(&self, field: RatField) -> Result<Option<RatDomain>> {
+		let axes = [
+			(RatField::Gx, RatField::Tpwgx, self.query.gmx, self.query.mtpwgx),
+			(RatField::Gy, RatField::Tpwgy, self.query.gmy, self.query.mtpwgy),
+			(RatField::Gz, RatField::Tpwgz, self.query.gmz, self.query.mtpwgz),
+		];
+		let jobs = [(self.query.M, RatField::M), (self.query.N, RatField::N)].into_iter().map(|(total, extent)| u64::from(total).div_ceil(self.selected(extent).unwrap_or(1))).product::<u64>();
+		let fits = |value| {
+			let chosen = |item| if item == field { Some(value) } else { self.selected(item) };
+			let selected = |item| chosen(item).unwrap_or(1) as u32;
+			let fragment = selected(RatField::Rdfk);
+			let chunk = chosen(RatField::Rdck).map_or(self.query.K - self.query.K % fragment, |chunk| chunk as u32);
+			let block = [RatField::Tpwgx, RatField::Tpwgy, RatField::Tpwgz].into_iter().map(selected).product();
+			let matrix = self.rat.matrix && [self.query.M, self.query.N, self.query.K].into_iter().all(|extent| extent >= fragment);
+			let extent = Tile { m: selected(RatField::M), n: selected(RatField::N), k: selected(RatField::K) };
+			native_contraction_shared_values(extent, selected(RatField::Rm), selected(RatField::Rn), block, chunk, self.rat.state_ratio, matrix)
+				.is_ok_and(|values| u128::from(values) * u128::from(self.rat.model_bytes) <= u128::from(self.query.lds))
+		};
+		let range = |lower: u64, mut upper: u64| {
+			if matches!(field, RatField::M | RatField::N | RatField::K | RatField::Gx | RatField::Gy | RatField::Gz) {
+				let mut last = lower - 1;
+				while last < upper {
+					let middle = last + (upper - last).div_ceil(2);
+					let valid = if matches!(field, RatField::Gx | RatField::Gy | RatField::Gz) { self.minimum_groups(Some((field, middle))) <= jobs } else { fits(middle) };
+					if valid { last = middle } else { upper = middle - 1 }
+				}
+			}
+			rat_range(field, lower, upper).map(Some)
+		};
+		let singleton = |value| rat_values(field, [value]).map(Some);
+		let selected_max = |base: u64, fields, role| -> Result<u64> { Ok(base / self.product(fields, field, role)?) };
+		match field {
+			RatField::Wvmd => rat_values(field, self.query.wave_modes().map(|mode| mode as u64)).map(Some),
+			RatField::Tpwgx | RatField::Tpwgy | RatField::Tpwgz => {
+				let (grid, _, _, maximum) = axes.into_iter().find(|(_, group, ..)| *group == field).unwrap();
+				let upper = u64::from(maximum)
+					.min(selected_max(u64::from(self.query.mtpwg), [RatField::Tpwgx, RatField::Tpwgy, RatField::Tpwgz], "tpwg")?)
+					.min(self.selected(grid).unwrap_or(u64::MAX));
+				rat_values(field, (1..=upper).filter(|value| fits(*value) && self.minimum_groups(Some((field, *value))) <= jobs)).map(Some)
+			}
+			RatField::Swz => range(1, u64::from(self.query.M)),
+			RatField::Gx | RatField::Gy | RatField::Gz => {
+				let (_, group, maximum, group_maximum) = axes.into_iter().find(|(grid, ..)| *grid == field).unwrap();
+				let width =
+					self.selected(group).unwrap_or(u64::from(group_maximum).min(selected_max(u64::from(self.query.mtpwg), [RatField::Tpwgx, RatField::Tpwgy, RatField::Tpwgz], "tpwg")?));
+				let upper = (u128::from(jobs) * u128::from(width)).min(u128::from(maximum)) as u64;
+				range(self.selected(group).unwrap_or(1), upper.min(selected_max(self.query.gms, [RatField::Gx, RatField::Gy, RatField::Gz], "g")?))
+			}
+			RatField::M | RatField::N => {
+				let (total, other, extent) = if field == RatField::M { (self.query.M, self.query.N, RatField::N) } else { (self.query.N, self.query.M, RatField::M) };
+				let needed = self.minimum_groups(None).div_ceil(u64::from(other).div_ceil(self.selected(extent).unwrap_or(1)));
+				range(1, if needed <= 1 { u64::from(total) } else { u64::from(total - 1) / (needed - 1) })
+			}
+			RatField::K => range(1, u64::from(self.query.K)),
+			RatField::Rm | RatField::Rn => {
+				let limit = if field == RatField::Rm { self.query.M } else { self.query.N };
+				let block = self.product([RatField::Tpwgx, RatField::Tpwgy, RatField::Tpwgz], field, "tpwg")?;
+				let fragment = self.selected(RatField::Rdfk).unwrap_or(1);
+				let matrix = self.rat.matrix && [self.query.M, self.query.N, self.query.K].into_iter().all(|extent| u64::from(extent) >= fragment);
+				let chunk = self.selected(RatField::Rdck).unwrap_or(u64::from(self.query.K) / fragment * fragment);
+				if block == 1 || matrix || self.selected(RatField::K).unwrap_or(1) <= chunk {
+					return range(1, u64::from(limit));
+				}
+				rat_values(field, (1..=u64::from(limit)).filter(|value| fits(*value))).map(Some)
+			}
+			RatField::Rdfk => {
+				let upper = u64::from(self.query.K);
+				rat_values(field, (1..=upper).filter(|value| self.selected(RatField::Rdck).is_none_or(|chunk| chunk % value == 0) && fits(*value))).map(Some)
+			}
+			RatField::Rdck => {
+				let upper = u64::from(self.query.K);
+				rat_values(field, (1..=upper).filter(|value| self.selected(RatField::Rdfk).is_none_or(|fragment| value % fragment == 0) && fits(*value))).map(Some)
+			}
+			RatField::Kpl | RatField::Kvs | RatField::Kms => range(1, u64::from(self.query.K)),
+			RatField::Tpwv => match self.selected(RatField::Wvmd) {
+				Some(value) => singleton(value),
+				None => Ok(None),
+			},
+			RatField::Tpwg => match (self.selected(RatField::Tpwgx), self.selected(RatField::Tpwgy), self.selected(RatField::Tpwgz)) {
+				(Some(x), Some(y), Some(z)) => singleton(x.checked_mul(y).and_then(|value| value.checked_mul(z)).ok_or_else(|| RecipeError::new("RAT tpwg overflows"))?),
+				_ => Ok(None),
+			},
+			RatField::Wpwg => match (self.selected(RatField::Tpwg), self.selected(RatField::Tpwv)) {
+				(Some(threads), Some(wave)) => singleton(threads.div_ceil(wave)),
+				_ => Ok(None),
+			},
+			RatField::Wgx => match (self.selected(RatField::Gx), self.selected(RatField::Tpwgx)) {
+				(Some(grid), Some(group)) => singleton(grid.div_ceil(group)),
+				_ => Ok(None),
+			},
+			RatField::Wgy => match (self.selected(RatField::Gy), self.selected(RatField::Tpwgy)) {
+				(Some(grid), Some(group)) => singleton(grid.div_ceil(group)),
+				_ => Ok(None),
+			},
+			RatField::Wgz => match (self.selected(RatField::Gz), self.selected(RatField::Tpwgz)) {
+				(Some(grid), Some(group)) => singleton(grid.div_ceil(group)),
+				_ => Ok(None),
+			},
+			RatField::Wg => match (self.selected(RatField::Wgx), self.selected(RatField::Wgy), self.selected(RatField::Wgz)) {
+				(Some(x), Some(y), Some(z)) => singleton(x.checked_mul(y).and_then(|value| value.checked_mul(z)).ok_or_else(|| RecipeError::new("RAT wg overflows"))?),
+				_ => Ok(None),
+			},
+			RatField::G => match (self.selected(RatField::Gx), self.selected(RatField::Gy), self.selected(RatField::Gz)) {
+				(Some(x), Some(y), Some(z)) => singleton(x.checked_mul(y).and_then(|value| value.checked_mul(z)).ok_or_else(|| RecipeError::new("RAT g overflows"))?),
+				_ => Ok(None),
+			},
+			RatField::T => match self.selected(RatField::G) {
+				Some(value) => singleton(value),
+				None => Ok(None),
+			},
+			RatField::Wv => match (self.selected(RatField::Wg), self.selected(RatField::Wpwg)) {
+				(Some(groups), Some(waves)) => singleton(groups.checked_mul(waves).ok_or_else(|| RecipeError::new("RAT wv overflows"))?),
+				_ => Ok(None),
+			},
+			RatField::Gd => singleton(GridDimensions::Three as u64),
+		}
+	}
+	fn assign(&mut self, field: RatField, value: u64) -> Result<()> {
+		let domain = self.domain(field)?.ok_or_else(|| RecipeError::new(format!("RAT {} cannot be derived yet", field.name())))?;
+		require(domain.contains(value), format!("RAT {} value {value} is outside its current search space", field.name()))?;
+		self.chosen[field as usize] = Some(value);
+		Ok(())
+	}
+	fn propagate(&mut self, order: &[RatField]) -> Result<()> {
+		loop {
+			let mut changed = false;
+			for field in order.iter().copied() {
+				if self.selected(field).is_some() {
+					continue;
+				}
+				if let Some(value) = self.domain(field)?.and_then(|domain| domain.only()) {
+					self.assign(field, value)?;
+					changed = true
+				}
+			}
+			if !changed {
+				return Ok(());
+			}
+		}
+	}
+	fn next(&mut self, order: &[RatField]) -> Result<Option<(RatField, RatDomain)>> {
+		self.propagate(order)?;
+		for field in order.iter().copied().filter(|field| field.predicted() && self.selected(*field).is_none()) {
+			let domain = self.domain(field)?.ok_or_else(|| RecipeError::new(format!("RAT {} has no search space", field.name())))?;
+			require(domain.length() > 1, format!("RAT {} singleton was not derived", field.name()))?;
+			return Ok(Some((field, domain)));
+		}
+		Ok(None)
+	}
+	fn decision(&self, field: RatField, domain: &RatDomain) -> Vec<f64> {
+		let mut values = Vec::with_capacity(RatDecision::WIDTH);
+		let scale = self.query.log_scale();
+		values.extend(self.query.values().map(|value| value.ln_1p() / scale));
+		values.extend(self.chosen.iter().map(|value| (value.unwrap_or(0) as f64).ln_1p() / scale));
+		values.extend(self.chosen.iter().map(|value| f64::from(value.is_some())));
+		values.extend(RatField::ALL.map(|candidate| f64::from(candidate == field)));
+		values.extend(domain.tokens().map(|value| value / scale));
+		values.extend([0.0; Knobs::WIDTH]);
+		values
+	}
+	fn finish(mut self, order: &[RatField]) -> Result<Knobs> {
+		self.propagate(order)?;
+		require(self.chosen.iter().all(Option::is_some), "RAT search space did not resolve every knob")?;
+		let value = |field: RatField| self.selected(field).unwrap_or(0);
+		let narrow = |field: RatField| u32::try_from(value(field)).map_err(|error| RecipeError::new(format!("RAT {} does not fit u32: {error}", field.name())));
+		let knobs = Knobs {
+			wvmd: WaveMode::from_size(narrow(RatField::Wvmd)?)?,
+			tpwgx: narrow(RatField::Tpwgx)?,
+			tpwgy: narrow(RatField::Tpwgy)?,
+			tpwgz: narrow(RatField::Tpwgz)?,
+			swz: value(RatField::Swz),
+			wg: value(RatField::Wg),
+			gd: GridDimensions::Three,
+			gx: narrow(RatField::Gx)?,
+			gy: narrow(RatField::Gy)?,
+			gz: narrow(RatField::Gz)?,
+			wv: value(RatField::Wv),
+			wpwg: narrow(RatField::Wpwg)?,
+			wgx: narrow(RatField::Wgx)?,
+			wgy: narrow(RatField::Wgy)?,
+			wgz: narrow(RatField::Wgz)?,
+			t: value(RatField::T),
+			tpwv: narrow(RatField::Tpwv)?,
+			tpwg: narrow(RatField::Tpwg)?,
+			g: value(RatField::G),
+			m: narrow(RatField::M)?,
+			n: narrow(RatField::N)?,
+			k: narrow(RatField::K)?,
+			rm: narrow(RatField::Rm)?,
+			rn: narrow(RatField::Rn)?,
+			rdfk: narrow(RatField::Rdfk)?,
+			rdck: narrow(RatField::Rdck)?,
+			kpl: narrow(RatField::Kpl)?,
+			kvs: narrow(RatField::Kvs)?,
+			kms: narrow(RatField::Kms)?,
+		};
+		self.query.constrain(knobs)?;
+		Ok(knobs)
+	}
+}
+struct RatDecision;
+impl RatDecision {
+	const CONTEXT: usize = Query::WIDTH + Knobs::WIDTH * 3 + 4;
+	const WIDTH: usize = Self::CONTEXT + Knobs::WIDTH;
+}
+fn shuffle_rat_fields(seed: &mut u64) -> Vec<RatField> {
+	let mut fields = RatField::ALL.to_vec();
+	for index in (1..fields.len()).rev() {
+		fields.swap(index, next_random(seed) as usize % (index + 1));
+	}
+	fields
+}
+fn install_rat_models(composed: &mut Graph, proposer: &Graph, benchmark: &Graph, proposer_parameters: usize, benchmark_offset: usize) -> Result<()> {
+	require(proposer.parameters.len() == proposer_parameters, "saved knob model parameter count changed")?;
+	require(benchmark_offset + benchmark.parameters.len() == composed.parameters.len(), "saved benchmark model parameter count changed")?;
+	composed.parameters[..proposer_parameters].copy_from_slice(&proposer.parameters);
+	composed.parameters[benchmark_offset..].copy_from_slice(&benchmark.parameters);
+	composed.state = proposer.state.clone();
+	for values in [&mut composed.state.moments, &mut composed.state.variances] {
+		values.resize(composed.parameters.len(), 0.0)
+	}
+	Ok(())
+}
+fn extract_rat_proposer(composed: &Graph, proposer: &mut Graph, proposer_parameters: usize) {
+	proposer.parameters.copy_from_slice(&composed.parameters[..proposer_parameters]);
+	proposer.state = composed.state.clone();
+	proposer.state.moments.truncate(proposer_parameters);
+	proposer.state.variances.truncate(proposer_parameters);
+}
+fn rat_model_path(value: &str) -> Result<PathBuf> {
+	let path = resolve_path(value)?;
+	let parent = path.parent().ok_or_else(|| RecipeError::new(format!("RAT model path {} has no parent", path.display())))?;
+	fs::create_dir_all(parent).map_err(|error| RecipeError::new(format!("cannot create {}: {error}", parent.display())))?;
+	Ok(path)
+}
+static RAT_SURROGATE: OnceLock<Result<Gpu>> = OnceLock::new();
+fn rat_surrogate() -> Result<&'static Gpu> {
+	RAT_SURROGATE.get_or_init(cpu_device).as_ref().map_err(Clone::clone)
+}
+fn load_rat_model(path: &Path, role: &str, gpu: &'static Gpu, config: Config) -> Result<(DataSchema, bundle::StoredGraph)> {
+	let (schema, mut saved) = bundle::load_semantic(path).map_err(|error| RecipeError::new(format!("cannot load RAT {role} model {}: {error}", path.display())))?;
+	require(saved.len() == 1, format!("RAT {role} model {} contains {} graphs, expected one", path.display(), saved.len()))?;
+	let saved = saved.pop().unwrap();
+	let samples = vec![0.0; saved.input.elements()];
+	let graph = materialize_saved_graph(&saved, &samples, gpu, Config { precision: saved.precision, ..config })?;
+	let stored = bundle::StoredGraph {
+		graph,
+		model: saved.model.clone(),
+		precision: saved.precision,
+		inputs: saved.inputs.clone(),
+		outputs: saved.outputs.clone(),
+		norm_mean: saved.norm_mean.clone(),
+		norm_scale: saved.norm_scale.clone(),
+		target_min: saved.target_min,
+		target_span: saved.target_span,
+		bn_stats: saved.bn_stats.clone(),
+		artifact: saved.artifact.clone(),
+	};
+	Ok((schema, stored))
+}
+impl RatModels {
+	fn load(model: &Model, rat: &mut RatConfig, gpu: &'static Gpu, config: Config) -> Result<Self> {
+		let proposer_path = rat_model_path(rat.knob_model)?;
+		let benchmark_path = rat_model_path(rat.bench_model)?;
+		let initialized = proposer_path.exists();
+		require(initialized == benchmark_path.exists(), "RAT requires both saved models or neither saved model")?;
+		let (schema, proposer, benchmark) = if initialized {
+			let (schema, proposer) = load_rat_model(&proposer_path, "knob", gpu, config)?;
+			let (benchmark_schema, benchmark) = load_rat_model(&benchmark_path, "bench", gpu, config)?;
+			require(schema == benchmark_schema, "RAT knob and bench model schemas differ")?;
+			(schema, proposer, benchmark)
+		} else {
+			let benchmark_model = model.downstream.as_deref().ok_or_else(|| RecipeError::new("a RAT knob model requires .loss(&benchmark)"))?;
+			let prepared = Prepared::matrix(vec![0.0; RatDecision::WIDTH], vec![0.0], 1, 1)?;
+			let composition = rat_graph(model, &prepared, gpu, config)?;
+			let mut proposer_model = model.clone();
+			proposer_model.downstream = None;
+			let data = recipe.data(auto);
+			let target = native_target_label(&gpu.native_target);
+			let mut proposer = stored_graph(&composition.proposer, &proposer_model, &data, None, config.precision, target);
+			proposer.outputs = RatField::ALL.map(|field| field.name().to_owned()).to_vec();
+			let benchmark = stored_graph(&composition.benchmark, &benchmark_model, &data, None, config.precision, target);
+			(DataSchema::default(), proposer, benchmark)
+		};
+		require(proposer.precision == benchmark.precision, "RAT knob and bench model arithmetic formats differ")?;
+		require(proposer.graph.input == Shape { channels: RatDecision::WIDTH, length: 1 }, "RAT knob model input shape is incompatible")?;
+		require(proposer.graph.output == Shape { channels: Knobs::WIDTH, length: 1 }, "RAT knob model output shape is incompatible")?;
+		require(benchmark.graph.input == Shape { channels: Query::WIDTH + Knobs::WIDTH, length: 1 }, "RAT bench model input shape is incompatible")?;
+		require(benchmark.graph.output.elements() == 1, "RAT bench model must emit one time")?;
+		let mut graph = proposer.graph.clone();
+		let proposer_parameters = graph.parameters.len();
+		let offset = compose_benchmark(&mut graph, benchmark.graph.clone())?;
+		install_rat_models(&mut graph, &proposer.graph, &benchmark.graph, proposer_parameters, offset)?;
+		let inference = NativeTape::new(&proposer.graph, &vec![0.0; RatDecision::WIDTH], &[], gpu, proposer.precision, None, None)?;
+		let training = NativeTape::new(&graph, &vec![0.0; RatDecision::WIDTH * Knobs::WIDTH], &vec![0.0; Knobs::WIDTH], gpu, proposer.precision, Some(benchmark.model.loss), None)?;
+		let measurement = NativeTape::new(&benchmark.graph, &vec![0.0; Query::WIDTH + Knobs::WIDTH], &[0.0], gpu, benchmark.precision, Some(benchmark.model.loss), None)?;
+		rat.initial_epochs = rat.initial_epochs.saturating_sub(training.step as usize);
+		Ok(Self { graph, offset, proposer, benchmark, schema, proposer_path, benchmark_path, inference, training, measurement, observations: Vec::new() })
+	}
+	fn choose(&mut self, query: Query, rat: RatConfig, seed: &mut u64, explore: bool) -> Result<RatChoice> {
+		let mut best: Option<(f64, RatChoice)> = None;
+		for _ in 0..if explore { 1 } else { rat.prediction_shuffles } {
+			let order = shuffle_rat_fields(seed);
+			let mut space = RatSearchSpace::new(query, rat)?;
+			let mut decisions = vec![Vec::new(); Knobs::WIDTH];
+			while let Some((field, domain)) = space.next(&order)? {
+				let input = space.decision(field, &domain);
+				let fraction = if explore {
+					next_random(seed) as f64 / u64::MAX as f64
+				} else {
+					self.inference.samples.write_float_bytes(0, &input, self.inference.precision.model)?;
+					self.inference.forward()?;
+					self.inference.predictions()?[field as usize].tanh().mul_add(0.5, 0.5)
+				};
+				space.assign(field, domain.select(fraction)?)?;
+				decisions[field as usize] = input;
+			}
+			let knobs = space.clone().finish(&order)?;
+			let scale = query.log_scale();
+			for field in RatField::ALL {
+				let input = &mut decisions[field as usize];
+				if input.is_empty() {
+					*input = space.decision(field, &rat_values(field, [space.selected(field).unwrap()])?);
+					input[Query::WIDTH + Knobs::WIDTH * 2..Query::WIDTH + Knobs::WIDTH * 3].fill(0.0);
+				}
+				input[RatDecision::CONTEXT..].copy_from_slice(&knobs.values().map(|value| value.ln_1p() / scale));
+			}
+			let decision = decisions.into_iter().flatten().collect();
+			let observation = query.values().into_iter().chain(knobs.values()).map(|value| value.ln_1p() / scale).collect::<Vec<_>>();
+			self.measurement.samples.write_float_bytes(0, &observation, self.measurement.precision.model)?;
+			self.measurement.forward()?;
+			let time = self.measurement.predictions()?[0];
+			if best.as_ref().is_none_or(|(minimum, _)| time < *minimum) {
+				best = Some((time, RatChoice { knobs, decision }));
+			}
+		}
+		Ok(best.unwrap().1)
+	}
+	fn update(&mut self, query: Query, choice: &RatChoice, milliseconds: f64, rate: f64, mut config: Config) -> Result<(f64, BenchmarkFit)> {
+		config.precision = self.proposer.precision;
+		let scale = query.log_scale();
+		let observation = query.values().into_iter().chain(choice.knobs.values()).map(|value| value.ln_1p() / scale).collect::<Vec<_>>();
+		self.observations.push((observation, milliseconds.ln_1p()));
+		let mut loss = 0.0;
+		for _ in 0..config.surrogate_epochs {
+			for (observation, target) in &self.observations {
+				self.measurement.samples.write_float_bytes(0, observation, self.measurement.precision.model)?;
+				self.measurement.targets.write_float_bytes(0, &[*target], self.measurement.precision.model)?;
+				self.measurement.advance()?;
+				loss = self.measurement.full_epoch(rate, config)?;
+			}
+		}
+		let predicted = self.measurement.predictions()?[0].exp_m1();
+		let weights = self.measurement.weights()?;
+		self.training.weights.write_float_bytes(self.offset * self.training.precision.model.bytes(), &weights, self.training.precision.model)?;
+		self.training.samples.write_float_bytes(0, &choice.decision, self.training.precision.model)?;
+		self.training.advance()?;
+		let knob_loss = self.training.full_epoch(rate, config)?;
+		let proposer = self.training.weights.download_float(self.proposer.graph.parameters.len(), self.training.precision.model)?;
+		self.inference.weights.write_float_bytes(0, &proposer, self.inference.precision.model)?;
+		Ok((knob_loss, BenchmarkFit { loss, predicted }))
+	}
+	fn save(&mut self) -> Result<()> {
+		self.training.capture(&mut self.graph)?;
+		let parameters = self.proposer.graph.parameters.len();
+		extract_rat_proposer(&self.graph, &mut self.proposer.graph, parameters);
+		self.measurement.capture(&mut self.benchmark.graph)?;
+		bundle::save_semantic(&self.proposer_path, &self.schema, std::slice::from_mut(&mut self.proposer))?;
+		bundle::save_semantic(&self.benchmark_path, &self.schema, std::slice::from_mut(&mut self.benchmark))?;
+		Ok(())
+	}
+}
+impl RatTraining {
+	fn load(graph: &Graph, rows: usize, gpu: &'static Gpu, config: Config) -> Result<Self> {
+		let mut rat = rat_config(gpu, config.precision)?;
+		let surrogate = rat_surrogate()?;
+		let benchmark = recipe.model().layer(config.surrogate_width).tanh().layer(1).exp().loss(huber);
+		let model = recipe.model().layer(config.surrogate_width).tanh().loss(&benchmark);
+		let mut models = RatModels::load(&model, &mut rat, surrogate, config)?;
+		let query = rat_query(graph, rows, gpu)?;
+		let mut seed = config.random_seed as u64;
+		let choice = models.choose(query, rat, &mut seed, rat.initial_epochs != 0)?;
+		Ok(Self { config: rat, models, query, seed, choice, best: None, updates: 0, timings: Vec::new() })
+	}
+	fn apply<T>(&mut self, config: Config, mut dispatch: impl FnMut(Knobs) -> Result<T>) -> Result<T> {
+		loop {
+			write_log(&format!("rat training choice\tquery\t{}x{}x{}\tknobs\t{:?}", self.query.M, self.query.N, self.query.K, self.choice.knobs))?;
+			match dispatch(self.choice.knobs) {
+				Err(error @ RecipeError::Residency(_)) => {
+					log_error(&format!("RAT configuration not dispatched: {error}"));
+					self.update(self.config.invalid_time_ms, config)?;
+					if self.updates >= self.config.initial_epochs + self.config.shuffles {
+						self.models.save()?;
+						return Err(error);
+					}
+				}
+				result => return result,
+			}
+		}
+	}
+	fn update(&mut self, milliseconds: f64, config: Config) -> Result<(f64, BenchmarkFit)> {
+		if self.best.as_ref().is_none_or(|(time, _)| milliseconds < *time) {
+			self.best = Some((milliseconds, self.choice.clone()));
+			write_log(&format!("rat best\tproposal\t{}\tmeasured ms\t{milliseconds}", self.updates))?;
+		}
+		let updated = self.models.update(self.query, &self.choice, milliseconds, self.config.learning_rate, config)?;
+		self.updates += 1;
+		if self.updates < self.config.initial_epochs + self.config.shuffles {
+			self.choice = self.models.choose(self.query, self.config, &mut self.seed, self.updates < self.config.initial_epochs)?;
+		} else {
+			self.choice = self.best.as_ref().unwrap().1.clone();
+		}
+		Ok(updated)
+	}
+}
+struct BenchmarkFit {
+	loss: f64,
+	predicted: f64,
+}
+/// A frozen one-hot projection that selects named input channels. The knob model
+/// reads its query and its own decisions through this, so the selection is part
+/// of the graph rather than a separate gather.
+fn embed(graph: &mut Graph, source: i32, shape: Shape, channels: impl IntoIterator<Item = Option<usize>>) -> Result<i32> {
+	let channels = channels.into_iter().collect::<Vec<_>>();
+	reset(graph, source, shape);
+	lower_project(graph, channels.len())?;
+	let node = graph.nodes.last().ok_or_else(|| RecipeError::new("channel embedding node is absent"))?;
+	let (offset, inputs, count) = (node.offset, node.input.channels, node.parameters);
+	for (output, input) in channels.into_iter().enumerate() {
+		if let Some(input) = input {
+			require(input < inputs, "channel embedding exceeds its input")?;
+			graph.parameters[offset + output * inputs + input] = 1.0;
+		}
+	}
+	graph.frozen[offset..offset + count].fill(1);
+	Ok(graph.source)
 }
