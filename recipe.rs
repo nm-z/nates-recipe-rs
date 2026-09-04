@@ -9985,33 +9985,48 @@ fn fit_forest(trees: usize, data: &Prepared, rows: usize, config: Config) -> Res
 	program.binary(PredictorOpcode::Divide);
 	Ok(Predictor::fitted(program.finish()?, move |sample| forest.iter().fold(0.0, |sum, tree| sum + tree_predict(tree, sample)) / trees as f64))
 }
+/// Solves the ridge system in the smaller of feature space and row space.
 fn solve_bayes(samples: &[f64], targets: &[f64], means: &[f64], target_mean: f64, config: Config) -> Result<Vec<f64>> {
 	let (rows, features) = (targets.len(), means.len());
 	require(rows != 0 && features != 0 && samples.len() == checked_mul(rows, features, "Bayes sample matrix")?, "Bayes system shape is invalid")?;
-	// Solve the smaller equivalent ridge system: feature space when features fit, or row space otherwise.
 	let dual = rows < features;
 	let (width, terms) = if dual { (rows, features) } else { (features, rows) };
-	let centered = |axis: usize, term: usize| {
-		if dual { samples[axis * features + term] - means[term] } else { samples[term * features + axis] - means[axis] }
-	};
-	// The system is symmetric and the noise variance is invariant, so only the
-	// lower triangle accumulates and the noise divides each sum once.
 	let mut matrix = vec![0.0; checked_mul(width, width, "Bayes system matrix")?];
+	let mut values = vec![0.0; width];
+	// The covariance is symmetric, so only its lower triangle accumulates. Row space
+	// reads a pair of sample rows in order, and feature space centers one sample at a time.
+	if dual {
+		for row in 0..width {
+			for column in 0..=row {
+				matrix[row * width + column] = (0..terms).map(|term| (samples[row * features + term] - means[term]) * (samples[column * features + term] - means[term])).sum()
+			}
+		}
+		for (value, target) in values.iter_mut().zip(targets) {
+			*value = target - target_mean
+		}
+	} else {
+		let mut centered = vec![0.0; width];
+		for (sample, target) in samples.chunks_exact(features).zip(targets) {
+			for (entry, (value, mean)) in centered.iter_mut().zip(sample.iter().zip(means)) {
+				*entry = value - mean
+			}
+			let response = target - target_mean;
+			for row in 0..width {
+				values[row] += centered[row] * response;
+				for column in 0..=row {
+					matrix[row * width + column] += centered[row] * centered[column]
+				}
+			}
+		}
+	}
+	// The noise variance is invariant, so it divides each accumulated sum once.
 	for row in 0..width {
+		values[row] /= config.bayes_noise_variance;
 		for column in 0..=row {
-			matrix[row * width + column] = (0..terms).map(|term| centered(row, term) * centered(column, term)).sum::<f64>() / config.bayes_noise_variance
+			matrix[row * width + column] /= config.bayes_noise_variance
 		}
 		matrix[row * width + row] += config.bayes_prior_precision
 	}
-	let mut values = if dual {
-		targets.iter().map(|target| (target - target_mean) / config.bayes_noise_variance).collect::<Vec<_>>()
-	} else {
-		(0..features)
-			.map(|feature| {
-				samples.chunks_exact(features).zip(targets).map(|(sample, target)| (sample[feature] - means[feature]) * (target - target_mean)).sum::<f64>() / config.bayes_noise_variance
-			})
-			.collect()
-	};
 	// Ridge regularization makes the system positive definite, so factor only its lower triangle.
 	for row in 0..width {
 		for column in 0..=row {
@@ -10038,8 +10053,8 @@ fn fit_bayes(_: usize, data: &Prepared, rows: usize, config: Config) -> Result<P
 	require(rows != 0 && data.features != 0, "Bayes requires training rows and features")?;
 	if !data.target_categorical {
 		let samples = &data.samples[..rows * data.features];
-		let mut means = vec![0.0; data.features];
 		let target_mean = data.targets[..rows].iter().sum::<f64>() / rows as f64;
+		let mut means = vec![0.0; data.features];
 		for sample in samples.chunks_exact(data.features) {
 			for (mean, value) in means.iter_mut().zip(sample) {
 				*mean += value / rows as f64
