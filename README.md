@@ -174,6 +174,28 @@ Feature generation is banned.
 
 `moe` scores every position with one `[width, experts]` router and keeps the `topk` highest scores. `scoring` reads those scores as a softmax over every expert or as a sigmoid of each one, and `renormalize` divides the kept weights by their own total; a plain softmax leaves the dropped experts weighted zero, which is the evaluate-all-then-mask reference. Only the kept experts run: each position gathers its own slices of the `[experts, hidden, width]` gate and up tables and the `[experts, width, hidden]` down table, and takes `down(activation(gate(x)) * up(x))` under its routing weight. A position costs `topk` experts, not `experts`. With `shared` set, one always-on expert of the same shape runs for every position and joins the sum under a trainable gain.
 
+## 2 block qualifiers
+
+```rust
+blck.atvn.norm.quant
+frozen.blck.atvn.norm.quant
+packed.blck.atvn.norm.quant
+frozen.packed.blck.atvn.norm.quant
+```
+
+`frozen` holds a block's own weights at their current values for the whole run and creates no
+optimizer state for them; the block still passes an input adjoint back, so earlier blocks learn.
+`packed` keeps a block's weights in their selected quantized representation and decodes each
+weight inside the consuming kernel, so inference never holds a decoded copy. `frozen` affects
+training only, `packed` affects inference only, and neither changes the selected precision or
+quantization. A qualifier on a block that owns no weights is rejected, as is `packed.frozen`.
+
+```rust
+let model = recipe.model()
+	.frozen().packed().layer(32).qi(4).0.gelu()
+	.layer(1);
+```
+
 ## 15 activations
 
 ```
