@@ -10835,30 +10835,18 @@ impl FeatureSelection {
 	}
 }
 fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathBuf>)> {
-	let mut paths = Vec::new();
-	for source in sources {
-		collect_files(&resolve_path(source)?, &mut paths)?;
-	}
-	for path in &mut paths {
-		*path = fs::canonicalize(&*path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))?
-	}
-	paths.sort();
-	paths.dedup();
-	// A ZIP source contributes its entries, not itself: the container is not a
-	// table or a sample, and its entries take virtual paths anchored at the
-	// archive's own path, so the directory-layout rules that already interpret
-	// a real class-subfolder tree interpret an archived one identically.
+	// A container contributes its contents, not itself: the container is not a
+	// table or a sample, and its contents take virtual paths anchored at its own
+	// path, so the directory-layout rules that already interpret a real
+	// class-subfolder tree interpret an archived or nested one identically.
 	let mut files = Vec::new();
-	for path in &paths {
-		let bytes = fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-		if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
-			for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
-				files.push((path.join(entry), contents));
-			}
-		} else {
-			files.push((path.clone(), bytes));
-		}
+	for source in sources {
+		let path = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve {source}: {error}")))?;
+		collect_files(&path, None, &mut files)?;
 	}
+	files.sort_by(|left, right| left.0.cmp(&right.0));
+	files.dedup_by(|left, right| left.0 == right.0);
+	let paths = files.iter().map(|(path, _)| path.clone()).collect::<Vec<_>>();
 	let mut grouped = Vec::new();
 	for (path, bytes) in &files {
 		if !path.extension().and_then(|value| value.to_str()).is_some_and(is_table) {
@@ -11631,20 +11619,34 @@ fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	}
 	Ok(path.to_owned())
 }
-fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-	let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
-	if metadata.is_file() {
-		files.push(path.to_owned());
+/// Every leaf file a container holds, to any depth: a folder contributes its
+/// entries and an archive its members, both anchored at the container's path.
+fn collect_files(path: &Path, member: Option<Vec<u8>>, files: &mut Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
+	let bytes = match member {
+		Some(bytes) => bytes,
+		None => {
+			let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
+			if !metadata.is_file() {
+				let mut children = fs::read_dir(path)
+					.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
+					.collect::<std::io::Result<Vec<_>>>()
+					.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+				children.sort_by_key(fs::DirEntry::path);
+				for child in children {
+					collect_files(&child.path(), None, files)?;
+				}
+				return Ok(());
+			}
+			fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
+		}
+	};
+	if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
+		for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
+			collect_files(&path.join(entry), Some(contents), files)?;
+		}
 		return Ok(());
 	}
-	let mut children = fs::read_dir(path)
-		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
-		.collect::<std::io::Result<Vec<_>>>()
-		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-	children.sort_by_key(fs::DirEntry::path);
-	for child in children {
-		collect_files(&child.path(), files)?;
-	}
+	files.push((path.to_owned(), bytes));
 	Ok(())
 }
 fn target_column(table: &Table, name: &str) -> Option<usize> {
