@@ -51,6 +51,8 @@ test.rs         combo testing
 weights:
 	layer(neurons)
 	conv(filters, kernel)
+	dconv(kernel)
+	delta(heads, kernel)
 	attn(heads)
 	perc(width)
 	rnn(hidden)
@@ -77,6 +79,10 @@ estimators:
 	bayes()
 ```
 Feature generation is banned.
+
+`dconv(kernel)` is a causal depthwise convolution: every channel mixes its own last `kernel` positions with one tap each, left-padded with zeros, so the shape is unchanged and position `t` sees `t - kernel + 1 ..= t`.
+
+`delta(heads, kernel)` is a gated delta rule. It projects the input to a query, key and value stream, runs `dconv(kernel)` over that stream, normalizes each head's query and key to unit length, and carries one `channels / heads` square state per head with `S <- g S + beta k' (v - k S)`, reading `o = q S`. The decay `g = exp(-softplus(a) exp(A))` and the write gate `beta = sigmoid(b)` come from a second projection, one of each per head; `A` is one trained scale per head. The output takes a per-head `rms` normalization, the gate `sigmoid(z)` from a third projection, and a fourth projection back to the input width. The sequence walks in chunks of `delta-chunk` positions and commits the carried state at each chunk start; a chunk of one is a decode step, and every chunk size gives the same values.
 
 ## 15 activations
 
