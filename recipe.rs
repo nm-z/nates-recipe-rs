@@ -4035,7 +4035,12 @@ fn normalize_span(node: &Node) -> usize {
 /// The statistics arena holds four values per group for either group shape.
 fn normalize_groups(node: &Node, rows: usize) -> Result<usize> {
 	let heads = normalize_span(node) / normalize_width(node);
-	Ok(node.output.channels.max(checked_mul(checked_mul(rows, node.output.length, "row groups")?, heads, "head groups")?))
+	match normalize_mode(node.argument[0])? {
+		program_ir::NormalizeMode::Batch | program_ir::NormalizeMode::Evaluation => Ok(node.output.channels),
+		program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms | program_ir::NormalizeMode::L2 => {
+			checked_mul(checked_mul(rows, node.output.length, "row groups")?, heads, "head groups")
+		}
+	}
 }
 
 fn alignment(ty: &str) -> usize {
