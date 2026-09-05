@@ -4434,7 +4434,6 @@ pub struct Data {
 	autoregressive: bool,
 	target: Vec<String>,
 	features: FeatureSelection,
-	broadcast: bool,
 	normalize: bool,
 	split: f64,
 	prepared: OnceLock<Result<Prepared>>,
@@ -6058,7 +6057,6 @@ impl Recipe {
 			autoregressive: T::AUTO,
 			target: Vec::new(),
 			features: FeatureSelection::All,
-			broadcast: false,
 			normalize: false,
 			split: 1.0,
 			prepared: OnceLock::new(),
@@ -10769,10 +10767,6 @@ impl Data {
 		self.sources.push(source.into());
 		self
 	}
-	pub const fn broadcast(mut self) -> Self {
-		self.broadcast = true;
-		self
-	}
 	pub const fn norm(mut self, _: ZScore) -> Self {
 		self.normalize = true;
 		self
@@ -10835,30 +10829,18 @@ impl FeatureSelection {
 	}
 }
 fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathBuf>)> {
-	let mut paths = Vec::new();
-	for source in sources {
-		collect_files(&resolve_path(source)?, &mut paths)?;
-	}
-	for path in &mut paths {
-		*path = fs::canonicalize(&*path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))?
-	}
-	paths.sort();
-	paths.dedup();
-	// A ZIP source contributes its entries, not itself: the container is not a
-	// table or a sample, and its entries take virtual paths anchored at the
-	// archive's own path, so the directory-layout rules that already interpret
-	// a real class-subfolder tree interpret an archived one identically.
+	// A container contributes its contents, not itself: the container is not a
+	// table or a sample, and its contents take virtual paths anchored at its own
+	// path, so the directory-layout rules that already interpret a real
+	// class-subfolder tree interpret an archived or nested one identically.
 	let mut files = Vec::new();
-	for path in &paths {
-		let bytes = fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-		if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
-			for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
-				files.push((path.join(entry), contents));
-			}
-		} else {
-			files.push((path.clone(), bytes));
-		}
+	for source in sources {
+		let path = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve {source}: {error}")))?;
+		collect_files(&path, None, &mut files)?;
 	}
+	files.sort_by(|left, right| left.0.cmp(&right.0));
+	files.dedup_by(|left, right| left.0 == right.0);
+	let paths = files.iter().map(|(path, _)| path.clone()).collect::<Vec<_>>();
 	let mut grouped = Vec::new();
 	for (path, bytes) in &files {
 		if !path.extension().and_then(|value| value.to_str()).is_some_and(is_table) {
@@ -10873,23 +10855,60 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 		return Ok((vec![table], paths));
 	}
 	let mut tables = merge_captures(grouped, &data.target)?;
-	tables = merge_partitions(tables, &data.target, &data.features)?;
+	tables = merge_partitions(tables, &data.target)?;
 	require(!tables.is_empty(), "data source contains no supported table")?;
-	if tables.len() > 1 {
-		let rows = tables.iter().map(|table| table.rows.len()).max().unwrap_or(0);
-		let aligned = rows != 0 && tables.iter().all(|table| table.rows.len() == rows);
-		require(aligned || data.broadcast, "multiple tables require explicit .broadcast() alignment")?;
-		if data.broadcast {
-			for table in &mut tables {
-				let count = table.rows.len();
-				require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
-				if count != rows {
-					table.rows = table.rows.iter().cloned().cycle().take(rows).collect()
-				}
-			}
-		}
+	let rows = tables.iter().map(|table| table.rows.len()).max().unwrap_or(0);
+	if tables.len() > 1 && tables.iter().any(|table| table.rows.len() != rows) {
+		tables = align_samples(tables)?
 	}
 	Ok((tables, paths))
+}
+/// Align feature sources by logical sample count. Tables that already agree on their row
+/// count are row-level samples; otherwise sibling tables sharing a schema are file-level
+/// samples, one per file, whose own rows become that sample's columns. A column recording
+/// those file names orders them against the tables that name them.
+fn align_samples(tables: Vec<Table>) -> Result<Vec<Table>> {
+	let mut sources = Vec::<Vec<Table>>::new();
+	for table in tables {
+		match sources.iter_mut().find(|source| source[0].headers == table.headers) {
+			Some(source) => source.push(table),
+			None => sources.push(vec![table]),
+		}
+	}
+	let count = |source: &[Table]| if let [table] = source { table.rows.len() } else { source.len() };
+	let samples = sources.iter().map(|source| count(source)).max().unwrap_or(0);
+	let mut recorded = Vec::new();
+	for source in &sources {
+		let [table] = source.as_slice() else { continue };
+		for column in 0..table.headers.len() {
+			let stem = |row: &Vec<String>| Path::new(row.get(column).map_or("", String::as_str)).file_stem().and_then(|value| value.to_str()).unwrap_or_default().to_owned();
+			recorded.push(table.rows.iter().map(stem).collect::<Vec<_>>())
+		}
+	}
+	let mut aligned = Vec::new();
+	for mut source in sources {
+		require(count(&source) == samples, format!("source {:?} contributes {} samples, expected {samples}", source[0].name, count(&source)))?;
+		if let [_] = source.as_slice() {
+			aligned.push(source.remove(0));
+			continue;
+		}
+		let names = source.iter().map(|table| table.name.as_str()).collect::<BTreeSet<_>>();
+		if let Some(order) = recorded.iter().find(|order| order.len() == names.len() && order.iter().map(String::as_str).collect::<BTreeSet<_>>() == names) {
+			source.sort_by_key(|table| order.iter().position(|name| *name == table.name).unwrap_or(order.len()))
+		}
+		let rows = source[0].rows.len();
+		let mut headers = Vec::new();
+		for row in 1..=rows {
+			headers.extend(source[0].headers.iter().map(|header| if rows == 1 { header.clone() } else { format!("{header}.{row}") }))
+		}
+		let mut values = Vec::with_capacity(source.len());
+		for table in source {
+			require(table.rows.len() == rows, format!("sample {:?} expected {rows} rows, received {}", table.name, table.rows.len()))?;
+			values.push(table.rows.into_iter().flatten().collect())
+		}
+		aligned.push(Table { name: "data".to_owned(), headers, rows: values, attention: None })
+	}
+	Ok(aligned)
 }
 /// One interpretation of directory layout for sample trees whose target is not a table
 /// column: flat sidecar-labeled samples, class-labeled subdirectories, and paired
@@ -11631,20 +11650,34 @@ fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	}
 	Ok(path.to_owned())
 }
-fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-	let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
-	if metadata.is_file() {
-		files.push(path.to_owned());
+/// Every leaf file a container holds, to any depth: a folder contributes its
+/// entries and an archive its members, both anchored at the container's path.
+fn collect_files(path: &Path, member: Option<Vec<u8>>, files: &mut Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
+	let bytes = match member {
+		Some(bytes) => bytes,
+		None => {
+			let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
+			if !metadata.is_file() {
+				let mut children = fs::read_dir(path)
+					.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
+					.collect::<std::io::Result<Vec<_>>>()
+					.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+				children.sort_by_key(fs::DirEntry::path);
+				for child in children {
+					collect_files(&child.path(), None, files)?;
+				}
+				return Ok(());
+			}
+			fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
+		}
+	};
+	if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
+		for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
+			collect_files(&path.join(entry), Some(contents), files)?;
+		}
 		return Ok(());
 	}
-	let mut children = fs::read_dir(path)
-		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
-		.collect::<std::io::Result<Vec<_>>>()
-		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-	children.sort_by_key(fs::DirEntry::path);
-	for child in children {
-		collect_files(&child.path(), files)?;
-	}
+	files.push((path.to_owned(), bytes));
 	Ok(())
 }
 fn target_column(table: &Table, name: &str) -> Option<usize> {
@@ -11663,22 +11696,7 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 			})
 	};
 	if targets.is_empty() || groups.values().all(|group| !valid(group)) {
-		let mut tables = Vec::new();
-		for mut group in groups.into_values() {
-			// Tables in one directory align onto each other only when they contribute different columns. Same columns means more rows of one table, and broadcasting those duplicates records instead of widening them.
-			if group.iter().any(|table| table.headers != group[0].headers) {
-				let rows = group.iter().map(|table| table.rows.len()).max().unwrap_or(0);
-				for table in &mut group {
-					let count = table.rows.len();
-					require(count != 0 && rows % count == 0, format!("table {:?} expected a nonzero row count dividing {rows}, received {count}", table.name))?;
-					if count != rows {
-						table.rows = table.rows.iter().cloned().cycle().take(rows).collect()
-					}
-				}
-			}
-			tables.extend(group);
-		}
-		return Ok(tables);
+		return Ok(groups.into_values().flatten().collect());
 	}
 	groups.retain(|_, group| group.iter().all(|table| !table.rows.is_empty()));
 	require(!groups.is_empty(), "data source contains no usable captures")?;
@@ -11731,42 +11749,39 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 	}
 	Ok(vec![Table { name: "data".to_owned(), headers, rows, attention: None }])
 }
-fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &FeatureSelection) -> Result<Vec<Table>> {
+fn merge_partitions(mut tables: Vec<Table>, targets: &[String]) -> Result<Vec<Table>> {
 	if targets.is_empty() || targets.iter().any(|target| target.contains('.')) {
 		return Ok(tables);
 	}
-	let members = tables.iter().enumerate().filter_map(|(index, table)| targets.iter().all(|target| target_column(table, target).is_some()).then_some(index)).collect::<Vec<_>>();
-	if members.len() < 2 {
+	// Partitions of one dataset share a schema. Target-bearing tables whose schemas differ
+	// describe different sources, not partitions of each other.
+	let mut groups = Vec::<Vec<usize>>::new();
+	for index in 0..tables.len() {
+		if !targets.iter().all(|target| target_column(&tables[index], target).is_some()) {
+			continue;
+		}
+		match groups.iter_mut().find(|group| tables[group[0]].headers == tables[index].headers) {
+			Some(group) => group.push(index),
+			None => groups.push(vec![index]),
+		}
+	}
+	groups.retain(|group| group.len() > 1);
+	let members = groups.iter().flatten().copied().collect::<Vec<_>>();
+	if members.is_empty() {
 		return Ok(tables);
 	}
-	let mut headers = Vec::new();
-	for &index in &members {
-		for header in &tables[index].headers {
-			if !headers.contains(header) {
-				headers.push(header.clone())
-			}
+	let mut merged = Vec::new();
+	for group in &groups {
+		let headers = tables[group[0]].headers.clone();
+		let mut rows = Vec::new();
+		for &index in group {
+			rows.extend(std::mem::take(&mut tables[index].rows));
 		}
+		merged.push(Table { name: "data".to_owned(), headers, rows, attention: None });
 	}
-	let union = Table { name: "data".to_owned(), headers: headers.clone(), rows: Vec::new(), attention: None };
-	for &index in &members {
-		for (column, header) in headers.iter().enumerate() {
-			let ignored = targets.iter().any(|name| column_match(name, &union, header, column)) || !features.selects(&union, header, column);
-			require(ignored || tables[index].headers.contains(header), format!("feature {header:?} is absent from partition {:?}", tables[index].name))?;
-		}
-	}
-	let mut rows = Vec::new();
-	for index in members {
-		let positions = tables[index].headers.iter().map(|header| headers.iter().position(|value| value == header).unwrap()).collect::<Vec<_>>();
-		for row in std::mem::take(&mut tables[index].rows) {
-			let mut merged = std::iter::repeat_with(String::new).take(headers.len()).collect::<Vec<_>>();
-			for (column, value) in row.into_iter().enumerate() {
-				merged[positions[column]] = value;
-			}
-			rows.push(merged);
-		}
-	}
-	let name = "data".to_owned();
-	Ok(vec![Table { name, headers, rows, attention: None }])
+	// Tables holding no target, and lone schemas, stay separate sources.
+	merged.extend(tables.into_iter().enumerate().filter_map(|(index, table)| (!members.contains(&index)).then_some(table)));
+	Ok(merged)
 }
 /// Decode one source file into its tables, dispatching on the container format.
 fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
@@ -12280,7 +12295,7 @@ fn hdf5_columns(bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
 	require(!columns.is_empty(), "HDF5 file has no datasets")?;
 	Ok(columns)
 }
-/// The stored entries of a ZIP archive, resolved through the central directory.
+/// The entries of a ZIP archive, resolved through the central directory.
 fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 	let read16 = |offset: usize| bytes.get(offset..offset + 2).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize);
 	let read32 = |offset: usize| bytes.get(offset..offset + 4).map(|value| u32::from_le_bytes(value.try_into().unwrap()) as usize);
@@ -12294,16 +12309,17 @@ fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 	let mut entries = Vec::new();
 	for _ in 0..count {
 		require(bytes.get(offset..offset + 4) == Some(&[0x50, 0x4b, 0x01, 0x02]), "ZIP central directory entry is invalid")?;
-		let (method, size, name_length, extra, comment) = (read16(offset + 10), read32(offset + 24), read16(offset + 28), read16(offset + 30), read16(offset + 32));
-		let (method, size) = (method.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?, size.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?);
+		let (method, compressed, name_length, extra, comment) = (read16(offset + 10), read32(offset + 20), read16(offset + 28), read16(offset + 30), read16(offset + 32));
+		let (method, compressed) = (method.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?, compressed.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?);
 		let local = read32(offset + 42).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?;
 		let name = String::from_utf8(bytes.get(offset + 46..offset + 46 + name_length.unwrap_or(0)).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?.to_vec())
 			.map_err(|error| RecipeError::new(format!("ZIP entry name is not UTF-8: {error}")))?;
 		require(bytes.get(local..local + 4) == Some(&[0x50, 0x4b, 0x03, 0x04]), "ZIP local header is invalid")?;
 		let (local_name, local_extra) = (read16(local + 26).unwrap_or(0), read16(local + 28).unwrap_or(0));
 		let start = local + 30 + local_name + local_extra;
-		require(method == 0, format!("ZIP entry {name:?} uses unsupported compression method {method}"))?;
-		let contents = bytes.get(start..start + size).ok_or_else(|| RecipeError::new(format!("ZIP entry {name:?} is truncated")))?.to_vec();
+		require(matches!(method, 0 | 8), format!("ZIP entry {name:?} uses unsupported compression method {method}"))?;
+		let stored = bytes.get(start..start + compressed).ok_or_else(|| RecipeError::new(format!("ZIP entry {name:?} is truncated")))?;
+		let contents = if method == 8 { inflate(stored)? } else { stored.to_vec() };
 		if !name.ends_with('/') {
 			entries.push((name, contents));
 		}
