@@ -1441,6 +1441,18 @@ fn native_cpu_target() -> Result<BackendTarget> {
 	Ok(target)
 }
 
+/// One forward entrypoint: the run of work between two of the grid barriers a
+/// fused forward would emit, the node whose window its launch names, whether
+/// its body still synchronizes the whole grid, and the shared memory the work
+/// it holds actually reserves.
+#[derive(Clone, Debug)]
+pub(crate) struct NativeSegment {
+	pub(crate) symbol: String,
+	pub(crate) node: usize,
+	pub(crate) cooperative: bool,
+	pub(crate) shared_values: u32,
+}
+
 pub(crate) struct NativeArtifact {
 	pub(crate) backend: BackendTarget,
 	pub(crate) layout: NativeLayout,
@@ -1448,6 +1460,7 @@ pub(crate) struct NativeArtifact {
 	pub(crate) artifact: Vec<u8>,
 	pub(crate) path: PathBuf,
 	pub(crate) storage: Vec<u8>,
+	pub(crate) segments: Vec<NativeSegment>,
 	pub(crate) training: bool,
 }
 
@@ -1900,11 +1913,96 @@ fn prune_internal_definitions(mut ir: String) -> String {
 	}
 }
 
-fn barrier(backend: Backend) -> &'static str {
+/// The line a split forward emits where a fused forward would synchronize the
+/// whole grid. Each run between two marks becomes its own entrypoint, and the
+/// launch that ends one run is the synchronization the mark stands for.
+const NATIVE_SEGMENT_MARK: &str = "\n; recipe.segment\n";
+
+fn barrier(backend: Backend, split: bool) -> &'static str {
 	match backend {
+		_ if split => NATIVE_SEGMENT_MARK,
 		Backend::Cpu => "call void @recipe.cpu.barrier()",
 		Backend::Amd | Backend::Nvidia => "call void @grid_barrier(i32 %threads)",
 	}
+}
+
+/// Every function of a module, as its name and the text of its body.
+fn module_bodies(ir: &str) -> Vec<(&str, &str)> {
+	let (mut bodies, mut at) = (Vec::new(), 0);
+	while let Some(offset) = ir[at..].find("define ") {
+		let start = at + offset;
+		let Some(open) = ir[start..].find('{').map(|offset| start + offset) else { break };
+		at = open + 1;
+		let Some(name) = ir[start..open].rsplit_once('@').and_then(|(_, rest)| rest.split_once('(')).map(|(name, _)| name) else { continue };
+		let mut depth = 0usize;
+		for (offset, byte) in ir[open..].bytes().enumerate() {
+			match byte {
+				b'{' => depth += 1,
+				b'}' => {
+					depth -= 1;
+					if depth == 0 {
+						bodies.push((name, &ir[open..open + offset]));
+						at = open + offset + 1;
+						break;
+					}
+				}
+				_ => {}
+			}
+		}
+	}
+	bodies
+}
+
+/// The functions of `ir` that reach a grid barrier, directly or through the
+/// functions they call. An entrypoint that calls one of them still needs every
+/// workgroup of its launch resident at once, because that is the only way the
+/// barrier inside it ever completes.
+fn grid_synchronized(ir: &str) -> Vec<String> {
+	let bodies = module_bodies(ir);
+	let mut reached = vec!["grid_barrier".to_owned()];
+	loop {
+		let found = bodies
+			.iter()
+			.filter(|(name, _)| !reached.iter().any(|found| found == name))
+			.filter(|(_, body)| reached.iter().any(|callee| body.contains(&format!("@{callee}("))))
+			.map(|(name, _)| (*name).to_owned())
+			.collect::<Vec<_>>();
+		if found.is_empty() {
+			return reached;
+		}
+		reached.extend(found);
+	}
+}
+
+/// The names a run of LLVM IR reads without defining. A run stands alone as an
+/// entrypoint only when every value and label it names is its own or an
+/// argument, so this is what decides a split is safe rather than assumed.
+fn undefined_names(run: &str, arguments: &[&str]) -> Vec<String> {
+	let identifier = |value: char| value.is_ascii_alphanumeric() || value == '_' || value == '.' || value == '$' || value == '-';
+	let (mut defined, mut used) = (arguments.iter().map(|name| name[1..].to_owned()).collect::<Vec<_>>(), Vec::new());
+	for line in run.lines().map(str::trim).filter(|line| !line.starts_with(';')) {
+		// A block label opens its own statement and carries no leading sigil.
+		for (at, _) in line.match_indices(':') {
+			let name = line[..at].rsplit(|value| !identifier(value)).next().unwrap_or_default();
+			let before = line[..at - name.len()].chars().next_back();
+			if !name.is_empty() && before.is_none_or(char::is_whitespace) {
+				defined.push(name.to_owned());
+			}
+		}
+		for (at, _) in line.match_indices('%') {
+			let rest = &line[at + 1..];
+			let end = rest.find(|value| !identifier(value)).unwrap_or(rest.len());
+			let (name, tail) = (&rest[..end], rest[end..].trim_start());
+			if name.is_empty() {
+				continue;
+			}
+			if tail.starts_with("= ") { defined.push(name.to_owned()) } else { used.push(name.to_owned()) }
+		}
+	}
+	used.retain(|name| !defined.contains(name));
+	used.sort_unstable();
+	used.dedup();
+	used
 }
 
 fn ptr_gep(backend: Backend, base: &str, offset: usize, name: &str) -> String {
@@ -2727,18 +2825,36 @@ mod quantized {
 use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantOps, ScalarLayout, dequant_nf4};
 
 impl NativeModelIr {
-	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool) -> Result<String> {
-		let mut ir = String::new();
+	/// Every node's forward or reverse code, in execution order. A fused pass
+	/// returns one run holding the whole sequence with a grid barrier between
+	/// nodes; a split pass returns the runs those barriers separate, each
+	/// carrying the node it belongs to and its own pointer and window prologue,
+	/// so a run stands alone as an entrypoint of its own.
+	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool, split: bool) -> Result<Vec<(usize, String)>> {
+		require(!(split && reverse), "a reverse pass has no split entrypoints")?;
+		let mut runs = Vec::new();
+		let mut fused = String::new();
 		let order = if reverse {
 			self.plans.iter().rev().enumerate().map(|(position, plan)| (self.plans.len() - position - 1, plan)).collect::<Vec<_>>()
 		} else {
 			self.plans.iter().enumerate().collect::<Vec<_>>()
 		};
 		for (index, plan) in order {
-			let pointers = self.emit_pointers(backend, index, plan, reverse, &mut ir)?;
+			let mut prologue = String::new();
+			let pointers = self.emit_pointers(backend, index, plan, reverse, &mut prologue)?;
 			let node = &plan.node;
-			// The reverse pass differentiates the whole sequence at once.
-			let window = if reverse { NodeWindow { begin: "0".to_owned(), span: node.output.length.to_string() } } else { self.emit_node_window(index, node, &mut ir)? };
+			// The reverse pass differentiates the whole sequence at once. A split
+			// pass takes the window its launch names, which the host derives with
+			// the same rule the fused pass emits.
+			let window = if reverse {
+				NodeWindow { begin: "0".to_owned(), span: node.output.length.to_string() }
+			} else if split {
+				prologue.push_str(&format!("%n{index}.begin = add i32 %begin, 0\n%n{index}.end = add i32 %end, 0\n%n{index}.span = sub i32 %end, %begin\n"));
+				NodeWindow { begin: format!("%n{index}.begin"), span: format!("%n{index}.span") }
+			} else {
+				self.emit_node_window(index, node, &mut prologue)?
+			};
+			let mut ir = String::new();
 			let (begin, span) = (&window.begin, &window.span);
 			match (reverse, node.op) {
 				(false, Primitive::Contraction) => {
@@ -2764,7 +2880,7 @@ impl NativeModelIr {
 						tile_k = extent.k
 					);
 					ir.push_str(&call);
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::Gather) => {
 					let (layout, _) = embedding_row(node)?;
@@ -2783,7 +2899,7 @@ impl NativeModelIr {
 							align = alignment(ty)
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::TopK) => {
 					// One router decision per row and position: a `[1, length]` shape.
@@ -2802,7 +2918,7 @@ impl NativeModelIr {
 							renormalize = node.argument[2]
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::Expand) => {
 					emit_fixed_loop(&mut ir, index, "expand", self.rows, node.output, &window, |ir, p| {
@@ -2816,7 +2932,7 @@ impl NativeModelIr {
 							lanes = node.argument[0]
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(reverse, Primitive::Rope) => {
 					let (input, output) = if reverse { (&pointers.delta, &pointers.source_adjoint) } else { (&pointers.source, &pointers.value) };
@@ -2833,10 +2949,10 @@ impl NativeModelIr {
 							rotated = node.argument[3]
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::ExpertIn) => {
-					self.emit_expert_forward(backend, index, plan, &pointers, &window, false, &mut ir)?;
+					self.emit_expert_forward(backend, index, plan, &pointers, &window, false, split, &mut ir)?;
 				}
 				(false, Primitive::Read) => {
 					emit_fixed_loop(&mut ir, index, "read", self.rows, node.output, &window, |ir, p| {
@@ -2852,7 +2968,7 @@ impl NativeModelIr {
 							gated = node.second >= 0
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::Dconv) => {
 					emit_fixed_loop(&mut ir, index, "dconv", self.rows, node.output, &window, |ir, p| {
@@ -2869,7 +2985,7 @@ impl NativeModelIr {
 							dilation = node.argument[1]
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::Lookup) => {
 					// The host stages the gathered rows of the window in the context as
@@ -2887,7 +3003,7 @@ impl NativeModelIr {
 							align = alignment(ty)
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::Fold) => {
 					emit_fixed_loop(&mut ir, index, "fold", self.rows, node.output, &window, |ir, p| {
@@ -2901,7 +3017,7 @@ impl NativeModelIr {
 							length = node.output.length
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::Outer) => {
 					emit_fixed_loop(&mut ir, index, "outer", self.rows, node.output, &window, |ir, p| {
@@ -2917,7 +3033,7 @@ impl NativeModelIr {
 							gated = node.second >= 0
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::Delta) => {
 					// One row and head per element: a `[heads, 1]` shape walked whole.
@@ -2941,10 +3057,10 @@ impl NativeModelIr {
 							arguments = shape.arguments
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::ExpertOut) => {
-					self.emit_expert_forward(backend, index, plan, &pointers, &window, true, &mut ir)?;
+					self.emit_expert_forward(backend, index, plan, &pointers, &window, true, split, &mut ir)?;
 				}
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
@@ -2962,7 +3078,7 @@ impl NativeModelIr {
 							channels = node.input.channels
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
@@ -2994,23 +3110,23 @@ impl NativeModelIr {
 						emit_fixed_loop(&mut ir, index, "index", self.rows, Shape { channels: 1, length: blocks }, &touched, |ir, p| {
 							ir.push_str(&format!("call void @attention_index_body( {pointer} {source}, {pointer} {context}, i32 {p}, i32 {begin}, i32 {end}, {shared} )\n"));
 						})?;
-						ir.push_str(barrier(backend));
+						ir.push_str(barrier(backend, split));
 						emit_fixed_loop(&mut ir, index, "select", self.rows, Shape { channels: 1, length: node.output.length }, &window, |ir, p| {
 							ir.push_str(&format!("call void @attention_select_body( {pointer} {source}, {pointer} {context}, i32 {p}, i32 {keep}, i1 {derivatives}, {shared} )\n"));
 						})?;
-						ir.push_str(barrier(backend));
+						ir.push_str(barrier(backend, split));
 					}
 					// The matrix body scores the whole sequence at once. Its keys past
 					// the window are zero and the causal mask drops them, so it stays
 					// correct on a step but reworks the positions the window skips.
 					let extended = if attention == "attention_forward_body" { format!("i32 {begin}, i32 {span}, ") } else { String::new() };
 					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {extended}i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::Scan) => {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?.forward;
 					ir.push_str(&format!("call void @scan_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {begin}, i32 {span}, i32 {gates}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i32 0, i32 {decode} )\n", decode = plan.decode(index), pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::Elementwise) => {
 					let pointer = pointer_type(backend);
@@ -3061,7 +3177,7 @@ impl NativeModelIr {
 							align = alignment(ty)
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::Predictor) => {
 					let locals = integer_argument(node.argument[0], "predictor locals")?;
@@ -3104,7 +3220,7 @@ impl NativeModelIr {
 							align = alignment(ty)
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(true, Primitive::Contraction) => {
 					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?;
@@ -3117,7 +3233,7 @@ impl NativeModelIr {
 					if composed_previous {
 						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, {pointer} {delta}, {pointer} {context}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0 )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, context = pointers.context, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					}
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				// The gather reads the packed table the run was given and the optimizer
 				// leaves it frozen, so the embedding contributes no reverse pass.
@@ -3134,7 +3250,7 @@ impl NativeModelIr {
 							lanes = node.argument[0]
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(true, Primitive::TopK) => {
 					let positions = Shape { channels: 1, length: node.output.length };
@@ -3152,7 +3268,7 @@ impl NativeModelIr {
 							renormalize = node.argument[2]
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(true, Primitive::Dconv) => {
 					emit_fixed_loop(&mut ir, index, "dconv.reverse", self.rows, node.output, &window, |ir, p| {
@@ -3168,7 +3284,7 @@ impl NativeModelIr {
 							dilation = node.argument[1]
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 					// One tap per channel and kernel position: a `[channels, kernel]` shape walked whole.
 					let kernel = integer_argument(node.argument[0], "depthwise kernel")? as usize;
 					let taps = Shape { channels: node.output.channels, length: kernel };
@@ -3186,7 +3302,7 @@ impl NativeModelIr {
 							offset = node.offset
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				// The lookup's table stays on the host and is never trained, so the
 				// rows it stages contribute no reverse pass.
@@ -3203,7 +3319,7 @@ impl NativeModelIr {
 							length = node.output.length
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(true, Primitive::ExpertIn) => {
 					let (channels, length) = (node.input.channels, node.output.length);
@@ -3218,8 +3334,8 @@ impl NativeModelIr {
 							adjoint = pointers.source_adjoint
 						));
 					})?;
-					ir.push_str(barrier(backend));
-					emit_expert_buckets(&mut ir, backend, index, self.rows, node, &pointers)?;
+					ir.push_str(barrier(backend, split));
+					emit_expert_buckets(&mut ir, backend, index, self.rows, node, &pointers, split)?;
 					let offset = narrow(plan.node.offset, "expert gradient offset")?;
 					// One table entry per element: a `[1, parameters]` shape walked whole.
 					let table = Shape { channels: 1, length: node.parameters };
@@ -3233,13 +3349,13 @@ impl NativeModelIr {
 							context = pointers.context
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(true, Primitive::Read) => {
 					emit_fixed_loop(&mut ir, index, "read.reverse", self.rows, node.input, &window, |ir, p| {
 						ir.push_str(&format!("call void @read_reverse_body( {pointer} {source}, {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate_adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n", pointer = pointer_type(backend), source = pointers.source, gate = pointers.second, delta = pointers.delta, adjoint = pointers.source_adjoint, gate_adjoint = pointers.second_adjoint, channels = node.output.channels, length = node.output.length, lanes = node.argument[0], gated = node.second >= 0));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(true, Primitive::Outer) => {
 					emit_fixed_loop(&mut ir, index, "outer.reverse", self.rows, node.input, &window, |ir, p| {
@@ -3255,7 +3371,7 @@ impl NativeModelIr {
 							gated = node.second >= 0
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 					if node.second >= 0 {
 						// One gate per row, lane, and position: a `[lanes, length]` shape walked whole.
 						let gates = Shape { channels: integer_argument(node.argument[0], "outer lanes")? as usize, length: node.input.length };
@@ -3271,7 +3387,7 @@ impl NativeModelIr {
 								lanes = node.argument[0]
 							));
 						})?;
-						ir.push_str(barrier(backend));
+						ir.push_str(barrier(backend, split));
 					}
 				}
 				(true, Primitive::Delta) => {
@@ -3295,7 +3411,7 @@ impl NativeModelIr {
 							arguments = shape.arguments
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 					// Then one decay scale per value head, folding that head's row partials.
 					emit_fixed_loop(&mut ir, index, "delta.decay.reverse", 1, pairs, &whole, |ir, p| {
 						ir.push_str(&format!(
@@ -3307,7 +3423,7 @@ impl NativeModelIr {
 							offset = node.offset
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(true, Primitive::ExpertOut) => {
 					let (channels, length) = (node.output.channels, node.output.length);
@@ -3322,7 +3438,7 @@ impl NativeModelIr {
 							adjoint = pointers.source_adjoint
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 					let positions = Shape { channels: 1, length };
 					emit_fixed_loop(&mut ir, index, "expert.out.routing", self.rows, positions, &window, |ir, p| {
 						ir.push_str(&format!(
@@ -3335,8 +3451,8 @@ impl NativeModelIr {
 							adjoint = pointers.second_adjoint
 						));
 					})?;
-					ir.push_str(barrier(backend));
-					emit_expert_buckets(&mut ir, backend, index, self.rows, node, &pointers)?;
+					ir.push_str(barrier(backend, split));
+					emit_expert_buckets(&mut ir, backend, index, self.rows, node, &pointers, split)?;
 					let offset = narrow(plan.node.offset, "expert gradient offset")?;
 					let table = Shape { channels: 1, length: node.parameters };
 					let whole = NodeWindow { begin: "0".to_owned(), span: node.parameters.to_string() };
@@ -3350,7 +3466,7 @@ impl NativeModelIr {
 							context = pointers.context
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(true, Primitive::Pool) => {
 					let pointer = pointer_type(backend);
@@ -3367,7 +3483,7 @@ impl NativeModelIr {
 						let source_sum = format!("%{prefix}.source.adjoint.sum");
 						ir.push_str(&format!("{context_pointer} = getelementptr inbounds i64, {pointer} {context}, i32 {p}\n{context_wide} = load i64, {pointer} {context_pointer}, align 8\n{context_index} = trunc i64 {context_wide} to i32\n{delta_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i32 {p}\n{delta_value} = load {ty}, {pointer} {delta_pointer}, align {align}\n{source_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i32 {context_index}\n{source_value} = load {ty}, {pointer} {source_pointer}, align {align}\n{source_sum} = call {ty} @recipe.add({ty} {source_value}, {ty} {delta_value})\nstore {ty} {source_sum}, {pointer} {source_pointer}, align {align}\n", context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, align = alignment(ty), pointer = pointer, ty = ty));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(true, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
@@ -3375,7 +3491,7 @@ impl NativeModelIr {
 					let selectors = attention_selectors(node, &self.precision)?;
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
 					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 					if attention_blocks(node) != 0 {
 						// The indexer gradient lands in the side projection's adjoint, which
 						// the attention node alone writes.
@@ -3385,16 +3501,16 @@ impl NativeModelIr {
 								"call void @attention_index_reverse_body( {pointer} {source}, {pointer} {context}, {pointer} {source_adjoint}, i32 {p}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors} )\n"
 							));
 						})?;
-						ir.push_str(barrier(backend));
+						ir.push_str(barrier(backend, split));
 					}
 				}
 				(true, Primitive::Scan) => {
 					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?;
 					ir.push_str(&format!("call void @scan_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 true, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {gates}, i32 {parameters}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, gates = integer_argument(node.argument[0], "scan gates")?, parameters = node.parameters, offset = plan.node.offset, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(true, Primitive::Predictor) => {
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(true, Primitive::Elementwise) => {
 					let pointer = pointer_type(backend);
@@ -3487,7 +3603,7 @@ impl NativeModelIr {
 					};
 					if gradients.is_empty() {
 						emit_fixed_loop(&mut ir, index, "scalar.reverse", self.rows, node.output, &window, scalar_body)?;
-						ir.push_str(barrier(backend));
+						ir.push_str(barrier(backend, split));
 					} else {
 						// A trainable scalar is one destination shared by every element, so
 						// the summation order has to belong to the program rather than to
@@ -3512,13 +3628,13 @@ impl NativeModelIr {
 							},
 							scalar_body,
 						)?;
-						ir.push_str(barrier(backend));
+						ir.push_str(barrier(backend, split));
 						let (columns, offset) = (narrow(node.parameters, "scalar gradient columns")?, narrow(plan.node.offset, "scalar gradient offset")?);
 						ir.push_str(&format!(
 							"call void @reduce_rows({pointer} {context}, {pointer} %gradient, i32 {partitions}, i32 {columns}, i32 {columns}, i32 0, i32 {offset}, i32 %threads)\n",
 							context = pointers.context
 						));
-						ir.push_str(barrier(backend));
+						ir.push_str(barrier(backend, split));
 					}
 				}
 				(false, Primitive::Normalize) => {
@@ -3529,7 +3645,7 @@ impl NativeModelIr {
 					let weight = (node.parameters != 0).then_some(pointers.weights.as_str());
 					if mode != program_ir::NormalizeMode::Evaluation && (training || mode.per_row()) {
 						ir.push_str(&self.emit_normalize_stats(backend, index, node, &pointers, mode)?);
-						ir.push_str(barrier(backend));
+						ir.push_str(barrier(backend, split));
 					}
 					emit_fixed_loop(&mut ir, index, "normalize", self.rows, node.output, &window, |ir, p| {
 						let source_pointer = format!("%{prefix}.source.ptr");
@@ -3566,7 +3682,7 @@ impl NativeModelIr {
 							align = alignment(ty)
 						));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 				}
 				(true, Primitive::Normalize) => {
 					let mode = normalize_mode(node.argument[0])?;
@@ -3598,7 +3714,7 @@ impl NativeModelIr {
 							&pointers.delta,
 							&pointers.value,
 						));
-						ir.push_str(barrier(backend));
+						ir.push_str(barrier(backend, split));
 					}
 					emit_fixed_loop(&mut ir, index, "normalize.reverse", self.rows, node.output, &window, |ir, p| {
 						let delta_pointer = format!("%{prefix}.delta.ptr");
@@ -3634,7 +3750,7 @@ impl NativeModelIr {
 						ir.push_str(&format!("{source_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i32 {p}\n", source_adjoint = pointers.source_adjoint));
 						ir.push_str(&accumulate_owned(&source_pointer, &fragment.contribution, ty, pointer, &format!("{prefix}.owned")));
 					})?;
-					ir.push_str(barrier(backend));
+					ir.push_str(barrier(backend, split));
 					if node.parameters != 0 {
 						// The weight gradient is one column per channel summed over every
 						// row and position: each partition accumulates its own contiguous
@@ -3693,16 +3809,25 @@ impl NativeModelIr {
 								ir.push_str(&format!("%{weight_prefix}.product = call {ty} @recipe.mul({ty} {delta_value}, {ty} {normalized})\n{live}%{weight_prefix}.contribution = select i1 %{weight_prefix}.live, {ty} %{weight_prefix}.product, {ty} {zero}\n%{weight_prefix}.column.channel = select i1 %{weight_prefix}.live, i32 %{weight_prefix}.normalize.channel, i32 0\n%{weight_prefix}.column = add i32 {row}, %{weight_prefix}.column.channel\n%{weight_prefix}.column.ptr = getelementptr inbounds {ty}, {pointer} {scratch}, i32 %{weight_prefix}.column\n%{weight_prefix}.column.value = load {ty}, {pointer} %{weight_prefix}.column.ptr, align {align}\n%{weight_prefix}.column.next = call {ty} @recipe.add({ty} %{weight_prefix}.column.value, {ty} %{weight_prefix}.contribution)\nstore {ty} %{weight_prefix}.column.next, {pointer} %{weight_prefix}.column.ptr, align {align}\n", normalized = fragment.value, align = alignment(ty)));
 							},
 						)?;
-						ir.push_str(barrier(backend));
+						ir.push_str(barrier(backend, split));
 						ir.push_str(&format!(
 							"call void @reduce_rows({pointer} {scratch}, {pointer} %gradient, i32 {partitions}, i32 {columns}, i32 {columns}, i32 0, i32 {offset}, i32 %threads)\n"
 						));
-						ir.push_str(barrier(backend));
+						ir.push_str(barrier(backend, split));
 					}
 				}
 			}
+			if split {
+				runs.extend(ir.split(NATIVE_SEGMENT_MARK).filter(|run| !run.trim().is_empty()).map(|run| (index, format!("{prologue}{run}\n"))));
+			} else {
+				fused.push_str(&prologue);
+				fused.push_str(&ir);
+			}
 		}
-		Ok(ir)
+		if !split {
+			runs.push((0, fused));
+		}
+		Ok(runs)
 	}
 
 	// Group statistics are reductions over the batch, like the loss, so they
@@ -3873,7 +3998,7 @@ impl NativeModelIr {
 	/// Runs every selected expert projection through the same cooperative
 	/// contraction used by an ordinary layer. Expert input uses one matrix row
 	/// per routed slot; expert output folds the routed slots into its K extent.
-	fn emit_expert_forward(&self, backend: Backend, index: usize, plan: &NodePlan, pointers: &ModelPointers, window: &NodeWindow, outward: bool, ir: &mut String) -> Result<()> {
+	fn emit_expert_forward(&self, backend: Backend, index: usize, plan: &NodePlan, pointers: &ModelPointers, window: &NodeWindow, outward: bool, split: bool, ir: &mut String) -> Result<()> {
 		let node = &plan.node;
 		let (experts, top, hidden) =
 			(integer_argument(node.argument[0], "expert count")?, integer_argument(node.argument[1], "experts used")?, integer_argument(node.argument[2], "expert width")?);
@@ -3900,7 +4025,7 @@ impl NativeModelIr {
 					kind = block_kind,
 				));
 			})?;
-			ir.push_str(barrier(backend));
+			ir.push_str(barrier(backend, split));
 			return Ok(());
 		}
 		let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native expert contraction schedule is absent"))?.forward;
@@ -3925,7 +4050,7 @@ impl NativeModelIr {
 			experts = experts,
 			top = top,
 			hidden = hidden,
-			barrier = barrier(backend),
+			barrier = barrier(backend, split),
 		));
 		Ok(())
 	}
@@ -4065,14 +4190,33 @@ impl NativeModelIr {
 			let columns = i32::try_from(stored.count.div_ceil(block) * block).map_err(|_| RecipeError::new("native quantized block count exceeds i32"))?;
 			let prefix = format!("load.n{index}");
 			ir.push_str(&format!("br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.storage = getelementptr i8, {pointer} %storage, i64 {storage}\n%{prefix}.base = getelementptr i8, {pointer} %weights, i64 {weight}\n%{prefix}.weights = getelementptr {ty}, {pointer} %{prefix}.base, i32 %{prefix}.p\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} %{prefix}.storage, i32 0, i32 %{prefix}.p, i32 {columns})\nstore {ty} %{prefix}.value, {pointer} %{prefix}.weights, align {align}\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, count = count, storage = plan.storage_offset, weight = plan.weight_offset, name = name, columns = columns, align = alignment(ty)).replace("%entry", &format!("%{predecessor}")));
-			ir.push_str(barrier(backend));
+			ir.push_str(barrier(backend, false));
 			predecessor = format!("{prefix}.done");
 		}
 		ir.push_str("ret void\n}\n");
 		Ok(ir)
 	}
 
-	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>) -> Result<String> {
+	/// The shared memory one forward entrypoint reserves, in model elements. Only
+	/// the contraction and attention bodies stage operands there, so a run that
+	/// calls neither reserves none and leaves the whole allocation to the
+	/// workgroups the device can then keep resident.
+	fn segment_shared_values(&self, node: usize, run: &str) -> Result<u32> {
+		if !["@contraction_", "@attention_", "@scan_", "@expert_", "@reduce_rows("].iter().any(|body| run.contains(body)) {
+			return Ok(0);
+		}
+		let schedule = &self.schedule;
+		let ratio = narrow(self.precision.state.bytes().div_ceil(self.precision.model.bytes()), "native contraction state ratio")? as u32;
+		if let Some(tiles) = schedule.contractions.get(node).copied().flatten() {
+			return native_contraction_shared_values(tiles.forward, schedule.register_m, schedule.register_n, schedule.block, schedule.chunk_k, ratio, schedule.matrix);
+		}
+		if let Some(extent) = schedule.attention.get(node).copied().flatten() {
+			return native_attention_shared_values(extent, extent.m as usize == self.graph.nodes[node].output.length);
+		}
+		Ok(schedule.shared_values)
+	}
+
+	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>) -> Result<(String, Vec<NativeSegment>)> {
 		let register_count = self.schedule.register_count;
 		let q8_0 = StorageCodec::Q8_0.quantization();
 		let iq1s = StorageCodec::IQ1S.quantization();
@@ -4126,21 +4270,35 @@ impl NativeModelIr {
 			Backend::Cpu => "call i32 @recipe.cpu.thread.id()".to_owned(),
 			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
 		};
-		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
 		let mut body = String::new();
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 %begin, i32 %end");
-		body.push_str(&format!("define internal void @recipe_model_inference_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
-		body.push_str(&inference_forward);
-		body.push_str("ret void\n}\n");
+		// The forward pass is one entrypoint per run of work between the grid
+		// barriers a fused pass would emit. The launch that ends one run is the
+		// synchronization, so no run reserves the whole device for a barrier that
+		// never happens, and each is sized for the work it actually does.
+		let synchronized = grid_synchronized(&ir);
+		let parameters = ["%samples", "%weights", "%values", "%contexts", "%rows", "%threads", "%begin", "%end", "%tid"];
+		let mut segments = Vec::new();
+		for (position, (node, run)) in self.emit_fixed_primitives(backend, matrix.is_some(), false, false, true)?.into_iter().enumerate() {
+			let symbol = format!("{NATIVE_FORWARD_SYMBOL}_{position}");
+			let undefined = undefined_names(&run, &parameters);
+			require(undefined.is_empty(), format!("{symbol} reads {} outside its own entrypoint", undefined.join(", ")))?;
+			let cooperative = synchronized.iter().any(|name| run.contains(&format!("@{name}(")));
+			let shared_values = self.segment_shared_values(node, &run)?;
+			body.push_str(&format!("define {kernel}void @{symbol}({forward_args}) #0 {{\nentry:\n%tid = {thread}\n{run}ret void\n}}\n"));
+			segments.push(NativeSegment { symbol, node, cooperative, shared_values });
+		}
+		require(!segments.is_empty(), "native model emitted no forward entrypoint")?;
 		if loss.is_some() {
-			let training_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, true)?;
+			let training_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, true, false)?;
 			body.push_str(&format!("define internal void @recipe_model_training_forward_body({forward_args}) #1 {{\nentry:\n%tid = {thread}\n"));
-			body.push_str(&training_forward);
+			for (_, run) in &training_forward {
+				body.push_str(run);
+			}
 			body.push_str("ret void\n}\n");
 		}
-		body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"));
 		if let Some(loss) = loss {
-			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false)?;
+			let reverse = self.emit_fixed_primitives(backend, matrix.is_some(), true, false, false)?.into_iter().map(|(_, run)| run).collect::<String>();
 			let gradient_bytes = checked_mul(self.graph.parameters.len(), self.precision.model.bytes(), "native gradient clear bytes")?;
 			let input_bytes = checked_mul(checked_mul(self.rows, self.graph.input.elements(), "native input clear elements")?, self.precision.model.bytes(), "native input clear bytes")?;
 			let epoch_args = format!(
@@ -4150,21 +4308,21 @@ impl NativeModelIr {
 			body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "gradient.entry")?);
 			body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
 			body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
-			body.push_str(barrier(backend));
+			body.push_str(barrier(backend, false));
 			body.push_str(&format!(
 				"\ncall void @recipe_model_training_forward_body({pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads, i32 0, i32 {positions})\n",
 				positions = graph_positions(&self.graph)
 			));
 			body.push('\n');
 			body.push_str(&self.emit_loss_and_seed(backend, loss, model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
-			body.push_str(barrier(backend));
+			body.push_str(barrier(backend, false));
 			body.push_str(&reverse);
 			body.push_str("br i1 %epoch.optimizer, label %optimizer.entry, label %epoch.done\n");
 			body.push_str(&self.emit_adamw(model_ty, state_precision, state_ty, pointer, model_align, state_align)?);
 			body.push_str("br label %epoch.done\nepoch.done:\nret void\n}\n");
 		}
 		ir.push_str(&body);
-		Ok(prune_internal_definitions(ir))
+		Ok((prune_internal_definitions(ir), segments))
 	}
 
 	fn emit_loss_and_seed(
@@ -4206,7 +4364,7 @@ impl NativeModelIr {
 		}
 		ir.push_str(&format!("store {state_ty} %loss.value, {pointer} %metric.ptr, align {state_align}\nbr label %loss.wait\nloss.wait:\n"));
 		let loss_value = if loss.0 == 1 {
-			ir.push_str(barrier(backend));
+			ir.push_str(barrier(backend, false));
 			ir.push_str(&format!("%loss.value.shared = load {state_ty}, {pointer} %metric.ptr, align {state_align}\n"));
 			"%loss.value.shared"
 		} else {
@@ -4610,7 +4768,7 @@ fn delta_shape(node: &Node, rows: usize) -> Result<DeltaShape> {
 
 /// List the positions routed to each expert, in ascending expert and position
 /// order. A weight gradient walks one expert's list instead of every position.
-fn emit_expert_buckets(ir: &mut String, backend: Backend, index: usize, rows: usize, node: &Node, pointers: &ModelPointers) -> Result<()> {
+fn emit_expert_buckets(ir: &mut String, backend: Backend, index: usize, rows: usize, node: &Node, pointers: &ModelPointers, split: bool) -> Result<()> {
 	let pairs = checked_mul(rows, node.output.length, "routed positions")?;
 	// One list per expert: an `[experts, 1]` shape walked whole.
 	let buckets = Shape { channels: integer_argument(node.argument[0], "routed experts")? as usize, length: 1 };
@@ -4626,7 +4784,7 @@ fn emit_expert_buckets(ir: &mut String, backend: Backend, index: usize, rows: us
 			top = node.argument[1]
 		));
 	})?;
-	ir.push_str(barrier(backend));
+	ir.push_str(barrier(backend, split));
 	Ok(())
 }
 
@@ -4809,7 +4967,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		_ => None,
 	}
 	.filter(|_| model.schedule.matrix);
-	let ir = model.emit(target.backend(), matrix, loss)?;
+	let (ir, segments) = model.emit(target.backend(), matrix, loss)?;
 	let key = native_artifact_key(target, &ir);
 	let directory = native_artifact_directory(&key)?;
 	fs::create_dir_all(&directory).map_err(|error| RecipeError::new(format!("cannot create native artifact directory: {error}")))?;
@@ -4850,7 +5008,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		fs::read(&path).map_err(|error| RecipeError::new(format!("cannot read native artifact {}: {error}", path.display())))?
 	};
 	require(!artifact.is_empty(), format!("native artifact {} is empty", path.display()))?;
-	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: model.storage(), training: loss.is_some() })
+	Ok(NativeArtifact { backend: target.clone(), layout: model.layout.clone(), precision: model.precision, artifact, path, storage: model.storage(), segments, training: loss.is_some() })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12171,11 +12329,19 @@ impl NativeTape {
 	fn forward_window(&self, begin: u32, end: u32) -> Result<()> {
 		require(begin <= end && end <= self.positions, format!("forward window {begin}..{end} is outside the {} input positions", self.positions))?;
 		self.stage_lookups(begin, end)?;
-		let threads = self.program.forward.geometry.threads()?;
+		let windows = self.node_windows(begin, end)?;
 		let rows = self.rows;
-		let thread_count = threads;
-		let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, thread_count, begin, end];
-		self.program.launch_forward(&mut call).map_err(|error| RecipeError::new(format!("forward: {error}")))?;
+		// The forward is one entrypoint per run of work between the grid barriers a
+		// fused pass would emit, launched in that order on the device's stream. The
+		// launch that ends one run is the synchronization, and the value and context
+		// arenas carry every position the earlier runs wrote.
+		for (segment, dispatch) in self.program.forward.iter().enumerate() {
+			let node = self.program.artifact.segments.get(segment).ok_or_else(|| RecipeError::new("native forward segment has no node"))?.node;
+			let (node_begin, node_end) = *windows.get(node).ok_or_else(|| RecipeError::new("native forward segment names an absent node"))?;
+			let threads = dispatch.geometry.threads()?;
+			let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, threads, node_begin, node_end];
+			self.program.launch_forward(segment, &mut call).map_err(|error| RecipeError::new(format!("forward segment {segment}: {error}")))?;
+		}
 		Ok(())
 	}
 	/// The runs of the one-row input that the input positions `begin..end`
@@ -12209,6 +12375,13 @@ impl NativeTape {
 	/// every node derives from its source, as the emitted forward derives it,
 	/// carried to the last node.
 	fn output_window(&self, begin: u32, end: u32) -> Result<(u32, u32)> {
+		self.node_windows(begin, end)?.last().copied().ok_or_else(|| RecipeError::new("native model has no node"))
+	}
+	/// The output positions the input positions `begin..end` reach at every node,
+	/// as the chain of window rules from the input. A split forward launches each
+	/// entrypoint over the window of the node it holds, so this is the same rule
+	/// a fused forward derives in the kernel.
+	fn node_windows(&self, begin: u32, end: u32) -> Result<Vec<(u32, u32)>> {
 		let mut windows = Vec::with_capacity(self.nodes.len());
 		for node in &self.nodes {
 			let (begin, end) = usize::try_from(node.source).map_or((begin, end), |source| windows[source]);
@@ -12227,7 +12400,7 @@ impl NativeTape {
 				_ => (begin, end),
 			});
 		}
-		windows.last().copied().ok_or_else(|| RecipeError::new("native model has no node"))
+		Ok(windows)
 	}
 	/// Move one output window into the next placed range. NVIDIA peers use one
 	/// pitched device copy for every channel instead of thousands of synchronous
@@ -13056,6 +13229,11 @@ struct Kernel {
 struct Dispatch {
 	kernel: Kernel,
 	geometry: Geometry,
+	/// Dynamic shared memory this entrypoint reserves, in model elements. It is
+	/// the staging tile of the work the entrypoint holds together with the lane
+	/// reduction its own workgroup width needs, and an entrypoint that stages
+	/// nothing reserves none.
+	values: u32,
 }
 type NativeForward = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, i32, i32, i32);
 type NativeModelLoad = unsafe extern "C" fn(Ptr, Ptr, i32);
@@ -13077,7 +13255,7 @@ enum NativeCpuEpoch {
 struct NativeCpuProgram {
 	_library: Library,
 	thread: NativeCpuThread,
-	forward: NativeForward,
+	forward: Vec<NativeForward>,
 	epoch: Option<NativeCpuEpoch>,
 	model_load: Option<NativeModelLoad>,
 }
@@ -13163,7 +13341,7 @@ struct NativeProgram {
 	gpu: &'static Gpu,
 	artifact: NativeArtifact,
 	backend: NativeBackend,
-	forward: Dispatch,
+	forward: Vec<Dispatch>,
 	epoch: Option<Dispatch>,
 	model_load: Option<Dispatch>,
 	tile: Tile,
@@ -13182,12 +13360,24 @@ impl Drop for NativeHsaProgram {
 	}
 }
 
+/// One loaded entrypoint. A forward pass names the segment it runs, because the
+/// forward is one entrypoint per run of work between the grid barriers a fused
+/// pass would emit.
 #[derive(Clone, Copy, Debug)]
-#[repr(u8)]
 enum NativeEntry {
-	Forward = 0,
-	Epoch = 1,
-	ModelLoad = 2,
+	Forward(usize),
+	Epoch,
+	ModelLoad,
+}
+
+/// The dynamic shared memory one entrypoint reserves, in model elements: the
+/// staging tile of the work it holds, widened to the lane reduction its own
+/// workgroup needs. An entrypoint that stages nothing reserves nothing.
+fn native_dynamic_values(shared_values: u32, register_values: u32, block: u32) -> Result<u32> {
+	if shared_values == 0 && register_values == 0 {
+		return Ok(0);
+	}
+	Ok(shared_values.max(block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native lane reduction buffer overflows"))?))
 }
 
 fn native_symbol(name: &str) -> Vec<u8> {
@@ -13485,7 +13675,7 @@ fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
 	let path = artifact.path.to_str().ok_or_else(|| RecipeError::new("CPU native artifact path is not UTF-8"))?;
 	let library = Library::open(path)?;
 	let thread = library.function::<NativeCpuThread>(&native_symbol(NATIVE_CPU_THREAD_SYMBOL))?;
-	let forward = library.function::<NativeForward>(&native_symbol(NATIVE_FORWARD_SYMBOL))?;
+	let forward = artifact.segments.iter().map(|segment| library.function::<NativeForward>(&native_symbol(&segment.symbol))).collect::<Result<Vec<_>>>()?;
 	let epoch = || -> Result<NativeCpuEpoch> {
 		match artifact.precision.state.bytes() {
 			8 => library.function::<NativeEpochF64>(&native_symbol(NATIVE_EPOCH_SYMBOL)).map(NativeCpuEpoch::F64),
@@ -14182,18 +14372,19 @@ fn kfd_property(text: &str, name: &str) -> Result<u32> {
 }
 #[cfg(amd)]
 impl Hsa {
-	unsafe fn native_dispatch(&self, executable: u64, element: u8, waves: u32, name: &str, layout: &'static [u8]) -> Result<Dispatch> {
+	unsafe fn native_dispatch(&self, executable: u64, element: u8, waves: u32, name: &str, layout: &'static [u8], shared_values: u32, register_values: u32) -> Result<Dispatch> {
 		unsafe {
 			let name = std::ffi::CString::new(format!("{name}.kd")).map_err(|error| RecipeError::new(format!("AMD native symbol is invalid: {error}")))?;
 			let kernel = hsa_kernel(self.symbol, self.symbol_info, executable, self.agent, &name, element, layout)?;
 			let geometry = amd(self.cus, self.wave, self.workgroup, self.lds, waves, Resources { shared: kernel.shared, max_block: self.workgroup })?;
-			Ok(Dispatch { kernel, geometry })
+			let values = native_dynamic_values(shared_values, register_values, geometry.block)?;
+			Ok(Dispatch { kernel, geometry, values })
 		}
 	}
 
 	unsafe fn load_native(
-		&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], training: bool, has_storage: bool, waves: u32,
-	) -> Result<(NativeHsaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
+		&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], segments: &[NativeSegment], training: bool, has_storage: bool, waves: u32, shared_values: u32, register_values: u32,
+	) -> Result<(NativeHsaProgram, Vec<Dispatch>, Option<Dispatch>, Option<Dispatch>)> {
 		unsafe {
 			require(!bytes.is_empty(), "native AMD artifact is empty")?;
 			let mut reader = HsaReader { handle: 0, destroy: self.reader_destroy };
@@ -14202,10 +14393,16 @@ impl Hsa {
 			driver_status(Backend::Amd, (self.executable_create)(1, 0, ptr::null_mut(), &mut executable.handle), "native executable creation")?;
 			driver_status(Backend::Amd, (self.executable_load)(executable.handle, self.agent, reader.handle, ptr::null_mut(), ptr::null_mut()), "native code-object load")?;
 			driver_status(Backend::Amd, (self.executable_freeze)(executable.handle, ptr::null_mut()), "native executable freeze")?;
-			let forward = self.native_dispatch(executable.handle, element, waves, NATIVE_FORWARD_SYMBOL, NATIVE_FORWARD_LAYOUT)?;
-			let epoch = training.then(|| self.native_dispatch(executable.handle, element, waves, NATIVE_EPOCH_SYMBOL, epoch_layout)).transpose()?;
-			let model_load = has_storage.then(|| self.native_dispatch(executable.handle, element, waves, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
-			let kernarg_size = [Some(forward), epoch, model_load].into_iter().flatten().map(|dispatch| dispatch.kernel.kernarg).max().unwrap_or(0);
+			let forward = segments
+				.iter()
+				.map(|segment| {
+					let reduction = if segment.shared_values == 0 { 0 } else { register_values };
+					self.native_dispatch(executable.handle, element, waves, &segment.symbol, NATIVE_FORWARD_LAYOUT, segment.shared_values, reduction)
+				})
+				.collect::<Result<Vec<_>>>()?;
+			let epoch = training.then(|| self.native_dispatch(executable.handle, element, waves, NATIVE_EPOCH_SYMBOL, epoch_layout, shared_values, register_values)).transpose()?;
+			let model_load = has_storage.then(|| self.native_dispatch(executable.handle, element, waves, NATIVE_MODEL_LOAD_SYMBOL, NATIVE_MODEL_LOAD_LAYOUT, 0, 0)).transpose()?;
+			let kernarg_size = forward.iter().copied().chain([epoch, model_load].into_iter().flatten()).map(|dispatch| dispatch.kernel.kernarg).max().unwrap_or(0);
 			let grid_sync = kernarg_size.next_multiple_of(HSA_GRID_SYNC_ALIGNMENT);
 			let allocation_size = grid_sync.checked_add(HSA_GRID_SYNC_BYTES).ok_or_else(|| RecipeError::new("native AMD KERNARG allocation overflows"))?;
 			let mut kernarg = ptr::null_mut();
@@ -14217,7 +14414,7 @@ impl Hsa {
 }
 #[cfg(nvidia)]
 impl Cuda {
-	unsafe fn native_dispatch(&self, module: Ptr, name: &str, element: u8, layout: &'static [u8], waves: u32, shared_values: u32, register_values: u32) -> Result<Dispatch> {
+	unsafe fn native_dispatch(&self, module: Ptr, name: &str, element: u8, layout: &'static [u8], waves: u32, shared_values: u32, register_values: u32, cooperative: bool) -> Result<Dispatch> {
 		unsafe {
 			let name = std::ffi::CString::new(name).map_err(|error| RecipeError::new(format!("NVIDIA native symbol is invalid: {error}")))?;
 			let mut object = 0;
@@ -14236,29 +14433,42 @@ impl Cuda {
 			// The grid is one workgroup per SM and the barrier only completes once every one of them
 			// is resident, so the occupancy question has to be asked about the launch this dispatch
 			// really makes. With no dynamic shared memory it answers a question nobody goes on to ask.
-			let values = shared_values.max(geometry.block.checked_mul(register_values).ok_or_else(|| RecipeError::new("NVIDIA native reduction buffer overflows"))?);
+			let values = native_dynamic_values(shared_values, register_values, geometry.block)?;
 			let dynamic = values.checked_mul(u32::from(element)).ok_or_else(|| RecipeError::new("NVIDIA native shared memory overflows"))?;
 			driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, geometry.block as i32, dynamic as usize), "native occupancy query")?;
 			require(active > 0, "NVIDIA native symbol has no resident workgroup")?;
+			// A cooperative entrypoint holds a barrier that only completes once every
+			// workgroup of its launch is resident, so its grid stays one workgroup per
+			// SM. Every other entrypoint takes the workgroups its own register and
+			// shared allocation leaves resident on each SM.
+			let geometry = Geometry { groups: if cooperative { geometry.groups } else { geometry.groups.saturating_mul(active as u32).max(1) }, ..geometry };
 			debug(&format!(
-				"NVIDIA native symbol={name:?} registers={used_registers} static_shared={shared} dynamic_shared={dynamic} resident_workgroups={active} groups={} block={}",
+				"NVIDIA native symbol={name:?} registers={used_registers} static_shared={shared} dynamic_shared={dynamic} resident_workgroups={active} cooperative={cooperative} groups={} block={}",
 				geometry.groups, geometry.block
 			))?;
-			Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry })
+			Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry, values })
 		}
 	}
 
 	unsafe fn load_native(
-		&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], training: bool, has_storage: bool, waves: u32, shared_values: u32, register_values: u32,
-	) -> Result<(NativeCudaProgram, Dispatch, Option<Dispatch>, Option<Dispatch>)> {
+		&self, bytes: &[u8], element: u8, epoch_layout: &'static [u8], segments: &[NativeSegment], training: bool, has_storage: bool, waves: u32, shared_values: u32, register_values: u32,
+	) -> Result<(NativeCudaProgram, Vec<Dispatch>, Option<Dispatch>, Option<Dispatch>)> {
 		unsafe {
 			driver_status(Backend::Nvidia, (self.set)(self.context), "native context")?;
 			let mut module = ptr::null_mut();
 			driver_status(Backend::Nvidia, (self.load)(&mut module, bytes.as_ptr().cast()), "native cubin load")?;
 			let program = NativeCudaProgram { module: module as usize, unload: self.unload };
-			let forward = self.native_dispatch(program.module as Ptr, NATIVE_FORWARD_SYMBOL, element, NATIVE_FORWARD_LAYOUT, waves, shared_values, register_values)?;
-			let epoch = training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves, shared_values, register_values)).transpose()?;
-			let model_load = has_storage.then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves, 0, 0)).transpose()?;
+			let forward = segments
+				.iter()
+				.map(|segment| {
+					let reduction = if segment.shared_values == 0 { 0 } else { register_values };
+					self.native_dispatch(program.module as Ptr, &segment.symbol, element, NATIVE_FORWARD_LAYOUT, waves, segment.shared_values, reduction, segment.cooperative)
+				})
+				.collect::<Result<Vec<_>>>()?;
+			let epoch =
+				training.then(|| self.native_dispatch(program.module as Ptr, NATIVE_EPOCH_SYMBOL, element, epoch_layout, waves, shared_values, register_values, true)).transpose()?;
+			let model_load =
+				has_storage.then(|| self.native_dispatch(program.module as Ptr, NATIVE_MODEL_LOAD_SYMBOL, element, NATIVE_MODEL_LOAD_LAYOUT, waves, 0, 0, true)).transpose()?;
 			Ok((program, forward, epoch, model_load))
 		}
 	}
@@ -14277,11 +14487,12 @@ unsafe extern "C" fn native_cpu_barrier(context: Ptr) {
 }
 
 #[cfg(unix)]
-unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCpuEpoch>, model_load: Option<NativeModelLoad>, entry: NativeEntry, arguments: &[Ptr]) -> Result<()> {
+unsafe fn launch_native_cpu_entry(forward: &[NativeForward], epoch: Option<NativeCpuEpoch>, model_load: Option<NativeModelLoad>, entry: NativeEntry, arguments: &[Ptr]) -> Result<()> {
 	unsafe {
 		match entry {
-			NativeEntry::Forward => {
+			NativeEntry::Forward(segment) => {
 				require(arguments.len() == NATIVE_FORWARD_LAYOUT.len(), "native CPU forward argument count is invalid")?;
+				let forward = *forward.get(segment).ok_or_else(|| RecipeError::new(format!("native CPU forward segment {segment} is absent")))?;
 				forward(
 					native_cpu_pointer(arguments, 0),
 					native_cpu_pointer(arguments, 1),
@@ -14349,7 +14560,7 @@ unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, argument
 	let barrier = std::sync::Barrier::new(threads as usize);
 	let context = ptr::from_ref(&barrier) as usize;
 	let wait = native_cpu_barrier as *const () as usize;
-	let (thread, forward, epoch, model_load) = (cpu.thread, cpu.forward, cpu.epoch, cpu.model_load);
+	let (thread, forward, epoch, model_load) = (cpu.thread, cpu.forward.as_slice(), cpu.epoch, cpu.model_load);
 	std::thread::scope(|scope| {
 		let workers = (0..threads)
 			.map(|thread_id| {
@@ -14382,10 +14593,18 @@ impl NativeProgram {
 				{
 					let cpu = load_native_cpu(&artifact)?;
 					let geometry = Geometry { groups: cpu_worker_threads()?, block: 1 };
-					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry };
-					let epoch = artifact.training.then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry });
-					let model_load =
-						(!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry });
+					let element = artifact.precision.model.bytes() as u8;
+					let forward = artifact
+						.segments
+						.iter()
+						.map(|segment| {
+							let reduction = if segment.shared_values == 0 { 0 } else { register_values };
+							Ok(Dispatch { kernel: Kernel::remote(0, element, NATIVE_FORWARD_LAYOUT), geometry, values: native_dynamic_values(segment.shared_values, reduction, geometry.block)? })
+						})
+						.collect::<Result<Vec<_>>>()?;
+					let values = native_dynamic_values(schedule.shared_values, register_values, geometry.block)?;
+					let epoch = artifact.training.then_some(Dispatch { kernel: Kernel::remote(0, element, artifact.precision.epoch_layout), geometry, values });
+					let model_load = (!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, element, NATIVE_MODEL_LOAD_LAYOUT), geometry, values: 0 });
 					(NativeBackend::Cpu(cpu), forward, epoch, model_load)
 				}
 				#[cfg(not(unix))]
@@ -14393,8 +14612,19 @@ impl NativeProgram {
 			}
 			#[cfg(amd)]
 			Driver::Hsa(driver) => {
-				let (program, forward, epoch, model_load) =
-					unsafe { driver.load_native(&artifact.artifact, element, artifact.precision.epoch_layout, artifact.training, !artifact.storage.is_empty(), waves)? };
+				let (program, forward, epoch, model_load) = unsafe {
+					driver.load_native(
+						&artifact.artifact,
+						element,
+						artifact.precision.epoch_layout,
+						&artifact.segments,
+						artifact.training,
+						!artifact.storage.is_empty(),
+						waves,
+						schedule.shared_values,
+						register_values,
+					)?
+				};
 				(NativeBackend::Amd(program), forward, epoch, model_load)
 			}
 			#[cfg(nvidia)]
@@ -14404,6 +14634,7 @@ impl NativeProgram {
 						&artifact.artifact,
 						element,
 						artifact.precision.epoch_layout,
+						&artifact.segments,
 						artifact.training,
 						!artifact.storage.is_empty(),
 						waves,
@@ -14425,27 +14656,36 @@ impl NativeProgram {
 				channel.write_u8(u8::from(artifact.training))?;
 				channel.write_u8(u8::from(artifact.precision.epoch_layout == NATIVE_EPOCH_LAYOUT_FP64))?;
 				channel.write_u8(u8::from(!artifact.storage.is_empty()))?;
+				channel.write_u32(narrow(artifact.segments.len(), "native forward segments")? as u32)?;
+				for segment in &artifact.segments {
+					channel.write_u32(narrow(segment.symbol.len(), "native segment symbol")? as u32)?;
+					channel.write_bytes(segment.symbol.as_bytes())?;
+					channel.write_u32(segment.shared_values)?;
+					channel.write_u8(u8::from(segment.cooperative))?;
+				}
 				channel.flush()?;
 				channel.read_status("artifact load")?;
 				let mut read_dispatch = |layout: &'static [u8]| -> Result<Dispatch> {
 					let shared = channel.read_u32()?;
 					let groups = channel.read_u32()?;
 					let block = channel.read_u32()?;
-					Ok(Dispatch { kernel: Kernel::remote(shared, element, layout), geometry: Geometry { groups, block } })
+					let values = channel.read_u32()?;
+					Ok(Dispatch { kernel: Kernel::remote(shared, element, layout), geometry: Geometry { groups, block }, values })
 				};
-				let forward = read_dispatch(NATIVE_FORWARD_LAYOUT)?;
+				let forward = artifact.segments.iter().map(|_| read_dispatch(NATIVE_FORWARD_LAYOUT)).collect::<Result<Vec<_>>>()?;
 				let epoch = artifact.training.then(|| read_dispatch(artifact.precision.epoch_layout)).transpose()?;
 				let model_load = (!artifact.storage.is_empty()).then(|| read_dispatch(NATIVE_MODEL_LOAD_LAYOUT)).transpose()?;
 				(NativeBackend::Remote, forward, epoch, model_load)
 			}
 		};
-		let entrypoints = [Some(NATIVE_FORWARD_SYMBOL), epoch.map(|_| NATIVE_EPOCH_SYMBOL), model_load.map(|_| NATIVE_MODEL_LOAD_SYMBOL)].into_iter().flatten().collect::<Vec<_>>().join(",");
+		let entrypoints = [epoch.map(|_| NATIVE_EPOCH_SYMBOL), model_load.map(|_| NATIVE_MODEL_LOAD_SYMBOL)].into_iter().flatten().collect::<Vec<_>>().join(",");
 		debug(&format!(
-			"native load key={} path={} entrypoints={entrypoints}",
+			"native load key={} path={} forward_entrypoints={} entrypoints={entrypoints}",
 			artifact.path.parent().and_then(Path::file_name).and_then(|key| key.to_str()).unwrap_or("unknown"),
-			artifact.path.display()
+			artifact.path.display(),
+			forward.len()
 		))?;
-		let block = forward.geometry.block.max(epoch.map_or(0, |dispatch| dispatch.geometry.block));
+		let block = forward.iter().map(|dispatch| dispatch.geometry.block).max().unwrap_or(0).max(epoch.map_or(0, |dispatch| dispatch.geometry.block));
 		let reduction_values = block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native contraction lane reduction overflows"))?;
 		let gradient_values = native_gradient_values(graph.parameters.len(), &schedule.contractions)?;
 		Ok(Self {
@@ -14465,14 +14705,15 @@ impl NativeProgram {
 
 	fn dispatch(&self, entry: NativeEntry) -> Result<Dispatch> {
 		match entry {
-			NativeEntry::Forward => Ok(self.forward),
+			NativeEntry::Forward(segment) => self.forward.get(segment).copied().ok_or_else(|| RecipeError::new(format!("native forward segment {segment} is absent"))),
 			NativeEntry::Epoch => self.epoch.ok_or_else(|| RecipeError::new("native epoch symbol is absent")),
 			NativeEntry::ModelLoad => self.model_load.ok_or_else(|| RecipeError::new("native model-load symbol is absent")),
 		}
 	}
 
-	fn launch_forward(&self, arguments: &mut [Ptr]) -> Result<()> {
-		self.launch(NativeEntry::Forward, arguments, self.forward.geometry.threads()?)
+	fn launch_forward(&self, segment: usize, arguments: &mut [Ptr]) -> Result<()> {
+		let dispatch = self.dispatch(NativeEntry::Forward(segment))?;
+		self.launch(NativeEntry::Forward(segment), arguments, dispatch.geometry.threads()?)
 	}
 
 	fn launch_epoch(&self, arguments: &mut [Ptr]) -> Result<()> {
@@ -14491,8 +14732,9 @@ impl NativeProgram {
 		let dispatch = self.dispatch(entry)?;
 		require(arguments.len() == dispatch.kernel.layout.len(), "native argument count is invalid")?;
 		gpu.activate()?;
-		let values = if matches!(entry, NativeEntry::ModelLoad) { 0 } else { self.shared_values.max(self.reduction_values) };
-		let dynamic = values.checked_mul(u32::from(dispatch.kernel.element)).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
+		// Each entrypoint reserves what the work it holds stages, which its own
+		// load sized, not what the widest node of the whole model would.
+		let dynamic = dispatch.values.checked_mul(u32::from(dispatch.kernel.element)).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
 		let shared = dispatch.kernel.shared.checked_add(dynamic).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
 		require(shared <= gpu.shared_limit, "native shared memory exceeds device limit")?;
 		let _guard = gpu.dispatch.lock().map_err(|_| RecipeError::new("GPU dispatch lock is poisoned"))?;
@@ -14588,14 +14830,16 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 				)
 			}
 			(NativeBackend::Remote, Driver::Remote(remote)) => {
-				let entry = match entry {
-					NativeEntry::Forward => 0_u8,
-					NativeEntry::Epoch => 1,
-					NativeEntry::ModelLoad => 2,
-				};
 				let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
 				channel.write_u8(REMOTE_LAUNCH)?;
-				channel.write_u8(entry)?;
+				match entry {
+					NativeEntry::Forward(segment) => {
+						channel.write_u8(0)?;
+						channel.write_u32(narrow(segment, "native forward segment")? as u32)?;
+					}
+					NativeEntry::Epoch => channel.write_u8(1)?,
+					NativeEntry::ModelLoad => channel.write_u8(2)?,
+				}
 				for (argument, kind) in arguments.iter().zip(dispatch.kernel.layout) {
 					let bytes = usize::from(*kind - b'0');
 					let mut data = [0_u8; 8];
@@ -14835,9 +15079,9 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 type WorkerWire = Wire<std::io::Stdin, std::io::Stdout>;
 struct WorkerProgram {
 	backend: NativeBackend,
-	dispatches: [Option<Dispatch>; 3],
-	shared_values: u32,
-	reduction_values: u32,
+	forward: Vec<Dispatch>,
+	epoch: Option<Dispatch>,
+	model_load: Option<Dispatch>,
 }
 /// Serves one local device to a remote Recipe process over stdin/stdout: the
 /// transport half of a cross-host topology link. Commands mirror the `Gpu`
@@ -14933,36 +15177,50 @@ pub fn worker_serve(name: &str) -> Result<()> {
 				let training = wire.read_u8()? != 0;
 				let epoch_layout: &'static [u8] = if wire.read_u8()? != 0 { NATIVE_EPOCH_LAYOUT_FP64 } else { NATIVE_EPOCH_LAYOUT_FP32 };
 				let has_storage = wire.read_u8()? != 0;
-				let loaded: Result<(NativeBackend, Dispatch, Option<Dispatch>, Option<Dispatch>)> = match &gpu.driver {
+				let mut segments = Vec::new();
+				for _ in 0..wire.read_u32()? {
+					let bytes = wire.read_u32()? as usize;
+					let mut symbol = vec![0_u8; bytes];
+					wire.read_into(&mut symbol)?;
+					let symbol = String::from_utf8(symbol).map_err(|error| RecipeError::new(format!("worker received an invalid entrypoint name: {error}")))?;
+					let shared_values = wire.read_u32()?;
+					let cooperative = wire.read_u8()? != 0;
+					segments.push(NativeSegment { symbol, node: 0, cooperative, shared_values });
+				}
+				let loaded: Result<(NativeBackend, Vec<Dispatch>, Option<Dispatch>, Option<Dispatch>)> = match &gpu.driver {
 					#[cfg(amd)]
-					Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves) }
+					Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, &segments, training, has_storage, waves, shared_values, register_values) }
 						.map(|(program, forward, epoch, model_load)| (NativeBackend::Amd(program), forward, epoch, model_load)),
 					#[cfg(nvidia)]
-					Driver::Cuda(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves, shared_values, register_values) }
+					Driver::Cuda(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, &segments, training, has_storage, waves, shared_values, register_values) }
 						.map(|(program, forward, epoch, model_load)| (NativeBackend::Nvidia(program), forward, epoch, model_load)),
 					_ => Err(RecipeError::new("worker device driver is not native")),
 				};
 				wire.status(&loaded.as_ref().map(|_| ()).map_err(Clone::clone))?;
 				if let Ok((backend, forward, epoch, model_load)) = loaded {
-					let block = forward.geometry.block.max(epoch.map_or(0, |dispatch| dispatch.geometry.block));
-					let reduction_values = block.checked_mul(register_values).ok_or_else(|| RecipeError::new("native contraction lane reduction overflows"))?;
-					for dispatch in [Some(forward), epoch, model_load].into_iter().flatten() {
+					for dispatch in forward.iter().copied().chain([epoch, model_load].into_iter().flatten()) {
 						wire.write_u32(dispatch.kernel.shared)?;
 						wire.write_u32(dispatch.geometry.groups)?;
 						wire.write_u32(dispatch.geometry.block)?;
+						wire.write_u32(dispatch.values)?;
 					}
-					program = Some(WorkerProgram { backend, dispatches: [Some(forward), epoch, model_load], shared_values, reduction_values });
+					program = Some(WorkerProgram { backend, forward, epoch, model_load });
 				}
 			}
 			REMOTE_LAUNCH => {
 				let entry = match wire.read_u8()? {
-					0 => NativeEntry::Forward,
+					0 => NativeEntry::Forward(wire.read_u32()? as usize),
 					1 => NativeEntry::Epoch,
 					2 => NativeEntry::ModelLoad,
 					byte => return Err(RecipeError::new(format!("worker received unknown entrypoint {byte}"))),
 				};
 				let launched = program.as_ref().ok_or_else(|| RecipeError::new("worker has no loaded program")).and_then(|program| {
-					let dispatch = program.dispatches[entry as usize].ok_or_else(|| RecipeError::new("worker entrypoint is absent"))?;
+					let dispatch = match entry {
+						NativeEntry::Forward(segment) => program.forward.get(segment).copied(),
+						NativeEntry::Epoch => program.epoch,
+						NativeEntry::ModelLoad => program.model_load,
+					}
+					.ok_or_else(|| RecipeError::new("worker entrypoint is absent"))?;
 					let mut slots = [0_u64; 32];
 					for (slot, kind) in slots.iter_mut().zip(dispatch.kernel.layout) {
 						let bytes = usize::from(*kind - b'0');
@@ -14971,8 +15229,7 @@ pub fn worker_serve(name: &str) -> Result<()> {
 						*slot = u64::from_le_bytes(data);
 					}
 					let mut arguments = slots[..dispatch.kernel.layout.len()].iter().map(|slot| slot as *const u64 as Ptr).collect::<Vec<_>>();
-					let values = if matches!(entry, NativeEntry::ModelLoad) { 0 } else { program.shared_values.max(program.reduction_values) };
-					let dynamic = values.checked_mul(u32::from(dispatch.kernel.element)).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
+					let dynamic = dispatch.values.checked_mul(u32::from(dispatch.kernel.element)).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
 					let shared = dispatch.kernel.shared.checked_add(dynamic).ok_or_else(|| RecipeError::new("native shared memory size overflows"))?;
 					require(shared <= gpu.shared_limit, "native shared memory exceeds device limit")?;
 					gpu.activate()?;
