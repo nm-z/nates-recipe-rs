@@ -3884,31 +3884,22 @@ impl NativeModelIr {
 			_ => 0,
 		});
 		if block_kind != 0 {
-			let name = if outward { "expert.out.block" } else { "expert.in.block" };
-			let call = |ir: &mut String, p: &str, active: Option<&str>, lane: Option<&str>| {
+			emit_fixed_loop(ir, index, if outward { "expert.out.block" } else { "expert.in.block" }, self.rows, node.output, window, |ir, p| {
 				ir.push_str(&format!(
-					"call void @expert_iq_{direction}_{method}forward_body({pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, {pointer} {routing_context}, {prefix}i32 {p}, i32 {in_channels}, i32 {out_channels}, i32 {length}, i32 {experts}, i32 {top}, i32 {hidden}, i32 {kind}, i32 {decode})\n",
+					"call void @expert_iq_{direction}_forward_body({pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, {pointer} {routing_context}, i32 {p}, i32 {in_channels}, i32 {out_channels}, i32 {length}, i32 {experts}, i32 {top}, i32 {hidden}, i32 {kind})\n",
 					direction = if outward { "out" } else { "in" },
-					method = if active.is_some() { "wave_" } else { "" },
 					pointer = pointer_type(backend),
 					source = pointers.source,
 					weights = pointers.weights,
 					value = pointers.value,
 					routing = pointers.second,
 					routing_context = pointers.second_context,
-					prefix = active.zip(lane).map_or_else(String::new, |(active, lane)| format!("i1 {active}, i32 {lane}, ")),
 					in_channels = node.input.channels,
 					out_channels = node.output.channels,
 					length = node.output.length,
 					kind = block_kind,
-					decode = plan.decode(index),
 				));
-			};
-			if backend == Backend::Nvidia {
-				emit_fixed_groups(ir, index, name, self.rows, node.output, window, 32, |ir, p, active, lane| call(ir, p, Some(active), Some(lane)))?;
-			} else {
-				emit_fixed_loop(ir, index, name, self.rows, node.output, window, |ir, p| call(ir, p, None, None))?;
-			}
+			})?;
 			ir.push_str(barrier(backend));
 			return Ok(());
 		}
@@ -4574,25 +4565,6 @@ fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, rows: usize, shape
 	));
 	body(ir, &format!("%{prefix}.at.p"));
 	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.at.next = add i32 %{prefix}.at.q, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
-	Ok(())
-}
-
-/// Walk one output per fixed-size device group. Every thread enters every
-/// round, including a short final round, so a body can use workgroup barriers
-/// while the group's lanes cooperate on that output.
-fn emit_fixed_groups(ir: &mut String, index: usize, name: &str, rows: usize, shape: Shape, window: &NodeWindow, group: usize, mut body: impl FnMut(&mut String, &str, &str, &str)) -> Result<()> {
-	let prefix = format!("n{index}.{name}");
-	let elements = narrow(checked_mul(shape.channels, shape.length, format!("native {name} row elements").as_str())?, "native group loop row elements")?;
-	let (channels, length) = (narrow(shape.channels, "native group loop channels")?, narrow(shape.length, "native group loop length")?);
-	narrow(checked_mul(rows, elements as usize, "native group loop batch elements")?, "native group loop batch elements")?;
-	let rows = narrow(rows, "native group loop rows")?;
-	let group = narrow(group, "native group width")?;
-	let (begin, span) = (&window.begin, &window.span);
-	ir.push_str(&format!(
-		"%{prefix}.at.plane = mul i32 {channels}, {span}\n%{prefix}.at.count = mul i32 {rows}, %{prefix}.at.plane\n%{prefix}.groups = udiv i32 %threads, {group}\n%{prefix}.group = udiv i32 %tid, {group}\n%{prefix}.lane = urem i32 %tid, {group}\nbr label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.round = phi i32 [ 0, %{prefix}.entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.round, %{prefix}.at.count\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n%{prefix}.at.q.raw = add i32 %{prefix}.round, %{prefix}.group\n%{prefix}.active = icmp ult i32 %{prefix}.at.q.raw, %{prefix}.at.count\n%{prefix}.at.q = select i1 %{prefix}.active, i32 %{prefix}.at.q.raw, i32 0\n%{prefix}.at.row = udiv i32 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.within = urem i32 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.channel = udiv i32 %{prefix}.at.within, {span}\n%{prefix}.at.offset = urem i32 %{prefix}.at.within, {span}\n%{prefix}.at.position = add i32 %{prefix}.at.offset, {begin}\n%{prefix}.at.row.base = mul i32 %{prefix}.at.row, {elements}\n%{prefix}.at.channel.base = mul i32 %{prefix}.at.channel, {length}\n%{prefix}.at.local = add i32 %{prefix}.at.channel.base, %{prefix}.at.position\n%{prefix}.at.p = add i32 %{prefix}.at.row.base, %{prefix}.at.local\n"
-	));
-	body(ir, &format!("%{prefix}.at.p"), &format!("%{prefix}.active"), &format!("%{prefix}.lane"));
-	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.next = add i32 %{prefix}.round, %{prefix}.groups\nbr label %{prefix}.loop\n{prefix}.done:\n"));
 	Ok(())
 }
 
@@ -9404,8 +9376,13 @@ fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], chann
 fn infer_gguf_with(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize, precision: Compute) -> Result<Vec<f64>> {
 	let (graph, device) = bound_graph(model, blocks, plan, input, channels)?;
 	let tape = NativeTape::new(&graph, input, input, &[], device, precision, None)?;
+	let started = std::time::Instant::now();
 	tape.forward()?;
-	tape.predictions()
+	debug(&format!("GGUF forward submitted in {:.9} seconds", started.elapsed().as_secs_f64()))?;
+	let started = std::time::Instant::now();
+	let predictions = tape.predictions()?;
+	debug(&format!("GGUF forward synchronized and downloaded in {:.9} seconds", started.elapsed().as_secs_f64()))?;
+	Ok(predictions)
 }
 fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Result<Generation> {
 	require(!prompt.is_empty(), "decode prompt is empty")?;
@@ -9429,7 +9406,9 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 				tape.write_sample(position, samples[position])?;
 			}
 			tape.forward_window(settled, reached)?;
-			tape.predictions()
+			let (_, output_end) = tape.output_window(settled, reached)?;
+			require(output_end != 0, "decode reached no output position")?;
+			tape.position_predictions(output_end - 1)
 		},
 	)
 }
@@ -10476,7 +10455,15 @@ impl Placed {
 		for step in 0..=budget {
 			let reached = narrow(generation.ids.len(), "decode position")? as u32;
 			let started = std::time::Instant::now();
-			let logits = self.run_window(&samples, settled, reached)?;
+			let predictions = self.run_window(&samples, settled, reached)?;
+			let ranges = self.tapes.first().ok_or_else(|| RecipeError::new("placement has no output ranges"))?;
+			let (mut output_begin, mut output_end) = (settled, reached);
+			for range in ranges {
+				(output_begin, output_end) = range.output_window(output_begin, output_end)?;
+			}
+			require(output_end != 0, "decode reached no output position")?;
+			let last = ranges.last().ok_or_else(|| RecipeError::new("placement has no output tape"))?;
+			let logits = select_position_predictions(&predictions, last.capacity, last.output, output_end - 1)?;
 			let seconds = started.elapsed().as_secs_f64();
 			if step == 0 {
 				generation.prefill_seconds = seconds;
@@ -10534,12 +10521,14 @@ impl Placed {
 		}
 		let (mut begin, mut end) = (begin, end);
 		for (index, tape) in tapes.iter().enumerate() {
+			let started = std::time::Instant::now();
 			tape.forward_window(begin, end)?;
+			debug(&format!("placed range {index} device={} window={begin}..{end} forward_seconds={:.9}", tape.program.gpu.name, started.elapsed().as_secs_f64()))?;
 			let Some(next) = tapes.get(index + 1) else { break };
 			(begin, end) = tape.output_window(begin, end)?;
-			for (start, count) in window_runs(tape.output, begin, end) {
-				next.write_samples(start, &tape.output(start, count)?)?;
-			}
+			let started = std::time::Instant::now();
+			tape.copy_output_window_to(next, begin, end)?;
+			debug(&format!("placed hop {index} window={begin}..{end} copy_seconds={:.9}", started.elapsed().as_secs_f64()))?;
 		}
 		last.predictions()
 	}
@@ -11979,6 +11968,13 @@ struct NativeTape {
 	positions: u32,
 	vocabulary: f64,
 }
+/// Select one sequence position from channel-major predictions for every row.
+fn select_position_predictions(values: &[f64], rows: usize, shape: Shape, position: u32) -> Result<Vec<f64>> {
+	let position = position as usize;
+	require(position < shape.length, "prediction position is outside the model output")?;
+	require(values.len() == rows * shape.elements(), "prediction arena has the wrong shape")?;
+	Ok((0..rows).flat_map(|row| (0..shape.channels).map(move |channel| values[row * shape.elements() + channel * shape.length + position])).collect())
+}
 macro_rules! ptrs { ($($e:expr),* $(,)?) => { [$(&$e as *const _ as Ptr),*] } }
 
 #[derive(Clone, Copy, Debug)]
@@ -12233,6 +12229,43 @@ impl NativeTape {
 		}
 		windows.last().copied().ok_or_else(|| RecipeError::new("native model has no node"))
 	}
+	/// Move one output window into the next placed range. NVIDIA peers use one
+	/// pitched device copy for every channel instead of thousands of synchronous
+	/// device-to-host and host-to-device calls.
+	fn copy_output_window_to(&self, next: &NativeTape, begin: u32, end: u32) -> Result<()> {
+		require(self.capacity == 1 && next.capacity == 1, "placed range copy expects one row")?;
+		require(self.output.channels == next.input.channels, "placed range channel widths differ")?;
+		require(end >= begin && end as usize <= self.output.length && end as usize <= next.input.length, "placed range window is outside its sequence")?;
+		require(self.precision.model == next.precision.model, "placed ranges use different precisions")?;
+		let bytes = self.precision.model.bytes();
+		#[cfg(nvidia)]
+		if self.values.runtime.backend == Backend::Nvidia && next.samples.runtime.backend == Backend::Nvidia {
+			let arena = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
+			let src = checked_add(arena, checked_mul(begin as usize, bytes, "placed source position")?, "placed source")?;
+			let dst = checked_mul(begin as usize, bytes, "placed destination position")?;
+			let width = checked_mul((end - begin) as usize, bytes, "placed window width")?;
+			let src_pitch = checked_mul(self.output.length, bytes, "placed source pitch")?;
+			let dst_pitch = checked_mul(next.input.length, bytes, "placed destination pitch")?;
+			let src_end = checked_add(checked_add(src, checked_mul(self.output.channels - 1, src_pitch, "placed source rows")?, "placed source extent")?, width, "placed source width")?;
+			let dst_end =
+				checked_add(checked_add(dst, checked_mul(next.input.channels - 1, dst_pitch, "placed destination rows")?, "placed destination extent")?, width, "placed destination width")?;
+			require(src_end <= self.values.bytes, "placed source window exceeds its arena")?;
+			require(dst_end <= next.samples.bytes, "placed destination window exceeds its arena")?;
+			return next.samples.runtime.copy_2d_from(
+				next.samples.pointer + dst as u64,
+				dst_pitch,
+				self.values.runtime,
+				self.values.pointer + src as u64,
+				src_pitch,
+				width,
+				self.output.channels,
+			);
+		}
+		for (start, count) in window_runs(self.output, begin, end) {
+			next.write_samples(start, &self.output(start, count)?)?;
+		}
+		Ok(())
+	}
 	/// Restore the token, input, and mutable arenas before a new sequence, while
 	/// retaining packed tables and saved evaluation statistics.
 	fn reset_sequence(&self) -> Result<()> {
@@ -12268,6 +12301,9 @@ impl NativeTape {
 	}
 	fn predictions(&self) -> Result<Vec<f64>> {
 		self.output(0, self.capacity * self.output.elements())
+	}
+	fn position_predictions(&self, position: u32) -> Result<Vec<f64>> {
+		select_position_predictions(&self.predictions()?, self.capacity, self.output, position)
 	}
 	/// A run of `count` output values from element `first` of the output arena.
 	fn output(&self, first: usize, count: usize) -> Result<Vec<f64>> {
@@ -13181,14 +13217,36 @@ impl Kernel {
 	}
 }
 #[cfg(nvidia)]
+#[repr(C)]
+struct CudaCopy2D {
+	src_x_bytes: usize,
+	src_y: usize,
+	src_memory: u32,
+	src_host: *const c_void,
+	src_device: u64,
+	src_array: Ptr,
+	src_pitch: usize,
+	dst_x_bytes: usize,
+	dst_y: usize,
+	dst_memory: u32,
+	dst_host: Ptr,
+	dst_device: u64,
+	dst_array: Ptr,
+	dst_pitch: usize,
+	width_bytes: usize,
+	height: usize,
+}
+#[cfg(nvidia)]
 struct Cuda {
 	_runtime: std::sync::Arc<Library>,
 	context: Ptr,
 	set: unsafe extern "C" fn(Ptr) -> i32,
+	enable_peer: unsafe extern "C" fn(Ptr, u32) -> i32,
 	allocate: unsafe extern "C" fn(*mut u64, usize) -> i32,
 	free: unsafe extern "C" fn(u64) -> i32,
 	upload: unsafe extern "C" fn(u64, *const c_void, usize) -> i32,
 	download: unsafe extern "C" fn(Ptr, u64, usize) -> i32,
+	copy_2d: unsafe extern "C" fn(*const CudaCopy2D) -> i32,
 	clear: unsafe extern "C" fn(u64, u8, usize) -> i32,
 	memory_info: unsafe extern "C" fn(*mut usize, *mut usize) -> i32,
 	synchronize: unsafe extern "C" fn() -> i32,
@@ -13518,7 +13576,7 @@ impl Gpu {
 		let chunk_k = narrow(natural("contraction chunk K", env!("RECIPE_CONTRACTION_CHUNK_K"))?, "contraction chunk K")? as u32;
 		require(chunk_k % fragment_k == 0, "contraction chunk K must be a multiple of the staging fragment")?;
 		let register_m = (narrow(natural("contraction register M", env!("RECIPE_CONTRACTION_REGISTER_M"))?, "contraction register M")? as u32).min(limits.m);
-		let waves = if self.backend == Backend::Amd { waves_per_workgroup } else { 1 };
+		let waves = if self.backend == Backend::Cpu { 1 } else { waves_per_workgroup };
 		let block = wave.checked_mul(waves).ok_or_else(|| RecipeError::new("native contraction workgroup overflows"))?;
 		let register_n = (narrow(natural("contraction register N", env!("RECIPE_CONTRACTION_REGISTER_N"))?, "contraction register N")? as u32).min(limits.n).min((self.shared_limit
 			/ precision.bytes() as u32
@@ -13526,14 +13584,10 @@ impl Gpu {
 			.checked_add(1)
 			.ok_or_else(|| RecipeError::new("native contraction register width overflows"))?)
 		.max(1));
-		// A cooperative grid deadlocks unless every workgroup is resident, so the
-		// tile must leave local memory unclaimed for the waves that share a compute
-		// unit. Local memory is allocated per workgroup rather than per wave, so
-		// this divisor is a margin and not the exact resource equation: it is the
-		// wave count because that is the multiple by which the workgroup was
-		// widened. Claiming the whole local store deadlocks even at one wave,
-		// because the kernel's own fixed allocation shares the same store.
-		let shared_budget = shared_values / waves;
+		// AMD reserves a margin for the waves widened into one workgroup. CUDA
+		// allocates shared memory once per block, and its dispatch path checks the
+		// complete static and dynamic allocation against real block occupancy.
+		let shared_budget = if self.backend == Backend::Amd { shared_values / waves } else { shared_values };
 		// Chunk partials keep the arithmetic width while the tile allocation is
 		// counted in model elements, so a narrow model needs proportionally more
 		// elements per partial value.
@@ -13770,6 +13824,42 @@ impl Gpu {
 				}
 			}
 		}
+	}
+	/// Copy one pitched rectangle directly between peer NVIDIA allocations. The
+	/// destination context owns the copy and already has access to the source
+	/// context, so a transfer failure remains visible instead of staging on the
+	/// host.
+	#[cfg(nvidia)]
+	fn copy_2d_from(&self, dst: u64, dst_pitch: usize, source: &Gpu, src: u64, src_pitch: usize, width: usize, height: usize) -> Result<()> {
+		require(width != 0 && height != 0 && width <= src_pitch && width <= dst_pitch, "pitched peer copy shape is invalid")?;
+		let (Driver::Cuda(destination), Driver::Cuda(_)) = (&self.driver, &source.driver) else {
+			return Err(RecipeError::new("pitched peer copy requires two NVIDIA devices"));
+		};
+		let started = std::time::Instant::now();
+		source.synchronize()?;
+		debug(&format!("pitched peer source={} synchronize_seconds={:.9}", source.name, started.elapsed().as_secs_f64()))?;
+		self.activate()?;
+		let copy = CudaCopy2D {
+			src_x_bytes: 0,
+			src_y: 0,
+			src_memory: 2,
+			src_host: ptr::null(),
+			src_device: src,
+			src_array: ptr::null_mut(),
+			src_pitch,
+			dst_x_bytes: 0,
+			dst_y: 0,
+			dst_memory: 2,
+			dst_host: ptr::null_mut(),
+			dst_device: dst,
+			dst_array: ptr::null_mut(),
+			dst_pitch,
+			width_bytes: width,
+			height,
+		};
+		let started = std::time::Instant::now();
+		self.status(unsafe { (destination.copy_2d)(&copy) }, "pitched peer copy")?;
+		debug(&format!("pitched peer source={} destination={} width={width} height={height} copy_seconds={:.9}", source.name, self.name, started.elapsed().as_secs_f64()))
 	}
 	/// The memory the device has free now. The host is not bounded by device
 	/// memory, so the CPU reports its whole capacity.
@@ -14150,6 +14240,10 @@ impl Cuda {
 			let dynamic = values.checked_mul(u32::from(element)).ok_or_else(|| RecipeError::new("NVIDIA native shared memory overflows"))?;
 			driver_status(Backend::Nvidia, (self.occupancy)(&mut active, object, geometry.block as i32, dynamic as usize), "native occupancy query")?;
 			require(active > 0, "NVIDIA native symbol has no resident workgroup")?;
+			debug(&format!(
+				"NVIDIA native symbol={name:?} registers={used_registers} static_shared={shared} dynamic_shared={dynamic} resident_workgroups={active} groups={} block={}",
+				geometry.groups, geometry.block
+			))?;
 			Ok(Dispatch { kernel: Kernel::cuda(object, resources.shared, element, layout), geometry })
 		}
 	}
@@ -14409,7 +14503,7 @@ impl NativeProgram {
 /// Dispatches one loaded entrypoint on the device that loaded it. The caller
 /// holds the device dispatch lock and has already validated the argument list
 /// and shared-memory budget.
-unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch, entry: NativeEntry, arguments: &mut [Ptr], threads: u32, dynamic: u32, shared: u32) -> Result<()> {
+unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch, entry: NativeEntry, arguments: &mut [Ptr], threads: u32, dynamic: u32, _shared: u32) -> Result<()> {
 	let block = dispatch.geometry.block;
 	unsafe {
 		match (backend, &gpu.driver) {
@@ -14468,7 +14562,7 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 					grid_y: 1,
 					grid_z: 1,
 					private: dispatch.kernel.private,
-					group: shared,
+					group: _shared,
 					object: dispatch.kernel.object,
 					kernarg,
 					reserved1: 0,
@@ -14675,10 +14769,12 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				_runtime: runtime.clone(),
 				context,
 				set: runtime.function(b"cuCtxSetCurrent\0")?,
+				enable_peer: runtime.function(b"cuCtxEnablePeerAccess\0")?,
 				allocate: runtime.function(b"cuMemAlloc_v2\0")?,
 				free: runtime.function(b"cuMemFree_v2\0")?,
 				upload: runtime.function(b"cuMemcpyHtoD_v2\0")?,
 				download: runtime.function(b"cuMemcpyDtoH_v2\0")?,
+				copy_2d: runtime.function(b"cuMemcpy2D_v2\0")?,
 				clear: runtime.function(b"cuMemsetD8_v2\0")?,
 				memory_info: runtime.function(b"cuMemGetInfo_v2\0")?,
 				synchronize: runtime.function(b"cuCtxSynchronize\0")?,
@@ -14716,7 +14812,24 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 			}
 		}
 		require(!discrete.is_empty(), "Nvidia has no discrete GPU")?;
-		discrete.into_iter().enumerate().filter(|(index, _)| _selection.is_none_or(|names| names.contains(&format!("nv{index}")))).map(|(index, device)| load_device(device, index)).collect()
+		let devices = discrete
+			.into_iter()
+			.enumerate()
+			.filter(|(index, _)| _selection.is_none_or(|names| names.contains(&format!("nv{index}"))))
+			.map(|(index, device)| load_device(device, index))
+			.collect::<Result<Vec<_>>>()?;
+		for (index, device) in devices.iter().enumerate() {
+			let Driver::Cuda(cuda) = &device.driver else { unreachable!() };
+			check((cuda.set)(cuda.context), "peer context")?;
+			for peer in devices.iter().skip(index + 1) {
+				let Driver::Cuda(peer) = &peer.driver else { unreachable!() };
+				check((cuda.enable_peer)(peer.context, 0), "peer access")?;
+				check((peer.set)(peer.context), "peer context")?;
+				check((peer.enable_peer)(cuda.context, 0), "peer access")?;
+				check((cuda.set)(cuda.context), "peer context")?;
+			}
+		}
+		Ok(devices)
 	}
 }
 type WorkerWire = Wire<std::io::Stdin, std::io::Stdout>;
