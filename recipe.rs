@@ -12379,7 +12379,13 @@ impl NativeTape {
 	/// recurrent state, and the convolution tail that earlier calls left.
 	fn forward_window(&self, begin: u32, end: u32) -> Result<()> {
 		require(begin <= end && end <= self.positions, format!("forward window {begin}..{end} is outside the {} input positions", self.positions))?;
+		let profile = std::env::var_os("RECIPE_DEBUG").is_some();
+		let started = std::time::Instant::now();
 		self.stage_lookups(begin, end)?;
+		debug(&format!("native lookup device={} window={begin}..{end} seconds={:.9}", self.program.gpu.name, started.elapsed().as_secs_f64()))?;
+		if profile {
+			self.program.gpu.synchronize()?;
+		}
 		let windows = self.node_windows(begin, end)?;
 		let rows = self.rows;
 		// The forward is one entrypoint per run of work between the grid barriers a
@@ -12391,7 +12397,17 @@ impl NativeTape {
 			let (node_begin, node_end) = *windows.get(node).ok_or_else(|| RecipeError::new("native forward segment names an absent node"))?;
 			let threads = dispatch.geometry.threads()?;
 			let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, threads, node_begin, node_end];
+			let started = std::time::Instant::now();
 			self.program.launch_forward(segment, &mut call).map_err(|error| RecipeError::new(format!("forward segment {segment}: {error}")))?;
+			if profile {
+				self.program.gpu.synchronize()?;
+				debug(&format!(
+					"native segment device={} segment={segment} node={node} op={} window={node_begin}..{node_end} seconds={:.9}",
+					self.program.gpu.name,
+					self.nodes[node].op as i32,
+					started.elapsed().as_secs_f64()
+				))?;
+			}
 		}
 		Ok(())
 	}
