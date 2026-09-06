@@ -5360,16 +5360,33 @@ mod gguf {
 	}
 
 	/// `count` elements of a tensor decoded to f64 from `data`, the bytes holding them.
+	fn decode_elements(data: &[u8], count: usize, stride: usize, decode: impl Fn(&[u8]) -> f64 + Copy + Send + Sync) -> Result<Vec<f64>> {
+		require(count.checked_mul(stride) == Some(data.len()), "unblocked GGUF tensor bytes do not match its element count")?;
+		let mut values = vec![0.0; count];
+		let workers = std::thread::available_parallelism().map_or(1, usize::from).min(count.max(1));
+		let chunk = count.div_ceil(workers).max(1);
+		std::thread::scope(|scope| {
+			for (bytes, output) in data.chunks(chunk * stride).zip(values.chunks_mut(chunk)) {
+				scope.spawn(move || {
+					for (encoded, value) in bytes.chunks_exact(stride).zip(output) {
+						*value = decode(encoded);
+					}
+				});
+			}
+		});
+		Ok(values)
+	}
+
 	fn decode(tensor: &GgufTensor, data: &[u8], count: usize) -> Result<Vec<f64>> {
 		match tensor.kind {
-			0 => Ok(data.chunks_exact(4).map(|bytes| f64::from(f32::from_le_bytes(bytes.try_into().unwrap()))).collect()),
-			1 => Ok(data.chunks_exact(2).map(|bytes| f64::from(unfp16(u16::from_le_bytes(bytes.try_into().unwrap())))).collect()),
-			30 => Ok(data.chunks_exact(2).map(|bytes| f64::from(f32::from_bits(u32::from(u16::from_le_bytes(bytes.try_into().unwrap())) << 16))).collect()),
-			28 => Ok(data.chunks_exact(8).map(|bytes| f64::from_le_bytes(bytes.try_into().unwrap())).collect()),
-			24 => Ok(data.iter().map(|byte| f64::from(*byte as i8)).collect()),
-			25 => Ok(data.chunks_exact(2).map(|bytes| f64::from(i16::from_le_bytes(bytes.try_into().unwrap()))).collect()),
-			26 => Ok(data.chunks_exact(4).map(|bytes| f64::from(i32::from_le_bytes(bytes.try_into().unwrap()))).collect()),
-			27 => Ok(data.chunks_exact(8).map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()) as f64).collect()),
+			0 => decode_elements(data, count, 4, |bytes| f64::from(f32::from_le_bytes(bytes.try_into().unwrap()))),
+			1 => decode_elements(data, count, 2, |bytes| f64::from(unfp16(u16::from_le_bytes(bytes.try_into().unwrap())))),
+			30 => decode_elements(data, count, 2, |bytes| f64::from(f32::from_bits(u32::from(u16::from_le_bytes(bytes.try_into().unwrap())) << 16))),
+			28 => decode_elements(data, count, 8, |bytes| f64::from_le_bytes(bytes.try_into().unwrap())),
+			24 => decode_elements(data, count, 1, |bytes| f64::from(bytes[0] as i8)),
+			25 => decode_elements(data, count, 2, |bytes| f64::from(i16::from_le_bytes(bytes.try_into().unwrap()))),
+			26 => decode_elements(data, count, 4, |bytes| f64::from(i32::from_le_bytes(bytes.try_into().unwrap()))),
+			27 => decode_elements(data, count, 8, |bytes| i64::from_le_bytes(bytes.try_into().unwrap()) as f64),
 			_ => block_format(tensor)?.decompress(data, &[], count),
 		}
 	}
