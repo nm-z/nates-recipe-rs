@@ -3876,6 +3876,8 @@ impl NativeModelIr {
 	fn emit_expert_forward(&self, backend: Backend, index: usize, plan: &NodePlan, pointers: &ModelPointers, window: &NodeWindow, outward: bool, ir: &mut String) -> Result<()> {
 		let node = &plan.node;
 		let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native expert contraction schedule is absent"))?.forward;
+		let (experts, top, hidden) =
+			(integer_argument(node.argument[0], "expert count")?, integer_argument(node.argument[1], "experts used")?, integer_argument(node.argument[2], "expert width")?);
 		ir.push_str(&format!(
 			"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, {pointer} {routing}, {pointer} {routing_context}, i32 %rows, i32 {in_channels}, i32 {length}, i32 {out_channels}, i32 {length}, i32 {begin}, i32 {span}, i32 0, i1 false, i1 false, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i32 0, i32 {decode}, i32 {mode}, i32 {experts}, i32 {top}, i32 {hidden} )\n{barrier}\n",
 			pointer = pointer_type(backend),
@@ -3886,7 +3888,7 @@ impl NativeModelIr {
 			routing_context = pointers.second_context,
 			in_channels = node.input.channels,
 			length = node.output.length,
-			out_channels = node.output.channels,
+			out_channels = if outward { node.output.channels } else { hidden as usize },
 			begin = window.begin,
 			span = window.span,
 			tile_m = extent.m,
@@ -3894,9 +3896,9 @@ impl NativeModelIr {
 			tile_k = extent.k,
 			decode = plan.decode(index),
 			mode = if outward { 2 } else { 1 },
-			experts = node.argument[0],
-			top = node.argument[1],
-			hidden = node.argument[2],
+			experts = experts,
+			top = top,
+			hidden = hidden,
 			barrier = barrier(backend),
 		));
 		Ok(())
