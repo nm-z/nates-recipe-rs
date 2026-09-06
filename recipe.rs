@@ -1499,24 +1499,35 @@ fn align(value: usize, boundary: usize) -> Result<usize> {
 	if remainder == 0 { Ok(value) } else { checked_add(value, boundary - remainder, "native arena alignment") }
 }
 
+fn encode_ieee(values: &[f64], bytes: usize, encode: impl Fn(f64) -> u64 + Copy + Send + Sync) -> Vec<u8> {
+	let mut encoded = vec![0_u8; values.len() * bytes];
+	let workers = std::thread::available_parallelism().map_or(1, usize::from).min(values.len().max(1));
+	let chunk = values.len().div_ceil(workers).max(1);
+	std::thread::scope(|scope| {
+		for (input, output) in values.chunks(chunk).zip(encoded.chunks_mut(chunk * bytes)) {
+			scope.spawn(move || {
+				for (index, value) in input.iter().enumerate() {
+					let at = index * bytes;
+					// Each thread owns this byte slice, whose allocation has no word
+					// alignment promise, so native words are written unaligned.
+					match bytes {
+						4 => unsafe { output.as_mut_ptr().add(at).cast::<u32>().write_unaligned((encode(*value) as u32).to_le()) },
+						8 => unsafe { output.as_mut_ptr().add(at).cast::<u64>().write_unaligned(encode(*value).to_le()) },
+						_ => unreachable!(),
+					}
+				}
+			});
+		}
+	});
+	encoded
+}
+
 fn encode_floats(values: &[f64], precision: Compute) -> Vec<u8> {
 	if precision == Compute::FP32 {
-		let mut encoded = vec![0_u8; values.len() * size_of::<f32>()];
-		for (index, value) in values.iter().enumerate() {
-			let bits = if value.is_nan() { ((value.to_bits() >> 63) as u32) << 31 | 0x7fc0_0000 } else { (*value as f32).to_bits() };
-			// The byte arena has no alignment promise, so write each native word
-			// unaligned while keeping the loop free of per-element Vec extension.
-			unsafe { encoded.as_mut_ptr().add(index * size_of::<u32>()).cast::<u32>().write_unaligned(bits.to_le()) }
-		}
-		return encoded;
+		return encode_ieee(values, size_of::<f32>(), |value| if value.is_nan() { u64::from(((value.to_bits() >> 63) as u32) << 31 | 0x7fc0_0000) } else { u64::from((value as f32).to_bits()) });
 	}
 	if precision == Compute::FP64 {
-		let mut encoded = vec![0_u8; std::mem::size_of_val(values)];
-		for (index, value) in values.iter().enumerate() {
-			let bits = if value.is_nan() { value.to_bits() >> 63 << 63 | 0x7ff8_0000_0000_0000 } else { value.to_bits() };
-			unsafe { encoded.as_mut_ptr().add(index * size_of::<u64>()).cast::<u64>().write_unaligned(bits.to_le()) }
-		}
-		return encoded;
+		return encode_ieee(values, size_of::<f64>(), |value| if value.is_nan() { value.to_bits() >> 63 << 63 | 0x7ff8_0000_0000_0000 } else { value.to_bits() });
 	}
 	let bytes = precision.bytes();
 	values.iter().flat_map(|value| precision.pack(*value).to_le_bytes().into_iter().take(bytes)).collect()
