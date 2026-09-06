@@ -1533,11 +1533,15 @@ fn native_weight_bytes(graph: &Graph, precision: Compute, inference: bool) -> Re
 	let (offsets, bytes) = native_weight_arena(graph, precision, inference)?;
 	let mut arena = vec![0_u8; bytes.max(1)];
 	for (index, node) in graph.nodes.iter().enumerate() {
-		let encoded = match packed_weight(graph, index, inference) {
-			Some(weight) => weight.bytes.to_vec(),
-			None => encode_floats(&graph.parameters[node.offset..node.offset + node.parameters], precision),
-		};
-		arena[offsets[index]..offsets[index] + encoded.len()].copy_from_slice(&encoded);
+		// A packed weight's runs land in the arena straight from where they are
+		// mapped or held, so the copy into the arena is the only one made.
+		match packed_weight(graph, index, inference) {
+			Some(weight) => weight.bytes.copy_into(&mut arena[offsets[index]..offsets[index] + weight.bytes.len()]),
+			None => {
+				let encoded = encode_floats(&graph.parameters[node.offset..node.offset + node.parameters], precision);
+				arena[offsets[index]..offsets[index] + encoded.len()].copy_from_slice(&encoded);
+			}
+		}
 	}
 	Ok(arena)
 }
@@ -1619,7 +1623,14 @@ impl NativeModelIr {
 			let id = || node.identity(index);
 			require(node.source >= -1 && node.source < index as i32, format!("{} has invalid source node {}", id(), node.source))?;
 			require(node.second >= -2 && node.second < index as i32, format!("{} has invalid second source node {}", id(), node.second))?;
-			require(node.offset.checked_add(node.parameters).is_some_and(|end| end <= graph.parameters.len()), format!("{} parameter range exceeds {} values", id(), graph.parameters.len()))?;
+			// A packed node reads its stored bytes, and one bound to a mapped
+			// weight owns no arithmetic span at all, so only a dense node's
+			// parameter range is checked against the graph's parameters.
+			let packed = packed_weight(graph, index, inference).is_some();
+			require(
+				packed || node.offset.checked_add(node.parameters).is_some_and(|end| end <= graph.parameters.len()),
+				format!("{} parameter range exceeds {} values", id(), graph.parameters.len()),
+			)?;
 			let width = if node.op == Primitive::Predictor { 2 } else { 3 };
 			let program_width = node.program_count.checked_mul(width).ok_or_else(|| RecipeError::new(format!("{} program length overflows", id())))?;
 			require(node.program_offset.checked_add(program_width).is_some_and(|end| end <= graph.programs.len()), format!("{} program range exceeds {} values", id(), graph.programs.len()))?;
@@ -1627,7 +1638,6 @@ impl NativeModelIr {
 			if let Some(weight) = &stored {
 				require(weight.count == node.weights(), format!("{} stored weight count {} does not match tensor count {}", id(), weight.count, node.weights()))?;
 			}
-			let packed = packed_weight(graph, index, inference).is_some();
 			let storage_offset = align(storage_bytes, alignment("float"))?;
 			if let Some(weight) = arena_weight(&node, &stored).filter(|_| !packed) {
 				storage_bytes = checked_add(storage_offset, weight.bytes.len(), "native storage arena")?;
@@ -4676,7 +4686,7 @@ impl IntFormat {
 /// key-value metadata and tensor descriptors, then an aligned data section
 /// whose tensors use the same GGML block layouts as Recipe's storage formats.
 mod gguf {
-	use super::{Integer, RecipeError, Result, StorageFormat, StoredBytes, StoredWeight, require, unfp16};
+	use super::{Binding, BoundNode, BoundWeight, Integer, RecipeError, Result, StorageFormat, StoredBytes, StoredWeight, checked_add, require, unfp16};
 	use std::{
 		path::{Path, PathBuf},
 		sync::Arc,
@@ -5169,6 +5179,48 @@ mod gguf {
 			let shard = &self.shards[tensor.shard];
 			let bytes = StoredBytes::mapped(&shard.mapping, shard.data + tensor.offset, tensor.bytes);
 			Ok(StoredWeight { format: block_format(tensor)?, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new() })
+		}
+		/// Resolves a plan against this file, one bound weight per entry. The views
+		/// of one entry must share a layout: block-quantized views join as runs of
+		/// their own mappings, so nothing is decoded or copied here, and views in
+		/// an unblocked layout decode into values. A view whose layout differs
+		/// from the entry's first is rejected by name before anything compiles.
+		pub(super) fn bound(&self, plan: &Binding) -> Result<Vec<BoundNode>> {
+			plan.nodes
+				.iter()
+				.enumerate()
+				.map(|(entry, planes)| {
+					let first = planes.first().ok_or_else(|| RecipeError::new(format!("plan entry {entry} names no tensor")))?;
+					if let Some(other) = planes.iter().find(|plane| plane.kind != first.kind) {
+						let name = |kind| layout(kind).map_or("an unsupported type", |(name, _, _, _)| name);
+						return Err(RecipeError::new(format!("tensor {} is {} but tensor {} of the same node is {}", other.name, name(other.kind), first.name, name(first.kind))));
+					}
+					let elements = planes.iter().try_fold(0, |total, plane| checked_add(total, plane.elements(), "plan tensor elements"))?;
+					let mut names = Vec::new();
+					for plane in planes {
+						if !names.contains(&plane.name.as_str()) {
+							names.push(&plane.name);
+						}
+					}
+					let names = match planes.len() {
+						1 => format!("tensor {} {:?}", first.name, first.shape),
+						count => format!("{count} views of {}", names.join(", ")),
+					};
+					let weight = if first.blocked() {
+						let parts = planes.iter().map(|plane| self.stored(plane)).collect::<Result<Vec<_>>>()?;
+						let format = parts[0].format;
+						let bytes = StoredBytes::joined(parts.into_iter().map(|part| part.bytes).collect());
+						BoundWeight::Stored(StoredWeight { format, count: elements, bytes, codebook: Vec::new(), arithmetic: Vec::new() })
+					} else {
+						let mut values = Vec::with_capacity(elements);
+						for plane in planes {
+							values.extend(self.values(plane)?);
+						}
+						BoundWeight::Values(values)
+					};
+					Ok(BoundNode { names, elements, weight })
+				})
+				.collect()
 		}
 	}
 
@@ -7916,9 +7968,10 @@ impl StoredBytes {
 	fn mapped(mapping: &Arc<gguf::Mapping>, at: usize, length: usize) -> Self {
 		Self(Arc::new(vec![StoredSegment::Mapped(mapping.clone(), at, length)]))
 	}
-	/// The runs of several weights, end to end, as one weight.
+	/// The runs of several weights, end to end, as one weight. A mapped run is
+	/// shared with the weight it came from, so joining copies no bytes.
 	fn joined(parts: Vec<Self>) -> Self {
-		Self(Arc::new(parts.into_iter().flat_map(|part| Arc::try_unwrap(part.0).unwrap_or_else(|shared| shared.iter().map(|run| StoredSegment::Owned(run.to_vec())).collect())).collect()))
+		Self(Arc::new(parts.iter().flat_map(|part| part.0.iter().cloned()).collect()))
 	}
 	fn len(&self) -> usize {
 		self.0.iter().map(|run| run.len()).sum()
@@ -7930,6 +7983,14 @@ impl StoredBytes {
 	fn extend_into(&self, out: &mut Vec<u8>) {
 		for run in self.runs() {
 			out.extend_from_slice(run);
+		}
+	}
+	/// Writes every run end to end over `out`, which spans exactly `len` bytes.
+	fn copy_into(&self, out: &mut [u8]) {
+		let mut at = 0;
+		for run in self.runs() {
+			out[at..at + run.len()].copy_from_slice(run);
+			at += run.len();
 		}
 	}
 	fn to_vec(&self) -> Vec<u8> {
@@ -7953,6 +8014,25 @@ pub(crate) struct StoredWeight {
 	pub(crate) bytes: StoredBytes,
 	pub(crate) codebook: Vec<f64>,
 	pub(crate) arithmetic: Vec<f64>,
+}
+
+/// What one parameterized node of a graph compiled over mapped tensors is
+/// filled with: the names of its planes for messages, their element sum, and
+/// the bytes or values they resolve to.
+#[derive(Clone)]
+struct BoundNode {
+	names: String,
+	elements: usize,
+	weight: BoundWeight,
+}
+/// Block-quantized planes stay packed as runs of their own mappings, so the
+/// node owns no arithmetic span and the tape decodes the file's blocks. Planes
+/// in an unblocked layout, such as F32 or F16, decode once into the node's
+/// span, which is the only representation those layouts have.
+#[derive(Clone)]
+enum BoundWeight {
+	Stored(StoredWeight),
+	Values(Vec<f64>),
 }
 
 impl StorageFormat {
@@ -8664,26 +8744,28 @@ impl Recipe {
 	}
 }
 impl Gguf {
-	/// Contracts `input` through the named tensor into `width` outputs. The tensor's
-	/// mapped bytes are the contraction's parameters, so the tape decodes the file's
-	/// own blocks and never holds a second copy of the weight.
+	/// Contracts `input` through the named tensor into `width` outputs: the
+	/// one-node plan of `infer`, so the tensor's mapped bytes are the
+	/// contraction's weight and the tape decodes the file's own blocks.
 	pub fn contract(&self, name: &str, input: &[f64], width: usize) -> Vec<f64> {
-		self.infer(&recipe.model().layer(width), &Binding::default().named(self, name), input, input.len())
+		self.infer(&recipe.model().layer(width), &self.plan().named(self, name), input, input.len())
 	}
 	/// Contracts `input` through expert `index` of a `[k, n, experts]` tensor, over that
 	/// expert's mapped blocks alone.
 	pub fn expert(&self, name: &str, index: usize, input: &[f64], width: usize) -> Vec<f64> {
 		let expert = self.named(name).expert(index).unwrap_or_else(|error| panic!("{error}"));
-		self.infer(&recipe.model().layer(width), &Binding::default().node(&[expert]), input, input.len())
+		self.infer(&recipe.model().layer(width), &self.plan().node(&[expert]), input, input.len())
 	}
-	/// Runs `blocks` over `input` with every weighted node filled from `plan`.
-	/// `channels` names the input's channel axis. The model is compiled through
-	/// the same path a trained model takes, so a bound block is an ordinary graph
-	/// whose weights happen to be views of the file.
+	/// Runs `blocks` over `input` with every parameterized node filled from
+	/// `plan`, and returns the model's own output. `channels` names the input's
+	/// channel axis, so the rest of its length is the sequence the blocks walk.
+	/// The model compiles through the path a trained model takes; a bound node
+	/// is an ordinary node whose weight is a view of the file, and a contraction
+	/// bound to a weight without a bias row lowers and runs without one.
 	pub fn infer(&self, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Vec<f64> {
 		infer_gguf(self, blocks, plan, input, channels).unwrap_or_else(|error| panic!("{error}"))
 	}
-	/// A weight plan for this model's tensors.
+	/// An empty weight plan to fill from this model's tensors.
 	pub fn plan(&self) -> Binding {
 		Binding::default()
 	}
@@ -8691,66 +8773,35 @@ impl Gguf {
 		self.tensor(name).unwrap_or_else(|| panic!("tensor {name} is absent")).clone()
 	}
 }
-/// Contracts `input` through the mapped tensors `planes` names, in order, as one
-/// `width`-wide projection. The planes concatenate into the node's weight as
-/// runs of their own mappings, so nothing is decoded or copied on the host. A
-/// weight that holds the matrix alone lowers without a bias; one that holds the
-/// trailing bias row too lowers with it.
-/// An ordered weight plan: the tensors that fill each weighted node of a
-/// compiled model, in the order the lowering pushes those nodes. One entry names
-/// as many tensors or row views as the node's planes take, in the order the
-/// lowering lays them out.
+/// An ordered weight plan: the tensor views that fill each parameterized node
+/// of a compiled model, one entry per node in the order the lowering pushes
+/// them. An entry names as many views as the node's planes take, in the order
+/// the lowering lays those planes out; a view is a whole tensor, one expert of a
+/// `[k, n, experts]` tensor, or a run of output rows, and the views of one node
+/// share a layout. A contraction whose views sum to its matrix binds no bias
+/// row; one whose views sum to the matrix plus one output row binds the trailing
+/// row as its bias.
 #[derive(Clone, Default)]
 pub struct Binding {
-	nodes: Vec<Vec<GgufTensor>>,
+	pub(crate) nodes: Vec<Vec<GgufTensor>>,
 }
 impl Binding {
-	/// The next weighted node, filled from `planes` end to end.
+	/// The next parameterized node, filled from `planes` end to end.
 	#[must_use]
 	pub fn node(mut self, planes: &[GgufTensor]) -> Self {
 		self.nodes.push(planes.to_vec());
 		self
 	}
-	/// The next weighted node, filled from one whole named tensor.
+	/// The next parameterized node, filled from one whole named tensor.
 	#[must_use]
 	pub fn named(self, model: &Gguf, name: &str) -> Self {
 		let tensor = model.named(name);
 		self.node(&[tensor])
 	}
 }
-/// Fills every weighted node of `graph`, in graph order, from the plan. A
-/// block-quantized plane binds as a view of its own mapping, so the tape decodes
-/// the file's blocks and the host holds no second copy. A plane in a layout the
-/// block decoders do not cover, such as F32 or F16, binds as the node's
-/// arithmetic parameters, which is the only representation those types have.
-fn bind_graph(model: &Gguf, graph: &mut Graph, plan: &Binding) -> Result<()> {
-	let weighted = graph.nodes.iter().enumerate().filter(|(_, node)| node.weights() != 0).map(|(index, _)| index).collect::<Vec<_>>();
-	require(weighted.len() == plan.nodes.len(), format!("the model has {} weighted nodes, the plan names {}", weighted.len(), plan.nodes.len()))?;
-	for (index, planes) in weighted.into_iter().zip(&plan.nodes) {
-		let (kind, offset, weights) = (graph.nodes[index].block_kind, graph.nodes[index].offset, graph.nodes[index].weights());
-		require(!planes.is_empty(), format!("the {kind} node at {index} names no tensor"))?;
-		let count = planes.iter().try_fold(0, |total, plane| checked_add(total, plane.elements(), "plan tensor elements"))?;
-		require(count == weights, format!("the {kind} node at {index} takes {weights} values; its tensors hold {count}"))?;
-		if planes.iter().all(GgufTensor::blocked) {
-			let parts = planes.iter().map(|plane| model.stored(plane)).collect::<Result<Vec<_>>>()?;
-			let format = parts[0].format;
-			require(parts.iter().all(|part| part.format == format), format!("the tensors of the {kind} node at {index} hold different block formats"))?;
-			let bytes = StoredBytes::joined(parts.into_iter().map(|part| part.bytes).collect());
-			graph.stored[index] = Some(StoredWeight { format, count, bytes, codebook: Vec::new(), arithmetic: Vec::new() });
-			continue;
-		}
-		require(count == graph.nodes[index].parameters, format!("the {kind} node at {index} holds no parameter span for an unblocked tensor"))?;
-		let mut values = Vec::with_capacity(count);
-		for plane in planes {
-			values.extend(model.values(plane)?);
-		}
-		graph.parameters[offset..offset + count].copy_from_slice(&values);
-	}
-	Ok(())
-}
-/// Compiles `model` over `input`, fills every weighted node from `plan`, and runs
-/// one forward. `channels` names the input's channel axis, so the rest of its
-/// length is the sequence the blocks walk.
+/// Compiles `blocks` over `input` with every parameterized node bound from
+/// `plan`, and runs one forward. `channels` names the input's channel axis, so
+/// the rest of its length is the sequence the blocks walk.
 fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Result<Vec<f64>> {
 	require(channels != 0 && !input.is_empty() && input.len() % channels == 0, "the input is not a whole number of channel rows")?;
 	let shape = Shape { channels, length: input.len() / channels };
@@ -8771,10 +8822,9 @@ fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], chann
 		norm_scale: Vec::new(),
 		identities: Vec::new(),
 		fitted: Vec::new(),
-		unbiased: true,
+		bound: Some(model.bound(plan)?),
 	};
-	let mut graph = compile(blocks, &data, &data.targets, 1, device, config, false)?;
-	bind_graph(model, &mut graph, plan)?;
+	let graph = compile(blocks, &data, &data.targets, 1, device, config, false)?;
 	let mut tape = NativeTape::new(&graph, input, &[], device, Compute::FP64, None)?;
 	tape.forward()?;
 	tape.predictions()
@@ -9106,7 +9156,8 @@ fn split_graph(graph: &Graph, split: &[usize]) -> Result<Vec<Graph>> {
 			block_kind: last.block_kind,
 			block_frozen: false,
 			block_packed: false,
-			unbiased: graph.unbiased,
+			bound: None,
+			bound_values: Vec::new(),
 		});
 		start = end;
 	}
@@ -9300,7 +9351,12 @@ struct Graph {
 	rank: usize,
 	block_frozen: bool,
 	block_packed: bool,
-	unbiased: bool,
+	/// The weights still to bind while a graph compiles over mapped tensors:
+	/// each parameterized node takes the front entry as it is pushed.
+	bound: Option<std::collections::VecDeque<BoundNode>>,
+	/// Bound values by node, written into their spans once every lowering has
+	/// set its own initial parameters.
+	bound_values: Vec<(usize, Vec<f64>)>,
 }
 impl Graph {
 	fn new(shape: Shape) -> Self {
@@ -9320,7 +9376,8 @@ impl Graph {
 			block_kind: "",
 			block_frozen: false,
 			block_packed: false,
-			unbiased: false,
+			bound: None,
+			bound_values: Vec::new(),
 		}
 	}
 	fn refresh_storage(&mut self, config: Config) -> Result<()> {
@@ -9330,6 +9387,11 @@ impl Graph {
 fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 	require(graph.stored.len() == graph.nodes.len(), "model graph storage spans are incomplete")?;
 	for (index, node) in graph.nodes.iter().enumerate() {
+		// A weight bound from a mapped file has no arithmetic to encode from and
+		// stays the bytes it was bound to.
+		if graph.stored[index].as_ref().is_some_and(|stored| stored.arithmetic.is_empty()) {
+			continue;
+		}
 		// A gather owns no parameter span, so its table is the tensor it was drawn into.
 		let drawn = graph.stored[index].take().filter(|_| node.op == Primitive::Gather).map(|stored| stored.arithmetic);
 		let weights = drawn.as_deref().unwrap_or(&graph.parameters[node.offset..node.offset + node.parameters]);
@@ -9368,7 +9430,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	let sequential = model.blocks.iter().any(|block| sequential_operation(&block.operation));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
-	graph.unbiased = data.unbiased;
+	graph.bound = data.bound.clone().map(std::collections::VecDeque::from);
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
 		graph.block_kind = block.operation.name();
@@ -9392,6 +9454,13 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 			graph.nodes.last_mut().unwrap().argument[8] = f64::from(model.quantization)
 		}
 		output_profile = StorageFormat(model.quantization).selection().map(|_| StorageFormat(model.quantization));
+	}
+	if let Some(left) = graph.bound.take().filter(|plan| !plan.is_empty()) {
+		return Err(RecipeError::new(format!("the plan names {} more weights than the model has parameterized nodes, starting with {}", left.len(), left[0].names)));
+	}
+	for (index, values) in std::mem::take(&mut graph.bound_values) {
+		let (offset, parameters) = (graph.nodes[index].offset, graph.nodes[index].parameters);
+		graph.parameters[offset..offset + parameters].copy_from_slice(&values);
 	}
 	if let Some(format) = output_profile
 		&& let Some(node) = graph.nodes.iter_mut().rev().find(|node| node.op != Primitive::Predictor && node.weights() != 0 && node.block_index + 1 == model.blocks.len())
@@ -9427,7 +9496,7 @@ fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: 
 		norm_scale: saved.norm_scale.clone(),
 		identities: Vec::new(),
 		fitted: saved.predictors.clone(),
-		unbiased: false,
+		bound: None,
 	};
 	let mut graph = compile(&saved.model, &prepared, &prepared.targets, 1, gpu, config, false)?;
 	require(graph.input == saved.input, "saved semantic input shape does not match the compiled model")?;
@@ -9523,7 +9592,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	let skip = graph.source;
 	let first = graph.nodes.len();
 	match &block.operation {
-		Operation::Layer(width) | Operation::Perceptron(width) => lower_project(graph, true, *width)?,
+		Operation::Layer(width) | Operation::Perceptron(width) => lower_project(graph, *width)?,
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
 		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
@@ -9564,10 +9633,8 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	Ok(())
 }
 fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize, argument: [f64; 9], second: i32) -> Result<()> {
-	let (source, offset) = (graph.source, graph.parameters.len());
-	graph.parameters.resize(checked_add(offset, parameters, "model parameters")?, 0.0);
-	graph.frozen.resize(graph.parameters.len(), 0);
-	graph.nodes.push(Node {
+	let (source, offset, index) = (graph.source, graph.parameters.len(), graph.nodes.len());
+	let mut node = Node {
 		op,
 		source,
 		second,
@@ -9582,8 +9649,35 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 		block_kind: graph.block_kind,
 		frozen: graph.block_frozen,
 		packed: graph.block_packed,
-	});
-	graph.stored.push(None);
+	};
+	// A graph compiled over mapped tensors fills each parameterized node from
+	// the next plan entry. Block bytes stay packed and the node reserves no
+	// arithmetic span; unblocked values wait until every lowering has written
+	// its own initial parameters, then land in the span.
+	let weights = node.weights();
+	let stored = match graph.bound.as_mut().filter(|_| weights != 0).map(std::collections::VecDeque::pop_front) {
+		None => None,
+		Some(None) => return Err(RecipeError::new(format!("{} takes {weights} values but the plan names no tensor for it", node.identity(index)))),
+		Some(Some(bound)) => {
+			require(bound.elements == weights, format!("{} hold {} values; {} takes {weights}", bound.names, bound.elements, node.identity(index)))?;
+			match bound.weight {
+				BoundWeight::Stored(weight) => {
+					node.packed = true;
+					Some(weight)
+				}
+				BoundWeight::Values(values) => {
+					graph.bound_values.push((index, values));
+					None
+				}
+			}
+		}
+	};
+	if stored.is_none() {
+		graph.parameters.resize(checked_add(offset, parameters, "model parameters")?, 0.0);
+		graph.frozen.resize(graph.parameters.len(), 0);
+	}
+	graph.nodes.push(node);
+	graph.stored.push(stored);
 	graph.output = output;
 	graph.source = graph.nodes.len() as i32 - 1;
 	Ok(())
@@ -9721,24 +9815,56 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 	debug_assert_eq!(result as usize + 1, program.0.len() / 3);
 	push_program(graph, -2, initial, program)
 }
-/// A projection of the graph output onto `channels`. `bias` adds the trailing
-/// bias row; a projection bound to a weight that carries none is lowered without
-/// it, so the parameter span is exactly the matrix.
-fn lower_project(graph: &mut Graph, bias: bool, channels: usize) -> Result<()> {
+/// Whether the contraction the graph is about to push carries a bias row. A
+/// trained contraction always does. A graph compiled over mapped tensors reads
+/// the answer off the views bound to the node: a sum equal to the matrix binds
+/// no bias row, a sum one output row larger binds the trailing row as the bias,
+/// and any other sum is rejected here, before anything runs, naming the views,
+/// the node and both spans.
+fn contraction_bias(graph: &Graph, matrix: usize, width: usize) -> Result<bool> {
+	let biased = checked_add(matrix, width, "contraction bias")?;
+	match graph.bound.as_ref().and_then(std::collections::VecDeque::front) {
+		None => Ok(true),
+		Some(bound) if bound.elements == matrix => Ok(false),
+		Some(bound) if bound.elements == biased => Ok(true),
+		Some(bound) => Err(RecipeError::new(format!(
+			"{} hold {} values; block {} {} node {} contracts {} inputs onto {width} outputs and takes {matrix} values without a bias row or {biased} with one",
+			bound.names,
+			bound.elements,
+			graph.block_index,
+			graph.block_kind,
+			graph.nodes.len(),
+			matrix / width
+		))),
+	}
+}
+/// A contraction's arguments: the convolution kernel, or zero for a projection;
+/// the fused ReLU flag, which activation lowering sets; and whether the node
+/// carries no bias row, which the kernels read to skip the bias term and which
+/// `output_bias_offset` follows.
+fn contraction_arguments(kernel: usize, bias: bool) -> [f64; 9] {
+	[kernel as f64, 0.0, f64::from(u8::from(!bias)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+/// A projection of the graph output onto `channels`, with a bias row unless the
+/// weight it binds to carries none, so its parameter span is then the matrix.
+fn lower_project(graph: &mut Graph, channels: usize) -> Result<()> {
 	require(channels != 0, "layer width must be positive")?;
-	let bias = bias && !graph.unbiased;
 	let matrix = checked_mul(graph.output.channels, channels, "projection matrix")?;
+	let bias = contraction_bias(graph, matrix, channels)?;
 	let parameters = if bias { checked_add(matrix, channels, "projection bias")? } else { matrix };
 	let output = Shape { channels, length: graph.output.length };
-	push_node(graph, Primitive::Contraction, output, parameters, [0.0, 0.0, f64::from(u8::from(!bias)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)
+	push_node(graph, Primitive::Contraction, output, parameters, contraction_arguments(0, bias), -2)
 }
 fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	require(filters != 0 && kernel != 0, "convolution dimensions must be positive")?;
 	require(kernel <= graph.output.length, "convolution kernel exceeds sequence length")?;
-	let parameters = checked_add(checked_mul(filters, checked_mul(graph.output.channels, kernel, "convolution window")?, "conv matrix")?, filters, "conv bias")?;
+	let matrix = checked_mul(filters, checked_mul(graph.output.channels, kernel, "convolution window")?, "conv matrix")?;
+	let bias = contraction_bias(graph, matrix, filters)?;
+	let parameters = if bias { checked_add(matrix, filters, "conv bias")? } else { matrix };
 	let output = Shape { channels: filters, length: graph.output.length - kernel + 1 };
-	push_node(graph, Primitive::Contraction, output, parameters, arguments(kernel as f64, 0.0), -2)
+	push_node(graph, Primitive::Contraction, output, parameters, contraction_arguments(kernel, bias), -2)
 }
+/// The bias row of the last contraction that carries one.
 fn output_bias_offset(graph: &Graph) -> Option<usize> {
 	graph.nodes.iter().rev().find(|node| node.op == Primitive::Contraction && node.argument[2] == 0.0).map(|node| node.offset + node.parameters - node.output.channels)
 }
@@ -9778,10 +9904,10 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	let inner = checked_mul(heads, value_width, "delta value width")?;
 	let recurrent = Shape { channels: inner, length: input.length };
 	let chunk = natural("delta chunk", env!("RECIPE_DELTA_CHUNK"))?;
-	lower_project(graph, true, checked_mul(2, heads, "delta gate width")?)?;
+	lower_project(graph, checked_mul(2, heads, "delta gate width")?)?;
 	let gates = graph.source;
 	reset(graph, source, input);
-	lower_project(graph, true, checked_add(checked_mul(2, keys, "delta query and key width")?, inner, "delta projection width")?)?;
+	lower_project(graph, checked_add(checked_mul(2, keys, "delta query and key width")?, inner, "delta projection width")?)?;
 	lower_dconv(graph, kernel)?;
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
@@ -9791,10 +9917,10 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	lower_normalize(graph, BlockNormalization::Rms, value_width, inner)?;
 	let normalized = graph.source;
 	reset(graph, source, input);
-	lower_project(graph, true, inner)?;
+	lower_project(graph, inner)?;
 	let (gate, shape) = activation(graph, graph.source, graph.output, Activation::Sigmoid, config)?;
 	binary(graph, normalized, gate, shape, ScalarOpcode::Multiply)?;
-	lower_project(graph, true, output)
+	lower_project(graph, output)
 }
 /// Lowers one attention block into its projection, the optional query and key
 /// normalization and rotary nodes, the attention node and the output
@@ -9817,7 +9943,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		None => 0,
 	};
 	let gated = if gate { inner } else { 0 };
-	lower_project(graph, true, checked_add(pairs, checked_add(side, gated, "attention gate width")?, "attention projection width")?)?;
+	lower_project(graph, checked_add(pairs, checked_add(side, gated, "attention gate width")?, "attention projection width")?)?;
 	if let Some(normalization) = qk {
 		// The projection lays the queries and keys out ahead of the values, so the
 		// normalized span stops at the value plane and each head owns one group.
@@ -9833,7 +9959,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
 	let argument = [heads as f64, kv as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, 0.0];
 	push_node(graph, Primitive::Attention, Shape { channels: inner, length: input.length }, 0, argument, -2)?;
-	lower_project(graph, true, input.channels)
+	lower_project(graph, input.channels)
 }
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
 /// `span` channels into groups of `width`; the rest pass through untouched.
@@ -9890,7 +10016,7 @@ fn lower_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, act
 	let (source, input) = (graph.source, graph.output);
 	// One router scores every expert per position. The top-k weights name the
 	// experts whose gated feed-forward runs, so a position costs top-k of them.
-	lower_project(graph, true, experts)?;
+	lower_project(graph, experts)?;
 	push_node(graph, Primitive::TopK, graph.output, 0, [top_k as f64, f64::from(scoring as u8), f64::from(u8::from(renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
 	let routing = graph.source;
 	let routed = Shape { channels: checked_mul(top_k, hidden, "moe routed width")?, length: input.length };
@@ -9913,14 +10039,14 @@ fn lower_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, act
 	let dispatched = graph.source;
 	let wide = Shape { channels: hidden, length: input.length };
 	reset(graph, source, input);
-	lower_project(graph, true, hidden)?;
+	lower_project(graph, hidden)?;
 	let shared_gate = graph.source;
 	reset(graph, source, input);
-	lower_project(graph, true, hidden)?;
+	lower_project(graph, hidden)?;
 	let shared_up = graph.source;
 	let shared_product = lower_gated(graph, shared_gate, shared_up, wide, activation, config)?;
 	reset(graph, shared_product, wide);
-	lower_project(graph, true, input.channels)?;
+	lower_project(graph, input.channels)?;
 	let mut gain = ScalarProgram(Vec::new());
 	let scale = gain.op(ScalarOpcode::Parameter, 0.0, 0.0);
 	gain.op(ScalarOpcode::Multiply, scale, -1.0);
@@ -9941,7 +10067,7 @@ fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Conf
 	require(!parts.is_empty(), "residual branch must contain an operation")?;
 	for part in parts {
 		match part {
-			Residual::Layer(width) => lower_project(graph, true, *width)?,
+			Residual::Layer(width) => lower_project(graph, *width)?,
 			Residual::Conv(filters, kernel) => lower_conv(graph, *filters, *kernel)?,
 			Residual::Activation(activation) => lower_activation(graph, *activation, config)?,
 		}
@@ -9995,8 +10121,8 @@ fn lower_gates(graph: &mut Graph, lanes: usize, rank: usize, write: bool) -> Res
 	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
 	push_node(graph, Primitive::Normalize, shape, 0, arguments(1.0, epsilon), -2)?;
 	let normalized = graph.source;
-	lower_project(graph, true, rank)?;
-	lower_project(graph, true, shape.channels)?;
+	lower_project(graph, rank)?;
+	lower_project(graph, shape.channels)?;
 	lower_offset_one(graph)?;
 	let read = graph.source;
 	if !write {
@@ -10004,7 +10130,7 @@ fn lower_gates(graph: &mut Graph, lanes: usize, rank: usize, write: bool) -> Res
 		return Ok((read, -2));
 	}
 	reset(graph, normalized, shape);
-	lower_project(graph, true, lanes)?;
+	lower_project(graph, lanes)?;
 	lower_offset_one(graph)?;
 	let write = graph.source;
 	reset(graph, stream, shape);
@@ -10043,7 +10169,7 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 			norm_scale: Vec::new(),
 			identities: Vec::new(),
 			fitted: Vec::new(),
-			unbiased: false,
+			bound: None,
 		};
 		let mut surrogate = compile(&surrogate_model(config.surrogate_width), &blank, &blank.targets, 1, gpu, config, false)?;
 		surrogate.frozen.fill(1);
@@ -10065,7 +10191,7 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 			norm_scale: Vec::new(),
 			identities: Vec::new(),
 			fitted: Vec::new(),
-			unbiased: false,
+			bound: None,
 		};
 		let fitted = estimator.fit(&prepared, rows, config)?;
 		let targets = predict_rows(&fitted, &inputs, input.elements())?;
@@ -10116,7 +10242,7 @@ fn initialize_graph(graph: &mut Graph, config: Config) {
 				graph.parameters[index] = next_weight(&mut state, scale);
 			}
 		}
-		if node.op == Primitive::Contraction {
+		if node.op == Primitive::Contraction && node.argument[2] == 0.0 {
 			graph.parameters[node.offset + node.parameters - node.output.channels..node.offset + node.parameters].fill(0.0);
 		}
 		// Depthwise taps open at the identity: the current position keeps its value
@@ -10430,11 +10556,7 @@ impl NativeTape {
 				let offset = layout.contexts[index];
 				let end = checked_add(offset, table.bytes.len(), "embedding table context")?;
 				require(end <= contexts.len(), "embedding table exceeds its context arena")?;
-				let mut at = offset;
-				for run in table.bytes.runs() {
-					contexts[at..at + run.len()].copy_from_slice(run);
-					at += run.len();
-				}
+				table.bytes.copy_into(&mut contexts[offset..end]);
 			}
 		}
 		Ok(Self {
@@ -10784,7 +10906,7 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 		norm_scale: Vec::new(),
 		identities: Vec::new(),
 		fitted: Vec::new(),
-		unbiased: false,
+		bound: None,
 	};
 	let graph = compile(&surrogate_model(config.surrogate_width), &prepared, &targets, rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, &samples, &targets, gpu, config.precision, Some(mse))?;
@@ -13068,7 +13190,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 		norm_scale: Vec::new(),
 		identities: Vec::new(),
 		fitted: Vec::new(),
-		unbiased: false,
+		bound: None,
 	};
 	let mut graph = compile(&model, &prepared, targets, prepared.rows, gpu, config, true)?;
 	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, Some(mse))?;
@@ -14317,9 +14439,9 @@ struct Prepared {
 	norm_scale: Vec<f64>,
 	identities: Vec<u64>,
 	fitted: Vec<PredictorProgram>,
-	/// Every projection of this graph lowers without its bias row, because the
-	/// weights it is bound to carry none.
-	unbiased: bool,
+	/// The weights each parameterized node binds to, in lowering order, when the
+	/// graph compiles over mapped tensors instead of training.
+	bound: Option<Vec<BoundNode>>,
 }
 struct Table {
 	name: String,
@@ -15103,7 +15225,7 @@ fn finish_prepared(
 		impute_missing(&mut samples);
 		(Vec::new(), Vec::new())
 	};
-	Ok(Prepared { samples, targets, target_width, rows, source_rows, features, schema, sequence, target_categorical, norm_mean, norm_scale, identities, fitted: Vec::new(), unbiased: false })
+	Ok(Prepared { samples, targets, target_width, rows, source_rows, features, schema, sequence, target_categorical, norm_mean, norm_scale, identities, fitted: Vec::new(), bound: None })
 }
 fn normalize_samples(samples: &mut [f64], features: usize, fit: usize) -> Result<(Vec<f64>, Vec<f64>)> {
 	require(fit != 0, "split must retain normalization rows")?;
