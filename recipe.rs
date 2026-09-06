@@ -12274,7 +12274,7 @@ impl NativeTape {
 			let storage = Buffer::upload(gpu, &program.artifact.storage)?;
 			let threads = program.dispatch(NativeEntry::ModelLoad)?.geometry.threads()?;
 			let mut call = ptrs![weights.pointer, storage.pointer, threads];
-			program.launch_model_load(&mut call)?;
+			program.launch(NativeEntry::ModelLoad, &mut call, threads)?;
 			gpu.synchronize()?;
 		} else {
 			require(program.artifact.storage.is_empty(), "native artifact storage has no model-load entrypoint")?;
@@ -12415,19 +12415,18 @@ impl NativeTape {
 		// fused pass would emit, launched in that order on the device's stream. The
 		// launch that ends one run is the synchronization, and the value and context
 		// arenas carry every position the earlier runs wrote.
-		for (segment, main_dispatch) in self.program.forward.iter().enumerate() {
-			let node = self.program.artifact.segments.get(segment).ok_or_else(|| RecipeError::new("native forward segment has no node"))?.node;
+		for (segment, entrypoint) in self.program.artifact.segments.iter().enumerate() {
+			let node = entrypoint.node;
 			let (node_begin, node_end) = *windows.get(node).ok_or_else(|| RecipeError::new("native forward segment names an absent node"))?;
-			let tiny = matches!(self.nodes[node].op, Primitive::Contraction) && rows.checked_mul(node_end - node_begin) == Some(1);
-			let dispatch = if tiny {
-				self.program.tiny.as_deref().ok_or_else(|| RecipeError::new("tiny-M native program is absent"))?.dispatch(NativeEntry::Forward(segment))?
-			} else {
-				*main_dispatch
+			let program = match (self.nodes[node].op, rows.checked_mul(node_end - node_begin), self.program.tiny.as_deref()) {
+				(Primitive::Contraction, Some(1), Some(tiny)) => tiny,
+				_ => &self.program,
 			};
+			let dispatch = program.dispatch(NativeEntry::Forward(segment))?;
 			let threads = dispatch.geometry.threads()?;
 			let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, threads, node_begin, node_end];
 			let started = std::time::Instant::now();
-			self.program.launch_forward(segment, &mut call, tiny).map_err(|error| RecipeError::new(format!("forward segment {segment}: {error}")))?;
+			program.launch(NativeEntry::Forward(segment), &mut call, threads).map_err(|error| RecipeError::new(format!("forward segment {segment}: {error}")))?;
 			if profile {
 				self.program.gpu.synchronize()?;
 				debug(&format!(
@@ -12621,7 +12620,7 @@ impl NativeTape {
 			run_optimizer
 		];
 		debug(&format!("epoch {} {operation:?} launch", self.step))?;
-		self.program.launch_epoch(&mut call).map_err(|error| RecipeError::new(format!("training epoch: {error}")))?;
+		self.program.launch(NativeEntry::Epoch, &mut call, threads).map_err(|error| RecipeError::new(format!("training epoch: {error}")))?;
 		debug(&format!("epoch {} {operation:?} launch complete", self.step))?;
 		Ok(())
 	}
@@ -13969,22 +13968,14 @@ impl Gpu {
 			let tiny = NativeProgram::load(self, tiny_artifact, graph, tiny_schedule, tiny_register_values, waves)?;
 			program.tiny = Some(Box::new(tiny));
 		}
-		for dispatch in program.forward.iter().chain(program.epoch.iter()).chain(program.model_load.iter()) {
-			let required = dispatch
-				.values
-				.checked_mul(precision.bytes() as u32)
-				.and_then(|dynamic| dispatch.kernel.shared.checked_add(dynamic))
-				.ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
-			require(required <= self.shared_limit, "native entrypoint exceeds resident device shared memory")?;
-		}
-		if let Some(tiny) = program.tiny.as_ref() {
-			for dispatch in tiny.forward.iter().chain(tiny.epoch.iter()).chain(tiny.model_load.iter()) {
+		for compiled in std::iter::once(&program).chain(program.tiny.as_deref()) {
+			for dispatch in compiled.forward.iter().chain(compiled.epoch.iter()).chain(compiled.model_load.iter()) {
 				let required = dispatch
 					.values
 					.checked_mul(precision.bytes() as u32)
 					.and_then(|dynamic| dispatch.kernel.shared.checked_add(dynamic))
-					.ok_or_else(|| RecipeError::new("tiny-M native entrypoint shared memory overflows"))?;
-				require(required <= self.shared_limit, "tiny-M native entrypoint exceeds resident device shared memory")?;
+					.ok_or_else(|| RecipeError::new("native entrypoint shared memory overflows"))?;
+				require(required <= self.shared_limit, "native entrypoint exceeds resident device shared memory")?;
 			}
 		}
 		Ok(program)
@@ -14822,22 +14813,6 @@ impl NativeProgram {
 			NativeEntry::Epoch => self.epoch.ok_or_else(|| RecipeError::new("native epoch symbol is absent")),
 			NativeEntry::ModelLoad => self.model_load.ok_or_else(|| RecipeError::new("native model-load symbol is absent")),
 		}
-	}
-
-	fn launch_forward(&self, segment: usize, arguments: &mut [Ptr], tiny: bool) -> Result<()> {
-		let program = tiny.then(|| self.tiny.as_deref()).flatten().unwrap_or(self);
-		let dispatch = program.dispatch(NativeEntry::Forward(segment))?;
-		program.launch(NativeEntry::Forward(segment), arguments, dispatch.geometry.threads()?)
-	}
-
-	fn launch_epoch(&self, arguments: &mut [Ptr]) -> Result<()> {
-		let dispatch = self.dispatch(NativeEntry::Epoch)?;
-		self.launch(NativeEntry::Epoch, arguments, dispatch.geometry.threads()?)
-	}
-
-	fn launch_model_load(&self, arguments: &mut [Ptr]) -> Result<()> {
-		let dispatch = self.dispatch(NativeEntry::ModelLoad)?;
-		self.launch(NativeEntry::ModelLoad, arguments, dispatch.geometry.threads()?)
 	}
 
 	fn launch(&self, entry: NativeEntry, arguments: &mut [Ptr], threads: u32) -> Result<()> {
