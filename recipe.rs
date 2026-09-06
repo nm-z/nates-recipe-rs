@@ -2861,6 +2861,19 @@ impl NativeModelIr {
 				(false, Primitive::Contraction) => {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?.forward;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
+					// The program is compiled for the full sequence, but placed inference
+					// launches this entrypoint over a changing window. Keep the scheduled
+					// M tile for a prefill while narrowing it to one register tile for a
+					// one-position decode. The contraction body still clamps the dynamic
+					// tile to the logical M extent, and the static shared allocation remains
+					// large enough for the scheduled tile.
+					let prefix = format!("n{index}.contraction");
+					let tile_m = format!("%{prefix}.tile.m");
+					ir.push_str(&format!(
+						"%{prefix}.window.m = mul i32 %rows, {span}\n%{prefix}.window.limit = icmp ult i32 %{prefix}.window.m, {extent_m}\n%{prefix}.window.clamped = select i1 %{prefix}.window.limit, i32 %{prefix}.window.m, i32 {extent_m}\n%{prefix}.m.short = icmp ult i32 %{prefix}.window.clamped, {register_m}\n{tile_m} = select i1 %{prefix}.m.short, i32 {register_m}, i32 %{prefix}.window.clamped\n",
+						extent_m = extent.m,
+						register_m = self.schedule.register_m,
+					));
 					let call = format!(
 						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, {pointer} {source}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {begin}, i32 {span}, i32 {kernel}, i1 {bias}, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i32 0, i32 {decode}, i32 0, i32 0, i32 0, i32 0 )\n",
 						pointer = pointer_type(backend),
@@ -2876,7 +2889,7 @@ impl NativeModelIr {
 						out_length = node.output.length,
 						kernel = integer_argument(node.argument[0], "contraction kernel")?,
 						relu = node.argument[1] == 1.0,
-						tile_m = extent.m,
+						tile_m = tile_m,
 						tile_n = extent.n,
 						tile_k = extent.k
 					);
