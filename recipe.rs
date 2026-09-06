@@ -3935,9 +3935,15 @@ impl NativeModelIr {
 	}
 
 	fn emit_quantized_decoders(&self, backend: Backend) -> Result<String> {
-		let mut emitted = String::new();
+		// The block-native contraction bodies read these two codebooks directly.
+		// Keep one definition per program, including programs that do not happen to
+		// bind either format, so the shared contraction template has no unresolved
+		// format symbols.
+		let mut emitted = NativeQuantTable::Unsigned("iq1", &IQ1).definition();
+		emitted.push_str(&NativeQuantTable::Unsigned("iq2xxs", &IQ2_XXS).definition());
+		emitted.push_str(&NativeQuantTable::Signed("iq4", &IQ4).definition());
 		let mut seen = Vec::new();
-		let mut tables = Vec::new();
+		let mut tables = vec!["iq1", "iq2xxs", "iq4"];
 		for (index, plan) in self.plans.iter().enumerate() {
 			// A lookup's table decodes on the host, so the device needs no decoder for it.
 			let Some(stored) = plan.stored.as_ref().filter(|_| plan.node.op != Primitive::Lookup) else { continue };
@@ -3966,13 +3972,22 @@ impl NativeModelIr {
 	/// Selects one packed node's decoder so a consuming kernel reads its stored representation.
 	fn emit_weight_decode(&self, backend: Backend) -> Result<String> {
 		let (pointer, ty) = (pointer_type(backend), self.precision.model_type);
-		let (mut arms, mut bodies, mut q8_0_arms) = (String::new(), String::new(), String::new());
+		let (mut arms, mut bodies, mut q8_0_arms, mut iq_arms) = (String::new(), String::new(), String::new(), String::new());
 		for (index, plan) in self.plans.iter().enumerate() {
 			let Some(stored) = plan.stored.as_ref().filter(|_| plan.packed) else { continue };
 			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
 			let format = spec.codec.quantization();
 			if spec.codec == StorageCodec::Q8_0 && plan.node.op == Primitive::Contraction && plan.node.input.channels % spec.block == 0 {
 				q8_0_arms.push_str(&format!("i32 {}, label %q8_0.yes\n", index + 1));
+			}
+			let iq_kind = match spec.codec {
+				StorageCodec::IQ1S => 1,
+				StorageCodec::IQ2XXS => 2,
+				StorageCodec::IQ4NL => 3,
+				_ => 0,
+			};
+			if iq_kind != 0 {
+				iq_arms.push_str(&format!("i32 {}, label %iq.kind.{iq_kind}\n", index + 1));
 			}
 			let (name, block) = match format.native {
 				NativeDequant::Nf4 => (format!("{}_n{index}", format.name), nf4_codebook(&stored.codebook, stored.count, stored.bytes.len())?.0),
@@ -3985,7 +4000,7 @@ impl NativeModelIr {
 			));
 		}
 		Ok(format!(
-			"define internal {ty} @recipe.model.decode({pointer} %matrix, i32 %index, i32 %node) #1 {{\nentry:\nswitch i32 %node, label %decode.absent [\n{arms}]\n{bodies}decode.absent:\nunreachable\n}}\ndefine internal i1 @recipe.model.q8_0(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %q8_0.no [\n{q8_0_arms}]\nq8_0.yes:\nret i1 true\nq8_0.no:\nret i1 false\n}}\n"
+			"define internal {ty} @recipe.model.decode({pointer} %matrix, i32 %index, i32 %node) #1 {{\nentry:\nswitch i32 %node, label %decode.absent [\n{arms}]\n{bodies}decode.absent:\nunreachable\n}}\ndefine internal i1 @recipe.model.q8_0(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %q8_0.no [\n{q8_0_arms}]\nq8_0.yes:\nret i1 true\nq8_0.no:\nret i1 false\n}}\ndefine internal i32 @recipe.model.iq.kind(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %iq.kind.0 [\n{iq_arms}]\niq.kind.1:\nret i32 1\niq.kind.2:\nret i32 2\niq.kind.3:\nret i32 3\niq.kind.0:\nret i32 0\n}}\n"
 		))
 	}
 
@@ -4034,6 +4049,9 @@ impl NativeModelIr {
 	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>) -> Result<String> {
 		let register_count = self.schedule.register_count;
 		let q8_0 = StorageCodec::Q8_0.quantization();
+		let iq1s = StorageCodec::IQ1S.quantization();
+		let iq2xxs = StorageCodec::IQ2XXS.quantization();
+		let iq4nl = StorageCodec::IQ4NL.quantization();
 		let q8_0_header = q8_0.stride.checked_sub(q8_0.block).ok_or_else(|| RecipeError::new("Q8_0 storage header is invalid"))?;
 		let q8_0_max = (1_u16 << (q8_0.bits - 1)) - 1;
 		let mut ir = backend_template(backend, self.precision, matrix)?
@@ -4051,9 +4069,16 @@ impl NativeModelIr {
 			.replace("RECIPE_Q8_0_BLOCK", &q8_0.block.to_string())
 			.replace("RECIPE_Q8_0_STRIDE", &q8_0.stride.to_string())
 			.replace("RECIPE_Q8_0_HEADER", &q8_0_header.to_string())
-			.replace("RECIPE_Q8_0_MAX", &format!("{}.0", q8_0_max));
+			.replace("RECIPE_Q8_0_MAX", &format!("{}.0", q8_0_max))
+			.replace("RECIPE_IQ1S_BLOCK", &iq1s.block.to_string())
+			.replace("RECIPE_IQ1S_STRIDE", &iq1s.stride.to_string())
+			.replace("RECIPE_IQ2XXS_BLOCK", &iq2xxs.block.to_string())
+			.replace("RECIPE_IQ2XXS_STRIDE", &iq2xxs.stride.to_string())
+			.replace("RECIPE_IQ4NL_BLOCK", &iq4nl.block.to_string())
+			.replace("RECIPE_IQ4NL_STRIDE", &iq4nl.stride.to_string());
 		ir = strip_definition(ir, "recipe.model.decode");
 		ir = strip_definition(ir, "recipe.model.q8_0");
+		ir = strip_definition(ir, "recipe.model.iq.kind");
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let weight_decode = self.emit_weight_decode(backend)?;
 		let model_load = self.emit_model_load(backend)?;
