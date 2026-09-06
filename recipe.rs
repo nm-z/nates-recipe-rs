@@ -3875,9 +3875,35 @@ impl NativeModelIr {
 	/// per routed slot; expert output folds the routed slots into its K extent.
 	fn emit_expert_forward(&self, backend: Backend, index: usize, plan: &NodePlan, pointers: &ModelPointers, window: &NodeWindow, outward: bool, ir: &mut String) -> Result<()> {
 		let node = &plan.node;
-		let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native expert contraction schedule is absent"))?.forward;
 		let (experts, top, hidden) =
 			(integer_argument(node.argument[0], "expert count")?, integer_argument(node.argument[1], "experts used")?, integer_argument(node.argument[2], "expert width")?);
+		let block_kind = plan.stored.as_ref().filter(|_| plan.packed).and_then(|stored| stored.format.spec()).map_or(0, |spec| match spec.codec {
+			StorageCodec::IQ1S => 1,
+			StorageCodec::IQ2XXS => 2,
+			StorageCodec::IQ4NL => 3,
+			_ => 0,
+		});
+		if block_kind != 0 {
+			emit_fixed_loop(ir, index, if outward { "expert.out.block" } else { "expert.in.block" }, self.rows, node.output, window, |ir, p| {
+				ir.push_str(&format!(
+					"call void @expert_iq_{direction}_forward_body({pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, {pointer} {routing_context}, i32 {p}, i32 {in_channels}, i32 {out_channels}, i32 {length}, i32 {experts}, i32 {top}, i32 {hidden}, i32 {kind})\n",
+					direction = if outward { "out" } else { "in" },
+					pointer = pointer_type(backend),
+					source = pointers.source,
+					weights = pointers.weights,
+					value = pointers.value,
+					routing = pointers.second,
+					routing_context = pointers.second_context,
+					in_channels = node.input.channels,
+					out_channels = node.output.channels,
+					length = node.output.length,
+					kind = block_kind,
+				));
+			})?;
+			ir.push_str(barrier(backend));
+			return Ok(());
+		}
+		let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native expert contraction schedule is absent"))?.forward;
 		ir.push_str(&format!(
 			"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, {pointer} {routing}, {pointer} {routing_context}, i32 %rows, i32 {in_channels}, i32 {length}, i32 {out_channels}, i32 {length}, i32 {begin}, i32 {span}, i32 0, i1 false, i1 false, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i32 0, i32 {decode}, i32 {mode}, i32 {experts}, i32 {top}, i32 {hidden} )\n{barrier}\n",
 			pointer = pointer_type(backend),

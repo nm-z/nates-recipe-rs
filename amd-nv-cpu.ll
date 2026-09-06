@@ -1081,6 +1081,85 @@ ret RECIPE_STATE %iq4nl.value
 absent:
 unreachable
 }
+; Packed routed projections walk one output per global thread. This preserves the
+; ordinary fixed-loop scheduling and traverses each selected 32-value weight
+; group once, without the contraction tile's K-lane replication.
+define internal void @expert_iq_in_forward_body(
+ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
+ptr addrspace(1) %routing, ptr addrspace(1) %routing.context,
+i32 %p, i32 %in.channels, i32 %out.channels, i32 %length,
+i32 %experts, i32 %top, i32 %hidden, i32 %kind ) #1 {
+entry:
+%out.row.elements = mul i32 %out.channels, %length
+%row = udiv i32 %p, %out.row.elements
+%within = urem i32 %p, %out.row.elements
+%routed.channel = udiv i32 %within, %length
+%position = urem i32 %within, %length
+%slot = udiv i32 %routed.channel, %hidden
+%channel = urem i32 %routed.channel, %hidden
+%routing.row.position = mul i32 %row, %length
+%routing.pair = add i32 %routing.row.position, %position
+%expert = call i32 @expert_selected(ptr addrspace(1) %routing.context, i32 %routing.pair, i32 %slot, i32 %experts, i32 %top)
+%input.row.elements = mul i32 %in.channels, %length
+%input.row = mul i32 %row, %input.row.elements
+%weight.plane = mul i32 %hidden, %in.channels
+%weight.expert = mul i32 %expert, %weight.plane
+%weight.channel = mul i32 %channel, %in.channels
+%weight.begin = add i32 %weight.expert, %weight.channel
+%sum = call RECIPE_STATE @contraction_iq_dot(i32 %kind, ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %position, i32 %length, i32 0, i32 %weight.begin, i32 %in.channels)
+%value = call double @recipe.encode(RECIPE_STATE %sum)
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
+store double %value, ptr addrspace(1) %output.ptr, align 8
+ret void
+}
+define internal void @expert_iq_out_forward_body(
+ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
+ptr addrspace(1) %routing, ptr addrspace(1) %routing.context,
+i32 %p, i32 %in.channels, i32 %out.channels, i32 %length,
+i32 %experts, i32 %top, i32 %hidden, i32 %kind ) #1 {
+entry:
+%out.row.elements = mul i32 %out.channels, %length
+%row = udiv i32 %p, %out.row.elements
+%within = urem i32 %p, %out.row.elements
+%channel = udiv i32 %within, %length
+%position = urem i32 %within, %length
+%routing.row.position = mul i32 %row, %length
+%routing.pair = add i32 %routing.row.position, %position
+%input.row.elements = mul i32 %in.channels, %length
+%input.row = mul i32 %row, %input.row.elements
+%zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+br label %slot.loop
+slot.loop:
+%slot = phi i32 [ 0, %entry ], [ %slot.next, %slot.step ]
+%sum = phi RECIPE_STATE [ %zero, %entry ], [ %sum.next, %slot.step ]
+%more = icmp ult i32 %slot, %top
+br i1 %more, label %slot.step, label %done
+slot.step:
+%expert = call i32 @expert_selected(ptr addrspace(1) %routing.context, i32 %routing.pair, i32 %slot, i32 %experts, i32 %top)
+%weight.plane = mul i32 %out.channels, %hidden
+%weight.expert = mul i32 %expert, %weight.plane
+%weight.channel = mul i32 %channel, %hidden
+%weight.begin = add i32 %weight.expert, %weight.channel
+%input.channel = mul i32 %slot, %hidden
+%dot = call RECIPE_STATE @contraction_iq_dot(i32 %kind, ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %position, i32 %length, i32 %input.channel, i32 %weight.begin, i32 %hidden)
+%routing.row.span = mul i32 %experts, %length
+%routing.row = mul i32 %row, %routing.row.span
+%routing.expert = mul i32 %expert, %length
+%routing.local = add i32 %routing.expert, %position
+%routing.index = add i32 %routing.row, %routing.local
+%routing.ptr = getelementptr inbounds double, ptr addrspace(1) %routing, i32 %routing.index
+%routing.value = load double, ptr addrspace(1) %routing.ptr, align 8
+%routing.wide = call RECIPE_STATE @recipe.state.from.model(double %routing.value)
+%scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %dot, RECIPE_STATE %routing.wide)
+%sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %scaled)
+%slot.next = add i32 %slot, 1
+br label %slot.loop
+done:
+%value = call double @recipe.encode(RECIPE_STATE %sum)
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
+store double %value, ptr addrspace(1) %output.ptr, align 8
+ret void
+}
 ; A lane owns one output accumulator. For routed input, its M coordinate also
 ; chooses one selected expert. For routed output, each selected expert contributes
 ; one hidden-width row span scaled by that token's routing weight.
