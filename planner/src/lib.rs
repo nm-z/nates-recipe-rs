@@ -3,8 +3,9 @@
 
 //! Finite, deterministic Draft candidate enumeration over measured topology.
 
-mod error; mod hash; mod planner;
+mod error;
+mod hash;
+mod planner;
 
-pub use error::{PlannerError, PlannerErrorKind, PlannerResult}; pub use planner::{
-	KernelPlacement, LogicalValueCopy, PlannedCandidate, PlannedExternalOutput, PlannedProgramCandidate,
-	ProgramPlannerSearch, StagePlacement, plan_program_candidates, };
+pub use error::{PlannerError, PlannerErrorKind, PlannerResult};
+pub use planner::{KernelPlacement, LogicalValueCopy, PlannedCandidate, PlannedExternalOutput, PlannedProgramCandidate, ProgramPlannerSearch, StagePlacement, plan_program_candidates};

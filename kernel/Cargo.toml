@@ -14,3 +14,4 @@ recipe-core = { path = "../core" }
 recipe-language = { path = "../language" }
 recipe-primitives = { path = "../primitives" }
 sha2 = "0.10"
+write = { path = "../write" }

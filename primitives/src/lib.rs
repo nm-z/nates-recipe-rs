@@ -9,7 +9,12 @@
 //! behavior, random-number semantics, and resource bounds without selecting a
 //! machine, driver API, or vendor library.
 
-mod error; mod hash; mod lower; mod model; mod validate;
+mod error;
+mod hash;
+mod lower;
+mod model;
+mod validate;
 
-pub use error::{LoweringError, LoweringErrorKind, LoweringResult, ProgramValidationError}; pub use lower::lower;
+pub use error::{LoweringError, LoweringErrorKind, LoweringResult, ProgramValidationError};
+pub use lower::lower;
 pub use model::*;

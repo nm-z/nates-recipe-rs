@@ -15,6 +15,10 @@ match arms. None of those pieces justifies the split that created them. Collapse
 them into one operation unless each division has an independent architectural
 reason to exist.
 
+Trivial getters are banned. Do not add a method whose only behavior is returning
+one field unchanged. Use the field directly or put the operation that needs the
+field on the type that owns it.
+
 Do not implement "you cannot do that, though" paths. If an action is invalid in
 the current state, the interface must not offer or represent it. A user would
 not attempt an invalid action unless the system exposed it as an available

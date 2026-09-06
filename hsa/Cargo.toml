@@ -10,6 +10,7 @@ categories = ["hardware-support"]
 
 [dependencies]
 libc = "0.2"
+write = { path = "../write" }
 
 [features]
 live-hsa = []

@@ -15,6 +15,24 @@ macro_rules! stable_ids { ($($name:ident),+ $(,)?) => { $(
 				fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(formatter) }
 			} )+ }; }
 
-stable_ids!( MachineId, NodeId, DeviceId, LinkId, TransportId, DuplexResourceId, ValueId, ScalarValueId,
-	KernelTemplateId, KernelInputId, KernelOutputId, TaskId, ArtifactId, QueueSlotId, CompletionSlotId, MetricId,
-	MetricSlotId, ArenaObjectId, RunId, );
+stable_ids!(
+	MachineId,
+	NodeId,
+	DeviceId,
+	LinkId,
+	TransportId,
+	DuplexResourceId,
+	ValueId,
+	ScalarValueId,
+	KernelTemplateId,
+	KernelInputId,
+	KernelOutputId,
+	TaskId,
+	ArtifactId,
+	QueueSlotId,
+	CompletionSlotId,
+	MetricId,
+	MetricSlotId,
+	ArenaObjectId,
+	RunId,
+);

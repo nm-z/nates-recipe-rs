@@ -15,12 +15,18 @@
 //! spellings are exact, collections are explicit, and no missing value receives
 //! a default.
 
-mod error; mod graph; mod ogdl; mod primitive; mod scalar_builder; mod shape; mod tensor;
+mod error;
+mod graph;
+mod ogdl;
+mod primitive;
+mod scalar_builder;
+mod shape;
+mod tensor;
 
-pub use error::{LanguageError, LanguageErrorKind, LanguageResult}; pub use graph::{CalculationGraph, CalculationNode};
-pub use ogdl::{OgdlCodecError, OgdlDocumentErrorKind}; pub use primitive::{
-	AtomicOperation, AtomicOrdering, Contraction, Elementwise, Gather, Histogram, IndexBounds, IndexMap,
-	PrimitiveAliasRule, PrimitiveKernel, PrimitiveKind, RandomDistribution, RandomKey, RandomMap, Reduce,
-	ReduceOperator, ReduceResult, Scan, ScanMode, Scatter, ScatterConflict, Sort, SortDirection, };
-pub use scalar_builder::{ScalarExpression, ScalarProgramBuilder}; pub use shape::{AxisSet, Shape};
+pub use error::{LanguageError, LanguageErrorKind, LanguageResult};
+pub use graph::{CalculationGraph, CalculationNode};
+pub use ogdl::{OgdlCodecError, OgdlDocumentErrorKind};
+pub use primitive::{AtomicOperation, AtomicOrdering, Contraction, Elementwise, Gather, Histogram, IndexBounds, IndexMap, PrimitiveAliasRule, PrimitiveKernel, PrimitiveKind, RandomDistribution, RandomKey, RandomMap, Reduce, ReduceOperator, ReduceResult, Scan, ScanMode, Scatter, ScatterConflict, Sort, SortDirection};
+pub use scalar_builder::{ScalarExpression, ScalarProgramBuilder};
+pub use shape::{AxisSet, Shape};
 pub use tensor::{ContiguousOrder, Tensor, TensorLayout};

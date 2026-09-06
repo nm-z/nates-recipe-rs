@@ -3,13 +3,14 @@ name = "recipe-ogdl"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Recipe's dependency-free OGDL-derived ordered graph syntax"
+description = "Recipe's OGDL-derived ordered graph syntax"
 readme = "README.md"
 repository = "https://github.com/nm-z/nates-recipe-rs"
 keywords = ["ogdl", "graph", "parser"]
 categories = ["parser-implementations"]
 
 [dependencies]
+write = { path = "../write" }
 
 [lints.rust]
 unsafe_code = "forbid"

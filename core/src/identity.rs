@@ -4,11 +4,19 @@ use core::fmt;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Label(String);
 
-impl Label { pub fn new(value: impl Into<String>) -> Result<Self, LabelError> { let value = value.into();
-		if value.trim().is_empty() { Err(LabelError) } else { Ok(Self(value)) } }
+impl Label {
+	pub fn new(value: impl Into<String>) -> Result<Self, LabelError> {
+		let value = value.into();
+		if value.trim().is_empty() {
+			Err(LabelError)
+		} else {
+			Ok(Self(value))
+		}
+	}
 
 	#[must_use]
-	pub fn as_str(&self) -> &str { &self.0 } }
+	pub fn as_str(&self) -> &str { &self.0 }
+}
 
 impl fmt::Display for Label {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(formatter) }
@@ -27,7 +35,8 @@ impl std::error::Error for LabelError {}
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Digest([u8; 32]);
 
-impl Digest { pub const ZERO: Self = Self([0; 32]);
+impl Digest {
+	pub const ZERO: Self = Self([0; 32]);
 
 	#[must_use]
 	pub const fn new(bytes: [u8; 32]) -> Self { Self(bytes) }
@@ -36,7 +45,8 @@ impl Digest { pub const ZERO: Self = Self([0; 32]);
 	pub const fn bytes(self) -> [u8; 32] { self.0 }
 
 	#[must_use]
-	pub fn is_zero(self) -> bool { self == Self::ZERO } }
+	pub fn is_zero(self) -> bool { self == Self::ZERO }
+}
 
 impl fmt::Debug for Digest {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -45,7 +55,8 @@ impl fmt::Debug for Digest {
 			write!(formatter, "{byte:02x}")?;
 		}
 		formatter.write_str("...)")
-	} }
+	}
+}
 
 macro_rules! digest_identities { ($($name:ident),+ $(,)?) => { $(
 			#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -61,5 +72,11 @@ macro_rules! digest_identities { ($($name:ident),+ $(,)?) => { $(
 				#[must_use]
 				pub fn is_zero(self) -> bool { self.0.is_zero() } } )+ }; }
 
-digest_identities!( TopologyIdentity, DiscoveryIdentity, DraftIdentity, CandidateIdentity, RealizationIdentity,
-	BundleIdentity, );
+digest_identities!(
+	TopologyIdentity,
+	DiscoveryIdentity,
+	DraftIdentity,
+	CandidateIdentity,
+	RealizationIdentity,
+	BundleIdentity,
+);

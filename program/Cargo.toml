@@ -13,6 +13,7 @@ categories.workspace = true
 recipe-core = { path = "../core" }
 recipe-language = { path = "../language" }
 recipe-ogdl = { path = "../ogdl" }
+write = { path = "../write" }
 
 [lints]
 workspace = true

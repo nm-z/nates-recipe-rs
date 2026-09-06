@@ -4,24 +4,24 @@ use std::{
 	env,
 	error::Error,
 	fmt, fs,
-	io::{self, Read, Write},
+	io::{self, Read},
 	path::PathBuf,
 	process::ExitCode,
 };
 
 use tokenizers::Tokenizer;
+use write::{always, err};
 
 fn main() -> ExitCode {
 	let arguments = env::args_os().skip(1).collect::<Vec<_>>();
 	if matches!(arguments.as_slice(), [argument] if argument == "-h" || argument == "--help") {
-		println!("{}", usage());
+		always(usage());
 		return ExitCode::SUCCESS;
 	}
 	match run(arguments.into_iter()) {
 		Ok(()) => ExitCode::SUCCESS,
 		Err(error) => {
-			eprintln!("tokenize: {error}");
-			eprintln!("{}", usage());
+			drop(err(format!("tokenize: {error}\n{}", usage())));
 			ExitCode::FAILURE
 		}
 	}
@@ -39,15 +39,12 @@ fn run(arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<(), Tokeni
 	let encoding = tokenizer
 		.encode(text, input.add_special_tokens)
 		.map_err(|error| TokenizeError::new(format!("tokenize input text: {error}")))?;
-	let mut output = open_output(&input.output)?;
+	let mut output = Vec::with_capacity(encoding.len().saturating_mul(core::mem::size_of::<i32>()));
 	for id in encoding.get_ids() {
-		let id = i32::try_from(*id)
-			.map_err(|error| TokenizeError::new(format!("token ID {id} is outside int32: {error}")))?;
-		output.write_all(&id.to_le_bytes())
-			.map_err(|error| TokenizeError::new(format!("write token IDs: {error}")))?;
+		let id = i32::try_from(*id).map_err(|error| TokenizeError::new(format!("token ID {id} is outside int32: {error}")))?;
+		output.extend_from_slice(&id.to_le_bytes());
 	}
-	output.flush()
-		.map_err(|error| TokenizeError::new(format!("flush token IDs: {error}")))?;
+	write_output(&input.output, &output)?;
 	Ok(())
 }
 
@@ -133,20 +130,14 @@ fn read_text(source: &Source) -> Result<String, TokenizeError> {
 				.map_err(|error| TokenizeError::new(format!("read input text from stdin: {error}")))?;
 			Ok(text)
 		}
-		Source::File(path) => fs::read_to_string(path)
-			.map_err(|error| TokenizeError::new(format!("read input text {}: {error}", path.display()))),
+		Source::File(path) => fs::read_to_string(path).map_err(|error| TokenizeError::new(format!("read input text {}: {error}", path.display()))),
 	}
 }
 
-fn open_output(destination: &Destination) -> Result<Box<dyn Write>, TokenizeError> {
+fn write_output(destination: &Destination, bytes: &[u8]) -> Result<(), TokenizeError> {
 	match destination {
-		Destination::Stdout => Ok(Box::new(io::BufWriter::new(io::stdout()))),
-		Destination::File(path) => {
-			let file = fs::File::create(path).map_err(|error| {
-				TokenizeError::new(format!("create token output {}: {error}", path.display()))
-			})?;
-			Ok(Box::new(io::BufWriter::new(file)))
-		}
+		Destination::Stdout => write::stdout(bytes).map_err(|error| TokenizeError::new(format!("write token IDs: {error}"))),
+		Destination::File(path) => fs::write(path, bytes).map_err(|error| TokenizeError::new(format!("write token output {}: {error}", path.display()))),
 	}
 }
 
@@ -164,9 +155,7 @@ impl TokenizeError {
 }
 
 impl fmt::Display for TokenizeError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		self.detail.fmt(formatter)
-	}
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { self.detail.fmt(formatter) }
 }
 
 impl Error for TokenizeError {}

@@ -1,0 +1,13 @@
+[package]
+name = "write"
+version = "1.0.0"
+edition = "2024"
+description = "Unified human-readable output and run logging for Recipe"
+license = "MIT"
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+name = "write"

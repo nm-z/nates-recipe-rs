@@ -12,6 +12,7 @@ categories.workspace = true
 [dependencies]
 recipe-core = { path = "../core" }
 recipe-ogdl = { path = "../ogdl" }
+write = { path = "../write" }
 
 [lints.rust]
 unsafe_code = "forbid"

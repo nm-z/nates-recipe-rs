@@ -9,14 +9,14 @@
 //! allocation, compilation, module loading, and external data ingress are not
 //! part of its API.
 
-mod backend; mod error; mod executor; mod metrics;
+mod backend;
+mod error;
+mod executor;
+mod metrics;
 
 #[doc(hidden)]
-pub use backend::sealed; pub use backend::{
-	ArenaSet, Backend, BackendPoll, BackendWork, CalculationWork, InitAdmissionWork,
-	MAX_PHYSICAL_CALLS_PER_OPERATION, MetricWork, PendingRequest, PhysicalCall, PhysicalCallBatch,
-	PhysicalCallBatchOverflow, PhysicalPollStatus, TransferWork, WorkClass, };
-pub use error::{BACKEND_MESSAGE_CAPACITY, BackendMessage, BackendOperation, ExecutorError, Result}; pub use executor::{
-	DeviceImage, ExitImage, ExitedLoop, ExitedRun, InitializedRun, JournalCapacity, JournalSummary, LogicalEvent,
-	LoopStatus, PendingPollCount, PreparedRun, RunFailure, RunFailureParts, RunJournal, RunningRun, Watchdog, };
+pub use backend::sealed;
+pub use backend::{ArenaSet, Backend, BackendPoll, BackendWork, CalculationWork, InitAdmissionWork, MAX_PHYSICAL_CALLS_PER_OPERATION, MetricWork, PendingRequest, PhysicalCall, PhysicalCallBatch, PhysicalCallBatchOverflow, PhysicalPollStatus, TransferWork, WorkClass};
+pub use error::{BACKEND_MESSAGE_CAPACITY, BackendMessage, BackendOperation, ExecutorError, Result};
+pub use executor::{DeviceImage, ExitImage, ExitedLoop, ExitedRun, InitializedRun, JournalCapacity, JournalSummary, LogicalEvent, LoopStatus, PendingPollCount, PreparedRun, RunFailure, RunFailureParts, RunJournal, RunningRun, Watchdog};
 pub use metrics::{MetricMailbox, MetricSample, MetricValue};

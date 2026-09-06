@@ -9,13 +9,13 @@
 //! contract. Domain checks are part of the generated program through
 //! [`recipe_core::ScalarOpcode::Require`].
 
-use recipe_core::ScalarProgram; use recipe_language::LanguageError;
+use recipe_core::ScalarProgram;
+use recipe_language::LanguageError;
 
-mod contract; mod program;
+mod contract;
+mod program;
 
-pub use contract::{
-	AlgorithmIdentity, ErrorBound, FiniteBound, FiniteDomain, FiniteInputDomain, MathContract, MathFunction,
-	NonFiniteBehavior, SpecialValueBehavior, };
+pub use contract::{AlgorithmIdentity, ErrorBound, FiniteBound, FiniteDomain, FiniteInputDomain, MathContract, MathFunction, NonFiniteBehavior, SpecialValueBehavior};
 
 /// Build Recipe's finite, nonpositive-input exponential program with gradual
 /// binary32 underflow.
@@ -31,6 +31,8 @@ pub use contract::{
 /// constructed.
 pub fn exp_with_gradual_underflow_program() -> Result<ScalarProgram, LanguageError> { ScalarProgram::try_from(MathFunction::ExpWithGradualUnderflow) }
 
-impl TryFrom<MathFunction> for ScalarProgram { type Error = LanguageError;
+impl TryFrom<MathFunction> for ScalarProgram {
+	type Error = LanguageError;
 
-	fn try_from(function: MathFunction) -> Result<Self, Self::Error> { program::build(function) } }
+	fn try_from(function: MathFunction) -> Result<Self, Self::Error> { program::build(function) }
+}

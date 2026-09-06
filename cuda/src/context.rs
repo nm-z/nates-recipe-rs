@@ -1,75 +1,159 @@
-use core::{marker::PhantomData, ops::Deref, ptr}; use std::rc::Rc;
+use core::{marker::PhantomData, ops::Deref, ptr};
+use std::rc::Rc;
 
-use crate::{ discovery::DeviceInfo, driver::Driver, error::{CudaError, Result}, ffi::CuContext, };
+use crate::{
+	discovery::DeviceInfo,
+	driver::Driver,
+	error::{CudaError, Result},
+	ffi::CuContext,
+};
 
-const CU_CTX_SCHED_MASK: u32 = 0x07; const CU_CTX_SCHED_AUTO: u32 = 0x00; const CU_CTX_SCHED_SPIN: u32 = 0x01;
-const CU_CTX_SCHED_YIELD: u32 = 0x02; const CU_CTX_SCHED_BLOCKING_SYNC: u32 = 0x04; const CU_CTX_MAP_HOST: u32 = 0x08;
+const CU_CTX_SCHED_MASK: u32 = 0x07;
+const CU_CTX_SCHED_AUTO: u32 = 0x00;
+const CU_CTX_SCHED_SPIN: u32 = 0x01;
+const CU_CTX_SCHED_YIELD: u32 = 0x02;
+const CU_CTX_SCHED_BLOCKING_SYNC: u32 = 0x04;
+const CU_CTX_MAP_HOST: u32 = 0x08;
 const CU_CTX_LMEM_RESIZE_TO_MAX: u32 = 0x10;
 const KNOWN_CONTEXT_FLAGS: u32 = CU_CTX_SCHED_MASK | CU_CTX_MAP_HOST | CU_CTX_LMEM_RESIZE_TO_MAX;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SchedulingPolicy {
 	#[default]
-	Auto, Spin, Yield, BlockingSync, }
-
-impl SchedulingPolicy { const fn bits(self) -> u32 { match self { Self::Auto => CU_CTX_SCHED_AUTO,
-			Self::Spin => CU_CTX_SCHED_SPIN, Self::Yield => CU_CTX_SCHED_YIELD, Self::BlockingSync => CU_CTX_SCHED_BLOCKING_SYNC,
-		} } }
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ContextFlags { pub scheduling: SchedulingPolicy, pub map_host: bool, pub local_memory_resize_to_max: bool, }
-
-impl ContextFlags { pub const fn new(scheduling: SchedulingPolicy) -> Self { Self { scheduling, map_host: false,
-			local_memory_resize_to_max: false, } }
-
-
-
-	pub const fn bits(self) -> u32 { self.scheduling.bits() | if self.map_host { CU_CTX_MAP_HOST } else { 0 }
-			| if self.local_memory_resize_to_max { CU_CTX_LMEM_RESIZE_TO_MAX } else { 0 } }
-
-	pub fn from_bits(bits: u32) -> Result<Self> { if bits & !KNOWN_CONTEXT_FLAGS != 0 {
-			return Err(CudaError::InvalidContextFlags { bits }); }
-		let scheduling = match bits & CU_CTX_SCHED_MASK { CU_CTX_SCHED_AUTO => SchedulingPolicy::Auto,
-			CU_CTX_SCHED_SPIN => SchedulingPolicy::Spin, CU_CTX_SCHED_YIELD => SchedulingPolicy::Yield,
-			CU_CTX_SCHED_BLOCKING_SYNC => SchedulingPolicy::BlockingSync,
-			_ => return Err(CudaError::InvalidContextFlags { bits }), }; Ok(Self { scheduling,
-			map_host: bits & CU_CTX_MAP_HOST != 0, local_memory_resize_to_max: bits & CU_CTX_LMEM_RESIZE_TO_MAX != 0, }) } }
-
-pub struct Context { driver: Driver, raw: Option<CuContext>, device: DeviceInfo, _not_send_or_sync: PhantomData<Rc<()>>,
+	Auto,
+	Spin,
+	Yield,
+	BlockingSync,
 }
 
-impl Context { pub fn create(driver: &Driver, device: &DeviceInfo, flags: ContextFlags) -> Result<Self> {
-		let bits = flags.bits(); let _ = ContextFlags::from_bits(bits)?; let mut raw = ptr::null_mut();
+impl SchedulingPolicy {
+	const fn bits(self) -> u32 {
+		match self {
+			Self::Auto => CU_CTX_SCHED_AUTO,
+			Self::Spin => CU_CTX_SCHED_SPIN,
+			Self::Yield => CU_CTX_SCHED_YIELD,
+			Self::BlockingSync => CU_CTX_SCHED_BLOCKING_SYNC,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContextFlags {
+	pub scheduling: SchedulingPolicy,
+	pub map_host: bool,
+	pub local_memory_resize_to_max: bool,
+}
+
+impl ContextFlags {
+	pub const fn new(scheduling: SchedulingPolicy) -> Self {
+		Self {
+			scheduling,
+			map_host: false,
+			local_memory_resize_to_max: false,
+		}
+	}
+
+	pub const fn bits(self) -> u32 {
+		self.scheduling.bits()
+			| if self.map_host { CU_CTX_MAP_HOST } else { 0 }
+			| if self.local_memory_resize_to_max {
+				CU_CTX_LMEM_RESIZE_TO_MAX
+			} else {
+				0
+			}
+	}
+
+	pub fn from_bits(bits: u32) -> Result<Self> {
+		if bits & !KNOWN_CONTEXT_FLAGS != 0 {
+			return Err(CudaError::InvalidContextFlags { bits });
+		}
+		let scheduling = match bits & CU_CTX_SCHED_MASK {
+			CU_CTX_SCHED_AUTO => SchedulingPolicy::Auto,
+			CU_CTX_SCHED_SPIN => SchedulingPolicy::Spin,
+			CU_CTX_SCHED_YIELD => SchedulingPolicy::Yield,
+			CU_CTX_SCHED_BLOCKING_SYNC => SchedulingPolicy::BlockingSync,
+			_ => return Err(CudaError::InvalidContextFlags { bits }),
+		};
+		Ok(Self {
+			scheduling,
+			map_host: bits & CU_CTX_MAP_HOST != 0,
+			local_memory_resize_to_max: bits & CU_CTX_LMEM_RESIZE_TO_MAX != 0,
+		})
+	}
+}
+
+pub struct Context {
+	driver: Driver,
+	raw: Option<CuContext>,
+	device: DeviceInfo,
+	_not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+impl Context {
+	pub fn create(driver: &Driver, device: &DeviceInfo, flags: ContextFlags) -> Result<Self> {
+		let bits = flags.bits();
+		let _ = ContextFlags::from_bits(bits)?;
+		let mut raw = ptr::null_mut();
 		driver.check("cuCtxCreate_v2", unsafe {
-			(driver.inner.api.ctx_create_v2)(&raw mut raw, bits, device.handle) })?; if raw.is_null() {
+			(driver.inner.api.ctx_create_v2)(&raw mut raw, bits, device.handle)
+		})?;
+		if raw.is_null() {
 			return Err(CudaError::InvalidDriverValue {
 				operation: "cuCtxCreate_v2",
 				detail: "success with a null context".to_owned(),
-			}); }
+			});
+		}
 
-		let mut popped = ptr::null_mut(); let pop_status = unsafe { (driver.inner.api.ctx_pop_current_v2)(&raw mut popped) };
+		let mut popped = ptr::null_mut();
+		let pop_status = unsafe { (driver.inner.api.ctx_pop_current_v2)(&raw mut popped) };
 		if let Err(error) = driver.check("cuCtxPopCurrent_v2(after create)", pop_status) {
-			let _ = unsafe { (driver.inner.api.ctx_destroy_v2)(raw) }; return Err(error); }
-		if popped != raw { let _ = unsafe { (driver.inner.api.ctx_destroy_v2)(raw) };
-			return Err(CudaError::ContextStackMismatch); }
+			let _ = unsafe { (driver.inner.api.ctx_destroy_v2)(raw) };
+			return Err(error);
+		}
+		if popped != raw {
+			let _ = unsafe { (driver.inner.api.ctx_destroy_v2)(raw) };
+			return Err(CudaError::ContextStackMismatch);
+		}
 
-		Ok(Self { driver: driver.clone(), raw: Some(raw), device: device.clone(), _not_send_or_sync: PhantomData, }) }
+		Ok(Self {
+			driver: driver.clone(),
+			raw: Some(raw),
+			device: device.clone(),
+			_not_send_or_sync: PhantomData,
+		})
+	}
 
 	pub fn device(&self) -> &DeviceInfo { &self.device }
 
 	pub fn enter(&self) -> Result<ContextGuard<'_>> {
 		let raw = self.raw.ok_or(CudaError::ContextClosed)?;
 		self.driver.check("cuCtxPushCurrent_v2", unsafe {
-			(self.driver.inner.api.ctx_push_current_v2)(raw) })?; Ok(ContextGuard { context: self, active: true, }) }
+			(self.driver.inner.api.ctx_push_current_v2)(raw)
+		})?;
+		Ok(ContextGuard {
+			context: self,
+			active: true,
+		})
+	}
 
 	pub fn as_raw(&self) -> Result<*mut core::ffi::c_void> { self.raw.ok_or(CudaError::ContextClosed) }
 
 	/// Returns the driver's current free and total memory counters for this
 	/// exact context device.
-	pub fn memory_info(&self) -> Result<MemoryInfo> { let guard = self.enter()?; let mut free = 0; let mut total = 0;
+	pub fn memory_info(&self) -> Result<MemoryInfo> {
+		let guard = self.enter()?;
+		let mut free = 0;
+		let mut total = 0;
 		let result = self.driver.check("cuMemGetInfo_v2", unsafe {
-			(self.driver.inner.api.mem_get_info_v2)(&raw mut free, &raw mut total) }); guard.leave()?; result?; Ok(MemoryInfo {
-			free_bytes: free, total_bytes: total, }) }
+			(self.driver.inner.api.mem_get_info_v2)(&raw mut free, &raw mut total)
+		});
+		guard.leave()?;
+		result?;
+		Ok(MemoryInfo {
+			free_bytes: free,
+			total_bytes: total,
+		})
+	}
 
 	pub(crate) fn driver(&self) -> &Driver { &self.driver }
 
@@ -77,42 +161,70 @@ impl Context { pub fn create(driver: &Driver, device: &DeviceInfo, flags: Contex
 
 	pub fn close(mut self) -> Result<()> { self.destroy() }
 
-	fn destroy(&mut self) -> Result<()> { let raw = self.raw.take().ok_or(CudaError::ContextClosed)?;
+	fn destroy(&mut self) -> Result<()> {
+		let raw = self.raw.take().ok_or(CudaError::ContextClosed)?;
 		self.driver.check("cuCtxDestroy_v2", unsafe {
-			(self.driver.inner.api.ctx_destroy_v2)(raw) }) } }
+			(self.driver.inner.api.ctx_destroy_v2)(raw)
+		})
+	}
+}
 
 /// One live CUDA memory-capacity observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MemoryInfo { pub free_bytes: usize, pub total_bytes: usize, }
+pub struct MemoryInfo {
+	pub free_bytes: usize,
+	pub total_bytes: usize,
+}
 
-impl Drop for Context { fn drop(&mut self) { if let Some(raw) = self.raw.take() {
-			let _ = unsafe { (self.driver.inner.api.ctx_destroy_v2)(raw) }; } } }
+impl Drop for Context {
+	fn drop(&mut self) {
+		if let Some(raw) = self.raw.take() {
+			let _ = unsafe { (self.driver.inner.api.ctx_destroy_v2)(raw) };
+		}
+	}
+}
 
 impl core::fmt::Debug for Context {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("Context")
 			.field("device", &self.device)
 			.field("open", &self.raw.is_some())
-			.finish_non_exhaustive() } }
+			.finish_non_exhaustive()
+	}
+}
 
 pub struct ContextGuard<'a> {
 	context: &'a Context,
-	active: bool, }
+	active: bool,
+}
 
 impl ContextGuard<'_> {
 	pub fn leave(mut self) -> Result<()> { self.pop() }
 
-	fn pop(&mut self) -> Result<()> { let expected = self.context.raw.ok_or(CudaError::ContextClosed)?;
+	fn pop(&mut self) -> Result<()> {
+		let expected = self.context.raw.ok_or(CudaError::ContextClosed)?;
 		let mut popped = ptr::null_mut();
 		self.context.driver.check("cuCtxPopCurrent_v2", unsafe {
-			(self.context.driver.inner.api.ctx_pop_current_v2)(&raw mut popped) })?; self.active = false; if popped != expected {
-			return Err(CudaError::ContextStackMismatch); }
-		Ok(()) } }
+			(self.context.driver.inner.api.ctx_pop_current_v2)(&raw mut popped)
+		})?;
+		self.active = false;
+		if popped != expected {
+			return Err(CudaError::ContextStackMismatch);
+		}
+		Ok(())
+	}
+}
 
 impl Deref for ContextGuard<'_> {
 	type Target = Context;
 
-	fn deref(&self) -> &Self::Target { self.context } }
+	fn deref(&self) -> &Self::Target { self.context }
+}
 
 impl Drop for ContextGuard<'_> {
-	fn drop(&mut self) { if self.active { let _ = self.pop(); } } }
+	fn drop(&mut self) {
+		if self.active {
+			let _ = self.pop();
+		}
+	}
+}

@@ -27,7 +27,7 @@ cargo build --workspace
 cargo check --workspace --all-targets
 cargo build --examples --release
 cargo +nightly fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --keep-going
 cargo run --bin recipe -- probe --help
 ```
 
@@ -35,6 +35,34 @@ Compilation, formatting, linting, and auditing are structural build hygiene;
 they are not runtime evidence. Acceptance runs execute public training or
 inference declarations on real datasets and real CUDA or HSA hardware with the
 corresponding drivers and offline toolchains.
+
+Always run `cargo fmt --all` immediately before pushing and immediately before
+counting anything. A count made before formatting is not valid.
+
+Never promote Clippy warnings to errors. Do not pass `-D warnings` or an
+equivalent deny flag to Clippy. Use `--keep-going` so warnings in one crate do
+not prevent checking the rest of the workspace.
+
+### Clippy Policy Is User-Owned
+
+Clippy configuration is user-owned policy. Never change Clippy unless the user
+asks for a Clippy change. A request to fix code, remove warnings, make a build
+pass, continue working, or complete a goal does not authorize editing lint
+levels. Do not add, remove, weaken, strengthen, rename, reorder, or relocate
+allow, warn, deny, forbid, expectation, priority, lint-group, command-line,
+workspace, crate, module, item, or environment settings. Do not reinterpret
+frustration with a warning as permission to suppress it. Do not convert a
+source problem into a configuration change because the source fix is
+repetitive, difficult, ugly, contradictory, or time-consuming. Do not decide
+that a lint is unreasonable and disable it. Do not insert attributes as a
+substitute for changing Cargo.toml. Do not pass extra Clippy flags that alter
+the configured diagnostic set unless the user requests those flags. When two
+lints conflict, report the conflict and leave policy unchanged. When Clippy
+cannot reach zero without a policy decision, preserve the diagnostics and state
+what remains. The user chooses whether a lint is allowed, warned, denied, or
+removed. Only an explicit request naming Clippy configuration, a lint, a lint
+group, or an allow or deny authorizes that exact change. Apply no Clippy
+changes.
 
 ## Coding Style & Naming Conventions
 
