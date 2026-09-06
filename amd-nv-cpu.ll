@@ -1267,12 +1267,12 @@ i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, double %decay.scale, i1 %store
 %write.pointer = getelementptr inbounds double, ptr addrspace(1) %gates, i64 %write.index
 %write.input = load double, ptr addrspace(1) %write.pointer, align 8 %write = call double @sigmoid(double %write.input)
 br label %column.loop
-column.loop: %column = phi i32 [ 0, %entry ], [ %column.next, %column.done ] %column.more = icmp ult i32 %column, %vwidth
+column.loop: %column = phi i32 [ 0, %entry ], [ %column.next, %column.done ] %column.wide = zext i32 %column to i64 %column.more = icmp ult i32 %column, %vwidth
 br i1 %column.more, label %read.loop, label %exit
 read.loop: %read.i = phi i32 [ 0, %column.loop ], [ %read.next, %read.step ]
 %read.sum = phi double [ 0.0, %column.loop ], [ %read.sum.next, %read.step ]
 %read.more = icmp ult i32 %read.i, %kwidth br i1 %read.more, label %read.step, label %read.done
-read.step: %read.i.wide = zext i32 %read.i to i64 %column.wide = zext i32 %column to i64 %read.row = mul i64 %read.i.wide, %vwidth.wide %read.cell = add i64 %read.row, %column.wide %read.index = add i64 %work.base, %read.cell
+read.step: %read.i.wide = zext i32 %read.i to i64 %read.row = mul i64 %read.i.wide, %vwidth.wide %read.cell = add i64 %read.row, %column.wide %read.index = add i64 %work.base, %read.cell
 %read.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i64 %read.index
 %read.state = load double, ptr addrspace(1) %read.pointer, align 8
 %read.offset.row = mul i64 %read.i.wide, %length.wide %read.offset = add i64 %read.offset.row, %time.wide %read.key.index = add i64 %k.base, %read.offset
@@ -1395,12 +1395,13 @@ store double %seed.total, ptr addrspace(1) %seed.pointer, align 8 %seed.j.next =
 seed.row.done: %seed.i.next = add nuw i32 %seed.i, 1 br label %seed.row
 column.loop: %column = phi i32 [ 0, %seed.row ], [ %column.next, %column.done ]
 %write.gradient = phi double [ 0.0, %seed.row ], [ %write.gradient.next, %column.done ]
+%column.wide = zext i32 %column to i64
 %column.more = icmp ult i32 %column, %vwidth br i1 %column.more, label %column.row, label %row.loop
 column.row: %column.i = phi i32 [ 0, %column.loop ], [ %column.i.next, %column.step ]
 %readout = phi double [ 0.0, %column.loop ], [ %readout.next, %column.step ]
 %weight = phi double [ 0.0, %column.loop ], [ %weight.next, %column.step ]
 %column.i.more = icmp ult i32 %column.i, %kwidth br i1 %column.i.more, label %column.step, label %column.store
-column.step: %column.i.wide = zext i32 %column.i to i64 %column.wide = zext i32 %column to i64 %column.i.row = mul i64 %column.i.wide, %vwidth.wide %column.cell = add i64 %column.i.row, %column.wide
+column.step: %column.i.wide = zext i32 %column.i to i64 %column.i.row = mul i64 %column.i.wide, %vwidth.wide %column.cell = add i64 %column.i.row, %column.wide
 %column.state.index = add i64 %previous, %column.cell
 %column.state.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i64 %column.state.index
 %column.state = load double, ptr addrspace(1) %column.state.pointer, align 8
@@ -2014,40 +2015,42 @@ ret i1 %result
 ; reference caches the raw key plane, pools a block by mean, then applies the
 ; key norm and rotary at the block position.
 define internal double @attention_index_mean(ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %context,
-i32 %key.origin, i32 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.width, i32 %length, i32 %d) #1 { entry:
+i64 %key.origin, i64 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.width, i32 %length, i32 %d) #1 { entry:
 %state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 %model.zero = call double @recipe.encode(RECIPE_STATE %state.zero)
-%start = mul i32 %block.index, %select.block
+%block.index.wide = zext i32 %block.index to i64 %select.block.wide = zext i32 %select.block to i64 %index.width.wide = zext i32 %index.width to i64 %length.wide = zext i32 %length to i64 %d.wide = zext i32 %d to i64
+%start = mul i64 %block.index.wide, %select.block.wide
 %query.block = udiv i32 %query, %select.block
 %own = icmp eq i32 %block.index, %query.block
 %query.next = add i32 %query, 1
-%remaining = sub i32 %length, %start
-%full = icmp ult i32 %remaining, %select.block
-%cached.count = select i1 %full, i32 %remaining, i32 %select.block
+%query.next.wide = zext i32 %query.next to i64
+%remaining = sub i64 %length.wide, %start
+%full = icmp ult i64 %remaining, %select.block.wide
+%remaining.i32 = trunc i64 %remaining to i32 %cached.count = select i1 %full, i32 %remaining.i32, i32 %select.block
 %count = select i1 %own, i32 %query.next, i32 %cached.count
-%count.less = select i1 %own, i32 %start, i32 0
+%start.i32 = trunc i64 %start to i32 %count.less = select i1 %own, i32 %start.i32, i32 0
 %filled = sub i32 %count, %count.less
-%d.offset = mul i32 %d, %length
+%d.offset = mul i64 %d.wide, %length.wide
 br i1 %own, label %prefix.loop, label %cached
 cached:
-%cached.block = mul i32 %block.index, %index.width
-%cached.row = add i32 %representative.start, %cached.block
-%cached.index = add i32 %cached.row, %d
-%cached.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %cached.index
+%cached.block = mul i64 %block.index.wide, %index.width.wide
+%cached.row = add i64 %representative.start, %cached.block
+%cached.index = add i64 %cached.row, %d.wide
+%cached.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %cached.index
 %cached.value = load double, ptr addrspace(1) %cached.ptr, align 8
 br label %done
 prefix.loop:
-%key = phi i32 [ %start, %entry ], [ %key.next, %prefix.step ]
+%key = phi i64 [ %start, %entry ], [ %key.next, %prefix.step ]
 %sum = phi double [ %model.zero, %entry ], [ %sum.next, %prefix.step ]
-%more = icmp ult i32 %key, %query.next
+%more = icmp ult i64 %key, %query.next.wide
 br i1 %more, label %prefix.step, label %done
 prefix.step:
-%key.position = add i32 %key.origin, %key
-%key.index = add i32 %key.position, %d.offset
-%key.ptr = getelementptr inbounds double, ptr addrspace(1) %indexer, i32 %key.index
+%key.position = add i64 %key.origin, %key
+%key.index = add i64 %key.position, %d.offset
+%key.ptr = getelementptr inbounds double, ptr addrspace(1) %indexer, i64 %key.index
 %key.value = load double, ptr addrspace(1) %key.ptr, align 8
 %sum.next = call double @recipe.add(double %sum, double %key.value)
-%key.next = add i32 %key, 1
+%key.next = add i64 %key, 1
 br label %prefix.loop
 done:
 %total = phi double [ %cached.value, %cached ], [ %sum, %prefix.loop ]
@@ -2060,12 +2063,12 @@ ret double %mean
 ; index.heads*width entries), and receives a raw pooled mean. The unscored path
 ; returns its cached mean because the key plane was normalized before pooling.
 define internal double @attention_index_normalized(ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %key.weights, ptr addrspace(1) nocapture readonly %context,
-i32 %key.origin, i32 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length, i32 %mode, double %epsilon, i1 %pooled, i32 %d) #1 { entry:
+i64 %key.origin, i64 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length, i32 %mode, double %epsilon, i1 %pooled, i32 %d) #1 { entry:
 %state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 br i1 %pooled, label %sum.loop, label %plain
 plain:
 %plain.mean = call double @attention_index_mean(ptr addrspace(1) %indexer, ptr addrspace(1) %context,
-i32 %key.origin, i32 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.width, i32 %length, i32 %d)
+i64 %key.origin, i64 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.width, i32 %length, i32 %d)
 ret double %plain.mean
 sum.loop:
 %sum.d = phi i32 [ 0, %entry ], [ %sum.d.next, %sum.step ]
@@ -2074,7 +2077,7 @@ sum.loop:
 br i1 %sum.more, label %sum.step, label %sum.done
 sum.step:
 %sum.mean = call double @attention_index_mean(ptr addrspace(1) %indexer, ptr addrspace(1) %context,
-i32 %key.origin, i32 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.width, i32 %length, i32 %sum.d)
+i64 %key.origin, i64 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.width, i32 %length, i32 %sum.d)
 %sum.wide = call RECIPE_STATE @recipe.decode(double %sum.mean)
 %sum.square = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %sum.wide, RECIPE_STATE %sum.wide)
 %sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %sum.square)
@@ -2101,15 +2104,15 @@ br label %deviation.merge
 deviation.merge:
 %deviation.final = phi RECIPE_STATE [ %deviation, %rms.deviation ], [ %deviation.l2, %l2.deviation ]
 %mean.final = call double @attention_index_mean(ptr addrspace(1) %indexer, ptr addrspace(1) %context,
-i32 %key.origin, i32 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.width, i32 %length, i32 %d)
+i64 %key.origin, i64 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.width, i32 %length, i32 %d)
 %mean.wide = call RECIPE_STATE @recipe.decode(double %mean.final)
 %unit = call RECIPE_STATE @recipe.state.div(RECIPE_STATE %mean.wide, RECIPE_STATE %deviation.final)
 %mode.scale = icmp eq i32 %mode, 2
 br i1 %mode.scale, label %scale.key, label %unit.plain
 scale.key:
-%query.scale.count = mul i32 %index.heads, %index.width
-%key.scale.index = add i32 %query.scale.count, %d
-%key.scale.ptr = getelementptr inbounds double, ptr addrspace(1) %key.weights, i32 %key.scale.index
+%index.heads.wide = zext i32 %index.heads to i64 %index.width.wide = zext i32 %index.width to i64 %d.wide = zext i32 %d to i64 %query.scale.count = mul i64 %index.heads.wide, %index.width.wide
+%key.scale.index = add i64 %query.scale.count, %d.wide
+%key.scale.ptr = getelementptr inbounds double, ptr addrspace(1) %key.weights, i64 %key.scale.index
 %key.scale.value = load double, ptr addrspace(1) %key.scale.ptr, align 8
 %key.scale.wide = call RECIPE_STATE @recipe.decode(double %key.scale.value)
 %scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %unit, RECIPE_STATE %key.scale.wide)
@@ -2125,9 +2128,9 @@ ret double %result
 ; Rotate one normalized pooled key dimension at its block position. This is the
 ; same half-width pairing as rope_body, with the block start as position.
 define internal double @attention_index_rotated(ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %key.weights, ptr addrspace(1) nocapture readonly %context,
-i32 %key.origin, i32 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length, i32 %mode, i32 %dims, RECIPE_STATE %base, double %epsilon, i1 %pooled, i32 %d) #1 { entry:
+i64 %key.origin, i64 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length, i32 %mode, i32 %dims, RECIPE_STATE %base, double %epsilon, i1 %pooled, i32 %d) #1 { entry:
 %value = call double @attention_index_normalized(ptr addrspace(1) %indexer, ptr addrspace(1) %key.weights, ptr addrspace(1) %context,
-i32 %key.origin, i32 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length, i32 %mode, double %epsilon, i1 %pooled, i32 %d)
+i64 %key.origin, i64 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length, i32 %mode, double %epsilon, i1 %pooled, i32 %d)
 %half = udiv i32 %dims, 2
 %inside = icmp ult i32 %d, %dims
 br i1 %inside, label %rotate, label %finish
@@ -2144,7 +2147,7 @@ partner.load:
 %partner.d = phi i32 [ %lower.partner, %rotate.lower ], [ %upper.partner, %rotate.upper ]
 %half.index = phi i32 [ %d, %rotate.lower ], [ %upper.partner, %rotate.upper ]
 %partner.value = call double @attention_index_normalized(ptr addrspace(1) %indexer, ptr addrspace(1) %key.weights, ptr addrspace(1) %context,
-i32 %key.origin, i32 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length, i32 %mode, double %epsilon, i1 %pooled, i32 %partner.d)
+i64 %key.origin, i64 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length, i32 %mode, double %epsilon, i1 %pooled, i32 %partner.d)
 %two.index = mul i32 %half.index, 2
 %two.value = call RECIPE_STATE @recipe.state.from.u32(i32 %two.index)
 %dims.value = call RECIPE_STATE @recipe.state.from.u32(i32 %dims)
@@ -2180,9 +2183,9 @@ ret double %result
 ; Compatibility wrapper retained for callers that need one transformed
 ; representative dimension.
 define internal double @attention_index_representative(ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %key.weights, ptr addrspace(1) nocapture readonly %context,
-i32 %key.origin, i32 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length, i32 %mode, i32 %dims, RECIPE_STATE %base, double %epsilon, i1 %pooled, i32 %d) #1 { entry:
+i64 %key.origin, i64 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length, i32 %mode, i32 %dims, RECIPE_STATE %base, double %epsilon, i1 %pooled, i32 %d) #1 { entry:
 %result = call double @attention_index_rotated(ptr addrspace(1) %indexer, ptr addrspace(1) %key.weights, ptr addrspace(1) %context,
-i32 %key.origin, i32 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length, i32 %mode, i32 %dims, RECIPE_STATE %base, double %epsilon, i1 %pooled, i32 %d)
+i64 %key.origin, i64 %representative.start, i32 %query, i32 %block.index, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length, i32 %mode, i32 %dims, RECIPE_STATE %base, double %epsilon, i1 %pooled, i32 %d)
 ret double %result
 }
 ; The running sum of indexer keys of one key block, extended by the keys of the
@@ -2190,36 +2193,37 @@ ret double %result
 ; lies in the window starts from zero; one that began earlier keeps the sum an
 ; earlier window left, so a decode step adds one key to one block.
 define internal void @attention_index_body( ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) %context,
-i32 %p, i32 %begin, i32 %end, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %index.heads, i32 %index.width,
+i64 %p, i32 %begin, i32 %end, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %index.heads, i32 %index.width,
 i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #1 { entry:
-%length = udiv i32 %from, %channels
-%index.query.channels = mul i32 %index.heads, %index.width
-%index.channels = add i32 %index.query.channels, %index.width
-%row.stride = mul i32 %index.channels, %length
-%index.key.base = mul i32 %index.query.channels, %length
-%blocks.numerator = add i32 %length, %select.block
-%blocks.less = sub i32 %blocks.numerator, 1
-%blocks = udiv i32 %blocks.less, %select.block
-%statistics.rows = mul i32 %rows, %heads
-%statistics.plane = mul i32 %statistics.rows, %length
-%representative.base = mul i32 %statistics.plane, 2
-%representative.stride = mul i32 %blocks, %index.width
-%row = udiv i32 %p, %blocks
-%block.index = urem i32 %p, %blocks
-%row.base = mul i32 %row, %row.stride
-%key.origin = add i32 %row.base, %index.key.base
-%representative.row = mul i32 %row, %representative.stride
-%representative.block = mul i32 %block.index, %index.width
-%representative.start.row = add i32 %representative.base, %representative.row
-%representative.start = add i32 %representative.start.row, %representative.block
-%start = mul i32 %block.index, %select.block
-%stop.full = add i32 %start, %select.block
-%stop.over = icmp ugt i32 %stop.full, %end
-%stop = select i1 %stop.over, i32 %end, i32 %stop.full
-%first.before = icmp ult i32 %start, %begin
-%first = select i1 %first.before, i32 %begin, i32 %start
-%fresh = icmp uge i32 %start, %begin
-%extends = icmp ult i32 %first, %stop
+%from.wide = zext i32 %from to i64 %channels.wide = zext i32 %channels to i64 %rows.wide = zext i32 %rows to i64 %heads.wide = zext i32 %heads to i64 %index.heads.wide = zext i32 %index.heads to i64 %index.width.wide = zext i32 %index.width to i64 %select.block.wide = zext i32 %select.block to i64 %begin.wide = zext i32 %begin to i64 %end.wide = zext i32 %end to i64
+%length = udiv i64 %from.wide, %channels.wide
+%index.query.channels = mul i64 %index.heads.wide, %index.width.wide
+%index.channels = add i64 %index.query.channels, %index.width.wide
+%row.stride = mul i64 %index.channels, %length
+%index.key.base = mul i64 %index.query.channels, %length
+%blocks.numerator = add i64 %length, %select.block.wide
+%blocks.less = sub i64 %blocks.numerator, 1
+%blocks = udiv i64 %blocks.less, %select.block.wide
+%statistics.rows = mul i64 %rows.wide, %heads.wide
+%statistics.plane = mul i64 %statistics.rows, %length
+%representative.base = mul i64 %statistics.plane, 2
+%representative.stride = mul i64 %blocks, %index.width.wide
+%row = udiv i64 %p, %blocks
+%block.index = urem i64 %p, %blocks
+%row.base = mul i64 %row, %row.stride
+%key.origin = add i64 %row.base, %index.key.base
+%representative.row = mul i64 %row, %representative.stride
+%representative.block = mul i64 %block.index, %index.width.wide
+%representative.start.row = add i64 %representative.base, %representative.row
+%representative.start = add i64 %representative.start.row, %representative.block
+%start = mul i64 %block.index, %select.block.wide
+%stop.full = add i64 %start, %select.block.wide
+%stop.over = icmp ugt i64 %stop.full, %end.wide
+%stop = select i1 %stop.over, i64 %end.wide, i64 %stop.full
+%first.before = icmp ult i64 %start, %begin.wide
+%first = select i1 %first.before, i64 %begin.wide, i64 %start
+%fresh = icmp uge i64 %start, %begin.wide
+%extends = icmp ult i64 %first, %stop
 %clear = and i1 %fresh, %extends
 %state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 %model.zero = call double @recipe.encode(RECIPE_STATE %state.zero)
@@ -2229,36 +2233,37 @@ clear.loop:
 %clear.more = icmp ult i32 %clear.d, %index.width
 br i1 %clear.more, label %clear.step, label %key.loop
 clear.step:
-%clear.index = add i32 %representative.start, %clear.d
-%clear.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %clear.index
+%clear.d.wide = zext i32 %clear.d to i64
+%clear.index = add i64 %representative.start, %clear.d.wide
+%clear.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %clear.index
 store double %model.zero, ptr addrspace(1) %clear.ptr, align 8
 %clear.next = add i32 %clear.d, 1
 br label %clear.loop
 key.loop:
-%key = phi i32 [ %first, %entry ], [ %first, %clear.loop ], [ %key.advance, %key.step ]
-%key.more = icmp ult i32 %key, %stop
+%key = phi i64 [ %first, %entry ], [ %first, %clear.loop ], [ %key.advance, %key.step ]
+%key.more = icmp ult i64 %key, %stop
 br i1 %key.more, label %key.prepare, label %exit
 key.prepare:
-%key.position = add i32 %key.origin, %key
+%key.position = add i64 %key.origin, %key
 br label %dim.loop
 dim.loop:
 %dim = phi i32 [ 0, %key.prepare ], [ %dim.advance, %dim.step ]
 %dim.more = icmp ult i32 %dim, %index.width
 br i1 %dim.more, label %dim.step, label %key.step
 dim.step:
-%dim.offset = mul i32 %dim, %length
-%dim.index = add i32 %key.position, %dim.offset
-%dim.ptr = getelementptr inbounds double, ptr addrspace(1) %indexer, i32 %dim.index
+%dim.wide = zext i32 %dim to i64 %dim.offset = mul i64 %dim.wide, %length
+%dim.index = add i64 %key.position, %dim.offset
+%dim.ptr = getelementptr inbounds double, ptr addrspace(1) %indexer, i64 %dim.index
 %dim.value = load double, ptr addrspace(1) %dim.ptr, align 8
-%dim.target = add i32 %representative.start, %dim
-%dim.target.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %dim.target
+%dim.target = add i64 %representative.start, %dim.wide
+%dim.target.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %dim.target
 %dim.prior = load double, ptr addrspace(1) %dim.target.ptr, align 8
 %dim.sum = call double @recipe.add(double %dim.prior, double %dim.value)
 store double %dim.sum, ptr addrspace(1) %dim.target.ptr, align 8
 %dim.advance = add i32 %dim, 1
 br label %dim.loop
 key.step:
-%key.advance = add i32 %key, 1
+%key.advance = add i64 %key, 1
 br label %key.loop
 exit:
 ret void
@@ -2268,34 +2273,37 @@ ret void
 ; the threshold is the score of the keep-th best, so a query keeps every block
 ; whose score reaches it.
 define internal void @attention_select_body( ptr addrspace(1) nocapture readonly %indexer, ptr addrspace(1) nocapture readonly %key.weights, ptr addrspace(1) %context,
-i32 %p, i32 %keep, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %index.heads,
+i64 %p, i32 %keep, i32 %rows, i32 %from, i32 %heads, i32 %channels, i32 %kv.heads, i32 %index.heads,
 i32 %index.width, i32 %select.block, i1 %gate, double %epsilon, i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #1 { entry:
-%length = udiv i32 %from, %channels
-%index.query.channels = mul i32 %index.heads, %index.width
-%index.channels = add i32 %index.query.channels, %index.width
-%row.stride = mul i32 %index.channels, %length
-%index.key.base = mul i32 %index.query.channels, %length
-%blocks.numerator = add i32 %length, %select.block
-%blocks.less = sub i32 %blocks.numerator, 1
-%blocks = udiv i32 %blocks.less, %select.block
-%score.stride = mul i32 %blocks, 2
-%statistics.rows = mul i32 %rows, %heads
-%statistics.plane = mul i32 %statistics.rows, %length
-%representative.base = mul i32 %statistics.plane, 2
-%representative.stride = mul i32 %blocks, %index.width
-%representative.total = mul i32 %representative.stride, %rows
-%score.base = add i32 %representative.base, %representative.total
-%row = udiv i32 %p, %length
-%query = urem i32 %p, %length
-%row.base = mul i32 %row, %row.stride
-%key.origin = add i32 %row.base, %index.key.base
-%query.position = add i32 %row.base, %query
-%count.less = udiv i32 %query, %select.block
-%count = add i32 %count.less, 1
-%score.query = mul i32 %p, %score.stride
-%score.start = add i32 %score.base, %score.query
-%representative.row = mul i32 %row, %representative.stride
-%representative.start = add i32 %representative.base, %representative.row
+%from.wide = zext i32 %from to i64 %channels.wide = zext i32 %channels to i64 %rows.wide = zext i32 %rows to i64 %heads.wide = zext i32 %heads to i64 %index.heads.wide = zext i32 %index.heads to i64 %index.width.wide = zext i32 %index.width to i64 %select.block.wide = zext i32 %select.block to i64
+%length = udiv i64 %from.wide, %channels.wide
+%index.query.channels = mul i64 %index.heads.wide, %index.width.wide
+%index.channels = add i64 %index.query.channels, %index.width.wide
+%row.stride = mul i64 %index.channels, %length
+%index.key.base = mul i64 %index.query.channels, %length
+%blocks.numerator = add i64 %length, %select.block.wide
+%blocks.less = sub i64 %blocks.numerator, 1
+%blocks = udiv i64 %blocks.less, %select.block.wide
+%score.stride = mul i64 %blocks, 2
+%statistics.rows = mul i64 %rows.wide, %heads.wide
+%statistics.plane = mul i64 %statistics.rows, %length
+%representative.base = mul i64 %statistics.plane, 2
+%representative.stride = mul i64 %blocks, %index.width.wide
+%representative.total = mul i64 %representative.stride, %rows.wide
+%score.base = add i64 %representative.base, %representative.total
+%row = udiv i64 %p, %length
+%query = urem i64 %p, %length
+%row.base = mul i64 %row, %row.stride
+%key.origin = add i64 %row.base, %index.key.base
+%query.position = add i64 %row.base, %query
+%count.less = udiv i64 %query, %select.block.wide
+%count.wide = add i64 %count.less, 1
+%count = trunc i64 %count.wide to i32
+%score.query = mul i64 %p, %score.stride
+%score.start = add i64 %score.base, %score.query
+%representative.row = mul i64 %row, %representative.stride
+%representative.start = add i64 %representative.base, %representative.row
+%query.i32 = trunc i64 %query to i32 %length.i32 = trunc i64 %length to i32
 %state.zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 %model.zero = call double @recipe.encode(RECIPE_STATE %state.zero)
 br label %clear.loop
@@ -2304,8 +2312,8 @@ clear.loop:
 %clear.more = icmp ult i32 %clear.b, %count
 br i1 %clear.more, label %clear.step, label %head.loop
 clear.step:
-%clear.index = add i32 %score.start, %clear.b
-%clear.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %clear.index
+%clear.b.wide = zext i32 %clear.b to i64 %clear.index = add i64 %score.start, %clear.b.wide
+%clear.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %clear.index
 store double %model.zero, ptr addrspace(1) %clear.ptr, align 8
 %clear.next = add i32 %clear.b, 1
 br label %clear.loop
@@ -2314,9 +2322,9 @@ head.loop:
 %head.more = icmp ult i32 %head, %index.heads
 br i1 %head.more, label %head.prepare, label %threshold.prepare
 head.prepare:
-%head.offset = mul i32 %head, %index.width
-%head.plane = mul i32 %head.offset, %length
-%head.base = add i32 %query.position, %head.plane
+%head.wide = zext i32 %head to i64 %head.offset = mul i64 %head.wide, %index.width.wide
+%head.plane = mul i64 %head.offset, %length
+%head.base = add i64 %query.position, %head.plane
 br label %score.loop
 score.loop:
 %score.b = phi i32 [ 0, %head.prepare ], [ %score.advance, %score.store ]
@@ -2330,12 +2338,12 @@ score.dim.loop:
 %score.dim.more = icmp ult i32 %score.d, %index.width
 br i1 %score.dim.more, label %score.dim.step, label %score.store
 score.dim.step:
-%score.dim.offset = mul i32 %score.d, %length
-%score.query.index = add i32 %head.base, %score.dim.offset
-%score.query.ptr = getelementptr inbounds double, ptr addrspace(1) %indexer, i32 %score.query.index
+%score.d.wide = zext i32 %score.d to i64 %score.dim.offset = mul i64 %score.d.wide, %length
+%score.query.index = add i64 %head.base, %score.dim.offset
+%score.query.ptr = getelementptr inbounds double, ptr addrspace(1) %indexer, i64 %score.query.index
 %score.query.value = load double, ptr addrspace(1) %score.query.ptr, align 8
 %score.representative.value = call double @attention_index_representative(ptr addrspace(1) %indexer, ptr addrspace(1) %key.weights, ptr addrspace(1) %context,
-i32 %key.origin, i32 %representative.start, i32 %query, i32 %score.b, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length, i32 %index.mode, i32 %index.dims, RECIPE_STATE %index.base, double %epsilon, i1 %index.pooled, i32 %score.d)
+i64 %key.origin, i64 %representative.start, i32 %query.i32, i32 %score.b, i32 %select.block, i32 %index.heads, i32 %index.width, i32 %length.i32, i32 %index.mode, i32 %index.dims, RECIPE_STATE %index.base, double %epsilon, i1 %index.pooled, i32 %score.d)
 %score.query.wide = call RECIPE_STATE @recipe.decode(double %score.query.value)
 %score.representative.wide = call RECIPE_STATE @recipe.decode(double %score.representative.value)
 %score.term = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %score.query.wide, RECIPE_STATE %score.representative.wide)
@@ -2347,8 +2355,8 @@ score.store:
 %score.positive = call i1 @recipe.ogt(double %score.sum.model, double 0.0)
 %score.head.model = select i1 %score.positive, double %score.sum.model, double %model.zero
 %score.head.wide = call RECIPE_STATE @recipe.decode(double %score.head.model)
-%score.index = add i32 %score.start, %score.b
-%score.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %score.index
+%score.b.wide = zext i32 %score.b to i64 %score.index = add i64 %score.start, %score.b.wide
+%score.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %score.index
 %score.prior = load double, ptr addrspace(1) %score.ptr, align 8
 %score.prior.wide = call RECIPE_STATE @recipe.decode(double %score.prior)
 %score.total = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %score.prior.wide, RECIPE_STATE %score.head.wide)
@@ -2360,15 +2368,15 @@ head.done:
 %head.advance = add i32 %head, 1
 br label %head.loop
 threshold.prepare:
-%flag.base = add i32 %score.start, %blocks
+%flag.base = add i64 %score.start, %blocks
 br label %rank.loop
 rank.loop:
 %rank.b = phi i32 [ 0, %threshold.prepare ], [ %rank.b.next, %rank.store ]
 %rank.more = icmp ult i32 %rank.b, %count
 br i1 %rank.more, label %rank.body, label %select.exit
 rank.body:
-%rank.b.index = add i32 %score.start, %rank.b
-%rank.b.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %rank.b.index
+%rank.b.wide = zext i32 %rank.b to i64 %rank.b.index = add i64 %score.start, %rank.b.wide
+%rank.b.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %rank.b.index
 %rank.b.score = load double, ptr addrspace(1) %rank.b.ptr, align 8
 br label %rank.inner
 rank.inner:
@@ -2377,8 +2385,8 @@ rank.inner:
 %rank.inner.more = icmp ult i32 %rank.c, %count
 br i1 %rank.inner.more, label %rank.inner.step, label %rank.decide
 rank.inner.step:
-%rank.c.index = add i32 %score.start, %rank.c
-%rank.c.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %rank.c.index
+%rank.c.wide = zext i32 %rank.c to i64 %rank.c.index = add i64 %score.start, %rank.c.wide
+%rank.c.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %rank.c.index
 %rank.c.score = load double, ptr addrspace(1) %rank.c.ptr, align 8
 %rank.greater = call i1 @recipe.ogt(double %rank.c.score, double %rank.b.score)
 %rank.same = call i1 @recipe.oeq(double %rank.c.score, double %rank.b.score)
@@ -2394,8 +2402,8 @@ rank.decide:
 br label %rank.store
 rank.store:
 %rank.flag = select i1 %rank.admit, double 1.000000e+00, double 0.000000e+00
-%rank.flag.index = add i32 %flag.base, %rank.b
-%rank.flag.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %rank.flag.index
+%rank.store.b.wide = zext i32 %rank.b to i64 %rank.flag.index = add i64 %flag.base, %rank.store.b.wide
+%rank.flag.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %rank.flag.index
 store double %rank.flag, ptr addrspace(1) %rank.flag.ptr, align 8
 %rank.b.next = add i32 %rank.b, 1
 br label %rank.loop

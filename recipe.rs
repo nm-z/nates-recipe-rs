@@ -2999,9 +2999,9 @@ impl NativeModelIr {
 							ir.push_str(&format!("call void @attention_index_body( {pointer} {source}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared} )\n"));
 						})?;
 						ir.push_str(barrier(backend));
-						emit_fixed_loop(&mut ir, index, "select", self.rows, Shape { channels: 1, length: node.output.length }, &window, |ir, p| {
+						emit_fixed_loop(&mut ir, index, "select", self.rows, Shape { channels: 1, length: node.output.length }, &window, |ir, _p, wide| {
 							ir.push_str(&format!(
-								"call void @attention_select_body( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i32 {p}, i32 {keep}, {shared} )\n"
+								"call void @attention_select_body( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i64 {wide}, i32 {keep}, {shared} )\n"
 							));
 						})?;
 						ir.push_str(barrier(backend));
@@ -5423,15 +5423,6 @@ mod gguf {
 
 	/// The Recipe storage format an embedding tensor decodes through, including
 	/// raw F32 and F16 tables.
-	pub(super) fn embedding_format(tensor: &GgufTensor) -> Result<StorageFormat> {
-		match tensor.kind {
-			0 => StorageFormat::named("f32").ok_or_else(|| RecipeError::new("F32 embedding layout is unavailable")),
-			1 => StorageFormat::named("f16").ok_or_else(|| RecipeError::new("F16 embedding layout is unavailable")),
-			_ => block_format(tensor),
-		}
-	}
-
-	/// The Recipe storage format a block-quantized tensor decodes through.
 	pub(super) fn embedding_format(tensor: &GgufTensor) -> Result<StorageFormat> {
 		match tensor.kind {
 			0 => StorageFormat::named("f32").ok_or_else(|| RecipeError::new("F32 embedding layout is unavailable")),
