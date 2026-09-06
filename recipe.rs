@@ -11370,27 +11370,15 @@ impl FeatureSelection {
 	}
 }
 fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathBuf>)> {
-	let mut paths = BTreeSet::new();
-	for source in sources {
-		collect_files(&resolve_path(source)?, &mut paths)?;
-	}
-	// ZIP sources contribute data entries at virtual archive paths, preserving directory layouts while ignoring object metadata.
+	// Preserve container-relative paths while recursively loading folders and archives.
 	let mut files = Vec::new();
-	for path in &paths {
-		let bytes = fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-		if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
-			for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
-				let metadata = Path::new(&entry).extension().and_then(|value| value.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-					&& str::from_utf8(&contents).is_ok_and(|text| text.trim_start().starts_with('{'));
-				if metadata {
-					continue;
-				}
-				files.push((path.join(entry), contents));
-			}
-		} else {
-			files.push((path.clone(), bytes));
-		}
+	for source in sources {
+		let path = fs::canonicalize(resolve_path(source)?).map_err(|error| RecipeError::new(format!("cannot resolve {source}: {error}")))?;
+		collect_files(&path, None, &mut files)?;
 	}
+	files.sort_by(|left, right| left.0.cmp(&right.0));
+	files.dedup_by(|left, right| left.0 == right.0);
+	let paths = files.iter().map(|(path, _)| path.clone()).collect::<Vec<_>>();
 	let mut grouped = Vec::new();
 	for (path, bytes) in &files {
 		if !path.extension().and_then(|value| value.to_str()).is_some_and(is_table) {
@@ -11402,7 +11390,7 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 		}
 	}
 	if let Some(table) = directory_samples(data, sources, &files, &grouped)? {
-		return Ok((vec![table], paths.into_iter().collect()));
+		return Ok((vec![table], paths));
 	}
 	let mut tables = merge_captures(grouped, &data.target)?;
 	tables = merge_partitions(tables, &data.target, &data.features)?;
@@ -11421,7 +11409,7 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 			}
 		}
 	}
-	Ok((tables, paths.into_iter().collect()))
+	Ok((tables, paths))
 }
 /// One interpretation of directory layout for sample trees whose target is not a table
 /// column: flat sidecar-labeled samples, class-labeled subdirectories, and paired
@@ -12166,20 +12154,39 @@ fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	}
 	Ok(path.to_owned())
 }
-fn collect_files(path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()> {
-	let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
-	if metadata.is_file() {
-		files.insert(fs::canonicalize(path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))?);
+/// Every leaf file a container holds, to any depth: a folder contributes its
+/// entries and an archive its members, both anchored at the container's path.
+fn collect_files(path: &Path, member: Option<Vec<u8>>, files: &mut Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
+	let bytes = match member {
+		Some(bytes) => bytes,
+		None => {
+			let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
+			if !metadata.is_file() {
+				let mut children = fs::read_dir(path)
+					.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
+					.collect::<std::io::Result<Vec<_>>>()
+					.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
+				children.sort_by_key(fs::DirEntry::path);
+				for child in children {
+					collect_files(&child.path(), None, files)?;
+				}
+				return Ok(());
+			}
+			fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
+		}
+	};
+	if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
+		for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
+			let metadata = Path::new(&entry).extension().and_then(|value| value.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+				&& str::from_utf8(&contents).is_ok_and(|text| text.trim_start().starts_with('{'));
+			if metadata {
+				continue;
+			}
+			collect_files(&path.join(entry), Some(contents), files)?;
+		}
 		return Ok(());
 	}
-	let mut children = fs::read_dir(path)
-		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?
-		.collect::<std::io::Result<Vec<_>>>()
-		.map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
-	children.sort_by_key(fs::DirEntry::path);
-	for child in children {
-		collect_files(&child.path(), files)?;
-	}
+	files.push((path.to_owned(), bytes));
 	Ok(())
 }
 fn target_column(table: &Table, name: &str) -> Option<usize> {
