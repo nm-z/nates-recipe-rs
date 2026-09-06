@@ -4203,7 +4203,17 @@ impl NativeModelIr {
 	/// the contraction and attention bodies stage operands there, so a run that
 	/// calls neither reserves none and leaves the whole allocation to the
 	/// workgroups the device can then keep resident.
-	fn segment_shared_values(&self, node: usize, run: &str) -> Result<u32> {
+	fn segment_shared_values(&self, backend: Backend, node: usize, run: &str) -> Result<u32> {
+		if run.contains("@expert_iq_") {
+			return if backend == Backend::Nvidia && self.precision.model == Compute::FP32 {
+				Ok(0)
+			} else {
+				self.schedule
+					.block
+					.checked_mul(self.precision.state.bytes().div_ceil(self.precision.model.bytes()) as u32)
+					.ok_or_else(|| RecipeError::new("expert reduction shared memory overflows"))
+			};
+		}
 		if !["@contraction_", "@attention_", "@scan_", "@expert_", "@reduce_rows("].iter().any(|body| run.contains(body)) {
 			return Ok(0);
 		}
@@ -4286,7 +4296,7 @@ impl NativeModelIr {
 			let undefined = undefined_names(&run, &parameters);
 			require(undefined.is_empty(), format!("{symbol} reads {} outside its own entrypoint", undefined.join(", ")))?;
 			let cooperative = synchronized.iter().any(|name| run.contains(&format!("@{name}(")));
-			let shared_values = self.segment_shared_values(node, &run)?;
+			let shared_values = self.segment_shared_values(backend, node, &run)?;
 			body.push_str(&format!("define {kernel}void @{symbol}({forward_args}) #0 {{\nentry:\n%tid = {thread}\n{run}ret void\n}}\n"));
 			segments.push(NativeSegment { symbol, node, cooperative, shared_values });
 		}
