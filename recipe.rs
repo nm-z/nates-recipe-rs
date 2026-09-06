@@ -18831,6 +18831,28 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 }
 
 #[cfg(test)]
+mod issue_676_tests {
+	use super::*;
+
+	#[test]
+	fn measured_split_refuses_before_tape_allocation() {
+		let mut graph = Graph::new(Shape { channels: 1, length: 1 }, 1.0e-5);
+		push_node(&mut graph, Primitive::Contraction, Shape { channels: 1024, length: 1024 }, 1, contraction_arguments(0, false), -2).unwrap();
+		let gpu = Box::leak(Box::new(Gpu {
+			name: "test".to_owned(),
+			backend: Backend::Cpu,
+			native_target: BackendTarget::Cpu { target: "test".to_owned() },
+			driver: Driver::Cpu,
+			memory: 1,
+			shared_limit: u32::MAX,
+			dispatch: Mutex::new(()),
+		}));
+		let error = measured_split(&graph, Compute::FP64, &[gpu]).unwrap_err().to_string();
+		assert!(error.contains("cannot hold placement blocks"), "unexpected error: {error}");
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 
