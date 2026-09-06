@@ -5944,7 +5944,7 @@ mod bundle {
 			Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => {
 				format!("moe,{experts},{top_k},{hidden},{},{},{},{}", *activation as u8, *scoring as u8, u8::from(*renormalize), u8::from(*shared))
 			}
-			Operation::Hyper(lanes, rank, parts) => format!("hyper,{lanes},{rank},{}", parts.iter().map(residual_text).collect::<Vec<_>>().join(";")),
+			Operation::Hyper(lanes, rank, blocks) => format!("hyper,{lanes},{rank},{}", blocks.iter().map(block_text).map(|block| text(&block)).collect::<Vec<_>>().join(";")),
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel) => format!("dconv,{kernel}"),
@@ -6009,11 +6009,11 @@ mod bundle {
 			"embed" => Ok(Operation::Embed(value_at(fields.next(), "embedding vocabulary")?, value_at(fields.next(), "embedding width")?)),
 			"hyper" => {
 				let (lanes, rest) = rest.split_once(',').unwrap_or((rest, ""));
-				let (rank, parts) = rest.split_once(',').unwrap_or((rest, ""));
+				let (rank, blocks) = rest.split_once(',').unwrap_or((rest, ""));
 				Ok(Operation::Hyper(
 					value_at(Some(lanes), "hyper-connection lanes")?,
 					value_at(Some(rank), "hyper-connection rank")?,
-					parts.split(';').filter(|part| !part.is_empty()).map(residual).collect::<Result<Vec<_>>>()?,
+					blocks.split(';').filter(|part| !part.is_empty()).map(|part| untext(part, "hyper-connection block").and_then(|part| block(&part))).collect::<Result<Vec<_>>>()?,
 				))
 			}
 			"dconv" => Ok(Operation::Dconv(value_at(Some(rest), "depthwise convolution kernel")?)),
@@ -6727,7 +6727,7 @@ enum Operation {
 	Moe(usize, usize, usize, Activation, Scoring, bool, bool),
 	Perceptron(usize),
 	Embed(usize, usize),
-	Hyper(usize, usize, Vec<Residual>),
+	Hyper(usize, usize, Vec<Block>),
 	Dconv(usize),
 	Delta(usize, usize),
 }
@@ -6938,11 +6938,12 @@ impl Model {
 	pub fn gate(&self) -> Self {
 		self.attention("gate", |attention| attention.gate = true)
 	}
-	/// Hyper-connections: a stream of `lanes` copies of the width feeds `parts`
-	/// through a gated read and takes their output back through gated writes.
+	/// Hyper-connections: a stream of `lanes` copies of the width feeds `branch`
+	/// through a gated read and takes its output back through gated writes.
 	/// `rank` sizes the gate bottleneck; zero fixes every gate at one.
-	pub fn hyper<const N: usize>(&self, lanes: usize, rank: usize, parts: [Residual; N]) -> Self {
-		self.push(Operation::Hyper(lanes, rank, parts.into()))
+	pub fn hyper(&self, lanes: usize, rank: usize, branch: &Model) -> Self {
+		assert!(!branch.blocks.is_empty(), "hyper-connection branch requires a block");
+		self.push(Operation::Hyper(lanes, rank, branch.blocks.clone()))
 	}
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
 		let mut model = self.suffix();
@@ -8321,7 +8322,7 @@ impl Operation {
 			// An embedding table is the gather's context: never trained and always read packed.
 			Self::Pool(_) | Self::Estimator(_) | Self::Embed(..) => false,
 			Self::Residual(parts) => weighted_parts(parts),
-			Self::Hyper(_, rank, parts) => *rank != 0 || weighted_parts(parts),
+			Self::Hyper(_, rank, blocks) => *rank != 0 || blocks.iter().any(|block| block.operation.weighted()),
 			_ => true,
 		}
 	}
@@ -9115,6 +9116,14 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 	}
 	Ok(())
 }
+fn sequential_operation(operation: &Operation) -> bool {
+	match operation {
+		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) => true,
+		Operation::Residual(parts) => parts.iter().any(|part| matches!(part, Residual::Conv(..))),
+		Operation::Hyper(_, _, blocks) => blocks.iter().any(|block| sequential_operation(&block.operation)),
+		_ => false,
+	}
+}
 fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config, initialize: bool) -> Result<Graph> {
 	require(!model.blocks.is_empty(), "model must contain a block")?;
 	if let Some(format) = model.blocks.iter().map(|block| StorageFormat(block.quantization)).find(|format| format.0 != 0 && !format.valid()) {
@@ -9122,12 +9131,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	}
 	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
 	// A sequential block anywhere in the model needs the sequence axis, including inside a residual or hyper branch.
-	let convolutional = model.blocks.iter().any(|block| match &block.operation {
-		Operation::Conv(..) | Operation::Pool(..) | Operation::Dconv(..) | Operation::Delta(..) => true,
-		Operation::Residual(parts) | Operation::Hyper(_, _, parts) => parts.iter().any(|part| matches!(part, Residual::Conv(..))),
-		_ => false,
-	});
-	let sequential = convolutional || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
+	let sequential = model.blocks.iter().any(|block| sequential_operation(&block.operation));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
 	for (index, block) in model.blocks.iter().enumerate() {
@@ -9295,7 +9299,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Lstm(width) => lower_scan(graph, *width, 4)?,
 		Operation::Residual(parts) => lower_residual(graph, parts, skip, config)?,
 		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
-		Operation::Hyper(lanes, rank, parts) => lower_hyper(graph, *lanes, *rank, parts, config)?,
+		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, blocks, total, data, targets, rows, gpu, config)?,
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
 			lower_estimator(graph, estimator, data, targets, rows, gpu, config)?
@@ -9698,8 +9702,8 @@ fn lower_residual(graph: &mut Graph, parts: &[Residual], skip: i32, config: Conf
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
 	push_program(graph, skip, &[], program)
 }
-fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, parts: &[Residual], config: Config) -> Result<()> {
-	require(lanes != 0 && !parts.is_empty(), "hyper-connections need at least one lane and one operation")?;
+fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
+	require(lanes != 0 && !blocks.is_empty(), "hyper-connections need at least one lane and one block")?;
 	if graph.lanes == 0 {
 		let shape = graph.output;
 		push_node(graph, Primitive::Expand, Shape { channels: checked_mul(shape.channels, lanes, "hyper-connection stream")?, length: shape.length }, 0, arguments(lanes as f64, 0.0), -2)?;
@@ -9712,13 +9716,18 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, parts: &[Residual],
 	let (read, write) = lower_gates(graph, lanes, rank, true)?;
 	reset(graph, stream, shape);
 	push_node(graph, Primitive::Read, Shape { channels: width, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
-	for part in parts {
-		match part {
-			Residual::Layer(width) => lower_project(graph, *width)?,
-			Residual::Conv(filters, kernel) => lower_conv(graph, *filters, *kernel)?,
-			Residual::Activation(activation) => lower_activation(graph, *activation, config)?,
-		}
+	let (outer_frozen, outer_packed, outer_kind) = (graph.block_frozen, graph.block_packed, graph.block_kind);
+	graph.lanes = 0;
+	for block in blocks {
+		graph.block_frozen = block.frozen;
+		graph.block_packed = block.packed;
+		graph.block_kind = block.operation.name();
+		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
 	}
+	if graph.lanes != 0 {
+		lower_collapse(graph)?;
+	}
+	(graph.block_frozen, graph.block_packed, graph.block_kind, graph.lanes) = (outer_frozen, outer_packed, outer_kind, lanes);
 	require(graph.output.channels == width && graph.output.length == shape.length, "hyper-connection branch shape mismatch")?;
 	push_node(graph, Primitive::Outer, shape, 0, arguments(lanes as f64, 0.0), write)?;
 	let mut program = ScalarProgram(Vec::new());
