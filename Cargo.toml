@@ -26,7 +26,7 @@ contraction-k-partitions = 32
 contraction-split-span = 128
 contraction-matrix-split-span = 64
 contraction-swizzle-m-tiles = 4
-contraction-resident-waves-per-workgroup = 2
+contraction-resident-waves-per-workgroup = 8
 contraction-matrix-max-waves-per-workgroup = 4
 attention-query-tile = 24
 # Positions per delta rule chunk. One commits the carried state every step, which
