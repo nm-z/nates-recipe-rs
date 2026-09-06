@@ -8711,6 +8711,13 @@ impl StoredBytes {
 	fn runs(&self) -> impl Iterator<Item = &[u8]> {
 		self.0.iter().map(|run| &**run)
 	}
+	fn retain_mapped_pages(&self) -> Result<()> {
+		#[cfg(unix)]
+		for run in self.0.iter().filter(|run| matches!(run, StoredSegment::Mapped(..))) {
+			require(unsafe { mlock(run.as_ptr().cast(), run.len()) } == 0, format!("cannot retain {} host lookup bytes in RAM: {}", run.len(), std::io::Error::last_os_error()))?;
+		}
+		Ok(())
+	}
 	/// The `length` bytes at `at`, gathered across the runs they fall in, so one
 	/// row of a mapped table is read without touching the rest of it.
 	fn slice(&self, at: usize, length: usize) -> Result<Vec<u8>> {
@@ -11564,6 +11571,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	reset(graph, source, input);
 	lower_project(graph, checked_add(checked_mul(2, keys, "delta query and key width")?, inner, "delta projection width")?)?;
 	lower_dconv(graph, kernel, 1)?;
+	lower_activation(graph, Activation::Silu, config)?;
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
 	lower_normalize(graph, BlockNormalization::L2, key_width, checked_mul(2, keys, "delta query and key span")?)?;
@@ -12292,6 +12300,7 @@ impl NativeTape {
 			}
 			if node.op == Primitive::Lookup {
 				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?.clone();
+				table.bytes.retain_mapped_pages()?;
 				let words = graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).ok_or_else(|| RecipeError::new("per-layer embedding hash is absent"))?;
 				require(node.output.length == positions, format!("per-layer embedding reads {} positions of {positions} ids", node.output.length))?;
 				require(token_count == rows * positions, format!("per-layer embedding reads {} ids for {rows} rows of {positions} positions, received {token_count}", rows * positions))?;
@@ -15321,6 +15330,7 @@ unsafe extern "C" {
 	fn dlclose(handle: Ptr) -> i32;
 	fn mmap(address: Ptr, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> Ptr;
 	fn munmap(address: Ptr, length: usize) -> i32;
+	fn mlock(address: *const c_void, length: usize) -> i32;
 }
 #[cfg(all(nvidia, windows))]
 unsafe fn dlopen(name: *const std::ffi::c_char, _: i32) -> Ptr {
