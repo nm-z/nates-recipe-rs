@@ -7388,10 +7388,7 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 		gpu.synchronize()?;
 		Ok(started.elapsed().as_secs_f64())
 	};
-	// The first dispatch of either kind pays a one-time cost, and one later
-	// sample can still carry a thread wake or a scheduler stall larger than the
-	// gradient work, so both kinds warm up and the two costs then interleave and
-	// each takes its floor over the configured surrogate epochs.
+	// Warm up both paths, then use minimum timings to reduce scheduling noise.
 	timed(&mut tape, true)?;
 	timed(&mut tape, false)?;
 	let (mut overhead, mut epoch) = (f64::INFINITY, f64::INFINITY);
