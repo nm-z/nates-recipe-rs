@@ -10284,6 +10284,7 @@ fn cuts_connection(graph: &Graph, start: usize) -> bool {
 /// tail. A part that fits here is the tape the device later builds, so a
 /// placement that no device can hold is refused before any tape is created.
 fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -> Result<Vec<usize>> {
+	require(!devices.is_empty(), "placement selected no devices")?;
 	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
 	let available = |device: &&'static Gpu| device.free_bytes().map(|free| free.saturating_sub(reserve));
 	let mut starts = Vec::new();
@@ -10295,10 +10296,15 @@ fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -
 	let (mut split, mut taken, mut first, mut free) = (Vec::new(), 0, 0, available(&devices[0])?);
 	for (block, &start) in starts.iter().enumerate() {
 		let end = starts.get(block + 1).copied().unwrap_or(graph.nodes.len());
-		let resident = part_bytes(&graph_part(graph, first, end)?, precision)? as u64;
+		let mut resident = part_bytes(&graph_part(graph, first, end)?, precision)? as u64;
 		if taken != 0 && resident > free && split.len() + 1 < devices.len() && !cuts_connection(graph, start) {
 			split.push(taken);
 			(taken, first, free) = (0, start, available(&devices[split.len()])?);
+			resident = part_bytes(&graph_part(graph, first, end)?, precision)? as u64;
+		}
+		if resident > free {
+			let device = split.len();
+			return Err(RecipeError::new(format!("device {device} cannot hold placement blocks {}..{}: {resident} bytes required, {free} bytes available", first, end)));
 		}
 		taken += 1;
 	}
