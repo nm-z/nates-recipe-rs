@@ -12815,9 +12815,7 @@ fn carried(node: &Node, rows: usize) -> Result<Carried> {
 			let (kernel, dilation) = (integer_argument(node.argument[0], "depthwise kernel")? as usize, integer_argument(node.argument[1], "depthwise dilation")?.max(1) as usize);
 			Carried { history: History::Positions(checked_mul(kernel.saturating_sub(1), dilation, "depthwise tail")?), values: 0 }
 		}
-		Primitive::Contraction if node.argument[0] > 1.0 => {
-			Carried { history: History::Positions(integer_argument(node.argument[0], "contraction kernel")? as usize - 1), values: 0 }
-		}
+		Primitive::Contraction if node.argument[0] > 1.0 => Carried { history: History::Positions(integer_argument(node.argument[0], "contraction kernel")? as usize - 1), values: 0 },
 		Primitive::Pool => Carried { history: History::Sequence, values: checked_mul(rows, node.output.elements(), "pool context")? },
 		// The rows the host gathers for every position, staged as [row][position][channel].
 		Primitive::Lookup => Carried { history: History::Sequence, values: checked_mul(rows, node.output.elements(), "lookup staging")? },
