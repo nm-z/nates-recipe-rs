@@ -42,15 +42,28 @@ recipe --device amd0 --device archy:nv0 model.rs
 let model = recipe.gguf("model-00001-of-00004.gguf");
 model.value("general.architecture");
 model.tensors();
-model.contract("blk.0.ffn_up.weight", &input, 16);
-model.expert("blk.0.ffn_up_exps.weight", 3, &input, 16);
+model.contract("blk.0.ffn_down.weight", &input, 1024);
+model.expert("blk.0.ffn_up_exps.weight", 3, &input, 640);
+let q = model.tensor("blk.3.attn_q.weight").unwrap();
+let query = (0..24).map(|head| q.rows(head * 512, 256).unwrap()).collect::<Vec<_>>();
+let plan = model.plan().node(&query).named(&model, "blk.3.attn_output.weight");
+model.infer(&recipe.model().layer(6144).layer(2560), &plan, &input, 2560);
 ```
 
 Every shard of a split is opened by name and the tensor data stays mapped. A
-quantized tensor binds to the tape in its own GGML layout, so the contraction
-reads the mapped bytes through the block decoders that read saved `.ogdl` models.
-A `[k, n, experts]` tensor addresses one expert by index and contracts that
-expert's `[k, n]` blocks alone.
+block-quantized tensor binds to the tape in its own GGML layout, so a node
+reads the mapped bytes through the block decoders that read saved `.ogdl`
+models and no run holds a decoded copy; an F32 or F16 tensor binds as the
+node's values. `infer` compiles the blocks over `input`, whose leading axis is
+`channels` wide, and fills every parameterized node from the plan, one entry
+per node in lowering order. An entry is one or more views laid end to end in
+the order the node's planes are laid out: a whole tensor, one expert of a
+`[k, n, experts]` tensor (`expert`), or a run of output rows (`rows`). A
+contraction whose views hold exactly its matrix lowers and runs without a bias
+row; one whose views hold the matrix plus one output row binds that row as its
+bias; any other count, a view that cuts a block, or views of different layouts
+in one node are rejected before anything runs, naming the tensor, the node
+and both counts. `contract` and `expert` are the one-node plans of `infer`.
 
 ## tokenizer
 
