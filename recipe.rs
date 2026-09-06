@@ -10173,8 +10173,10 @@ fn part_bytes(part: &Graph, precision: Compute) -> Result<usize> {
 /// Whether a device boundary before node `start` cuts a connection into a later
 /// node: a residual reaching back over it, or the model input.
 fn cuts_connection(graph: &Graph, start: usize) -> bool {
-	graph.nodes[start..].iter().flat_map(|node| [(node.source, 1), (node.second, 0)]).any(|(index, first)| match usize::try_from(index) {
-		Ok(from) => from + first < start,
+	graph.nodes[start..].iter().flat_map(|node| [node.source, node.second]).any(|index| match usize::try_from(index) {
+		// The stream immediately before the boundary is the one value moved to
+		// the next range, and either operand may read it.
+		Ok(from) => from + 1 < start,
 		Err(_) => index == -1 && start != 0,
 	})
 }
