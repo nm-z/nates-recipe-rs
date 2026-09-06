@@ -238,6 +238,20 @@ over its head-width slice, leaving the values untouched:
 .attn(4).qk(rms)
 ```
 
+`.epsilon(value)` sets the model's normalization epsilon, the shift under every
+variance and the floor under every norm the model lowers: block norms, query and
+key norms, the delta rule's norms, hyper-connection gates, and the attention
+node. It sits beside `.loss` on the model, so one value covers every block and
+every hyper branch. The default is the `normalization-epsilon` in `Cargo.toml`.
+The value is saved in the bundle with the model, so a model reloads with the
+epsilon it was trained with on any build, and a bundle written before models
+carried one reloads with the default it was lowered with. A checkpoint bound
+from GGUF takes its own `attention.layer_norm_rms_epsilon` the same way:
+
+```rust
+recipe.model().layer(16).gelu().attn(2).qk(rms).layer(1).epsilon(1e-6)
+```
+
 ## sparse attention
 
 `attn(heads)` builds one query, key and value plane per head. `.kv(heads)` unties
