@@ -3807,7 +3807,7 @@ impl NativeModelIr {
 			let Some(stored) = plan.stored.as_ref().filter(|_| plan.packed) else { continue };
 			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
 			let format = spec.codec.quantization();
-			if spec.codec == StorageCodec::Q8_0 {
+			if spec.codec == StorageCodec::Q8_0 && plan.node.op == Primitive::Contraction && plan.node.input.channels % spec.block == 0 {
 				q8_0_arms.push_str(&format!("i32 {}, label %q8_0.yes\n", index + 1));
 			}
 			let (name, block) = match format.native {
