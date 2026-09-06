@@ -2589,7 +2589,7 @@ mod quantized {
 		}
 	}
 }
-use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantOps, ScalarLayout, dequant_nf4};
+use quantized::{HostQuantOps, Iq1Layout, Iq4Layout, IqLayout, IqPacking, NativeQuantOps, QuantIntOp, QuantOps, ScalarLayout, dequant_nf4};
 
 impl NativeModelIr {
 	pub(crate) fn emit_fixed_primitives(&self, backend: Backend, matrix: bool, reverse: bool, training: bool) -> Result<String> {
@@ -2858,7 +2858,8 @@ impl NativeModelIr {
 				(false, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length { "attention_forward_matrix_body" } else { "attention_forward_body" };
-					let selectors = attention_selectors(node, &self.precision)?;
+					let geometry = self.indexer_geometry(index)?;
+					let selectors = attention_selectors(node, &self.precision, geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
 					let blocks = attention_blocks(node);
 					if blocks != 0 {
@@ -2869,6 +2870,7 @@ impl NativeModelIr {
 						// the select loop scores only the window's queries, so a step costs
 						// the blocks it touches and a whole forward costs the sequence once.
 						let (pointer, source, context) = (pointer_type(backend), &pointers.second, &pointers.context);
+						let key_weights = &geometry.key_weights;
 						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
 						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
 						let block = integer_argument(node.argument[3], "indexer block")?;
@@ -2884,7 +2886,9 @@ impl NativeModelIr {
 						})?;
 						ir.push_str(barrier(backend));
 						emit_fixed_loop(&mut ir, index, "select", self.rows, Shape { channels: 1, length: node.output.length }, &window, |ir, p| {
-							ir.push_str(&format!("call void @attention_select_body( {pointer} {source}, {pointer} {context}, i32 {p}, i32 {keep}, {shared} )\n"));
+							ir.push_str(&format!(
+								"call void @attention_select_body( {pointer} {source}, {pointer} {key_weights}, {pointer} {context}, i32 {p}, i32 {keep}, {shared} )\n"
+							));
 						})?;
 						ir.push_str(barrier(backend));
 					}
@@ -3260,21 +3264,14 @@ impl NativeModelIr {
 				(true, Primitive::Attention) => {
 					let extent = self.schedule.attention[index].ok_or_else(|| RecipeError::new("native attention schedule is absent"))?;
 					let attention = if matrix && extent.m as usize == node.output.length { "attention_reverse_matrix_body" } else { "attention_reverse_body" };
-					let selectors = attention_selectors(node, &self.precision)?;
+					let geometry = self.indexer_geometry(index)?;
+					let selectors = attention_selectors(node, &self.precision, geometry.mode, geometry.dims, geometry.pooled, geometry.base)?;
 					let (heads, from, channels) = (integer_argument(node.argument[0], "attention heads")?, node.output.elements(), node.output.channels);
 					ir.push_str(&format!("call void @{attention}( {pointer} {source}, {pointer} {value}, {pointer} {context}, {pointer} {delta}, {pointer} {source_adjoint}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, {selectors} )\n", pointer = pointer_type(backend), source = pointers.source, value = pointers.value, context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, tile_m = extent.m, tile_n = extent.n, tile_k = extent.k));
 					ir.push_str(barrier(backend));
-					if attention_blocks(node) != 0 {
-						// The indexer gradient lands in the side projection's adjoint, which
-						// the attention node alone writes.
-						let (pointer, source, context, source_adjoint) = (pointer_type(backend), &pointers.second, &pointers.context, &pointers.second_adjoint);
-						emit_fixed_loop(&mut ir, index, "index.reverse", self.rows, Shape { channels: 1, length: node.output.length }, &window, |ir, p| {
-							ir.push_str(&format!(
-								"call void @attention_index_reverse_body( {pointer} {source}, {pointer} {context}, {pointer} {source_adjoint}, i32 {p}, i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors} )\n"
-							));
-						})?;
-						ir.push_str(barrier(backend));
-					}
+					// Index admission is a hard rank gate. Its score has no
+					// differentiable path into the attention output, so the ordinary
+					// attention reverse above is the complete backward pass.
 				}
 				(true, Primitive::Scan) => {
 					let tiles = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native scan schedule is absent"))?;
@@ -4078,17 +4075,78 @@ fn type_literal(ty: &str, value: f64) -> String {
 	}
 }
 
-/// The selector arguments every attention kernel takes after its tiling.
-fn attention_selectors(node: &Node, precision: &NativePrecision) -> Result<String> {
+#[derive(Clone, Debug)]
+struct IndexerGeometry {
+	mode: i32,
+	dims: i32,
+	/// Whether key representatives need the trained post-pooling transform.
+	pooled: bool,
+	base: f64,
+	key_weights: String,
+}
+
+impl IndexerGeometry {
+	fn none(index: usize) -> Self {
+		Self { mode: 4, dims: 0, pooled: false, base: 1.0, key_weights: format!("%n{index}.weights") }
+	}
+}
+
+impl NativeModelIr {
+	/// Finds the side normalization and rotary nodes that feed an indexed
+	/// attention. The query transform is represented by those nodes; the key
+	/// scale, when present, is the trailing part of the same normalization node
+	/// and is consumed only after the kernel pools raw keys.
+	fn indexer_geometry(&self, index: usize) -> Result<IndexerGeometry> {
+		let node = &self.plans[index].node;
+		let mut geometry = IndexerGeometry::none(index);
+		if attention_blocks(node) == 0 {
+			return Ok(geometry);
+		}
+		let query_channels = checked_mul(node.argument[5] as usize, node.argument[6] as usize, "indexer query width")?;
+		let mut cursor = node.second;
+		let (mut mode_seen, mut dims_seen) = (false, false);
+		while cursor >= 0 {
+			let candidate = &self.plans[usize::try_from(cursor).map_err(|_| RecipeError::new("indexer side node is invalid"))?].node;
+			match candidate.op {
+				Primitive::Normalize if !mode_seen => {
+					geometry.mode = integer_argument(candidate.argument[0], "indexer scoring normalization")?;
+					geometry.pooled = candidate.argument[3] as usize == query_channels;
+					mode_seen = true;
+					if geometry.pooled && candidate.parameters > query_channels {
+						geometry.key_weights = format!("%n{cursor}.weights");
+					}
+				}
+				Primitive::Rope if !dims_seen => {
+					geometry.dims = integer_argument(candidate.argument[0], "indexer rotary dimensions")?;
+					geometry.base = candidate.argument[1];
+					dims_seen = true;
+				}
+				_ => {}
+			}
+			cursor = candidate.source;
+		}
+		Ok(geometry)
+	}
+}
+
+/// The selector arguments every attention kernel takes after its tiling. The
+/// model epsilon stays in model storage; the rotary base stays in arithmetic
+/// state so narrow or integer model encodings cannot clip it.
+fn attention_selectors(node: &Node, precision: &NativePrecision, index_mode: i32, index_dims: i32, index_pooled: bool, index_base: f64) -> Result<String> {
 	Ok(format!(
-		"i32 {kv}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {ty} {epsilon}",
+		"i32 {kv}, i32 {index_heads}, i32 {index_width}, i32 {block}, i1 {gate}, {model_ty} {epsilon}, i32 {index_mode}, i32 {index_dims}, i1 {pooled}, {state_ty} {index_base}",
 		kv = integer_argument(node.argument[1], "attention key-value heads")?,
 		index_heads = integer_argument(node.argument[5], "indexer heads")?,
 		index_width = integer_argument(node.argument[6], "indexer width")?,
 		block = integer_argument(node.argument[3], "indexer block")?,
 		gate = node.argument[2] != 0.0,
-		ty = precision.model_type,
-		epsilon = native_literal(precision.model, precision.model_type, node.argument[7])
+		model_ty = precision.model_type,
+		state_ty = precision.state_type,
+		epsilon = native_literal(precision.model, precision.model_type, node.argument[7]),
+		index_mode = index_mode,
+		index_dims = index_dims,
+		pooled = index_pooled,
+		index_base = native_literal(precision.state, precision.state_type, index_base),
 	))
 }
 fn native_literal(precision: Compute, ty: &str, value: f64) -> String {
@@ -4762,7 +4820,7 @@ impl IntFormat {
 /// key-value metadata and tensor descriptors, then an aligned data section
 /// whose tensors use the same GGML block layouts as Recipe's storage formats.
 mod gguf {
-	use super::{Binding, BoundNode, BoundWeight, Integer, RecipeError, Result, StorageFormat, StoredBytes, StoredWeight, checked_add, require, unfp16};
+	use super::{Binding, BoundNode, BoundWeight, Integer, Plane, RecipeError, Result, StorageFormat, StoredBytes, StoredWeight, checked_add, require, unfp16};
 	use std::{
 		path::{Path, PathBuf},
 		sync::Arc,
@@ -4832,49 +4890,6 @@ mod gguf {
 		shard: usize,
 	}
 
-	/// The model dimensions and routing metadata required to build Qwen3.8 Flash
-	/// Next on Recipe's inference graph.
-	#[derive(Clone, Debug, PartialEq)]
-	pub struct Qwen4ExpMetadata {
-		pub blocks: usize,
-		pub context: usize,
-		pub embedding: usize,
-		pub vocabulary: usize,
-		pub attention_heads: usize,
-		pub attention_kv_heads: usize,
-		pub attention_key: usize,
-		pub attention_value: usize,
-		pub rope_dimensions: usize,
-		pub rope_sections: Vec<usize>,
-		pub rope_base: f64,
-		pub rms_epsilon: f64,
-		pub experts: usize,
-		pub experts_used: usize,
-		pub expert_width: usize,
-		pub shared_expert_width: usize,
-		pub delta_conv: usize,
-		pub delta_state: usize,
-		pub delta_key_heads: usize,
-		pub delta_value_heads: usize,
-		pub delta_inner: usize,
-		pub full_attention_interval: usize,
-		pub hyper_lanes: usize,
-		pub hyper_rank: usize,
-		pub indexer_heads: usize,
-		pub indexer_key: usize,
-		pub indexer_top_k: usize,
-		pub attention_compression: Vec<usize>,
-		pub ple_layers: Vec<usize>,
-		pub ple_ngram: usize,
-		pub ple_heads_per_ngram: usize,
-		pub ple_head_width: usize,
-		pub ple_conv: usize,
-		pub ple_eos: u32,
-		pub ple_image: u32,
-		pub ple_multipliers: Vec<u64>,
-		pub ple_offsets: Vec<u64>,
-		pub ple_vocabularies: Vec<u64>,
-	}
 	impl GgufTensor {
 		/// The element count the shape declares.
 		pub fn elements(&self) -> usize {
@@ -5046,12 +5061,14 @@ mod gguf {
 		}
 	}
 
+	#[derive(Clone)]
 	struct Shard {
 		mapping: Arc<Mapping>,
 		data: usize,
 	}
 
 	/// One model: a single file or every shard of a split, opened by name.
+	#[derive(Clone)]
 	pub struct Gguf {
 		shards: Vec<Shard>,
 		metadata: Vec<(String, GgufValue)>,
@@ -5132,14 +5149,14 @@ mod gguf {
 		pub fn tensor(&self, name: &str) -> Option<&GgufTensor> {
 			self.tensors.iter().find(|tensor| tensor.name == name)
 		}
-		fn required(&self, key: &str) -> Result<&GgufValue> {
+		pub(super) fn required(&self, key: &str) -> Result<&GgufValue> {
 			self.value(key).ok_or_else(|| RecipeError::new(format!("{key} is absent")))
 		}
 		pub(super) fn integer_at(&self, key: &str) -> Result<usize> {
 			let value = self.required(key)?.integer().ok_or_else(|| RecipeError::new(format!("{key} is not a nonnegative integer")))?;
 			usize::try_from(value).map_err(|_| RecipeError::new(format!("{key} exceeds the address space")))
 		}
-		fn float_at(&self, key: &str) -> Result<f64> {
+		pub(super) fn float_at(&self, key: &str) -> Result<f64> {
 			self.required(key)?.float().ok_or_else(|| RecipeError::new(format!("{key} is not a float")))
 		}
 		pub(super) fn integers_at(&self, key: &str) -> Result<Vec<u64>> {
@@ -5152,80 +5169,6 @@ mod gguf {
 		}
 		pub(super) fn indices_at(&self, key: &str) -> Result<Vec<usize>> {
 			self.integers_at(key)?.into_iter().map(|value| usize::try_from(value).map_err(|_| RecipeError::new(format!("{key} exceeds the address space")))).collect()
-		}
-		fn parse_qwen4exp(&self) -> Result<Qwen4ExpMetadata> {
-			let architecture = self.required("general.architecture")?.text().ok_or_else(|| RecipeError::new("general.architecture is not a string"))?;
-			require(architecture == "qwen4exp", format!("model architecture is {architecture:?}, expected qwen4exp"))?;
-			let key = |suffix: &str| format!("{architecture}.{suffix}");
-			let tensor = self.tensor("token_embd.weight").ok_or_else(|| RecipeError::new("token_embd.weight is absent"))?;
-			let embedding = self.integer_at(&key("embedding_length"))?;
-			let tensor_embedding = tensor.shape.first().copied().and_then(|value| usize::try_from(value).ok());
-			require(tensor.shape.len() == 2 && tensor_embedding == Some(embedding), format!("token_embd.weight shape {:?} does not begin with embedding length {embedding}", tensor.shape))?;
-			let vocabulary = usize::try_from(tensor.shape[1]).map_err(|_| RecipeError::new("token_embd.weight vocabulary exceeds the address space"))?;
-			let blocks = self.integer_at(&key("block_count"))?;
-			let rope_dimensions = self.integer_at(&key("rope.dimension_count"))?;
-			let rope_sections = self.indices_at(&key("rope.dimension_sections"))?;
-			let rope_total = rope_sections.iter().try_fold(0_usize, |total, section| total.checked_add(*section)).and_then(|total| total.checked_mul(2));
-			require(rope_total == Some(rope_dimensions), format!("rope sections {rope_sections:?} do not cover {rope_dimensions} dimensions"))?;
-			let attention_compression = self.indices_at(&key("attention.compress_ratios"))?;
-			require(attention_compression.len() == blocks, format!("attention compression has {} entries for {blocks} blocks", attention_compression.len()))?;
-			let ple_ngram = self.integer_at(&key("ple.ngram_size"))?;
-			let ple_heads_per_ngram = self.integer_at(&key("ple.heads_per_ngram"))?;
-			let ple_heads = ple_ngram.checked_sub(1).and_then(|orders| orders.checked_mul(ple_heads_per_ngram)).ok_or_else(|| RecipeError::new("PLE head count overflows"))?;
-			let ple_multipliers = self.integers_at(&key("ple.layer_multipliers"))?;
-			let ple_offsets = self.integers_at(&key("ple.head_offsets"))?;
-			let ple_vocabularies = self.integers_at(&key("ple.head_vocab_sizes"))?;
-			require(ple_multipliers.len() == ple_ngram, format!("PLE has {} multipliers for ngram size {ple_ngram}", ple_multipliers.len()))?;
-			require(
-				ple_offsets.len() == ple_heads && ple_vocabularies.len() == ple_heads,
-				format!("PLE has {} offsets and {} vocabularies for {ple_heads} heads", ple_offsets.len(), ple_vocabularies.len()),
-			)?;
-			let ple_eos = self.integer_at(&key("ple.eos_token_id"))?;
-			let ple_image = self.integer_at(&key("ple.image_token_id"))?;
-			Ok(Qwen4ExpMetadata {
-				blocks,
-				context: self.integer_at(&key("context_length"))?,
-				embedding,
-				vocabulary,
-				attention_heads: self.integer_at(&key("attention.head_count"))?,
-				attention_kv_heads: self.integer_at(&key("attention.head_count_kv"))?,
-				attention_key: self.integer_at(&key("attention.key_length"))?,
-				attention_value: self.integer_at(&key("attention.value_length"))?,
-				rope_dimensions,
-				rope_sections,
-				rope_base: self.float_at(&key("rope.freq_base"))?,
-				rms_epsilon: self.float_at(&key("attention.layer_norm_rms_epsilon"))?,
-				experts: self.integer_at(&key("expert_count"))?,
-				experts_used: self.integer_at(&key("expert_used_count"))?,
-				expert_width: self.integer_at(&key("expert_feed_forward_length"))?,
-				shared_expert_width: self.integer_at(&key("expert_shared_feed_forward_length"))?,
-				delta_conv: self.integer_at(&key("ssm.conv_kernel"))?,
-				delta_state: self.integer_at(&key("ssm.state_size"))?,
-				delta_key_heads: self.integer_at(&key("ssm.group_count"))?,
-				delta_value_heads: self.integer_at(&key("ssm.time_step_rank"))?,
-				delta_inner: self.integer_at(&key("ssm.inner_size"))?,
-				full_attention_interval: self.integer_at(&key("full_attention_interval"))?,
-				hyper_lanes: self.integer_at(&key("hyper_connection.count"))?,
-				hyper_rank: self.integer_at(&key("hyper_connection.low_rank"))?,
-				indexer_heads: self.integer_at(&key("attention.indexer.head_count"))?,
-				indexer_key: self.integer_at(&key("attention.indexer.key_length"))?,
-				indexer_top_k: self.integer_at(&key("attention.indexer.top_k"))?,
-				attention_compression,
-				ple_layers: self.indices_at(&key("ple.layers"))?,
-				ple_ngram,
-				ple_heads_per_ngram,
-				ple_head_width: self.integer_at(&key("embedding_length_per_layer_input"))?,
-				ple_conv: self.integer_at(&key("ple.conv_kernel"))?,
-				ple_eos: u32::try_from(ple_eos).map_err(|_| RecipeError::new("PLE EOS token exceeds u32"))?,
-				ple_image: u32::try_from(ple_image).map_err(|_| RecipeError::new("PLE image token exceeds u32"))?,
-				ple_multipliers,
-				ple_offsets,
-				ple_vocabularies,
-			})
-		}
-		/// Reads Qwen3.8 Flash Next dimensions from the mapped GGUF metadata.
-		pub fn qwen4exp(&self) -> Qwen4ExpMetadata {
-			self.parse_qwen4exp().unwrap_or_else(|error| panic!("{error}"))
 		}
 		/// The tensor's bytes in the mapped file, in its GGML block layout.
 		pub fn data(&self, tensor: &GgufTensor) -> &[u8] {
@@ -5260,43 +5203,70 @@ mod gguf {
 			let bytes = StoredBytes::mapped(&shard.mapping, shard.data + tensor.offset, tensor.bytes);
 			Ok(StoredWeight { format: block_format(tensor)?, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new() })
 		}
+		/// The embedding table's native layout. F32 and F16 tables use the same
+		/// mapped gather path as block-quantized tables, with one raw value per
+		/// block and a decoder that reads its element directly.
+		fn embedding_stored(&self, tensor: &GgufTensor) -> Result<StoredWeight> {
+			let shard = &self.shards[tensor.shard];
+			let bytes = StoredBytes::mapped(&shard.mapping, shard.data + tensor.offset, tensor.bytes);
+			Ok(StoredWeight { format: embedding_format(tensor)?, count: tensor.elements(), bytes, codebook: Vec::new(), arithmetic: Vec::new() })
+		}
 		/// Resolves a plan against this file, one bound weight per entry. The views
 		/// of one entry must share a layout: block-quantized views join as runs of
 		/// their own mappings, so nothing is decoded or copied here, and views in
-		/// an unblocked layout decode into values. A view whose layout differs
-		/// from the entry's first is rejected by name before anything compiles.
+		/// an unblocked layout, or values the host rewrote, decode into values,
+		/// and then every view of the entry decodes with them. Block-quantized
+		/// views whose layouts differ are rejected by name before anything compiles.
 		pub(super) fn bound(&self, plan: &Binding) -> Result<Vec<BoundNode>> {
 			plan.nodes
 				.iter()
 				.enumerate()
 				.map(|(entry, planes)| {
 					let first = planes.first().ok_or_else(|| RecipeError::new(format!("plan entry {entry} names no tensor")))?;
-					if let Some(other) = planes.iter().find(|plane| plane.kind != first.kind) {
+					let views = planes.iter().map(Plane::mapped).collect::<Option<Vec<_>>>();
+					let packed = views.as_ref().is_some_and(|views| views.iter().all(|view| view.blocked()));
+					if let Some(views) = views.as_ref().filter(|_| packed)
+						&& let Some(other) = views.iter().find(|plane| plane.kind != views[0].kind)
+					{
 						let name = |kind| layout(kind).map_or("an unsupported type", |(name, _, _, _)| name);
-						return Err(RecipeError::new(format!("tensor {} is {} but tensor {} of the same node is {}", other.name, name(other.kind), first.name, name(first.kind))));
+						return Err(RecipeError::new(format!("tensor {} is {} but tensor {} of the same node is {}", other.name, name(other.kind), views[0].name, name(views[0].kind))));
 					}
 					let elements = planes.iter().try_fold(0, |total, plane| checked_add(total, plane.elements(), "plan tensor elements"))?;
 					let mut names = Vec::new();
 					for plane in planes {
-						if !names.contains(&plane.name.as_str()) {
-							names.push(&plane.name);
+						if !names.contains(&plane.name()) {
+							names.push(plane.name());
 						}
 					}
-					let names = match planes.len() {
-						1 => format!("tensor {} {:?}", first.name, first.shape),
-						count => format!("{count} views of {}", names.join(", ")),
+					let names = match (planes.len(), first) {
+						(1, Plane::Mapped(tensor)) => format!("tensor {} {:?}", tensor.name, tensor.shape),
+						(1, Plane::Owned { name, .. }) => format!("values {name}"),
+						(count, _) => format!("{count} views of {}", names.join(", ")),
 					};
-					let weight = if first.blocked() {
-						let parts = planes.iter().map(|plane| self.stored(plane)).collect::<Result<Vec<_>>>()?;
-						let format = parts[0].format;
-						let bytes = StoredBytes::joined(parts.into_iter().map(|part| part.bytes).collect());
-						BoundWeight::Stored(StoredWeight { format, count: elements, bytes, codebook: Vec::new(), arithmetic: Vec::new() })
-					} else {
-						let mut values = Vec::with_capacity(elements);
-						for plane in planes {
-							values.extend(self.values(plane)?);
+					let weight = match views.filter(|_| packed) {
+						Some(views) => {
+							let parts = views.iter().map(|plane| self.stored(plane)).collect::<Result<Vec<_>>>()?;
+							let format = parts[0].format;
+							let bytes = StoredBytes::joined(parts.into_iter().map(|part| part.bytes).collect());
+							BoundWeight::Stored(StoredWeight { format, count: elements, bytes, codebook: Vec::new(), arithmetic: Vec::new() })
 						}
-						BoundWeight::Values(values)
+						None if entry == 0 && planes.len() == 1 && matches!(first, Plane::Mapped(tensor) if tensor.name == "token_embd.weight" && matches!(tensor.kind, 0 | 1)) => {
+							let tensor = match first {
+								Plane::Mapped(tensor) => tensor,
+								Plane::Owned { .. } => unreachable!(),
+							};
+							BoundWeight::Stored(self.embedding_stored(tensor)?)
+						}
+						None => {
+							let mut values = Vec::with_capacity(elements);
+							for plane in planes {
+								match plane {
+									Plane::Mapped(tensor) => values.extend(self.values(tensor)?),
+									Plane::Owned { values: owned, .. } => values.extend_from_slice(owned),
+								}
+							}
+							BoundWeight::Values(values)
+						}
 					};
 					Ok(BoundNode { names, elements, weight })
 				})
@@ -5304,8 +5274,18 @@ mod gguf {
 		}
 	}
 
+	/// The Recipe storage format an embedding tensor decodes through, including
+	/// raw F32 and F16 tables.
+	pub(super) fn embedding_format(tensor: &GgufTensor) -> Result<StorageFormat> {
+		match tensor.kind {
+			0 => StorageFormat::named("f32").ok_or_else(|| RecipeError::new("F32 embedding layout is unavailable")),
+			1 => StorageFormat::named("f16").ok_or_else(|| RecipeError::new("F16 embedding layout is unavailable")),
+			_ => block_format(tensor),
+		}
+	}
+
 	/// The Recipe storage format a block-quantized tensor decodes through.
-	fn block_format(tensor: &GgufTensor) -> Result<StorageFormat> {
+	pub(super) fn block_format(tensor: &GgufTensor) -> Result<StorageFormat> {
 		let (name, _, _, format) = layout(tensor.kind)?;
 		format.ok_or_else(|| RecipeError::new(format!("tensor {} is {name}, which the tape reads only as a block-quantized weight", tensor.name)))
 	}
@@ -5333,7 +5313,7 @@ mod gguf {
 		Ok(path.with_file_name(format!("{prefix}-{:05}-of-{count:05}.gguf", index + 1)))
 	}
 }
-pub use gguf::{Gguf, GgufTensor, GgufValue, Qwen4ExpMetadata};
+pub use gguf::{Gguf, GgufTensor, GgufValue};
 mod tokenizer {
 	//! A byte-level BPE tokenizer built from GGUF metadata alone: the token
 	//! table, the piece ranks, the pre-tokenizer family, the added tokens, the
@@ -6324,8 +6304,13 @@ mod bundle {
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel, dilation) => format!("dconv,{kernel},{dilation}"),
-			Operation::Delta(delta) => format!("delta,{},{},{},{},{},{}", delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output),
+			Operation::Delta(delta) => format!(
+				"delta,{},{},{},{},{},{},{},{}",
+				delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output, delta.conv_activation as u8, delta.output_activation as u8
+			),
 			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
+			Operation::Norm => "norm".to_owned(),
+			Operation::Glu(hidden, activation) => format!("glu,{hidden},{}", *activation as u8),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -6409,7 +6394,11 @@ mod bundle {
 				let mut extent = |role| fields.next().map(|field| value_at(Some(field), role)).transpose().map(|value| value.unwrap_or(0));
 				let (key_heads, key_width) = (extent("delta key heads")?, extent("delta key width")?);
 				let (value_width, output) = (extent("delta value width")?, extent("delta output width")?);
-				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output }))
+				// Older bundles always used a linear convolution and sigmoid output gate.
+				// Keep those defaults when the optional activation selectors are absent.
+				let conv_activation = fields.next().map(|field| value_at(Some(field), "delta convolution activation").and_then(activation)).transpose()?.unwrap_or(Activation::Linear);
+				let output_activation = fields.next().map(|field| value_at(Some(field), "delta output activation").and_then(activation)).transpose()?.unwrap_or(Activation::Sigmoid);
+				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output, conv_activation, output_activation }))
 			}
 			"ple" => {
 				let (heads, width) = (value_at(fields.next(), "per-layer embedding heads")?, value_at(fields.next(), "per-layer embedding width")?);
@@ -6419,6 +6408,8 @@ mod bundle {
 				require(hash.heads() == heads, format!("per-layer embedding names {heads} heads, its hash addresses {}", hash.heads()))?;
 				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash }))
 			}
+			"norm" => Ok(Operation::Norm),
+			"glu" => Ok(Operation::Glu(value_at(fields.next(), "gated feed-forward width")?, activation(value_at(fields.next(), "gated feed-forward activation")?)?)),
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
 	}
@@ -7157,10 +7148,17 @@ struct DeltaBlock {
 	key_width: usize,
 	value_width: usize,
 	output: usize,
+	/// Activation applied after the causal convolution. Existing hand-built
+	/// models default to linear for compatibility; GGUF Qwen delta blocks set
+	/// this to SiLU from their architecture row.
+	conv_activation: Activation,
+	/// Activation applied to the output gate. Existing hand-built models
+	/// default to sigmoid, while Qwen3.5 uses SiLU and Qwen4 uses sigmoid.
+	output_activation: Activation,
 }
 impl DeltaBlock {
 	fn new(heads: usize, kernel: usize) -> Self {
-		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0 }
+		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0, conv_activation: Activation::Linear, output_activation: Activation::Sigmoid }
 	}
 	/// The key heads and width, the value width, and the output width, resolved
 	/// against a block input of `channels`.
@@ -7216,6 +7214,11 @@ enum Operation {
 	Dconv(usize, usize),
 	Delta(DeltaBlock),
 	Ple(PleBlock),
+	/// A normalization that leads a model: the block's own normalization is the
+	/// only thing it does, so the model input is normalized before its first block.
+	Norm,
+	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`.
+	Glu(usize, Activation),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -7504,11 +7507,19 @@ impl Model {
 	pub fn ple(&self, table: &Ngram<'_>) -> Self {
 		self.push(Operation::Ple(table.block()))
 	}
+	/// Normalizes the preceding block's output. Leading a model, it normalizes
+	/// the model input before the first block, which is the pre-normalization
+	/// of a residual branch when the model is one.
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
-		let mut model = self.suffix();
+		let mut model = if self.blocks.is_empty() { self.push(Operation::Norm) } else { self.suffix() };
 		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("normalization requires a preceding block"));
 		block.normalization = Some(normalization.normalization());
 		model
+	}
+	/// A gated feed-forward: `down(activation(gate(x)) * up(x))` through `hidden`,
+	/// returning to the block input width.
+	pub fn glu(&self, hidden: usize, activation: Activation) -> Self {
+		self.push(Operation::Glu(hidden, activation))
 	}
 	/// Normalizes each attention head's query and key rows after the projection.
 	/// The value rows keep their projected magnitudes.
@@ -8168,6 +8179,8 @@ pub(crate) struct StorageFormat(pub(crate) u16);
 
 #[derive(Clone, Copy)]
 enum NativeDequant {
+	F16,
+	F32,
 	Nf4,
 	Scalar(ScalarLayout),
 	Q2K,
@@ -8183,6 +8196,16 @@ enum NativeDequant {
 impl NativeDequant {
 	fn decode<Q: QuantOps>(self, operations: &mut Q) -> Q::Value {
 		match self {
+			Self::F16 => {
+				let index = operations.index();
+				let offset = operations.int(QuantIntOp::Multiply, index, operations.integer(2));
+				operations.half(offset)
+			}
+			Self::F32 => {
+				let index = operations.index();
+				let offset = operations.int(QuantIntOp::Multiply, index, operations.integer(4));
+				operations.float(offset)
+			}
 			Self::Nf4 => unreachable!("NF4 dequantization requires its model codebook"),
 			Self::Scalar(layout) => quantized::dequant_scalar(operations, layout),
 			Self::Q2K => quantized::dequant_q2k(operations),
@@ -8235,6 +8258,7 @@ impl NativeQuantTable {
 
 #[derive(Clone, Copy)]
 enum Quantizer {
+	Raw,
 	Scalar { bits: u8, variant: u8 },
 	Q2K,
 	Q3K,
@@ -8273,6 +8297,8 @@ macro_rules! quantizations {
 }
 
 quantizations! {
+	F16 { code: (2, 16, [0]), block: 1, stride: 2, name: "f16", quant: Quantizer::Raw, native: Some(NativeDequant::F16) }
+	F32 { code: (2, 32, [0]), block: 1, stride: 4, name: "f32", quant: Quantizer::Raw, native: Some(NativeDequant::F32) }
 	Q4_0 { code: (0, 4, [0]), block: 32, stride: 18, name: "q4_0", quant: Quantizer::Scalar { bits: 4, variant: 0 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 4, variant: 0 })) }
 	Q4_1 { code: (0, 4, [1]), block: 32, stride: 20, name: "q4_1", quant: Quantizer::Scalar { bits: 4, variant: 1 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 4, variant: 1 })) }
 	Q5_0 { code: (0, 5, [0]), block: 32, stride: 22, name: "q5_0", quant: Quantizer::Scalar { bits: 5, variant: 0 }, native: Some(NativeDequant::Scalar(ScalarLayout { sign: 1, exp: 5, man: 5, variant: 0 })) }
@@ -8953,6 +8979,8 @@ impl Operation {
 			Self::Dconv(..) => "dconv",
 			Self::Delta(..) => "delta",
 			Self::Ple(_) => "ple",
+			Self::Norm => "norm",
+			Self::Glu(..) => "glu",
 		}
 	}
 	/// Reports whether the operation owns weights that a qualifier can govern.
@@ -9193,13 +9221,41 @@ impl Gguf {
 /// row as its bias.
 #[derive(Clone, Default)]
 pub struct Binding {
-	pub(crate) nodes: Vec<Vec<GgufTensor>>,
+	pub(crate) nodes: Vec<Vec<Plane>>,
+}
+/// One plane of a node's weight: a view of a stored tensor, or values the host
+/// rewrote once from a tensor the file stores in another parametrization, which
+/// bind only as the node's values.
+#[derive(Clone)]
+pub(crate) enum Plane {
+	Mapped(GgufTensor),
+	Owned { name: String, values: Vec<f64> },
+}
+impl Plane {
+	fn elements(&self) -> usize {
+		match self {
+			Self::Mapped(tensor) => tensor.elements(),
+			Self::Owned { values, .. } => values.len(),
+		}
+	}
+	fn name(&self) -> &str {
+		match self {
+			Self::Mapped(tensor) => &tensor.name,
+			Self::Owned { name, .. } => name,
+		}
+	}
+	fn mapped(&self) -> Option<&GgufTensor> {
+		match self {
+			Self::Mapped(tensor) => Some(tensor),
+			Self::Owned { .. } => None,
+		}
+	}
 }
 impl Binding {
 	/// The next parameterized node, filled from `planes` end to end.
 	#[must_use]
 	pub fn node(mut self, planes: &[GgufTensor]) -> Self {
-		self.nodes.push(planes.to_vec());
+		self.nodes.push(planes.iter().cloned().map(Plane::Mapped).collect());
 		self
 	}
 	/// The next parameterized node, filled from one whole named tensor.
@@ -9226,22 +9282,38 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 		*slot = f64::from(*id);
 	}
 	let (graph, device) = bound_graph(model, blocks, plan, &samples, 1)?;
-	let tape = NativeTape::new(&graph, &samples, &samples, &[], device, Compute::FP64, None)?;
-	decode_steps(&mut samples, prompt, sampler, stop, budget, |_| Ok(()), |samples, settled, reached| {
-		for position in settled as usize..reached as usize {
-			tape.write_sample(position, samples[position])?;
-		}
-		tape.forward_window(settled, reached)?;
-		tape.predictions()
-	})
+	let mut tape = NativeTape::new(&graph, &samples, &samples, &[], device, Compute::FP64, None)?;
+	decode_steps(
+		&mut tape,
+		&mut samples,
+		prompt,
+		sampler,
+		stop,
+		budget,
+		|_| Ok(()),
+		|tape, samples, settled, reached| {
+			for position in settled as usize..reached as usize {
+				tape.write_sample(position, samples[position])?;
+			}
+			tape.forward_window(settled, reached)?;
+			let predictions = tape.predictions()?;
+			let logits = tape.last_logits(&predictions, settled, reached)?;
+			Ok((predictions, logits))
+		},
+	)
 }
 /// Compiles `blocks` over `input` and fills every weighted node from `plan`.
 /// `channels` names the input's channel axis, so the rest of its length is the
 /// sequence the blocks walk.
 fn bound_graph(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Result<(Graph, &'static Gpu)> {
+	let device = selected_gpu()?;
+	let graph = bound_graph_on(model, blocks, plan, input, channels, device)?;
+	Ok((graph, device))
+}
+fn bound_graph_on(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize, device: &'static Gpu) -> Result<Graph> {
 	require(channels != 0 && !input.is_empty() && input.len() % channels == 0, "the input is not a whole number of channel rows")?;
 	let shape = Shape { channels, length: input.len() / channels };
-	let (device, config) = (selected_gpu()?, Config::load()?);
+	let config = Config::load()?;
 	// A zero target width asks compile for the model's own output, so no
 	// projection onto a target is appended to a bound graph.
 	let data = Prepared {
@@ -9260,8 +9332,565 @@ fn bound_graph(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], chan
 		fitted: Vec::new(),
 		bound: Some(model.bound(plan)?),
 	};
-	let graph = compile(blocks, &data, &data.targets, 1, device, config, false)?;
-	Ok((graph, device))
+	compile(blocks, &data, &data.targets, 1, device, config, false)
+}
+/// How an architecture pairs the channels its rotary embedding rotates. Recipe's
+/// rope pairs each channel with the one half the rotated span away; an
+/// architecture that pairs neighbouring channels binds its query and key rows in
+/// the order that makes the two rotations agree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RopePairs {
+	Halves,
+	Neighbours,
+}
+/// One row of the architecture table: the `general.architecture` names whose
+/// standard metadata keys and tensor names map onto the same blocks, and the
+/// convention those names leave implicit. Every dimension comes from the
+/// `<architecture>.*` namespace and every weight from the `blk.<n>.*`,
+/// `token_embd`, `output_norm` and `output` names, so a row adds no path of
+/// its own.
+struct Architecture {
+	names: &'static [&'static str],
+	rope: RopePairs,
+	delta_activation: Option<(Activation, Activation)>,
+}
+const ARCHITECTURES: &[Architecture] = &[
+	Architecture { names: &["llama"], rope: RopePairs::Neighbours, delta_activation: None },
+	Architecture { names: &["qwen2", "qwen3", "qwen2moe", "qwen3moe"], rope: RopePairs::Halves, delta_activation: None },
+	Architecture { names: &["qwen35", "qwen3next"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Silu)) },
+	Architecture { names: &["qwen4exp"], rope: RopePairs::Halves, delta_activation: Some((Activation::Silu, Activation::Sigmoid)) },
+];
+/// A model built from a GGUF file: the blocks its architecture metadata declares
+/// and the plan that binds every weighted node to the file's tensors by name.
+pub struct Bound {
+	file: Gguf,
+	model: Model,
+	plan: Binding,
+	blocks: usize,
+	tensors: usize,
+	vocabulary: usize,
+}
+impl Gguf {
+	/// The model this file describes: `general.architecture` selects the row of
+	/// the architecture table, the `<architecture>.*` namespace sizes every block,
+	/// and each weighted node binds to the tensor of the standard name that
+	/// holds its weight. A tensor no node reads, a node no tensor fills, or a
+	/// tensor the file lacks is an error here, before any device is touched.
+	pub fn model(&self) -> Bound {
+		Builder::build(self).unwrap_or_else(|error| panic!("{error}"))
+	}
+}
+impl Bound {
+	/// The blocks the architecture declares, each an attention or delta block
+	/// and its feed-forward, both on the residual stream.
+	pub fn blocks(&self) -> usize {
+		self.blocks
+	}
+	/// The stored tensors the plan reads, each counted once: as a mapped view, or
+	/// as the values the host rewrote from it.
+	pub fn tensors(&self) -> usize {
+		self.tensors
+	}
+	pub fn vocabulary(&self) -> usize {
+		self.vocabulary
+	}
+	/// The Recipe model the blocks lower through.
+	pub fn model(&self) -> &Model {
+		&self.model
+	}
+	/// The plan that fills the model's weighted nodes.
+	pub fn plan(&self) -> &Binding {
+		&self.plan
+	}
+	/// One forward over `ids`: the logit of every id at every position, laid out
+	/// as `vocabulary` rows of one value per position.
+	pub fn infer(&self, ids: &[u32]) -> Vec<f64> {
+		let input = ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>();
+		self.file.infer(&self.model, &self.plan, &input, 1)
+	}
+	/// Place this bound model across the selected devices for a sequence of
+	/// `positions` token ids. `split` names the Recipe blocks each device takes;
+	/// an empty split is measured from each device's free memory.
+	pub fn place(&self, positions: usize, split: &[usize]) -> Placed {
+		selected_gpus().and_then(|devices| place_bound(self, positions, split, devices)).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Decode through this bound model after placing it across the selected devices.
+	pub fn decode(&self, positions: usize, split: &[usize], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
+		self.place(positions, split).decode(prompt, sampler, stop, budget)
+	}
+	/// Serve `requests` decodes through this bound model after placing it across
+	/// the selected devices.
+	pub fn serve(&self, positions: usize, split: &[usize], address: &str, requests: usize) {
+		self.place(positions, split).serve(address, requests);
+	}
+}
+/// Walks the standard metadata and tensor names of one file, emitting the
+/// Recipe blocks and, beside every block, the plan entries its weighted nodes
+/// take, in the order the lowering pushes those nodes.
+struct Builder<'a> {
+	file: &'a Gguf,
+	architecture: &'a str,
+	rope: RopePairs,
+	delta_activation: Option<(Activation, Activation)>,
+	plan: Binding,
+	consumed: std::collections::BTreeSet<String>,
+}
+/// The dimensions every row reads from the `<architecture>.*` namespace.
+struct Dimensions {
+	width: usize,
+	heads: usize,
+	kv: usize,
+	head: usize,
+	rope_dims: usize,
+	rope_base: f64,
+	/// Every `interval`th block attends and the rest are delta blocks; absent,
+	/// every block attends.
+	interval: Option<usize>,
+	delta: Option<DeltaDims>,
+	feed_forward: Option<usize>,
+	experts: Option<ExpertDims>,
+	hyper: Option<(usize, usize)>,
+	indexer: Option<(usize, usize, usize)>,
+	compression: Vec<usize>,
+}
+struct DeltaDims {
+	heads: usize,
+	key_heads: usize,
+	state: usize,
+	kernel: usize,
+	inner: usize,
+}
+struct ExpertDims {
+	count: usize,
+	used: usize,
+	hidden: usize,
+	scoring: Scoring,
+	renormalize: bool,
+}
+impl<'a> Builder<'a> {
+	fn build(file: &'a Gguf) -> Result<Bound> {
+		let architecture = file.required("general.architecture")?.text().ok_or_else(|| RecipeError::new("general.architecture is not a string"))?;
+		let row = ARCHITECTURES.iter().find(|row| row.names.contains(&architecture)).ok_or_else(|| {
+			let known = ARCHITECTURES.iter().flat_map(|row| row.names).copied().collect::<Vec<_>>().join(", ");
+			RecipeError::new(format!("architecture {architecture:?} is not in the table; the table knows {known}"))
+		})?;
+		let mut builder = Self { file, architecture, rope: row.rope, delta_activation: row.delta_activation, plan: Binding::default(), consumed: std::collections::BTreeSet::new() };
+		let dimensions = builder.dimensions()?;
+		let blocks = builder.integer("block_count")?;
+		let embedding = builder.tensor("token_embd.weight", "the embedding")?;
+		require(
+			embedding.shape.len() == 2 && embedding.shape[0] as usize == dimensions.width,
+			format!("token_embd.weight has shape {:?}, not [{}, vocabulary]", embedding.shape, dimensions.width),
+		)?;
+		let vocabulary = embedding.shape[1] as usize;
+		let format = gguf::embedding_format(&embedding)?;
+		let mut model = recipe.model();
+		if builder.present("attention.layer_norm_rms_epsilon") {
+			model = model.epsilon(file.float_at(&builder.key("attention.layer_norm_rms_epsilon"))?);
+		}
+		model = model.embed(vocabulary, dimensions.width);
+		// The gather addresses rows of the file's own layout, so the block's
+		// storage format is the tensor's format rather than a selection.
+		let block = model.blocks.last_mut().ok_or_else(|| RecipeError::new("the embedding block is absent"))?;
+		(block.quantization, block.profile) = (format.0, false);
+		builder.mapped(vec![embedding.clone()]);
+		let ple = if builder.present("ple.ngram_size") { Some(Ngram::new(file)?) } else { None };
+		for layer in 0..blocks {
+			if let Some(ple) = ple.as_ref().filter(|ple| ple.layer() == layer) {
+				model = model.ple(ple);
+				builder.ple(layer, ple, &dimensions)?;
+			}
+			let attends = dimensions.interval.is_none_or(|interval| (layer + 1) % interval == 0);
+			let branch = builder.open(layer, "attn", &dimensions)?;
+			let branch = if attends { builder.attention(branch, layer, &dimensions)? } else { builder.delta(branch, layer, &dimensions)? };
+			model = builder.close(model, branch, &dimensions);
+			let branch = builder.open(layer, "ffn", &dimensions)?;
+			let branch = match &dimensions.experts {
+				Some(experts) => builder.experts(branch, layer, experts, &dimensions)?,
+				None => builder.feed_forward(branch, layer, &dimensions)?,
+			};
+			model = builder.close(model, branch, &dimensions);
+		}
+		if let Some(scale) = builder.optional("output_norm.weight") {
+			model = model.norm(rms);
+			builder.mapped(vec![scale]);
+		} else if dimensions.hyper.is_some_and(|(_, rank)| rank != 0) {
+			// The head mixer reads the stream through its own gates before the output.
+			builder.whole("output_hc_norm.weight", "the head mixer normalization")?;
+			builder.whole("output_hc_down.weight", "the head mixer read gate")?;
+			builder.whole("output_hc_up.weight", "the head mixer read gate")?;
+		}
+		model = model.layer(vocabulary);
+		// A file without an output tensor ties the output to the embedding.
+		let output = match builder.optional("output.weight") {
+			Some(output) => output,
+			None => embedding,
+		};
+		builder.mapped(vec![output]);
+		let unread = file.tensors().iter().filter(|tensor| !builder.consumed.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
+		require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
+		let tensors = builder.consumed.len();
+		Ok(Bound { file: file.clone(), model, plan: builder.plan, blocks, tensors, vocabulary })
+	}
+	fn key(&self, suffix: &str) -> String {
+		format!("{}.{suffix}", self.architecture)
+	}
+	fn integer(&self, suffix: &str) -> Result<usize> {
+		self.file.integer_at(&self.key(suffix))
+	}
+	fn integer_or(&self, suffix: &str, default: usize) -> Result<usize> {
+		match self.file.value(&self.key(suffix)) {
+			Some(_) => self.integer(suffix),
+			None => Ok(default),
+		}
+	}
+	fn present(&self, suffix: &str) -> bool {
+		self.file.value(&self.key(suffix)).is_some()
+	}
+	fn dimensions(&self) -> Result<Dimensions> {
+		let width = self.integer("embedding_length")?;
+		let heads = self.integer("attention.head_count")?;
+		let kv = self.integer_or("attention.head_count_kv", heads)?;
+		require(heads != 0 && width % heads == 0 || self.present("attention.key_length"), format!("{} heads do not partition a stream of {width}", heads))?;
+		let head = self.integer_or("attention.key_length", width / heads.max(1))?;
+		let value = self.integer_or("attention.value_length", head)?;
+		require(value == head, format!("attention keys are {head} wide and values {value}; the attention block takes one head width"))?;
+		let rope_dims = self.integer_or("rope.dimension_count", head)?;
+		let rope_base = if self.present("rope.freq_base") { self.file.float_at(&self.key("rope.freq_base"))? } else { 10000.0 };
+		let interval = if self.present("full_attention_interval") { Some(self.integer("full_attention_interval")?) } else { None };
+		let delta = match interval {
+			Some(_) => Some(DeltaDims {
+				heads: self.integer("ssm.time_step_rank")?,
+				key_heads: self.integer("ssm.group_count")?,
+				state: self.integer("ssm.state_size")?,
+				kernel: self.integer("ssm.conv_kernel")?,
+				inner: self.integer("ssm.inner_size")?,
+			}),
+			None => None,
+		};
+		let experts = match self.integer_or("expert_count", 0)? {
+			0 => None,
+			count => Some(ExpertDims {
+				count,
+				used: self.integer("expert_used_count")?,
+				hidden: self.integer("expert_feed_forward_length")?,
+				scoring: match self.integer_or("expert_gating_func", 1)? {
+					1 => Scoring::Softmax,
+					2 => Scoring::Sigmoid,
+					other => return Err(RecipeError::new(format!("expert gating function {other} is unknown"))),
+				},
+				renormalize: match self.file.value(&self.key("expert_weights_norm")) {
+					Some(GgufValue::Bool(value)) => *value,
+					Some(_) => return Err(RecipeError::new("expert_weights_norm is not a boolean")),
+					None => true,
+				},
+			}),
+		};
+		let feed_forward = if self.present("feed_forward_length") { Some(self.integer("feed_forward_length")?) } else { None };
+		require(experts.is_some() || feed_forward.is_some(), "the architecture names neither a feed-forward width nor experts")?;
+		let hyper = if self.present("hyper_connection.count") { Some((self.integer("hyper_connection.count")?, self.integer("hyper_connection.low_rank")?)) } else { None };
+		let indexer = if self.present("attention.indexer.head_count") {
+			Some((self.integer("attention.indexer.head_count")?, self.integer("attention.indexer.key_length")?, self.integer("attention.indexer.top_k")?))
+		} else {
+			None
+		};
+		let compression = if indexer.is_some() { self.file.indices_at(&self.key("attention.compress_ratios"))? } else { Vec::new() };
+		Ok(Dimensions { width, heads, kv, head, rope_dims, rope_base, interval, delta, feed_forward, experts, hyper, indexer, compression })
+	}
+	/// The named tensor, which `role` reads, marked as read.
+	fn tensor(&mut self, name: &str, role: &str) -> Result<GgufTensor> {
+		let tensor = self.file.tensor(name).ok_or_else(|| RecipeError::new(format!("tensor {name} is absent; {role} reads it")))?.clone();
+		self.consumed.insert(name.to_owned());
+		Ok(tensor)
+	}
+	fn optional(&mut self, name: &str) -> Option<GgufTensor> {
+		let tensor = self.file.tensor(name)?.clone();
+		self.consumed.insert(name.to_owned());
+		Some(tensor)
+	}
+	/// The next parameterized node, filled from mapped views.
+	fn mapped(&mut self, planes: Vec<GgufTensor>) {
+		self.slot(planes.into_iter().map(Plane::Mapped).collect());
+	}
+	fn slot(&mut self, planes: Vec<Plane>) {
+		self.plan.nodes.push(planes);
+	}
+	/// The next weighted node, filled from one whole named tensor.
+	fn whole(&mut self, name: &str, role: &str) -> Result<()> {
+		let tensor = self.tensor(name, role)?;
+		self.mapped(vec![tensor]);
+		Ok(())
+	}
+	/// A projection `[inputs, outputs]` of the given name, checked against the
+	/// widths the node contracts over.
+	fn projection(&mut self, name: &str, role: &str, inputs: usize, outputs: usize) -> Result<GgufTensor> {
+		let tensor = self.tensor(name, role)?;
+		require(
+			tensor.shape.len() == 2 && tensor.shape[0] as usize == inputs && tensor.shape[1] as usize == outputs,
+			format!("{name} has shape {:?}; {role} contracts {inputs} inputs into {outputs} outputs", tensor.shape),
+		)?;
+		Ok(tensor)
+	}
+	/// A normalization scale of `width` values, repeated over `groups` groups of
+	/// the span it normalizes, in the order `order` reads each group's channels.
+	fn scale(&mut self, name: &str, role: &str, width: usize, groups: usize, order: &[usize]) -> Result<Vec<Plane>> {
+		let tensor = self.tensor(name, role)?;
+		require(tensor.elements() == width, format!("{name} holds {} values; {role} scales {width} channels", tensor.elements()))?;
+		if order.iter().enumerate().all(|(index, channel)| index == *channel) {
+			return Ok(vec![Plane::Mapped(tensor); groups]);
+		}
+		let values = self.file.values(&tensor)?;
+		let permuted = order.iter().map(|channel| values[*channel]).collect::<Vec<_>>();
+		Ok(vec![Plane::Owned { name: format!("{name} (paired)"), values: permuted }; groups])
+	}
+	/// The order Recipe reads one head's rows in: the channels the rotation pairs
+	/// as neighbours moved into halves, the rest in place.
+	fn head_order(&self, width: usize, dims: usize) -> Vec<usize> {
+		match self.rope {
+			RopePairs::Halves => (0..width).collect(),
+			RopePairs::Neighbours => (0..dims).step_by(2).chain((1..dims).step_by(2)).chain(dims..width).collect(),
+		}
+	}
+	/// The rows of one head at `base`, as one view when they are read in place
+	/// and as one view per row otherwise.
+	fn head_rows(tensor: &GgufTensor, base: usize, order: &[usize]) -> Result<Vec<GgufTensor>> {
+		if order.iter().enumerate().all(|(index, channel)| index == *channel) {
+			return Ok(vec![tensor.rows(base, order.len())?]);
+		}
+		order.iter().map(|channel| tensor.rows(base + channel, 1)).collect()
+	}
+	/// One attention block and the plan of its projection, its query and key
+	/// scales, and its output projection.
+	fn attention(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
+		let Dimensions { width, heads, kv, head, rope_dims, rope_base, .. } = *dimensions;
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let role = format!("block {layer} attention");
+		let query = self.tensor(&name("attn_q.weight"), &role)?;
+		require(query.shape.len() == 2 && query.shape[0] as usize == width, format!("{} has shape {:?}; {role} contracts {width} inputs", query.name, query.shape))?;
+		let gated = match query.shape[1] as usize {
+			outputs if outputs == heads * head => false,
+			outputs if outputs == 2 * heads * head => true,
+			outputs => return Err(RecipeError::new(format!("{} projects {outputs} outputs; {heads} heads of {head} take {} or, gated, {}", query.name, heads * head, 2 * heads * head))),
+		};
+		let key = self.projection(&name("attn_k.weight"), &role, width, kv * head)?;
+		let value = self.projection(&name("attn_v.weight"), &role, width, kv * head)?;
+		let order = self.head_order(head, rope_dims);
+		let stride = if gated { 2 * head } else { head };
+		let mut planes = Vec::new();
+		for index in 0..heads {
+			planes.extend(Self::head_rows(&query, index * stride, &order)?);
+		}
+		for index in 0..kv {
+			planes.extend(Self::head_rows(&key, index * head, &order)?);
+		}
+		planes.push(value);
+		let mut block = branch.attn(heads).kv(kv).head(head);
+		if gated {
+			for index in 0..heads {
+				planes.push(query.rows(index * stride + head, head)?);
+			}
+			block = block.gate();
+		}
+		let normalized = self.file.tensor(&name("attn_q_norm.weight")).is_some();
+		if normalized {
+			block = block.qk(rms);
+		}
+		block = block.rope(rope_dims, rope_base);
+		self.mapped(planes);
+		if normalized {
+			let mut scales = self.scale(&name("attn_q_norm.weight"), &role, head, heads, &order)?;
+			scales.extend(self.scale(&name("attn_k_norm.weight"), &role, head, kv, &order)?);
+			self.slot(scales);
+		}
+		if let Some((index_heads, index_width, top_k)) = dimensions.indexer {
+			let block_size = dimensions.compression.get(layer).copied().filter(|ratio| *ratio != 0).unwrap_or(1);
+			let query = self.projection(&name("indexer.q_proj.weight"), &role, width, index_heads * index_width)?;
+			let key = self.projection(&name("indexer.k_proj.weight"), &role, width, index_width)?;
+			// The indexer uses the same rotary pairing as the main Q/K planes. Keep
+			// each head's rows in Recipe's order so a neighbour-paired GGUF tensor
+			// reaches the adjacent-pair Rope with the matching columns.
+			let index_order = self.head_order(index_width, rope_dims);
+			let mut index_planes = Vec::new();
+			for index in 0..index_heads {
+				index_planes.extend(Self::head_rows(&query, index * index_width, &index_order)?);
+			}
+			index_planes.extend(Self::head_rows(&key, 0, &index_order)?);
+			self.mapped(index_planes);
+			block = block.index(index_heads, index_width, block_size, 1).budget(top_k);
+			let query_norm = name("indexer.q_norm.weight");
+			let key_norm = name("indexer.k_norm.weight");
+			if self.file.tensor(&query_norm).is_some() || self.file.tensor(&key_norm).is_some() {
+				block = block.score(rms, rope_dims);
+				let mut scales = self.scale(&query_norm, &role, index_width, index_heads, &index_order)?;
+				scales.extend(self.scale(&key_norm, &role, index_width, 1, &index_order)?);
+				self.slot(scales);
+			}
+		}
+		let output = self.projection(&name("attn_output.weight"), &role, heads * head, width)?;
+		self.mapped(vec![output]);
+		Ok(block)
+	}
+	/// One gated delta rule block and the plan of its gate projection, its
+	/// query-key-value projection, its convolution taps, its decay, its output
+	/// scale, its output gate and its output projection.
+	fn delta(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
+		let width = dimensions.width;
+		let DeltaDims { heads, key_heads, state, kernel, inner } = *dimensions.delta.as_ref().ok_or_else(|| RecipeError::new("the architecture declares delta blocks without ssm dimensions"))?;
+		require(inner == heads * state, format!("ssm.inner_size {inner} is not {heads} value heads of {state}"))?;
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let role = format!("block {layer} delta");
+		let alpha = self.projection(&name("ssm_alpha.weight"), &role, width, heads)?;
+		let beta = self.projection(&name("ssm_beta.weight"), &role, width, heads)?;
+		let mut gates = vec![Plane::Mapped(alpha), Plane::Mapped(beta)];
+		// The decay bias offsets the alpha half; the beta half has none, so the
+		// bias row the node binds ends with zeros there.
+		if let Some(bias) = self.optional(&name("ssm_dt.bias")) {
+			require(bias.elements() == heads, format!("{} holds {} values; {role} offsets {heads} decay gates", bias.name, bias.elements()))?;
+			gates.push(Plane::Mapped(bias));
+			gates.push(Plane::Owned { name: name("ssm_beta.bias (zero)"), values: vec![0.0; heads] });
+		}
+		self.slot(gates);
+		let conv_width = 2 * key_heads * state + inner;
+		let qkv = self.projection(&name("attn_qkv.weight"), &role, width, conv_width)?;
+		self.mapped(vec![qkv]);
+		let taps = self.tensor(&name("ssm_conv1d.weight"), &role)?;
+		require(
+			taps.shape.len() == 2 && taps.shape[0] as usize == kernel && taps.shape[1] as usize == conv_width,
+			format!("{} has shape {:?}; {role} convolves {conv_width} channels with {kernel} taps", taps.name, taps.shape),
+		)?;
+		self.mapped(vec![taps]);
+		// The file stores the decay as `-exp(A)`; the delta node takes `A`.
+		let decay = self.tensor(&name("ssm_a"), &role)?;
+		let values = self.file.values(&decay)?;
+		require(values.len() == heads && values.iter().all(|value| *value < 0.0), format!("{} holds {} values; {role} takes {heads} negative decays", decay.name, values.len()))?;
+		self.slot(vec![Plane::Owned { name: format!("{} (ln(-a))", decay.name), values: values.iter().map(|value| (-value).ln()).collect() }]);
+		let order = (0..state).collect::<Vec<_>>();
+		let scales = self.scale(&name("ssm_norm.weight"), &role, state, heads, &order)?;
+		self.slot(scales);
+		let gate = self.projection(&name("attn_gate.weight"), &role, width, inner)?;
+		self.mapped(vec![gate]);
+		let output = self.projection(&name("ssm_out.weight"), &role, inner, width)?;
+		self.mapped(vec![output]);
+		// A missing row selector keeps the historical hand-built defaults;
+		// architecture rows that use this block provide their trained pair.
+		let (conv_activation, output_activation) = self.delta_activation.unwrap_or((Activation::Linear, Activation::Sigmoid));
+		let block = branch.delta(heads, kernel).keys(key_heads, state).values(state).out(width);
+		Ok(block.delta_block("activations", |delta| {
+			delta.conv_activation = conv_activation;
+			delta.output_activation = output_activation;
+		}))
+	}
+	/// One gated feed-forward and the plan of its gate, up and down projections.
+	fn feed_forward(&mut self, branch: Model, layer: usize, dimensions: &Dimensions) -> Result<Model> {
+		let width = dimensions.width;
+		let hidden = dimensions.feed_forward.ok_or_else(|| RecipeError::new("the architecture names no feed-forward width"))?;
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let role = format!("block {layer} feed-forward");
+		for (suffix, inputs, outputs) in [("ffn_gate.weight", width, hidden), ("ffn_up.weight", width, hidden), ("ffn_down.weight", hidden, width)] {
+			let tensor = self.projection(&name(suffix), &role, inputs, outputs)?;
+			self.mapped(vec![tensor]);
+		}
+		Ok(branch.glu(hidden, Activation::Silu))
+	}
+	/// One mixture of experts and the plan of its router, its expert tables and
+	/// its shared expert.
+	fn experts(&mut self, branch: Model, layer: usize, experts: &ExpertDims, dimensions: &Dimensions) -> Result<Model> {
+		let width = dimensions.width;
+		let ExpertDims { count, used, hidden, scoring, renormalize } = *experts;
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let role = format!("block {layer} experts");
+		let router = self.projection(&name("ffn_gate_inp.weight"), &role, width, count)?;
+		self.mapped(vec![router]);
+		for (suffix, inputs, outputs) in [("ffn_gate_exps.weight", width, hidden), ("ffn_up_exps.weight", width, hidden), ("ffn_down_exps.weight", hidden, width)] {
+			let table = self.tensor(&name(suffix), &role)?;
+			require(
+				table.shape.len() == 3 && table.shape[0] as usize == inputs && table.shape[1] as usize == outputs && table.shape[2] as usize == count,
+				format!("{} has shape {:?}; {role} holds {count} experts of [{inputs}, {outputs}]", table.name, table.shape),
+			)?;
+			self.mapped(vec![table]);
+		}
+		let shared = self.file.tensor(&name("ffn_gate_shexp.weight")).is_some();
+		if shared {
+			let shared_role = format!("block {layer} shared expert");
+			// The per-position gate is the first weighted node in the shared path.
+			let gate = self.tensor(&name("ffn_gate_inp_shexp.weight"), &shared_role)?;
+			require(gate.elements() == width, format!("{} holds {} values; {shared_role} gate takes {width}", gate.name, gate.elements()))?;
+			self.mapped(vec![gate]);
+			for (suffix, inputs, outputs) in [("ffn_gate_shexp.weight", width, hidden), ("ffn_up_shexp.weight", width, hidden), ("ffn_down_shexp.weight", hidden, width)] {
+				let tensor = self.projection(&name(suffix), &shared_role, inputs, outputs)?;
+				self.mapped(vec![tensor]);
+			}
+		}
+		Ok(branch.moe(count, used, hidden, Activation::Silu, scoring, renormalize, shared))
+	}
+	/// One per-layer embedding and the plan of its host table, key and value
+	/// projections, grouped normalization scales, and dilated depthwise taps.
+	fn ple(&mut self, layer: usize, ple: &Ngram<'_>, dimensions: &Dimensions) -> Result<()> {
+		let role = format!("block {layer} per-layer embedding");
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		let (table_name, _, _) = ple.table();
+		let table = self.tensor(table_name, &role)?;
+		self.mapped(vec![table]);
+		let lanes = dimensions.hyper.map_or(1, |(lanes, _)| lanes);
+		let stream = checked_mul(lanes, dimensions.width, "per-layer embedding stream")?;
+		let gathered = ple.width();
+		let key = self.projection(&name("ple_key.weight"), &role, gathered, stream)?;
+		self.mapped(vec![key]);
+		self.whole(&name("ple_norm_key.weight"), &role)?;
+		self.whole(&name("ple_norm_query.weight"), &role)?;
+		let value = self.projection(&name("ple_value.weight"), &role, gathered, dimensions.width)?;
+		self.mapped(vec![value]);
+		self.whole(&name("ple_norm_conv.weight"), &role)?;
+		let taps = self.tensor(&name("ple_conv1d.weight"), &role)?;
+		require(
+			taps.shape.len() == 2 && taps.shape[0] as usize == ple.kernel() && taps.shape[1] as usize == stream,
+			format!("{} has shape {:?}; {role} convolves {stream} channels with {} taps", taps.name, taps.shape, ple.kernel()),
+		)?;
+		self.mapped(vec![taps]);
+		Ok(())
+	}
+	/// Opens the `part` branch of block `layer` on the residual stream. Under the
+	/// hyper-connection mixer the architecture declares, the mixer's gates bind
+	/// ahead of the branch and the branch starts empty; on a plain residual the
+	/// branch starts with its pre-normalization, whose scale binds first.
+	fn open(&mut self, layer: usize, part: &str, dimensions: &Dimensions) -> Result<Model> {
+		let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+		match dimensions.hyper {
+			Some((lanes, rank)) => {
+				if rank != 0 {
+					let role = format!("block {layer} {part} mixer");
+					let stream = lanes * dimensions.width;
+					self.whole(&name(&format!("hc_{part}_norm.weight")), &role)?;
+					let down = self.projection(&name(&format!("hc_{part}_down.weight")), &role, stream, rank)?;
+					let up = self.projection(&name(&format!("hc_{part}_up.weight")), &role, rank, stream)?;
+					let inject = self.projection(&name(&format!("hc_{part}_inject.weight")), &role, stream, lanes)?;
+					self.mapped(vec![down]);
+					self.mapped(vec![up]);
+					self.mapped(vec![inject]);
+				}
+				Ok(recipe.model())
+			}
+			None => {
+				let role = format!("block {layer} {part} pre-normalization");
+				let scale = match part {
+					"attn" => self.tensor(&name("attn_norm.weight"), &role)?,
+					_ => match self.optional(&name("ffn_norm.weight")) {
+						Some(scale) => scale,
+						None => self.tensor(&name("post_attention_norm.weight"), &role)?,
+					},
+				};
+				require(scale.elements() == dimensions.width, format!("{} holds {} values; {role} scales {} channels", scale.name, scale.elements(), dimensions.width))?;
+				self.mapped(vec![scale]);
+				Ok(recipe.model().norm(rms))
+			}
+		}
+	}
+	/// Closes a branch: the mixer's lanes and rank under hyper-connections, and
+	/// one ungated lane, the plain residual, otherwise.
+	fn close(&self, model: Model, branch: Model, dimensions: &Dimensions) -> Model {
+		let (lanes, rank) = dimensions.hyper.unwrap_or((1, 0));
+		model.hyper(lanes, rank, &branch)
+	}
 }
 /// One id at a time from a model's logits: a repetition penalty over the
 /// recent ids, then top-k, top-p, min-p, temperature, and a seeded draw.
@@ -9451,15 +10080,15 @@ fn serve_decode(placed: &Placed, stream: &mut std::net::TcpStream) -> Result<()>
 /// runs the prompt, every step adds one id and forwards the positions it reaches
 /// through `logits`, and `samples` holds the whole sequence as the ids settle.
 fn decode_steps(
-	samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>,
-	mut logits: impl FnMut(&[f64], u32, u32) -> Result<Vec<f64>>,
+	tape: &mut NativeTape, samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>,
+	mut logits: impl FnMut(&mut NativeTape, &[f64], u32, u32) -> Result<(Vec<f64>, Vec<f64>)>,
 ) -> Result<Generation> {
 	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
 	let mut settled = 0;
 	for step in 0..=budget {
 		let reached = narrow(generation.ids.len(), "decode position")? as u32;
 		let started = std::time::Instant::now();
-		let logits = logits(samples, settled, reached)?;
+		let (predictions, sample_logits) = logits(tape, samples, settled, reached)?;
 		let seconds = started.elapsed().as_secs_f64();
 		if step == 0 {
 			generation.prefill_seconds = seconds;
@@ -9467,11 +10096,11 @@ fn decode_steps(
 			generation.step_seconds.push(seconds);
 		}
 		settled = reached;
-		generation.logits = logits;
+		generation.logits = predictions;
 		if step == budget {
 			break;
 		}
-		let id = sampler.sample(&generation.logits, &generation.ids);
+		let id = sampler.sample(&sample_logits, &generation.ids);
 		emit(id)?;
 		samples[generation.ids.len()] = f64::from(id);
 		generation.ids.push(id);
@@ -9481,12 +10110,18 @@ fn decode_steps(
 	}
 	Ok(generation)
 }
-/// A saved model placed across the selected devices: contiguous block ranges,
-/// each held by one persistent tape on its own device, run in sequence with
-/// the stream moved at every hop. The tapes are the model's state, so a decode
+/// The interface in front of placed tapes: a saved semantic pipeline applies
+/// its named-input transforms, while a bound graph reads its input directly.
+enum PlacedSource {
+	Saved(Vec<bundle::SemanticGraph>),
+	Bound(Shape),
+}
+/// A model placed across the selected devices: contiguous block ranges, each
+/// held by one persistent tape on its own device, run in sequence with the
+/// stream moved at every hop. The tapes are the model's state, so a decode
 /// extends them one position at a time.
 pub struct Placed {
-	graphs: Vec<bundle::SemanticGraph>,
+	source: PlacedSource,
 	split: Vec<usize>,
 	/// One tape per range of every graph, on the range's device.
 	tapes: Vec<Vec<NativeTape>>,
@@ -9502,35 +10137,14 @@ fn saved_statistics(nodes: &[Node], rows: usize) -> Result<Vec<(usize, usize)>> 
 		.map(|(index, state)| (index, state.values))
 		.collect())
 }
-/// The bytes a device holds for the nodes `range` of an inference graph, as
-/// the tape lays them out: each node's packed or decoded weights, and its
-/// value and context arenas for one row, which keep every position's
-/// activations, attention keys and values, recurrent state, convolution tail
-/// and batch normalization statistics.
-fn resident_bytes(graph: &Graph, range: std::ops::Range<usize>, precision: Compute) -> Result<usize> {
-	let element = precision.bytes();
-	let mut bytes = 0;
-	for index in range {
-		let node = &graph.nodes[index];
-		let weights = match packed_weight(graph, index, true) {
-			Some(weight) => weight.bytes.len(),
-			None => checked_mul(node.parameters, element, "resident weights")?,
-		};
-		for span in [align(weights, element)?, align(graph_rows_buffer(node.output, 1, element)?, element.max(8))?, align(node_context(node, 1, element)?, element.max(8))?] {
-			bytes = checked_add(bytes, span, "resident bytes")?;
-		}
-	}
-	Ok(bytes)
-}
-/// The input row a range starting at node `start` holds: the model's ids for
-/// a gather, else the stream the previous node leaves.
-fn input_row_bytes(graph: &Graph, start: usize, element: usize) -> Result<usize> {
-	let (shape, element) = match start {
-		0 if graph.nodes.first().is_some_and(|node| node.op == Primitive::Gather) => (graph.input, size_of::<i32>()),
-		0 => (graph.input, element),
-		_ => (graph.nodes[start - 1].output, element),
-	};
-	checked_mul(shape.elements(), element, "input row bytes")
+/// The bytes a device holds to run one row of a graph part: its input, weight
+/// arena, and value and context arenas for the part's own layout.
+fn part_bytes(part: &Graph, precision: Compute) -> Result<usize> {
+	let (_, weights) = native_weight_arena(part, precision, true)?;
+	let layout = NativeLayout::for_graph(part, 1, precision)?;
+	let input_element = if part.nodes.first().is_some_and(|node| node.op == Primitive::Gather) { size_of::<i32>() } else { precision.bytes() };
+	let input = checked_mul(part.input.elements(), input_element, "part input bytes")?;
+	checked_add(input, checked_add(weights, checked_add(layout.values_bytes, layout.contexts_bytes, "part arena bytes")?, "part resident bytes")?, "part resident bytes")
 }
 /// Whether a device boundary before node `start` cuts a connection into a later
 /// node: a residual reaching back over it, or the model input.
@@ -9553,23 +10167,66 @@ fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -
 			starts.push(index)
 		}
 	}
-	let (mut split, mut taken, mut free) = (Vec::new(), 0, available(&devices[0])?);
+	let (mut split, mut taken, mut first, mut free) = (Vec::new(), 0, 0, available(&devices[0])?);
 	for (block, &start) in starts.iter().enumerate() {
 		let end = starts.get(block + 1).copied().unwrap_or(graph.nodes.len());
-		let resident = resident_bytes(graph, start..end, precision)? as u64;
+		let resident = part_bytes(&graph_part(graph, first, end)?, precision)? as u64;
 		if taken != 0 && resident > free && split.len() + 1 < devices.len() && !cuts_connection(graph, start) {
 			split.push(taken);
-			(taken, free) = (0, available(&devices[split.len()])?);
+			(taken, first, free) = (0, start, available(&devices[split.len()])?);
 		}
-		if taken == 0 {
-			free = free.saturating_sub(input_row_bytes(graph, start, precision.bytes())? as u64);
-		}
-		free = free.saturating_sub(resident);
 		taken += 1;
 	}
 	require(taken != 0, "model has no block")?;
 	split.push(taken);
 	Ok(split)
+}
+/// The nodes `start..end`, rebased as a graph of their own whose input is the
+/// node before `start`.
+fn graph_part(graph: &Graph, start: usize, end: usize) -> Result<Graph> {
+	require(end > start, "a device takes no blocks")?;
+	require(!cuts_connection(graph, start), format!("the split cuts a connection into block {}", graph.nodes[start].block_index))?;
+	let base = graph.nodes[start].offset;
+	let rebase = |index: i32| {
+		if index >= start as i32 {
+			index - start as i32
+		} else if index == -2 {
+			-2
+		} else {
+			-1
+		}
+	};
+	let nodes = graph.nodes[start..end]
+		.iter()
+		.map(|node| {
+			require(node.op != Primitive::Predictor, "estimator blocks cannot be placed across devices")?;
+			Ok(Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() })
+		})
+		.collect::<Result<Vec<_>>>()?;
+	let last = &graph.nodes[end - 1];
+	// A packed bound node owns logical parameters without an arithmetic arena
+	// span. The next node's offset is the actual end of this part's span.
+	let parameters = graph.nodes.get(end).map_or(graph.parameters.len(), |node| node.offset);
+	Ok(Graph {
+		nodes,
+		parameters: graph.parameters[base..parameters].to_vec(),
+		frozen: graph.frozen[base..parameters].to_vec(),
+		programs: graph.programs.clone(),
+		lanes: graph.lanes,
+		rank: graph.rank,
+		stored: graph.stored[start..end].to_vec(),
+		input: if start == 0 { graph.input } else { graph.nodes[start - 1].output },
+		output: last.output,
+		source: (end - start) as i32 - 1,
+		state: TrainingState::default(),
+		block_index: last.block_index,
+		block_kind: last.block_kind,
+		block_frozen: false,
+		block_packed: false,
+		bound: None,
+		bound_values: Vec::new(),
+		epsilon: graph.epsilon,
+	})
 }
 /// The nodes of the blocks each device takes, rebased so every part is a graph
 /// of its own whose input is the previous part's output.
@@ -9579,46 +10236,7 @@ fn split_graph(graph: &Graph, split: &[usize]) -> Result<Vec<Graph>> {
 		first_block += blocks;
 		let end = if device + 1 == split.len() { graph.nodes.len() } else { graph.nodes.iter().position(|node| node.block_index >= first_block).unwrap_or(graph.nodes.len()) };
 		require(end > start, format!("device {device} takes no blocks"))?;
-		require(!cuts_connection(graph, start), format!("the split cuts a connection into block {}", graph.nodes[start].block_index))?;
-		let base = graph.nodes[start].offset;
-		let rebase = |index: i32| {
-			if index >= start as i32 {
-				index - start as i32
-			} else if index == -2 {
-				-2
-			} else {
-				-1
-			}
-		};
-		let nodes = graph.nodes[start..end]
-			.iter()
-			.map(|node| {
-				require(node.op != Primitive::Predictor, "estimator blocks cannot be placed across devices")?;
-				Ok(Node { source: rebase(node.source), second: rebase(node.second), offset: node.offset - base, ..node.clone() })
-			})
-			.collect::<Result<Vec<_>>>()?;
-		let last = &graph.nodes[end - 1];
-		let parameters = last.offset + last.parameters;
-		parts.push(Graph {
-			nodes,
-			parameters: graph.parameters[base..parameters].to_vec(),
-			frozen: graph.frozen[base..parameters].to_vec(),
-			programs: graph.programs.clone(),
-			lanes: graph.lanes,
-			rank: graph.rank,
-			stored: graph.stored[start..end].to_vec(),
-			input: if start == 0 { graph.input } else { graph.nodes[start - 1].output },
-			output: last.output,
-			source: (end - start) as i32 - 1,
-			state: TrainingState::default(),
-			block_index: last.block_index,
-			block_kind: last.block_kind,
-			block_frozen: false,
-			block_packed: false,
-			bound: None,
-			bound_values: Vec::new(),
-			epsilon: graph.epsilon,
-		});
+		parts.push(graph_part(graph, start, end)?);
 		start = end;
 	}
 	Ok(parts)
@@ -9630,43 +10248,59 @@ fn window_runs(shape: Shape, begin: u32, end: u32) -> Vec<(usize, usize)> {
 	let (begin, end) = (begin as usize, end as usize);
 	if begin == 0 && end == shape.length { vec![(0, shape.elements())] } else { (0..shape.channels).map(|channel| (channel * shape.length + begin, end - begin)).collect() }
 }
+/// Build one persistent tape for every contiguous device range of `graph`.
+fn place_ranges(graph: &Graph, split: &[usize], devices: &'static [&'static Gpu], precision: Compute, bn_stats: &[f64]) -> Result<(Vec<usize>, Vec<NativeTape>, Vec<usize>, usize)> {
+	let split = if split.is_empty() { measured_split(graph, precision, devices)? } else { split.to_vec() };
+	let blocks = graph.nodes.last().map_or(0, |node| node.block_index + 1);
+	require(split.len() <= devices.len(), format!("the split names {} devices but {} are selected", split.len(), devices.len()))?;
+	require(split.iter().sum::<usize>() == blocks, format!("the split places {} blocks but the model has {blocks}", split.iter().sum::<usize>()))?;
+	let (mut ranges, mut resident, mut moved, mut statistics) = (Vec::new(), vec![0; devices.len()], 0, 0);
+	let tokens = vec![0.0; graph_positions(graph)];
+	for (index, (part, device)) in split_graph(graph, &split)?.iter().zip(devices).enumerate() {
+		let tape = range_tape(part, &vec![0.0; part.input.elements()], &tokens, device, precision, bn_stats, &mut statistics)?;
+		resident[index] = tape.resident_bytes();
+		if index + 1 < split.len() {
+			moved += part.output.channels * precision.bytes();
+		}
+		ranges.push(tape);
+	}
+	require(statistics == bn_stats.len(), "saved batch normalization statistics contain unused values")?;
+	Ok((split, ranges, resident, moved))
+}
 /// Place a saved model over `devices`: every range gets its tape, created once
 /// on its device with the batch normalization statistics its blocks carry.
 fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -> Result<Placed> {
 	let path = resolve_path(path)?;
 	let (_, graphs) = bundle::load_semantic(&path)?;
-	let (mut split, mut tapes, mut resident, mut moved) = (split.to_vec(), Vec::new(), vec![0; devices.len()], 0);
+	let (mut chosen, mut tapes, mut resident, mut moved) = (split.to_vec(), Vec::new(), vec![0; devices.len()], 0);
 	for stored in &graphs {
 		let graph = materialize_saved_graph(stored, &vec![0.0; stored.input.elements()], devices[0], Config::load()?)?;
-		if split.is_empty() {
-			split = measured_split(&graph, stored.precision, devices)?;
+		let (next, ranges, bytes, movement) = place_ranges(&graph, &chosen, devices, stored.precision, &stored.bn_stats)?;
+		if chosen.is_empty() {
+			chosen = next;
 		}
-		let blocks = stored.model.blocks.len();
-		require(split.len() <= devices.len(), format!("the split names {} devices but {} are selected", split.len(), devices.len()))?;
-		require(split.iter().sum::<usize>() == blocks, format!("the split places {} blocks but the model has {blocks}", split.iter().sum::<usize>()))?;
-		let (mut ranges, mut statistics) = (Vec::new(), 0);
-		let tokens = vec![0.0; stored.input.elements()];
-		for (index, (part, device)) in split_graph(&graph, &split)?.iter().zip(devices).enumerate() {
-			let tape = range_tape(part, &vec![0.0; part.input.elements()], &tokens, device, stored, &mut statistics)?;
-			resident[index] += tape.resident_bytes();
-			if index + 1 < split.len() {
-				moved += part.output.channels * stored.precision.bytes();
-			}
-			ranges.push(tape);
+		for (total, bytes) in resident.iter_mut().zip(bytes) {
+			*total += bytes;
 		}
+		moved += movement;
 		tapes.push(ranges);
 	}
-	Ok(Placed { graphs, split, tapes, resident, moved })
+	Ok(Placed { source: PlacedSource::Saved(graphs), split: chosen, tapes, resident, moved })
+}
+/// Place a GGUF-bound model over the selected devices through the same graph
+/// partition and tape construction used by a saved model.
+fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'static [&'static Gpu]) -> Result<Placed> {
+	require(positions != 0, "a placed bound model has no positions")?;
+	let samples = vec![0.0; positions];
+	let graph = bound_graph_on(&model.file, &model.model, &model.plan, &samples, 1, devices[0])?;
+	let input = graph.input;
+	let (split, ranges, resident, moved) = place_ranges(&graph, split, devices, Compute::FP64, &[])?;
+	Ok(Placed { source: PlacedSource::Bound(input), split, tapes: vec![ranges], resident, moved })
 }
 impl Placed {
 	pub fn infer(&self, input: &[f64]) -> Vec<f64> {
-		let mut graph = 0;
-		bundle::infer_graphs(&self.graphs, input, |_, samples| {
-			let tapes = &self.tapes[graph];
-			graph += 1;
-			self.forward_window(tapes, samples, 0, tapes.first().map_or(0, |tape| tape.positions))
-		})
-		.unwrap_or_else(|error| panic!("{error}"))
+		let end = self.tapes.first().and_then(|ranges| ranges.first()).map_or(0, |tape| tape.positions);
+		self.run_window(input, 0, end).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// Autoregressive decode over the placed model, whose input is a sequence
 	/// of ids and whose output is one logit per id. The tapes hold the state of
@@ -9698,21 +10332,76 @@ impl Placed {
 		self.moved
 	}
 	fn try_decode(&self, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
-		let (stored, tapes) = match (self.graphs.as_slice(), self.tapes.as_slice()) {
-			([only], [tapes]) => (only, tapes.as_slice()),
-			_ => return Err(RecipeError::new(format!("decode expects a model of one graph, this model has {}", self.graphs.len()))),
+		let sequence = match &self.source {
+			PlacedSource::Saved(graphs) => match graphs.as_slice() {
+				[only] => {
+					require(only.input.channels == 1 || only.input.length == 1, "decode expects one input value per position")?;
+					only.inputs.len()
+				}
+				_ => return Err(RecipeError::new(format!("decode expects a model of one graph, this model has {}", graphs.len()))),
+			},
+			PlacedSource::Bound(input) => {
+				require(input.channels == 1 || input.length == 1, "decode expects one input value per position")?;
+				input.elements()
+			}
 		};
-		let sequence = stored.inputs.len();
+		require(self.tapes.len() == 1, format!("decode expects one range set, this placement has {}", self.tapes.len()))?;
 		require(!prompt.is_empty(), "decode prompt is empty")?;
-		require(stored.input.channels == 1 || stored.input.length == 1, "decode expects one input value per position")?;
 		require(checked_add(prompt.len(), budget, "decode length")? <= sequence, format!("decode of {} prompt ids and {budget} steps exceeds the model sequence of {sequence}", prompt.len()))?;
 		let mut samples = vec![0.0; sequence];
 		for (slot, id) in samples.iter_mut().zip(prompt) {
 			*slot = f64::from(*id);
 		}
-		decode_steps(&mut samples, prompt, sampler, stop, budget, emit, |samples, settled, reached| {
-			bundle::infer_graphs(&self.graphs, samples, |_, prepared| self.forward_window(tapes, prepared, settled, reached))
-		})
+		let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
+		let mut settled = 0;
+		for step in 0..=budget {
+			let reached = narrow(generation.ids.len(), "decode position")? as u32;
+			let started = std::time::Instant::now();
+			let predictions = self.run_window(&samples, settled, reached)?;
+			let sample_logits = self.last_logits(&predictions, settled, reached)?;
+			let seconds = started.elapsed().as_secs_f64();
+			if step == 0 {
+				generation.prefill_seconds = seconds;
+			} else {
+				generation.step_seconds.push(seconds);
+			}
+			settled = reached;
+			generation.logits = predictions;
+			if step == budget {
+				break;
+			}
+			let id = sampler.sample(&sample_logits, &generation.ids);
+			emit(id)?;
+			samples[generation.ids.len()] = f64::from(id);
+			generation.ids.push(id);
+			if stop.contains(&id) {
+				break;
+			}
+		}
+		Ok(generation)
+	}
+	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
+		let tape = self.tapes.first().and_then(|ranges| ranges.last()).ok_or_else(|| RecipeError::new("placement has no output range"))?;
+		tape.last_logits(predictions, begin, end)
+	}
+	/// Run a window through either a saved semantic pipeline or one directly
+	/// bound GGUF graph, using the placement's persistent range tapes.
+	fn run_window(&self, samples: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
+		match &self.source {
+			PlacedSource::Saved(graphs) => {
+				let mut graph = 0;
+				bundle::infer_graphs(graphs, samples, |_, prepared| {
+					let ranges = self.tapes.get(graph).ok_or_else(|| RecipeError::new("saved graph has no placed ranges"))?;
+					graph += 1;
+					self.forward_window(ranges, prepared, begin, end)
+				})
+			}
+			PlacedSource::Bound(input) => {
+				require(samples.len() == input.elements(), format!("bound model takes {} input values, received {}", input.elements(), samples.len()))?;
+				let ranges = self.tapes.first().ok_or_else(|| RecipeError::new("bound graph has no placed ranges"))?;
+				self.forward_window(ranges, samples, begin, end)
+			}
+		}
 	}
 	/// Run the input positions `begin..end` through every range in order. A
 	/// window from position zero starts a new sequence. The window's rows of
@@ -9750,6 +10439,12 @@ impl Shape {
 	fn elements(self) -> usize {
 		self.channels * self.length
 	}
+}
+fn select_last_logits(predictions: &[f64], output: Shape, position: usize) -> Result<Vec<f64>> {
+	require(position < output.length, format!("decode output position {position} exceeds {}", output.length))?;
+	let elements = output.elements();
+	require(predictions.len() >= elements, format!("native output has {} values, expected at least {elements}", predictions.len()))?;
+	Ok((0..output.channels).map(|channel| predictions[channel * output.length + position]).collect())
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -10098,16 +10793,16 @@ fn split_at_block(graph: &Graph, block: usize) -> Result<(Option<Graph>, Graph)>
 }
 /// The tape of one part of a split graph on its device, holding the batch
 /// normalization statistics that follow the parts already made.
-fn range_tape(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu, stored: &bundle::SemanticGraph, statistics: &mut usize) -> Result<NativeTape> {
-	let tape = NativeTape::new(graph, samples, tokens, &[], gpu, stored.precision, None)?;
+fn range_tape(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu, precision: Compute, bn_stats: &[f64], statistics: &mut usize) -> Result<NativeTape> {
+	let tape = NativeTape::new(graph, samples, tokens, &[], gpu, precision, None)?;
 	let count = tape.batch_normalizations.iter().map(|(_, values)| values).sum::<usize>();
-	tape.inject_bn_stats(stored.bn_stats.get(*statistics..*statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
+	tape.inject_bn_stats(bn_stats.get(*statistics..*statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
 	*statistics += count;
 	Ok(tape)
 }
 /// One part of a split graph run forward on its device.
 fn forward_part(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu, stored: &bundle::SemanticGraph, statistics: &mut usize) -> Result<Vec<f64>> {
-	let tape = range_tape(graph, samples, tokens, gpu, stored, statistics)?;
+	let tape = range_tape(graph, samples, tokens, gpu, stored.precision, &stored.bn_stats, statistics)?;
 	tape.forward()?;
 	tape.predictions()
 }
@@ -10157,6 +10852,8 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Residual(parts) => lower_residual(graph, parts, skip, config)?,
 		Operation::Moe(experts, top_k, hidden, activation, scoring, renormalize, shared) => lower_moe(graph, *experts, *top_k, *hidden, *activation, *scoring, *renormalize, *shared, config)?,
 		Operation::Hyper(lanes, rank, blocks) => lower_hyper(graph, *lanes, *rank, blocks, total, data, targets, rows, gpu, config)?,
+		Operation::Norm => require(block.normalization.is_some(), "a leading normalization block names no normalization")?,
+		Operation::Glu(hidden, activation) => lower_glu(graph, *hidden, *activation, config)?,
 		Operation::Estimator(estimator) => {
 			initialize_graph(graph, config);
 			lower_estimator(graph, estimator, data, targets, rows, gpu, config)?
@@ -10547,6 +11244,11 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	reset(graph, source, input);
 	lower_project(graph, checked_add(checked_mul(2, keys, "delta query and key width")?, inner, "delta projection width")?)?;
 	lower_dconv(graph, kernel, 1)?;
+	if delta.conv_activation != Activation::Linear {
+		// Qwen's gated delta recurrence applies SiLU to the causal convolution
+		// before splitting the query, key, and value planes.
+		lower_activation(graph, delta.conv_activation, config)?;
+	}
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
 	lower_normalize(graph, BlockNormalization::L2, key_width, checked_mul(2, keys, "delta query and key span")?)?;
@@ -10556,7 +11258,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	let normalized = graph.source;
 	reset(graph, source, input);
 	lower_project(graph, inner)?;
-	let (gate, shape) = activation(graph, graph.source, graph.output, Activation::Sigmoid, config)?;
+	let (gate, shape) = activation(graph, graph.source, graph.output, delta.output_activation, config)?;
 	binary(graph, normalized, gate, shape, ScalarOpcode::Multiply)?;
 	lower_project(graph, output)
 }
@@ -10587,10 +11289,9 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	}
 	let (main, main_shape) = (graph.source, graph.output);
 	// The indexer is its own projection of the block input, so a checkpoint binds
-	// its indexer tensors as their own node in whatever layout they hold, and the
-	// normalization and rotary the model trained sit on that projection as graph
-	// nodes: every indexer head normalizes under `.score`, or to unit length
-	// without it, before the attention node scores plain dot products.
+	// its indexer tensors as their own node in whatever layout they hold. Query
+	// normalization and rotary stay graph nodes. A trained score keeps keys raw
+	// until the selector pools each block, then applies the matching key geometry.
 	let indexer = index.unwrap_or(Indexer::NONE);
 	let mut side = -2;
 	if let Some(index) = index {
@@ -10599,12 +11300,20 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		reset(graph, source, input);
 		lower_project(graph, checked_mul(index.width, checked_add(index.heads, 1, "indexer projection heads")?, "indexer projection width")?)?;
 		let (normalization, dims) = index.score.unwrap_or((BlockNormalization::L2, 0));
-		let planes = graph.output.channels;
-		lower_normalize(graph, normalization, index.width, planes)?;
+		let scored = index.score.is_some();
+		// The query heads are normalized and rotated before scoring. A trained
+		// score leaves the key plane raw: the reference pools raw keys first, then
+		// applies its RMS/L2 norm and rotary at the block position in the indexer
+		// kernel. The unscored index path keeps its historical per-key L2
+		// normalization before pooling.
+		let query_channels = checked_mul(index.heads, index.width, "indexer query width")?;
+		let span = if scored { query_channels } else { graph.output.channels };
+		let parameters = if normalization == BlockNormalization::Rms { if scored { checked_add(query_channels, index.width, "indexer query and key scales")? } else { span } } else { 0 };
+		lower_normalize_parameters(graph, normalization, index.width, span, parameters)?;
 		if dims != 0 {
 			let (_, base) = rope.ok_or_else(|| RecipeError::new("indexer rotary dimensions require the block's rope base"))?;
 			require(dims % 2 == 0 && dims <= index.width, "indexer rotary dimensions must be even and at most the indexer width")?;
-			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), index.width as f64, planes as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+			push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), index.width as f64, query_channels as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
 		}
 		side = graph.source;
 		reset(graph, main, main_shape);
@@ -10617,9 +11326,20 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
 /// `span` channels into groups of `width`; the rest pass through untouched.
 fn lower_normalize(graph: &mut Graph, normalization: BlockNormalization, width: usize, span: usize) -> Result<()> {
+	let parameters = if normalization == BlockNormalization::Rms { span } else { 0 };
+	lower_normalize_parameters(graph, normalization, width, span, parameters)
+}
+/// Pushes a normalization whose trainable scale may include deferred columns.
+/// The ordinary forward path only applies the first `span` columns; an indexer
+/// uses the trailing columns as key scales after raw key pooling in its kernel.
+fn lower_normalize_parameters(graph: &mut Graph, normalization: BlockNormalization, width: usize, span: usize, parameters: usize) -> Result<()> {
+	if normalization == BlockNormalization::Rms {
+		require(parameters >= span, "normalization scale is narrower than its span")?;
+	} else {
+		require(parameters == 0, "non-RMS normalization cannot carry a scale")?;
+	}
 	let epsilon = graph.epsilon;
 	// RMS carries one trainable scale per normalized channel, starting at identity.
-	let parameters = if normalization == BlockNormalization::Rms { span } else { 0 };
 	let output = graph.output;
 	push_node(graph, Primitive::Normalize, output, parameters, [normalization.mode(), epsilon, width as f64, span as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
 	let offset = graph.parameters.len() - parameters;
@@ -10679,6 +11399,21 @@ fn lower_experts(graph: &mut Graph, source: i32, input: Shape, routing: i32, exp
 	let product = lower_gated(graph, gate, up, routed, activation, config)?;
 	reset(graph, product, routed);
 	push_node(graph, Primitive::ExpertOut, input, table, dispatch, routing)
+}
+/// One gated feed-forward over the block input: the gate and up projections,
+/// their activated product, and the down projection back to the input width.
+fn lower_glu(graph: &mut Graph, hidden: usize, activation: Activation, config: Config) -> Result<()> {
+	require(hidden != 0, "gated feed-forward width must be positive")?;
+	let (source, input) = (graph.source, graph.output);
+	let wide = Shape { channels: hidden, length: input.length };
+	lower_project(graph, hidden)?;
+	let gate = graph.source;
+	reset(graph, source, input);
+	lower_project(graph, hidden)?;
+	let up = graph.source;
+	let product = lower_gated(graph, gate, up, wide, activation, config)?;
+	reset(graph, product, wide);
+	lower_project(graph, input.channels)
 }
 fn lower_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, config: Config) -> Result<()> {
 	require(experts != 0, "moe requires an expert")?;
@@ -11437,6 +12172,15 @@ impl NativeTape {
 	fn predictions(&self) -> Result<Vec<f64>> {
 		self.output(0, self.capacity * self.output.elements())
 	}
+	/// Select the last output position reached by an input window for
+	/// autoregressive sampling. Predictions stay channel-major (`channel,
+	/// position`) so a decode must sample one value from each channel while
+	/// retaining the full tensor for `Generation::logits`.
+	fn last_logits(&self, predictions: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
+		let (_, reached) = self.output_window(begin, end)?;
+		require(reached != 0, "decode window reaches no output position")?;
+		select_last_logits(predictions, self.output, reached as usize - 1)
+	}
 	/// A run of `count` output values from element `first` of the output arena.
 	fn output(&self, first: usize, count: usize) -> Result<Vec<f64>> {
 		let arena = *self.program.artifact.layout.values.last().ok_or_else(|| RecipeError::new("native model has no output arena"))?;
@@ -12071,9 +12815,7 @@ fn carried(node: &Node, rows: usize) -> Result<Carried> {
 			let (kernel, dilation) = (integer_argument(node.argument[0], "depthwise kernel")? as usize, integer_argument(node.argument[1], "depthwise dilation")?.max(1) as usize);
 			Carried { history: History::Positions(checked_mul(kernel.saturating_sub(1), dilation, "depthwise tail")?), values: 0 }
 		}
-		Primitive::Contraction if node.argument[0] > 1.0 => {
-			Carried { history: History::Positions(integer_argument(node.argument[0], "contraction kernel")? as usize - 1), values: 0 }
-		}
+		Primitive::Contraction if node.argument[0] > 1.0 => Carried { history: History::Positions(integer_argument(node.argument[0], "contraction kernel")? as usize - 1), values: 0 },
 		Primitive::Pool => Carried { history: History::Sequence, values: checked_mul(rows, node.output.elements(), "pool context")? },
 		// The rows the host gathers for every position, staged as [row][position][channel].
 		Primitive::Lookup => Carried { history: History::Sequence, values: checked_mul(rows, node.output.elements(), "lookup staging")? },
@@ -12109,13 +12851,12 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 		// minimum allocation below.
 		Primitive::Elementwise => checked_mul(checked_mul(rows, node.output.elements(), "program batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "scalar gradient partials")?,
 		Primitive::Predictor => checked_mul(checked_add(node.argument[0] as usize, node.argument[1] as usize, "predictor workspace")?, rows, "predictor batch")?,
-		// One row of block scores and one admission flag per block per query, then
-		// one block score gradient per attention head per query.
+		// Softmax statistics, then the indexer block representatives, then one
+		// row of block scores and one admission flag per block per query.
 		Primitive::Attention => {
 			let (queries, blocks) = (checked_mul(rows, node.output.length, "attention statistics rows")?, attention_blocks(node));
 			let scores = checked_mul(queries, checked_mul(blocks, 2, "indexer score row")?, "indexer scores")?;
-			let derivatives = checked_mul(checked_mul(queries, node.argument[0] as usize, "indexer derivative heads")?, blocks, "indexer derivatives")?;
-			checked_add(state, checked_add(scores, derivatives, "indexer gradient context")?, "attention context")?
+			checked_add(state, scores, "attention context")?
 		}
 		Primitive::Scan => {
 			let gradients = checked_mul(rows, node.parameters, "scan gradients")?;
@@ -17908,4 +18649,23 @@ fn coefficient(targets: &[f64], predictions: &[f64]) -> f64 {
 	let residual = targets.iter().zip(predictions).map(|(target, value)| (target - value).powi(2)).sum::<f64>();
 	let total = targets.iter().map(|target| (target - mean).powi(2)).sum::<f64>();
 	if total == 0.0 { 0.0 } else { 1.0 - residual / total }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn decode_samples_the_last_channel_major_position() {
+		let output = Shape { channels: 3, length: 4 };
+		let predictions = (0..output.elements()).map(|value| value as f64).collect::<Vec<_>>();
+		assert_eq!(select_last_logits(&predictions, output, 3).unwrap(), [3.0, 7.0, 11.0]);
+	}
+
+	#[test]
+	fn decode_rejects_a_position_outside_the_output() {
+		let output = Shape { channels: 2, length: 3 };
+		let predictions = vec![0.0; output.elements()];
+		assert!(select_last_logits(&predictions, output, output.length).is_err());
+	}
 }
