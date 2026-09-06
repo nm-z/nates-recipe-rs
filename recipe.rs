@@ -1546,23 +1546,126 @@ fn native_weight_bytes(graph: &Graph, precision: Compute, inference: bool) -> Re
 	Ok(arena)
 }
 
+/// Whether a node's forward kernel reads its operands at positions outside the
+/// window it writes: earlier keys and values, the recurrent replay, the
+/// convolution tail, the pooled span, or the whole batch. Every other kernel
+/// reads one operand position per output position.
+fn reads_beyond_window(node: &Node) -> bool {
+	match node.op {
+		Primitive::Attention | Primitive::Delta | Primitive::Dconv | Primitive::Pool | Primitive::Predictor => true,
+		Primitive::Contraction => node.argument[0] > 1.0,
+		_ => false,
+	}
+}
+
+/// The positions each node writes in one forward window, as the chain of
+/// window rules from the input, so two nodes with equal signatures write the
+/// same positions of every window.
+fn window_signatures(graph: &Graph) -> Vec<String> {
+	let mut signatures: Vec<String> = Vec::with_capacity(graph.nodes.len());
+	for node in &graph.nodes {
+		let source = usize::try_from(node.source).map_or_else(|_| "input".to_owned(), |source| signatures[source].clone());
+		signatures.push(match node.op {
+			Primitive::Predictor => "whole".to_owned(),
+			Primitive::Pool => format!("pool{}({source})", node.argument[0]),
+			Primitive::Contraction if node.argument[0] > 1.0 => format!("shift{}({source})", node.argument[0]),
+			_ => source,
+		});
+	}
+	signatures
+}
+
+/// The outputs a later forward window reads, so their slots must outlive the
+/// window that writes them: the graph output, an operand a kernel reads beyond
+/// its own window, a scan's own carried output, and a second operand whose
+/// window differs from the window its consumer walks. Every other output is
+/// consumed within the window that writes it.
+fn retained_outputs(graph: &Graph) -> Vec<bool> {
+	let signatures = window_signatures(graph);
+	let mut retained = vec![false; graph.nodes.len()];
+	if let Some(last) = retained.last_mut() {
+		*last = true;
+	}
+	for (index, node) in graph.nodes.iter().enumerate() {
+		let beyond = reads_beyond_window(node);
+		if node.op == Primitive::Scan {
+			retained[index] = true;
+		}
+		if let Ok(source) = usize::try_from(node.source) {
+			retained[source] |= beyond;
+		}
+		if let Ok(second) = usize::try_from(node.second) {
+			retained[second] |= beyond || signatures[second] != signatures[index];
+		}
+	}
+	retained
+}
+
+/// The index of the last node that reads each node's output, or the node's own
+/// index when nothing reads it.
+fn last_uses(graph: &Graph) -> Vec<usize> {
+	let mut last = (0..graph.nodes.len()).collect::<Vec<_>>();
+	for (index, node) in graph.nodes.iter().enumerate() {
+		for operand in [node.source, node.second] {
+			if let Ok(operand) = usize::try_from(operand) {
+				last[operand] = index;
+			}
+		}
+	}
+	last
+}
+
 impl NativeLayout {
-	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute) -> Result<Self> {
+	/// Training gives every node its own value, context and adjoint slot for the
+	/// whole run, because the reverse pass reads each output after every later
+	/// node has run. An inference tape holds no adjoints, drops the context
+	/// regions only the reverse pass fills, and shares value slots: a retained
+	/// output keeps a slot of its own, and a transient one takes a released slot
+	/// of the same size when one exists. A slot is released after the last node
+	/// that reads it, and a barrier follows every node, so no reader overlaps the
+	/// writer that follows.
+	pub(crate) fn for_graph(graph: &Graph, rows: usize, precision: Compute, inference: bool) -> Result<Self> {
 		let element = precision.bytes();
+		let unit = element.max(8);
 		let mut values = Vec::with_capacity(graph.nodes.len());
 		let mut contexts = Vec::with_capacity(graph.nodes.len());
 		let mut adjoints = Vec::with_capacity(graph.nodes.len());
 		let (mut value_offset, mut context_offset, mut adjoint_offset) = (0, 0, 0);
-		for node in &graph.nodes {
-			value_offset = align(value_offset, element.max(8))?;
-			context_offset = align(context_offset, element.max(8))?;
-			adjoint_offset = align(adjoint_offset, element.max(8))?;
-			values.push(value_offset);
+		let (retained, last) = if inference { (retained_outputs(graph), last_uses(graph)) } else { (Vec::new(), Vec::new()) };
+		let mut released: Vec<(usize, usize)> = Vec::new();
+		for (index, node) in graph.nodes.iter().enumerate() {
+			let bytes = graph_rows_buffer(node.output, rows, element)?;
+			let reuse = inference && !retained[index];
+			let slot = match released.iter().position(|(size, _)| reuse && *size == bytes) {
+				Some(position) => released.remove(position).1,
+				None => {
+					let slot = align(value_offset, unit)?;
+					value_offset = checked_add(slot, bytes, "model value arena")?;
+					slot
+				}
+			};
+			values.push(slot);
+			context_offset = align(context_offset, unit)?;
 			contexts.push(context_offset);
-			adjoints.push(adjoint_offset);
-			value_offset = checked_add(value_offset, graph_rows_buffer(node.output, rows, element)?, "model value arena")?;
-			context_offset = checked_add(context_offset, node_context(node, rows, element)?, "model context arena")?;
-			adjoint_offset = checked_add(adjoint_offset, graph_rows_buffer(node.output, rows, element)?, "model adjoint arena")?;
+			context_offset = checked_add(context_offset, node_context(node, rows, element, inference)?, "model context arena")?;
+			if inference {
+				adjoints.push(0);
+				let mut operands = [node.source, node.second, index as i32];
+				operands.sort_unstable();
+				for (position, operand) in operands.into_iter().enumerate() {
+					let Ok(operand) = usize::try_from(operand) else { continue };
+					if position > 0 && operands[position - 1] == operand as i32 {
+						continue;
+					}
+					if last[operand] == index && !retained[operand] {
+						released.push((graph_rows_buffer(graph.nodes[operand].output, rows, element)?, values[operand]));
+					}
+				}
+			} else {
+				adjoint_offset = align(adjoint_offset, unit)?;
+				adjoints.push(adjoint_offset);
+				adjoint_offset = checked_add(adjoint_offset, bytes, "model adjoint arena")?;
+			}
 		}
 		Ok(Self { values, contexts, adjoints, values_bytes: value_offset.max(element), contexts_bytes: context_offset.max(element), adjoints_bytes: adjoint_offset.max(element) })
 	}
@@ -1609,12 +1712,15 @@ pub(crate) struct NativeModelIr {
 	schedule: NativeSchedule,
 	plans: Vec<NodePlan>,
 	storage_bytes: usize,
+	/// The layout is the inference layout: no adjoints, forward-only contexts,
+	/// and shared value slots.
+	inference: bool,
 }
 
 impl NativeModelIr {
 	pub(crate) fn from_graph(graph: &Graph, rows: usize, precision: Compute, schedule: NativeSchedule, inference: bool) -> Result<Self> {
 		require(rows != 0, "native model rows must be positive")?;
-		let layout = NativeLayout::for_graph(graph, rows, precision)?;
+		let layout = NativeLayout::for_graph(graph, rows, precision, inference)?;
 		let (weight_offsets, _) = native_weight_arena(graph, precision, inference)?;
 		let precision = NativePrecision::new(precision)?;
 		let mut plans = Vec::with_capacity(graph.nodes.len());
@@ -1654,7 +1760,7 @@ impl NativeModelIr {
 				packed,
 			});
 		}
-		Ok(Self { graph: graph.clone(), layout, precision, rows, schedule, plans, storage_bytes })
+		Ok(Self { graph: graph.clone(), layout, precision, rows, schedule, plans, storage_bytes, inference })
 	}
 	fn storage(&self) -> Vec<u8> {
 		let mut storage = Vec::with_capacity(self.storage_bytes);
@@ -2803,9 +2909,13 @@ impl NativeModelIr {
 					let shape = delta_shape(node, self.rows)?;
 					let pairs = Shape { channels: shape.heads as usize, length: 1 };
 					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
+					// The reverse pass replays each chunk from its committed entry state,
+					// so a training layout commits every entry; an inference layout holds
+					// the live state alone and commits nothing.
+					let entries = if self.inference { 0 } else { shape.chunks };
 					emit_fixed_loop(&mut ir, index, "delta", self.rows, pairs, &whole, |ir, p| {
 						ir.push_str(&format!(
-							"call void @delta_forward_body( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 {p}, {arguments}, i32 {decode} )\n",
+							"call void @delta_forward_body( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 {p}, {arguments}, i32 {entries}, i32 {decode} )\n",
 							pointer = pointer_type(backend),
 							decode = plan.decode(index),
 							source = pointers.source,
@@ -2873,6 +2983,9 @@ impl NativeModelIr {
 						let key_weights = &geometry.key_weights;
 						let shared = format!("i32 %rows, i32 {from}, i32 {heads}, i32 {channels}, {selectors}");
 						let keep = integer_argument(node.argument[4], "indexer blocks kept")?;
+						// The selection clears the block score gradients the reverse pass
+						// accumulates; an inference layout holds none.
+						let derivatives = !self.inference;
 						let block = integer_argument(node.argument[3], "indexer block")?;
 						let (first, count) = (format!("%n{index}.index.first"), format!("%n{index}.index.count"));
 						let end = format!("%n{index}.end");
@@ -4404,10 +4517,13 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 /// Walk the elements of one window of output positions. The positions of a
 /// channel are contiguous, so the window is a run per row and channel and the
 /// loop index maps onto the element it owns.
+/// The bodies index one batch element in `i32`, so a batch whose elements pass
+/// `i32` is refused here rather than wrapped inside the loop.
 fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, rows: usize, shape: Shape, window: &NodeWindow, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
 	let prefix = format!("n{index}.{name}");
 	let elements = narrow(checked_mul(shape.channels, shape.length, format!("native {name} row elements").as_str())?, "native loop row elements")?;
 	let (channels, length) = (narrow(shape.channels, "native loop channels")?, narrow(shape.length, "native loop length")?);
+	narrow(checked_mul(rows, elements as usize, "native loop elements")?, "native loop batch elements")?;
 	let rows = narrow(rows, "native loop rows")?;
 	let (begin, span) = (&window.begin, &window.span);
 	ir.push_str(&format!(
@@ -4423,6 +4539,7 @@ fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, rows: usize, shape
 struct DeltaShape {
 	heads: i32,
 	key_heads: i32,
+	chunks: i32,
 	partials: i32,
 	arguments: String,
 }
@@ -4448,7 +4565,13 @@ fn delta_shape(node: &Node, rows: usize) -> Result<DeltaShape> {
 		"delta partials",
 	)?;
 	let (length, count, blocks) = (narrow(node.output.length, "delta length")?, narrow(pairs, "delta pairs")?, narrow(chunks, "delta chunks")?);
-	Ok(DeltaShape { heads, key_heads, partials, arguments: format!("i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {chunk}, i32 {blocks}, i32 {count}") })
+	Ok(DeltaShape {
+		heads,
+		key_heads,
+		chunks: blocks,
+		partials,
+		arguments: format!("i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {chunk}, i32 {blocks}, i32 {count}"),
+	})
 }
 
 /// List the positions routed to each expert, in ascending expert and position
@@ -10138,10 +10261,10 @@ fn saved_statistics(nodes: &[Node], rows: usize) -> Result<Vec<(usize, usize)>> 
 		.collect())
 }
 /// The bytes a device holds to run one row of a graph part: its input, weight
-/// arena, and value and context arenas for the part's own layout.
+/// arena, and value and context arenas for the part's own inference layout.
 fn part_bytes(part: &Graph, precision: Compute) -> Result<usize> {
 	let (_, weights) = native_weight_arena(part, precision, true)?;
-	let layout = NativeLayout::for_graph(part, 1, precision)?;
+	let layout = NativeLayout::for_graph(part, 1, precision, true)?;
 	let input_element = if part.nodes.first().is_some_and(|node| node.op == Primitive::Gather) { size_of::<i32>() } else { precision.bytes() };
 	let input = checked_mul(part.input.elements(), input_element, "part input bytes")?;
 	checked_add(input, checked_add(weights, checked_add(layout.values_bytes, layout.contexts_bytes, "part arena bytes")?, "part resident bytes")?, "part resident bytes")
@@ -10155,9 +10278,11 @@ fn cuts_connection(graph: &Graph, start: usize) -> bool {
 	})
 }
 /// Blocks per device measured from the free memory of each: a block joins the
-/// current device while its resident bytes, weights and state, fit and the
+/// current device while the part from the device's first block through it,
+/// weights and arenas together, fits that device's free memory and the
 /// boundary before it cuts no connection, so the device listed last takes the
-/// tail.
+/// tail. A part that fits here is the tape the device later builds, so a
+/// placement that no device can hold is refused before any tape is created.
 fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -> Result<Vec<usize>> {
 	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
 	let available = |device: &&'static Gpu| device.free_bytes().map(|free| free.saturating_sub(reserve));
@@ -10323,7 +10448,7 @@ impl Placed {
 		&self.split
 	}
 	/// Bytes each device holds, in `--device` order: its ranges' weights,
-	/// input rows, and the arenas that keep their state.
+	/// input, and the value and context arenas of its inference tape.
 	pub fn resident_bytes(&self) -> &[usize] {
 		&self.resident
 	}
@@ -11968,19 +12093,24 @@ impl NativeTape {
 		} else {
 			require(program.artifact.storage.is_empty(), "native artifact storage has no model-load entrypoint")?;
 		}
+		// The arenas are cleared on the device rather than staged whole on the
+		// host: a later position reads the zeros the earlier windows left.
+		let values = Buffer::zeroed(gpu, layout.values_bytes)?;
+		let contexts = Buffer::zeroed(gpu, layout.contexts_bytes)?;
 		// The packed embedding table is the gather's context, so it reaches the
 		// device whole once and the kernel then reads only the rows it addresses.
-		let mut contexts = vec![0_u8; layout.contexts_bytes.max(1)];
 		// A lookup's table never leaves the host: the tape keeps it with its hash
 		// and stages the rows of every forward window from the ids it holds.
 		let (mut lookups, positions) = (Vec::new(), graph_positions(graph));
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if node.op == Primitive::Gather {
 				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("embedding table is absent"))?;
-				let offset = layout.contexts[index];
-				let end = checked_add(offset, table.bytes.len(), "embedding table context")?;
-				require(end <= contexts.len(), "embedding table exceeds its context arena")?;
-				table.bytes.copy_into(&mut contexts[offset..end]);
+				let mut at = layout.contexts[index];
+				require(checked_add(at, table.bytes.len(), "embedding table context")? <= contexts.bytes, "embedding table exceeds its context arena")?;
+				for run in table.bytes.runs() {
+					contexts.write_bytes(at, run)?;
+					at += run.len();
+				}
 			}
 			if node.op == Primitive::Lookup {
 				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?.clone();
@@ -12006,11 +12136,19 @@ impl NativeTape {
 				context_resets.push((start, end));
 			}
 		}
+		debug(&format!(
+			"native tape device={} mode={} rows={rows} values={} contexts={} weights={} adjoints={adjoints_bytes}",
+			gpu.name,
+			if inference { "inference" } else { "training" },
+			values.bytes,
+			contexts.bytes,
+			weights.bytes
+		))?;
 		let tape = Self {
 			program,
 			precision,
-			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
-			contexts: Buffer::upload(gpu, &contexts)?,
+			values,
+			contexts,
 			context_resets,
 			lookups,
 			tokens,
@@ -12023,7 +12161,7 @@ impl NativeTape {
 			frozen: Buffer::upload(gpu, &frozen)?,
 			moments: Buffer::upload_float(gpu, &moments, precision.state)?,
 			variances: Buffer::upload_float(gpu, &variances, precision.state)?,
-			gradient: Buffer::upload(gpu, &vec![0_u8; gradient_bytes])?,
+			gradient: Buffer::zeroed(gpu, gradient_bytes)?,
 			metrics: Buffer::upload_float(gpu, &[0.0], precision.state)?,
 			best_loss,
 			rows: narrow(rows, "native rows")? as u32,
@@ -12842,32 +12980,46 @@ fn carried_state(nodes: &[Node], rows: usize) -> Result<Vec<(usize, Carried)>> {
 	}
 	Ok(declared)
 }
-fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
+/// The context bytes a node holds. Training keeps every region the forward and
+/// reverse passes share; an inference tape runs no reverse pass, so it holds
+/// only the regions the forward kernels read and write.
+fn node_context(node: &Node, rows: usize, element: usize, inference: bool) -> Result<usize> {
 	let state = carried(node, rows)?.values;
-	// Beyond the state the node carries, the context holds what one pass needs.
 	let elements = match node.op {
 		// One scratch row per reduction partition, holding this node's trainable
 		// scalars. Programs without trainable scalars reduce nothing and take the
-		// minimum allocation below.
+		// minimum allocation below. Only the reverse pass fills the rows.
+		Primitive::Elementwise if inference => 1,
 		Primitive::Elementwise => checked_mul(checked_mul(rows, node.output.elements(), "program batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "scalar gradient partials")?,
 		Primitive::Predictor => checked_mul(checked_add(node.argument[0] as usize, node.argument[1] as usize, "predictor workspace")?, rows, "predictor batch")?,
 		// Softmax statistics, then the indexer block representatives, then one
 		// row of block scores and one admission flag per block per query.
 		Primitive::Attention => {
 			let (queries, blocks) = (checked_mul(rows, node.output.length, "attention statistics rows")?, attention_blocks(node));
+			let statistics = checked_mul(checked_mul(queries, node.argument[0] as usize, "attention statistics heads")?, 2, "attention statistics")?;
+			let representatives = checked_mul(checked_mul(rows, blocks, "indexer block rows")?, node.argument[6] as usize, "indexer representatives")?;
 			let scores = checked_mul(queries, checked_mul(blocks, 2, "indexer score row")?, "indexer scores")?;
-			checked_add(state, scores, "attention context")?
+			let derivatives = if inference { 0 } else { checked_mul(checked_mul(queries, node.argument[0] as usize, "indexer derivative heads")?, blocks, "indexer derivatives")? };
+			checked_add(statistics, checked_add(representatives, checked_add(scores, derivatives, "indexer gradient context")?, "indexer context")?, "attention context")?
 		}
+		// The gate states, then the weight gradient rows only the reverse pass
+		// accumulates, then the reduction scratch.
 		Primitive::Scan => {
-			let gradients = checked_mul(rows, node.parameters, "scan gradients")?;
-			checked_add(state, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?
+			let (state_count, gates) = (checked_mul(rows, node.output.elements(), "scan batch")?, node.argument[0] as usize);
+			let states = checked_mul(2 * gates + 1, state_count, "scan states")?;
+			let gradients = if inference { 0 } else { checked_mul(rows, node.parameters, "scan gradients")? };
+			checked_add(states, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?
 		}
-		// The state adjoint, the readout error and key weight vectors, and one
-		// decay partial ride beside the states one thread owns.
+		// One thread owns one row and head: the chunk entry states, the live state,
+		// the chunk the reverse pass replays, the state adjoint, the readout error
+		// and key weight vectors, and one decay partial. The forward pass carries
+		// the live state alone, so an inference pair holds no entry or replay span.
 		Primitive::Delta => {
-			let (_, _, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
-			let vectors = checked_mul(checked_mul(rows, heads, "delta pairs")?, checked_add(checked_mul(2, width, "delta vectors")?, 1, "delta decay partial")?, "delta scratch")?;
-			checked_add(state, vectors, "delta context")?
+			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
+			let (chunk, state) = ((node.argument[2] as usize).max(1), checked_mul(key_width, width, "delta state")?);
+			let spans = if inference { 1 } else { checked_add(node.output.length.div_ceil(chunk), checked_add(chunk, 2, "delta live states")?, "delta state spans")? };
+			let pair = checked_add(checked_mul(spans, state, "delta state span")?, checked_add(checked_mul(2, width, "delta vectors")?, 1, "delta decay partial")?, "delta pair context")?;
+			checked_mul(checked_mul(rows, heads, "delta pairs")?, pair, "delta context")?
 		}
 		Primitive::Pool => return checked_mul(state, size_of::<u64>(), "pool context bytes"),
 		// The packed embedding table is the node's persistent state: the gather
@@ -12875,7 +13027,9 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 		Primitive::Gather => return checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, embedding_row(node)?.1, "embedding table bytes"),
 		Primitive::Lookup => state,
 		// One count per expert, then every routed position of every expert in
-		// ascending expert and position order.
+		// ascending expert and position order. Only the weight gradients walk
+		// the lists, so an inference tape holds none.
+		Primitive::ExpertIn | Primitive::ExpertOut if inference => 1,
 		Primitive::ExpertIn | Primitive::ExpertOut => {
 			let entries = checked_mul(checked_mul(rows, node.output.length, "routed positions")?, node.argument[1] as usize, "routed slots")?;
 			return checked_mul(checked_add(node.argument[0] as usize, entries, "expert bucket")?, size_of::<u32>(), "expert bucket bytes");
@@ -12884,7 +13038,11 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 		// mean and variance the node declares, so it is counted once.
 		Primitive::Normalize => {
 			let statistics = checked_mul(4, normalize_groups(node, rows)?, "normalization context")?;
-			let partials = checked_mul(checked_mul(rows, node.output.elements(), "normalization batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "normalization weight partials")?;
+			let partials = if inference {
+				0
+			} else {
+				checked_mul(checked_mul(rows, node.output.elements(), "normalization batch")?.min(NATIVE_SCALAR_PARTITIONS), node.parameters, "normalization weight partials")?
+			};
 			checked_add(statistics, partials, "normalization")?
 		}
 		_ => 1,
@@ -12899,10 +13057,23 @@ struct Buffer {
 	pointer: u64,
 	bytes: usize,
 }
+/// The largest host buffer a zero fill stages at once, so an arena of any size
+/// clears without a host copy of its own size.
+const ZERO_FILL_BYTES: usize = 64 << 20;
 impl Buffer {
 	fn upload<T>(runtime: &'static Gpu, values: &[T]) -> Result<Self> {
 		let bytes = size_of_val(values);
 		Ok(Self { runtime, pointer: runtime.upload(0, values.as_ptr().cast(), bytes)?, bytes })
+	}
+	/// A device buffer of `bytes` zeros, filled one bounded host block at a time.
+	fn zeroed(runtime: &'static Gpu, bytes: usize) -> Result<Self> {
+		let bytes = bytes.max(1);
+		let buffer = Self { runtime, pointer: runtime.allocate(bytes)?, bytes };
+		let zeros = vec![0_u8; bytes.min(ZERO_FILL_BYTES)];
+		for offset in (0..bytes).step_by(zeros.len()) {
+			buffer.write_bytes(offset, &zeros[..zeros.len().min(bytes - offset)])?;
+		}
+		Ok(buffer)
 	}
 	fn upload_float(runtime: &'static Gpu, values: &[f64], precision: Compute) -> Result<Self> {
 		Self::upload(runtime, &encode_floats(values, precision))
@@ -13551,7 +13722,9 @@ impl Gpu {
 		}
 		let chunk_values = owned.checked_mul(register_count).ok_or_else(|| RecipeError::new("native contraction chunk buffer overflows"))?;
 		let chunk_bias_values = owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?;
-		let scratch_base = narrow(graph.parameters.len().next_multiple_of(NATIVE_SCRATCH_ROW_VALUES), "native gradient scratch base")?;
+		// The gradient scratch rows follow the parameters in the gradient buffer,
+		// which only the epoch entry reads, so an inference program has none.
+		let scratch_base = if loss.is_none() { 0 } else { narrow(graph.parameters.len().next_multiple_of(NATIVE_SCRATCH_ROW_VALUES), "native gradient scratch base")? };
 		debug(&format!("native schedule block={block} waves={waves} registers={register_count} shared={shared_values} contractions={contractions:?} attention={attention:?}"))?;
 		let schedule = NativeSchedule {
 			matrix,

@@ -186,7 +186,9 @@ placed.resident_bytes();
 placed.moved_bytes();
 ```
 
-Inference blocks across the selected devices. An empty split is measured: each block joins the current device while its parameters and carried state fit that device's free memory, and the CPU is selectable last so a placement can end on the host. A split names the blocks each device takes instead. Every range runs as its own tape on its device and the stream hops between them, so the output equals a single-device run.
+Inference blocks across the selected devices. An empty split is measured: each block joins the current device while the device's range, its weights and the value and context arenas of its inference tape together, fits that device's free memory, and the CPU is selectable last so a placement can end on the host. A split names the blocks each device takes instead. Every range runs as its own tape on its device and the stream hops between them, so the output equals a single-device run. `resident_bytes()` is that measured size per device.
+
+An inference tape holds only what the forward pass reads: the weights, the outputs later positions read (attention keys and values, the recurrent input and gates, the convolution tail, a scan's carried output), the contexts the forward kernels use, and a working set for the outputs the next node consumes, which share slots by size. The reverse-only regions (adjoints, attention score gradients, delta entry and replay states, scan and scalar gradient partials, expert lists) exist only on a training tape, whose layout is unchanged.
 
 ## files
 
