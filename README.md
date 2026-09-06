@@ -60,7 +60,7 @@ weights:
 blocks:
 	moe(topk, [...])
 	res([...])
-	hyper(lanes, rank, [...])
+	hyper(lanes, rank, &model)
 
 feature reduction:
 	pool(size)
@@ -79,7 +79,7 @@ estimators:
 ```
 Feature generation is banned.
 
-`hyper` widens the residual stream to `lanes` copies of the width. Each block reads the stream into its parts through a gate, writes their output back through one gate per lane, and the head reads the stream once more before the output projection; gates come from a `rank` bottleneck on the normalized stream, and `rank` zero fixes them at one, which is the plain residual.
+`hyper` widens the residual stream to `lanes` copies of the width. Each block reads the stream into a Recipe submodel through a gate, writes its output back through one gate per lane, and the head reads the stream once more before the output projection; gates come from a `rank` bottleneck on the normalized stream, and `rank` zero fixes them at one, which is the plain residual.
 
 ## 15 activations
 
