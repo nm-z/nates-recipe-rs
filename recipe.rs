@@ -3090,11 +3090,13 @@ impl NativeModelIr {
 					}
 				}
 				(true, Primitive::Delta) => {
-					// One row and head per element, then one decay scale per head.
 					let shape = delta_shape(node, self.rows)?;
+					let keys = Shape { channels: shape.key_heads as usize, length: 1 };
 					let pairs = Shape { channels: shape.heads as usize, length: 1 };
 					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
-					emit_fixed_loop(&mut ir, index, "delta.reverse", self.rows, pairs, &whole, |ir, p| {
+					// One row and key head per element, so the value heads sharing a key head
+					// walk in one thread and own the query and key adjoint elements they share.
+					emit_fixed_loop(&mut ir, index, "delta.reverse", self.rows, keys, &whole, |ir, p| {
 						ir.push_str(&format!(
 							"call void @delta_reverse_body( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {context}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate} , i32 {p}, {arguments} )\n",
 							pointer = pointer_type(backend),
@@ -3109,6 +3111,7 @@ impl NativeModelIr {
 						));
 					})?;
 					ir.push_str(barrier(backend));
+					// Then one decay scale per value head, folding that head's row partials.
 					emit_fixed_loop(&mut ir, index, "delta.decay.reverse", 1, pairs, &whole, |ir, p| {
 						ir.push_str(&format!(
 							"call void @delta_reverse_decay_body( {pointer} {context}, {pointer} %gradient, i32 {p}, i32 %rows, i32 {heads}, i32 {partials}, i32 {offset} )\n",
@@ -4274,14 +4277,25 @@ fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, rows: usize, shape
 /// per-pair decay partials that follow every other region.
 struct DeltaShape {
 	heads: i32,
+	key_heads: i32,
 	partials: i32,
 	arguments: String,
 }
 
-fn delta_shape(node: &Node, rows: usize) -> Result<DeltaShape> {
+/// A delta node's key and value extents. The queries and keys span the key
+/// heads, the values and the recurrence output the value heads, and one thread
+/// owns one row and value head, so its state is `key width` by `value width`.
+fn delta_extent(node: &Node) -> Result<(i32, i32, i32, i32)> {
 	let (heads, width) = (integer_argument(node.argument[0], "delta heads")?, integer_argument(node.argument[1], "delta width")?);
+	let key_heads = integer_argument(node.argument[3], "delta key heads")?;
+	let key_width = integer_argument(node.argument[4], "delta key width")?;
+	Ok((if key_heads == 0 { heads } else { key_heads }, if key_width == 0 { width } else { key_width }, heads, width))
+}
+
+fn delta_shape(node: &Node, rows: usize) -> Result<DeltaShape> {
+	let (key_heads, key_width, heads, width) = delta_extent(node)?;
 	let chunk = integer_argument(node.argument[2], "delta chunk")?;
-	let (pairs, state) = (checked_mul(rows, heads as usize, "delta pairs")?, checked_mul(width as usize, width as usize, "delta state")?);
+	let (pairs, state) = (checked_mul(rows, heads as usize, "delta pairs")?, checked_mul(key_width as usize, width as usize, "delta state")?);
 	let chunks = node.output.length.div_ceil(chunk as usize);
 	let spans = checked_add(chunks, checked_add(chunk as usize, 2, "delta live states")?, "delta state spans")?;
 	let partials = narrow(
@@ -4289,7 +4303,7 @@ fn delta_shape(node: &Node, rows: usize) -> Result<DeltaShape> {
 		"delta partials",
 	)?;
 	let (length, count, blocks) = (narrow(node.output.length, "delta length")?, narrow(pairs, "delta pairs")?, narrow(chunks, "delta chunks")?);
-	Ok(DeltaShape { heads, partials, arguments: format!("i32 {heads}, i32 {width}, i32 {length}, i32 {chunk}, i32 {blocks}, i32 {count}") })
+	Ok(DeltaShape { heads, key_heads, partials, arguments: format!("i32 {key_heads}, i32 {key_width}, i32 {heads}, i32 {width}, i32 {length}, i32 {chunk}, i32 {blocks}, i32 {count}") })
 }
 
 /// List the positions routed to each expert, in ascending expert and position
@@ -5935,7 +5949,17 @@ mod bundle {
 			Operation::Attention(attention) => {
 				let (dims, base) = attention.rope.map_or((0, 0.0), |(dims, base)| (dims, f64::from_bits(base)));
 				let index = attention.index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
-				format!("attn,{},{},{dims},{base},{},{},{},{},{}", attention.heads, attention.kv, index.heads, index.width, index.block, index.keep, u8::from(attention.gate))
+				format!(
+					"attn,{},{},{dims},{base},{},{},{},{},{},{}",
+					attention.heads,
+					attention.kv,
+					index.heads,
+					index.width,
+					index.block,
+					index.keep,
+					u8::from(attention.gate),
+					attention.width
+				)
 			}
 			Operation::Rnn(width) => format!("rnn,{width}"),
 			Operation::Gru(width) => format!("gru,{width}"),
@@ -5948,7 +5972,7 @@ mod bundle {
 			Operation::Perceptron(width) => format!("perc,{width}"),
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel) => format!("dconv,{kernel}"),
-			Operation::Delta(heads, kernel) => format!("delta,{heads},{kernel}"),
+			Operation::Delta(delta) => format!("delta,{},{},{},{},{},{}", delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -5984,12 +6008,14 @@ mod bundle {
 					block: value_at(fields.next(), "indexer block")?,
 					keep: value_at(fields.next(), "indexer blocks kept")?,
 				};
+				let gate = value_at::<u8>(fields.next(), "attention gate")? != 0;
 				Ok(Operation::Attention(AttentionBlock {
 					heads,
 					kv,
+					width: fields.next().map(|field| value_at(Some(field), "attention head width")).transpose()?.unwrap_or(0),
 					rope: (dims != 0).then_some((dims, base.to_bits())),
 					index: (index.block != 0).then_some(index),
-					gate: value_at::<u8>(fields.next(), "attention gate")? != 0,
+					gate,
 				}))
 			}
 			"rnn" => Ok(Operation::Rnn(value_at(Some(rest), "RNN width")?)),
@@ -6017,7 +6043,15 @@ mod bundle {
 				))
 			}
 			"dconv" => Ok(Operation::Dconv(value_at(Some(rest), "depthwise convolution kernel")?)),
-			"delta" => Ok(Operation::Delta(value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?)),
+			"delta" => {
+				let (heads, kernel) = (value_at(fields.next(), "delta heads")?, value_at(fields.next(), "delta kernel")?);
+				// A bundle written before the extents were separable names neither, so
+				// an absent field takes the extent from the stream, as the builder does.
+				let mut extent = |role| fields.next().map(|field| value_at(Some(field), role)).transpose().map(|value| value.unwrap_or(0));
+				let (key_heads, key_width) = (extent("delta key heads")?, extent("delta key width")?);
+				let (value_width, output) = (extent("delta value width")?, extent("delta output width")?);
+				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output }))
+			}
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
 	}
@@ -6698,19 +6732,66 @@ struct Indexer {
 	block: usize,
 	keep: usize,
 }
-/// One attention block: query heads, key-value heads, and the rotary, indexer
-/// and output gate selectors.
+/// One attention block: query heads, key-value heads, the head width, and the
+/// rotary, indexer and output gate selectors. A zero width takes the head width
+/// from the stream, so the heads exactly partition the block input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AttentionBlock {
 	heads: usize,
 	kv: usize,
+	width: usize,
 	rope: Option<(usize, u64)>,
 	index: Option<Indexer>,
 	gate: bool,
 }
 impl AttentionBlock {
 	fn new(heads: usize) -> Self {
-		Self { heads, kv: heads, rope: None, index: None, gate: false }
+		Self { heads, kv: heads, width: 0, rope: None, index: None, gate: false }
+	}
+	/// The head width this block attends at, and the inner width its heads span.
+	fn extent(self, channels: usize) -> Result<(usize, usize)> {
+		require(self.heads != 0, "attention head partition is invalid")?;
+		let width = match self.width {
+			0 => {
+				require(channels % self.heads == 0, "attention head partition is invalid")?;
+				channels / self.heads
+			}
+			width => width,
+		};
+		Ok((width, checked_mul(self.heads, width, "attention inner width")?))
+	}
+}
+/// One gated delta rule block: value heads, the convolution kernel, and the key
+/// and value extents. A zero extent takes it from the stream, so the value heads
+/// exactly partition the block input and the keys match the values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeltaBlock {
+	heads: usize,
+	kernel: usize,
+	key_heads: usize,
+	key_width: usize,
+	value_width: usize,
+	output: usize,
+}
+impl DeltaBlock {
+	fn new(heads: usize, kernel: usize) -> Self {
+		Self { heads, kernel, key_heads: 0, key_width: 0, value_width: 0, output: 0 }
+	}
+	/// The key heads and width, the value width, and the output width, resolved
+	/// against a block input of `channels`.
+	fn extent(self, channels: usize) -> Result<(usize, usize, usize, usize)> {
+		require(self.heads != 0, "delta head partition is invalid")?;
+		let value = match self.value_width {
+			0 => {
+				require(channels % self.heads == 0, "delta head partition is invalid")?;
+				channels / self.heads
+			}
+			width => width,
+		};
+		let keys = if self.key_heads == 0 { self.heads } else { self.key_heads };
+		let key = if self.key_width == 0 { value } else { self.key_width };
+		require(keys != 0 && self.heads % keys == 0, "delta key head partition is invalid")?;
+		Ok((keys, key, value, if self.output == 0 { channels } else { self.output }))
 	}
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6729,7 +6810,7 @@ enum Operation {
 	Embed(usize, usize),
 	Hyper(usize, usize, Vec<Block>),
 	Dconv(usize),
-	Delta(usize, usize),
+	Delta(DeltaBlock),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -6900,7 +6981,7 @@ impl Model {
 	fn perc(width: usize) = Operation::Perceptron(width);
 	fn embed(vocabulary: usize, width: usize) = Operation::Embed(vocabulary, width);
 	fn dconv(kernel: usize) = Operation::Dconv(kernel);
-	fn delta(heads: usize, kernel: usize) = Operation::Delta(heads, kernel); }
+	fn delta(heads: usize, kernel: usize) = Operation::Delta(DeltaBlock::new(heads, kernel)); }
 	pub fn res<const N: usize>(&self, parts: [Residual; N]) -> Self {
 		self.push(Operation::Residual(parts.into()))
 	}
@@ -6916,10 +6997,39 @@ impl Model {
 		}
 		model
 	}
+	fn delta_block(&self, selector: &str, apply: impl FnOnce(&mut DeltaBlock)) -> Self {
+		let mut model = self.suffix();
+		let block = model.blocks.last_mut().unwrap_or_else(|| panic!("{selector} requires a preceding delta block"));
+		match &mut block.operation {
+			Operation::Delta(delta) => apply(delta),
+			_ => panic!("{selector} requires a preceding delta block"),
+		}
+		model
+	}
 	/// Key-value heads of the preceding `attn` block. Each key-value head serves
 	/// `heads / kv` query heads.
 	pub fn kv(&self, heads: usize) -> Self {
 		self.attention("kv", |attention| attention.kv = heads)
+	}
+	/// Head width of the preceding `attn` block, so the heads need not partition
+	/// the stream. The block attends over `heads * width` and its gate spans the
+	/// same width before the output projection returns to the stream.
+	pub fn head(&self, width: usize) -> Self {
+		self.attention("head", |attention| attention.width = width)
+	}
+	/// Key and query heads of the preceding `delta` block, at `width` each. Every
+	/// key head serves `heads / count` value heads.
+	pub fn keys(&self, count: usize, width: usize) -> Self {
+		self.delta_block("keys", |delta| (delta.key_heads, delta.key_width) = (count, width))
+	}
+	/// Value width per head of the preceding `delta` block, so its value heads
+	/// need not partition the stream.
+	pub fn values(&self, width: usize) -> Self {
+		self.delta_block("values", |delta| delta.value_width = width)
+	}
+	/// Output width of the preceding `delta` block's closing projection.
+	pub fn out(&self, width: usize) -> Self {
+		self.delta_block("out", |delta| delta.output = width)
 	}
 	/// Rotary position embedding on the preceding `attn` block: the first `dims`
 	/// channels of every query and key head rotate by their position at
@@ -9292,7 +9402,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Pool(size) => lower_pool(graph, *size)?,
 		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
 		Operation::Dconv(kernel) => lower_dconv(graph, *kernel)?,
-		Operation::Delta(heads, kernel) => lower_delta(graph, *heads, *kernel, config)?,
+		Operation::Delta(delta) => lower_delta(graph, *delta, config)?,
 		Operation::Attention(attention) => lower_attention(graph, *attention, block.qk)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
@@ -9526,38 +9636,45 @@ fn lower_dconv(graph: &mut Graph, kernel: usize) -> Result<()> {
 /// recurrence reads one value per head. The queries and keys take a per-head unit
 /// length, the output a per-head root mean square and the gate built from a third
 /// projection, and the output projection closes the block.
-fn lower_delta(graph: &mut Graph, heads: usize, kernel: usize, config: Config) -> Result<()> {
-	require(heads != 0 && graph.output.channels % heads == 0, "delta head partition is invalid")?;
+fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<()> {
 	let (source, input) = (graph.source, graph.output);
-	let (channels, width) = (input.channels, input.channels / heads);
+	let (heads, kernel) = (delta.heads, delta.kernel);
+	let (key_heads, key_width, value_width, output) = delta.extent(input.channels)?;
+	// Queries and keys span the key heads; values, the recurrence output and the
+	// gate span the value heads. Both are independent of the stream the block sits on.
+	let keys = checked_mul(key_heads, key_width, "delta key width")?;
+	let inner = checked_mul(heads, value_width, "delta value width")?;
+	let recurrent = Shape { channels: inner, length: input.length };
 	let chunk = natural("delta chunk", env!("RECIPE_DELTA_CHUNK"))?;
 	lower_project(graph, checked_mul(2, heads, "delta gate width")?)?;
 	let gates = graph.source;
 	reset(graph, source, input);
-	lower_project(graph, checked_mul(3, channels, "delta projection width")?)?;
+	lower_project(graph, checked_add(checked_mul(2, keys, "delta query and key width")?, inner, "delta projection width")?)?;
 	lower_dconv(graph, kernel)?;
 	// The projection lays the queries and keys out ahead of the values, so the
-	// normalized span stops at the value plane and each head owns one group.
-	lower_normalize(graph, BlockNormalization::L2, width, checked_mul(2, channels, "delta query and key span")?)?;
-	push_node(graph, Primitive::Delta, input, heads, [heads as f64, width as f64, chunk as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], gates)?;
-	lower_normalize(graph, BlockNormalization::Rms, width, channels)?;
+	// normalized span stops at the value plane and each key head owns one group.
+	lower_normalize(graph, BlockNormalization::L2, key_width, checked_mul(2, keys, "delta query and key span")?)?;
+	let argument = [heads as f64, value_width as f64, chunk as f64, key_heads as f64, key_width as f64, 0.0, 0.0, 0.0, 0.0];
+	push_node(graph, Primitive::Delta, recurrent, heads, argument, gates)?;
+	lower_normalize(graph, BlockNormalization::Rms, value_width, inner)?;
 	let normalized = graph.source;
 	reset(graph, source, input);
-	lower_project(graph, channels)?;
+	lower_project(graph, inner)?;
 	let (gate, shape) = activation(graph, graph.source, graph.output, Activation::Sigmoid, config)?;
 	binary(graph, normalized, gate, shape, ScalarOpcode::Multiply)?;
-	lower_project(graph, channels)
+	lower_project(graph, output)
 }
 /// Lowers one attention block into its projection, the optional query and key
 /// normalization and rotary nodes, the attention node and the output
 /// projection. The projection carries the query, key and value planes, then
 /// the indexer planes, then the gate plane.
 fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<BlockNormalization>) -> Result<()> {
-	let AttentionBlock { heads, kv, rope, index, gate } = attention;
-	require(heads != 0 && graph.output.channels % heads == 0, "attention head partition is invalid")?;
-	require(kv != 0 && kv <= heads && heads % kv == 0, "attention key-value head partition is invalid")?;
+	let AttentionBlock { heads, kv, rope, index, gate, .. } = attention;
 	let input = graph.output;
-	let width = input.channels / heads;
+	// The heads attend at their own width, so the inner width the block spans is
+	// independent of the stream the output projection returns to.
+	let (width, inner) = attention.extent(input.channels)?;
+	require(kv != 0 && kv <= heads && heads % kv == 0, "attention key-value head partition is invalid")?;
 	let pairs = checked_mul(width, checked_add(heads, checked_mul(2, kv, "attention key-value planes")?, "attention projection heads")?, "attention QKV projection width")?;
 	let side = match index {
 		Some(index) => {
@@ -9567,7 +9684,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		}
 		None => 0,
 	};
-	let gated = if gate { input.channels } else { 0 };
+	let gated = if gate { inner } else { 0 };
 	lower_project(graph, checked_add(pairs, checked_add(side, gated, "attention gate width")?, "attention projection width")?)?;
 	if let Some(normalization) = qk {
 		// The projection lays the queries and keys out ahead of the values, so the
@@ -9583,7 +9700,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 	let indexer = index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
 	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
 	let argument = [heads as f64, kv as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, 0.0];
-	push_node(graph, Primitive::Attention, input, 0, argument, -2)?;
+	push_node(graph, Primitive::Attention, Shape { channels: inner, length: input.length }, 0, argument, -2)?;
 	lower_project(graph, input.channels)
 }
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
@@ -10835,8 +10952,8 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 		// the chunk the reverse pass replays, the state adjoint, the readout error
 		// and key weight vectors, and one decay partial.
 		Primitive::Delta => {
-			let (heads, width) = (node.argument[0] as usize, node.argument[1] as usize);
-			let (chunk, state) = ((node.argument[2] as usize).max(1), checked_mul(width, width, "delta state")?);
+			let (_, key_width, heads, width) = delta_extent(node).map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize))?;
+			let (chunk, state) = ((node.argument[2] as usize).max(1), checked_mul(key_width, width, "delta state")?);
 			let spans = checked_add(node.output.length.div_ceil(chunk), checked_add(chunk, 2, "delta live states")?, "delta state spans")?;
 			let pair = checked_add(checked_mul(spans, state, "delta state span")?, checked_add(checked_mul(2, width, "delta vectors")?, 1, "delta decay partial")?, "delta pair context")?;
 			checked_mul(checked_mul(rows, heads, "delta pairs")?, pair, "delta context")?

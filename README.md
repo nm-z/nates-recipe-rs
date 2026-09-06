@@ -134,8 +134,8 @@ weights:
 	layer(neurons)
 	conv(filters, kernel)
 	dconv(kernel)
-	delta(heads, kernel)
-	attn(heads)[.kv(heads)][.qk(rms|l2)][.rope(dims, base)][.index(heads, width, block, keep)][.gate()]
+	delta(heads, kernel)[.keys(heads, width)][.values(width)][.out(width)]
+	attn(heads)[.kv(heads)][.head(width)][.qk(rms|l2)][.rope(dims, base)][.index(heads, width, block, keep)][.gate()]
 	perc(width)
 	embed(vocab, width)
 	rnn(hidden)
@@ -171,6 +171,12 @@ Feature generation is banned.
 `dconv(kernel)` is a causal depthwise convolution: every channel mixes its own last `kernel` positions with one tap each, left-padded with zeros, so the shape is unchanged and position `t` sees `t - kernel + 1 ..= t`.
 
 `delta(heads, kernel)` is a gated delta rule. It projects the input to a query, key and value stream, runs `dconv(kernel)` over that stream, normalizes each head's query and key to unit length, and carries one `channels / heads` square state per head with `S <- g S + beta k' (v - k S)`, reading `o = q S`. The decay `g = exp(-softplus(a) exp(A))` and the write gate `beta = sigmoid(b)` come from a second projection, one of each per head; `A` is one trained scale per head. The output takes a per-head `rms` normalization, the gate `sigmoid(z)` from a third projection, and a fourth projection back to the input width. The sequence walks in chunks of `delta-chunk` positions and commits the carried state at each chunk start; a chunk of one is a decode step, and every chunk size gives the same values.
+
+`.keys(heads, width)`, `.values(width)` and `.out(width)` name the extents instead of taking them from the stream. `heads` remains the value head count; each key head serves `heads / keys` of them, the carried state per value head is `key width` by `value width`, and the closing projection ends at `out`. Without them the value width is the stream over `heads`, the keys match the values one for one, and `out` is the stream.
+
+```rust
+.delta(48, 4).keys(16, 128).values(128).out(2560)
+```
 
 `moe` scores every position with one `[width, experts]` router and keeps the `topk` highest scores. `scoring` reads those scores as a softmax over every expert or as a sigmoid of each one, and `renormalize` divides the kept weights by their own total; a plain softmax leaves the dropped experts weighted zero, which is the evaluate-all-then-mask reference. Only the kept experts run: each position gathers its own slices of the `[experts, hidden, width]` gate and up tables and the `[experts, width, hidden]` down table, and takes `down(activation(gate(x)) * up(x))` under its routing weight. A position costs `topk` experts, not `experts`. With `shared` set, one always-on expert of the same shape runs for every position and joins the sum under a trainable gain.
 
@@ -225,10 +231,14 @@ over its head-width slice, leaving the values untouched:
 the key-value head count, so each key-value head serves `heads / kv` query heads.
 `.index(heads, width, block, keep)` adds a side projection that scores every group
 of `block` keys and keeps the best `keep` blocks per query. `.gate()` multiplies the
-attention output by a sigmoid of its own projection of the block input.
+attention output by a sigmoid of its own projection of the block input. `.head(width)`
+names the head width, so the heads need not partition the stream: the block attends
+over `heads * width`, its gate spans that same width, and the output projection
+returns to the stream width. Without it the head width is the stream over `heads`.
 
 ```rust
 .attn(8).kv(2).qk(rms).rope(32, 10000.0).index(2, 16, 32, 4).gate()
+.attn(24).kv(2).head(256).gate()
 ```
 
 ## compute precisions
