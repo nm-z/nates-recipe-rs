@@ -5195,7 +5195,7 @@ impl IntFormat {
 /// key-value metadata and tensor descriptors, then an aligned data section
 /// whose tensors use the same GGML block layouts as Recipe's storage formats.
 mod gguf {
-	use super::{Binding, BoundNode, BoundWeight, Integer, Plane, RecipeError, Result, StorageFormat, StoredBytes, StoredWeight, checked_add, require, unfp16};
+	use super::{Binding, BoundNode, BoundWeight, Compute, Integer, Plane, RecipeError, Result, StorageFormat, StoredBytes, StoredWeight, checked_add, require, unfp16};
 	use std::{
 		path::{Path, PathBuf},
 		sync::Arc,
@@ -5448,6 +5448,7 @@ mod gguf {
 		shards: Vec<Shard>,
 		metadata: Vec<(String, GgufValue)>,
 		tensors: Vec<GgufTensor>,
+		pub(super) precision: Compute,
 	}
 	impl Gguf {
 		pub(super) fn open(path: &Path) -> Result<Self> {
@@ -5468,7 +5469,7 @@ mod gguf {
 			if let Some(declared) = declared {
 				require(declared == tensors.len() as u64, format!("GGUF split declares {declared} tensors and holds {}", tensors.len()))?;
 			}
-			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors })
+			Ok(Self { shards: shards.into_iter().map(|(shard, _, _)| shard).collect(), metadata, tensors, precision: Compute::FP64 })
 		}
 		/// Parses one file: its metadata, its tensors, and where its data begins.
 		fn shard(path: &Path, index: u64) -> Result<(Shard, Vec<(String, GgufValue)>, Vec<GgufTensor>)> {
@@ -9512,7 +9513,12 @@ impl Gguf {
 	/// is an ordinary node whose weight is a view of the file, and a contraction
 	/// bound to a weight without a bias row lowers and runs without one.
 	pub fn infer(&self, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Vec<f64> {
-		infer_gguf(self, blocks, plan, input, channels).unwrap_or_else(|error| panic!("{error}"))
+		infer_gguf_with(self, blocks, plan, input, channels, self.precision).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Use IEEE floating-point arithmetic of `bits` bits for direct GGUF inference.
+	pub fn fp(mut self, bits: u8) -> Self {
+		self.precision = fp_arithmetic(bits);
+		self
 	}
 	/// Autoregressive decode over `blocks` bound from `plan`, as `recipe.decode`
 	/// runs a saved model: one tape of `sequence` id positions holds every block's
@@ -9520,7 +9526,7 @@ impl Gguf {
 	/// the positions it reaches. The logits are the model's output after the last
 	/// forward.
 	pub fn decode(&self, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
-		decode_gguf(self, blocks, plan, sequence, prompt, sampler, stop, budget).unwrap_or_else(|error| panic!("{error}"))
+		decode_gguf(self, blocks, plan, sequence, prompt, sampler, stop, budget, self.precision).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// An empty weight plan to fill from this model's tensors.
 	pub fn plan(&self) -> Binding {
@@ -9584,12 +9590,6 @@ impl Binding {
 		self.node(&[tensor])
 	}
 }
-/// Compiles `blocks` over `input` with every parameterized node bound from
-/// `plan`, and runs one forward. `channels` names the input's channel axis, so
-/// the rest of its length is the sequence the blocks walk.
-fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Result<Vec<f64>> {
-	infer_gguf_with(model, blocks, plan, input, channels, Compute::FP64)
-}
 fn infer_gguf_with(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize, precision: Compute) -> Result<Vec<f64>> {
 	let (graph, device) = bound_graph(model, blocks, plan, input, channels)?;
 	let tape = NativeTape::new(&graph, input, input, &[], device, precision, None)?;
@@ -9601,7 +9601,7 @@ fn infer_gguf_with(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], 
 	debug(&format!("GGUF forward synchronized and downloaded in {:.9} seconds", started.elapsed().as_secs_f64()))?;
 	Ok(predictions)
 }
-fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Result<Generation> {
+fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, precision: Compute) -> Result<Generation> {
 	require(!prompt.is_empty(), "decode prompt is empty")?;
 	require(checked_add(prompt.len(), budget, "decode length")? <= sequence, format!("decode of {} prompt ids and {budget} steps exceeds the sequence of {sequence}", prompt.len()))?;
 	let mut samples = vec![0.0; sequence];
@@ -9609,7 +9609,7 @@ fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, pr
 		*slot = f64::from(*id);
 	}
 	let (graph, device) = bound_graph(model, blocks, plan, &samples, 1)?;
-	let mut tape = NativeTape::new(&graph, &samples, &samples, &[], device, Compute::FP64, None)?;
+	let mut tape = NativeTape::new(&graph, &samples, &samples, &[], device, precision, None)?;
 	decode_steps(
 		&mut tape,
 		&mut samples,
@@ -9861,7 +9861,7 @@ impl<'a> Builder<'a> {
 		let unread = file.tensors().iter().filter(|tensor| !builder.consumed.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 		require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
 		let tensors = builder.consumed.len();
-		Ok(Bound { file: file.clone(), model, plan: builder.plan, precision: Compute::FP64, blocks, tensors, vocabulary })
+		Ok(Bound { file: file.clone(), model, plan: builder.plan, precision: file.precision, blocks, tensors, vocabulary })
 	}
 	fn key(&self, suffix: &str) -> String {
 		format!("{}.{suffix}", self.architecture)
