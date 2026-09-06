@@ -2741,12 +2741,13 @@ impl NativeModelIr {
 					let per_row = checked_mul(node.output.channels, node.output.length, "gather row elements")?;
 					let (pointer, ty) = (pointer_type(backend), self.precision.model_type);
 					let prefix = format!("n{index}.gather");
-					emit_fixed_loop(&mut ir, index, "gather", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "gather", self.rows, node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"%{prefix}.row = udiv i32 {p}, {per_row}\n%{prefix}.within = urem i32 {p}, {per_row}\n%{prefix}.channel = udiv i32 %{prefix}.within, {length}\n%{prefix}.position = urem i32 %{prefix}.within, {length}\n%{prefix}.base = mul i32 %{prefix}.row, {length}\n%{prefix}.token = add i32 %{prefix}.base, %{prefix}.position\n%{prefix}.id.ptr = getelementptr inbounds i32, {pointer} {source}, i32 %{prefix}.token\n%{prefix}.id = load i32, {pointer} %{prefix}.id.ptr, align 4\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} {table}, i32 %{prefix}.id, i32 %{prefix}.channel, i32 {width})\n%{prefix}.out = getelementptr inbounds {ty}, {pointer} {value}, i32 {p}\nstore {ty} %{prefix}.value, {pointer} %{prefix}.out, align {align}\n",
+							"%{prefix}.row = udiv i64 {wide}, {per_row}\n%{prefix}.within = urem i64 {wide}, {per_row}\n%{prefix}.channel = udiv i64 %{prefix}.within, {length}\n%{prefix}.position = urem i64 %{prefix}.within, {length}\n%{prefix}.base = mul i64 %{prefix}.row, {length}\n%{prefix}.token = add i64 %{prefix}.base, %{prefix}.position\n%{prefix}.token.i32 = trunc i64 %{prefix}.token to i32\n%{prefix}.channel.i32 = trunc i64 %{prefix}.channel to i32\n%{prefix}.id.ptr = getelementptr inbounds i32, {pointer} {source}, i64 %{prefix}.token\n%{prefix}.id = load i32, {pointer} %{prefix}.id.ptr, align 4\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} {table}, i32 %{prefix}.id, i32 %{prefix}.channel.i32, i32 {width})\n%{prefix}.out = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.value, {pointer} %{prefix}.out, align {align}\n",
 							source = pointers.source,
 							table = pointers.context,
 							value = pointers.value,
+							wide = wide,
 							length = node.output.length,
 							width = node.output.channels,
 							name = layout.name,
@@ -2758,9 +2759,9 @@ impl NativeModelIr {
 				(false, Primitive::TopK) => {
 					// One router decision per row and position: a `[1, length]` shape.
 					let positions = Shape { channels: 1, length: node.output.length };
-					emit_fixed_loop(&mut ir, index, "topk", self.rows, positions, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "topk", self.rows, positions, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @topk_forward_body( {pointer} {source}, {pointer} {value}, i32 {p}, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize} )\n",
+							"call void @topk_forward_body( {pointer} {source}, {pointer} {value}, i64 {wide}, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							value = pointers.value,
@@ -2774,9 +2775,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Expand) => {
-					emit_fixed_loop(&mut ir, index, "expand", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "expand", self.rows, node.output, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @expand_forward_body( {pointer} {source}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes} )\n",
+							"call void @expand_forward_body( {pointer} {source}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							value = pointers.value,
@@ -2791,9 +2792,9 @@ impl NativeModelIr {
 					let (input, output) = if reverse { (&pointers.delta, &pointers.source_adjoint) } else { (&pointers.source, &pointers.value) };
 					let ty = self.precision.model_type;
 					let base = native_literal(self.precision.model, ty, node.argument[1]);
-					emit_fixed_loop(&mut ir, index, if reverse { "rope.reverse" } else { "rope" }, self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, if reverse { "rope.reverse" } else { "rope" }, self.rows, node.output, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @rope_body( {pointer} {input}, {pointer} {output}, i32 {p}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, i1 {reverse} )\n",
+							"call void @rope_body( {pointer} {input}, {pointer} {output}, i64 {wide}, i32 {channels}, i32 {length}, i32 {head_width}, i32 {dims}, i32 {rotated}, {ty} {base}, i1 {reverse} )\n",
 							pointer = pointer_type(backend),
 							channels = node.output.channels,
 							length = node.output.length,
@@ -2805,9 +2806,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::ExpertIn) => {
-					emit_fixed_loop(&mut ir, index, "expert.in", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "expert.in", self.rows, node.output, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @expert_in_forward_body( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {decode} )\n",
+							"call void @expert_in_forward_body( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {decode} )\n",
 							pointer = pointer_type(backend),
 							decode = plan.decode(index),
 							source = pointers.source,
@@ -2824,9 +2825,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Read) => {
-					emit_fixed_loop(&mut ir, index, "read", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "read", self.rows, node.output, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @read_forward_body( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
+							"call void @read_forward_body( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							gate = pointers.second,
@@ -2840,9 +2841,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Dconv) => {
-					emit_fixed_loop(&mut ir, index, "dconv", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "dconv", self.rows, node.output, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @dconv_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {decode} )\n",
+							"call void @dconv_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {decode} )\n",
 							pointer = pointer_type(backend),
 							decode = plan.decode(index),
 							source = pointers.source,
@@ -2862,11 +2863,12 @@ impl NativeModelIr {
 					let (pointer, ty) = (pointer_type(backend), self.precision.model_type);
 					let prefix = format!("n{index}.lookup");
 					let per_row = checked_mul(node.output.channels, node.output.length, "lookup row elements")?;
-					emit_fixed_loop(&mut ir, index, "lookup", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "lookup", self.rows, node.output, &window, |ir, _p, wide| {
 						ir.push_str(&format!(
-							"%{prefix}.row = udiv i32 {p}, {per_row}\n%{prefix}.within = urem i32 {p}, {per_row}\n%{prefix}.channel = udiv i32 %{prefix}.within, {length}\n%{prefix}.position = urem i32 %{prefix}.within, {length}\n%{prefix}.token = mul i32 %{prefix}.row, {length}\n%{prefix}.slot = add i32 %{prefix}.token, %{prefix}.position\n%{prefix}.base = mul i32 %{prefix}.slot, {channels}\n%{prefix}.index = add i32 %{prefix}.base, %{prefix}.channel\n%{prefix}.in = getelementptr inbounds {ty}, {pointer} {context}, i32 %{prefix}.index\n%{prefix}.value = load {ty}, {pointer} %{prefix}.in, align {align}\n%{prefix}.out = getelementptr inbounds {ty}, {pointer} {value}, i32 {p}\nstore {ty} %{prefix}.value, {pointer} %{prefix}.out, align {align}\n",
+							"%{prefix}.row = udiv i64 {wide}, {per_row}\n%{prefix}.within = urem i64 {wide}, {per_row}\n%{prefix}.channel = udiv i64 %{prefix}.within, {length}\n%{prefix}.position = urem i64 %{prefix}.within, {length}\n%{prefix}.token = mul i64 %{prefix}.row, {length}\n%{prefix}.slot = add i64 %{prefix}.token, %{prefix}.position\n%{prefix}.base = mul i64 %{prefix}.slot, {channels}\n%{prefix}.index = add i64 %{prefix}.base, %{prefix}.channel\n%{prefix}.in = getelementptr inbounds {ty}, {pointer} {context}, i64 %{prefix}.index\n%{prefix}.value = load {ty}, {pointer} %{prefix}.in, align {align}\n%{prefix}.out = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} %{prefix}.value, {pointer} %{prefix}.out, align {align}\n",
 							context = pointers.context,
 							value = pointers.value,
+							wide = wide,
 							length = node.output.length,
 							channels = node.output.channels,
 							align = alignment(ty)
@@ -2875,9 +2877,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Fold) => {
-					emit_fixed_loop(&mut ir, index, "fold", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "fold", self.rows, node.output, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @fold_forward_body( {pointer} {source}, {pointer} {value}, i32 {p}, i32 {groups}, i32 {width}, i32 {length} )\n",
+							"call void @fold_forward_body( {pointer} {source}, {pointer} {value}, i64 {wide}, i32 {groups}, i32 {width}, i32 {length} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							value = pointers.value,
@@ -2889,9 +2891,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::Outer) => {
-					emit_fixed_loop(&mut ir, index, "outer", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "outer", self.rows, node.output, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @outer_forward_body( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
+							"call void @outer_forward_body( {pointer} {source}, {pointer} {gate}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							gate = pointers.second,
@@ -2913,9 +2915,9 @@ impl NativeModelIr {
 					// so a training layout commits every entry; an inference layout holds
 					// the live state alone and commits nothing.
 					let entries = if self.inference { 0 } else { shape.chunks };
-					emit_fixed_loop(&mut ir, index, "delta", self.rows, pairs, &whole, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "delta", self.rows, pairs, &whole, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @delta_forward_body( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 {p}, {arguments}, i32 {entries}, i32 {decode} )\n",
+							"call void @delta_forward_body( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i64 {wide}, {arguments}, i32 {entries}, i32 {decode} )\n",
 							pointer = pointer_type(backend),
 							decode = plan.decode(index),
 							source = pointers.source,
@@ -2929,9 +2931,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::ExpertOut) => {
-					emit_fixed_loop(&mut ir, index, "expert.out", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "expert.out", self.rows, node.output, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @expert_out_forward_body( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {decode} )\n",
+							"call void @expert_out_forward_body( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {value}, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {decode} )\n",
 							pointer = pointer_type(backend),
 							decode = plan.decode(index),
 							source = pointers.source,
@@ -2949,14 +2951,13 @@ impl NativeModelIr {
 				}
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
-					emit_fixed_loop(&mut ir, index, "pool", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "pool", self.rows, node.output, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @pool_forward_body( {pointer} {source}, {pointer} {value}, {pointer} {context}, i32 {p}, i32 {from}, i32 {to}, i32 {size}, i32 {channels} )\n",
+							"call void @pool_forward_body( {pointer} {source}, {pointer} {value}, {pointer} {context}, i64 {wide}, i32 {from}, i32 {to}, i32 {size}, i32 {channels} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							value = pointers.value,
 							context = pointers.context,
-							p = p,
 							from = node.input.elements(),
 							to = node.output.elements(),
 							size = size,
@@ -2994,8 +2995,8 @@ impl NativeModelIr {
 							last = block - 1
 						));
 						let touched = NodeWindow { begin: first, span: count };
-						emit_fixed_loop(&mut ir, index, "index", self.rows, Shape { channels: 1, length: blocks }, &touched, |ir, p| {
-							ir.push_str(&format!("call void @attention_index_body( {pointer} {source}, {pointer} {context}, i32 {p}, i32 {begin}, i32 {end}, {shared} )\n"));
+						emit_fixed_loop(&mut ir, index, "index", self.rows, Shape { channels: 1, length: blocks }, &touched, |ir, p, wide| {
+							ir.push_str(&format!("call void @attention_index_body( {pointer} {source}, {pointer} {context}, i64 {wide}, i32 {begin}, i32 {end}, {shared} )\n"));
 						})?;
 						ir.push_str(barrier(backend));
 						emit_fixed_loop(&mut ir, index, "select", self.rows, Shape { channels: 1, length: node.output.length }, &window, |ir, p| {
@@ -3045,23 +3046,29 @@ impl NativeModelIr {
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_fixed_loop(&mut ir, index, "scalar", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "scalar", self.rows, node.output, &window, |ir, _p, wide| {
 						let first_pointer = format!("%{prefix}.first.ptr");
 						let output_pointer = format!("%{prefix}.output.ptr");
 						ir.push_str(&format!(
-							"{first_pointer} = getelementptr inbounds {ty}, {pointer} {source}, i32 {p}\n{first} = load {ty}, {pointer} {first_pointer}, align {align}\n",
+							"{first_pointer} = getelementptr inbounds {ty}, {pointer} {source}, i64 {wide}\n{first} = load {ty}, {pointer} {first_pointer}, align {align}\n",
 							source = pointers.source,
+							wide = wide,
 							align = alignment(ty)
 						));
 						if pointers.second != pointers.source {
 							let second_pointer = format!("%{prefix}.second.ptr");
-							ir.push_str(&format!("{second_pointer} = getelementptr inbounds {ty}, {pointer} {second_source}, i32 {p}\n", second_source = pointers.second));
+							ir.push_str(&format!(
+								"{second_pointer} = getelementptr inbounds {ty}, {pointer} {second_source}, i64 {wide}\n",
+								second_source = pointers.second,
+								wide = wide
+							));
 							ir.push_str(&format!("{second} = load {ty}, {pointer} {second_pointer}, align {align}\n", align = alignment(ty)));
 						}
 						ir.push_str(&forward.code);
 						ir.push_str(&format!(
-							"{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i32 {p}\nstore {ty} {result}, {pointer} {output_pointer}, align {align}\n",
+							"{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} {result}, {pointer} {output_pointer}, align {align}\n",
 							value = pointers.value,
+							wide = wide,
 							result = forward.value,
 							align = alignment(ty)
 						));
@@ -3098,13 +3105,14 @@ impl NativeModelIr {
 						},
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
-					emit_fixed_loop(&mut ir, index, "predictor", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "predictor", self.rows, node.output, &window, |ir, p, wide| {
 						ir.push_str(&format!("{row} = udiv i32 {p}, {elements}\n", elements = node.output.elements()));
 						ir.push_str(&forward.code);
 						let output_pointer = format!("%{prefix}.output.ptr");
 						ir.push_str(&format!(
-							"{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i32 {p}\nstore {ty} {result}, {pointer} {output_pointer}, align {align}\n",
+							"{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} {result}, {pointer} {output_pointer}, align {align}\n",
 							value = pointers.value,
+							wide = wide,
 							result = forward.value,
 							align = alignment(ty)
 						));
@@ -3128,9 +3136,9 @@ impl NativeModelIr {
 				// leaves it frozen, so the embedding contributes no reverse pass.
 				(true, Primitive::Gather) => {}
 				(true, Primitive::Expand) => {
-					emit_fixed_loop(&mut ir, index, "expand.reverse", self.rows, node.input, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "expand.reverse", self.rows, node.input, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @expand_reverse_body( {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes} )\n",
+							"call void @expand_reverse_body( {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes} )\n",
 							pointer = pointer_type(backend),
 							delta = pointers.delta,
 							adjoint = pointers.source_adjoint,
@@ -3143,9 +3151,9 @@ impl NativeModelIr {
 				}
 				(true, Primitive::TopK) => {
 					let positions = Shape { channels: 1, length: node.output.length };
-					emit_fixed_loop(&mut ir, index, "topk.reverse", self.rows, positions, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "topk.reverse", self.rows, positions, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @topk_reverse_body( {pointer} {source}, {pointer} {value}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {experts}, i32 {length}, i32 {scoring}, i32 {renormalize} )\n",
+							"call void @topk_reverse_body( {pointer} {source}, {pointer} {value}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {experts}, i32 {length}, i32 {scoring}, i32 {renormalize} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							value = pointers.value,
@@ -3160,9 +3168,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Dconv) => {
-					emit_fixed_loop(&mut ir, index, "dconv.reverse", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "dconv.reverse", self.rows, node.output, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @dconv_reverse_input_body( {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation} )\n",
+							"call void @dconv_reverse_input_body( {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation} )\n",
 							pointer = pointer_type(backend),
 							weights = pointers.weights,
 							delta = pointers.delta,
@@ -3178,9 +3186,9 @@ impl NativeModelIr {
 					let kernel = integer_argument(node.argument[0], "depthwise kernel")? as usize;
 					let taps = Shape { channels: node.output.channels, length: kernel };
 					let whole = NodeWindow { begin: "0".to_owned(), span: kernel.to_string() };
-					emit_fixed_loop(&mut ir, index, "dconv.weight.reverse", 1, taps, &whole, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "dconv.weight.reverse", 1, taps, &whole, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @dconv_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} %gradient, i32 {p}, i32 %rows, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {offset} )\n",
+							"call void @dconv_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} %gradient, i64 {wide}, i32 %rows, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {offset} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							delta = pointers.delta,
@@ -3197,9 +3205,9 @@ impl NativeModelIr {
 				// rows it stages contribute no reverse pass.
 				(true, Primitive::Lookup) => {}
 				(true, Primitive::Fold) => {
-					emit_fixed_loop(&mut ir, index, "fold.reverse", self.rows, node.input, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "fold.reverse", self.rows, node.input, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @fold_reverse_body( {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {groups}, i32 {width}, i32 {length} )\n",
+							"call void @fold_reverse_body( {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {groups}, i32 {width}, i32 {length} )\n",
 							pointer = pointer_type(backend),
 							delta = pointers.delta,
 							adjoint = pointers.source_adjoint,
@@ -3213,9 +3221,9 @@ impl NativeModelIr {
 				(true, Primitive::ExpertIn) => {
 					let (channels, length) = (node.input.channels, node.output.length);
 					let (hidden, experts, top) = (node.argument[2], node.argument[0], node.argument[1]);
-					emit_fixed_loop(&mut ir, index, "expert.in.reverse", self.rows, node.input, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "expert.in.reverse", self.rows, node.input, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @expert_in_reverse_input_body( {pointer} {routing}, {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
+							"call void @expert_in_reverse_input_body( {pointer} {routing}, {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
 							pointer = pointer_type(backend),
 							routing = pointers.second,
 							weights = pointers.weights,
@@ -3229,9 +3237,9 @@ impl NativeModelIr {
 					// One table entry per element: a `[1, parameters]` shape walked whole.
 					let table = Shape { channels: 1, length: node.parameters };
 					let whole = NodeWindow { begin: "0".to_owned(), span: node.parameters.to_string() };
-					emit_fixed_loop(&mut ir, index, "expert.in.gradient", 1, table, &whole, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "expert.in.gradient", 1, table, &whole, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @expert_in_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} {context}, {pointer} %gradient, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {offset} )\n",
+							"call void @expert_in_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} {context}, {pointer} %gradient, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {offset} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							delta = pointers.delta,
@@ -3241,15 +3249,15 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Read) => {
-					emit_fixed_loop(&mut ir, index, "read.reverse", self.rows, node.input, &window, |ir, p| {
-						ir.push_str(&format!("call void @read_reverse_body( {pointer} {source}, {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate_adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n", pointer = pointer_type(backend), source = pointers.source, gate = pointers.second, delta = pointers.delta, adjoint = pointers.source_adjoint, gate_adjoint = pointers.second_adjoint, channels = node.output.channels, length = node.output.length, lanes = node.argument[0], gated = node.second >= 0));
+					emit_fixed_loop(&mut ir, index, "read.reverse", self.rows, node.input, &window, |ir, p, wide| {
+						ir.push_str(&format!("call void @read_reverse_body( {pointer} {source}, {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate_adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n", pointer = pointer_type(backend), source = pointers.source, gate = pointers.second, delta = pointers.delta, adjoint = pointers.source_adjoint, gate_adjoint = pointers.second_adjoint, channels = node.output.channels, length = node.output.length, lanes = node.argument[0], gated = node.second >= 0));
 					})?;
 					ir.push_str(barrier(backend));
 				}
 				(true, Primitive::Outer) => {
-					emit_fixed_loop(&mut ir, index, "outer.reverse", self.rows, node.input, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "outer.reverse", self.rows, node.input, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @outer_reverse_branch_body( {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
+							"call void @outer_reverse_branch_body( {pointer} {gate}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes}, i1 {gated} )\n",
 							pointer = pointer_type(backend),
 							gate = pointers.second,
 							delta = pointers.delta,
@@ -3264,9 +3272,9 @@ impl NativeModelIr {
 					if node.second >= 0 {
 						// One gate per row, lane, and position: a `[lanes, length]` shape walked whole.
 						let gates = Shape { channels: integer_argument(node.argument[0], "outer lanes")? as usize, length: node.input.length };
-						emit_fixed_loop(&mut ir, index, "outer.gate.reverse", self.rows, gates, &window, |ir, p| {
+						emit_fixed_loop(&mut ir, index, "outer.gate.reverse", self.rows, gates, &window, |ir, p, wide| {
 							ir.push_str(&format!(
-								"call void @outer_reverse_gate_body( {pointer} {source}, {pointer} {delta}, {pointer} {gate_adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {lanes} )\n",
+								"call void @outer_reverse_gate_body( {pointer} {source}, {pointer} {delta}, {pointer} {gate_adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {lanes} )\n",
 								pointer = pointer_type(backend),
 								source = pointers.source,
 								delta = pointers.delta,
@@ -3286,9 +3294,9 @@ impl NativeModelIr {
 					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
 					// One row and key head per element, so the value heads sharing a key head
 					// walk in one thread and own the query and key adjoint elements they share.
-					emit_fixed_loop(&mut ir, index, "delta.reverse", self.rows, keys, &whole, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "delta.reverse", self.rows, keys, &whole, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @delta_reverse_body( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {context}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate} , i32 {p}, {arguments} )\n",
+							"call void @delta_reverse_body( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {context}, {pointer} {delta}, {pointer} {adjoint}, {pointer} {gate} , i64 {wide}, {arguments} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							second = pointers.second,
@@ -3302,9 +3310,9 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 					// Then one decay scale per value head, folding that head's row partials.
-					emit_fixed_loop(&mut ir, index, "delta.decay.reverse", 1, pairs, &whole, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "delta.decay.reverse", 1, pairs, &whole, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @delta_reverse_decay_body( {pointer} {context}, {pointer} %gradient, i32 {p}, i32 %rows, i32 {heads}, i32 {partials}, i32 {offset} )\n",
+							"call void @delta_reverse_decay_body( {pointer} {context}, {pointer} %gradient, i64 {wide}, i32 %rows, i32 {heads}, i32 {partials}, i32 {offset} )\n",
 							pointer = pointer_type(backend),
 							context = pointers.context,
 							heads = shape.heads,
@@ -3317,9 +3325,9 @@ impl NativeModelIr {
 				(true, Primitive::ExpertOut) => {
 					let (channels, length) = (node.output.channels, node.output.length);
 					let (hidden, experts, top) = (node.argument[2], node.argument[0], node.argument[1]);
-					emit_fixed_loop(&mut ir, index, "expert.out.reverse", self.rows, node.input, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "expert.out.reverse", self.rows, node.input, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @expert_out_reverse_values_body( {pointer} {routing}, {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
+							"call void @expert_out_reverse_values_body( {pointer} {routing}, {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
 							pointer = pointer_type(backend),
 							routing = pointers.second,
 							weights = pointers.weights,
@@ -3329,9 +3337,9 @@ impl NativeModelIr {
 					})?;
 					ir.push_str(barrier(backend));
 					let positions = Shape { channels: 1, length };
-					emit_fixed_loop(&mut ir, index, "expert.out.routing", self.rows, positions, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "expert.out.routing", self.rows, positions, &window, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @expert_out_reverse_routing_body( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
+							"call void @expert_out_reverse_routing_body( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							routing = pointers.second,
@@ -3345,9 +3353,9 @@ impl NativeModelIr {
 					let offset = narrow(plan.node.offset, "expert gradient offset")?;
 					let table = Shape { channels: 1, length: node.parameters };
 					let whole = NodeWindow { begin: "0".to_owned(), span: node.parameters.to_string() };
-					emit_fixed_loop(&mut ir, index, "expert.out.gradient", 1, table, &whole, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "expert.out.gradient", 1, table, &whole, |ir, p, wide| {
 						ir.push_str(&format!(
-							"call void @expert_out_reverse_weight_body( {pointer} {source}, {pointer} {routing}, {pointer} {delta}, {pointer} {context}, {pointer} %gradient, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {offset} )\n",
+							"call void @expert_out_reverse_weight_body( {pointer} {source}, {pointer} {routing}, {pointer} {delta}, {pointer} {context}, {pointer} %gradient, i64 {wide}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {offset} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							routing = pointers.second,
@@ -3361,16 +3369,15 @@ impl NativeModelIr {
 					let pointer = pointer_type(backend);
 					let ty = self.precision.model_type;
 					let prefix = format!("n{index}.pool.reverse");
-					emit_fixed_loop(&mut ir, index, "pool.reverse", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "pool.reverse", self.rows, node.output, &window, |ir, _p, wide| {
 						let context_pointer = format!("%{prefix}.context.ptr");
 						let context_wide = format!("%{prefix}.context.index.wide");
-						let context_index = format!("%{prefix}.context.index");
 						let delta_pointer = format!("%{prefix}.delta.ptr");
 						let delta_value = format!("%{prefix}.delta.value");
 						let source_pointer = format!("%{prefix}.source.adjoint.ptr");
 						let source_value = format!("%{prefix}.source.adjoint.value");
 						let source_sum = format!("%{prefix}.source.adjoint.sum");
-						ir.push_str(&format!("{context_pointer} = getelementptr inbounds i64, {pointer} {context}, i32 {p}\n{context_wide} = load i64, {pointer} {context_pointer}, align 8\n{context_index} = trunc i64 {context_wide} to i32\n{delta_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i32 {p}\n{delta_value} = load {ty}, {pointer} {delta_pointer}, align {align}\n{source_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i32 {context_index}\n{source_value} = load {ty}, {pointer} {source_pointer}, align {align}\n{source_sum} = call {ty} @recipe.add({ty} {source_value}, {ty} {delta_value})\nstore {ty} {source_sum}, {pointer} {source_pointer}, align {align}\n", context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, align = alignment(ty), pointer = pointer, ty = ty));
+						ir.push_str(&format!("{context_pointer} = getelementptr inbounds i64, {pointer} {context}, i64 {wide}\n{context_wide} = load i64, {pointer} {context_pointer}, align 8\n{delta_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i64 {wide}\n{delta_value} = load {ty}, {pointer} {delta_pointer}, align {align}\n{source_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i64 {context_wide}\n{source_value} = load {ty}, {pointer} {source_pointer}, align {align}\n{source_sum} = call {ty} @recipe.add({ty} {source_value}, {ty} {delta_value})\nstore {ty} {source_sum}, {pointer} {source_pointer}, align {align}\n", context = pointers.context, delta = pointers.delta, source_adjoint = pointers.source_adjoint, align = alignment(ty), pointer = pointer, ty = ty, wide = wide));
 					})?;
 					ir.push_str(barrier(backend));
 				}
@@ -3440,37 +3447,45 @@ impl NativeModelIr {
 					)
 					.map_err(|error| RecipeError::new(error.to_string()))?;
 					let gradients = reverse.parameter_adjoint.iter().map(|(&parameter, value)| Ok((parameter, value.clone()))).collect::<Result<Vec<_>>>()?;
-					let scalar_body = |ir: &mut String, p: &str| {
+					let scalar_body = |ir: &mut String, _p: &str, wide: &str| {
 						let first_pointer = format!("%{prefix}.first.ptr");
 						let incoming_pointer = format!("%{prefix}.incoming.ptr");
 						let first_adjoint_pointer = format!("%{prefix}.first.adjoint.ptr");
 						ir.push_str(&format!(
-							"{first_pointer} = getelementptr inbounds {ty}, {pointer} {source}, i32 {p}\n{first} = load {ty}, {pointer} {first_pointer}, align {align}\n",
+							"{first_pointer} = getelementptr inbounds {ty}, {pointer} {source}, i64 {wide}\n{first} = load {ty}, {pointer} {first_pointer}, align {align}\n",
 							source = pointers.source,
+							wide = wide,
 							align = alignment(ty)
 						));
 						if pointers.second != pointers.source {
 							let second_pointer = format!("%{prefix}.second.ptr");
 							ir.push_str(&format!(
-								"{second_pointer} = getelementptr inbounds {ty}, {pointer} {second_source}, i32 {p}\n{second} = load {ty}, {pointer} {second_pointer}, align {align}\n",
+								"{second_pointer} = getelementptr inbounds {ty}, {pointer} {second_source}, i64 {wide}\n{second} = load {ty}, {pointer} {second_pointer}, align {align}\n",
 								second_source = pointers.second,
+								wide = wide,
 								align = alignment(ty)
 							));
 						}
 						ir.push_str(&format!(
-							"{incoming_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i32 {p}\n{incoming} = load {ty}, {pointer} {incoming_pointer}, align {align}\n",
+							"{incoming_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i64 {wide}\n{incoming} = load {ty}, {pointer} {incoming_pointer}, align {align}\n",
 							delta = pointers.delta,
+							wide = wide,
 							align = alignment(ty)
 						));
 						ir.push_str(&forward.code);
 						ir.push_str(&reverse.code);
-						ir.push_str(&format!("{first_adjoint_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i32 {p}\n", source_adjoint = pointers.source_adjoint));
+						ir.push_str(&format!(
+							"{first_adjoint_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i64 {wide}\n",
+							source_adjoint = pointers.source_adjoint,
+							wide = wide
+						));
 						if node.second >= 0 {
 							let second_adjoint_pointer = format!("%{prefix}.second.adjoint.ptr");
 							ir.push_str(&accumulate_owned(&first_adjoint_pointer, &reverse.first_adjoint, ty, pointer, &format!("{prefix}.first.owned")));
 							ir.push_str(&format!(
-								"{second_adjoint_pointer} = getelementptr inbounds {ty}, {pointer} {second_adjoint}, i32 {p}\n",
-								second_adjoint = pointers.second_adjoint
+								"{second_adjoint_pointer} = getelementptr inbounds {ty}, {pointer} {second_adjoint}, i64 {wide}\n",
+								second_adjoint = pointers.second_adjoint,
+								wide = wide
 							));
 							ir.push_str(&accumulate_owned(&second_adjoint_pointer, &reverse.second_adjoint, ty, pointer, &format!("{prefix}.second.owned")));
 						} else {
@@ -3484,7 +3499,7 @@ impl NativeModelIr {
 						}
 					};
 					if gradients.is_empty() {
-						emit_fixed_loop(&mut ir, index, "scalar.reverse", self.rows, node.output, &window, scalar_body)?;
+						emit_fixed_loop(&mut ir, index, "scalar.reverse", self.rows, node.output, &window, |ir, p, wide| scalar_body(ir, p, wide))?;
 						ir.push_str(barrier(backend));
 					} else {
 						// A trainable scalar is one destination shared by every element, so
@@ -3508,7 +3523,11 @@ impl NativeModelIr {
 								zero: &literal(0.0, ty),
 								gradients: &gradients,
 							},
-							scalar_body,
+							|ir, p| {
+								let wide = format!("%{prefix}.partitioned.p.wide");
+								ir.push_str(&format!("{wide} = zext i32 {p} to i64\n"));
+								scalar_body(ir, p, &wide)
+							},
 						)?;
 						ir.push_str(barrier(backend));
 						let (columns, offset) = (narrow(node.parameters, "scalar gradient columns")?, narrow(plan.node.offset, "scalar gradient offset")?);
@@ -3529,12 +3548,13 @@ impl NativeModelIr {
 						ir.push_str(&self.emit_normalize_stats(backend, index, node, &pointers, mode)?);
 						ir.push_str(barrier(backend));
 					}
-					emit_fixed_loop(&mut ir, index, "normalize", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "normalize", self.rows, node.output, &window, |ir, p, wide| {
 						let source_pointer = format!("%{prefix}.source.ptr");
 						let source_value = format!("%{prefix}.source.value");
 						ir.push_str(&format!(
-							"{source_pointer} = getelementptr inbounds {ty}, {pointer} {source}, i32 {p}\n{source_value} = load {ty}, {pointer} {source_pointer}, align {align}\n",
+							"{source_pointer} = getelementptr inbounds {ty}, {pointer} {source}, i64 {wide}\n{source_value} = load {ty}, {pointer} {source_pointer}, align {align}\n",
 							source = pointers.source,
+							wide = wide,
 							align = alignment(ty)
 						));
 						let fragment = program_ir::emit_normalize(
@@ -3558,8 +3578,9 @@ impl NativeModelIr {
 						ir.push_str(&fragment.code);
 						let output_pointer = format!("%{prefix}.output.ptr");
 						ir.push_str(&format!(
-							"{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i32 {p}\nstore {ty} {result}, {pointer} {output_pointer}, align {align}\n",
+							"{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\nstore {ty} {result}, {pointer} {output_pointer}, align {align}\n",
 							value = pointers.value,
+							wide = wide,
 							result = fragment.value,
 							align = alignment(ty)
 						));
@@ -3598,12 +3619,12 @@ impl NativeModelIr {
 						));
 						ir.push_str(barrier(backend));
 					}
-					emit_fixed_loop(&mut ir, index, "normalize.reverse", self.rows, node.output, &window, |ir, p| {
+					emit_fixed_loop(&mut ir, index, "normalize.reverse", self.rows, node.output, &window, |ir, p, wide| {
 						let delta_pointer = format!("%{prefix}.delta.ptr");
 						let delta_value = format!("%{prefix}.delta.value");
 						let output_pointer = format!("%{prefix}.output.ptr");
 						let output_value = format!("%{prefix}.output.value");
-						ir.push_str(&format!("{delta_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i32 {p}\n{delta_value} = load {ty}, {pointer} {delta_pointer}, align {align}\n{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i32 {p}\n{output_value} = load {ty}, {pointer} {output_pointer}, align {align}\n", delta = pointers.delta, value = pointers.value, align = alignment(ty)));
+						ir.push_str(&format!("{delta_pointer} = getelementptr inbounds {ty}, {pointer} {delta}, i64 {wide}\n{delta_value} = load {ty}, {pointer} {delta_pointer}, align {align}\n{output_pointer} = getelementptr inbounds {ty}, {pointer} {value}, i64 {wide}\n{output_value} = load {ty}, {pointer} {output_pointer}, align {align}\n", delta = pointers.delta, value = pointers.value, align = alignment(ty), wide = wide));
 						let state_zero = native_literal(self.precision.state, self.precision.state_type, 0.0);
 						let fragment = program_ir::emit_normalize_reverse(
 							program_ir::NormalizeReverseContext {
@@ -3629,7 +3650,11 @@ impl NativeModelIr {
 						);
 						ir.push_str(&fragment.code);
 						let source_pointer = format!("%{prefix}.source.adjoint.ptr");
-						ir.push_str(&format!("{source_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i32 {p}\n", source_adjoint = pointers.source_adjoint));
+						ir.push_str(&format!(
+							"{source_pointer} = getelementptr inbounds {ty}, {pointer} {source_adjoint}, i64 {wide}\n",
+							source_adjoint = pointers.source_adjoint,
+							wide = wide
+						));
 						ir.push_str(&accumulate_owned(&source_pointer, &fragment.contribution, ty, pointer, &format!("{prefix}.owned")));
 					})?;
 					ir.push_str(barrier(backend));
@@ -4517,20 +4542,19 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 /// Walk the elements of one window of output positions. The positions of a
 /// channel are contiguous, so the window is a run per row and channel and the
 /// loop index maps onto the element it owns.
-/// The bodies index one batch element in `i32`, so a batch whose elements pass
-/// `i32` is refused here rather than wrapped inside the loop.
-fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, rows: usize, shape: Shape, window: &NodeWindow, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
+/// The loop's element coordinates are `i64`, while callbacks that expose a
+/// narrow ABI receive the checked low word alongside the wide pointer index.
+fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, rows: usize, shape: Shape, window: &NodeWindow, mut body: impl FnMut(&mut String, &str, &str)) -> Result<()> {
 	let prefix = format!("n{index}.{name}");
-	let elements = narrow(checked_mul(shape.channels, shape.length, format!("native {name} row elements").as_str())?, "native loop row elements")?;
+	let elements = checked_mul(shape.channels, shape.length, format!("native {name} row elements").as_str())?;
 	let (channels, length) = (narrow(shape.channels, "native loop channels")?, narrow(shape.length, "native loop length")?);
-	narrow(checked_mul(rows, elements as usize, "native loop elements")?, "native loop batch elements")?;
 	let rows = narrow(rows, "native loop rows")?;
 	let (begin, span) = (&window.begin, &window.span);
 	ir.push_str(&format!(
-		"%{prefix}.at.plane = mul i32 {channels}, {span}\n%{prefix}.at.count = mul i32 {rows}, %{prefix}.at.plane\nbr label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.at.q = phi i32 [ %tid, %{prefix}.entry ], [ %{prefix}.at.next, %{prefix}.step ]\n%{prefix}.at.more = icmp ult i32 %{prefix}.at.q, %{prefix}.at.count\nbr i1 %{prefix}.at.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n%{prefix}.at.row = udiv i32 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.within = urem i32 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.channel = udiv i32 %{prefix}.at.within, {span}\n%{prefix}.at.offset = urem i32 %{prefix}.at.within, {span}\n%{prefix}.at.position = add i32 %{prefix}.at.offset, {begin}\n%{prefix}.at.row.base = mul i32 %{prefix}.at.row, {elements}\n%{prefix}.at.channel.base = mul i32 %{prefix}.at.channel, {length}\n%{prefix}.at.local = add i32 %{prefix}.at.channel.base, %{prefix}.at.position\n%{prefix}.at.p = add i32 %{prefix}.at.row.base, %{prefix}.at.local\n"
+		"%{prefix}.at.channels = zext i32 {channels} to i64\n%{prefix}.at.length = zext i32 {length} to i64\n%{prefix}.at.begin = zext i32 {begin} to i64\n%{prefix}.at.span = zext i32 {span} to i64\n%{prefix}.at.rows = zext i32 {rows} to i64\n%{prefix}.at.threads = zext i32 %threads to i64\n%{prefix}.at.tid = zext i32 %tid to i64\n%{prefix}.at.plane = mul i64 %{prefix}.at.channels, %{prefix}.at.span\n%{prefix}.at.count = mul i64 %{prefix}.at.rows, %{prefix}.at.plane\nbr label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.at.q = phi i64 [ %{prefix}.at.tid, %{prefix}.entry ], [ %{prefix}.at.next, %{prefix}.step ]\n%{prefix}.at.more = icmp ult i64 %{prefix}.at.q, %{prefix}.at.count\nbr i1 %{prefix}.at.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n%{prefix}.at.row = udiv i64 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.within = urem i64 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.channel = udiv i64 %{prefix}.at.within, %{prefix}.at.span\n%{prefix}.at.offset = urem i64 %{prefix}.at.within, %{prefix}.at.span\n%{prefix}.at.position = add i64 %{prefix}.at.offset, %{prefix}.at.begin\n%{prefix}.at.row.base = mul i64 %{prefix}.at.row, {elements}\n%{prefix}.at.channel.base = mul i64 %{prefix}.at.channel, %{prefix}.at.length\n%{prefix}.at.local = add i64 %{prefix}.at.channel.base, %{prefix}.at.position\n%{prefix}.at.p = add i64 %{prefix}.at.row.base, %{prefix}.at.local\n%{prefix}.at.p.i32 = trunc i64 %{prefix}.at.p to i32\n"
 	));
-	body(ir, &format!("%{prefix}.at.p"));
-	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.at.next = add i32 %{prefix}.at.q, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
+	body(ir, &format!("%{prefix}.at.p.i32"), &format!("%{prefix}.at.p"));
+	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.at.next = add i64 %{prefix}.at.q, %{prefix}.at.threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
 	Ok(())
 }
 
@@ -4581,9 +4605,9 @@ fn emit_expert_buckets(ir: &mut String, backend: Backend, index: usize, rows: us
 	// One list per expert: an `[experts, 1]` shape walked whole.
 	let buckets = Shape { channels: integer_argument(node.argument[0], "routed experts")? as usize, length: 1 };
 	let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
-	emit_fixed_loop(ir, index, "expert.bucket", 1, buckets, &whole, |ir, p| {
+	emit_fixed_loop(ir, index, "expert.bucket", 1, buckets, &whole, |ir, _p, wide| {
 		ir.push_str(&format!(
-			"call void @moe_bucket_body( {pointer} {routing}, {pointer} {context}, i32 {p}, i32 {pairs}, i32 {length}, i32 {experts}, i32 {top} )\n",
+			"call void @moe_bucket_body( {pointer} {routing}, {pointer} {context}, i64 {wide}, i32 {pairs}, i32 {length}, i32 {experts}, i32 {top} )\n",
 			pointer = pointer_type(backend),
 			routing = pointers.second,
 			context = pointers.context,
@@ -18858,6 +18882,30 @@ mod issue_676_tests {
 		}));
 		let error = measured_split(&graph, Compute::FP64, &[gpu]).unwrap_err().to_string();
 		assert!(error.contains("cannot hold placement blocks"), "unexpected error: {error}");
+	}
+
+	#[test]
+	fn inference_layout_reuses_transient_value_slots() {
+		let shape = Shape { channels: 2, length: 4 };
+		let mut graph = Graph::new(shape, 1.0e-5);
+		for _ in 0..4 {
+			push_node(&mut graph, Primitive::Elementwise, shape, 0, arguments(0.0, 0.0), -2).unwrap();
+		}
+		let training = NativeLayout::for_graph(&graph, 1, Compute::FP64, false).unwrap();
+		let inference = NativeLayout::for_graph(&graph, 1, Compute::FP64, true).unwrap();
+		assert_eq!(training.values_bytes, 4 * shape.elements() * Compute::FP64.bytes());
+		assert_eq!(inference.values[2], inference.values[0]);
+		assert!(inference.values_bytes < training.values_bytes);
+		assert_eq!(inference.adjoints_bytes, Compute::FP64.bytes());
+	}
+
+	#[test]
+	fn fixed_loop_widens_large_element_coordinates() {
+		let mut ir = String::new();
+		let window = NodeWindow { begin: "0".to_owned(), span: "3".to_owned() };
+		emit_fixed_loop(&mut ir, 0, "wide", 1, Shape { channels: 1 << 30, length: 3 }, &window, |_, _, _| {}).unwrap();
+		assert!(ir.contains("phi i64"));
+		assert!(ir.contains("mul i64"));
 	}
 }
 
