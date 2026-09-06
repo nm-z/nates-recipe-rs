@@ -1,3 +1,0 @@
-   Compiling recipe v0.1.0 (/home/nate/Developer/wt-multi-entry)
-recipe.rs:13860:39: error[E0308]: mismatched types: expected `Option<Vec<Dispatch>>`, found `Option<Dispatch>`
-error: could not compile `recipe` (lib) due to 1 previous error
