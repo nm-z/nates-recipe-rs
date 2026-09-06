@@ -7349,11 +7349,11 @@ fn debug(message: &str) -> Result<()> {
 		return Ok(());
 	}
 	let file = DEBUG_LOG
-		.get_or_init(|| fs::OpenOptions::new().create(true).write(true).truncate(true).open(DEBUG_LOG_PATH).map(Mutex::new))
+		.get_or_init(|| fs::OpenOptions::new().create(true).append(true).open(DEBUG_LOG_PATH).map(Mutex::new))
 		.as_ref()
 		.map_err(|error| RecipeError::new(format!("cannot open {DEBUG_LOG_PATH}: {error}")))?;
 	let mut file = file.lock().map_err(|_| RecipeError::new("debug log lock is poisoned"))?;
-	writeln!(file, "{message}").and_then(|_| file.flush()).map_err(|error| RecipeError::new(format!("cannot write {DEBUG_LOG_PATH}: {error}")))
+	writeln!(file, "pid={} {message}", std::process::id()).and_then(|_| file.flush()).map_err(|error| RecipeError::new(format!("cannot write {DEBUG_LOG_PATH}: {error}")))
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipeError(String);
