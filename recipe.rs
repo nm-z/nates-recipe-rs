@@ -9262,8 +9262,11 @@ impl Binding {
 /// `plan`, and runs one forward. `channels` names the input's channel axis, so
 /// the rest of its length is the sequence the blocks walk.
 fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Result<Vec<f64>> {
+	infer_gguf_with(model, blocks, plan, input, channels, Compute::FP64)
+}
+fn infer_gguf_with(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize, precision: Compute) -> Result<Vec<f64>> {
 	let (graph, device) = bound_graph(model, blocks, plan, input, channels)?;
-	let tape = NativeTape::new(&graph, input, input, &[], device, Compute::FP64, None)?;
+	let tape = NativeTape::new(&graph, input, input, &[], device, precision, None)?;
 	tape.forward()?;
 	tape.predictions()
 }
@@ -9356,6 +9359,7 @@ pub struct Bound {
 	file: Gguf,
 	model: Model,
 	plan: Binding,
+	precision: Compute,
 	blocks: usize,
 	tensors: usize,
 	vocabulary: usize,
@@ -9396,7 +9400,12 @@ impl Bound {
 	/// as `vocabulary` rows of one value per position.
 	pub fn infer(&self, ids: &[u32]) -> Vec<f64> {
 		let input = ids.iter().map(|id| f64::from(*id)).collect::<Vec<_>>();
-		self.file.infer(&self.model, &self.plan, &input, 1)
+		infer_gguf_with(&self.file, &self.model, &self.plan, &input, 1, self.precision).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Use IEEE floating-point arithmetic of `bits` bits for inference.
+	pub fn fp(mut self, bits: u8) -> Self {
+		self.precision = fp_arithmetic(bits);
+		self
 	}
 	/// Place this bound model across the selected devices for a sequence of
 	/// `positions` token ids. `split` names the Recipe blocks each device takes;
@@ -9519,7 +9528,7 @@ impl<'a> Builder<'a> {
 		let unread = file.tensors().iter().filter(|tensor| !builder.consumed.contains(&tensor.name)).map(|tensor| tensor.name.as_str()).collect::<Vec<_>>();
 		require(unread.is_empty(), format!("{} tensors are read by no node: {}", unread.len(), unread.join(", ")))?;
 		let tensors = builder.consumed.len();
-		Ok(Bound { file: file.clone(), model, plan: builder.plan, blocks, tensors, vocabulary })
+		Ok(Bound { file: file.clone(), model, plan: builder.plan, precision: Compute::FP64, blocks, tensors, vocabulary })
 	}
 	fn key(&self, suffix: &str) -> String {
 		format!("{}.{suffix}", self.architecture)
@@ -10265,7 +10274,7 @@ fn place_bound(model: &Bound, positions: usize, split: &[usize], devices: &'stat
 	let samples = vec![0.0; positions];
 	let graph = bound_graph_on(&model.file, &model.model, &model.plan, &samples, 1, devices[0])?;
 	let input = graph.input;
-	let (split, ranges, resident, moved) = place_ranges(&graph, split, devices, Compute::FP64, &[])?;
+	let (split, ranges, resident, moved) = place_ranges(&graph, split, devices, model.precision, &[])?;
 	Ok(Placed { source: PlacedSource::Bound(input), split, tapes: vec![ranges], resident, moved })
 }
 impl Placed {
@@ -18055,6 +18064,15 @@ impl Compute {
 		}
 	}
 }
+fn fp_arithmetic(bits: u8) -> Compute {
+	match bits {
+		8 => Compute::FP8,
+		16 => Compute::FP16,
+		32 => Compute::FP32,
+		64 => Compute::FP64,
+		_ => panic!("fp bits must be 8, 16, 32, or 64"),
+	}
+}
 impl Train {
 	fn arithmetic(mut self, format: Compute) -> Self {
 		self.precision = format;
@@ -18065,14 +18083,7 @@ impl Train {
 		self.arithmetic(Compute::F(FloatFormat::computed(exp, man)))
 	}
 	pub fn fp(self, bits: u8) -> Self {
-		let format = match bits {
-			8 => Compute::FP8,
-			16 => Compute::FP16,
-			32 => Compute::FP32,
-			64 => Compute::FP64,
-			_ => panic!("fp bits must be 8, 16, 32, or 64"),
-		};
-		self.arithmetic(format)
+		self.arithmetic(fp_arithmetic(bits))
 	}
 	pub fn int(self, bits: u8) -> Self {
 		let format = match bits {
