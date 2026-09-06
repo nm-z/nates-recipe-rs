@@ -5408,6 +5408,15 @@ mod gguf {
 	}
 
 	/// The Recipe storage format a block-quantized tensor decodes through.
+	pub(super) fn embedding_format(tensor: &GgufTensor) -> Result<StorageFormat> {
+		match tensor.kind {
+			0 => StorageFormat::named("f32").ok_or_else(|| RecipeError::new("F32 embedding layout is unavailable")),
+			1 => StorageFormat::named("f16").ok_or_else(|| RecipeError::new("F16 embedding layout is unavailable")),
+			_ => block_format(tensor),
+		}
+	}
+
+	/// The Recipe storage format a block-quantized tensor decodes through.
 	pub(super) fn block_format(tensor: &GgufTensor) -> Result<StorageFormat> {
 		let (name, _, _, format) = layout(tensor.kind)?;
 		format.ok_or_else(|| RecipeError::new(format!("tensor {} is {name}, which the tape reads only as a block-quantized weight", tensor.name)))
