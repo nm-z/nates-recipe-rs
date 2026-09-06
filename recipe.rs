@@ -1621,7 +1621,8 @@ impl NativeModelIr {
 		let mut storage_bytes = 0usize;
 		for (index, node) in graph.nodes.iter().cloned().enumerate() {
 			let id = || node.identity(index);
-			require(node.source >= -1 && node.source < index as i32, format!("{} has invalid source node {}", id(), node.source))?;
+			// A lookup reads its ids on the host, so it names no device source.
+			require((node.source >= -1 || (node.source == -2 && node.op == Primitive::Lookup)) && node.source < index as i32, format!("{} has invalid source node {}", id(), node.source))?;
 			require(node.second >= -2 && node.second < index as i32, format!("{} has invalid second source node {}", id(), node.second))?;
 			// A packed node reads its stored bytes, and one bound to a mapped
 			// weight owns no arithmetic span at all, so only a dense node's
@@ -2735,7 +2736,7 @@ impl NativeModelIr {
 				(false, Primitive::Dconv) => {
 					emit_fixed_loop(&mut ir, index, "dconv", self.rows, node.output, &window, |ir, p| {
 						ir.push_str(&format!(
-							"call void @dconv_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {decode} )\n",
+							"call void @dconv_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {decode} )\n",
 							pointer = pointer_type(backend),
 							decode = plan.decode(index),
 							source = pointers.source,
@@ -2743,7 +2744,40 @@ impl NativeModelIr {
 							value = pointers.value,
 							channels = node.output.channels,
 							length = node.output.length,
-							kernel = node.argument[0]
+							kernel = node.argument[0],
+							dilation = node.argument[1]
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(false, Primitive::Lookup) => {
+					// The host stages the gathered rows of the window in the context as
+					// [row][position][channel]; the device lays them out as its value plane.
+					let (pointer, ty) = (pointer_type(backend), self.precision.model_type);
+					let prefix = format!("n{index}.lookup");
+					let per_row = checked_mul(node.output.channels, node.output.length, "lookup row elements")?;
+					emit_fixed_loop(&mut ir, index, "lookup", self.rows, node.output, &window, |ir, p| {
+						ir.push_str(&format!(
+							"%{prefix}.row = udiv i32 {p}, {per_row}\n%{prefix}.within = urem i32 {p}, {per_row}\n%{prefix}.channel = udiv i32 %{prefix}.within, {length}\n%{prefix}.position = urem i32 %{prefix}.within, {length}\n%{prefix}.token = mul i32 %{prefix}.row, {length}\n%{prefix}.slot = add i32 %{prefix}.token, %{prefix}.position\n%{prefix}.base = mul i32 %{prefix}.slot, {channels}\n%{prefix}.index = add i32 %{prefix}.base, %{prefix}.channel\n%{prefix}.in = getelementptr inbounds {ty}, {pointer} {context}, i32 %{prefix}.index\n%{prefix}.value = load {ty}, {pointer} %{prefix}.in, align {align}\n%{prefix}.out = getelementptr inbounds {ty}, {pointer} {value}, i32 {p}\nstore {ty} %{prefix}.value, {pointer} %{prefix}.out, align {align}\n",
+							context = pointers.context,
+							value = pointers.value,
+							length = node.output.length,
+							channels = node.output.channels,
+							align = alignment(ty)
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				(false, Primitive::Fold) => {
+					emit_fixed_loop(&mut ir, index, "fold", self.rows, node.output, &window, |ir, p| {
+						ir.push_str(&format!(
+							"call void @fold_forward_body( {pointer} {source}, {pointer} {value}, i32 {p}, i32 {groups}, i32 {width}, i32 {length} )\n",
+							pointer = pointer_type(backend),
+							source = pointers.source,
+							value = pointers.value,
+							groups = node.output.channels,
+							width = node.argument[0],
+							length = node.output.length
 						));
 					})?;
 					ir.push_str(barrier(backend));
@@ -3002,14 +3036,15 @@ impl NativeModelIr {
 				(true, Primitive::Dconv) => {
 					emit_fixed_loop(&mut ir, index, "dconv.reverse", self.rows, node.output, &window, |ir, p| {
 						ir.push_str(&format!(
-							"call void @dconv_reverse_input_body( {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel} )\n",
+							"call void @dconv_reverse_input_body( {pointer} {weights}, {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation} )\n",
 							pointer = pointer_type(backend),
 							weights = pointers.weights,
 							delta = pointers.delta,
 							adjoint = pointers.source_adjoint,
 							channels = node.output.channels,
 							length = node.output.length,
-							kernel = node.argument[0]
+							kernel = node.argument[0],
+							dilation = node.argument[1]
 						));
 					})?;
 					ir.push_str(barrier(backend));
@@ -3019,14 +3054,32 @@ impl NativeModelIr {
 					let whole = NodeWindow { begin: "0".to_owned(), span: kernel.to_string() };
 					emit_fixed_loop(&mut ir, index, "dconv.weight.reverse", 1, taps, &whole, |ir, p| {
 						ir.push_str(&format!(
-							"call void @dconv_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} %gradient, i32 {p}, i32 %rows, i32 {channels}, i32 {length}, i32 {kernel}, i32 {offset} )\n",
+							"call void @dconv_reverse_weight_body( {pointer} {source}, {pointer} {delta}, {pointer} %gradient, i32 {p}, i32 %rows, i32 {channels}, i32 {length}, i32 {kernel}, i32 {dilation}, i32 {offset} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							delta = pointers.delta,
 							channels = node.output.channels,
 							length = node.output.length,
 							kernel = node.argument[0],
+							dilation = node.argument[1],
 							offset = node.offset
+						));
+					})?;
+					ir.push_str(barrier(backend));
+				}
+				// The lookup's table stays on the host and is never trained, so the
+				// rows it stages contribute no reverse pass.
+				(true, Primitive::Lookup) => {}
+				(true, Primitive::Fold) => {
+					emit_fixed_loop(&mut ir, index, "fold.reverse", self.rows, node.input, &window, |ir, p| {
+						ir.push_str(&format!(
+							"call void @fold_reverse_body( {pointer} {delta}, {pointer} {adjoint}, i32 {p}, i32 {groups}, i32 {width}, i32 {length} )\n",
+							pointer = pointer_type(backend),
+							delta = pointers.delta,
+							adjoint = pointers.source_adjoint,
+							groups = node.output.channels,
+							width = node.argument[0],
+							length = node.output.length
 						));
 					})?;
 					ir.push_str(barrier(backend));
@@ -3722,7 +3775,8 @@ impl NativeModelIr {
 		let mut seen = Vec::new();
 		let mut tables = Vec::new();
 		for (index, plan) in self.plans.iter().enumerate() {
-			let Some(stored) = &plan.stored else { continue };
+			// A lookup's table decodes on the host, so the device needs no decoder for it.
+			let Some(stored) = plan.stored.as_ref().filter(|_| plan.node.op != Primitive::Lookup) else { continue };
 			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
 			let format = spec.codec.quantization();
 			let native = format.native;
@@ -5059,14 +5113,14 @@ mod gguf {
 		fn required(&self, key: &str) -> Result<&GgufValue> {
 			self.value(key).ok_or_else(|| RecipeError::new(format!("{key} is absent")))
 		}
-		fn integer_at(&self, key: &str) -> Result<usize> {
+		pub(super) fn integer_at(&self, key: &str) -> Result<usize> {
 			let value = self.required(key)?.integer().ok_or_else(|| RecipeError::new(format!("{key} is not a nonnegative integer")))?;
 			usize::try_from(value).map_err(|_| RecipeError::new(format!("{key} exceeds the address space")))
 		}
 		fn float_at(&self, key: &str) -> Result<f64> {
 			self.required(key)?.float().ok_or_else(|| RecipeError::new(format!("{key} is not a float")))
 		}
-		fn integers_at(&self, key: &str) -> Result<Vec<u64>> {
+		pub(super) fn integers_at(&self, key: &str) -> Result<Vec<u64>> {
 			match self.required(key)? {
 				GgufValue::Array(values) => {
 					values.iter().map(|value| value.integer().ok_or_else(|| RecipeError::new(format!("{key} holds a value that is not a nonnegative integer")))).collect()
@@ -5074,7 +5128,7 @@ mod gguf {
 				_ => Err(RecipeError::new(format!("{key} is not an array"))),
 			}
 		}
-		fn indices_at(&self, key: &str) -> Result<Vec<usize>> {
+		pub(super) fn indices_at(&self, key: &str) -> Result<Vec<usize>> {
 			self.integers_at(key)?.into_iter().map(|value| usize::try_from(value).map_err(|_| RecipeError::new(format!("{key} exceeds the address space")))).collect()
 		}
 		fn parse_qwen4exp(&self) -> Result<Qwen4ExpMetadata> {
@@ -5800,82 +5854,277 @@ mod tokenizer {
 }
 pub use tokenizer::Tokenizer;
 mod ngram {
-	//! N-gram embeddings gathered on the host from a mapped GGUF table. Each head
-	//! hashes the current token with its previous one, and as many heads with its
-	//! previous two, into its own row range; the gathered rows are added to the
-	//! stream before the block the table names, so only `2 * heads` rows of a table
-	//! far larger than device memory are ever read.
+	//! N-gram embeddings gathered on the host from a mapped GGUF table. Each token
+	//! hashes itself with its predecessors into one row per head, the rows decode
+	//! from their own bytes, and only those rows of a table far larger than device
+	//! memory are ever read. The `ngram.*` keys describe a seeded hash into equal
+	//! ranges; the `<arch>.ple.*` keys of a per-layer embedding describe the
+	//! reference multiply-xor hash into named ranges. Both fill one description.
 	use super::*;
 
-	/// A token outside the context, before the sequence start or an end id.
+	/// A token outside the context of a seeded table, before the sequence start or an end id.
 	const ABSENT: u32 = u32::MAX;
+
+	/// How one token addresses its rows. The context is the token and its `ngram - 1`
+	/// predecessors, cut at an end id: a predecessor at or behind one, or before the
+	/// sequence start, reads as `absent`. Every order `n` in `2..=ngram` hashes the
+	/// leading `n` ids of the context for `per_order` heads, and head `h` lands in
+	/// `offsets[h] + hash % vocabularies[h]`. The reference fold xors each id times
+	/// its `multipliers` entry; a table with `seeds` folds the ids into its head's
+	/// seed instead. `image` is the id a position without a token hashes as.
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	pub struct RowHash {
+		pub(crate) ngram: usize,
+		pub(crate) per_order: usize,
+		pub(crate) multipliers: Vec<u64>,
+		pub(crate) seeds: Vec<u64>,
+		pub(crate) offsets: Vec<u64>,
+		pub(crate) vocabularies: Vec<u64>,
+		pub(crate) ends: Vec<u32>,
+		pub(crate) absent: u64,
+		pub(crate) image: u64,
+	}
+	impl RowHash {
+		/// Rows one token reads: `per_order` heads for every order.
+		pub fn heads(&self) -> usize {
+			self.ngram.saturating_sub(1) * self.per_order
+		}
+		/// Rows the highest head range reaches.
+		pub fn rows(&self) -> usize {
+			self.offsets.iter().zip(&self.vocabularies).map(|(offset, vocabulary)| offset.saturating_add(*vocabulary)).max().unwrap_or(0) as usize
+		}
+		pub(crate) fn validate(&self) -> Result<()> {
+			let heads = self.heads();
+			require(self.ngram >= 2 && self.per_order != 0, format!("a row hash of {} ids with {} heads per order addresses no row", self.ngram, self.per_order))?;
+			require(self.seeds.is_empty() || self.seeds.len() == heads, format!("row hash holds {} seeds for {heads} heads", self.seeds.len()))?;
+			require(!self.seeds.is_empty() || self.multipliers.len() == self.ngram, format!("row hash holds {} multipliers for {} ids", self.multipliers.len(), self.ngram))?;
+			require(
+				self.offsets.len() == heads && self.vocabularies.len() == heads,
+				format!("row hash holds {} offsets and {} vocabularies for {heads} heads", self.offsets.len(), self.vocabularies.len()),
+			)?;
+			require(self.vocabularies.iter().all(|vocabulary| *vocabulary != 0), "row hash holds an empty head vocabulary")?;
+			Ok(())
+		}
+		/// The row each head addresses for the token at `position`: the heads of
+		/// order two first, then of every higher order.
+		pub fn rows_at(&self, ids: &[u32], position: usize) -> Vec<usize> {
+			let context = (0..self.ngram)
+				.map(|back| if back <= position && !ids[position - back..position].iter().any(|id| self.ends.contains(id)) { u64::from(ids[position - back]) } else { self.absent })
+				.collect::<Vec<_>>();
+			let mut rows = Vec::with_capacity(self.heads());
+			for order in 2..=self.ngram {
+				let mixed = context[..order].iter().zip(&self.multipliers).fold(0, |mixed, (id, multiplier)| mixed ^ id.wrapping_mul(*multiplier));
+				for head in (order - 2) * self.per_order..(order - 1) * self.per_order {
+					let hash = match self.seeds.get(head) {
+						Some(seed) => context[..order].iter().fold(*seed, |hash, id| {
+							let mixed = (hash ^ id).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+							mixed ^ (mixed >> 32)
+						}),
+						None => mixed,
+					};
+					rows.push((self.offsets[head] + hash % self.vocabularies[head]) as usize);
+				}
+			}
+			rows
+		}
+		/// The description as the words a graph carries beside its lookup node, so
+		/// a tape addresses rows without the table's metadata: the counts, then every
+		/// 64-bit value as its high and low halves, exactly.
+		pub(crate) fn words(&self) -> Vec<f64> {
+			let mut words = vec![self.ngram as f64, self.per_order as f64, self.multipliers.len() as f64, self.seeds.len() as f64, self.offsets.len() as f64, self.ends.len() as f64];
+			for value in [self.absent, self.image].iter().chain(&self.multipliers).chain(&self.seeds).chain(&self.offsets).chain(&self.vocabularies) {
+				words.extend([(value >> 32) as f64, (value & 0xFFFF_FFFF) as f64]);
+			}
+			words.extend(self.ends.iter().map(|end| f64::from(*end)));
+			words
+		}
+		pub(crate) fn from_words(words: &[f64]) -> Result<Self> {
+			let count = |index: usize| {
+				words.get(index).copied().filter(|value| value.fract() == 0.0 && *value >= 0.0).map(|value| value as usize).ok_or_else(|| RecipeError::new("row hash words are invalid"))
+			};
+			let (ngram, per_order) = (count(0)?, count(1)?);
+			let (multipliers, seeds, heads, ends) = (count(2)?, count(3)?, count(4)?, count(5)?);
+			let mut at = 6;
+			let mut wide = |count: usize| -> Result<Vec<u64>> {
+				let values = words.get(at..at + 2 * count).ok_or_else(|| RecipeError::new("row hash words are incomplete"))?;
+				at += 2 * count;
+				Ok(values.chunks_exact(2).map(|halves| (halves[0] as u64) << 32 | halves[1] as u64).collect())
+			};
+			let fixed = wide(2)?;
+			let (multipliers, seeds, offsets, vocabularies) = (wide(multipliers)?, wide(seeds)?, wide(heads)?, wide(heads)?);
+			let ends = words.get(at..at + ends).ok_or_else(|| RecipeError::new("row hash words are incomplete"))?.iter().map(|end| *end as u32).collect();
+			let hash = Self { ngram, per_order, multipliers, seeds, offsets, vocabularies, ends, absent: fixed[0], image: fixed[1] };
+			hash.validate()?;
+			Ok(hash)
+		}
+		/// The description as the fields of a saved model block.
+		pub(crate) fn text(&self) -> String {
+			let list = |values: &[u64]| values.iter().map(u64::to_string).collect::<Vec<_>>().join(":");
+			let ends = self.ends.iter().map(u32::to_string).collect::<Vec<_>>().join(":");
+			format!(
+				"{},{},{},{},{},{},{},{},{ends}",
+				self.ngram,
+				self.per_order,
+				self.absent,
+				self.image,
+				list(&self.multipliers),
+				list(&self.seeds),
+				list(&self.offsets),
+				list(&self.vocabularies)
+			)
+		}
+		pub(crate) fn parse<'f>(fields: &mut impl Iterator<Item = &'f str>) -> Result<Self> {
+			let mut next = |role: &str| fields.next().ok_or_else(|| RecipeError::new(format!("row hash {role} is absent")));
+			let value = |text: &str, role: &str| text.parse::<u64>().map_err(|error| RecipeError::new(format!("invalid row hash {role}: {error}")));
+			let list = |text: &str, role: &str| text.split(':').filter(|item| !item.is_empty()).map(|item| value(item, role)).collect::<Result<Vec<_>>>();
+			let (ngram, per_order) = (value(next("ids")?, "ids")? as usize, value(next("heads per order")?, "heads per order")? as usize);
+			let (absent, image) = (value(next("absent id")?, "absent id")?, value(next("image id")?, "image id")?);
+			let multipliers = list(next("multipliers")?, "multiplier")?;
+			let seeds = list(next("seeds")?, "seed")?;
+			let offsets = list(next("offsets")?, "offset")?;
+			let vocabularies = list(next("vocabularies")?, "vocabulary")?;
+			let ends = list(next("end ids")?, "end id")?.into_iter().map(|end| u32::try_from(end).map_err(|_| RecipeError::new("row hash end id exceeds u32"))).collect::<Result<Vec<_>>>()?;
+			let hash = Self { ngram, per_order, multipliers, seeds, offsets, vocabularies, ends, absent, image };
+			hash.validate()?;
+			Ok(hash)
+		}
+	}
+
+	/// Row `index` of a stored `[width, rows]` table, decoded from that row's own
+	/// bytes: a raw table holds little-endian f64 values, a quantized one its blocks.
+	pub(crate) fn table_row(table: &StoredWeight, width: usize, index: usize) -> Result<Vec<f64>> {
+		require(width != 0 && index.checked_mul(width).is_some_and(|start| start + width <= table.count), format!("table of {} values has no row {index} of {width}", table.count))?;
+		if table.format.0 == 0 {
+			let bytes = table.bytes.slice(index * width * size_of::<f64>(), width * size_of::<f64>())?;
+			return Ok(bytes.chunks_exact(size_of::<f64>()).map(|value| f64::from_le_bytes(value.try_into().unwrap())).collect());
+		}
+		let spec = table.format.spec().ok_or_else(|| table.format.unavailable())?;
+		require(width % spec.block == 0, format!("table rows of {width} are not whole blocks of {}", spec.block))?;
+		let row = width / spec.block * spec.stride;
+		table.format.decompress(&table.bytes.slice(index * row, row)?, &table.codebook, width)
+	}
 
 	pub struct Ngram<'a> {
 		model: &'a Gguf,
 		table: GgufTensor,
 		taps: Vec<f64>,
-		heads: usize,
+		hash: RowHash,
 		layer: usize,
+		kernel: usize,
 		width: usize,
 		rows: usize,
-		seeds: Vec<u64>,
-		ends: Vec<u32>,
 	}
 
 	impl<'a> Ngram<'a> {
 		pub(super) fn new(model: &'a Gguf) -> Result<Self> {
 			let integer = |key: &str| model.value(key).and_then(GgufValue::integer);
 			let named = |key: &str, fallback| model.value(key).and_then(GgufValue::text).unwrap_or(fallback);
-			let heads = integer("ngram.heads").ok_or_else(|| RecipeError::new("ngram.heads is absent"))? as usize;
-			let name = named("ngram.table", "ngram.table");
-			let table = model.tensor(name).ok_or_else(|| RecipeError::new(format!("n-gram table {name:?} is absent")))?.clone();
-			require(table.shape.len() == 2 && heads != 0, format!("n-gram table {name:?} must be [width, rows] with at least one head"))?;
-			let (width, rows) = (table.shape[0] as usize, table.shape[1] as usize);
-			require(rows % (2 * heads) == 0, format!("n-gram table rows {rows} do not split into {} head ranges", 2 * heads))?;
-			let seeds = match model.value("ngram.seeds") {
-				Some(GgufValue::Array(items)) => items.iter().map(|item| item.integer().ok_or_else(|| RecipeError::new("ngram.seeds holds a non-integer"))).collect::<Result<Vec<_>>>()?,
-				_ => (1..=2 * heads as u64).collect(),
+			let architecture = model.value("general.architecture").and_then(GgufValue::text).unwrap_or("");
+			let ple = |suffix: &str| format!("{architecture}.ple.{suffix}");
+			let (name, hash, layer, kernel) = if let Some(heads) = integer("ngram.heads") {
+				// The seeded form: every head owns an equal range of the table.
+				let heads = heads as usize;
+				let name = named("ngram.table", "ngram.table");
+				let table = model.tensor(name).ok_or_else(|| RecipeError::new(format!("n-gram table {name:?} is absent")))?;
+				require(table.shape.len() == 2 && heads != 0, format!("n-gram table {name:?} must be [width, rows] with at least one head"))?;
+				let rows = table.shape[1] as usize;
+				require(rows % (2 * heads) == 0, format!("n-gram table rows {rows} do not split into {} head ranges", 2 * heads))?;
+				let seeds = match model.value("ngram.seeds") {
+					Some(GgufValue::Array(items)) => {
+						items.iter().map(|item| item.integer().ok_or_else(|| RecipeError::new("ngram.seeds holds a non-integer"))).collect::<Result<Vec<_>>>()?
+					}
+					_ => (1..=2 * heads as u64).collect(),
+				};
+				require(seeds.len() == 2 * heads, format!("ngram.seeds holds {} seeds for {} heads", seeds.len(), 2 * heads))?;
+				let range = (rows / (2 * heads)) as u64;
+				let hash = RowHash {
+					ngram: 3,
+					per_order: heads,
+					multipliers: Vec::new(),
+					seeds,
+					offsets: (0..2 * heads as u64).map(|head| head * range).collect(),
+					vocabularies: vec![range; 2 * heads],
+					ends: integer("tokenizer.ggml.eos_token_id").map(|id| id as u32).into_iter().collect(),
+					absent: u64::from(ABSENT),
+					image: u64::from(ABSENT),
+				};
+				(name, hash, integer("ngram.layer").unwrap_or(0) as usize, integer("ngram.kernel").unwrap_or(1) as usize)
+			} else if model.value(&ple("ngram_size")).is_some() {
+				// The reference form: the metadata names every head's range and the
+				// multipliers of the fold, and the end id stands in for a missing id.
+				let ngram = model.integer_at(&ple("ngram_size"))?;
+				let per_order = model.integer_at(&ple("heads_per_ngram"))?;
+				let eos = model.integer_at(&ple("eos_token_id"))?;
+				let hash = RowHash {
+					ngram,
+					per_order,
+					multipliers: model.integers_at(&ple("layer_multipliers"))?,
+					seeds: Vec::new(),
+					offsets: model.integers_at(&ple("head_offsets"))?,
+					vocabularies: model.integers_at(&ple("head_vocab_sizes"))?,
+					ends: vec![u32::try_from(eos).map_err(|_| RecipeError::new(format!("{} exceeds u32", ple("eos_token_id"))))?],
+					absent: eos as u64,
+					image: integer(&ple("image_token_id")).unwrap_or(eos as u64),
+				};
+				let layer = model.value(&ple("layers")).map(|_| model.indices_at(&ple("layers"))).transpose()?.and_then(|layers| layers.first().copied()).unwrap_or(0);
+				let kernel = model.value(&ple("conv_kernel")).map(|_| model.integer_at(&ple("conv_kernel"))).transpose()?.unwrap_or(1);
+				("per_layer_token_embd.weight", hash, layer, kernel)
+			} else {
+				return Err(RecipeError::new(format!("ngram.heads and {} are absent", ple("ngram_size"))));
 			};
-			require(seeds.len() == 2 * heads, format!("ngram.seeds holds {} seeds for {} heads", seeds.len(), 2 * heads))?;
+			hash.validate()?;
+			let table = model.tensor(name).ok_or_else(|| RecipeError::new(format!("n-gram table {name:?} is absent")))?.clone();
+			require(table.shape.len() == 2, format!("n-gram table {name:?} must be [width, rows]"))?;
+			let (width, rows) = (table.shape[0] as usize, table.shape[1] as usize);
+			require(width != 0 && hash.rows() <= rows, format!("n-gram table {name:?} holds {rows} rows of {width}, the hash reaches row {}", hash.rows()))?;
+			require(kernel != 0, "n-gram convolution kernel must be positive")?;
 			let taps = match model.tensor(named("ngram.conv", "ngram.conv")) {
 				Some(tensor) => model.values(tensor)?,
 				None => Vec::new(),
 			};
-			let ends = integer("tokenizer.ggml.eos_token_id").map(|id| id as u32).into_iter().collect();
-			Ok(Self { model, table, taps, heads, layer: integer("ngram.layer").unwrap_or(0) as usize, width, rows, seeds, ends })
+			Ok(Self { model, table, taps, hash, layer, kernel, width, rows })
 		}
+		/// Heads per n-gram order.
 		pub fn heads(&self) -> usize {
-			self.heads
+			self.hash.per_order
 		}
-		/// Values per token: `2 * heads` rows of the table width.
+		/// Values per token: one row of the table width per head of every order.
 		pub fn width(&self) -> usize {
-			2 * self.heads * self.width
+			self.hash.heads() * self.width
 		}
-		/// The block the gathered vector is added to the stream before.
+		/// The block the gathered vector is added to the stream before, or the layer
+		/// a per-layer embedding block sits at.
 		pub fn layer(&self) -> usize {
 			self.layer
 		}
+		/// The depthwise convolution kernel of a per-layer embedding block.
+		pub fn kernel(&self) -> usize {
+			self.kernel
+		}
+		/// How the rows are addressed.
+		pub fn hash(&self) -> &RowHash {
+			&self.hash
+		}
 		/// The mapped table bytes one token reads, over every convolved position.
 		pub fn bytes(&self) -> usize {
-			2 * self.heads * (self.table.bytes / self.rows) * self.taps.len().max(1)
+			self.hash.heads() * (self.table.bytes / self.rows) * self.taps.len().max(1)
 		}
-		/// The row each head addresses for the token at `position`: the first
-		/// `heads` rows hash the bigram, the rest the trigram. A token before the
-		/// sequence start or behind an end id is absent from the context.
+		/// The mapped table: its name, its rows, and the bytes of one row.
+		pub fn table(&self) -> (&str, usize, usize) {
+			(&self.table.name, self.rows, self.table.bytes / self.rows)
+		}
+		/// The row each head addresses for the token at `position`: the heads
+		/// hashing the bigram first, then those hashing the trigram, and so on. A
+		/// token before the sequence start or behind an end id is absent from the
+		/// context.
 		pub fn rows(&self, ids: &[u32], position: usize) -> Vec<usize> {
-			let previous = |back: usize| if back <= position && !ids[position - back..position].iter().any(|id| self.ends.contains(id)) { ids[position - back] } else { ABSENT };
-			let context = [ids[position], previous(1), previous(2)];
-			let range = self.rows / (2 * self.heads);
-			(0..2 * self.heads)
-				.map(|head| {
-					let order = if head < self.heads { 2 } else { 3 };
-					let hash = context[..order].iter().fold(self.seeds[head], |hash, id| {
-						let mixed = (hash ^ u64::from(*id)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-						mixed ^ (mixed >> 32)
-					});
-					head * range + (hash % range as u64) as usize
-				})
-				.collect()
+			self.hash.rows_at(ids, position)
+		}
+		/// The per-layer embedding block this table feeds: `heads` rows of `width`
+		/// per token, a `kernel`-wide depthwise convolution dilated by the n-gram
+		/// size, and the table's row count.
+		pub(super) fn block(&self) -> PleBlock {
+			PleBlock { heads: self.hash.heads(), width: self.width, rows: self.rows, kernel: self.kernel, dilation: self.hash.ngram, hash: self.hash.clone() }
 		}
 		/// The rows one token addresses, concatenated, decoded from their own bytes.
 		fn gather(&self, ids: &[u32], position: usize) -> Result<Vec<f64>> {
@@ -5921,26 +6170,27 @@ mod ngram {
 				let (head, tail) = split_at_block(&graph, self.layer)?;
 				let mut statistics = 0;
 				let mut stream = match &head {
-					Some(head) => forward_part(head, samples, device, stored, &mut statistics)?,
+					Some(head) => forward_part(head, samples, samples, device, stored, &mut statistics)?,
 					None => samples.to_vec(),
 				};
 				require(stream.len() == injected.len(), format!("block {} takes {} values, the n-gram table gathers {}", self.layer, stream.len(), injected.len()))?;
 				for (value, added) in stream.iter_mut().zip(&injected) {
 					*value += added;
 				}
-				forward_part(&tail, &stream, device, stored, &mut statistics)
+				forward_part(&tail, &stream, samples, device, stored, &mut statistics)
 			})
 		}
 	}
 
 	impl Gguf {
-		/// The n-gram table the metadata describes, gathered on the host.
+		/// The hashed row table the metadata describes, gathered on the host: the
+		/// `ngram.*` keys or the `<arch>.ple.*` keys of a per-layer embedding.
 		pub fn ngram(&self) -> Ngram<'_> {
 			Ngram::new(self).unwrap_or_else(|error| panic!("{error}"))
 		}
 	}
 }
-pub use ngram::Ngram;
+pub use ngram::{Ngram, RowHash};
 mod bundle {
 	use super::*;
 	use std::{collections::BTreeMap, io::Write as _, str::FromStr};
@@ -6050,6 +6300,7 @@ mod bundle {
 			Operation::Embed(vocabulary, width) => format!("embed,{vocabulary},{width}"),
 			Operation::Dconv(kernel) => format!("dconv,{kernel}"),
 			Operation::Delta(delta) => format!("delta,{},{},{},{},{},{}", delta.heads, delta.kernel, delta.key_heads, delta.key_width, delta.value_width, delta.output),
+			Operation::Ple(ple) => format!("ple,{},{},{},{},{},{}", ple.heads, ple.width, ple.rows, ple.kernel, ple.dilation, ple.hash.text()),
 		}
 	}
 	fn estimator(name: &str, param: usize) -> Result<Estimator> {
@@ -6128,6 +6379,14 @@ mod bundle {
 				let (key_heads, key_width) = (extent("delta key heads")?, extent("delta key width")?);
 				let (value_width, output) = (extent("delta value width")?, extent("delta output width")?);
 				Ok(Operation::Delta(DeltaBlock { heads, kernel, key_heads, key_width, value_width, output }))
+			}
+			"ple" => {
+				let (heads, width) = (value_at(fields.next(), "per-layer embedding heads")?, value_at(fields.next(), "per-layer embedding width")?);
+				let (rows, kernel) = (value_at(fields.next(), "per-layer embedding rows")?, value_at(fields.next(), "per-layer embedding kernel")?);
+				let dilation = value_at(fields.next(), "per-layer embedding dilation")?;
+				let hash = RowHash::parse(&mut fields)?;
+				require(hash.heads() == heads, format!("per-layer embedding names {heads} heads, its hash addresses {}", hash.heads()))?;
+				Ok(Operation::Ple(PleBlock { heads, width, rows, kernel, dilation, hash }))
 			}
 			_ => Err(RecipeError::new(format!("invalid model operation {name:?}"))),
 		}
@@ -6214,7 +6473,7 @@ mod bundle {
 		pub artifact: String,
 	}
 
-	fn raw_weight(values: &[f64]) -> StoredWeight {
+	pub(super) fn raw_weight(values: &[f64]) -> StoredWeight {
 		let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
 		StoredWeight { format: StorageFormat(0), count: values.len(), bytes: bytes.into(), codebook: Vec::new(), arithmetic: values.to_vec() }
 	}
@@ -6330,10 +6589,12 @@ mod bundle {
 				"semantic model normalization stats have the wrong width",
 			)?;
 			require(!self.artifact.is_empty(), "native artifact identity is absent")?;
-			// An embed block saves its table as the gather's packed context, so it owns a
-			// tensor without a parameter span for the frozen mask to cover.
-			let tables = model.blocks.iter().filter_map(|block| match block.operation {
-				Operation::Embed(vocabulary, width) => Some(vocabulary.saturating_mul(width)),
+			// An embed block saves its table as the gather's packed context, and a
+			// per-layer embedding its host table, so each owns a tensor without a
+			// parameter span for the frozen mask to cover.
+			let tables = model.blocks.iter().filter_map(|block| match &block.operation {
+				Operation::Embed(vocabulary, width) => Some(vocabulary.saturating_mul(*width)),
+				Operation::Ple(ple) => Some(ple.table()),
 				_ => None,
 			});
 			require(self.frozen.len().saturating_add(tables.sum::<usize>()) == self.tensors.iter().map(|tensor| tensor.count).sum::<usize>(), "semantic model frozen weights are incomplete")?;
@@ -6638,7 +6899,7 @@ mod bundle {
 					require(encoded.count == node.weights(), "saved semantic tensor has the wrong shape")?;
 					current.graph.parameters[node.offset..node.offset + node.parameters].copy_from_slice(&encoded.arithmetic[..node.parameters]);
 					if let Some(slot) = current.graph.stored.get_mut(index) {
-						*slot = (encoded.format.0 != 0).then_some(encoded.clone())
+						*slot = (encoded.format.0 != 0 || node.table()).then_some(encoded.clone())
 					}
 					tensor += 1;
 				}
@@ -6875,6 +7136,25 @@ impl DeltaBlock {
 		Ok((keys, key, value, if self.output == 0 { channels } else { self.output }))
 	}
 }
+/// One per-layer embedding block: every token gathers `heads` rows of `width`
+/// from a host-resident table of `rows` rows, addressed by `hash`, and the block
+/// projects, gates, convolves and adds them into the stream it sits on. The
+/// depthwise convolution is `kernel` wide and dilated by `dilation` positions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PleBlock {
+	heads: usize,
+	width: usize,
+	rows: usize,
+	kernel: usize,
+	dilation: usize,
+	hash: RowHash,
+}
+impl PleBlock {
+	/// Values the table holds: its rows of the head width.
+	fn table(&self) -> usize {
+		self.rows.saturating_mul(self.width)
+	}
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Operation {
 	Layer(usize),
@@ -6892,6 +7172,7 @@ enum Operation {
 	Hyper(usize, usize, Vec<Block>),
 	Dconv(usize),
 	Delta(DeltaBlock),
+	Ple(PleBlock),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -7137,6 +7418,12 @@ impl Model {
 	pub fn hyper(&self, lanes: usize, rank: usize, branch: &Model) -> Self {
 		assert!(!branch.blocks.is_empty(), "hyper-connection branch requires a block");
 		self.push(Operation::Hyper(lanes, rank, branch.blocks.clone()))
+	}
+	/// Per-layer embedding: every token gathers `table`'s rows on the host, and the
+	/// block projects, gates and convolves them into the stream it sits on, at
+	/// whatever width the stream has there.
+	pub fn ple(&self, table: &Ngram<'_>) -> Self {
+		self.push(Operation::Ple(table.block()))
 	}
 	pub fn norm(&self, normalization: impl NormalizationSelector) -> Self {
 		let mut model = self.suffix();
@@ -7999,6 +8286,21 @@ impl StoredBytes {
 	fn runs(&self) -> impl Iterator<Item = &[u8]> {
 		self.0.iter().map(|run| &**run)
 	}
+	/// The `length` bytes at `at`, gathered across the runs they fall in, so one
+	/// row of a mapped table is read without touching the rest of it.
+	fn slice(&self, at: usize, length: usize) -> Result<Vec<u8>> {
+		require(at.checked_add(length).is_some_and(|end| end <= self.len()), format!("stored bytes {at}..{} exceed {} bytes", at.saturating_add(length), self.len()))?;
+		let (mut out, mut skipped) = (Vec::with_capacity(length), 0);
+		for run in self.runs() {
+			let start = (at.max(skipped) - skipped).min(run.len());
+			let end = ((at + length).saturating_sub(skipped)).min(run.len());
+			if start < end {
+				out.extend_from_slice(&run[start..end]);
+			}
+			skipped += run.len();
+		}
+		Ok(out)
+	}
 	/// Appends every run to `out`, which is the only point a mapped weight is copied.
 	fn extend_into(&self, out: &mut Vec<u8>) {
 		for run in self.runs() {
@@ -8571,6 +8873,7 @@ impl Operation {
 			Self::Hyper(..) => "hyper",
 			Self::Dconv(_) => "dconv",
 			Self::Delta(..) => "delta",
+			Self::Ple(_) => "ple",
 		}
 	}
 	/// Reports whether the operation owns weights that a qualifier can govern.
@@ -8755,7 +9058,7 @@ impl Recipe {
 		let result = bundle::run_infer(&path, input, |stored, samples| {
 			let config = Config::load()?;
 			let graph = materialize_saved_graph(stored, samples, device, config)?;
-			let mut tape = NativeTape::new(&graph, samples, &[], device, stored.precision, None)?;
+			let mut tape = NativeTape::new(&graph, samples, samples, &[], device, stored.precision, None)?;
 			tape.inject_bn_stats(&stored.bn_stats)?;
 			tape.forward()?;
 			tape.predictions()
@@ -8784,6 +9087,14 @@ impl Gguf {
 	/// bound to a weight without a bias row lowers and runs without one.
 	pub fn infer(&self, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Vec<f64> {
 		infer_gguf(self, blocks, plan, input, channels).unwrap_or_else(|error| panic!("{error}"))
+	}
+	/// Autoregressive decode over `blocks` bound from `plan`, as `recipe.decode`
+	/// runs a saved model: one tape of `sequence` id positions holds every block's
+	/// state, the prompt prefills it, and each step adds one id and forwards only
+	/// the positions it reaches. The logits are the model's output after the last
+	/// forward.
+	pub fn decode(&self, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Generation {
+		decode_gguf(self, blocks, plan, sequence, prompt, sampler, stop, budget).unwrap_or_else(|error| panic!("{error}"))
 	}
 	/// An empty weight plan to fill from this model's tensors.
 	pub fn plan(&self) -> Binding {
@@ -8823,6 +9134,41 @@ impl Binding {
 /// `plan`, and runs one forward. `channels` names the input's channel axis, so
 /// the rest of its length is the sequence the blocks walk.
 fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Result<Vec<f64>> {
+	let (graph, device) = bound_graph(model, blocks, plan, input, channels)?;
+	let mut tape = NativeTape::new(&graph, input, input, &[], device, Compute::FP64, None)?;
+	tape.forward()?;
+	tape.predictions()
+}
+fn decode_gguf(model: &Gguf, blocks: &Model, plan: &Binding, sequence: usize, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize) -> Result<Generation> {
+	require(!prompt.is_empty(), "decode prompt is empty")?;
+	require(checked_add(prompt.len(), budget, "decode length")? <= sequence, format!("decode of {} prompt ids and {budget} steps exceeds the sequence of {sequence}", prompt.len()))?;
+	let mut samples = vec![0.0; sequence];
+	for (slot, id) in samples.iter_mut().zip(prompt) {
+		*slot = f64::from(*id);
+	}
+	let (graph, device) = bound_graph(model, blocks, plan, &samples, 1)?;
+	let mut tape = NativeTape::new(&graph, &samples, &samples, &[], device, Compute::FP64, None)?;
+	decode_steps(
+		&mut tape,
+		&mut samples,
+		prompt,
+		sampler,
+		stop,
+		budget,
+		|_| Ok(()),
+		|tape, samples, settled, reached| {
+			for position in settled as usize..reached as usize {
+				tape.write_sample(position, samples[position])?;
+			}
+			tape.forward_window(settled, reached)?;
+			tape.predictions()
+		},
+	)
+}
+/// Compiles `blocks` over `input` and fills every weighted node from `plan`.
+/// `channels` names the input's channel axis, so the rest of its length is the
+/// sequence the blocks walk.
+fn bound_graph(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Result<(Graph, &'static Gpu)> {
 	require(channels != 0 && !input.is_empty() && input.len() % channels == 0, "the input is not a whole number of channel rows")?;
 	let shape = Shape { channels, length: input.len() / channels };
 	let (device, config) = (selected_gpu()?, Config::load()?);
@@ -8845,9 +9191,7 @@ fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], chann
 		bound: Some(model.bound(plan)?),
 	};
 	let graph = compile(blocks, &data, &data.targets, 1, device, config, false)?;
-	let mut tape = NativeTape::new(&graph, input, &[], device, Compute::FP64, None)?;
-	tape.forward()?;
-	tape.predictions()
+	Ok((graph, device))
 }
 /// One id at a time from a model's logits: a repetition penalty over the
 /// recent ids, then top-k, top-p, min-p, temperature, and a seeded draw.
@@ -9028,7 +9372,7 @@ fn serve_decode(path: &impl AsRef<Path>, stream: &mut std::net::TcpStream) -> Re
 	})?;
 	write(stream, b"0\r\n\r\n")
 }
-fn try_decode(path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
+fn try_decode(path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, emit: impl FnMut(u32) -> Result<()>) -> Result<Generation> {
 	let path = resolve_path(path)?;
 	let device = selected_gpu()?;
 	let (_, graphs) = bundle::load_semantic(&path)?;
@@ -9045,20 +9389,31 @@ fn try_decode(path: impl AsRef<Path>, prompt: &[u32], sampler: &mut Sampler, sto
 		*slot = f64::from(*id);
 	}
 	let graph = materialize_saved_graph(stored, &samples, device, Config::load()?)?;
-	let mut tape = NativeTape::new(&graph, &samples, &[], device, stored.precision, None)?;
+	let mut tape = NativeTape::new(&graph, &samples, &samples, &[], device, stored.precision, None)?;
 	tape.inject_bn_stats(&stored.bn_stats)?;
-	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
-	let mut settled = 0;
-	for step in 0..=budget {
-		let reached = narrow(generation.ids.len(), "decode position")? as u32;
-		let started = std::time::Instant::now();
-		let logits = bundle::infer_graphs(&graphs, &samples, |_, prepared| {
+	decode_steps(&mut tape, &mut samples, prompt, sampler, stop, budget, emit, |tape, samples, settled, reached| {
+		bundle::infer_graphs(&graphs, samples, |_, prepared| {
 			for position in settled as usize..reached as usize {
 				tape.write_sample(position, prepared[position])?;
 			}
 			tape.forward_window(settled, reached)?;
 			tape.predictions()
-		})?;
+		})
+	})
+}
+/// One id at a time over a tape whose input is a sequence of ids. The prefill
+/// runs the prompt, every step adds one id and forwards the positions it reaches
+/// through `logits`, and `samples` holds the whole sequence as the ids settle.
+fn decode_steps(
+	tape: &mut NativeTape, samples: &mut [f64], prompt: &[u32], sampler: &mut Sampler, stop: &[u32], budget: usize, mut emit: impl FnMut(u32) -> Result<()>,
+	mut logits: impl FnMut(&mut NativeTape, &[f64], u32, u32) -> Result<Vec<f64>>,
+) -> Result<Generation> {
+	let mut generation = Generation { ids: prompt.to_vec(), logits: Vec::new(), prefill_seconds: 0.0, step_seconds: Vec::new() };
+	let mut settled = 0;
+	for step in 0..=budget {
+		let reached = narrow(generation.ids.len(), "decode position")? as u32;
+		let started = std::time::Instant::now();
+		let logits = logits(tape, samples, settled, reached)?;
 		let seconds = started.elapsed().as_secs_f64();
 		if step == 0 {
 			generation.prefill_seconds = seconds;
@@ -9221,9 +9576,11 @@ impl Placed {
 	}
 	fn forward(&self, stored: &bundle::SemanticGraph, samples: &[f64]) -> Result<Vec<f64>> {
 		let graph = materialize_saved_graph(stored, samples, self.devices[0], Config::load()?)?;
+		// Every part reads the model's ids for the rows its lookups gather, whatever
+		// stream it takes as input.
 		let (mut stream, mut statistics) = (samples.to_vec(), 0);
 		for (part, device) in split_graph(&graph, &self.split)?.iter().zip(self.devices) {
-			stream = forward_part(part, &stream, device, stored, &mut statistics)?;
+			stream = forward_part(part, &stream, samples, device, stored, &mut statistics)?;
 		}
 		Ok(stream)
 	}
@@ -9270,6 +9627,10 @@ enum Primitive {
 	Dconv = 17,
 	Delta = 18,
 	ExpertOut = 19,
+	/// Rows gathered on the host from a table the device never holds.
+	Lookup = 20,
+	/// Every group of channels summed into one.
+	Fold = 21,
 }
 struct ScalarProgram(Vec<f64>);
 impl ScalarProgram {
@@ -9300,8 +9661,17 @@ impl ScalarProgram {
 impl Node {
 	// A gather owns no trainable parameters: its table is the packed context the
 	// kernel reads, so its tensor spans the vocabulary instead of a parameter span.
+	// A lookup's table stays on the host and spans its rows of the head width.
 	fn weights(&self) -> usize {
-		if self.op == Primitive::Gather { (self.argument[0] as usize).saturating_mul(self.output.channels) } else { self.parameters }
+		match self.op {
+			Primitive::Gather => (self.argument[0] as usize).saturating_mul(self.output.channels),
+			Primitive::Lookup => (self.argument[2] as usize).saturating_mul(self.argument[1] as usize),
+			_ => self.parameters,
+		}
+	}
+	/// Whether the node's weights are a table it reads rows of rather than a parameter span.
+	fn table(&self) -> bool {
+		matches!(self.op, Primitive::Gather | Primitive::Lookup)
 	}
 	fn identity(&self, index: usize) -> String {
 		let prim = match self.op {
@@ -9322,6 +9692,8 @@ impl Node {
 			Primitive::TopK => "TopK",
 			Primitive::ExpertIn => "ExpertIn",
 			Primitive::ExpertOut => "ExpertOut",
+			Primitive::Lookup => "Lookup",
+			Primitive::Fold => "Fold",
 		};
 		format!(
 			"block {} {}, node {} {}, input {}x{}, output {}x{}, offset={} count={}, source={}",
@@ -9416,10 +9788,14 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 		if graph.stored[index].as_ref().is_some_and(|stored| stored.arithmetic.is_empty()) {
 			continue;
 		}
-		// A gather owns no parameter span, so its table is the tensor it was drawn into.
-		let drawn = graph.stored[index].take().filter(|_| node.op == Primitive::Gather).map(|stored| stored.arithmetic);
+		// A table owns no parameter span, so it is the tensor it was drawn into, and
+		// one that carries no quantization stays as drawn.
+		let drawn = graph.stored[index].take().filter(|_| node.table()).map(|stored| stored.arithmetic);
 		let weights = drawn.as_deref().unwrap_or(&graph.parameters[node.offset..node.offset + node.parameters]);
 		if weights.is_empty() || node.argument[8] == 0.0 {
+			if let Some(arithmetic) = drawn {
+				graph.stored[index] = Some(bundle::raw_weight(&arithmetic));
+			}
 			continue;
 		}
 		let format = StorageFormat(node.argument[8] as u16);
@@ -9438,7 +9814,7 @@ fn encode_graph_storage(graph: &mut Graph, config: Config) -> Result<()> {
 }
 fn sequential_operation(operation: &Operation) -> bool {
 	match operation {
-		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) => true,
+		Operation::Conv(..) | Operation::Pool(..) | Operation::Attention(..) | Operation::Dconv(..) | Operation::Delta(..) | Operation::Ple(..) => true,
 		Operation::Residual(parts) => parts.iter().any(|part| matches!(part, Residual::Conv(..))),
 		Operation::Hyper(_, _, blocks) => blocks.iter().any(|block| sequential_operation(&block.operation)),
 		_ => false,
@@ -9535,7 +9911,7 @@ fn materialize_saved_graph(saved: &bundle::SemanticGraph, samples: &[f64], gpu: 
 		require(encoded.count == node.weights(), "saved semantic tensor has the wrong shape")?;
 		graph.parameters[node.offset..node.offset + node.parameters].copy_from_slice(&encoded.arithmetic[..node.parameters]);
 		if let Some(slot) = graph.stored.get_mut(index) {
-			*slot = (encoded.format.0 != 0).then_some(encoded.clone())
+			*slot = (encoded.format.0 != 0 || node.table()).then_some(encoded.clone())
 		}
 		tensor += 1;
 	}
@@ -9578,8 +9954,8 @@ fn split_at_block(graph: &Graph, block: usize) -> Result<(Option<Graph>, Graph)>
 }
 /// One part of a split graph run forward on its device, reading the batch
 /// normalization statistics that follow the parts already run.
-fn forward_part(graph: &Graph, samples: &[f64], gpu: &'static Gpu, stored: &bundle::SemanticGraph, statistics: &mut usize) -> Result<Vec<f64>> {
-	let mut tape = NativeTape::new(graph, samples, &[], gpu, stored.precision, None)?;
+fn forward_part(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu, stored: &bundle::SemanticGraph, statistics: &mut usize) -> Result<Vec<f64>> {
+	let mut tape = NativeTape::new(graph, samples, tokens, &[], gpu, stored.precision, None)?;
 	let count = tape.batch_normalizations.iter().map(|(_, channels)| 2 * channels).sum::<usize>();
 	tape.inject_bn_stats(stored.bn_stats.get(*statistics..*statistics + count).ok_or_else(|| RecipeError::new("saved batch normalization statistics are incomplete"))?)?;
 	*statistics += count;
@@ -9610,7 +9986,9 @@ fn append_graph(graph: &mut Graph, mut part: Graph) -> Result<i32> {
 	Ok(graph.source)
 }
 fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, targets: &[f64], rows: usize, gpu: &'static Gpu, config: Config) -> Result<()> {
-	if graph.lanes != 0 && !matches!(block.operation, Operation::Hyper(..)) {
+	// A per-layer embedding adds into the lanes-wide stream itself, so it keeps
+	// the stream open as a hyper-connection block does.
+	if graph.lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..)) {
 		lower_collapse(graph)?;
 	}
 	let skip = graph.source;
@@ -9620,8 +9998,9 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 		Operation::Conv(f, k) => lower_conv(graph, *f, *k)?,
 		Operation::Pool(size) => lower_pool(graph, *size)?,
 		Operation::Embed(vocabulary, width) => lower_embed(graph, *vocabulary, *width)?,
-		Operation::Dconv(kernel) => lower_dconv(graph, *kernel)?,
+		Operation::Dconv(kernel) => lower_dconv(graph, *kernel, 1)?,
 		Operation::Delta(delta) => lower_delta(graph, *delta, config)?,
+		Operation::Ple(ple) => lower_ple(graph, ple, config)?,
 		Operation::Attention(attention) => lower_attention(graph, *attention, block.qk)?,
 		Operation::Rnn(width) => lower_scan(graph, *width, 1)?,
 		Operation::Gru(width) => lower_scan(graph, *width, 3)?,
@@ -9688,6 +10067,11 @@ fn push_node(graph: &mut Graph, op: Primitive, output: Shape, parameters: usize,
 				BoundWeight::Stored(weight) => {
 					node.packed = true;
 					Some(weight)
+				}
+				// A table has no parameter span: its rows decode from the bound
+				// bytes, on the device or on the host, so it binds only packed.
+				BoundWeight::Values(_) if node.table() => {
+					return Err(RecipeError::new(format!("{} bind {}, a table that reads its rows only from a block-quantized layout", bound.names, node.identity(index))));
 				}
 				BoundWeight::Values(values) => {
 					graph.bound_values.push((index, values));
@@ -9907,10 +10291,84 @@ fn lower_embed(graph: &mut Graph, vocabulary: usize, width: usize) -> Result<()>
 	push_node(graph, Primitive::Gather, output, 0, arguments(vocabulary as f64, width as f64), -2)
 }
 /// A causal depthwise convolution keeps the shape: every channel mixes its own
-/// last `kernel` positions with one tap each, left-padded with zeros.
-fn lower_dconv(graph: &mut Graph, kernel: usize) -> Result<()> {
-	require(kernel != 0, "depthwise convolution kernel must be positive")?;
-	push_node(graph, Primitive::Dconv, graph.output, checked_mul(graph.output.channels, kernel, "depthwise taps")?, arguments(kernel as f64, 0.0), -2)
+/// last `kernel` positions with one tap each, left-padded with zeros. The taps
+/// sit `dilation` positions apart, so position `t` reads `t - j * dilation`.
+fn lower_dconv(graph: &mut Graph, kernel: usize, dilation: usize) -> Result<()> {
+	require(kernel != 0 && dilation != 0, "depthwise convolution kernel and dilation must be positive")?;
+	push_node(graph, Primitive::Dconv, graph.output, checked_mul(graph.output.channels, kernel, "depthwise taps")?, arguments(kernel as f64, dilation as f64), -2)
+}
+/// A per-layer embedding. The rows one token addresses are gathered on the host
+/// and staged for the device, which projects them to a key and a value without
+/// a bias. The key and the stream take grouped root-mean-square norms over one
+/// lane with a scale over every lane; their per-lane dot product over the root of
+/// the lane width, through a signed square root and a sigmoid, gates the value
+/// broadcast over the lanes. A third grouped norm, a causal depthwise convolution
+/// dilated by the n-gram size and a SiLU form the second term, and both add into
+/// the stream, which keeps its width.
+fn lower_ple(graph: &mut Graph, ple: &PleBlock, config: Config) -> Result<()> {
+	let (stream, shape) = (graph.source, graph.output);
+	require(stream >= 0, "a per-layer embedding follows the block whose stream it adds into")?;
+	require(ple.heads != 0 && ple.width != 0 && ple.kernel != 0 && ple.dilation != 0, "per-layer embedding dimensions must be positive")?;
+	ple.hash.validate()?;
+	require(ple.hash.heads() == ple.heads, format!("per-layer embedding names {} heads, its hash addresses {}", ple.heads, ple.hash.heads()))?;
+	require(ple.hash.rows() <= ple.rows, format!("per-layer embedding table holds {} rows, its hash reaches row {}", ple.rows, ple.hash.rows()))?;
+	let lanes = graph.lanes.max(1);
+	require(shape.channels != 0 && shape.channels % lanes == 0, format!("per-layer embedding stream of {} does not split into {lanes} lanes", shape.channels))?;
+	let channels = shape.channels / lanes;
+	let gathered = Shape { channels: checked_mul(ple.heads, ple.width, "per-layer embedding width")?, length: shape.length };
+	// The lookup reads the ids on the host, so it names no device source; the
+	// hash rides beside the node as program words.
+	let (program_offset, words) = (graph.programs.len(), ple.hash.words());
+	let program_count = words.len().div_ceil(3);
+	graph.programs.extend(words);
+	graph.programs.resize(program_offset + program_count * 3, 0.0);
+	reset(graph, -2, Shape { channels: 1, length: shape.length });
+	let argument = [ple.heads as f64, ple.width as f64, ple.rows as f64, ple.kernel as f64, ple.dilation as f64, 0.0, 0.0, 0.0, 0.0];
+	push_node(graph, Primitive::Lookup, gathered, 0, argument, -2)?;
+	if let Some(node) = graph.nodes.last_mut() {
+		(node.program_offset, node.program_count) = (program_offset, program_count);
+	}
+	let rows = graph.source;
+	lower_project(graph, shape.channels)?;
+	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
+	let key = graph.source;
+	reset(graph, stream, shape);
+	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
+	let query = graph.source;
+	binary(graph, key, query, shape, ScalarOpcode::Multiply)?;
+	push_node(graph, Primitive::Fold, Shape { channels: lanes, length: shape.length }, 0, arguments(channels as f64, 0.0), -2)?;
+	// gate = sigmoid(sign(s) * sqrt(max(|s|, 1e-6))) for s the scaled dot product.
+	let (mut program, x) = (ScalarProgram(Vec::new()), -1.0);
+	let scale = program.constant(1.0 / (channels as f64).sqrt());
+	let s = program.op(ScalarOpcode::Multiply, x, scale);
+	let (zero, one, half) = (program.constant(0.0), program.constant(1.0), program.constant(0.5));
+	let magnitude = program.unary(ScalarOpcode::Absolute, s);
+	let floor = program.constant(1e-6);
+	let above = program.op(ScalarOpcode::Greater, magnitude, floor);
+	let clamped = program.choose(above, magnitude, floor);
+	let log = program.unary(ScalarOpcode::Log, clamped);
+	let half_log = program.op(ScalarOpcode::Multiply, half, log);
+	let root = program.unary(ScalarOpcode::Exp, half_log);
+	let positive = program.op(ScalarOpcode::Greater, s, zero);
+	let negative = program.op(ScalarOpcode::Greater, zero, s);
+	let sign = program.op(ScalarOpcode::Subtract, positive, negative);
+	let signed = program.op(ScalarOpcode::Multiply, sign, root);
+	let negated = program.op(ScalarOpcode::Subtract, zero, signed);
+	let exponential = program.unary(ScalarOpcode::Exp, negated);
+	let denominator = program.op(ScalarOpcode::Add, one, exponential);
+	program.op(ScalarOpcode::Divide, one, denominator);
+	push_program(graph, -2, &[], program)?;
+	let gate = graph.source;
+	reset(graph, rows, gathered);
+	lower_project(graph, channels)?;
+	push_node(graph, Primitive::Outer, shape, 0, arguments(lanes as f64, 0.0), gate)?;
+	let gated = graph.source;
+	lower_normalize(graph, BlockNormalization::Rms, channels, shape.channels)?;
+	lower_dconv(graph, ple.kernel, ple.dilation)?;
+	lower_activation(graph, Activation::Silu, config)?;
+	let convolved = graph.source;
+	let added = binary(graph, gated, convolved, shape, ScalarOpcode::Add)?;
+	binary(graph, stream, added, shape, ScalarOpcode::Add).map(drop)
 }
 /// A gated delta rule carries one `width` by `width` state per head. One projection
 /// feeds the causal depthwise convolution over the concatenated query, key and value
@@ -9932,7 +10390,7 @@ fn lower_delta(graph: &mut Graph, delta: DeltaBlock, config: Config) -> Result<(
 	let gates = graph.source;
 	reset(graph, source, input);
 	lower_project(graph, checked_add(checked_mul(2, keys, "delta query and key width")?, inner, "delta projection width")?)?;
-	lower_dconv(graph, kernel)?;
+	lower_dconv(graph, kernel, 1)?;
 	// The projection lays the queries and keys out ahead of the values, so the
 	// normalized span stops at the value plane and each key head owns one group.
 	lower_normalize(graph, BlockNormalization::L2, key_width, checked_mul(2, keys, "delta query and key span")?)?;
@@ -10254,9 +10712,9 @@ fn initialize_graph(graph: &mut Graph, config: Config) {
 		};
 		let fan_in = span.max(1) as f64;
 		let scale = config.initial / fan_in.sqrt();
-		// The table is the gather's packed context rather than a trainable span, so it
-		// is drawn once into the node's tensor and no optimizer step can write it back.
-		if node.op == Primitive::Gather {
+		// A table is the node's context rather than a trainable span, so it is
+		// drawn once into the node's tensor and no optimizer step can write it back.
+		if node.table() {
 			if graph.stored[position].is_none() {
 				let arithmetic = (0..node.weights()).map(|_| next_weight(&mut state, scale)).collect::<Vec<_>>();
 				graph.stored[position] = Some(StoredWeight { format: StorageFormat(0), count: arithmetic.len(), bytes: Vec::new().into(), codebook: Vec::new(), arithmetic });
@@ -10485,11 +10943,23 @@ fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetS
 	let artifact = bundle::artifact_key(model, &schema, precision, graph, target);
 	bundle::StoredGraph { graph: graph.clone(), model: model.clone(), precision, inputs, outputs, norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new(), artifact }
 }
+/// A host-gathered table of one lookup node: the rows every token addresses are
+/// decoded on the host and staged in the node's context as [row][position][channel]
+/// for the positions a forward writes.
+struct HostLookup {
+	context: usize,
+	hash: RowHash,
+	table: StoredWeight,
+	width: usize,
+	length: usize,
+}
 struct NativeTape {
 	program: NativeProgram,
 	precision: NativePrecision,
 	values: Buffer,
 	contexts: Buffer,
+	lookups: Vec<HostLookup>,
+	tokens: Vec<f64>,
 	adjoints: Buffer,
 	batch_normalizations: Vec<(usize, usize)>,
 	samples: Buffer,
@@ -10529,7 +10999,10 @@ impl EpochOperation {
 }
 
 impl NativeTape {
-	fn new(graph: &Graph, samples: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
+	/// `tokens` are the model's ids, one per position of every row, which the
+	/// lookups of this graph gather rows for; a whole graph reads its own
+	/// samples, and a part of a split graph reads the ids its stream came from.
+	fn new(graph: &Graph, samples: &[f64], tokens: &[f64], targets: &[f64], gpu: &'static Gpu, precision: Compute, loss: Option<LossFunction>) -> Result<Self> {
 		let input = graph.input.elements();
 		require(input != 0 && !samples.is_empty() && samples.len() % input == 0, format!("model input batch expected a nonempty multiple of {input} values, received {}", samples.len()))?;
 		let rows = samples.len() / input;
@@ -10562,6 +11035,7 @@ impl NativeTape {
 		let input_adjoint_bytes = if training { checked_mul(samples.len(), precision.model.bytes(), "native input adjoint allocation")?.max(1) } else { 1 };
 		// A graph that starts with a gather reads its input as i32 token ids.
 		let vocabulary = graph.nodes.first().filter(|node| node.op == Primitive::Gather).map_or(0.0, |node| node.argument[0]);
+		let tokens = tokens.to_vec();
 		let samples = if vocabulary > 0.0 {
 			Buffer::upload(gpu, &samples.iter().map(|id| token_id(*id, vocabulary)).collect::<Result<Vec<_>>>()?)?
 		} else {
@@ -10581,6 +11055,9 @@ impl NativeTape {
 		// The packed embedding table is the gather's context, so it reaches the
 		// device whole once and the kernel then reads only the rows it addresses.
 		let mut contexts = vec![0_u8; layout.contexts_bytes.max(1)];
+		// A lookup's table never leaves the host: the tape keeps it with its hash
+		// and stages the rows of every forward window from the ids it holds.
+		let (mut lookups, positions) = (Vec::new(), graph_positions(graph));
 		for (index, node) in graph.nodes.iter().enumerate() {
 			if node.op == Primitive::Gather {
 				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("embedding table is absent"))?;
@@ -10589,12 +11066,21 @@ impl NativeTape {
 				require(end <= contexts.len(), "embedding table exceeds its context arena")?;
 				table.bytes.copy_into(&mut contexts[offset..end]);
 			}
+			if node.op == Primitive::Lookup {
+				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?.clone();
+				let words = graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).ok_or_else(|| RecipeError::new("per-layer embedding hash is absent"))?;
+				require(node.output.length == positions, format!("per-layer embedding reads {} positions of {positions} ids", node.output.length))?;
+				require(tokens.len() == rows * positions, format!("per-layer embedding reads {} ids for {rows} rows of {positions} positions, received {}", rows * positions, tokens.len()))?;
+				lookups.push(HostLookup { context: layout.contexts[index], hash: RowHash::from_words(words)?, table, width: node.argument[1] as usize, length: node.output.length });
+			}
 		}
-		Ok(Self {
+		let tape = Self {
 			program,
 			precision,
 			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
 			contexts: Buffer::upload(gpu, &contexts)?,
+			lookups,
+			tokens,
 			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes },
 			batch_normalizations,
 			samples,
@@ -10612,12 +11098,42 @@ impl NativeTape {
 			step,
 			output,
 			capacity: rows,
-			positions: narrow(graph_positions(graph), "native input positions")? as u32,
+			positions: narrow(positions, "native input positions")? as u32,
 			vocabulary,
-		})
+		};
+		tape.stage_lookups(0, tape.positions)?;
+		Ok(tape)
 	}
 	fn forward(&mut self) -> Result<()> {
 		self.forward_window(0, self.positions)
+	}
+	/// The id one input value names.
+	fn token(&self, value: f64) -> Result<u32> {
+		if self.vocabulary > 0.0 {
+			return token_id(value, self.vocabulary).map(|id| id as u32);
+		}
+		require(value.fract() == 0.0 && value >= 0.0 && value <= f64::from(u32::MAX), format!("input value {value} is not a token id"))?;
+		Ok(value as u32)
+	}
+	/// Gather every lookup's rows for the positions `begin..end` of every row on
+	/// the host and write them into the staging context the device reads.
+	fn stage_lookups(&self, begin: u32, end: u32) -> Result<()> {
+		let (begin, end, bytes) = (begin as usize, end as usize, self.precision.model.bytes());
+		for lookup in &self.lookups {
+			let channels = lookup.hash.heads() * lookup.width;
+			for row in 0..self.rows as usize {
+				let ids = self.tokens[row * lookup.length..(row + 1) * lookup.length].iter().map(|value| self.token(*value)).collect::<Result<Vec<_>>>()?;
+				let mut staged = Vec::with_capacity((end - begin) * channels);
+				for position in begin..end {
+					for index in lookup.hash.rows_at(&ids, position) {
+						staged.extend(ngram::table_row(&lookup.table, lookup.width, index)?);
+					}
+				}
+				let slot = checked_mul(checked_add(checked_mul(row, lookup.length, "lookup row")?, begin, "lookup slot")?, channels, "lookup staging offset")?;
+				self.contexts.write_float_bytes(checked_add(lookup.context, checked_mul(slot, bytes, "lookup staging bytes")?, "lookup staging")?, &staged, self.precision.model)?;
+			}
+		}
+		Ok(())
 	}
 	/// Write the output positions that the input positions before `end` reach and
 	/// that the input positions before `begin` did not. The arenas keep every
@@ -10625,6 +11141,7 @@ impl NativeTape {
 	/// recurrent state, and the convolution tail that earlier calls left.
 	fn forward_window(&mut self, begin: u32, end: u32) -> Result<()> {
 		require(begin <= end && end <= self.positions, format!("forward window {begin}..{end} is outside the {} input positions", self.positions))?;
+		self.stage_lookups(begin, end)?;
 		let threads = self.program.forward.geometry.threads()?;
 		let rows = self.rows;
 		let thread_count = threads;
@@ -10634,7 +11151,10 @@ impl NativeTape {
 	}
 	/// Replace the input value at one position. A graph that starts with a gather
 	/// holds its input as i32 token ids.
-	fn write_sample(&self, position: usize, value: f64) -> Result<()> {
+	fn write_sample(&mut self, position: usize, value: f64) -> Result<()> {
+		if let Some(token) = self.tokens.get_mut(position) {
+			*token = value;
+		}
 		if self.vocabulary > 0.0 {
 			let id = token_id(value, self.vocabulary)?;
 			self.samples.write_bytes(checked_mul(position, size_of::<i32>(), "token offset")?, &id.to_ne_bytes())
@@ -10940,7 +11460,7 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 		bound: None,
 	};
 	let graph = compile(&surrogate_model(config.surrogate_width), &prepared, &targets, rows, gpu, config, true)?;
-	let mut tape = NativeTape::new(&graph, &samples, &targets, gpu, config.precision, Some(mse))?;
+	let mut tape = NativeTape::new(&graph, &samples, &samples, &targets, gpu, config.precision, Some(mse))?;
 	let timed = |tape: &mut NativeTape, gradient: bool| -> Result<f64> {
 		tape.advance()?;
 		let started = Instant::now();
@@ -11053,7 +11573,15 @@ impl DeviceTape {
 		let (mut shards, mut start) = (Vec::new(), 0);
 		for (device, count) in route.iter().zip(&counts) {
 			let end = start + count;
-			shards.push(NativeTape::new(graph, &samples[start * input..end * input], &targets[start * output..end * output], gpus[*device], precision, Some(loss))?);
+			shards.push(NativeTape::new(
+				graph,
+				&samples[start * input..end * input],
+				&samples[start * input..end * input],
+				&targets[start * output..end * output],
+				gpus[*device],
+				precision,
+				Some(loss),
+			)?);
 			start = end;
 		}
 		Ok(Self { shards, placement })
@@ -11155,11 +11683,17 @@ impl DeviceTape {
 	}
 	/// Reports the executing route and every movement its fused epoch performs, in the order the epoch performs them.
 	fn print_devices(&self, graph: &Graph) -> Result<()> {
-		for node in &graph.nodes {
+		for (index, node) in graph.nodes.iter().enumerate() {
 			if node.op == Primitive::Gather {
 				let (layout, row) = embedding_row(node)?;
 				let table = checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, row, "embedding table bytes")?;
 				eprintln!("movement gather {} {row} bytes per token of a {table} byte table", layout.name);
+			}
+			if node.op == Primitive::Lookup
+				&& let Some(table) = graph.stored.get(index).and_then(Option::as_ref)
+			{
+				let (heads, rows) = (node.argument[0] as usize, (node.argument[2] as usize).max(1));
+				eprintln!("movement lookup {heads} rows of {} bytes per token from a {} byte host table", table.bytes.len() / rows, table.bytes.len());
 			}
 		}
 		for (shard, share) in self.shards.iter().zip(&self.placement.shares) {
@@ -11210,10 +11744,10 @@ fn embedding_row(node: &Node) -> Result<(&'static Quantization, usize)> {
 	require(node.output.channels % layout.block == 0, format!("embedding width {} must be a multiple of the {} block of {}", node.output.channels, layout.name, layout.block))?;
 	checked_mul(node.output.channels / layout.block, layout.stride, "embedding row bytes").map(|row| (layout, row))
 }
-// The embedding table is decoded one row at a time from the context arena, so
-// it is absent from the storage the model-load kernel expands into weights.
+// A table is decoded one row at a time, from the context arena or on the host,
+// so it is absent from the storage the model-load kernel expands into weights.
 fn arena_weight<'a>(node: &Node, stored: &'a Option<StoredWeight>) -> Option<&'a StoredWeight> {
-	stored.as_ref().filter(|_| node.op != Primitive::Gather)
+	stored.as_ref().filter(|_| !node.table())
 }
 fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 	let elements = match node.op {
@@ -11254,6 +11788,8 @@ fn node_context(node: &Node, rows: usize, element: usize) -> Result<usize> {
 		// The packed embedding table is the node's persistent state: the gather
 		// decodes rows out of it and never expands it into the weights.
 		Primitive::Gather => return checked_mul(integer_argument(node.argument[0], "embedding vocabulary")? as usize, embedding_row(node)?.1, "embedding table bytes"),
+		// The rows the host gathers for every position, staged as [row][position][channel].
+		Primitive::Lookup => checked_mul(rows, node.output.elements(), "lookup staging")?,
 		// One count per expert, then every routed position of every expert in
 		// ascending expert and position order.
 		Primitive::ExpertIn | Primitive::ExpertOut => {
@@ -13195,7 +13731,7 @@ fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gp
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
 	let _ = targets;
-	let mut tape = NativeTape::new(graph, &samples[..input_count], &[], gpu, precision, None)?;
+	let mut tape = NativeTape::new(graph, &samples[..input_count], &samples[..input_count], &[], gpu, precision, None)?;
 	tape.forward()?;
 	tape.predictions()
 }
@@ -13224,7 +13760,7 @@ fn fit_surrogate(input: Shape, samples: &[f64], targets: &[f64], hidden: usize, 
 		bound: None,
 	};
 	let mut graph = compile(&model, &prepared, targets, prepared.rows, gpu, config, true)?;
-	let mut tape = NativeTape::new(&graph, samples, targets, gpu, config.precision, Some(mse))?;
+	let mut tape = NativeTape::new(&graph, samples, samples, targets, gpu, config.precision, Some(mse))?;
 	for _ in 0..config.surrogate_epochs {
 		tape.advance()?;
 		tape.full_epoch(config.surrogate_rate, config)?;
@@ -16678,7 +17214,7 @@ impl Train {
 			let mut raw_outputs = Vec::new();
 			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
 			for sample in prepared.samples.chunks_exact(prepared.features) {
-				let mut validation = NativeTape::new(&graph, sample, &[], gpu, config.precision, None)?;
+				let mut validation = NativeTape::new(&graph, sample, sample, &[], gpu, config.precision, None)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
 				validation.forward()?;
 				let raw = validation.predictions()?;
@@ -16701,7 +17237,7 @@ impl Train {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
 			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_values..]);
-			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], validation_targets, gpu, config.precision, None)?;
+			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], &prepared.samples[start..], validation_targets, gpu, config.precision, None)?;
 			validation.inject_bn_stats(&stored.bn_stats)?;
 			validation.forward()?;
 			let raw = validation.predictions()?;
