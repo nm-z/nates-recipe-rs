@@ -3037,9 +3037,9 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend, split));
 				}
 				(false, Primitive::Delta) => {
-					// One row and head per element: a `[heads, 1]` shape walked whole.
 					let shape = delta_shape(node, self.rows)?;
-					let pairs = Shape { channels: shape.heads as usize, length: 1 };
+					let columns = delta_extent(node)?.3 as usize;
+					let pairs = Shape { channels: checked_mul(shape.heads as usize, columns, "delta value columns")?, length: 1 };
 					let whole = NodeWindow { begin: "0".to_owned(), span: "1".to_owned() };
 					// The reverse pass replays each chunk from its committed entry state,
 					// so a training layout commits every entry; an inference layout holds
@@ -3047,7 +3047,7 @@ impl NativeModelIr {
 					let entries = if self.inference { 0 } else { shape.chunks };
 					emit_fixed_loop(&mut ir, index, "delta", self.rows, pairs, &whole, |ir, p| {
 						ir.push_str(&format!(
-							"call void @delta_forward_body( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 {p}, {arguments}, i32 {entries}, i32 {decode} )\n",
+							"call void @delta_forward_body( {pointer} {source}, {pointer} {second}, {pointer} {weights}, {pointer} {value}, {pointer} {context}, i32 {p}, {arguments}, i32 {entries}, i32 {decode}, i32 {begin}, i32 {span} )\n",
 							pointer = pointer_type(backend),
 							decode = plan.decode(index),
 							source = pointers.source,
@@ -3056,6 +3056,7 @@ impl NativeModelIr {
 							value = pointers.value,
 							context = pointers.context,
 							arguments = shape.arguments
+							,begin = window.begin, span = window.span
 						));
 					})?;
 					ir.push_str(barrier(backend, split));

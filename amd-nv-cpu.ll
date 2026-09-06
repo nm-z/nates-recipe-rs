@@ -1735,7 +1735,7 @@ define internal double @softplus(double %x) #1 { entry: %magnitude = call double
 ; ascending order, so the position update never depends on the chunk it sits in.
 define internal void @delta_step( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %output, ptr addrspace(1) %context,
 i32 %q.base, i32 %k.base, i32 %v.base, i32 %o.base, i32 %a.base, i32 %b.base, i32 %work.base,
-i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, double %decay.scale, i1 %store ) #3 { entry:
+i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, double %decay.scale, i32 %column.begin, i32 %column.end, i1 %store ) #3 { entry:
 %decay.index = add i32 %a.base, %time
 %decay.pointer = getelementptr inbounds double, ptr addrspace(1) %gates, i32 %decay.index
 %decay.input = load double, ptr addrspace(1) %decay.pointer, align 8 %softplus = call double @softplus(double %decay.input)
@@ -1744,7 +1744,7 @@ i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, double %decay.scale, i1 %store
 %write.pointer = getelementptr inbounds double, ptr addrspace(1) %gates, i32 %write.index
 %write.input = load double, ptr addrspace(1) %write.pointer, align 8 %write = call double @sigmoid(double %write.input)
 br label %column.loop
-column.loop: %column = phi i32 [ 0, %entry ], [ %column.next, %column.done ] %column.more = icmp ult i32 %column, %vwidth
+column.loop: %column = phi i32 [ %column.begin, %entry ], [ %column.next, %column.done ] %column.more = icmp ult i32 %column, %column.end
 br i1 %column.more, label %read.loop, label %exit
 read.loop: %read.i = phi i32 [ 0, %column.loop ], [ %read.next, %read.step ]
 %read.sum = phi double [ 0.0, %column.loop ], [ %read.sum.next, %read.step ]
@@ -1787,12 +1787,14 @@ write.store: %output.index = add i32 %o.base, %value.offset
 store double %write.sum, ptr addrspace(1) %output.pointer, align 8 br label %column.done
 column.done: %column.next = add nuw i32 %column, 1 br label %column.loop
 exit: ret void }
-; One row and head of the gated delta rule. The sequence walks in chunks of
-; %chunk positions and the carried state is committed at every chunk start, so a
-; chunk of one commits each decode step. The chunk never reaches the arithmetic.
+; Each thread owns one value column of a head's recurrent state. Decode updates
+; only the requested window; training retains chunk-entry states for reversal.
 define internal void @delta_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %weights, ptr addrspace(1) %output, ptr addrspace(1) %context,
-i32 %p, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %chunk, i32 %chunks, i32 %pairs, i32 %entries, i32 %decode ) #3 { entry:
-%row = udiv i32 %p, %vheads %head = urem i32 %p, %vheads %state = mul i32 %kwidth, %vwidth
+i32 %p, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %chunk, i32 %chunks, i32 %pairs, i32 %entries, i32 %decode, i32 %begin, i32 %span ) #3 { entry:
+%pair = udiv i32 %p, %vwidth %column = urem i32 %p, %vwidth %column.end = add i32 %column, 1
+%row = udiv i32 %pair, %vheads %head = urem i32 %pair, %vheads %state = mul i32 %kwidth, %vwidth
+%end = add i32 %begin, %span %first.chunk = udiv i32 %begin, %chunk
+%reset = icmp eq i32 %begin, 0 %zero.count = select i1 %reset, i32 %state, i32 0
 %committing = icmp ne i32 %entries, 0 %commit.count = select i1 %committing, i32 %state, i32 0
 %kchannels = mul i32 %kheads, %kwidth %kstream = mul i32 %kchannels, %length
 %vchannels = mul i32 %vheads, %vwidth %stream = mul i32 %vchannels, %length
@@ -1805,31 +1807,33 @@ i32 %p, i32 %kheads, i32 %kwidth, i32 %vheads, i32 %vwidth, i32 %length, i32 %ch
 %output.row = mul i32 %row, %stream %o.base = add i32 %output.row, %head.offset
 %gate.stream = mul i32 %vheads, %length %gate.row = mul i32 %row, %gate.stream %gate.pair = mul i32 %gate.row, 2
 %head.length = mul i32 %head, %length %a.base = add i32 %gate.pair, %head.length %b.base = add i32 %a.base, %gate.stream
-%entry.span = mul i32 %entries, %state %entry.base = mul i32 %p, %entry.span
-%work.region = mul i32 %pairs, %entry.span %work.offset = mul i32 %p, %state %work.base = add i32 %work.region, %work.offset
+%entry.span = mul i32 %entries, %state %entry.base = mul i32 %pair, %entry.span
+%work.region = mul i32 %pairs, %entry.span %work.offset = mul i32 %pair, %state %work.base = add i32 %work.region, %work.offset
 %decay.parameter = call double @recipe.model.weight(ptr addrspace(1) %weights, i32 %head, i32 %decode) %decay.scale = call double @recipe.exp(double %decay.parameter)
 br label %zero.loop
-zero.loop: %zero.i = phi i32 [ 0, %entry ], [ %zero.next, %zero.step ] %zero.more = icmp ult i32 %zero.i, %state
+zero.loop: %zero.i = phi i32 [ %column, %entry ], [ %zero.next, %zero.step ] %zero.more = icmp ult i32 %zero.i, %zero.count
 br i1 %zero.more, label %zero.step, label %chunk.loop
 zero.step: %zero.index = add i32 %work.base, %zero.i
 %zero.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i32 %zero.index
-store double 0.0, ptr addrspace(1) %zero.pointer, align 8 %zero.next = add nuw i32 %zero.i, 1 br label %zero.loop
-chunk.loop: %chunk.index = phi i32 [ 0, %zero.loop ], [ %chunk.next, %chunk.done ] %chunk.more = icmp ult i32 %chunk.index, %chunks
-%chunk.start = mul i32 %chunk.index, %chunk %chunk.entry = mul i32 %chunk.index, %state %chunk.entry.base = add i32 %entry.base, %chunk.entry
+store double 0.0, ptr addrspace(1) %zero.pointer, align 8 %zero.next = add nuw i32 %zero.i, %vwidth br label %zero.loop
+chunk.loop: %chunk.index = phi i32 [ %first.chunk, %zero.loop ], [ %chunk.next, %chunk.done ]
+%chunk.start = mul i32 %chunk.index, %chunk %chunk.more = icmp ult i32 %chunk.start, %end
+%chunk.entry = mul i32 %chunk.index, %state %chunk.entry.base = add i32 %entry.base, %chunk.entry
+%partial.chunk = icmp ugt i32 %begin, %chunk.start %offset.delta = sub i32 %begin, %chunk.start %first.offset = select i1 %partial.chunk, i32 %offset.delta, i32 0
 br i1 %chunk.more, label %commit.loop, label %exit
-commit.loop: %commit.i = phi i32 [ 0, %chunk.loop ], [ %commit.next, %commit.step ] %commit.more = icmp ult i32 %commit.i, %commit.count
+commit.loop: %commit.i = phi i32 [ %column, %chunk.loop ], [ %commit.next, %commit.step ] %commit.more = icmp ult i32 %commit.i, %commit.count
 br i1 %commit.more, label %commit.step, label %time.loop
 commit.step: %commit.work = add i32 %work.base, %commit.i
 %commit.work.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i32 %commit.work
 %commit.value = load double, ptr addrspace(1) %commit.work.pointer, align 8 %commit.entry = add i32 %chunk.entry.base, %commit.i
 %commit.entry.pointer = getelementptr inbounds double, ptr addrspace(1) %context, i32 %commit.entry
-store double %commit.value, ptr addrspace(1) %commit.entry.pointer, align 8 %commit.next = add nuw i32 %commit.i, 1 br label %commit.loop
-time.loop: %offset = phi i32 [ 0, %commit.loop ], [ %offset.next, %step.done ] %time = add i32 %chunk.start, %offset
-%offset.more = icmp ult i32 %offset, %chunk %time.more = icmp ult i32 %time, %length %step.more = and i1 %offset.more, %time.more
+store double %commit.value, ptr addrspace(1) %commit.entry.pointer, align 8 %commit.next = add nuw i32 %commit.i, %vwidth br label %commit.loop
+time.loop: %offset = phi i32 [ %first.offset, %commit.loop ], [ %offset.next, %step.done ] %time = add i32 %chunk.start, %offset
+%offset.more = icmp ult i32 %offset, %chunk %time.more = icmp ult i32 %time, %end %step.more = and i1 %offset.more, %time.more
 br i1 %step.more, label %step, label %chunk.done
 step: call void @delta_step( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %output, ptr addrspace(1) %context,
 i32 %q.base, i32 %k.base, i32 %v.base, i32 %o.base, i32 %a.base, i32 %b.base, i32 %work.base,
-i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, double %decay.scale, i1 true )
+i32 %kwidth, i32 %vwidth, i32 %length, i32 %time, double %decay.scale, i32 %column, i32 %column.end, i1 true )
 br label %step.done
 step.done: %offset.next = add nuw i32 %offset, 1 br label %time.loop
 chunk.done: %chunk.next = add nuw i32 %chunk.index, 1 br label %chunk.loop
@@ -2062,7 +2066,7 @@ save.step: %save.work = add i32 %work.base, %save.i
 store double %save.value, ptr addrspace(1) %save.slot.pointer, align 8 %save.next = add nuw i32 %save.i, 1 br label %replay.save
 replay.step: call void @delta_step( ptr addrspace(1) %input, ptr addrspace(1) %gates, ptr addrspace(1) %context, ptr addrspace(1) %context,
 i32 %q.base, i32 %k.base, i32 %v.base, i32 %o.base, i32 %a.base, i32 %b.base, i32 %work.base,
-i32 %kwidth, i32 %vwidth, i32 %length, i32 %replay.time, double %decay.scale, i1 false )
+i32 %kwidth, i32 %vwidth, i32 %length, i32 %replay.time, double %decay.scale, i32 0, i32 %vwidth, i1 false )
 %replay.i.next = add nuw i32 %replay.i, 1 br label %replay.loop
 backward.loop: %backward.i = phi i32 [ %replay.i, %replay.loop ], [ %backward.index, %backward.step ]
 %decay.sum = phi double [ %total, %replay.loop ], [ %decay.sum.next, %backward.step ]
