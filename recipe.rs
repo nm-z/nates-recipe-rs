@@ -9058,7 +9058,7 @@ impl Recipe {
 		let result = bundle::run_infer(&path, input, |stored, samples| {
 			let config = Config::load()?;
 			let graph = materialize_saved_graph(stored, samples, device, config)?;
-			let mut tape = NativeTape::new(&graph, samples, samples, &[], device, stored.precision, None)?;
+			let tape = NativeTape::new(&graph, samples, samples, &[], device, stored.precision, None)?;
 			tape.inject_bn_stats(&stored.bn_stats)?;
 			tape.forward()?;
 			tape.predictions()
@@ -9135,7 +9135,7 @@ impl Binding {
 /// the rest of its length is the sequence the blocks walk.
 fn infer_gguf(model: &Gguf, blocks: &Model, plan: &Binding, input: &[f64], channels: usize) -> Result<Vec<f64>> {
 	let (graph, device) = bound_graph(model, blocks, plan, input, channels)?;
-	let mut tape = NativeTape::new(&graph, input, input, &[], device, Compute::FP64, None)?;
+	let tape = NativeTape::new(&graph, input, input, &[], device, Compute::FP64, None)?;
 	tape.forward()?;
 	tape.predictions()
 }
@@ -9569,8 +9569,9 @@ fn place_model(path: &Path, split: &[usize], devices: &'static [&'static Gpu]) -
 		require(split.len() <= devices.len(), format!("the split names {} devices but {} are selected", split.len(), devices.len()))?;
 		require(split.iter().sum::<usize>() == blocks, format!("the split places {} blocks but the model has {blocks}", split.iter().sum::<usize>()))?;
 		let (mut ranges, mut statistics) = (Vec::new(), 0);
+		let tokens = vec![0.0; stored.input.elements()];
 		for (index, (part, device)) in split_graph(&graph, &split)?.iter().zip(devices).enumerate() {
-			let tape = range_tape(part, &vec![0.0; part.input.elements()], &vec![0.0; stored.input.elements()], device, stored, &mut statistics)?;
+			let tape = range_tape(part, &vec![0.0; part.input.elements()], &tokens, device, stored, &mut statistics)?;
 			resident[index] += tape.resident_bytes();
 			if index + 1 < split.len() {
 				moved += part.output.channels * stored.precision.bytes();
@@ -9668,8 +9669,10 @@ impl Placed {
 	fn forward_window(&self, tapes: &[NativeTape], samples: &[f64], begin: u32, end: u32) -> Result<Vec<f64>> {
 		let (Some(first), Some(last)) = (tapes.first(), tapes.last()) else { return Err(RecipeError::new("placement has no range")) };
 		if begin == 0 {
-			tapes.iter().try_for_each(NativeTape::clear_values)?;
+			tapes.iter().try_for_each(NativeTape::reset_sequence)?;
 		}
+		let token_window = samples.get(begin as usize..end as usize).ok_or_else(|| RecipeError::new("token window is outside the model input"))?;
+		tapes.iter().try_for_each(|tape| tape.write_tokens(begin as usize, token_window))?;
 		for (start, count) in first.input_runs(begin, end) {
 			first.write_samples(start, samples.get(start..start + count).ok_or_else(|| RecipeError::new("input window is outside the model input"))?)?;
 		}
@@ -10051,7 +10054,7 @@ fn range_tape(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu,
 }
 /// One part of a split graph run forward on its device.
 fn forward_part(graph: &Graph, samples: &[f64], tokens: &[f64], gpu: &'static Gpu, stored: &bundle::SemanticGraph, statistics: &mut usize) -> Result<Vec<f64>> {
-	let mut tape = range_tape(graph, samples, tokens, gpu, stored, statistics)?;
+	let tape = range_tape(graph, samples, tokens, gpu, stored, statistics)?;
 	tape.forward()?;
 	tape.predictions()
 }
@@ -11051,8 +11054,9 @@ struct NativeTape {
 	precision: NativePrecision,
 	values: Buffer,
 	contexts: Buffer,
+	context_resets: Vec<(usize, usize)>,
 	lookups: Vec<HostLookup>,
-	tokens: Vec<f64>,
+	tokens: Mutex<Vec<f64>>,
 	adjoints: Buffer,
 	batch_normalizations: Vec<(usize, usize)>,
 	samples: Buffer,
@@ -11130,7 +11134,8 @@ impl NativeTape {
 		let input_adjoint_bytes = if training { checked_mul(samples.len(), precision.model.bytes(), "native input adjoint allocation")?.max(1) } else { 1 };
 		// A graph that starts with a gather reads its input as i32 token ids.
 		let vocabulary = graph.nodes.first().filter(|node| node.op == Primitive::Gather).map_or(0.0, |node| node.argument[0]);
-		let tokens = tokens.to_vec();
+		let token_count = tokens.len();
+		let tokens = Mutex::new(tokens.to_vec());
 		let samples = if vocabulary > 0.0 {
 			Buffer::upload(gpu, &samples.iter().map(|id| token_id(*id, vocabulary)).collect::<Result<Vec<_>>>()?)?
 		} else {
@@ -11165,8 +11170,24 @@ impl NativeTape {
 				let table = graph.stored.get(index).and_then(Option::as_ref).ok_or_else(|| RecipeError::new("per-layer embedding table is absent"))?.clone();
 				let words = graph.programs.get(node.program_offset..node.program_offset + node.program_count * 3).ok_or_else(|| RecipeError::new("per-layer embedding hash is absent"))?;
 				require(node.output.length == positions, format!("per-layer embedding reads {} positions of {positions} ids", node.output.length))?;
-				require(tokens.len() == rows * positions, format!("per-layer embedding reads {} ids for {rows} rows of {positions} positions, received {}", rows * positions, tokens.len()))?;
+				require(token_count == rows * positions, format!("per-layer embedding reads {} ids for {rows} rows of {positions} positions, received {token_count}", rows * positions))?;
 				lookups.push(HostLookup { context: layout.contexts[index], hash: RowHash::from_words(words)?, table, width: node.argument[1] as usize, length: node.output.length });
+			}
+		}
+		// A new sequence clears every mutable context span. Packed embedding
+		// tables and saved evaluation statistics remain unchanged.
+		let mut context_resets = Vec::<(usize, usize)>::new();
+		for (index, node) in graph.nodes.iter().enumerate() {
+			let persistent = node.op == Primitive::Gather || (node.op == Primitive::Normalize && normalize_mode(node.argument[0])? == program_ir::NormalizeMode::Evaluation);
+			if persistent {
+				continue;
+			}
+			let start = layout.contexts[index];
+			let end = layout.contexts.get(index + 1).copied().unwrap_or(layout.contexts_bytes);
+			if let Some((_, prior_end)) = context_resets.last_mut().filter(|(_, prior_end)| *prior_end == start) {
+				*prior_end = end;
+			} else {
+				context_resets.push((start, end));
 			}
 		}
 		let tape = Self {
@@ -11174,6 +11195,7 @@ impl NativeTape {
 			precision,
 			values: Buffer::upload(gpu, &vec![0_u8; layout.values_bytes.max(1)])?,
 			contexts: Buffer::upload(gpu, &contexts)?,
+			context_resets,
 			lookups,
 			tokens,
 			adjoints: Buffer { runtime: gpu, pointer: gpu.allocate(adjoints_bytes)?, bytes: adjoints_bytes },
@@ -11216,10 +11238,11 @@ impl NativeTape {
 	/// the host and write them into the staging context the device reads.
 	fn stage_lookups(&self, begin: u32, end: u32) -> Result<()> {
 		let (begin, end, bytes) = (begin as usize, end as usize, self.precision.model.bytes());
+		let tokens = self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?;
 		for lookup in &self.lookups {
 			let channels = lookup.hash.heads() * lookup.width;
 			for row in 0..self.rows as usize {
-				let ids = self.tokens[row * lookup.length..(row + 1) * lookup.length].iter().map(|value| self.token(*value)).collect::<Result<Vec<_>>>()?;
+				let ids = tokens[row * lookup.length..(row + 1) * lookup.length].iter().map(|value| self.token(*value)).collect::<Result<Vec<_>>>()?;
 				let mut staged = Vec::with_capacity((end - begin) * channels);
 				for position in begin..end {
 					for index in lookup.hash.rows_at(&ids, position) {
@@ -11262,10 +11285,15 @@ impl NativeTape {
 			self.samples.write_float_bytes(checked_mul(first, self.precision.model.bytes(), "sample offset")?, values, self.precision.model)
 		}
 	}
-	fn write_sample(&mut self, position: usize, value: f64) -> Result<()> {
-		if let Some(token) = self.tokens.get_mut(position) {
-			*token = value;
-		}
+	fn write_tokens(&self, first: usize, values: &[f64]) -> Result<()> {
+		let mut tokens = self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?;
+		let end = checked_add(first, values.len(), "token write")?;
+		let target = tokens.get_mut(first..end).ok_or_else(|| RecipeError::new("token write exceeds the sequence"))?;
+		target.copy_from_slice(values);
+		Ok(())
+	}
+	fn write_sample(&self, position: usize, value: f64) -> Result<()> {
+		self.write_tokens(position, &[value])?;
 		self.write_samples(position, &[value])
 	}
 	/// The output positions the input positions `begin..end` reach: the window
@@ -11292,10 +11320,13 @@ impl NativeTape {
 		}
 		windows.last().copied().ok_or_else(|| RecipeError::new("native model has no node"))
 	}
-	/// Forget every value the arenas hold, so the next forward reads nothing an
-	/// earlier sequence left at a position it does not write.
-	fn clear_values(&self) -> Result<()> {
-		self.values.write_bytes(0, &vec![0_u8; self.values.bytes])
+	/// Restore the token, input, and mutable arenas before a new sequence, while
+	/// retaining packed tables and saved evaluation statistics.
+	fn reset_sequence(&self) -> Result<()> {
+		self.tokens.lock().map_err(|_| RecipeError::new("token state is poisoned"))?.fill(0.0);
+		self.samples.clear()?;
+		self.values.clear()?;
+		self.context_resets.iter().try_for_each(|&(start, end)| self.contexts.clear_range(start, end - start))
 	}
 	/// The bytes this tape holds on its device: the weights, the input row, and
 	/// the value and context arenas that keep every position's activations,
@@ -11977,6 +12008,13 @@ impl Buffer {
 		require(checked_add(offset, values.len(), "GPU byte write")? <= self.bytes, "GPU byte write exceeds buffer")?;
 		self.runtime.upload(self.pointer + offset as u64, values.as_ptr().cast(), values.len()).map(|_| ())
 	}
+	fn clear(&self) -> Result<()> {
+		self.clear_range(0, self.bytes)
+	}
+	fn clear_range(&self, offset: usize, bytes: usize) -> Result<()> {
+		require(checked_add(offset, bytes, "GPU byte clear")? <= self.bytes, "GPU byte clear exceeds buffer")?;
+		self.runtime.clear(self.pointer + offset as u64, bytes)
+	}
 	fn download<T: Copy + Default>(&self, count: usize) -> Result<Vec<T>> {
 		self.download_range(0, count)
 	}
@@ -12203,6 +12241,7 @@ struct Cuda {
 	free: unsafe extern "C" fn(u64) -> i32,
 	upload: unsafe extern "C" fn(u64, *const c_void, usize) -> i32,
 	download: unsafe extern "C" fn(Ptr, u64, usize) -> i32,
+	clear: unsafe extern "C" fn(u64, u8, usize) -> i32,
 	memory_info: unsafe extern "C" fn(*mut usize, *mut usize) -> i32,
 	synchronize: unsafe extern "C" fn() -> i32,
 	launch: unsafe extern "C" fn(usize, u32, u32, u32, u32, u32, u32, u32, Ptr, *mut Ptr, *mut Ptr) -> i32,
@@ -12251,6 +12290,7 @@ struct Hsa {
 	free: unsafe extern "C" fn(Ptr) -> i32,
 	allow: unsafe extern "C" fn(u32, *const u64, *const u32, *const c_void) -> i32,
 	copy: unsafe extern "C" fn(Ptr, *const c_void, usize) -> i32,
+	clear: unsafe extern "C" fn(Ptr, u32, usize) -> i32,
 	store: unsafe extern "C" fn(u64, i64),
 	wait: unsafe extern "C" fn(u64, i32, i64, u64, i32) -> i64,
 	write: unsafe extern "C" fn(*const HsaQueue, u64) -> u64,
@@ -12273,6 +12313,7 @@ const REMOTE_SYNCHRONIZE: u8 = 5;
 const REMOTE_LOAD: u8 = 6;
 const REMOTE_LAUNCH: u8 = 7;
 const REMOTE_MEMORY: u8 = 8;
+const REMOTE_CLEAR: u8 = 9;
 struct Wire<R: Read, W: Write> {
 	input: std::io::BufReader<R>,
 	output: std::io::BufWriter<W>,
@@ -12713,6 +12754,39 @@ impl Gpu {
 					channel.write_bytes(std::slice::from_raw_parts(src.cast::<u8>(), bytes))?;
 					channel.flush()?;
 					channel.read_status("upload").map(|_| dst)
+				}
+			}
+		}
+	}
+	#[cfg_attr(not(any(amd, nvidia)), allow(unused_unsafe))]
+	fn clear(&self, pointer: u64, bytes: usize) -> Result<()> {
+		self.activate()?;
+		unsafe {
+			match &self.driver {
+				Driver::Cpu => {
+					ptr::write_bytes(pointer as *mut u8, 0, bytes);
+					Ok(())
+				}
+				#[cfg(nvidia)]
+				Driver::Cuda(driver) => self.status((driver.clear)(pointer, 0, bytes), "clear"),
+				#[cfg(amd)]
+				Driver::Hsa(driver) => {
+					let words = bytes / size_of::<u32>();
+					self.status((driver.clear)(pointer as Ptr, 0, words), "clear")?;
+					let tail = bytes - words * size_of::<u32>();
+					if tail != 0 {
+						let zero = [0_u8; size_of::<u32>() - 1];
+						self.status((driver.copy)((pointer as usize + words * size_of::<u32>()) as Ptr, zero.as_ptr().cast(), tail), "clear")?;
+					}
+					Ok(())
+				}
+				Driver::Remote(remote) => {
+					let mut channel = remote.channel.lock().map_err(|_| RecipeError::new("remote channel is poisoned"))?;
+					channel.write_u8(REMOTE_CLEAR)?;
+					channel.write_u64(pointer)?;
+					channel.write_u64(bytes as u64)?;
+					channel.flush()?;
+					channel.read_status("clear")
 				}
 			}
 		}
@@ -13573,6 +13647,7 @@ fn load_amd_gpu(runtime: &std::sync::Arc<Library>, info: HsaInfo, cpu_agent: u64
 			cpu_agent,
 			free: runtime.function(b"hsa_amd_memory_pool_free\0")?,
 			copy: runtime.function(b"hsa_memory_copy\0")?,
+			clear: runtime.function(b"hsa_amd_memory_fill\0")?,
 			store: runtime.function(b"hsa_signal_store_screlease\0")?,
 			wait: runtime.function(b"hsa_signal_wait_scacquire\0")?,
 			write: runtime.function(b"hsa_queue_add_write_index_scacq_screl\0")?,
@@ -13649,6 +13724,7 @@ fn load_nvidia(_selection: Option<&[String]>) -> Result<Vec<Gpu>> {
 				free: runtime.function(b"cuMemFree_v2\0")?,
 				upload: runtime.function(b"cuMemcpyHtoD_v2\0")?,
 				download: runtime.function(b"cuMemcpyDtoH_v2\0")?,
+				clear: runtime.function(b"cuMemsetD8_v2\0")?,
 				memory_info: runtime.function(b"cuMemGetInfo_v2\0")?,
 				synchronize: runtime.function(b"cuCtxSynchronize\0")?,
 				launch: runtime.function(b"cuLaunchKernel\0")?,
@@ -13773,6 +13849,11 @@ pub fn worker_serve(name: &str) -> Result<()> {
 					wire.write_bytes(&bytes.to_le_bytes())?;
 				}
 			}
+			REMOTE_CLEAR => {
+				let pointer = wire.read_u64()?;
+				let bytes = wire.read_u64()? as usize;
+				wire.status(&gpu.clear(pointer, bytes))?;
+			}
 			REMOTE_LOAD => {
 				let bytes = wire.read_u64()? as usize;
 				let mut artifact = vec![0_u8; bytes];
@@ -13878,7 +13959,7 @@ fn graph_inputs(graph: &Graph, samples: &[f64], targets: &[f64], rows: usize, gp
 		return Ok(samples[..rows * graph.output.elements()].to_vec());
 	}
 	let _ = targets;
-	let mut tape = NativeTape::new(graph, &samples[..input_count], &samples[..input_count], &[], gpu, precision, None)?;
+	let tape = NativeTape::new(graph, &samples[..input_count], &samples[..input_count], &[], gpu, precision, None)?;
 	tape.forward()?;
 	tape.predictions()
 }
@@ -17361,7 +17442,7 @@ impl Train {
 			let mut raw_outputs = Vec::new();
 			let stream = self.log_metrics.iter().any(|metric| metric.0 == tok.0);
 			for sample in prepared.samples.chunks_exact(prepared.features) {
-				let mut validation = NativeTape::new(&graph, sample, sample, &[], gpu, config.precision, None)?;
+				let validation = NativeTape::new(&graph, sample, sample, &[], gpu, config.precision, None)?;
 				validation.inject_bn_stats(&stored.bn_stats)?;
 				validation.forward()?;
 				let raw = validation.predictions()?;
@@ -17384,7 +17465,7 @@ impl Train {
 			let mut graph = stored.graph.clone();
 			graph.parameters = tape.weights()?;
 			let (start, validation_targets) = (training_rows * prepared.features, &target_values[training_values..]);
-			let mut validation = NativeTape::new(&graph, &prepared.samples[start..], &prepared.samples[start..], validation_targets, gpu, config.precision, None)?;
+			let validation = NativeTape::new(&graph, &prepared.samples[start..], &prepared.samples[start..], validation_targets, gpu, config.precision, None)?;
 			validation.inject_bn_stats(&stored.bn_stats)?;
 			validation.forward()?;
 			let raw = validation.predictions()?;
