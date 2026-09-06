@@ -3884,22 +3884,31 @@ impl NativeModelIr {
 			_ => 0,
 		});
 		if block_kind != 0 {
-			emit_fixed_loop(ir, index, if outward { "expert.out.block" } else { "expert.in.block" }, self.rows, node.output, window, |ir, p| {
+			let name = if outward { "expert.out.block" } else { "expert.in.block" };
+			let call = |ir: &mut String, p: &str, active: Option<&str>, lane: Option<&str>| {
 				ir.push_str(&format!(
-					"call void @expert_iq_{direction}_forward_body({pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, {pointer} {routing_context}, i32 {p}, i32 {in_channels}, i32 {out_channels}, i32 {length}, i32 {experts}, i32 {top}, i32 {hidden}, i32 {kind})\n",
+					"call void @expert_iq_{direction}_{method}forward_body({pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, {pointer} {routing_context}, {prefix}i32 {p}, i32 {in_channels}, i32 {out_channels}, i32 {length}, i32 {experts}, i32 {top}, i32 {hidden}, i32 {kind}, i32 {decode})\n",
 					direction = if outward { "out" } else { "in" },
+					method = if active.is_some() { "wave_" } else { "" },
 					pointer = pointer_type(backend),
 					source = pointers.source,
 					weights = pointers.weights,
 					value = pointers.value,
 					routing = pointers.second,
 					routing_context = pointers.second_context,
+					prefix = active.zip(lane).map_or_else(String::new, |(active, lane)| format!("i1 {active}, i32 {lane}, ")),
 					in_channels = node.input.channels,
 					out_channels = node.output.channels,
 					length = node.output.length,
 					kind = block_kind,
+					decode = plan.decode(index),
 				));
-			})?;
+			};
+			if backend == Backend::Nvidia {
+				emit_fixed_groups(ir, index, name, self.rows, node.output, window, 32, |ir, p, active, lane| call(ir, p, Some(active), Some(lane)))?;
+			} else {
+				emit_fixed_loop(ir, index, name, self.rows, node.output, window, |ir, p| call(ir, p, None, None))?;
+			}
 			ir.push_str(barrier(backend));
 			return Ok(());
 		}
@@ -4565,6 +4574,25 @@ fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, rows: usize, shape
 	));
 	body(ir, &format!("%{prefix}.at.p"));
 	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.at.next = add i32 %{prefix}.at.q, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n"));
+	Ok(())
+}
+
+/// Walk one output per fixed-size device group. Every thread enters every
+/// round, including a short final round, so a body can use workgroup barriers
+/// while the group's lanes cooperate on that output.
+fn emit_fixed_groups(ir: &mut String, index: usize, name: &str, rows: usize, shape: Shape, window: &NodeWindow, group: usize, mut body: impl FnMut(&mut String, &str, &str, &str)) -> Result<()> {
+	let prefix = format!("n{index}.{name}");
+	let elements = narrow(checked_mul(shape.channels, shape.length, format!("native {name} row elements").as_str())?, "native group loop row elements")?;
+	let (channels, length) = (narrow(shape.channels, "native group loop channels")?, narrow(shape.length, "native group loop length")?);
+	narrow(checked_mul(rows, elements as usize, "native group loop batch elements")?, "native group loop batch elements")?;
+	let rows = narrow(rows, "native group loop rows")?;
+	let group = narrow(group, "native group width")?;
+	let (begin, span) = (&window.begin, &window.span);
+	ir.push_str(&format!(
+		"%{prefix}.at.plane = mul i32 {channels}, {span}\n%{prefix}.at.count = mul i32 {rows}, %{prefix}.at.plane\n%{prefix}.groups = udiv i32 %threads, {group}\n%{prefix}.group = udiv i32 %tid, {group}\n%{prefix}.lane = urem i32 %tid, {group}\nbr label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.round = phi i32 [ 0, %{prefix}.entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.round, %{prefix}.at.count\nbr i1 %{prefix}.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n%{prefix}.at.q.raw = add i32 %{prefix}.round, %{prefix}.group\n%{prefix}.active = icmp ult i32 %{prefix}.at.q.raw, %{prefix}.at.count\n%{prefix}.at.q = select i1 %{prefix}.active, i32 %{prefix}.at.q.raw, i32 0\n%{prefix}.at.row = udiv i32 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.within = urem i32 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.channel = udiv i32 %{prefix}.at.within, {span}\n%{prefix}.at.offset = urem i32 %{prefix}.at.within, {span}\n%{prefix}.at.position = add i32 %{prefix}.at.offset, {begin}\n%{prefix}.at.row.base = mul i32 %{prefix}.at.row, {elements}\n%{prefix}.at.channel.base = mul i32 %{prefix}.at.channel, {length}\n%{prefix}.at.local = add i32 %{prefix}.at.channel.base, %{prefix}.at.position\n%{prefix}.at.p = add i32 %{prefix}.at.row.base, %{prefix}.at.local\n"
+	));
+	body(ir, &format!("%{prefix}.at.p"), &format!("%{prefix}.active"), &format!("%{prefix}.lane"));
+	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.next = add i32 %{prefix}.round, %{prefix}.groups\nbr label %{prefix}.loop\n{prefix}.done:\n"));
 	Ok(())
 }
 
