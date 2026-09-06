@@ -4717,6 +4717,50 @@ mod gguf {
 		pub bytes: usize,
 		shard: usize,
 	}
+
+	/// The model dimensions and routing metadata required to build Qwen3.8 Flash
+	/// Next on Recipe's inference graph.
+	#[derive(Clone, Debug, PartialEq)]
+	pub struct Qwen4ExpMetadata {
+		pub blocks: usize,
+		pub context: usize,
+		pub embedding: usize,
+		pub vocabulary: usize,
+		pub attention_heads: usize,
+		pub attention_kv_heads: usize,
+		pub attention_key: usize,
+		pub attention_value: usize,
+		pub rope_dimensions: usize,
+		pub rope_sections: Vec<usize>,
+		pub rope_base: f64,
+		pub rms_epsilon: f64,
+		pub experts: usize,
+		pub experts_used: usize,
+		pub expert_width: usize,
+		pub shared_expert_width: usize,
+		pub delta_conv: usize,
+		pub delta_state: usize,
+		pub delta_key_heads: usize,
+		pub delta_value_heads: usize,
+		pub delta_inner: usize,
+		pub full_attention_interval: usize,
+		pub hyper_lanes: usize,
+		pub hyper_rank: usize,
+		pub indexer_heads: usize,
+		pub indexer_key: usize,
+		pub indexer_top_k: usize,
+		pub attention_compression: Vec<usize>,
+		pub ple_layers: Vec<usize>,
+		pub ple_ngram: usize,
+		pub ple_heads_per_ngram: usize,
+		pub ple_head_width: usize,
+		pub ple_conv: usize,
+		pub ple_eos: u32,
+		pub ple_image: u32,
+		pub ple_multipliers: Vec<u64>,
+		pub ple_offsets: Vec<u64>,
+		pub ple_vocabularies: Vec<u64>,
+	}
 	impl GgufTensor {
 		/// The element count the shape declares.
 		pub fn elements(&self) -> usize {
@@ -4954,6 +4998,105 @@ mod gguf {
 		pub fn tensor(&self, name: &str) -> Option<&GgufTensor> {
 			self.tensors.iter().find(|tensor| tensor.name == name)
 		}
+		fn required(&self, key: &str) -> Result<&GgufValue> {
+			self.value(key).ok_or_else(|| RecipeError::new(format!("{key} is absent")))
+		}
+		fn integer_at(&self, key: &str) -> Result<usize> {
+			let value = self.required(key)?.integer().ok_or_else(|| RecipeError::new(format!("{key} is not a nonnegative integer")))?;
+			usize::try_from(value).map_err(|_| RecipeError::new(format!("{key} exceeds the address space")))
+		}
+		fn float_at(&self, key: &str) -> Result<f64> {
+			match self.required(key)? {
+				GgufValue::F32(value) => Ok(f64::from(*value)),
+				GgufValue::F64(value) => Ok(*value),
+				_ => Err(RecipeError::new(format!("{key} is not a float"))),
+			}
+		}
+		fn integers_at(&self, key: &str) -> Result<Vec<u64>> {
+			match self.required(key)? {
+				GgufValue::Array(values) => {
+					values.iter().map(|value| value.integer().ok_or_else(|| RecipeError::new(format!("{key} holds a value that is not a nonnegative integer")))).collect()
+				}
+				_ => Err(RecipeError::new(format!("{key} is not an array"))),
+			}
+		}
+		fn indices_at(&self, key: &str) -> Result<Vec<usize>> {
+			self.integers_at(key)?.into_iter().map(|value| usize::try_from(value).map_err(|_| RecipeError::new(format!("{key} exceeds the address space")))).collect()
+		}
+		fn parse_qwen4exp(&self) -> Result<Qwen4ExpMetadata> {
+			let architecture = self.required("general.architecture")?.text().ok_or_else(|| RecipeError::new("general.architecture is not a string"))?;
+			require(architecture == "qwen4exp", format!("model architecture is {architecture:?}, expected qwen4exp"))?;
+			let key = |suffix: &str| format!("{architecture}.{suffix}");
+			let tensor = self.tensor("token_embd.weight").ok_or_else(|| RecipeError::new("token_embd.weight is absent"))?;
+			let embedding = self.integer_at(&key("embedding_length"))?;
+			let tensor_embedding = tensor.shape.first().copied().and_then(|value| usize::try_from(value).ok());
+			require(tensor.shape.len() == 2 && tensor_embedding == Some(embedding), format!("token_embd.weight shape {:?} does not begin with embedding length {embedding}", tensor.shape))?;
+			let vocabulary = usize::try_from(tensor.shape[1]).map_err(|_| RecipeError::new("token_embd.weight vocabulary exceeds the address space"))?;
+			let blocks = self.integer_at(&key("block_count"))?;
+			let rope_dimensions = self.integer_at(&key("rope.dimension_count"))?;
+			let rope_sections = self.indices_at(&key("rope.dimension_sections"))?;
+			let rope_total = rope_sections.iter().try_fold(0_usize, |total, section| total.checked_add(*section)).and_then(|total| total.checked_mul(2));
+			require(rope_total == Some(rope_dimensions), format!("rope sections {rope_sections:?} do not cover {rope_dimensions} dimensions"))?;
+			let attention_compression = self.indices_at(&key("attention.compress_ratios"))?;
+			require(attention_compression.len() == blocks, format!("attention compression has {} entries for {blocks} blocks", attention_compression.len()))?;
+			let ple_ngram = self.integer_at(&key("ple.ngram_size"))?;
+			let ple_heads_per_ngram = self.integer_at(&key("ple.heads_per_ngram"))?;
+			let ple_heads = ple_ngram.checked_sub(1).and_then(|orders| orders.checked_mul(ple_heads_per_ngram)).ok_or_else(|| RecipeError::new("PLE head count overflows"))?;
+			let ple_multipliers = self.integers_at(&key("ple.layer_multipliers"))?;
+			let ple_offsets = self.integers_at(&key("ple.head_offsets"))?;
+			let ple_vocabularies = self.integers_at(&key("ple.head_vocab_sizes"))?;
+			require(ple_multipliers.len() == ple_ngram, format!("PLE has {} multipliers for ngram size {ple_ngram}", ple_multipliers.len()))?;
+			require(
+				ple_offsets.len() == ple_heads && ple_vocabularies.len() == ple_heads,
+				format!("PLE has {} offsets and {} vocabularies for {ple_heads} heads", ple_offsets.len(), ple_vocabularies.len()),
+			)?;
+			let ple_eos = self.integer_at(&key("ple.eos_token_id"))?;
+			let ple_image = self.integer_at(&key("ple.image_token_id"))?;
+			Ok(Qwen4ExpMetadata {
+				blocks,
+				context: self.integer_at(&key("context_length"))?,
+				embedding,
+				vocabulary,
+				attention_heads: self.integer_at(&key("attention.head_count"))?,
+				attention_kv_heads: self.integer_at(&key("attention.head_count_kv"))?,
+				attention_key: self.integer_at(&key("attention.key_length"))?,
+				attention_value: self.integer_at(&key("attention.value_length"))?,
+				rope_dimensions,
+				rope_sections,
+				rope_base: self.float_at(&key("rope.freq_base"))?,
+				rms_epsilon: self.float_at(&key("attention.layer_norm_rms_epsilon"))?,
+				experts: self.integer_at(&key("expert_count"))?,
+				experts_used: self.integer_at(&key("expert_used_count"))?,
+				expert_width: self.integer_at(&key("expert_feed_forward_length"))?,
+				shared_expert_width: self.integer_at(&key("expert_shared_feed_forward_length"))?,
+				delta_conv: self.integer_at(&key("ssm.conv_kernel"))?,
+				delta_state: self.integer_at(&key("ssm.state_size"))?,
+				delta_key_heads: self.integer_at(&key("ssm.group_count"))?,
+				delta_value_heads: self.integer_at(&key("ssm.time_step_rank"))?,
+				delta_inner: self.integer_at(&key("ssm.inner_size"))?,
+				full_attention_interval: self.integer_at(&key("full_attention_interval"))?,
+				hyper_lanes: self.integer_at(&key("hyper_connection.count"))?,
+				hyper_rank: self.integer_at(&key("hyper_connection.low_rank"))?,
+				indexer_heads: self.integer_at(&key("attention.indexer.head_count"))?,
+				indexer_key: self.integer_at(&key("attention.indexer.key_length"))?,
+				indexer_top_k: self.integer_at(&key("attention.indexer.top_k"))?,
+				attention_compression,
+				ple_layers: self.indices_at(&key("ple.layers"))?,
+				ple_ngram,
+				ple_heads_per_ngram,
+				ple_head_width: self.integer_at(&key("embedding_length_per_layer_input"))?,
+				ple_conv: self.integer_at(&key("ple.conv_kernel"))?,
+				ple_eos: u32::try_from(ple_eos).map_err(|_| RecipeError::new("PLE EOS token exceeds u32"))?,
+				ple_image: u32::try_from(ple_image).map_err(|_| RecipeError::new("PLE image token exceeds u32"))?,
+				ple_multipliers,
+				ple_offsets,
+				ple_vocabularies,
+			})
+		}
+		/// Reads Qwen3.8 Flash Next dimensions from the mapped GGUF metadata.
+		pub fn qwen4exp(&self) -> Qwen4ExpMetadata {
+			self.parse_qwen4exp().unwrap_or_else(|error| panic!("{error}"))
+		}
 		/// The tensor's bytes in the mapped file, in its GGML block layout.
 		pub fn data(&self, tensor: &GgufTensor) -> &[u8] {
 			let shard = &self.shards[tensor.shard];
@@ -5018,7 +5161,7 @@ mod gguf {
 		Ok(path.with_file_name(format!("{prefix}-{:05}-of-{count:05}.gguf", index + 1)))
 	}
 }
-pub use gguf::{Gguf, GgufTensor, GgufValue};
+pub use gguf::{Gguf, GgufTensor, GgufValue, Qwen4ExpMetadata};
 mod tokenizer {
 	//! A byte-level BPE tokenizer built from GGUF metadata alone: the token
 	//! table, the piece ranks, the pre-tokenizer family, the added tokens, the
