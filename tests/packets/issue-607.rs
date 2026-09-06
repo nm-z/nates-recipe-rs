@@ -1,7 +1,18 @@
 use recipe::*;
 
 fn main() {
-	let bundle = "target/issue-607.ogdl";
+	let directory = std::path::Path::new("target/packets");
+	std::fs::create_dir_all(directory).unwrap();
+	let bundle = directory.join("issue-607.ogdl");
+	if std::env::var_os("RECIPE_PACKET_INFER").is_some() {
+		let before = std::fs::read(&bundle).unwrap();
+		let output = recipe.infer(&bundle, &[0.0; 20]);
+		assert!(!output.is_empty());
+		assert!(output.iter().all(|value| value.is_finite()));
+		assert_eq!(std::fs::read(&bundle).unwrap(), before);
+		println!("inference {output:?}; bundle unchanged");
+		return;
+	}
 	let data = recipe.data("data/temporal/chronological_splits")
 		.target("target");
 	let model = recipe.model()
@@ -17,9 +28,11 @@ fn main() {
 		.log(all)
 		.stop(0.8)
 		.int(8)
-		.save(bundle)
+		.save(&bundle)
 		.run(&model, &data);
 	assert!(report.final_loss().is_finite());
-	let output = recipe.infer(bundle, &[0.0; 20]);
-	assert!(output.iter().all(|value| value.is_finite()), "inference is not finite: {output:?}");
+	assert!(!report.predictions().is_empty());
+	assert!(report.predictions().iter().all(|value| value.is_finite()));
+	assert!(std::fs::metadata(&bundle).unwrap().len() > 0);
+	println!("bundle {}", bundle.display());
 }
