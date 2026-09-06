@@ -459,8 +459,8 @@ fn native_ir(ir: String, suffix: &str, llvm: &str, format: FloatFormat) -> Build
 			"bfloat" => format!("0xR{:04X}", format.pack(value)),
 			_ => format!("0x{:016X}", format.unpack(format.pack(value)).to_bits()),
 		};
+		kernel = word(kernel, &format!("{llvm} 0.1"), &format!("{llvm} {}", literal(0.1)));
 		kernel = kernel
-			.replace(&format!("{llvm} 0.1"), &format!("{llvm} {}", literal(0.1)))
 			.replace("0x3CB0000000000000", &literal(f64::from_bits(0x3CB0000000000000)))
 			.replace("0x3FEFFFFFFFFFFFFE", &literal(f64::from_bits(0x3FEFFFFFFFFFFFFE)))
 	}
