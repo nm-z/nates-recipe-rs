@@ -10033,16 +10033,11 @@ fn lower_gated(graph: &mut Graph, gate: i32, up: i32, shape: Shape, activation: 
 	let activated = graph.source;
 	binary(graph, activated, up, shape, ScalarOpcode::Multiply)
 }
-fn lower_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, config: Config) -> Result<()> {
-	require(experts != 0, "moe requires an expert")?;
-	require(top_k != 0 && top_k <= experts, "moe top-k is invalid")?;
-	require(hidden != 0, "moe expert width must be positive")?;
-	let (source, input) = (graph.source, graph.output);
-	// One router scores every expert per position. The top-k weights name the
-	// experts whose gated feed-forward runs, so a position costs top-k of them.
-	lower_project(graph, experts)?;
-	push_node(graph, Primitive::TopK, graph.output, 0, [top_k as f64, f64::from(scoring as u8), f64::from(u8::from(renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
-	let routing = graph.source;
+/// Runs the gated feed-forward of the experts `routing` names over `input`, the
+/// graph output at `source`. `routing` is a `[experts, length]` plane of per-position
+/// weights: a nonzero entry takes that expert for the position, and the position's
+/// output is the sum of its `top_k` experts under those weights.
+fn lower_experts(graph: &mut Graph, source: i32, input: Shape, routing: i32, experts: usize, top_k: usize, hidden: usize, activation: Activation, config: Config) -> Result<()> {
 	let routed = Shape { channels: checked_mul(top_k, hidden, "moe routed width")?, length: input.length };
 	let table = checked_mul(experts, checked_mul(hidden, input.channels, "moe expert matrix")?, "moe expert table")?;
 	let dispatch = [experts as f64, top_k as f64, hidden as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
@@ -10054,29 +10049,36 @@ fn lower_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, act
 	let up = graph.source;
 	let product = lower_gated(graph, gate, up, routed, activation, config)?;
 	reset(graph, product, routed);
-	push_node(graph, Primitive::ExpertOut, input, table, dispatch, routing)?;
+	push_node(graph, Primitive::ExpertOut, input, table, dispatch, routing)
+}
+fn lower_moe(graph: &mut Graph, experts: usize, top_k: usize, hidden: usize, activation: Activation, scoring: Scoring, renormalize: bool, shared: bool, config: Config) -> Result<()> {
+	require(experts != 0, "moe requires an expert")?;
+	require(top_k != 0 && top_k <= experts, "moe top-k is invalid")?;
+	require(hidden != 0, "moe expert width must be positive")?;
+	let (source, input) = (graph.source, graph.output);
+	// One router scores every expert per position. The top-k weights name the
+	// experts whose gated feed-forward runs, so a position costs top-k of them.
+	lower_project(graph, experts)?;
+	push_node(graph, Primitive::TopK, graph.output, 0, [top_k as f64, f64::from(scoring as u8), f64::from(u8::from(renormalize)), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
+	let routing = graph.source;
+	lower_experts(graph, source, input, routing, experts, top_k, hidden, activation, config)?;
 	if !shared {
 		return Ok(());
 	}
-	// The shared expert runs for every position and joins the routed sum under
-	// one trainable gain.
+	// The shared expert is one more expert that every position takes. Its routing
+	// weight is the sigmoid of a `[width]` gate over the position, with no bias,
+	// so the dispatch that runs the routed experts runs it under that per-position
+	// value and its gradient reaches the gate and the input through the same adjoints.
 	let dispatched = graph.source;
-	let wide = Shape { channels: hidden, length: input.length };
 	reset(graph, source, input);
-	lower_project(graph, hidden)?;
-	let shared_gate = graph.source;
-	reset(graph, source, input);
-	lower_project(graph, hidden)?;
-	let shared_up = graph.source;
-	let shared_product = lower_gated(graph, shared_gate, shared_up, wide, activation, config)?;
-	reset(graph, shared_product, wide);
-	lower_project(graph, input.channels)?;
-	let mut gain = ScalarProgram(Vec::new());
-	let scale = gain.op(ScalarOpcode::Parameter, 0.0, 0.0);
-	gain.op(ScalarOpcode::Multiply, scale, -1.0);
-	push_program(graph, -2, &[1.0], gain)?;
-	let scaled = graph.source;
-	binary(graph, dispatched, scaled, input, ScalarOpcode::Add)?;
+	// The gate is the `[width]` vector alone, trained or bound, so a view of it
+	// must hold exactly that many values.
+	push_node(graph, Primitive::Contraction, Shape { channels: 1, length: input.length }, input.channels, contraction_arguments(0, false), -2)?;
+	lower_activation(graph, Activation::Sigmoid, config)?;
+	let gate = graph.source;
+	lower_experts(graph, source, input, gate, 1, 1, hidden, activation, config)?;
+	let gated = graph.source;
+	binary(graph, dispatched, gated, input, ScalarOpcode::Add)?;
 	Ok(())
 }
 fn lower_scan(graph: &mut Graph, channels: usize, gates: usize) -> Result<()> {
