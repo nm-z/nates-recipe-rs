@@ -4734,6 +4734,14 @@ mod gguf {
 				_ => None,
 			}
 		}
+		/// The value as a real number, whichever float width the file chose.
+		pub fn float(&self) -> Option<f64> {
+			match *self {
+				Self::F32(value) => Some(f64::from(value)),
+				Self::F64(value) => Some(value),
+				_ => None,
+			}
+		}
 	}
 
 	/// One tensor descriptor: `kind` is the GGML type id and `offset` counts bytes
@@ -5056,11 +5064,7 @@ mod gguf {
 			usize::try_from(value).map_err(|_| RecipeError::new(format!("{key} exceeds the address space")))
 		}
 		fn float_at(&self, key: &str) -> Result<f64> {
-			match self.required(key)? {
-				GgufValue::F32(value) => Ok(f64::from(*value)),
-				GgufValue::F64(value) => Ok(*value),
-				_ => Err(RecipeError::new(format!("{key} is not a float"))),
-			}
+			self.required(key)?.float().ok_or_else(|| RecipeError::new(format!("{key} is not a float")))
 		}
 		fn integers_at(&self, key: &str) -> Result<Vec<u64>> {
 			match self.required(key)? {
@@ -6171,10 +6175,10 @@ mod bundle {
 	fn model_text(model: &Model) -> Vec<String> {
 		model.blocks.iter().map(block_text).collect()
 	}
-	fn model(blocks: Vec<Block>, loss: u8, quantization: u16) -> Result<Model> {
+	fn model(blocks: Vec<Block>, loss: u8, quantization: u16, epsilon: f64) -> Result<Model> {
 		require(!blocks.is_empty(), "semantic model has no blocks")?;
 		require(matches!(loss, 0..=4 | 6), format!("saved model loss {loss} is unavailable"))?;
-		Ok(Model { blocks, loss: LossFunction(loss), quantization, frozen: false, packed: false })
+		Ok(Model { blocks, loss: LossFunction(loss), quantization, epsilon, frozen: false, packed: false })
 	}
 	#[derive(Clone)]
 	pub(super) struct StoredGraph {
@@ -6256,7 +6260,7 @@ mod bundle {
 		})
 	}
 	fn same_model(a: &Model, b: &Model) -> bool {
-		a.loss.0 == b.loss.0 && a.quantization == b.quantization && model_text(a) == model_text(b)
+		a.loss.0 == b.loss.0 && a.quantization == b.quantization && a.epsilon.to_bits() == b.epsilon.to_bits() && model_text(a) == model_text(b)
 	}
 	fn values<T: FromStr>(text: &str, role: &str) -> Result<Vec<T>>
 	where
@@ -6285,6 +6289,7 @@ mod bundle {
 	struct ModelParts {
 		loss: Option<u8>,
 		quantization: Option<u16>,
+		epsilon: Option<f64>,
 		blocks: Vec<Block>,
 	}
 	#[derive(Default)]
@@ -6315,6 +6320,8 @@ mod bundle {
 				parts.blocks,
 				parts.loss.ok_or_else(|| RecipeError::new("semantic model has no loss"))?,
 				parts.quantization.ok_or_else(|| RecipeError::new("semantic model has no quantization"))?,
+				// A bundle saved before models carried an epsilon was lowered with the Cargo default.
+				parts.epsilon.map_or_else(default_epsilon, Ok)?,
 			)?;
 			require(self.inputs.len() == input.elements(), "semantic model input schema has the wrong width")?;
 			require(self.outputs.len() == output.elements(), "semantic model output schema has the wrong width")?;
@@ -6403,11 +6410,12 @@ mod bundle {
 			match kind {
 				"model" => {
 					let fields = value.split_whitespace().collect::<Vec<_>>();
-					require(fields.len() == 2, "semantic model header has the wrong width")?;
+					require(matches!(fields.len(), 2 | 3), "semantic model header has the wrong width")?;
 					require(builder.model.is_none(), "semantic graph has more than one model")?;
 					builder.model = Some(ModelParts {
 						loss: Some(value_at(fields.first().copied(), "semantic model loss")?),
 						quantization: Some(value_at(fields.get(1).copied(), "semantic model quantization")?),
+						epsilon: fields.get(2).map(|field| number("semantic model epsilon", field)).transpose()?,
 						..ModelParts::default()
 					});
 				}
@@ -6491,7 +6499,7 @@ mod bundle {
 		}
 		for semantic in graphs {
 			document.push_str("    graph\n");
-			field(&mut document, "model", &format!("{} {}", semantic.model.loss.0, semantic.model.quantization));
+			field(&mut document, "model", &format!("{} {} {}", semantic.model.loss.0, semantic.model.quantization, semantic.model.epsilon));
 			for block in &semantic.model.blocks {
 				field(&mut document, "block", &block_text(block));
 			}
@@ -6583,7 +6591,7 @@ mod bundle {
 		}
 		feed(target);
 		feed(&format!("precision:{precision:?};"));
-		feed(&format!("loss:{};quant:{};blocks:{};", model.loss.0, model.quantization, model_text(model).join("/")));
+		feed(&format!("loss:{};quant:{};epsilon:{};blocks:{};", model.loss.0, model.quantization, model.epsilon.to_bits(), model_text(model).join("/")));
 		for node in &graph.nodes {
 			feed(&format!("node:{}:{}:{}:{};", node.offset, node.parameters, node.argument[8].to_bits(), node.output.elements()));
 		}
@@ -6987,6 +6995,8 @@ pub struct Model {
 	blocks: Vec<Block>,
 	loss: LossFunction,
 	quantization: u16,
+	/// The epsilon every normalization the model lowers is built with; saved with the model.
+	epsilon: f64,
 	frozen: bool,
 	packed: bool,
 }
@@ -7152,6 +7162,16 @@ impl Model {
 	pub fn loss(&self, loss: LossFunction) -> Self {
 		let mut model = self.clone();
 		model.loss = loss;
+		model
+	}
+	/// The epsilon every normalization of this model lowers with: the floor under an
+	/// L2 norm and the shift under a batch, layer, or RMS variance, in every block,
+	/// query and key normalization, delta rule, and hyper-connection gate. It is
+	/// saved with the model, so a bundle reloads with the value it was trained with.
+	pub fn epsilon(&self, value: f64) -> Self {
+		assert!(value.is_finite() && value > 0.0, "normalization epsilon must be finite and positive");
+		let mut model = self.clone();
+		model.epsilon = value;
 		model
 	}
 	pub fn quantize(&self, family: u16, bits: u8, variant: u16) -> Self {
@@ -8716,7 +8736,7 @@ impl Recipe {
 		}
 	}
 	pub fn model(&self) -> Model {
-		Model { blocks: Vec::new(), loss: mse, quantization: 0, frozen: false, packed: false }
+		Model { blocks: Vec::new(), loss: mse, quantization: 0, epsilon: default_epsilon().unwrap_or_else(|error| panic!("{error}")), frozen: false, packed: false }
 	}
 	pub const fn train(&self) -> Train {
 		Train { epochs: 1, learning_rate: 0.001, log_metrics: Vec::new(), stop: Some(1.0), resume: None, save: None, seed: None, precision: Compute::FP64 }
@@ -9158,6 +9178,7 @@ fn split_graph(graph: &Graph, split: &[usize]) -> Result<Vec<Graph>> {
 			block_packed: false,
 			bound: None,
 			bound_values: Vec::new(),
+			epsilon: graph.epsilon,
 		});
 		start = end;
 	}
@@ -9357,10 +9378,13 @@ struct Graph {
 	/// Bound values by node, written into their spans once every lowering has
 	/// set its own initial parameters.
 	bound_values: Vec<(usize, Vec<f64>)>,
+	/// The model's normalization epsilon, which every lowered normalization reads.
+	epsilon: f64,
 }
 impl Graph {
-	fn new(shape: Shape) -> Self {
+	fn new(shape: Shape, epsilon: f64) -> Self {
 		Self {
+			epsilon,
 			nodes: Vec::new(),
 			parameters: Vec::new(),
 			frozen: Vec::new(),
@@ -9429,7 +9453,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	// A sequential block anywhere in the model needs the sequence axis, including inside a residual or hyper branch.
 	let sequential = model.blocks.iter().any(|block| sequential_operation(&block.operation));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
-	let mut graph = Graph::new(shape);
+	let mut graph = Graph::new(shape, model.epsilon);
 	graph.bound = data.bound.clone().map(std::collections::VecDeque::from);
 	for (index, block) in model.blocks.iter().enumerate() {
 		graph.block_index = index;
@@ -9956,7 +9980,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 		push_node(graph, Primitive::Rope, graph.output, 0, [dims as f64, f64::from_bits(base), width as f64, rotated as f64, 0.0, 0.0, 0.0, 0.0, 0.0], -2)?;
 	}
 	let indexer = index.unwrap_or(Indexer { heads: 0, width: 0, block: 0, keep: 0 });
-	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
+	let epsilon = graph.epsilon;
 	let argument = [heads as f64, kv as f64, f64::from(u8::from(gate)), indexer.block as f64, indexer.keep as f64, indexer.heads as f64, indexer.width as f64, epsilon, 0.0];
 	push_node(graph, Primitive::Attention, Shape { channels: inner, length: input.length }, 0, argument, -2)?;
 	lower_project(graph, input.channels)
@@ -9964,7 +9988,7 @@ fn lower_attention(graph: &mut Graph, attention: AttentionBlock, qk: Option<Bloc
 /// Pushes a normalization over the graph output. A per-row mode splits the leading
 /// `span` channels into groups of `width`; the rest pass through untouched.
 fn lower_normalize(graph: &mut Graph, normalization: BlockNormalization, width: usize, span: usize) -> Result<()> {
-	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
+	let epsilon = graph.epsilon;
 	// RMS carries one trainable scale per normalized channel, starting at identity.
 	let parameters = if normalization == BlockNormalization::Rms { span } else { 0 };
 	let output = graph.output;
@@ -10118,7 +10142,7 @@ fn lower_gates(graph: &mut Graph, lanes: usize, rank: usize, write: bool) -> Res
 		return Ok((-2, -2));
 	}
 	let (stream, shape) = (graph.source, graph.output);
-	let epsilon = number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))?;
+	let epsilon = graph.epsilon;
 	push_node(graph, Primitive::Normalize, shape, 0, arguments(1.0, epsilon), -2)?;
 	let normalized = graph.source;
 	lower_project(graph, rank)?;
@@ -10419,6 +10443,11 @@ impl Config {
 			precision: Compute::FP64,
 		})
 	}
+}
+/// The normalization epsilon a model starts with: the Cargo default, which is also
+/// the value every bundle saved before models carried their own was lowered with.
+fn default_epsilon() -> Result<f64> {
+	number("normalization epsilon", env!("RECIPE_NORMALIZATION_EPSILON"))
 }
 fn number(name: &str, text: &str) -> Result<f64> {
 	let value = text.parse::<f64>().map_err(|error| RecipeError::new(format!("invalid {name}: {error}")))?;
