@@ -1500,6 +1500,22 @@ fn align(value: usize, boundary: usize) -> Result<usize> {
 }
 
 fn encode_floats(values: &[f64], precision: Compute) -> Vec<u8> {
+	if precision == Compute::FP32 {
+		let mut encoded = Vec::with_capacity(values.len() * size_of::<f32>());
+		for value in values {
+			let bits = if value.is_nan() { ((value.to_bits() >> 63) as u32) << 31 | 0x7fc0_0000 } else { (*value as f32).to_bits() };
+			encoded.extend_from_slice(&bits.to_le_bytes());
+		}
+		return encoded;
+	}
+	if precision == Compute::FP64 {
+		let mut encoded = Vec::with_capacity(std::mem::size_of_val(values));
+		for value in values {
+			let bits = if value.is_nan() { value.to_bits() >> 63 << 63 | 0x7ff8_0000_0000_0000 } else { value.to_bits() };
+			encoded.extend_from_slice(&bits.to_le_bytes());
+		}
+		return encoded;
+	}
 	let bytes = precision.bytes();
 	values.iter().flat_map(|value| precision.pack(*value).to_le_bytes().into_iter().take(bytes)).collect()
 }
