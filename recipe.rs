@@ -1144,7 +1144,7 @@ impl BackendTarget {
 
 	fn artifact_extension(&self) -> &'static str {
 		match self {
-			Self::Cpu { .. } => "so",
+			Self::Cpu { .. } => std::env::consts::DLL_EXTENSION,
 			Self::Amd { .. } => "hsaco",
 			Self::Nvidia { .. } => "ptx",
 		}
@@ -1213,8 +1213,9 @@ fn cpu_identity(target: &str) -> Result<(&str, &str, &str, &str)> {
 fn native_cpu_target() -> Result<BackendTarget> {
 	let compiler = native_cpu_compiler()?;
 	let target = option_env!("RECIPE_CPU_TARGET").ok_or_else(|| RecipeError::new("CPU native target is unavailable"))?;
+	let null = option_env!("RECIPE_NULL_DEVICE").ok_or_else(|| RecipeError::new("CPU null device is unavailable"))?;
 	let output = Command::new(compiler)
-		.args(["-target", target, "-march=native", "-###", "-x", "ir", "-c", "/dev/null", "-o", "/dev/null"])
+		.args(["-target", target, "-march=native", "-###", "-x", "ir", "-c", null, "-o", null])
 		.output()
 		.map_err(|error| RecipeError::new(format!("cannot query CPU native target: {error}")))?;
 	require(output.status.success(), format!("CPU native target query failed: {}", String::from_utf8_lossy(&output.stderr).lines().next().unwrap_or("no compiler diagnostic")))?;
@@ -1492,7 +1493,7 @@ fn barrier(backend: Backend) -> &'static str {
 
 fn ptr_gep(backend: Backend, base: &str, offset: usize, name: &str) -> String {
 	let pointer = pointer_type(backend);
-	format!("%{name} = getelementptr i8, {pointer} %{base}, i32 {offset}\n")
+	format!("%{name} = getelementptr i8, {pointer} %{base}, i64 {offset}\n")
 }
 
 mod quantized {
@@ -2916,17 +2917,9 @@ impl NativeModelIr {
 		}
 		let pointer = pointer_type(backend);
 		let ty = self.precision.model_type;
-		let thread = match backend {
-			Backend::Cpu => "call i32 @recipe.cpu.thread.id()".to_owned(),
-			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
-		};
-		let kernel = match backend {
-			Backend::Cpu => "",
-			Backend::Amd => "protected amdgpu_kernel ",
-			Backend::Nvidia => "protected ptx_kernel ",
-		};
+		let (kernel, thread) = native_entry(backend)?;
 		let mut ir = format!(
-			"define {kernel}void @recipe_model_load({pointer} %weights, {pointer} %storage, i32 %threads) #0 {{\nentry:\n%tid = {thread}\n",
+			"define {kernel} void @recipe_model_load({pointer} %weights, {pointer} %storage, i32 %threads) #0 {{\nentry:\n%tid = {thread}\n",
 			kernel = kernel,
 			pointer = pointer,
 			thread = thread
@@ -2944,7 +2937,7 @@ impl NativeModelIr {
 			let count = i32::try_from(stored.count).map_err(|_| RecipeError::new("native quantized weight count exceeds i32"))?;
 			let columns = i32::try_from(stored.count.div_ceil(block) * block).map_err(|_| RecipeError::new("native quantized block count exceeds i32"))?;
 			let prefix = format!("load.n{index}");
-			ir.push_str(&format!("br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.storage = getelementptr i8, {pointer} %storage, i32 {storage}\n%{prefix}.index = add i32 %{prefix}.p, {weight}\n%{prefix}.weights = getelementptr {ty}, {pointer} %weights, i32 %{prefix}.index\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} %{prefix}.storage, i32 0, i32 %{prefix}.p, i32 {columns})\nstore {ty} %{prefix}.value, {pointer} %{prefix}.weights, align {align}\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, count = count, storage = plan.storage_offset, weight = plan.node.offset, name = name, columns = columns, align = alignment(ty)).replace("%entry", &format!("%{predecessor}")));
+			ir.push_str(&format!("br label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.p = phi i32 [ %tid, %entry ], [ %{prefix}.next, %{prefix}.step ]\n%{prefix}.more = icmp ult i32 %{prefix}.p, {count}\nbr i1 %{prefix}.more, label %{prefix}.step, label %{prefix}.done\n{prefix}.step:\n%{prefix}.storage = getelementptr i8, {pointer} %storage, i64 {storage}\n%{prefix}.index = add i32 %{prefix}.p, {weight}\n%{prefix}.weights = getelementptr {ty}, {pointer} %weights, i32 %{prefix}.index\n%{prefix}.value = call {ty} @recipe_model_quantized_{name}({pointer} %{prefix}.storage, i32 0, i32 %{prefix}.p, i32 {columns})\nstore {ty} %{prefix}.value, {pointer} %{prefix}.weights, align {align}\n%{prefix}.next = add i32 %{prefix}.p, %threads\nbr label %{prefix}.loop\n{prefix}.done:\n", pointer = pointer, ty = ty, count = count, storage = plan.storage_offset, weight = plan.node.offset, name = name, columns = columns, align = alignment(ty)).replace("%entry", &format!("%{predecessor}")));
 			ir.push_str(barrier(backend));
 			predecessor = format!("{prefix}.done");
 		}
@@ -2976,15 +2969,7 @@ impl NativeModelIr {
 		let state_ty = self.precision.state_type;
 		let model_align = alignment(model_ty);
 		let state_align = alignment(state_ty);
-		let kernel = match backend {
-			Backend::Cpu => "",
-			Backend::Amd => "protected amdgpu_kernel ",
-			Backend::Nvidia => "protected ptx_kernel ",
-		};
-		let thread = match backend {
-			Backend::Cpu => "call i32 @recipe.cpu.thread.id()".to_owned(),
-			Backend::Amd | Backend::Nvidia => "call i32 @global_id()".to_owned(),
-		};
+		let (kernel, thread) = native_entry(backend)?;
 		let inference_forward = self.emit_fixed_primitives(backend, matrix.is_some(), false, false)?;
 		let mut body = String::new();
 		let forward_args = format!("{pointer} %samples, {pointer} %weights, {pointer} %values, {pointer} %contexts, i32 %rows, i32 %threads");
@@ -2999,10 +2984,10 @@ impl NativeModelIr {
 		}
 		let forward_entry_args = format!("{forward_args}, i32 %training");
 		if loss.is_some() {
-			body.push_str(&format!("define {kernel}void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%forward.training = icmp ne i32 %training, 0\nbr i1 %forward.training, label %forward.training.entry, label %forward.inference.entry\nforward.inference.entry:\ncall void @recipe_model_inference_forward_body({forward_args})\nbr label %forward.done\nforward.training.entry:\ncall void @recipe_model_training_forward_body({forward_args})\nbr label %forward.done\nforward.done:\nret void\n}}\n"));
+			body.push_str(&format!("define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\n%forward.training = icmp ne i32 %training, 0\nbr i1 %forward.training, label %forward.training.entry, label %forward.inference.entry\nforward.inference.entry:\ncall void @recipe_model_inference_forward_body({forward_args})\nbr label %forward.done\nforward.training.entry:\ncall void @recipe_model_training_forward_body({forward_args})\nbr label %forward.done\nforward.done:\nret void\n}}\n"));
 		} else {
 			body.push_str(&format!(
-				"define {kernel}void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
+				"define {kernel} void @recipe_model_forward({forward_entry_args}) #0 {{\nentry:\ncall void @recipe_model_inference_forward_body({forward_args})\nret void\n}}\n"
 			));
 		}
 		if let Some(loss) = loss {
@@ -3012,7 +2997,7 @@ impl NativeModelIr {
 			let epoch_args = format!(
 				"{pointer} %samples, {pointer} %targets, {pointer} %weights, {pointer} %frozen, {pointer} %moments, {pointer} %variances, {pointer} %gradient, {pointer} %metrics, {pointer} %input_adjoint, {pointer} %values, {pointer} %contexts, {pointer} %adjoints, i32 %rows, i32 %threads, {state_ty} %rate, {state_ty} %beta1, {state_ty} %beta2, {state_ty} %beta1.power, {state_ty} %beta2.power, {state_ty} %epsilon, {state_ty} %decay, i32 %run.gradient, i32 %run.optimizer"
 			);
-			body.push_str(&format!("define {kernel}void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %optimizer.entry\ngradient.entry:\n"));
+			body.push_str(&format!("define {kernel} void @recipe_model_epoch({epoch_args}) #0 {{\nentry:\n%tid = {thread}\n%epoch.gradient = icmp ne i32 %run.gradient, 0\n%epoch.optimizer = icmp ne i32 %run.optimizer, 0\nbr i1 %epoch.gradient, label %gradient.entry, label %optimizer.entry\ngradient.entry:\n"));
 			body.push_str(&self.emit_clear_bytes(backend, "gradient", gradient_bytes, "gradient", "gradient.entry")?);
 			body.push_str(&self.emit_clear_bytes(backend, "adjoints", self.layout.adjoints_bytes, "adjoints", "clear.gradient.done")?);
 			body.push_str(&self.emit_clear_bytes(backend, "input_adjoint", input_bytes, "input", "clear.adjoints.done")?);
@@ -3027,7 +3012,11 @@ impl NativeModelIr {
 			body.push_str("br label %epoch.done\nepoch.done:\nret void\n}\n");
 		}
 		ir.push_str(&body);
-		Ok(prune_internal_definitions(ir))
+		let mut ir = prune_internal_definitions(ir);
+		if matches!(backend, Backend::Cpu) {
+			ir.push_str(native_cpu_setting("module-suffix")?);
+		}
+		Ok(ir)
 	}
 
 	fn emit_loss_and_seed(
@@ -3040,7 +3029,7 @@ impl NativeModelIr {
 		let adjoint_offset = last.adjoint;
 		let mut ir = String::new();
 		let zero = native_literal(state_precision, state_ty, 0.0);
-		ir.push_str(&format!("%prediction.base = getelementptr i8, {pointer} %values, i32 {prediction_offset}\n%prediction = bitcast {pointer} %prediction.base to {pointer}\n%metric.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 0\n%loss.leader = icmp eq i32 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
+		ir.push_str(&format!("%prediction.base = getelementptr i8, {pointer} %values, i64 {prediction_offset}\n%prediction = bitcast {pointer} %prediction.base to {pointer}\n%metric.ptr = getelementptr {state_ty}, {pointer} %metrics, i32 0\n%loss.leader = icmp eq i32 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n"));
 		ir.push_str(&format!("%loss.items = call {state_ty} @recipe.state.from.u32(i32 {items})\n"));
 		if loss.0 <= 1 {
 			ir.push_str(&format!("%loss.normalizer = call {state_ty} @recipe.state.sqrt({state_ty} %loss.items)\n"));
@@ -3075,7 +3064,7 @@ impl NativeModelIr {
 		} else {
 			zero.as_str()
 		};
-		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i32 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, {items}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
+		ir.push_str(&format!("%adjoint.base = getelementptr i8, {pointer} %adjoints, i64 {adjoint_offset}\n%adjoint = bitcast {pointer} %adjoint.base to {pointer}\nbr label %seed.loop\nseed.loop:\n%seed.p = phi i32 [ %tid, %loss.wait ], [ %seed.next, %seed.step ]\n%seed.more = icmp ult i32 %seed.p, {items}\nbr i1 %seed.more, label %seed.step, label %seed.done\nseed.step:\n%seed.pred.ptr = getelementptr {model_ty}, {pointer} %prediction, i32 %seed.p\n%seed.pred.model = load {model_ty}, {pointer} %seed.pred.ptr, align {model_align}\n%seed.pred = call {state_ty} @recipe.state.from.model({model_ty} %seed.pred.model)\n%seed.target.ptr = getelementptr {model_ty}, {pointer} %targets, i32 %seed.p\n%seed.target.model = load {model_ty}, {pointer} %seed.target.ptr, align {model_align}\n%seed.target = call {state_ty} @recipe.state.from.model({model_ty} %seed.target.model)\n",));
 		let gradient = emit_loss_gradient(&mut ir, loss, state_precision, state_ty, "%seed.pred", "%seed.target", &threshold, loss_value, &format!("{items}"))?;
 		ir.push_str(&format!("%seed.model = call {model_ty} @recipe.model.from.state({state_ty} {gradient})\n%seed.ptr = getelementptr {model_ty}, {pointer} %adjoint, i32 %seed.p\nstore {model_ty} %seed.model, {pointer} %seed.ptr, align {model_align}\n%seed.next = add i32 %seed.p, %threads\nbr label %seed.loop\nseed.done:\n"));
 		Ok(ir)
@@ -3373,15 +3362,18 @@ impl Drop for NativeTemporaryFiles {
 	}
 }
 
+fn home_directory() -> Result<PathBuf> {
+	std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).ok_or_else(|| RecipeError::new("home directory is absent"))
+}
+
 fn native_artifact_directory(key: &str) -> Result<PathBuf> {
 	require(!key.is_empty() && key != "." && key != ".." && !key.contains('/') && !key.contains('\\'), "native artifact key is not a single path component")?;
-	let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| RecipeError::new("home directory is absent"))?;
-	Ok(PathBuf::from(home).join(".cache").join("recipe").join("native").join(key))
+	Ok(home_directory()?.join(".cache").join("recipe").join("native").join(key))
 }
 
 fn native_artifact_key(target: &BackendTarget, ir: &str) -> String {
 	let mut hash = 14695981039346656037_u64;
-	for part in [b"recipe-native-v2".as_slice(), native_target_label(target).as_bytes(), ir.as_bytes()] {
+	for part in [b"recipe-native-v3".as_slice(), native_target_label(target).as_bytes(), env!("RECIPE_NATIVE_CONFIGURATION").as_bytes(), ir.as_bytes()] {
 		for byte in (part.len() as u64).to_le_bytes().into_iter().chain(part.iter().copied()) {
 			hash = (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
 		}
@@ -3451,6 +3443,27 @@ fn native_cpu_compiler() -> Result<&'static str> {
 	option_env!("RECIPE_CPU_COMPILER").ok_or_else(|| RecipeError::new("CPU native compiler is unavailable"))
 }
 
+fn native_cpu_setting(name: &str) -> Result<&'static str> {
+	match name {
+		"linker" => option_env!("RECIPE_CPU_LINKER"),
+		"linker-driver" => option_env!("RECIPE_CPU_LINKER_DRIVER"),
+		"library-flags" => option_env!("RECIPE_CPU_LIBRARY_FLAGS"),
+		"link-flags" => option_env!("RECIPE_CPU_LINK_FLAGS"),
+		"entry-linkage" => option_env!("RECIPE_CPU_ENTRY_LINKAGE"),
+		"module-suffix" => option_env!("RECIPE_CPU_MODULE_SUFFIX"),
+		_ => None,
+	}
+	.ok_or_else(|| RecipeError::new(format!("CPU native {name} is unavailable")))
+}
+
+fn native_entry(backend: Backend) -> Result<(&'static str, &'static str)> {
+	Ok(match backend {
+		Backend::Cpu => (native_cpu_setting("entry-linkage")?, "call i32 @recipe.cpu.thread.id()"),
+		Backend::Amd => ("protected amdgpu_kernel", "call i32 @global_id()"),
+		Backend::Nvidia => ("protected ptx_kernel", "call i32 @global_id()"),
+	})
+}
+
 fn native_amd_compiler() -> Result<&'static str> {
 	option_env!("RECIPE_HSA_COMPILER").ok_or_else(|| RecipeError::new("AMD native compiler is unavailable"))
 }
@@ -3469,11 +3482,21 @@ fn native_amd_library(name: &'static str) -> Result<&'static str> {
 		.ok_or_else(|| RecipeError::new(format!("AMD native {name} library is unavailable")))
 }
 
-fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, bitcode: Option<&Path>, key: &str) -> Result<Vec<KernelResources>> {
+fn native_nvidia_device_library() -> Result<&'static str> {
+	option_env!("RECIPE_NV_DEVICE_LIBRARY").ok_or_else(|| RecipeError::new("NVIDIA native device library is unavailable"))
+}
+
+fn native_nvidia_ptx_version() -> Result<&'static str> {
+	option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))
+}
+
+fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path, key: &str) -> Result<Vec<KernelResources>> {
 	match target {
 		BackendTarget::Cpu { target } => {
 			let compiler = native_cpu_compiler()?;
 			let (target, compiler_identity, _, _) = cpu_identity(target)?;
+			let linker = Path::new(native_cpu_setting("linker")?);
+			let linker_directory = linker.parent().ok_or_else(|| RecipeError::new("CPU native linker has no directory"))?;
 			let mut command = Command::new(compiler);
 			command.args(["-target", target, "-march=native"]);
 			if cpu_llvm_major(compiler_identity)? < LLVM_OPAQUE_POINTER_DEFAULT_MAJOR {
@@ -3482,7 +3505,16 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 			if compiler_identity.contains(APPLE_CLANG_BROKEN_LICM_PROMOTION_PREFIX) {
 				command.args(["-mllvm", "-disable-licm-promotion"]);
 			}
-			command.args(["-x", "ir", "-O2", "-fPIC", "-shared", "-o"]).arg(output).arg(source);
+			command
+				.args(["-x", "ir", "-O2"])
+				.args(native_cpu_setting("library-flags")?.split_whitespace())
+				.arg(format!("-B{}", linker_directory.display()))
+				.arg(format!("-fuse-ld={}", native_cpu_setting("linker-driver")?))
+				.args(["-shared"])
+				.args(native_cpu_setting("link-flags")?.split_whitespace())
+				.args(["-o"])
+				.arg(output)
+				.arg(source);
 			native_command(command, "CPU LLVM IR compiler", key).map(|_| Vec::new())
 		}
 		BackendTarget::Amd { architecture } => {
@@ -3502,22 +3534,17 @@ fn compile_native_artifact(target: &BackendTarget, source: &Path, output: &Path,
 		}
 		BackendTarget::Nvidia { architecture } => {
 			let compiler = native_nvidia_compiler()?;
-			let device = option_env!("RECIPE_NV_DEVICE_LIBRARY").ok_or_else(|| RecipeError::new("NVIDIA native device library is unavailable"))?;
-			let bitcode = bitcode.ok_or_else(|| RecipeError::new("NVIDIA bitcode path is absent"))?;
-			let ptx_version = option_env!("RECIPE_NV_PTX_VERSION").ok_or_else(|| RecipeError::new("NVIDIA PTX version is unavailable"))?;
-			let mut llvm = Command::new(compiler);
-			llvm.args(["-target", "nvptx64-nvidia-cuda"])
+			let device = native_nvidia_device_library()?;
+			let ptx_version = native_nvidia_ptx_version()?;
+			let mut command = Command::new(compiler);
+			command
+				.args(["-target", "nvptx64-nvidia-cuda"])
 				.arg(format!("-march={architecture}"))
-				.args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-emit-llvm", "-c", "-x", "ir"])
-				.arg(source.to_str().ok_or_else(|| RecipeError::new("native LLVM source path is not UTF-8"))?)
+				.args(["-Xclang", "-target-feature", "-Xclang", ptx_version, "-O2", "-S", "-x", "ir"])
+				.arg(source)
 				.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang", device, "-o"])
-				.arg(bitcode);
-			native_command(llvm, "NVIDIA LLVM IR compiler", key)?;
-			// Both stages take the pinned ISA: the bitcode step rejects any target newer than its own default, and the generator stamps the version into the artifact so the driver JIT loads it on every driver at or above that version.
-			let generator = option_env!("RECIPE_NV_PTX_GENERATOR").ok_or_else(|| RecipeError::new("NVIDIA PTX generator is unavailable"))?;
-			let mut llc = Command::new(generator);
-			llc.args(["-march=nvptx64", &format!("-mcpu={architecture}"), &format!("-mattr={ptx_version}"), "-O2"]).arg(bitcode).args(["-o"]).arg(output);
-			native_command(llc, "NVIDIA PTX generator", key)?;
+				.arg(output);
+			native_command(command, "NVIDIA LLVM IR compiler", key)?;
 			fs::read(output)
 				.and_then(|mut image| {
 					image.push(0);
@@ -3559,8 +3586,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		let stem = format!(".recipe-native-{}-{serial}", std::process::id());
 		let source = directory.join(format!("{stem}.ll"));
 		let output = directory.join(format!("{stem}.{}", target.artifact_extension()));
-		let bitcode = (target.backend() == Backend::Nvidia).then(|| directory.join(format!("{stem}.bc")));
-		let temporary = NativeTemporaryFiles { paths: std::iter::once(source.clone()).chain(std::iter::once(output.clone())).chain(bitcode.iter().cloned()).collect() };
+		let temporary = NativeTemporaryFiles { paths: vec![source.clone(), output.clone()] };
 		fs::write(&source, ir).map_err(|error| RecipeError::new(format!("cannot write native LLVM IR: {error}")))?;
 		debug(&format!("native source key={key} path={}", source.display()))?;
 		// The artifact is cached on disk, so this is the one moment the compiler's
@@ -3570,7 +3596,7 @@ pub(crate) fn compile_model(target: &BackendTarget, graph: &Graph, precision: Co
 		// nonzero occupancy here holds for every workgroup width the schedule can
 		// pick. It does not bound the tile: local memory is checked separately, and
 		// the schedule still does not resize itself from these numbers.
-		for kernel in compile_native_artifact(target, &source, &output, bitcode.as_deref(), &key)? {
+		for kernel in compile_native_artifact(target, &source, &output, &key)? {
 			debug(&format!("native kernel {} registers={} scalars={} occupancy={} waves per SIMD", kernel.name, kernel.registers, kernel.scalars, kernel.occupancy))?;
 			require(kernel.occupancy != 0, format!("native kernel {} cannot be resident at any workgroup width", kernel.name))?;
 		}
@@ -3622,7 +3648,13 @@ impl FloatLayout {
 							exponent += 1
 						}
 						let stored_exponent = exponent + self.bias() as i64;
-						if stored_exponent >= exponent_limit as i64 { sign | exponent_limit << self.man } else { sign | (stored_exponent as u64) << self.man | mantissa }
+						// A finite value above the format's range saturates to its largest finite
+						// magnitude. Encoding infinity makes an in-range sample nonfinite instead.
+						if stored_exponent >= exponent_limit as i64 {
+							sign | (exponent_limit - 1) << self.man | (mantissa_limit - 1)
+						} else {
+							sign | (stored_exponent as u64) << self.man | mantissa
+						}
 					}
 				}
 			}
@@ -4342,10 +4374,14 @@ mod bundle {
 		Ok(result)
 	}
 }
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap},
 	error::Error,
-	ffi::c_void,
+	ffi::{OsStr, c_void},
 	fmt, fs,
 	io::{IsTerminal, Read, Write},
 	mem::{size_of, size_of_val},
@@ -4367,12 +4403,32 @@ const DEBUG_LOG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/recipe.log");
 const SIGINT: i32 = 2;
 const INTERRUPTED_EXIT: i32 = 128 + SIGINT;
 static SIGNAL: OnceLock<usize> = OnceLock::new();
-extern "C" fn interrupt(_: i32) {
+fn record_interrupt() {
 	if !INTERRUPTED.swap(true, Ordering::AcqRel) {
 		let message = b"\ninterrupt received, finishing checkpoint\n";
 		unsafe {
 			write(2, message.as_ptr().cast(), message.len());
 		}
+	}
+}
+#[cfg(unix)]
+extern "C" fn interrupt(_: i32) {
+	record_interrupt()
+}
+#[cfg(windows)]
+unsafe extern "system" fn interrupt(event: u32) -> i32 {
+	if event != CTRL_C_EVENT {
+		return 0;
+	}
+	record_interrupt();
+	1
+}
+fn register_interrupt() -> usize {
+	unsafe {
+		#[cfg(unix)]
+		return signal(SIGINT, interrupt);
+		#[cfg(windows)]
+		return SetConsoleCtrlHandler(Some(interrupt), 1) as usize;
 	}
 }
 fn debug(message: &str) -> Result<()> {
@@ -5462,6 +5518,22 @@ fn decode_blocks(data: &[u8], count: usize, block: usize, stride: usize, error: 
 	}
 	Ok(weights)
 }
+/// Encodes each `block`-wide slice of the weights on the configured CPU workers and
+/// concatenates the encoded blocks in index order. A trailing partial slice pads with
+/// zeros. Block formats carry no codebook.
+fn encode_blocks(weights: &[f64], block: usize, encode: impl Fn(usize, &[f32], &mut Vec<u8>) + Sync) -> Result<(Vec<u8>, Vec<f64>)> {
+	let blocks = parallel_map(weights.len().div_ceil(block), |chunk| {
+		let values = block_values(weights, chunk, block);
+		let mut data = Vec::new();
+		encode(chunk, &values, &mut data);
+		data
+	})?;
+	Ok((blocks.concat(), Vec::new()))
+}
+/// Reads the `chunk`-th `block`-wide slice as single precision, padding past the end with zeros.
+fn block_values(values: &[f64], chunk: usize, block: usize) -> Vec<f32> {
+	(0..block).map(|index| values.get(chunk * block + index).copied().unwrap_or(0.0) as f32).collect()
+}
 impl Integer for StorageFormat {
 	fn bits(self) -> u8 {
 		self.0 as u8
@@ -5470,11 +5542,9 @@ impl Integer for StorageFormat {
 		let quantizer = self.spec().ok_or_else(|| self.unavailable())?.codec.quantization().quantizer;
 		if let Quantizer::Scalar { bits, variant } = quantizer {
 			let block = 32;
-			let mut data = Vec::new();
-			for values in weights.chunks(block) {
-				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
-				let (minimum, maximum) = (0..block).map(value).fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), value| (low.min(value), high.max(value)));
-				let extreme = (0..block).map(value).max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
+			return encode_blocks(weights, block, |_, values, data| {
+				let (minimum, maximum) = values.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), value| (low.min(*value), high.max(*value)));
+				let extreme = values.iter().copied().max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
 				let scale = match (bits, variant) {
 					(8, _) => extreme.abs() / 127.0,
 					(_, 0) => extreme / -(1_i32 << (bits - 1)) as f32,
@@ -5482,17 +5552,17 @@ impl Integer for StorageFormat {
 					_ => unreachable!(),
 				};
 				let inverse = if scale == 0.0 { 0.0 } else { scale.recip() };
-				put_half(&mut data, scale);
+				put_half(data, scale);
 				if variant == 1 && bits != 8 {
-					put_half(&mut data, minimum)
+					put_half(data, minimum)
 				}
 				let (mut low, mut high) = ([0_u8; 32], [0_u8; 4]);
 				let mut sum = 0_i32;
 				for index in 0..block {
 					let shifted = match (bits, variant) {
-						(8, _) => (value(index) * inverse).round() + 128.0,
-						(_, 0) => value(index) * inverse + (1_i32 << (bits - 1)) as f32 + 0.5,
-						(_, 1) => (value(index) - minimum) * inverse + 0.5,
+						(8, _) => (values[index] * inverse).round() + 128.0,
+						(_, 0) => values[index] * inverse + (1_i32 << (bits - 1)) as f32 + 0.5,
+						(_, 1) => (values[index] - minimum) * inverse + 0.5,
 						_ => unreachable!(),
 					};
 					let code = shifted.max(0.0).min(f32::from((1_u16 << bits) - 1)) as u8;
@@ -5511,7 +5581,7 @@ impl Integer for StorageFormat {
 					data.extend(high)
 				}
 				if bits == 8 && variant == 1 {
-					put_half(&mut data, scale * sum as f32)
+					put_half(data, scale * sum as f32)
 				}
 				data.extend_from_slice(
 					&low[..match bits {
@@ -5520,13 +5590,10 @@ impl Integer for StorageFormat {
 						_ => unreachable!(),
 					}],
 				);
-			}
-			return Ok((data, Vec::new()));
+			});
 		}
 		if matches!(quantizer, Quantizer::Q2K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut codes, mut scales, mut minima) = ([0_u8; 256], [0.0_f32; 16], [0.0_f32; 16]);
 				for block in 0..16 {
 					let weights = values[block * 16..block * 16 + 16].iter().map(|value| value.abs()).collect::<Vec<_>>();
@@ -5555,15 +5622,12 @@ impl Integer for StorageFormat {
 				}
 				data.extend(packed_scales);
 				data.extend(packed);
-				put_half(&mut data, scale);
-				put_half(&mut data, minimum);
-			}
-			return Ok((data, Vec::new()));
+				put_half(data, scale);
+				put_half(data, minimum);
+			});
 		}
 		if matches!(quantizer, Quantizer::Q3K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut codes, mut block_scales) = ([0_i8; 256], [0.0_f32; 16]);
 				let (mut maximum, mut extreme) = (0.0, 0.0);
 				for block in 0..16 {
@@ -5607,15 +5671,11 @@ impl Integer for StorageFormat {
 				data.extend(high);
 				data.extend(low);
 				data.extend(scales);
-				put_half(&mut data, scale);
-			}
-			return Ok((data, Vec::new()));
+				put_half(data, scale);
+			});
 		}
 		if let Quantizer::Q45K { bits } = quantizer {
-			let chunks = weights.chunks(256).collect::<Vec<_>>();
-			let data = parallel_map(chunks.len(), |chunk| {
-				let values = (0..256).map(|index| chunks[chunk].get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
-				let mut data = Vec::new();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut codes, mut block_scales, mut minima) = ([0_u8; 256], [0.0_f32; 8], [0.0_f32; 8]);
 				for block in 0..8 {
 					let slice = &values[block * 32..block * 32 + 32];
@@ -5656,21 +5716,17 @@ impl Integer for StorageFormat {
 						high[offset] |= (codes[group + offset] >> 4) << (group / 32) | (codes[group + offset + 32] >> 4) << (group / 32 + 1)
 					}
 				}
-				put_half(&mut data, scale);
-				put_half(&mut data, minimum);
+				put_half(data, scale);
+				put_half(data, minimum);
 				data.extend(metadata);
 				if bits == 5 {
 					data.extend(high)
 				}
 				data.extend(packed);
-				data
-			})?;
-			return Ok((data.concat(), Vec::new()));
+			});
 		}
 		if matches!(quantizer, Quantizer::Q6K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut codes, mut block_scales) = ([0_i8; 256], [0.0_f32; 16]);
 				let (mut maximum, mut extreme) = (0.0, 0.0);
 				for block in 0..16 {
@@ -5705,25 +5761,21 @@ impl Integer for StorageFormat {
 				data.extend(low);
 				data.extend(high);
 				data.extend(scales.map(|value| value as u8));
-				put_half(&mut data, scale);
-			}
-			return Ok((data, Vec::new()));
+				put_half(data, scale);
+			});
 		}
 		if matches!(quantizer, Quantizer::Q8K) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let value = |index| values.get(index).copied().unwrap_or(0.0) as f32;
-				let maximum = (0..256).map(value).max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
+			return encode_blocks(weights, 256, |_, values, data| {
+				let maximum = values.iter().copied().max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);
 				let inverse = if maximum == 0.0 { 0.0 } else { -127.0 / maximum };
 				let scale = if inverse == 0.0 { 0.0 } else { inverse.recip() };
 				data.extend(scale.to_le_bytes());
-				let codes = (0..256).map(|index| qround(inverse * value(index)).max(-128.0).min(127.0) as i8).collect::<Vec<_>>();
+				let codes = values.iter().map(|value| qround(inverse * value).max(-128.0).min(127.0) as i8).collect::<Vec<_>>();
 				data.extend(codes.iter().map(|code| *code as u8));
 				for block in codes.chunks(16) {
 					data.extend(block.iter().map(|code| i16::from(*code)).sum::<i16>().to_le_bytes())
 				}
-			}
-			return Ok((data, Vec::new()));
+			});
 		}
 		if matches!(quantizer, Quantizer::Nf4) {
 			const NF4: [f64; 16] = [
@@ -5759,21 +5811,16 @@ impl Integer for StorageFormat {
 			return Ok((data, metadata));
 		}
 		if matches!(quantizer, Quantizer::Iq4Nl) {
-			let mut data = Vec::new();
-			for values in weights.chunks(32) {
-				let values = (0..32).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
-				let (scale, codes) = iq4_fit(&values, -1);
-				put_half(&mut data, scale);
+			return encode_blocks(weights, 32, |_, values, data| {
+				let (scale, codes) = iq4_fit(values, -1);
+				put_half(data, scale);
 				for index in 0..16 {
 					data.push(codes[index] | codes[index + 16] << 4)
 				}
-			}
-			return Ok((data, Vec::new()));
+			});
 		}
 		if matches!(quantizer, Quantizer::Iq4Xs) {
-			let mut data = Vec::new();
-			for values in weights.chunks(256) {
-				let values = (0..256).map(|index| values.get(index).copied().unwrap_or(0.0) as f32).collect::<Vec<_>>();
+			return encode_blocks(weights, 256, |_, values, data| {
 				let (mut scales, mut codes) = ([0.0_f32; 8], [0_u8; 256]);
 				let (mut maximum, mut extreme) = (0.0, 0.0);
 				for block in 0..8 {
@@ -5799,7 +5846,7 @@ impl Integer for StorageFormat {
 						codes[block * 32 + offset] = iq4_code(values[block * 32 + offset] * inverse)
 					}
 				}
-				put_half(&mut data, scale);
+				put_half(data, scale);
 				data.extend(high.to_le_bytes());
 				data.extend(low);
 				for block in 0..8 {
@@ -5807,40 +5854,38 @@ impl Integer for StorageFormat {
 						data.push(codes[block * 32 + offset] | codes[block * 32 + offset + 16] << 4)
 					}
 				}
-			}
-			return Ok((data, Vec::new()));
+			});
 		}
+		let weighted = |chunk: usize| block_values(importance, chunk, 256);
 		if matches!(quantizer, Quantizer::Iq2Xxs) {
 			require(
 				importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0),
 				"GGML IQ2_XXS requires trained importance weights",
 			)?;
-			return Ok((iq2_xxs(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), &importance.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
+			return encode_blocks(weights, 256, |chunk, values, data| data.extend(iq2_xxs(values, &weighted(chunk))));
 		}
 		if matches!(quantizer, Quantizer::Iq2 { importance: true, xs: true }) {
 			require(
 				importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0),
 				"GGML IQ2_XS requires trained importance weights",
 			)?;
-			return Ok((iq2_16(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), Some(&importance.iter().map(|value| *value as f32).collect::<Vec<_>>()), true), Vec::new()));
+			return encode_blocks(weights, 256, |chunk, values, data| data.extend(iq2_16(values, Some(&weighted(chunk)), true)));
 		}
 		if let Quantizer::Iq1 { medium } = quantizer {
 			require(
 				importance.len() == weights.len() && importance.iter().all(|value| value.is_finite() && *value >= 0.0) && importance.iter().any(|value| *value > 0.0),
 				format!("GGML IQ1_{} requires trained importance weights", if medium { "M" } else { "S" }),
 			)?;
-			return Ok((iq1(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), &importance.iter().map(|value| *value as f32).collect::<Vec<_>>(), medium), Vec::new()));
+			return encode_blocks(weights, 256, |chunk, values, data| data.extend(iq1(values, &weighted(chunk), medium)));
 		}
 		if matches!(quantizer, Quantizer::Iq3Xxs) {
-			let weights = weights.iter().map(|value| *value as f32).collect::<Vec<_>>();
-			let chunks = weights.chunks(256).collect::<Vec<_>>();
-			return Ok((parallel_map(chunks.len(), |chunk| iq3_xxs(chunks[chunk]))?.concat(), Vec::new()));
+			return encode_blocks(weights, 256, |_, values, data| data.extend(iq3_xxs(values)));
 		}
 		if matches!(quantizer, Quantizer::Iq2 { importance: false, xs: false }) {
-			return Ok((iq2_16(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>(), None, false), Vec::new()));
+			return encode_blocks(weights, 256, |_, values, data| data.extend(iq2_16(values, None, false)));
 		}
 		if matches!(quantizer, Quantizer::Iq3S) {
-			return Ok((iq3_s(&weights.iter().map(|value| *value as f32).collect::<Vec<_>>()), Vec::new()));
+			return encode_blocks(weights, 256, |_, values, data| data.extend(iq3_s(values)));
 		}
 		Err(self.unavailable())
 	}
@@ -6215,7 +6260,13 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 		return Err(format.unavailable());
 	}
 	let sequence = data.sequence.map(|(sequence, attention)| if matches!(model.blocks[0].operation, Operation::Attention(_)) { attention } else { sequence });
-	let sequential = matches!(model.blocks[0].operation, Operation::Conv(..) | Operation::Pool(..)) || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
+	// A convolution or pool anywhere in the model needs the sequence axis, including inside a residual or mixture branch.
+	let convolutional = model.blocks.iter().any(|block| match &block.operation {
+		Operation::Conv(..) | Operation::Pool(..) => true,
+		Operation::Residual(parts) | Operation::Moe(_, parts) => parts.iter().any(|part| matches!(part, Residual::Conv(..))),
+		_ => false,
+	});
+	let sequential = convolutional || sequence.is_some() && matches!(model.blocks[0].operation, Operation::Attention(_));
 	let shape = if sequential { sequence.unwrap_or(Shape { channels: 1, length: data.features }) } else { Shape { channels: data.features, length: 1 } };
 	let mut graph = Graph::new(shape);
 	for (index, block) in model.blocks.iter().enumerate() {
@@ -6723,8 +6774,17 @@ fn lower_estimator(graph: &mut Graph, estimator: &Estimator, data: &Prepared, ta
 			fitted: Vec::new(),
 		};
 		let fitted = estimator.fit(&prepared, rows, config)?;
-		let targets = predict_rows(&fitted, &inputs, input.elements())?;
-		(fitted.program, fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?)
+		// The surrogate exists to carry this block's adjoint into its input, so a prefix
+		// whose parameters are all frozen never reads the weights a fit would produce.
+		let surrogate = if graph.frozen.contains(&0) {
+			let targets = predict_rows(&fitted, &inputs, input.elements())?;
+			fit_surrogate(input, &inputs, &targets, config.surrogate_width, gpu, config)?
+		} else {
+			let mut untrained = compile(&surrogate_model(config.surrogate_width), &prepared, &prepared.targets, rows, gpu, config, true)?;
+			untrained.frozen.fill(1);
+			untrained
+		};
+		(fitted.program, surrogate)
 	};
 	reset(graph, source, input);
 	push_predictor(graph, predictor)?;
@@ -6934,20 +6994,20 @@ fn count(name: &str, text: &str) -> Result<usize> {
 }
 fn stored_graph(graph: &Graph, model: &Model, data: &Data, scale: Option<TargetScale>, precision: Compute, target: &str) -> bundle::StoredGraph {
 	let inputs = (0..graph.input.elements()).map(|index| format!("input{index}")).collect();
-	// Every selected target column is an output, in the order the user declared them.
-	let outputs = if data.autoregressive {
-		vec!["char-id".to_owned()]
-	} else if data.target.is_empty() {
-		vec!["target".to_owned()]
-	} else {
-		data.target.clone()
-	};
 	let (norm_mean, norm_scale) = match data.prepared.get() {
 		Some(Ok(prepared)) => (prepared.norm_mean.clone(), prepared.norm_scale.clone()),
 		_ => (Vec::new(), Vec::new()),
 	};
 	let (target_min, target_span) = scale.map_or((0.0, 0.0), |s| (s.minimum, s.span));
 	let schema = data.prepared.get().and_then(|prepared| prepared.as_ref().ok()).map_or_else(DataSchema::default, |prepared| prepared.schema.clone());
+	// Every selected target column is an output, in the order the user declared them.
+	let outputs = if data.autoregressive {
+		vec!["char-id".to_owned()]
+	} else if data.target.is_empty() {
+		vec!["target".to_owned()]
+	} else {
+		schema.iter().filter(|(kind, _)| kind == "target").map(|(_, name)| name.clone()).collect()
+	};
 	let artifact = bundle::artifact_key(model, &schema, precision, graph, target);
 	bundle::StoredGraph { graph: graph.clone(), model: model.clone(), precision, inputs, outputs, norm_mean, norm_scale, target_min, target_span, bn_stats: Vec::new(), artifact }
 }
@@ -7393,10 +7453,7 @@ fn calibrate(gpu: &'static Gpu, config: Config) -> Result<(f64, f64)> {
 		gpu.synchronize()?;
 		Ok(started.elapsed().as_secs_f64())
 	};
-	// The first dispatch of either kind pays a one-time cost, and one later
-	// sample can still carry a thread wake or a scheduler stall larger than the
-	// gradient work, so both kinds warm up and the two costs then interleave and
-	// each takes its floor over the configured surrogate epochs.
+	// Warm up both paths, then use minimum timings to reduce scheduling noise.
 	timed(&mut tape, true)?;
 	timed(&mut tape, false)?;
 	let (mut overhead, mut epoch) = (f64::INFINITY, f64::INFINITY);
@@ -7680,8 +7737,14 @@ fn node_context(graph: &Graph, node: &Node, rows: usize, precision: Compute) -> 
 			checked_add(states, checked_add(gradients, 2 * rows * node.output.channels, "scan scratch")?, "scan")?
 		}
 		Primitive::Pool => return checked_mul(checked_mul(rows, node.output.elements(), "pool context")?, size_of::<u64>(), "pool context bytes"),
+		// Four statistic planes over the group count the emitted kernel walks:
+		// batch and evaluation groups are channels, layer and RMS groups are row
+		// positions.
 		Primitive::Normalize => {
-			let groups = node.output.channels.max(checked_mul(rows, node.output.length, "layer groups")?);
+			let groups = match normalize_mode(node.argument[0])? {
+				program_ir::NormalizeMode::Batch | program_ir::NormalizeMode::Evaluation => node.output.channels,
+				program_ir::NormalizeMode::Layer | program_ir::NormalizeMode::Rms => checked_mul(rows, node.output.length, "layer groups")?,
+			};
 			checked_mul(4, groups, "normalization context")?
 		}
 		_ => 1,
@@ -7759,6 +7822,7 @@ impl Drop for Buffer {
 }
 #[derive(Clone, Copy)]
 struct Kernel {
+	#[cfg(any(amd, nvidia))]
 	object: u64,
 	shared: u32,
 	element: u8,
@@ -7789,7 +7853,6 @@ enum NativeCpuEpoch {
 	F8(NativeEpochF8),
 }
 
-#[cfg(unix)]
 struct NativeCpuProgram {
 	_library: Library,
 	thread: NativeCpuThread,
@@ -7866,7 +7929,6 @@ impl Drop for NativeCudaProgram {
 }
 
 enum NativeBackend {
-	#[cfg(unix)]
 	Cpu(NativeCpuProgram),
 	#[cfg(amd)]
 	Amd(NativeHsaProgram),
@@ -7921,6 +7983,7 @@ fn native_artifact_contract(artifact: &NativeArtifact) -> Result<()> {
 impl Kernel {
 	const fn remote(shared: u32, element: u8, layout: &'static [u8]) -> Self {
 		Self {
+			#[cfg(any(amd, nvidia))]
 			object: 0,
 			shared,
 			element,
@@ -8139,39 +8202,43 @@ struct HsaPacket {
 }
 #[cfg(nvidia)]
 type NvQuery = unsafe extern "C" fn(*mut i32, i32, i32) -> i32;
-#[cfg(any(unix, all(nvidia, windows)))]
 struct Library(usize);
-#[cfg(any(unix, all(nvidia, windows)))]
 impl Library {
-	fn open(name: &str) -> Result<Self> {
-		let name = format!("{name}\0");
-		let handle = unsafe { dlopen(name.as_ptr().cast(), 2) };
-		require(!handle.is_null(), format!("cannot load {name:?}"))?;
+	fn open(name: impl AsRef<OsStr>) -> Result<Self> {
+		let name = name.as_ref();
+		let handle = unsafe { native_library(name) };
+		require(!handle.is_null(), format!("cannot load {:?}", name.to_string_lossy()))?;
 		Ok(Self(handle as usize))
 	}
 	fn function<F: Copy>(&self, name: &[u8]) -> Result<F> {
-		let pointer = unsafe { dlsym(self.0 as Ptr, name.as_ptr().cast()) };
+		let pointer = unsafe {
+			#[cfg(unix)]
+			{
+				dlsym(self.0 as Ptr, name.as_ptr().cast())
+			}
+			#[cfg(windows)]
+			{
+				GetProcAddress(self.0 as Ptr, name.as_ptr().cast())
+			}
+		};
 		require(!pointer.is_null(), format!("runtime symbol {:?} is absent", name))?;
 		Ok(unsafe { std::mem::transmute_copy(&pointer) })
 	}
 }
 
-#[cfg(any(unix, all(nvidia, windows)))]
 impl Drop for Library {
 	fn drop(&mut self) {
 		unsafe {
 			#[cfg(unix)]
 			dlclose(self.0 as Ptr);
-			#[cfg(all(nvidia, windows))]
+			#[cfg(windows)]
 			FreeLibrary(self.0 as Ptr);
 		}
 	}
 }
 
-#[cfg(unix)]
 fn load_native_cpu(artifact: &NativeArtifact) -> Result<NativeCpuProgram> {
-	let path = artifact.path.to_str().ok_or_else(|| RecipeError::new("CPU native artifact path is not UTF-8"))?;
-	let library = Library::open(path)?;
+	let library = Library::open(&artifact.path)?;
 	let thread = library.function::<NativeCpuThread>(&native_symbol(NATIVE_CPU_THREAD_SYMBOL))?;
 	let forward = library.function::<NativeForward>(&native_symbol(NATIVE_FORWARD_SYMBOL))?;
 	let epoch = || -> Result<NativeCpuEpoch> {
@@ -8327,10 +8394,12 @@ impl Gpu {
 		// the output lanes and so grow the k lanes, so the full-tile lane count
 		// bounds how many chunks a lane can hold.
 		let mut owned = 1_u32;
-		for extent in contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]) {
-			let output_lanes = (extent.m / register_m).max(1).checked_mul((extent.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
-			let k_lanes = (block / output_lanes).max(2);
-			owned = owned.max(extent.k.div_ceil(chunk_k).div_ceil(k_lanes));
+		if block > 1 {
+			for extent in contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]) {
+				let output_lanes = (extent.m / register_m).max(1).checked_mul((extent.n / register_n).max(1)).ok_or_else(|| RecipeError::new("native contraction lane count overflows"))?;
+				let k_lanes = (block / output_lanes).max(2);
+				owned = owned.max(extent.k.div_ceil(chunk_k).div_ceil(k_lanes));
+			}
 		}
 		let chunk_values = owned.checked_mul(register_count).ok_or_else(|| RecipeError::new("native contraction chunk buffer overflows"))?;
 		let chunk_bias_values = owned.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction chunk bias buffer overflows"))?;
@@ -8537,11 +8606,19 @@ fn device(name: Option<&str>) -> Result<&'static Gpu> {
 	require(found.len() == 1, "multiple GPUs require named selection")?;
 	Ok(&found[0])
 }
+#[cfg(unix)]
 fn local_host() -> Result<String> {
 	let output = Command::new("hostname").output().map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	require(output.status.success(), "cannot read hostname")?;
 	let host = String::from_utf8(output.stdout).map_err(|error| RecipeError::new(format!("cannot read hostname: {error}")))?;
 	Ok(host.trim().to_owned())
+}
+#[cfg(windows)]
+fn local_host() -> Result<String> {
+	let mut words = [0_u16; 256];
+	let mut length = words.len() as u32;
+	require(unsafe { GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, words.as_mut_ptr(), &mut length) } != 0, "cannot query hostname")?;
+	String::from_utf16(&words[..length as usize]).map_err(|error| RecipeError::new(format!("hostname is not UTF-16: {error}")))
 }
 static SELECTED: OnceLock<Result<Vec<&'static Gpu>>> = OnceLock::new();
 /// Resolves the `RECIPE_DEVICE` selection to the ordered device list. Each
@@ -8840,12 +8917,40 @@ unsafe fn native_cpu_value<T: Copy>(arguments: &[Ptr], index: usize) -> T {
 	unsafe { *arguments[index].cast::<T>() }
 }
 
-#[cfg(unix)]
 unsafe extern "C" fn native_cpu_barrier(context: Ptr) {
 	unsafe { &*context.cast::<std::sync::Barrier>() }.wait();
 }
 
-#[cfg(unix)]
+macro_rules! launch_native_cpu_epoch {
+	($function:expr, $arguments:expr) => {
+		($function)(
+			native_cpu_pointer($arguments, 0),
+			native_cpu_pointer($arguments, 1),
+			native_cpu_pointer($arguments, 2),
+			native_cpu_pointer($arguments, 3),
+			native_cpu_pointer($arguments, 4),
+			native_cpu_pointer($arguments, 5),
+			native_cpu_pointer($arguments, 6),
+			native_cpu_pointer($arguments, 7),
+			native_cpu_pointer($arguments, 8),
+			native_cpu_pointer($arguments, 9),
+			native_cpu_pointer($arguments, 10),
+			native_cpu_pointer($arguments, 11),
+			native_cpu_value($arguments, 12),
+			native_cpu_value($arguments, 13),
+			native_cpu_value($arguments, 14),
+			native_cpu_value($arguments, 15),
+			native_cpu_value($arguments, 16),
+			native_cpu_value($arguments, 17),
+			native_cpu_value($arguments, 18),
+			native_cpu_value($arguments, 19),
+			native_cpu_value($arguments, 20),
+			native_cpu_value($arguments, 21),
+			native_cpu_value($arguments, 22),
+		)
+	};
+}
+
 unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCpuEpoch>, model_load: Option<NativeModelLoad>, entry: NativeEntry, arguments: &[Ptr]) -> Result<()> {
 	unsafe {
 		match entry {
@@ -8863,41 +8968,11 @@ unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCp
 			}
 			NativeEntry::Epoch => {
 				require(arguments.len() == NATIVE_EPOCH_LAYOUT_FP64.len(), "native CPU epoch argument count is invalid")?;
-				let pointers = (0..12).map(|index| native_cpu_pointer(arguments, index)).collect::<Vec<_>>();
-				macro_rules! launch {
-					($function:expr) => {
-						$function(
-							pointers[0],
-							pointers[1],
-							pointers[2],
-							pointers[3],
-							pointers[4],
-							pointers[5],
-							pointers[6],
-							pointers[7],
-							pointers[8],
-							pointers[9],
-							pointers[10],
-							pointers[11],
-							native_cpu_value(arguments, 12),
-							native_cpu_value(arguments, 13),
-							native_cpu_value(arguments, 14),
-							native_cpu_value(arguments, 15),
-							native_cpu_value(arguments, 16),
-							native_cpu_value(arguments, 17),
-							native_cpu_value(arguments, 18),
-							native_cpu_value(arguments, 19),
-							native_cpu_value(arguments, 20),
-							native_cpu_value(arguments, 21),
-							native_cpu_value(arguments, 22),
-						)
-					};
-				}
 				match epoch.ok_or_else(|| RecipeError::new("native epoch symbol is absent"))? {
-					NativeCpuEpoch::F64(function) => launch!(function),
-					NativeCpuEpoch::F32(function) => launch!(function),
-					NativeCpuEpoch::F16(function) => launch!(function),
-					NativeCpuEpoch::F8(function) => launch!(function),
+					NativeCpuEpoch::F64(function) => launch_native_cpu_epoch!(function, arguments),
+					NativeCpuEpoch::F32(function) => launch_native_cpu_epoch!(function, arguments),
+					NativeCpuEpoch::F16(function) => launch_native_cpu_epoch!(function, arguments),
+					NativeCpuEpoch::F8(function) => launch_native_cpu_epoch!(function, arguments),
 				}
 			}
 			NativeEntry::ModelLoad => {
@@ -8910,7 +8985,6 @@ unsafe fn launch_native_cpu_entry(forward: NativeForward, epoch: Option<NativeCp
 	}
 }
 
-#[cfg(unix)]
 unsafe fn launch_native_cpu(cpu: &NativeCpuProgram, entry: NativeEntry, arguments: &[Ptr], threads: u32) -> Result<()> {
 	require(threads != 0, "native CPU worker count is empty")?;
 	let slots = arguments.iter().map(|argument| *argument as usize).collect::<Vec<_>>();
@@ -8946,18 +9020,12 @@ impl NativeProgram {
 		let element = u8::try_from(artifact.precision.model.bytes()).map_err(|_| RecipeError::new("native precision width is invalid"))?;
 		let (backend, forward, epoch, model_load) = match &gpu.driver {
 			Driver::Cpu => {
-				#[cfg(unix)]
-				{
-					let cpu = load_native_cpu(&artifact)?;
-					let geometry = Geometry { groups: cpu_worker_threads()?, block: 1 };
-					let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry };
-					let epoch = artifact.training.then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry });
-					let model_load =
-						(!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry });
-					(NativeBackend::Cpu(cpu), forward, epoch, model_load)
-				}
-				#[cfg(not(unix))]
-				return Err(RecipeError::new("CPU native artifact loading requires POSIX dynamic loading"));
+				let cpu = load_native_cpu(&artifact)?;
+				let geometry = Geometry { groups: cpu_worker_threads()?, block: 1 };
+				let forward = Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_FORWARD_LAYOUT), geometry };
+				let epoch = artifact.training.then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, artifact.precision.epoch_layout), geometry });
+				let model_load = (!artifact.storage.is_empty()).then_some(Dispatch { kernel: Kernel::remote(0, artifact.precision.model.bytes() as u8, NATIVE_MODEL_LOAD_LAYOUT), geometry });
+				(NativeBackend::Cpu(cpu), forward, epoch, model_load)
 			}
 			#[cfg(amd)]
 			Driver::Hsa(driver) => {
@@ -9071,11 +9139,13 @@ impl NativeProgram {
 /// Dispatches one loaded entrypoint on the device that loaded it. The caller
 /// holds the device dispatch lock and has already validated the argument list
 /// and shared-memory budget.
-unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch, entry: NativeEntry, arguments: &mut [Ptr], threads: u32, dynamic: u32, shared: u32) -> Result<()> {
+unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch, entry: NativeEntry, arguments: &mut [Ptr], threads: u32, dynamic: u32, _shared: u32) -> Result<()> {
+	#[cfg(any(amd, nvidia))]
 	let block = dispatch.geometry.block;
+	#[cfg(not(any(amd, nvidia)))]
+	let _ = (threads, dynamic, _shared);
 	unsafe {
 		match (backend, &gpu.driver) {
-			#[cfg(unix)]
 			(NativeBackend::Cpu(cpu), Driver::Cpu) => launch_native_cpu(cpu, entry, arguments, threads),
 			#[cfg(amd)]
 			(NativeBackend::Amd(program), Driver::Hsa(driver)) => {
@@ -9130,7 +9200,7 @@ unsafe fn launch_backend(gpu: &Gpu, backend: &NativeBackend, dispatch: &Dispatch
 					grid_y: 1,
 					grid_z: 1,
 					private: dispatch.kernel.private,
-					group: shared,
+					group: _shared,
 					object: dispatch.kernel.object,
 					kernarg,
 					reserved1: 0,
@@ -9288,7 +9358,7 @@ fn load_nvidia() -> Result<Vec<Gpu>> {
 		const REGISTERS_PER_SM: i32 = 82;
 		const COMPUTE_MAJOR: i32 = 75;
 		const COMPUTE_MINOR: i32 = 76;
-		let runtime = std::sync::Arc::new(Library::open(if cfg!(windows) { "nvcuda.dll" } else { env!("RECIPE_NV_RUNTIME") })?);
+		let runtime = std::sync::Arc::new(Library::open(env!("RECIPE_NV_RUNTIME"))?);
 		let init: unsafe extern "C" fn(u32) -> i32 = runtime.function(b"cuInit\0")?;
 		let count_devices: unsafe extern "C" fn(*mut i32) -> i32 = runtime.function(b"cuDeviceGetCount\0")?;
 		let get_device: unsafe extern "C" fn(*mut i32, i32) -> i32 = runtime.function(b"cuDeviceGet\0")?;
@@ -9385,15 +9455,12 @@ struct WorkerProgram {
 /// place work on this host's device exactly as on a local one.
 pub fn worker_serve(name: &str) -> Result<()> {
 	let mut wire = WorkerWire { input: std::io::BufReader::new(std::io::stdin()), output: std::io::BufWriter::new(std::io::stdout()), role: "worker" };
-	let probe = device(Some(name)).and_then(|gpu| {
-		let (backend, wave) = match &gpu.driver {
-			#[cfg(amd)]
-			Driver::Hsa(driver) => (1_u8, driver.wave),
-			#[cfg(nvidia)]
-			Driver::Cuda(driver) => (2_u8, driver.wave),
-			_ => return Err(RecipeError::new(format!("device {name:?} is not a local GPU"))),
-		};
-		Ok((gpu, backend, wave))
+	let probe: Result<(&'static Gpu, u8, u32)> = device(Some(name)).and_then(|gpu| match &gpu.driver {
+		#[cfg(amd)]
+		Driver::Hsa(driver) => Ok((gpu, 1_u8, driver.wave)),
+		#[cfg(nvidia)]
+		Driver::Cuda(driver) => Ok((gpu, 2_u8, driver.wave)),
+		_ => Err(RecipeError::new(format!("device {name:?} is not a local GPU"))),
 	});
 	let (gpu, backend, wave) = match probe {
 		Ok(probe) => probe,
@@ -9461,6 +9528,8 @@ pub fn worker_serve(name: &str) -> Result<()> {
 				let training = wire.read_u8()? != 0;
 				let epoch_layout: &'static [u8] = if wire.read_u8()? != 0 { NATIVE_EPOCH_LAYOUT_FP64 } else { NATIVE_EPOCH_LAYOUT_FP32 };
 				let has_storage = wire.read_u8()? != 0;
+				#[cfg(not(any(amd, nvidia)))]
+				let _ = (waves, element, training, epoch_layout, has_storage);
 				let loaded: Result<(NativeBackend, Dispatch, Option<Dispatch>, Option<Dispatch>)> = match &gpu.driver {
 					#[cfg(amd)]
 					Driver::Hsa(driver) => unsafe { driver.load_native(&artifact, element, epoch_layout, training, has_storage, waves) }
@@ -9514,29 +9583,39 @@ pub fn worker_serve(name: &str) -> Result<()> {
 		wire.flush()?;
 	}
 }
-#[cfg(all(unix, not(windows)))]
+#[cfg(unix)]
 #[link(name = "dl")]
 unsafe extern "C" {
 	fn dlopen(name: *const std::ffi::c_char, flags: i32) -> Ptr;
 	fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr;
 	fn dlclose(handle: Ptr) -> i32;
 }
-#[cfg(all(nvidia, windows))]
-unsafe fn dlopen(name: *const std::ffi::c_char, _: i32) -> Ptr {
-	unsafe { LoadLibraryA(name) }
+#[cfg(unix)]
+unsafe fn native_library(name: &OsStr) -> Ptr {
+	let mut name = name.as_bytes().to_vec();
+	name.push(0);
+	unsafe { dlopen(name.as_ptr().cast(), 2) }
 }
-#[cfg(all(nvidia, windows))]
-unsafe fn dlsym(handle: Ptr, name: *const std::ffi::c_char) -> Ptr {
-	unsafe { GetProcAddress(handle, name) }
+#[cfg(windows)]
+unsafe fn native_library(name: &OsStr) -> Ptr {
+	let name = name.encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+	unsafe { LoadLibraryW(name.as_ptr()) }
 }
-#[cfg(all(nvidia, windows))]
+#[cfg(windows)]
+const CTRL_C_EVENT: u32 = 0;
+#[cfg(windows)]
+const COMPUTER_NAME_DNS_HOSTNAME: i32 = 1;
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
-	fn LoadLibraryA(name: *const std::ffi::c_char) -> Ptr;
+	fn LoadLibraryW(name: *const u16) -> Ptr;
 	fn GetProcAddress(handle: Ptr, name: *const std::ffi::c_char) -> Ptr;
 	fn FreeLibrary(handle: Ptr) -> i32;
+	fn GetComputerNameExW(format: i32, name: *mut u16, length: *mut u32) -> i32;
+	fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
 }
 unsafe extern "C" {
+	#[cfg(unix)]
 	fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
 	#[cfg_attr(windows, link_name = "_write")]
 	fn write(file: i32, bytes: *const c_void, length: usize) -> isize;
@@ -10311,19 +10390,25 @@ fn catboost_borders(samples: &[f64], features: usize, rows: usize, count: usize)
 }
 fn ordered_split(borders: &[CatboostBorders], residuals: &[f64], permutation: &[usize], codes: &[usize], level: usize, prior: f64, minimum: usize) -> Result<Option<(usize, f64)>> {
 	let Some(groups) = 1_usize.checked_shl((level + 1) as u32) else { return Ok(None) };
+	// Every candidate of every feature rescans the same rows in the same order
+	// against the same group divisors, so the scan reads both in sequence
+	// instead of gathering a permuted row and widening a count on each step.
+	let ordered = permutation.iter().map(|&row| (residuals[row], codes[row])).collect::<Vec<_>>();
+	let divisors = (0..=permutation.len()).map(|count| count as f64 + prior).collect::<Vec<_>>();
 	// Each feature's candidate scan is independent; the reduction keeps the first
 	// strict minimum in feature order, matching the sequential scan.
 	Ok(parallel_map(borders.len(), |feature| {
 		let candidates = &borders[feature];
+		let bins = permutation.iter().map(|&row| candidates.bins[row]).collect::<Vec<_>>();
 		let (mut counts, mut sums, mut best) = (vec![0_usize; groups], vec![0.0; groups], None);
 		for (index, &threshold) in candidates.thresholds.iter().enumerate() {
 			counts.fill(0);
 			sums.fill(0.0);
 			let mut error = 0.0;
-			for &row in permutation {
-				let group = codes[row] | usize::from(candidates.bins[row] <= index) << level;
-				error += (residuals[row] - sums[group] / (counts[group] as f64 + prior)).powi(2);
-				sums[group] += residuals[row];
+			for (&(residual, code), &bin) in ordered.iter().zip(&bins) {
+				let group = code | usize::from(bin <= index) << level;
+				error += (residual - sums[group] / divisors[counts[group]]).powi(2);
+				sums[group] += residual;
 				counts[group] += 1;
 			}
 			if counts.iter().filter(|count| **count != 0).all(|count| *count >= minimum) && best.as_ref().is_none_or(|value: &(f64, f64)| error < value.0) {
@@ -10833,6 +10918,8 @@ struct Prepared {
 struct Table {
 	name: String,
 	headers: Vec<String>,
+	/// Whether the source names the headers; a headerless table takes positional names instead.
+	declared: bool,
 	rows: Vec<Vec<String>>,
 	/// Row-major image values are channel-major when each image row is one channel.
 	attention: Option<Shape>,
@@ -10866,24 +10953,21 @@ impl FeatureSelection {
 	}
 }
 fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathBuf>)> {
-	let mut paths = Vec::new();
+	let mut paths = BTreeSet::new();
 	for source in sources {
 		collect_files(&resolve_path(source)?, &mut paths)?;
 	}
-	for path in &mut paths {
-		*path = fs::canonicalize(&*path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))?
-	}
-	paths.sort();
-	paths.dedup();
-	// A ZIP source contributes its entries, not itself: the container is not a
-	// table or a sample, and its entries take virtual paths anchored at the
-	// archive's own path, so the directory-layout rules that already interpret
-	// a real class-subfolder tree interpret an archived one identically.
+	// ZIP sources contribute data entries at virtual archive paths, preserving directory layouts while ignoring object metadata.
 	let mut files = Vec::new();
 	for path in &paths {
 		let bytes = fs::read(path).map_err(|error| RecipeError::new(format!("cannot read {}: {error}", path.display())))?;
 		if path.extension().and_then(|value| value.to_str()).is_some_and(is_archive) {
 			for (entry, contents) in zip_entries(&bytes).map_err(|error| RecipeError::new(format!("dataset {}: {error}", path.display())))? {
+				let metadata = Path::new(&entry).extension().and_then(|value| value.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+					&& str::from_utf8(&contents).is_ok_and(|text| text.trim_start().starts_with('{'));
+				if metadata {
+					continue;
+				}
 				files.push((path.join(entry), contents));
 			}
 		} else {
@@ -10901,7 +10985,7 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 		}
 	}
 	if let Some(table) = directory_samples(data, sources, &files, &grouped)? {
-		return Ok((vec![table], paths));
+		return Ok((vec![table], paths.into_iter().collect()));
 	}
 	let mut tables = merge_captures(grouped, &data.target)?;
 	tables = merge_partitions(tables, &data.target, &data.features)?;
@@ -10920,7 +11004,7 @@ fn load_tables(data: &Data, sources: &[String]) -> Result<(Vec<Table>, Vec<PathB
 			}
 		}
 	}
-	Ok((tables, paths))
+	Ok((tables, paths.into_iter().collect()))
 }
 /// One interpretation of directory layout for sample trees whose target is not a table
 /// column: flat sidecar-labeled samples, class-labeled subdirectories, and paired
@@ -11020,13 +11104,15 @@ fn directory_samples(data: &Data, sources: &[String], files: &[(PathBuf, Vec<u8>
 			}
 			headers.extend((1..=width).map(|index| if width == 1 { column.clone() } else { format!("{column}.{index}") }));
 		}
-		return Ok(Some(Table { name, headers, rows, attention: attention.filter(|shape| shape.channels != 0) }));
+		return Ok(Some(Table { name, headers, declared: true, rows, attention: attention.filter(|shape| shape.channels != 0) }));
 	}
 	if aligned {
 		return Ok(None);
 	}
 	// Class subdirectories: differing sample stems, the directory name is the target value.
-	if parsed.iter().any(|(_, table)| target_column(table, target).is_some()) {
+	// Only a declared column overrides the directory names; the positional names a headerless
+	// sample takes name its one field by convention rather than carrying a label.
+	if parsed.iter().any(|(_, table)| table.declared && target_column(table, target).is_some()) {
 		return Ok(None);
 	}
 	let mut builder = SampleTableBuilder::new(target.clone());
@@ -11064,7 +11150,7 @@ impl SampleTableBuilder {
 		Ok(())
 	}
 	fn finish(self, name: String) -> Result<Table> {
-		Ok(Table { name, headers: self.headers, rows: self.rows, attention: self.shape.map(|shape| Shape { channels: shape.length, length: shape.channels }) })
+		Ok(Table { name, headers: self.headers, declared: true, rows: self.rows, attention: self.shape.map(|shape| Shape { channels: shape.length, length: shape.channels }) })
 	}
 }
 fn sample_text(path: &Path, bytes: &[u8]) -> Result<String> {
@@ -11437,7 +11523,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 		require(data.tests.is_empty(), "autoregressive test data is unsupported")?;
 		return prepare_autoregression(data, &tables);
 	}
-	let mut selected = Vec::new();
+	let (mut selected, mut target_names) = (Vec::new(), Vec::new());
 	for name in &data.target {
 		let mut matches = Vec::new();
 		for (table, value) in tables.iter().enumerate() {
@@ -11451,9 +11537,11 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 			let grouped = !matches.is_empty()
 				&& matches.iter().all(|(table, column)| tables[*table].headers[*column].rsplit_once('.').is_some_and(|(base, suffix)| base == name && suffix.parse::<usize>().is_ok()));
 			require(grouped, format!("target {name:?} must identify exactly one feature or a numbered group"))?;
+			target_names.extend(matches.iter().map(|(table, column)| tables[*table].headers[*column].clone()));
 			selected.extend(matches);
 			continue;
 		}
+		target_names.push(name.clone());
 		selected.push(matches[0]);
 	}
 	let table_index = selected.first().map_or(0, |target| target.0);
@@ -11543,7 +11631,7 @@ fn prepare_data(data: &Data) -> Result<Prepared> {
 	let schema = columns
 		.iter()
 		.map(|column| ("feature".to_owned(), format!("{} {}.{}", column.2.width(), tables[column.0].name, tables[column.0].headers[column.1])))
-		.chain(data.target.iter().cloned().map(|target| ("target".to_owned(), target)))
+		.chain(target_names.into_iter().map(|target| ("target".to_owned(), target)))
 		.collect();
 	finish_prepared(data, samples, targets, target_width, source_rows, features, shapes, target_categorical, schema)
 }
@@ -11657,15 +11745,14 @@ fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf> {
 	let path = path.as_ref();
 	let mut components = path.components();
 	if components.next().is_some_and(|component| component.as_os_str() == "~") {
-		let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| RecipeError::new("home directory is absent"))?;
-		return Ok(PathBuf::from(home).join(components.as_path()));
+		return Ok(home_directory()?.join(components.as_path()));
 	}
 	Ok(path.to_owned())
 }
-fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_files(path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()> {
 	let metadata = fs::metadata(path).map_err(|error| RecipeError::new(format!("cannot inspect {}: {error}", path.display())))?;
 	if metadata.is_file() {
-		files.push(path.to_owned());
+		files.insert(fs::canonicalize(path).map_err(|error| RecipeError::new(format!("cannot resolve {}: {error}", path.display())))?);
 		return Ok(());
 	}
 	let mut children = fs::read_dir(path)
@@ -11760,7 +11847,7 @@ fn merge_captures(tables: Vec<(PathBuf, Table)>, targets: &[String]) -> Result<V
 		require(row.len() == headers.len(), "capture value width differs")?;
 		rows.push(row);
 	}
-	Ok(vec![Table { name: "data".to_owned(), headers, rows, attention: None }])
+	Ok(vec![Table { name: "data".to_owned(), headers, declared: true, rows, attention: None }])
 }
 fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &FeatureSelection) -> Result<Vec<Table>> {
 	if targets.is_empty() || targets.iter().any(|target| target.contains('.')) {
@@ -11778,7 +11865,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &Featu
 			}
 		}
 	}
-	let union = Table { name: "data".to_owned(), headers: headers.clone(), rows: Vec::new(), attention: None };
+	let union = Table { name: "data".to_owned(), headers: headers.clone(), declared: true, rows: Vec::new(), attention: None };
 	for &index in &members {
 		for (column, header) in headers.iter().enumerate() {
 			let ignored = targets.iter().any(|name| column_match(name, &union, header, column)) || !features.selects(&union, header, column);
@@ -11797,7 +11884,7 @@ fn merge_partitions(mut tables: Vec<Table>, targets: &[String], features: &Featu
 		}
 	}
 	let name = "data".to_owned();
-	Ok(vec![Table { name, headers, rows, attention: None }])
+	Ok(vec![Table { name, headers, declared: true, rows, attention: None }])
 }
 /// Decode one source file into its tables, dispatching on the container format.
 fn decode_tables(path: &Path, bytes: &[u8]) -> Result<Vec<Table>> {
@@ -11870,7 +11957,7 @@ fn sqlite_tables(bytes: &[u8]) -> Result<Vec<Table>> {
 			require(row.len() <= headers.len(), format!("SQLite table {name:?} row exceeds {} columns", headers.len()))?;
 			row.resize_with(headers.len(), String::new);
 		}
-		tables.push(Table { name: name.clone(), headers, rows, attention: None });
+		tables.push(Table { name: name.clone(), headers, declared: true, rows, attention: None });
 	}
 	require(!tables.is_empty(), "SQLite database has no tables")?;
 	Ok(tables)
@@ -12311,7 +12398,7 @@ fn hdf5_columns(bytes: &[u8]) -> Result<Vec<(String, usize, Vec<f64>)>> {
 	require(!columns.is_empty(), "HDF5 file has no datasets")?;
 	Ok(columns)
 }
-/// The stored entries of a ZIP archive, resolved through the central directory.
+/// The entries of a ZIP archive, resolved through the central directory.
 fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 	let read16 = |offset: usize| bytes.get(offset..offset + 2).map(|value| u16::from_le_bytes(value.try_into().unwrap()) as usize);
 	let read32 = |offset: usize| bytes.get(offset..offset + 4).map(|value| u32::from_le_bytes(value.try_into().unwrap()) as usize);
@@ -12325,16 +12412,17 @@ fn zip_entries(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 	let mut entries = Vec::new();
 	for _ in 0..count {
 		require(bytes.get(offset..offset + 4) == Some(&[0x50, 0x4b, 0x01, 0x02]), "ZIP central directory entry is invalid")?;
-		let (method, size, name_length, extra, comment) = (read16(offset + 10), read32(offset + 24), read16(offset + 28), read16(offset + 30), read16(offset + 32));
-		let (method, size) = (method.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?, size.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?);
+		let (method, compressed, name_length, extra, comment) = (read16(offset + 10), read32(offset + 20), read16(offset + 28), read16(offset + 30), read16(offset + 32));
+		let (method, compressed) = (method.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?, compressed.ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?);
 		let local = read32(offset + 42).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?;
 		let name = String::from_utf8(bytes.get(offset + 46..offset + 46 + name_length.unwrap_or(0)).ok_or_else(|| RecipeError::new("ZIP archive is truncated"))?.to_vec())
 			.map_err(|error| RecipeError::new(format!("ZIP entry name is not UTF-8: {error}")))?;
 		require(bytes.get(local..local + 4) == Some(&[0x50, 0x4b, 0x03, 0x04]), "ZIP local header is invalid")?;
 		let (local_name, local_extra) = (read16(local + 26).unwrap_or(0), read16(local + 28).unwrap_or(0));
 		let start = local + 30 + local_name + local_extra;
-		require(method == 0, format!("ZIP entry {name:?} uses unsupported compression method {method}"))?;
-		let contents = bytes.get(start..start + size).ok_or_else(|| RecipeError::new(format!("ZIP entry {name:?} is truncated")))?.to_vec();
+		require(matches!(method, 0 | 8), format!("ZIP entry {name:?} uses unsupported compression method {method}"))?;
+		let stored = bytes.get(start..start + compressed).ok_or_else(|| RecipeError::new(format!("ZIP entry {name:?} is truncated")))?;
+		let contents = if method == 8 { inflate(stored)? } else { stored.to_vec() };
 		if !name.ends_with('/') {
 			entries.push((name, contents));
 		}
@@ -12403,7 +12491,7 @@ fn array_table(name: String, columns: Vec<(String, usize, Vec<f64>)>) -> Result<
 	}
 	let headers = columns.iter().map(|(header, _, _)| header.clone()).collect();
 	let table_rows = (0..rows).map(|row| columns.iter().map(|(_, _, values)| values[row].to_string()).collect()).collect();
-	Ok(Table { name, headers, rows: table_rows, attention: None })
+	Ok(Table { name, headers, declared: true, rows: table_rows, attention: None })
 }
 /// The records of a top-level JSON array.
 fn json_array(text: &str) -> Result<Vec<JsonValue>> {
@@ -12626,7 +12714,7 @@ fn json_records_table(name: String, records: &[JsonValue]) -> Result<Table> {
 		}
 		rows.push(row);
 	}
-	Ok(Table { name, headers, rows, attention: None })
+	Ok(Table { name, headers, declared: true, rows, attention: None })
 }
 fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	// The delimiter splits every record into the same number of fields. First-line frequency does not identify it: one incidental comma in a line of prose is not a second column.
@@ -12651,7 +12739,7 @@ fn parse_table(path: &Path, bytes: &[u8]) -> Result<(Table, usize)> {
 	let malformed = rows.iter().filter(|row| row.len() != width).count();
 	require(malformed == 0, format!("dataset {} has {malformed} rows differing from the expected {width} fields", path.display()))?;
 	let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or("data").to_owned();
-	Ok((Table { name, headers, rows, attention: None }, blank))
+	Ok((Table { name, headers, declared: !headerless, rows, attention: None }, blank))
 }
 fn records(bytes: &[u8], delimiter: u8) -> Result<(Vec<Vec<String>>, usize)> {
 	let (mut rows, mut row, mut field, mut quoted, mut blank) = (Vec::new(), Vec::new(), Vec::new(), false, 0);
@@ -12921,7 +13009,7 @@ impl Train {
 		self
 	}
 	fn execute(&self, model: &Model, data: &Data, evaluation: bool) -> TrainingReport {
-		SIGNAL.get_or_init(|| unsafe { signal(SIGINT, interrupt) });
+		SIGNAL.get_or_init(register_interrupt);
 		INTERRUPT_CHECKPOINTED.store(false, Ordering::Release);
 		if INTERRUPTED.load(Ordering::Acquire) {
 			std::process::exit(INTERRUPTED_EXIT);
