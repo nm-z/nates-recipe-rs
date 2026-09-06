@@ -12415,13 +12415,19 @@ impl NativeTape {
 		// fused pass would emit, launched in that order on the device's stream. The
 		// launch that ends one run is the synchronization, and the value and context
 		// arenas carry every position the earlier runs wrote.
-		for (segment, dispatch) in self.program.forward.iter().enumerate() {
+		for (segment, main_dispatch) in self.program.forward.iter().enumerate() {
 			let node = self.program.artifact.segments.get(segment).ok_or_else(|| RecipeError::new("native forward segment has no node"))?.node;
 			let (node_begin, node_end) = *windows.get(node).ok_or_else(|| RecipeError::new("native forward segment names an absent node"))?;
+			let tiny = matches!(self.nodes[node].op, Primitive::Contraction) && rows.checked_mul(node_end - node_begin) == Some(1);
+			let dispatch = if tiny {
+				self.program.tiny.as_deref().ok_or_else(|| RecipeError::new("tiny-M native program is absent"))?.dispatch(NativeEntry::Forward(segment))?
+			} else {
+				*main_dispatch
+			};
 			let threads = dispatch.geometry.threads()?;
 			let mut call = ptrs![self.samples.pointer, self.weights.pointer, self.values.pointer, self.contexts.pointer, rows, threads, node_begin, node_end];
 			let started = std::time::Instant::now();
-			self.program.launch_forward(segment, &mut call).map_err(|error| RecipeError::new(format!("forward segment {segment}: {error}")))?;
+			self.program.launch_forward(segment, &mut call, tiny).map_err(|error| RecipeError::new(format!("forward segment {segment}: {error}")))?;
 			if profile {
 				self.program.gpu.synchronize()?;
 				debug(&format!(
@@ -13425,6 +13431,10 @@ struct NativeProgram {
 	gpu: &'static Gpu,
 	artifact: NativeArtifact,
 	backend: NativeBackend,
+	/// Inference-only contractions with one active output position use a
+	/// scalar-M artifact. Keeping this beside the normal program leaves the
+	/// multi-position prefill on its vector register layout.
+	tiny: Option<Box<NativeProgram>>,
 	forward: Vec<Dispatch>,
 	epoch: Option<Dispatch>,
 	model_load: Option<Dispatch>,
@@ -13944,7 +13954,21 @@ impl Gpu {
 			attention,
 		};
 		let artifact = compile_model(&self.native_target, graph, precision, loss, rows, schedule.clone())?;
-		let program = NativeProgram::load(self, artifact, graph, schedule, register_values, waves)?;
+		let mut program = NativeProgram::load(self, artifact, graph, schedule.clone(), register_values, waves)?;
+		// A one-position inference window has no useful M vector to amortize. A
+		// second, inference-only artifact keeps that path scalar while preserving
+		// the normal register layout for prefills and multi-position windows.
+		if loss.is_none() && rows == 1 && !schedule.matrix && schedule.register_m > 1 && graph.nodes.iter().any(|node| node.op == Primitive::Contraction) {
+			let tiny_schedule = native_tiny_m_schedule(schedule.clone())?;
+			let tiny_register_values = tiny_schedule
+				.register_count
+				.checked_add(tiny_schedule.register_n)
+				.and_then(|values| values.checked_mul(ratio))
+				.ok_or_else(|| RecipeError::new("tiny-M native contraction register reduction overflows"))?;
+			let tiny_artifact = compile_model(&self.native_target, graph, precision, loss, rows, tiny_schedule.clone())?;
+			let tiny = NativeProgram::load(self, tiny_artifact, graph, tiny_schedule, tiny_register_values, waves)?;
+			program.tiny = Some(Box::new(tiny));
+		}
 		for dispatch in program.forward.iter().chain(program.epoch.iter()).chain(program.model_load.iter()) {
 			let required = dispatch
 				.values
@@ -13952,6 +13976,16 @@ impl Gpu {
 				.and_then(|dynamic| dispatch.kernel.shared.checked_add(dynamic))
 				.ok_or_else(|| RecipeError::new("native model shared memory overflows"))?;
 			require(required <= self.shared_limit, "native entrypoint exceeds resident device shared memory")?;
+		}
+		if let Some(tiny) = program.tiny.as_ref() {
+			for dispatch in tiny.forward.iter().chain(tiny.epoch.iter()).chain(tiny.model_load.iter()) {
+				let required = dispatch
+					.values
+					.checked_mul(precision.bytes() as u32)
+					.and_then(|dynamic| dispatch.kernel.shared.checked_add(dynamic))
+					.ok_or_else(|| RecipeError::new("tiny-M native entrypoint shared memory overflows"))?;
+				require(required <= self.shared_limit, "tiny-M native entrypoint exceeds resident device shared memory")?;
+			}
 		}
 		Ok(program)
 	}
@@ -14779,7 +14813,7 @@ impl NativeProgram {
 			forward.len()
 		))?;
 		let gradient_values = native_gradient_values(graph.parameters.len(), &schedule.contractions)?;
-		Ok(Self { gpu, artifact, backend, forward, epoch, model_load, tile: schedule.tile, contractions: schedule.contractions, gradient_values })
+		Ok(Self { gpu, artifact, backend, tiny: None, forward, epoch, model_load, tile: schedule.tile, contractions: schedule.contractions, gradient_values })
 	}
 
 	fn dispatch(&self, entry: NativeEntry) -> Result<Dispatch> {
@@ -14790,9 +14824,10 @@ impl NativeProgram {
 		}
 	}
 
-	fn launch_forward(&self, segment: usize, arguments: &mut [Ptr]) -> Result<()> {
-		let dispatch = self.dispatch(NativeEntry::Forward(segment))?;
-		self.launch(NativeEntry::Forward(segment), arguments, dispatch.geometry.threads()?)
+	fn launch_forward(&self, segment: usize, arguments: &mut [Ptr], tiny: bool) -> Result<()> {
+		let program = tiny.then(|| self.tiny.as_deref()).flatten().unwrap_or(self);
+		let dispatch = program.dispatch(NativeEntry::Forward(segment))?;
+		program.launch(NativeEntry::Forward(segment), arguments, dispatch.geometry.threads()?)
 	}
 
 	fn launch_epoch(&self, arguments: &mut [Ptr]) -> Result<()> {
@@ -16469,6 +16504,24 @@ fn native_contraction_shared_values(extent: Tile, register_m: u32, register_n: u
 		.checked_mul(native_contraction_partial_per_chunk(extent.m, extent.n, register_m, register_n, block, ratio)?)
 		.ok_or_else(|| RecipeError::new("native contraction partial region overflows"))?;
 	Ok(staging.max(partials))
+}
+/// Build the inference-only register layout for a single active M position.
+/// The contraction tile dimensions stay those chosen for the full graph, so
+/// the existing shared-memory schedule remains a safe upper bound; only the
+/// compile-time M vector and its private reduction storage narrow.
+fn native_tiny_m_schedule(mut schedule: NativeSchedule) -> Result<NativeSchedule> {
+	require(!schedule.matrix && schedule.register_m > 1, "tiny-M schedule requires the vector contraction path")?;
+	schedule.register_m = 1;
+	schedule.register_count = schedule.register_m.checked_mul(schedule.register_n).ok_or_else(|| RecipeError::new("tiny-M register tile overflows"))?;
+	let mut owned = 1_u32;
+	for extent in schedule.contractions.iter().flatten().flat_map(|contraction| [contraction.forward, contraction.gradient, contraction.previous]) {
+		let output_lanes = (extent.m / schedule.register_m).max(1).checked_mul((extent.n / schedule.register_n).max(1)).ok_or_else(|| RecipeError::new("tiny-M lane count overflows"))?;
+		let k_lanes = (schedule.block / output_lanes).max(2);
+		owned = owned.max(extent.k.div_ceil(schedule.chunk_k).div_ceil(k_lanes));
+	}
+	schedule.chunk_values = owned.checked_mul(schedule.register_count).ok_or_else(|| RecipeError::new("tiny-M chunk values overflow"))?;
+	schedule.chunk_bias_values = owned.checked_mul(schedule.register_n).ok_or_else(|| RecipeError::new("tiny-M chunk bias values overflow"))?;
+	Ok(schedule)
 }
 /// Values per split-K scratch row. Rows are written by separate workgroups, so
 /// each row starts on a machine-word boundary for every supported element width.
