@@ -13535,7 +13535,12 @@ impl Gpu {
 				#[cfg(nvidia)]
 				Driver::Cuda(driver) => {
 					let mut pointer = 0;
-					self.status((driver.allocate)(&mut pointer, bytes), "allocation")?;
+					let status = (driver.allocate)(&mut pointer, bytes);
+					if status != 0 {
+						let (mut free, mut total) = (0, 0);
+						self.status((driver.memory_info)(&mut free, &mut total), "memory after failed allocation")?;
+						return Err(RecipeError::new(format!("device {} Nvidia allocation of {bytes} bytes failed with status {status}; {free} of {total} bytes remain free", self.name)));
+					}
 					Ok(pointer)
 				}
 				#[cfg(amd)]
