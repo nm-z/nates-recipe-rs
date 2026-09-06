@@ -680,6 +680,33 @@ fn compile_amd(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult
 	}
 	Ok(())
 }
+const NVIDIA_FP32_EXPERT_STORE: &str = r#"declare float @llvm.nvvm.shfl.down.f32(float, i32, i32)
+define internal void @expert_iq_group_store(
+ptr addrspace(1) %output, i32 %p, i1 %active, i32 %split, i32 %splits,
+float %partial ) convergent #1 {
+entry:
+%v16 = call float @llvm.nvvm.shfl.down.f32(float %partial, i32 16, i32 31)
+%s16 = call float @recipe.state.add(float %partial, float %v16)
+%v8 = call float @llvm.nvvm.shfl.down.f32(float %s16, i32 8, i32 31)
+%s8 = call float @recipe.state.add(float %s16, float %v8)
+%v4 = call float @llvm.nvvm.shfl.down.f32(float %s8, i32 4, i32 31)
+%s4 = call float @recipe.state.add(float %s8, float %v4)
+%v2 = call float @llvm.nvvm.shfl.down.f32(float %s4, i32 2, i32 31)
+%s2 = call float @recipe.state.add(float %s4, float %v2)
+%v1 = call float @llvm.nvvm.shfl.down.f32(float %s2, i32 1, i32 31)
+%sum = call float @recipe.state.add(float %s2, float %v1)
+%owner = icmp eq i32 %split, 0
+%store = and i1 %active, %owner
+br i1 %store, label %write, label %finish
+write:
+%value = call float @recipe.encode(float %sum)
+%output.ptr = getelementptr inbounds float, ptr addrspace(1) %output, i32 %p
+store float %value, ptr addrspace(1) %output.ptr, align 4
+br label %finish
+finish:
+ret void
+}"#;
+
 fn compile_nvidia(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildResult<()> {
 	let ir = wmma_source(&fs::read_to_string("amd-nv-cpu.ll")?);
 	let ir = parallel_ir(ir, "declare i32 @recipe.workgroup.size.x()", NVIDIA_GRID_BARRIER)
@@ -692,7 +719,12 @@ fn compile_nvidia(manifest: &str, out: &PathBuf, schedule: Schedule) -> BuildRes
 		.replace(", addrspace(5)", "")
 		.replace(" addrspace(5)", "");
 	let mut values = Vec::new();
-	for (suffix, contents) in precision_sources(ir, schedule)? {
+	for (suffix, mut contents) in precision_sources(ir, schedule)? {
+		if suffix == "-f32" {
+			let start = contents.find("define internal void @expert_iq_group_store(").ok_or_else(|| io::Error::other("packed expert reduction is absent"))?;
+			let end = start + contents[start..].find("\n}").ok_or_else(|| io::Error::other("packed expert reduction is incomplete"))? + "\n}".len();
+			contents.replace_range(start..end, NVIDIA_FP32_EXPERT_STORE);
+		}
 		let path = out.join(format!("recipe-nvidia{suffix}.ll"));
 		fs::write(&path, compose_contraction(contents, false))?;
 		values.push(format!("{}={}", if suffix.is_empty() { "default" } else { suffix }, path.display()));

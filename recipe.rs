@@ -3878,16 +3878,17 @@ impl NativeModelIr {
 		let node = &plan.node;
 		let (experts, top, hidden) =
 			(integer_argument(node.argument[0], "expert count")?, integer_argument(node.argument[1], "experts used")?, integer_argument(node.argument[2], "expert width")?);
-		let block_kind = plan.stored.as_ref().filter(|_| plan.packed).and_then(|stored| stored.format.spec()).map_or(0, |spec| match spec.codec {
-			StorageCodec::IQ1S => 1,
-			StorageCodec::IQ2XXS => 2,
-			StorageCodec::IQ4NL => 3,
-			_ => 0,
-		});
+		let block_kind = plan.stored.as_ref().filter(|_| plan.packed).map_or(0, expert_block_kind);
 		if block_kind != 0 {
-			emit_fixed_loop(ir, index, if outward { "expert.out.block" } else { "expert.in.block" }, self.rows, node.output, window, |ir, p| {
+			// One lane per output leaves the K walk serial. A fixed group of lanes
+			// splits that walk by whole 32-value weight groups, so each lane still
+			// decodes a group header once and reuses it, and the group folds through
+			// the shared tile. The CPU backend runs one thread per workgroup, so its
+			// group is one lane and the walk is unchanged.
+			let group = if backend == Backend::Cpu { 1 } else { NATIVE_EXPERT_BLOCK_GROUP };
+			emit_fixed_groups(ir, index, if outward { "expert.out.block" } else { "expert.in.block" }, self.rows, node.output, window, group, |ir, p, active, lane| {
 				ir.push_str(&format!(
-					"call void @expert_iq_{direction}_forward_body({pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, {pointer} {routing_context}, i32 {p}, i32 {in_channels}, i32 {out_channels}, i32 {length}, i32 {experts}, i32 {top}, i32 {hidden}, i32 {kind})\n",
+					"call void @expert_iq_{direction}_forward_body({pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {routing}, {pointer} {routing_context}, i1 {active}, i32 {lane}, i32 {group}, i32 {p}, i32 {in_channels}, i32 {out_channels}, i32 {length}, i32 {experts}, i32 {top}, i32 {hidden}, i32 {kind})\n",
 					direction = if outward { "out" } else { "in" },
 					pointer = pointer_type(backend),
 					source = pointers.source,
@@ -4554,6 +4555,40 @@ fn emit_partitioned_loop(ir: &mut String, index: usize, name: &str, shape: Parti
 /// loop index maps onto the element it owns.
 /// The bodies index one batch element in `i32`, so a batch whose elements pass
 /// `i32` is refused here rather than wrapped inside the loop.
+/// Lanes per cooperative group in a packed routed projection. One group owns one
+/// output and splits its K walk by whole 32-value weight groups.
+const NATIVE_EXPERT_BLOCK_GROUP: usize = 32;
+
+/// The block dot a packed routed projection reads its weights with, or zero when
+/// the stored codec has none and the node takes the cooperative contraction.
+fn expert_block_kind(stored: &StoredWeight) -> usize {
+	stored.format.spec().map_or(0, |spec| match spec.codec {
+		StorageCodec::IQ1S => 1,
+		StorageCodec::IQ2XXS => 2,
+		StorageCodec::IQ4NL => 3,
+		_ => 0,
+	})
+}
+
+/// Walk one output per fixed-size group of lanes. Every thread enters every
+/// round, and an out-of-range round is marked inactive rather than skipped, so a
+/// body may fold its group's partials through a workgroup barrier.
+fn emit_fixed_groups(ir: &mut String, index: usize, name: &str, rows: usize, shape: Shape, window: &NodeWindow, group: usize, mut body: impl FnMut(&mut String, &str, &str, &str)) -> Result<()> {
+	let prefix = format!("n{index}.{name}");
+	let elements = narrow(checked_mul(shape.channels, shape.length, format!("native {name} row elements").as_str())?, "native group loop row elements")?;
+	let (channels, length) = (narrow(shape.channels, "native group loop channels")?, narrow(shape.length, "native group loop length")?);
+	narrow(checked_mul(rows, elements as usize, "native group loop elements")?, "native group loop batch elements")?;
+	let rows = narrow(rows, "native group loop rows")?;
+	let group = narrow(group, "native group width")?;
+	let (begin, span) = (&window.begin, &window.span);
+	ir.push_str(&format!(
+		"%{prefix}.at.plane = mul i32 {channels}, {span}\n%{prefix}.at.count = mul i32 {rows}, %{prefix}.at.plane\n%{prefix}.groups = udiv i32 %threads, {group}\n%{prefix}.group = udiv i32 %tid, {group}\n%{prefix}.lane = urem i32 %tid, {group}\nbr label %{prefix}.entry\n{prefix}.entry:\nbr label %{prefix}.loop\n{prefix}.loop:\n%{prefix}.at.base = phi i32 [ 0, %{prefix}.entry ], [ %{prefix}.at.next, %{prefix}.step ]\n%{prefix}.at.more = icmp ult i32 %{prefix}.at.base, %{prefix}.at.count\nbr i1 %{prefix}.at.more, label %{prefix}.body, label %{prefix}.done\n{prefix}.body:\n%{prefix}.at.q.raw = add i32 %{prefix}.at.base, %{prefix}.group\n%{prefix}.at.active = icmp ult i32 %{prefix}.at.q.raw, %{prefix}.at.count\n%{prefix}.at.q = select i1 %{prefix}.at.active, i32 %{prefix}.at.q.raw, i32 0\n%{prefix}.at.row = udiv i32 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.within = urem i32 %{prefix}.at.q, %{prefix}.at.plane\n%{prefix}.at.channel = udiv i32 %{prefix}.at.within, {span}\n%{prefix}.at.offset = urem i32 %{prefix}.at.within, {span}\n%{prefix}.at.position = add i32 %{prefix}.at.offset, {begin}\n%{prefix}.at.row.base = mul i32 %{prefix}.at.row, {elements}\n%{prefix}.at.channel.base = mul i32 %{prefix}.at.channel, {length}\n%{prefix}.at.local = add i32 %{prefix}.at.channel.base, %{prefix}.at.position\n%{prefix}.at.p = add i32 %{prefix}.at.row.base, %{prefix}.at.local\n"
+	));
+	body(ir, &format!("%{prefix}.at.p"), &format!("%{prefix}.at.active"), &format!("%{prefix}.lane"));
+	ir.push_str(&format!("br label %{prefix}.step\n{prefix}.step:\n%{prefix}.at.next = add i32 %{prefix}.at.base, %{prefix}.groups\nbr label %{prefix}.loop\n{prefix}.done:\n"));
+	Ok(())
+}
+
 fn emit_fixed_loop(ir: &mut String, index: usize, name: &str, rows: usize, shape: Shape, window: &NodeWindow, mut body: impl FnMut(&mut String, &str)) -> Result<()> {
 	let prefix = format!("n{index}.{name}");
 	let elements = narrow(checked_mul(shape.channels, shape.length, format!("native {name} row elements").as_str())?, "native loop row elements")?;
@@ -13628,7 +13663,13 @@ impl Gpu {
 			.into_iter()
 			.max()
 			.unwrap_or(1);
-		let shared_values = contraction_shared_values.max(attention_shared_values);
+		// A packed routed projection folds one partial per lane through the shared
+		// tile, so a graph that holds one needs a tile as wide as the workgroup.
+		// Every other graph keeps the tile its own kernels ask for.
+		let routed_block = graph.nodes.iter().enumerate().any(|(index, node)| {
+			matches!(node.op, Primitive::ExpertIn | Primitive::ExpertOut) && graph.stored.get(index).and_then(|stored| stored.as_ref()).is_some_and(|stored| expert_block_kind(stored) != 0)
+		});
+		let shared_values = contraction_shared_values.max(attention_shared_values).max(if routed_block { block } else { 1 });
 		let register_count = register_m.checked_mul(register_n).ok_or_else(|| RecipeError::new("native contraction register tile overflows"))?;
 		let register_values =
 			register_count.checked_add(register_n).and_then(|values| values.checked_mul(ratio)).ok_or_else(|| RecipeError::new("native contraction register reduction overflows"))?;

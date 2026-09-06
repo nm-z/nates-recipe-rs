@@ -795,12 +795,13 @@ many: %base = mul i32 %pair, %top %index = add i32 %base, %slot %pointer = getel
 define internal RECIPE_STATE @contraction_iq1s_dot(
 ptr addrspace(1) %input, ptr addrspace(1) %weights,
 i32 %input.row, i32 %input.position, i32 %input.length,
-i32 %input.channel.begin, i32 %weight.begin, i32 %count ) #1 {
+i32 %input.channel.begin, i32 %weight.begin, i32 %count, i32 %split, i32 %splits ) #1 {
 entry:
 %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%k.first = mul i32 %split, 32 %k.stride = mul i32 %splits, 32
 br label %group.loop
 group.loop:
-%k = phi i32 [ 0, %entry ], [ %k.next, %grid.done ]
+%k = phi i32 [ %k.first, %entry ], [ %k.next, %grid.done ]
 %sum = phi RECIPE_STATE [ %zero, %entry ], [ %grid.sum, %grid.done ]
 %more = icmp ult i32 %k, %count
 br i1 %more, label %group.step, label %exit
@@ -811,13 +812,13 @@ group.step:
 %block.group = udiv i32 %block.local, 32
 %block.byte = mul i32 %block.index, RECIPE_IQ1S_STRIDE
 %scale.ptr = getelementptr inbounds i8, ptr addrspace(1) %weights, i32 %block.byte
-%scale.half = load half, ptr addrspace(1) %scale.ptr, align 2
+%scale.half = load half, ptr addrspace(1) %scale.ptr, align 2, !invariant.load !2
 %scale.base = call double @recipe.from.f16(half %scale.half)
 %qh.local = mul i32 %block.group, 2
 %qh.offset.0 = add i32 %block.byte, 34
 %qh.offset = add i32 %qh.offset.0, %qh.local
 %qh.ptr = getelementptr inbounds i8, ptr addrspace(1) %weights, i32 %qh.offset
-%qh = load i16, ptr addrspace(1) %qh.ptr, align 2
+%qh = load i16, ptr addrspace(1) %qh.ptr, align 2, !invariant.load !2
 %factor.shifted = lshr i16 %qh, 12
 %factor.code = and i16 %factor.shifted, 7
 %factor.twice = shl i16 %factor.code, 1
@@ -840,7 +841,7 @@ grid.step:
 %qs.offset.1 = add i32 %qs.offset.0, %qs.group
 %qs.offset = add i32 %qs.offset.1, %grid
 %qs.ptr = getelementptr inbounds i8, ptr addrspace(1) %weights, i32 %qs.offset
-%qs.low = load i8, ptr addrspace(1) %qs.ptr, align 1
+%qs.low = load i8, ptr addrspace(1) %qs.ptr, align 1, !invariant.load !2
 %qh.shift.amount.i32 = mul i32 %grid, 3
 %qh.shift.amount = trunc i32 %qh.shift.amount.i32 to i16
 %qh.shifted = lshr i16 %qh, %qh.shift.amount
@@ -850,7 +851,7 @@ grid.step:
 %table.index.i16 = or i16 %qs.low.wide, %qh.high.shifted
 %table.index = zext i16 %table.index.i16 to i32
 %table.ptr = getelementptr inbounds [2048 x i16], ptr @recipe_model_iq1, i32 0, i32 %table.index
-%table = load i16, ptr %table.ptr, align 2
+%table = load i16, ptr %table.ptr, align 2, !invariant.load !2
 br label %lane.loop
 lane.loop:
 %lane = phi i32 [ 0, %grid.step ], [ %lane.next, %lane.step ]
@@ -885,7 +886,7 @@ lane.done:
 %grid.next = add i32 %grid, 1
 br label %grid.loop
 grid.done:
-%k.next = add i32 %k, 32
+%k.next = add i32 %k, %k.stride
 br label %group.loop
 exit:
 ret RECIPE_STATE %sum
@@ -895,12 +896,13 @@ ret RECIPE_STATE %sum
 define internal RECIPE_STATE @contraction_iq2xxs_dot(
 ptr addrspace(1) %input, ptr addrspace(1) %weights,
 i32 %input.row, i32 %input.position, i32 %input.length,
-i32 %input.channel.begin, i32 %weight.begin, i32 %count ) #1 {
+i32 %input.channel.begin, i32 %weight.begin, i32 %count, i32 %split, i32 %splits ) #1 {
 entry:
 %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%k.first = mul i32 %split, 32 %k.stride = mul i32 %splits, 32
 br label %group.loop
 group.loop:
-%k = phi i32 [ 0, %entry ], [ %k.next, %grid.done ]
+%k = phi i32 [ %k.first, %entry ], [ %k.next, %grid.done ]
 %sum = phi RECIPE_STATE [ %zero, %entry ], [ %grid.sum, %grid.done ]
 %more = icmp ult i32 %k, %count
 br i1 %more, label %group.step, label %exit
@@ -911,13 +913,13 @@ group.step:
 %block.group = udiv i32 %block.local, 32
 %block.byte = mul i32 %block.index, RECIPE_IQ2XXS_STRIDE
 %scale.ptr = getelementptr inbounds i8, ptr addrspace(1) %weights, i32 %block.byte
-%scale.half = load half, ptr addrspace(1) %scale.ptr, align 2
+%scale.half = load half, ptr addrspace(1) %scale.ptr, align 2, !invariant.load !2
 %scale.base = call double @recipe.from.f16(half %scale.half)
 %group.byte = mul i32 %block.group, 8
 %word.offset.0 = add i32 %block.byte, 6
 %word.offset = add i32 %word.offset.0, %group.byte
 %word.ptr = getelementptr inbounds i8, ptr addrspace(1) %weights, i32 %word.offset
-%word = load i32, ptr addrspace(1) %word.ptr, align 2
+%word = load i32, ptr addrspace(1) %word.ptr, align 2, !invariant.load !2
 %factor.code = lshr i32 %word, 28
 %factor.twice = shl i32 %factor.code, 1
 %factor.odd = or i32 %factor.twice, 1
@@ -935,10 +937,10 @@ grid.step:
 %qs.offset.1 = add i32 %qs.offset.0, %group.byte
 %qs.offset = add i32 %qs.offset.1, %grid
 %qs.ptr = getelementptr inbounds i8, ptr addrspace(1) %weights, i32 %qs.offset
-%qs = load i8, ptr addrspace(1) %qs.ptr, align 1
+%qs = load i8, ptr addrspace(1) %qs.ptr, align 1, !invariant.load !2
 %table.index = zext i8 %qs to i32
 %table.ptr = getelementptr inbounds [256 x i16], ptr @recipe_model_iq2xxs, i32 0, i32 %table.index
-%table = load i16, ptr %table.ptr, align 2
+%table = load i16, ptr %table.ptr, align 2, !invariant.load !2
 %sign.shift = mul i32 %grid, 7
 %sign.shifted = lshr i32 %word, %sign.shift
 %signs = and i32 %sign.shifted, 127
@@ -991,7 +993,7 @@ lane.done:
 %grid.next = add i32 %grid, 1
 br label %grid.loop
 grid.done:
-%k.next = add i32 %k, 32
+%k.next = add i32 %k, %k.stride
 br label %group.loop
 exit:
 ret RECIPE_STATE %sum
@@ -1006,12 +1008,13 @@ ret RECIPE_STATE %sum
 define internal RECIPE_STATE @contraction_iq4nl_dot(
 ptr addrspace(1) %input, ptr addrspace(1) %weights,
 i32 %input.row, i32 %input.position, i32 %input.length,
-i32 %input.channel.begin, i32 %weight.begin, i32 %count ) #1 {
+i32 %input.channel.begin, i32 %weight.begin, i32 %count, i32 %split, i32 %splits ) #1 {
 entry:
 %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+%k.first = mul i32 %split, 32 %k.stride = mul i32 %splits, 32
 br label %block.loop
 block.loop:
-%k = phi i32 [ 0, %entry ], [ %k.next, %lane.done ]
+%k = phi i32 [ %k.first, %entry ], [ %k.next, %lane.done ]
 %sum = phi RECIPE_STATE [ %zero, %entry ], [ %lane.sum, %lane.done ]
 %more = icmp ult i32 %k, %count
 br i1 %more, label %block.step, label %exit
@@ -1020,7 +1023,7 @@ block.step:
 %block.index = udiv i32 %weight.absolute, RECIPE_IQ4NL_BLOCK
 %block.byte = mul i32 %block.index, RECIPE_IQ4NL_STRIDE
 %scale.ptr = getelementptr inbounds i8, ptr addrspace(1) %weights, i32 %block.byte
-%scale.half = load half, ptr addrspace(1) %scale.ptr, align 2
+%scale.half = load half, ptr addrspace(1) %scale.ptr, align 2, !invariant.load !2
 %scale = call double @recipe.from.f16(half %scale.half)
 br label %lane.loop
 lane.loop:
@@ -1033,14 +1036,14 @@ lane.step:
 %payload.offset.0 = add i32 %block.byte, 2
 %payload.offset = add i32 %payload.offset.0, %payload.lane
 %payload.ptr = getelementptr inbounds i8, ptr addrspace(1) %weights, i32 %payload.offset
-%payload = load i8, ptr addrspace(1) %payload.ptr, align 1
+%payload = load i8, ptr addrspace(1) %payload.ptr, align 1, !invariant.load !2
 %upper = icmp uge i32 %lane, 16
 %shift = select i1 %upper, i8 4, i8 0
 %payload.shifted = lshr i8 %payload, %shift
 %code.i8 = and i8 %payload.shifted, 15
 %code = zext i8 %code.i8 to i32
 %table.ptr = getelementptr inbounds [16 x i8], ptr @recipe_model_iq4, i32 0, i32 %code
-%level.i8 = load i8, ptr %table.ptr, align 1
+%level.i8 = load i8, ptr %table.ptr, align 1, !invariant.load !2
 %level.i32 = sext i8 %level.i8 to i32
 %level = call double @recipe.from.s32(i32 %level.i32)
 %weight = call double @recipe.mul(double %scale, double %level)
@@ -1058,7 +1061,7 @@ lane.step:
 %lane.next = add i32 %lane, 1
 br label %lane.loop
 lane.done:
-%k.next = add i32 %k, 32
+%k.next = add i32 %k, %k.stride
 br label %block.loop
 exit:
 ret RECIPE_STATE %sum
@@ -1066,30 +1069,67 @@ ret RECIPE_STATE %sum
 define internal RECIPE_STATE @contraction_iq_dot(
 i32 %kind, ptr addrspace(1) %input, ptr addrspace(1) %weights,
 i32 %input.row, i32 %input.position, i32 %input.length,
-i32 %input.channel.begin, i32 %weight.begin, i32 %count ) #1 {
+i32 %input.channel.begin, i32 %weight.begin, i32 %count, i32 %split, i32 %splits ) #1 {
 entry:
 switch i32 %kind, label %absent [ i32 1, label %iq1s i32 2, label %iq2xxs i32 3, label %iq4nl ]
 iq1s:
-%iq1s.value = call RECIPE_STATE @contraction_iq1s_dot(ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %input.position, i32 %input.length, i32 %input.channel.begin, i32 %weight.begin, i32 %count)
+%iq1s.value = call RECIPE_STATE @contraction_iq1s_dot(ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %input.position, i32 %input.length, i32 %input.channel.begin, i32 %weight.begin, i32 %count, i32 %split, i32 %splits)
 ret RECIPE_STATE %iq1s.value
 iq2xxs:
-%iq2xxs.value = call RECIPE_STATE @contraction_iq2xxs_dot(ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %input.position, i32 %input.length, i32 %input.channel.begin, i32 %weight.begin, i32 %count)
+%iq2xxs.value = call RECIPE_STATE @contraction_iq2xxs_dot(ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %input.position, i32 %input.length, i32 %input.channel.begin, i32 %weight.begin, i32 %count, i32 %split, i32 %splits)
 ret RECIPE_STATE %iq2xxs.value
 iq4nl:
-%iq4nl.value = call RECIPE_STATE @contraction_iq4nl_dot(ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %input.position, i32 %input.length, i32 %input.channel.begin, i32 %weight.begin, i32 %count)
+%iq4nl.value = call RECIPE_STATE @contraction_iq4nl_dot(ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %input.position, i32 %input.length, i32 %input.channel.begin, i32 %weight.begin, i32 %count, i32 %split, i32 %splits)
 ret RECIPE_STATE %iq4nl.value
 absent:
 unreachable
 }
-; Packed routed projections walk one output per global thread. This preserves the
-; ordinary fixed-loop scheduling and traverses each selected 32-value weight
-; group once, without the contraction tile's K-lane replication.
+; One fixed group of lanes cooperates on one output. Each lane walks a disjoint
+; stride of 32-value weight groups, so a group header is still decoded once and
+; reused for its 32 products, and the group's partials fold through the shared
+; tile before the owning lane stores. A group of one lane is the scalar walk.
+define internal void @expert_iq_group_store(
+ptr addrspace(1) %output, i32 %p, i1 %active, i32 %split, i32 %splits,
+RECIPE_STATE %partial ) #1 {
+entry:
+%lid = call i32 @recipe.local.id.x()
+%slot = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %lid
+store RECIPE_STATE %partial, ptr addrspace(3) %slot, align RECIPE_STATE_ALIGN
+call void @recipe.local.barrier()
+%owner = icmp eq i32 %split, 0
+%store = and i1 %active, %owner
+br i1 %store, label %fold.loop, label %finish
+fold.loop:
+%part = phi i32 [ 0, %entry ], [ %part.next, %fold.step ]
+%sum = phi RECIPE_STATE [ zeroinitializer, %entry ], [ %sum.next, %fold.step ]
+%more = icmp ult i32 %part, %splits
+br i1 %more, label %fold.step, label %fold.done
+fold.step:
+%source.index = add i32 %lid, %part
+%source.ptr = getelementptr RECIPE_STATE, ptr addrspace(3) @contraction_tile, i32 %source.index
+%source = load RECIPE_STATE, ptr addrspace(3) %source.ptr, align RECIPE_STATE_ALIGN
+%sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %sum, RECIPE_STATE %source)
+%part.next = add i32 %part, 1
+br label %fold.loop
+fold.done:
+%value = call double @recipe.encode(RECIPE_STATE %sum)
+%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
+store double %value, ptr addrspace(1) %output.ptr, align 8
+br label %finish
+finish:
+call void @recipe.local.barrier()
+ret void
+}
 define internal void @expert_iq_in_forward_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
 ptr addrspace(1) %routing, ptr addrspace(1) %routing.context,
+i1 %active, i32 %split, i32 %splits,
 i32 %p, i32 %in.channels, i32 %out.channels, i32 %length,
 i32 %experts, i32 %top, i32 %hidden, i32 %kind ) #1 {
 entry:
+%zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+br i1 %active, label %prepare, label %finish
+prepare:
 %out.row.elements = mul i32 %out.channels, %length
 %row = udiv i32 %p, %out.row.elements
 %within = urem i32 %p, %out.row.elements
@@ -1106,18 +1146,23 @@ entry:
 %weight.expert = mul i32 %expert, %weight.plane
 %weight.channel = mul i32 %channel, %in.channels
 %weight.begin = add i32 %weight.expert, %weight.channel
-%sum = call RECIPE_STATE @contraction_iq_dot(i32 %kind, ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %position, i32 %length, i32 0, i32 %weight.begin, i32 %in.channels)
-%value = call double @recipe.encode(RECIPE_STATE %sum)
-%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
-store double %value, ptr addrspace(1) %output.ptr, align 8
+%sum = call RECIPE_STATE @contraction_iq_dot(i32 %kind, ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %position, i32 %length, i32 0, i32 %weight.begin, i32 %in.channels, i32 %split, i32 %splits)
+br label %finish
+finish:
+%partial = phi RECIPE_STATE [ %zero, %entry ], [ %sum, %prepare ]
+call void @expert_iq_group_store(ptr addrspace(1) %output, i32 %p, i1 %active, i32 %split, i32 %splits, RECIPE_STATE %partial)
 ret void
 }
 define internal void @expert_iq_out_forward_body(
 ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
 ptr addrspace(1) %routing, ptr addrspace(1) %routing.context,
+i1 %active, i32 %split, i32 %splits,
 i32 %p, i32 %in.channels, i32 %out.channels, i32 %length,
 i32 %experts, i32 %top, i32 %hidden, i32 %kind ) #1 {
 entry:
+%zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
+br i1 %active, label %prepare, label %finish
+prepare:
 %out.row.elements = mul i32 %out.channels, %length
 %row = udiv i32 %p, %out.row.elements
 %within = urem i32 %p, %out.row.elements
@@ -1127,11 +1172,10 @@ entry:
 %routing.pair = add i32 %routing.row.position, %position
 %input.row.elements = mul i32 %in.channels, %length
 %input.row = mul i32 %row, %input.row.elements
-%zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 br label %slot.loop
 slot.loop:
-%slot = phi i32 [ 0, %entry ], [ %slot.next, %slot.step ]
-%sum = phi RECIPE_STATE [ %zero, %entry ], [ %sum.next, %slot.step ]
+%slot = phi i32 [ 0, %prepare ], [ %slot.next, %slot.step ]
+%sum = phi RECIPE_STATE [ %zero, %prepare ], [ %sum.next, %slot.step ]
 %more = icmp ult i32 %slot, %top
 br i1 %more, label %slot.step, label %done
 slot.step:
@@ -1141,7 +1185,7 @@ slot.step:
 %weight.channel = mul i32 %channel, %hidden
 %weight.begin = add i32 %weight.expert, %weight.channel
 %input.channel = mul i32 %slot, %hidden
-%dot = call RECIPE_STATE @contraction_iq_dot(i32 %kind, ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %position, i32 %length, i32 %input.channel, i32 %weight.begin, i32 %hidden)
+%dot = call RECIPE_STATE @contraction_iq_dot(i32 %kind, ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %position, i32 %length, i32 %input.channel, i32 %weight.begin, i32 %hidden, i32 %split, i32 %splits)
 %routing.row.span = mul i32 %experts, %length
 %routing.row = mul i32 %row, %routing.row.span
 %routing.expert = mul i32 %expert, %length
@@ -1155,21 +1199,20 @@ slot.step:
 %slot.next = add i32 %slot, 1
 br label %slot.loop
 done:
-%value = call double @recipe.encode(RECIPE_STATE %sum)
-%output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %p
-store double %value, ptr addrspace(1) %output.ptr, align 8
+br label %finish
+finish:
+%partial = phi RECIPE_STATE [ %zero, %entry ], [ %sum, %done ]
+call void @expert_iq_group_store(ptr addrspace(1) %output, i32 %p, i1 %active, i32 %split, i32 %splits, RECIPE_STATE %partial)
 ret void
 }
-; A lane owns one output accumulator. For routed input, its M coordinate also
-; chooses one selected expert. For routed output, each selected expert contributes
-; one hidden-width row span scaled by that token's routing weight.
+; A lane owns one output accumulator of a packed dense contraction. Routed
+; projections never arrive here: emit_expert_forward drives every packed expert
+; node through expert_iq_group_store instead, so this holds the dense walk alone.
 define internal void @contraction_iq_accumulate(
 ptr addrspace(5) %sums, ptr addrspace(1) %input, ptr addrspace(1) %weights,
-ptr addrspace(1) %routing, ptr addrspace(1) %routing.context,
 i1 %lane.active, i32 %lid, i32 %m.lanes, i32 %m.base, i32 %n.base,
 i32 %m.count, i32 %n.count, i32 %out.begin, i32 %out.span,
-i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %weight.base,
-i32 %kind, i32 %expert.mode, i32 %experts, i32 %top, i32 %hidden ) #1 {
+i32 %in.channels, i32 %in.length, i32 %weight.base, i32 %kind ) #1 {
 entry:
 br i1 %lane.active, label %register.loop, label %exit
 register.loop:
@@ -1186,69 +1229,14 @@ br i1 %valid, label %register.begin, label %register.done
 register.begin:
 %global.m = add i32 %m.base, %local.m
 %global.n = add i32 %n.base, %local.n
-%expert.in = icmp eq i32 %expert.mode, 1
-%expert.out = icmp eq i32 %expert.mode, 2
-%expert.any = or i1 %expert.in, %expert.out
-%top.safe = select i1 %expert.any, i32 %top, i32 1
-%expert.in.pair = udiv i32 %global.m, %top.safe
-%pair = select i1 %expert.in, i32 %expert.in.pair, i32 %global.m
-%row = udiv i32 %pair, %out.span
-%position.local = urem i32 %pair, %out.span
+%row = udiv i32 %global.m, %out.span
+%position.local = urem i32 %global.m, %out.span
 %position = add i32 %position.local, %out.begin
 %row.elements = mul i32 %in.channels, %in.length
 %input.row = mul i32 %row, %row.elements
-%routing.row.position = mul i32 %row, %in.length
-%routing.pair = add i32 %routing.row.position, %position
-br i1 %expert.out, label %out.slot.loop, label %single.classify
-single.classify:
-br i1 %expert.in, label %single.expert, label %single.regular
-single.regular:
-%regular.channel.base = mul i32 %global.n, %in.channels
-%regular.weight.local = add i32 %regular.channel.base, %weight.base
-br label %single.dot
-single.expert:
-%in.slot = urem i32 %global.m, %top.safe
-%in.expert = call i32 @expert_selected(ptr addrspace(1) %routing.context, i32 %routing.pair, i32 %in.slot, i32 %experts, i32 %top)
-%in.plane = mul i32 %out.channels, %in.channels
-%in.expert.base = mul i32 %in.expert, %in.plane
-%in.channel.base = mul i32 %global.n, %in.channels
-%in.weight.0 = add i32 %in.expert.base, %in.channel.base
-%in.weight.local = add i32 %in.weight.0, %weight.base
-br label %single.dot
-single.dot:
-%single.weight = phi i32 [ %regular.weight.local, %single.regular ], [ %in.weight.local, %single.expert ]
-%single.sum = call RECIPE_STATE @contraction_iq_dot(i32 %kind, ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %position, i32 %in.length, i32 0, i32 %single.weight, i32 %in.channels)
-br label %sum.ready
-out.slot.loop:
-%out.slot = phi i32 [ 0, %register.begin ], [ %out.slot.next, %out.slot.step ]
-%out.sum = phi RECIPE_STATE [ zeroinitializer, %register.begin ], [ %out.sum.next, %out.slot.step ]
-%out.slot.more = icmp ult i32 %out.slot, %top
-br i1 %out.slot.more, label %out.slot.step, label %out.slot.done
-out.slot.step:
-%out.expert = call i32 @expert_selected(ptr addrspace(1) %routing.context, i32 %routing.pair, i32 %out.slot, i32 %experts, i32 %top)
-%out.plane = mul i32 %out.channels, %hidden
-%out.expert.base = mul i32 %out.expert, %out.plane
-%out.channel.base = mul i32 %global.n, %hidden
-%out.weight.0 = add i32 %out.expert.base, %out.channel.base
-%out.weight.local = add i32 %out.weight.0, %weight.base
-%out.input.channel = mul i32 %out.slot, %hidden
-%out.dot = call RECIPE_STATE @contraction_iq_dot(i32 %kind, ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %position, i32 %in.length, i32 %out.input.channel, i32 %out.weight.local, i32 %hidden)
-%routing.row.span = mul i32 %experts, %in.length
-%routing.row = mul i32 %row, %routing.row.span
-%routing.expert = mul i32 %out.expert, %in.length
-%routing.local = add i32 %routing.expert, %position
-%routing.index = add i32 %routing.row, %routing.local
-%routing.ptr = getelementptr inbounds double, ptr addrspace(1) %routing, i32 %routing.index
-%routing.value = load double, ptr addrspace(1) %routing.ptr, align 8
-%routing.wide = call RECIPE_STATE @recipe.state.from.model(double %routing.value)
-%out.scaled = call RECIPE_STATE @recipe.state.mul(RECIPE_STATE %out.dot, RECIPE_STATE %routing.wide)
-%out.sum.next = call RECIPE_STATE @recipe.state.add(RECIPE_STATE %out.sum, RECIPE_STATE %out.scaled)
-%out.slot.next = add i32 %out.slot, 1
-br label %out.slot.loop
-out.slot.done:
-br label %sum.ready
-sum.ready:
-%sum = phi RECIPE_STATE [ %single.sum, %single.dot ], [ %out.sum, %out.slot.done ]
+%channel.base = mul i32 %global.n, %in.channels
+%weight.local = add i32 %channel.base, %weight.base
+%sum = call RECIPE_STATE @contraction_iq_dot(i32 %kind, ptr addrspace(1) %input, ptr addrspace(1) %weights, i32 %input.row, i32 %position, i32 %in.length, i32 0, i32 %weight.local, i32 %in.channels, i32 0, i32 1)
 %sum.ptr = getelementptr RECIPE_STATE, ptr addrspace(5) %sums, i32 %register
 store RECIPE_STATE %sum, ptr addrspace(5) %sum.ptr, align RECIPE_STATE_ALIGN
 br label %register.done
@@ -1383,7 +1371,7 @@ i1 %has.bias, i1 %relu, i1 %transpose, i1 %reverse, i1 %accumulate, i32 %tile.m,
 %weight.project = icmp eq i32 %kernel, 0
 %expert.in = icmp eq i32 %expert.mode, 1 %expert.out = icmp eq i32 %expert.mode, 2 %expert.any = or i1 %expert.in, %expert.out %expert.none = xor i1 %expert.any, true %expert.top.safe = select i1 %expert.any, i32 %expert.top, i32 1
 %weight.q8_0.project = and i1 %weight.q8_0.raw, %weight.project %weight.q8_0 = and i1 %weight.q8_0.project, %expert.none
-%weight.iq = and i1 %weight.iq.present, %weight.project
+%weight.iq.project = and i1 %weight.iq.present, %weight.project %weight.iq = and i1 %weight.iq.project, %expert.none
 ; The running sums live in the arithmetic type for the whole K extent and are
 ; rounded to the model type once, at the store. Staging the operands in tiles
 ; therefore cannot move a rounding point.
@@ -1423,7 +1411,7 @@ br label %store.loop
 iq.test:
 br i1 %weight.iq, label %iq, label %tile.loop
 iq:
-call void @contraction_iq_accumulate(ptr addrspace(5) %sums, ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %routing, ptr addrspace(1) %routing.context, i1 %lane.active, i32 %lid, i32 %m.lanes, i32 %m.base, i32 %n.base, i32 %m.count, i32 %n.count, i32 %out.begin, i32 %out.span, i32 %in.channels, i32 %in.length, i32 %out.channels, i32 %weight.base, i32 %weight.iq.kind, i32 %expert.mode, i32 %expert.experts, i32 %expert.top, i32 %expert.hidden)
+call void @contraction_iq_accumulate(ptr addrspace(5) %sums, ptr addrspace(1) %input, ptr addrspace(1) %weights, i1 %lane.active, i32 %lid, i32 %m.lanes, i32 %m.base, i32 %n.base, i32 %m.count, i32 %n.count, i32 %out.begin, i32 %out.span, i32 %in.channels, i32 %in.length, i32 %weight.base, i32 %weight.iq.kind)
 br label %store.loop
 tile.loop:
 %term.base = phi i32 [ 0, %iq.test ], [ %term.next, %tile.done ] %k.remaining = sub i32 %terms, %term.base %k.partial = icmp ult i32 %k.remaining, %k.tile %k.count = select i1 %k.partial, i32 %k.remaining, i32 %k.tile
@@ -5367,3 +5355,6 @@ invalid: call void @llvm.trap() br label %exit exit: ret void } attributes #0 = 
 ; and the accumulator vector remains in registers.
 !0 = distinct !{!0, !1}
 !1 = !{!"llvm.loop.unroll.full"}
+; Packed weight bytes and the quantization codebooks are written once, before the
+; kernel launches, and no kernel stores to them, so every read of them is invariant.
+!2 = !{}
