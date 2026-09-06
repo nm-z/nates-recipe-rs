@@ -3802,11 +3802,14 @@ impl NativeModelIr {
 	/// Selects one packed node's decoder so a consuming kernel reads its stored representation.
 	fn emit_weight_decode(&self, backend: Backend) -> Result<String> {
 		let (pointer, ty) = (pointer_type(backend), self.precision.model_type);
-		let (mut arms, mut bodies) = (String::new(), String::new());
+		let (mut arms, mut bodies, mut q8_0_arms) = (String::new(), String::new(), String::new());
 		for (index, plan) in self.plans.iter().enumerate() {
 			let Some(stored) = plan.stored.as_ref().filter(|_| plan.packed) else { continue };
 			let spec = stored.format.spec().ok_or_else(|| RecipeError::new(format!("native quantized format {} is unavailable", stored.format.0)))?;
 			let format = spec.codec.quantization();
+			if spec.codec == StorageCodec::Q8_0 && plan.node.op == Primitive::Contraction && plan.node.input.channels % spec.block == 0 {
+				q8_0_arms.push_str(&format!("i32 {}, label %q8_0.yes\n", index + 1));
+			}
 			let (name, block) = match format.native {
 				NativeDequant::Nf4 => (format!("{}_n{index}", format.name), nf4_codebook(&stored.codebook, stored.count, stored.bytes.len())?.0),
 				_ => (format.name.to_owned(), spec.block),
@@ -3818,7 +3821,7 @@ impl NativeModelIr {
 			));
 		}
 		Ok(format!(
-			"define internal {ty} @recipe.model.decode({pointer} %matrix, i32 %index, i32 %node) #1 {{\nentry:\nswitch i32 %node, label %decode.absent [\n{arms}]\n{bodies}decode.absent:\nunreachable\n}}\n"
+			"define internal {ty} @recipe.model.decode({pointer} %matrix, i32 %index, i32 %node) #1 {{\nentry:\nswitch i32 %node, label %decode.absent [\n{arms}]\n{bodies}decode.absent:\nunreachable\n}}\ndefine internal i1 @recipe.model.q8_0(i32 %node) #1 {{\nentry:\nswitch i32 %node, label %q8_0.no [\n{q8_0_arms}]\nq8_0.yes:\nret i1 true\nq8_0.no:\nret i1 false\n}}\n"
 		))
 	}
 
@@ -3866,6 +3869,9 @@ impl NativeModelIr {
 
 	pub(crate) fn emit(&self, backend: Backend, matrix: Option<NativeMatrix>, loss: Option<LossFunction>) -> Result<String> {
 		let register_count = self.schedule.register_count;
+		let q8_0 = StorageCodec::Q8_0.quantization();
+		let q8_0_header = q8_0.stride.checked_sub(q8_0.block).ok_or_else(|| RecipeError::new("Q8_0 storage header is invalid"))?;
+		let q8_0_max = (1_u16 << (q8_0.bits - 1)) - 1;
 		let mut ir = backend_template(backend, self.precision, matrix)?
 			.replace("RECIPE_WORKGROUP_SIZE", &self.schedule.block.to_string())
 			.replace("RECIPE_REGISTER_M", &self.schedule.register_m.to_string())
@@ -3877,8 +3883,13 @@ impl NativeModelIr {
 			.replace("RECIPE_CHUNK_BIAS_VALUES", &self.schedule.chunk_bias_values.to_string())
 			.replace("RECIPE_SCRATCH_ROW_MASK", &(NATIVE_SCRATCH_ROW_VALUES - 1).to_string())
 			.replace("RECIPE_SCRATCH_ROW_CLEAR", &(-(NATIVE_SCRATCH_ROW_VALUES as i64)).to_string())
-			.replace("RECIPE_GRADIENT_SCRATCH_BASE", &self.schedule.scratch_base.to_string());
+			.replace("RECIPE_GRADIENT_SCRATCH_BASE", &self.schedule.scratch_base.to_string())
+			.replace("RECIPE_Q8_0_BLOCK", &q8_0.block.to_string())
+			.replace("RECIPE_Q8_0_STRIDE", &q8_0.stride.to_string())
+			.replace("RECIPE_Q8_0_HEADER", &q8_0_header.to_string())
+			.replace("RECIPE_Q8_0_MAX", &format!("{}.0", q8_0_max));
 		ir = strip_definition(ir, "recipe.model.decode");
+		ir = strip_definition(ir, "recipe.model.q8_0");
 		let quantized_definitions = self.emit_quantized_decoders(backend)?;
 		let weight_decode = self.emit_weight_decode(backend)?;
 		let model_load = self.emit_model_load(backend)?;
@@ -9841,7 +9852,7 @@ fn compile(model: &Model, data: &Prepared, targets: &[f64], rows: usize, gpu: &'
 	graph.block_frozen = false;
 	graph.block_packed = false;
 	if graph.lanes != 0 {
-		lower_collapse(&mut graph)?;
+		lower_collapse(&mut graph, config)?;
 	}
 	let mut output_profile = model.blocks.last().filter(|block| block.profile).map(|block| StorageFormat(block.quantization));
 	// A model whose last block already emits one value per target needs no projection; the
@@ -9989,7 +10000,7 @@ fn lower_block(graph: &mut Graph, block: &Block, total: usize, data: &Prepared, 
 	// A per-layer embedding adds into the lanes-wide stream itself, so it keeps
 	// the stream open as a hyper-connection block does.
 	if graph.lanes != 0 && !matches!(block.operation, Operation::Hyper(..) | Operation::Ple(..)) {
-		lower_collapse(graph)?;
+		lower_collapse(graph, config)?;
 	}
 	let skip = graph.source;
 	let first = graph.nodes.len();
@@ -10224,25 +10235,27 @@ fn lower_activation(graph: &mut Graph, activation: Activation, config: Config) -
 	push_program(graph, -2, initial, program)
 }
 /// Whether the contraction the graph is about to push carries a bias row. A
-/// trained contraction always does. A graph compiled over mapped tensors reads
-/// the answer off the views bound to the node: a sum equal to the matrix binds
-/// no bias row, a sum one output row larger binds the trailing row as the bias,
-/// and any other sum is rejected here, before anything runs, naming the views,
-/// the node and both spans.
-fn contraction_bias(graph: &Graph, matrix: usize, width: usize) -> Result<bool> {
+/// trained contraction does when its lowering owns one (`bias`); a gate that
+/// never carries one takes the matrix alone. A graph compiled over mapped
+/// tensors reads the answer off the views bound to the node: a sum equal to the
+/// matrix binds no bias row, a sum one output row larger binds the trailing row
+/// as the bias of a node that owns one, and any other sum is rejected here,
+/// before anything runs, naming the views, the node and the accepted spans.
+fn contraction_bias(graph: &Graph, matrix: usize, width: usize, bias: bool) -> Result<bool> {
 	let biased = checked_add(matrix, width, "contraction bias")?;
 	match graph.bound.as_ref().and_then(std::collections::VecDeque::front) {
-		None => Ok(true),
+		None => Ok(bias),
 		Some(bound) if bound.elements == matrix => Ok(false),
-		Some(bound) if bound.elements == biased => Ok(true),
+		Some(bound) if bias && bound.elements == biased => Ok(true),
 		Some(bound) => Err(RecipeError::new(format!(
-			"{} hold {} values; block {} {} node {} contracts {} inputs onto {width} outputs and takes {matrix} values without a bias row or {biased} with one",
+			"{} hold {} values; block {} {} node {} contracts {} inputs onto {width} outputs and takes {matrix} values{}",
 			bound.names,
 			bound.elements,
 			graph.block_index,
 			graph.block_kind,
 			graph.nodes.len(),
-			matrix / width
+			matrix / width,
+			if bias { format!(" without a bias row or {biased} with one") } else { String::new() }
 		))),
 	}
 }
@@ -10256,9 +10269,14 @@ fn contraction_arguments(kernel: usize, bias: bool) -> [f64; 9] {
 /// A projection of the graph output onto `channels`, with a bias row unless the
 /// weight it binds to carries none, so its parameter span is then the matrix.
 fn lower_project(graph: &mut Graph, channels: usize) -> Result<()> {
+	lower_contraction(graph, channels, true)
+}
+/// A contraction of the graph output onto `channels` whose lowering owns a bias
+/// row when `bias` is set; a gate lowered without one spans the matrix alone.
+fn lower_contraction(graph: &mut Graph, channels: usize, bias: bool) -> Result<()> {
 	require(channels != 0, "layer width must be positive")?;
 	let matrix = checked_mul(graph.output.channels, channels, "projection matrix")?;
-	let bias = contraction_bias(graph, matrix, channels)?;
+	let bias = contraction_bias(graph, matrix, channels, bias)?;
 	let parameters = if bias { checked_add(matrix, channels, "projection bias")? } else { matrix };
 	let output = Shape { channels, length: graph.output.length };
 	push_node(graph, Primitive::Contraction, output, parameters, contraction_arguments(0, bias), -2)
@@ -10267,7 +10285,7 @@ fn lower_conv(graph: &mut Graph, filters: usize, kernel: usize) -> Result<()> {
 	require(filters != 0 && kernel != 0, "convolution dimensions must be positive")?;
 	require(kernel <= graph.output.length, "convolution kernel exceeds sequence length")?;
 	let matrix = checked_mul(filters, checked_mul(graph.output.channels, kernel, "convolution window")?, "conv matrix")?;
-	let bias = contraction_bias(graph, matrix, filters)?;
+	let bias = contraction_bias(graph, matrix, filters, true)?;
 	let parameters = if bias { checked_add(matrix, filters, "conv bias")? } else { matrix };
 	let output = Shape { channels: filters, length: graph.output.length - kernel + 1 };
 	push_node(graph, Primitive::Contraction, output, parameters, contraction_arguments(kernel, bias), -2)
@@ -10572,8 +10590,8 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	graph.rank = rank;
 	let (stream, shape) = (graph.source, graph.output);
 	let width = shape.channels / lanes;
-	let (read, write) = lower_gates(graph, lanes, rank, true)?;
-	reset(graph, stream, shape);
+	let (source, read, write) = lower_gates(graph, lanes, rank, true, config)?;
+	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: width, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
 	let (outer_frozen, outer_packed, outer_kind) = (graph.block_frozen, graph.block_packed, graph.block_kind);
 	graph.lanes = 0;
@@ -10584,7 +10602,7 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 		lower_block(graph, block, total, data, targets, rows, gpu, config)?;
 	}
 	if graph.lanes != 0 {
-		lower_collapse(graph)?;
+		lower_collapse(graph, config)?;
 	}
 	(graph.block_frozen, graph.block_packed, graph.block_kind, graph.lanes) = (outer_frozen, outer_packed, outer_kind, lanes);
 	require(graph.output.channels == width && graph.output.length == shape.length, "hyper-connection branch shape mismatch")?;
@@ -10593,44 +10611,49 @@ fn lower_hyper(graph: &mut Graph, lanes: usize, rank: usize, blocks: &[Block], t
 	program.op(ScalarOpcode::Add, -1.0, -2.0);
 	push_program(graph, stream, &[], program)
 }
-/// Data-dependent gates from the layer-normalized stream: a read gate the width
-/// of the stream through a bottleneck of `rank`, and one write gate per lane,
-/// both offset by one so a fresh model starts at the plain residual. With
-/// `rank` zero every gate is one and no node is added.
-fn lower_gates(graph: &mut Graph, lanes: usize, rank: usize, write: bool) -> Result<(i32, i32)> {
-	if rank == 0 {
-		return Ok((-2, -2));
-	}
+/// The mixer gates from the stream: per-lane RMS statistics under one trainable
+/// scale over the whole stream give `xn`; the read gate is
+/// `sigmoid(W_up · silu(W_down · xn / lanes))` over the stream, and the write
+/// gate is `2 sigmoid(W_inject · xn / lanes)` per lane, so a zero injection is
+/// the plain residual. No projection carries a bias. Returns the node the read
+/// consumes, the read gate, and the write gate. With `rank` zero no node is
+/// added, every gate is one, and the read takes the raw stream.
+fn lower_gates(graph: &mut Graph, lanes: usize, rank: usize, write: bool, config: Config) -> Result<(i32, i32, i32)> {
 	let (stream, shape) = (graph.source, graph.output);
-	let epsilon = graph.epsilon;
-	push_node(graph, Primitive::Normalize, shape, 0, arguments(1.0, epsilon), -2)?;
+	if rank == 0 {
+		return Ok((stream, -2, -2));
+	}
+	lower_normalize(graph, BlockNormalization::Rms, shape.channels / lanes, shape.channels)?;
 	let normalized = graph.source;
-	lower_project(graph, rank)?;
-	lower_project(graph, shape.channels)?;
-	lower_offset_one(graph)?;
+	lower_contraction(graph, rank, false)?;
+	lower_scale(graph, 1.0 / lanes as f64)?;
+	lower_activation(graph, Activation::Silu, config)?;
+	lower_contraction(graph, shape.channels, false)?;
+	lower_activation(graph, Activation::Sigmoid, config)?;
 	let read = graph.source;
 	if !write {
-		reset(graph, stream, shape);
-		return Ok((read, -2));
+		return Ok((normalized, read, -2));
 	}
 	reset(graph, normalized, shape);
-	lower_project(graph, lanes)?;
-	lower_offset_one(graph)?;
-	let write = graph.source;
-	reset(graph, stream, shape);
-	Ok((read, write))
+	lower_contraction(graph, lanes, false)?;
+	lower_scale(graph, 1.0 / lanes as f64)?;
+	lower_activation(graph, Activation::Sigmoid, config)?;
+	lower_scale(graph, 2.0)?;
+	Ok((normalized, read, graph.source))
 }
-fn lower_offset_one(graph: &mut Graph) -> Result<()> {
+/// Multiplies the graph output by `factor`.
+fn lower_scale(graph: &mut Graph, factor: f64) -> Result<()> {
 	let mut program = ScalarProgram(Vec::new());
-	let one = program.constant(1.0);
-	program.op(ScalarOpcode::Add, -1.0, one);
+	let factor = program.constant(factor);
+	program.op(ScalarOpcode::Multiply, -1.0, factor);
 	push_program(graph, -2, &[], program)
 }
-/// The head read: the stream collapses to the width through its own read gate.
-fn lower_collapse(graph: &mut Graph) -> Result<()> {
-	let (lanes, rank, stream, shape) = (graph.lanes, graph.rank, graph.source, graph.output);
-	let (read, _) = lower_gates(graph, lanes, rank, false)?;
-	reset(graph, stream, shape);
+/// The head read: the stream collapses to the mean of its lanes under its own
+/// read gate.
+fn lower_collapse(graph: &mut Graph, config: Config) -> Result<()> {
+	let (lanes, rank, shape) = (graph.lanes, graph.rank, graph.output);
+	let (source, read, _) = lower_gates(graph, lanes, rank, false, config)?;
+	reset(graph, source, shape);
 	push_node(graph, Primitive::Read, Shape { channels: shape.channels / lanes, length: shape.length }, 0, arguments(lanes as f64, 0.0), read)?;
 	graph.lanes = 0;
 	Ok(())
