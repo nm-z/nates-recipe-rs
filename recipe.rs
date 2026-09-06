@@ -9471,19 +9471,21 @@ fn cuts_connection(graph: &Graph, start: usize) -> bool {
 /// boundary before it cuts no connection, so the device listed last takes the
 /// tail.
 fn measured_split(graph: &Graph, precision: Compute, devices: &[&'static Gpu]) -> Result<Vec<usize>> {
+	let reserve = natural("placement launch reserve bytes", env!("RECIPE_PLACEMENT_LAUNCH_RESERVE_BYTES"))? as u64;
+	let available = |device: &&'static Gpu| device.free_bytes().map(|free| free.saturating_sub(reserve));
 	let mut starts = Vec::new();
 	for (index, node) in graph.nodes.iter().enumerate() {
 		if index == 0 || node.block_index != graph.nodes[index - 1].block_index {
 			starts.push(index)
 		}
 	}
-	let (mut split, mut taken, mut free) = (Vec::new(), 0, devices[0].free_bytes()?);
+	let (mut split, mut taken, mut free) = (Vec::new(), 0, available(&devices[0])?);
 	for (block, &start) in starts.iter().enumerate() {
 		let end = starts.get(block + 1).copied().unwrap_or(graph.nodes.len());
 		let resident = resident_bytes(graph, start..end, precision)? as u64;
 		if taken != 0 && resident > free && split.len() + 1 < devices.len() && !cuts_connection(graph, start) {
 			split.push(taken);
-			(taken, free) = (0, devices[split.len()].free_bytes()?);
+			(taken, free) = (0, available(&devices[split.len()])?);
 		}
 		if taken == 0 {
 			free = free.saturating_sub(input_row_bytes(graph, start, precision.bytes())? as u64);
