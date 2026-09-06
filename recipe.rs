@@ -2745,8 +2745,9 @@ impl NativeModelIr {
 					let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native contraction schedule is absent"))?.forward;
 					require(node.argument[1] == 0.0 || node.argument[1] == 1.0, "contraction ReLU flag is invalid")?;
 					let call = format!(
-						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {begin}, i32 {span}, i32 {kernel}, i1 {bias}, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i32 0, i32 {decode} )\n",
+						"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, {pointer} {source}, {pointer} {context}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {begin}, i32 {span}, i32 {kernel}, i1 {bias}, i1 {relu}, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i32 0, i32 {decode}, i32 0, i32 0, i32 0, i32 0 )\n",
 						pointer = pointer_type(backend),
+						context = pointers.context,
 						bias = node.argument[2] == 0.0,
 						decode = plan.decode(index),
 						source = pointers.source,
@@ -2789,10 +2790,11 @@ impl NativeModelIr {
 					let positions = Shape { channels: 1, length: node.output.length };
 					emit_fixed_loop(&mut ir, index, "topk", self.rows, positions, &window, |ir, p| {
 						ir.push_str(&format!(
-							"call void @topk_forward_body( {pointer} {source}, {pointer} {value}, i32 {p}, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize} )\n",
+							"call void @topk_forward_body( {pointer} {source}, {pointer} {value}, {pointer} {context}, i32 {p}, i32 {experts}, i32 {length}, i32 {top}, i32 {scoring}, i32 {renormalize} )\n",
 							pointer = pointer_type(backend),
 							source = pointers.source,
 							value = pointers.value,
+							context = pointers.context,
 							experts = node.output.channels,
 							length = node.output.length,
 							top = node.argument[0],
@@ -2834,23 +2836,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::ExpertIn) => {
-					emit_fixed_loop(&mut ir, index, "expert.in", self.rows, node.output, &window, |ir, p| {
-						ir.push_str(&format!(
-							"call void @expert_in_forward_body( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {decode} )\n",
-							pointer = pointer_type(backend),
-							decode = plan.decode(index),
-							source = pointers.source,
-							routing = pointers.second,
-							weights = pointers.weights,
-							value = pointers.value,
-							channels = node.input.channels,
-							length = node.output.length,
-							hidden = node.argument[2],
-							experts = node.argument[0],
-							top = node.argument[1]
-						));
-					})?;
-					ir.push_str(barrier(backend));
+					self.emit_expert_forward(backend, index, plan, &pointers, &window, false, &mut ir)?;
 				}
 				(false, Primitive::Read) => {
 					emit_fixed_loop(&mut ir, index, "read", self.rows, node.output, &window, |ir, p| {
@@ -2958,23 +2944,7 @@ impl NativeModelIr {
 					ir.push_str(barrier(backend));
 				}
 				(false, Primitive::ExpertOut) => {
-					emit_fixed_loop(&mut ir, index, "expert.out", self.rows, node.output, &window, |ir, p| {
-						ir.push_str(&format!(
-							"call void @expert_out_forward_body( {pointer} {source}, {pointer} {routing}, {pointer} {weights}, {pointer} {value}, i32 {p}, i32 {channels}, i32 {length}, i32 {hidden}, i32 {experts}, i32 {top}, i32 {decode} )\n",
-							pointer = pointer_type(backend),
-							decode = plan.decode(index),
-							source = pointers.source,
-							routing = pointers.second,
-							weights = pointers.weights,
-							value = pointers.value,
-							channels = node.output.channels,
-							length = node.output.length,
-							hidden = node.argument[2],
-							experts = node.argument[0],
-							top = node.argument[1]
-						));
-					})?;
-					ir.push_str(barrier(backend));
+					self.emit_expert_forward(backend, index, plan, &pointers, &window, true, &mut ir)?;
 				}
 				(false, Primitive::Pool) => {
 					let size = integer_argument(node.argument[0], "pool size")?;
@@ -3145,7 +3115,7 @@ impl NativeModelIr {
 					let accumulate_previous = self.plans[index + 1..].iter().any(|candidate| candidate.node.source == node.source || candidate.node.second == node.source);
 					ir.push_str(&format!("call void @contraction_reverse_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {delta}, {pointer} {source_adjoint}, {pointer} %gradient, i1 {write_input}, i1 {bias}, i1 {relu}, i1 {matrix_gradient}, i32 %rows, i32 {in_channels}, i32 {in_length}, i32 {out_channels}, i32 {out_length}, i32 {kernel}, i32 {offset}, i32 {gradient_m}, i32 {gradient_n}, i32 {gradient_k}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads )\n", pointer = pointer_type(backend), source = pointers.source, weights = pointers.weights, value = pointers.value, delta = pointers.delta, source_adjoint = pointers.source_adjoint, write_input = !composed_previous, bias = node.argument[2] == 0.0, matrix_gradient = matrix_gradient, in_channels = node.input.channels, in_length = node.input.length, out_channels = node.output.channels, out_length = node.output.length, kernel = kernel, offset = plan.node.offset, relu = node.argument[1] == 1.0, gradient_m = tiles.gradient.m, gradient_n = tiles.gradient.n, gradient_k = tiles.gradient.k, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					if composed_previous {
-						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i32 0, i32 0 )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
+						ir.push_str(&format!("call void @contraction_forward_body( {pointer} {delta}, {pointer} {weights}, {pointer} {source_adjoint}, {pointer} {value}, {pointer} {delta}, {pointer} {context}, i32 %rows, i32 {out_channels}, i32 {out_length}, i32 {in_channels}, i32 {in_length}, i32 0, i32 {in_length}, i32 0, i1 false, i1 {relu}, i1 true, i1 true, i1 {accumulate}, i32 {previous_m}, i32 {previous_n}, i32 {previous_k}, i32 %threads, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0 )\n", pointer = pointer_type(backend), delta = pointers.delta, weights = pointers.weights, source_adjoint = pointers.source_adjoint, value = pointers.value, context = pointers.context, out_channels = node.output.channels, out_length = node.output.length, in_channels = node.input.channels, in_length = node.input.length, relu = node.argument[1] == 1.0, accumulate = accumulate_previous, previous_m = tiles.previous.m, previous_n = tiles.previous.n, previous_k = tiles.previous.k));
 					}
 					ir.push_str(barrier(backend));
 				}
@@ -3866,6 +3836,13 @@ impl NativeModelIr {
 		} else {
 			source.clone()
 		};
+		let second_context = if plan.node.second >= 0 {
+			let second = usize::try_from(plan.node.second).map_err(|_| RecipeError::new("native second context node is invalid"))?;
+			ir.push_str(&ptr_gep(backend, "contexts", self.layout.contexts[second], &format!("{prefix}.second.context")));
+			format!("%{prefix}.second.context")
+		} else {
+			format!("%{prefix}.context")
+		};
 		let value = format!("%{prefix}.value");
 		let context = format!("%{prefix}.context");
 		let delta = format!("%{prefix}.delta");
@@ -3890,7 +3867,39 @@ impl NativeModelIr {
 		} else {
 			source_adjoint.clone()
 		};
-		Ok(ModelPointers { source, second, value, context, delta, weights, source_adjoint, second_adjoint })
+		Ok(ModelPointers { source, second, second_context, value, context, delta, weights, source_adjoint, second_adjoint })
+	}
+
+	/// Runs every selected expert projection through the same cooperative
+	/// contraction used by an ordinary layer. Expert input uses one matrix row
+	/// per routed slot; expert output folds the routed slots into its K extent.
+	fn emit_expert_forward(&self, backend: Backend, index: usize, plan: &NodePlan, pointers: &ModelPointers, window: &NodeWindow, outward: bool, ir: &mut String) -> Result<()> {
+		let node = &plan.node;
+		let extent = self.schedule.contractions[index].ok_or_else(|| RecipeError::new("native expert contraction schedule is absent"))?.forward;
+		ir.push_str(&format!(
+			"call void @contraction_forward_body( {pointer} {source}, {pointer} {weights}, {pointer} {value}, {pointer} {source}, {pointer} {routing}, {pointer} {routing_context}, i32 %rows, i32 {in_channels}, i32 {length}, i32 {out_channels}, i32 {length}, i32 {begin}, i32 {span}, i32 0, i1 false, i1 false, i1 false, i1 false, i1 false, i32 {tile_m}, i32 {tile_n}, i32 {tile_k}, i32 %threads, i32 0, i32 {decode}, i32 {mode}, i32 {experts}, i32 {top}, i32 {hidden} )\n{barrier}\n",
+			pointer = pointer_type(backend),
+			source = pointers.source,
+			weights = pointers.weights,
+			value = pointers.value,
+			routing = pointers.second,
+			routing_context = pointers.second_context,
+			in_channels = node.input.channels,
+			length = node.output.length,
+			out_channels = node.output.channels,
+			begin = window.begin,
+			span = window.span,
+			tile_m = extent.m,
+			tile_n = extent.n,
+			tile_k = extent.k,
+			decode = plan.decode(index),
+			mode = if outward { 2 } else { 1 },
+			experts = node.argument[0],
+			top = node.argument[1],
+			hidden = node.argument[2],
+			barrier = barrier(backend),
+		));
+		Ok(())
 	}
 
 	fn emit_native_quantization(&self, backend: Backend, format: &'static Quantization, native: NativeDequant) -> Result<String> {
@@ -4203,6 +4212,7 @@ impl NativeModelIr {
 struct ModelPointers {
 	source: String,
 	second: String,
+	second_context: String,
 	value: String,
 	context: String,
 	delta: String,
@@ -12754,6 +12764,13 @@ fn arena_weight<'a>(node: &Node, stored: &'a Option<StoredWeight>) -> Option<&'a
 /// only the regions the forward kernels read and write.
 fn node_context(node: &Node, rows: usize, element: usize, inference: bool) -> Result<usize> {
 	let elements = match node.op {
+		// The selected expert IDs, in routing rank order, are shared by every
+		// expert projection instead of rediscovering them from the dense weights.
+		Primitive::TopK => {
+			let positions = checked_mul(rows, node.output.length, "routing positions")?;
+			let selected = checked_mul(positions, node.argument[0] as usize, "selected experts")?;
+			return checked_mul(selected, size_of::<u32>(), "selected expert bytes");
+		}
 		// One scratch row per reduction partition, holding this node's trainable
 		// scalars. Programs without trainable scalars reduce nothing and take the
 		// minimum allocation below. Only the reverse pass fills the rows.
@@ -15742,6 +15759,11 @@ fn native_contraction_shapes(graph: &Graph, rows: usize) -> Result<Vec<Option<Na
 						parameters,
 					))
 				}
+				Primitive::ExpertIn => {
+					let hidden = integer_argument(node.argument[2], "native expert width")? as usize;
+					Some(((1, hidden, node.input.channels), (1, 1, 1), (1, 1, 1), 0))
+				}
+				Primitive::ExpertOut => Some(((1, node.output.channels, node.input.channels), (1, 1, 1), (1, 1, 1), 0)),
 				_ => None,
 			};
 			dimensions
