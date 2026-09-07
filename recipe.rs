@@ -4294,11 +4294,21 @@ mod gguf {
 				let (_, block, stride, _) = layout(kind)?;
 				let elements = shape.iter().try_fold(1_u64, |product, dimension| product.checked_mul(*dimension)).ok_or_else(|| RecipeError::new(format!("tensor {name} shape overflows")))?;
 				require(elements % block as u64 == 0, format!("tensor {name} holds {elements} elements, not a multiple of its {block}-element block"))?;
-				let bytes = usize::try_from(elements / block as u64 * stride as u64).map_err(|_| RecipeError::new(format!("tensor {name} exceeds the address space")))?;
+				let bytes = elements
+					.checked_div(block as u64)
+					.and_then(|blocks| blocks.checked_mul(stride as u64))
+					.and_then(|bytes| usize::try_from(bytes).ok())
+					.ok_or_else(|| RecipeError::new(format!("tensor {name} byte extent overflows")))?;
 				let offset = usize::try_from(offset).map_err(|_| RecipeError::new(format!("tensor {name} offset exceeds the address space")))?;
 				tensors.push(GgufTensor { name, shape, kind, offset, bytes, shard: 0 });
 			}
-			let data = usize::try_from((reader.at as u64).div_ceil(alignment) * alignment).map_err(|_| RecipeError::new("GGUF data offset exceeds the address space"))?;
+			let header = u64::try_from(reader.at).map_err(|_| RecipeError::new("GGUF header offset exceeds the address space"))?;
+			let data = header
+				.checked_add(alignment - 1)
+				.and_then(|offset| offset.checked_div(alignment))
+				.and_then(|blocks| blocks.checked_mul(alignment))
+				.and_then(|offset| usize::try_from(offset).ok())
+				.ok_or_else(|| RecipeError::new("GGUF data offset exceeds the address space"))?;
 			for tensor in &tensors {
 				let end = data.checked_add(tensor.offset).and_then(|start| start.checked_add(tensor.bytes));
 				require(end.is_some_and(|end| end <= bytes.len()), format!("tensor {} runs past the end of {}", tensor.name, path.display()))?;
@@ -6882,7 +6892,7 @@ fn contract_gguf(model: &Gguf, name: &str, input: &[f64], width: usize) -> Resul
 	require(stored.count == parameters, format!("tensor {name} holds {} values; a {}-wide contraction of {} inputs takes {parameters}", stored.count, width, input.len()))?;
 	graph.stored[index] = Some(stored);
 	let mut tape = NativeTape::new(&graph, input, &[], device, Compute::FP64, None)?;
-	tape.forward()?;
+	tape.forward(ForwardMode::Inference)?;
 	tape.predictions()
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
