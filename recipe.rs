@@ -18922,7 +18922,7 @@ mod issue_676_tests {
 	fn explicit_split_refuses_before_tape_allocation() {
 		let mut graph = Graph::new(Shape { channels: 1, length: 1 }, 1.0e-5);
 		push_node(&mut graph, Primitive::Contraction, Shape { channels: 1024, length: 1024 }, 1, contraction_arguments(0, false), -2).unwrap();
-		let gpu = Box::leak(Box::new(Gpu {
+		let gpu: &'static Gpu = Box::leak(Box::new(Gpu {
 			name: "test-explicit".to_owned(),
 			backend: Backend::Cpu,
 			native_target: BackendTarget::Cpu { target: "test-explicit".to_owned() },
@@ -18931,7 +18931,8 @@ mod issue_676_tests {
 			shared_limit: u32::MAX,
 			dispatch: Mutex::new(()),
 		}));
-		let error = match place_ranges(&graph, &[1], Box::leak(vec![gpu].into_boxed_slice()), Compute::FP64, &[]) {
+		let devices: &'static [&'static Gpu] = Box::leak(vec![gpu].into_boxed_slice());
+		let error = match place_ranges(&graph, &[1], devices, Compute::FP64, &[]) {
 			Ok(_) => panic!("an explicit split with one byte of memory unexpectedly fit"),
 			Err(error) => error.to_string(),
 		};
