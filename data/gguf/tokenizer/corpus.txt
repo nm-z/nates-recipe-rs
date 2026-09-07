@@ -9,6 +9,6 @@ fn main() {
 Emoji: 😀🚀 café naïve résumé — “quotes” … ellipsis
 <|im_start|>user
 What is    the   answer?<|im_end|>
-Tabs		and   spaces     
+Tabs		and   spaces
    indented line
 END
