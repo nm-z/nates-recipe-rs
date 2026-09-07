@@ -1048,7 +1048,7 @@ store.bias.ready:
 %store.biased = call double @recipe.add(double %store.sum, double %store.bias) %store.raw = select i1 %has.bias, double %store.biased, double %store.sum %store.forward = xor i1 %reverse, true %store.activate = and i1 %relu, %store.forward %store.positive = call i1 @recipe.ogt(double %store.raw, double 0.0) %store.activated = select i1 %store.positive, double %store.raw, double 0.0 %store.result = select i1 %store.activate, double %store.activated, double %store.raw %store.prior = load double, ptr addrspace(1) %store.output.ptr, align 2 %store.accumulated = call double @recipe.add(double %store.prior, double %store.result) %store.value = select i1 %accumulate, double %store.accumulated, double %store.result store double %store.value, ptr addrspace(1) %store.output.ptr, align 8 br label %store.next
 store.next: %store.register.next = add i32 %store.register, 1 br label %store.loop job.done: %job.next = add i32 %job, %groups br label %job.loop exit: ret void }
 define internal void @pool_forward_body( ptr addrspace(1) %input, ptr addrspace(1) %output, ptr addrspace(1) %context,
-i64 %p, i32 %from, i32 %to, i32 %size, i32 %channels ) #1 { entry: %from.wide = zext i32 %from to i64 %to.wide = zext i32 %to to i64 %size.wide = zext i32 %size to i64 %channels.wide = zext i32 %channels to i64
+i64 %p, i32 %from, i32 %to, i32 %size, i32 %channels, i1 %store.index ) #1 { entry: %from.wide = zext i32 %from to i64 %to.wide = zext i32 %to to i64 %size.wide = zext i32 %size to i64 %channels.wide = zext i32 %channels to i64
 %length = udiv i64 %from.wide, %channels.wide %pooled.length = udiv i64 %to.wide, %channels.wide %row = udiv i64 %p, %to.wide %out = urem i64 %p, %to.wide
 %channel = udiv i64 %out, %pooled.length %spatial = urem i64 %out, %pooled.length %start = mul i64 %spatial, %size.wide
 %candidate.end = add i64 %start, %size.wide %short = icmp ult i64 %candidate.end, %length
@@ -1063,9 +1063,14 @@ br i1 %more, label %step, label %done step: %index = add i64 %input.base, %i
 %maximum.next = select i1 %greater, double %value, double %maximum
 %maximum.index.next = select i1 %greater, i64 %index, i64 %maximum.index %next = add i64 %i, 1 br label %loop done:
 %output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %p
-%context.ptr = getelementptr inbounds i64, ptr addrspace(1) %context, i64 %p
 store double %maximum, ptr addrspace(1) %output.ptr, align 8
-store i64 %maximum.index, ptr addrspace(1) %context.ptr, align 8 ret void }
+br i1 %store.index, label %store.argmax, label %pool.exit
+store.argmax:
+%context.ptr = getelementptr inbounds i64, ptr addrspace(1) %context, i64 %p
+store i64 %maximum.index, ptr addrspace(1) %context.ptr, align 8
+br label %pool.exit
+pool.exit:
+ret void }
 ; Rotary embedding over the first %rotated channels of a fused QKV row: inside
 ; each head the channel pairs (i, i + dims/2) below %dims rotate by
 ; position * base^(-2i/dims). With %reverse the transpose rotation is added
@@ -2414,10 +2419,10 @@ select.exit:
 ret void
 }
 
-define internal void @attention_tile_products(ptr addrspace(1) nocapture readonly %output, i32 %output.row,
+define internal void @attention_tile_products(ptr addrspace(1) nocapture readonly %output, i64 %output.row,
 i32 %delta.base, i32 %product.base, i32 %query.base, i32 %query.count, i32 %head.start,
 i32 %head.width, i32 %length, i32 %lid, i32 %block) #1 { entry:
-%output.row.wide = zext i32 %output.row to i64 %delta.base.wide = zext i32 %delta.base to i64 %product.base.wide = zext i32 %product.base to i64 %query.base.wide = zext i32 %query.base to i64 %head.start.wide = zext i32 %head.start to i64 %head.width.wide = zext i32 %head.width to i64 %length.wide = zext i32 %length to i64
+%output.row.wide = add i64 %output.row, 0 %delta.base.wide = zext i32 %delta.base to i64 %product.base.wide = zext i32 %product.base to i64 %query.base.wide = zext i32 %query.base to i64 %head.start.wide = zext i32 %head.start to i64 %head.width.wide = zext i32 %head.width to i64 %length.wide = zext i32 %length to i64
 %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 br label %query.loop
 query.loop:
@@ -2465,9 +2470,9 @@ define internal void @attention_tile_derivatives(ptr addrspace(1) nocapture read
 i32 %query.shared, i32 %key.shared, i32 %delta.shared, i32 %value.shared,
 i32 %probability.shared, i32 %derivative.shared, i32 %product.shared,
 i32 %query.base, i32 %key.base, i32 %query.count, i32 %key.count, i32 %tile.n,
-i32 %head.job, i32 %length, i32 %statistics.denominator.base, i32 %head.width,
+i64 %head.job, i64 %length, i64 %statistics.denominator.base, i32 %head.width,
 double %scale, i32 %lid, i32 %block, i64 %score.row, i32 %blocks, i32 %select.block, i1 %select) #1 { entry:
-%query.shared.wide = zext i32 %query.shared to i64 %probability.shared.wide = zext i32 %probability.shared to i64 %derivative.shared.wide = zext i32 %derivative.shared to i64 %product.shared.wide = zext i32 %product.shared to i64 %query.base.wide = zext i32 %query.base to i64 %key.base.wide = zext i32 %key.base to i64 %tile.n.wide = zext i32 %tile.n to i64 %head.job.wide = zext i32 %head.job to i64 %length.wide = zext i32 %length to i64 %statistics.denominator.base.wide = zext i32 %statistics.denominator.base to i64 %head.width.wide = zext i32 %head.width to i64
+%query.shared.wide = zext i32 %query.shared to i64 %probability.shared.wide = zext i32 %probability.shared to i64 %derivative.shared.wide = zext i32 %derivative.shared to i64 %product.shared.wide = zext i32 %product.shared to i64 %query.base.wide = zext i32 %query.base to i64 %key.base.wide = zext i32 %key.base to i64 %tile.n.wide = zext i32 %tile.n to i64 %head.job.wide = add i64 %head.job, 0 %length.wide = add i64 %length, 0 %statistics.denominator.base.wide = add i64 %statistics.denominator.base, 0 %head.width.wide = zext i32 %head.width to i64
 %pair.count = mul i32 %query.count, %key.count
 %zero = call RECIPE_STATE @recipe.state.from.u1(i1 false)
 %model.zero = call double @recipe.encode(RECIPE_STATE %zero)
@@ -3524,12 +3529,14 @@ attention.matrix.score.complete:
 %matrix.dp.wide = extractelement <8 x RECIPE_STATE> %matrix.dp.accumulator, i32 %matrix.output
 %matrix.dp = call double @recipe.encode(RECIPE_STATE %matrix.dp.wide)
 %matrix.causal = icmp ule i32 %matrix.k, %matrix.query
-%matrix.statistics.base = mul i32 %head.job, %length
-%matrix.statistics.index = add i32 %matrix.statistics.base, %matrix.query
-%matrix.maximum.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %matrix.statistics.index
+%matrix.head.job.global = zext i32 %head.job to i64
+%matrix.query.global = zext i32 %matrix.query to i64
+%matrix.statistics.base = mul i64 %matrix.head.job.global, %length.global
+%matrix.statistics.index = add i64 %matrix.statistics.base, %matrix.query.global
+%matrix.maximum.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %matrix.statistics.index
 %matrix.maximum = load double, ptr addrspace(1) %matrix.maximum.ptr, align 8
-%matrix.denominator.index = add i32 %statistics.rows, %matrix.statistics.index
-%matrix.denominator.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %matrix.denominator.index
+%matrix.denominator.index = add i64 %statistics.rows.global, %matrix.statistics.index
+%matrix.denominator.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %matrix.denominator.index
 %matrix.denominator = load double, ptr addrspace(1) %matrix.denominator.ptr, align 8
 %matrix.centered = call double @recipe.sub(double %matrix.score, double %matrix.maximum)
 %matrix.exponential = call double @recipe.exp(double %matrix.centered)
@@ -3609,6 +3616,11 @@ i32 %index.mode, i32 %index.dims, i1 %index.pooled, RECIPE_STATE %index.base ) #
 %representative.total = mul i32 %representative.stride, %rows
 %score.base = add i32 %representative.base, %representative.total
 %score.row.stride = mul i32 %length, %score.stride
+%attn.rows.wide = zext i32 %rows to i64 %attn.from.wide = zext i32 %from to i64 %attn.heads.wide = zext i32 %heads to i64 %attn.channels.wide = zext i32 %channels to i64 %attn.length.wide = zext i32 %length to i64 %attn.head.width.wide = zext i32 %head.width to i64 %attn.kv.heads.wide = zext i32 %kv.heads to i64 %attn.index.heads.wide = zext i32 %index.heads to i64 %attn.index.width.wide = zext i32 %index.width to i64
+%attn.kv.channels.wide = mul i64 %attn.kv.heads.wide, %attn.head.width.wide %attn.kv.plane.wide = mul i64 %attn.kv.channels.wide, %attn.length.wide %attn.kv.planes.wide = mul i64 %attn.kv.plane.wide, 2 %attn.value.plane.base.wide = add i64 %attn.from.wide, %attn.kv.plane.wide
+%attn.index.query.channels.wide = mul i64 %attn.index.heads.wide, %attn.index.width.wide %attn.index.channels.wide = add i64 %attn.index.query.channels.wide, %attn.index.width.wide %attn.index.plane.wide = mul i64 %attn.index.channels.wide, %attn.length.wide %attn.gate.plane.wide = select i1 %gate, i64 %attn.from.wide, i64 0
+%attn.index.query.base.wide = add i64 %attn.from.wide, %attn.kv.planes.wide %attn.gate.base.wide = add i64 %attn.index.query.base.wide, 0 %attn.row.stride.wide = add i64 %attn.gate.base.wide, %attn.gate.plane.wide
+%attn.blocks.wide = zext i32 %blocks to i64 %attn.score.stride.wide = mul i64 %attn.blocks.wide, 2 %attn.head.jobs.wide = mul i64 %attn.rows.wide, %attn.heads.wide %attn.statistics.rows.wide = mul i64 %attn.head.jobs.wide, %attn.length.wide %attn.representative.base.wide = mul i64 %attn.statistics.rows.wide, 2 %attn.representative.stride.wide = mul i64 %attn.blocks.wide, %attn.index.width.wide %attn.representative.total.wide = mul i64 %attn.representative.stride.wide, %attn.rows.wide %attn.score.base.wide = add i64 %attn.representative.base.wide, %attn.representative.total.wide %attn.score.row.stride.wide = mul i64 %attn.length.wide, %attn.score.stride.wide
 %query.values = mul i32 %tile.m, %head.width
 %key.values = mul i32 %tile.n, %head.width
 %pair.values = mul i32 %tile.m, %tile.n
@@ -3635,20 +3647,18 @@ dq.job.prepare:
 %dq.query.tile = urem i32 %dq.job, %query.tiles
 %dq.head.job = udiv i32 %dq.job, %query.tiles
 %dq.head = urem i32 %dq.head.job, %heads
-%dq.row = udiv i32 %dq.head.job, %heads
-%dq.query.base = mul i32 %dq.query.tile, %tile.m
+%dq.row = udiv i32 %dq.head.job, %heads %dq.head.job.wide = zext i32 %dq.head.job to i64 %dq.row.wide = zext i32 %dq.row to i64
+%dq.query.base = mul i32 %dq.query.tile, %tile.m %dq.query.base.wide = zext i32 %dq.query.base to i64
 %dq.query.remaining = sub i32 %length, %dq.query.base
 %dq.query.short = icmp ult i32 %dq.query.remaining, %tile.m
 %dq.query.count = select i1 %dq.query.short, i32 %dq.query.remaining, i32 %tile.m
 %dq.query.last = add i32 %dq.query.base, %dq.query.count
-%dq.head.start = mul i32 %dq.head, %head.width
-%dq.kv.head = udiv i32 %dq.head, %kv.group
-%dq.kv.head.start = mul i32 %dq.kv.head, %head.width
-%dq.input.row = mul i32 %dq.row, %row.stride
-%dq.output.row = mul i32 %dq.row, %from
-%dq.score.row = mul i32 %dq.row, %score.row.stride
-%dq.score.row.base.narrow = add i32 %score.base, %dq.score.row
-%dq.score.row.base = zext i32 %dq.score.row.base.narrow to i64
+%dq.head.start = mul i32 %dq.head, %head.width %dq.head.wide = zext i32 %dq.head to i64 %dq.head.start.wide = mul i64 %dq.head.wide, %attn.head.width.wide
+%dq.kv.head = udiv i32 %dq.head, %kv.group %dq.kv.head.wide = zext i32 %dq.kv.head to i64 %dq.kv.head.start = mul i32 %dq.kv.head, %head.width %dq.kv.head.start.wide = mul i64 %dq.kv.head.wide, %attn.head.width.wide
+%dq.input.row = mul i32 %dq.row, %row.stride %dq.input.row.wide = mul i64 %dq.row.wide, %attn.row.stride.wide
+%dq.output.row = mul i32 %dq.row, %from %dq.output.row.wide = mul i64 %dq.row.wide, %attn.from.wide
+%dq.score.row = mul i32 %dq.row, %score.row.stride %dq.score.row.wide = mul i64 %dq.row.wide, %attn.score.row.stride.wide
+%dq.score.row.base = add i64 %attn.score.base.wide, %dq.score.row.wide
 %dq.active.query.values = mul i32 %dq.query.count, %head.width
 br label %dq.query.stage.loop
 dq.query.stage.loop:
@@ -3656,19 +3666,19 @@ dq.query.stage.loop:
 %dq.query.p.more = icmp ult i32 %dq.query.p, %dq.active.query.values
 br i1 %dq.query.p.more, label %dq.query.stage.step, label %dq.query.stage.done
 dq.query.stage.step:
-%dq.query.local = udiv i32 %dq.query.p, %head.width
-%dq.channel.local = urem i32 %dq.query.p, %head.width
-%dq.query.position = add i32 %dq.query.base, %dq.query.local
-%dq.channel = add i32 %dq.head.start, %dq.channel.local
-%dq.channel.base = mul i32 %dq.channel, %length
-%dq.local = add i32 %dq.channel.base, %dq.query.position
-%dq.input.index = add i32 %dq.input.row, %dq.local
-%dq.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %dq.input.index
+%dq.query.local = udiv i32 %dq.query.p, %head.width %dq.query.local.wide = zext i32 %dq.query.local to i64
+%dq.channel.local = urem i32 %dq.query.p, %head.width %dq.channel.local.wide = zext i32 %dq.channel.local to i64
+%dq.query.position = add i32 %dq.query.base, %dq.query.local %dq.query.position.wide = add i64 %dq.query.base.wide, %dq.query.local.wide
+%dq.channel = add i32 %dq.head.start, %dq.channel.local %dq.channel.wide = add i64 %dq.head.start.wide, %dq.channel.local.wide
+%dq.channel.base = mul i32 %dq.channel, %length %dq.channel.base.wide = mul i64 %dq.channel.wide, %attn.length.wide
+%dq.local = add i32 %dq.channel.base, %dq.query.position %dq.local.wide = add i64 %dq.channel.base.wide, %dq.query.position.wide
+%dq.input.index = add i32 %dq.input.row, %dq.local %dq.input.index.wide = add i64 %dq.input.row.wide, %dq.local.wide
+%dq.input.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %dq.input.index.wide
 %dq.query.value = load double, ptr addrspace(1) %dq.input.ptr, align 8
 %dq.query.shared.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %dq.query.p
 store double %dq.query.value, ptr addrspace(3) %dq.query.shared.ptr, align 8
-%dq.delta.index = add i32 %dq.output.row, %dq.local
-%dq.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %dq.delta.index
+%dq.delta.index = add i32 %dq.output.row, %dq.local %dq.delta.index.wide = add i64 %dq.output.row.wide, %dq.local.wide
+%dq.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i64 %dq.delta.index.wide
 %dq.delta.value = load double, ptr addrspace(1) %dq.delta.ptr, align 8
 %dq.delta.shared.index = add i32 %dq.delta.base.shared, %dq.query.p
 %dq.delta.shared.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %dq.delta.shared.index
@@ -3680,7 +3690,7 @@ store double 0.0, ptr addrspace(3) %dq.gradient.shared.ptr, align 8
 br label %dq.query.stage.loop
 dq.query.stage.done:
 call void @recipe.local.barrier()
-call void @attention_tile_products(ptr addrspace(1) %output, i32 %dq.output.row, i32 %dq.delta.base.shared,
+call void @attention_tile_products(ptr addrspace(1) %output, i64 %dq.output.row.wide, i32 %dq.delta.base.shared,
 i32 %dq.product.base.shared, i32 %dq.query.base, i32 %dq.query.count, i32 %dq.head.start,
 i32 %head.width, i32 %length, i32 %lid, i32 %block)
 call void @recipe.local.barrier()
@@ -3692,28 +3702,28 @@ dq.gate.loop:
 %dq.gate.more = icmp ult i32 %dq.gate.p, %dq.active.query.values
 br i1 %dq.gate.more, label %dq.gate.step, label %dq.gate.exit
 dq.gate.step:
-%dq.gate.query = udiv i32 %dq.gate.p, %head.width
-%dq.gate.channel = urem i32 %dq.gate.p, %head.width
-%dq.gate.position = add i32 %dq.query.base, %dq.gate.query
-%dq.gate.output.channel = add i32 %dq.head.start, %dq.gate.channel
-%dq.gate.channel.base = mul i32 %dq.gate.output.channel, %length
-%dq.gate.local = add i32 %dq.gate.channel.base, %dq.gate.position
-%dq.gate.row = add i32 %dq.input.row, %gate.base
-%dq.gate.index = add i32 %dq.gate.row, %dq.gate.local
-%dq.gate.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i32 %dq.gate.index
+%dq.gate.query = udiv i32 %dq.gate.p, %head.width %dq.gate.query.wide = zext i32 %dq.gate.query to i64
+%dq.gate.channel = urem i32 %dq.gate.p, %head.width %dq.gate.channel.wide = zext i32 %dq.gate.channel to i64
+%dq.gate.position = add i32 %dq.query.base, %dq.gate.query %dq.gate.position.wide = add i64 %dq.query.base.wide, %dq.gate.query.wide
+%dq.gate.output.channel = add i32 %dq.head.start, %dq.gate.channel %dq.gate.output.channel.wide = add i64 %dq.head.start.wide, %dq.gate.channel.wide
+%dq.gate.channel.base = mul i32 %dq.gate.output.channel, %length %dq.gate.channel.base.wide = mul i64 %dq.gate.output.channel.wide, %attn.length.wide
+%dq.gate.local = add i32 %dq.gate.channel.base, %dq.gate.position %dq.gate.local.wide = add i64 %dq.gate.channel.base.wide, %dq.gate.position.wide
+%dq.gate.row = add i32 %dq.input.row, %gate.base %dq.gate.row.wide = add i64 %dq.input.row.wide, %attn.gate.base.wide
+%dq.gate.index = add i32 %dq.gate.row, %dq.gate.local %dq.gate.index.wide = add i64 %dq.gate.row.wide, %dq.gate.local.wide
+%dq.gate.ptr = getelementptr inbounds double, ptr addrspace(1) %input, i64 %dq.gate.index.wide
 %dq.gate.value = load double, ptr addrspace(1) %dq.gate.ptr, align 8
 %dq.gate.factor = call double @recipe.sigmoid(double %dq.gate.value)
 %dq.gate.shared.index = add i32 %dq.delta.base.shared, %dq.gate.p
 %dq.gate.shared.ptr = getelementptr [0 x double], ptr addrspace(3) @contraction_tile, i32 0, i32 %dq.gate.shared.index
 %dq.gate.delta = load double, ptr addrspace(3) %dq.gate.shared.ptr, align 8
-%dq.gate.output.index = add i32 %dq.output.row, %dq.gate.local
-%dq.gate.output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %dq.gate.output.index
+%dq.gate.output.index = add i32 %dq.output.row, %dq.gate.local %dq.gate.output.index.wide = add i64 %dq.output.row.wide, %dq.gate.local.wide
+%dq.gate.output.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %dq.gate.output.index.wide
 %dq.gate.output.value = load double, ptr addrspace(1) %dq.gate.output.ptr, align 8
 %dq.gate.one = call double @recipe.from.u1(i1 true)
 %dq.gate.complement = call double @recipe.sub(double %dq.gate.one, double %dq.gate.factor)
 %dq.gate.product = call double @recipe.mul(double %dq.gate.delta, double %dq.gate.output.value)
 %dq.gate.gradient = call double @recipe.mul(double %dq.gate.product, double %dq.gate.complement)
-%dq.gate.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %dq.gate.index
+%dq.gate.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i64 %dq.gate.index.wide
 store double %dq.gate.gradient, ptr addrspace(1) %dq.gate.previous.ptr, align 8
 %dq.gate.scaled = call double @recipe.mul(double %dq.gate.delta, double %dq.gate.factor)
 store double %dq.gate.scaled, ptr addrspace(3) %dq.gate.shared.ptr, align 8
@@ -4490,6 +4500,7 @@ call void @grid_barrier(i32 %threads)
 call void @reduce_rows(ptr addrspace(1) %gradient.scratch, ptr addrspace(1) %gradient, i32 %gradient.splits, i32 %gradient.values, i32 %gradient.stride, i32 0, i32 %offset, i32 %threads)
 br label %previous.test
 previous.test: br i1 %write.input, label %previous.entry, label %exit previous.entry:
+%previous.span.wide = zext i32 %span to i64
 %previous.m.total = mul i32 %rows, %in.length %previous.r.total = mul i32 %out.channels, %span
 %previous.m.short = icmp ult i32 %previous.tile.m, %previous.m.total %previous.m.tile = select i1 %previous.m.short, i32 %previous.tile.m, i32 %previous.m.total %previous.n.short = icmp ult i32 %previous.tile.n, %in.channels %previous.n.tile = select i1 %previous.n.short, i32 %previous.tile.n, i32 %in.channels
 %previous.k.short = icmp ult i32 %previous.tile.k, %previous.r.total %previous.k.tile = select i1 %previous.k.short, i32 %previous.tile.k, i32 %previous.r.total
@@ -4527,36 +4538,36 @@ previous.sum.init.step: %previous.sum.init.ptr = getelementptr [RECIPE_REGISTER_
 %previous.a.count = mul i32 %previous.m.count, %previous.a.columns %previous.b.count = mul i32 %previous.r.count, %previous.b.columns %previous.load.count = add i32 %previous.a.count, %previous.b.count br label %previous.load.loop previous.load.loop:
 %previous.load = phi i32 [ %lid, %previous.tile.loop ], [ %previous.load.next, %previous.load.advance ] %previous.load.more = icmp ult i32 %previous.load, %previous.load.count br i1 %previous.load.more, label %previous.load.classify, label %previous.load.done
 previous.load.classify: %previous.load.a = icmp ult i32 %previous.load, %previous.a.count br i1 %previous.load.a, label %previous.load.a.step, label %previous.load.b.step
-previous.load.a.step: %previous.a.m = udiv i32 %previous.load, %previous.a.columns %previous.a.column = urem i32 %previous.load, %previous.a.columns %previous.a.r = mul i32 %previous.a.column, %previous.a.width %previous.a.term = add i32 %previous.r.base, %previous.a.r
+previous.load.a.step: %previous.a.m = udiv i32 %previous.load, %previous.a.columns %previous.a.column = urem i32 %previous.load, %previous.a.columns %previous.a.r = mul i32 %previous.a.column, %previous.a.width %previous.a.term = add i32 %previous.r.base, %previous.a.r %previous.a.term.wide = zext i32 %previous.a.term to i64
 %previous.a.filter = udiv i32 %previous.a.term, %span %previous.a.kernel = urem i32 %previous.a.term, %span %previous.a.global = add i32 %previous.m.base, %previous.a.m %previous.a.row = udiv i32 %previous.a.global, %in.length %previous.a.position = urem i32 %previous.a.global, %in.length
 %previous.a.low = icmp uge i32 %previous.a.position, %previous.a.kernel %previous.a.position.raw = sub i32 %previous.a.position, %previous.a.kernel %previous.a.high = icmp ult i32 %previous.a.position.raw, %out.length %previous.a.valid = and i1 %previous.a.low, %previous.a.high
-%previous.a.position.safe = select i1 %previous.a.valid, i32 %previous.a.position.raw, i32 0 %previous.a.row.base = mul i32 %previous.a.row, %out.elements %previous.a.filter.base = mul i32 %previous.a.filter, %out.length
-%previous.a.local = add i32 %previous.a.filter.base, %previous.a.position.safe %previous.a.index = add i32 %previous.a.row.base, %previous.a.local %previous.a.tile.index = call i32 @contraction_a_index(i32 %previous.a.r, i32 %previous.a.m, i32 %previous.tile.m, i32 %previous.tile.k)
+%previous.a.position.safe = select i1 %previous.a.valid, i32 %previous.a.position.raw, i32 0 %previous.a.row.wide = zext i32 %previous.a.row to i64 %previous.a.filter.wide = zext i32 %previous.a.filter to i64 %previous.a.position.safe.wide = zext i32 %previous.a.position.safe to i64 %previous.a.row.base = mul i64 %previous.a.row.wide, %out.elements.wide %previous.a.filter.base = mul i64 %previous.a.filter.wide, %out.length.wide
+%previous.a.local = add i64 %previous.a.filter.base, %previous.a.position.safe.wide %previous.a.index = add i64 %previous.a.row.base, %previous.a.local %previous.a.tile.index = call i32 @contraction_a_index(i32 %previous.a.r, i32 %previous.a.m, i32 %previous.tile.m, i32 %previous.tile.k)
 br i1 %previous.a.vector, label %previous.load.a.vector, label %previous.load.a.scalar
 previous.load.a.vector:
-%previous.a.vector.delta = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %previous.a.index
-%previous.a.vector.output = getelementptr inbounds double, ptr addrspace(1) %output, i32 %previous.a.index
+%previous.a.vector.delta = getelementptr inbounds double, ptr addrspace(1) %delta, i64 %previous.a.index
+%previous.a.vector.output = getelementptr inbounds double, ptr addrspace(1) %output, i64 %previous.a.index
 %previous.a.vector.delta.value = load <RECIPE_FRAGMENT_K x double>, ptr addrspace(1) %previous.a.vector.delta, align 8
 %previous.a.vector.output.value = load <RECIPE_FRAGMENT_K x double>, ptr addrspace(1) %previous.a.vector.output, align 8
 call void @contraction_stage_delta_a_fragment(<RECIPE_FRAGMENT_K x double> %previous.a.vector.delta.value, <RECIPE_FRAGMENT_K x double> %previous.a.vector.output.value, i1 %relu, i32 %previous.a.r, i32 %previous.a.m, i32 %previous.tile.m, i32 %previous.tile.k)
 br label %previous.load.advance
 previous.load.a.scalar:
-%previous.a.raw = call double @contraction_delta(ptr addrspace(1) %delta, ptr addrspace(1) %output, i32 %previous.a.index, i1 %relu)
+%previous.a.raw = call double @contraction_delta(ptr addrspace(1) %delta, ptr addrspace(1) %output, i64 %previous.a.index, i1 %relu)
 %previous.a.value = select i1 %previous.a.valid, double %previous.a.raw, double 0.0
 br label %previous.load.store
 previous.load.b.step: %previous.b.local = sub i32 %previous.load, %previous.a.count %previous.b.r = udiv i32 %previous.b.local, %previous.b.columns %previous.b.column = urem i32 %previous.b.local, %previous.b.columns %previous.b.n = mul i32 %previous.b.column, %previous.b.width %previous.b.term = add i32 %previous.r.base, %previous.b.r
-%previous.b.filter = udiv i32 %previous.b.term, %span %previous.b.kernel = urem i32 %previous.b.term, %span %previous.b.channel = add i32 %previous.n.base, %previous.b.n %previous.b.filter.base = mul i32 %previous.b.filter, %window
-%previous.b.channel.base = mul i32 %previous.b.channel, %span %previous.b.channel.local = add i32 %previous.b.channel.base, %previous.b.kernel %previous.b.index = add i32 %previous.b.filter.base, %previous.b.channel.local
+%previous.b.filter = udiv i32 %previous.b.term, %span %previous.b.kernel = urem i32 %previous.b.term, %span %previous.b.channel = add i32 %previous.n.base, %previous.b.n %previous.b.filter.wide = zext i32 %previous.b.filter to i64 %previous.b.channel.wide = zext i32 %previous.b.channel to i64 %previous.b.kernel.wide = zext i32 %previous.b.kernel to i64 %previous.b.filter.base = mul i64 %previous.b.filter.wide, %window.wide
+%previous.b.channel.base = mul i64 %previous.b.channel.wide, %previous.span.wide %previous.b.channel.local = add i64 %previous.b.channel.base, %previous.b.kernel.wide %previous.b.index = add i64 %previous.b.filter.base, %previous.b.channel.local
 %previous.b.tile.base = mul i32 %previous.tile.m, %previous.tile.k
 %previous.b.tile.local = call i32 @contraction_b_index(i32 %previous.b.r, i32 %previous.b.n, i32 %previous.tile.n, i32 %previous.tile.k) %previous.b.tile.index = add i32 %previous.b.tile.base, %previous.b.tile.local
 br i1 %previous.b.vector, label %previous.load.b.vector, label %previous.load.b.scalar
 previous.load.b.vector:
-%previous.b.vector.source = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %previous.b.index
+%previous.b.vector.source = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %previous.b.index
 %previous.b.vector.value = load <RECIPE_FRAGMENT_K x double>, ptr addrspace(1) %previous.b.vector.source, align 8
 call void @contraction_stage_b_fragment(<RECIPE_FRAGMENT_K x double> %previous.b.vector.value, i32 %previous.b.r, i32 %previous.b.n, i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k)
 br label %previous.load.advance
 previous.load.b.scalar:
-%previous.b.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %previous.b.index
+%previous.b.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %previous.b.index
 %previous.b.value = load double, ptr addrspace(1) %previous.b.ptr, align 8
 br label %previous.load.store
 previous.load.store: %previous.load.value = phi double [ %previous.a.value, %previous.load.a.scalar ], [ %previous.b.value, %previous.load.b.scalar ] %previous.load.index = phi i32 [ %previous.a.tile.index, %previous.load.a.scalar ], [ %previous.b.tile.index, %previous.load.b.scalar ]
@@ -4583,8 +4594,8 @@ call void @contraction_product_accumulate(ptr addrspace(5) %sums, i1 %previous.l
 %previous.store.register = phi i32 [ 0, %previous.load.ready ], [ %previous.store.register.next, %previous.store.next ] %previous.store.more = icmp ult i32 %previous.store.register, RECIPE_REGISTER_COUNT br i1 %previous.store.more, label %previous.store.test, label %previous.job.done
 previous.store.test: %previous.store.output.m.raw = call i32 @contraction_output_m(i32 %lid, i32 %previous.store.register, i32 %previous.m.lanes) %previous.store.output.n.raw = call i32 @contraction_output_n(i32 %lid, i32 %previous.store.register, i32 %previous.m.lanes) %previous.store.register.valid = call i1 @contraction_output_register_valid(i32 %previous.store.register)
 %previous.store.output.m.valid = icmp ult i32 %previous.store.output.m.raw, %previous.m.count %previous.store.output.n.valid = icmp ult i32 %previous.store.output.n.raw, %previous.n.count %previous.store.output.valid = and i1 %previous.store.output.m.valid, %previous.store.output.n.valid %previous.lane.output.active = and i1 %previous.method.store, %previous.store.output.valid %previous.store.active = and i1 %previous.lane.output.active, %previous.store.register.valid br i1 %previous.store.active, label %previous.store, label %previous.store.next
-previous.store: %previous.store.m.global = add i32 %previous.m.base, %previous.store.output.m.raw %previous.store.channel = add i32 %previous.n.base, %previous.store.output.n.raw %previous.store.row = udiv i32 %previous.store.m.global, %in.length %previous.store.position = urem i32 %previous.store.m.global, %in.length
-%previous.store.row.base = mul i32 %previous.store.row, %in.elements %previous.store.channel.base = mul i32 %previous.store.channel, %in.length %previous.store.local = add i32 %previous.store.channel.base, %previous.store.position %previous.store.index = add i32 %previous.store.row.base, %previous.store.local %previous.store.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i32 %previous.store.index
+previous.store: %previous.store.m.global = add i32 %previous.m.base, %previous.store.output.m.raw %previous.store.channel = add i32 %previous.n.base, %previous.store.output.n.raw %previous.store.m.global.wide = zext i32 %previous.store.m.global to i64 %previous.store.channel.wide = zext i32 %previous.store.channel to i64 %previous.store.row.wide = udiv i64 %previous.store.m.global.wide, %in.length.wide %previous.store.position.wide = urem i64 %previous.store.m.global.wide, %in.length.wide
+%previous.store.row.base = mul i64 %previous.store.row.wide, %in.elements.wide %previous.store.channel.base = mul i64 %previous.store.channel.wide, %in.length.wide %previous.store.local = add i64 %previous.store.channel.base, %previous.store.position.wide %previous.store.index = add i64 %previous.store.row.base, %previous.store.local %previous.store.ptr = getelementptr inbounds double, ptr addrspace(1) %previous, i64 %previous.store.index
 %previous.store.old = load double, ptr addrspace(1) %previous.store.ptr, align 8 %previous.store.sum.ptr = getelementptr [RECIPE_REGISTER_COUNT x RECIPE_STATE], ptr addrspace(5) %sums, i32 0, i32 %previous.store.register %previous.store.sum.wide = load RECIPE_STATE, ptr addrspace(5) %previous.store.sum.ptr, align RECIPE_STATE_ALIGN %previous.store.sum = call double @recipe.encode(RECIPE_STATE %previous.store.sum.wide) %previous.store.value = call double @recipe.add(double %previous.store.old, double %previous.store.sum) store double %previous.store.value, ptr addrspace(1) %previous.store.ptr, align 8 br label %previous.store.next
 previous.store.next: %previous.store.register.next = add i32 %previous.store.register, 1 br label %previous.store.loop previous.job.done: %previous.job.next = add i32 %previous.job, %groups br label %previous.job.loop exit: ret void }
 define internal void @scan_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %weights, ptr addrspace(1) %output,
@@ -4592,38 +4603,38 @@ ptr addrspace(1) %context, ptr addrspace(1) %delta, ptr addrspace(1) %previous,
 ptr addrspace(1) %gradient, i1 %write.input, i32 %rows, i32 %in.channels,
 i32 %length, i32 %out.channels, i32 %gates, i32 %parameters, i32 %offset,
 i32 %gradient.tile.m, i32 %gradient.tile.n, i32 %gradient.tile.k, i32 %previous.tile.m, i32 %previous.tile.n, i32 %previous.tile.k, i32 %threads ) #3 { entry:
-%tid = call i32 @llvm.amdgcn.workitem.id.x() %in.elements = mul i32 %in.channels, %length
-%out.elements = mul i32 %out.channels, %length %batch = mul i32 %rows, %out.elements
-%gate.stride.0 = mul i32 %in.channels, %out.channels %state.matrix = mul i32 %out.channels, %out.channels
-%gate.stride.1 = add i32 %gate.stride.0, %state.matrix %gate.stride = add i32 %gate.stride.1, %out.channels
-%delta.base.factor = add i32 %gates, 1 %delta.base = mul i32 %delta.base.factor, %batch %gate2.batch = mul i32 %batch, 2
-%row.gradient.factor = mul i32 %gates, 2 %row.gradient.factor.1 = add i32 %row.gradient.factor, 1
-%row.gradient.base = mul i32 %row.gradient.factor.1, %batch %rnn = icmp eq i32 %gates, 1
+%tid = call i32 @llvm.amdgcn.workitem.id.x() %scan.in.channels.wide = zext i32 %in.channels to i64 %scan.length.wide = zext i32 %length to i64 %scan.out.channels.wide = zext i32 %out.channels to i64 %scan.rows.wide = zext i32 %rows to i64 %scan.gates.wide = zext i32 %gates to i64 %scan.parameters.wide = zext i32 %parameters to i64 %in.elements = mul i32 %in.channels, %length %scan.in.elements.wide = mul i64 %scan.in.channels.wide, %scan.length.wide
+%out.elements = mul i32 %out.channels, %length %scan.out.elements.wide = mul i64 %scan.out.channels.wide, %scan.length.wide %batch = mul i32 %rows, %out.elements %scan.batch.wide = mul i64 %scan.rows.wide, %scan.out.elements.wide
+%gate.stride.0 = mul i32 %in.channels, %out.channels %scan.gate.stride.0.wide = mul i64 %scan.in.channels.wide, %scan.out.channels.wide %state.matrix = mul i32 %out.channels, %out.channels %scan.state.matrix.wide = mul i64 %scan.out.channels.wide, %scan.out.channels.wide
+%gate.stride.1 = add i32 %gate.stride.0, %state.matrix %scan.gate.stride.1.wide = add i64 %scan.gate.stride.0.wide, %scan.state.matrix.wide %gate.stride = add i32 %gate.stride.1, %out.channels %scan.gate.stride.wide = add i64 %scan.gate.stride.1.wide, %scan.out.channels.wide
+%delta.base.factor = add i32 %gates, 1 %scan.delta.base.factor.wide = add i64 %scan.gates.wide, 1 %delta.base = mul i32 %delta.base.factor, %batch %scan.delta.base.wide = mul i64 %scan.delta.base.factor.wide, %scan.batch.wide %gate2.batch = mul i32 %batch, 2 %scan.gate2.batch.wide = mul i64 %scan.batch.wide, 2
+%row.gradient.factor = mul i32 %gates, 2 %scan.row.gradient.factor.wide = mul i64 %scan.gates.wide, 2 %row.gradient.factor.1 = add i32 %row.gradient.factor, 1 %scan.row.gradient.factor.1.wide = add i64 %scan.row.gradient.factor.wide, 1
+%row.gradient.base = mul i32 %row.gradient.factor.1, %batch %scan.row.gradient.base.wide = mul i64 %scan.row.gradient.factor.1.wide, %scan.batch.wide %rnn = icmp eq i32 %gates, 1
 %gru = icmp eq i32 %gates, 3 %lstm = icmp eq i32 %gates, 4 %simple = or i1 %rnn, %gru
 %supported = or i1 %simple, %lstm br i1 %supported, label %row.loop, label %invalid row.loop:
 %row = phi i32 [ %tid, %entry ], [ %row.next, %row.done ]
 %row.more = icmp ult i32 %row, %rows br i1 %row.more, label %clear.gradient.loop, label %reduce.entry
 clear.gradient.loop: %clear.p = phi i32 [ 0, %row.loop ], [ %clear.next, %clear.gradient.step ]
-%row.gradient.offset = mul i32 %row, %parameters %row.gradient.start = add i32 %row.gradient.base, %row.gradient.offset
+%scan.row.wide = zext i32 %row to i64 %scan.clear.p.wide = zext i32 %clear.p to i64 %row.gradient.offset = mul i32 %row, %parameters %scan.row.gradient.offset.wide = mul i64 %scan.row.wide, %scan.parameters.wide %scan.row.gradient.start.wide = add i64 %scan.row.gradient.base.wide, %scan.row.gradient.offset.wide %row.gradient.start = add i32 %row.gradient.base, %row.gradient.offset
 %clear.more = icmp ult i32 %clear.p, %parameters br i1 %clear.more, label %clear.gradient.step, label %clear.state.loop
-clear.gradient.step: %clear.index = add i32 %row.gradient.start, %clear.p
-%clear.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %clear.index
+clear.gradient.step: %clear.index = add i32 %row.gradient.start, %clear.p %scan.clear.index.wide = add i64 %scan.row.gradient.start.wide, %scan.clear.p.wide
+%clear.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.clear.index.wide
 store double 0.0, ptr addrspace(1) %clear.ptr, align 8 %clear.next = add nuw i32 %clear.p, 1
 br label %clear.gradient.loop clear.state.loop:
 %clear.h = phi i32 [ 0, %clear.gradient.loop ], [ %clear.h.next, %clear.state.step ]
-%scratch.base.0 = mul i32 %rows, %parameters %scratch.base = add i32 %row.gradient.base, %scratch.base.0
-%scratch.row = mul i32 %row, %out.channels %dh.start = add i32 %scratch.base, %scratch.row
-%dc.base.0 = mul i32 %rows, %out.channels %dc.base = add i32 %scratch.base, %dc.base.0
-%dc.start = add i32 %dc.base, %scratch.row %clear.h.more = icmp ult i32 %clear.h, %out.channels
+%scratch.base.0 = mul i32 %rows, %parameters %scan.scratch.base.0.wide = mul i64 %scan.rows.wide, %scan.parameters.wide %scratch.base = add i32 %row.gradient.base, %scratch.base.0 %scan.scratch.base.wide = add i64 %scan.row.gradient.base.wide, %scan.scratch.base.0.wide
+%scratch.row = mul i32 %row, %out.channels %scan.scratch.row.wide = mul i64 %scan.row.wide, %scan.out.channels.wide %dh.start = add i32 %scratch.base, %scratch.row %scan.dh.start.wide = add i64 %scan.scratch.base.wide, %scan.scratch.row.wide
+%dc.base.0 = mul i32 %rows, %out.channels %scan.dc.base.0.wide = mul i64 %scan.rows.wide, %scan.out.channels.wide %dc.base = add i32 %scratch.base, %dc.base.0 %scan.dc.base.wide = add i64 %scan.scratch.base.wide, %scan.dc.base.0.wide
+%dc.start = add i32 %dc.base, %scratch.row %scan.dc.start.wide = add i64 %scan.dc.base.wide, %scan.scratch.row.wide %clear.h.more = icmp ult i32 %clear.h, %out.channels
 br i1 %clear.h.more, label %clear.state.step, label %time.loop clear.state.step:
-%clear.dh.index = add i32 %dh.start, %clear.h %clear.dc.index = add i32 %dc.start, %clear.h
-%clear.dh.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %clear.dh.index
-%clear.dc.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %clear.dc.index
+%clear.dh.index = add i32 %dh.start, %clear.h %clear.dc.index = add i32 %dc.start, %clear.h %scan.clear.h.wide = zext i32 %clear.h to i64 %scan.clear.dh.index.wide = add i64 %scan.dh.start.wide, %scan.clear.h.wide %scan.clear.dc.index.wide = add i64 %scan.dc.start.wide, %scan.clear.h.wide
+%clear.dh.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.clear.dh.index.wide
+%clear.dc.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.clear.dc.index.wide
 store double 0.0, ptr addrspace(1) %clear.dh.ptr, align 8 store double 0.0, ptr addrspace(1) %clear.dc.ptr, align 8
 %clear.h.next = add nuw i32 %clear.h, 1 br label %clear.state.loop time.loop:
-%time = phi i32 [ %length, %clear.state.loop ], [ %time.current, %time.done ] %time.current = sub i32 %time, 1
-%row.output.base = mul i32 %row, %out.elements %input.row.base = mul i32 %row, %in.elements
-%previous.time = sub i32 %time.current, 1 %previous.exists = icmp sge i32 %previous.time, 0
+%time = phi i32 [ %length, %clear.state.loop ], [ %time.current, %time.done ] %time.current = sub i32 %time, 1 %scan.time.current.wide = zext i32 %time.current to i64 %scan.previous.time.wide = sub i64 %scan.time.current.wide, 1
+%row.output.base = mul i32 %row, %out.elements %scan.row.output.base.wide = mul i64 %scan.row.wide, %scan.out.elements.wide %input.row.base = mul i32 %row, %in.elements %scan.input.row.base.wide = mul i64 %scan.row.wide, %scan.in.elements.wide
+%previous.time = sub i32 %time.current, 1 %previous.exists = icmp sge i32 %previous.time, 0 %scan.previous.safe.wide = select i1 %previous.exists, i64 %scan.previous.time.wide, i64 0
 %previous.safe = select i1 %previous.exists, i32 %previous.time, i32 0 %time.more = icmp sge i32 %time.current, 0
 br i1 %time.more, label %scan.mode, label %row.done scan.mode:
 br i1 %lstm, label %gate.delta.loop, label %rnn.test rnn.test:
@@ -4631,31 +4642,29 @@ br i1 %rnn, label %rnn.delta.loop, label %gru.delta.loop rnn.delta.loop:
 %rnn.hidden = phi i32 [ 0, %rnn.test ], [ %rnn.next, %rnn.delta.step ]
 %rnn.more = icmp ult i32 %rnn.hidden, %out.channels
 br i1 %rnn.more, label %rnn.delta.step, label %delta.done rnn.delta.step:
-%rnn.hidden.base = mul i32 %rnn.hidden, %length %rnn.local = add i32 %rnn.hidden.base, %time.current
-%rnn.index = add i32 %row.output.base, %rnn.local %rnn.dy.ptr = getelementptr inbounds double,
-ptr addrspace(1) %delta, i32 %rnn.index %rnn.future.index = add i32 %dh.start, %rnn.hidden
-%rnn.future.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %rnn.future.index
-%rnn.gate.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %rnn.index
+%rnn.hidden.wide = zext i32 %rnn.hidden to i64 %rnn.hidden.base = mul i32 %rnn.hidden, %length %scan.rnn.hidden.base.wide = mul i64 %rnn.hidden.wide, %scan.length.wide %rnn.local = add i32 %rnn.hidden.base, %time.current %scan.rnn.local.wide = add i64 %scan.rnn.hidden.base.wide, %scan.time.current.wide
+%rnn.index = add i32 %row.output.base, %rnn.local %scan.rnn.index.wide = add i64 %scan.row.output.base.wide, %scan.rnn.local.wide %rnn.dy.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i64 %scan.rnn.index.wide %rnn.future.index = add i32 %dh.start, %rnn.hidden %scan.rnn.future.index.wide = add i64 %scan.dh.start.wide, %rnn.hidden.wide
+%rnn.future.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.rnn.future.index.wide
+%rnn.gate.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.rnn.index.wide
 %rnn.dy = load double, ptr addrspace(1) %rnn.dy.ptr, align 8
 %rnn.future = load double, ptr addrspace(1) %rnn.future.ptr, align 8
 %rnn.gate = load double, ptr addrspace(1) %rnn.gate.ptr, align 8 %rnn.dh = call double @recipe.add(double %rnn.dy, double %rnn.future)
 %rnn.square = call double @recipe.mul(double %rnn.gate, double %rnn.gate) %rnn.derivative = call double @recipe.sub(double 1.0, double %rnn.square)
-%rnn.delta = call double @recipe.mul(double %rnn.dh, double %rnn.derivative) %rnn.delta.index = add i32 %delta.base, %rnn.index
-%rnn.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %rnn.delta.index
+%rnn.delta = call double @recipe.mul(double %rnn.dh, double %rnn.derivative) %rnn.delta.index = add i32 %delta.base, %rnn.index %scan.rnn.delta.index.wide = add i64 %scan.delta.base.wide, %scan.rnn.index.wide
+%rnn.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.rnn.delta.index.wide
 store double %rnn.delta, ptr addrspace(1) %rnn.delta.ptr, align 8 %rnn.next = add i32 %rnn.hidden, 1
 br label %rnn.delta.loop gru.delta.loop: %gru.hidden = phi i32 [ 0, %rnn.test ], [ %gru.next, %gru.delta.step ]
 %gru.more = icmp ult i32 %gru.hidden, %out.channels
 br i1 %gru.more, label %gru.delta.step, label %gru.reset.loop gru.delta.step:
-%gru.hidden.base = mul i32 %gru.hidden, %length %gru.local = add i32 %gru.hidden.base, %time.current
-%gru.index = add i32 %row.output.base, %gru.local %gru.previous.local = add i32 %gru.hidden.base, %previous.safe
-%gru.previous.index = add i32 %row.output.base, %gru.previous.local
-%gru.dy.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %gru.index
-%gru.future.index = add i32 %dh.start, %gru.hidden
-%gru.future.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gru.future.index
-%gru.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %gru.previous.index
-%gru.z.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gru.index
-%gru.n.index = add i32 %gru.index, %gate2.batch
-%gru.n.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gru.n.index
+%gru.hidden.wide = zext i32 %gru.hidden to i64 %gru.hidden.base = mul i32 %gru.hidden, %length %scan.gru.hidden.base.wide = mul i64 %gru.hidden.wide, %scan.length.wide %gru.local = add i32 %gru.hidden.base, %time.current %scan.gru.local.wide = add i64 %scan.gru.hidden.base.wide, %scan.time.current.wide
+%gru.index = add i32 %row.output.base, %gru.local %scan.gru.index.wide = add i64 %scan.row.output.base.wide, %scan.gru.local.wide %gru.previous.local = add i32 %gru.hidden.base, %previous.safe %scan.gru.previous.local.wide = add i64 %scan.gru.hidden.base.wide, %scan.previous.safe.wide
+%gru.previous.index = add i32 %row.output.base, %gru.previous.local %scan.gru.previous.index.wide = add i64 %scan.row.output.base.wide, %scan.gru.previous.local.wide
+%gru.dy.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i64 %scan.gru.index.wide %gru.future.index = add i32 %dh.start, %gru.hidden %scan.gru.future.index.wide = add i64 %scan.dh.start.wide, %gru.hidden.wide
+%gru.future.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.gru.future.index.wide
+%gru.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %scan.gru.previous.index.wide
+%gru.z.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.gru.index.wide
+%gru.n.index = add i32 %gru.index, %gate2.batch %scan.gru.n.index.wide = add i64 %scan.gru.index.wide, %scan.gate2.batch.wide
+%gru.n.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.gru.n.index.wide
 %gru.dy = load double, ptr addrspace(1) %gru.dy.ptr, align 8
 %gru.future = load double, ptr addrspace(1) %gru.future.ptr, align 8
 %gru.previous.loaded = load double, ptr addrspace(1) %gru.previous.ptr, align 8
@@ -4666,68 +4675,68 @@ br i1 %gru.more, label %gru.delta.step, label %gru.reset.loop gru.delta.step:
 %gru.dz.0 = call double @recipe.mul(double %gru.dh, double %gru.z.difference) %gru.dz.1 = call double @recipe.mul(double %gru.dz.0, double %gru.z)
 %gru.dz = call double @recipe.mul(double %gru.dz.1, double %gru.one.z) %gru.n.square = call double @recipe.mul(double %gru.n, double %gru.n)
 %gru.n.derivative = call double @recipe.sub(double 1.0, double %gru.n.square) %gru.dn.0 = call double @recipe.mul(double %gru.dh, double %gru.one.z)
-%gru.dn = call double @recipe.mul(double %gru.dn.0, double %gru.n.derivative) %gru.dz.index = add i32 %delta.base, %gru.index
-%gru.dn.index.0 = add i32 %delta.base, %gate2.batch %gru.dn.index = add i32 %gru.dn.index.0, %gru.index
-%gru.dz.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gru.dz.index
-%gru.dn.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gru.dn.index
+%gru.dn = call double @recipe.mul(double %gru.dn.0, double %gru.n.derivative) %gru.dz.index = add i32 %delta.base, %gru.index %scan.gru.dz.index.wide = add i64 %scan.delta.base.wide, %scan.gru.index.wide
+%gru.dn.index.0 = add i32 %delta.base, %gate2.batch %scan.gru.dn.base.wide = add i64 %scan.delta.base.wide, %scan.gate2.batch.wide %scan.gru.dn.index.wide = add i64 %scan.gru.dn.base.wide, %scan.gru.index.wide
+%gru.dz.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.gru.dz.index.wide
+%gru.dn.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.gru.dn.index.wide
 store double %gru.dz, ptr addrspace(1) %gru.dz.ptr, align 8
 store double %gru.dn, ptr addrspace(1) %gru.dn.ptr, align 8 %gru.next = add i32 %gru.hidden, 1
 br label %gru.delta.loop gru.reset.loop:
 %gru.source = phi i32 [ 0, %gru.delta.loop ], [ %gru.source.next, %gru.reset.store ]
-%gru.source.more = icmp ult i32 %gru.source, %out.channels
+%gru.source.more = icmp ult i32 %gru.source, %out.channels %scan.gru.source.wide = zext i32 %gru.source to i64
 br i1 %gru.source.more, label %gru.reset.sum.loop, label %delta.done gru.reset.sum.loop:
 %gru.target = phi i32 [ 0, %gru.reset.loop ], [ %gru.target.next, %gru.reset.sum.step ]
 %gru.reset.sum = phi double [ 0.0, %gru.reset.loop ], [ %gru.reset.sum.next, %gru.reset.sum.step ]
 %gru.target.more = icmp ult i32 %gru.target, %out.channels
 br i1 %gru.target.more, label %gru.reset.sum.step, label %gru.reset.store gru.reset.sum.step:
-%gru.candidate.base = mul i32 %gate.stride, 2 %gru.candidate.state = add i32 %gru.candidate.base, %gate.stride.0
-%gru.weight.row = mul i32 %gru.source, %out.channels %gru.weight.local = add i32 %gru.weight.row, %gru.target
-%gru.weight.index = add i32 %gru.candidate.state, %gru.weight.local
-%gru.weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %gru.weight.index
-%gru.target.base = mul i32 %gru.target, %length %gru.target.local = add i32 %gru.target.base, %time.current
-%gru.target.index = add i32 %row.output.base, %gru.target.local %gru.target.delta.0 = add i32 %delta.base, %gate2.batch
-%gru.target.delta.index = add i32 %gru.target.delta.0, %gru.target.index
-%gru.target.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gru.target.delta.index
+%scan.gru.target.wide = zext i32 %gru.target to i64 %gru.candidate.base = mul i32 %gate.stride, 2 %scan.gru.candidate.base.wide = mul i64 %scan.gate.stride.wide, 2 %gru.candidate.state = add i32 %gru.candidate.base, %gate.stride.0 %scan.gru.candidate.state.wide = add i64 %scan.gru.candidate.base.wide, %scan.gate.stride.0.wide
+%gru.weight.row = mul i32 %gru.source, %out.channels %scan.gru.weight.row.wide = mul i64 %scan.gru.source.wide, %scan.out.channels.wide %gru.weight.local = add i32 %gru.weight.row, %gru.target %scan.gru.weight.local.wide = add i64 %scan.gru.weight.row.wide, %scan.gru.target.wide
+%gru.weight.index = add i32 %gru.candidate.state, %gru.weight.local %scan.gru.weight.index.wide = add i64 %scan.gru.candidate.state.wide, %scan.gru.weight.local.wide
+%gru.weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %scan.gru.weight.index.wide
+%gru.target.base = mul i32 %gru.target, %length %scan.gru.target.base.wide = mul i64 %scan.gru.target.wide, %scan.length.wide %gru.target.local = add i32 %gru.target.base, %time.current %scan.gru.target.local.wide = add i64 %scan.gru.target.base.wide, %scan.time.current.wide
+%gru.target.index = add i32 %row.output.base, %gru.target.local %scan.gru.target.index.wide = add i64 %scan.row.output.base.wide, %scan.gru.target.local.wide %gru.target.delta.0 = add i32 %delta.base, %gate2.batch %scan.gru.target.delta.0.wide = add i64 %scan.delta.base.wide, %scan.gate2.batch.wide
+%gru.target.delta.index = add i32 %gru.target.delta.0, %gru.target.index %scan.gru.target.delta.index.wide = add i64 %scan.gru.target.delta.0.wide, %scan.gru.target.index.wide
+%gru.target.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.gru.target.delta.index.wide
 %gru.weight = load double, ptr addrspace(1) %gru.weight.ptr, align 8
 %gru.target.delta = load double, ptr addrspace(1) %gru.target.delta.ptr, align 8
 %gru.reset.product = call double @recipe.mul(double %gru.weight, double %gru.target.delta)
 %gru.reset.sum.next = call double @recipe.add(double %gru.reset.sum, double %gru.reset.product)
 %gru.target.next = add i32 %gru.target, 1 br label %gru.reset.sum.loop gru.reset.store:
-%gru.source.base = mul i32 %gru.source, %length %gru.source.local = add i32 %gru.source.base, %time.current
-%gru.source.index = add i32 %row.output.base, %gru.source.local
-%gru.source.previous.local = add i32 %gru.source.base, %previous.safe
-%gru.source.previous.index = add i32 %row.output.base, %gru.source.previous.local
-%gru.source.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %gru.source.previous.index
-%gru.r.index = add i32 %batch, %gru.source.index
-%gru.r.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gru.r.index
+%gru.source.base = mul i32 %gru.source, %length %scan.gru.source.base.wide = mul i64 %scan.gru.source.wide, %scan.length.wide %gru.source.local = add i32 %gru.source.base, %time.current %scan.gru.source.local.wide = add i64 %scan.gru.source.base.wide, %scan.time.current.wide
+%gru.source.index = add i32 %row.output.base, %gru.source.local %scan.gru.source.index.wide = add i64 %scan.row.output.base.wide, %scan.gru.source.local.wide
+%gru.source.previous.local = add i32 %gru.source.base, %previous.safe %scan.gru.source.previous.local.wide = add i64 %scan.gru.source.base.wide, %scan.previous.safe.wide
+%gru.source.previous.index = add i32 %row.output.base, %gru.source.previous.local %scan.gru.source.previous.index.wide = add i64 %scan.row.output.base.wide, %scan.gru.source.previous.local.wide
+%gru.source.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %scan.gru.source.previous.index.wide
+%gru.r.index = add i32 %batch, %gru.source.index %scan.gru.r.index.wide = add i64 %scan.batch.wide, %scan.gru.source.index.wide
+%gru.r.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.gru.r.index.wide
 %gru.source.previous.loaded = load double, ptr addrspace(1) %gru.source.previous.ptr, align 8
 %gru.source.previous = select i1 %previous.exists, double %gru.source.previous.loaded, double 0.0
 %gru.r = load double, ptr addrspace(1) %gru.r.ptr, align 8
 %gru.dr = call double @recipe.mul(double %gru.reset.sum, double %gru.source.previous) %gru.one.r = call double @recipe.sub(double 1.0, double %gru.r)
 %gru.dr.0 = call double @recipe.mul(double %gru.dr, double %gru.r) %gru.dr.1 = call double @recipe.mul(double %gru.dr.0, double %gru.one.r)
-%gru.dr.base = add i32 %delta.base, %batch %gru.dr.index = add i32 %gru.dr.base, %gru.source.index
-%gru.dr.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %gru.dr.index
+%gru.dr.base = add i32 %delta.base, %batch %scan.gru.dr.base.wide = add i64 %scan.delta.base.wide, %scan.batch.wide %gru.dr.index = add i32 %gru.dr.base, %gru.source.index %scan.gru.dr.index.wide = add i64 %scan.gru.dr.base.wide, %scan.gru.source.index.wide
+%gru.dr.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.gru.dr.index.wide
 store double %gru.dr.1, ptr addrspace(1) %gru.dr.ptr, align 8 %gru.source.next = add i32 %gru.source, 1
 br label %gru.reset.loop gate.delta.loop: %hidden = phi i32 [ 0, %scan.mode ], [ %hidden.next, %gate.delta.step ]
 %hidden.more = icmp ult i32 %hidden, %out.channels br i1 %hidden.more, label %gate.delta.step, label %delta.done
-gate.delta.step: %hidden.base = mul i32 %hidden, %length %local = add i32 %hidden.base, %time.current
-%index = add i32 %row.output.base, %local %previous.local = add i32 %hidden.base, %previous.safe
-%previous.index = add i32 %row.output.base, %previous.local %cell.base = mul i32 %gates, %batch
-%cell.index = add i32 %cell.base, %index %cell.previous.index = add i32 %cell.base, %previous.index
-%dy.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %index %dh.index = add i32 %dh.start, %hidden
-%dc.index = add i32 %dc.start, %hidden %dh.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %dh.index
-%dc.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %dc.index
-%cell.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %cell.index
-%cell.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %cell.previous.index
+gate.delta.step: %hidden.wide = zext i32 %hidden to i64 %hidden.base = mul i32 %hidden, %length %scan.lstm.hidden.base.wide = mul i64 %hidden.wide, %scan.length.wide %local = add i32 %hidden.base, %time.current %scan.lstm.local.wide = add i64 %scan.lstm.hidden.base.wide, %scan.time.current.wide
+%index = add i32 %row.output.base, %local %scan.lstm.index.wide = add i64 %scan.row.output.base.wide, %scan.lstm.local.wide %previous.local = add i32 %hidden.base, %previous.safe %scan.lstm.previous.local.wide = add i64 %scan.lstm.hidden.base.wide, %scan.previous.safe.wide
+%previous.index = add i32 %row.output.base, %previous.local %scan.lstm.previous.index.wide = add i64 %scan.row.output.base.wide, %scan.lstm.previous.local.wide %cell.base = mul i32 %gates, %batch %scan.lstm.cell.base.wide = mul i64 %scan.gates.wide, %scan.batch.wide
+%cell.index = add i32 %cell.base, %index %scan.lstm.cell.index.wide = add i64 %scan.lstm.cell.base.wide, %scan.lstm.index.wide %cell.previous.index = add i32 %cell.base, %previous.index %scan.lstm.cell.previous.index.wide = add i64 %scan.lstm.cell.base.wide, %scan.lstm.previous.index.wide
+%dy.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i64 %scan.lstm.index.wide %dh.index = add i32 %dh.start, %hidden %scan.lstm.dh.index.wide = add i64 %scan.dh.start.wide, %hidden.wide
+%dc.index = add i32 %dc.start, %hidden %scan.lstm.dc.index.wide = add i64 %scan.dc.start.wide, %hidden.wide %dh.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.lstm.dh.index.wide
+%dc.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.lstm.dc.index.wide
+%cell.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.lstm.cell.index.wide
+%cell.previous.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.lstm.cell.previous.index.wide
 %dy = load double, ptr addrspace(1) %dy.ptr, align 8 %dh.future = load double, ptr addrspace(1) %dh.ptr, align 8
 %dc.future = load double, ptr addrspace(1) %dc.ptr, align 8 %cell = load double, ptr addrspace(1) %cell.ptr, align 8
 %cell.previous.loaded = load double, ptr addrspace(1) %cell.previous.ptr, align 8
 %cell.previous = select i1 %previous.exists, double %cell.previous.loaded, double 0.0
-%i.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %index %f.index = add i32 %batch, %index
-%o.index = add i32 %f.index, %batch %g.index = add i32 %o.index, %batch
-%f.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %f.index
-%o.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %o.index
-%g.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %g.index
+%i.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.lstm.index.wide %f.index = add i32 %batch, %index %scan.lstm.f.index.wide = add i64 %scan.batch.wide, %scan.lstm.index.wide
+%o.index = add i32 %f.index, %batch %scan.lstm.o.index.wide = add i64 %scan.lstm.f.index.wide, %scan.batch.wide %g.index = add i32 %o.index, %batch %scan.lstm.g.index.wide = add i64 %scan.lstm.o.index.wide, %scan.batch.wide
+%f.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.lstm.f.index.wide
+%o.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.lstm.o.index.wide
+%g.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.lstm.g.index.wide
 %i = load double, ptr addrspace(1) %i.ptr, align 8 %f = load double, ptr addrspace(1) %f.ptr, align 8
 %o = load double, ptr addrspace(1) %o.ptr, align 8 %g = load double, ptr addrspace(1) %g.ptr, align 8
 %dh = call double @recipe.add(double %dy, double %dh.future) %cell.tanh = call double @recipe.tanh(double %cell)
@@ -4739,13 +4748,13 @@ gate.delta.step: %hidden.base = mul i32 %hidden, %length %local = add i32 %hidde
 %df.0 = call double @recipe.mul(double %dc, double %cell.previous) %df.1 = call double @recipe.mul(double %df.0, double %f) %df = call double @recipe.mul(double %df.1, double %one.f)
 %g.square = call double @recipe.mul(double %g, double %g) %one.g.square = call double @recipe.sub(double 1.0, double %g.square) %dg.0 = call double @recipe.mul(double %dc, double %i)
 %dg = call double @recipe.mul(double %dg.0, double %one.g.square) %dc.previous = call double @recipe.mul(double %dc, double %f)
-store double %dc.previous, ptr addrspace(1) %dc.ptr, align 8 %delta0.index = add i32 %delta.base, %index
-%delta1.index = add i32 %delta0.index, %batch %delta2.index = add i32 %delta1.index, %batch
-%delta3.index = add i32 %delta2.index, %batch
-%delta0.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %delta0.index
-%delta1.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %delta1.index
-%delta2.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %delta2.index
-%delta3.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %delta3.index
+store double %dc.previous, ptr addrspace(1) %dc.ptr, align 8 %delta0.index = add i32 %delta.base, %index %scan.lstm.delta0.index.wide = add i64 %scan.delta.base.wide, %scan.lstm.index.wide
+%delta1.index = add i32 %delta0.index, %batch %scan.lstm.delta1.index.wide = add i64 %scan.lstm.delta0.index.wide, %scan.batch.wide %delta2.index = add i32 %delta1.index, %batch %scan.lstm.delta2.index.wide = add i64 %scan.lstm.delta1.index.wide, %scan.batch.wide
+%delta3.index = add i32 %delta2.index, %batch %scan.lstm.delta3.index.wide = add i64 %scan.lstm.delta2.index.wide, %scan.batch.wide
+%delta0.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.lstm.delta0.index.wide
+%delta1.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.lstm.delta1.index.wide
+%delta2.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.lstm.delta2.index.wide
+%delta3.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.lstm.delta3.index.wide
 store double %di, ptr addrspace(1) %delta0.ptr, align 8 store double %df, ptr addrspace(1) %delta1.ptr, align 8
 store double %do, ptr addrspace(1) %delta2.ptr, align 8 store double %dg, ptr addrspace(1) %delta3.ptr, align 8
 %hidden.next = add nuw i32 %hidden, 1 br label %gate.delta.loop delta.done: br label %parameter.loop parameter.loop:
@@ -4756,72 +4765,72 @@ br i1 %p.more, label %parameter.step, label %hidden.gradient.loop parameter.step
 br i1 %input.weight, label %parameter.advance, label %parameter.value parameter.value:
 %state.end = add i32 %gate.stride.0, %state.matrix %state.weight = icmp ult i32 %within, %state.end
 %state.index = sub i32 %within, %gate.stride.0 %selected.index = select i1 %state.weight, i32 %state.index, i32 0
-%source.channel = udiv i32 %selected.index, %out.channels %target.hidden = urem i32 %selected.index, %out.channels
+%source.channel = udiv i32 %selected.index, %out.channels %scan.source.channel.wide = zext i32 %source.channel to i64 %target.hidden = urem i32 %selected.index, %out.channels
 %bias.hidden = sub i32 %within, %state.end %delta.hidden = select i1 %state.weight, i32 %target.hidden, i32 %bias.hidden
-%delta.hidden.base = mul i32 %delta.hidden, %length %delta.local = add i32 %delta.hidden.base, %time.current
-%delta.row.local = add i32 %row.output.base, %delta.local %delta.gate.base = mul i32 %gate, %batch
-%delta.gate.local = add i32 %delta.base, %delta.gate.base %delta.index = add i32 %delta.gate.local, %delta.row.local
-%gate.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %delta.index
+%delta.hidden.base = mul i32 %delta.hidden, %length %scan.delta.hidden.wide = zext i32 %delta.hidden to i64 %scan.delta.hidden.base.wide = mul i64 %scan.delta.hidden.wide, %scan.length.wide %delta.local = add i32 %delta.hidden.base, %time.current %scan.delta.local.wide = add i64 %scan.delta.hidden.base.wide, %scan.time.current.wide
+%delta.row.local = add i32 %row.output.base, %delta.local %scan.delta.row.local.wide = add i64 %scan.row.output.base.wide, %scan.delta.local.wide %delta.gate.base = mul i32 %gate, %batch %scan.delta.gate.wide = zext i32 %gate to i64 %scan.delta.gate.base.wide = mul i64 %scan.delta.gate.wide, %scan.batch.wide
+%delta.gate.local = add i32 %delta.base, %delta.gate.base %scan.delta.gate.local.wide = add i64 %scan.delta.base.wide, %scan.delta.gate.base.wide %delta.index = add i32 %delta.gate.local, %delta.row.local %scan.delta.index.wide = add i64 %scan.delta.gate.local.wide, %scan.delta.row.local.wide
+%gate.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.delta.index.wide
 %gate.delta = load double, ptr addrspace(1) %gate.delta.ptr, align 8
-%state.hidden.base = mul i32 %source.channel, %length
-%state.local = add i32 %state.hidden.base, %previous.safe %state.index.value = add i32 %row.output.base, %state.local
-%state.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i32 %state.index.value
+%state.hidden.base = mul i32 %source.channel, %length %scan.state.hidden.base.wide = mul i64 %scan.source.channel.wide, %scan.length.wide %state.local = add i32 %state.hidden.base, %previous.safe %scan.state.local.wide = add i64 %scan.state.hidden.base.wide, %scan.previous.safe.wide %state.index.value = add i32 %row.output.base, %state.local %scan.state.index.value.wide = add i64 %scan.row.output.base.wide, %scan.state.local.wide
+%state.ptr = getelementptr inbounds double, ptr addrspace(1) %output, i64 %scan.state.index.value.wide
 %state.loaded = load double, ptr addrspace(1) %state.ptr, align 8
 %state.value = select i1 %previous.exists, double %state.loaded, double 0.0
 %candidate.gate = icmp eq i32 %gate, 2 %gru.candidate = and i1 %gru, %candidate.gate
-%parameter.reset.local = add i32 %state.hidden.base, %time.current
-%parameter.reset.row = add i32 %row.output.base, %parameter.reset.local
-%parameter.reset.raw = add i32 %batch, %parameter.reset.row
-%parameter.reset.index = select i1 %gru.candidate, i32 %parameter.reset.raw, i32 0
-%parameter.reset.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %parameter.reset.index
+%parameter.reset.local = add i32 %state.hidden.base, %time.current %scan.parameter.reset.local.wide = add i64 %scan.state.hidden.base.wide, %scan.time.current.wide
+%parameter.reset.row = add i32 %row.output.base, %parameter.reset.local %scan.parameter.reset.row.wide = add i64 %scan.row.output.base.wide, %scan.parameter.reset.local.wide
+%parameter.reset.raw = add i32 %batch, %parameter.reset.row %scan.parameter.reset.raw.wide = add i64 %scan.batch.wide, %scan.parameter.reset.row.wide
+%parameter.reset.index = select i1 %gru.candidate, i32 %parameter.reset.raw, i32 0 %scan.parameter.reset.index.wide = select i1 %gru.candidate, i64 %scan.parameter.reset.raw.wide, i64 0
+%parameter.reset.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.parameter.reset.index.wide
 %parameter.reset = load double, ptr addrspace(1) %parameter.reset.ptr, align 8
 %parameter.reset.state = call double @recipe.mul(double %parameter.reset, double %state.value)
 %parameter.state = select i1 %gru.candidate, double %parameter.reset.state, double %state.value
 %source.value = select i1 %state.weight, double %parameter.state, double 1.0
-%contribution = call double @recipe.mul(double %source.value, double %gate.delta) %row.gradient.index = add i32 %row.gradient.start, %p
-%row.gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %row.gradient.index
+%contribution = call double @recipe.mul(double %source.value, double %gate.delta) %scan.p.wide = zext i32 %p to i64 %scan.row.gradient.index.wide = add i64 %scan.row.gradient.start.wide, %scan.p.wide %row.gradient.index = add i32 %row.gradient.start, %p
+%row.gradient.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.row.gradient.index.wide
 %row.gradient.old = load double, ptr addrspace(1) %row.gradient.ptr, align 8
 %row.gradient.new = call double @recipe.add(double %row.gradient.old, double %contribution)
 store double %row.gradient.new, ptr addrspace(1) %row.gradient.ptr, align 8
 br label %parameter.advance parameter.advance:
 %p.next = add nuw i32 %p, 1 br label %parameter.loop hidden.gradient.loop:
-%state.channel = phi i32 [ 0, %parameter.loop ], [ %state.channel.next, %hidden.gradient.store ]
+%state.channel = phi i32 [ 0, %parameter.loop ], [ %state.channel.next, %hidden.gradient.store ] %scan.state.channel.wide = zext i32 %state.channel to i64
 %state.channel.more = icmp ult i32 %state.channel, %out.channels
 br i1 %state.channel.more, label %hidden.gradient.sum.loop, label %time.done hidden.gradient.sum.loop:
 %state.term = phi i32 [ 0, %hidden.gradient.loop ], [ %state.term.next, %hidden.gradient.sum.step ]
 %state.sum = phi double [ 0.0, %hidden.gradient.loop ], [ %state.sum.next, %hidden.gradient.sum.step ]
 %state.terms = mul i32 %gates, %out.channels %state.term.more = icmp ult i32 %state.term, %state.terms
 br i1 %state.term.more, label %hidden.gradient.sum.step, label %hidden.gradient.store hidden.gradient.sum.step:
-%state.gate = udiv i32 %state.term, %out.channels %state.hidden = urem i32 %state.term, %out.channels
-%state.gate.base = mul i32 %state.gate, %gate.stride %state.matrix.base = add i32 %state.gate.base, %gate.stride.0
-%state.weight.row = mul i32 %state.channel, %out.channels %state.weight.local = add i32 %state.weight.row, %state.hidden
-%state.weight.index = add i32 %state.matrix.base, %state.weight.local
-%state.weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %state.weight.index
-%state.delta.hidden.base = mul i32 %state.hidden, %length
-%state.delta.local = add i32 %state.delta.hidden.base, %time.current
-%state.delta.row = add i32 %row.output.base, %state.delta.local %state.delta.gate.base = mul i32 %state.gate, %batch
-%state.delta.base = add i32 %delta.base, %state.delta.gate.base
-%state.delta.index = add i32 %state.delta.base, %state.delta.row
-%state.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %state.delta.index
+%state.gate = udiv i32 %state.term, %out.channels %state.hidden = urem i32 %state.term, %out.channels %scan.state.gate.wide = zext i32 %state.gate to i64 %scan.state.hidden.wide = zext i32 %state.hidden to i64
+%state.gate.base = mul i32 %state.gate, %gate.stride %scan.state.gate.base.wide = mul i64 %scan.state.gate.wide, %scan.gate.stride.wide %state.matrix.base = add i32 %state.gate.base, %gate.stride.0 %scan.state.matrix.base.wide = add i64 %scan.state.gate.base.wide, %scan.gate.stride.0.wide
+%state.weight.row = mul i32 %state.channel, %out.channels %scan.state.weight.row.wide = mul i64 %scan.state.channel.wide, %scan.out.channels.wide %state.weight.local = add i32 %state.weight.row, %state.hidden %scan.state.weight.local.wide = add i64 %scan.state.weight.row.wide, %scan.state.hidden.wide
+%state.weight.index = add i32 %state.matrix.base, %state.weight.local %scan.state.weight.index.wide = add i64 %scan.state.matrix.base.wide, %scan.state.weight.local.wide
+%state.weight.ptr = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %scan.state.weight.index.wide
+%state.delta.hidden.base = mul i32 %state.hidden, %length %scan.state.delta.hidden.base.wide = mul i64 %scan.state.hidden.wide, %scan.length.wide
+%state.delta.local = add i32 %state.delta.hidden.base, %time.current %scan.state.delta.local.wide = add i64 %scan.state.delta.hidden.base.wide, %scan.time.current.wide
+%state.delta.row = add i32 %row.output.base, %state.delta.local %scan.state.delta.row.wide = add i64 %scan.row.output.base.wide, %scan.state.delta.local.wide %state.delta.gate.base = mul i32 %state.gate, %batch %scan.state.delta.gate.base.wide = mul i64 %scan.state.gate.wide, %scan.batch.wide
+%state.delta.base = add i32 %delta.base, %state.delta.gate.base %scan.state.delta.base.wide = add i64 %scan.delta.base.wide, %scan.state.delta.gate.base.wide
+%state.delta.index = add i32 %state.delta.base, %state.delta.row %scan.state.delta.index.wide = add i64 %scan.state.delta.base.wide, %scan.state.delta.row.wide
+%state.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.state.delta.index.wide
 %state.weight.value = load double, ptr addrspace(1) %state.weight.ptr, align 8
 %state.delta.value = load double, ptr addrspace(1) %state.delta.ptr, align 8
 %state.product = call double @recipe.mul(double %state.weight.value, double %state.delta.value) %state.candidate = icmp eq i32 %state.gate, 2
-%state.gru.candidate = and i1 %gru, %state.candidate %state.reset.hidden.base = mul i32 %state.channel, %length
-%state.reset.local = add i32 %state.reset.hidden.base, %time.current
-%state.reset.row = add i32 %row.output.base, %state.reset.local %state.reset.raw = add i32 %batch, %state.reset.row
-%state.reset.index = select i1 %state.gru.candidate, i32 %state.reset.raw, i32 0
-%state.reset.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %state.reset.index
+%state.gru.candidate = and i1 %gru, %state.candidate %state.reset.hidden.base = mul i32 %state.channel, %length %scan.state.reset.hidden.base.wide = mul i64 %scan.state.channel.wide, %scan.length.wide
+%state.reset.local = add i32 %state.reset.hidden.base, %time.current %scan.state.reset.local.wide = add i64 %scan.state.reset.hidden.base.wide, %scan.time.current.wide
+%state.reset.row = add i32 %row.output.base, %state.reset.local %scan.state.reset.row.wide = add i64 %scan.row.output.base.wide, %scan.state.reset.local.wide %state.reset.raw = add i32 %batch, %state.reset.row %scan.state.reset.raw.wide = add i64 %scan.batch.wide, %scan.state.reset.row.wide
+%state.reset.index = select i1 %state.gru.candidate, i32 %state.reset.raw, i32 0 %scan.state.reset.index.wide = select i1 %state.gru.candidate, i64 %scan.state.reset.raw.wide, i64 0
+%state.reset.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.state.reset.index.wide
 %state.reset = load double, ptr addrspace(1) %state.reset.ptr, align 8
 %state.reset.product = call double @recipe.mul(double %state.product, double %state.reset)
 %state.contribution = select i1 %state.gru.candidate, double %state.reset.product, double %state.product
 %state.sum.next = call double @recipe.add(double %state.sum, double %state.contribution) %state.term.next = add nuw i32 %state.term, 1
-br label %hidden.gradient.sum.loop hidden.gradient.store: %state.dh.index = add i32 %dh.start, %state.channel
-%state.dh.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %state.dh.index
-%state.direct.hidden.base = mul i32 %state.channel, %length
-%state.direct.local = add i32 %state.direct.hidden.base, %time.current
-%state.direct.index = add i32 %row.output.base, %state.direct.local
-%state.direct.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i32 %state.direct.index
-%state.direct.z.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i32 %state.direct.index
+br label %hidden.gradient.sum.loop hidden.gradient.store:
+%state.dh.index = add i32 %dh.start, %state.channel %scan.state.dh.index.wide = add i64 %scan.dh.start.wide, %scan.state.channel.wide
+%state.dh.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.state.dh.index.wide
+%state.direct.hidden.base = mul i32 %state.channel, %length %scan.state.direct.hidden.base.wide = mul i64 %scan.state.channel.wide, %scan.length.wide
+%state.direct.local = add i32 %state.direct.hidden.base, %time.current %scan.state.direct.local.wide = add i64 %scan.state.direct.hidden.base.wide, %scan.time.current.wide
+%state.direct.index = add i32 %row.output.base, %state.direct.local %scan.state.direct.index.wide = add i64 %scan.row.output.base.wide, %scan.state.direct.local.wide
+%state.direct.delta.ptr = getelementptr inbounds double, ptr addrspace(1) %delta, i64 %scan.state.direct.index.wide
+%state.direct.z.ptr = getelementptr inbounds double, ptr addrspace(1) %context, i64 %scan.state.direct.index.wide
 %state.direct.dy = load double, ptr addrspace(1) %state.direct.delta.ptr, align 8
 %state.direct.future = load double, ptr addrspace(1) %state.dh.ptr, align 8
 %state.direct.z = load double, ptr addrspace(1) %state.direct.z.ptr, align 8
@@ -4838,11 +4847,11 @@ projection.entry: call void @grid_barrier(i32 %threads) br label %projection.loo
 %projection.gate = phi i32 [ 0, %projection.entry ], [ %projection.next, %projection.step ]
 %projection.more = icmp ult i32 %projection.gate, %gates
 br i1 %projection.more, label %projection.step, label %exit projection.step:
-%projection.weight.offset = mul i32 %projection.gate, %gate.stride
-%projection.weights = getelementptr inbounds double, ptr addrspace(1) %weights, i32 %projection.weight.offset
-%projection.delta.gate = mul i32 %projection.gate, %batch
-%projection.delta.offset = add i32 %delta.base, %projection.delta.gate
-%projection.delta = getelementptr inbounds double, ptr addrspace(1) %context, i32 %projection.delta.offset
+%projection.gate.wide = zext i32 %projection.gate to i64 %projection.weight.offset = mul i32 %projection.gate, %gate.stride %projection.weight.offset.wide = mul i64 %projection.gate.wide, %scan.gate.stride.wide
+%projection.weights = getelementptr inbounds double, ptr addrspace(1) %weights, i64 %projection.weight.offset.wide
+%projection.delta.gate = mul i32 %projection.gate, %batch %projection.delta.gate.wide = mul i64 %projection.gate.wide, %scan.batch.wide
+%projection.delta.offset = add i32 %delta.base, %projection.delta.gate %projection.delta.offset.wide = add i64 %scan.delta.base.wide, %projection.delta.gate.wide
+%projection.delta = getelementptr inbounds double, ptr addrspace(1) %context, i64 %projection.delta.offset.wide
 %projection.gradient.offset = add i32 %offset, %projection.weight.offset
 call void @contraction_reverse_body( ptr addrspace(1) %input, ptr addrspace(1) %projection.weights, ptr addrspace(1) %output,
 ptr addrspace(1) %projection.delta, ptr addrspace(1) %previous, ptr addrspace(1) %gradient, i1 %write.input, i1 false, i1 false, i1 false,
